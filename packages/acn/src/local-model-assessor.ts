@@ -1,4 +1,4 @@
-import { Cause, Context, Effect, Exit, Layer, Option, Schema, Stream } from "effect"
+import { Cause, Context, Effect, Exit, Layer, Option, Schema, Stream, SubscriptionRef } from "effect"
 import {
   LocalModelConfigurationAssessmentSchema,
   ModelServingConfigurationSchema,
@@ -18,7 +18,6 @@ import {
   catalogModelEffectiveConfigurationFromIcn,
 } from "./local-model-icn-adapter"
 import { LocalModelPackages } from "./local-model-packages"
-import { makeObservedState } from "./mirrored-state"
 
 const CoordinatedLocalModelAssessmentStateSchema = Schema.Union(
   Schema.TaggedStruct("Assessing", {}),
@@ -193,7 +192,7 @@ export const LocalModelAssessorLive: Layer.Layer<
   const hardware = yield* IcnHardware
   const assessments = yield* LocalModelAssessments
   const packages = yield* LocalModelPackages
-  const observed = yield* makeObservedState<AssessorState>({
+  const current = yield* SubscriptionRef.make<AssessorState>({
     desired: new Map(),
     published: new Map(),
     completedKeys: new Map(),
@@ -217,7 +216,7 @@ export const LocalModelAssessorLive: Layer.Layer<
       ...desiredCatalogConfigurations,
       ...effectiveCatalogConfigurations,
     ]
-    const packageState = (yield* packages.snapshot).state
+    const packageState = yield* packages.state
     const packageEntries = new Map(packageState.entries.map((entry) => [entry.package.id, entry]))
     const hardwareState = (yield* hardware.get).state
     const hardwareEvidence = {
@@ -250,20 +249,21 @@ export const LocalModelAssessorLive: Layer.Layer<
     return desired
   })
 
-  const publish = (state: AssessorState) => observed.setIfChanged(
-    state,
-    (left, right) => publishedEquivalent(left.published, right.published)
-      && sameDesired(left.desired, right.desired)
-      && sameCompleted(left.completedKeys, right.completedKeys),
-  )
+  const publish = (state: AssessorState) => Effect.gen(function* () {
+    const previous = yield* SubscriptionRef.get(current)
+    const equivalent = publishedEquivalent(previous.published, state.published)
+      && sameDesired(previous.desired, state.desired)
+      && sameCompleted(previous.completedKeys, state.completedKeys)
+    if (!equivalent) yield* SubscriptionRef.set(current, state)
+  })
 
   const reconcile = lock.withPermits(1)(Effect.gen(function* () {
     const desired = yield* readDesired
-    const current = (yield* observed.get).state
+    const state = yield* SubscriptionRef.get(current)
     const pending = [...desired].filter(([demandKey, { semanticKey }]) =>
-      current.completedKeys.get(demandKey) !== semanticKey)
+      state.completedKeys.get(demandKey) !== semanticKey)
     const published = new Map(
-      [...current.published].filter(([demandKey]) => desired.has(demandKey)),
+      [...state.published].filter(([demandKey]) => desired.has(demandKey)),
     )
     for (const [demandKey, entry] of published) {
       const next = desired.get(demandKey)
@@ -280,7 +280,7 @@ export const LocalModelAssessorLive: Layer.Layer<
         assessment: { _tag: "Assessing" },
       })
     }
-    yield* publish({ ...current, desired, published })
+    yield* publish({ ...state, desired, published })
     if (pending.length === 0) return
 
     const outcome = yield* Effect.exit(assessments.assess(
@@ -291,7 +291,7 @@ export const LocalModelAssessorLive: Layer.Layer<
       () => Effect.void,
     ))
     const latestDesired = yield* readDesired
-    const latest = (yield* observed.get).state
+    const latest = yield* SubscriptionRef.get(current)
     const nextPublished = new Map(latest.published)
     const completedKeys = new Map(latest.completedKeys)
     if (Exit.isFailure(outcome)) {
@@ -357,11 +357,11 @@ export const LocalModelAssessorLive: Layer.Layer<
   const publicState = (published: AssessorState["published"]) => [...published.values()]
 
   return LocalModelAssessor.of({
-    state: observed.get.pipe(Effect.map(({ state }) => publicState(state.published))),
-    changes: observed.changes.pipe(Stream.map(({ state }) => publicState(state.published))),
+    state: SubscriptionRef.get(current).pipe(Effect.map((state) => publicState(state.published))),
+    changes: current.changes.pipe(Stream.map((state) => publicState(state.published))),
     settled: Effect.gen(function* () {
       const desired = yield* readDesired
-      const { completedKeys } = (yield* observed.get).state
+      const { completedKeys } = yield* SubscriptionRef.get(current)
       return [...desired].every(([demandKey, { semanticKey }]) =>
         completedKeys.get(demandKey) === semanticKey)
     }).pipe(Effect.orElseSucceed(() => false)),

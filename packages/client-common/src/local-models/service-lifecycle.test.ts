@@ -27,15 +27,26 @@ const localModelsState: LocalModelsState = {
   .IS_REACT_ACT_ENVIRONMENT = true
 
 const makeFakeAgentClient = (
-  onGetLocalModels: () => void,
+  onGetModelCatalog: () => void,
   options?: {
     readonly getLocalModels?: () => Effect.Effect<unknown, unknown>
   },
 ) => {
   const request = (tag: string): Effect.Effect<unknown, unknown> => {
-    if (tag === "GetLocalModels") {
-      onGetLocalModels()
-      return options?.getLocalModels?.() ?? Effect.succeed({ state: localModelsState })
+    if (tag === "GetModelCatalog") {
+      onGetModelCatalog()
+      return options?.getLocalModels?.() ?? Effect.succeed({
+        _tag: "Ready",
+        providers: [],
+        models: localModelsState.models.map((product) => ({
+          _tag: "Local",
+          product,
+          offering: { _tag: "None" },
+        })),
+        failures: [],
+        localInventoryState: localModelsState.inventoryState,
+        localDiscoveryState: localModelsState.discoveryState,
+      })
     }
     return Effect.dieMessage(`Unexpected RPC in local-model lifecycle test: ${tag}`)
   }
@@ -87,7 +98,7 @@ const renderHarness = (
 )
 
 describe("local model query lifecycle", () => {
-  it("does not refetch GetLocalModels when switching menu consumers", async () => {
+  it("does not refetch GetModelCatalog when switching menu consumers", async () => {
     let calls = 0
     const { client } = makeFakeAgentClient(() => calls++)
     const registry = Registry.make({ defaultIdleTTL: 5_000 })
@@ -114,7 +125,7 @@ describe("local model query lifecycle", () => {
     registry.dispose()
   })
 
-  it("keeps invalidation subscribed after the initial GetLocalModels request fails", async () => {
+  it("keeps invalidation subscribed after the initial GetModelCatalog request fails", async () => {
     let calls = 0
     const { client, invalidations } = makeFakeAgentClient(
       () => calls++,
@@ -135,13 +146,13 @@ describe("local model query lifecycle", () => {
     const callsBeforeInvalidation = calls
 
     await act(async () => {
-      await Effect.runPromise(invalidations.publish({ query: "GetModelSlots", revision: 1 }))
+      await Effect.runPromise(invalidations.publish({ query: "GetModelSlots" }))
       await Effect.runPromise(Effect.sleep("10 millis"))
     })
     expect(calls).toBe(callsBeforeInvalidation)
 
     await act(async () => {
-      await Effect.runPromise(invalidations.publish({ query: "GetLocalModels", revision: 2 }))
+      await Effect.runPromise(invalidations.publish({ query: "GetModelCatalog" }))
       await Effect.runPromise(Effect.sleep("10 millis"))
     })
     expect(calls).toBe(callsBeforeInvalidation + 1)

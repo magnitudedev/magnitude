@@ -1,13 +1,11 @@
 import { FetchHttpClient } from "@effect/platform"
-import { Cause, Context, Data, Effect, Either, Exit, Layer, Match, Option, Schema, Scope, Stream } from "effect"
+import { Cause, Context, Data, Effect, Either, Exit, Layer, Match, Option, Schema, Scope, Stream, SubscriptionRef } from "effect"
 import {
   PRIMARY_SLOT_ID,
   ProviderModelCatalogLifecycle,
   ProviderModelCatalogLoading,
   ProviderModelCatalogStateSchema,
-  Configuration,
   SECONDARY_SLOT_ID,
-  type MirroredSnapshot,
   type ProviderCatalogEntry,
   type ProviderCatalogFailure,
   type ProviderModelCatalogEntry,
@@ -22,8 +20,6 @@ import {
   type ReasoningEffort,
 } from "@magnitudedev/sdk"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
-import { AcnChanges } from "./changes"
-import { makeMirroredState } from "./mirrored-state"
 import { LocalProviderOfferings } from "./local-provider-offerings"
 import { makeServiceOperationCoordinator } from "./service-operation-coordinator"
 
@@ -162,8 +158,8 @@ const outcomeModels = (
 }
 
 export interface ProviderModelCatalogApi {
-  readonly snapshot: Effect.Effect<MirroredSnapshot<ProviderModelCatalogState>>
-  readonly changes: Stream.Stream<MirroredSnapshot<ProviderModelCatalogState>>
+  readonly state: Effect.Effect<ProviderModelCatalogState>
+  readonly changes: Stream.Stream<ProviderModelCatalogState>
   readonly refresh: (providerId: Option.Option<ProviderId>) => Effect.Effect<void>
 }
 
@@ -183,27 +179,28 @@ const sameRefreshTarget = (
 export const ProviderModelCatalogLive: Layer.Layer<
   ProviderModelCatalog,
   never,
-  ProviderClient | LocalProviderOfferings | AcnChanges
+  ProviderClient | LocalProviderOfferings
 > = Layer.scoped(ProviderModelCatalog, Effect.gen(function* () {
   const client = yield* ProviderClient
   const localOfferings = yield* LocalProviderOfferings
   const scope = yield* Scope.Scope
   const lock = yield* Effect.makeSemaphore(1)
+  const stateLock = yield* Effect.makeSemaphore(1)
   const refreshOperations = yield* makeServiceOperationCoordinator<
     Option.Option<ProviderId>,
     never
   >(sameRefreshTarget)
-  const mirror = yield* makeMirroredState<ProviderModelCatalogState>(
-    { name: Configuration.GetProviderModelCatalog.name },
+  const current = yield* SubscriptionRef.make<ProviderModelCatalogState>(
     new ProviderModelCatalogLoading({}),
   )
   const equivalent = Schema.equivalence(ProviderModelCatalogStateSchema)
 
   const updateCatalog = (update: (state: ProviderModelCatalogState) => ProviderModelCatalogState) =>
-    mirror.modify((state) => {
+    stateLock.withPermits(1)(Effect.gen(function* () {
+      const state = yield* SubscriptionRef.get(current)
       const next = update(state)
-      return { state: next, result: undefined, changed: !equivalent(state, next) }
-    })
+      if (!equivalent(state, next)) yield* SubscriptionRef.set(current, next)
+    }))
 
   const beginRefresh = updateCatalog((state) => ProviderModelCatalogLifecycle.match(state, {
     Loading: (current) => current,
@@ -224,7 +221,7 @@ export const ProviderModelCatalogLive: Layer.Layer<
   })
 
   const reconcile = (outcomes: readonly ProviderCatalogOutcome[]) => Effect.gen(function* () {
-    const previous = contents((yield* mirror.get).state)
+    const previous = contents(yield* SubscriptionRef.get(current))
     const modelsByProvider = new Map<ProviderId, readonly ProviderModelCatalogEntry[]>()
     for (const model of previous.models) {
       modelsByProvider.set(model.providerId, [...(modelsByProvider.get(model.providerId) ?? []), model])
@@ -302,7 +299,7 @@ export const ProviderModelCatalogLive: Layer.Layer<
         yield* reconcile(result.right)
         return
       }
-      const previous = contents((yield* mirror.get).state)
+      const previous = contents(yield* SubscriptionRef.get(current))
       yield* publish(
         previous.providers,
         previous.models,
@@ -317,7 +314,7 @@ export const ProviderModelCatalogLive: Layer.Layer<
 
   const terminalizeRefreshFailure = (cause: Cause.Cause<unknown>) => Effect.gen(function* () {
     yield* beginRefresh
-    const previous = contents((yield* mirror.get).state)
+    const previous = contents(yield* SubscriptionRef.get(current))
     yield* publish(
       previous.providers,
       previous.models,
@@ -377,8 +374,8 @@ export const ProviderModelCatalogLive: Layer.Layer<
   )
 
   return ProviderModelCatalog.of({
-    snapshot: mirror.get,
-    changes: mirror.changes,
+    state: SubscriptionRef.get(current),
+    changes: current.changes,
     refresh: requestRefresh,
   })
 }))

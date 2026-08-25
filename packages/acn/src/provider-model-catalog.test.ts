@@ -114,7 +114,7 @@ describe("provider model catalog", () => {
       )
       return yield* Effect.gen(function* () {
         const catalog = yield* ProviderModelCatalog
-        const initialState = (yield* catalog.snapshot).state
+        const initialState = yield* catalog.state
         yield* Ref.set(outcomes, available)
         yield* catalog.refresh(Option.none())
         yield* Ref.set(outcomes, [
@@ -138,22 +138,18 @@ describe("provider model catalog", () => {
         const refreshCount = yield* Ref.get(refreshCalls)
         const localRead = yield* Deferred.make<void>()
         yield* Ref.set(localReadSignal, Option.some(localRead))
-        const beforeLocalRevision = (yield* catalog.snapshot).revision
-        const localTerminal = yield* catalog.changes.pipe(
-          Stream.filter((snapshot) =>
-            snapshot.revision > beforeLocalRevision && snapshot.state._tag !== "Refreshing"),
-          Stream.runHead,
-          Effect.fork,
-        )
         yield* PubSub.publish(localChanges, undefined)
         yield* Deferred.await(localRead)
-        yield* Fiber.join(localTerminal)
+        yield* catalog.changes.pipe(
+          Stream.filter((state) => state._tag !== "Refreshing"),
+          Stream.runHead,
+        )
         expect(yield* Ref.get(refreshCalls)).toBe(refreshCount)
         yield* Ref.set(defectRefresh, true)
         yield* catalog.refresh(Option.some(providerB))
         return {
           initialState,
-          finalState: (yield* catalog.snapshot).state,
+          finalState: yield* catalog.state,
         }
       }).pipe(Effect.provide(ProviderModelCatalogLive.pipe(Layer.provide(dependencies))))
     }))

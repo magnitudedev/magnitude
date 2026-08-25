@@ -2,6 +2,7 @@ import {
   AcnBoundary,
   AcnRpc,
   Configuration,
+  Models,
   SessionOperationFailed,
   type DisplayViewShape,
   type SessionError,
@@ -25,8 +26,10 @@ import { UserBashCommandId, type AppEvent } from "@magnitudedev/agent";
 import { createId } from "@magnitudedev/generate-id";
 import { Onboarding } from "../onboarding";
 import { AcnChanges } from "../changes";
-import { LocalModels } from "../local-models";
-import { LocalModelRecommendations } from "../local-model-recommendations";
+import { ModelCatalog } from "../model-catalog";
+import { ModelInstances } from "../model-instances";
+import { ModelCommands } from "../model-commands";
+import { LocalInferenceHardware } from "../local-inference-hardware";
 import { ClientLeaseManager } from "../client-lease-manager";
 import { FileMentionSearcher } from "../file-mention-searcher";
 import { FileSystemManager } from "../file-system-manager";
@@ -66,18 +69,13 @@ export const AcnBoundaryLive = AcnRpc.toLayer(AcnBoundary,
     const displayStreams = yield* DisplayViewStreams;
     const onboarding = yield* Onboarding;
     const changes = yield* AcnChanges;
-    const localModels = yield* LocalModels;
-    const localModelRecommendations = yield* LocalModelRecommendations;
+    const modelCatalog = yield* ModelCatalog;
+    const modelInstances = yield* ModelInstances;
+    const modelCommands = yield* ModelCommands;
+    const localInferenceHardware = yield* LocalInferenceHardware;
     const clientLeases = yield* ClientLeaseManager;
     const displayViewIntrospector = yield* Effect.serviceOption(
       AcnDisplayViewIntrospector
-    );
-    yield* localModelRecommendations.changes.pipe(
-      Stream.runForEach(({ revision }) => changes.publish({
-        query: Configuration.GetLocalModelRecommendations.name,
-        revision,
-      })),
-      Effect.forkScoped,
     );
     // Observe programming defects without changing the Cause. Expected domain
     // failures stay typed, defects stay defects, and interruption is preserved.
@@ -312,31 +310,52 @@ export const AcnBoundaryLive = AcnRpc.toLayer(AcnBoundary,
           providerCredentials.list.pipe(Effect.map((auths) => ({ auths: Object.fromEntries(auths) })))
         ),
 
-      GetProviderModelCatalog: () =>
-        observeRpcDefects("GetProviderModelCatalog", providerModelCatalog.snapshot),
-
       RefreshModelCatalog: ({ providerId }) =>
         observeRpcDefects(
           "RefreshModelCatalog",
-          providerModelCatalog.refresh(providerId).pipe(Effect.as({})),
+          modelCatalog.refresh(providerId).pipe(Effect.as({})),
         ),
 
       GetModelSlots: () =>
-        observeRpcDefects("GetModelSlots", modelSlots.selectionSnapshot),
+        observeRpcDefects("GetModelSlots", modelSlots.state),
 
-      GetLocalModelRecommendations: () =>
-        observeRpcDefects("GetLocalModelRecommendations", localModelRecommendations.publicSnapshot),
+      GetModelCatalog: () =>
+        observeRpcDefects("GetModelCatalog", modelCatalog.state),
 
-      GetLocalModels: () =>
-        observeRpcDefects("GetLocalModels", localModels.snapshot),
+      GetModelInstances: () =>
+        observeRpcDefects("GetModelInstances", modelInstances.state),
 
-      AssignSlot: ({ slotId, selection }) =>
+      GetLocalInferenceEnvironment: () =>
+        observeRpcDefects("GetLocalInferenceEnvironment", localInferenceHardware.state),
+
+      InstallLocalModel: ({ modelId }) =>
+        observeRpcDefects("InstallLocalModel", modelCommands.install(modelId)),
+
+      CancelModelDownload: ({ downloadId }) =>
+        observeRpcDefects("CancelModelDownload", modelCommands.cancelDownload(downloadId)),
+
+      AcknowledgeModelDownloadFailure: ({ downloadId }) =>
+        observeRpcDefects("AcknowledgeModelDownloadFailure", modelCommands.acknowledgeDownloadFailure(downloadId)),
+
+      UninstallLocalModel: ({ modelId }) =>
+        observeRpcDefects("UninstallLocalModel", modelCommands.uninstall(modelId)),
+
+      LoadModelSlot: ({ slotId }) =>
+        observeRpcDefects("LoadModelSlot", modelCommands.loadSlot(slotId)),
+
+      PreviewModelSlotLoad: ({ slotId }) =>
+        observeRpcDefects("PreviewModelSlotLoad", modelCommands.previewSlotLoad(slotId)),
+
+      StopModelSlot: ({ slotId }) =>
+        observeRpcDefects("StopModelSlot", modelCommands.stopSlot(slotId)),
+
+      AssignModelSlot: ({ slotId, selection }) =>
         observeRpcDefects(
           "AssignSlot",
           modelSlots.updateModelSlot(slotId, Option.some(selection)).pipe(Effect.as({})),
         ),
 
-      ClearSlot: ({ slotId }) =>
+      ClearModelSlot: ({ slotId }) =>
         observeRpcDefects(
           "ClearSlot",
           modelSlots.updateModelSlot(slotId, Option.none()).pipe(Effect.as({})),
@@ -361,7 +380,7 @@ export const AcnBoundaryLive = AcnRpc.toLayer(AcnBoundary,
       GetOnboardingState: () =>
         observeRpcDefects(
           "GetOnboardingState",
-          onboarding.snapshot,
+          onboarding.state,
         ),
 
       CompleteOnboarding: () =>

@@ -212,7 +212,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
       )
       return Result.flatMap(models, (modelState) => Result.map(
         slotResponse,
-        ({ state: slotState }) => ({
+        (slotState) => ({
           _tag: "Open" as const,
           exitKind,
           notice: current._tag === "Resting" ? current.notice : Option.none(),
@@ -381,7 +381,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
   }
 
   const awaitReady = (assigned: AssignedModel) => {
-    const project = ({ state }: { readonly state: ModelSlotsState }): TerminalFact<AssignedModel> => {
+    const project = (state: ModelSlotsState): TerminalFact<AssignedModel> => {
         const slot = state.slots.primary
         if (slot._tag !== "ConfiguredLocal" || !sameSlotSelection(slot.selection, assigned.selection)) {
           return { _tag: "Failed", failure: new OnboardingModelResourceChanged({
@@ -520,7 +520,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
       }
       const models = yield* restore(Registry.getResult(registry, localModels.state))
       const slotResponse = yield* restore(Registry.getResult(registry, slots.state))
-      const resolved = yield* resolveChoice(modelId, models, slotResponse.state)
+      const resolved = yield* resolveChoice(modelId, models, slotResponse)
       const invocation: SelectionInvocation = {
         cancellation: yield* Deferred.make<void>(),
         done: yield* Deferred.make<void, OnboardingModelSetupFailure>(),

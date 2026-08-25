@@ -63,6 +63,8 @@ export const slotStatus = (
 ): { label: string; tone: string; detail: string | null } => {
   if (slot._tag === "Unassigned")
     return { label: "Not configured", tone: "neutral", detail: null }
+  if (slot._tag === "Resolving")
+    return { label: "Preparing", tone: "progress", detail: null }
   if (slot._tag === "ConfiguredRemote") {
     return {
       label: "Unsupported selection",

@@ -5,7 +5,6 @@ import { Onboarding } from "@magnitudedev/sdk"
 import { ClientEffectQuery } from "../state/client-effect-query"
 
 
-export { OnboardingPersistenceSynchronizationFailed } from "@magnitudedev/sdk"
 
 const makeOnboardingPersistence = Effect.gen(function* () {
   const effectQuery = yield* ClientEffectQuery
@@ -15,7 +14,7 @@ const makeOnboardingPersistence = Effect.gen(function* () {
   const complete = effectQuery.Onboarding.CompleteOnboarding
 
   return {
-    state: Atom.make((get) => Result.map(get(query).result, (snapshot) => snapshot.state)),
+    state: Atom.make((get) => get(query).result),
     retry: queryClient.invalidate(Onboarding.GetOnboardingState.match()),
     complete: Mutation.execute(complete, {}).pipe(
       Effect.provideService(Registry.AtomRegistry, registry),

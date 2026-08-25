@@ -55,23 +55,17 @@ describe("Onboarding", () => {
       )))
       return yield* Effect.gen(function* () {
         const onboarding = yield* Onboarding
-        const before = yield* onboarding.snapshot
+        const before = yield* onboarding.state
         yield* onboarding.complete
-        const after = yield* onboarding.snapshot
+        const after = yield* onboarding.state
         yield* onboarding.complete
-        const afterRepeatedCompletion = yield* onboarding.snapshot
+        const afterRepeatedCompletion = yield* onboarding.state
         return { before, after, afterRepeatedCompletion }
       }).pipe(Effect.provide(layer))
     })))
 
-    expect(result.before).toMatchObject({
-      revision: 0,
-      state: { completed: false },
-    })
-    expect(result.after).toMatchObject({
-      revision: 1,
-      state: { completed: true },
-    })
+    expect(result.before).toEqual({ completed: false })
+    expect(result.after).toEqual({ completed: true })
     expect(result.afterRepeatedCompletion).toEqual(result.after)
   })
 })

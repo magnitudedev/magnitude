@@ -1,14 +1,7 @@
 export { protocolLayer } from "./protocol"
 export {
-  Inference,
   MagnitudeBoundary,
-  makeInferenceImplementations,
-  inferenceImplementationsLayer,
-  invalidateAllInferenceQueries,
-  invalidateInferenceTopic,
-  inferenceClientErrorMessage,
   magnitudeImplementationsLayer,
-  type InferenceClientError,
   type MagnitudeImplementationError,
 } from "./inference"
 export {
@@ -18,7 +11,6 @@ export {
 export {
   makeInferenceClient,
   type InferenceClient,
-  type InferenceEffectQueryClient,
 } from "./inference-client"
 
 export {

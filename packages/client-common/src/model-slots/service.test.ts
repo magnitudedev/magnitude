@@ -1,12 +1,10 @@
-import { Cause, Option } from "effect"
-import { Result } from "@effect-atom/atom-react"
+import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   ModelSlotUnassigned,
   ModelSlotConfiguredLocal,
   ModelInstanceIdSchema,
   PRIMARY_SLOT_ID,
-  ProviderModelCatalogLoading,
   ProviderIdSchema,
   ProviderModelIdSchema,
   ReasoningEffortSchema,
@@ -15,7 +13,6 @@ import {
 } from "@magnitudedev/sdk"
 import {
   presentedSlotSelection,
-  projectModelSlotsResult,
   modelLoadIsVisible,
   selectedModelStopIsVisible,
   slotAssignmentIsVisible,
@@ -60,46 +57,6 @@ describe("model-slot service presentation", () => {
 
     expect(Option.isNone(presented)).toBe(true)
   })
-})
-
-describe("model-slot resource composition", () => {
-  const slots = { revision: 1, state: {
-    slots: { primary: Option.none(), secondary: Option.none() },
-    recentModels: { primary: [], secondary: [] },
-    favoriteModels: [],
-  } }
-  const catalog = {
-    revision: 1,
-    state: new ProviderModelCatalogLoading({}),
-  }
-  const models = {
-    diagnostics: [],
-    models: [],
-    reconciliationComplete: true,
-    revision: 1,
-  }
-  const instances = { instances: [], revision: 1 }
-
-  it.each(["slots", "catalog", "models", "instances"] as const)(
-    "preserves a complete projected snapshot when the %s resource refetch fails",
-    (failedResource) => {
-      const failAfter = <A>(value: A) => Result.failure(Cause.fail("unavailable"), {
-        previousSuccess: Option.some(Result.success(value)),
-      })
-      const result = projectModelSlotsResult(
-        failedResource === "slots" ? failAfter(slots) : Result.success(slots),
-        failedResource === "catalog" ? failAfter(catalog) : Result.success(catalog),
-        failedResource === "models" ? failAfter(models) : Result.success(models),
-        failedResource === "instances" ? failAfter(instances) : Result.success(instances),
-      )
-
-      expect(result._tag).toBe("Failure")
-      if (result._tag !== "Failure") return
-      const previous = Option.getOrThrow(result.previousSuccess)
-      expect(previous.value.state.slots.primary._tag).toBe("Unassigned")
-      expect(previous.value.state.slots.secondary._tag).toBe("Unassigned")
-    },
-  )
 })
 
 describe("model-slot mutation synchronization", () => {

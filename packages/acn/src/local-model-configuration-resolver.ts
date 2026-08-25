@@ -148,7 +148,7 @@ export const LocalModelConfigurationResolverLive: Layer.Layer<
       Option.isSome(entry)
         ? [{ identity: entry.value[0], configuration: entry.value[1] }]
         : [])
-    const packageState = (yield* packages.snapshot).state
+    const packageState = yield* packages.state
     const packageEntries = new Map(packageState.entries.map((entry) => [entry.package.id, entry]))
     return resolveLocalModelConfigurations({
       catalog: catalogModels,

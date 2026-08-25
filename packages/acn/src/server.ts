@@ -80,6 +80,9 @@ import { LocalModelConfigurationResolverLive } from "./local-model-configuration
 import { LocalModelPackagesLive } from "./local-model-packages"
 import { makeLocalModelRecommendationsLive } from "./local-model-recommendations"
 import { LocalModelsLive } from "./local-models"
+import { ModelInstancesLive } from "./model-instances"
+import { ModelCatalogLive } from "./model-catalog"
+import { ModelCommandsLive } from "./model-commands"
 import { LocalProviderOfferingsLive } from "./local-provider-offerings"
 import { installAcnOwnershipMonitor } from "./ownership-monitor"
 import { LocalProviderResolverLive } from "./local-provider-resolver"
@@ -377,9 +380,10 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
     ProviderModelCatalogLive,
     withSharedClient
   )
+  const withModelCatalog = Layer.provideMerge(ModelCatalogLive, withCatalog)
   const withCredentials = Layer.provideMerge(
     ProviderCredentialsLive,
-    withCatalog
+    withModelCatalog
   )
   const withCloudUsage = Layer.provideMerge(
     MagnitudeCloudUsageLive,
@@ -389,9 +393,10 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
     ModelSlotControllerLive,
     withCloudUsage
   )
+  const withModelCommands = Layer.provideMerge(ModelCommandsLive, withModelSlots)
   const withCustomEndpointReconciliation = Layer.provideMerge(
     CustomEndpointReconcilerLive,
-    withModelSlots,
+    withModelCommands,
   )
   const withFactory = Layer.provideMerge(
     AgentFactoryLive({ debug, version: ACN_VERSION }),
@@ -449,7 +454,8 @@ const addLocalInferenceServices = <A, E, R>(
     withOfferings
   )
   const withLocalModels = Layer.provideMerge(LocalModelsLive, withRecommendations)
-  const withOnboarding = Layer.provideMerge(OnboardingLive, withLocalModels)
+  const withModelInstances = Layer.provideMerge(ModelInstancesLive, withLocalModels)
+  const withOnboarding = Layer.provideMerge(OnboardingLive, withModelInstances)
   const withResolver = Layer.provideMerge(
     LocalProviderResolverLive,
     withOnboarding
@@ -576,9 +582,12 @@ export const proxyInferenceWebRequest = async (
   fetchTarget: typeof fetch = fetch,
   signal: AbortSignal = source.signal,
 ): Promise<Response> => {
-    const incoming = new URL(source.url)
-    const targetPath = incoming.pathname.slice("/inference".length) || "/"
-    const target = new URL(`${targetPath}${incoming.search}`, icn.origin)
+  const incoming = new URL(source.url)
+  const targetPath = incoming.pathname.slice("/inference".length) || "/"
+  if (targetPath !== "/v1" && !targetPath.startsWith("/v1/")) {
+    return new Response("Not found", { status: 404 })
+  }
+  const target = new URL(`${targetPath}${incoming.search}`, icn.origin)
     const headers = new Headers(source.headers)
     headers.delete("host")
     headers.delete("authorization")
@@ -599,23 +608,6 @@ export const proxyInferenceWebRequest = async (
     const responseHeaders = new Headers(response.headers)
     for (const header of HOP_BY_HOP_HEADERS) responseHeaders.delete(header)
 
-    if (targetPath === "/openapi.json" && response.ok) {
-      try {
-        const document = await response.json() as Record<string, unknown>
-        // The representation changes when the public server base is injected;
-        // representation metadata from the private response is no longer valid.
-        responseHeaders.delete("content-length")
-        responseHeaders.delete("content-encoding")
-        responseHeaders.delete("content-md5")
-        responseHeaders.delete("etag")
-        return Response.json({
-          ...document,
-          servers: [{ url: "/inference" }],
-        }, { status: response.status, headers: responseHeaders })
-      } catch {
-        return new Response("Invalid ICN OpenAPI document", { status: 502 })
-      }
-    }
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
@@ -795,7 +787,7 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
         )),
         Effect.orDie,
       ))
-      yield* publicRouter.prefixed("/inference").add("*", "/*", makeInferenceProxy(icn))
+      yield* publicRouter.prefixed("/inference/v1").add("*", "/*", makeInferenceProxy(icn))
       yield* publicServer.serve(publicRouter.asHttpEffect()).pipe(Effect.provide(publicInfrastructure))
       yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie))
       return {

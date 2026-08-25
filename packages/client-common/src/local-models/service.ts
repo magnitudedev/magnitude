@@ -3,14 +3,11 @@ import { Atom, Registry, Result, useAtomSet, useAtomValue } from "@effect-atom/a
 import { Context, Data, Effect, Layer, Option, Schema } from "effect"
 import { Mutation, QueryClient } from "@magnitudedev/effect-query"
 import {
-  Configuration,
+  Models,
   CatalogIdentitySchema,
-  Inference,
   findLocalModelById,
   localModelCatalogIdentity,
-  ProviderModelIdSchema,
   type CatalogIdentity,
-  ModelDownloadIdSchema,
   type ModelDownloadId,
   type LocalModelsState,
   type LocalModel,
@@ -18,6 +15,7 @@ import {
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 import { ClientEffectQuery } from "../state/client-effect-query"
+import { localModelsFromCatalog } from "../model-catalog/projection"
 
 export { installationAdmissionIsVisible } from "@magnitudedev/sdk"
 
@@ -122,13 +120,13 @@ const makeLocalModels = Effect.gen(function* () {
   const effectQuery = yield* ClientEffectQuery
   const queryClient = yield* QueryClient.QueryClient
   const registry = yield* Registry.AtomRegistry
-  const query = effectQuery.Configuration.GetLocalModels({})
-  const install = effectQuery.Inference.InstallInferenceModel
-  const cancelDownload = effectQuery.Inference.CancelInferenceDownload
-  const dismissDownloadFailure = effectQuery.Inference.AcknowledgeInferenceDownloadFailure
-  const uninstall = effectQuery.Inference.UninstallInferenceModel
+  const query = effectQuery.Models.GetCatalog({})
+  const install = effectQuery.Models.InstallLocalModel
+  const cancelDownload = effectQuery.Models.CancelModelDownload
+  const dismissDownloadFailure = effectQuery.Models.AcknowledgeModelDownloadFailure
+  const uninstall = effectQuery.Models.UninstallLocalModel
   const installationInvocations = yield* Mutation.state({
-    filters: { mutation: Inference.InstallInferenceModel },
+    filters: { mutation: Models.InstallLocalModel },
     select: ({ input, result }): ReconciliationInvocationState => ({
       identity: catalogIdentityFromCanonicalModelId(input.modelId),
       waiting: Result.isWaiting(result),
@@ -136,7 +134,7 @@ const makeLocalModels = Effect.gen(function* () {
     }),
   })
   const deletionInvocations = yield* Mutation.state({
-    filters: { mutation: Inference.UninstallInferenceModel },
+    filters: { mutation: Models.UninstallLocalModel },
     select: ({ input, result }): DeletionInvocationState => ({
       identity: catalogIdentityFromCanonicalModelId(input.modelId),
       waiting: Result.isWaiting(result),
@@ -145,7 +143,10 @@ const makeLocalModels = Effect.gen(function* () {
   })
   const latestInstallationFailed = Atom.make((get) =>
     get(installationInvocations).at(-1)?.failed ?? false)
-  const state = Atom.make((get) => Result.map(get(query).result, (snapshot) => snapshot.state))
+  const state = Atom.make((get) => Result.map(
+    get(query).result,
+    localModelsFromCatalog,
+  ))
   const catalog = Atom.make((get) => Result.map(
     get(state),
     (models) => projectCatalogModelsView(
@@ -157,17 +158,7 @@ const makeLocalModels = Effect.gen(function* () {
   const provideRegistry = Effect.provideService(Registry.AtomRegistry, registry)
   const provideQueryClient = Effect.provideService(QueryClient.QueryClient, queryClient)
 
-  const currentModels = QueryClient.fetch(Configuration.GetLocalModels, {}).pipe(
-    Effect.map(({ state }) => state),
-  )
-  const refreshLocalModels = queryClient.refetch(
-    Configuration.GetLocalModels.match(),
-  ).pipe(
-    Effect.zipRight(QueryClient.fetch(Configuration.GetLocalModels, {})),
-    Effect.asVoid,
-    provideQueryClient,
-  )
-
+  const currentModels = QueryClient.fetch(Models.GetCatalog, {}).pipe(Effect.map(localModelsFromCatalog))
   const installModel = (modelId: ProviderModelId) =>
     currentModels.pipe(
       provideQueryClient,
@@ -178,24 +169,7 @@ const makeLocalModels = Effect.gen(function* () {
           message: "Only catalog models can be reconciled.",
         })),
       )),
-      Effect.flatMap(() => Mutation.execute(install, { modelId }).pipe(
-          Effect.map((admission) => admission._tag === "Current"
-            ? {
-                _tag: "Current" as const,
-                providerModelId: ProviderModelIdSchema.make(modelId),
-              }
-            : {
-                _tag: "DownloadAdmitted" as const,
-                providerModelId: ProviderModelIdSchema.make(modelId),
-                downloadId: ModelDownloadIdSchema.make(admission.downloadId),
-              }),
-        )),
-      // The native mutation invalidates native inference resources. This
-      // authored product service also consumes the ACN's richer local-model
-      // projection, so request its refreshed projection as part of the
-      // composition rather than coupling that concern into the inference
-      // operation itself.
-      Effect.tap(() => refreshLocalModels),
+      Effect.flatMap(() => Mutation.execute(install, { modelId })),
       provideRegistry,
     )
 
@@ -210,7 +184,6 @@ const makeLocalModels = Effect.gen(function* () {
         })),
       )),
       Effect.flatMap(() => Mutation.execute(uninstall, { modelId })),
-      Effect.tap(() => refreshLocalModels),
       provideRegistry,
     )
 
@@ -218,16 +191,14 @@ const makeLocalModels = Effect.gen(function* () {
     state,
     catalog,
     latestInstallationFailed,
-    retry: queryClient.invalidate(Configuration.GetLocalModels.match()),
+    retry: queryClient.invalidate(Models.GetCatalog.match()),
     install: installModel,
     cancelDownload: (downloadId: ModelDownloadId) =>
       Mutation.execute(cancelDownload, { downloadId }).pipe(
-        Effect.tap(() => refreshLocalModels),
         provideRegistry,
       ),
     dismissDownloadFailure: (downloadId: ModelDownloadId) =>
       Mutation.execute(dismissDownloadFailure, { downloadId }).pipe(
-        Effect.tap(() => refreshLocalModels),
         provideRegistry,
       ),
     delete: deleteModel,

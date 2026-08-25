@@ -23,7 +23,9 @@ export const deriveSelectedLocalModel = (
     Option.contains(localModelProviderModelId(model), primary.selection.providerModelId)) ?? null
 }
 
-type AssignedSlot = Exclude<ModelSlot, { readonly _tag: "Unassigned" }>
+type AssignedSlot = Extract<ModelSlot, {
+  readonly _tag: "ConfiguredRemote" | "ConfiguredLocal"
+}>
 
 export interface SelectedSlotModel {
   readonly model: ProviderModelCatalogEntry
@@ -61,7 +63,7 @@ export type LocalModelLoadActivity = NonNullable<
 >
 
 export const isModelSlotConfigured = (slot: ModelSlot): slot is AssignedSlot =>
-  slot._tag !== "Unassigned"
+  slot._tag === "ConfiguredRemote" || slot._tag === "ConfiguredLocal"
 
 export const modelSlotResidentAllocation = (
   slot: ModelSlot,
@@ -87,7 +89,7 @@ export function selectedSlotModel(
     Unavailable: () => Option.none<readonly ProviderModelCatalogEntry[]>(),
   })
   const slot = slots.slots[slotId === PRIMARY_SLOT_ID ? "primary" : "secondary"]
-  if (slot._tag === "Unassigned") return Option.none()
+  if (slot._tag === "Unassigned" || slot._tag === "Resolving") return Option.none()
   return Option.flatMap(models, (catalogModels) => Option.map(
     Option.fromNullable(catalogModels.find((model) =>
       model.providerId === slot.selection.providerId

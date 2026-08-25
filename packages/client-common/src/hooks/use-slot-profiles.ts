@@ -16,6 +16,7 @@ import { useDisplayState } from "../state/display-state-store"
 import { useAgentClient } from "../state/agent-client-context"
 import { ModelSlots } from "../model-slots/service"
 import { formatModelDisplayName } from "../utils/model-presentation"
+import { providerCatalogFromCatalog } from "../model-catalog/projection"
 
 export interface SlotProfile {
   readonly slotId: SlotId
@@ -56,16 +57,19 @@ export function useSlotProfiles() {
     (service) => get(service.state),
   )), [slotService])
   const slots = useAtomValue(slotState)
-  const catalogAtom = useMemo(() => Atom.make((get) => get(client.Configuration.GetProviderModelCatalog({})).result), [client])
+  const catalogAtom = useMemo(() => Atom.make((get) => Result.map(
+    get(client.Models.GetCatalog({})).result,
+    providerCatalogFromCatalog,
+  )), [client])
   const catalog = useAtomValue(catalogAtom)
-  const refresh = useAtomSet(client.Configuration.RefreshModelCatalog)
+  const refresh = useAtomSet(client.Models.RefreshCatalog)
   const retry = useCallback(() => refresh({ providerId: Option.none() }), [refresh])
 
-  const profiles = Option.flatMap(Result.value(slots), ({ state: slotState }) =>
-    Option.map(Result.value(catalog), ({ state: catalogState }): SlotProfiles => {
+  const profiles = Option.flatMap(Result.value(slots), (slotState) =>
+    Option.map(Result.value(catalog), (catalogState): SlotProfiles => {
       const models = catalogModels(catalogState)
       const profile = (slot: typeof slotState.slots.primary): SlotProfile | undefined => {
-        if (slot._tag === "Unassigned") return undefined
+        if (slot._tag === "Unassigned" || slot._tag === "Resolving") return undefined
         const model = models.find((candidate) => candidate.providerId === slot.selection.providerId
           && candidate.providerModelId === slot.selection.providerModelId)
         if (!model) return undefined

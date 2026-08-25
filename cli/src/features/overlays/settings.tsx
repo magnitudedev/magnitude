@@ -106,7 +106,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   const displayedAuthError = error ?? auth.error
 
   const catalogSnapshot = modelConfig ? Result.value(modelConfig.catalog) : Option.none()
-  const catalogState = Option.map(catalogSnapshot, ({ state }) => state)
+  const catalogState = catalogSnapshot
   const models = Option.getOrNull(Option.flatMap(catalogState, (state) => ProviderModelCatalogLifecycle.match(state, {
     Loading: () => Option.none(),
     Ready: ({ models }) => Option.some(models),
@@ -129,7 +129,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     Unavailable: ({ failures }) => failures,
   })), () => [] as readonly ProviderCatalogFailure[])
   const slotsSnapshot = modelConfig ? Result.value(modelConfig.slots) : Option.none()
-  const slotsState = Option.map(slotsSnapshot, ({ state }) => state)
+  const slotsState = slotsSnapshot
   const catalogLoading = Option.match(catalogState, {
     onNone: () => modelConfig !== undefined && !Result.isFailure(modelConfig.catalog),
     onSome: (state) => ProviderModelCatalogLifecycle.is(state, 'Loading'),

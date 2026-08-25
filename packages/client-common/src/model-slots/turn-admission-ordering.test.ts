@@ -5,10 +5,11 @@ import { Client, Mutation } from "@magnitudedev/effect-query"
 import {
   MagnitudeBoundary,
   PRIMARY_SLOT_ID,
+  SECONDARY_SLOT_ID,
   ProviderIdSchema,
   ProviderModelIdSchema,
   ReasoningEffortSchema,
-  type ModelSlotSelectionsState,
+  type ModelSlotsState,
 } from "@magnitudedev/sdk"
 import { clientServicesLayer, type ClientServices } from "../state/client-services"
 import type { AcnClientRequirements } from "../state/agent-client"
@@ -22,12 +23,24 @@ const selection = {
 
 const modelSlots = {
   slots: {
-    primary: Option.some(selection),
-    secondary: Option.none(),
+    primary: {
+      _tag: "ConfiguredRemote",
+      slotId: PRIMARY_SLOT_ID,
+      selection,
+      descriptor: {
+        providerId: selection.providerId,
+        providerModelId: selection.providerModelId,
+        displayName: "New Model",
+        variantLabel: Option.none(),
+      },
+      availability: { _tag: "Available" },
+      actions: [],
+    },
+    secondary: { _tag: "Unassigned", slotId: SECONDARY_SLOT_ID },
   },
   recentModels: { primary: [], secondary: [] },
   favoriteModels: [],
-} satisfies ModelSlotSelectionsState
+} satisfies ModelSlotsState
 
 const reproduceOvertake = (submit: (client: ReturnType<typeof makeClient>) =>
   Effect.Effect<unknown, unknown, Registry.AtomRegistry>) =>
@@ -35,21 +48,17 @@ const reproduceOvertake = (submit: (client: ReturnType<typeof makeClient>) =>
     const assignmentSynchronizationEntered = yield* Deferred.make<void>()
     const releaseAssignmentSynchronization = yield* Deferred.make<void>()
     const turnMutationEntered = yield* Deferred.make<void>()
-    let assignmentCommitted = false
 
     const implementation = fakeAcnImplementationsLayer((name) => {
-        if (name === "AssignSlot") {
-          assignmentCommitted = true
-          return Effect.succeed({})
+        if (name === "AssignModelSlot") {
+          return Effect.gen(function* () {
+            yield* Deferred.succeed(assignmentSynchronizationEntered, undefined)
+            yield* Deferred.await(releaseAssignmentSynchronization)
+            return {}
+          })
         }
         if (name === "GetModelSlots") {
-          return Effect.gen(function* () {
-            if (assignmentCommitted) {
-              yield* Deferred.succeed(assignmentSynchronizationEntered, undefined)
-              yield* Deferred.await(releaseAssignmentSynchronization)
-            }
-            return { revision: 1, state: modelSlots }
-          })
+          return Effect.succeed(modelSlots)
         }
         if (name === "SendMessage" || name === "StartGoal" || name === "CreateSession") {
           return Deferred.succeed(turnMutationEntered, undefined).pipe(Effect.as({}))
@@ -59,7 +68,7 @@ const reproduceOvertake = (submit: (client: ReturnType<typeof makeClient>) =>
     const client = makeClient(implementation)
     const registry = Registry.make()
 
-    const assignment = yield* Mutation.execute(client.Configuration.AssignSlot, {
+    const assignment = yield* Mutation.execute(client.Models.AssignSlot, {
       slotId: PRIMARY_SLOT_ID,
       selection,
     }).pipe(

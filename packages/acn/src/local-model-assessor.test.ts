@@ -18,12 +18,9 @@ describe("LocalModelAssessor", () => {
 
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const packageChanges = yield* PubSub.unbounded<{
-        readonly revision: number
-        readonly state: {
-          readonly inventory: { readonly _tag: "Ready" }
-          readonly entries: readonly ModelPackageEntry[]
-          readonly downloads: readonly never[]
-        }
+        readonly inventory: { readonly _tag: "Ready" }
+        readonly entries: readonly ModelPackageEntry[]
+        readonly downloads: readonly never[]
       }>()
       const packageId = ModelPackageIdSchema.make("package-test")
       const modelPackage = {
@@ -62,10 +59,7 @@ describe("LocalModelAssessor", () => {
         },
         catalogAttribution: { _tag: "NotCatalogTarget" },
       }
-      const packageSnapshot = {
-        revision: 1,
-        state: { inventory: { _tag: "Ready" as const }, entries: [packageEntry], downloads: [] },
-      }
+      const packageState = { inventory: { _tag: "Ready" as const }, entries: [packageEntry], downloads: [] }
       const configuration = {
         bundle: { _tag: "Standalone" as const, package: modelPackage },
         profile: { contextLength: 32_768 },
@@ -125,7 +119,7 @@ describe("LocalModelAssessor", () => {
         })),
         Layer.succeed(LocalModelPackages, LocalModelPackages.of({
           initialized: Effect.succeed(true),
-          snapshot: Effect.succeed(packageSnapshot),
+          state: Effect.succeed(packageState),
           changes: Stream.fromPubSub(packageChanges),
           installedPackageIds: Effect.succeed(new Set([packageId])),
         })),
@@ -171,8 +165,8 @@ describe("LocalModelAssessor", () => {
             retryable: false,
           },
         })
-        yield* PubSub.publish(packageChanges, packageSnapshot)
-        yield* PubSub.publish(packageChanges, packageSnapshot)
+        yield* PubSub.publish(packageChanges, packageState)
+        yield* PubSub.publish(packageChanges, packageState)
         yield* Effect.sleep("100 millis")
 
         expect(assessmentCalls).toBe(1)

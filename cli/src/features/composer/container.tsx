@@ -155,7 +155,7 @@ export function ComposerContainer({
       catalog: Result.value(modelConfig.catalog),
       slots: Result.value(modelConfig.slots),
     }),
-    ({ catalog, slots }) => selectedSlotModel(catalog.state, slots.state, PRIMARY_SLOT_ID),
+    ({ catalog, slots }) => selectedSlotModel(catalog, slots, PRIMARY_SLOT_ID),
   )
   const thinkingOptions = Option.match(selectedModel, {
     onNone: () => [],

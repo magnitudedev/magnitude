@@ -1,21 +1,19 @@
-import { Context, Effect, Layer, Schema, Scope, Stream } from "effect"
+import { Context, Effect, Layer, Scope, Stream } from "effect"
 import {
-  InferenceHardwareProjectionError,
-  LocalInferenceHardwareSchema,
+  Models,
   inferenceAcceleratorDisplayName,
   projectInferenceHardware,
   type LocalInferenceHardware as LocalInferenceHardwareState,
-  type MirroredSnapshot,
 } from "@magnitudedev/acn-protocol"
 import { IcnHardware, IcnInstances } from "@magnitudedev/icn"
-import { makeObservedState } from "./mirrored-state"
+import { AcnChanges } from "./changes"
 
 export const acceleratorDisplayName = inferenceAcceleratorDisplayName
 export const projectLocalInferenceHardware = projectInferenceHardware
 
 export interface LocalInferenceHardwareApi {
-  readonly snapshot: Effect.Effect<MirroredSnapshot<LocalInferenceHardwareState>>
-  readonly changes: Stream.Stream<MirroredSnapshot<LocalInferenceHardwareState>>
+  readonly state: Effect.Effect<LocalInferenceHardwareState>
+  readonly changes: Stream.Stream<LocalInferenceHardwareState>
   readonly refresh: Effect.Effect<void>
 }
 
@@ -26,33 +24,28 @@ export class LocalInferenceHardware extends Context.Tag("LocalInferenceHardware"
 
 export const LocalInferenceHardwareLive: Layer.Layer<
   LocalInferenceHardware,
-  InferenceHardwareProjectionError,
-  IcnHardware | IcnInstances
+  never,
+  IcnHardware | IcnInstances | AcnChanges
 > = Layer.scoped(LocalInferenceHardware, Effect.gen(function* () {
   const hardware = yield* IcnHardware
   const instances = yield* IcnInstances
+  const changes = yield* AcnChanges
   const scope = yield* Scope.Scope
-  const mirror = yield* makeObservedState(
-    yield* projectLocalInferenceHardware((yield* hardware.get).state),
-  )
-  const rebuild = hardware.get.pipe(
+  const state = hardware.get.pipe(
     Effect.flatMap(({ state }) => projectLocalInferenceHardware(state)),
-    Effect.flatMap((state) => mirror.setIfChanged(
-      state,
-      Schema.equivalence(LocalInferenceHardwareSchema),
-    )),
+    Effect.orDie,
   )
-  yield* Effect.forkIn(hardware.changes.pipe(
-    Stream.runForEach(({ state }) => projectLocalInferenceHardware(state).pipe(
-      Effect.flatMap((projected) => mirror.setIfChanged(
-        projected,
-        Schema.equivalence(LocalInferenceHardwareSchema),
-      )),
-      Effect.catchAll((error) => Effect.logWarning("Unable to project local inference hardware").pipe(
+  const projectedChanges = hardware.changes.pipe(
+    Stream.mapEffect(({ state }) => projectLocalInferenceHardware(state).pipe(
+      Effect.tapError((error) => Effect.logWarning("Unable to project local inference hardware").pipe(
         Effect.annotateLogs({ cause: error.message }),
       )),
-      Effect.asVoid,
+      Effect.option,
     )),
+    Stream.filterMap((state) => state),
+  )
+  yield* Effect.forkIn(projectedChanges.pipe(
+    Stream.runForEach(() => changes.publish({ query: Models.GetLocalEnvironment.name })),
   ), scope)
   // Instance changes can immediately alter available memory. The hardware
   // projection owns invalidating and rebuilding its availability snapshot;
@@ -62,10 +55,9 @@ export const LocalInferenceHardwareLive: Layer.Layer<
     Stream.runForEach(() => hardware.refresh.pipe(Effect.ignore)),
   ), scope)
   return LocalInferenceHardware.of({
-    snapshot: mirror.get,
-    changes: mirror.changes,
+    state,
+    changes: projectedChanges,
     refresh: hardware.refresh.pipe(
-      Effect.zipRight(rebuild),
       Effect.asVoid,
       Effect.catchAll((error) => Effect.logWarning("Unable to refresh local inference hardware").pipe(
         Effect.annotateLogs({ cause: error instanceof Error ? error.message : String(error) }),

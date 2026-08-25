@@ -203,11 +203,13 @@ function OnboardingGate(
     }
   }
 
-  const primary = Option.map(slotsSnapshot, ({ state }) => state.slots.primary);
+  const primary = Option.map(slotsSnapshot, (state) => state.slots.primary);
   const onboardingSetupOpen = onboardingSetup.view.value._tag === "Open";
   const modelsConfigured = Option.exists(primary, isModelSlotConfigured);
   const modelsAvailableForInitialWork = Option.exists(primary, (slot) => {
-    if (slot._tag === "Unassigned" || slot.availability._tag !== "Available")
+    if (slot._tag === "Unassigned"
+      || slot._tag === "Resolving"
+      || slot.availability._tag !== "Available")
       return false;
     return true;
   });

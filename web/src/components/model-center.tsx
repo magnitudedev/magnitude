@@ -46,7 +46,6 @@ import {
 import {
   deriveHardwareMemoryView,
   formatLocalModelDisplayName,
-  localModelConfigurationId,
   localModelRadarAxes,
   modelDownloadFailureMessage,
   modelSlotResidentAllocation,
@@ -84,10 +83,7 @@ const recommendationOrder = {
 } as const
 const valueOf = <A, E>(result: Result.Result<A, E>): A | null =>
   Option.getOrNull(Result.value(result))
-const modelKey = (model: LocalModel): string =>
-  Option.getOrElse(localModelConfigurationId(model), () =>
-    formatLocalModelDisplayName(model)
-  )
+const modelKey = (model: LocalModel): string => model.modelId
 function QueryNotice({
   result,
   label,
@@ -341,7 +337,7 @@ function InstalledModelMenu({
   const platform = usePlatform()
   const actions = useLocalModelActions()
   const [confirmingRemoval, setConfirmingRemoval] = useState(false)
-  const configurationId = Option.getOrNull(localModelConfigurationId(model))
+  const configurationId = model.modelId
   const displayName = formatLocalModelDisplayName(model)
   const installedPath = installedModelTargetPath(model)
 
@@ -700,7 +696,7 @@ function CatalogInspector({
 }): ReactNode {
   const { model, reconciliationState } = view
   const modelActions = useLocalModelActions()
-  const configurationId = Option.getOrNull(localModelConfigurationId(model))
+  const configurationId = model.modelId
   const status = modelStatus(model, reconciliationState)
   const serving =
     model.servingState._tag === "Assessed" ? model.servingState : null
@@ -1134,6 +1130,8 @@ function HardwareView(): ReactNode {
                 <strong>
                   {primary?._tag === "Unassigned" || primary === null
                     ? "No local model selected"
+                    : primary._tag === "Resolving"
+                    ? "Preparing selected model"
                     : primary.descriptor.displayName}
                 </strong>
                 <span>
