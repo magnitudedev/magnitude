@@ -1,87 +1,85 @@
 <p align="center">
-  <img src="docs/logo-nobg.svg" alt="Magnitude icon" width="120">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/icon-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/brand/icon-light.svg">
+    <img alt="Magnitude icon" src="assets/brand/icon-light.svg" width="120">
+  </picture>
 </p>
 
 <h1 align="center">Magnitude</h1>
 
-<p align="center">Open source agent with local models built in. Fully private and offline. Works out of the box on any hardware.</p>
+<p align="center"><strong>Local models, tuned to your machine.</strong></p>
 
 <p align="center">
-  <a href="https://docs.magnitude.dev" target="_blank"><img src="https://img.shields.io/badge/📕-Docs-0369a1?style=flat-square&labelColor=0369a1&color=gray" alt="Documentation" /></a>
-  <a href="https://discord.gg/EHt48pPWdC" target="_blank"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white&labelColor=5865F2&color=gray" alt="Discord" /></a>
-  <a href="https://x.com/usemagnitude" target="_blank"><img src="https://img.shields.io/badge/Twitter-Follow-000000?style=flat-square&logo=x&logoColor=white&labelColor=000000&color=gray" alt="Follow Magnitude on Twitter" /></a>
-  <a href="https://github.com/magnitudedev/magnitude/stargazers"><img src="https://img.shields.io/github/stars/magnitudedev/magnitude" alt="GitHub Repo stars" /></a>
-  <a href="https://www.npmjs.com/package/@magnitudedev/cli"><img src="https://img.shields.io/npm/v/%40magnitudedev%2Fcli" alt="npm version" /></a>
+  <a href="https://docs.magnitude.dev"><img src="https://img.shields.io/badge/%F0%9F%93%95-Docs-0369a1?style=flat-square&labelColor=0369a1&color=gray" alt="Documentation"></a>
+  <a href="https://discord.gg/EHt48pPWdC"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white&labelColor=5865F2&color=gray" alt="Discord"></a>
+  <a href="https://x.com/usemagnitude"><img src="https://img.shields.io/badge/Twitter-Follow-000000?style=flat-square&logo=x&logoColor=white&labelColor=000000&color=gray" alt="Follow Magnitude on Twitter"></a>
+  <a href="https://github.com/magnitudedev/magnitude/stargazers"><img src="https://img.shields.io/github/stars/magnitudedev/magnitude" alt="GitHub Repo stars"></a>
+  <a href="https://www.npmjs.com/package/@magnitudedev/cli"><img src="https://img.shields.io/npm/v/%40magnitudedev%2Fcli" alt="npm version"></a>
 </p>
 
-<p align="center">⭐ Help us reach more developers and grow the Magnitude community. Star this repo!</p>
+Open source inference server that profiles your hardware, recommends the best models for it, and runs them. Plug it into pi, Hermes, or whatever harness you already use.
 
-<p align="center">
-  <img src="docs/maglocaldemo.gif" alt="Magnitude running a local model">
-</p>
+⭐ Help us reach more developers and grow the Magnitude community. Star this repo!
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/ecosystem-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/readme/ecosystem-light.png">
+  <img alt="Magnitude works with Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline, and leading local models" src="assets/readme/ecosystem-light.png">
+</picture>
 
 ## Get started
 
-```sh
-npm install -g @magnitudedev/cli
-cd your-project
-magnitude
+Paste this into pi, Hermes, or whatever harness you already use:
+
 ```
+Install magnitude: `npm i -g @magnitudedev/cli`. After installing, run this and follow instructions: `magnitude docs onboarding`
+```
+
+Your agent installs Magnitude, profiles your machine, and walks you through picking a model.
 
 Magnitude supports macOS and Linux. Windows is supported through WSL.
 
 ## Why Magnitude?
 
-- **Fully private and offline** Everything stays on your machine, including the models.
-- **Models for every machine** Profiles your hardware and recommends the best models.
-- **Works out of the box** No Ollama, model server, or inference setup to configure.
-- **Skills** Extend Magnitude to work with Excel, PDFs, Chrome, and more.
-- **Free to run** No token costs, API keys, subscriptions, or rate limits.
-- **Open source** Apache 2.0 licensed, fully inspectable, and yours to modify.
-
-## Add skills
-
-Skills are reusable capabilities for your agent. A good way to get them is [skills.sh](https://www.skills.sh), a skills directory from Vercel.
-
-Skills we recommend:
-
-```sh
-npx skills add vercel-labs/agent-browser   # drive your logged-in Chrome browser
-npx skills add anthropics/skills/xlsx      # read and build Excel spreadsheets
-npx skills add anthropics/skills/pptx      # build PowerPoint decks
-npx skills add anthropics/skills/docx      # read and write Word documents
-npx skills add anthropics/skills/pdf       # read, fill, and create PDFs
-```
+- **Knows your hardware:** profiles your chip, memory, and bandwidth
+- **Recommends what fits:** the best models for your machine, with estimated tok/s
+- **Runs the models itself:** built-in inference server, no Ollama, etc.
+- **Tuned end to end:** speculative decoding, concurrency, all set for your machine
+- **Set up in one prompt:** your agent installs it and walks you through the rest
+- **Fully private and offline:** models, prompts, and files stay on your machine
+- **Free to run:** no token costs, API keys, or rate limits
+- **Open source:** Apache 2.0, yours to modify
 
 ## FAQ
 
 ### What is Magnitude?
 
-Magnitude is an open source agent with local models built in. Everything runs directly on your machine.
-
-### How is Magnitude different from Ollama or Hermes?
-
-Ollama runs local models. Hermes is an agent that can use local models. Magnitude combines both in one: it profiles your hardware, recommends and downloads models, then configures and runs them inside the agent. Nothing else to set up.
+An open source inference server that profiles your hardware, recommends the best models for it, and runs them, tuned to your machine. Plug it into whatever harness you already use.
 
 ### What hardware do I need?
 
-There’s no fixed minimum. Magnitude profiles your hardware and recommends the best models for your machine. More memory lets you run larger models.
+There's no fixed minimum. Magnitude profiles your hardware and recommends the best models for your machine. More memory lets you run larger models.
+
+### How is it different from Ollama or LM Studio?
+
+Ollama and LM Studio run the model you tell them to. Figuring out which model, which quant, whether it fits, and how fast it'll be is on you. Magnitude removes the guesswork. It profiles your machine, shows you exactly what will run well and how fast, then runs it with everything tuned, from speculative decoding to concurrency. Nothing to research, nothing to configure.
+
+### Which harnesses work with it?
+
+Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi (omp), and Cline. Your agent handles the connection during setup, since the Magnitude CLI knows each harness's config and hooks itself up. Don't have one? Run Magnitude in interactive mode and use its built-in harness, optimized for local models.
 
 ### Does my data go to the cloud?
 
-No. Your prompts and files stay on your machine.
+No. Prompts, files, and models stay on your machine.
 
-### Can Magnitude run completely offline?
+### Can it run completely offline?
 
 Yes. Once Magnitude and a model are downloaded, you can use it without an internet connection.
 
 ### Can I use models outside the catalog?
 
 Yes. You can [download compatible GGUF models from Hugging Face](https://docs.magnitude.dev/models#download-a-model-outside-the-catalog) and use them in Magnitude.
-
-### Can I use my own inference server?
-
-Yes. You can [connect an OpenAI-compatible endpoint](https://docs.magnitude.dev/custom-endpoints) and use its models in Magnitude.
 
 ## Learn more
 
@@ -92,4 +90,4 @@ Yes. You can [connect an OpenAI-compatible endpoint](https://docs.magnitude.dev/
 
 ## License
 
-Magnitude is licensed under the [Apache License 2.0](LICENSE).
+Magnitude is licensed under the [Apache License 2.0](https://github.com/magnitudedev/magnitude/blob/main/LICENSE).
