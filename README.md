@@ -18,7 +18,7 @@
   <a href="https://www.npmjs.com/package/@magnitudedev/cli"><img src="https://img.shields.io/npm/v/%40magnitudedev%2Fcli" alt="npm version"></a>
 </p>
 
-Open source inference server that profiles your hardware, recommends the best models for it, and runs them. Plug it into pi, Hermes, or whatever harness you already use.
+Open source inference server that profiles your hardware, recommends the best models for it, then downloads, tunes, and runs them. Plug it into Pi, Hermes, or whatever harness you already use.
 
 ⭐ Help us reach more developers and grow the Magnitude community. Star this repo!
 
@@ -30,13 +30,11 @@ Open source inference server that profiles your hardware, recommends the best mo
 
 ## Get started
 
-Paste this into pi, Hermes, or whatever harness you already use:
-
 ```
-Install magnitude: `npm i -g @magnitudedev/cli`. After installing, run this and follow instructions: `magnitude docs onboarding`
+npm i -g @magnitudedev/cli && magnitude setup
 ```
 
-Your agent installs Magnitude, profiles your machine, and walks you through picking a model.
+Magnitude asks which harness you'd like to set up, or you can use the built-in harness. It then profiles your machine and walks you through picking a model.
 
 Magnitude supports macOS and Linux. Windows is supported through WSL.
 
@@ -46,7 +44,7 @@ Magnitude supports macOS and Linux. Windows is supported through WSL.
 - **Recommends what fits:** the best models for your machine, with estimated tok/s
 - **Runs the models itself:** built-in inference server, no Ollama, etc.
 - **Tuned end to end:** speculative decoding, concurrency, all set for your machine
-- **Set up in one prompt:** your agent installs it and walks you through the rest
+- **Set up with one command:** install it, profile your machine, and connect your harness
 - **Fully private and offline:** models, prompts, and files stay on your machine
 - **Free to run:** no token costs, API keys, or rate limits
 - **Open source:** Apache 2.0, yours to modify
@@ -67,7 +65,7 @@ Ollama and LM Studio run the model you tell them to. Figuring out which model, w
 
 ### Which harnesses work with it?
 
-Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi (omp), and Cline. Your agent handles the connection during setup, since the Magnitude CLI knows each harness's config and hooks itself up. Don't have one? Run Magnitude in interactive mode and use its built-in harness, optimized for local models.
+Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi (omp), and Cline. Magnitude handles the connection during setup, since the CLI knows each harness's config and hooks itself up. Don't have one? Run Magnitude in interactive mode and use its built-in harness, optimized for local models.
 
 ### Does my data go to the cloud?
 
