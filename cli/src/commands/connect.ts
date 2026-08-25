@@ -1,19 +1,24 @@
 import type { Command as Commander } from "@commander-js/extra-typings"
+import { Atom, Registry } from "@effect-atom/atom"
 import * as FileSystem from "@effect/platform/FileSystem"
 import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
+import { Client, Mutation } from "@magnitudedev/effect-query"
+import type { AgentClient } from "@magnitudedev/client-common"
 import {
-  Inference,
-  makeInferenceClient,
-  type InferenceClient,
-  inferenceClientErrorMessage,
+  MagnitudeBoundary,
   MAGNITUDE_INFERENCE_BASE_URL,
+  ProviderModelIdSchema,
+  magnitudeImplementationsLayer,
+  type ModelDownloadId,
+  type ProviderModelId,
 } from "@magnitudedev/sdk"
-import { Data, Effect } from "effect"
+import { Data, Effect, Option, Schema } from "effect"
 import { applyEdits, modify, parse, type ParseError } from "jsonc-parser"
 import { homedir } from "node:os"
 import { startServer } from "./server"
 import { writeFileAtomic } from "../utils/atomic-file"
+import { makeTerminalPlatform } from "../platform/terminal"
 
 const INFERENCE_BASE_URL = new URL("v1", MAGNITUDE_INFERENCE_BASE_URL).href.replace(/\/$/, "")
 const CODEX_MANAGED_START = "# >>> Magnitude managed provider"
@@ -135,33 +140,61 @@ const configureHarness = (harness: Harness, modelId: string) => Effect.gen(funct
   ? error
   : connectFailure(String(error))))
 
-const awaitDownload = (client: InferenceClient, downloadId: string): Effect.Effect<void, unknown> =>
-  client.query(Inference.GetInferenceDownload, { downloadId }).pipe(
-    Effect.flatMap(({ state }) => {
-      switch (state._tag) {
-        case "Completed": return Effect.void
-        case "Failed": return Effect.fail(connectFailure(`Model installation failed: ${JSON.stringify(state.failure)}`))
-        case "Cancelled": return Effect.fail(connectFailure("Model installation was cancelled"))
-        case "Pending":
-        case "Downloading": return Effect.sleep("250 millis").pipe(
-          Effect.zipRight(Effect.suspend(() => awaitDownload(client, downloadId))),
-        )
-      }
-    }),
-  )
+const awaitDownload = (
+  client: Pick<AgentClient, "Models">,
+  registry: Registry.Registry,
+  modelId: ProviderModelId,
+  downloadId: ModelDownloadId,
+): Effect.Effect<void, unknown> => Registry.getResult(
+  registry,
+  Atom.make((get) => get(client.Models.GetCatalog({})).result),
+).pipe(
+  Effect.flatMap((state) => {
+    if (state._tag === "Initializing") return Effect.sleep("250 millis").pipe(
+      Effect.zipRight(Effect.suspend(() => awaitDownload(client, registry, modelId, downloadId))),
+    )
+    const entry = state.models.find((candidate) =>
+      candidate._tag === "Local" && candidate.product.modelId === modelId)
+    if (entry?._tag !== "Local") {
+      return Effect.fail(connectFailure(`Model ${modelId} is absent from the ACN catalog`))
+    }
+    const acquisition = entry.product.acquisitionState
+    if (acquisition._tag === "Installed") return Effect.void
+    if (acquisition._tag === "Failed" && acquisition.downloadId === downloadId) {
+      return Effect.fail(connectFailure(`Model installation failed: ${JSON.stringify(acquisition.failure)}`))
+    }
+    if (acquisition._tag === "Cancelled" && acquisition.downloadId === downloadId) {
+      return Effect.fail(connectFailure("Model installation was cancelled"))
+    }
+    return Effect.sleep("250 millis").pipe(
+      Effect.zipRight(Effect.suspend(() => awaitDownload(client, registry, modelId, downloadId))),
+    )
+  }),
+)
 
 const connectHarness = (harness: Harness, modelId: string) => Effect.gen(function* () {
   yield* startServer
-  const client = yield* makeInferenceClient()
-  const configured = yield* Effect.acquireUseRelease(
-    Effect.succeed(client),
-    (active) => active.mutate(Inference.InstallInferenceModel, { modelId }).pipe(
+  const terminal = yield* makeTerminalPlatform({
+    launchCommand: Option.none(),
+    debug: false,
+    effectLoggingLayer: Option.none(),
+  })
+  const client = Client.make(
+    MagnitudeBoundary,
+    magnitudeImplementationsLayer(terminal.platform.protocolLayer),
+  )
+  const registry = Registry.make()
+  yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+  const providerModelId = yield* Schema.decodeUnknown(ProviderModelIdSchema)(modelId)
+  const configured = yield* Mutation.execute(
+    client.Models.InstallLocalModel,
+    { modelId: providerModelId },
+  ).pipe(
+      Effect.provideService(Registry.AtomRegistry, registry),
       Effect.flatMap((admission) => admission._tag === "DownloadAdmitted"
-        ? awaitDownload(active, admission.downloadId)
+        ? awaitDownload(client, registry, providerModelId, admission.downloadId)
         : Effect.void),
       Effect.zipRight(configureHarness(harness, modelId)),
-    ),
-    (active) => active.close,
   )
   yield* Effect.sync(() => process.stdout.write([
     `Magnitude configured ${harness} for ${modelId}.`,
@@ -171,7 +204,7 @@ const connectHarness = (harness: Harness, modelId: string) => Effect.gen(functio
   ].join("\n")))
 }).pipe(Effect.mapError((error) => error instanceof HarnessConnectError
   ? error
-  : connectFailure(inferenceClientErrorMessage(error))))
+  : connectFailure(String(error))))
 
 export const registerConnectCommand = (program: Commander): void => {
   program.command("connect")
@@ -180,7 +213,7 @@ export const registerConnectCommand = (program: Commander): void => {
     .argument("<model-id>", "Canonical Magnitude model ID")
     .action((harness, modelId) => Effect.runPromise(
       (["pi", "opencode", "codex"] as const).includes(harness as Harness)
-        ? connectHarness(harness as Harness, modelId).pipe(
+        ? Effect.scoped(connectHarness(harness as Harness, modelId)).pipe(
             Effect.provide([BunContext.layer, FetchHttpClient.layer]),
             Effect.catchAll((error) => Effect.sync(() => {
               process.stderr.write(`${error.message}\n`)

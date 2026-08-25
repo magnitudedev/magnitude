@@ -1,12 +1,20 @@
 import type { Command as Commander } from "@commander-js/extra-typings"
-import { FetchHttpClient } from "@effect/platform"
+import { Atom, Registry } from "@effect-atom/atom"
+import { Client, Mutation } from "@magnitudedev/effect-query"
+import type { AgentClient } from "@magnitudedev/client-common"
 import {
-  Inference,
-  makeInferenceClient,
-  type InferenceClient,
-  inferenceClientErrorMessage,
+  MagnitudeBoundary,
+  ModelDownloadIdSchema,
+  ProviderModelIdSchema,
+  SlotIdSchema,
+  magnitudeImplementationsLayer,
 } from "@magnitudedev/sdk"
-import { Effect } from "effect"
+import { Effect, Option, Schema } from "effect"
+import { makeTerminalPlatform } from "../platform/terminal"
+
+const decodeModelId = Schema.decodeUnknown(ProviderModelIdSchema)
+const decodeDownloadId = Schema.decodeUnknown(ModelDownloadIdSchema)
+const decodeSlotId = Schema.decodeUnknown(SlotIdSchema)
 
 const printJson = (value: unknown) => Effect.sync(() => {
   process.stdout.write(`${JSON.stringify(value, (_key, member) => {
@@ -15,123 +23,100 @@ const printJson = (value: unknown) => Effect.sync(() => {
   }, 2)}\n`)
 })
 
-const explain = inferenceClientErrorMessage
+const explain = (error: unknown): string => typeof error === "object"
+  && error !== null
+  && "message" in error
+  && typeof error.message === "string"
+  ? error.message
+  : String(error)
 
-const runInference = <Value>(
-  use: (client: InferenceClient) => Effect.Effect<Value, unknown>,
-) => Effect.runPromise(Effect.acquireUseRelease(
-  makeInferenceClient(),
-  (client) => use(client).pipe(Effect.tap(printJson)),
-  (client) => client.close,
-).pipe(
-  Effect.provide(FetchHttpClient.layer),
-  Effect.catchAll((error) => Effect.sync(() => {
-    process.stderr.write(`${explain(error)}\n`)
-    process.exitCode = 1
-  })),
-  Effect.asVoid,
+const runModels = <Value>(
+  use: (client: Pick<AgentClient, "Models">, registry: Registry.Registry) => Effect.Effect<Value, unknown>,
+) => Effect.runPromise(Effect.scoped(
+  Effect.gen(function* () {
+    const terminal = yield* makeTerminalPlatform({
+      launchCommand: Option.none(),
+      debug: false,
+      effectLoggingLayer: Option.none(),
+    })
+    const registry = Registry.make()
+    yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+    const client = Client.make(
+      MagnitudeBoundary,
+      magnitudeImplementationsLayer(terminal.platform.protocolLayer),
+    )
+    return yield* use(client, registry)
+  }).pipe(
+    Effect.tap(printJson),
+    Effect.catchAll((error) => Effect.sync(() => {
+      process.stderr.write(`${explain(error)}\n`)
+      process.exitCode = 1
+    })),
+    Effect.asVoid,
+  ),
 ))
 
 export const registerInferenceCommands = (program: Commander): void => {
   program.command("hardware")
-    .description("Show the local inference hardware profile")
-    .action(() => runInference((client) => client.query(
-      Inference.GetInferenceHardware,
-      {},
-    )))
+    .description("Show the local inference environment")
+    .action(() => runModels((client, registry) =>
+      Registry.getResult(registry, Atom.make((get) => get(client.Models.GetLocalEnvironment({})).result))))
 
-  const models = program.command("models").description("Inspect and manage inference models")
+  const models = program.command("models").description("Inspect and manage models")
   models.command("list")
-    .description("List callable models and their installation state")
-    .action(() => runInference((client) => client.query(Inference.GetInferenceModels, {})))
-  models.command("get")
-    .argument("<model-id>", "Canonical model ID")
-    .action((modelId) => runInference((client) => client.query(
-      Inference.GetInferenceModel,
-      { modelId },
-    )))
+    .description("Show the unified model catalog")
+    .action(() => runModels((client, registry) =>
+      Registry.getResult(registry, Atom.make((get) => get(client.Models.GetCatalog({})).result))))
   models.command("install")
     .argument("<model-id>", "Canonical model ID")
-    .action((modelId) => runInference((client) => client.mutate(
-      Inference.InstallInferenceModel,
-      { modelId },
+    .action((modelId) => runModels((client, registry) => decodeModelId(modelId).pipe(
+      Effect.flatMap((decoded) => Mutation.execute(client.Models.InstallLocalModel, { modelId: decoded })),
+      Effect.provideService(Registry.AtomRegistry, registry),
     )))
   models.command("uninstall")
     .argument("<model-id>", "Canonical model ID")
-    .action((modelId) => runInference((client) => client.mutate(
-      Inference.UninstallInferenceModel,
-      { modelId },
-    )))
-  models.command("load-plan")
-    .argument("<model-id>", "Canonical model ID")
-    .action((modelId) => runInference((client) => client.query(
-      Inference.PreviewInferenceModelLoad,
-      { modelId },
-    )))
-  models.command("properties")
-    .argument("<model-id>", "Canonical model ID")
-    .action((modelId) => runInference((client) => client.query(
-      Inference.GetInferenceModelProperties,
-      { modelId },
+    .action((modelId) => runModels((client, registry) => decodeModelId(modelId).pipe(
+      Effect.flatMap((decoded) => Mutation.execute(client.Models.UninstallLocalModel, { modelId: decoded })),
+      Effect.provideService(Registry.AtomRegistry, registry),
     )))
 
   const downloads = program.command("downloads").description("Inspect and control model downloads")
   downloads.command("list")
-    .action(() => runInference((client) => client.query(Inference.GetInferenceDownloads, {})))
-  downloads.command("get")
-    .argument("<download-id>", "Exact download occurrence ID")
-    .action((downloadId) => runInference((client) => client.query(
-      Inference.GetInferenceDownload,
-      { downloadId },
-    )))
+    .description("Show download state in the unified model catalog")
+    .action(() => runModels((client, registry) =>
+      Registry.getResult(registry, Atom.make((get) => get(client.Models.GetCatalog({})).result))))
   downloads.command("cancel")
     .argument("<download-id>", "Exact download occurrence ID")
-    .action((downloadId) => runInference((client) => client.mutate(
-      Inference.CancelInferenceDownload,
-      { downloadId },
+    .action((downloadId) => runModels((client, registry) => decodeDownloadId(downloadId).pipe(
+      Effect.flatMap((decoded) => Mutation.execute(client.Models.CancelModelDownload, { downloadId: decoded })),
+      Effect.provideService(Registry.AtomRegistry, registry),
     )))
   downloads.command("acknowledge-failure")
     .argument("<download-id>", "Exact failed download occurrence ID")
-    .action((downloadId) => runInference((client) => client.mutate(
-      Inference.AcknowledgeInferenceDownloadFailure,
-      { downloadId },
+    .action((downloadId) => runModels((client, registry) => decodeDownloadId(downloadId).pipe(
+      Effect.flatMap((decoded) => Mutation.execute(client.Models.AcknowledgeModelDownloadFailure, { downloadId: decoded })),
+      Effect.provideService(Registry.AtomRegistry, registry),
     )))
 
-  const packages = program.command("packages").description("Inspect and remove installed model packages")
-  packages.command("list")
-    .action(() => runInference((client) => client.query(Inference.GetInferencePackages, {})))
-  packages.command("get")
-    .argument("<package-id>", "Immutable package ID")
-    .action((packageId) => runInference((client) => client.query(
-      Inference.GetInferencePackage,
-      { packageId },
-    )))
-  packages.command("remove")
-    .argument("<package-id>", "Immutable package ID")
-    .action((packageId) => runInference((client) => client.mutate(
-      Inference.RemoveInferencePackage,
-      { packageId },
-    )))
-
-  const instances = program.command("instances").description("Inspect and control loaded model instances")
+  const instances = program.command("instances").description("Inspect and control model residency")
   instances.command("list")
-    .action(() => runInference((client) => client.query(Inference.GetInferenceInstances, {})))
-  instances.command("get")
-    .argument("<instance-id>", "Exact instance occurrence ID")
-    .action((instanceId) => runInference((client) => client.query(
-      Inference.GetInferenceInstance,
-      { instanceId },
-    )))
+    .action(() => runModels((client, registry) =>
+      Registry.getResult(registry, Atom.make((get) => get(client.Models.GetInstances({})).result))))
   instances.command("load")
-    .argument("<model-id>", "Canonical model ID")
-    .action((modelId) => runInference((client) => client.mutate(
-      Inference.EnsureInferenceInstance,
-      { modelId },
+    .argument("<slot-id>", "Configured slot ID")
+    .action((slotId) => runModels((client, registry) => decodeSlotId(slotId).pipe(
+      Effect.flatMap((decoded) => Mutation.execute(client.Models.LoadSlot, { slotId: decoded })),
+      Effect.provideService(Registry.AtomRegistry, registry),
     )))
   instances.command("stop")
-    .argument("<instance-id>", "Exact instance occurrence ID")
-    .action((instanceId) => runInference((client) => client.mutate(
-      Inference.StopInferenceInstance,
-      { instanceId },
+    .argument("<slot-id>", "Configured slot ID")
+    .action((slotId) => runModels((client, registry) => decodeSlotId(slotId).pipe(
+      Effect.flatMap((decoded) => Mutation.execute(client.Models.StopSlot, { slotId: decoded })),
+      Effect.provideService(Registry.AtomRegistry, registry),
     )))
+
+  program.command("slots")
+    .description("Show resolved model slots")
+    .action(() => runModels((client, registry) =>
+      Registry.getResult(registry, Atom.make((get) => get(client.Models.GetSlots({})).result))))
 }

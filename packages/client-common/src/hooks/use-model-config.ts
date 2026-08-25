@@ -15,10 +15,14 @@ import {
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 import { ModelSlots, useModelSlotMutations } from "../model-slots/service"
+import { providerCatalogFromCatalog } from "../model-catalog/projection"
 
 export function useModelConfig() {
   const client = useAgentClient()
-  const catalogAtom = useMemo(() => Atom.make((get) => get(client.Configuration.GetProviderModelCatalog({})).result), [client])
+  const catalogAtom = useMemo(() => Atom.make((get) => Result.map(
+    get(client.Models.GetCatalog({})).result,
+    (state) => providerCatalogFromCatalog(state),
+  )), [client])
   const catalog = useAtomValue(catalogAtom)
   const slotService = useMemo(() => client.runtime.atom(ModelSlots), [client])
   const slotState = useMemo(() => Atom.make((get) => Result.flatMap(
@@ -31,12 +35,12 @@ export function useModelConfig() {
   )), [slotService])
   const slotMutations = useModelSlotMutations()
   const slots = useAtomValue(slotState)
-  const refreshAtom = client.Configuration.RefreshModelCatalog
+  const refreshAtom = client.Models.RefreshCatalog
   const catalogRefresh = useAtomValue(refreshAtom)
   const selections = Result.value(useAtomValue(slotSelections))
   const refresh = useAtomSet(refreshAtom)
 
-  const catalogModels = Option.flatMap(Result.value(catalog), ({ state }) =>
+  const catalogModels = Option.flatMap(Result.value(catalog), (state) =>
     ProviderModelCatalogLifecycle.match(state, {
       Loading: () => Option.none(),
       Ready: ({ models }) => Option.some(models),
@@ -110,7 +114,7 @@ export function useModelConfig() {
 
   const favoriteModels = Option.match(Result.value(slots), {
     onNone: () => [] as readonly ProviderModelIdentity[],
-    onSome: ({ state }) => state.favoriteModels,
+    onSome: (state) => state.favoriteModels,
   })
   const setModelFavorite = useMemo(() => (
     model: ProviderModelIdentity,

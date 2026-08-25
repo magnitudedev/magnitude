@@ -97,11 +97,12 @@ therefore do not contact a catalog service, fetch model headers, or depend on a 
 Development generation and release CI build it explicitly from immutable catalog revisions;
 ordinary TypeScript and Cargo builds perform no catalog network access.
 
-ACN owns the parent scope and application policy. It supplies ICN's storage roots and supported
-binary identity, and may translate native observations into Magnitude-owned recommendation,
-provider, and product projections. Hardware, Models, Packages, Downloads, and Instances remain
-native ICN resources. ACN exposes their generated contract unchanged through its `/inference`
-proxy; it does not duplicate them as application RPCs or source-backed mirrors.
+ACN owns the parent scope, application policy, and complete first-party client control plane. It
+supplies ICN's storage roots and supported binary identity and translates native observations into
+Magnitude-owned catalog, Slot, Instance, environment, recommendation, and provider resources.
+Hardware, Models, Packages, Downloads, and Instances remain native ICN authorities, but their
+generated management contract and event stream are private to ACN. Only the OpenAI-compatible
+`/inference/v1/**` serving data plane is proxied publicly; `/inference/api/**` is not public.
 
 ## Generated API boundary
 

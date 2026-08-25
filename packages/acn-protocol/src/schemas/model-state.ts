@@ -878,12 +878,15 @@ export const LocalModelDiscoveryStateSchema = Schema.Union(
 )
 export type LocalModelDiscoveryState = typeof LocalModelDiscoveryStateSchema.Type
 
+export const LocalModelInventoryStateSchema = Schema.Union(
+  Schema.TaggedStruct("Initializing", {}),
+  Schema.TaggedStruct("Ready", {}),
+  Schema.TaggedStruct("Degraded", { failure: ModelFailureSchema }),
+)
+export type LocalModelInventoryState = typeof LocalModelInventoryStateSchema.Type
+
 export const LocalModelsStateSchema = Schema.Struct({
-  inventoryState: Schema.Union(
-    Schema.TaggedStruct("Initializing", {}),
-    Schema.TaggedStruct("Ready", {}),
-    Schema.TaggedStruct("Degraded", { failure: ModelFailureSchema }),
-  ),
+  inventoryState: LocalModelInventoryStateSchema,
   models: Schema.Array(LocalModelSchema),
   discoveryState: LocalModelDiscoveryStateSchema,
 }).pipe(Schema.filter(({ models }) => {
@@ -1010,6 +1013,41 @@ export const ProviderModelCatalogStateSchema = Schema.Union(
 }, { message: () => "catalog identities must be unique and every model provider must resolve" }))
 export type ProviderModelCatalogState = typeof ProviderModelCatalogStateSchema.Type
 
+export const ModelCatalogEntrySchema = Schema.Union(
+  Schema.TaggedStruct("Remote", {
+    offering: ProviderModelCatalogEntrySchema,
+  }),
+  Schema.TaggedStruct("Local", {
+    product: LocalModelSchema,
+    offering: Schema.optionalWith(ProviderModelCatalogEntrySchema, {
+      as: "Option",
+      exact: true,
+    }),
+  }),
+)
+export type ModelCatalogEntry = typeof ModelCatalogEntrySchema.Type
+
+const ModelCatalogSnapshotFields = {
+  providers: Schema.Array(ProviderCatalogEntrySchema),
+  models: Schema.Array(ModelCatalogEntrySchema),
+  failures: Schema.Array(ProviderCatalogFailureSchema),
+  localInventoryState: LocalModelInventoryStateSchema,
+  localDiscoveryState: LocalModelDiscoveryStateSchema,
+} as const
+
+export const ModelCatalogStateSchema = Schema.Union(
+  Schema.TaggedStruct("Initializing", {}),
+  Schema.TaggedStruct("Ready", ModelCatalogSnapshotFields),
+  Schema.TaggedStruct("Refreshing", ModelCatalogSnapshotFields),
+  Schema.TaggedStruct("Degraded", ModelCatalogSnapshotFields),
+).pipe(Schema.filter((state) => state._tag === "Initializing" || (() => {
+  const identities = state.models.map((entry) => entry._tag === "Remote"
+    ? `${entry.offering.providerId}:${entry.offering.providerModelId}`
+    : `local:${entry.product.modelId}`)
+  return new Set(identities).size === identities.length
+})(), { message: () => "model catalog entries must have unique provider-qualified identities" }))
+export type ModelCatalogState = typeof ModelCatalogStateSchema.Type
+
 export const SlotSelectionSchema = Schema.Struct({
   providerId: ProviderIdSchema,
   providerModelId: ProviderModelIdSchema,
@@ -1033,6 +1071,11 @@ export type ModelSlotSelectionsState = typeof ModelSlotSelectionsStateSchema.Typ
 
 export class ModelSlotUnassigned extends Schema.TaggedClass<ModelSlotUnassigned>()("Unassigned", {
   slotId: SlotIdSchema,
+}) {}
+
+export class ModelSlotResolving extends Schema.TaggedClass<ModelSlotResolving>()("Resolving", {
+  slotId: SlotIdSchema,
+  selection: SlotSelectionSchema,
 }) {}
 
 export const ModelSlotDescriptorSchema = Schema.Struct({
@@ -1087,6 +1130,20 @@ export const ModelResidencySchema = Schema.Union(
 )
 export type ModelResidency = typeof ModelResidencySchema.Type
 
+export const ModelInstanceEntrySchema = Schema.Struct({
+  instanceId: ModelInstanceIdSchema,
+  modelId: ProviderModelIdSchema,
+  residency: ModelResidencySchema,
+})
+export type ModelInstanceEntry = typeof ModelInstanceEntrySchema.Type
+
+export const ModelInstancesStateSchema = Schema.Struct({
+  instances: Schema.Array(ModelInstanceEntrySchema),
+}).pipe(Schema.filter(({ instances }) =>
+  new Set(instances.map(({ instanceId }) => instanceId)).size === instances.length,
+{ message: () => "model instance identities must be unique" }))
+export type ModelInstancesState = typeof ModelInstancesStateSchema.Type
+
 export const ModelSlotActionSchema = Schema.Literal("Load", "Stop", "RetryLoad")
 export type ModelSlotAction = typeof ModelSlotActionSchema.Type
 
@@ -1128,22 +1185,25 @@ export class ModelSlotConfiguredLocal extends Schema.TaggedClass<ModelSlotConfig
 export const ModelSlotLifecycle = defineFSM(
   {
     Unassigned: ModelSlotUnassigned,
+    Resolving: ModelSlotResolving,
     ConfiguredRemote: ModelSlotConfiguredRemote,
     ConfiguredLocal: ModelSlotConfiguredLocal,
   },
   {
-    Unassigned: ["ConfiguredRemote", "ConfiguredLocal"],
-    ConfiguredRemote: ["Unassigned", "ConfiguredLocal"],
-    ConfiguredLocal: ["Unassigned", "ConfiguredRemote"],
+    Unassigned: ["Resolving", "ConfiguredRemote", "ConfiguredLocal"],
+    Resolving: ["Unassigned", "ConfiguredRemote", "ConfiguredLocal"],
+    ConfiguredRemote: ["Unassigned", "Resolving", "ConfiguredLocal"],
+    ConfiguredLocal: ["Unassigned", "Resolving", "ConfiguredRemote"],
   } as const,
 )
 
 export const ModelSlotSchema = Schema.Union(
   ModelSlotUnassigned,
+  ModelSlotResolving,
   ModelSlotConfiguredRemote,
   ModelSlotConfiguredLocal,
 ).pipe(Schema.filter((slot) => {
-  if (slot._tag === "Unassigned") return true
+  if (slot._tag === "Unassigned" || slot._tag === "Resolving") return true
   if (slot.selection.providerId !== slot.descriptor.providerId
     || slot.selection.providerModelId !== slot.descriptor.providerModelId) return false
   if (slot._tag === "ConfiguredRemote") {

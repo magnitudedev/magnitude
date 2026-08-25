@@ -7,6 +7,7 @@ import {
   Ref,
   Schema,
   Stream,
+  SubscriptionRef,
 } from "effect"
 import { createHash } from "node:crypto"
 import {
@@ -20,12 +21,10 @@ import {
   type LocalModelRecommendationProgressStepId,
   type ServableModelBundle,
   type ModelFailure,
-  type ModelRecommendationsState,
   type ModelServingConfiguration,
   type RecommendableModel,
 } from "@magnitudedev/acn-protocol"
 import { IcnHardware, IcnModels } from "@magnitudedev/icn"
-import { makeObservedState } from "./mirrored-state"
 import { LocalModelAssessor } from "./local-model-assessor"
 import { LocalModelPackages } from "./local-model-packages"
 import { catalogModelDefinitionFromIcn } from "./local-model-icn-adapter"
@@ -74,18 +73,8 @@ export const localModelRecommendationFailure = (
       }
 
 export interface LocalModelRecommendationsApi {
-  readonly snapshot: Effect.Effect<{
-    readonly revision: number
-    readonly state: RecommendationState
-  }>
-  readonly changes: Stream.Stream<{
-    readonly revision: number
-    readonly state: RecommendationState
-  }>
-  readonly publicSnapshot: Effect.Effect<{
-    readonly revision: number
-    readonly state: ModelRecommendationsState
-  }>
+  readonly state: Effect.Effect<RecommendationState>
+  readonly changes: Stream.Stream<RecommendationState>
 }
 
 export class LocalModelRecommendations extends Context.Tag(
@@ -159,7 +148,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
       const startupProgress = updateProgress(initialProgress(), "hardware", {
         status: { _tag: "Running", startedAtMs: startupStartedAtMs },
       })
-      const mirror = yield* makeObservedState<RecommendationState>({
+      const current = yield* SubscriptionRef.make<RecommendationState>({
         _tag: "Loading",
         progress: startupProgress,
       })
@@ -205,20 +194,23 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
             right._tag === "Failed" &&
             failuresEquivalent(left.failure, right.failure)))
       const lock = yield* Effect.makeSemaphore(1)
+      const publish = (next: RecommendationState) => Effect.gen(function* () {
+        const previous = yield* SubscriptionRef.get(current)
+        if (!equivalent(previous, next)) yield* SubscriptionRef.set(current, next)
+      })
 
       const publishProgress = (
         progress: readonly LocalModelRecommendationProgressStep[]
       ): Effect.Effect<void> =>
         Effect.gen(function* () {
           yield* Ref.set(progressRef, progress)
-          const current = (yield* mirror.get).state
-          yield* mirror.setIfChanged(
-            current._tag === "Ready"
-              ? { ...current, progress }
-              : current._tag === "Failed"
+          const state = yield* SubscriptionRef.get(current)
+          yield* publish(
+            state._tag === "Ready"
+              ? { ...state, progress }
+              : state._tag === "Failed"
               ? { _tag: "Loading", progress }
-              : { ...current, progress },
-            equivalent
+              : { ...state, progress },
           )
         })
 
@@ -264,7 +256,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
       const generate = lock
         .withPermits(1)(
           Effect.gen(function* () {
-            const currentStateBeforeRefresh = (yield* mirror.get).state
+            const currentStateBeforeRefresh = yield* SubscriptionRef.get(current)
             let progress =
               currentStateBeforeRefresh._tag === "Loading"
                 ? yield* Ref.get(progressRef)
@@ -298,7 +290,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
               progress = yield* startStep(progress, "inventory")
             }
             if (!(yield* packages.initialized)) return
-            const packageState = (yield* packages.snapshot).state
+            const packageState = yield* packages.state
             const installedCount = packageState.entries.filter(({ localState }) =>
               localState._tag === "Installed").length
             progress = yield* completeStep(
@@ -356,7 +348,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
               .update(inputState)
               .digest("hex")
             const previousDigest = yield* Ref.get(lastInputDigest)
-            const currentState = (yield* mirror.get).state
+            const currentState = yield* SubscriptionRef.get(current)
             if (
               Option.exists(
                 previousDigest,
@@ -390,10 +382,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                 estimatedRemainingMs: Option.none(),
               })
               yield* Ref.set(progressRef, progress)
-              yield* mirror.setIfChanged(
-                { ...currentState, progress },
-                equivalent
-              )
+              yield* publish({ ...currentState, progress })
               return
             }
 
@@ -502,14 +491,13 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
               lastInputDigest,
               Option.some(inputDigest)
             )
-            yield* mirror.setIfChanged(
+            yield* publish(
               {
                 _tag: "Ready",
                 recommendations: selected,
                 catalog: catalogCandidates,
                 progress,
               },
-              equivalent
             )
           })
         )
@@ -545,16 +533,15 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                   : step
               )
               yield* Ref.set(progressRef, failedProgress)
-              const current = (yield* mirror.get).state
-              yield* mirror.setIfChanged(
-                current._tag === "Ready"
-                  ? { ...current, progress: failedProgress }
+              const state = yield* SubscriptionRef.get(current)
+              yield* publish(
+                state._tag === "Ready"
+                  ? { ...state, progress: failedProgress }
                   : {
                       _tag: "Failed",
                       failure: reportedFailure,
                       progress: failedProgress,
                     },
-                equivalent
               )
               yield* Effect.logWarning(
                 "Unable to generate local model recommendations"
@@ -575,24 +562,8 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
       )
 
       return LocalModelRecommendations.of({
-        snapshot: mirror.get,
-        changes: mirror.changes,
-        publicSnapshot: mirror.get.pipe(Effect.map(({ revision, state }) => {
-          if (state._tag !== "Ready") return { revision, state }
-          return {
-            revision,
-            state: {
-              _tag: "Ready" as const,
-              progress: state.progress,
-              recommendations: state.recommendations.map((recommendation) => ({
-                  modelId: recommendation.modelId,
-                  id: recommendation.id,
-                  intent: recommendation.intent,
-                  explanation: recommendation.explanation,
-                })),
-            },
-          }
-        })),
+        state: SubscriptionRef.get(current),
+        changes: current.changes,
       })
     })
   )

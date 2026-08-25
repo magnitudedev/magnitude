@@ -125,15 +125,17 @@ transport success !=  query visibility
 When submitted input completely determines an immediate user-facing value, presentation may
 project the latest pending mutation over the authoritative query result. This optimistic value is
 a derived view of command intent, not copied server state and not a query-cache write. Rejection
-removes the pending projection and reveals the unchanged query value. Success keeps the mutation
-pending through synchronization so the refreshed authoritative value replaces the projection
-without exposing a stale intermediate value.
+removes the pending projection and reveals the unchanged query value. Successful synchronization
+invalidates affected query entries before publishing mutation success. The next observation reads
+the owner's committed value; it does not poll the query to prove an acknowledgement the owner has
+already made.
 
-Synchronization validates the mutation's exact acknowledgement contract in the refreshed query,
-not merely that a fetch completed. When a command returns an admitted occurrence or commits an
-exact selection, mutation success requires that same identity and postcondition to be visible.
-Dependent Effects may then consume the command output without a separate `seen` flag or timing
-assumption.
+The command owner defines the acknowledgement boundary. A committed command returns only after
+its durable or in-memory owner state has been updated. An admitted long-running command returns
+after the external owner accepts the exact occurrence; later progress arrives through ordinary
+resource observation. The client-side synchronization hook only invalidates affected queries. It
+does not perform a post-mutation proof read, retry a domain predicate, or create a second completion
+protocol.
 
 ### Client-side services
 
@@ -195,7 +197,8 @@ but they do not fan out parallel snapshot reads.
 Fetch and prefetch obey freshness: they return or preserve a fresh retained result, join active
 work, and execute only for missing or stale state. Refetch is the explicit operation that forces
 new observational work. A mutation that changes query authority invalidates the affected query
-before fetching the synchronized snapshot.
+before publishing mutation success. Mounted consumers then refetch through normal query
+observation; imperative consumers fetch when they next require the value.
 
 An imperative fetch operation awaits an internal ticket for the fetch generation it joined or
 started. It does not infer completion from public presentation state such as `idle`, `paused`, or
@@ -408,12 +411,11 @@ concurrent installations of different configurations while serializing duplicate
 same configuration. Pending and failure presentation is selected from those exact mutation states.
 It is never represented by a singleton `installingId`, `busy`, or error side channel.
 
-Mutation success includes synchronization with every canonical query whose visibility is promised
-by the command. A command that admits a download remains pending until a fresh local-model snapshot
-shows that exact configuration with either the admitted model-download identity or installed
-acquisition. Mutation synchronization does not wait for the admitted download or later provider
-publication to finish; progress, physical completion, and serving readiness remain authoritative
-query state consumed by the dependent Effect.
+Mutation success includes invalidation of every canonical query whose visibility may have changed.
+The command owner, not a client reread, defines acknowledgement: a committed command returns after
+its owner commit; a command admitting a download or instance returns the exact admitted identity.
+Progress, physical completion, and serving readiness remain authoritative query state. Mutation
+synchronization never polls a query until it appears to prove the command response.
 
 There is one canonical query cache and one mutation-state registry per connection; a second cache,
 request system, or command-state mechanism is prohibited. Definers know their semantic boundary,
@@ -424,28 +426,25 @@ not the transport; callers know the three primitives, not the transport.
 ```text
 component
    +-- ACN domain member ------> Effect Query client ----> ACN RPC
-   +-- inference member -------> Effect Query client ----> generated ICN HTTP client
-                                           ^                         ^
-                                           |                         +-- ICN events invalidate native query
-                                           +-- StreamChanges invalidates RPC query
+                                           ^
+                                           +-- StreamChanges invalidates query
 ```
 
-- The ACN transport service executes RPCs; the generated ICN client executes native HTTP. Neither
-  owns query or mutation state. The ACN transport's
-  implementation (the JIT runtime, recovering HTTP protocol, subscription framing) is the only
-  place that knows Effect RPC.
+- The ACN transport service executes RPCs and owns no query or mutation state. Its implementation
+  (the JIT runtime, recovering HTTP protocol, subscription framing) is the only client-side place
+  that knows Effect RPC. Native ICN management and observation remain private to ACN.
 - One Effect Query client per connection owns the Atom runtime, query cache, mutation history, and
   the domain service Layers.
 - Definitions are transport-neutral values requiring a generic operation implementation through
   Effect DI. The connection installs the RPC-backed implementation layer.
-- Freshness is owned by the connection: `StreamChanges` invalidates ACN Queries and one multiplexed
-  ICN event stream invalidates native inference Queries in the same cache. Reconnect rereads every
-  covered authoritative snapshot.
+- Freshness is owned by the connection: `StreamChanges` invalidates ACN Queries. Reconnect rereads
+  every covered authoritative snapshot.
 - A keyed subscription that keeps queries fresh (`WatchFile`, `WatchProjectFiles`) is a dependency
   of the query atoms it serves, owned by that domain's client service: open while observed, closed
   when unobserved. Components and hooks mount no watches and own no stream fibers.
 - Components do not own RPC clients, request caches, retries, or invalidation wiring.
-- Mutation receipts may await query visibility; they do not create another resource state.
+- Mutation receipts acknowledge owner commit or exact admission; they do not create another
+  resource state or await a proof reread.
 - Reconnection preserves client state and rereads authoritative ACN state.
 
 ### Sessions, events, projections, and workers
@@ -643,7 +642,6 @@ For every domain:
 ## Related domain contracts
 
 - [Operation ownership](./operation-ownership.md)
-- [Mirrored state](../misc/mirrored-state.md)
 - [JIT ACN spawning](../acn/lifecycle/jit-spawning.md)
 - [ACN client lifecycle](../acn/lifecycle/client-lifecycle.md)
 - [ACN service lifecycle](../acn/lifecycle/service-lifecycle.md)

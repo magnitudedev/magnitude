@@ -2,9 +2,7 @@ import { useCallback, useMemo } from "react"
 import { Effect, Option, type Equivalence } from "effect"
 import { Atom, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import {
-  Inference,
   ProviderIdSchema,
-  projectInferenceHardware,
   type LocalModelsState,
   type ProviderModelId,
   type SlotId,
@@ -16,14 +14,12 @@ import {
   useLocalModelMutations,
 } from "../local-models/service"
 import { ModelSlots, useModelSlotMutations } from "../model-slots/service"
+import { providerCatalogFromCatalog } from "../model-catalog/projection"
 
 export const useLocalInferenceHardware = () => {
   const client = useAgentClient()
   const hardware = useMemo(() => Atom.make((get) =>
-    Result.map(
-      get(client.Inference.GetInferenceHardware({})).result,
-      (state) => Effect.runSync(projectInferenceHardware(state)),
-    )), [client])
+    get(client.Models.GetLocalEnvironment({})).result), [client])
   return useAtomValue(hardware)
 }
 export type LocalInferenceHardwareResult = ReturnType<typeof useLocalInferenceHardware>
@@ -70,13 +66,13 @@ export const useModelSlots = () => {
   const service = useMemo(() => client.runtime.atom(ModelSlots), [client])
   const state = useMemo(() => Atom.make((get) =>
     Result.flatMap(get(service), (slots) => get(slots.state))), [service])
-  return Result.map(useAtomValue(state), ({ state: slots }) => slots)
+  return useAtomValue(state)
 }
 
 export const useProviderModelCatalog = () => {
   const client = useAgentClient()
   const catalog = useMemo(() => Atom.make((get) =>
-    Result.map(get(client.Configuration.GetProviderModelCatalog({})).result, ({ state }) => state)), [client])
+    Result.map(get(client.Models.GetCatalog({})).result, providerCatalogFromCatalog)), [client])
   return useAtomValue(catalog)
 }
 
@@ -89,14 +85,12 @@ export function usePreviewModelLoad(slotId: SlotId) {
   const modelSlots = useMemo(() => client.runtime.atom(ModelSlots), [client])
   const preview = useMemo(() => {
     return Atom.make((get) => {
-      get(client.Inference.GetInferenceHardware({}))
+      get(client.Models.GetLocalEnvironment({}))
       return Result.flatMap(get(modelSlots), (service) =>
-        Result.flatMap(get(service.state), ({ state }) => {
+        Result.flatMap(get(service.state), (state) => {
           const slot = slotId === "primary" ? state.slots.primary : state.slots.secondary
           return slot._tag === "ConfiguredLocal"
-            ? get(client.Inference.PreviewInferenceModelLoad({
-                modelId: slot.selection.providerModelId,
-              })).result
+            ? get(client.Models.PreviewSlotLoad({ slotId })).result
             : Result.initial()
         }))
     })

@@ -123,6 +123,9 @@ export function buildConfigStateFromSlots(
     if (slot._tag === 'Unassigned') {
       return { _tag: 'Unassigned', slotId }
     }
+    if (slot._tag === 'Resolving') {
+      return { _tag: 'Pending', slotId }
+    }
     if (slot.availability._tag === 'Pending') {
       return { _tag: 'Pending', slotId }
     }

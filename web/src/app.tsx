@@ -833,6 +833,9 @@ function AppInner({
       {
         onNone: () => "Local model settings are temporarily unavailable.",
         onSome: (failure) => {
+          if (failure._tag !== "OnboardingModelSetupObservationFailed") {
+            return "Local model settings are temporarily unavailable."
+          }
           switch (failure.source) {
             case "onboarding":
               return "Magnitude couldn’t read onboarding status from the daemon."
@@ -903,7 +906,7 @@ function AuthenticatedAppContent({
     rootSlotId,
     rootProfile,
   } = useSlotProfiles()
-  const modelSlots = Option.getOrNull(Result.value(slotsResult))?.state ?? null
+  const modelSlots = Option.getOrNull(Result.value(slotsResult))
   const modelLoadActivity = modelSlots === null
     ? null
     : deriveLocalModelLoadActivity(modelSlots, rootSlotId)

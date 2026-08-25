@@ -10,13 +10,13 @@ describe("ACN changes", () => {
       const changes = yield* AcnChanges
       const collected = yield* changes.stream.pipe(Stream.take(2), Stream.runCollect, Effect.fork)
       yield* Effect.sleep("5 millis")
-      yield* changes.publish({ query: "GetModelSlots", revision: 4 })
+      yield* changes.publish({ query: "GetModelSlots" })
       yield* changes.publish({ query: "GetSession", key: { sessionId: "s1" } })
       return Chunk.toReadonlyArray(yield* Fiber.join(collected))
     }).pipe(Effect.provide(AcnChangesLive))))
 
     expect(values).toEqual([
-      { query: "GetModelSlots", revision: 4 },
+      { query: "GetModelSlots" },
       { query: "GetSession", key: { sessionId: "s1" } },
     ])
   })

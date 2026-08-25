@@ -1,7 +1,6 @@
-import { Data, Effect, Schema } from "effect"
+import { Schema } from "effect"
 import { Group, Mutation, Query, QueryClient } from "@magnitudedev/effect-query"
 import { OnboardingError } from "../errors"
-import { MirroredSnapshotSchema } from "../schemas/mirrored-state"
 import { OnboardingState } from "../schemas/onboarding"
 
 /**
@@ -10,30 +9,18 @@ import { OnboardingState } from "../schemas/onboarding"
  */
 const GetOnboardingState = Query.make("GetOnboardingState", {
   payload: Schema.Struct({}),
-  success: MirroredSnapshotSchema(OnboardingState),
+  success: OnboardingState,
   error: OnboardingError,
   staleTime: Infinity,
   gcTime: Infinity,
 })
-
-/** Completion was acknowledged but the state did not report completed. */
-export class OnboardingPersistenceSynchronizationFailed extends Data.TaggedError(
-  "OnboardingPersistenceSynchronizationFailed",
-)<{}> {}
 
 const CompleteOnboarding = Mutation.make("CompleteOnboarding", {
   policy: { recovery: "ReplaySafe" },
   payload: Schema.Struct({}),
   success: Schema.Struct({}),
   error: OnboardingError,
-  synchronize: () => QueryClient.invalidate(GetOnboardingState.match()).pipe(
-    Effect.zipRight(QueryClient.fetch(GetOnboardingState, {})),
-    Effect.filterOrFail(
-      ({ state }) => state.completed,
-      () => new OnboardingPersistenceSynchronizationFailed(),
-    ),
-    Effect.asVoid,
-  ),
+  synchronize: () => QueryClient.invalidate(GetOnboardingState.match()),
 })
 
 export const Onboarding = Group.make({ GetOnboardingState, CompleteOnboarding })

@@ -6,7 +6,6 @@ import { Result } from "@effect-atom/atom-react"
 import { AlertTriangle, Cpu, HardDrive, Loader2, X } from "lucide-react"
 import {
   formatLocalModelDisplayName,
-  localModelConfigurationId,
   modelDownloadFailureMessage,
   onboardingModelSetupFailureMessage,
   type useOnboardingModelSetup,
@@ -326,7 +325,7 @@ export function LocalModelOnboarding({
                 <Button variant="unstyled" size="unstyled"
                   type="button"
                   className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-blue-700 text-slate-50 hover:bg-blue-800 dark:bg-blue-500 dark:text-slate-925 dark:hover:bg-blue-400"
-                  onClick={() => setup.select(operation.configurationId)}
+                  onClick={() => setup.select(operation.modelId)}
                 >
                   Retry
                 </Button>
@@ -354,18 +353,15 @@ export function LocalModelOnboarding({
         {content._tag === "Chooser" && operation === null && (
           <section className="mt-[22px] grid grid-cols-2 gap-[11px] max-[760px]:grid-cols-1">
             {content.options.map((option) => {
-              const configurationId = Option.getOrNull(
-                localModelConfigurationId(option.model)
-              )
+              const modelId = option.model.modelId
               return (
                 <Button variant="unstyled" size="unstyled"
                   type="button"
                   className="appearance-none rounded-[10px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-850 p-[17px] text-left cursor-pointer font-[inherit] hover:border-blue-400 hover:bg-slate-100 dark:hover:border-blue-600 dark:hover:bg-slate-800 [&_h3]:mb-[5px] [&_h3]:text-[15px] [&_h3]:leading-[1.3] [&_h3]:text-slate-900 dark:[&_h3]:text-slate-200 [&_p]:my-1.5 [&_p]:text-[12.5px] [&_p]:leading-normal [&_p]:text-slate-600 dark:[&_p]:text-slate-400"
                   key={option.id}
                   onClick={() =>
-                    configurationId && setup.select(configurationId)
+                    setup.select(modelId)
                   }
-                  disabled={configurationId === null}
                 >
                   <div className="model-card-header">
                     <div>

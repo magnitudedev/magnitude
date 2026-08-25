@@ -36,7 +36,7 @@ describe("ACN inference proxy", () => {
     }) as typeof fetch
     const signal = new AbortController().signal
     const result = await proxyInferenceWebRequest(new Request(
-      "http://127.0.0.1:10100/inference/api/v1/models?installed=true",
+      "http://127.0.0.1:10100/inference/v1/chat/completions?stream=true",
       {
         method: "POST",
         body: requestBody,
@@ -50,7 +50,7 @@ describe("ACN inference proxy", () => {
       } as RequestInit,
     ), target, fetchTarget, signal)
 
-    expect(forwardedUrl).toBe("http://127.0.0.1:43210/api/v1/models?installed=true")
+    expect(forwardedUrl).toBe("http://127.0.0.1:43210/v1/chat/completions?stream=true")
     expect(new Headers(forwarded?.headers).get("authorization")).toBe("Bearer private-icn")
     expect(new Headers(forwarded?.headers).has("x-magnitude-acn-id")).toBe(false)
     expect(forwarded?.signal).toBe(signal)
@@ -61,31 +61,18 @@ describe("ACN inference proxy", () => {
     expect(await result.text()).toBe("response bytes")
   })
 
-  it("publishes the proxied OpenAPI base without changing the contract", async () => {
-    const fetchTarget = (async () => new Response(JSON.stringify({
-      openapi: "3.1.0",
-      paths: { "/v1/models": { get: {} } },
-      servers: [{ url: "/" }],
-    }), {
-      headers: {
-        "content-type": "application/json",
-        "content-length": "999",
-        "content-encoding": "gzip",
-        etag: '"private-document"',
-      },
-    })) as unknown as typeof fetch
+  it("does not expose the ICN management or metadata surface", async () => {
+    let forwarded = false
+    const fetchTarget = (async () => {
+      forwarded = true
+      return new Response("unexpected")
+    }) as unknown as typeof fetch
     const result = await proxyInferenceWebRequest(
-      new Request("http://127.0.0.1:10100/inference/openapi.json"),
+      new Request("http://127.0.0.1:10100/inference/api/v1/models"),
       target,
       fetchTarget,
     )
-    expect(await result.json()).toEqual({
-      openapi: "3.1.0",
-      paths: { "/v1/models": { get: {} } },
-      servers: [{ url: "/inference" }],
-    })
-    expect(result.headers.get("content-length")).toBeNull()
-    expect(result.headers.get("content-encoding")).toBeNull()
-    expect(result.headers.get("etag")).toBeNull()
+    expect(result.status).toBe(404)
+    expect(forwarded).toBe(false)
   })
 })

@@ -7,6 +7,7 @@ import { Connection } from "./connection"
 import { Display } from "./display"
 import { Files } from "./files"
 import { Git } from "./git"
+import { Models } from "./models"
 import { Onboarding } from "./onboarding"
 import { ProjectFiles } from "./project-files"
 import { Projects } from "./projects"
@@ -24,6 +25,7 @@ export const AcnBoundary = Group.make({
   Configuration,
   Files,
   Git,
+  Models,
   Skills,
   Shell,
   Display,

@@ -1,6 +1,5 @@
-import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
+import { Context, Effect, Layer, Option, Schema, Stream, SubscriptionRef } from "effect"
 import {
-  Configuration,
   LocalModelsStateSchema,
   ServableModelBundleSchema,
   sameServableModelBundleIdentity,
@@ -26,8 +25,6 @@ import {
 import type { ProviderModelId } from "@magnitudedev/ai"
 import { IcnInstances, IcnModels } from "@magnitudedev/icn"
 import type * as Generated from "@magnitudedev/icn-protocol/schemas"
-import { AcnChanges } from "./changes"
-import { makeMirroredState } from "./mirrored-state"
 import { LocalInferenceHardware as LocalInferenceHardwareService } from "./local-inference-hardware"
 import { LocalModelPackages } from "./local-model-packages"
 import { LocalModelRecommendations } from "./local-model-recommendations"
@@ -340,8 +337,8 @@ export const projectLocalModelMemory = (
 }
 
 export interface LocalModelsApi {
-  readonly snapshot: Effect.Effect<{ readonly revision: number; readonly state: LocalModelsState }>
-  readonly changes: Stream.Stream<{ readonly revision: number; readonly state: LocalModelsState }>
+  readonly state: Effect.Effect<LocalModelsState>
+  readonly changes: Stream.Stream<LocalModelsState>
   /** Publishes a snapshot from the current lower-domain facts before returning. */
   readonly refresh: Effect.Effect<void>
 }
@@ -353,7 +350,7 @@ export const LocalModelsLive: Layer.Layer<
   never,
   IcnModels | LocalModelPackages | LocalModelRecommendations
     | LocalModelConfigurationResolver | LocalProviderOfferings | LocalInferenceHardwareService
-    | IcnInstances | AcnChanges
+    | IcnInstances
 > = Layer.scoped(LocalModels, Effect.gen(function* () {
   const icnModels = yield* IcnModels
   const packages = yield* LocalModelPackages
@@ -362,31 +359,28 @@ export const LocalModelsLive: Layer.Layer<
   const offerings = yield* LocalProviderOfferings
   const hardware = yield* LocalInferenceHardwareService
   const instances = yield* IcnInstances
-  const mirror = yield* makeMirroredState<LocalModelsState>(
-    { name: Configuration.GetLocalModels.name },
-    {
-      inventoryState: { _tag: "Initializing" },
-      models: [],
-      discoveryState: { _tag: "Loading", progress: [] },
-    },
-  )
+  const current = yield* SubscriptionRef.make<LocalModelsState>({
+    inventoryState: { _tag: "Initializing" },
+    models: [],
+    discoveryState: { _tag: "Loading", progress: [] },
+  })
   const equivalent = Schema.equivalence(LocalModelsStateSchema)
   const lock = yield* Effect.makeSemaphore(1)
 
   const project = lock.withPermits(1)(Effect.gen(function* () {
-    const packageState = (yield* packages.snapshot).state
+    const packageState = yield* packages.state
     const nativeCatalogModels = (yield* icnModels.get).state.models
     const catalogModels = yield* Effect.forEach(
       nativeCatalogModels,
       catalogModelDefinitionFromIcn,
     )
-    const recommendationState = (yield* recommendations.snapshot).state
+    const recommendationState = yield* recommendations.state
     const resolvedConfigurations = new Map<string, import("./local-model-configuration-resolver").ResolvedLocalModelConfiguration>(
       yield* resolver.get,
     )
     const configured = yield* offerings.list
     const projectedOfferings = yield* offerings.state
-    const hardwareState = (yield* hardware.snapshot).state
+    const hardwareState = yield* hardware.state
     const instanceState = yield* instances.get
     const packageEntries = new Map(
       packageState.entries.map((entry) => [entry.package.id, entry]),
@@ -632,11 +626,13 @@ export const LocalModelsLive: Layer.Layer<
             progress: recommendationState.progress,
           }
         : { _tag: "Ready" as const, progress: recommendationState.progress }
-    yield* mirror.setIfChanged({
+    const next = {
       inventoryState: packageState.inventory,
       models,
       discoveryState,
-    }, equivalent)
+    }
+    const previous = yield* SubscriptionRef.get(current)
+    if (!equivalent(previous, next)) yield* SubscriptionRef.set(current, next)
   })).pipe(Effect.catchAllCause((cause) =>
     Effect.logWarning("Unable to project local models").pipe(
       Effect.annotateLogs({ cause: String(cause) }),
@@ -659,8 +655,8 @@ export const LocalModelsLive: Layer.Layer<
   )
 
   return LocalModels.of({
-    snapshot: mirror.get,
-    changes: mirror.changes,
+    state: SubscriptionRef.get(current),
+    changes: current.changes,
     refresh: project,
   })
 }))

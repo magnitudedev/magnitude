@@ -5,7 +5,6 @@ import {
   type ConfigState,
 } from "@magnitudedev/agent"
 import {
-  authoritativeSlotSelection,
   modelSlotActions,
   servableModelBundlePackageIds,
   ModelPreferenceMutationFailed,
@@ -13,17 +12,15 @@ import {
   ModelSlotMutationFailed,
   ModelSlotMutationRejected,
   ModelSlotUnassigned,
-  Configuration,
+  Models,
   ModelSlotsStateSchema,
   PRIMARY_SLOT_ID,
   SECONDARY_SLOT_ID,
-  type MirroredSnapshot,
   type ModelFailure,
   type ModelSlot,
   type ModelSlotAvailability,
   type ModelSlotDescriptor,
   type ModelSlotsState,
-  type ModelSlotSelectionsState,
   type ModelSlotUpdateError,
   type ProviderCatalogEntry,
   type ProviderModelCatalogEntry,
@@ -44,17 +41,18 @@ import { AcnChanges } from "./changes"
 import { LocalModelPackages } from "./local-model-packages"
 import { LocalProviderOfferings } from "./local-provider-offerings"
 import { ProviderModelCatalog } from "./provider-model-catalog"
+import { ModelInstances } from "./model-instances"
 import {
   localModelSlotAvailability,
   selectableModelCapabilities,
 } from "./model-slot-projection"
 
 export interface ModelSlotControllerApi {
-  readonly snapshot: Effect.Effect<MirroredSnapshot<ModelSlotsState>>
-  readonly selectionSnapshot: Effect.Effect<MirroredSnapshot<ModelSlotSelectionsState>>
-  readonly changes: Stream.Stream<MirroredSnapshot<ModelSlotsState>>
+  readonly state: Effect.Effect<ModelSlotsState>
+  readonly changes: Stream.Stream<ModelSlotsState>
   readonly agentModelConfiguration: Effect.Effect<ConfigState>
   readonly agentModelConfigurationChanges: Stream.Stream<ConfigState>
+  readonly refresh: Effect.Effect<void>
   readonly updateModelSlot: (
     slotId: SlotId,
     selection: Option.Option<SlotSelection>,
@@ -71,7 +69,7 @@ export class ModelSlotController extends Context.Tag("ModelSlotController")<
 >() {}
 
 interface ControllerAggregate {
-  readonly snapshot: MirroredSnapshot<ModelSlotsState>
+  readonly state: ModelSlotsState
   readonly agentConfiguration: ConfigState
 }
 
@@ -121,20 +119,21 @@ export const ModelSlotControllerLive: Layer.Layer<
   ModelSlotController,
   never,
   ModelSelection | MagnitudeStorage | LocalModelPackages | LocalProviderOfferings
-    | ProviderModelCatalog | AcnChanges
+    | ProviderModelCatalog | ModelInstances | AcnChanges
 > = Layer.scoped(ModelSlotController, Effect.gen(function* () {
   const modelSelection = yield* ModelSelection
   const storage = yield* MagnitudeStorage
   const localPackages = yield* LocalModelPackages
   const localOfferings = yield* LocalProviderOfferings
   const catalog = yield* ProviderModelCatalog
+  const instances = yield* ModelInstances
   const changes = yield* AcnChanges
   const scope = yield* Scope.Scope
   const stateLock = yield* Effect.makeSemaphore(1)
 
   const initialSelection = yield* modelSelection.get
   const configuredContextLimits = yield* storage.config.getContextLimitPolicy().pipe(Effect.orDie)
-  const initialCatalog = (yield* catalog.snapshot).state
+  const initialCatalog = yield* catalog.state
   const emptyState: ModelSlotsState = {
     slots: {
       primary: new ModelSlotUnassigned({ slotId: PRIMARY_SLOT_ID }),
@@ -144,7 +143,7 @@ export const ModelSlotControllerLive: Layer.Layer<
     favoriteModels: initialSelection.favorites,
   }
   const aggregate = yield* SubscriptionRef.make<ControllerAggregate>({
-    snapshot: { revision: 0, state: emptyState },
+    state: emptyState,
     agentConfiguration: buildConfigStateFromSlots(
       catalogContents(initialCatalog).models,
       emptyState.slots,
@@ -159,7 +158,7 @@ export const ModelSlotControllerLive: Layer.Layer<
     const previous = yield* SubscriptionRef.get(aggregate)
     const stateChanged = !Schema.equivalence(
       ModelSlotsStateSchema,
-    )(previous.snapshot.state, state)
+    )(previous.state, state)
     const candidateAgentConfiguration = buildConfigStateFromSlots(
       catalogModels,
       state.slots,
@@ -172,18 +171,15 @@ export const ModelSlotControllerLive: Layer.Layer<
     if (!stateChanged && !agentConfigurationChanged) {
       return previous
     }
-    const revision = stateChanged
-      ? previous.snapshot.revision + 1
-      : previous.snapshot.revision
     const next: ControllerAggregate = {
-      snapshot: stateChanged ? { revision, state } : previous.snapshot,
+      state: stateChanged ? state : previous.state,
       agentConfiguration: agentConfigurationChanged
         ? candidateAgentConfiguration
         : previous.agentConfiguration,
     }
     yield* SubscriptionRef.set(aggregate, next)
     if (stateChanged) {
-      yield* changes.publish({ query: Configuration.GetModelSlots.name, revision })
+      yield* changes.publish({ query: Models.GetSlots.name })
     }
     return next
   })
@@ -239,28 +235,29 @@ export const ModelSlotControllerLive: Layer.Layer<
   const descriptorFor = (
     selection: SlotSelection,
     models: readonly ProviderModelCatalogEntry[],
-  ): ModelSlotDescriptor => {
+  ): Option.Option<ModelSlotDescriptor> => {
     const model = models.find((item) =>
       item.providerId === selection.providerId
       && item.providerModelId === selection.providerModelId)
-    return {
+    return model === undefined ? Option.none() : Option.some({
       providerId: selection.providerId,
       providerModelId: selection.providerModelId,
-      displayName: model?.displayName || selection.providerModelId,
-      variantLabel: model?.variantLabel ?? Option.none(),
-    }
+      displayName: model.displayName,
+      variantLabel: model.variantLabel,
+    })
   }
 
   const rebuild = stateLock.withPermits(1)(Effect.gen(function* () {
     const configured = yield* modelSelection.get
-    const catalogState = (yield* catalog.snapshot).state
+    const catalogState = yield* catalog.state
     const contents = catalogContents(catalogState)
     const localOfferingsReady = yield* localOfferings.ready
-    const packageState = (yield* localPackages.snapshot).state
+    const packageState = yield* localPackages.state
     const packages = yield* localPackages.installedPackageIds
     const previousAggregate = yield* SubscriptionRef.get(aggregate)
-    const previous = previousAggregate.snapshot.state
+    const previous = previousAggregate.state
     const offerings = yield* localOfferings.list.pipe(Effect.orElseSucceed(() => []))
+    const instanceState = yield* instances.state
 
     const buildSlot = (slotId: SlotId, selection: Option.Option<SlotSelection>): ModelSlot =>
       Option.match(selection, {
@@ -269,6 +266,7 @@ export const ModelSlotControllerLive: Layer.Layer<
           switch (current._tag) {
             case "Unassigned":
               return ModelSlotLifecycle.hold(current, { slotId })
+            case "Resolving":
             case "ConfiguredRemote":
             case "ConfiguredLocal":
               return ModelSlotLifecycle.transition(current, "Unassigned", { slotId })
@@ -276,13 +274,19 @@ export const ModelSlotControllerLive: Layer.Layer<
         },
         onSome: (selected) => {
           const descriptor = descriptorFor(selected, contents.models)
-          const baseAvailability = providerAvailability(selected, catalogState)
           const current = previous.slots[slotKey(slotId)]
+          if (Option.isNone(descriptor)) {
+            const props = { slotId, selection: selected } as const
+            return current._tag === "Resolving"
+              ? ModelSlotLifecycle.hold(current, props)
+              : ModelSlotLifecycle.transition(current, "Resolving", props)
+          }
+          const baseAvailability = providerAvailability(selected, catalogState)
           if (selected.providerId !== LOCAL_PROVIDER_ID) {
             const props = {
               slotId,
               selection: selected,
-              descriptor,
+              descriptor: descriptor.value,
               availability: baseAvailability,
               actions: [],
             } as const
@@ -290,6 +294,7 @@ export const ModelSlotControllerLive: Layer.Layer<
               case "ConfiguredRemote":
                 return ModelSlotLifecycle.hold(current, props)
               case "Unassigned":
+              case "Resolving":
               case "ConfiguredLocal":
                 return ModelSlotLifecycle.transition(current, "ConfiguredRemote", props)
             }
@@ -306,11 +311,13 @@ export const ModelSlotControllerLive: Layer.Layer<
             offeringExists: offering !== undefined,
             installed: downloaded,
           })
-          const residency = { _tag: "Unloaded" as const }
+          const instance = instanceState.instances.findLast((candidate) =>
+            candidate.modelId === selected.providerModelId)
+          const residency = instance?.residency ?? { _tag: "Unloaded" as const }
           const props = {
             slotId,
             selection: selected,
-            descriptor,
+            descriptor: descriptor.value,
             availability,
             residency,
             actions: modelSlotActions(availability, residency),
@@ -319,6 +326,7 @@ export const ModelSlotControllerLive: Layer.Layer<
             case "ConfiguredLocal":
               return ModelSlotLifecycle.hold(current, props)
             case "Unassigned":
+            case "Resolving":
             case "ConfiguredRemote":
               return ModelSlotLifecycle.transition(current, "ConfiguredLocal", props)
           }
@@ -350,7 +358,7 @@ export const ModelSlotControllerLive: Layer.Layer<
 
   const reconcileSelections = Effect.gen(function* () {
     const configured = yield* modelSelection.get
-    const catalogState = (yield* catalog.snapshot).state
+    const catalogState = yield* catalog.state
     const contents = catalogContents(catalogState)
     const localReady = yield* localOfferings.ready
     const localResult = yield* Effect.either(localOfferings.list)
@@ -386,6 +394,7 @@ export const ModelSlotControllerLive: Layer.Layer<
   yield* Effect.forkIn(catalog.changes.pipe(
     Stream.runForEach(() => reconcileAndRebuild),
   ), scope)
+  yield* Effect.forkIn(instances.changes.pipe(Stream.runForEach(() => rebuild)), scope)
 
   const reject = (slotId: SlotId, message: string) =>
     new ModelSlotMutationRejected({ slotId, message })
@@ -394,7 +403,7 @@ export const ModelSlotControllerLive: Layer.Layer<
     slotId: SlotId,
     selection: SlotSelection,
   ): Effect.Effect<SlotSelection, ModelSlotMutationRejected> => Effect.gen(function* () {
-    const contents = catalogContents((yield* catalog.snapshot).state)
+    const contents = catalogContents(yield* catalog.state)
     const model = contents.models.find((item) =>
       item.providerId === selection.providerId
       && item.providerModelId === selection.providerModelId)
@@ -439,7 +448,7 @@ export const ModelSlotControllerLive: Layer.Layer<
       const normalized = Option.isSome(selection)
         ? Option.some(yield* normalizeAndValidateSelection(slotId, selection.value))
         : Option.none<SlotSelection>()
-      const previous = (yield* SubscriptionRef.get(aggregate)).snapshot.state.slots[slotKey(slotId)]
+      const previous = (yield* SubscriptionRef.get(aggregate)).state.slots[slotKey(slotId)]
       if (Option.isNone(normalized) && previous._tag === "Unassigned") return
       if (Option.isSome(normalized) && previous._tag !== "Unassigned"
         && sameSelection(previous.selection, normalized.value)) return
@@ -463,22 +472,11 @@ export const ModelSlotControllerLive: Layer.Layer<
       Effect.asVoid,
     )
 
-      return ModelSlotController.of({
-        snapshot: SubscriptionRef.get(aggregate).pipe(Effect.map(({ snapshot }) => snapshot)),
-        selectionSnapshot: SubscriptionRef.get(aggregate).pipe(Effect.map(({ snapshot }) => ({
-          revision: snapshot.revision,
-          state: {
-            slots: {
-              primary: authoritativeSlotSelection(snapshot.state, PRIMARY_SLOT_ID),
-              secondary: authoritativeSlotSelection(snapshot.state, SECONDARY_SLOT_ID),
-            },
-            recentModels: snapshot.state.recentModels,
-            favoriteModels: snapshot.state.favoriteModels,
-          },
-        }))),
+  return ModelSlotController.of({
+    state: SubscriptionRef.get(aggregate).pipe(Effect.map(({ state }) => state)),
     changes: aggregate.changes.pipe(
-      Stream.map(({ snapshot }) => snapshot),
-      Stream.changesWith((left, right) => left.revision === right.revision),
+      Stream.map(({ state }) => state),
+      Stream.changesWith(Schema.equivalence(ModelSlotsStateSchema)),
     ),
     agentModelConfiguration: SubscriptionRef.get(aggregate).pipe(
       Effect.map(({ agentConfiguration }) => agentConfiguration),
@@ -487,6 +485,7 @@ export const ModelSlotControllerLive: Layer.Layer<
       Stream.map(({ agentConfiguration }) => agentConfiguration),
       Stream.changesWith(sameConfigStateValue),
     ),
+    refresh: rebuild.pipe(Effect.asVoid),
     updateModelSlot,
     setModelFavorite,
   })

@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
+import { Context, Effect, Layer, Option, Schema, Stream, SubscriptionRef } from "effect"
 import {
   LocalModelMutationFailed,
   type LocalInferenceError,
@@ -18,7 +18,6 @@ import {
   LocalModelConfigurationResolver,
   type ResolvedLocalModelConfiguration,
 } from "./local-model-configuration-resolver"
-import { makeObservedState } from "./mirrored-state"
 import { resolveBundlePresentation } from "./local-model-presentation"
 export { localCatalogProviderModelId } from "./local-provider-model-id"
 import { localCatalogProviderModelId } from "./local-provider-model-id"
@@ -151,7 +150,7 @@ export const LocalProviderOfferingsLive: Layer.Layer<
 
   const changes = resolver.changes
 
-  const observed = yield* makeObservedState<LocalProviderOfferingsState>({
+  const current = yield* SubscriptionRef.make<LocalProviderOfferingsState>({
     packageEvidence: Option.none(),
     entries: [],
     failure: Option.none(),
@@ -169,9 +168,9 @@ export const LocalProviderOfferingsLive: Layer.Layer<
 
   const compute = Effect.gen(function* () {
     const resolved = [...(yield* resolver.get).values()]
-    const packageSnapshot = yield* packages.snapshot
+    const packageState = yield* packages.state
     const packageEntries = new Map(
-      packageSnapshot.state.entries.map((entry) => [entry.package.id, entry]),
+      packageState.entries.map((entry) => [entry.package.id, entry]),
     )
     const configured = readyOfferingsFrom(resolved)
     const offerings = configured.map(({ offering }) => offering)
@@ -220,19 +219,23 @@ export const LocalProviderOfferingsLive: Layer.Layer<
   })
 
   const publishCurrent: Effect.Effect<void, LocalInferenceError> = compute.pipe(
-    Effect.flatMap(({ entries, packageEvidence }) => observed.setIfChanged({
-      packageEvidence: Option.some(packageEvidence),
-      entries,
-      failure: Option.none(),
-    }, stateEquivalent)),
+    Effect.flatMap(({ entries, packageEvidence }) => Effect.gen(function* () {
+      const previous = yield* SubscriptionRef.get(current)
+      const next = {
+        packageEvidence: Option.some(packageEvidence),
+        entries,
+        failure: Option.none<LocalInferenceError>(),
+      }
+      if (!stateEquivalent(previous, next)) yield* SubscriptionRef.set(current, next)
+    })),
   )
 
   const project = publishCurrent.pipe(
-    Effect.catchAll((error) => observed.get.pipe(Effect.flatMap(({ state }) =>
-      observed.setIfChanged(
-        { ...state, failure: Option.some(error) },
-        stateEquivalent,
-      ).pipe(Effect.asVoid)))),
+    Effect.catchAll((error) => Effect.gen(function* () {
+      const previous = yield* SubscriptionRef.get(current)
+      const next = { ...previous, failure: Option.some(error) }
+      if (!stateEquivalent(previous, next)) yield* SubscriptionRef.set(current, next)
+    })),
     Effect.catchAllCause((cause) => Effect.logWarning(
       "Unable to project local provider offerings",
     ).pipe(Effect.annotateLogs({ cause: String(cause) }))),
@@ -251,12 +254,12 @@ export const LocalProviderOfferingsLive: Layer.Layer<
     ready: resolver.settled,
     list,
     changes,
-    catalog: observed.get.pipe(Effect.flatMap(({ state }) => Option.match(state.failure, {
+    catalog: SubscriptionRef.get(current).pipe(Effect.flatMap((state) => Option.match(state.failure, {
       onNone: () => Effect.succeed(state.entries),
       onSome: Effect.fail,
     }))),
-    state: observed.get.pipe(Effect.map(({ state }) => state)),
-    catalogChanges: observed.changes.pipe(Stream.map(() => undefined)),
+    state: SubscriptionRef.get(current),
+    catalogChanges: current.changes.pipe(Stream.map(() => undefined)),
     resolve: (providerModelId) => list.pipe(Effect.flatMap((offerings) => {
       const offering = offerings.find((candidate) => candidate.providerModelId === providerModelId)
       return offering

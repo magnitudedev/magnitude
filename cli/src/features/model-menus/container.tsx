@@ -177,7 +177,7 @@ interface CatalogContents {
 const catalogContents = (
   config: ReturnType<typeof useModelConfig>,
 ): CatalogContents => Option.getOrElse(
-  Option.map(Result.value(config.catalog), ({ state }) =>
+  Option.map(Result.value(config.catalog), (state) =>
     ProviderModelCatalogLifecycle.match(state, {
       Loading: () => ({ providers: [], models: [] }),
       Ready: ({ providers, models }) => ({ providers, models }),
@@ -699,7 +699,7 @@ const ModelsMenu = memo(function ModelsMenu(props: ModelsMenuProps) {
   const catalogReady = Result.match(config.catalog, {
     onInitial: () => false,
     onFailure: () => true,
-    onSuccess: ({ value: { state } }) => ProviderModelCatalogLifecycle.match(state, {
+    onSuccess: ({ value }) => ProviderModelCatalogLifecycle.match(value, {
       Loading: () => false,
       Ready: () => true,
       Refreshing: () => true,
@@ -708,7 +708,7 @@ const ModelsMenu = memo(function ModelsMenu(props: ModelsMenuProps) {
     }),
   })
   const slotsReady = !Result.isInitial(config.slots)
-  const slots = Option.map(Result.value(config.slots), ({ state }) => state)
+  const slots = Result.value(config.slots)
   const selected = Option.flatMap(config.selections, ({ primary }) => primary)
   const ordering = modelsMenuOrderingAtOpen(catalogReady, slotsReady, slots, selected)
 
@@ -829,7 +829,7 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
   }
   const primarySlot = Option.match(slotsSnapshot, {
     onNone: () => null,
-    onSome: ({ state }) => state.slots.primary,
+    onSome: (state) => state.slots.primary,
   })
   const detailIsLocal = detail !== null && detail._tag !== "Provider"
   const detailIsSelected = detail !== null && isSelected(detail)
@@ -1665,7 +1665,7 @@ const CatalogMenu = memo(function CatalogMenu({
   const selectedModel = Option.flatMap(config.selections, ({ primary }) => primary)
   const primarySlot = Option.match(Result.value(config.slots), {
     onNone: () => null,
-    onSome: ({ state }) => state.slots.primary,
+    onSome: (state) => state.slots.primary,
   })
   const inspectedSelected = inspected !== null && catalogModelIsSelected(inspected, selectedModel)
   const inspectedSlot = inspected === null ? null : catalogSlotForModel(inspected, primarySlot)
@@ -2043,7 +2043,7 @@ const HardwareMenu = memo(function HardwareMenu() {
   const slotActions = useModelSlotActions()
   const hardwareSnapshot = Result.value(hardwareState)
   const slotsSnapshot = Result.value(config.slots)
-  const currentSlot = Option.flatMap(slotsSnapshot, ({ state }) => {
+  const currentSlot = Option.flatMap(slotsSnapshot, (state) => {
     const slot = state.slots.primary
     return slot._tag === "ConfiguredLocal"
       ? Option.some(slot)

@@ -61,7 +61,7 @@ export const CustomEndpointReconcilerLive: Layer.Layer<
     const current = yield* Ref.get(previous)
     const removed = removedCustomEndpointModels(current, next)
     if (removed.length > 0) {
-      const snapshot = (yield* slots.snapshot).state.slots
+      const snapshot = (yield* slots.state).slots
       for (const slot of [snapshot.primary, snapshot.secondary]) {
         if (slot._tag !== "Unassigned"
           && removed.some((identity) =>

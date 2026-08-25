@@ -51,20 +51,18 @@ transport.
 ## Change notifications
 
 Connection-global change notifications share one subscription, `StreamChanges`. Each event is a
-poke in the clients' query-identity space — `{ query, key?, revision? }` naming the query whose
-authoritative data may have changed. The ACN change registry multiplexes every source: a versioned
-snapshot commit names its own query with its revision; a storage commit names every query it backs.
-Multiplexing neither combines state nor creates a cross-domain authority.
+poke in the clients' query-identity space — `{ query, key? }` naming the query whose authoritative
+data may have changed. The ACN change registry multiplexes every source: an owner commit names its
+query; a storage commit names every query it backs. Multiplexing neither combines state nor creates
+a cross-domain authority. Pokes carry no snapshot, revision, acknowledgement, or ordering claim.
 
 The client drains `StreamChanges` once per connection and invalidates the named query; every
 (re)connection after the first invalidates everything, since pokes may have been missed. Nothing
 else is derived from pokes and no domain code interprets them.
 
-Native inference uses ICN's `/api/v1/events` SSE stream rather than ACN RPC framing. The authored
-Inference Effect Query layer drains that one multiplexed stream and invalidates Hardware, Models,
-Packages, Downloads, Instances, and residency-policy Queries. Both drains feed the same
-connection-scoped query cache and use the same reconnect-then-reread rule; they do not combine the
-underlying authorities or introduce another frontend state system.
+ICN's native event stream is private to ACN. ACN resource owners observe it through their
+domain-specific ICN services and publish ACN query pokes after accepting changed native evidence.
+First-party clients never drain native events or maintain a second inference query cache.
 
 ## Keyed subscriptions
 

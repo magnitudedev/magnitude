@@ -5,7 +5,7 @@ import {
   Option,
   Schema,
   Stream,
-  type Equivalence,
+  SubscriptionRef,
 } from "effect"
 import {
   InstalledCatalogAttributionSchema,
@@ -23,7 +23,6 @@ import {
   IcnInstalledModels,
   IcnModels,
 } from "@magnitudedev/icn"
-import { makeObservedState } from "./mirrored-state"
 import {
   modelDownloadFromIcn,
   modelPackageFromIcn,
@@ -72,8 +71,8 @@ export const packageAcquisition = (
 
 export interface LocalModelPackagesApi {
   readonly initialized: Effect.Effect<boolean>
-  readonly snapshot: Effect.Effect<{ readonly revision: number; readonly state: ModelPackagesState }>
-  readonly changes: Stream.Stream<{ readonly revision: number; readonly state: ModelPackagesState }>
+  readonly state: Effect.Effect<ModelPackagesState>
+  readonly changes: Stream.Stream<ModelPackagesState>
   readonly installedPackageIds: Effect.Effect<ReadonlySet<string>>
 }
 
@@ -90,13 +89,16 @@ export const LocalModelPackagesLive: Layer.Layer<
   const models = yield* IcnModels
   const installed = yield* IcnInstalledModels
   const downloads = yield* IcnDownloads
-  const mirror = yield* makeObservedState<ModelPackagesState>({
+  const current = yield* SubscriptionRef.make<ModelPackagesState>({
     inventory: { _tag: "Initializing" },
     entries: [],
     downloads: [],
   })
-  const equivalent: Equivalence.Equivalence<ModelPackagesState> =
-    Schema.equivalence(ModelPackagesStateSchema)
+  const equivalent = Schema.equivalence(ModelPackagesStateSchema)
+  const publish = (next: ModelPackagesState) => Effect.gen(function* () {
+    const previous = yield* SubscriptionRef.get(current)
+    if (!equivalent(previous, next)) yield* SubscriptionRef.set(current, next)
+  })
   const projectionLock = yield* Effect.makeSemaphore(1)
   const observedCompletions = new Set<string>()
 
@@ -162,17 +164,17 @@ export const LocalModelPackagesLive: Layer.Layer<
             ?? { _tag: "NotCatalogTarget" },
         }
       })
-    yield* mirror.setIfChanged({
+    yield* publish({
       inventory: installedState.reconciliationComplete
         ? { _tag: "Ready" }
         : { _tag: "Initializing" },
       entries,
       downloads: bundleDownloads,
-    }, equivalent)
+    })
   })).pipe(
     Effect.catchAllCause((cause) =>
-      mirror.get.pipe(
-        Effect.flatMap(({ state }) => mirror.setIfChanged({
+      SubscriptionRef.get(current).pipe(
+        Effect.flatMap((state) => publish({
           ...state,
           inventory: {
             _tag: "Degraded",
@@ -182,7 +184,7 @@ export const LocalModelPackagesLive: Layer.Layer<
               retryable: true,
             },
           },
-        }, equivalent)),
+        })),
         Effect.zipRight(Effect.logWarning("Unable to project local model packages").pipe(
           Effect.annotateLogs({ cause: String(cause) }),
         )),
@@ -202,8 +204,8 @@ export const LocalModelPackagesLive: Layer.Layer<
 
   return LocalModelPackages.of({
     initialized: installed.initialized,
-    snapshot: mirror.get,
-    changes: mirror.changes,
+    state: SubscriptionRef.get(current),
+    changes: current.changes,
     installedPackageIds: installed.get.pipe(Effect.map(({ state }) =>
       new Set(state.packages.map(({ package: modelPackage }) => modelPackage.id)))),
   })

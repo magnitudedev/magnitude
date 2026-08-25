@@ -6,7 +6,7 @@ import {
   useAtomValue,
 } from "@effect-atom/atom-react"
 import { Effect } from "effect"
-import { projectInferenceHardware, type ProviderModelId } from "@magnitudedev/sdk"
+import { type ProviderModelId } from "@magnitudedev/sdk"
 import { OnboardingModelSetup } from "../local-models/setup"
 import { onboardingModelSetupViewAtom } from "../local-models/setup-view"
 import { useAgentClient } from "../state/agent-client-context"
@@ -14,10 +14,7 @@ import { useAgentClient } from "../state/agent-client-context"
 export const useOnboardingModelSetup = () => {
   const client = useAgentClient()
   const hardwareAtom = useMemo(() => Atom.make((get) =>
-    Result.map(
-      get(client.Inference.GetInferenceHardware({})).result,
-      (state) => Effect.runSync(projectInferenceHardware(state)),
-    )), [client])
+    get(client.Models.GetLocalEnvironment({})).result), [client])
   const view = useMemo(() => onboardingModelSetupViewAtom(client), [client])
   const retryAction = useMemo(() => client.runtime.fn(
     () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.retry),

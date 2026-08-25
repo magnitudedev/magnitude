@@ -134,10 +134,7 @@ describe("local provider offering projection", () => {
       })),
       Layer.succeed(LocalModelPackages, LocalModelPackages.of({
         initialized: Effect.succeed(true),
-        snapshot: Effect.succeed({
-          revision: 1,
-          state: { inventory: { _tag: "Ready" }, entries: [packageEntry], downloads: [] },
-        }),
+        state: Effect.succeed({ inventory: { _tag: "Ready" }, entries: [packageEntry], downloads: [] }),
         changes: Stream.never,
         installedPackageIds: Effect.succeed(new Set([packageId])),
       })),
@@ -212,10 +209,7 @@ describe("local provider offering projection", () => {
         })),
         Layer.succeed(LocalModelPackages, LocalModelPackages.of({
           initialized: Effect.succeed(true),
-          snapshot: Effect.succeed({
-            revision: 1,
-            state: { inventory: { _tag: "Ready" }, entries: [packageEntry], downloads: [] },
-          }),
+          state: Effect.succeed({ inventory: { _tag: "Ready" }, entries: [packageEntry], downloads: [] }),
           changes: Stream.never,
           installedPackageIds: Effect.succeed(new Set([packageId])),
         })),
