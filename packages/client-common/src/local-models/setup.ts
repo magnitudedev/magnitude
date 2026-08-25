@@ -342,12 +342,15 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
               ? cancel.pipe(Effect.zipRight(Effect.fail(new OnboardingModelSelectionCancelled())))
               : admission._tag === "DownloadAdmitted"
                 ? Effect.raceFirst(
-                    awaitInstalled(resolved.prepared, admission),
-                    Deferred.await(invocation.cancellation).pipe(
-                      Effect.zipRight(cancel),
-                      Effect.zipRight(Effect.fail(new OnboardingModelSelectionCancelled())),
+                    awaitInstalled(resolved.prepared, admission).pipe(
+                      Effect.map((installed) => ({ _tag: "Installed" as const, installed })),
                     ),
-                  )
+                    Deferred.await(invocation.cancellation).pipe(
+                      Effect.as({ _tag: "Cancelled" as const }),
+                    ),
+                  ).pipe(Effect.flatMap((outcome) => outcome._tag === "Installed"
+                    ? Effect.succeed(outcome.installed)
+                    : cancel.pipe(Effect.zipRight(Effect.fail(new OnboardingModelSelectionCancelled())))))
                 : awaitInstalled(resolved.prepared, admission)),
           )
         }),
