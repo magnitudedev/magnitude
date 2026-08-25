@@ -210,13 +210,14 @@ describe('makeAgentBoundModel tracing', () => {
     expect(traceMock.traces).toEqual([])
   })
 
-  it('projects live model preparation outside the response event stream', async () => {
+  it('projects model preparation without persisting it as response output', async () => {
     const rawModel: BoundModel<BaseCallOptions, StreamStartFailure, IcnModelPreparation> = {
-      stream: (_prompt, _tools, _options, onPreparation) => Effect.succeed({
-        events: Stream.fromEffect(onPreparation!({
+      stream: () => Effect.succeed({
+        events: Stream.make({
+          _tag: 'preparation_update' as const,
           preparation: { phase: 'queued' as const },
           requestId: 'request-1',
-        })).pipe(Stream.zipRight(Stream.make({ _tag: 'message_start' as const }))),
+        }, { _tag: 'message_start' as const }),
         parsers: new Map(),
         logprobs: [],
         requestId: 'request-1',
@@ -236,8 +237,9 @@ describe('makeAgentBoundModel tracing', () => {
     })
 
     const result = await run(wrapped.model.stream(prompt, []))
-    await Effect.runPromise(Stream.runDrain(result.events))
+    const responseEvents = Array.from(await Effect.runPromise(Stream.runCollect(result.events)))
 
+    expect(responseEvents.map((event) => event._tag)).toEqual(['message_start'])
     expect(activities).toEqual([
       { _tag: 'Starting', requestId: null },
       { _tag: 'Preparing', preparation: { phase: 'queued' }, requestId: 'request-1' },

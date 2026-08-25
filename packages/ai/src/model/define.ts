@@ -163,10 +163,16 @@ export function modelDefine<
         if (Option.isNone(listenerOption)) {
           // No listener — zero overhead path
           return yield* httpEffect.pipe(
-            Effect.map((httpResult) => ({
-              ...config.codec.decode(httpResult.stream, makeDecodeOptions(httpResult, tools, runtimeOptions.generateToolCallId)),
-              requestId: httpResult.response.requestId,
-            })),
+            Effect.map((httpResult) => {
+              const decoded = config.codec.decode(
+                httpResult.stream,
+                makeDecodeOptions(httpResult, tools, runtimeOptions.generateToolCallId),
+              )
+              return {
+                ...decoded,
+                requestId: httpResult.response.requestId,
+              }
+            }),
           )
         }
 

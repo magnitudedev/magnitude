@@ -10,8 +10,7 @@ export { Option } from "./options/option"
 export type { ProviderModelCapabilities, ImagePlaceholderConfig } from "./model/capabilities"
 export type {
   ModelSpec,
-  ModelPreparationObserver,
-  ModelPreparationUpdate,
+  ModelStreamEvent,
   ModelStreamResult,
 } from "./model/model-spec"
 export type { BoundModel } from "./model/bound-model"

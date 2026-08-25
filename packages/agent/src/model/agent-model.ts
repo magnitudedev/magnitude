@@ -6,6 +6,7 @@ import {
   type ToolCallId,
   type ToolDefinition,
   type StreamStartFailure,
+  type ModelStreamEvent,
 } from '@magnitudedev/ai'
 import type { IcnModelPreparation } from '@magnitudedev/sdk'
 import type { ModelRequestActivity } from './model-request-activity'
@@ -88,6 +89,15 @@ export interface AgentBoundModelConfig {
   readonly maxToolCalls?: number
   readonly roleId?: RoleId | null
 }
+
+type PreparationUpdate = Extract<
+  ModelStreamEvent<IcnModelPreparation>,
+  { readonly _tag: 'preparation_update' }
+>
+
+const isPreparationUpdate = (
+  event: ModelStreamEvent<IcnModelPreparation>,
+): event is PreparationUpdate => event._tag === 'preparation_update'
 
 /**
  * When `maxToolCalls` is configured and tools are present, override `toolChoice`
@@ -232,19 +242,7 @@ export function makeAgentBoundModel(config: AgentBoundModelConfig): AgentBoundMo
           let requestId: string | null = null
           yield* (config.reportActivity?.({ _tag: 'Starting', requestId }) ?? Effect.void)
           let accepted = false
-          const streamResult = yield* config.rawModel.stream(
-            prompt,
-            tools,
-            effectiveOptions,
-            ({ preparation, requestId: preparationRequestId }) => {
-              if (preparationRequestId !== null) requestId = preparationRequestId
-              return config.reportActivity?.({
-                _tag: 'Preparing',
-                preparation,
-                requestId,
-              }) ?? Effect.void
-            },
-          ).pipe(
+          const streamResult = yield* config.rawModel.stream(prompt, tools, effectiveOptions).pipe(
             Effect.tap((result) => Effect.sync(() => {
               accepted = true
               requestId = result.requestId
@@ -255,15 +253,27 @@ export function makeAgentBoundModel(config: AgentBoundModelConfig): AgentBoundMo
                 : config.reportActivity?.({ _tag: 'Ended', requestId }) ?? Effect.void)),
           )
           let reportedStreaming = false
-          const events = streamResult.events.pipe(
+          const observedEvents = streamResult.events.pipe(
             Stream.tap((event) => {
-              switch (event._tag) {
-                default:
-                  if (event._tag === 'stream_end' || reportedStreaming) return Effect.void
-                  reportedStreaming = true
-                  return config.reportActivity?.({ _tag: 'Streaming', requestId }) ?? Effect.void
+              if (isPreparationUpdate(event)) {
+                if (event.requestId !== null) requestId = event.requestId
+                return config.reportActivity?.({
+                  _tag: 'Preparing',
+                  preparation: event.preparation,
+                  requestId,
+                }) ?? Effect.void
               }
+
+              if (event._tag === 'stream_end' || reportedStreaming) return Effect.void
+              reportedStreaming = true
+              return config.reportActivity?.({ _tag: 'Streaming', requestId }) ?? Effect.void
             }),
+          )
+          const events = Stream.unwrapScoped(observedEvents.pipe(
+            Stream.partition(isPreparationUpdate),
+            Effect.map(([responses, preparation]) =>
+              Stream.merge(responses, preparation.pipe(Stream.drain))),
+          )).pipe(
             Stream.ensuring(Effect.suspend(() =>
               config.reportActivity?.({ _tag: 'Ended', requestId }) ?? Effect.void)),
           )

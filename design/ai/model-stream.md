@@ -11,33 +11,33 @@ applies_to:
 
 ## Contract
 
-A bound model has one ordered stream of provider-neutral `ResponseStreamEvent`s. A provider may
-also expose request-local preparation through the optional
-`ModelPreparationObserver<TPreparation>` argument to `stream`. The observer payload is generic and
-consumer-defined; the AI contract defines no loading, queue, prefill, or local-inference activity
-vocabulary. `TPreparation = never` is the default for providers without that capability.
+A bound model returns one ordered `ModelStreamEvent<TPreparation>` stream. Ordinary events remain
+provider-neutral `ResponseStreamEvent`s. A provider may additionally emit the explicitly identified
+`preparation_update` event carrying a generic consumer-defined preparation payload. The AI contract
+defines no loading, queue, prefill, or local-inference preparation vocabulary.
+`TPreparation = never` is the default for providers without that capability.
 
-Preparation observation is a side channel of the same request, not model output. Starting,
-streaming, and ending remain caller-owned observations rather than provider events.
+`Starting` is represented structurally by the pending `stream` Effect before it returns the
+`ModelStreamResult`. Ending remains part of the terminal response event or Effect interruption.
 
 ## Persistence boundary
 
 Model activity is transient and must never enter the canonical harness or agent event log. The
-agent model decorator supplies the preparation observer and projects its updates through runtime
-Ambient state. The decorated model exposes only `ResponseStreamEvent`s to the harness, so only
-response-derived `HarnessEvent`s can cross the persistence boundary.
+agent model decorator observes the raw mixed stream in source order, projects activity through
+runtime Ambient state, and partitions it into preparation and response branches. It drains the
+preparation branch and exposes only the response branch. The harness therefore accepts only
+response events and contains no preparation-specific behavior.
 
 The agent derives its transient `Streaming` state from the first non-terminal
 `ResponseStreamEvent`. A terminal response without semantic output never enters `Streaming`.
 
-ICN reports requested progress chunks through the observer before filtering them from
-provider-neutral response decoding. ICN-specific preparation data never enters
-`ResponseStreamEvent` or a terminal payload.
+ICN maps requested progress chunks to `preparation_update` events before the corresponding response
+events. ICN-specific preparation data never enters `ResponseStreamEvent` or a terminal payload.
 
 ## Guarantees
 
-- Preparation callbacks run in source order before the corresponding semantic response chunks.
+- Preparation events occur in source order before the corresponding semantic response events.
 - A provider error remains a terminal response event, not activity.
 - Stream completion, failure, or interruption clears transient activity.
-- Consumers may omit the preparation observer without changing inference behavior.
-- Tests must prove both activity projection and exclusion from harness output.
+- Agent-model consumers receive only response semantics without filtering.
+- Tests must prove both activity projection and exclusion from the returned agent-model stream.

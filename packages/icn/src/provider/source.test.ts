@@ -213,7 +213,6 @@ describe("ICN local provider", () => {
         },
       },
     ])))
-    const preparation: unknown[] = []
     const output = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const provider = yield* IcnProvider
       const bound = yield* provider.bindModel(modelId, {
@@ -225,13 +224,13 @@ describe("ICN local provider", () => {
       const result = yield* bound.stream(
         PromptBuilder.empty().user("hello").build(),
         [],
-        undefined,
-        (update) => Effect.sync(() => { preparation.push(update) }),
       )
       return yield* Stream.runCollect(result.events)
     }).pipe(Effect.provide(makeTestLayer(http, modelId)))))
 
     expect(Array.from(output).map((event) => event._tag)).toEqual([
+      "preparation_update",
+      "preparation_update",
       "message_start",
       "message_delta",
       "message_end",
@@ -245,9 +244,10 @@ describe("ICN local provider", () => {
         timeToFirstTokenMs: 6,
       },
     })
-    expect(preparation).toEqual([
-      { preparation: { phase: "queued" }, requestId: "request-1" },
+    expect(Array.from(output).slice(0, 2)).toEqual([
+      { _tag: "preparation_update", preparation: { phase: "queued" }, requestId: "request-1" },
       {
+        _tag: "preparation_update",
         preparation: {
           phase: "prefill",
           completed_tokens: 1,
@@ -257,6 +257,42 @@ describe("ICN local provider", () => {
         requestId: "request-1",
       },
     ])
+  })
+
+  it("emits preparation progress before any model response event exists", async () => {
+    const modelId = ProviderModelIdSchema.make("mdl_test")
+    const progress = {
+      id: "request-1",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: modelId,
+      choices: [],
+      progress: { phase: "model_loading", fraction: 0.25 },
+    }
+    const http = HttpClient.make((request) => Effect.succeed(HttpClientResponse.fromWeb(
+      request,
+      new Response(new ReadableStream({
+        start: (controller) => {
+          controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(progress)}\n\n`))
+        },
+      }), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    )))
+
+    const first = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const provider = yield* IcnProvider
+      const bound = yield* provider.bindModel(modelId)
+      const result = yield* bound.stream(PromptBuilder.empty().user("hello").build(), [])
+      return yield* Stream.runHead(result.events).pipe(Effect.timeout("1 second"))
+    }).pipe(Effect.provide(makeTestLayer(http, modelId)))))
+
+    expect(first).toEqual(Option.some({
+      _tag: "preparation_update",
+      preparation: { phase: "model_loading", fraction: 0.25 },
+      requestId: "request-1",
+    }))
   })
 
   it("reports attribution without fabricating lifecycle phases for a rejected request", async () => {

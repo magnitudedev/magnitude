@@ -1,4 +1,4 @@
-import { Cause, Context, Effect, Layer, Match, Option, Ref, Schema, Stream } from "effect"
+import { Cause, Context, Effect, Layer, Match, Option, Queue, Ref, Schema, Stream } from "effect"
 import {
   ModelCatalogError,
   ModelDiscoveryOperationIdSchema,
@@ -24,7 +24,7 @@ import {
   type BaseCallOptions,
   ChatCompletionsStreamChunk,
   type GenerationPerformance,
-  type ModelPreparationObserver,
+  type ModelStreamEvent,
   ModelRequestTerminal,
   type ProviderModelBindOptions,
   type ProviderId,
@@ -187,7 +187,6 @@ const bindIcnModel = (
     prompt: Prompt,
     tools: readonly ToolDefinition[],
     requestOptions?: BaseCallOptions & { generateToolCallId?: () => ToolCallId },
-    onPreparation?: ModelPreparationObserver<IcnModelPreparation>,
   ) => {
     const call = {
       provider: "local",
@@ -231,6 +230,11 @@ const bindIcnModel = (
           Effect.flatMap(({ status, headers, events }) => Effect.gen(function* () {
               const response = acceptedHttpResponse(status, headers)
               const performance = yield* Ref.make(Option.none<GenerationPerformance>())
+              const output = yield* Queue.bounded<
+                | { readonly _tag: "Event"; readonly event: ModelStreamEvent<IcnModelPreparation> }
+                | { readonly _tag: "End" }
+                | { readonly _tag: "Defect"; readonly cause: Cause.Cause<never> }
+              >(64)
               let acceptingPreparation = true
               const reportProgress = (
                 requestId: string,
@@ -240,10 +244,14 @@ const bindIcnModel = (
                   acceptingPreparation = false
                   return Effect.void
                 }
-                if (!acceptingPreparation || onPreparation === undefined) return Effect.void
-                return onPreparation({
-                  preparation: progress,
-                  requestId,
+                if (!acceptingPreparation) return Effect.void
+                return Queue.offer(output, {
+                  _tag: "Event",
+                  event: {
+                    _tag: "preparation_update",
+                    preparation: progress,
+                    requestId,
+                  },
                 })
               }
               const sourceEvents = events.pipe(
@@ -309,9 +317,28 @@ const bindIcnModel = (
                   })))
                 }),
               )
+              const driver = decodedEvents.pipe(
+                Stream.runForEach((event) => Queue.offer(output, {
+                  _tag: "Event",
+                  event,
+                })),
+                Effect.matchCauseEffect({
+                  onFailure: (cause) => Queue.offer(output, { _tag: "Defect", cause }),
+                  onSuccess: () => Queue.offer(output, { _tag: "End" }),
+                }),
+              )
+              const modelEvents = Stream.unwrapScoped(Effect.gen(function* () {
+                yield* Effect.forkScoped(driver)
+                return Stream.fromQueue(output).pipe(
+                  Stream.takeWhile((item) => item._tag !== "End"),
+                  Stream.mapEffect((item) => item._tag === "Event"
+                    ? Effect.succeed(item.event)
+                    : Effect.failCause(item.cause)),
+                )
+              }))
               return {
                 ...decoded,
-                events: decodedEvents,
+                events: modelEvents,
                 requestId: response.requestId,
               }
           })),

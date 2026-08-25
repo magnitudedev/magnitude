@@ -148,12 +148,12 @@ Context admission uses the resident configuration's context length. Catalog meta
 load planning, and request admission must agree on that exact configuration.
 
 ICN lifecycle control chunks are process-local request observations, not assistant output. The
-local provider reports meaningful preparation through the generic optional preparation observer
-and removes those chunks before the provider-neutral response codec. ICN defines the concrete
-preparation payload; the provider-neutral AI contract does not. The agent model decorator owns
-Starting, Streaming, and terminal cleanup and projects preparation through transient Ambient state,
-so the display sees one continuous lifecycle without provider-specific cleanup events. Providers
-that do not support preparation observation remain valid and expose no synthetic progress.
+local provider reports meaningful preparation through the generic `preparation_update` stream event.
+Ordinary provider-neutral response events remain unchanged. ICN defines the concrete preparation
+payload; the provider-neutral AI contract does not. The agent model decorator owns transient
+activity projection, preparation/response partitioning, and terminal cleanup, so the display sees
+one continuous lifecycle while downstream agent consumers receive response events only. Providers
+without preparation data use `TPreparation = never`.
 
 If the backing instance is explicitly stopped during preparation, ICN emits the exact
 non-retryable `model_instance_stopped` error. Explicit Stop after readiness terminates active
@@ -203,7 +203,7 @@ reports the selected method, effective parameters, and whether drafting actually
 - Every assessed local provider catalog entry exposes ICN's complete per-domain memory accounting
   for that exact serving configuration.
 - Provider binding does not load a model.
-- Local preparation is represented only by the generic request-local observer with ICN-owned detail.
+- Local preparation is represented only by generic request-local `preparation_update` events with ICN-owned detail.
 - Inference admission remains held until ICN atomically acquires the request's generation lease.
 - Chat, Responses, and explicit warm-load share one residency coordinator.
 - Slot selection and recency refer only to stable provider model IDs.

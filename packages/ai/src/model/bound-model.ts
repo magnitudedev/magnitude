@@ -4,7 +4,7 @@ import { Prompt } from "../prompt/prompt"
 import type { ToolCallId } from "../prompt/ids"
 import type { ToolDefinition } from "../tools/tool-definition"
 import type { StreamStartFailure } from "../errors/failure"
-import type { ModelPreparationObserver, ModelStreamResult } from "./model-spec"
+import type { ModelStreamResult } from "./model-spec"
 
 export interface BoundModel<
   TCallOptions,
@@ -15,9 +15,8 @@ export interface BoundModel<
     prompt: Prompt,
     tools: readonly ToolDefinition[],
     options?: TCallOptions & { generateToolCallId?: () => ToolCallId },
-    onPreparation?: ModelPreparationObserver<TPreparation>,
   ) => Effect.Effect<
-    ModelStreamResult,
+    ModelStreamResult<TPreparation>,
     TStartFailure,
     HttpClient.HttpClient
   >
