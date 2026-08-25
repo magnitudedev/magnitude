@@ -1,4 +1,4 @@
-import { Effect, Stream, Layer, Ref, Queue, Option } from "effect"
+import { Effect, Stream, Layer, Ref, Queue } from "effect"
 import type * as HttpClient from "@effect/platform/HttpClient"
 import {
   BoundModel,
@@ -8,7 +8,6 @@ import {
   createToolCallId,
   createStreamingFieldParser,
   type ToolCallId,
-  type ResponseStreamEvent,
 } from "@magnitudedev/ai"
 import { renderSchemaParams } from "@magnitudedev/utils/schema"
 import type { HarnessEvent } from "../events"
@@ -34,9 +33,8 @@ export interface HarnessConfig<
   TToolkit extends Toolkit<any> = Toolkit<any>,
   RHooks = never,
   TStartFailure = StreamStartFailure,
-  TPreparation = never,
 > {
-  readonly model: BoundModel<TCallOptions, TStartFailure, TPreparation>
+  readonly model: BoundModel<TCallOptions, TStartFailure>
   readonly toolkit: TToolkit
   readonly hooks?: HarnessHooks<RHooks>
   readonly layer?: Layer.Layer<ToolkitRequirements<TToolkit> | RHooks>
@@ -50,7 +48,6 @@ export interface HarnessConfig<
 export interface Harness<
   TCallOptions,
   TStartFailure = StreamStartFailure,
-  TPreparation = never,
 > {
   /** Stream a model response, dispatch tool calls, and produce events.
    *  Returns a LiveTurn whose events stream is driven by the harness —
@@ -130,10 +127,9 @@ export function createHarness<
   TToolkit extends Toolkit<any> = Toolkit<any>,
   RHooks = never,
   TStartFailure = StreamStartFailure,
-  TPreparation = never,
 >(
-  config: HarnessConfig<TCallOptions, TToolkit, RHooks, TStartFailure, TPreparation>,
-): Harness<TCallOptions, TStartFailure, TPreparation> {
+  config: HarnessConfig<TCallOptions, TToolkit, RHooks, TStartFailure>,
+): Harness<TCallOptions, TStartFailure> {
   const { toolkit, hooks, model } = config
   if (
     config.maxToolCalls !== undefined
@@ -230,17 +226,6 @@ export function createHarness<
         toolDefs,
         streamOpts,
       )
-      const observedModelEvents = modelEvents.pipe(
-        Stream.filterMap((event): Option.Option<ResponseStreamEvent> => {
-          switch (event._tag) {
-            case "preparation_update":
-              return Option.none()
-            default:
-              return Option.some(event)
-          }
-        }),
-      )
-
       const stateRef = yield* makeStateRef(
         config.initialState ? { engine: config.initialState } : undefined,
       )
@@ -249,7 +234,7 @@ export function createHarness<
 
       // Build dispatch — delegates all event processing and tool execution
       const processing = dispatch({
-        events: observedModelEvents,
+        events: modelEvents,
         parsers,
         toolkit,
         hooks: hooks as HarnessHooks<unknown> | undefined,
@@ -267,9 +252,7 @@ export function createHarness<
       // the consumer and discard buffered items.
       yield* Effect.fork(
         processing.pipe(
-          Effect.ensuring(
-            Queue.offer(eventQueue, END),
-          ),
+          Effect.ensuring(Queue.offer(eventQueue, END)),
         ),
       )
 

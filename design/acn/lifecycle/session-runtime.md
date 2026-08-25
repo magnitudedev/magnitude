@@ -58,7 +58,11 @@ initial message or goal publication and draft promotion or rollback then complet
 client interruption.
 
 Deletion closes new work, waits for accepted work, retires the runtime, and only then removes durable
-state. ACN shutdown instead closes every resident runtime scope directly.
+state. Claiming deletion atomically transfers it to a manager-scope fiber; the requesting caller
+then waits interruptibly and may detach without canceling accepted cleanup. Retirement itself
+remains interruptible so its liveness race can cancel the losing watchdog, and only the brief claim
+and ownership transfer are masked. ACN shutdown instead closes every resident runtime scope
+directly.
 
 ## Runtime configuration
 

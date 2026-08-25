@@ -156,6 +156,38 @@ const projectSlotResidency = (
   }
 }
 
+type Snapshot<State> = {
+  readonly revision: number
+  readonly state: State
+}
+
+/**
+ * Compose the four independently refreshed model-state resources in dependency
+ * order. `Result.all` cannot be used here: on failure it preserves the failed
+ * member's `previousSuccess`, whose value is not the aggregate object.
+ */
+export const projectModelSlotsResult = <SlotError, CatalogError, ModelsError, InstancesError>(
+  slotsResult: Result.Result<Snapshot<ModelSlotSelectionsState>, SlotError>,
+  catalogResult: Result.Result<Snapshot<ProviderModelCatalogState>, CatalogError>,
+  modelsResult: Result.Result<InferenceModelsResponse, ModelsError>,
+  instancesResult: Result.Result<InferenceInstancesSnapshot, InstancesError>,
+) => Result.flatMap(
+  slotsResult,
+  (slots) => Result.flatMap(
+    catalogResult,
+    (catalog) => Result.flatMap(
+      modelsResult,
+      (models) => Result.map(instancesResult, (instances) => ({
+        ...slots,
+        state: projectSlotResidency(
+          projectSlotIntent(slots.state, catalog.state, models),
+          instances,
+        ),
+      })),
+    ),
+  ),
+)
+
 /** The latest pending exact assignment for a slot, presented over authoritative state. */
 export const presentedSlotSelection = (
   state: ModelSlotsState,
@@ -193,15 +225,12 @@ const makeModelSlots = Effect.gen(function* () {
       pending: Result.isWaiting(result),
     }),
   })
-  const state = Atom.make((get) => Result.map(Result.all({
-    slots: get(query).result,
-    catalog: get(catalogQuery).result,
-    models: get(modelsQuery).result,
-    instances: get(instancesQuery).result,
-  }), ({ slots, catalog, models, instances }) => ({
-    ...slots,
-    state: projectSlotResidency(projectSlotIntent(slots.state, catalog.state, models), instances),
-  })))
+  const state = Atom.make((get) => projectModelSlotsResult(
+    get(query).result,
+    get(catalogQuery).result,
+    get(modelsQuery).result,
+    get(instancesQuery).result,
+  ))
   const selections = Atom.make((get) => Result.map(get(state), ({ state: current }) => ({
     primary: presentedSlotSelection(current, get(assignments), PRIMARY_SLOT_ID),
     secondary: presentedSlotSelection(

@@ -457,6 +457,38 @@ describe("AgentRuntime", () => {
     await Effect.runPromise(program)
   })
 
+  it("cancels the retirement watchdog after successful retirement", async () => {
+    const program = Effect.gen(function* () {
+      const shutdownRequest = yield* Ref.make<string | null>(null)
+      const lifecycle: AcnServiceLifecycleApi = {
+        state: Effect.die("unused"),
+        dispatchRpc: Effect.die("unused"),
+        reportStarting: () => Effect.die("unused"),
+        becomeReady: () => Effect.die("unused"),
+        beginStopping: (request) =>
+          Ref.set(shutdownRequest, request.detail ?? request.reason).pipe(Effect.as(true)),
+        awaitStopping: Effect.never,
+        setClientPresence: () => Effect.die("unused"),
+      }
+      const setup = yield* makeSetup({
+        factory: { createSession: () => Effect.succeed(idleSession) },
+        retirementShutdownTimeout: "3 seconds",
+        lifecycle,
+      })
+      yield* Effect.gen(function* () {
+        const runtime = yield* AgentRuntime
+        yield* Effect.scoped(
+          runtime.acquireSessionRequest(setup.request("successful-retirement"), "initial"),
+        )
+        yield* runtime.dispose("successful-retirement")
+        yield* TestClock.adjust("3 seconds")
+        yield* Effect.yieldNow()
+        expect(yield* Ref.get(shutdownRequest)).toBeNull()
+      }).pipe(Effect.provide(setup.layer))
+    })
+    await Effect.runPromise(program)
+  })
+
   it("does not let passive active-only acquisition revive an idle runtime", async () => {
     const program = Effect.gen(function* () {
       const setup = yield* makeSetup({
@@ -658,6 +690,38 @@ describe("AgentRuntime", () => {
         expect(yield* residentCount(runtime)).toBe(0)
         yield* Deferred.succeed(allowRemoval, undefined)
         yield* Fiber.join(deletion)
+      }).pipe(Effect.provide(setup.layer))
+    })
+    await Effect.runPromise(program)
+  })
+
+  it("keeps an accepted deletion owned after the requesting caller is interrupted", async () => {
+    const program = Effect.gen(function* () {
+      const removalEntered = yield* Deferred.make<void>()
+      const allowRemoval = yield* Deferred.make<void>()
+      const removalFinished = yield* Deferred.make<void>()
+      const setup = yield* makeSetup({
+        factory: { createSession: () => Effect.succeed(idleSession) },
+        storedSessionIds: ["interrupt-delete"],
+      })
+
+      yield* Effect.gen(function* () {
+        const runtime = yield* AgentRuntime
+        yield* Effect.scoped(runtime.acquireSession("interrupt-delete", "initial"))
+        const caller = yield* runtime
+          .deleteSession(
+            "interrupt-delete",
+            Deferred.succeed(removalEntered, undefined).pipe(
+              Effect.zipRight(Deferred.await(allowRemoval)),
+              Effect.zipRight(Deferred.succeed(removalFinished, undefined)),
+            ),
+          )
+          .pipe(Effect.fork)
+        yield* Deferred.await(removalEntered)
+        yield* Fiber.interrupt(caller)
+        yield* Deferred.succeed(allowRemoval, undefined)
+        yield* Deferred.await(removalFinished)
+        expect(yield* residentCount(runtime)).toBe(0)
       }).pipe(Effect.provide(setup.layer))
     })
     await Effect.runPromise(program)

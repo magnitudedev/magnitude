@@ -61,12 +61,14 @@ API:
 - one or more connected clients: release after 60 minutes continuously idle;
 - no connected clients: release after 10 minutes continuously idle.
 
-A newer policy starts a fresh idle interval for a resident generation with no inference leases.
+A newer policy starts a fresh idle interval for a Ready instance with no inference leases.
 Exact retries are idempotent. Older generations and equal generations with different content are
 rejected. Before each ACN transition, ACN reads the authoritative ICN policy, advances that
 generation, writes the desired timeout, and rereads to verify acknowledgement. It therefore remains
-correct if another management-API consumer advanced the policy generation. Idle release revalidates the exact model generation, policy generation, zero inference
-leases, and the complete interval under the model controller's mutation authority.
+correct if another management-API consumer advanced the policy generation. The residency actor
+qualifies each idle deadline by exact instance ID and an actor-owned idle generation. Lease
+acquisition, lease release, or policy change advances that generation; only a matching deadline
+with zero leases may begin idle drain.
 
 If ACN cannot establish a first/final-client policy after bounded retries, it fails closed instead
 of committing a client count paired with an unproved model timeout.

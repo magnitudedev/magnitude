@@ -149,7 +149,6 @@ const synchronizationFailed = (operation: string, message: string) =>
 const inferenceInvalidationDependencies = {
   hardware: [
     GetInferenceHardware,
-    AssessInferenceModels,
     PreviewInferenceModelLoad,
   ],
   models: [
@@ -173,7 +172,6 @@ const inferenceInvalidationDependencies = {
     GetInferenceInstances,
     GetInferenceInstance,
     GetInferenceHardware,
-    AssessInferenceModels,
     PreviewInferenceModelLoad,
   ],
   "residency-policy": [GetInferenceResidencyPolicy],
@@ -314,7 +312,11 @@ const StopInferenceInstance = Mutation.make("StopInferenceInstance", {
   scope: ({ instanceId }) => Mutation.MutationScope(`inference-instance:${instanceId}`),
   synchronize: (_, { instanceId }) => Effect.gen(function* () {
     const instance = yield* refreshInferenceQuery(GetInferenceInstance, { instanceId })
-    yield* invalidateInferenceQueries(GetInferenceInstances, GetInferenceHardware)
+    yield* invalidateInferenceQueries(
+      GetInferenceInstances,
+      GetInferenceHardware,
+      PreviewInferenceModelLoad,
+    )
     if (instance.id !== instanceId
       || instance.lifecycle._tag === "Loading"
       || instance.lifecycle._tag === "Ready") {
@@ -334,7 +336,11 @@ const EnsureInferenceInstance = Mutation.make("EnsureInferenceInstance", {
     const instance = yield* refreshInferenceQuery(GetInferenceInstance, {
       instanceId: output.id,
     })
-    yield* invalidateInferenceQueries(GetInferenceInstances, GetInferenceHardware)
+    yield* invalidateInferenceQueries(
+      GetInferenceInstances,
+      GetInferenceHardware,
+      PreviewInferenceModelLoad,
+    )
     if (output.lifecycle._tag !== "Ready"
       || instance.id !== output.id
       || instance.modelId !== modelId

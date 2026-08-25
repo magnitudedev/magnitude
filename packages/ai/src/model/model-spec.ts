@@ -12,18 +12,17 @@ import type { StreamStartFailure } from "../errors/failure"
 import type { StreamingFieldParser } from "../streaming/field-parser"
 import type { TokenLogprob } from "../trace"
 
-export type ModelStreamEvent<TPreparation = never> =
-  | ResponseStreamEvent
-  | ([TPreparation] extends [never]
-      ? never
-      : {
-          readonly _tag: "preparation_update"
-          readonly preparation: TPreparation
-          readonly requestId: string | null
-        })
+export interface ModelPreparationUpdate<TPreparation> {
+  readonly preparation: TPreparation
+  readonly requestId: string | null
+}
 
-export type ModelStreamResult<TPreparation = never> = {
-  readonly events: Stream.Stream<ModelStreamEvent<TPreparation>, never>
+export type ModelPreparationObserver<TPreparation> = (
+  update: ModelPreparationUpdate<TPreparation>,
+) => Effect.Effect<void, never, never>
+
+export type ModelStreamResult = {
+  readonly events: Stream.Stream<ResponseStreamEvent, never>
   readonly parsers: ReadonlyMap<ToolCallId, StreamingFieldParser>
   readonly logprobs: TokenLogprob[]
   readonly requestId: string | null

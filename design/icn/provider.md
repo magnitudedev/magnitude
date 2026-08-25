@@ -120,14 +120,15 @@ release retain lease draining. A delayed Stop cannot affect a newer instance of 
 
 ## Concurrency and lifetime
 
-The ICN `ModelInstanceController` is the sole native mutation and lease authority.
+The ICN `ModelInstanceController` delegates every physical decision to one residency actor, which
+is the sole native mutation and lease authority.
 
-- Load, Stop, and replacement mutations serialize.
+- Same-model demand joins; conflicting demand is FIFO through the actor mailbox.
 - Equivalent instance admissions are idempotent; caller interruption never cancels admitted work.
 - A projected Loading or Stopping lifecycle always has a matching live ICN owner.
-- An identical load is idempotent after current state is rechecked.
-- Replacement closes new admission and waits for existing generation leases.
-- A completion holds one generation lease until its body completes, fails, or is canceled.
+- Loading success and inference-lease grants are one state transition.
+- Replacement closes new admission and drains existing leases; explicit Stop interrupts them.
+- A completion holds one exact-instance lease until its body completes, fails, or is canceled.
 - A failed mutation does not poison later attempts.
 - Unexpected resident-worker loss is observed with the exact instance ID and becomes a typed
   blocked slot state; it is not inferred from generic provider unavailability.
@@ -147,13 +148,12 @@ Context admission uses the resident configuration's context length. Catalog meta
 load planning, and request admission must agree on that exact configuration.
 
 ICN lifecycle control chunks are process-local request observations, not assistant output. The
-local provider removes them before the provider-neutral response codec and emits queue, prefill,
-model-loading, and generation-start activity in the same ordered generic model-event stream.
-ICN defines the concrete preparation payload; the provider-neutral AI contract does not. The
-harness owns Starting and terminal cleanup and supplies a Streaming fallback on the first semantic
-response event, so the display sees one continuous lifecycle without provider-specific cleanup
-events. Providers that do not support preparation observation remain valid and expose no synthetic
-preparation progress.
+local provider reports meaningful preparation through the generic optional preparation observer
+and removes those chunks before the provider-neutral response codec. ICN defines the concrete
+preparation payload; the provider-neutral AI contract does not. The agent model decorator owns
+Starting, Streaming, and terminal cleanup and projects preparation through transient Ambient state,
+so the display sees one continuous lifecycle without provider-specific cleanup events. Providers
+that do not support preparation observation remain valid and expose no synthetic progress.
 
 If the backing instance is explicitly stopped during preparation, ICN emits the exact
 non-retryable `model_instance_stopped` error. Explicit Stop after readiness terminates active
@@ -203,7 +203,7 @@ reports the selected method, effective parameters, and whether drafting actually
 - Every assessed local provider catalog entry exposes ICN's complete per-domain memory accounting
   for that exact serving configuration.
 - Provider binding does not load a model.
-- Local preparation is represented only by generic model-stream activity with ICN-owned detail.
+- Local preparation is represented only by the generic request-local observer with ICN-owned detail.
 - Inference admission remains held until ICN atomically acquires the request's generation lease.
 - Chat, Responses, and explicit warm-load share one residency coordinator.
 - Slot selection and recency refer only to stable provider model IDs.

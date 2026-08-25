@@ -543,8 +543,7 @@ export const makeAgentRuntimeLive = (
                   }),
                 ),
                 // The retirement result remains authoritative. Requesting a
-                // ACN shutdown must not roll this gate back
-                // and admit work into a partially closed generation.
+                // shutdown does not reopen a partially closed generation.
                 Effect.zipRight(Effect.never),
               ),
             ),
@@ -558,7 +557,7 @@ export const makeAgentRuntimeLive = (
       })
 
       const deleteSession: AgentRuntimeApi["deleteSession"] = (sessionId, removeDurableState) =>
-        Effect.uninterruptible(
+        Effect.uninterruptibleMask((restore) =>
           Effect.gen(function* () {
             const candidate = yield* Deferred.make<void, SessionError>()
             const claim = yield* admissionLock.withPermits(1)(
@@ -574,24 +573,29 @@ export const makeAgentRuntimeLive = (
                 },
               ),
             )
-            if (claim._tag === "joiner") return yield* Deferred.await(claim.deferred)
+            if (claim._tag === "joiner") return yield* restore(Deferred.await(claim.deferred))
 
-            const result = yield* Effect.gen(function* () {
-              const pendingStart = (yield* Ref.get(starts)).get(sessionId)
-              if (pendingStart) yield* Deferred.await(pendingStart).pipe(Effect.exit)
-              yield* dispose(sessionId)
-              yield* removeDurableState
-            }).pipe(Effect.exit)
-            yield* Deferred.done(candidate, result)
-            yield* admissionLock.withPermits(1)(
-              Ref.update(deletions, (current) => {
-                if (current.get(sessionId) !== candidate) return current
-                const next = new Map(current)
-                next.delete(sessionId)
-                return next
-              }),
+            const operation = Effect.gen(function* () {
+              const result = yield* Effect.gen(function* () {
+                const pendingStart = (yield* Ref.get(starts)).get(sessionId)
+                if (pendingStart) yield* Deferred.await(pendingStart).pipe(Effect.exit)
+                yield* dispose(sessionId)
+                yield* removeDurableState
+              }).pipe(Effect.exit)
+              yield* admissionLock.withPermits(1)(
+                Ref.update(deletions, (current) => {
+                  if (current.get(sessionId) !== candidate) return current
+                  const next = new Map(current)
+                  next.delete(sessionId)
+                  return next
+                }),
+              )
+              yield* Deferred.done(candidate, result)
+            })
+            yield* operation.pipe(
+              Effect.forkIn(managerScope),
             )
-            return yield* Deferred.await(candidate)
+            return yield* restore(Deferred.await(candidate))
           }),
         )
       return {

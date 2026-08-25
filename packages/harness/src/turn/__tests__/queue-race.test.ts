@@ -100,20 +100,16 @@ describe('queue race', () => {
       expect(turnEnd.outcome._tag).toBe('ToolExecutionError')
     }))
 
-  it('preserves generic preparation and maps provider stop without caller interruption', () =>
+  it('maps provider stop without caller interruption', () =>
     Effect.gen(function* () {
-      type Preparation = { readonly detail: 'loading' }
-      const model: BoundModel<any, never, Preparation> = {
+      const model: BoundModel<any, never> = {
         stream: () => Effect.gen(function* () {
           const terminalEvent: ResponseStreamEvent = {
             _tag: 'stream_end',
             terminal: ModelRequestTerminal.ModelInstanceStopped(),
           }
           return {
-            events: Stream.make(
-              { _tag: 'preparation_update' as const, preparation: { detail: 'loading' as const }, requestId: 'request-1' },
-              terminalEvent,
-            ),
+            events: Stream.make(terminalEvent),
             parsers: new Map(),
             logprobs: [],
             requestId: 'request-1',
@@ -130,8 +126,6 @@ describe('queue race', () => {
       const events = Array.from(yield* Stream.runCollect(turn.events))
       const turnEnd = events.find((event) => event._tag === 'TurnEnd')
 
-      const canonicalTags: readonly string[] = events.map((event) => event._tag)
-      expect(canonicalTags).not.toContain('preparation_update')
       expect(turnEnd).toMatchObject({
         _tag: 'TurnEnd',
         outcome: { _tag: 'ModelInstanceStopped' },

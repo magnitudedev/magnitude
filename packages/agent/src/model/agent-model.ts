@@ -57,7 +57,7 @@ export type ModelSource = { readonly slotId: SlotId }
  * and grammar wrapping on top, operating on universal `BaseCallOptions`.
  */
 export interface AgentBoundModel {
-  readonly model: BoundModel<BaseCallOptions, AgentModelStartFailure, IcnModelPreparation>
+  readonly model: BoundModel<BaseCallOptions, AgentModelStartFailure>
   readonly modelSource: ModelSource
   readonly modelId: string
   readonly modelDisplayName: string
@@ -215,7 +215,7 @@ function deriveScope(input: {
 // =============================================================================
 
 export function makeAgentBoundModel(config: AgentBoundModelConfig): AgentBoundModel {
-  const model: BoundModel<BaseCallOptions, AgentModelStartFailure, IcnModelPreparation> = {
+  const model: BoundModel<BaseCallOptions, AgentModelStartFailure> = {
     stream: (prompt, tools, options) =>
       Effect.gen(function* () {
         const callOptions = options as CallOptionsWithToolIds | undefined
@@ -232,7 +232,19 @@ export function makeAgentBoundModel(config: AgentBoundModelConfig): AgentBoundMo
           let requestId: string | null = null
           yield* (config.reportActivity?.({ _tag: 'Starting', requestId }) ?? Effect.void)
           let accepted = false
-          const streamResult = yield* config.rawModel.stream(prompt, tools, effectiveOptions).pipe(
+          const streamResult = yield* config.rawModel.stream(
+            prompt,
+            tools,
+            effectiveOptions,
+            ({ preparation, requestId: preparationRequestId }) => {
+              if (preparationRequestId !== null) requestId = preparationRequestId
+              return config.reportActivity?.({
+                _tag: 'Preparing',
+                preparation,
+                requestId,
+              }) ?? Effect.void
+            },
+          ).pipe(
             Effect.tap((result) => Effect.sync(() => {
               accepted = true
               requestId = result.requestId
@@ -246,13 +258,6 @@ export function makeAgentBoundModel(config: AgentBoundModelConfig): AgentBoundMo
           const events = streamResult.events.pipe(
             Stream.tap((event) => {
               switch (event._tag) {
-                case 'preparation_update':
-                  if (event.requestId !== null) requestId = event.requestId
-                  return config.reportActivity?.({
-                    _tag: 'Preparing',
-                    preparation: event.preparation,
-                    requestId,
-                  }) ?? Effect.void
                 default:
                   if (event._tag === 'stream_end' || reportedStreaming) return Effect.void
                   reportedStreaming = true
