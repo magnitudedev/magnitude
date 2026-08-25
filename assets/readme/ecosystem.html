@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Magnitude ecosystem</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html,
+    body {
+      width: 1600px;
+      height: 600px;
+      margin: 0;
+      overflow: hidden;
+      background: transparent;
+    }
+
+    body {
+      --card: #121d2c;
+      --card-border: #273448;
+      --heading: #f8fafc;
+      --muted: #93a1b6;
+      --tile: #152234;
+      --tile-border: #2c3b50;
+      --runtime-start: #16253a;
+      --runtime-end: #111c2c;
+      --runtime-border: #435875;
+      --runtime-rule: #304058;
+      --model-tile: #101a29;
+      --model-border: #2d3c51;
+      --arrow: #6680a5;
+      color: var(--heading);
+    }
+
+    body.light {
+      --card: #f8fafc;
+      --card-border: #cbd5e1;
+      --heading: #0f172a;
+      --muted: #64748b;
+      --tile: #ffffff;
+      --tile-border: #d8dee8;
+      --runtime-start: #ffffff;
+      --runtime-end: #f1f5f9;
+      --runtime-border: #94a3b8;
+      --runtime-rule: #d8dee8;
+      --model-tile: #ffffff;
+      --model-border: #d8dee8;
+      --arrow: #64748b;
+    }
+
+    .stage {
+      position: absolute;
+      inset: 24px;
+      display: grid;
+      grid-template-columns: 540px 130px 1fr;
+      align-items: center;
+      overflow: hidden;
+      padding: 42px 50px;
+      border: 2px solid var(--card-border);
+      border-radius: 28px;
+      background: var(--card);
+    }
+
+    .clients {
+      display: flex;
+      flex-direction: column;
+      gap: 28px;
+    }
+
+    .clients h1 {
+      margin: 0;
+      font-size: 32px;
+      line-height: 1.2;
+      letter-spacing: -.02em;
+    }
+
+    .clients h1 span { color: var(--muted); }
+
+    .harness-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 18px;
+    }
+
+    .harness-item {
+      display: flex;
+      height: 132px;
+      min-width: 0;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 13px;
+      padding-top: 10px;
+      border: 1px solid var(--tile-border);
+      border-radius: 20px;
+      background: var(--tile);
+    }
+
+    .h-icon {
+      width: 62px;
+      height: 62px;
+      object-fit: contain;
+    }
+
+    .h-name {
+      color: var(--muted);
+      font-size: 18px;
+      font-weight: 600;
+      line-height: 1;
+      white-space: nowrap;
+    }
+
+    .intake {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .arrow {
+      position: relative;
+      width: 76px;
+      height: 4px;
+      background: var(--arrow);
+    }
+
+    .arrow::before,
+    .arrow::after {
+      position: absolute;
+      top: 50%;
+      content: "";
+      transform: translateY(-50%);
+      border-block: 10px solid transparent;
+    }
+
+    .arrow::before {
+      left: -1px;
+      border-right: 16px solid var(--arrow);
+    }
+
+    .arrow::after {
+      right: -1px;
+      border-left: 16px solid var(--arrow);
+    }
+
+    .runtime {
+      height: 100%;
+      padding: 24px;
+      border: 2px solid var(--runtime-border);
+      border-radius: 32px;
+      background: linear-gradient(145deg, var(--runtime-start), var(--runtime-end));
+    }
+
+    .runtime-header {
+      display: flex;
+      height: 92px;
+      align-items: center;
+      gap: 16px;
+      padding: 0 14px 20px;
+      border-bottom: 1px solid var(--runtime-rule);
+    }
+
+    .runtime-header img {
+      width: 78px;
+      height: 78px;
+    }
+
+    .runtime-header strong {
+      display: block;
+      font-size: 35px;
+      line-height: 1.05;
+      letter-spacing: -.02em;
+    }
+
+    .runtime-header span {
+      display: block;
+      margin-top: 7px;
+      color: var(--muted);
+      font-size: 23px;
+      line-height: 1.2;
+    }
+
+    .model-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      grid-template-rows: repeat(3, 92px);
+      gap: 13px;
+      padding-top: 20px;
+    }
+
+    .model-item {
+      display: flex;
+      height: 92px;
+      min-width: 0;
+      align-items: center;
+      justify-content: center;
+      padding: 12px;
+      border: 1px solid var(--model-border);
+      border-radius: 18px;
+      background: var(--model-tile);
+    }
+
+    .model-logo {
+      max-width: 148px;
+      max-height: 46px;
+      object-fit: contain;
+    }
+
+    .qwen-lockup,
+    .gemma-lockup { gap: 8px; }
+
+    .qwen-lockup .model-icon,
+    .gemma-lockup .model-icon {
+      width: 42px;
+      height: 42px;
+      object-fit: contain;
+    }
+
+    .qwen-lockup .model-logo { width: 100px; }
+    .gemma-lockup .model-logo { width: 105px; }
+
+    .deepseek-lockup .model-logo,
+    .poolside-lockup .model-logo { transform: scale(1.18); }
+
+    .gemma-lockup-inner {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      transform: scale(1.15);
+    }
+    .prism-lockup .model-logo { transform: scale(1.15); }
+    .nvidia-lockup .model-logo { transform: scale(1.1); }
+
+    .only-light { display: none; }
+    body.light .only-dark { display: none; }
+    body.light .only-light { display: block; }
+
+    body.dark .dark-invert { filter: brightness(0) invert(1); }
+    body.light .light-darken { filter: brightness(0) saturate(100%); }
+  </style>
+  <script>
+    const requestedTheme = new URLSearchParams(location.search).get('theme')
+    const theme = requestedTheme === 'light' || requestedTheme === 'dark'
+      ? requestedTheme
+      : matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
+    document.documentElement.style.colorScheme = theme
+    addEventListener('DOMContentLoaded', () => document.body.classList.add(theme))
+  </script>
+</head>
+<body>
+  <main class="stage">
+    <section class="clients">
+      <h1>Works with your<br><span>existing harness</span></h1>
+      <div class="harness-grid">
+        <div class="harness-item"><img class="h-icon light-darken" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/pi.svg" alt=""><span class="h-name">Pi</span></div>
+        <div class="harness-item"><img class="h-icon light-darken" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/opencode.svg" alt=""><span class="h-name">OpenCode</span></div>
+        <div class="harness-item"><img class="h-icon" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/hermes.svg" alt=""><span class="h-name">Hermes</span></div>
+        <div class="harness-item"><img class="h-icon" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/openclaw.svg" alt=""><span class="h-name">OpenClaw</span></div>
+        <div class="harness-item"><img class="h-icon light-darken" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/codex.svg" alt=""><span class="h-name">Codex</span></div>
+        <div class="harness-item"><img class="h-icon" src="../../../magnitude-dev-landing/src/assets/logos/claude.svg" alt=""><span class="h-name">Claude Code</span></div>
+        <div class="harness-item"><img class="h-icon" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/omp.svg" alt=""><span class="h-name">Oh My Pi</span></div>
+        <div class="harness-item"><img class="h-icon dark-invert" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/cline.svg" alt=""><span class="h-name">Cline</span></div>
+      </div>
+    </section>
+
+    <div class="intake" aria-hidden="true"><div class="arrow"></div></div>
+
+    <section class="runtime">
+      <header class="runtime-header">
+        <img class="only-dark" src="../brand/icon-dark.svg" alt="">
+        <img class="only-light" src="../brand/icon-light.svg" alt="">
+        <div><strong>Magnitude</strong><span>Runs the best local models for your machine</span></div>
+      </header>
+      <div class="model-grid">
+        <div class="model-item qwen-lockup"><img class="model-icon" src="../../../magnitude-dev-landing/src/assets/logos/qwen.svg" alt=""><img class="model-logo dark-invert" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/qwen-wordmark.svg" alt="Qwen"></div>
+        <div class="model-item deepseek-lockup"><img class="model-logo" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/deepseek.svg" alt="DeepSeek"></div>
+        <div class="model-item gemma-lockup"><div class="gemma-lockup-inner"><img class="model-icon" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/gemma-icon-trimmed.png" alt=""><img class="model-logo dark-invert" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/gemma-wordmark.svg" alt="Gemma"></div></div>
+        <div class="model-item"><img class="model-logo light-darken" src="../../../magnitude-dev-landing/src/assets/logos/zai.svg" alt="Z.ai"></div>
+        <div class="model-item nvidia-lockup"><img class="model-logo light-darken" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/nvidia.svg" alt="NVIDIA"></div>
+        <div class="model-item"><img class="model-logo light-darken" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/meta.svg" alt="Meta"></div>
+        <div class="model-item"><img class="model-logo light-darken" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/liquid-ai.svg" alt="Liquid AI"></div>
+        <div class="model-item poolside-lockup"><img class="model-logo" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/poolside.svg" alt="Poolside"></div>
+        <div class="model-item prism-lockup"><img class="model-logo light-darken" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/prismml.svg" alt="PrismML"></div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
