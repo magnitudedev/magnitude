@@ -6,7 +6,7 @@ import {
   formatStorageSize,
   formatTransferRate,
 } from "@magnitudedev/client-common"
-import type { LocalModel, ModelDownloadId } from "@magnitudedev/sdk"
+import { acquisitionProgress, type LocalModel, type ProviderModelId } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
 import { useTheme } from "../../hooks/use-theme"
 
@@ -40,19 +40,16 @@ export function OnboardingModelDownloadProgress({
   readonly operation: OnboardingModelDownloadOperation
 }): ReactNode {
   const theme = useTheme()
-  const [confirmationDownloadId, setConfirmationDownloadId] = useState<ModelDownloadId | null>(null)
+  const [confirmationModelId, setConfirmationModelId] = useState<ProviderModelId | null>(null)
   const [choice, setChoice] = useState<ConfirmationChoice>("yes")
   const [hovered, setHovered] = useState<string | null>(null)
-  const download = model.acquisitionState
   const starting = operation.starting
-  const activeDownload = !starting && download._tag === "Downloading"
-    ? download
-    : null
+  const activeDownload = starting ? null : acquisitionProgress(model.acquisitionState) ?? null
   const downloading = activeDownload !== null
   const active = starting || downloading
   const cancelling = operation.cancelling
   const cancelable = activeDownload !== null && !cancelling
-  const confirming = cancelable && confirmationDownloadId === activeDownload.downloadId
+  const confirming = cancelable && confirmationModelId === model.modelId
   const totalBytes = activeDownload?.totalBytes ?? model.downloadBytes
   const fraction = activeDownload !== null
     ? activeDownload.completedBytes / Math.max(1, activeDownload.totalBytes)
@@ -78,13 +75,13 @@ export function OnboardingModelDownloadProgress({
         ? `Downloading (${formatStorageSize(totalBytes)})`
         : null
   const declineCancellation = useCallback(() => {
-    setConfirmationDownloadId(null)
+    setConfirmationModelId(null)
     setChoice("yes")
   }, [])
 
   const confirmCancellation = useCallback(() => {
     if (!cancelable) return
-    setConfirmationDownloadId(null)
+    setConfirmationModelId(null)
     setChoice("yes")
     operation.onCancel()
   }, [cancelable, operation])
@@ -95,7 +92,7 @@ export function OnboardingModelDownloadProgress({
       if (key.name === "escape" && cancelable) {
         key.preventDefault()
         setChoice("yes")
-        setConfirmationDownloadId(activeDownload.downloadId)
+        setConfirmationModelId(model.modelId)
       }
       return
     }
@@ -114,7 +111,7 @@ export function OnboardingModelDownloadProgress({
       if (choice === "yes") confirmCancellation()
       else declineCancellation()
     }
-  }, [activeDownload, cancelable, cancelling, choice, confirmCancellation, confirming, declineCancellation]))
+  }, [model.modelId, cancelable, cancelling, choice, confirmCancellation, confirming, declineCancellation]))
 
   if (!active || status === null) return null
 
@@ -179,7 +176,7 @@ export function OnboardingModelDownloadProgress({
               <Button
                 onClick={() => {
                   setChoice("yes")
-                  setConfirmationDownloadId(activeDownload.downloadId)
+                  setConfirmationModelId(model.modelId)
                 }}
                 onMouseOver={() => setHovered("cancel")}
                 onMouseOut={() => setHovered((current) => current === "cancel" ? null : current)}

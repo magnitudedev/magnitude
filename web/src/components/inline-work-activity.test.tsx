@@ -4,7 +4,6 @@ import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   ModelSlotConfiguredLocal,
-  ModelInstanceIdSchema,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ProviderModelIdSchema,
@@ -47,7 +46,6 @@ const loadingModel = (progress: Option.Option<number>) => new ModelSlotConfigure
   ...requestedModel,
   residency: {
     _tag: "Loading",
-    instanceId: ModelInstanceIdSchema.make("instance"),
     stage: "loading",
     progress,
     plannedAllocation: Option.none(),

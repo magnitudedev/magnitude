@@ -10,9 +10,11 @@ import {
   onboardingModelSetupFailureMessage,
   type useOnboardingModelSetup,
 } from "@magnitudedev/client-common"
-import type {
-  LocalModel,
-  LocalModelRecommendationProgressStep,
+import {
+  acquisitionFailure,
+  acquisitionProgress,
+  type LocalModel,
+  type LocalModelRecommendationProgressStep,
 } from "@magnitudedev/sdk"
 import {
   formatBytes,
@@ -131,16 +133,16 @@ export function LocalModelOnboarding({
   const operation =
     content._tag === "Chooser" ? Option.getOrNull(content.operation) : null
   const operationModel = operation?.model ?? null
-  const transfer =
-    operationModel?.acquisitionState._tag === "Downloading"
-      ? operationModel.acquisitionState
-      : operationModel?.upgradeState._tag === "Upgrading"
-      ? operationModel.upgradeState
-      : null
+  const transfer = operationModel === null
+    ? null
+    : acquisitionProgress(operationModel.acquisitionState) ?? null
+  const transferFailure = operationModel === null
+    ? undefined
+    : acquisitionFailure(operationModel.acquisitionState)
   const operationFailure =
     (operation?._tag === "Loading" ? operation.failure?.message : null) ??
-    (operationModel?.acquisitionState._tag === "Failed"
-      ? modelDownloadFailureMessage(operationModel.acquisitionState.failure)
+    (transferFailure !== undefined
+      ? modelDownloadFailureMessage(transferFailure)
       : null)
   const preparationStep =
     content._tag === "Preparation"

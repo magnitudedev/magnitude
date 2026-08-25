@@ -12,9 +12,9 @@ import {
 } from "@magnitudedev/acn-protocol"
 import { ProviderModelIdSchema } from "@magnitudedev/sdk"
 import {
-  aggregateAcquisitionState,
   availabilityFromProviderProjection,
-  deriveCatalogUpgradeState,
+  deriveModelAcquisitionState,
+  installedBundleFields,
   resolveBundlePresentation,
 } from "./local-models"
 
@@ -87,23 +87,101 @@ describe("bundle acquisition projection", () => {
       },
     }]
 
-    expect(aggregateAcquisitionState(bundle, entries, downloads)).toMatchObject({
-      _tag: "Downloading",
-      downloadId,
-      completedBytes: 1,
-      totalBytes: 2,
+    expect(deriveModelAcquisitionState({
+      currentBundle: bundle,
+      desiredBundle: bundle,
+      currentInstalled: installedBundleFields(bundle, entries),
+      downloads,
+      updateAvailable: false,
+      priorEntries: [],
+      residencyState: { _tag: "Unloaded" },
+    })).toMatchObject({
+      _tag: "Installing",
+      progress: { stage: "downloading", completedBytes: 1, totalBytes: 2 },
     })
   })
 
-  it("derives an upgrade only for a superseded installed catalog target", () => {
-    const notInstalled = { _tag: "NotInstalled" as const, completedBytes: 0, totalBytes: 10 }
-    expect(deriveCatalogUpgradeState({
-      inCatalog: true,
-      nativeUpdateAvailable: true,
-      currentAcquisitionState: notInstalled,
-      desiredAcquisitionState: notInstalled,
-      hasPriorCatalogTarget: true,
-    })).toEqual({ _tag: "Available" })
+  it("reports an update in progress while the installed version stays usable", () => {
+    const installedBundle = standaloneBundle({ _tag: "Local", path: "/models/current.gguf" })
+    const desired = {
+      ...standaloneBundle({ _tag: "Local", path: "/models/next.gguf" }),
+    }
+    const desiredBundle: ServableModelBundle = {
+      ...desired,
+      package: { ...desired.package, id: ModelPackageIdSchema.make("package-next") },
+    }
+    const entries = new Map<string, ModelPackageEntry>([
+      [installedBundle.package.id, {
+        package: installedBundle.package,
+        localState: { _tag: "Installed", path: "/models/current.gguf", origin: "Magnitude" },
+        inspection: { _tag: "Pending" },
+        catalogAttribution: { _tag: "NotCatalogTarget" },
+      }],
+    ])
+    const downloads: readonly ModelBundleDownload[] = [{
+      id: ModelDownloadIdSchema.make("update-download"),
+      bundle: desiredBundle,
+      state: {
+        _tag: "Downloading",
+        stage: "downloading",
+        completedBytes: 5,
+        totalBytes: 10,
+        bytesPerSecond: Option.none(),
+      },
+    }]
+    expect(deriveModelAcquisitionState({
+      currentBundle: installedBundle,
+      desiredBundle,
+      currentInstalled: installedBundleFields(installedBundle, entries),
+      downloads,
+      updateAvailable: true,
+      priorEntries: [],
+      residencyState: { _tag: "Unloaded" },
+    })).toMatchObject({
+      _tag: "Updating",
+      packages: [{ path: "/models/current.gguf" }],
+      progress: { completedBytes: 5, totalBytes: 10 },
+    })
+  })
+
+  it("returns to NotInstalled after a cancelled download", () => {
+    const bundle = standaloneBundle({ _tag: "Local", path: "/models/target.gguf" })
+    const downloads: readonly ModelBundleDownload[] = [{
+      id: ModelDownloadIdSchema.make("cancelled-download"),
+      bundle,
+      state: { _tag: "Cancelled", completedBytes: 1, totalBytes: 2 },
+    }]
+    expect(deriveModelAcquisitionState({
+      currentBundle: bundle,
+      desiredBundle: bundle,
+      currentInstalled: undefined,
+      downloads,
+      updateAvailable: false,
+      priorEntries: [],
+      residencyState: { _tag: "Unloaded" },
+    })).toEqual({ _tag: "NotInstalled" })
+  })
+
+  it("surfaces an unacknowledged failure until it is acknowledged", () => {
+    const bundle = standaloneBundle({ _tag: "Local", path: "/models/target.gguf" })
+    const failure = { _tag: "Interrupted" as const }
+    const failedDownload = (acknowledged: boolean): ModelBundleDownload => ({
+      id: ModelDownloadIdSchema.make("failed-download"),
+      bundle,
+      state: { _tag: "Failed", completedBytes: 1, totalBytes: 2, failure, acknowledged },
+    })
+    const inputs = {
+      currentBundle: bundle,
+      desiredBundle: bundle,
+      currentInstalled: undefined,
+      updateAvailable: false,
+      priorEntries: [],
+      residencyState: { _tag: "Unloaded" },
+    } as const
+    expect(deriveModelAcquisitionState({ ...inputs, downloads: [failedDownload(false)] }))
+      .toEqual({ _tag: "InstallFailed", failure })
+    expect(deriveModelAcquisitionState({ ...inputs, downloads: [failedDownload(true)] }))
+      .toEqual({ _tag: "NotInstalled" })
   })
 })
 

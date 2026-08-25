@@ -22,17 +22,19 @@ separate model-management or appearance interface.
 
 ## Authority and boundaries
 
-`LocalModelsState` is ACN's read-only Magnitude product projection for assessment presentation,
-provider availability, recommendations, updates, and product warnings. Native ICN Models,
-Packages, Downloads, Instances, and Hardware remain independently authoritative. `ModelSlotsState`
-owns durable selection, favorites, and recency, but no physical residency. Client-common joins these
-Queries by canonical model ID for presentation without copying them into a writable mirror.
+The unified `ModelCatalog` is ACN's read-only Magnitude product projection: each local row's
+`acquisitionState` carries the model's complete materialization lifecycle (disk truth, transfer
+progress, unacknowledged failure, update availability, and residency once installed) alongside
+assessment presentation, provider availability, recommendations, and product warnings. Native ICN
+Models, Packages, Downloads, Instances, and Hardware remain authoritative beneath ACN and are not
+client-visible. `ModelSlotsState` owns durable selection, favorites, and recency, resolved
+server-side to truthful Slot states including residency.
 
 Web consumes those domains through one connection-scoped Effect Query runtime containing ACN RPC
-and authored inference HTTP operations, plus the composed `LocalModels`, `ModelSlots`, and
-`OnboardingModelSetup` client-common services. React hooks are adapters to those services. DOM
-components may derive labels and layout, but do not construct services, cache server snapshots, or
-infer compatibility, availability, readiness, progress, or command completion.
+operations, plus the composed `LocalModels`, `ModelSlots`, and `OnboardingModelSetup`
+client-common services. React hooks are adapters to those services. DOM components may derive
+labels and layout, but do not construct services, cache server snapshots, or infer compatibility,
+availability, readiness, progress, or command completion.
 
 The web product presents only local models. Protocol support for another provider does not make it
 a web product choice or readiness signal. Cloud login, account usage, subscription, connection,

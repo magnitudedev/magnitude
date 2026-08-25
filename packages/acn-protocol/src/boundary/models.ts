@@ -10,9 +10,6 @@ import {
   CatalogModelReconciliationAdmissionSchema,
   LocalInferenceHardwareSchema,
   ModelCatalogStateSchema,
-  ModelDownloadIdSchema,
-  ModelInstanceIdSchema,
-  ModelInstancesStateSchema,
   ModelLoadPlanSchema,
   ModelSlotsStateSchema,
   ProviderModelIdentitySchema,
@@ -32,7 +29,6 @@ const stateQuery = <const Name extends string, A, I>(name: Name, schema: Schema.
 
 const GetCatalog = stateQuery("GetModelCatalog", ModelCatalogStateSchema)
 const GetSlots = stateQuery("GetModelSlots", ModelSlotsStateSchema)
-const GetInstances = stateQuery("GetModelInstances", ModelInstancesStateSchema)
 const GetLocalEnvironment = stateQuery("GetLocalInferenceEnvironment", LocalInferenceHardwareSchema)
 
 const RefreshCatalog = Mutation.make("RefreshModelCatalog", {
@@ -89,19 +85,19 @@ const InstallLocalModel = Mutation.make("InstallLocalModel", {
 
 const CancelModelDownload = Mutation.make("CancelModelDownload", {
   policy: { recovery: "AtMostOnce" },
-  payload: Schema.Struct({ downloadId: ModelDownloadIdSchema }),
+  payload: Schema.Struct({ modelId: ProviderModelIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
-  scope: ({ downloadId }) => Mutation.MutationScope(`model-download:${downloadId}`),
+  scope: ({ modelId }) => Mutation.MutationScope(`local-model:${modelId}`),
   synchronize: () => invalidateCatalog,
 })
 
 const AcknowledgeModelDownloadFailure = Mutation.make("AcknowledgeModelDownloadFailure", {
   policy: { recovery: "AtMostOnce" },
-  payload: Schema.Struct({ downloadId: ModelDownloadIdSchema }),
+  payload: Schema.Struct({ modelId: ProviderModelIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
-  scope: ({ downloadId }) => Mutation.MutationScope(`model-download:${downloadId}`),
+  scope: ({ modelId }) => Mutation.MutationScope(`local-model:${modelId}`),
   synchronize: () => invalidateCatalog,
 })
 
@@ -117,7 +113,7 @@ const UninstallLocalModel = Mutation.make("UninstallLocalModel", {
 const LoadSlot = Mutation.make("LoadModelSlot", {
   policy: { recovery: "AtMostOnce" },
   payload: Schema.Struct({ slotId: SlotIdSchema }),
-  success: Schema.Struct({ instanceId: ModelInstanceIdSchema }),
+  success: Schema.Struct({}),
   error: LocalInferenceError,
   scope: ({ slotId }) => Mutation.MutationScope(`model-slot-instance:${slotId}`),
   synchronize: () => invalidateSlots,
@@ -126,7 +122,7 @@ const LoadSlot = Mutation.make("LoadModelSlot", {
 const StopSlot = Mutation.make("StopModelSlot", {
   policy: { recovery: "AtMostOnce" },
   payload: Schema.Struct({ slotId: SlotIdSchema }),
-  success: Schema.Struct({ instanceId: ModelInstanceIdSchema }),
+  success: Schema.Struct({}),
   error: LocalInferenceError,
   scope: ({ slotId }) => Mutation.MutationScope(`model-slot-instance:${slotId}`),
   synchronize: () => invalidateSlots,
@@ -141,7 +137,6 @@ const PreviewSlotLoad = Query.make("PreviewModelSlotLoad", {
 export const Models = Group.make({
   GetCatalog,
   GetSlots,
-  GetInstances,
   GetLocalEnvironment,
   PreviewSlotLoad,
   RefreshCatalog,

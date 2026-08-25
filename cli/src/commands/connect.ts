@@ -10,7 +10,6 @@ import {
   MAGNITUDE_INFERENCE_BASE_URL,
   ProviderModelIdSchema,
   magnitudeImplementationsLayer,
-  type ModelDownloadId,
   type ProviderModelId,
 } from "@magnitudedev/sdk"
 import { Data, Effect, Option, Schema } from "effect"
@@ -144,31 +143,40 @@ const awaitDownload = (
   client: Pick<AgentClient, "Models">,
   registry: Registry.Registry,
   modelId: ProviderModelId,
-  downloadId: ModelDownloadId,
+  transferObserved = false,
 ): Effect.Effect<void, unknown> => Registry.getResult(
   registry,
   Atom.make((get) => get(client.Models.GetCatalog({})).result),
 ).pipe(
   Effect.flatMap((state) => {
-    if (state._tag === "Initializing") return Effect.sleep("250 millis").pipe(
-      Effect.zipRight(Effect.suspend(() => awaitDownload(client, registry, modelId, downloadId))),
+    const again = (observed: boolean) => Effect.sleep("250 millis").pipe(
+      Effect.zipRight(Effect.suspend(() => awaitDownload(client, registry, modelId, observed))),
     )
+    if (state._tag === "Initializing") return again(transferObserved)
     const entry = state.models.find((candidate) =>
       candidate._tag === "Local" && candidate.product.modelId === modelId)
     if (entry?._tag !== "Local") {
       return Effect.fail(connectFailure(`Model ${modelId} is absent from the ACN catalog`))
     }
-    const acquisition = entry.product.acquisitionState
-    if (acquisition._tag === "Installed") return Effect.void
-    if (acquisition._tag === "Failed" && acquisition.downloadId === downloadId) {
-      return Effect.fail(connectFailure(`Model installation failed: ${JSON.stringify(acquisition.failure)}`))
+    switch (entry.product.acquisitionState._tag) {
+      case "Installed":
+      case "UpdateAvailable":
+      case "Updating":
+      case "UpdateFailed":
+        return Effect.void
+      case "Installing":
+        return again(true)
+      case "InstallFailed":
+        return Effect.fail(connectFailure(
+          `Model installation failed: ${JSON.stringify(entry.product.acquisitionState.failure)}`,
+        ))
+      case "NotInstalled":
+        // The admitted transfer disappeared without installing: it was
+        // cancelled or its failure was acknowledged elsewhere.
+        return transferObserved
+          ? Effect.fail(connectFailure("Model installation was cancelled"))
+          : again(false)
     }
-    if (acquisition._tag === "Cancelled" && acquisition.downloadId === downloadId) {
-      return Effect.fail(connectFailure("Model installation was cancelled"))
-    }
-    return Effect.sleep("250 millis").pipe(
-      Effect.zipRight(Effect.suspend(() => awaitDownload(client, registry, modelId, downloadId))),
-    )
   }),
 )
 
@@ -192,7 +200,7 @@ const connectHarness = (harness: Harness, modelId: string) => Effect.gen(functio
   ).pipe(
       Effect.provideService(Registry.AtomRegistry, registry),
       Effect.flatMap((admission) => admission._tag === "DownloadAdmitted"
-        ? awaitDownload(client, registry, providerModelId, admission.downloadId)
+        ? awaitDownload(client, registry, providerModelId)
         : Effect.void),
       Effect.zipRight(configureHarness(harness, modelId)),
   )

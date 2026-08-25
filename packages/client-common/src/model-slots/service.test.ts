@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest"
 import {
   ModelSlotUnassigned,
   ModelSlotConfiguredLocal,
-  ModelInstanceIdSchema,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ProviderModelIdSchema,
@@ -77,7 +76,6 @@ describe("model-slot mutation synchronization", () => {
         availability: { _tag: "Available" },
         residency: {
           _tag: "Loading",
-          instanceId: ModelInstanceIdSchema.make("instance"),
           stage: "queued",
           progress: Option.none(),
           plannedAllocation: Option.none(),

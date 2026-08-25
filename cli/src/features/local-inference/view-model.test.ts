@@ -1,6 +1,5 @@
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
-import { ModelDownloadIdSchema } from "@magnitudedev/sdk"
 import {
   buildLocalInferenceSelections,
   installedLocalModels,
@@ -66,12 +65,13 @@ describe("unified local inference projection", () => {
 
   it("keeps active acquisition visible without manufacturing a download record", () => {
     const model = makeAcquiringModel({
-      _tag: "Downloading",
-      downloadId: ModelDownloadIdSchema.make("download"),
-      stage: "downloading",
-      completedBytes: GIB,
-      totalBytes: 2 * GIB,
-      bytesPerSecond: Option.none(),
+      _tag: "Installing",
+      progress: {
+        stage: "downloading",
+        completedBytes: GIB,
+        totalBytes: 2 * GIB,
+        bytesPerSecond: Option.none(),
+      },
     })
     const view = makeView({ models: [model], ready: false })
     expect(buildLocalInferenceSelections(view.models, view.slots)[0]?.model).toBe(model)

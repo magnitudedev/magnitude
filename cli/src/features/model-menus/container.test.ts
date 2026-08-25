@@ -1,10 +1,11 @@
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 import {
-  ModelDownloadIdSchema,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ProviderModelIdSchema,
+  type LocalModel,
+  type ModelTransferProgress,
   type ProviderModelCatalogEntry,
 } from "@magnitudedev/sdk"
 import {
@@ -33,6 +34,30 @@ import {
   TEST_MODEL_ID,
   withDoesNotFitAssessment,
 } from "../local-inference/test-fixtures"
+
+const testProgress: ModelTransferProgress = {
+  stage: "downloading",
+  completedBytes: 1,
+  totalBytes: 4,
+  bytesPerSecond: Option.none(),
+}
+
+const installedFieldsOf = (model: LocalModel) => {
+  if (model.acquisitionState._tag !== "Installed") {
+    throw new Error("expected an installed fixture")
+  }
+  return model.acquisitionState
+}
+
+const withUpdateAvailable = (model: LocalModel): LocalModel => ({
+  ...model,
+  acquisitionState: { ...installedFieldsOf(model), _tag: "UpdateAvailable" },
+})
+
+const withUpdating = (model: LocalModel): LocalModel => ({
+  ...model,
+  acquisitionState: { ...installedFieldsOf(model), _tag: "Updating", progress: testProgress },
+})
 
 describe("unified models menu projection", () => {
   it("handles unmodified lateral and tab navigation", () => {
@@ -83,7 +108,7 @@ describe("unified models menu projection", () => {
   it("includes only fitting catalog rows in Catalog", () => {
     const catalogFit = makeCatalogOnlyModel()
     const nonCatalogFit = makeModel({
-      acquisitionState: { _tag: "NotInstalled", completedBytes: 0, totalBytes: 1 },
+      acquisitionState: { _tag: "NotInstalled" },
     })
     const models = [
       catalogFit,
@@ -99,7 +124,7 @@ describe("unified models menu projection", () => {
       _tag: "Starting",
       operation: "Install",
     })).toBe("Starting download…")
-    expect(catalogStatus(makeModel({ upgradeState: { _tag: "Available" } }), {
+    expect(catalogStatus(withUpdateAvailable(makeModel()), {
       _tag: "Starting",
       operation: "Update",
     })).toBe("Starting update…")
@@ -108,46 +133,25 @@ describe("unified models menu projection", () => {
   it("prefers authoritative download progress once it is visible", () => {
     expect(catalogStatus({
       ...makeCatalogOnlyModel(),
-      acquisitionState: {
-        _tag: "Downloading",
-        downloadId: ModelDownloadIdSchema.make("download-a"),
-        stage: "downloading",
-        completedBytes: 1,
-        totalBytes: 4,
-        bytesPerSecond: Option.none(),
-      },
+      acquisitionState: { _tag: "Installing", progress: testProgress },
     }, {
       _tag: "Transferring",
       operation: "Install",
-      downloadId: ModelDownloadIdSchema.make("download-a"),
-      stage: "downloading",
-      completedBytes: 1,
-      totalBytes: 4,
-      bytesPerSecond: Option.none(),
+      progress: testProgress,
     })).toBe("Downloading 25%")
   })
 
   it("shows exact catalog drift as an available update without hiding the installed model", () => {
-    expect(catalogStatus({
-      ...makeModel(),
-      upgradeState: { _tag: "Available" },
-    })).toBe("Update available")
+    expect(catalogStatus(withUpdateAvailable(makeModel()))).toBe("Update available")
   })
 
   it("preserves the established detail actions and labels", () => {
     const available = makeCatalogOnlyModel()
     const installed = makeModel()
-    const update = makeModel({ upgradeState: { _tag: "Available" } })
+    const update = withUpdateAvailable(makeModel())
     const selectedSlot = makeView().slots.slots.primary
     const downloading = makeCatalogOnlyModel({
-      acquisitionState: {
-        _tag: "Downloading",
-        downloadId: ModelDownloadIdSchema.make("download-a"),
-        stage: "downloading",
-        completedBytes: 1,
-        totalBytes: 4,
-        bytesPerSecond: Option.none(),
-      },
+      acquisitionState: { _tag: "Installing", progress: testProgress },
     })
 
     expect(catalogInspectorActions(available, { _tag: "Idle" })).toEqual(["primary"])
@@ -305,28 +309,13 @@ describe("unified models menu projection", () => {
   })
 
   it("renders catalog upgrade state without inferring artifact differences", () => {
-    expect(localModelReadinessStatus(makeModel({
-      upgradeState: { _tag: "Available" },
-    }))).toBe("Update available")
-    const model = makeModel({
-      upgradeState: {
-        _tag: "Upgrading",
-        downloadId: ModelDownloadIdSchema.make("download-upgrade"),
-        stage: "downloading",
-        completedBytes: 1,
-        totalBytes: 4,
-        bytesPerSecond: Option.none(),
-      },
-    })
+    expect(localModelReadinessStatus(withUpdateAvailable(makeModel()))).toBe("Update available")
+    const model = withUpdating(makeModel())
     expect(localModelReadinessStatus(model)).toBe("Updating")
     expect(catalogStatus(model, {
       _tag: "Transferring",
       operation: "Update",
-      downloadId: ModelDownloadIdSchema.make("download-upgrade"),
-      stage: "downloading",
-      completedBytes: 1,
-      totalBytes: 4,
-      bytesPerSecond: Option.none(),
+      progress: testProgress,
     })).toBe("Updating 25%")
   })
 })

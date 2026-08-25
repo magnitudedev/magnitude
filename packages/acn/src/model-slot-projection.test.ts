@@ -1,7 +1,6 @@
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 import {
-  ModelInstanceIdSchema,
   modelSlotActions,
   PRIMARY_SLOT_ID,
   SECONDARY_SLOT_ID,
@@ -23,7 +22,6 @@ describe("model slot projection", () => {
     expect(modelSlotActions(available, { _tag: "Unloaded" })).toEqual(["Load"])
     expect(modelSlotActions(available, {
       _tag: "Loading",
-      instanceId: ModelInstanceIdSchema.make("instance"),
       stage: "loading",
       progress: Option.none(),
       plannedAllocation: Option.none(),

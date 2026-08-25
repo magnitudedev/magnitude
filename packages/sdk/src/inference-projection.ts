@@ -1,10 +1,9 @@
 import { Option } from "effect"
 import type * as InferenceSchema from "@magnitudedev/icn-protocol/schemas"
-import {
-  ModelInstanceIdSchema,
-  type ModelInstanceAllocation,
-  type ModelLoadPlan,
-  type ModelResidency,
+import type {
+  ModelInstanceAllocation,
+  ModelLoadPlan,
+  ModelResidency,
 } from "@magnitudedev/acn-protocol"
 
 export const projectInferenceAllocation = (
@@ -34,25 +33,19 @@ export const projectInferenceLoadPlan = (
 export const projectInferenceResidency = (
   instance: InferenceSchema.ModelInstance,
 ): ModelResidency => {
-  const identity = {
-    instanceId: ModelInstanceIdSchema.make(instance.id),
-  }
   switch (instance.lifecycle._tag) {
     case "Loading": return {
       _tag: "Loading",
-      ...identity,
       stage: instance.lifecycle.stage,
       progress: Option.flatMap(instance.lifecycle.progress, Option.fromNullable),
       plannedAllocation: Option.map(instance.lifecycle.plannedAllocation, projectInferenceLoadPlan),
     }
     case "Ready": return {
       _tag: "Ready",
-      ...identity,
       allocation: projectInferenceAllocation(instance.lifecycle.allocation),
     }
     case "Stopping": return {
       _tag: "Stopping",
-      ...identity,
       reason: instance.lifecycle.reason,
       allocation: instance.lifecycle.allocation._tag === "Resident"
         ? { _tag: "Resident", allocation: projectInferenceAllocation(instance.lifecycle.allocation.allocation) }

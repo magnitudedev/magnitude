@@ -126,9 +126,6 @@ export const ModelDownloadStageSchema = Schema.Literal(
 )
 export type ModelDownloadStage = typeof ModelDownloadStageSchema.Type
 
-export const ModelInstanceIdSchema = NonEmptyString.pipe(Schema.brand("ModelInstanceId"))
-export type ModelInstanceId = typeof ModelInstanceIdSchema.Type
-
 export const ModelVariantLabelSchema = NonEmptyString.pipe(Schema.brand("ModelVariantLabel"))
 export type ModelVariantLabel = typeof ModelVariantLabelSchema.Type
 
@@ -519,28 +516,6 @@ export const FitsModelAssessmentSchema = Schema.TaggedStruct("Fits", {
 { message: () => "performance samples must end at the serving profile context" }))
 export type FitsModelAssessment = typeof FitsModelAssessmentSchema.Type
 
-const LocalModelNotInstalledSchema = Schema.TaggedStruct("NotInstalled", {
-  completedBytes: NonNegativeSafeInteger,
-  totalBytes: NonNegativeSafeInteger,
-})
-const LocalModelDownloadingSchema = Schema.TaggedStruct("Downloading", {
-  downloadId: ModelDownloadIdSchema,
-  stage: ModelDownloadStageSchema,
-  completedBytes: NonNegativeSafeInteger,
-  totalBytes: NonNegativeSafeInteger,
-  bytesPerSecond: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
-})
-const LocalModelDownloadFailedSchema = Schema.TaggedStruct("Failed", {
-  downloadId: ModelDownloadIdSchema,
-  completedBytes: NonNegativeSafeInteger,
-  totalBytes: NonNegativeSafeInteger,
-  failure: ModelDownloadFailureSchema,
-})
-const LocalModelDownloadCancelledSchema = Schema.TaggedStruct("Cancelled", {
-  downloadId: ModelDownloadIdSchema,
-  completedBytes: NonNegativeSafeInteger,
-  totalBytes: NonNegativeSafeInteger,
-})
 export const LocalModelInstalledPackageSchema = Schema.Struct({
   packageId: ModelPackageIdSchema,
   path: NonEmptyString,
@@ -548,21 +523,109 @@ export const LocalModelInstalledPackageSchema = Schema.Struct({
 })
 export type LocalModelInstalledPackage = typeof LocalModelInstalledPackageSchema.Type
 
-const LocalModelInstalledSchema = Schema.TaggedStruct("Installed", {
+export const ModelReleaseReasonSchema = Schema.Literal(
+  "user_stop",
+  "idle_timeout",
+  "replacement",
+  "memory_pressure",
+)
+export type ModelReleaseReason = typeof ModelReleaseReasonSchema.Type
+
+export const ModelResidencySchema = Schema.Union(
+  Schema.TaggedStruct("Unloaded", {}),
+  Schema.TaggedStruct("Requested", {}),
+  Schema.TaggedStruct("Loading", {
+    stage: Schema.Literal("queued", "resolving", "unloading", "loading", "verifying"),
+    progress: Schema.optionalWith(Schema.Number.pipe(Schema.finite(), Schema.between(0, 1)), {
+      as: "Option",
+      exact: true,
+    }),
+    plannedAllocation: Schema.optionalWith(ModelLoadPlanSchema, { as: "Option", exact: true }),
+  }),
+  Schema.TaggedStruct("Ready", {
+    allocation: ModelInstanceAllocationSchema,
+  }),
+  Schema.TaggedStruct("Stopping", {
+    reason: ModelReleaseReasonSchema,
+    allocation: ModelStoppingAllocationSchema,
+  }),
+  Schema.TaggedStruct("Failed", { failure: ModelInstanceFailureSchema }),
+)
+export type ModelResidency = typeof ModelResidencySchema.Type
+
+export const ModelTransferProgressSchema = Schema.Struct({
+  stage: ModelDownloadStageSchema,
+  completedBytes: NonNegativeSafeInteger,
+  totalBytes: NonNegativeSafeInteger,
+  bytesPerSecond: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
+})
+export type ModelTransferProgress = typeof ModelTransferProgressSchema.Type
+
+const InstalledModelFields = {
   installedBytes: NonNegativeSafeInteger,
   packages: Schema.NonEmptyArray(LocalModelInstalledPackageSchema),
-}).pipe(Schema.filter(({ packages }) =>
+  residencyState: ModelResidencySchema,
+} as const
+
+const uniqueInstalledPackages = <A extends {
+  readonly packages: readonly { readonly packageId: string }[]
+}, I>(schema: Schema.Schema<A, I>) => schema.pipe(Schema.filter(({ packages }) =>
   new Set(packages.map(({ packageId }) => packageId)).size === packages.length,
 { message: () => "installed local model packages must have unique package identities" }))
 
+/**
+ * The single per-model materialization lifecycle: what exists on disk, the one
+ * transfer that may be running for it, and — once bits exist — the model's
+ * runtime residency. Every variant is a reachable product state; progress and
+ * failure payloads exist only under the states they belong to.
+ */
 export const LocalModelAcquisitionStateSchema = Schema.Union(
-  LocalModelNotInstalledSchema,
-  LocalModelDownloadingSchema,
-  LocalModelDownloadFailedSchema,
-  LocalModelDownloadCancelledSchema,
-  LocalModelInstalledSchema,
+  Schema.TaggedStruct("NotInstalled", {}),
+  Schema.TaggedStruct("Installing", { progress: ModelTransferProgressSchema }),
+  /** Acknowledged failure returns to NotInstalled. */
+  Schema.TaggedStruct("InstallFailed", { failure: ModelDownloadFailureSchema }),
+  uniqueInstalledPackages(Schema.TaggedStruct("Installed", InstalledModelFields)),
+  uniqueInstalledPackages(Schema.TaggedStruct("UpdateAvailable", InstalledModelFields)),
+  uniqueInstalledPackages(Schema.TaggedStruct("Updating", {
+    ...InstalledModelFields,
+    progress: ModelTransferProgressSchema,
+  })),
+  /** Acknowledged failure returns to UpdateAvailable. */
+  uniqueInstalledPackages(Schema.TaggedStruct("UpdateFailed", {
+    ...InstalledModelFields,
+    failure: ModelDownloadFailureSchema,
+  })),
 )
 export type LocalModelAcquisitionState = typeof LocalModelAcquisitionStateSchema.Type
+
+export type InstalledLocalModelAcquisitionState = Extract<
+  LocalModelAcquisitionState,
+  { readonly packages: unknown }
+>
+
+/** The installed-family payload when any version of the model is on disk. */
+export const installedAcquisition = (
+  state: LocalModelAcquisitionState,
+): InstalledLocalModelAcquisitionState | undefined => state._tag === "Installed"
+  || state._tag === "UpdateAvailable"
+  || state._tag === "Updating"
+  || state._tag === "UpdateFailed"
+  ? state
+  : undefined
+
+/** The transfer progress when a download is running for the model. */
+export const acquisitionProgress = (
+  state: LocalModelAcquisitionState,
+): ModelTransferProgress | undefined => state._tag === "Installing" || state._tag === "Updating"
+  ? state.progress
+  : undefined
+
+/** The unacknowledged transfer failure when the model's last download failed. */
+export const acquisitionFailure = (
+  state: LocalModelAcquisitionState,
+): ModelDownloadFailure | undefined => state._tag === "InstallFailed" || state._tag === "UpdateFailed"
+  ? state.failure
+  : undefined
 
 export const CatalogModelReconciliationAdmissionSchema = Schema.Union(
   Schema.TaggedStruct("Current", {
@@ -570,7 +633,6 @@ export const CatalogModelReconciliationAdmissionSchema = Schema.Union(
   }),
   Schema.TaggedStruct("DownloadAdmitted", {
     providerModelId: ProviderModelIdSchema,
-    downloadId: ModelDownloadIdSchema,
   }),
 )
 export type CatalogModelReconciliationAdmission =
@@ -737,21 +799,6 @@ export const LocalModelAvailabilityStateSchema = Schema.Union(
 )
 export type LocalModelAvailabilityState = typeof LocalModelAvailabilityStateSchema.Type
 
-export const LocalModelUpgradeStateSchema = Schema.Union(
-  Schema.TaggedStruct("NotApplicable", {}),
-  Schema.TaggedStruct("Current", {}),
-  Schema.TaggedStruct("Available", {}),
-  Schema.TaggedStruct("Upgrading", {
-    downloadId: ModelDownloadIdSchema,
-    stage: ModelDownloadStageSchema,
-    completedBytes: NonNegativeSafeInteger,
-    totalBytes: NonNegativeSafeInteger,
-    bytesPerSecond: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
-  }),
-  Schema.TaggedStruct("Failed", { failure: ModelDownloadFailureSchema }),
-)
-export type LocalModelUpgradeState = typeof LocalModelUpgradeStateSchema.Type
-
 export const LocalModelPresentationSchema = Schema.Struct({
   displayName: NonEmptyString,
   variantLabel: ModelVariantLabelSchema,
@@ -789,9 +836,10 @@ export const LocalModelSchema = Schema.Struct({
   downloadBytes: NonNegativeSafeInteger,
   catalogMembershipState: LocalModelCatalogMembershipStateSchema,
   acquisitionState: LocalModelAcquisitionStateSchema,
-  upgradeState: LocalModelUpgradeStateSchema,
   servingState: LocalModelServingStateSchema,
 }).pipe(Schema.filter((model) => {
+  // Only the current target's installation matches the row's bundle exactly;
+  // the update-family variants may hold a prior version's packages.
   if (model.acquisitionState._tag !== "Installed") return true
   const bundlePackageIds = servableModelBundlePackageIds(model.bundle)
   const installedPackageIds = model.acquisitionState.packages.map(({ packageId }) => packageId)
@@ -1093,57 +1141,6 @@ export const ModelSlotAvailabilitySchema = Schema.Union(
 )
 export type ModelSlotAvailability = typeof ModelSlotAvailabilitySchema.Type
 
-export const ModelReleaseReasonSchema = Schema.Literal(
-  "user_stop",
-  "idle_timeout",
-  "replacement",
-  "memory_pressure",
-)
-export type ModelReleaseReason = typeof ModelReleaseReasonSchema.Type
-
-const ModelResidencyIdentityFields = {
-  instanceId: ModelInstanceIdSchema,
-} as const
-
-export const ModelResidencySchema = Schema.Union(
-  Schema.TaggedStruct("Unloaded", {}),
-  Schema.TaggedStruct("Requested", {}),
-  Schema.TaggedStruct("Loading", {
-    ...ModelResidencyIdentityFields,
-    stage: Schema.Literal("queued", "resolving", "unloading", "loading", "verifying"),
-    progress: Schema.optionalWith(Schema.Number.pipe(Schema.finite(), Schema.between(0, 1)), {
-      as: "Option",
-      exact: true,
-    }),
-    plannedAllocation: Schema.optionalWith(ModelLoadPlanSchema, { as: "Option", exact: true }),
-  }),
-  Schema.TaggedStruct("Ready", {
-    ...ModelResidencyIdentityFields,
-    allocation: ModelInstanceAllocationSchema,
-  }),
-  Schema.TaggedStruct("Stopping", {
-    ...ModelResidencyIdentityFields,
-    reason: ModelReleaseReasonSchema,
-    allocation: ModelStoppingAllocationSchema,
-  }),
-  Schema.TaggedStruct("Failed", { failure: ModelInstanceFailureSchema }),
-)
-export type ModelResidency = typeof ModelResidencySchema.Type
-
-export const ModelInstanceEntrySchema = Schema.Struct({
-  instanceId: ModelInstanceIdSchema,
-  modelId: ProviderModelIdSchema,
-  residency: ModelResidencySchema,
-})
-export type ModelInstanceEntry = typeof ModelInstanceEntrySchema.Type
-
-export const ModelInstancesStateSchema = Schema.Struct({
-  instances: Schema.Array(ModelInstanceEntrySchema),
-}).pipe(Schema.filter(({ instances }) =>
-  new Set(instances.map(({ instanceId }) => instanceId)).size === instances.length,
-{ message: () => "model instance identities must be unique" }))
-export type ModelInstancesState = typeof ModelInstancesStateSchema.Type
-
 export const ModelSlotActionSchema = Schema.Literal("Load", "Stop", "RetryLoad")
 export type ModelSlotAction = typeof ModelSlotActionSchema.Type
 
@@ -1230,25 +1227,6 @@ export const ModelSlotsStateSchema = Schema.Struct({
   Schema.filter((state) => state.slots.primary.slotId === PRIMARY_SLOT_ID
     && state.slots.secondary.slotId === SECONDARY_SLOT_ID,
   { message: () => "each model slot state must carry its containing slot identity" }),
-  Schema.filter((state) => {
-    const local = [state.slots.primary, state.slots.secondary].filter(
-      (slot): slot is ModelSlotConfiguredLocal => slot._tag === "ConfiguredLocal",
-    )
-    const instanceIdsByModel = new Map<string, Set<ModelInstanceId>>()
-    for (const slot of local) {
-      const residency = slot.residency
-      if (residency._tag !== "Loading"
-        && residency._tag !== "Ready"
-        && residency._tag !== "Stopping") continue
-      const ids = instanceIdsByModel.get(slot.selection.providerModelId)
-        ?? new Set<ModelInstanceId>()
-      ids.add(residency.instanceId)
-      instanceIdsByModel.set(slot.selection.providerModelId, ids)
-    }
-    return [...instanceIdsByModel.values()].every((ids) => ids.size === 1)
-  }, {
-    message: () => "matching local slots must share one canonical model instance",
-  }),
 )
 export type ModelSlotsState = typeof ModelSlotsStateSchema.Type
 

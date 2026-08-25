@@ -61,6 +61,9 @@ import {
 } from "@magnitudedev/client-common"
 import {
   PRIMARY_SLOT_ID,
+  acquisitionFailure,
+  acquisitionProgress,
+  installedAcquisition,
   servableModelBundlePackages,
   servableModelBundleTargetPackageId,
   type LocalModel,
@@ -132,10 +135,9 @@ function LoadingNotice({
   )
 }
 const modelFailure = (model: LocalModel): string | null => {
-  if (model.acquisitionState._tag === "Failed")
-    return modelDownloadFailureMessage(model.acquisitionState.failure)
-  if (model.upgradeState._tag === "Failed")
-    return modelDownloadFailureMessage(model.upgradeState.failure)
+  const transferFailure = acquisitionFailure(model.acquisitionState)
+  if (transferFailure !== undefined)
+    return modelDownloadFailureMessage(transferFailure)
   if (model.servingState._tag === "Failed")
     return model.servingState.failure.message
   if (model.servingState._tag === "Assessed") {
@@ -152,24 +154,7 @@ const modelFailure = (model: LocalModel): string | null => {
   return null
 }
 const modelTransfer = (model: LocalModel) =>
-  model.acquisitionState._tag === "Downloading"
-    ? model.acquisitionState
-    : model.upgradeState._tag === "Upgrading"
-    ? model.upgradeState
-    : null
-const modelDownloadId = (model: LocalModel) => {
-  const acquisition = model.acquisitionState
-  if (
-    acquisition._tag === "Downloading" ||
-    acquisition._tag === "Failed" ||
-    acquisition._tag === "Cancelled"
-  ) {
-    return acquisition.downloadId
-  }
-  return model.upgradeState._tag === "Upgrading"
-    ? model.upgradeState.downloadId
-    : null
-}
+  acquisitionProgress(model.acquisitionState) ?? null
 type StatusTone = "neutral" | "success" | "progress" | "warning" | "danger"
 const modelStatus = (
   model: LocalModel,
@@ -194,7 +179,7 @@ const modelStatus = (
     return {
       label: `${
         reconciliation.operation === "Update" ? "Updating" : "Downloading"
-      } ${transferProgress(reconciliation)}%`,
+      } ${transferProgress(reconciliation.progress)}%`,
       tone: "progress",
     }
   if (reconciliation?._tag === "Failed")
@@ -232,25 +217,36 @@ const modelStatus = (
       label: "Unavailable",
       tone: "danger",
     }
-  if (model.acquisitionState._tag === "Installed") {
-    if (model.upgradeState._tag === "Available")
-      return {
-        label: "Update available",
-        tone: "warning",
-      }
+  if (model.acquisitionState._tag === "UpdateAvailable")
+    return {
+      label: "Update available",
+      tone: "warning",
+    }
+  if (installedAcquisition(model.acquisitionState) !== undefined
+    && model.acquisitionState._tag !== "Updating"
+    && model.acquisitionState._tag !== "UpdateFailed")
     return {
       label: "Installed",
       tone: "success",
     }
-  }
-  if (model.acquisitionState._tag === "Downloading")
+  if (model.acquisitionState._tag === "Installing")
     return {
-      label: `Downloading ${transferProgress(model.acquisitionState)}%`,
+      label: `Downloading ${transferProgress(model.acquisitionState.progress)}%`,
       tone: "progress",
     }
-  if (model.acquisitionState._tag === "Failed")
+  if (model.acquisitionState._tag === "Updating")
+    return {
+      label: `Updating ${transferProgress(model.acquisitionState.progress)}%`,
+      tone: "progress",
+    }
+  if (model.acquisitionState._tag === "InstallFailed")
     return {
       label: "Download failed",
+      tone: "danger",
+    }
+  if (model.acquisitionState._tag === "UpdateFailed")
+    return {
+      label: "Update failed",
       tone: "danger",
     }
   return {
@@ -320,10 +316,11 @@ function ModelTransferProgress({
   )
 }
 const installedModelTargetPath = (model: LocalModel): string | null => {
-  if (model.acquisitionState._tag !== "Installed") return null
+  const acquisition = installedAcquisition(model.acquisitionState)
+  if (acquisition === undefined) return null
   const targetPackageId = servableModelBundleTargetPackageId(model.bundle)
   return (
-    model.acquisitionState.packages.find(
+    acquisition.packages.find(
       ({ packageId }) => packageId === targetPackageId
     )?.path ?? null
   )
@@ -522,7 +519,7 @@ function ModelsView(): ReactNode {
   const inventoryLoading = models?.inventoryState._tag === "Initializing"
   const installed =
     models?.models.filter(
-      (model) => model.acquisitionState._tag === "Installed"
+      (model) => installedAcquisition(model.acquisitionState) !== undefined
     ) ?? []
   return (
     <div className="box-border mx-auto flex w-full max-w-[1240px] flex-col gap-[34px] px-[clamp(18px,4vw,48px)] pt-[34px] pb-[72px] max-[640px]:pt-16 max-[620px]:px-3.5">
@@ -600,7 +597,7 @@ const matchesCatalogFilter = (
 ): boolean => {
   const { model } = view
   if (filter === "all") return true
-  return model.acquisitionState._tag === "Installed"
+  return installedAcquisition(model.acquisitionState) !== undefined
 }
 
 const compareCatalogModels = (
@@ -704,13 +701,9 @@ function CatalogInspector({
   const axes = Option.getOrNull(localModelRadarAxes(model))
   const transfer =
     reconciliationState._tag === "Transferring"
-      ? reconciliationState
+      ? reconciliationState.progress
       : modelTransfer(model)
-  const downloadId =
-    reconciliationState._tag === "Transferring"
-      ? reconciliationState.downloadId
-      : modelDownloadId(model)
-  const installed = model.acquisitionState._tag === "Installed"
+  const installed = installedAcquisition(model.acquisitionState) !== undefined
   const starting =
     reconciliationState._tag === "Starting" ||
     reconciliationState._tag === "Removing"
@@ -736,19 +729,18 @@ function CatalogInspector({
           disabled={starting}
           onClick={() => modelActions.install(configurationId)}
         >
-          {model.acquisitionState._tag === "Failed" ? (
+          {model.acquisitionState._tag === "InstallFailed" ? (
             <RefreshCw size={14} />
           ) : (
             <Download size={14} />
           )}
-          {model.acquisitionState._tag === "Failed"
+          {model.acquisitionState._tag === "InstallFailed"
             ? "Retry download"
             : "Download"}
         </Button>
       )}
-      {installed &&
-        (model.upgradeState._tag === "Available" ||
-          model.upgradeState._tag === "Failed") &&
+      {(model.acquisitionState._tag === "UpdateAvailable" ||
+        model.acquisitionState._tag === "UpdateFailed") &&
         configurationId && (
           <Button
             variant="default"
@@ -758,15 +750,15 @@ function CatalogInspector({
             onClick={() => modelActions.install(configurationId)}
           >
             <RefreshCw size={14} />
-            {model.upgradeState._tag === "Failed" ? "Retry update" : "Update"}
+            {model.acquisitionState._tag === "UpdateFailed" ? "Retry update" : "Update"}
           </Button>
         )}
-      {transfer && downloadId && (
+      {transfer && configurationId && (
         <Button
           variant="outline"
           size="default"
           type="button"
-          onClick={() => modelActions.cancel(downloadId)}
+          onClick={() => modelActions.cancel(configurationId)}
         >
           <X size={14} /> Cancel
         </Button>

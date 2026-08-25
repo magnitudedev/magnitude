@@ -41,11 +41,16 @@ independently of command attribution.
 
 ACN owns the complete client-facing model contract:
 
-- `ModelCatalog`: the unified local and remote product view;
+- `ModelCatalog`: the unified local and remote product view. Each local row carries one
+  `acquisitionState` union covering the model's whole materialization lifecycle — disk truth,
+  the single transfer that may exist for it, unacknowledged transfer failure, update
+  availability, and (once any version is installed) runtime residency. Every variant is a
+  reachable product state; progress and failure payloads exist only under the states they
+  belong to, and native occurrence identities (download and instance ids) never appear;
 - `ModelSlots`: durable selection resolved to truthful client-ready Slot states;
-- `ModelInstances`: the client-facing projection of native instance occurrences;
 - `LocalInferenceEnvironment`: normalized hardware and memory presentation facts; and
-- model-management commands and their application-level validation.
+- model-management commands and their application-level validation. Commands are addressed by
+  product identity (`modelId`, `slotId`); ACN resolves the native occurrence.
 
 ACN also owns Magnitude recommendations, warnings, provider status, favorites, Slot reference
 integrity, and the atomic configuration admitted to agent work. It may project ICN facts into
@@ -64,7 +69,7 @@ A service may retain state only when it owns a real domain lifecycle that cannot
 current authoritative read. Such state has a domain-specific representation and invariants. Views
 fully determined by current inputs are computed directly and are not stored:
 
-- instance and hardware queries project current ICN observations directly;
+- hardware queries and per-model residency project current ICN observations directly;
 - the unified Catalog is a pure union of the current remote catalog and local product projection;
 - Slots retain their real resolved lifecycle because ACN owns durable selection, reference
   reconciliation, and admitted agent configuration together; and

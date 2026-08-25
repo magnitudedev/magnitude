@@ -3,7 +3,6 @@ import { testRender } from "@opentui/react/test-utils"
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
-import { ModelDownloadIdSchema } from "@magnitudedev/sdk"
 import {
   makeAcquiringModel,
   makeCatalogModel,
@@ -218,12 +217,13 @@ describe("onboarding model chooser identity", () => {
 
   it("carries the canonical model through acquisition operations", () => {
     const model = makeAcquiringModel({
-      _tag: "Downloading",
-      downloadId: ModelDownloadIdSchema.make("download"),
-      stage: "downloading",
-      completedBytes: 1,
-      totalBytes: 2,
-      bytesPerSecond: Option.none(),
+      _tag: "Installing",
+      progress: {
+        stage: "downloading",
+        completedBytes: 1,
+        totalBytes: 2,
+        bytesPerSecond: Option.none(),
+      },
     })
     const operation: OnboardingModelChooserOperation = {
       _tag: "Downloading",

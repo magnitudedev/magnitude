@@ -4,16 +4,15 @@ import { Client, Mutation } from "@magnitudedev/effect-query"
 import type { AgentClient } from "@magnitudedev/client-common"
 import {
   MagnitudeBoundary,
-  ModelDownloadIdSchema,
   ProviderModelIdSchema,
   SlotIdSchema,
+  installedAcquisition,
   magnitudeImplementationsLayer,
 } from "@magnitudedev/sdk"
 import { Effect, Option, Schema } from "effect"
 import { makeTerminalPlatform } from "../platform/terminal"
 
 const decodeModelId = Schema.decodeUnknown(ProviderModelIdSchema)
-const decodeDownloadId = Schema.decodeUnknown(ModelDownloadIdSchema)
 const decodeSlotId = Schema.decodeUnknown(SlotIdSchema)
 
 const printJson = (value: unknown) => Effect.sync(() => {
@@ -86,22 +85,34 @@ export const registerInferenceCommands = (program: Commander): void => {
     .action(() => runModels((client, registry) =>
       Registry.getResult(registry, Atom.make((get) => get(client.Models.GetCatalog({})).result))))
   downloads.command("cancel")
-    .argument("<download-id>", "Exact download occurrence ID")
-    .action((downloadId) => runModels((client, registry) => decodeDownloadId(downloadId).pipe(
-      Effect.flatMap((decoded) => Mutation.execute(client.Models.CancelModelDownload, { downloadId: decoded })),
+    .argument("<model-id>", "Canonical model ID whose download to cancel")
+    .action((modelId) => runModels((client, registry) => decodeModelId(modelId).pipe(
+      Effect.flatMap((decoded) => Mutation.execute(client.Models.CancelModelDownload, { modelId: decoded })),
       Effect.provideService(Registry.AtomRegistry, registry),
     )))
   downloads.command("acknowledge-failure")
-    .argument("<download-id>", "Exact failed download occurrence ID")
-    .action((downloadId) => runModels((client, registry) => decodeDownloadId(downloadId).pipe(
-      Effect.flatMap((decoded) => Mutation.execute(client.Models.AcknowledgeModelDownloadFailure, { downloadId: decoded })),
+    .argument("<model-id>", "Canonical model ID whose failed download to acknowledge")
+    .action((modelId) => runModels((client, registry) => decodeModelId(modelId).pipe(
+      Effect.flatMap((decoded) => Mutation.execute(client.Models.AcknowledgeModelDownloadFailure, { modelId: decoded })),
       Effect.provideService(Registry.AtomRegistry, registry),
     )))
 
   const instances = program.command("instances").description("Inspect and control model residency")
   instances.command("list")
     .action(() => runModels((client, registry) =>
-      Registry.getResult(registry, Atom.make((get) => get(client.Models.GetInstances({})).result))))
+      Registry.getResult(registry, Atom.make((get) => get(client.Models.GetCatalog({})).result)).pipe(
+        Effect.map((state) => state._tag === "Initializing"
+          ? { models: [] }
+          : {
+              models: state.models.flatMap((entry) => {
+                if (entry._tag !== "Local") return []
+                const installed = installedAcquisition(entry.product.acquisitionState)
+                return installed === undefined
+                  ? []
+                  : [{ modelId: entry.product.modelId, residencyState: installed.residencyState }]
+              }),
+            }),
+      )))
   instances.command("load")
     .argument("<slot-id>", "Configured slot ID")
     .action((slotId) => runModels((client, registry) => decodeSlotId(slotId).pipe(

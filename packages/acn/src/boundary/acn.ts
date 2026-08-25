@@ -27,7 +27,6 @@ import { createId } from "@magnitudedev/generate-id";
 import { Onboarding } from "../onboarding";
 import { AcnChanges } from "../changes";
 import { ModelCatalog } from "../model-catalog";
-import { ModelInstances } from "../model-instances";
 import { ModelCommands } from "../model-commands";
 import { LocalInferenceHardware } from "../local-inference-hardware";
 import { ClientLeaseManager } from "../client-lease-manager";
@@ -70,7 +69,6 @@ export const AcnBoundaryLive = AcnRpc.toLayer(AcnBoundary,
     const onboarding = yield* Onboarding;
     const changes = yield* AcnChanges;
     const modelCatalog = yield* ModelCatalog;
-    const modelInstances = yield* ModelInstances;
     const modelCommands = yield* ModelCommands;
     const localInferenceHardware = yield* LocalInferenceHardware;
     const clientLeases = yield* ClientLeaseManager;
@@ -322,20 +320,17 @@ export const AcnBoundaryLive = AcnRpc.toLayer(AcnBoundary,
       GetModelCatalog: () =>
         observeRpcDefects("GetModelCatalog", modelCatalog.state),
 
-      GetModelInstances: () =>
-        observeRpcDefects("GetModelInstances", modelInstances.state),
-
       GetLocalInferenceEnvironment: () =>
         observeRpcDefects("GetLocalInferenceEnvironment", localInferenceHardware.state),
 
       InstallLocalModel: ({ modelId }) =>
         observeRpcDefects("InstallLocalModel", modelCommands.install(modelId)),
 
-      CancelModelDownload: ({ downloadId }) =>
-        observeRpcDefects("CancelModelDownload", modelCommands.cancelDownload(downloadId)),
+      CancelModelDownload: ({ modelId }) =>
+        observeRpcDefects("CancelModelDownload", modelCommands.cancelDownload(modelId)),
 
-      AcknowledgeModelDownloadFailure: ({ downloadId }) =>
-        observeRpcDefects("AcknowledgeModelDownloadFailure", modelCommands.acknowledgeDownloadFailure(downloadId)),
+      AcknowledgeModelDownloadFailure: ({ modelId }) =>
+        observeRpcDefects("AcknowledgeModelDownloadFailure", modelCommands.acknowledgeDownloadFailure(modelId)),
 
       UninstallLocalModel: ({ modelId }) =>
         observeRpcDefects("UninstallLocalModel", modelCommands.uninstall(modelId)),

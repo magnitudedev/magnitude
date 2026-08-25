@@ -1,7 +1,6 @@
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 import {
-  ModelInstanceIdSchema,
   ModelSlotConfiguredLocal,
   ModelSlotUnassigned,
   PRIMARY_SLOT_ID,
@@ -27,7 +26,6 @@ const descriptor = {
   displayName: "Local model",
   variantLabel: Option.none(),
 }
-const instanceId = ModelInstanceIdSchema.make("instance")
 const allocation = {
   contextWindowTokens: 4096,
   parallelSequences: 2,
@@ -47,7 +45,7 @@ const configured = (lifecycle: {
   selection,
   descriptor,
   availability: { _tag: "Available" },
-  residency: { ...lifecycle, instanceId },
+  residency: lifecycle,
   actions: lifecycle._tag === "Ready" || lifecycle._tag === "Loading" ? ["Stop"] : [],
 })
 

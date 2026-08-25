@@ -7,9 +7,7 @@ import {
   AssessmentEnvironmentIdSchema,
   CatalogModelIdSchema,
   CatalogVariantIdSchema,
-  ModelDownloadIdSchema,
   ModelAssessmentIdSchema,
-  ModelInstanceIdSchema,
   ModelPackageIdSchema,
   ModelReleaseDateSchema,
   ModelSlotConfiguredLocal,
@@ -41,8 +39,7 @@ import {
 } from "./setup-state"
 
 const providerModelId = ProviderModelIdSchema.make("setup-model:gguf:q4")
-const instanceId = ModelInstanceIdSchema.make("setup-instance")
-const downloadId = ModelDownloadIdSchema.make("setup-attempt")
+const instanceId = "setup-instance"
 const reasoningEffort = ReasoningEffortSchema.make("none")
 const localProviderId = ProviderIdSchema.make("local")
 const allocation = {
@@ -95,14 +92,14 @@ const makeModel = (installed: boolean): LocalModel => {
         qualityNotes: [],
       },
     },
-    upgradeState: installed ? { _tag: "Current" } : { _tag: "NotApplicable" },
     acquisitionState: installed
       ? {
           _tag: "Installed",
           installedBytes: 1,
           packages: [{ packageId: bundle.package.id, path: "/models/setup.gguf", origin: "Magnitude" }],
+          residencyState: { _tag: "Unloaded" },
         }
-      : { _tag: "NotInstalled", completedBytes: 0, totalBytes: 1 },
+      : { _tag: "NotInstalled" },
     servingState: {
       _tag: "Assessed",
       capabilities: {
@@ -177,10 +174,9 @@ const configuredSlots = (
       residency: lifecycle === "None" || lifecycle === "Stopped"
         ? { _tag: "Unloaded" }
         : lifecycle === "Ready"
-          ? { _tag: "Ready", instanceId: id, allocation }
+          ? { _tag: "Ready", allocation }
           : {
               _tag: "Loading",
-              instanceId: id,
               stage: "loading",
               progress: Option.none(),
               plannedAllocation: Option.none(),
@@ -277,17 +273,18 @@ describe("projectOnboardingModelSetupContent", () => {
 })
 
 describe("installationAdmissionIsVisible", () => {
-  it("accepts the exact admitted model download before a provider identity exists", () => {
+  it("accepts the admitted model transfer before a provider identity exists", () => {
     const uninstalled = makeModel(false)
     const downloading: LocalModel = {
       ...uninstalled,
       acquisitionState: {
-        _tag: "Downloading",
-        downloadId,
-        stage: "downloading",
-        completedBytes: 0,
-        totalBytes: 1,
-        bytesPerSecond: Option.none(),
+        _tag: "Installing",
+        progress: {
+          stage: "downloading",
+          completedBytes: 0,
+          totalBytes: 1,
+          bytesPerSecond: Option.none(),
+        },
       },
     }
     const state: LocalModelsState = {
@@ -299,33 +296,21 @@ describe("installationAdmissionIsVisible", () => {
     expect(installationAdmissionIsVisible(state, providerModelId, {
       _tag: "DownloadAdmitted",
       providerModelId,
-      downloadId,
     })).toBe(true)
     expect(Option.isNone(localModelProviderModelId(downloading))).toBe(true)
   })
 
-  it("rejects a different model-download occurrence for the same configuration", () => {
+  it("rejects an admitted download whose model shows no remaining transfer", () => {
     const uninstalled = makeModel(false)
     const state: LocalModelsState = {
       inventoryState: { _tag: "Ready" },
-      models: [{
-        ...uninstalled,
-        acquisitionState: {
-          _tag: "Downloading",
-          downloadId: ModelDownloadIdSchema.make("replacement-download"),
-          stage: "downloading",
-          completedBytes: 0,
-          totalBytes: 1,
-          bytesPerSecond: Option.none(),
-        },
-      }],
+      models: [uninstalled],
       discoveryState: { _tag: "Ready", progress: [] },
     }
 
     expect(installationAdmissionIsVisible(state, providerModelId, {
       _tag: "DownloadAdmitted",
       providerModelId,
-      downloadId,
     })).toBe(false)
   })
 
@@ -349,13 +334,18 @@ describe("installationAdmissionIsVisible", () => {
     })).toBe(true)
   })
 
-  it("does not complete update admission until the exact occurrence is visible", () => {
-    const installed = {
-      ...makeModel(true),
-      upgradeState: {
-        _tag: "Available" as const,
-        missingPackageIds: [],
-        supersededPackageIds: [],
+  it("does not complete update admission until the update transfer is visible", () => {
+    const base = makeModel(true)
+    const installedFields = base.acquisitionState._tag === "Installed"
+      ? base.acquisitionState
+      : (() => { throw new Error("expected an installed fixture") })()
+    const installed: LocalModel = {
+      ...base,
+      acquisitionState: {
+        _tag: "UpdateAvailable",
+        installedBytes: installedFields.installedBytes,
+        packages: installedFields.packages,
+        residencyState: installedFields.residencyState,
       },
     }
     const state = {
@@ -363,19 +353,23 @@ describe("installationAdmissionIsVisible", () => {
       models: [installed],
       discoveryState: { _tag: "Ready" as const, progress: [] },
     }
-    const admission = { _tag: "DownloadAdmitted" as const, providerModelId, downloadId }
+    const admission = { _tag: "DownloadAdmitted" as const, providerModelId }
     expect(installationAdmissionIsVisible(state, providerModelId, admission)).toBe(false)
     expect(installationAdmissionIsVisible({
       ...state,
       models: [{
         ...installed,
-        upgradeState: {
-          _tag: "Upgrading",
-          downloadId,
-          stage: "downloading",
-          completedBytes: 0,
-          totalBytes: 1,
-          bytesPerSecond: Option.none(),
+        acquisitionState: {
+          _tag: "Updating",
+          installedBytes: installedFields.installedBytes,
+          packages: installedFields.packages,
+          residencyState: installedFields.residencyState,
+          progress: {
+            stage: "downloading",
+            completedBytes: 0,
+            totalBytes: 1,
+            bytesPerSecond: Option.none(),
+          },
         },
       }],
     }, providerModelId, admission)).toBe(true)
@@ -406,12 +400,13 @@ const makeHarness = (options: HarnessOptions) => {
     model = {
       ...model,
       acquisitionState: {
-        _tag: "Downloading",
-        downloadId,
-        stage: "downloading",
-        completedBytes: 0,
-        totalBytes: 1,
-        bytesPerSecond: Option.none(),
+        _tag: "Installing",
+        progress: {
+          stage: "downloading",
+          completedBytes: 0,
+          totalBytes: 1,
+          bytesPerSecond: Option.none(),
+        },
       },
       servingState: {
         ...model.servingState,
@@ -513,10 +508,7 @@ const makeHarness = (options: HarnessOptions) => {
               return {
                 ...uninstalled,
                 acquisitionState: {
-                  _tag: "Failed" as const,
-                  downloadId,
-                  completedBytes: 0,
-                  totalBytes: 1,
+                  _tag: "InstallFailed" as const,
                   failure: options.downloadFailure,
                 },
               }
@@ -527,12 +519,13 @@ const makeHarness = (options: HarnessOptions) => {
               return uninstalled.servingState._tag === "Assessed" ? {
                 ...uninstalled,
                 acquisitionState: {
-                  _tag: "Downloading" as const,
-                  downloadId,
-                  stage: "downloading" as const,
-                  completedBytes: 0,
-                  totalBytes: 1,
-                  bytesPerSecond: Option.none(),
+                  _tag: "Installing" as const,
+                  progress: {
+                    stage: "downloading" as const,
+                    completedBytes: 0,
+                    totalBytes: 1,
+                    bytesPerSecond: Option.none(),
+                  },
                 },
                 servingState: {
                   ...uninstalled.servingState,
@@ -545,7 +538,6 @@ const makeHarness = (options: HarnessOptions) => {
         return Queue.offer(changes, { query: "GetModelCatalog" }).pipe(Effect.as({
           _tag: "DownloadAdmitted",
           providerModelId,
-          downloadId,
         }))
       }
       case "AssignModelSlot": {
@@ -574,24 +566,19 @@ const makeHarness = (options: HarnessOptions) => {
         // the instance is ready. Cancelling this client wait must only detach
         // from the request; the shared ICN acquisition continues.
         return Queue.offer(changes, { query: "GetModelSlots" }).pipe(
-          Effect.zipRight(options.keepLoading ? Effect.never : Effect.succeed({ instanceId })),
+          Effect.zipRight(options.keepLoading ? Effect.never : Effect.succeed({})),
         )
       case "StopModelSlot":
         stoppedInstances.push(instanceId)
         slots = configuredSlots("Stopped", instanceId)
-        return Queue.offer(changes, { query: "GetModelSlots" }).pipe(Effect.as({ instanceId }))
+        return Queue.offer(changes, { query: "GetModelSlots" }).pipe(Effect.as({}))
       case "CancelModelDownload":
-        cancelledDownloads.push(payload.downloadId)
+        cancelledDownloads.push(payload.modelId)
         models = {
           ...models,
           models: [{
             ...model,
-            acquisitionState: {
-              _tag: "Cancelled",
-              downloadId,
-              completedBytes: 0,
-              totalBytes: 1,
-            },
+            acquisitionState: { _tag: "NotInstalled" },
           }],
         }
         return Queue.offer(changes, { query: "GetModelCatalog" }).pipe(Effect.as({}))
@@ -1110,7 +1097,7 @@ describe("OnboardingModelSetup", () => {
     await Effect.runPromise(waitForCall(harness.calls, "InstallLocalModel"))
     await Effect.runPromise(execute(harness.registry, harness.service.cancel, undefined))
 
-    expect(harness.cancelledDownloads).toEqual([downloadId])
+    expect(harness.cancelledDownloads).toEqual([providerModelId])
     expect(harness.calls).not.toContain("AssignModelSlot")
     expect(harness.calls).not.toContain("LoadModelSlot")
     harness.registry.dispose()

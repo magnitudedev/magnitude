@@ -1,6 +1,5 @@
 import { describe, expect, test } from "vitest"
 import { Option } from "effect"
-import { ModelDownloadIdSchema } from "@magnitudedev/sdk"
 import { makeModel, makeView } from "../local-inference/test-fixtures"
 import { modelMenusLocalModelsStateEquivalent } from "./state"
 
@@ -68,12 +67,13 @@ describe("model-menu state equality", () => {
       models: left.models.map((model) => ({
         ...model,
         acquisitionState: {
-          _tag: "Downloading" as const,
-          downloadId: ModelDownloadIdSchema.make("download"),
-          stage: "downloading" as const,
-          completedBytes: 1,
-          totalBytes: 2,
-          bytesPerSecond: Option.none(),
+          _tag: "Installing" as const,
+          progress: {
+            stage: "downloading" as const,
+            completedBytes: 1,
+            totalBytes: 2,
+            bytesPerSecond: Option.none(),
+          },
         },
       })),
     }
