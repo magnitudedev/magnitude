@@ -9,6 +9,7 @@ import {
   truncateToDisplayWidth,
   formatLocalModelDisplayName,
   formatMemorySize,
+  type OnboardingModelLoadStatus,
   type LocalModelOption,
   type LocalInferenceHardwareResult,
 } from "@magnitudedev/client-common"
@@ -16,7 +17,6 @@ import type {
   LocalModel,
   LocalModelMemory,
   LocalModelRecommendationProgressStep,
-  ModelInstanceFailure,
   ProviderModelId,
 } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
@@ -48,7 +48,8 @@ import {
 import { discoveredModelLocation } from "./discovered-model"
 import {
   OnboardingModelDownloadProgress,
-  ONBOARDING_MODEL_DOWNLOAD_ROWS,
+  OnboardingModelLoadProgress,
+  ONBOARDING_MODEL_OPERATION_ROWS,
 } from "./model-status"
 import { isWideSetupLayout, SetupFrame, setupBodyWidth, type SetupStage } from "./setup-frame"
 
@@ -282,8 +283,7 @@ export type OnboardingModelChooserOperation =
       readonly _tag: "Activating"
       readonly providerModelId: ProviderModelId
       readonly model: LocalModel
-      readonly phase: "Loading" | "Stopping" | "Ready" | "Failed"
-      readonly failure: ModelInstanceFailure | null
+      readonly status: OnboardingModelLoadStatus
       readonly onRetry: () => void
       readonly onChooseAnother: () => void
     }
@@ -300,12 +300,12 @@ export const onboardingSelectionEnterAction = (
 export const onboardingModelDetailRows = ({
   recommendation,
   memoryWarning,
-  downloadRows,
+  operationRows,
   modelSummaryRadarGap,
 }: {
   readonly recommendation: boolean
   readonly memoryWarning: boolean
-  readonly downloadRows: number
+  readonly operationRows: number
   readonly modelSummaryRadarGap: boolean
 }): number => MODEL_TITLE_ROWS
   + MODEL_SUMMARY_ROWS
@@ -313,25 +313,25 @@ export const onboardingModelDetailRows = ({
   + PENTAGON_RADAR_ROWS
   + (recommendation
     ? RECOMMENDATION_HEADING_ROWS + RECOMMENDATION_ROWS
-    : (memoryWarning ? 1 : 0) + downloadRows)
+    : (memoryWarning ? 1 : 0) + operationRows)
 
 const ONBOARDING_IDLE_MODEL_DETAIL_ROWS = onboardingModelDetailRows({
   recommendation: true,
   memoryWarning: false,
-  downloadRows: 0,
+  operationRows: 0,
   modelSummaryRadarGap: true,
 })
 
-const ONBOARDING_DOWNLOADING_DETAIL_ROWS = onboardingModelDetailRows({
+const ONBOARDING_OPERATION_DETAIL_ROWS = onboardingModelDetailRows({
   recommendation: false,
   memoryWarning: false,
-  downloadRows: ONBOARDING_MODEL_DOWNLOAD_ROWS,
+  operationRows: ONBOARDING_MODEL_OPERATION_ROWS,
   modelSummaryRadarGap: true,
 })
 
 export const ONBOARDING_MODEL_DETAIL_ROWS = Math.max(
   ONBOARDING_IDLE_MODEL_DETAIL_ROWS,
-  ONBOARDING_DOWNLOADING_DETAIL_ROWS,
+  ONBOARDING_OPERATION_DETAIL_ROWS,
 )
 
 export const onboardingLocalModelViewportRows = ({
@@ -412,6 +412,7 @@ export function OnboardingModelChooser({
   const leftWidth = wide ? WIDE_LIST_WIDTH : Math.max(1, cardWidth - 6)
   const detailWidth = wide ? Math.max(1, cardWidth - leftWidth - 9) : leftWidth
   const downloadOperation = operation?._tag === "Downloading" ? operation : null
+  const loadOperation = operation?._tag === "Activating" ? operation : null
   const detailContentRows = ONBOARDING_MODEL_DETAIL_ROWS
   const detailPanelRows = detailContentRows + (wide ? 0 : 1)
   const downloadViewportRows = Math.min(SECTION_VIEWPORT_ROWS, downloads.length)
@@ -578,6 +579,7 @@ export function OnboardingModelChooser({
   const showRecommendationExplanation = selected !== undefined
     && selected.recommendations.length > 0
     && operation?._tag !== "Downloading"
+    && operation?._tag !== "Activating"
   const emptySelectionMessage = "No compatible models found."
   const regularDetails = detailModel ? (
     <>
@@ -650,7 +652,7 @@ export function OnboardingModelChooser({
             )}
         </box>
       )}
-      {!showRecommendationExplanation && downloadOperation === null && memoryWarning && (
+      {!showRecommendationExplanation && downloadOperation === null && loadOperation === null && memoryWarning && (
         <text style={{ fg: theme.status.warning, width: detailWidth }} wrapMode="none">{memoryWarning}</text>
       )}
       <box style={{ flexGrow: 1 }} />
@@ -661,21 +663,18 @@ export function OnboardingModelChooser({
           operation={downloadOperation}
         />
       )}
+      {loadOperation !== null && (
+        <OnboardingModelLoadProgress
+          status={loadOperation.status}
+          width={detailWidth}
+          onRetry={loadOperation.onRetry}
+          onChooseAnother={loadOperation.onChooseAnother}
+        />
+      )}
     </>
   ) : (
     <text style={{ fg: theme.text.supporting }}>{emptySelectionMessage}</text>
   )
-  const detailsContent = operation?._tag === "Activating" ? (
-    <OnboardingModelLoadingDetails
-      displayName={formatLocalModelDisplayName(operation.model)}
-      width={detailWidth}
-      height={detailContentRows}
-      phase={operation.phase}
-      failed={operation.failure}
-      onRetry={operation.onRetry}
-      onChooseAnother={operation.onChooseAnother}
-    />
-  ) : regularDetails
   const details = (
     <box style={{
       flexDirection: "column",
@@ -691,7 +690,7 @@ export function OnboardingModelChooser({
       borderColor: theme.border.standard,
       customBorderChars: BOX_CHARS,
     }}>
-      {detailsContent}
+      {regularDetails}
     </box>
   )
   const enterAction = onboardingSelectionEnterAction(selected?.kind)
@@ -706,11 +705,11 @@ export function OnboardingModelChooser({
       : operation?._tag === "Configuring"
         ? "Configuring model…"
       : operation?._tag === "Activating"
-        ? operation.phase === "Failed"
+        ? operation.status._tag === "Failed"
           ? "Model loading failed"
-          : operation.phase === "Stopping"
+          : operation.status._tag === "Stopping"
             ? "Stopping model…"
-            : operation.phase === "Loading"
+            : operation.status._tag === "Preparing" || operation.status._tag === "Loading"
               ? "Loading model into memory…"
               : "Finishing setup…"
     : Option.exists(
@@ -824,105 +823,5 @@ export function OnboardingModelExiting({
     >
       <text style={{ fg: theme.text.body }}>{spinner} Saving onboarding completion…</text>
     </OnboardingSetupCard>
-  )
-}
-
-function OnboardingModelLoadingDetails({
-  displayName,
-  width,
-  height,
-  phase,
-  failed,
-  onRetry,
-  onChooseAnother,
-}: {
-  readonly displayName: string
-  readonly width: number
-  readonly height: number
-  readonly phase: "Loading" | "Stopping" | "Ready" | "Failed"
-  readonly failed: ModelInstanceFailure | null
-  readonly onRetry: () => void
-  readonly onChooseAnother: () => void
-}): ReactNode {
-  const theme = useTheme()
-  const [hovered, setHovered] = useState<"retry" | "choose" | null>(null)
-  const spinner = useSpinnerFrame(failed === null)
-  return (
-    <box style={{
-      width,
-      height,
-      minHeight: height,
-      maxHeight: height,
-      flexShrink: 0,
-      flexDirection: "column",
-      overflow: "hidden",
-    }}>
-      <DetailRow width={width}>
-        <text style={{ fg: theme.text.body, width }} attributes={TextAttributes.BOLD} wrapMode="none">
-          {truncateToDisplayWidth(
-            failed
-              ? `Couldn’t load ${displayName}`
-              : phase === "Stopping"
-                ? `Stopping ${displayName}`
-                : phase === "Loading"
-                  ? `Loading ${displayName} into memory`
-                  : `Finishing setup for ${displayName}`,
-            width,
-          )}
-        </text>
-      </DetailRow>
-      <box style={{ height: 1 }} />
-      {failed ? (
-        <>
-          {"_tag" in failed && failed._tag === "LowMemory" ? (
-            <box style={{ width, flexShrink: 0, flexDirection: "column" }}>
-              <text style={{ fg: theme.status.warning, width }} attributes={TextAttributes.BOLD}>
-                ! Not enough memory available
-              </text>
-              <box style={{ height: 1 }} />
-              <text style={{ fg: theme.text.body, width }} wrapMode="word">
-                {`Free at least ${formatMemorySize(failed.minimumAdditionalAvailableBytes, { rounding: "up" })} and try again.`}
-              </text>
-              <text style={{ fg: theme.text.supporting, width }} wrapMode="word">
-                Close memory-intensive applications or choose a smaller model.
-              </text>
-              <box style={{ height: 1 }} />
-              <text style={{ fg: theme.text.supporting, width }}>
-                {`Needed at attempt    ${formatMemorySize(failed.loadBoundaryBytes)}`}
-              </text>
-              <text style={{ fg: theme.text.supporting, width }}>
-                {`Available at attempt ${formatMemorySize(failed.allocationHeadroomBytes)}`}
-              </text>
-              <box style={{ height: 1 }} />
-            </box>
-          ) : (
-            <box style={{ width, height: 5, flexShrink: 0, flexDirection: "column", overflow: "hidden" }}>
-              <text style={{ fg: theme.status.failure, width }} wrapMode="word">{failed.message}</text>
-            </box>
-          )}
-          <box style={{ flexDirection: "row", gap: 2 }}>
-            <Button onClick={onRetry} onMouseOver={() => setHovered("retry")} onMouseOut={() => setHovered(null)}>
-              <text style={{ fg: hovered === "retry" ? theme.accent : theme.text.body }}>Retry loading</text>
-            </Button>
-            <Button onClick={onChooseAnother} onMouseOver={() => setHovered("choose")} onMouseOut={() => setHovered(null)}>
-              <text style={{ fg: hovered === "choose" ? theme.accent : theme.text.body }}>Choose another model</text>
-            </Button>
-          </box>
-        </>
-      ) : (
-        <box style={{ width, flexDirection: "row" }}>
-          <text style={{ fg: theme.accent, width: 2, flexShrink: 0 }} wrapMode="none">
-            {spinner}
-          </text>
-          <text style={{ fg: theme.text.supporting, width: Math.max(1, width - 2) }} wrapMode="none">
-            {phase === "Loading"
-              ? "Loading model weights…"
-              : phase === "Stopping"
-                ? "Stopping model…"
-                : "Finishing setup…"}
-          </text>
-        </box>
-      )}
-    </box>
   )
 }

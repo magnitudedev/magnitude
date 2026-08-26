@@ -180,6 +180,67 @@ pub struct ResponseOutputTokenDetails {
     pub reasoning_tokens: u64,
 }
 
+// One constructor per output item kind, shared by the non-streaming response
+// and the streaming projection. Both paths must emit identical item shapes:
+// clients replay emitted items verbatim as later input, and the replay
+// closure test exercises these exact constructors.
+pub(crate) fn reasoning_item(
+    id: String,
+    status: &'static str,
+    text: Option<String>,
+) -> ResponseOutputItem {
+    ResponseOutputItem::Reasoning {
+        id,
+        status,
+        summary: Vec::new(),
+        content: text
+            .map(|text| {
+                vec![ResponseReasoningContent {
+                    r#type: "reasoning_text",
+                    text,
+                }]
+            })
+            .unwrap_or_default(),
+    }
+}
+
+pub(crate) fn message_item(
+    id: String,
+    status: &'static str,
+    text: Option<String>,
+) -> ResponseOutputItem {
+    ResponseOutputItem::Message {
+        id,
+        status,
+        role: "assistant",
+        content: text
+            .map(|text| {
+                vec![ResponseOutputContent {
+                    r#type: "output_text",
+                    text,
+                    annotations: Vec::new(),
+                }]
+            })
+            .unwrap_or_default(),
+    }
+}
+
+pub(crate) fn function_call_item(
+    id: String,
+    status: &'static str,
+    call_id: String,
+    name: String,
+    arguments: String,
+) -> ResponseOutputItem {
+    ResponseOutputItem::FunctionCall {
+        id,
+        status,
+        call_id,
+        name,
+        arguments,
+    }
+}
+
 pub fn from_result(
     id: &str,
     created_at: u64,
@@ -189,38 +250,29 @@ pub fn from_result(
 ) -> ResponseObject {
     let mut output = Vec::new();
     if let Some(reasoning) = result.output().reasoning() {
-        output.push(ResponseOutputItem::Reasoning {
-            id: format!("rs_{}", &id[5..]),
-            status: "completed",
-            summary: Vec::new(),
-            content: vec![ResponseReasoningContent {
-                r#type: "reasoning_text",
-                text: reasoning.as_str().to_owned(),
-            }],
-        });
+        output.push(reasoning_item(
+            format!("rs_{}", &id[5..]),
+            "completed",
+            Some(reasoning.as_str().to_owned()),
+        ));
     }
     if let Some(text) = result.output().text() {
-        output.push(ResponseOutputItem::Message {
-            id: format!("msg_{}", &id[5..]),
-            status: "completed",
-            role: "assistant",
-            content: vec![ResponseOutputContent {
-                r#type: "output_text",
-                text: text.as_str().to_owned(),
-                annotations: Vec::new(),
-            }],
-        });
+        output.push(message_item(
+            format!("msg_{}", &id[5..]),
+            "completed",
+            Some(text.as_str().to_owned()),
+        ));
     }
     if !result.output().tool_calls().is_empty() {
         output.extend(result.output().tool_calls().iter().map(|call| {
-            ResponseOutputItem::FunctionCall {
-                id: format!("fc_{}", call.id().as_str()),
-                status: "completed",
-                call_id: call.id().as_str().to_owned(),
-                name: call.name().as_str().to_owned(),
-                arguments: serde_json::to_string(call.input().as_map())
+            function_call_item(
+                format!("fc_{}", call.id().as_str()),
+                "completed",
+                call.id().as_str().to_owned(),
+                call.name().as_str().to_owned(),
+                serde_json::to_string(call.input().as_map())
                     .expect("validated tool input is serializable"),
-            }
+            )
         }));
     }
     let incomplete = matches!(result.termination(), domain::Termination::OutputLimit);
@@ -448,10 +500,10 @@ impl StreamProjector {
                     None => {
                         let index = self.allocate_output();
                         self.reasoning_output_index = Some(index);
-                        let item_id = self.reasoning_id();
+                        let item = reasoning_item(self.reasoning_id(), "in_progress", None);
                         self.require(self.send("response.output_item.added", object(serde_json::json!({
                             "output_index": index,
-                            "item": { "id": item_id, "type": "reasoning", "status": "in_progress", "summary": [], "content": [] },
+                            "item": item,
                         }))))?;
                         index
                     }
@@ -473,9 +525,10 @@ impl StreamProjector {
                     None => {
                         let index = self.allocate_output();
                         self.message_output_index = Some(index);
+                        let item = message_item(self.message_id.clone(), "in_progress", None);
                         self.require(self.send("response.output_item.added", object(serde_json::json!({
                             "output_index": index,
-                            "item": { "id": self.message_id, "type": "message", "status": "in_progress", "role": "assistant", "content": [] },
+                            "item": item,
                         }))))?;
                         self.require(self.send("response.content_part.added", object(serde_json::json!({
                             "item_id": self.message_id, "output_index": index, "content_index": 0,
@@ -510,12 +563,18 @@ impl StreamProjector {
                         String::new(),
                     ),
                 );
+                let item = function_call_item(
+                    item_id,
+                    "in_progress",
+                    call_id,
+                    name,
+                    String::new(),
+                );
                 self.require(self.send(
                     "response.output_item.added",
                     object(serde_json::json!({
                         "output_index": output_index,
-                        "item": { "id": item_id, "type": "function_call", "status": "in_progress",
-                            "call_id": call_id, "name": name, "arguments": "" },
+                        "item": item,
                     })),
                 ))
             }
@@ -549,11 +608,12 @@ impl StreamProjector {
         let mut indexed = Vec::new();
         if let Some(index) = self.reasoning_output_index {
             let item_id = self.reasoning_id();
-            let item = serde_json::json!({
-                "id": item_id, "type": "reasoning", "status": "completed",
-                "summary": [],
-                "content": [{ "type": "reasoning_text", "text": self.reasoning }],
-            });
+            let item = serde_json::to_value(reasoning_item(
+                item_id.clone(),
+                "completed",
+                Some(self.reasoning.clone()),
+            ))
+            .expect("output item is serializable");
             for (kind, data) in [
                 (
                     "response.reasoning_text.done",
@@ -573,13 +633,13 @@ impl StreamProjector {
             indexed.push((index, item));
         }
         if let Some(index) = self.message_output_index {
-            let content = serde_json::json!([{
-                "type": "output_text", "text": self.text, "annotations": [],
-            }]);
-            let item = serde_json::json!({
-                "id": self.message_id, "type": "message", "status": "completed",
-                "role": "assistant", "content": content,
-            });
+            let item = serde_json::to_value(message_item(
+                self.message_id.clone(),
+                "completed",
+                Some(self.text.clone()),
+            ))
+            .expect("output item is serializable");
+            let content = item["content"].clone();
             for (kind, data) in [
                 (
                     "response.output_text.done",
@@ -606,10 +666,14 @@ impl StreamProjector {
             indexed.push((index, item));
         }
         for (output_index, item_id, call_id, name, arguments) in self.tool_calls.values() {
-            let item = serde_json::json!({
-                "id": item_id, "type": "function_call", "status": "completed",
-                "call_id": call_id, "name": name, "arguments": arguments,
-            });
+            let item = serde_json::to_value(function_call_item(
+                item_id.clone(),
+                "completed",
+                call_id.clone(),
+                name.clone(),
+                arguments.clone(),
+            ))
+            .expect("output item is serializable");
             for (kind, data) in [
                 (
                     "response.function_call_arguments.done",
@@ -742,6 +806,12 @@ pub enum ResponseInput {
     Items(Vec<ResponseInputItem>),
 }
 
+// Untagged because the protocol's shorthand message form carries no `type`
+// discriminator; variants are matched by shape, and each explicit `type`
+// field is a single-literal enum so a present tag is still verified.
+// Replay closure invariant: every item `ResponseOutputItem` can emit must
+// parse here, because clients replay our output verbatim as later input
+// (pinned by `responses_output_items_replay_as_input`).
 #[derive(Debug, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum ResponseInputItem {
@@ -795,6 +865,8 @@ pub struct ResponseFunctionCall {
     pub r#type: ResponseFunctionCallType,
     #[serde(default)]
     pub id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
     pub call_id: String,
     pub name: String,
     pub arguments: String,
@@ -806,6 +878,8 @@ pub struct ResponseFunctionCallOutput {
     pub r#type: ResponseFunctionCallOutputType,
     #[serde(default)]
     pub id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
     pub call_id: String,
     pub output: FunctionCallOutput,
 }
@@ -919,23 +993,56 @@ pub enum ResponseContentPart {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
+// Function declarations are the executable semantic core and stay strictly
+// typed. Every other declaration (namespace, web_search, and any future
+// hosted tool type) is opaque by policy: never locally executable, retained
+// verbatim only for response projection — so its shape is deliberately not
+// modeled and new hosted tool types require no adapter change.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum ResponseTool {
-    Function {
-        name: String,
-        description: Option<String>,
-        parameters: Map<String, Value>,
-        strict: Option<bool>,
-    },
-    Namespace {
-        name: String,
-        description: String,
-        tools: Vec<Value>,
-    },
-    WebSearch {
-        external_web_access: Option<bool>,
-    },
+    Function(ResponseFunctionTool),
+    Other(Value),
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseFunctionTool {
+    pub r#type: ResponseFunctionType,
+    pub name: String,
+    pub description: Option<String>,
+    pub parameters: Map<String, Value>,
+    pub strict: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseFunctionType {
+    Function,
+}
+
+impl PartialSchema for ResponseTool {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        AnyOfBuilder::new()
+            .item(Ref::from_schema_name(ResponseFunctionTool::name()))
+            .item(utoipa::openapi::schema::ObjectBuilder::new())
+            .into()
+    }
+}
+
+impl ToSchema for ResponseTool {
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        schemas.push((
+            ResponseFunctionTool::name().into_owned(),
+            ResponseFunctionTool::schema(),
+        ));
+        ResponseFunctionTool::schemas(schemas);
+    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1014,27 +1121,26 @@ pub(crate) fn adapt(request: ResponseCreateRequest) -> Result<AdaptedResponseReq
         return Err(ApiError::invalid("automatic truncation is not supported"));
     }
     let context = context(request.instructions, request.input)?;
-    let definitions = request
-        .tools
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|tool| match tool {
-            ResponseTool::Function {
-                name,
-                description,
-                parameters,
-                ..
-            } => Some((name, description, parameters)),
-            ResponseTool::Namespace { .. } | ResponseTool::WebSearch { .. } => None,
-        })
-        .map(|(name, description, parameters)| {
-            Ok(domain::ToolDefinition::new(
-                domain::ToolName::try_new(name).map_err(domain_error)?,
-                description,
-                domain::JsonObject::new(parameters),
-            ))
-        })
-        .collect::<Result<Vec<_>, ApiError>>()?;
+    let mut definitions = Vec::new();
+    for tool in request.tools.unwrap_or_default() {
+        match tool {
+            ResponseTool::Function(function) => definitions.push(domain::ToolDefinition::new(
+                domain::ToolName::try_new(function.name).map_err(domain_error)?,
+                function.description,
+                domain::JsonObject::new(function.parameters),
+            )),
+            // Opaque declarations are projection-only. The one guard: a
+            // function-typed declaration that failed strict parsing must stay
+            // a request error, never a silent demotion to non-executable.
+            ResponseTool::Other(value) => match value.get("type").and_then(Value::as_str) {
+                Some("function") => {
+                    return Err(ApiError::invalid("malformed function tool declaration"));
+                }
+                Some(_) => {}
+                None => return Err(ApiError::invalid("tool declarations require a type")),
+            },
+        }
+    }
     let choice = match request.tool_choice {
         None | Some(ResponseToolChoice::Mode(ResponseToolChoiceMode::Auto)) => {
             domain::ToolChoice::Auto

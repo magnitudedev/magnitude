@@ -3,8 +3,10 @@ import { TextAttributes, type KeyEvent } from "@opentui/core"
 import { useKeyboard } from "@opentui/react"
 import { Option } from "effect"
 import {
+  formatMemorySize,
   formatStorageSize,
   formatTransferRate,
+  type OnboardingModelLoadStatus,
 } from "@magnitudedev/client-common"
 import { acquisitionProgress, type LocalModel, type ProviderModelId } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
@@ -20,6 +22,29 @@ const progressBar = (fraction: number, width: number): string => {
   return `${"█".repeat(filled)}${"░".repeat(Math.max(0, width - filled))}`
 }
 
+const ModelOperationProgressBar = ({
+  progress,
+  width,
+}: {
+  readonly progress: Option.Option<number>
+  readonly width: number
+}): ReactNode => {
+  const theme = useTheme()
+  const percentageLabel = Option.match(progress, {
+    onNone: () => "0%",
+    onSome: (fraction) => `${Math.round(Math.max(0, Math.min(1, fraction)) * 100)}%`,
+  })
+  const barWidth = Math.max(8, width - 6)
+  return (
+    <text style={{ width }} wrapMode="none">
+      <span style={{ fg: theme.accent }}>
+        {progressBar(Option.getOrElse(progress, () => 0), barWidth)}
+      </span>
+      <span style={{ fg: theme.text.supporting }}>{`  ${percentageLabel.padStart(4)}`}</span>
+    </text>
+  )
+}
+
 type ConfirmationChoice = "yes" | "no"
 
 export interface OnboardingModelDownloadOperation {
@@ -28,7 +53,7 @@ export interface OnboardingModelDownloadOperation {
   readonly onCancel: () => void
 }
 
-export const ONBOARDING_MODEL_DOWNLOAD_ROWS = 4
+export const ONBOARDING_MODEL_OPERATION_ROWS = 4
 
 export function OnboardingModelDownloadProgress({
   model,
@@ -51,11 +76,9 @@ export function OnboardingModelDownloadProgress({
   const cancelable = activeDownload !== null && !cancelling
   const confirming = cancelable && confirmationModelId === model.modelId
   const totalBytes = activeDownload?.totalBytes ?? model.downloadBytes
-  const fraction = activeDownload !== null
-    ? activeDownload.completedBytes / Math.max(1, activeDownload.totalBytes)
-    : 0
-  const percentageLabel = `${Math.round(Math.max(0, Math.min(1, fraction)) * 100)}%`
-  const barWidth = Math.max(8, width - percentageLabel.length - 2)
+  const progress = activeDownload !== null
+    ? Option.some(activeDownload.completedBytes / Math.max(1, activeDownload.totalBytes))
+    : Option.none<number>()
   const rate = activeDownload === null ? null : Option.getOrNull(activeDownload.bytesPerSecond)
   const transferDetail = useMemo(() => {
     if (starting || cancelling) return null
@@ -134,9 +157,9 @@ export function OnboardingModelDownloadProgress({
   return (
     <box style={{
       width,
-      height: ONBOARDING_MODEL_DOWNLOAD_ROWS,
-      minHeight: ONBOARDING_MODEL_DOWNLOAD_ROWS,
-      maxHeight: ONBOARDING_MODEL_DOWNLOAD_ROWS,
+      height: ONBOARDING_MODEL_OPERATION_ROWS,
+      minHeight: ONBOARDING_MODEL_OPERATION_ROWS,
+      maxHeight: ONBOARDING_MODEL_OPERATION_ROWS,
       flexDirection: "column",
       flexShrink: 0,
       overflow: "hidden",
@@ -144,10 +167,7 @@ export function OnboardingModelDownloadProgress({
       <text style={{ fg: theme.text.body, width }} wrapMode="none">
         {status}
       </text>
-      <text style={{ width }} wrapMode="none">
-        <span style={{ fg: theme.accent }}>{progressBar(fraction, barWidth)}</span>
-        <span style={{ fg: theme.text.supporting }}>{`  ${percentageLabel}`}</span>
-      </text>
+      <ModelOperationProgressBar progress={progress} width={width} />
       <text style={{ fg: theme.text.supporting, width }} wrapMode="none">
         {transferDetail ?? ""}
       </text>
@@ -186,6 +206,102 @@ export function OnboardingModelDownloadProgress({
                 </text>
               </Button>
             )}
+          </>
+        )}
+      </box>
+    </box>
+  )
+}
+
+const loadingStatusLabel = (status: OnboardingModelLoadStatus): string => {
+  switch (status._tag) {
+    case "Preparing": return "Preparing model…"
+    case "Stopping": return "Stopping current model…"
+    case "Ready": return "Finishing setup…"
+    case "Failed": return "Couldn’t load model"
+    case "Loading": {
+      switch (status.stage) {
+        case "queued": return "Waiting to load model…"
+        case "resolving": return "Preparing model…"
+        case "unloading": return "Unloading current model…"
+        case "loading": return "Loading model into memory…"
+        case "verifying": return "Verifying model…"
+      }
+    }
+  }
+}
+
+const loadingStatusDetail = (status: OnboardingModelLoadStatus): string => {
+  if (status._tag === "Failed") {
+    return "_tag" in status.failure && status.failure._tag === "LowMemory"
+      ? `Not enough memory. Free ${formatMemorySize(status.failure.minimumAdditionalAvailableBytes, { rounding: "up" })} and try again.`
+      : status.failure.message
+  }
+  if (status._tag !== "Loading") return ""
+  switch (status.stage) {
+    case "queued": return "Waiting for the model loader…"
+    case "resolving": return "Resolving the model configuration…"
+    case "unloading": return "Making room for the selected model…"
+    case "loading": return "Loading model weights…"
+    case "verifying": return "Checking that the model is ready…"
+  }
+}
+
+export function OnboardingModelLoadProgress({
+  status,
+  width,
+  onRetry,
+  onChooseAnother,
+}: {
+  readonly status: OnboardingModelLoadStatus
+  readonly width: number
+  readonly onRetry: () => void
+  readonly onChooseAnother: () => void
+}): ReactNode {
+  const theme = useTheme()
+  const [hovered, setHovered] = useState<"retry" | "choose" | null>(null)
+  const progress = status._tag === "Loading"
+    ? status.progress
+    : status._tag === "Ready"
+      ? Option.some(1)
+      : Option.none<number>()
+  return (
+    <box style={{
+      width,
+      height: ONBOARDING_MODEL_OPERATION_ROWS,
+      minHeight: ONBOARDING_MODEL_OPERATION_ROWS,
+      maxHeight: ONBOARDING_MODEL_OPERATION_ROWS,
+      flexDirection: "column",
+      flexShrink: 0,
+      overflow: "hidden",
+    }}>
+      <text style={{ fg: status._tag === "Failed" ? theme.status.failure : theme.text.body, width }} wrapMode="none">
+        {loadingStatusLabel(status)}
+      </text>
+      {status._tag === "Failed"
+        ? <text style={{ fg: theme.text.supporting, width }} wrapMode="none">{loadingStatusDetail(status)}</text>
+        : <ModelOperationProgressBar progress={progress} width={width} />}
+      <text style={{ fg: theme.text.supporting, width }} wrapMode="none">
+        {status._tag === "Failed" ? "" : loadingStatusDetail(status)}
+      </text>
+      <box style={{ width, height: 1, minHeight: 1, maxHeight: 1, flexDirection: "row", flexShrink: 0 }}>
+        {status._tag === "Failed" && (
+          <>
+            <Button
+              onClick={onRetry}
+              onMouseOver={() => setHovered("retry")}
+              onMouseOut={() => setHovered(null)}
+            >
+              <text style={{ fg: hovered === "retry" ? theme.accent : theme.text.body }}>Retry loading</text>
+            </Button>
+            <box style={{ width: 2, flexShrink: 0 }} />
+            <Button
+              onClick={onChooseAnother}
+              onMouseOver={() => setHovered("choose")}
+              onMouseOut={() => setHovered(null)}
+            >
+              <text style={{ fg: hovered === "choose" ? theme.accent : theme.text.body }}>Choose another model</text>
+            </Button>
           </>
         )}
       </box>

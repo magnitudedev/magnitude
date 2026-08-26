@@ -159,6 +159,9 @@ height.
 The frame reserves one shared footer position across stages. Stage guidance and interaction hints
 use the same two-line typography there, so changing stages does not move or restyle the footer. One
 empty row is guaranteed immediately before the footer without changing the frame's total height.
+Downloading and loading keep the selected model details and radar visible. Both render through the
+same fixed progress region beneath the radar with the same progress-bar geometry; loading begins at
+zero percent until authoritative fractional progress advances it.
 The harness stage is one unboxed linear menu containing supported destinations followed by the
 startup and skill toggles. Harness rows are ordinary single-choice rows, not checkbox controls.
 Up and Down traverse every enabled control in that order; unavailable destinations remain visible

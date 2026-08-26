@@ -157,6 +157,7 @@ const unassignedSlots = (): ModelSlotsState => ({
 const configuredSlots = (
   lifecycle: "None" | "Loading" | "Ready" | "Stopped",
   id = instanceId,
+  loadingProgress: Option.Option<number> = Option.none(),
 ): ModelSlotsState => ({
   ...unassignedSlots(),
   slots: {
@@ -178,7 +179,7 @@ const configuredSlots = (
           : {
               _tag: "Loading",
               stage: "loading",
-              progress: Option.none(),
+              progress: loadingProgress,
               plannedAllocation: Option.none(),
             },
       actions: lifecycle === "None" || lifecycle === "Stopped" ? ["Load"] : ["Stop"],
@@ -212,7 +213,39 @@ describe("projectOnboardingModelSetupContent", () => {
     )
 
     expect(Option.getOrThrow(state._tag === "Chooser" ? state.operation : Option.none()))
-      .toMatchObject({ _tag: "Loading", phase: "Ready" })
+      .toMatchObject({ _tag: "Loading", status: { _tag: "Ready" } })
+  })
+
+  it("preserves authoritative model loading progress", () => {
+    const model = makeModel(true)
+    const slots = configuredSlots("Loading", instanceId, Option.some(0.42))
+    const option = localModelOptions({
+      inventoryState: { _tag: "Ready" },
+      models: [model],
+      discoveryState: { _tag: "Ready", progress: [] },
+    }, slots)[0]!
+    const state = projectOnboardingModelSetupContent(
+      Option.some({
+        _tag: "Loading",
+        option,
+        modelId: providerModelId,
+        providerModelId,
+        selection,
+        cancelling: false,
+      }),
+      {
+        inventoryState: { _tag: "Ready" },
+        models: [model],
+        discoveryState: { _tag: "Ready", progress: [] },
+      },
+      slots,
+    )
+
+    expect(Option.getOrThrow(state._tag === "Chooser" ? state.operation : Option.none()))
+      .toMatchObject({
+        _tag: "Loading",
+        status: { _tag: "Loading", stage: "loading", progress: Option.some(0.42) },
+      })
   })
 
   it("does not let discovery refresh mask an active invocation", () => {

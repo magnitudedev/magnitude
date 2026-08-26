@@ -6,6 +6,7 @@ import type {
   LocalModelsState,
   ModelDownloadFailure,
   ModelInstanceFailure,
+  ModelResidency,
   ModelSlotsState,
   ProviderModelId,
   SlotSelection,
@@ -75,6 +76,17 @@ export type OnboardingModelSetupFailure =
 
 export type OnboardingModelSetupExitKind = "Skip" | "Close"
 
+export type OnboardingModelLoadStatus =
+  | { readonly _tag: "Preparing" }
+  | {
+      readonly _tag: "Loading"
+      readonly stage: Extract<ModelResidency, { readonly _tag: "Loading" }>["stage"]
+      readonly progress: Option.Option<number>
+    }
+  | { readonly _tag: "Stopping" }
+  | { readonly _tag: "Ready" }
+  | { readonly _tag: "Failed"; readonly failure: ModelInstanceFailure }
+
 export type OnboardingModelSetupOperation =
   | {
       readonly _tag: "Preparing" | "Installing" | "Configuring"
@@ -86,8 +98,7 @@ export type OnboardingModelSetupOperation =
       readonly model: LocalModel
       readonly modelId: ProviderModelId
       readonly providerModelId: ProviderModelId
-      readonly phase: "Loading" | "Stopping" | "Ready" | "Failed"
-      readonly failure: ModelInstanceFailure | null
+      readonly status: OnboardingModelLoadStatus
     }
   | {
       readonly _tag: "Completing"
@@ -253,22 +264,22 @@ export const projectOnboardingModelSetupContent = (
     && sameSelection(slot.selection, current.selection)
     ? Option.some(slot.residency)
     : Option.none()
-  const failure = Option.getOrNull(Option.flatMap(
-    residency,
-    (value) => value._tag === "Failed" ? Option.some(value.failure) : Option.none(),
-  ))
-  const phase = current.cancelling
-    ? "Stopping" as const
+  const status: OnboardingModelLoadStatus = current.cancelling
+    ? { _tag: "Stopping" }
     : Option.match(residency, {
-        onNone: () => "Loading" as const,
+        onNone: () => ({ _tag: "Preparing" }),
         onSome: (value) => {
           switch (value._tag) {
-            case "Failed": return "Failed" as const
+            case "Failed": return { _tag: "Failed" as const, failure: value.failure }
             case "Stopping":
-            case "Unloaded": return "Stopping" as const
-            case "Ready": return "Ready" as const
-            case "Requested":
-            case "Loading": return "Loading" as const
+            case "Unloaded": return { _tag: "Stopping" as const }
+            case "Ready": return { _tag: "Ready" as const }
+            case "Requested": return { _tag: "Preparing" as const }
+            case "Loading": return {
+              _tag: "Loading" as const,
+              stage: value.stage,
+              progress: value.progress,
+            }
           }
         },
       })
@@ -280,8 +291,7 @@ export const projectOnboardingModelSetupContent = (
       model: currentModel,
       modelId: current.modelId,
       providerModelId: current.providerModelId,
-      phase,
-      failure,
+      status,
     }),
   }
 }

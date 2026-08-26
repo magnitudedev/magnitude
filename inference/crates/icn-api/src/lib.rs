@@ -3266,7 +3266,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_accepts_codex_namespace_and_web_search_tools() {
+    fn responses_retains_non_function_tools_without_executing_them() {
         let request: protocols::responses::ResponseCreateRequest = serde_json::from_value(json!({
             "model": "test-model",
             "input": "hello",
@@ -3291,13 +3291,14 @@ mod tests {
                         "parameters": { "type": "object" }
                     }]
                 },
-                { "type": "web_search", "external_web_access": true }
+                { "type": "web_search", "external_web_access": true },
+                { "type": "file_search", "vector_store_ids": ["vs_1"] }
             ]
         }))
-        .expect("current Codex tool declarations must decode");
+        .expect("hosted tool declarations of any type must decode");
 
         let (_, canonical) = protocols::responses::adapt(request)
-            .expect("unsupported hosted tools must not block local function tools")
+            .expect("hosted tools must not block local function tools")
             .invocation
             .into_parts();
         assert_eq!(canonical.tools().definitions().len(), 1);
@@ -3305,6 +3306,152 @@ mod tests {
             canonical.tools().definitions()[0].name().as_str(),
             "exec_command"
         );
+    }
+
+    #[test]
+    fn responses_rejects_malformed_function_tools_instead_of_demoting_them() {
+        let request: protocols::responses::ResponseCreateRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "input": "hello",
+            "tools": [{ "type": "function", "name": "broken" }]
+        }))
+        .expect("the declaration decodes as an opaque tool");
+
+        let Err(error) = protocols::responses::adapt(request) else {
+            panic!("a function declaration missing parameters must not silently become opaque");
+        };
+        assert_eq!(error.body.error.message, "malformed function tool declaration");
+    }
+
+    fn full_output_result() -> domain::InferenceResult {
+        domain::InferenceResult::new(
+            domain::InferenceOutput::new(
+                Some(domain::NonEmptyText::try_new("brief thought", "reasoning").unwrap()),
+                Some(domain::NonEmptyText::try_new("calling a tool", "text").unwrap()),
+                vec![domain::ToolCall::new(
+                    domain::ToolCallId::try_new("call_1").unwrap(),
+                    domain::ToolName::try_new("lookup").unwrap(),
+                    domain::JsonObject::new(serde_json::Map::new()),
+                )],
+            ),
+            domain::TokenUsage::default(),
+            domain::Termination::ToolCalls,
+            GenerationMetrics::default(),
+        )
+    }
+
+    // Replay closure: everything each protocol's projection emits must parse
+    // back through that protocol's input path, because clients resend emitted
+    // output verbatim as later history.
+    #[test]
+    fn responses_output_items_replay_as_input() {
+        let result = full_output_result();
+        let projection = protocols::responses::adapt(
+            serde_json::from_value(json!({ "model": "test-model", "input": "hi" })).unwrap(),
+        )
+        .unwrap()
+        .projection;
+        let emitted = serde_json::to_value(protocols::responses::from_result(
+            "resp_test",
+            1,
+            "test-model",
+            &projection,
+            &result,
+        ))
+        .unwrap();
+        let mut input = emitted["output"]
+            .as_array()
+            .expect("output is an array")
+            .clone();
+        input.push(json!({ "type": "function_call_output", "call_id": "call_1", "output": "result" }));
+        input.push(json!({ "role": "user", "content": "continue" }));
+
+        let request: protocols::responses::ResponseCreateRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "input": input,
+        }))
+        .expect("every emitted output item must decode as replay input");
+        let (_, canonical) = protocols::responses::adapt(request)
+            .expect("replayed output must adapt")
+            .invocation
+            .into_parts();
+        assert_eq!(canonical.context().entries().len(), 3);
+        let domain::ContextEntry::Assistant { entry } = &canonical.context().entries()[0] else {
+            panic!("replayed reasoning and message must form an assistant entry");
+        };
+        assert_eq!(
+            entry.reasoning().map(domain::NonEmptyText::as_str),
+            Some("brief thought")
+        );
+    }
+
+    #[test]
+    fn anthropic_output_blocks_replay_as_input() {
+        let result = full_output_result();
+        let response = protocols::anthropic::message("msg_test", "test-model", &result);
+        let content = serde_json::to_value(&response.content).unwrap();
+
+        let request: protocols::anthropic::MessagesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [
+                { "role": "user", "content": "hello" },
+                { "role": "assistant", "content": content },
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "call_1", "content": "result" }
+                ] }
+            ]
+        }))
+        .expect("every emitted content block must decode as replay input");
+        let (_, canonical) = protocols::anthropic::adapt(request)
+            .expect("replayed output must adapt")
+            .invocation
+            .into_parts();
+        assert_eq!(canonical.context().entries().len(), 2);
+        let domain::ContextEntry::Assistant { entry } = &canonical.context().entries()[1] else {
+            panic!("replayed blocks must form an assistant entry");
+        };
+        assert_eq!(
+            entry.reasoning().map(domain::NonEmptyText::as_str),
+            Some("brief thought")
+        );
+        assert_eq!(entry.tool_calls().len(), 1);
+    }
+
+    #[test]
+    fn chat_output_message_replays_as_input() {
+        let result = full_output_result();
+        let response = serde_json::to_value(protocols::chat::chat_completion_response(
+            "chatcmpl_test".into(),
+            1,
+            "test-model".into(),
+            &result,
+        ))
+        .unwrap();
+        let message = response["choices"][0]["message"].clone();
+
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [
+                { "role": "user", "content": "hello" },
+                message,
+                { "role": "tool", "tool_call_id": "call_1", "content": "result" },
+                { "role": "user", "content": "continue" }
+            ]
+        }))
+        .expect("the emitted assistant message must decode as replay input");
+        let (_, canonical) = adapt_request(request)
+            .expect("replayed output must adapt")
+            .invocation
+            .into_parts();
+        let domain::ContextEntry::Assistant { entry } = &canonical.context().entries()[1] else {
+            panic!("the replayed message must form an assistant entry");
+        };
+        assert_eq!(
+            entry.reasoning().map(domain::NonEmptyText::as_str),
+            Some("brief thought")
+        );
+        assert_eq!(entry.tool_calls().len(), 1);
     }
 
     #[test]

@@ -82,6 +82,44 @@ describe("onboarding model chooser identity", () => {
     }
   })
 
+  it("renders model loading progress beneath the selected model radar", async () => {
+    const state = makeView({ models: [makeModel()], ready: false })
+    const options = buildLocalInferenceSelections(state.models, state.slots)
+    const model = state.models.models[0]!
+    const view = await testRender(
+      <OnboardingModelChooser
+        hardware={Result.success(state.hardware)}
+        options={options}
+        width={120}
+        error={null}
+        operation={{
+          _tag: "Activating",
+          providerModelId: model.modelId,
+          model,
+          status: { _tag: "Loading", stage: "loading", progress: Option.none() },
+          onRetry: () => undefined,
+          onChooseAnother: () => undefined,
+        }}
+        onSelect={() => undefined}
+        onExit={() => undefined}
+        exitKind="Skip"
+      />,
+      { width: 120, height: 40 },
+    )
+
+    try {
+      await act(view.renderOnce)
+      const frame = view.captureCharFrame()
+      expect(frame).toContain("Qwen Test (Q4)")
+      expect(frame).toContain("INTELLIGENCE")
+      expect(frame).toContain("Loading model into memory…")
+      expect(frame).toContain("0%")
+      expect(frame.indexOf("Loading model into memory…")).toBeGreaterThan(frame.indexOf("INTELLIGENCE"))
+    } finally {
+      await act(async () => view.renderer.destroy())
+    }
+  })
+
   it("shows catalog release recency before compact model facts", async () => {
     const catalog = makeCatalogModel()
     if (catalog.servingState._tag !== "Assessed") throw new Error("fixture must be assessed")
@@ -127,13 +165,13 @@ describe("onboarding model chooser identity", () => {
     expect(onboardingModelDetailRows({
       recommendation: false,
       memoryWarning: false,
-      downloadRows: 0,
+      operationRows: 0,
       modelSummaryRadarGap: true,
     })).toBe(18)
     expect(onboardingModelDetailRows({
       recommendation: false,
       memoryWarning: false,
-      downloadRows: 4,
+      operationRows: 4,
       modelSummaryRadarGap: true,
     })).toBe(22)
     expect(ONBOARDING_MODEL_DETAIL_ROWS).toBe(22)
