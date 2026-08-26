@@ -255,6 +255,36 @@ describe("projectOnboardingModelSetupContent", () => {
       })
   })
 
+  it("distinguishes cancellation from ordinary model stopping", () => {
+    const model = makeModel(true)
+    const slots = configuredSlots("Loading", instanceId, Option.some(0.42))
+    const option = localModelOptions({
+      inventoryState: { _tag: "Ready" },
+      models: [model],
+      discoveryState: { _tag: "Ready", progress: [] },
+    }, slots)[0]!
+    const state = projectOnboardingModelSetupContent(
+      Option.some({
+        _tag: "Loading",
+        option,
+        modelId: providerModelId,
+        providerModelId,
+        selection,
+        cancelling: true,
+      }),
+      {
+        inventoryState: { _tag: "Ready" },
+        models: [model],
+        discoveryState: { _tag: "Ready", progress: [] },
+      },
+      slots,
+      defaultOnboardingModelRankingControls,
+    )
+
+    expect(Option.getOrThrow(state._tag === "Chooser" ? state.operation : Option.none()))
+      .toMatchObject({ _tag: "Loading", status: { _tag: "Cancelling" } })
+  })
+
   it("does not let discovery refresh mask an active invocation", () => {
     const model = makeModel(true)
     const option = localModelOptions({

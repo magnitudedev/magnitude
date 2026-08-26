@@ -101,6 +101,7 @@ export type OnboardingModelLoadStatus =
       readonly stage: Extract<ModelResidency, { readonly _tag: "Loading" }>["stage"]
       readonly progress: Option.Option<number>
     }
+  | { readonly _tag: "Cancelling" }
   | { readonly _tag: "Stopping" }
   | { readonly _tag: "Ready" }
   | { readonly _tag: "Failed"; readonly failure: ModelInstanceFailure }
@@ -288,7 +289,7 @@ export const projectOnboardingModelSetupContent = (
     ? Option.some(slot.residency)
     : Option.none()
   const status: OnboardingModelLoadStatus = current.cancelling
-    ? { _tag: "Stopping" }
+    ? { _tag: "Cancelling" }
     : Option.match(residency, {
         onNone: () => ({ _tag: "Preparing" }),
         onSome: (value) => {

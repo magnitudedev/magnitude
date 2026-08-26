@@ -13,7 +13,7 @@ import {
 } from "../local-inference/test-fixtures"
 import {
   ONBOARDING_MODEL_DETAIL_ROWS,
-  onboardingLocalModelViewportRows,
+  onboardingLocalModelLayout,
   onboardingModelActionLabel,
   OnboardingModelChooser,
   onboardingModelDetailRows,
@@ -190,7 +190,8 @@ describe("onboarding model chooser identity", () => {
     }
   })
 
-  it("renders model loading progress beneath the selected model radar", async () => {
+  it("replaces the preference scale with model loading progress", async () => {
+    let cancellations = 0
     const state = makeView({ models: [makeModel()], ready: false })
     const options = buildLocalInferenceSelections(state.models, state.slots)
     const model = state.models.models[0]!
@@ -207,6 +208,7 @@ describe("onboarding model chooser identity", () => {
           providerModelId: model.modelId,
           model,
           status: { _tag: "Loading", stage: "loading", progress: Option.none() },
+          onCancel: () => { cancellations += 1 },
           onRetry: () => undefined,
           onChooseAnother: () => undefined,
         }}
@@ -224,7 +226,68 @@ describe("onboarding model chooser identity", () => {
       expect(frame).toContain("INTELLIGENCE")
       expect(frame).toContain("Loading model into memory…")
       expect(frame).toContain("0%")
-      expect(frame.indexOf("Loading model into memory…")).toBeGreaterThan(frame.indexOf("INTELLIGENCE"))
+      expect(frame).toContain("Cancel (Esc)")
+      expect(frame).not.toContain("←/→ change preference")
+      expect(frame.indexOf("Loading model into memory…")).toBeLessThan(frame.indexOf("ON THIS COMPUTER"))
+      expect(frame.indexOf("Loading model into memory…")).toBeLessThan(frame.indexOf("INTELLIGENCE"))
+      const lines = frame.split("\n")
+      const setupColumn = lines.find((line) => line.includes("MAGNITUDE SETUP"))
+        ?.indexOf("MAGNITUDE SETUP")
+      const progressLine = lines.find((line) => line.includes("0%"))
+      expect(setupColumn).toBeDefined()
+      expect(progressLine).toBeDefined()
+      expect(progressLine?.trimEnd().length).toBe((setupColumn ?? 0) + 97)
+      await act(async () => {
+        view.mockInput.pressEscape()
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      })
+      await act(view.renderOnce)
+      expect(view.captureCharFrame()).toContain("Cancel loading?  › Yes")
+      await act(async () => view.mockInput.pressEnter())
+      expect(cancellations).toBe(1)
+    } finally {
+      await act(async () => view.renderer.destroy())
+    }
+  })
+
+  it("keeps download measurements on the status line in the three-row operation region", async () => {
+    const model = makeAcquiringModel({
+      _tag: "Installing",
+      progress: {
+        stage: "downloading",
+        completedBytes: 1,
+        totalBytes: 2,
+        bytesPerSecond: Option.none(),
+      },
+    })
+    const view = await testRender(
+      <OnboardingModelChooser
+        hardware={Result.success(makeHardware())}
+        options={[{ id: "downloadable:test", kind: "downloadable", model }]}
+        rankingControls={rankingControls}
+        onRankingControlsChange={onRankingControlsChange}
+        width={120}
+        error={null}
+        operation={{
+          _tag: "Downloading",
+          model,
+          starting: false,
+          cancelling: false,
+          onCancel: () => undefined,
+        }}
+        onSelect={() => undefined}
+        onExit={() => undefined}
+        exitKind="Skip"
+      />,
+      { width: 120, height: 40 },
+    )
+
+    try {
+      await act(view.renderOnce)
+      const frame = view.captureCharFrame()
+      expect(frame).toContain("Downloading · 1 B / 2 B · Estimating…")
+      expect(frame).toContain("Cancel (Esc)")
+      expect(frame).not.toContain("Estimating time remaining")
     } finally {
       await act(async () => view.renderer.destroy())
     }
@@ -289,6 +352,58 @@ describe("onboarding model chooser identity", () => {
     }
   })
 
+  it("shows exact hidden-model counts above and below an overflowing local list", async () => {
+    const options = Array.from({ length: 20 }, (_, index) => {
+      const base = makeModel({ modelId: ProviderModelIdSchema.make(`local-${index + 1}`) })
+      return {
+        id: `installed:${index + 1}`,
+        kind: "stored" as const,
+        model: {
+          ...base,
+          presentation: { ...base.presentation, displayName: `Local Model ${index + 1}` },
+        },
+      }
+    })
+    const view = await testRender(
+      <OnboardingModelChooser
+        hardware={Result.success(makeHardware())}
+        options={options}
+        rankingControls={rankingControls}
+        onRankingControlsChange={onRankingControlsChange}
+        width={120}
+        error={null}
+        operation={null}
+        onSelect={() => undefined}
+        onExit={() => undefined}
+        exitKind="Skip"
+      />,
+      { width: 120, height: 44 },
+    )
+
+    try {
+      await act(view.renderOnce)
+      const initialFrame = view.captureCharFrame()
+      expect(initialFrame).toContain("… and 4 more")
+      const initialLines = initialFrame.split("\n")
+      const firstModelRow = initialLines.find((line) =>
+        line.includes("Local Model 1 (Q4)") && line.includes("Load"))
+      expect(initialLines.find((line) => line.includes("… and 4 more"))?.indexOf("…"))
+        .toBe(firstModelRow?.indexOf("Local Model 1"))
+      expect(initialLines.findIndex((line) =>
+        line.includes("Local Model 1 (Q4)") && line.includes("Load")))
+        .toBe(initialLines.findIndex((line) => line.includes("ON THIS COMPUTER")) + 1)
+      for (let index = 0; index < 16; index += 1) {
+        await act(async () => view.mockInput.pressArrow("down"))
+      }
+      await act(view.renderOnce)
+      const frame = view.captureCharFrame()
+      expect(frame).toContain("… and 2 more")
+      expect(frame).toContain("… and 3 more")
+    } finally {
+      await act(async () => view.renderer.destroy())
+    }
+  })
+
   it("describes the Enter action from the selected model state", () => {
     expect(onboardingSelectionEnterAction("downloadable")).toBe("download")
     expect(onboardingSelectionEnterAction("stored")).toBe("load")
@@ -299,32 +414,30 @@ describe("onboarding model chooser identity", () => {
   it("derives detail height from explicit row regions", () => {
     expect(onboardingModelDetailRows({
       memoryWarning: false,
-      operationRows: 0,
       modelSummaryRadarGap: true,
     })).toBe(18)
     expect(onboardingModelDetailRows({
-      memoryWarning: false,
-      operationRows: 4,
+      memoryWarning: true,
       modelSummaryRadarGap: true,
-    })).toBe(22)
-    expect(ONBOARDING_MODEL_DETAIL_ROWS).toBe(22)
+    })).toBe(19)
+    expect(ONBOARDING_MODEL_DETAIL_ROWS).toBe(18)
   })
 
-  it("lets local models fill the remaining wide-layout rows", () => {
-    expect(onboardingLocalModelViewportRows({
+  it("uses overflow indicator rows inside the local-model row budget", () => {
+    expect(onboardingLocalModelLayout({
       wide: true,
       localCount: 12,
       detailPanelRows: ONBOARDING_MODEL_DETAIL_ROWS,
-      downloadRows: 5,
+      rankedRows: 5,
       sectionGap: 1,
-    })).toBe(15)
-    expect(onboardingLocalModelViewportRows({
+    })).toEqual({ viewportRows: 11, showOverflow: true })
+    expect(onboardingLocalModelLayout({
       wide: false,
       localCount: 12,
       detailPanelRows: ONBOARDING_MODEL_DETAIL_ROWS,
-      downloadRows: 5,
+      rankedRows: 5,
       sectionGap: 1,
-    })).toBe(4)
+    })).toEqual({ viewportRows: 4, showOverflow: true })
   })
 
   it("keeps variants in downloadable model names", () => {

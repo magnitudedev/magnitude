@@ -163,6 +163,12 @@ determines whether its action is Loaded, Load, or Download.
 Ranking input and model input are locked during an active operation. Hardware failure does not
 fabricate a memory maximum or selectable ranked results.
 
+Each clipped model section overlays dim overflow affordances within its fixed model-row viewport;
+it reserves no indicator rows. The lower affordance replaces the last otherwise-visible model row
+while models remain below. After scrolling, the upper affordance replaces the first otherwise-visible
+model row and reports the exact number above. An absent affordance leaves neither a blank line nor
+extra height, so the first model always sits immediately below its section heading at the top.
+
 The shared frame height is the model chooser's required row count, not a percentage of the terminal.
 Its wide and stacked variants account for their respective progress and chooser layouts, and the
 removed duplicate model title contributes no reserved row. Every later stage reuses that computed
@@ -171,12 +177,20 @@ height.
 The frame reserves one shared footer position across stages. Stage guidance and interaction hints
 use the same two-line typography there, so changing stages does not move or restyle the footer. One
 empty row is guaranteed immediately before the footer without changing the frame's total height.
-Downloading and loading keep the selected model details and radar visible. Both render through the
-same fixed progress region beneath the radar with the same progress-bar geometry; loading begins at
-zero percent until authoritative fractional progress advances it. The active operation label above
-the bar uses a short eased shimmer sweep for starting, downloading, cancelling, preparing, stopping,
-loading, verifying, and finishing states. A narrow cosine highlight crosses muted text in about 700 ms,
-then disappears for about 1.8 seconds; it never changes text weight. Failure text remains static.
+The detail pane reserves rows only for the selected model title, one-line summary, radar, and an
+applicable memory warning; it never reserves operation rows. Starting an operation replaces the
+Fast-to-Smart control region with a fixed three-row operation region while keeping the selected
+model details and radar visible. The frame therefore has exactly the same height while choosing,
+downloading, and loading. The first operation row contains the status and any useful transfer
+measurements, the second contains the progress bar, and the third contains controls. Loading and
+downloading both expose `Cancel (Esc)` and replace that control with an inline Yes/No confirmation;
+failure replaces the bar with its compact failure message and renders retry/choose actions directly
+beneath it. Stage-explanation subtext is not rendered. Loading begins at zero percent until
+authoritative fractional progress advances it. The active operation label uses an eased shimmer for
+starting, downloading, cancelling, configuring, preparing, stopping, loading, verifying, and
+finishing states. Its cosine highlight scales with the text length, crosses muted text in about
+850 ms, and remains absent for about 950 ms between sweeps; it never changes text weight. Failure
+text remains static.
 The harness stage is one unboxed linear menu containing supported destinations followed by the
 startup and skill toggles. Harness rows are ordinary single-choice rows, not checkbox controls.
 Up and Down traverse every enabled control in that order; unavailable destinations remain visible
