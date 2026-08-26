@@ -5,36 +5,102 @@ import type { HarnessConnectionPaths } from "../paths"
 import { OPENAI_BASE_URL, defineConnector, launchPlan, readOr } from "../shared"
 import { writeFileAtomic } from "../../utils/atomic-file"
 
-export const codexConfig = (spec: HarnessConnectionSpec): string => `model_provider = "magnitude"
-${Option.match(spec.setCurrent, {
-  onNone: () => "\n",
-  onSome: (modelId) => `model = ${JSON.stringify(modelId)}\n\n`,
-})}[model_providers.magnitude]
+const CODEX_BASE_INSTRUCTIONS = "You are a coding agent running in Codex CLI. Work with the user in the current workspace until their request is resolved. Inspect relevant files before changing them, follow repository instructions, make focused edits, verify consequential changes, and communicate progress and results concisely. Use the available tools when they are needed and preserve user work unrelated to the request."
+
+const reasoningDescription = (effort: string): string => `Use the model's ${effort} reasoning effort.`
+
+const currentModel = (spec: HarnessConnectionSpec) => Option.flatMap(
+  spec.setCurrent,
+  (modelId) => Option.fromNullable(spec.models.find(({ id }) => id === modelId)),
+)
+
+export const codexModelCatalog = (spec: HarnessConnectionSpec): string => `${JSON.stringify({
+  models: spec.models.map((model, priority) => ({
+    slug: model.id,
+    display_name: model.name,
+    description: model.description,
+    ...(model.capabilities.reasoning.supported
+      ? { default_reasoning_level: model.capabilities.reasoning.defaultEffort }
+      : {}),
+    supported_reasoning_levels: model.capabilities.reasoning.efforts.map((effort) => ({
+      effort,
+      description: reasoningDescription(effort),
+    })),
+    shell_type: "default",
+    visibility: "list",
+    supported_in_api: true,
+    priority,
+    additional_speed_tiers: [],
+    service_tiers: [],
+    availability_nux: null,
+    upgrade: null,
+    base_instructions: CODEX_BASE_INSTRUCTIONS,
+    model_messages: null,
+    supports_reasoning_summaries: false,
+    default_reasoning_summary: "auto",
+    support_verbosity: false,
+    default_verbosity: null,
+    apply_patch_tool_type: null,
+    web_search_tool_type: "text",
+    truncation_policy: { mode: "bytes", limit: 10_000 },
+    supports_parallel_tool_calls: false,
+    supports_image_detail_original: false,
+    context_window: model.contextWindow,
+    max_context_window: model.contextWindow,
+    auto_compact_token_limit: null,
+    comp_hash: null,
+    effective_context_window_percent: 95,
+    experimental_supported_tools: [],
+    input_modalities: model.capabilities.vision ? ["text", "image"] : ["text"],
+    supports_search_tool: false,
+    use_responses_lite: false,
+  })),
+}, null, 2)}\n`
+
+export const codexConfig = (spec: HarnessConnectionSpec, modelCatalogPath: string): string => {
+  const selected = currentModel(spec)
+  return `model_provider = "magnitude"
+model_catalog_json = ${JSON.stringify(modelCatalogPath)}
+service_tier = "default"
+${Option.match(selected, {
+  onNone: () => "",
+  onSome: (model) => `model = ${JSON.stringify(model.id)}\n${model.capabilities.reasoning.supported
+    ? `model_reasoning_effort = ${JSON.stringify(model.capabilities.reasoning.defaultEffort)}\n`
+    : `model_reasoning_effort = "none"\n`}`,
+})}
+[model_providers.magnitude]
 name = "Magnitude"
 base_url = ${JSON.stringify(OPENAI_BASE_URL)}
 wire_api = "responses"
 requires_openai_auth = false
 `
+}
+
+const removeExact = (path: string, expected: string) => FileSystem.FileSystem.pipe(
+  Effect.flatMap((fs) => fs.readFileString(path).pipe(
+    Effect.flatMap((source) => source === expected ? fs.remove(path) : Effect.void),
+    Effect.catchTag("SystemError", (error) => error.reason === "NotFound" ? Effect.void : Effect.fail(error)),
+  )),
+)
 
 export const makeCodexConnector = (paths: HarnessConnectionPaths) => defineConnector({
   id: "codex",
   name: "Codex",
   executable: "codex",
   skillFile: paths.skills.codex!,
-  configurationFiles: [paths.codex],
+  configurationFiles: [paths.codex, paths.codexModels],
   connect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.codex, "")
     if (source.trim() !== "" && !source.includes("[model_providers.magnitude]")) {
       throw new Error(`Codex profile file is not Magnitude-owned: ${paths.codex}`)
     }
-    yield* writeFileAtomic(paths.codex, codexConfig(spec))
+    yield* writeFileAtomic(paths.codexModels, codexModelCatalog(spec))
+    yield* writeFileAtomic(paths.codex, codexConfig(spec, paths.codexModels))
   }),
-  disconnect: (spec) => FileSystem.FileSystem.pipe(
-    Effect.flatMap((fs) => fs.readFileString(paths.codex).pipe(
-      Effect.flatMap((source) => source === codexConfig(spec) ? fs.remove(paths.codex) : Effect.void),
-      Effect.catchTag("SystemError", (error) => error.reason === "NotFound" ? Effect.void : Effect.fail(error)),
-    )),
-  ),
+  disconnect: (spec) => Effect.all([
+    removeExact(paths.codex, codexConfig(spec, paths.codexModels)),
+    removeExact(paths.codexModels, codexModelCatalog(spec)),
+  ], { discard: true }),
   launch(modelId, installation) {
     return launchPlan(this, installation, modelId, ["--profile", "magnitude"])
   },

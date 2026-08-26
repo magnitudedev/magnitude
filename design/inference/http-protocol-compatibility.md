@@ -112,9 +112,10 @@ ACN exposes OpenAI traffic under `/inference/v1/**` and Anthropic traffic under
 `anthropic-local/<canonical-model-id>`.
 
 The OpenAI model-list response retains the standard `data` array and also includes a Magnitude-owned
-`models` array for local clients that need catalog labels. Each installed entry contains its canonical
-model ID and the same `Model Name (Variant Label)` text shown by Magnitude. This extension is discovery
-metadata only and does not change model selection semantics.
+`models` array for local clients that need harness-facing metadata. Each installed entry contains its
+canonical model ID, the same `Model Name (Variant Label)` text shown by Magnitude, description,
+configured context window, input and tool capabilities, and reasoning effort domain and default.
+This extension is discovery metadata only and does not change model selection semantics.
 
 For a reserved alias, ACN removes any caller-supplied alias-echo header, rewrites only the request
 model to its canonical ID, removes caller credentials, installs private ICN authorization, and

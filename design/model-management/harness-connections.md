@@ -33,7 +33,9 @@ rows, display Not installed, and are disabled.
 
 The user manifest records desired harness connections. It contains no gateway credential or
 historical harness settings. Each entry contains the harness, complete installed Magnitude model
-set as `{ id, name }` descriptors, optional current-model selection, and update time. `add` connects
+set as harness-facing descriptors, optional current-model selection, and update time. A descriptor
+contains identity, display name, description, context window, modalities and tool capabilities, and
+the model's reasoning domain and default. `add` connects
 every installed Magnitude model and optionally applies `setCurrent`; `sync` refreshes the complete model set without launching
 anything; and `remove` deletes only values
 that still equal the connector's expected managed value. Divergent user edits are preserved.
@@ -56,7 +58,7 @@ neither contains connector-specific transforms.
 
 The unified connector contract is `detect`, `connect(HarnessConnectionSpec)`,
 `disconnect(HarnessConnectionSpec)`, `launch(modelId, installation)`, and `installSkill`. The spec
-contains the complete Magnitude model set as `{ id, name }` plus an optional `setCurrent` model ID. Each harness
+contains the complete harness-facing Magnitude model descriptors plus an optional `setCurrent` model ID. Each harness
 implements this contract in its own module. The registry only composes those modules in canonical
 priority order; it contains no harness configuration logic.
 
@@ -69,7 +71,12 @@ default OpenAI-compatible provider path rather than opting into Responses.
 
 Codex is the sole Responses consumer. Its separately owned profile uses the base
 `http://127.0.0.1:10100/inference/v1`, producing `/inference/v1/responses`, with
-`wire_api = "responses"`. The profile does not impose a reasoning effort. Claude Code is the
+`wire_api = "responses"`. The connector also owns a Codex-native model catalog derived from the
+shared descriptors and points the profile's `model_catalog_json` at it. This prevents fallback
+metadata and supplies Codex with exact display names, context windows, input modalities, and
+reasoning domains. When `setCurrent` is present, the profile selects that model and its advertised
+default reasoning effort. The profile explicitly selects the default service tier so unrelated
+global priority-tier configuration cannot leak into local requests. Claude Code is the
 sole Anthropic Messages consumer. It uses
 `http://127.0.0.1:10100/inference/anthropic`, producing `/inference/anthropic/v1/messages`, and
 receives `anthropic-local/<model-id>` through launch-scoped model environment and `--model`. The reserved
@@ -79,8 +86,9 @@ model. A CLI connection without `--set-current` changes no current-model selecti
 registrations expose the complete Magnitude model set.
 The model name is Magnitude's catalog display name followed by its variant label in parentheses.
 Pi, OpenCode, OpenClaw, Oh My Pi, and Cline receive that name through their native per-model display
-field. Hermes, Codex, and Claude Code have no separate display-name field in the configuration path
-used by their connector, so those harnesses receive the provider-facing model ID only.
+field. Codex receives it through its connector-owned native model catalog. Hermes and Claude Code
+have no separate display-name field in the configuration path used by their connector, so those
+harnesses receive the provider-facing model ID only.
 For Cline, the connector writes its supported `openai-compatible` provider settings, its named model
 catalog in `<CLINE_DATA_DIR>/settings/models.json`, and the launch
 plan passes `--provider openai-compatible --model <id>` in addition to `--tui`; configuration
