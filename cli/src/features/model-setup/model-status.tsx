@@ -10,6 +10,7 @@ import {
 } from "@magnitudedev/client-common"
 import { acquisitionProgress, type LocalModel, type ProviderModelId } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
+import { ShimmerText } from "../../components/shimmer-text"
 import { useTheme } from "../../hooks/use-theme"
 
 const formatEta = (remainingBytes: number, bytesPerSecond: number): string => {
@@ -41,6 +42,25 @@ const ModelOperationProgressBar = ({
         {progressBar(Option.getOrElse(progress, () => 0), barWidth)}
       </span>
       <span style={{ fg: theme.text.supporting }}>{`  ${percentageLabel.padStart(4)}`}</span>
+    </text>
+  )
+}
+
+const ModelOperationStatusText = ({
+  text,
+  width,
+}: {
+  readonly text: string
+  readonly width: number
+}): ReactNode => {
+  const theme = useTheme()
+  return (
+    <text style={{ width }} wrapMode="none">
+      <ShimmerText
+        text={text}
+        baseColor={theme.text.supporting}
+        highlightColor={theme.text.emphasized}
+      />
     </text>
   )
 }
@@ -164,9 +184,7 @@ export function OnboardingModelDownloadProgress({
       flexShrink: 0,
       overflow: "hidden",
     }}>
-      <text style={{ fg: theme.text.body, width }} wrapMode="none">
-        {status}
-      </text>
+      <ModelOperationStatusText text={status} width={width} />
       <ModelOperationProgressBar progress={progress} width={width} />
       <text style={{ fg: theme.text.supporting, width }} wrapMode="none">
         {transferDetail ?? ""}
@@ -275,9 +293,13 @@ export function OnboardingModelLoadProgress({
       flexShrink: 0,
       overflow: "hidden",
     }}>
-      <text style={{ fg: status._tag === "Failed" ? theme.status.failure : theme.text.body, width }} wrapMode="none">
-        {loadingStatusLabel(status)}
-      </text>
+      {status._tag === "Failed"
+        ? (
+            <text style={{ fg: theme.status.failure, width }} wrapMode="none">
+              {loadingStatusLabel(status)}
+            </text>
+          )
+        : <ModelOperationStatusText text={loadingStatusLabel(status)} width={width} />}
       {status._tag === "Failed"
         ? <text style={{ fg: theme.text.supporting, width }} wrapMode="none">{loadingStatusDetail(status)}</text>
         : <ModelOperationProgressBar progress={progress} width={width} />}

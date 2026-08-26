@@ -1,22 +1,26 @@
-import { useCallback, useMemo, useRef, useState, type ReactNode, type Ref } from "react"
+import { Fragment, useCallback, useMemo, useRef, useState, type ReactNode, type Ref } from "react"
 import { TextAttributes, type KeyEvent, type ScrollBoxRenderable } from "@opentui/core"
 import { useKeyboard } from "@opentui/react"
 import { Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import {
   getAnimationTimeSnapshot,
-  clampTextToVisualLines,
   truncateToDisplayWidth,
   formatLocalModelDisplayName,
   formatMemorySize,
   type OnboardingModelLoadStatus,
   type LocalModelOption,
   type LocalInferenceHardwareResult,
+  type OnboardingModelRankingControls,
+  LOCAL_MODEL_RANKING_SCALE_INTERVALS,
+  LOCAL_MODEL_RANKING_SCALE_LABELS,
+  rankedLocalModelOptions,
+  targetPhysicalMemoryBytes,
 } from "@magnitudedev/client-common"
 import type {
   LocalModel,
   LocalModelMemory,
-  LocalModelRecommendationProgressStep,
+  LocalModelDiscoveryProgressStep,
   ProviderModelId,
 } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
@@ -54,12 +58,31 @@ import {
 import { isWideSetupLayout, SetupFrame, setupBodyWidth, type SetupStage } from "./setup-frame"
 
 const SECTION_VIEWPORT_ROWS = 4
+const RECOMMENDED_VIEWPORT_ROWS = 10
 const MODEL_TITLE_ROWS = 1
 const MODEL_SUMMARY_ROWS = 1
 const MODEL_SUMMARY_RADAR_GAP_ROWS = 1
-const RECOMMENDATION_HEADING_ROWS = 1
-const RECOMMENDATION_ROWS = 3
 const WIDE_LIST_WIDTH = 38
+const RANKING_LABEL_GAP = 2
+const FAST_TO_SMART_SEGMENT_COLUMNS = Math.max(...LOCAL_MODEL_RANKING_SCALE_LABELS
+  .slice(1)
+  .map((label, index) => Math.ceil(LOCAL_MODEL_RANKING_SCALE_LABELS[index]!.length / 2)
+    + Math.floor(label.length / 2)
+    + RANKING_LABEL_GAP))
+const FAST_TO_SMART_TRACK_COLUMNS = FAST_TO_SMART_SEGMENT_COLUMNS
+  * LOCAL_MODEL_RANKING_SCALE_INTERVALS
+const FAST_TO_SMART_TRACK_LEFT_PADDING = Math.floor(LOCAL_MODEL_RANKING_SCALE_LABELS[0].length / 2)
+const FAST_TO_SMART_LABEL_LAYOUT = (() => {
+  let previousEnd = 0
+  return LOCAL_MODEL_RANKING_SCALE_LABELS.map((label, index) => {
+    const center = FAST_TO_SMART_TRACK_LEFT_PADDING + index * FAST_TO_SMART_SEGMENT_COLUMNS
+    const start = center - Math.floor(label.length / 2)
+    const leadingSpaces = start - previousEnd
+    previousEnd = start + label.length
+    return { label, leadingSpaces }
+  })
+})()
+export const ONBOARDING_RANKING_CONTROL_ROWS = 3
 
 const onboardingModelRowId = (selectionId: string): string =>
   `onboarding-model:${selectionId}`
@@ -71,19 +94,9 @@ export const scrollOnboardingModelIntoView = (
   scrollbox?.scrollChildIntoView(onboardingModelRowId(selectionId))
 }
 
-const intentLabel = (intent: "balanced" | "smartest" | "fastest" | "lightweight"): string => {
-  if (intent === "smartest") return "Smartest"
-  if (intent === "fastest") return "Fastest"
-  if (intent === "lightweight") return "Lightweight"
-  return "Balanced"
-}
-
 export const onboardingModelActionLabel = (selection: LocalInferenceSelection): string => {
   if (selection.kind === "running") return "Loaded"
-  if (selection.recommendations.length > 0) {
-    return selection.recommendations.map(({ intent }) => intentLabel(intent)).join(" / ")
-  }
-  if (selection.kind === "recommendation") return "Download"
+  if (selection.kind === "downloadable") return "Download"
   return "Load"
 }
 
@@ -106,6 +119,7 @@ const ModelRow = ({
   disabled,
   width,
   rowId,
+  rank,
   onHover,
   onChoose,
 }: {
@@ -114,16 +128,17 @@ const ModelRow = ({
   readonly disabled: boolean
   readonly width: number
   readonly rowId: string
+  readonly rank?: number
   readonly onHover: () => void
   readonly onChoose: () => void
 }): ReactNode => {
   const theme = useTheme()
   const action = onboardingModelActionLabel(selection)
-  const enabled = selection.kind !== "recommendation"
-    || selection.recommendations.length > 0
+  const enabled = true
   const markerWidth = 2
+  const rankLabel = rank === undefined ? "" : `${rank}. `
   const gap = 2
-  const nameWidth = Math.max(1, width - markerWidth - gap - action.length - 1)
+  const nameWidth = Math.max(1, width - markerWidth - rankLabel.length - gap - action.length - 1)
   return (
     <Button
       id={rowId}
@@ -137,11 +152,13 @@ const ModelRow = ({
         attributes={selected ? TextAttributes.BOLD : TextAttributes.NONE}
         wrapMode="none"
       >
-        {selected ? "› " : "  "}{truncateToDisplayWidth(onboardingModelRowName(selection), nameWidth).padEnd(nameWidth)}
+        {selected ? "› " : "  "}
+        {rankLabel.length > 0 && <span fg={theme.text.detail}>{rankLabel}</span>}
+        {truncateToDisplayWidth(onboardingModelRowName(selection), nameWidth).padEnd(nameWidth)}
         {"  "}
         <span fg={selection.kind === "running"
           ? theme.status.success
-          : selection.recommendations.length > 0 || selected
+          : selection.kind === "downloadable" || selected
             ? theme.accent
             : theme.text.supporting}>
           {action}
@@ -248,9 +265,9 @@ const OnboardingSetupCard = ({
 }): ReactNode => {
   const theme = useTheme()
   const bodyWidth = setupBodyWidth(width)
-  const additionalRows = Result.isSuccess(hardware)
+  const additionalRows = ONBOARDING_RANKING_CONTROL_ROWS + (Result.isSuccess(hardware)
     ? Math.max(0, describeLocalHardwareSummary(hardware.value).length - 1)
-    : 0
+    : 0)
   return (
     <SetupFrame width={width} stage={stage} footer={footer} additionalRows={additionalRows}>
       {title !== undefined && (
@@ -291,19 +308,17 @@ export type OnboardingModelChooserOperation =
 export const onboardingSelectionEnterAction = (
   kind: LocalInferenceSelection["kind"] | undefined,
 ): "download" | "load" | "select" | null => {
-  if (kind === "recommendation") return "download"
+  if (kind === "downloadable") return "download"
   if (kind === "stored") return "load"
   if (kind === "running") return "select"
   return null
 }
 
 export const onboardingModelDetailRows = ({
-  recommendation,
   memoryWarning,
   operationRows,
   modelSummaryRadarGap,
 }: {
-  readonly recommendation: boolean
   readonly memoryWarning: boolean
   readonly operationRows: number
   readonly modelSummaryRadarGap: boolean
@@ -311,19 +326,16 @@ export const onboardingModelDetailRows = ({
   + MODEL_SUMMARY_ROWS
   + (modelSummaryRadarGap ? MODEL_SUMMARY_RADAR_GAP_ROWS : 0)
   + PENTAGON_RADAR_ROWS
-  + (recommendation
-    ? RECOMMENDATION_HEADING_ROWS + RECOMMENDATION_ROWS
-    : (memoryWarning ? 1 : 0) + operationRows)
+  + (memoryWarning ? 1 : 0)
+  + operationRows
 
 const ONBOARDING_IDLE_MODEL_DETAIL_ROWS = onboardingModelDetailRows({
-  recommendation: true,
   memoryWarning: false,
   operationRows: 0,
   modelSummaryRadarGap: true,
 })
 
 const ONBOARDING_OPERATION_DETAIL_ROWS = onboardingModelDetailRows({
-  recommendation: false,
   memoryWarning: false,
   operationRows: ONBOARDING_MODEL_OPERATION_ROWS,
   modelSummaryRadarGap: true,
@@ -356,6 +368,8 @@ export const onboardingLocalModelViewportRows = ({
 export function OnboardingModelChooser({
   hardware,
   options,
+  rankingControls,
+  onRankingControlsChange,
   width,
   error,
   operation,
@@ -365,6 +379,8 @@ export function OnboardingModelChooser({
 }: {
   readonly hardware: LocalInferenceHardwareResult
   readonly options: readonly LocalModelOption[]
+  readonly rankingControls: OnboardingModelRankingControls
+  readonly onRankingControlsChange: (controls: OnboardingModelRankingControls) => void
   readonly width: number
   readonly error: string | null
   readonly operation: OnboardingModelChooserOperation | null
@@ -373,30 +389,45 @@ export function OnboardingModelChooser({
   readonly exitKind: "Skip" | "Close"
 }): ReactNode {
   const theme = useTheme()
-  const { selections, downloads, local } = useMemo(() => {
-    const eligible = options.filter((selection) =>
-      selection.kind !== "recommendation"
-        || selection.recommendations.length > 0)
-    const downloads = eligible.filter(({ kind }) => kind === "recommendation")
-    const local = eligible.filter(({ kind }) => kind === "running" || kind === "stored")
-    return { selections: [...downloads, ...local], downloads, local }
-  }, [options])
+  const maximumMemoryBytes = Result.isSuccess(hardware)
+    ? targetPhysicalMemoryBytes(hardware.value)
+    : null
+  const selectedRankingScaleIndex = Math.round(
+    Math.min(1, Math.max(0, rankingControls.fastToSmart)) * LOCAL_MODEL_RANKING_SCALE_INTERVALS,
+  )
+  const { selections, ranked, local } = useMemo(() => {
+    const ranked = maximumMemoryBytes === null
+      ? []
+      : rankedLocalModelOptions(options, {
+          fastToSmart: rankingControls.fastToSmart,
+          memoryBudgetBytes: maximumMemoryBytes,
+        }).map((option) => ({ ...option, id: `ranked:${option.id}` }))
+    const local = options.filter(({ kind }) => kind === "running" || kind === "stored")
+    return { selections: [...ranked, ...local], ranked, local }
+  }, [maximumMemoryBytes, options, rankingControls.fastToSmart])
   const [selectedId, setSelectedId] = useState<Option.Option<string>>(Option.none())
+  const [cursorIndex, setCursorIndex] = useState(0)
   const [radarTransition, setRadarTransition] = useState<PentagonRadarTransition | null>(null)
   const localScrollRef = useRef<ScrollBoxRenderable | null>(null)
   const downloadScrollRef = useRef<ScrollBoxRenderable | null>(null)
+  const activeCursorIndex = Math.min(cursorIndex, Math.max(0, selections.length - 1))
+  const activeCursorId = selections[activeCursorIndex]?.id ?? ""
+  const operationMatchesSelection = (selection: LocalInferenceSelection): boolean =>
+    operation !== null && (operation._tag === "Downloading" || operation._tag === "Configuring"
+      ? operation.model.modelId === selection.model.modelId
+      : Option.contains(selectionProviderModelId(selection), operation.providerModelId))
   const activeSelectionId = operation === null
     ? Option.none<string>()
-    : Option.fromNullable(selections.find((selection) =>
-      operation._tag === "Downloading" || operation._tag === "Configuring"
-      ? operation.model.modelId === selection.model.modelId
-      : Option.contains(selectionProviderModelId(selection), operation.providerModelId))?.id)
+    : Option.fromNullable((
+        selections.find((selection) =>
+          Option.contains(selectedId, selection.id) && operationMatchesSelection(selection))
+        ?? selections.find(operationMatchesSelection)
+      )?.id)
   const selectedIndex = operation !== null && Option.isNone(activeSelectionId)
     ? -1
-    : selectedInferenceIndex(
-        selections,
-        Option.isSome(activeSelectionId) ? activeSelectionId : selectedId,
-      )
+    : operation === null
+      ? activeCursorIndex
+      : selectedInferenceIndex(selections, activeSelectionId)
   const selected = selections[selectedIndex]
   const detailModel = operation?.model ?? selected?.model
   const selectedMemory = detailModel?.servingState._tag === "Assessed"
@@ -415,18 +446,18 @@ export function OnboardingModelChooser({
   const loadOperation = operation?._tag === "Activating" ? operation : null
   const detailContentRows = ONBOARDING_MODEL_DETAIL_ROWS
   const detailPanelRows = detailContentRows + (wide ? 0 : 1)
-  const downloadViewportRows = Math.min(SECTION_VIEWPORT_ROWS, downloads.length)
-  const downloadRows = downloads.length > 0 ? downloadViewportRows + 1 : 0
-  const sectionGap = local.length > 0 && downloads.length > 0 ? 1 : 0
+  const rankedViewportRows = Math.min(RECOMMENDED_VIEWPORT_ROWS, ranked.length)
+  const rankedRows = ranked.length > 0 ? rankedViewportRows + 1 : 0
+  const sectionGap = local.length > 0 && ranked.length > 0 ? 1 : 0
   const localViewportRows = onboardingLocalModelViewportRows({
     wide,
     localCount: local.length,
     detailPanelRows,
-    downloadRows,
+    downloadRows: rankedRows,
     sectionGap,
   })
   const localRows = local.length > 0 ? localViewportRows + 1 : 0
-  const listRows = downloadRows + sectionGap + localRows
+  const listRows = rankedRows + sectionGap + localRows
   const chooserHeight = wide
     ? Math.max(listRows, detailPanelRows)
     : listRows + detailPanelRows
@@ -435,7 +466,8 @@ export function OnboardingModelChooser({
   }, [onSelect])
 
   const moveSelectionTo = useCallback((index: number) => {
-    const selection = selections[index]
+    const nextIndex = Math.min(Math.max(0, index), Math.max(0, selections.length - 1))
+    const selection = selections[nextIndex]
     if (!selection) return
     const fromAxes = selected === undefined ? Option.none() : localModelRadarAxes(selected.model)
     const toAxes = localModelRadarAxes(selection.model)
@@ -450,55 +482,76 @@ export function OnboardingModelChooser({
       setRadarTransition(null)
     }
     setSelectedId(Option.some(selection.id))
+    setCursorIndex(nextIndex)
     scrollOnboardingModelIntoView(
-      selection.kind === "recommendation" ? downloadScrollRef.current : localScrollRef.current,
+      selection.id.startsWith("ranked:") ? downloadScrollRef.current : localScrollRef.current,
       selection.id,
     )
   }, [radarTransition, selected, selections])
+
+  const moveCursorTo = useCallback((index: number) => {
+    moveSelectionTo(index)
+  }, [moveSelectionTo])
+
+  const adjustControl = useCallback((direction: -1 | 1) => {
+    onRankingControlsChange({
+      fastToSmart: Math.min(1, Math.max(0,
+        rankingControls.fastToSmart + direction / LOCAL_MODEL_RANKING_SCALE_INTERVALS)),
+    })
+  }, [onRankingControlsChange, rankingControls.fastToSmart])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (locked) return
     if (key.name === "up" || key.name === "k") {
       key.preventDefault()
-      moveSelectionTo(Math.max(0, selectedIndex - 1))
+      moveCursorTo(activeCursorIndex - 1)
       return
     }
-    if (key.name === "down" || key.name === "j" || key.name === "tab") {
+    if (key.name === "down" || key.name === "j") {
       key.preventDefault()
-      moveSelectionTo(Math.min(
-        Math.max(0, selections.length - 1),
-        selectedIndex + 1,
-      ))
+      moveCursorTo(activeCursorIndex + 1)
       return
     }
-    if ((key.name === "return" || key.name === "enter") && selected) {
+    if (key.name === "left" || key.name === "h") {
       key.preventDefault()
-      choose(selected)
+      adjustControl(-1)
+      return
+    }
+    if (key.name === "right" || key.name === "l") {
+      key.preventDefault()
+      adjustControl(1)
+      return
+    }
+    const cursorSelection = selections[activeCursorIndex]
+    if ((key.name === "return" || key.name === "enter") && cursorSelection) {
+      key.preventDefault()
+      choose(cursorSelection)
       return
     }
     if (key.name === "escape") {
       key.preventDefault()
       onExit()
     }
-  }, [choose, locked, moveSelectionTo, onExit, selected, selectedIndex, selections.length]))
+  }, [activeCursorIndex, adjustControl, choose, locked, moveCursorTo, onExit, selections]))
 
   const list = (
     <box style={{ width: wide ? leftWidth : "100%", flexDirection: "column", paddingRight: wide ? 1 : 0 }}>
-      {downloads.length > 0 && (
+      {ranked.length > 0 && (
         <text style={{ fg: theme.text.supporting }} attributes={TextAttributes.BOLD}>
-          AVAILABLE TO DOWNLOAD
+          RECOMMENDED MODELS
         </text>
       )}
-      {downloads.length > 0 && (
-        <ModelSectionViewport scrollRef={downloadScrollRef} rows={downloadViewportRows}>
-          {downloads.map((selection) => (
+      {ranked.length > 0 && (
+        <ModelSectionViewport scrollRef={downloadScrollRef} rows={rankedViewportRows}>
+          {ranked.map((selection, index) => (
             <ModelRow
               key={selection.id}
               selection={selection}
-              selected={selection.id === selected?.id}
+              selected={selection.id === activeCursorId}
               disabled={locked}
               width={leftWidth}
               rowId={onboardingModelRowId(selection.id)}
+              rank={index + 1}
               onHover={() => moveSelectionTo(selections.indexOf(selection))}
               onChoose={() => choose(selection)}
             />
@@ -506,7 +559,7 @@ export function OnboardingModelChooser({
         </ModelSectionViewport>
       )}
       {local.length > 0 && (
-        <text style={{ fg: theme.text.supporting, marginTop: downloads.length > 0 ? 1 : 0 }} attributes={TextAttributes.BOLD}>
+        <text style={{ fg: theme.text.supporting, marginTop: ranked.length > 0 ? 1 : 0 }} attributes={TextAttributes.BOLD}>
           ON THIS COMPUTER
         </text>
       )}
@@ -516,7 +569,7 @@ export function OnboardingModelChooser({
             <ModelRow
               key={selection.id}
               selection={selection}
-              selected={selection.id === selected?.id}
+              selected={selection.id === activeCursorId}
               disabled={locked}
               width={leftWidth}
               rowId={onboardingModelRowId(selection.id)}
@@ -565,21 +618,6 @@ export function OnboardingModelChooser({
     && detailModel.servingState._tag === "Assessed"
     ? formatModelReleaseRecency(detailModel.catalogMembershipState.catalogData.releaseDate)
     : null
-  const recommendationBodyRows = Math.max(
-    1,
-    RECOMMENDATION_ROWS - (memoryWarning === null ? 0 : 1),
-  )
-  const recommendationExplanation = selected?.recommendations[0] !== undefined
-    ? clampTextToVisualLines(
-        selected.recommendations[0].explanation,
-        detailWidth,
-        recommendationBodyRows,
-      )
-    : ""
-  const showRecommendationExplanation = selected !== undefined
-    && selected.recommendations.length > 0
-    && operation?._tag !== "Downloading"
-    && operation?._tag !== "Activating"
   const emptySelectionMessage = "No compatible models found."
   const regularDetails = detailModel ? (
     <>
@@ -623,36 +661,7 @@ export function OnboardingModelChooser({
           />
         ),
       })}
-      {showRecommendationExplanation && (
-        <box style={{
-          height: RECOMMENDATION_HEADING_ROWS + RECOMMENDATION_ROWS,
-          minHeight: RECOMMENDATION_HEADING_ROWS + RECOMMENDATION_ROWS,
-          maxHeight: RECOMMENDATION_HEADING_ROWS + RECOMMENDATION_ROWS,
-          flexDirection: "column",
-          flexShrink: 0,
-          overflow: "hidden",
-        }}>
-            <text style={{ fg: theme.text.supporting, width: detailWidth }} attributes={TextAttributes.BOLD} wrapMode="none">
-              WHY THIS MODEL
-            </text>
-            <box style={{
-              height: recommendationBodyRows,
-              minHeight: recommendationBodyRows,
-              maxHeight: recommendationBodyRows,
-              flexDirection: "column",
-              flexShrink: 0,
-              overflow: "hidden",
-            }}>
-              <text style={{ fg: theme.text.supporting, width: detailWidth }} wrapMode="none">
-                {recommendationExplanation}
-              </text>
-            </box>
-            {memoryWarning && (
-              <text style={{ fg: theme.status.warning, width: detailWidth }} wrapMode="none">{memoryWarning}</text>
-            )}
-        </box>
-      )}
-      {!showRecommendationExplanation && downloadOperation === null && loadOperation === null && memoryWarning && (
+      {downloadOperation === null && loadOperation === null && memoryWarning && (
         <text style={{ fg: theme.status.warning, width: detailWidth }} wrapMode="none">{memoryWarning}</text>
       )}
       <box style={{ flexGrow: 1 }} />
@@ -733,6 +742,33 @@ export function OnboardingModelChooser({
         </>
       )}
     >
+      <box style={{ flexDirection: "column", width: "100%", marginBottom: 1 }}>
+        <box style={{ flexDirection: "column" }}>
+          <text selectable={false} style={{ fg: theme.text.body }} wrapMode="none">
+            {" ".repeat(FAST_TO_SMART_TRACK_LEFT_PADDING)}
+            {LOCAL_MODEL_RANKING_SCALE_LABELS.map((_, index) => (
+              <Fragment key={index}>
+                <span fg={index === selectedRankingScaleIndex ? theme.accent : theme.text.body}>
+                  {index === 0 ? "├" : index === LOCAL_MODEL_RANKING_SCALE_INTERVALS ? "┤" : "┼"}
+                </span>
+                {index < LOCAL_MODEL_RANKING_SCALE_INTERVALS
+                  ? "─".repeat(FAST_TO_SMART_SEGMENT_COLUMNS - 1)
+                  : ""}
+              </Fragment>
+            ))}
+            {"    "}
+            <span fg={theme.text.disabled}>←/→ change preference</span>
+          </text>
+          <text selectable={false} style={{ fg: theme.text.body }} wrapMode="none">
+            {FAST_TO_SMART_LABEL_LAYOUT.map(({ label, leadingSpaces }, index) => (
+              <Fragment key={label}>
+                {" ".repeat(leadingSpaces)}
+                <span fg={index === selectedRankingScaleIndex ? theme.accent : theme.text.body}>{label}</span>
+              </Fragment>
+            ))}
+          </text>
+        </box>
+      </box>
       <box style={{
         flexDirection: wide ? "row" : "column",
         width: "100%",
@@ -758,7 +794,7 @@ export function OnboardingModelPreparation({
   exitKind,
 }: {
   readonly hardware: LocalInferenceHardwareResult
-  readonly progress: readonly LocalModelRecommendationProgressStep[]
+  readonly progress: readonly LocalModelDiscoveryProgressStep[]
   readonly error: string | null
   readonly width: number
   readonly onExit: (() => void) | undefined

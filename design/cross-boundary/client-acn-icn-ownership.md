@@ -33,7 +33,7 @@ ICN owns physical inference truth: native models and packages, installation and 
 occurrences, hardware observations, planning, assessment, safety, instance lifecycle, residency
 policy, and inference execution. ICN operations revalidate native preconditions at admission.
 
-ICN does not own Magnitude Slots, favorites, recommendations, provider policy, presentation
+ICN does not own Magnitude Slots, favorites, ranking preference, provider policy, presentation
 states, or client interaction flows. Native changes may originate from ACN commands, chat
 completions, residency policy, recovery, or another internal caller, so ACN observes them
 independently of command attribution.
@@ -53,7 +53,7 @@ ACN owns the complete client-facing model contract:
 - model-management commands and their application-level validation. Commands are addressed by
   product identity (`modelId`, `slotId`); ACN resolves the native occurrence.
 
-ACN also owns Magnitude recommendations, warnings, provider status, favorites, Slot reference
+ACN also owns stable ranking scores, warnings, provider status, favorites, Slot reference
 integrity, and the atomic configuration admitted to agent work. It may project ICN facts into
 application semantics, but it does not become the authority for the native resource.
 

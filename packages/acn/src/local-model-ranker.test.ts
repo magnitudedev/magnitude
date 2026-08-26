@@ -4,12 +4,12 @@ import { describe, expect, it } from "vitest"
 
 import {
   exactBundleTensorStorageBytes,
-  localModelRecommendationFailure,
-} from "./local-model-recommendations"
+  localModelRankingFailure,
+} from "./local-model-ranker"
 
-describe("localModelRecommendationFailure", () => {
+describe("localModelRankingFailure", () => {
   it("preserves typed assessment failure metadata for the public lifecycle", () => {
-    expect(localModelRecommendationFailure(new LocalModelMutationFailed({
+    expect(localModelRankingFailure(new LocalModelMutationFailed({
       code: "planner_timeout",
       message: "Hardware assessment took longer than five minutes.",
       retryable: true,

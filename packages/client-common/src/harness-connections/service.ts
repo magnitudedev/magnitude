@@ -82,7 +82,7 @@ export const HarnessConnection = Context.GenericTag<HarnessConnection>(
 
 const magnitudeDestination: HarnessDestination = {
   id: HarnessIdSchema.make("magnitude"),
-  name: "Magnitude",
+  name: "Magnitude Harness",
   availability: "Installed",
   selectable: true,
   note: "Optimized for local models",

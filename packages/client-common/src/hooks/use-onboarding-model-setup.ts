@@ -9,6 +9,7 @@ import { Effect } from "effect"
 import { type ProviderModelId } from "@magnitudedev/sdk"
 import type { HarnessId } from "../harness-connections/service"
 import { OnboardingModelSetup } from "../local-models/setup"
+import type { OnboardingModelRankingControls } from "../local-models/setup-state"
 import { onboardingModelSetupViewAtom } from "../local-models/setup-view"
 import { useAgentClient } from "../state/agent-client-context"
 
@@ -29,6 +30,13 @@ export const useOnboardingModelSetup = () => {
     (modelId) => Effect.flatMap(
       OnboardingModelSetup,
       (setup) => setup.select(modelId),
+    ),
+    { concurrent: true },
+  ), [client])
+  const setRankingControlsAction = useMemo(() => client.runtime.fn<OnboardingModelRankingControls>()(
+    (controls) => Effect.flatMap(
+      OnboardingModelSetup,
+      (setup) => setup.setRankingControls(controls),
     ),
     { concurrent: true },
   ), [client])
@@ -58,6 +66,7 @@ export const useOnboardingModelSetup = () => {
   const retry = useAtomSet(retryAction)
   const open = useAtomSet(openAction)
   const select = useAtomSet(selectAction)
+  const setRankingControls = useAtomSet(setRankingControlsAction)
   const cancel = useAtomSet(cancelAction)
   const exit = useAtomSet(exitAction)
   const back = useAtomSet(backAction)
@@ -71,6 +80,9 @@ export const useOnboardingModelSetup = () => {
     select: useCallback((modelId: ProviderModelId) => {
       select(modelId)
     }, [select]),
+    setRankingControls: useCallback((controls: OnboardingModelRankingControls) => {
+      setRankingControls(controls)
+    }, [setRankingControls]),
     cancel: useCallback(() => cancel(), [cancel]),
     back: useCallback(() => back(), [back]),
     continueWithHarness: useCallback((input: {

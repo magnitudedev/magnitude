@@ -39,7 +39,6 @@ import { useTheme } from '../../hooks/use-theme'
 import { fitItems } from './fit-items'
 import { SystemMessageRow } from './messages/system-message-row'
 
-const SHIMMER_INTERVAL_MS = 160
 const MAX_COMMAND_DISPLAY_LEN = 80
 const PREVIEW_LINE_CAP = 3
 
@@ -208,7 +207,7 @@ function ShellStep({
         {isExecuting && (
           <>
             <span style={{ fg: theme.text.metadata }}>{' · '}</span>
-            <ShimmerText text="Running..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
+            <ShimmerText text="Running..." baseColor={theme.text.metadata} highlightColor={theme.text.body} />
           </>
         )}
         {isCompleted && (
@@ -278,7 +277,7 @@ function FileWriteStep({
           ) : (
             <span style={{ fg: theme.text.metadata }}>{` · ${lineCount} lines`}</span>
           )}
-          {isRunning && <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />}
+          {isRunning && <ShimmerText text="..." baseColor={theme.text.metadata} highlightColor={theme.text.body} />}
         </text>
       </box>
     )
@@ -300,7 +299,7 @@ function FileWriteStep({
           {step.failed ? (
             <span style={{ fg: theme.status.failure }}>{' · Error'}</span>
           ) : isRunning ? (
-            <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
+          <ShimmerText text="..." baseColor={theme.text.metadata} highlightColor={theme.text.body} />
           ) : (
             <span style={{ fg: theme.status.changeAdded }} attributes={TextAttributes.DIM}>{` +${lineCount}`}</span>
           )}
@@ -361,7 +360,7 @@ function FileEditStep({
               <span style={{ fg: theme.status.failure }} attributes={TextAttributes.DIM}>{`-${removed}`}</span>
             </>
           ) : isRunning ? (
-            <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
+          <ShimmerText text="..." baseColor={theme.text.metadata} highlightColor={theme.text.body} />
           ) : null}
         </text>
       </box>
@@ -384,7 +383,7 @@ function FileEditStep({
           {step.failed ? (
             <span style={{ fg: theme.status.failure }}>{' · Error'}</span>
           ) : isRunning && !step.diff ? (
-            <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
+          <ShimmerText text="..." baseColor={theme.text.metadata} highlightColor={theme.text.body} />
           ) : added > 0 || removed > 0 ? (
             <>
               <span style={{ fg: theme.status.changeAdded }} attributes={TextAttributes.DIM}>{` +${added}`}</span>
@@ -472,7 +471,7 @@ function CheckpointStep({ step }: { step: CheckpointPresentation }): ReactNode {
       {step.running ? (
         <>
           <span>{' '}</span>
-          <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
+          <ShimmerText text="..." baseColor={theme.text.metadata} highlightColor={theme.text.body} />
         </>
       ) : (
         <>
@@ -540,7 +539,7 @@ function CompactPathStep({
         {step.failed ? (
           <span style={{ fg: theme.status.failure }}>{' · Error'}</span>
         ) : step.running ? (
-          <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
+          <ShimmerText text="..." baseColor={theme.text.metadata} highlightColor={theme.text.body} />
         ) : step.toolKey === 'fileRead' && step.lineCount != null ? (
           <span style={{ fg: theme.text.metadata }}>{` · ${step.lineCount} lines`}</span>
         ) : null}
@@ -567,7 +566,7 @@ function FileSearchStep({ step }: { step: FileSearchPresentation }): ReactNode {
         {step.failed ? (
           <span style={{ fg: theme.status.failure }}>{' · Error'}</span>
         ) : step.running ? (
-          <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
+          <ShimmerText text="..." baseColor={theme.text.metadata} highlightColor={theme.text.body} />
         ) : (
           <span style={{ fg: theme.text.metadata }}>{` · ${step.matchCount} match${step.matchCount === 1 ? '' : 'es'} in ${step.fileCount} file${step.fileCount === 1 ? '' : 's'}`}</span>
         )}
@@ -594,7 +593,7 @@ function FileTreeStep({ step }: { step: FileTreePresentation }): ReactNode {
         {step.failed ? (
           <span style={{ fg: theme.status.failure }}>{' · Error'}</span>
         ) : step.running ? (
-          <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
+          <ShimmerText text="..." baseColor={theme.text.metadata} highlightColor={theme.text.body} />
         ) : (
           <span style={{ fg: theme.text.metadata }}>{` · ${step.fileCount} file${step.fileCount === 1 ? '' : 's'}, ${step.dirCount} dir${step.dirCount === 1 ? '' : 's'}`}</span>
         )}
@@ -621,7 +620,7 @@ function WebSearchStep({ step }: { step: WebSearchPresentation }): ReactNode {
         {step.failed ? (
           <span style={{ fg: theme.status.failure }}>{' · Error'}</span>
         ) : step.running ? (
-          <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
+          <ShimmerText text="..." baseColor={theme.text.metadata} highlightColor={theme.text.body} />
         ) : (
           <span style={{ fg: theme.text.metadata }}>{` · ${step.sourceCount} source${step.sourceCount === 1 ? '' : 's'}`}</span>
         )}
@@ -648,7 +647,7 @@ function WebFetchStep({ step }: { step: WebFetchPresentation }): ReactNode {
         {step.failed ? (
           <span style={{ fg: theme.status.failure }}>{' · Error'}</span>
         ) : step.running ? (
-          <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
+          <ShimmerText text="..." baseColor={theme.text.metadata} highlightColor={theme.text.body} />
         ) : (
           <span style={{ fg: theme.status.success }}>{' · Done'}</span>
         )}
@@ -678,7 +677,7 @@ function QueryImageStep({
         {step.failed ? (
           <span style={{ fg: theme.status.failure }}>{' · Error'}</span>
         ) : step.running ? (
-          <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
+            <ShimmerText text="..." baseColor={theme.text.metadata} highlightColor={theme.text.body} />
         ) : (
           <span style={{ fg: theme.status.success }}>{' · Done'}</span>
         )}
@@ -698,7 +697,7 @@ function GenericStep({ step }: { step: GenericToolPresentation }): ReactNode {
         {step.running ? (
           <>
             <span>{' '}</span>
-            <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.text.metadata} />
+            <ShimmerText text="..." baseColor={theme.text.metadata} highlightColor={theme.text.body} />
           </>
         ) : (
           <span style={{ fg: isErrorLike ? theme.status.failure : theme.status.success }}>

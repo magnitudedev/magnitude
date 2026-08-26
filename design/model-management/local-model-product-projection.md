@@ -67,7 +67,7 @@ failure; they are never hidden or guessed between.
 
 ## ACN product projection
 
-ACN enriches the ICN model snapshot with assessment, provider publication, recommendations, and
+ACN enriches the ICN model snapshot with assessment, provider publication, ranking scores, and
 live memory observations. Clients consume one `LocalModel` row and do not correlate parallel
 collections.
 
@@ -107,6 +107,6 @@ never persisted.
 - Any exact desired/current package difference produces update availability.
 - Completed files, not download history or cached state, determine presence.
 - Catalog or attribution failure cannot hide an installed target.
-- Clients consume acquisition, reconciliation, serving, and recommendation state from one row.
+- Clients consume acquisition, reconciliation, serving, and ranking state from one row.
 - Every installed row carries the exact current filesystem location of every bundle package.
 - Every assessed row and provider offering carries capabilities for its exact effective target.

@@ -81,7 +81,7 @@ The ICN package owns:
 
 The package owns exact hardware, recommendable-catalog, installed-package, and download observation
 plus the local provider adaptation because those capabilities compose the one generated ICN client.
-It does not own recommendation policy, user selection, ACN RPC state, cloud
+It does not own ranking policy, user selection, ACN RPC state, cloud
 provider routing, or client presentation. It does not independently inspect hardware or GGUF files
 in Bun; it obtains those facts through generated ICN operations. It contains no fallback
 implementation of an ICN operation and no hand-written HTTP client, SSE parser, wire schema, or
@@ -99,7 +99,7 @@ ordinary TypeScript and Cargo builds perform no catalog network access.
 
 ACN owns the parent scope, application policy, and complete first-party client control plane. It
 supplies ICN's storage roots and supported binary identity and translates native observations into
-Magnitude-owned catalog, Slot, Instance, environment, recommendation, and provider resources.
+Magnitude-owned catalog, Slot, Instance, environment, ranking, and provider resources.
 Hardware, Models, Packages, Downloads, and Instances remain native ICN authorities, but their
 generated management contract and event stream are private to ACN. Only the OpenAI-compatible
 `/inference/v1/**` and `/inference/anthropic/**` serving data planes are public; private

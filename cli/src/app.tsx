@@ -86,6 +86,7 @@ import {
 } from "./features/sessions/container";
 import {
   OnboardingModelChooser,
+  ONBOARDING_RANKING_CONTROL_ROWS,
   OnboardingModelExiting,
   OnboardingModelPreparation,
   HarnessChooser,
@@ -264,9 +265,9 @@ function CliAppContent(
   const { showCopiedToast: clipboardToast } = useSelectionAutoCopy();
   const notificationAreaState = useAtomValue(notificationAreaStateAtom);
   const onboardingSetup = props.onboardingSetup;
-  const setupAdditionalRows = Result.isSuccess(onboardingSetup.hardware)
+  const setupAdditionalRows = ONBOARDING_RANKING_CONTROL_ROWS + (Result.isSuccess(onboardingSetup.hardware)
     ? Math.max(0, describeLocalHardwareSummary(onboardingSetup.hardware.value).length - 1)
-    : 0;
+    : 0);
   const modelSlotsState = Option.getOrNull(Result.value(useModelSlots()));
   const { rootSlotId } = useSlotProfiles();
   const selectedLocalProviderModelId = modelSlotsState?.slots.primary._tag
@@ -418,6 +419,8 @@ function CliAppContent(
         <OnboardingModelChooser
           hardware={onboardingSetup.hardware}
           options={content.options}
+          rankingControls={content.rankingControls}
+          onRankingControlsChange={onboardingSetup.setRankingControls}
           width={chatColumnWidth}
           error={setupError}
           operation={operation}

@@ -15,13 +15,11 @@ import {
   ProviderModelCatalogReady,
   ProviderModelIdSchema,
   ReasoningEffortSchema,
-  RecommendationIdSchema,
   SECONDARY_SLOT_ID,
   servableModelBundlePackages,
   type LocalInferenceHardware,
   type LocalModel,
   type LocalModelAcquisitionState,
-  type LocalModelRecommendation,
   type LocalModelsState,
   type ModelInstanceAllocation,
   type ModelReleaseDate,
@@ -107,15 +105,6 @@ const performance = (contextLength: number) => [...new Set([
   }
 })
 
-export const makeRecommendation = (
-  overrides: Partial<LocalModelRecommendation> = {},
-): LocalModelRecommendation => ({
-  id: RecommendationIdSchema.make("recommendation_test"),
-  intent: "balanced",
-  explanation: "Balanced local inference.",
-  ...overrides,
-})
-
 export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => {
   const bundle = overrides.bundle ?? makeStandaloneBundle()
   const contextLength = 32_768
@@ -171,7 +160,7 @@ export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => {
         performance: performance(contextLength),
       },
       availabilityState: { _tag: "Selectable", providerModelId: TEST_MODEL_ID },
-      recommendations: [],
+      rankingScores: Option.none(),
     },
     ...overrides,
   }
@@ -204,6 +193,7 @@ export const makeCatalogOnlyModel = (
     servingState: {
       ...model.servingState,
       availabilityState: { _tag: "Installable" },
+      rankingScores: Option.some({ intelligence: 0.75, speed: 0.65, quality: 0.75 }),
     },
     presentation: { ...model.presentation, license: Option.some("Apache-2.0") },
     ...overrides,

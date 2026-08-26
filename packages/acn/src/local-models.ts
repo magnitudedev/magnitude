@@ -2,6 +2,7 @@ import { Context, Effect, Layer, Option, Schema, Stream, SubscriptionRef } from 
 import type { NonEmptyReadonlyArray } from "effect/Array"
 import {
   LocalModelsStateSchema,
+  ModelServingConfigurationSchema,
   ServableModelBundleSchema,
   sameServableModelBundleIdentity,
   servableModelBundlePackageIds,
@@ -13,7 +14,6 @@ import {
   type LocalModelAvailabilityState,
   type LocalModelInstalledPackage,
   type LocalModelMemory,
-  type LocalModelRecommendation,
   type LocalModelsState,
   type MemoryAssessment,
   type ModelDownloadFailure,
@@ -32,7 +32,7 @@ import { IcnInstances, IcnModels } from "@magnitudedev/icn"
 import type * as Generated from "@magnitudedev/icn-protocol/schemas"
 import { LocalInferenceHardware as LocalInferenceHardwareService } from "./local-inference-hardware"
 import { LocalModelPackages } from "./local-model-packages"
-import { LocalModelRecommendations } from "./local-model-recommendations"
+import { LocalModelRanker } from "./local-model-ranker"
 import { LocalProviderOfferings, localCatalogProviderModelId } from "./local-provider-offerings"
 import {
   providerOfferingPackageEvidence,
@@ -378,13 +378,13 @@ export class LocalModels extends Context.Tag("LocalModels")<LocalModels, LocalMo
 export const LocalModelsLive: Layer.Layer<
   LocalModels,
   never,
-  IcnModels | LocalModelPackages | LocalModelRecommendations
+  IcnModels | LocalModelPackages | LocalModelRanker
     | LocalModelConfigurationResolver | LocalProviderOfferings | LocalInferenceHardwareService
     | IcnInstances
 > = Layer.scoped(LocalModels, Effect.gen(function* () {
   const icnModels = yield* IcnModels
   const packages = yield* LocalModelPackages
-  const recommendations = yield* LocalModelRecommendations
+  const ranker = yield* LocalModelRanker
   const resolver = yield* LocalModelConfigurationResolver
   const offerings = yield* LocalProviderOfferings
   const hardware = yield* LocalInferenceHardwareService
@@ -407,7 +407,7 @@ export const LocalModelsLive: Layer.Layer<
       nativeCatalogModels,
       catalogModelDefinitionFromIcn,
     )
-    const recommendationState = yield* recommendations.state
+    const rankingState = yield* ranker.state
     const resolvedConfigurations = new Map<string, import("./local-model-configuration-resolver").ResolvedLocalModelConfiguration>(
       yield* resolver.get,
     )
@@ -458,29 +458,8 @@ export const LocalModelsLive: Layer.Layer<
           model,
         ] as const))),
     )
-    const recommendationCandidates = recommendationState._tag === "Ready"
-      ? recommendationState.catalog
-      : []
-    const recommendationTargets = new Set(recommendationCandidates.map((candidate) =>
-      localCatalogProviderModelId(candidate.model)))
-    const recommendationsByTarget = new Map<string, LocalModelRecommendation[]>()
-    if (recommendationState._tag === "Ready") {
-      for (const recommendation of recommendationState.recommendations) {
-        const target = recommendation.modelId
-        if (!recommendationTargets.has(target)) continue
-        const entries = recommendationsByTarget.get(target) ?? []
-        entries.push({
-          id: recommendation.id,
-          intent: recommendation.intent,
-          explanation: recommendation.explanation,
-        })
-        recommendationsByTarget.set(target, entries)
-      }
-    }
-    const recommendationOrderByTarget = new Map<string, number>(recommendationCandidates.map((candidate, index) => [
-      localCatalogProviderModelId(candidate.model),
-      index,
-    ]))
+    const rankingEntries = rankingState._tag === "Ready" ? rankingState.entries : []
+    const sameConfiguration = Schema.equivalence(ModelServingConfigurationSchema)
 
     const downloadIndex = new Map<ProviderModelId, ModelBundleDownload>()
     const models: LocalModel[] = [...groups.entries()].map(([identity, bundle]): LocalModel => {
@@ -633,7 +612,9 @@ export const LocalModelsLive: Layer.Layer<
             capabilities: targetInspection.capabilities,
             assessment,
             availabilityState,
-            recommendations: recommendationsByTarget.get(identity) ?? [],
+            rankingScores: Option.fromNullable(rankingEntries.find((entry) =>
+              entry.modelId === identity
+              && sameConfiguration(entry.configuration, servingConfiguration))?.scores),
           }
         }
       }
@@ -648,25 +629,20 @@ export const LocalModelsLive: Layer.Layer<
       }
     }).sort((left, right) => {
       const productIdentity = (model: LocalModel) => model.modelId
-      const leftOrder = recommendationOrderByTarget.get(productIdentity(left))
-        ?? Number.MAX_SAFE_INTEGER
-      const rightOrder = recommendationOrderByTarget.get(productIdentity(right))
-        ?? Number.MAX_SAFE_INTEGER
-      return leftOrder - rightOrder
-        || left.presentation.displayName.localeCompare(right.presentation.displayName)
+      return left.presentation.displayName.localeCompare(right.presentation.displayName)
         || left.presentation.variantLabel.localeCompare(right.presentation.variantLabel)
         || productIdentity(left).localeCompare(productIdentity(right))
     })
 
-    const discoveryState = recommendationState._tag === "Loading"
-      ? { _tag: "Loading" as const, progress: recommendationState.progress }
-      : recommendationState._tag === "Failed"
+    const discoveryState = rankingState._tag === "Loading"
+      ? { _tag: "Loading" as const, progress: rankingState.progress }
+      : rankingState._tag === "Failed"
         ? {
             _tag: "Failed" as const,
-            failure: recommendationState.failure,
-            progress: recommendationState.progress,
+            failure: rankingState.failure,
+            progress: rankingState.progress,
           }
-        : { _tag: "Ready" as const, progress: recommendationState.progress }
+        : { _tag: "Ready" as const, progress: rankingState.progress }
     const next = {
       inventoryState: packageState.inventory,
       models,
@@ -684,7 +660,7 @@ export const LocalModelsLive: Layer.Layer<
   yield* Stream.mergeAll([
     packages.changes,
     icnModels.changes,
-    recommendations.changes,
+    ranker.changes,
     resolver.changes,
     offerings.changes,
     offerings.catalogChanges,

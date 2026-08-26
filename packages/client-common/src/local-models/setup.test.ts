@@ -16,7 +16,6 @@ import {
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ProviderModelIdSchema,
-  RecommendationIdSchema,
   ReasoningEffortSchema,
   SECONDARY_SLOT_ID,
   type LocalModel,
@@ -34,6 +33,8 @@ import { installationAdmissionIsVisible } from "./service"
 import { OnboardingModelSetup } from "./setup"
 import { localModelOptions } from "./options"
 import {
+  defaultOnboardingModelRankingControls,
+  normalizeOnboardingModelRankingControls,
   projectOnboardingModelSetupContent,
   type OnboardingModelSetupState,
 } from "./setup-state"
@@ -130,11 +131,9 @@ const makeModel = (installed: boolean): LocalModel => {
       availabilityState: installed
         ? { _tag: "Selectable", providerModelId }
         : { _tag: "Installable" },
-      recommendations: installed ? [] : [{
-        id: RecommendationIdSchema.make("setup-recommendation"),
-        intent: "balanced",
-        explanation: "Recommended for setup tests",
-      }],
+      rankingScores: installed
+        ? Option.none()
+        : Option.some({ intelligence: 0.7, speed: 0.8, quality: 0.9 }),
     },
   }
 }
@@ -188,6 +187,12 @@ const configuredSlots = (
 })
 
 describe("projectOnboardingModelSetupContent", () => {
+  it("clamps the connection-scoped ranking preference", () => {
+    expect(normalizeOnboardingModelRankingControls({
+      fastToSmart: 2,
+    })).toEqual({ fastToSmart: 1 })
+  })
+
   it("reports the selected model's ready instance", () => {
     const model = makeModel(true)
     const option = localModelOptions({
@@ -210,6 +215,7 @@ describe("projectOnboardingModelSetupContent", () => {
         discoveryState: { _tag: "Ready", progress: [] },
       },
       configuredSlots("Ready", instanceId),
+      defaultOnboardingModelRankingControls,
     )
 
     expect(Option.getOrThrow(state._tag === "Chooser" ? state.operation : Option.none()))
@@ -239,6 +245,7 @@ describe("projectOnboardingModelSetupContent", () => {
         discoveryState: { _tag: "Ready", progress: [] },
       },
       slots,
+      defaultOnboardingModelRankingControls,
     )
 
     expect(Option.getOrThrow(state._tag === "Chooser" ? state.operation : Option.none()))
@@ -270,6 +277,7 @@ describe("projectOnboardingModelSetupContent", () => {
         discoveryState: { _tag: "Loading", progress: [] },
       },
       configuredSlots("Loading"),
+      defaultOnboardingModelRankingControls,
     )
 
     expect(Option.getOrThrow(state._tag === "Chooser" ? state.operation : Option.none()))
@@ -298,6 +306,7 @@ describe("projectOnboardingModelSetupContent", () => {
         discoveryState: { _tag: "Loading", progress: [] },
       },
       configuredSlots("Loading"),
+      defaultOnboardingModelRankingControls,
     )
 
     expect(Option.getOrThrow(state._tag === "Chooser" ? state.operation : Option.none()))

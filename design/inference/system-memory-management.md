@@ -165,7 +165,7 @@ query and is not stored in canonical model state or evaluated in the background.
 
 Frozen-topology candidate assessments are cached as disposable derived evidence and shared by
 preview and load. Live hardware polling therefore reruns only the fresh admission selection when
-stable assessment evidence is unchanged. Catalog assessment and recommendation work does not rerun for
+stable assessment evidence is unchanged. Catalog assessment and ranking work does not rerun for
 availability-only hardware changes.
 
 While current hardware or system-domain evidence is unavailable, clients do not infer either

@@ -25,7 +25,7 @@ separate model-management or appearance interface.
 The unified `ModelCatalog` is ACN's read-only Magnitude product projection: each local row's
 `acquisitionState` carries the model's complete materialization lifecycle (disk truth, transfer
 progress, unacknowledged failure, update availability, and residency once installed) alongside
-assessment presentation, provider availability, recommendations, and product warnings. Native ICN
+assessment presentation, provider availability, ranking scores, and product warnings. Native ICN
 Models, Packages, Downloads, Instances, and Hardware remain authoritative beneath ACN and are not
 client-visible. `ModelSlotsState` owns durable selection, favorites, and recency, resolved
 server-side to truthful Slot states including residency.
@@ -65,10 +65,9 @@ The ordinary shell contains a dedicated Settings surface for local inference:
   only artifact-level actions: reveal the daemon-published installed target path or remove the
   download. Slot selection, residency, favorites, transfer activity, and load controls do not belong
   on this surface.
-- Catalog presents the unified assessed local catalog and recommendation evidence. Its index may be
-  searched by model identity, filtered to installed models, and sorted
-  by recommendation, release date, intelligence, download size, or name. Recommendation is an
-  ordering and visible model annotation rather than a second overlapping filter. Ordinary
+- Catalog presents the unified assessed local catalog. Its index may be searched by model identity,
+  filtered to installed models, and sorted by intelligence (the default), release date, download
+  size, or name. Onboarding preference is not applied to this general catalog. Ordinary
   downloadable rows do not repeat an `Available` label; non-default lifecycle and compatibility
   states remain visible while completed `DoesNotFit` and `Incompatible` assessments are excluded
   from the browsable catalog. Catalog owns
@@ -187,7 +186,7 @@ semantics.
 - Wide and narrow layouts preserve access to every model-management view and action.
 - Footer model and reasoning choices remain available without navigating away from the chat.
 - Catalog keeps the selected model's primary action visible while its evidence scrolls, labels
-  radar axes directly, presents recommendation evidence before the radar and license/source metadata
+  radar axes directly, and presents license/source metadata
   below it, and does not repeat radar evidence in candidate rows or metric tiles. The chart remains
   fully contained without horizontal scrolling. Search,
   the installed-model filter, and the labeled sort control remain visually distinct. Its

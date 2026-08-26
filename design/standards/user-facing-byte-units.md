@@ -4,7 +4,7 @@ applies_to:
   - packages/client-common/src/local-models/failure-messages.ts
   - packages/client-common/src/state/notification-area-state.ts
   - cli/src/**
-  - packages/acn/src/local-model-recommendation-policy.ts
+  - packages/acn/src/local-model-ranking-policy.ts
   - packages/agent/src/tools/web-fetch-tool.ts
   - packages/agent/src/window/inbox/render.ts
   - packages/release/src/**

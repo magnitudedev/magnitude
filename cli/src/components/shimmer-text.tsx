@@ -1,156 +1,79 @@
-import { TextAttributes } from '@opentui/core'
-import React, { useMemo } from 'react'
-
 import { useTheme } from '../hooks/use-theme'
-import {
-  clampRange,
-  convertHslToRgb,
-  convertRgbToHsl,
-  formatRgbToHex,
-  parseHexColorToRgb,
-} from '@magnitudedev/client-common'
-import { useAnimationStep } from '../hooks/use-animation-time'
+import { interpolateHexColor } from '@magnitudedev/client-common'
+import { useAnimationTime } from '../hooks/use-animation-time'
 
-const buildPaletteFromPrimaryColor = (
-  primaryColor: string,
-  size: number,
-  fallbackColor: string,
-): string[] => {
-  const baseRgb = parseHexColorToRgb(primaryColor)
-  if (!baseRgb) {
-    // If we can't parse the color, return a simple palette using the fallback
-    return Array.from({ length: size }, () => fallbackColor)
-  }
+const DEFAULT_SWEEP_DURATION_MS = 850
+const DEFAULT_SWEEP_CYCLE_MS = 1_800
+const SWEEP_RADIUS_RATIO = 0.22
+const MIN_SWEEP_RADIUS = 2
 
-  const { h, s, l } = convertRgbToHsl(baseRgb.r, baseRgb.g, baseRgb.b)
-  const palette: string[] = []
-  const paletteSize = Math.max(6, Math.min(24, size))
-  const lightnessRange = 0.22
-
-  for (let i = 0; i < paletteSize; i++) {
-    const ratio = paletteSize === 1 ? 0.5 : i / (paletteSize - 1)
-    const offset = (0.5 - ratio) * 2 * lightnessRange
-    const adjustedLightness = clampRange(l + offset, 0.08, 0.92)
-    // Keep full saturation for vibrant colors, only vary lightness
-    const adjustedSaturation = s
-    const { r, g, b } = convertHslToRgb(h, adjustedSaturation, adjustedLightness)
-    palette.push(formatRgbToHex(r, g, b))
-  }
-
-  return palette
-}
-
-const buildGradientColors = (
-  length: number,
-  colorPalette: string[],
-  mutedColor: string,
-): string[] => {
-  if (length === 0) return []
-  if (colorPalette.length === 0) {
-    return Array.from({ length }, () => mutedColor)
-  }
-  if (colorPalette.length === 1) {
-    return Array.from({ length }, () => colorPalette[0])
-  }
-  const generatedColors: string[] = []
-  for (let i = 0; i < length; i++) {
-    const ratio = length === 1 ? 0 : i / (length - 1)
-    const colorIndex = Math.min(
-      colorPalette.length - 1,
-      Math.floor(ratio * (colorPalette.length - 1)),
-    )
-    generatedColors.push(colorPalette[colorIndex])
-  }
-  return generatedColors
-}
-
-const buildGradientAttributes = (length: number): number[] => {
-  const attributes: number[] = []
-  for (let i = 0; i < length; i++) {
-    const ratio = length <= 1 ? 0 : i / (length - 1)
-    if (ratio < 0.23) {
-      attributes.push(TextAttributes.BOLD)
-    } else if (ratio < 0.69) {
-      attributes.push(TextAttributes.NONE)
-    } else {
-      attributes.push(TextAttributes.DIM)
-    }
-  }
-  return attributes
+export const sweepShimmerIntensities = ({
+  length,
+  timeMs,
+  sweepDurationMs = DEFAULT_SWEEP_DURATION_MS,
+  cycleDurationMs = DEFAULT_SWEEP_CYCLE_MS,
+  radius,
+}: {
+  readonly length: number
+  readonly timeMs: number
+  readonly sweepDurationMs?: number
+  readonly cycleDurationMs?: number
+  readonly radius?: number
+}): readonly number[] => {
+  const safeLength = Math.max(0, Math.floor(length))
+  const resolvedRadius = radius ?? Math.max(MIN_SWEEP_RADIUS, safeLength * SWEEP_RADIUS_RATIO)
+  if (safeLength === 0 || sweepDurationMs <= 0 || cycleDurationMs <= 0 || resolvedRadius <= 0) return []
+  const cycleTime = ((timeMs % cycleDurationMs) + cycleDurationMs) % cycleDurationMs
+  if (cycleTime >= sweepDurationMs) return Array.from({ length: safeLength }, () => 0)
+  const progress = cycleTime / sweepDurationMs
+  const easedProgress = 0.5 - 0.5 * Math.cos(progress * Math.PI)
+  const center = -resolvedRadius + easedProgress * (safeLength - 1 + resolvedRadius * 2)
+  return Array.from({ length: safeLength }, (_, index) => {
+    const distance = Math.abs(index - center)
+    return distance >= resolvedRadius
+      ? 0
+      : 0.5 + 0.5 * Math.cos(Math.PI * distance / resolvedRadius)
+  })
 }
 
 export const ShimmerText = ({
   text,
-  interval = 180,
-  colors,
-  primaryColor,
+  baseColor,
+  highlightColor,
+  sweepDurationMs = DEFAULT_SWEEP_DURATION_MS,
+  cycleDurationMs = DEFAULT_SWEEP_CYCLE_MS,
 }: {
-  text: string
-  interval?: number
-  colors?: string[]
-  primaryColor?: string
+  readonly text: string
+  readonly baseColor?: string
+  readonly highlightColor?: string
+  readonly sweepDurationMs?: number
+  readonly cycleDurationMs?: number
 }) => {
   const theme = useTheme()
-  const animationPhase = useAnimationStep(true, interval)
-  const chars = text.split('')
-  const numChars = chars.length
-
-  const normalizedAnimationPhase = numChars === 0 ? 0 : animationPhase % numChars
-
-  const palette = useMemo(() => {
-    if (colors && colors.length > 0) {
-      return colors
-    }
-    if (primaryColor) {
-      const paletteSize = Math.max(8, Math.min(20, Math.ceil(numChars * 1.5)))
-      return buildPaletteFromPrimaryColor(primaryColor, paletteSize, theme.text.supporting)
-    }
-    // Use theme shimmer color as default
-    const paletteSize = Math.max(8, Math.min(20, Math.ceil(numChars * 1.5)))
-    return buildPaletteFromPrimaryColor(theme.status.information, paletteSize, theme.text.supporting)
-  }, [colors, primaryColor, numChars, theme.status.information, theme.text.supporting])
-
-  const generatedColors = useMemo(
-    () => buildGradientColors(numChars, palette, theme.text.supporting),
-    [numChars, palette, theme.text.supporting],
-  )
-  const attributes = useMemo(() => buildGradientAttributes(numChars), [numChars])
-
-  const segments: { text: string; color: string; attr: number }[] = []
-  let currentColor = generatedColors[0]
-  let currentAttr = attributes[0]
-  let currentText = ''
-
-  chars.forEach((char, index) => {
-    const phase = (normalizedAnimationPhase - index + numChars) % numChars
-    const charColor = generatedColors[phase]
-    const charAttr = attributes[phase]
-
-    if (charColor === currentColor && charAttr === currentAttr) {
-      currentText += char
-    } else {
-      if (currentText) {
-        segments.push({
-          text: currentText,
-          color: currentColor,
-          attr: currentAttr,
-        })
-      }
-      currentText = char
-      currentColor = charColor
-      currentAttr = charAttr
-    }
+  const animationTime = useAnimationTime(true)
+  const resolvedBaseColor = baseColor ?? theme.text.supporting
+  const resolvedHighlightColor = highlightColor ?? theme.text.emphasized
+  const intensities = sweepShimmerIntensities({
+    length: text.length,
+    timeMs: animationTime,
+    sweepDurationMs,
+    cycleDurationMs,
   })
-
-  if (currentText) {
-    segments.push({ text: currentText, color: currentColor, attr: currentAttr })
+  if (intensities.every((intensity) => intensity === 0)) {
+    return <span fg={resolvedBaseColor}>{text}</span>
   }
-
   return (
     <>
-      {segments.map((part, index) => (
-        <span key={index} fg={part.color} attributes={part.attr}>
-          {part.text}
+      {[...text].map((character, index) => (
+        <span
+          key={index}
+          fg={interpolateHexColor(
+            resolvedBaseColor,
+            resolvedHighlightColor,
+            intensities[index] ?? 0,
+          )}
+        >
+          {character}
         </span>
       ))}
     </>

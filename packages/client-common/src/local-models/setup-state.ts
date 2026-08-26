@@ -2,7 +2,7 @@ import { Cause, Data, Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
 import type {
   LocalModel,
-  LocalModelRecommendationProgressStep,
+  LocalModelDiscoveryProgressStep,
   LocalModelsState,
   ModelDownloadFailure,
   ModelInstanceFailure,
@@ -76,6 +76,24 @@ export type OnboardingModelSetupFailure =
 
 export type OnboardingModelSetupExitKind = "Skip" | "Close"
 
+export interface OnboardingModelRankingControls {
+  readonly fastToSmart: number
+}
+
+export const defaultOnboardingModelRankingControls: OnboardingModelRankingControls = {
+  fastToSmart: 0.5,
+}
+
+const normalizeRankingControl = (value: number): number => Number.isFinite(value)
+  ? Math.min(1, Math.max(0, value))
+  : 0
+
+export const normalizeOnboardingModelRankingControls = (
+  controls: OnboardingModelRankingControls,
+): OnboardingModelRankingControls => ({
+  fastToSmart: normalizeRankingControl(controls.fastToSmart),
+})
+
 export type OnboardingModelLoadStatus =
   | { readonly _tag: "Preparing" }
   | {
@@ -110,7 +128,7 @@ export type OnboardingModelSetupOperation =
 export type OnboardingModelSetupContent =
   | {
       readonly _tag: "Preparation"
-      readonly progress: readonly LocalModelRecommendationProgressStep[]
+      readonly progress: readonly LocalModelDiscoveryProgressStep[]
       readonly discoveryFailure: Extract<
         LocalModelsState["discoveryState"],
         { readonly _tag: "Failed" }
@@ -119,6 +137,7 @@ export type OnboardingModelSetupContent =
   | {
       readonly _tag: "Chooser"
       readonly options: readonly LocalModelOption[]
+      readonly rankingControls: OnboardingModelRankingControls
       readonly operation: Option.Option<OnboardingModelSetupOperation>
     }
   | {
@@ -202,6 +221,7 @@ export const projectOnboardingModelSetupContent = (
   execution: Option.Option<OnboardingModelSetupExecution>,
   models: LocalModelsState,
   slots: ModelSlotsState,
+  rankingControls: OnboardingModelRankingControls,
 ): OnboardingModelSetupContent => {
   if (Option.isNone(execution)) {
     if (models.discoveryState._tag === "Loading") {
@@ -221,6 +241,7 @@ export const projectOnboardingModelSetupContent = (
     return {
       _tag: "Chooser",
       options: localModelOptions(models, slots),
+      rankingControls,
       operation: Option.none(),
     }
   }
@@ -239,6 +260,7 @@ export const projectOnboardingModelSetupContent = (
     return {
       _tag: "Chooser",
       options,
+      rankingControls,
       operation: Option.some({
         _tag: "Completing",
         model: currentModel,
@@ -251,6 +273,7 @@ export const projectOnboardingModelSetupContent = (
     return {
       _tag: "Chooser",
       options,
+      rankingControls,
       operation: Option.some({
         _tag: current._tag,
         model: currentModel,
@@ -286,6 +309,7 @@ export const projectOnboardingModelSetupContent = (
   return {
     _tag: "Chooser",
     options,
+    rankingControls,
     operation: Option.some({
       _tag: "Loading",
       model: currentModel,

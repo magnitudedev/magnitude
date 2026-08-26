@@ -76,7 +76,7 @@ satisfied by the build job.
 
 The complete candidate gate additionally installs the packed npm package through Node and Bun,
 acquires CLI, ACN, and ICN through their production paths from an empty data root, reaches ACN/ICN
-readiness and local-model recommendation readiness, shuts down the exact owned processes, and proves
+readiness and local-model ranking readiness, shuts down the exact owned processes, and proves
 the validated cache works when the artifact endpoint is unavailable.
 
 Pull requests run the complete build and acceptance graph without publishing. A manually dispatched

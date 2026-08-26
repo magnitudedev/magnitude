@@ -25,7 +25,7 @@ applies_to:
 | **Slot** | ACN-owned durable provider-qualified model selection, reasoning preference, favorites, and recency for a product role. It contains no Instance identity or residency state. |
 
 Catalog is a source of Model declarations, not a parallel collection. A local product view is a
-read-only ACN projection adding Magnitude assessment, provider, recommendation, update, and warning
+read-only ACN projection adding Magnitude assessment, provider, ranking, update, and warning
 semantics to native facts. It is not an inference authority.
 
 ## Derived values

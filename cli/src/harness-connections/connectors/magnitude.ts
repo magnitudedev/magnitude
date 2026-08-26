@@ -4,7 +4,7 @@ import { defineConnector, launchPlan } from "../shared"
 
 export const makeMagnitudeConnector = (paths: HarnessConnectionPaths) => defineConnector({
   id: "magnitude",
-  name: "Magnitude",
+  name: "Magnitude Harness",
   executable: "magnitude",
   recommended: true,
   note: "Optimized for local models",

@@ -36,10 +36,10 @@ domain. Their passive query Atoms are canonical server observations. Their Mutat
 commands and synchronize the acknowledged postcondition back into the canonical query. Query and
 Mutation definitions remain private to the owning service.
 
-The composed onboarding setup service owns only shared client interaction state and the lifetime of
-the active cross-domain Effect. It defines no Query, Mutation, cache, mirror, or second copy of
-server state. React and the CLI observe its one view and invoke semantic Effects; they do not own the
-workflow or infer it from mutation history.
+The composed onboarding setup service owns only shared client interaction state, including the local
+model ranking preference, and the lifetime of the active cross-domain Effect. It defines no Query,
+Mutation, cache, mirror, or second copy of server state. React and the CLI observe its one view and
+invoke semantic Effects; they do not own the workflow or infer it from mutation history.
 
 ## Visibility and exit semantics
 
@@ -133,7 +133,9 @@ Open {
 }
 ```
 
-Repeated metadata lives on its parent. Choice options exist only on chooser content. The active
+Repeated metadata lives on its parent. Choice options and the connection-scoped Fast-to-Smart
+preference exist only on chooser content. Its normalized value is clamped to `[0, 1]`, survives
+renderer remounts for the connection, and are not durable onboarding state. The active
 operation carries its model directly. Harness content carries the captured ready model and one
 ordered detection snapshot. The hook separately exposes hardware because hardware is an
 orthogonal server observation, not setup lifecycle state.
@@ -151,6 +153,16 @@ Stage content does not repeat the active step as a second title. In particular, 
 begins with its hardware context beneath the progress indicator rather than rendering a redundant
 `Choose a local model` heading.
 
+The chooser places the non-focusable Fast-to-Smart scale after hardware and before model rows. It shows
+at most ten ranked eligible models regardless of installation state, followed by every installed
+model under `ON THIS COMPUTER`. An installed model may therefore appear in both groups. Keyboard
+traversal visits only model rows; Left/Right and `h`/`l` adjust Fast-to-Smart regardless of which
+model row is selected. Re-ranking preserves the cursor's row/rank position rather than following the
+previous model identity. A ranked row's installation state
+determines whether its action is Loaded, Load, or Download.
+Ranking input and model input are locked during an active operation. Hardware failure does not
+fabricate a memory maximum or selectable ranked results.
+
 The shared frame height is the model chooser's required row count, not a percentage of the terminal.
 Its wide and stacked variants account for their respective progress and chooser layouts, and the
 removed duplicate model title contributes no reserved row. Every later stage reuses that computed
@@ -161,7 +173,10 @@ use the same two-line typography there, so changing stages does not move or rest
 empty row is guaranteed immediately before the footer without changing the frame's total height.
 Downloading and loading keep the selected model details and radar visible. Both render through the
 same fixed progress region beneath the radar with the same progress-bar geometry; loading begins at
-zero percent until authoritative fractional progress advances it.
+zero percent until authoritative fractional progress advances it. The active operation label above
+the bar uses a short eased shimmer sweep for starting, downloading, cancelling, preparing, stopping,
+loading, verifying, and finishing states. A narrow cosine highlight crosses muted text in about 700 ms,
+then disappears for about 1.8 seconds; it never changes text weight. Failure text remains static.
 The harness stage is one unboxed linear menu containing supported destinations followed by the
 startup and skill toggles. Harness rows are ordinary single-choice rows, not checkbox controls.
 Up and Down traverse every enabled control in that order; unavailable destinations remain visible
@@ -188,5 +203,7 @@ only then starts the returned executable with inherited terminal I/O and the cap
 - Closed and Closing views do not observe unrelated model or slot queries.
 - Query retry targets the failed participating owner.
 - UI code renders one setup view and never inspects mutation history to derive lifecycle.
+- Ranking controls are connection-scoped setup state and never persisted or sent to ACN.
+- Downloadable ranking is derived only from authoritative hardware, model facts, and the chooser controls.
 - A ready model advances to harness selection; model readiness alone never completes onboarding.
 - External harness launch never overlaps the Magnitude renderer.

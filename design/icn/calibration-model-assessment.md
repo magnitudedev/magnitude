@@ -22,7 +22,7 @@ applies_to:
 |---|---|
 | Hardware discovery, calibration, native planning, memory and performance evidence | ICN |
 | Serving-configuration construction, canonical identity, validation | ICN |
-| Profile policy, assessment orchestration, recommendations | ACN |
+| Profile policy, assessment orchestration, ranking scores | ACN |
 | Presentation | Clients |
 
 ## Terms
@@ -223,7 +223,7 @@ persisted. Operational failures are never persisted.
 configurations plus canonical standard profiles for installed standalone bundles. ACN supplies the
 bundle and chosen profile for standard demand; ICN constructs and canonically identifies the exact
 configuration it assesses. The semantic assessment key covers every native cache-identity input
-plus that exact configuration and requested performance-depth policy. Provider, recommendation,
+plus that exact configuration and requested performance-depth policy. Provider, ranking,
 and product projections consume the resulting per-configuration state and do not invoke this
 endpoint directly.
 
@@ -237,7 +237,7 @@ configurations, and completion publishes only if that key remains current.
 - Reading catalog, inventory, or TUI state does not itself invoke native assessment.
 - One assessor evaluates issued catalog configurations plus canonical standard profiles through
   the shared assessment service; ICN constructs every resulting exact
-  configuration, and recommendation policy consumes only private eligible catalog inputs.
+  configuration, and ranking policy consumes only private eligible catalog inputs.
 - Inventory reconciliation is coalesced background work; reads return the last complete snapshot.
 - Resolved configurations remain visible while assessment is pending or fails.
 - Only completed `Fits` configurations can become installable catalog rows or enabled provider

@@ -22,7 +22,7 @@ import {
   type LocalInferenceMemoryDomainId,
   type LocalModel,
   type LocalModelsState,
-  type LocalModelRecommendationProgressStep,
+  type LocalModelDiscoveryProgressStep,
   type ModelAssessmentId,
   type ModelSlotsState,
   type ProviderModelId,
@@ -133,7 +133,7 @@ export const performanceRangeSpeedLabel = (
 }
 
 const progressLabel = (
-  step: LocalModelRecommendationProgressStep,
+  step: LocalModelDiscoveryProgressStep,
   completed: boolean,
 ): string => {
   if (step.id === "hardware") return completed ? "Detected hardware" : "Detecting hardware"
@@ -147,9 +147,9 @@ const progressLabel = (
     const count = Option.getOrElse(step.completedItems, () => 0)
     return `Assessed ${count} models for this machine`
   }
-  if (!completed) return "Preparing recommendations"
+  if (!completed) return "Ranking models"
   const count = Option.getOrElse(step.completedItems, () => 0)
-  return `Prepared ${count} recommendations`
+  return `Ranked ${count} models`
 }
 
 const formatDurationMs = (durationMs: number): string => durationMs < 1_000
@@ -159,14 +159,14 @@ const formatDurationMs = (durationMs: number): string => durationMs < 1_000
     : `${Math.floor(durationMs / 60_000)}m ${Math.round(durationMs % 60_000 / 1_000)}s`
 
 export interface LocalInferenceProgressLine {
-  readonly id: LocalModelRecommendationProgressStep["id"]
+  readonly id: LocalModelDiscoveryProgressStep["id"]
   readonly state: "pending" | "running" | "completed" | "failed"
   readonly label: string
   readonly metadata: string
 }
 
 export const localInferenceProgressLines = (
-  steps: readonly LocalModelRecommendationProgressStep[],
+  steps: readonly LocalModelDiscoveryProgressStep[],
 ): readonly LocalInferenceProgressLine[] => steps.map((step) => {
   const completed = step.status._tag === "Completed"
   const label = progressLabel(step, completed)

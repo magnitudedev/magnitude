@@ -106,6 +106,8 @@ describe("Settings model loading states", () => {
     expect(html).toContain('aria-label="Search catalog"')
     expect(html).toContain('aria-label="Filter catalog"')
     expect(html).toContain('aria-label="Sort catalog"')
+    expect(html).toContain("Most intelligent")
+    expect(html).not.toContain("Recommended")
     expect(html).toContain("Installed")
     expect(html).not.toContain("Loading catalog")
   })
