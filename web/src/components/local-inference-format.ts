@@ -115,13 +115,3 @@ export const slotStatus = (
       }
   }
 }
-
-export const intentLabel = (
-  intent: "balanced" | "smartest" | "fastest" | "lightweight"
-): string =>
-  ({
-    balanced: "Balanced",
-    smartest: "Smartest",
-    fastest: "Fastest",
-    lightweight: "Lightweight",
-  }[intent])

@@ -16,7 +16,6 @@ import {
   makeAcquiringModel,
   makeCatalogModel,
   makeModel,
-  makeRecommendation,
   makeStandaloneBundle,
   makeView,
   withDoesNotFitAssessment,
@@ -40,27 +39,13 @@ describe("unified local inference projection", () => {
     expect(Option.getOrThrow(selectionProviderModelId(selection!))).toBeDefined()
   })
 
-  it("publishes one row when one model carries several recommendation annotations", () => {
-    const base = makeCatalogModel()
-    if (base.servingState._tag !== "Assessed") throw new Error("fixture must be assessed")
-    const model = {
-      ...base,
-      servingState: {
-        ...base.servingState,
-        recommendations: [
-          makeRecommendation({ intent: "balanced" }),
-          makeRecommendation({ intent: "fastest" }),
-        ],
-      },
-    }
+  it("publishes one downloadable row for one scored catalog model", () => {
+    const model = makeCatalogModel()
     const view = makeView({ models: [model], ready: false })
     const selections = buildLocalInferenceSelections(view.models, view.slots)
     expect(selections).toHaveLength(1)
     expect(selections[0]?.model).toBe(model)
-    expect(selections[0]?.recommendations.map(({ intent }) => intent)).toEqual([
-      "balanced",
-      "fastest",
-    ])
+    expect(selections[0]?.kind).toBe("downloadable")
   })
 
   it("keeps active acquisition visible without manufacturing a download record", () => {

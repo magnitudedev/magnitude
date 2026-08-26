@@ -1,10 +1,10 @@
 ---
 title: Models
-description: "Model recommendations, catalog, and downloads"
+description: "Model ranking, catalog, and downloads"
 icon: boxes
 ---
 
-Magnitude profiles your hardware and recommends the best local models for your machine. Open `/settings` to choose a recommendation, browse the full catalog, manage downloaded models, or inspect your hardware.
+Magnitude profiles your hardware and ranks compatible local models for your machine. Open `/settings` to tune setup choices, browse the full catalog, manage downloaded models, or inspect your hardware.
 
 ## Hardware detection and profiling
 
@@ -12,24 +12,22 @@ Magnitude detects your processor, memory, system architecture, and acceleration 
 
 Magnitude reuses the profile until your hardware or inference engine changes. Open `/settings → Hardware` to inspect the results.
 
-## Recommendations
+## Ranked setup choices
 
-Magnitude combines the hardware profile with its curated model data to recommend a small set of configurations for your machine. Each recommendation is a specific model, quantization, and context size.
+Magnitude combines the hardware profile with curated intelligence and quality data to rank up to ten downloadable configurations. Each choice is a specific model, quantization, and context size.
 
-- **Balanced** offers the best overall mix of capability, speed, and memory use.
-- **Smartest** prioritizes model capability or higher model fidelity.
-- **Fastest** prioritizes response speed.
-- **Lightweight** uses less memory and disk space.
+- Move **Fast to Smart** toward Fast to favor generation speed or toward Smart to favor intelligence.
+- Lower **Memory** to exclude configurations whose assessed runtime allocation exceeds that budget.
 
-Recommendations consider agent capability, estimated speed, context, runtime memory, download size, and how much quality is retained by the quantization. They can differ between computers even when both machines have enough memory for the same model.
+Ranking combines intelligence, estimated speed, and quantization quality. Memory is a hard filter rather than a ranking factor. Installed models remain available separately from ranked downloads.
 
 Speed is shown as a range, such as `~36–48 tok/s`. Actual performance varies with prompt length, other work running on the computer, and the exact model revision.
 
 ## Model catalog
 
-Recommendations are a short list selected for your machine. The catalog contains the complete curated set of local model configurations Magnitude can evaluate for it.
+Ranked setup choices are a short preference-dependent list for your machine. The catalog contains the complete curated set of fitting local model configurations and does not inherit setup-slider state.
 
-Open `/settings`, then select **catalog** to compare model details including recommendation, memory, intelligence, quantization quality, speed, context, and license information. You can download another model at any time or select one that is already installed.
+Open `/settings`, then select **catalog** to compare memory, intelligence, quantization quality, speed, context, and license information. You can download another model at any time or select one that is already installed.
 
 Magnitude-managed models are stored in `~/.magnitude/models`. Magnitude also checks the Hugging Face Hub cache for compatible GGUF models, respecting `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HOME`, and `XDG_CACHE_HOME` before falling back to `~/.cache/huggingface/hub`.
 

@@ -122,7 +122,7 @@ never rewritten as insufficient model memory, model incompatibility, unavailable
 Once preparation succeeds, compatibility and memory capacity remain independent from performance.
 Complete execution assessment always includes measured performance. A hardware-calibration, workload, or
 estimator failure fails the assessment operation and is never rewritten as incompatibility or a
-successful empty recommendation result.
+successful empty ranking result.
 
 ## Conformance
 
@@ -134,7 +134,7 @@ successful empty recommendation result.
 - Architecture-specific targets never use the ordinary numeric-forward rule.
 - A CUDA backend is not ready until an isolated synchronized operation succeeds.
 - Cold preparation is visible as `PreparingBackend(Cuda, hardwareLabel)` during ACN bootstrap.
-- Performance failure cannot create a successful empty recommendation result.
+- Performance failure cannot create a successful empty ranking result.
 
 ## NVIDIA references
 

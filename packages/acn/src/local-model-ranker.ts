@@ -12,47 +12,49 @@ import {
 import { createHash } from "node:crypto"
 import {
   LocalModelMutationFailed,
+  LocalModelDiscoveryProgressStepSchema,
   ModelFailureSchema,
   ModelServingConfigurationSchema,
-  LocalModelRecommendationProgressStepSchema,
   servableModelBundlePackages,
-  servableModelBundleTargetPackageId,
-  type LocalModelRecommendationProgressStep,
-  type LocalModelRecommendationProgressStepId,
+  type LocalModelDiscoveryProgressStep,
+  type LocalModelDiscoveryProgressStepId,
+  type LocalModelRankingScores,
   type ServableModelBundle,
   type ModelFailure,
   type ModelServingConfiguration,
   type RecommendableModel,
 } from "@magnitudedev/acn-protocol"
+import type { ProviderModelId } from "@magnitudedev/ai"
 import { IcnHardware, IcnModels } from "@magnitudedev/icn"
 import { LocalModelAssessor } from "./local-model-assessor"
 import { LocalModelPackages } from "./local-model-packages"
 import { catalogModelDefinitionFromIcn } from "./local-model-icn-adapter"
-import {
-  assembleRecommendationCatalogCandidates,
-  selectRecommendationPortfolio,
-  type RecommendationCandidate,
-  type RecommendationSelection,
-} from "./local-model-recommendation-policy"
+import { localCatalogProviderModelId } from "./local-provider-model-id"
+import { modelRankingScores } from "./local-model-ranking-policy"
 
-type RecommendationState =
+export interface LocalModelRankingEntry {
+  readonly modelId: ProviderModelId
+  readonly configuration: ModelServingConfiguration
+  readonly scores: LocalModelRankingScores
+}
+
+type RankingState =
   | {
       readonly _tag: "Loading"
-      readonly progress: readonly LocalModelRecommendationProgressStep[]
+      readonly progress: readonly LocalModelDiscoveryProgressStep[]
     }
   | {
       readonly _tag: "Ready"
-      readonly recommendations: readonly RecommendationSelection[]
-      readonly catalog: readonly RecommendationCandidate[]
-      readonly progress: readonly LocalModelRecommendationProgressStep[]
+      readonly entries: readonly LocalModelRankingEntry[]
+      readonly progress: readonly LocalModelDiscoveryProgressStep[]
     }
   | {
       readonly _tag: "Failed"
       readonly failure: ModelFailure
-      readonly progress: readonly LocalModelRecommendationProgressStep[]
+      readonly progress: readonly LocalModelDiscoveryProgressStep[]
     }
 
-export const localModelRecommendationFailure = (
+export const localModelRankingFailure = (
   error: {
     readonly message: string
     readonly retryable?: boolean
@@ -65,21 +67,21 @@ export const localModelRecommendationFailure = (
         retryable: error.retryable,
       }
     : {
-        code: "recommendations_unavailable",
+        code: "model_ranking_unavailable",
         message:
           error?.message.trim() ||
-          "Local model recommendations are temporarily unavailable",
+          "Local model ranking is temporarily unavailable",
         retryable: error?.retryable ?? true,
       }
 
-export interface LocalModelRecommendationsApi {
-  readonly state: Effect.Effect<RecommendationState>
-  readonly changes: Stream.Stream<RecommendationState>
+export interface LocalModelRankerApi {
+  readonly state: Effect.Effect<RankingState>
+  readonly changes: Stream.Stream<RankingState>
 }
 
-export class LocalModelRecommendations extends Context.Tag(
-  "LocalModelRecommendations"
-)<LocalModelRecommendations, LocalModelRecommendationsApi>() {}
+export class LocalModelRanker extends Context.Tag(
+  "LocalModelRanker"
+)<LocalModelRanker, LocalModelRankerApi>() {}
 
 export const exactBundleTensorStorageBytes = (
   model: RecommendableModel
@@ -109,8 +111,8 @@ const exactTensorStorageBytes = (
 }
 
 const pendingProgress = (
-  id: LocalModelRecommendationProgressStepId
-): LocalModelRecommendationProgressStep => ({
+  id: LocalModelDiscoveryProgressStepId
+): LocalModelDiscoveryProgressStep => ({
   id,
   status: { _tag: "Pending" },
   completedItems: Option.none(),
@@ -118,27 +120,27 @@ const pendingProgress = (
   estimatedRemainingMs: Option.none(),
 })
 
-const initialProgress = (): readonly LocalModelRecommendationProgressStep[] => [
+const initialProgress = (): readonly LocalModelDiscoveryProgressStep[] => [
   pendingProgress("hardware"),
   pendingProgress("inventory"),
   pendingProgress("assessment"),
-  pendingProgress("recommendations"),
+  pendingProgress("ranking"),
 ]
 
 const updateProgress = (
-  progress: readonly LocalModelRecommendationProgressStep[],
-  id: LocalModelRecommendationProgressStepId,
-  update: Partial<LocalModelRecommendationProgressStep>
-): readonly LocalModelRecommendationProgressStep[] =>
+  progress: readonly LocalModelDiscoveryProgressStep[],
+  id: LocalModelDiscoveryProgressStepId,
+  update: Partial<LocalModelDiscoveryProgressStep>
+): readonly LocalModelDiscoveryProgressStep[] =>
   progress.map((step) => (step.id === id ? { ...step, ...update } : step))
 
-export const makeLocalModelRecommendationsLive = (): Layer.Layer<
-  LocalModelRecommendations,
+export const makeLocalModelRankerLive = (): Layer.Layer<
+  LocalModelRanker,
   never,
   IcnModels | IcnHardware | LocalModelAssessor | LocalModelPackages
 > =>
   Layer.scoped(
-    LocalModelRecommendations,
+    LocalModelRanker,
     Effect.gen(function* () {
       const models = yield* IcnModels
       const hardware = yield* IcnHardware
@@ -148,59 +150,41 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
       const startupProgress = updateProgress(initialProgress(), "hardware", {
         status: { _tag: "Running", startedAtMs: startupStartedAtMs },
       })
-      const current = yield* SubscriptionRef.make<RecommendationState>({
+      const current = yield* SubscriptionRef.make<RankingState>({
         _tag: "Loading",
         progress: startupProgress,
       })
       const progressRef = yield* Ref.make(startupProgress)
-      const lastInputDigest = yield* Ref.make<Option.Option<string>>(
-        Option.none()
-      )
-      const recommendationsEquivalent = (
-        left: readonly RecommendationSelection[],
-        right: readonly RecommendationSelection[],
-      ): boolean => left.length === right.length && left.every((entry, index) => {
-        const other = right[index]
-          return other !== undefined
-          && entry.id === other.id
-          && entry.modelId === other.modelId
-          && entry.displayName === other.displayName
-          && entry.intent === other.intent
-          && entry.explanation === other.explanation
-      })
-      const catalogEquivalent = (
-        left: readonly RecommendationCandidate[],
-        right: readonly RecommendationCandidate[],
+      const lastInputDigest = yield* Ref.make<Option.Option<string>>(Option.none())
+      const entriesEquivalent = (
+        left: readonly LocalModelRankingEntry[],
+        right: readonly LocalModelRankingEntry[],
       ): boolean => JSON.stringify(left) === JSON.stringify(right)
       const failuresEquivalent = Schema.equivalence(ModelFailureSchema)
       const progressEquivalent = Schema.equivalence(
-        Schema.Array(LocalModelRecommendationProgressStepSchema)
+        Schema.Array(LocalModelDiscoveryProgressStepSchema)
       )
       const equivalent = (
-        left: RecommendationState,
-        right: RecommendationState
+        left: RankingState,
+        right: RankingState
       ): boolean =>
         left._tag === right._tag &&
         progressEquivalent(left.progress, right.progress) &&
         (left._tag === "Loading" ||
           (left._tag === "Ready" &&
             right._tag === "Ready" &&
-            recommendationsEquivalent(
-              left.recommendations,
-              right.recommendations
-            ) &&
-            catalogEquivalent(left.catalog, right.catalog)) ||
+            entriesEquivalent(left.entries, right.entries)) ||
           (left._tag === "Failed" &&
             right._tag === "Failed" &&
             failuresEquivalent(left.failure, right.failure)))
       const lock = yield* Effect.makeSemaphore(1)
-      const publish = (next: RecommendationState) => Effect.gen(function* () {
+      const publish = (next: RankingState) => Effect.gen(function* () {
         const previous = yield* SubscriptionRef.get(current)
         if (!equivalent(previous, next)) yield* SubscriptionRef.set(current, next)
       })
 
       const publishProgress = (
-        progress: readonly LocalModelRecommendationProgressStep[]
+        progress: readonly LocalModelDiscoveryProgressStep[]
       ): Effect.Effect<void> =>
         Effect.gen(function* () {
           yield* Ref.set(progressRef, progress)
@@ -215,8 +199,8 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
         })
 
       const startStep = (
-        progress: readonly LocalModelRecommendationProgressStep[],
-        id: LocalModelRecommendationProgressStepId,
+        progress: readonly LocalModelDiscoveryProgressStep[],
+        id: LocalModelDiscoveryProgressStepId,
         counts?: { readonly completed: number; readonly total: number }
       ) => {
         const next = updateProgress(progress, id, {
@@ -231,8 +215,8 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
       }
 
       const completeStep = (
-        progress: readonly LocalModelRecommendationProgressStep[],
-        id: LocalModelRecommendationProgressStepId,
+        progress: readonly LocalModelDiscoveryProgressStep[],
+        id: LocalModelDiscoveryProgressStepId,
         startedAtMs: number,
         cached: boolean,
         counts?: { readonly completed: number; readonly total: number }
@@ -257,6 +241,42 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
         .withPermits(1)(
           Effect.gen(function* () {
             const currentStateBeforeRefresh = yield* SubscriptionRef.get(current)
+            const hardwareSnapshot = (yield* hardware.get).state
+            if (!(yield* packages.initialized) || !(yield* models.initialized)) return
+            const packageState = yield* packages.state
+            const modelsState = (yield* models.get).state
+            const catalogModels = yield* Effect.forEach(
+              modelsState.models,
+              catalogModelDefinitionFromIcn,
+            )
+            const coordinated = yield* assessments.state
+            const encodedInput = yield* Schema.encode(
+              Schema.parseJson(Schema.Unknown),
+            )({
+              catalog: catalogModels.map((model) => ({
+                modelId: model.modelId,
+                variantId: model.variantId,
+                configuration: model.configuration,
+                qualityScore: model.qualityScore,
+                fidelityRank: model.fidelityRank,
+                tensorStorageBytes: Option.getOrNull(exactBundleTensorStorageBytes(model)),
+              })),
+              assessments: coordinated,
+              hardware: {
+                topology: hardwareSnapshot.topology_fingerprint,
+                nativeBuild: hardwareSnapshot.native_build,
+                backends: hardwareSnapshot.enabled_backends,
+                memoryDomains: hardwareSnapshot.memory_domains.map((domain) => ({
+                  id: domain.id,
+                  stableCapacityBytes: domain.stable_capacity_bytes,
+                })),
+              },
+            })
+            const inputDigest = createHash("sha256").update(encodedInput).digest("hex")
+            const previousDigest = yield* Ref.get(lastInputDigest)
+            if (currentStateBeforeRefresh._tag === "Ready"
+              && Option.contains(previousDigest, inputDigest)) return
+
             let progress =
               currentStateBeforeRefresh._tag === "Loading"
                 ? yield* Ref.get(progressRef)
@@ -269,7 +289,6 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
             if (hardwareStep?.status._tag !== "Running") {
               progress = yield* startStep(progress, "hardware")
             }
-            const hardwareSnapshot = (yield* hardware.get).state
             progress = yield* completeStep(
               progress,
               "hardware",
@@ -289,8 +308,6 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
             if (inventoryStep?.status._tag !== "Running") {
               progress = yield* startStep(progress, "inventory")
             }
-            if (!(yield* packages.initialized)) return
-            const packageState = yield* packages.state
             const installedCount = packageState.entries.filter(({ localState }) =>
               localState._tag === "Installed").length
             progress = yield* completeStep(
@@ -304,88 +321,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
               }
             )
 
-            if (!(yield* models.initialized)) return
-            const modelsState = (yield* models.get).state
-            const catalogModels = yield* Effect.forEach(
-              modelsState.models,
-              catalogModelDefinitionFromIcn
-            )
             const assessmentConfigurations = catalogModels
-            const inputState = yield* Schema.encode(
-              Schema.parseJson(Schema.Unknown)
-            )({
-              catalog: catalogModels.map((model) => ({
-                modelId: model.modelId,
-                variantId: model.variantId,
-                catalogModelId: model.modelId,
-                configuration: model.configuration,
-                displayName: model.displayName,
-                variantLabel: model.variantLabel,
-                description: model.description,
-                license: model.license,
-                capabilities: model.capabilities,
-                qualityScore: model.qualityScore,
-                qualityScoreProvenance: model.qualityScoreProvenance,
-                fidelityRank: model.fidelityRank,
-                quantizationAware: model.quantizationAware,
-                qualityEvidence: model.qualityEvidence,
-                tensorStorageBytes: Option.getOrNull(
-                  exactBundleTensorStorageBytes(model)
-                ),
-              })),
-              hardware: hardwareSnapshot.topology_fingerprint,
-              nativeBuild: hardwareSnapshot.native_build,
-              backends: hardwareSnapshot.enabled_backends,
-              platform: hardwareSnapshot.platform,
-              architecture: hardwareSnapshot.architecture,
-              memoryDomains: hardwareSnapshot.memory_domains.map((domain) => ({
-                id: domain.id,
-                stableCapacityBytes: domain.stable_capacity_bytes,
-                totalCapacityBytes: domain.total_capacity_bytes,
-              })),
-            })
-            const inputDigest = createHash("sha256")
-              .update(inputState)
-              .digest("hex")
-            const previousDigest = yield* Ref.get(lastInputDigest)
-            const currentState = yield* SubscriptionRef.get(current)
-            if (
-              Option.exists(
-                previousDigest,
-                (digest) => digest === inputDigest
-              ) &&
-              currentState._tag === "Ready"
-            ) {
-              const reusedAt = Date.now()
-              progress = updateProgress(progress, "assessment", {
-                status: {
-                  _tag: "Completed",
-                  startedAtMs: reusedAt,
-                  durationMs: 0,
-                  cached: true,
-                },
-                completedItems: Option.some(assessmentConfigurations.length),
-                totalItems: Option.some(assessmentConfigurations.length),
-                estimatedRemainingMs: Option.none(),
-              })
-              progress = updateProgress(progress, "recommendations", {
-                status: {
-                  _tag: "Completed",
-                  startedAtMs: reusedAt,
-                  durationMs: 0,
-                  cached: true,
-                },
-                completedItems: Option.some(
-                  currentState.recommendations.length
-                ),
-                totalItems: Option.some(4),
-                estimatedRemainingMs: Option.none(),
-              })
-              yield* Ref.set(progressRef, progress)
-              yield* publish({ ...currentState, progress })
-              return
-            }
-
             const aggregateStableCapacityBytes = hardwareSnapshot.memory_domains.reduce(
               (total, domain) => total + domain.stable_capacity_bytes,
               0
@@ -404,7 +340,6 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
               total: assessmentConfigurations.length,
             })
             yield* publishProgress(progress)
-            const coordinated = yield* assessments.state
             const sameConfiguration = Schema.equivalence(ModelServingConfigurationSchema)
             const assessmentFor = (configuration: ModelServingConfiguration) =>
               coordinated.find((entry) =>
@@ -435,78 +370,51 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
               false,
               { completed: assessmentConfigurations.length, total: assessmentConfigurations.length }
             )
-            const evaluated = catalogModels.flatMap(
-              (model): readonly RecommendationCandidate[] => {
-                const result = assessmentFor(model.configuration)
-                if (result?._tag !== "Fits") return []
-                const profile = result.assessment.profile
-                return [{
-                        model,
-                        profile,
-                        assessment: result.assessment,
-                        artifactId: servableModelBundleTargetPackageId(model.configuration.bundle),
-                        catalogModelId: model.modelId,
-                        capabilityScore: model.qualityScore,
-                        fidelityRank: model.fidelityRank,
-                        quantizationAware: model.quantizationAware,
-                        estimatedLoadedBytes:
-                          result.assessment.memory.reduce(
-                            (total, domain) => total + domain.requiredBytes,
-                            0
-                          ),
-                        stableCapacityBudgetBytes:
-                          result.assessment.memory.reduce(
-                            (total, domain) =>
-                              total +
-                              Math.max(
-                                0,
-                                domain.capacityBytes -
-                                  domain.compatibilityReserveBytes
-                              ),
-                            0
-                          ),
-                      }]
-              }
-            )
-            const selectionStartedAt = Date.now()
-            progress = yield* startStep(progress, "recommendations")
-            const selected = selectRecommendationPortfolio(evaluated)
-            const catalogCandidates = assembleRecommendationCatalogCandidates(
-              evaluated,
-              selected
-            )
-            progress = updateProgress(progress, "recommendations", {
+            const rankingStartedAt = Date.now()
+            progress = yield* startStep(progress, "ranking")
+            const entries = yield* Effect.forEach(catalogModels, (model) => {
+              const result = assessmentFor(model.configuration)
+              if (result?._tag !== "Fits") return Effect.succeed(Option.none<LocalModelRankingEntry>())
+              return modelRankingScores({
+                model,
+                profile: result.assessment.profile,
+                assessment: result.assessment,
+              }).pipe(Effect.map((scores) => Option.some<LocalModelRankingEntry>({
+                modelId: localCatalogProviderModelId(model),
+                configuration: model.configuration,
+                scores,
+              })))
+            }).pipe(Effect.map((results) => results.flatMap((entry) =>
+              Option.isSome(entry) ? [entry.value] : [])))
+            entries.sort((left, right) => left.modelId.localeCompare(right.modelId))
+            progress = updateProgress(progress, "ranking", {
               status: {
                 _tag: "Completed",
-                startedAtMs: selectionStartedAt,
-                durationMs: Math.max(0, Date.now() - selectionStartedAt),
+                startedAtMs: rankingStartedAt,
+                durationMs: Math.max(0, Date.now() - rankingStartedAt),
                 cached: false,
               },
-              completedItems: Option.some(selected.length),
-              totalItems: Option.some(4),
+              completedItems: Option.some(entries.length),
+              totalItems: Option.some(assessmentConfigurations.length),
               estimatedRemainingMs: Option.none(),
             })
             yield* Ref.set(progressRef, progress)
-            yield* Ref.set(
-              lastInputDigest,
-              Option.some(inputDigest)
-            )
+            yield* Ref.set(lastInputDigest, Option.some(inputDigest))
             yield* publish(
               {
                 _tag: "Ready",
-                recommendations: selected,
-                catalog: catalogCandidates,
+                entries,
                 progress,
               },
             )
           })
         )
         .pipe(
-          Effect.withSpan("acn.local-model-recommendations.generate"),
+          Effect.withSpan("acn.local-model-ranker.generate"),
           Effect.catchAllCause((cause) =>
             Effect.gen(function* () {
               const failure = Cause.failureOption(cause)
-              const reportedFailure = localModelRecommendationFailure(
+              const reportedFailure = localModelRankingFailure(
                 Option.getOrUndefined(failure)
               )
               const failedAtMs = Date.now()
@@ -533,18 +441,15 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
                   : step
               )
               yield* Ref.set(progressRef, failedProgress)
-              const state = yield* SubscriptionRef.get(current)
               yield* publish(
-                state._tag === "Ready"
-                  ? { ...state, progress: failedProgress }
-                  : {
-                      _tag: "Failed",
-                      failure: reportedFailure,
-                      progress: failedProgress,
-                    },
+                {
+                  _tag: "Failed",
+                  failure: reportedFailure,
+                  progress: failedProgress,
+                },
               )
               yield* Effect.logWarning(
-                "Unable to generate local model recommendations"
+                "Unable to prepare local model ranking scores"
               ).pipe(Effect.annotateLogs({ cause: String(cause) }))
             })
           )
@@ -561,7 +466,7 @@ export const makeLocalModelRecommendationsLive = (): Layer.Layer<
         Effect.forkScoped
       )
 
-      return LocalModelRecommendations.of({
+      return LocalModelRanker.of({
         state: SubscriptionRef.get(current),
         changes: current.changes,
       })

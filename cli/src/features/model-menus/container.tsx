@@ -1627,7 +1627,7 @@ const CatalogMenu = memo(function CatalogMenu({
       model.servingState._tag === "Assessed"
         && model.servingState.assessment._tag === "Fits"),
   })
-  const recommendationsReady = Option.exists(
+  const rankingReady = Option.exists(
     catalogView,
     (models) => models.discoveryState._tag === "Ready",
   )
@@ -1954,9 +1954,9 @@ const CatalogMenu = memo(function CatalogMenu({
           {spinner} {runningProgress.label}{runningProgress.metadata}
         </text>
       )}
-      {candidates.length === 0 && recommendationsReady ? (
+      {candidates.length === 0 && rankingReady ? (
         <text style={{ fg: theme.status.warning, marginLeft: 2 }}>
-          No compatible recommended models are currently available.
+          No compatible models are currently available.
         </text>
       ) : candidates.map((candidate, index) => {
         const modelId = modelIdFor(candidate)

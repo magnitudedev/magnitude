@@ -37,7 +37,7 @@ quantization-aware-training fact. Each model declaration records the calendar da
 represented upstream model or material named revision was first publicly released. Artifact
 conversions, quantizations, quantization-aware packaging, and provider publication do not change
 that date; every artifact variant inherits the model declaration's date. Each entry publishes one exact default
-`ModelServingConfiguration`, required package components, presentation, and recommendation
+`ModelServingConfiguration`, required package components, presentation, and ranking
 evidence. Reviewed model parameterization states whether the architecture is dense or
 mixture-of-experts, its positive total parameter count, and, only for mixture-of-experts, a
 positive active parameter count smaller than the total. Parameter counts are factual catalog data;
@@ -61,7 +61,7 @@ Incomplete coverage, integrity mismatch, invalid relationships, or assessment mi
 generation or ICN readiness.
 
 An issued configuration remains resolvable by its canonical identity across later releases.
-Deprecation excludes an entry from recommendation and first-time discovery without deleting its
+Deprecation excludes an entry from ranking and first-time discovery without deleting its
 configuration or package declaration. Existing selections, installed artifacts, and explicit
 reacquisition can therefore resolve the same bundle and profile without a user-state copy of the
 catalog entry. Runtime catalog use performs no upstream discovery and does not follow mutable
@@ -75,7 +75,7 @@ accepted only after it matches the exact package.
 
 An explicitly declared fallback may change the retrieval commit when the primary revision is no
 longer available. It must not change package identity, bundle composition, capabilities, planner
-inputs, or recommendation evidence. Authentication, authorization, rate-limit, timeout, and server
+inputs, or ranking scores. Authentication, authorization, rate-limit, timeout, and server
 failures preserve their original classification. A fallback is accepted only when every required
 path, size, and digest matches.
 
@@ -115,7 +115,7 @@ operation. One cached GGUF inspection supplies every derived property
 for an immutable component. Reconciliation publishes complete inventory snapshots and retains the
 previous complete inventory snapshot while a refresh is in flight. Queries return the current materialized snapshot
 and perform no filesystem work. Discovery is hardware-independent and performs no network access,
-assessment, calibration, profile choice, or recommendation.
+assessment, calibration, profile choice, or ranking.
 
 All inventory indexes, content hashes, inspections, and derived package evidence are optimistic
 caches. Missing, stale, malformed, unreadable, or unwritable cache state causes scoped recomputation

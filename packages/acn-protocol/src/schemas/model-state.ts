@@ -192,9 +192,6 @@ export const CatalogIdentitySchema = Schema.Struct({
 })
 export type CatalogIdentity = typeof CatalogIdentitySchema.Type
 
-export const RecommendationIdSchema = NonEmptyString.pipe(Schema.brand("RecommendationId"))
-export type RecommendationId = typeof RecommendationIdSchema.Type
-
 export const ModelAssessmentIdSchema =
   NonEmptyString.pipe(Schema.brand("ModelAssessmentId"))
 export type ModelAssessmentId = typeof ModelAssessmentIdSchema.Type
@@ -715,12 +712,17 @@ export const LocalModelCatalogMembershipStateSchema = Schema.Union(
 export type LocalModelCatalogMembershipState =
   typeof LocalModelCatalogMembershipStateSchema.Type
 
-export const LocalModelRecommendationSchema = Schema.Struct({
-  id: RecommendationIdSchema,
-  intent: Schema.Literal("balanced", "smartest", "fastest", "lightweight"),
-  explanation: Schema.String,
+const NormalizedRankingScoreSchema = Schema.Number.pipe(
+  Schema.finite(),
+  Schema.between(0, 1),
+)
+
+export const LocalModelRankingScoresSchema = Schema.Struct({
+  intelligence: NormalizedRankingScoreSchema,
+  speed: NormalizedRankingScoreSchema,
+  quality: NormalizedRankingScoreSchema,
 })
-export type LocalModelRecommendation = typeof LocalModelRecommendationSchema.Type
+export type LocalModelRankingScores = typeof LocalModelRankingScoresSchema.Type
 
 export const LocalModelMemoryHeadroomObservationSchema = Schema.Struct({
   requiredSystemMemoryBytes: NonNegativeSafeInteger,
@@ -824,7 +826,10 @@ export const LocalModelServingStateSchema = Schema.Union(
     capabilities: ModelCapabilitiesSchema,
     assessment: LocalModelAssessmentSchema,
     availabilityState: LocalModelAvailabilityStateSchema,
-    recommendations: Schema.Array(LocalModelRecommendationSchema),
+    rankingScores: Schema.optionalWith(LocalModelRankingScoresSchema, {
+      as: "Option",
+      exact: true,
+    }),
   }),
 )
 export type LocalModelServingState = typeof LocalModelServingStateSchema.Type
@@ -848,16 +853,16 @@ export const LocalModelSchema = Schema.Struct({
 }, { message: () => "installed local models must carry the exact location of every bundle package" }))
 export type LocalModel = typeof LocalModelSchema.Type
 
-export const LocalModelRecommendationProgressStepIdSchema = Schema.Literal(
+export const LocalModelDiscoveryProgressStepIdSchema = Schema.Literal(
   "hardware",
   "inventory",
   "assessment",
-  "recommendations",
+  "ranking",
 )
-export type LocalModelRecommendationProgressStepId =
-  typeof LocalModelRecommendationProgressStepIdSchema.Type
+export type LocalModelDiscoveryProgressStepId =
+  typeof LocalModelDiscoveryProgressStepIdSchema.Type
 
-export const LocalModelRecommendationProgressStatusSchema = Schema.Union(
+export const LocalModelDiscoveryProgressStatusSchema = Schema.Union(
   Schema.TaggedStruct("Pending", {}),
   Schema.TaggedStruct("Running", {
     startedAtMs: NonNegativeSafeInteger,
@@ -873,12 +878,12 @@ export const LocalModelRecommendationProgressStatusSchema = Schema.Union(
     failure: ModelFailureSchema,
   }),
 )
-export type LocalModelRecommendationProgressStatus =
-  typeof LocalModelRecommendationProgressStatusSchema.Type
+export type LocalModelDiscoveryProgressStatus =
+  typeof LocalModelDiscoveryProgressStatusSchema.Type
 
-export const LocalModelRecommendationProgressStepSchema = Schema.Struct({
-  id: LocalModelRecommendationProgressStepIdSchema,
-  status: LocalModelRecommendationProgressStatusSchema,
+export const LocalModelDiscoveryProgressStepSchema = Schema.Struct({
+  id: LocalModelDiscoveryProgressStepIdSchema,
+  status: LocalModelDiscoveryProgressStatusSchema,
   completedItems: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
   totalItems: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
   estimatedRemainingMs: Schema.optionalWith(
@@ -886,42 +891,19 @@ export const LocalModelRecommendationProgressStepSchema = Schema.Struct({
     { as: "Option", exact: true },
   ),
 })
-export type LocalModelRecommendationProgressStep =
-  typeof LocalModelRecommendationProgressStepSchema.Type
-
-export const ModelRecommendationSchema = Schema.Struct({
-  modelId: ProviderModelIdSchema,
-  id: RecommendationIdSchema,
-  intent: Schema.Literal("balanced", "smartest", "fastest", "lightweight"),
-  explanation: Schema.String,
-})
-export type ModelRecommendation = typeof ModelRecommendationSchema.Type
-
-export const ModelRecommendationsStateSchema = Schema.Union(
-  Schema.TaggedStruct("Loading", {
-    progress: Schema.Array(LocalModelRecommendationProgressStepSchema),
-  }),
-  Schema.TaggedStruct("Ready", {
-    recommendations: Schema.Array(ModelRecommendationSchema),
-    progress: Schema.Array(LocalModelRecommendationProgressStepSchema),
-  }),
-  Schema.TaggedStruct("Failed", {
-    failure: ModelFailureSchema,
-    progress: Schema.Array(LocalModelRecommendationProgressStepSchema),
-  }),
-)
-export type ModelRecommendationsState = typeof ModelRecommendationsStateSchema.Type
+export type LocalModelDiscoveryProgressStep =
+  typeof LocalModelDiscoveryProgressStepSchema.Type
 
 export const LocalModelDiscoveryStateSchema = Schema.Union(
   Schema.TaggedStruct("Loading", {
-    progress: Schema.Array(LocalModelRecommendationProgressStepSchema),
+    progress: Schema.Array(LocalModelDiscoveryProgressStepSchema),
   }),
   Schema.TaggedStruct("Ready", {
-    progress: Schema.Array(LocalModelRecommendationProgressStepSchema),
+    progress: Schema.Array(LocalModelDiscoveryProgressStepSchema),
   }),
   Schema.TaggedStruct("Failed", {
     failure: ModelFailureSchema,
-    progress: Schema.Array(LocalModelRecommendationProgressStepSchema),
+    progress: Schema.Array(LocalModelDiscoveryProgressStepSchema),
   }),
 )
 export type LocalModelDiscoveryState = typeof LocalModelDiscoveryStateSchema.Type

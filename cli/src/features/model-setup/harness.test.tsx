@@ -29,7 +29,7 @@ const keyEvent = (name: string) => new KeyEvent({
 })
 
 const destinations = [
-  { id: HarnessIdSchema.make("magnitude"), name: "Magnitude", availability: "Installed" as const, selectable: true, note: "Optimized for local models" },
+  { id: HarnessIdSchema.make("magnitude"), name: "Magnitude Harness", availability: "Installed" as const, selectable: true, note: "Optimized for local models" },
   { id: HarnessIdSchema.make("codex"), name: "Codex", availability: "Installed" as const, selectable: true },
   { id: HarnessIdSchema.make("cline"), name: "Cline", availability: "Not installed" as const, selectable: false },
 ]
@@ -52,11 +52,11 @@ describe("harness chooser layout", () => {
       await act(view.renderOnce)
       const frame = view.captureCharFrame()
       expect(frame).not.toContain("┌")
-      expect(frame).toContain("› Magnitude  Optimized for local models")
+      expect(frame).toContain("› Magnitude Harness  Optimized for local models")
       expect(frame).not.toContain("Recommended")
-      expect(frame).not.toContain("Magnitude  Optimized for local models  Installed")
-      expect(frame).toContain("  [x] Launch Magnitude on startup")
-      expect(frame).not.toContain("[x] Magnitude  Optimized")
+      expect(frame).not.toContain("Magnitude Harness  Optimized for local models  Installed")
+      expect(frame).toContain("  [x] Launch Magnitude server on startup")
+      expect(frame).not.toContain("[x] Magnitude Harness  Optimized")
       expect(frame).not.toContain("Continue with Magnitude")
       expect(frame).toContain("↑/↓ choose · Space toggle · Enter continue · Esc back")
       const lines = frame.split("\n")
@@ -87,8 +87,8 @@ describe("harness chooser layout", () => {
       expect(onContinue).toHaveBeenCalledWith(expect.objectContaining({ harness: "magnitude" }))
       for (const expected of [
         "› Codex",
-        "› [x] Launch Magnitude on startup",
-        "› [x] Install the Magnitude skill globally",
+        "› [x] Launch Magnitude server on startup",
+        "› [x] Install Magnitude skill to help agents manage local models",
       ]) {
         act(() => keyboard.handler?.(keyEvent("down")))
         await act(view.renderOnce)

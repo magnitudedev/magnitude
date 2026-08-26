@@ -72,18 +72,11 @@ import type { SettingsTab } from "../state/web-atoms"
 import {
   formatBytes,
   formatContext,
-  intentLabel,
   modelContextLength,
   slotStatus,
   transferProgress,
 } from "./local-inference-format"
 import { ModelRadarChart } from "./model-radar-chart"
-const recommendationOrder = {
-  balanced: 0,
-  smartest: 1,
-  fastest: 2,
-  lightweight: 3,
-} as const
 const valueOf = <A, E>(result: Result.Result<A, E>): A | null =>
   Option.getOrNull(Result.value(result))
 const modelKey = (model: LocalModel): string => model.modelId
@@ -557,16 +550,8 @@ const repositoryUrl = (model: LocalModel): string | null => {
     ? `https://huggingface.co/${repository.repository}`
     : null
 }
-const recommendationRank = (view: CatalogModelView): number => {
-  const serving = view.model.servingState
-  const intent =
-    serving._tag === "Assessed" ? serving.recommendations[0]?.intent : undefined
-  return intent === undefined ? 4 : recommendationOrder[intent]
-}
-
 type CatalogFilter = "all" | "installed"
 type CatalogSort =
-  | "recommended"
   | "recent"
   | "intelligence"
   | "largest"
@@ -574,7 +559,6 @@ type CatalogSort =
   | "name"
 
 const catalogSortLabels: Readonly<Record<CatalogSort, string>> = {
-  recommended: "Recommended",
   recent: "Newest",
   intelligence: "Most intelligent",
   largest: "Largest download",
@@ -630,7 +614,7 @@ const compareCatalogModels = (
   if (sort === "smallest") {
     return left.model.downloadBytes - right.model.downloadBytes || byName
   }
-  return recommendationRank(left) - recommendationRank(right) || byName
+  return byName
 }
 
 function CatalogCandidate({
@@ -644,10 +628,6 @@ function CatalogCandidate({
 }): ReactNode {
   const { model, reconciliationState } = view
   const status = modelStatus(model, reconciliationState)
-  const recommendation =
-    model.servingState._tag === "Assessed"
-      ? model.servingState.recommendations[0] ?? null
-      : null
   return (
     <Button
       variant="unstyled"
@@ -659,24 +639,16 @@ function CatalogCandidate({
       onClick={onSelect}
     >
       <span className="flex min-w-0 flex-1 flex-col gap-1.5">
-        {recommendation || status.tone !== "neutral" ? (
+        {status.tone !== "neutral" ? (
           <span className="flex items-center justify-between gap-3 text-[10px] font-semibold uppercase leading-none tracking-[.07em]">
-            {recommendation ? (
-              <span className="text-violet-700 dark:text-violet-400">
-                {intentLabel(recommendation.intent)} pick
-              </span>
-            ) : (
-              <span />
-            )}
-            {status.tone !== "neutral" ? (
-              <span
-                className={`${statusToneClass(
-                  status.tone
-                )} shrink-0 tracking-normal normal-case`}
-              >
-                {status.label}
-              </span>
-            ) : null}
+            <span />
+            <span
+              className={`${statusToneClass(
+                status.tone
+              )} shrink-0 tracking-normal normal-case`}
+            >
+              {status.label}
+            </span>
           </span>
         ) : null}
         <strong className="text-[13px] font-semibold leading-[1.4] text-slate-900 [overflow-wrap:anywhere] dark:text-slate-100">
@@ -695,9 +667,6 @@ function CatalogInspector({
   const modelActions = useLocalModelActions()
   const configurationId = model.modelId
   const status = modelStatus(model, reconciliationState)
-  const serving =
-    model.servingState._tag === "Assessed" ? model.servingState : null
-  const recommendation = serving?.recommendations[0] ?? null
   const axes = Option.getOrNull(localModelRadarAxes(model))
   const transfer =
     reconciliationState._tag === "Transferring"
@@ -797,31 +766,9 @@ function CatalogInspector({
           </p>
         )}
 
-        {recommendation ? (
-          <section
-            className="max-w-[760px]"
-            aria-labelledby="why-model-title"
-          >
-            <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-              <h3
-                id="why-model-title"
-                className="font-heading text-[18px] text-slate-900 dark:text-slate-100"
-              >
-                Why this model
-              </h3>
-              <span className="text-[11px] font-semibold uppercase tracking-[.07em] text-violet-700 dark:text-violet-400">
-                {intentLabel(recommendation.intent)}
-              </span>
-            </div>
-            <p className="mt-2 text-[13px] leading-5 text-slate-600 dark:text-slate-400">
-              {recommendation.explanation}
-            </p>
-          </section>
-        ) : null}
-
         {axes ? (
           <section
-            className={`${recommendation ? "mt-7" : ""} min-w-0`}
+            className="min-w-0"
             aria-labelledby="model-profile-title"
           >
             <h3
@@ -868,7 +815,7 @@ function CatalogView(): ReactNode {
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
   const [query, setQuery] = useState("")
   const [filter, setFilter] = useState<CatalogFilter>("all")
-  const [sort, setSort] = useState<CatalogSort>("recommended")
+  const [sort, setSort] = useState<CatalogSort>("intelligence")
   const normalizedQuery = query.trim().toLowerCase()
   const allCandidates = catalog?.models ?? []
   const visibleCandidates = useMemo(
@@ -994,7 +941,6 @@ function CatalogView(): ReactNode {
                     <SelectValue>{catalogSortLabels[sort]}</SelectValue>
                   </SelectTrigger>
                   <SelectContent align="end" className="w-[196px]">
-                    <SelectItem value="recommended">Recommended</SelectItem>
                     <SelectItem value="recent">Newest</SelectItem>
                     <SelectItem value="intelligence">Most intelligent</SelectItem>
                     <SelectItem value="largest">Largest download</SelectItem>

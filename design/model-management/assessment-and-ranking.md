@@ -11,7 +11,7 @@ applies_to:
   - web/src/components/model-center.tsx
 ---
 
-# Model assessment and recommendation
+# Model assessment and ranking
 
 Terms follow [Model-management terminology](./terminology.md). Native mechanics follow
 [Hardware calibration and model assessment](../icn/calibration-model-assessment.md).
@@ -22,7 +22,7 @@ Terms follow [Model-management terminology](./terminology.md). Native mechanics 
 |---|---|
 | Native compatibility, memory, placement, performance | ICN |
 | Native serving-configuration resolution and validation | ICN |
-| Profile set, orchestration, recommendation policy | ACN |
+| Profile set, assessment orchestration, normalized ranking scores | ACN |
 | Rendering | Clients |
 
 ## Pipeline
@@ -35,7 +35,7 @@ sequenceDiagram
     participant ACN
     participant ICN
     participant Resolver
-    participant Recommender
+    participant Ranker
 
     Catalog->>ACN: Reviewed model identity and configuration (bundle, profile)
     ACN->>ACN: Preserve reviewed profile
@@ -49,7 +49,7 @@ sequenceDiagram
 
     ACN->>Resolver: Publish configuration and assessment
     Resolver->>Resolver: Resolve catalog model configuration
-    ACN->>Recommender: Evaluate Fits catalog configuration
+    ACN->>Ranker: Derive normalized scores for Fits catalog configuration
 ```
 
 ACN supplies the reviewed serving profile for each catalog model. ICN resolves and validates the
@@ -74,10 +74,10 @@ opening across their assessment. Missing, duplicate, or unrequested profile outc
 assessment operation contract; they fail the operation rather than becoming a model compatibility
 or capacity state.
 One ACN local-model assessor owns demand for each catalog model's desired configuration and its
-installed effective configuration when different. Desired catalog assessment supports recommendation
+installed effective configuration when different. Desired catalog assessment supports ranking
 and acquisition; effective catalog assessment supports current serving.
-Recommendation, provider-offering, and local-model projections consume its state and
-never invoke assessment independently. Recommendation policy consumes only release-catalog
+Ranking, provider-offering, and local-model projections consume its state and
+never invoke assessment independently. The ranker consumes only release-catalog
 candidates. Each release-catalog configuration uses its reviewed catalog profile. Installed
 artifacts that are not attributed to a catalog model remain package inventory; they do not become
 callable models with fabricated identities. An installed catalog target remains the effective
@@ -128,17 +128,17 @@ state.
 
 ## Publication boundary
 
-Recommendation policy evaluates private inputs for catalog configurations with completed `Fits`
+The ranker evaluates private inputs for catalog configurations with completed `Fits`
 assessment. The client-facing projection does not publish a parallel candidate entity. It publishes
-one `LocalModel` per exact bundle and annotates its assessed serving state with catalog ranking
-evidence and any selected recommendation intents.
+one `LocalModel` per exact bundle and annotates its assessed serving state with optional
+`LocalModelRankingScores` for that exact configuration.
 
 Performance evidence is an ordered set of samples for the same configuration. Samples above the
 configured context are omitted, and the final sample is always the configured context.
 
-Recommendation evidence is present only when the bundle is active in the recommendable catalog.
+Ranking scores are present only when the bundle is active in the rankable catalog.
 Deprecated catalog configurations remain resolvable and assessable but receive no fabricated
-intelligence, fidelity, quality, or recommendation evidence.
+intelligence, fidelity, quality, or ranking scores.
 
 `DoesNotFit` and `Incompatible` are completed evidence but are not selectable. Missing,
 `Assessing`, canceled, or defective work is not published as a successful empty portfolio.
@@ -161,22 +161,19 @@ An assessment-operation defect publishes `Failed` with its typed failure. It is 
 `DoesNotFit` or `Incompatible`, and it cannot replace the local-model collection with an empty
 snapshot.
 
-## Recommendation portfolio
+## Ranking scores
 
-Selection objectives, equations, and portfolio rules are defined by
-[Model recommendation](./recommendation.md). This document owns the assessment evidence and
-publication lifecycle consumed by that policy.
+Score normalization and client preference utility are defined by
+[Local model ranking](./ranking.md). This document owns the assessment evidence and publication
+lifecycle consumed by the ranker.
 
 ## Invalidation
 
-Recommendation reuse requires unchanged catalog content, profiles, stable topology and capacity,
-native build and backends, hardware calibration, assessment method, and recommendation policy.
-Live memory availability does not invalidate assessment or recommendation.
-
-Onboarding therefore keeps recommendation-tier labels and explanations stable as availability
-changes. Current loadability is a separate right-hand detail alongside the explanation: stable
-assessment may report a tight fit while live admission headroom simultaneously reports that the
-model cannot load now. Neither condition replaces or relabels the recommendation.
+Ranking-score reuse requires unchanged catalog content, profiles, stable topology and capacity,
+native build and backends, hardware calibration, assessment method, and ranking policy. Live memory
+availability does not invalidate assessment or ranking scores. Current loadability remains a
+separate presentation fact; stable assessment can coexist with insufficient live admission
+headroom.
 
 ## Loading
 
@@ -199,14 +196,13 @@ Cached assessment never authorizes loading.
 - Provider-offering and local-model projection never invoke assessment.
 - Assessment completion cannot publish against a superseded semantic key.
 - Assessment results correlate by exact request and profile identity, never by configuration-record comparison.
-- Recommendation generation never replaces a valid portfolio with a defect-derived empty result.
+- Ranking failure never becomes a successful empty result.
 - Clients display a bounded 25K-to-75K expected-speed range without context-variant candidates.
-- Recommendation-policy inputs remain private; client-visible recommendation annotations preserve
-  the canonical catalog model ID.
+- Ranker inputs remain private; client-visible ranking scores preserve the canonical catalog model
+  ID and exact configuration.
 - Loading never treats cached assessment as admission authority.
 - ACN startup and service publication never wait for model assessment.
 - Onboarding keeps installed and downloadable model groups at a stable layout height while making
   every presented model reachable by keyboard navigation and pointer scrolling.
-- Onboarding preserves recommendation-intent labels for installed and downloadable models in the
-  model list and renders stable fit and current loadability independently in the selected model's
-  detail pane.
+- Onboarding ranks downloadable models from connection-scoped controls while keeping installed
+  models separate and rendering stable fit independently from current loadability.

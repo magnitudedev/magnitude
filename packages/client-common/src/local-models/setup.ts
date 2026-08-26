@@ -29,10 +29,13 @@ import {
   OnboardingModelSetupCancellationUnavailable,
   OnboardingModelSetupNotActive,
   OnboardingModelSetupNotOpen,
+  defaultOnboardingModelRankingControls,
+  normalizeOnboardingModelRankingControls,
   projectOnboardingModelSetupContent,
   tagOnboardingModelSetupObservation,
   type OnboardingModelSetupExecution,
   type OnboardingModelSetupFailure,
+  type OnboardingModelRankingControls,
   type OnboardingModelSetupState,
 } from "./setup-state"
 
@@ -206,6 +209,9 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
     ...closedLifecycle,
     retainedOpen: config.initiallyOpen,
   }))
+  const rankingControls = Atom.keepAlive(Atom.make<OnboardingModelRankingControls>(
+    defaultOnboardingModelRankingControls,
+  ))
 
   const view = Atom.make((get) => {
     const current = get(lifecycle)
@@ -274,6 +280,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
             current._tag === "Selecting" ? Option.some(current.execution) : Option.none(),
             modelState,
             slotState,
+            get(rankingControls),
           ),
         }),
       ))
@@ -293,6 +300,10 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
       if (Result.isFailure(registry.get(slots.state))) retries.push(slots.retry)
     }
     return Effect.all(retries, { discard: true })
+  })
+
+  const setRankingControls = (next: OnboardingModelRankingControls) => Effect.sync(() => {
+    registry.set(rankingControls, normalizeOnboardingModelRankingControls(next))
   })
 
   const setExecution = (
@@ -673,6 +684,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
   return {
     view,
     retry,
+    setRankingControls,
     open,
     select,
     cancel,

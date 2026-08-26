@@ -15,7 +15,7 @@ applies_to:
 ## Contract
 
 ICN estimates single-user decode throughput at several occupied-context depths for one exact
-assessed profile. The ordered estimates are advisory recommendation evidence. They never change
+assessed profile. The ordered estimates are advisory ranking inputs. They never change
 capacity, authorize loading, or replace observed runtime timing.
 
 | Layer | Responsibility |
@@ -23,7 +23,7 @@ capacity, authorize loading, or replace observed runtime timing.
 | Native bindings | Exact workload, placement, and model-free calibration facts |
 | `icn-hardware` | Formula, uncertainty, confidence, and failure policy |
 | ICN model service | Assessment lifecycle, identity, and caching |
-| ACN | Recommendation ranking only |
+| ACN | Local model ranking only |
 
 Performance estimation is part of model assessment. On an exact cache miss, obtaining its workload
 requires the same native model open and profile-specific context graph as memory assessment. The
@@ -103,7 +103,7 @@ reused while fallback placement can observe process-local free memory.
 
 - Preview and assessment read no tensor payload and run no model decode.
 - Performance failure never changes native capacity evidence into another domain result.
-- Bindings contain no token-rate formula, confidence, profile, or recommendation policy.
+- Bindings contain no token-rate formula, confidence, profile, or ranking policy.
 - Dense, routed, recurrent, conventional-attention, MLA, compressed, sparse, unified-memory, and
   cross-domain paths have deterministic fixture coverage.
 - Increasing active traffic cannot improve an otherwise identical estimate.

@@ -1,4 +1,4 @@
-import type { ReactNode } from "react"
+import { Fragment, type ReactNode } from "react"
 import { Button } from "@/components/ui/button"
 import { Progress } from "@/components/ui/progress"
 import { Option } from "effect"
@@ -8,18 +8,21 @@ import {
   formatLocalModelDisplayName,
   modelDownloadFailureMessage,
   onboardingModelSetupFailureMessage,
+  rankedLocalModelOptions,
+  LOCAL_MODEL_RANKING_SCALE_INTERVALS,
+  LOCAL_MODEL_RANKING_SCALE_LABELS,
+  targetPhysicalMemoryBytes,
   type useOnboardingModelSetup,
 } from "@magnitudedev/client-common"
 import {
   acquisitionFailure,
   acquisitionProgress,
   type LocalModel,
-  type LocalModelRecommendationProgressStep,
+  type LocalModelDiscoveryProgressStep,
 } from "@magnitudedev/sdk"
 import {
   formatBytes,
   formatContext,
-  intentLabel,
   modelContextLength,
   transferLabel,
   transferProgress,
@@ -36,7 +39,7 @@ const formatDurationMs = (durationMs: number): string =>
         )}s`
 
 const preparationLabel = (
-  step: LocalModelRecommendationProgressStep,
+  step: LocalModelDiscoveryProgressStep,
   completed: boolean
 ): string => {
   if (step.id === "hardware") {
@@ -52,13 +55,13 @@ const preparationLabel = (
     const count = Option.getOrElse(step.completedItems, () => 0)
     return `Assessed ${count} models for this machine`
   }
-  if (!completed) return "Preparing recommendations"
+  if (!completed) return "Ranking models"
   const count = Option.getOrElse(step.completedItems, () => 0)
-  return `Prepared ${count} recommendations`
+  return `Ranked ${count} models`
 }
 
 const preparationMetadata = (
-  step: LocalModelRecommendationProgressStep
+  step: LocalModelDiscoveryProgressStep
 ): string | null => {
   if (step.status._tag === "Failed") return step.status.failure.message
   if (step.status._tag === "Completed") {
@@ -87,7 +90,7 @@ const preparationMetadata = (
 }
 
 const preparationFraction = (
-  step: LocalModelRecommendationProgressStep
+  step: LocalModelDiscoveryProgressStep
 ): number | null => {
   if (step.status._tag !== "Running") return null
   return Option.match(
@@ -122,7 +125,7 @@ export function LocalModelOnboarding({
 }: {
   readonly setup: Setup
 }): ReactNode {
-  const hardware = Option.getOrNull(Result.value(setup.hardware))
+  const hardware = Result.isSuccess(setup.hardware) ? setup.hardware.value : null
   const state = Option.getOrNull(Result.value(setup.view))
   if (state === null || state._tag === "Closed") return null
   const notice = Option.match(state.notice, {
@@ -140,7 +143,9 @@ export function LocalModelOnboarding({
     ? undefined
     : acquisitionFailure(operationModel.acquisitionState)
   const operationFailure =
-    (operation?._tag === "Loading" ? operation.failure?.message : null) ??
+    (operation?._tag === "Loading" && operation.status._tag === "Failed"
+      ? operation.status.failure.message
+      : null) ??
     (transferFailure !== undefined
       ? modelDownloadFailureMessage(transferFailure)
       : null)
@@ -159,6 +164,16 @@ export function LocalModelOnboarding({
     content._tag === "Preparation"
       ? content.progress.filter((step) => step.status._tag === "Completed")
       : []
+  const rankedOptions = content._tag === "Chooser" && hardware !== null
+      ? rankedLocalModelOptions(content.options, {
+        fastToSmart: content.rankingControls.fastToSmart,
+        memoryBudgetBytes: targetPhysicalMemoryBytes(hardware),
+      }).map((option) => ({ ...option, id: `ranked:${option.id}` }))
+    : []
+  const installedOptions = content._tag === "Chooser"
+    ? content.options.filter(({ kind }) => kind === "running" || kind === "stored")
+    : []
+  const chooserOptions = [...rankedOptions, ...installedOptions]
   return (
     <main className="flex min-h-screen justify-center overflow-auto bg-slate-50 dark:bg-slate-925 text-slate-900 dark:text-slate-200">
       <div className="box-border w-[min(980px,100%)] px-[clamp(18px,5vw,56px)] py-[clamp(28px,6vh,70px)]">
@@ -285,14 +300,43 @@ export function LocalModelOnboarding({
           </section>
         )}
 
+        {content._tag === "Chooser" && hardware !== null && (
+          <section className="mt-[22px] grid gap-4 rounded-[10px] border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-850">
+            <label className="grid gap-2 text-xs font-semibold text-slate-700 dark:text-slate-300">
+              <span className="grid grid-cols-5 font-normal text-slate-500 dark:text-slate-400">
+                {LOCAL_MODEL_RANKING_SCALE_LABELS.map((label, index) => (
+                  <span key={label} className={index === 0 ? "text-left" : index === LOCAL_MODEL_RANKING_SCALE_INTERVALS ? "text-right" : "text-center"}>{label}</span>
+                ))}
+              </span>
+              <input
+                aria-label="Fast to Smart"
+                type="range"
+                min={0}
+                max={LOCAL_MODEL_RANKING_SCALE_INTERVALS}
+                step={1}
+                list="local-model-ranking-scale"
+                disabled={operation !== null}
+                value={Math.round(content.rankingControls.fastToSmart * LOCAL_MODEL_RANKING_SCALE_INTERVALS)}
+                onChange={(event) => setup.setRankingControls({
+                  ...content.rankingControls,
+                  fastToSmart: Number(event.currentTarget.value) / LOCAL_MODEL_RANKING_SCALE_INTERVALS,
+                })}
+              />
+              <datalist id="local-model-ranking-scale">
+                {LOCAL_MODEL_RANKING_SCALE_LABELS.map((label, index) => <option key={label} value={index} label={label} />)}
+              </datalist>
+            </label>
+          </section>
+        )}
+
         {operationModel && operation && (
           <section className="mt-[26px] flex items-center gap-[15px] rounded-[11px] border border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-850 p-5 text-blue-700 dark:text-blue-500 max-[760px]:flex-col max-[760px]:items-start [&>div:nth-child(2)]:min-w-0 [&>div:nth-child(2)]:flex-1 [&_h2]:mb-1 [&_h2]:text-[17px] [&_h2]:text-slate-900 dark:[&_h2]:text-slate-200 [&_p]:text-xs [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
-            {operation._tag === "Loading" && operation.phase === "Failed" ? (
+            {operation._tag === "Loading" && operation.status._tag === "Failed" ? (
               <AlertTriangle size={24} />
             ) : (
               <Loader2
                 className={
-                  operation._tag === "Loading" && operation.phase === "Ready"
+                  operation._tag === "Loading" && operation.status._tag === "Ready"
                     ? ""
                     : "animate-spin"
                 }
@@ -302,7 +346,7 @@ export function LocalModelOnboarding({
             <div>
               <span className="block text-slate-500 font-sans text-[10px] font-[650] leading-[1.2] tracking-[.09em] uppercase mb-[5px]">
                 {operation._tag === "Loading"
-                  ? operation.phase
+                  ? operation.status._tag
                   : operation._tag}
               </span>
               <h2>{formatLocalModelDisplayName(operationModel)}</h2>
@@ -323,7 +367,7 @@ export function LocalModelOnboarding({
               )}
             </div>
             <div className="model-actions">
-              {operation._tag === "Loading" && operation.phase === "Failed" && (
+              {operation._tag === "Loading" && operation.status._tag === "Failed" && (
                 <Button variant="unstyled" size="unstyled"
                   type="button"
                   className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-blue-700 text-slate-50 hover:bg-blue-800 dark:bg-blue-500 dark:text-slate-925 dark:hover:bg-blue-400"
@@ -334,7 +378,7 @@ export function LocalModelOnboarding({
               )}
               {operation._tag !== "Completing" &&
                 !(
-                  operation._tag === "Loading" && operation.phase === "Ready"
+                  operation._tag === "Loading" && operation.status._tag === "Ready"
                 ) && (
                   <Button variant="unstyled" size="unstyled"
                     type="button"
@@ -353,25 +397,27 @@ export function LocalModelOnboarding({
         )}
 
         {content._tag === "Chooser" && operation === null && (
-          <section className="mt-[22px] grid grid-cols-2 gap-[11px] max-[760px]:grid-cols-1">
-            {content.options.map((option) => {
-              const modelId = option.model.modelId
-              return (
-                <Button variant="unstyled" size="unstyled"
+          <section className="mt-[22px]">
+            <div className="grid grid-cols-2 gap-[11px] max-[760px]:grid-cols-1">
+              {rankedOptions.length > 0 && (
+                <h2 className="col-span-full text-[11px] font-semibold tracking-[.08em] text-slate-500">RECOMMENDED MODELS</h2>
+              )}
+              {chooserOptions.map((option) => {
+                const modelId = option.model.modelId
+                return (
+                  <Fragment key={option.id}>
+                    {option === installedOptions[0] && (
+                      <h2 className="col-span-full mt-2 text-[11px] font-semibold tracking-[.08em] text-slate-500">ON THIS COMPUTER</h2>
+                    )}
+                    <Button variant="unstyled" size="unstyled"
                   type="button"
                   className="appearance-none rounded-[10px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-850 p-[17px] text-left cursor-pointer font-[inherit] hover:border-blue-400 hover:bg-slate-100 dark:hover:border-blue-600 dark:hover:bg-slate-800 [&_h3]:mb-[5px] [&_h3]:text-[15px] [&_h3]:leading-[1.3] [&_h3]:text-slate-900 dark:[&_h3]:text-slate-200 [&_p]:my-1.5 [&_p]:text-[12.5px] [&_p]:leading-normal [&_p]:text-slate-600 dark:[&_p]:text-slate-400"
-                  key={option.id}
                   onClick={() =>
                     setup.select(modelId)
                   }
                 >
                   <div className="model-card-header">
                     <div>
-                      {option.recommendations[0] && (
-                        <span className="recommendation-badge">
-                          {intentLabel(option.recommendations[0].intent)}
-                        </span>
-                      )}
                       <h3>{formatLocalModelDisplayName(option.model)}</h3>
                       <p>{option.model.presentation.description}</p>
                     </div>
@@ -384,27 +430,20 @@ export function LocalModelOnboarding({
                           : "progress"
                       }`}
                     >
-                      {option.kind === "running"
-                        ? "Ready"
-                        : option.kind === "stored"
-                        ? "Installed"
-                        : "Download"}
+                      {option.kind === "running" ? "Loaded" : option.kind === "stored" ? "Load" : "Download"}
                     </span>
                   </div>
-                  {option.recommendations[0] && (
-                    <p className="recommendation-copy">
-                      {option.recommendations[0].explanation}
-                    </p>
-                  )}
                   <ModelSummary model={option.model} />
-                </Button>
-              )
-            })}
-            {content.options.length === 0 && (
-              <div className="rounded-[10px] border border-dashed border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-850 p-[26px] text-center text-[13px] text-slate-500">
-                No compatible model choices are available yet.
-              </div>
-            )}
+                    </Button>
+                  </Fragment>
+                )
+              })}
+              {chooserOptions.length === 0 && (
+                <div className="rounded-[10px] border border-dashed border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-850 p-[26px] text-center text-[13px] text-slate-500">
+                  No compatible model choices are available yet.
+                </div>
+              )}
+            </div>
           </section>
         )}
 

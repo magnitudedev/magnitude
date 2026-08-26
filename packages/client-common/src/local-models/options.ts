@@ -1,43 +1,80 @@
 import { Option } from "effect"
 import type {
+  LocalInferenceHardware,
   LocalModel,
-  LocalModelRecommendation,
+  LocalModelRankingScores,
   LocalModelsState,
   ModelSlotsState,
 } from "@magnitudedev/sdk"
 import { servableModelBundlePackages } from "@magnitudedev/sdk"
 import { formatLocalModelDisplayName } from "../utils/model-presentation"
-import {
-  installedLocalModels,
-  localModelProviderModelId,
-} from "./projection"
+import { installedLocalModels, localModelProviderModelId } from "./projection"
 
 export interface LocalModelOption {
   readonly id: string
-  readonly kind: "running" | "stored" | "recommendation"
+  readonly kind: "running" | "stored" | "downloadable"
   readonly model: LocalModel
-  readonly recommendations: readonly LocalModelRecommendation[]
 }
+
+export interface LocalModelRankingPreference {
+  readonly fastToSmart: number
+  readonly memoryBudgetBytes: number
+}
+
+export const LOCAL_MODEL_RANKING_SCALE_LABELS = [
+  "Fastest",
+  "Faster",
+  "Balanced",
+  "Smarter",
+  "Smartest",
+] as const
+
+export const LOCAL_MODEL_RANKING_SCALE_INTERVALS = LOCAL_MODEL_RANKING_SCALE_LABELS.length - 1
+
+const clamp01 = (value: number): number => Number.isFinite(value)
+  ? Math.min(1, Math.max(0, value))
+  : 0
 
 const kindOrder: Record<LocalModelOption["kind"], number> = {
   running: 0,
   stored: 1,
-  recommendation: 2,
+  downloadable: 2,
 }
 
-const intentOrder = {
-  balanced: 0,
-  smartest: 1,
-  fastest: 2,
-  lightweight: 3,
-} as const
+export const localModelRankingUtility = (
+  scores: LocalModelRankingScores,
+  fastToSmart: number,
+): number => {
+  const preference = clamp01(fastToSmart)
+  return scores.intelligence ** (0.9 * preference)
+    * scores.speed ** (0.9 * (1 - preference))
+    * scores.quality ** 0.1
+}
 
-const orderedRecommendations = (
-  recommendations: readonly LocalModelRecommendation[],
-): readonly LocalModelRecommendation[] => [...recommendations]
-  .filter((recommendation, index, all) => all.findIndex(({ intent }) =>
-    intent === recommendation.intent) === index)
-  .sort((left, right) => intentOrder[left.intent] - intentOrder[right.intent])
+export const targetPhysicalMemoryBytes = (hardware: LocalInferenceHardware): number =>
+  hardware.memoryDomains.reduce((total, domain) => total + domain.totalBytes, 0)
+
+export const rankedLocalModelOptions = (
+  options: readonly LocalModelOption[],
+  preference: LocalModelRankingPreference,
+  limit = 10,
+): readonly LocalModelOption[] => options
+  .flatMap((option): readonly { readonly option: LocalModelOption; readonly utility: number }[] => {
+    const serving = option.model.servingState
+    if (serving._tag !== "Assessed"
+      || serving.assessment._tag !== "Fits"
+      || Option.isNone(serving.rankingScores)
+      || !Number.isFinite(preference.memoryBudgetBytes)
+      || serving.assessment.memory.totalRequiredBytes > Math.max(0, preference.memoryBudgetBytes)) return []
+    return [{
+      option,
+      utility: localModelRankingUtility(serving.rankingScores.value, preference.fastToSmart),
+    }]
+  })
+  .sort((left, right) => right.utility - left.utility
+    || left.option.model.modelId.localeCompare(right.option.model.modelId))
+  .slice(0, Math.max(0, Math.floor(limit)))
+  .map(({ option }) => option)
 
 export const localModelBundleKey = (model: LocalModel): string =>
   model.bundle._tag === "Standalone"
@@ -50,16 +87,6 @@ export const localModelOptions = (
   models: LocalModelsState,
   slots: ModelSlotsState,
 ): readonly LocalModelOption[] => {
-  const recommendationsByBundle = new Map<string, LocalModelRecommendation[]>()
-  for (const model of models.models) {
-    if (model.servingState._tag !== "Assessed"
-      || model.servingState.assessment._tag !== "Fits") continue
-    const key = localModelBundleKey(model)
-    recommendationsByBundle.set(key, [
-      ...(recommendationsByBundle.get(key) ?? []),
-      ...model.servingState.recommendations,
-    ])
-  }
   const runningProviderModelIds = new Set([
     slots.slots.primary,
     slots.slots.secondary,
@@ -72,34 +99,22 @@ export const localModelOptions = (
     kind: Option.exists(localModelProviderModelId(model), (providerModelId) =>
       runningProviderModelIds.has(providerModelId)) ? "running" : "stored",
     model,
-    recommendations: orderedRecommendations(
-      recommendationsByBundle.get(localModelBundleKey(model)) ?? [],
-    ),
   }))
   const representedBundles = new Set(installed.map(({ model }) => localModelBundleKey(model)))
-  const recommendations = models.models.flatMap((model): readonly LocalModelOption[] => {
+  const downloadable = models.models.flatMap((model): readonly LocalModelOption[] => {
     if (representedBundles.has(localModelBundleKey(model))
+      || model.catalogMembershipState._tag !== "InCatalog"
       || model.servingState._tag !== "Assessed"
-      || model.servingState.assessment._tag !== "Fits") return []
-    const recommendations = orderedRecommendations(model.servingState.recommendations)
-    const acquisitionActive = model.acquisitionState._tag === "Installing"
-      || model.acquisitionState._tag === "InstallFailed"
-    if (recommendations.length === 0 && !acquisitionActive) return []
+      || model.servingState.assessment._tag !== "Fits"
+      || Option.isNone(model.servingState.rankingScores)) return []
     return [{
-      id: recommendations.length === 0
-        ? `acquisition:${model.modelId}`
-        : `recommendation:${recommendations[0]!.id}`,
-      kind: "recommendation",
+      id: `downloadable:${model.modelId}`,
+      kind: "downloadable",
       model,
-      recommendations,
     }]
   })
-  return [...installed, ...recommendations].sort((left, right) =>
+  return [...installed, ...downloadable].sort((left, right) =>
     kindOrder[left.kind] - kindOrder[right.kind]
-    || (left.kind === "recommendation" && right.kind === "recommendation"
-      ? (left.recommendations[0] ? intentOrder[left.recommendations[0].intent] : 4)
-        - (right.recommendations[0] ? intentOrder[right.recommendations[0].intent] : 4)
-      : 0)
     || formatLocalModelDisplayName(left.model).localeCompare(formatLocalModelDisplayName(right.model))
     || left.id.localeCompare(right.id))
 }
