@@ -6,8 +6,8 @@ export type SetupStage = "choose" | "install" | "harness"
 
 const SETUP_CONTENT_MAX_WIDTH = 110
 const SETUP_WIDE_MIN_WIDTH = 105
-const WIDE_SETUP_FRAME_ROWS = 30
-const NARROW_SETUP_FRAME_ROWS = 46
+const WIDE_SETUP_FRAME_ROWS = 26
+const NARROW_SETUP_FRAME_ROWS = 42
 
 export const setupContentWidth = (viewportWidth: number): number =>
   Math.max(1, Math.min(SETUP_CONTENT_MAX_WIDTH, viewportWidth - 2))

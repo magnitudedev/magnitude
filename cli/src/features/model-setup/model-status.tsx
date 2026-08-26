@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState, type ReactNode } from "react"
+import { useCallback, useState, type ReactNode } from "react"
 import { TextAttributes, type KeyEvent } from "@opentui/core"
 import { useKeyboard } from "@opentui/react"
 import { Option } from "effect"
@@ -15,7 +15,7 @@ import { useTheme } from "../../hooks/use-theme"
 
 const formatEta = (remainingBytes: number, bytesPerSecond: number): string => {
   const minutes = Math.max(1, Math.ceil(remainingBytes / bytesPerSecond / 60))
-  return `about ${minutes} ${minutes === 1 ? "minute" : "minutes"} remaining`
+  return `about ${minutes} min remaining`
 }
 
 const progressBar = (fraction: number, width: number): string => {
@@ -73,7 +73,27 @@ export interface OnboardingModelDownloadOperation {
   readonly onCancel: () => void
 }
 
-export const ONBOARDING_MODEL_OPERATION_ROWS = 4
+export const ONBOARDING_MODEL_OPERATION_ROWS = 3
+
+export function OnboardingModelConfiguringProgress({
+  width,
+}: {
+  readonly width: number
+}): ReactNode {
+  return (
+    <box style={{
+      width,
+      height: ONBOARDING_MODEL_OPERATION_ROWS,
+      minHeight: ONBOARDING_MODEL_OPERATION_ROWS,
+      maxHeight: ONBOARDING_MODEL_OPERATION_ROWS,
+      flexDirection: "column",
+      flexShrink: 0,
+      overflow: "hidden",
+    }}>
+      <ModelOperationStatusText text="Configuring model…" width={width} />
+    </box>
+  )
+}
 
 export function OnboardingModelDownloadProgress({
   model,
@@ -93,30 +113,27 @@ export function OnboardingModelDownloadProgress({
   const downloading = activeDownload !== null
   const active = starting || downloading
   const cancelling = operation.cancelling
-  const cancelable = activeDownload !== null && !cancelling
+  const cancelable = active && !cancelling
   const confirming = cancelable && confirmationModelId === model.modelId
   const totalBytes = activeDownload?.totalBytes ?? model.downloadBytes
   const progress = activeDownload !== null
     ? Option.some(activeDownload.completedBytes / Math.max(1, activeDownload.totalBytes))
     : Option.none<number>()
   const rate = activeDownload === null ? null : Option.getOrNull(activeDownload.bytesPerSecond)
-  const transferDetail = useMemo(() => {
-    if (starting || cancelling) return null
-    if (activeDownload === null) return null
-    if (activeDownload.stage === "verifying" || activeDownload.stage === "publishing") {
-      return "Verifying download…"
-    }
-    const transferred = `${formatStorageSize(activeDownload.completedBytes)} / ${formatStorageSize(activeDownload.totalBytes)}`
-    if (rate === null || rate <= 0) return `${transferred} · Estimating time remaining…`
-    return `${transferred} · ${formatTransferRate(rate)} · ${formatEta(activeDownload.totalBytes - activeDownload.completedBytes, rate)}`
-  }, [activeDownload, cancelling, rate, starting])
-  const status = starting
-    ? `Starting download (${formatStorageSize(totalBytes)})…`
-    : cancelling
-      ? "Cancelling download…"
-      : downloading
-        ? `Downloading (${formatStorageSize(totalBytes)})`
-        : null
+  const transferred = activeDownload === null
+    ? formatStorageSize(totalBytes)
+    : `${formatStorageSize(activeDownload.completedBytes)} / ${formatStorageSize(activeDownload.totalBytes)}`
+  const status = cancelling
+    ? `Cancelling download · ${transferred}`
+    : starting
+      ? `Starting download · ${formatStorageSize(totalBytes)}`
+      : activeDownload?.stage === "verifying" || activeDownload?.stage === "publishing"
+        ? `Verifying download · ${transferred}`
+        : downloading
+          ? rate === null || rate <= 0
+            ? `Downloading · ${transferred} · Estimating…`
+            : `Downloading · ${transferred} · ${formatTransferRate(rate)} · ${formatEta(activeDownload.totalBytes - activeDownload.completedBytes, rate)}`
+          : null
   const declineCancellation = useCallback(() => {
     setConfirmationModelId(null)
     setChoice("yes")
@@ -186,9 +203,6 @@ export function OnboardingModelDownloadProgress({
     }}>
       <ModelOperationStatusText text={status} width={width} />
       <ModelOperationProgressBar progress={progress} width={width} />
-      <text style={{ fg: theme.text.supporting, width }} wrapMode="none">
-        {transferDetail ?? ""}
-      </text>
       <box style={{
         width,
         height: 1,
@@ -201,7 +215,7 @@ export function OnboardingModelDownloadProgress({
         {confirming ? (
           <>
             <text style={{ fg: theme.text.body, flexShrink: 0 }} wrapMode="none">
-              Are you sure you want to cancel?
+              Cancel download?
             </text>
             <box style={{ width: 2, flexShrink: 0 }} />
             {choiceButton("yes", "Yes")}
@@ -234,13 +248,14 @@ export function OnboardingModelDownloadProgress({
 const loadingStatusLabel = (status: OnboardingModelLoadStatus): string => {
   switch (status._tag) {
     case "Preparing": return "Preparing model…"
+    case "Cancelling": return "Cancelling loading…"
     case "Stopping": return "Stopping current model…"
     case "Ready": return "Finishing setup…"
     case "Failed": return "Couldn’t load model"
     case "Loading": {
       switch (status.stage) {
         case "queued": return "Waiting to load model…"
-        case "resolving": return "Preparing model…"
+        case "resolving": return "Resolving model…"
         case "unloading": return "Unloading current model…"
         case "loading": return "Loading model into memory…"
         case "verifying": return "Verifying model…"
@@ -249,40 +264,88 @@ const loadingStatusLabel = (status: OnboardingModelLoadStatus): string => {
   }
 }
 
-const loadingStatusDetail = (status: OnboardingModelLoadStatus): string => {
-  if (status._tag === "Failed") {
-    return "_tag" in status.failure && status.failure._tag === "LowMemory"
-      ? `Not enough memory. Free ${formatMemorySize(status.failure.minimumAdditionalAvailableBytes, { rounding: "up" })} and try again.`
-      : status.failure.message
-  }
-  if (status._tag !== "Loading") return ""
-  switch (status.stage) {
-    case "queued": return "Waiting for the model loader…"
-    case "resolving": return "Resolving the model configuration…"
-    case "unloading": return "Making room for the selected model…"
-    case "loading": return "Loading model weights…"
-    case "verifying": return "Checking that the model is ready…"
-  }
-}
+const loadingFailureLabel = (
+  status: Extract<OnboardingModelLoadStatus, { readonly _tag: "Failed" }>,
+): string => "_tag" in status.failure && status.failure._tag === "LowMemory"
+  ? `Couldn’t load model · Free ${formatMemorySize(status.failure.minimumAdditionalAvailableBytes, { rounding: "up" })} and try again`
+  : `Couldn’t load model · ${status.failure.message}`
 
 export function OnboardingModelLoadProgress({
   status,
   width,
+  onCancel,
   onRetry,
   onChooseAnother,
 }: {
   readonly status: OnboardingModelLoadStatus
   readonly width: number
+  readonly onCancel: () => void
   readonly onRetry: () => void
   readonly onChooseAnother: () => void
 }): ReactNode {
   const theme = useTheme()
-  const [hovered, setHovered] = useState<"retry" | "choose" | null>(null)
+  const [hovered, setHovered] = useState<"retry" | "choose" | "cancel" | ConfirmationChoice | null>(null)
+  const [confirmingCancellation, setConfirmingCancellation] = useState(false)
+  const [cancellationChoice, setCancellationChoice] = useState<ConfirmationChoice>("yes")
+  const cancelable = status._tag !== "Cancelling"
+    && status._tag !== "Ready"
+    && status._tag !== "Failed"
+  const declineCancellation = useCallback(() => {
+    setConfirmingCancellation(false)
+    setCancellationChoice("yes")
+  }, [])
+  const confirmCancellation = useCallback(() => {
+    if (!cancelable) return
+    setConfirmingCancellation(false)
+    setCancellationChoice("yes")
+    onCancel()
+  }, [cancelable, onCancel])
+  useKeyboard(useCallback((key: KeyEvent) => {
+    if (!cancelable) return
+    if (!confirmingCancellation) {
+      if (key.name === "escape") {
+        key.preventDefault()
+        setCancellationChoice("yes")
+        setConfirmingCancellation(true)
+      }
+      return
+    }
+    if (key.name === "escape") {
+      key.preventDefault()
+      declineCancellation()
+      return
+    }
+    if (key.name === "left" || key.name === "right") {
+      key.preventDefault()
+      setCancellationChoice((current) => current === "yes" ? "no" : "yes")
+      return
+    }
+    if (key.name === "return" || key.name === "enter") {
+      key.preventDefault()
+      if (cancellationChoice === "yes") confirmCancellation()
+      else declineCancellation()
+    }
+  }, [cancelable, cancellationChoice, confirmCancellation, confirmingCancellation, declineCancellation]))
   const progress = status._tag === "Loading"
     ? status.progress
     : status._tag === "Ready"
       ? Option.some(1)
       : Option.none<number>()
+  const cancellationChoiceButton = (value: ConfirmationChoice, label: string) => (
+    <Button
+      onClick={() => value === "yes" ? confirmCancellation() : declineCancellation()}
+      onMouseOver={() => setHovered(value)}
+      onMouseOut={() => setHovered(null)}
+    >
+      <text style={{
+        fg: value === "yes"
+          ? cancellationChoice === value || hovered === value ? theme.status.failure : theme.text.body
+          : cancellationChoice === value || hovered === value ? theme.accent : theme.text.body,
+      }} attributes={cancellationChoice === value ? TextAttributes.BOLD : TextAttributes.NONE}>
+        {cancellationChoice === value ? "› " : "  "}{label}
+      </text>
+    </Button>
+  )
   return (
     <box style={{
       width,
@@ -294,20 +357,11 @@ export function OnboardingModelLoadProgress({
       overflow: "hidden",
     }}>
       {status._tag === "Failed"
-        ? (
-            <text style={{ fg: theme.status.failure, width }} wrapMode="none">
-              {loadingStatusLabel(status)}
-            </text>
-          )
+        ? <text style={{ fg: theme.status.failure, width }} wrapMode="none">{loadingFailureLabel(status)}</text>
         : <ModelOperationStatusText text={loadingStatusLabel(status)} width={width} />}
-      {status._tag === "Failed"
-        ? <text style={{ fg: theme.text.supporting, width }} wrapMode="none">{loadingStatusDetail(status)}</text>
-        : <ModelOperationProgressBar progress={progress} width={width} />}
-      <text style={{ fg: theme.text.supporting, width }} wrapMode="none">
-        {status._tag === "Failed" ? "" : loadingStatusDetail(status)}
-      </text>
+      {status._tag !== "Failed" && <ModelOperationProgressBar progress={progress} width={width} />}
       <box style={{ width, height: 1, minHeight: 1, maxHeight: 1, flexDirection: "row", flexShrink: 0 }}>
-        {status._tag === "Failed" && (
+        {status._tag === "Failed" ? (
           <>
             <Button
               onClick={onRetry}
@@ -325,7 +379,30 @@ export function OnboardingModelLoadProgress({
               <text style={{ fg: hovered === "choose" ? theme.accent : theme.text.body }}>Choose another model</text>
             </Button>
           </>
-        )}
+        ) : confirmingCancellation ? (
+          <>
+            <text style={{ fg: theme.text.body, flexShrink: 0 }} wrapMode="none">
+              Cancel loading?
+            </text>
+            <box style={{ width: 2, flexShrink: 0 }} />
+            {cancellationChoiceButton("yes", "Yes")}
+            <box style={{ width: 2, flexShrink: 0 }} />
+            {cancellationChoiceButton("no", "No")}
+          </>
+        ) : cancelable ? (
+          <Button
+            onClick={() => {
+              setCancellationChoice("yes")
+              setConfirmingCancellation(true)
+            }}
+            onMouseOver={() => setHovered("cancel")}
+            onMouseOut={() => setHovered(null)}
+          >
+            <text style={{ fg: hovered === "cancel" ? theme.status.failure : theme.text.supporting }}>
+              Cancel (Esc)
+            </text>
+          </Button>
+        ) : null}
       </box>
     </box>
   )

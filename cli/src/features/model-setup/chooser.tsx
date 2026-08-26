@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useMemo, useRef, useState, type ReactNode, type Ref } from "react"
+import { Fragment, useCallback, useMemo, useRef, useState, useSyncExternalStore, type ReactNode, type Ref } from "react"
 import { TextAttributes, type KeyEvent, type ScrollBoxRenderable } from "@opentui/core"
 import { useKeyboard } from "@opentui/react"
 import { Result } from "@effect-atom/atom-react"
@@ -35,6 +35,7 @@ import { PentagonRadarView } from "../../components/pentagon-radar-view"
 import { spinnerFrameAt, useSpinnerFrame } from "../../hooks/use-spinner-frame"
 import { useTheme } from "../../hooks/use-theme"
 import { BOX_CHARS } from "../../utils/ui-constants"
+import { subscribeScrollboxActivity } from "../../utils/scroll-helpers"
 import {
   describeLocalHardwareSummary,
   localInferenceProgressLines,
@@ -51,14 +52,15 @@ import {
 } from "../local-inference/model-classification"
 import { discoveredModelLocation } from "./discovered-model"
 import {
+  OnboardingModelConfiguringProgress,
   OnboardingModelDownloadProgress,
   OnboardingModelLoadProgress,
-  ONBOARDING_MODEL_OPERATION_ROWS,
 } from "./model-status"
 import { isWideSetupLayout, SetupFrame, setupBodyWidth, type SetupStage } from "./setup-frame"
 
 const SECTION_VIEWPORT_ROWS = 4
 const RECOMMENDED_VIEWPORT_ROWS = 10
+const MODEL_SECTION_HEADING_ROWS = 1
 const MODEL_TITLE_ROWS = 1
 const MODEL_SUMMARY_ROWS = 1
 const MODEL_SUMMARY_RADAR_GAP_ROWS = 1
@@ -92,6 +94,25 @@ export const scrollOnboardingModelIntoView = (
   selectionId: string,
 ): void => {
   scrollbox?.scrollChildIntoView(onboardingModelRowId(selectionId))
+}
+
+const scrollOnboardingModelPastOverflowIndicators = (
+  scrollbox: ScrollBoxRenderable | null,
+  selectionId: string,
+  itemIndex: number,
+  itemCount: number,
+  viewportRows: number,
+): void => {
+  if (scrollbox === null) return
+  scrollOnboardingModelIntoView(scrollbox, selectionId)
+  const scrollTop = Math.max(0, Math.floor(scrollbox.scrollTop + 0.001))
+  if (scrollTop > 0 && itemIndex === scrollTop) {
+    scrollbox.scrollTo(Math.max(0, scrollTop - 1))
+    return
+  }
+  if (scrollTop + viewportRows < itemCount && itemIndex === scrollTop + viewportRows - 1) {
+    scrollbox.scrollTo(scrollTop + 1)
+  }
 }
 
 export const onboardingModelActionLabel = (selection: LocalInferenceSelection): string => {
@@ -171,33 +192,111 @@ const ModelRow = ({
 const ModelSectionViewport = ({
   scrollRef,
   rows,
+  itemCount,
+  showOverflow,
   children,
 }: {
   readonly scrollRef: Ref<ScrollBoxRenderable | null>
   readonly rows: number
+  readonly itemCount: number
+  readonly showOverflow: boolean
   readonly children: ReactNode
-}): ReactNode => (
-  <scrollbox
-    ref={scrollRef}
-    scrollX={false}
-    scrollbarOptions={{ visible: false }}
-    style={{
+}): ReactNode => {
+  const theme = useTheme()
+  const mountedScrollboxRef = useRef<ScrollBoxRenderable | null>(null)
+  const attachScrollbox = useCallback((value: ScrollBoxRenderable | null) => {
+    mountedScrollboxRef.current = value
+    if (typeof scrollRef === "function") scrollRef(value)
+    else if (scrollRef !== null) scrollRef.current = value
+  }, [scrollRef])
+  const subscribe = useCallback(
+    (onStoreChange: () => void) => subscribeScrollboxActivity(
+      mountedScrollboxRef.current,
+      () => onStoreChange(),
+    ),
+    [],
+  )
+  const getScrollTop = useCallback(
+    () => Math.max(0, mountedScrollboxRef.current?.scrollTop ?? 0),
+    [],
+  )
+  const scrollTop = useSyncExternalStore(subscribe, getScrollTop, () => 0)
+  const nativeHiddenAbove = showOverflow ? Math.min(itemCount, Math.floor(scrollTop + 0.001)) : 0
+  const nativeHiddenBelow = showOverflow
+    ? Math.max(0, itemCount - Math.ceil(scrollTop + rows - 0.001))
+    : 0
+  const hiddenAbove = nativeHiddenAbove > 0 ? nativeHiddenAbove + 1 : 0
+  const hiddenBelow = nativeHiddenBelow > 0 ? nativeHiddenBelow + 1 : 0
+  const overflowLine = (count: number) => (
+    <text style={{
+      fg: theme.text.disabled,
+      height: 1,
+      minHeight: 1,
+      maxHeight: 1,
       flexShrink: 0,
-      rootOptions: {
-        height: rows,
-        minHeight: rows,
-        maxHeight: rows,
-        flexShrink: 0,
-        backgroundColor: "transparent",
-      },
-      wrapperOptions: { border: false, backgroundColor: "transparent" },
-      viewportOptions: { backgroundColor: "transparent" },
-      contentOptions: { flexDirection: "column" },
-    }}
-  >
-    {children}
-  </scrollbox>
-)
+    }} wrapMode="none">
+      {count > 0 ? `  … and ${count} more` : ""}
+    </text>
+  )
+  return (
+    <box style={{
+      position: "relative",
+      flexDirection: "column",
+      flexShrink: 0,
+      height: rows,
+      minHeight: rows,
+      maxHeight: rows,
+    }}>
+      <scrollbox
+        ref={attachScrollbox}
+        focusable={false}
+        scrollX={false}
+        scrollbarOptions={{ visible: false }}
+        style={{
+          flexShrink: 0,
+          rootOptions: {
+            height: rows,
+            minHeight: rows,
+            maxHeight: rows,
+            flexShrink: 0,
+            backgroundColor: "transparent",
+          },
+          wrapperOptions: { border: false, backgroundColor: "transparent" },
+          viewportOptions: { backgroundColor: "transparent" },
+          contentOptions: { flexDirection: "column" },
+        }}
+      >
+        {children}
+      </scrollbox>
+      {hiddenAbove > 0 && (
+        <box style={{
+          position: "absolute",
+          top: 0,
+          left: 0,
+          right: 0,
+          height: 1,
+          zIndex: 100,
+          backgroundColor: theme.background.terminal,
+        }}>
+          {overflowLine(hiddenAbove)}
+        </box>
+      )}
+      {hiddenBelow > 0 && (
+        <box style={{
+          position: "absolute",
+          bottom: 0,
+          left: 0,
+          right: 0,
+          height: 1,
+          zIndex: 100,
+          backgroundColor: theme.background.terminal,
+        }}>
+          {overflowLine(hiddenBelow)}
+        </box>
+      )}
+    </box>
+  )
+}
 
 const DetailRow = ({
   width,
@@ -301,6 +400,7 @@ export type OnboardingModelChooserOperation =
       readonly providerModelId: ProviderModelId
       readonly model: LocalModel
       readonly status: OnboardingModelLoadStatus
+      readonly onCancel: () => void
       readonly onRetry: () => void
       readonly onChooseAnother: () => void
     }
@@ -316,53 +416,43 @@ export const onboardingSelectionEnterAction = (
 
 export const onboardingModelDetailRows = ({
   memoryWarning,
-  operationRows,
   modelSummaryRadarGap,
 }: {
   readonly memoryWarning: boolean
-  readonly operationRows: number
   readonly modelSummaryRadarGap: boolean
 }): number => MODEL_TITLE_ROWS
   + MODEL_SUMMARY_ROWS
   + (modelSummaryRadarGap ? MODEL_SUMMARY_RADAR_GAP_ROWS : 0)
   + PENTAGON_RADAR_ROWS
   + (memoryWarning ? 1 : 0)
-  + operationRows
 
-const ONBOARDING_IDLE_MODEL_DETAIL_ROWS = onboardingModelDetailRows({
+export const ONBOARDING_MODEL_DETAIL_ROWS = onboardingModelDetailRows({
   memoryWarning: false,
-  operationRows: 0,
   modelSummaryRadarGap: true,
 })
 
-const ONBOARDING_OPERATION_DETAIL_ROWS = onboardingModelDetailRows({
-  memoryWarning: false,
-  operationRows: ONBOARDING_MODEL_OPERATION_ROWS,
-  modelSummaryRadarGap: true,
-})
-
-export const ONBOARDING_MODEL_DETAIL_ROWS = Math.max(
-  ONBOARDING_IDLE_MODEL_DETAIL_ROWS,
-  ONBOARDING_OPERATION_DETAIL_ROWS,
-)
-
-export const onboardingLocalModelViewportRows = ({
+export const onboardingLocalModelLayout = ({
   wide,
   localCount,
   detailPanelRows,
-  downloadRows,
+  rankedRows,
   sectionGap,
 }: {
   readonly wide: boolean
   readonly localCount: number
   readonly detailPanelRows: number
-  readonly downloadRows: number
+  readonly rankedRows: number
   readonly sectionGap: number
-}): number => {
-  if (localCount === 0) return 0
-  if (!wide) return Math.min(SECTION_VIEWPORT_ROWS, localCount)
-  const localHeadingRows = 1
-  return Math.max(1, detailPanelRows - downloadRows - sectionGap - localHeadingRows)
+}): { readonly viewportRows: number; readonly showOverflow: boolean } => {
+  if (localCount === 0) return { viewportRows: 0, showOverflow: false }
+  const availableRows = wide
+    ? Math.max(1, detailPanelRows - rankedRows - sectionGap - MODEL_SECTION_HEADING_ROWS)
+    : Math.min(SECTION_VIEWPORT_ROWS, localCount)
+  const showOverflow = localCount > availableRows
+  const viewportRows = wide
+    ? Math.min(localCount, availableRows)
+    : Math.min(SECTION_VIEWPORT_ROWS, localCount)
+  return { viewportRows, showOverflow }
 }
 
 export function OnboardingModelChooser({
@@ -442,21 +532,27 @@ export function OnboardingModelChooser({
   const wide = isWideSetupLayout(width)
   const leftWidth = wide ? WIDE_LIST_WIDTH : Math.max(1, cardWidth - 6)
   const detailWidth = wide ? Math.max(1, cardWidth - leftWidth - 9) : leftWidth
-  const downloadOperation = operation?._tag === "Downloading" ? operation : null
-  const loadOperation = operation?._tag === "Activating" ? operation : null
+  const operationWidth = wide ? leftWidth + detailWidth : leftWidth
   const detailContentRows = ONBOARDING_MODEL_DETAIL_ROWS
   const detailPanelRows = detailContentRows + (wide ? 0 : 1)
   const rankedViewportRows = Math.min(RECOMMENDED_VIEWPORT_ROWS, ranked.length)
-  const rankedRows = ranked.length > 0 ? rankedViewportRows + 1 : 0
+  const rankedShowOverflow = ranked.length > rankedViewportRows
+  const rankedRows = ranked.length > 0
+    ? rankedViewportRows
+      + MODEL_SECTION_HEADING_ROWS
+    : 0
   const sectionGap = local.length > 0 && ranked.length > 0 ? 1 : 0
-  const localViewportRows = onboardingLocalModelViewportRows({
+  const localLayout = onboardingLocalModelLayout({
     wide,
     localCount: local.length,
     detailPanelRows,
-    downloadRows: rankedRows,
+    rankedRows,
     sectionGap,
   })
-  const localRows = local.length > 0 ? localViewportRows + 1 : 0
+  const localRows = local.length > 0
+    ? localLayout.viewportRows
+      + MODEL_SECTION_HEADING_ROWS
+    : 0
   const listRows = rankedRows + sectionGap + localRows
   const chooserHeight = wide
     ? Math.max(listRows, detailPanelRows)
@@ -483,11 +579,26 @@ export function OnboardingModelChooser({
     }
     setSelectedId(Option.some(selection.id))
     setCursorIndex(nextIndex)
-    scrollOnboardingModelIntoView(
-      selection.id.startsWith("ranked:") ? downloadScrollRef.current : localScrollRef.current,
-      selection.id,
-    )
-  }, [radarTransition, selected, selections])
+    const rankedIndex = ranked.indexOf(selection)
+    const localIndex = local.indexOf(selection)
+    if (rankedIndex >= 0) {
+      scrollOnboardingModelPastOverflowIndicators(
+        downloadScrollRef.current,
+        selection.id,
+        rankedIndex,
+        ranked.length,
+        rankedViewportRows,
+      )
+    } else if (localIndex >= 0) {
+      scrollOnboardingModelPastOverflowIndicators(
+        localScrollRef.current,
+        selection.id,
+        localIndex,
+        local.length,
+        localLayout.viewportRows,
+      )
+    }
+  }, [local, localLayout.viewportRows, radarTransition, ranked, rankedViewportRows, selected, selections])
 
   const moveCursorTo = useCallback((index: number) => {
     moveSelectionTo(index)
@@ -542,7 +653,12 @@ export function OnboardingModelChooser({
         </text>
       )}
       {ranked.length > 0 && (
-        <ModelSectionViewport scrollRef={downloadScrollRef} rows={rankedViewportRows}>
+        <ModelSectionViewport
+          scrollRef={downloadScrollRef}
+          rows={rankedViewportRows}
+          itemCount={ranked.length}
+          showOverflow={rankedShowOverflow}
+        >
           {ranked.map((selection, index) => (
             <ModelRow
               key={selection.id}
@@ -564,7 +680,12 @@ export function OnboardingModelChooser({
         </text>
       )}
       {local.length > 0 && (
-        <ModelSectionViewport scrollRef={localScrollRef} rows={localViewportRows}>
+        <ModelSectionViewport
+          scrollRef={localScrollRef}
+          rows={localLayout.viewportRows}
+          itemCount={local.length}
+          showOverflow={localLayout.showOverflow}
+        >
           {local.map((selection) => (
             <ModelRow
               key={selection.id}
@@ -661,24 +782,8 @@ export function OnboardingModelChooser({
           />
         ),
       })}
-      {downloadOperation === null && loadOperation === null && memoryWarning && (
+      {operation === null && memoryWarning && (
         <text style={{ fg: theme.status.warning, width: detailWidth }} wrapMode="none">{memoryWarning}</text>
-      )}
-      <box style={{ flexGrow: 1 }} />
-      {downloadOperation !== null && (
-        <OnboardingModelDownloadProgress
-          model={downloadOperation.model}
-          width={detailWidth}
-          operation={downloadOperation}
-        />
-      )}
-      {loadOperation !== null && (
-        <OnboardingModelLoadProgress
-          status={loadOperation.status}
-          width={detailWidth}
-          onRetry={loadOperation.onRetry}
-          onChooseAnother={loadOperation.onChooseAnother}
-        />
       )}
     </>
   ) : (
@@ -716,7 +821,9 @@ export function OnboardingModelChooser({
       : operation?._tag === "Activating"
         ? operation.status._tag === "Failed"
           ? "Model loading failed"
-          : operation.status._tag === "Stopping"
+          : operation.status._tag === "Cancelling"
+            ? "Cancelling loading…"
+            : operation.status._tag === "Stopping"
             ? "Stopping model…"
             : operation.status._tag === "Preparing" || operation.status._tag === "Loading"
               ? "Loading model into memory…"
@@ -742,33 +849,53 @@ export function OnboardingModelChooser({
         </>
       )}
     >
-      <box style={{ flexDirection: "column", width: "100%", marginBottom: 1 }}>
-        <box style={{ flexDirection: "column" }}>
-          <text selectable={false} style={{ fg: theme.text.body }} wrapMode="none">
-            {" ".repeat(FAST_TO_SMART_TRACK_LEFT_PADDING)}
-            {LOCAL_MODEL_RANKING_SCALE_LABELS.map((_, index) => (
-              <Fragment key={index}>
-                <span fg={index === selectedRankingScaleIndex ? theme.accent : theme.text.body}>
-                  {index === 0 ? "├" : index === LOCAL_MODEL_RANKING_SCALE_INTERVALS ? "┤" : "┼"}
-                </span>
-                {index < LOCAL_MODEL_RANKING_SCALE_INTERVALS
-                  ? "─".repeat(FAST_TO_SMART_SEGMENT_COLUMNS - 1)
-                  : ""}
-              </Fragment>
-            ))}
-            {"    "}
-            <span fg={theme.text.disabled}>←/→ change preference</span>
-          </text>
-          <text selectable={false} style={{ fg: theme.text.body }} wrapMode="none">
-            {FAST_TO_SMART_LABEL_LAYOUT.map(({ label, leadingSpaces }, index) => (
-              <Fragment key={label}>
-                {" ".repeat(leadingSpaces)}
-                <span fg={index === selectedRankingScaleIndex ? theme.accent : theme.text.body}>{label}</span>
-              </Fragment>
-            ))}
-          </text>
-        </box>
-      </box>
+      {operation === null
+        ? (
+            <box style={{ flexDirection: "column", width: "100%", marginBottom: 1 }}>
+              <text selectable={false} style={{ fg: theme.text.body }} wrapMode="none">
+                {" ".repeat(FAST_TO_SMART_TRACK_LEFT_PADDING)}
+                {LOCAL_MODEL_RANKING_SCALE_LABELS.map((_, index) => (
+                  <Fragment key={index}>
+                    <span fg={index === selectedRankingScaleIndex ? theme.accent : theme.text.body}>
+                      {index === 0 ? "├" : index === LOCAL_MODEL_RANKING_SCALE_INTERVALS ? "┤" : "┼"}
+                    </span>
+                    {index < LOCAL_MODEL_RANKING_SCALE_INTERVALS
+                      ? "─".repeat(FAST_TO_SMART_SEGMENT_COLUMNS - 1)
+                      : ""}
+                  </Fragment>
+                ))}
+                {"    "}
+                <span fg={theme.text.disabled}>←/→ change preference</span>
+              </text>
+              <text selectable={false} style={{ fg: theme.text.body }} wrapMode="none">
+                {FAST_TO_SMART_LABEL_LAYOUT.map(({ label, leadingSpaces }, index) => (
+                  <Fragment key={label}>
+                    {" ".repeat(leadingSpaces)}
+                    <span fg={index === selectedRankingScaleIndex ? theme.accent : theme.text.body}>{label}</span>
+                  </Fragment>
+                ))}
+              </text>
+            </box>
+          )
+        : operation._tag === "Downloading"
+          ? (
+              <OnboardingModelDownloadProgress
+                model={operation.model}
+                width={operationWidth}
+                operation={operation}
+              />
+            )
+          : operation._tag === "Activating"
+            ? (
+                <OnboardingModelLoadProgress
+                  status={operation.status}
+                  width={operationWidth}
+                  onCancel={operation.onCancel}
+                  onRetry={operation.onRetry}
+                  onChooseAnother={operation.onChooseAnother}
+                />
+              )
+            : <OnboardingModelConfiguringProgress width={operationWidth} />}
       <box style={{
         flexDirection: wide ? "row" : "column",
         width: "100%",
