@@ -5,9 +5,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
+use icn_contracts::inference::{
+    InferenceCompletion, InferenceObservation, ResolvedInferenceRequest,
+};
 use icn_contracts::{
-    ChatRequest, ChatTemplateRequest, CompletionBackend, Generation, InferenceError,
-    InferenceStreamEvent, ModelProperties, PreparedChatInfo, SpeculativeDecodingConfig,
+    CompletionBackend, InferenceError, ModelProperties, PreparedChatInfo, SpeculativeDecodingConfig,
 };
 use icn_engine::{ModelLoadObserver, ModelLoadPhase, NativeBackend};
 use icn_hardware::CapacityPolicy;
@@ -15,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::worker_process::{NativeWorkerLauncher, NativeWorkerRole};
 
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 const MAX_FRAME_BYTES: usize = 48 * 1024 * 1024;
 // At most one maximum-sized request may wait behind the frame currently being written.
 const COMMAND_QUEUE_CAPACITY: usize = 1;
@@ -45,12 +47,17 @@ enum HostMessage {
     },
     Infer {
         request_id: u64,
-        request: ChatRequest,
+        request: ResolvedInferenceRequest,
         trace: crate::telemetry::TraceCarrier,
     },
     ApplyTemplate {
         request_id: u64,
-        request: ChatTemplateRequest,
+        request: ResolvedInferenceRequest,
+        trace: crate::telemetry::TraceCarrier,
+    },
+    CountTokens {
+        request_id: u64,
+        request: ResolvedInferenceRequest,
         trace: crate::telemetry::TraceCarrier,
     },
     ObserveModelInstance {
@@ -86,13 +93,13 @@ enum WorkerMessage {
     LoadFailed {
         message: String,
     },
-    InferenceEvent {
+    InferenceObservation {
         request_id: u64,
-        event: InferenceStreamEvent,
+        event: InferenceObservation,
     },
     RequestCompleted {
         request_id: u64,
-        generation: Generation,
+        completion: InferenceCompletion,
     },
     RequestFailed {
         request_id: u64,
@@ -101,6 +108,10 @@ enum WorkerMessage {
     TemplateCompleted {
         request_id: u64,
         result: Result<PreparedChatInfo, WireInferenceError>,
+    },
+    TokenCountCompleted {
+        request_id: u64,
+        result: Result<u64, WireInferenceError>,
     },
     ModelInstanceObserved {
         request_id: u64,
@@ -208,10 +219,11 @@ pub(crate) enum LoadEvent {
 }
 
 enum RequestReply {
-    Event(InferenceStreamEvent),
-    Completed(Generation),
+    Event(InferenceObservation),
+    Completed(InferenceCompletion),
     Failed(WireInferenceError),
     Template(Result<PreparedChatInfo, WireInferenceError>),
+    TokenCount(Result<u64, WireInferenceError>),
     ModelInstance(Result<icn_engine::ModelInstanceObservation, String>),
 }
 
@@ -364,7 +376,7 @@ impl CompletionBackend for RemoteBackend {
 
     fn apply_template(
         &self,
-        request: ChatTemplateRequest,
+        request: ResolvedInferenceRequest,
     ) -> Result<PreparedChatInfo, InferenceError> {
         let waiter = self
             .client
@@ -383,11 +395,27 @@ impl CompletionBackend for RemoteBackend {
         }
     }
 
+    fn count_tokens(&self, request: ResolvedInferenceRequest) -> Result<u64, InferenceError> {
+        let waiter = self.client.request(|request_id| HostMessage::CountTokens {
+            request_id,
+            request,
+            trace: crate::telemetry::inject_current_trace(),
+        })?;
+        match waiter.receiver.recv() {
+            Ok(RequestReply::TokenCount(result)) => result.map_err(Into::into),
+            Ok(RequestReply::Failed(error)) => Err(error.into()),
+            Ok(_) => Err(InferenceError::Backend(
+                "worker returned the wrong token-count response".to_owned(),
+            )),
+            Err(_) => Err(InferenceError::ExecutorStopped),
+        }
+    }
+
     fn complete(
         &self,
-        request: ChatRequest,
-        on_event: &mut dyn FnMut(InferenceStreamEvent) -> Result<(), InferenceError>,
-    ) -> Result<Generation, InferenceError> {
+        request: ResolvedInferenceRequest,
+        on_event: &mut dyn FnMut(InferenceObservation) -> Result<(), InferenceError>,
+    ) -> Result<InferenceCompletion, InferenceError> {
         let waiter = self.client.request(|request_id| HostMessage::Infer {
             request_id,
             request,
@@ -403,7 +431,7 @@ impl CompletionBackend for RemoteBackend {
                         return Err(error);
                     }
                 }
-                Ok(RequestReply::Completed(generation)) => return Ok(generation),
+                Ok(RequestReply::Completed(completion)) => return Ok(completion),
                 Ok(RequestReply::Failed(error)) => return Err(error.into()),
                 Ok(_) => {
                     return Err(InferenceError::Backend(
@@ -778,20 +806,23 @@ fn dispatch_worker_message(inner: &Arc<ClientInner>, message: WorkerMessage) {
         WorkerMessage::LoadFailed { message } => {
             let _ = inner.load_events.blocking_send(LoadEvent::Failed(message));
         }
-        WorkerMessage::InferenceEvent { request_id, event } => {
+        WorkerMessage::InferenceObservation { request_id, event } => {
             send_request_reply(inner, request_id, RequestReply::Event(event), false);
         }
         WorkerMessage::RequestCompleted {
             request_id,
-            generation,
+            completion,
         } => {
-            send_request_reply(inner, request_id, RequestReply::Completed(generation), true);
+            send_request_reply(inner, request_id, RequestReply::Completed(completion), true);
         }
         WorkerMessage::RequestFailed { request_id, error } => {
             send_request_reply(inner, request_id, RequestReply::Failed(error), true);
         }
         WorkerMessage::TemplateCompleted { request_id, result } => {
             send_request_reply(inner, request_id, RequestReply::Template(result), true);
+        }
+        WorkerMessage::TokenCountCompleted { request_id, result } => {
+            send_request_reply(inner, request_id, RequestReply::TokenCount(result), true);
         }
         WorkerMessage::ModelInstanceObserved { request_id, result } => {
             send_request_reply(inner, request_id, RequestReply::ModelInstance(result), true);
@@ -987,16 +1018,16 @@ pub(crate) fn run_worker(build: String, native: NativeBackend) -> anyhow::Result
                             return Err(InferenceError::Cancelled);
                         }
                         responses
-                            .send(WorkerMessage::InferenceEvent { request_id, event })
+                            .send(WorkerMessage::InferenceObservation { request_id, event })
                             .map_err(|_| InferenceError::ExecutorStopped)
                     });
                     if let Ok(mut active) = cancellations.lock() {
                         active.remove(&request_id);
                     }
                     let message = match result {
-                        Ok(generation) => WorkerMessage::RequestCompleted {
+                        Ok(completion) => WorkerMessage::RequestCompleted {
                             request_id,
-                            generation,
+                            completion,
                         },
                         Err(error) => WorkerMessage::RequestFailed {
                             request_id,
@@ -1020,6 +1051,25 @@ pub(crate) fn run_worker(build: String, native: NativeBackend) -> anyhow::Result
                     let _entered = span.enter();
                     let result = backend.apply_template(request).map_err(Into::into);
                     let _ = responses.send(WorkerMessage::TemplateCompleted { request_id, result });
+                });
+            }
+            HostMessage::CountTokens {
+                request_id,
+                request,
+                trace,
+            } => {
+                let backend = Arc::clone(&backend);
+                let responses = responses.clone();
+                thread::spawn(move || {
+                    let span = tracing::info_span!(
+                        "icn.worker.count_tokens",
+                        worker.request.id = request_id
+                    );
+                    crate::telemetry::set_parent_from_carrier(&span, &trace);
+                    let _entered = span.enter();
+                    let result = backend.count_tokens(request).map_err(Into::into);
+                    let _ =
+                        responses.send(WorkerMessage::TokenCountCompleted { request_id, result });
                 });
             }
             HostMessage::ObserveModelInstance {

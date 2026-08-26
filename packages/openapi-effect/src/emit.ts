@@ -741,9 +741,40 @@ import * as Schemas from ${quote(
               )
               .join(", ")}]`,
           ];
-          return `export const ${value.name}Operation = { ${fields.join(
+          const httpFields = [
+            `operationId: ${quote(value.operationId)}`,
+            `transport: "http"`,
+            `method: ${quote(value.method)}`,
+            `path: ${quote(value.path)}`,
+            `group: ${quote(value.group)}`,
+            ...fields.filter((field) =>
+              field.startsWith("pathParameters:") ||
+              field.startsWith("queryParameters:") ||
+              field.startsWith("headers:") ||
+              field.startsWith("payload:") ||
+              field.startsWith("errors:")
+            ),
+            `successes: [${value.successes
+              .map(
+                (response) =>
+                  `{ status: ${response.status}, schema: ${responseSchema(
+                    response,
+                    ir.components
+                  )}${Option.match(response.mediaType, {
+                    onNone: () => "",
+                    onSome: (mediaType) => `, mediaType: ${quote(mediaType)}`,
+                  })} }`
+              )
+              .join(", ")}]`,
+          ];
+          const streamDescriptor = `export const ${value.name}Operation = { ${fields.join(
             ", "
           )} } as const`;
+          return value.successes.length === 0
+            ? streamDescriptor
+            : `${streamDescriptor}\n\nexport const ${value.name}HttpOperation = { ${httpFields.join(
+                ", "
+              )} } as const`;
         },
       })
     )
@@ -764,11 +795,9 @@ const emitClient = (ir: ProtocolIr, config: OpenApiEffectConfig): string => {
         (operation) =>
           Operation.$is("Http")(operation) && operation.groupName === groupName
       );
-      const streams = [...ir.operations].filter(
-        (operation) =>
-          Operation.$is("Stream")(operation) &&
-          operation.groupName === groupName
-      );
+      const streams = [...ir.operations]
+        .filter(Operation.$is("Stream"))
+        .filter((operation) => operation.groupName === groupName);
       const entries = [
         ...ordinary.map(
           ({ name }) =>
@@ -781,6 +810,12 @@ const emitClient = (ir: ProtocolIr, config: OpenApiEffectConfig): string => {
             `${JSON.stringify(
               name
             )}: makeStreamOperation(http, options, Operations.${name}Operation)`
+        ),
+        ...streams.filter(({ successes }) => successes.length > 0).map(
+          ({ name }) =>
+            `${JSON.stringify(
+              `${name}Http`
+            )}: makeHttpOperation(http, options, Operations.${name}HttpOperation)`
         ),
       ];
       return `${JSON.stringify(groupName)}: { ${entries.join(", ")} }`;

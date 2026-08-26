@@ -168,6 +168,85 @@ export const cancelModelDownloadOperation = {
   pathParameters: S.Struct({ download_id: S.String }),
 } as const
 
+export const countAnthropicMessageTokensOperation = {
+  operationId: "countAnthropicMessageTokens",
+  transport: "http",
+  method: "POST",
+  path: "/anthropic/v1/messages/count_tokens",
+  group: "anthropic",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.CountTokensResponse, Schemas.CountTokensResponseEncoded> => Schemas.CountTokensResponse,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+      mediaType: "application/json",
+    },
+    {
+      status: 404,
+      schema: S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+      mediaType: "application/json",
+    },
+  ],
+  payload: S.suspend((): S.Schema<Schemas.MessagesRequest, Schemas.MessagesRequestEncoded> => Schemas.MessagesRequest),
+  payloadMediaType: "application/json",
+  payloadRequired: true,
+} as const
+
+export const createAnthropicMessageOperation = {
+  operationId: "createAnthropicMessage",
+  transport: "http",
+  method: "POST",
+  path: "/anthropic/v1/messages",
+  group: "anthropic",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.MessageResponse, Schemas.MessageResponseEncoded> => Schemas.MessageResponse,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+      mediaType: "application/json",
+    },
+    {
+      status: 404,
+      schema: S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+      mediaType: "application/json",
+    },
+    {
+      status: 409,
+      schema: S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+      mediaType: "application/json",
+    },
+  ],
+  payload: S.suspend((): S.Schema<Schemas.MessagesRequest, Schemas.MessagesRequestEncoded> => Schemas.MessagesRequest),
+  payloadMediaType: "application/json",
+  payloadRequired: true,
+} as const
+
 export const createChatCompletionOperation = {
   operationId: "createChatCompletion",
   transport: "sse",
@@ -176,7 +255,7 @@ export const createChatCompletionOperation = {
   group: "chat",
   mediaType: "text/event-stream",
   responseStatus: 200,
-  eventSchema: Schemas.ChatCompletionChunk,
+  eventSchema: Schemas.ChatCompletionStreamEvent,
   termination: { type: "sentinel", value: "[DONE]" },
   reconnect: { type: "none" },
   headers: S.Struct({
@@ -211,6 +290,59 @@ export const createChatCompletionOperation = {
     {
       status: 500,
       schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+} as const
+
+export const createChatCompletionHttpOperation = {
+  operationId: "createChatCompletion",
+  transport: "http",
+  method: "POST",
+  path: "/v1/chat/completions",
+  group: "chat",
+  headers: S.Struct({
+    "Magnitude-Include-Progress": S.optionalWith(S.BooleanFromString, { exact: true, as: "Option" }),
+  }),
+  payload: S.suspend(
+    (): S.Schema<Schemas.ChatCompletionRequest, Schemas.ChatCompletionRequestEncoded> => Schemas.ChatCompletionRequest,
+  ),
+  payloadMediaType: "application/json",
+  payloadRequired: true,
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 404,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 409,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 422,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.ChatCompletionResponse, Schemas.ChatCompletionResponseEncoded> =>
+          Schemas.ChatCompletionResponse,
+      ),
       mediaType: "application/json",
     },
   ],
@@ -259,6 +391,56 @@ export const createResponseOperation = {
     {
       status: 500,
       schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+} as const
+
+export const createResponseHttpOperation = {
+  operationId: "createResponse",
+  transport: "http",
+  method: "POST",
+  path: "/v1/responses",
+  group: "inference",
+  headers: S.Struct({
+    "Magnitude-Include-Progress": S.optionalWith(S.BooleanFromString, { exact: true, as: "Option" }),
+  }),
+  payload: S.suspend(
+    (): S.Schema<Schemas.ResponseCreateRequest, Schemas.ResponseCreateRequestEncoded> => Schemas.ResponseCreateRequest,
+  ),
+  payloadMediaType: "application/json",
+  payloadRequired: true,
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 404,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 409,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 422,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend((): S.Schema<Schemas.ResponseObject, Schemas.ResponseObjectEncoded> => Schemas.ResponseObject),
       mediaType: "application/json",
     },
   ],

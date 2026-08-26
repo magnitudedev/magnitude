@@ -114,6 +114,57 @@ export const cancelModelDownload = HttpApiEndpoint.post("cancelModelDownload", "
     { status: 500 },
   )
 
+export const countAnthropicMessageTokens = HttpApiEndpoint.post(
+  "countAnthropicMessageTokens",
+  "/anthropic/v1/messages/count_tokens",
+)
+  .setPayload(
+    S.suspend((): S.Schema<Schemas.MessagesRequest, Schemas.MessagesRequestEncoded> => Schemas.MessagesRequest),
+  )
+  .addSuccess(
+    S.suspend(
+      (): S.Schema<Schemas.CountTokensResponse, Schemas.CountTokensResponseEncoded> => Schemas.CountTokensResponse,
+    ),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+    { status: 400 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+    { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+    { status: 500 },
+  )
+
+export const createAnthropicMessage = HttpApiEndpoint.post("createAnthropicMessage", "/anthropic/v1/messages")
+  .setPayload(
+    S.suspend((): S.Schema<Schemas.MessagesRequest, Schemas.MessagesRequestEncoded> => Schemas.MessagesRequest),
+  )
+  .addSuccess(
+    S.suspend((): S.Schema<Schemas.MessageResponse, Schemas.MessageResponseEncoded> => Schemas.MessageResponse),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+    { status: 400 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+    { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+    { status: 409 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+    { status: 500 },
+  )
+
 export const ensureModelInstance = HttpApiEndpoint.post("ensureModelInstance", "/api/v1/instances")
   .setPayload(
     S.suspend(
@@ -538,6 +589,10 @@ export const uninstallModel = HttpApiEndpoint.post("uninstallModel", "/api/v1/mo
     { status: 500 },
   )
 
+export const AnthropicGroup = HttpApiGroup.make("anthropic")
+  .add(countAnthropicMessageTokens)
+  .add(createAnthropicMessage)
+
 export const ChatGroup = HttpApiGroup.make("chat").add(applyChatTemplate)
 
 export const HuggingFaceGroup = HttpApiGroup.make("huggingFace")
@@ -571,6 +626,7 @@ export const ModelsGroup = HttpApiGroup.make("models")
 export const SystemGroup = HttpApiGroup.make("system").add(getHardware).add(health)
 
 export const IcnApi = HttpApi.make("IcnApi")
+  .add(AnthropicGroup)
   .add(ChatGroup)
   .add(HuggingFaceGroup)
   .add(InferenceGroup)

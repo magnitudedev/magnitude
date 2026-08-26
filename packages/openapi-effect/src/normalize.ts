@@ -761,7 +761,8 @@ const isSupportedMediaType = (value: string): value is MediaType =>
 
 const selectMediaType = <A>(
   content: Readonly<Record<string, A>>,
-  pointer: string
+  pointer: string,
+  ignored: ReadonlySet<string> = new Set()
 ): Effect.Effect<
   Option.Option<readonly [MediaType, A]>,
   never,
@@ -769,7 +770,10 @@ const selectMediaType = <A>(
 > =>
   Effect.gen(function* () {
     const context = yield* NormalizationContext;
-    const entries = Object.entries(content);
+    const entries = Object.entries(content).filter(([mediaType]) =>
+      !ignored.has(mediaType)
+    );
+    if (entries.length === 0) return Option.none();
     const supported = entries.filter((entry): entry is [MediaType, A] =>
       isSupportedMediaType(entry[0])
     );
@@ -856,7 +860,8 @@ const resolveResponse = (
 const normalizeResponses = (
   responses: OperationObject["responses"],
   pointer: string,
-  requireSuccess = true
+  requireSuccess = true,
+  ignoredMediaTypes: ReadonlySet<string> = new Set()
 ): Effect.Effect<readonly OperationResponse[], never, NormalizationContext> =>
   Effect.gen(function* () {
     const context = yield* NormalizationContext;
@@ -909,7 +914,8 @@ const normalizeResponses = (
           }
           const selected = yield* selectMediaType(
             response.value.content.value,
-            pointerChild(responsePointer, "content")
+            pointerChild(responsePointer, "content"),
+            ignoredMediaTypes
           );
           if (Option.isNone(selected)) return Option.none<OperationResponse>();
           const [mediaType, media] = selected.value;
@@ -1214,6 +1220,12 @@ const normalizeOperation = (
           ([status]) => /^\d{3}$/.test(status) && Number(status) >= 300
         )
       );
+      const allResponses = yield* normalizeResponses(
+        operation.responses,
+        pointerChild(pointer, "responses"),
+        false,
+        new Set([expectedMediaType])
+      );
       return Option.some(
         Operation.Stream({
           ...common,
@@ -1233,6 +1245,7 @@ const normalizeOperation = (
             stream.reconnect.type === "last-event-id"
               ? StreamReconnect.LastEventId()
               : StreamReconnect.None(),
+          successes: allResponses.filter(({ success }) => success),
           errors: yield* normalizeResponses(
             errorResponses,
             pointerChild(pointer, "responses"),

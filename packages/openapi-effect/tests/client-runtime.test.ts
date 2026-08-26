@@ -171,6 +171,36 @@ describe("generated stream client runtime", () => {
     expect(incomplete).toBeInstanceOf(GeneratedClientIncompleteStreamError);
   });
 
+  it("preserves SSE event names and promotes declared error events", async () => {
+    const http = HttpClient.make((request) => Effect.succeed(
+      HttpClientResponse.fromWeb(
+        request,
+        new Response('event: error\ndata: {"code":"stopped"}\n\n', {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      ),
+    ));
+    const call = makeStreamOperation(
+      http,
+      { baseUrl: "http://127.0.0.1:1" },
+      descriptor,
+    );
+    const failure = await Effect.runPromise(
+      call({
+        path: { model_id: "model" },
+        urlParams: { follow: false },
+        payload: { count: 1 },
+      }).pipe(
+        Effect.flatMap((response) => Stream.runDrain(response.events)),
+        Effect.flip,
+      ),
+    );
+    expect(failure).toBeInstanceOf(GeneratedClientRemoteError);
+    expect((failure as GeneratedClientRemoteError<{ code: string }>).body)
+      .toEqual({ code: "stopped" });
+  });
+
   it("reconnects declared long-lived SSE streams with Last-Event-ID", async () => {
     const headers: Array<string | undefined> = [];
     let requestCount = 0;

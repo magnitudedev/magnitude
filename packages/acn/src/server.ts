@@ -113,6 +113,11 @@ import {
 } from "./service-lifecycle"
 import { ClientLeaseManagerLive } from "./client-lease-manager"
 import { ModelResidencyPolicyLive } from "./model-residency-policy"
+import {
+  type InferenceProxyTarget,
+  makeAnthropicGateway,
+  proxyOpenAiInferenceRequest,
+} from "./inference-gateway"
 
 export interface AcnServerOptions {
   readonly parentBound?: boolean
@@ -206,7 +211,7 @@ const acnServerUrl = (address: HttpServer.Address): string => {
 }
 
 const CORS_ALLOWED_HEADERS =
-  "Accept, Authorization, Content-Type, Content-Length, Magnitude-Include-Progress, x-magnitude-acn-id, traceparent, tracestate, baggage, b3, x-b3-traceid, x-b3-spanid, x-b3-parentspanid, x-b3-sampled, x-b3-flags"
+  "Accept, Authorization, Content-Type, Content-Length, Magnitude-Include-Progress, anthropic-version, anthropic-beta, x-api-key, x-magnitude-acn-id, traceparent, tracestate, baggage, b3, x-b3-traceid, x-b3-spanid, x-b3-parentspanid, x-b3-sampled, x-b3-flags"
 const LOCAL_HTTP_ORIGIN =
   /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/
 const LOCAL_HTTP_HOST = /^(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/
@@ -243,6 +248,7 @@ function corsHeadersFor(
     "access-control-allow-origin": origin,
     "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS",
     "access-control-allow-headers": CORS_ALLOWED_HEADERS,
+    "access-control-expose-headers": "request-id, x-request-id",
     "access-control-max-age": "86400",
     vary: "Origin",
   }
@@ -556,65 +562,23 @@ const rejectCoordinationFailure = <A>(
     : new AcnBootstrapRejected({ reason: `${error._tag}: ${error.message}` })),
 )
 
-const HOP_BY_HOP_HEADERS = [
-  "connection",
-  "keep-alive",
-  "proxy-authenticate",
-  "proxy-authorization",
-  "te",
-  "trailer",
-  "transfer-encoding",
-  "upgrade",
-] as const
-
-interface InferenceProxyTarget {
-  readonly origin: URL
-  readonly clientOptions: {
-    readonly headers?: Readonly<Record<string, string>>
-  }
-}
-
 export const proxyInferenceWebRequest = async (
   source: Request,
   icn: InferenceProxyTarget,
   fetchTarget: typeof fetch = fetch,
   signal: AbortSignal = source.signal,
 ): Promise<Response> => {
-  const incoming = new URL(source.url)
-  const targetPath = incoming.pathname.slice("/inference".length) || "/"
-  if (targetPath !== "/v1" && !targetPath.startsWith("/v1/")) {
-    return new Response("Not found", { status: 404 })
-  }
-  const target = new URL(`${targetPath}${incoming.search}`, icn.origin)
-    const headers = new Headers(source.headers)
-    headers.delete("host")
-    headers.delete("authorization")
-    headers.delete("x-magnitude-acn-id")
-    for (const header of HOP_BY_HOP_HEADERS) headers.delete(header)
-    const privateAuthorization = icn.clientOptions.headers?.authorization
-    if (privateAuthorization !== undefined) {
-      headers.set("authorization", privateAuthorization)
-    }
-
-    const response = await fetchTarget(target, {
-      method: source.method,
-      headers,
-      body: source.body,
-      signal,
-      redirect: "manual",
-    })
-    const responseHeaders = new Headers(response.headers)
-    for (const header of HOP_BY_HOP_HEADERS) responseHeaders.delete(header)
-
-    return new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: responseHeaders,
-    })
+  return proxyOpenAiInferenceRequest(source, icn, fetchTarget, signal)
 }
 
-const makeInferenceProxy = (icn: Context.Tag.Service<typeof IcnProcess>) =>
-  (request: HttpServerRequest.HttpServerRequest) => Effect.gen(function* () {
+const makeInferenceProxy = (
+  icn: Context.Tag.Service<typeof IcnProcess>,
+  protocol: "openai" | "anthropic",
+) => {
+  const anthropicGateway = protocol === "anthropic"
+    ? makeAnthropicGateway(icn)
+    : undefined
+  return (request: HttpServerRequest.HttpServerRequest) => Effect.gen(function* () {
     // The wildcard proxy route is also the most specific OPTIONS route. Handle
     // browser preflight locally instead of forwarding it to an ICN operation.
     if (request.method === "OPTIONS") return yield* OptionsRouteHandler(request)
@@ -622,14 +586,40 @@ const makeInferenceProxy = (icn: Context.Tag.Service<typeof IcnProcess>) =>
     if (!(source instanceof Request)) {
       return HttpServerResponse.text("Unsupported request transport", { status: 500 })
     }
-    const response = yield* Effect.tryPromise({
-      try: (signal) => proxyInferenceWebRequest(source, icn, fetch, signal),
-      catch: (cause) => new InferenceProxyFailed({ cause }),
-    }).pipe(Effect.option)
-    return Option.isNone(response)
-      ? HttpServerResponse.text("Local inference service unavailable", { status: 502 })
-      : HttpServerResponse.fromWeb(response.value)
+    const response = anthropicGateway === undefined
+      ? yield* Effect.tryPromise({
+          try: (signal) => proxyInferenceWebRequest(source, icn, fetch, signal),
+          catch: (cause) => new InferenceProxyFailed({ cause }),
+        }).pipe(Effect.either)
+      : yield* anthropicGateway.route(source).pipe(Effect.either)
+    if (response._tag === "Right") {
+      return HttpServerResponse.fromWeb(response.right)
+    }
+    yield* Effect.logError("Inference gateway failed", response.left)
+    const requestId = `req_acn_gateway_${Date.now()}`
+    const body = protocol === "anthropic"
+      ? {
+          type: "error",
+          error: {
+            type: "api_error",
+            message: "Local inference gateway unavailable",
+          },
+          request_id: requestId,
+        }
+      : {
+          error: {
+            message: "Local inference gateway unavailable",
+            type: "server_error",
+            param: null,
+            code: "gateway_unavailable",
+          },
+        }
+    return yield* HttpServerResponse.json(body, {
+      status: 502,
+      headers: { "request-id": requestId },
+    }).pipe(Effect.orDie)
   })
+}
 
 const predecessorAbsent = (
   owner: Option.Option<{ readonly pid: number; readonly processStartIdentity: ExactProcess["processStartIdentity"] }>,
@@ -785,7 +775,16 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
         )),
         Effect.orDie,
       ))
-      yield* publicRouter.prefixed("/inference/v1").add("*", "/*", makeInferenceProxy(icn))
+      yield* publicRouter.prefixed("/inference/v1").add(
+        "*",
+        "/*",
+        makeInferenceProxy(icn, "openai"),
+      )
+      yield* publicRouter.prefixed("/inference/anthropic").add(
+        "*",
+        "/*",
+        makeInferenceProxy(icn, "anthropic"),
+      )
       yield* publicServer.serve(publicRouter.asHttpEffect()).pipe(Effect.provide(publicInfrastructure))
       yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie))
       return {

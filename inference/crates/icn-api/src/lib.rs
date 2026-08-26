@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -20,6 +20,7 @@ use icn_contracts::bootstrap_protocol::{
     IcnStartupProgressRecordType, IcnStartupRecord, IcnStartupRecordType, MetalEligibility,
     VulkanEligibility,
 };
+use icn_contracts::inference as domain;
 use icn_contracts::models::{
     AssessModelsRequest, AssessModelsResponse, CatalogModelLocalState, CatalogModels,
     InferenceModel, InstallCatalogModelRequest, InstallModelResponse, InstalledModelPackage,
@@ -30,44 +31,39 @@ use icn_contracts::models::{
     RemoveInstalledModelPackageResponse,
 };
 use icn_contracts::{
-    AllowedToolsMode, CacheType, ChatContent, ChatContentPart, ChatMessage, ChatRequest, ChatRole,
-    ChatTemplateRequest, CompletionBackend, ExecutionConfig, ExecutionConfigReport, FinishReason,
-    FlashAttention, Generation, GenerationMetrics, GenerationSnapshot, GpuLayers, GrammarTrigger,
-    HardwareProvider, HardwareSnapshot, HuggingFaceModelCatalog, HuggingFaceModelSearchRequest,
-    HuggingFaceModelSearchResults, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
-    ImageInput, InferenceError, InferenceEvent, InferenceProgress, InferenceStreamEvent,
-    InventoryError, ModelModalities, ModelProperties, PreparedChatInfo, ReasoningControl,
-    ResponseFormat, SplitMode, TemplateCapabilities, ToolCall, ToolChoice, ToolDefinition,
+    CacheType, CompletionBackend, ExecutionConfig, ExecutionConfigReport, FlashAttention,
+    GenerationMetrics, GenerationSnapshot, GpuLayers, HardwareProvider, HardwareSnapshot,
+    HuggingFaceModelCatalog, HuggingFaceModelSearchRequest, HuggingFaceModelSearchResults,
+    HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot, ImageInput, InferenceError,
+    InventoryError, ModelModalities, ModelProperties, PreparedChatInfo, SplitMode,
+    TemplateCapabilities,
 };
-use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value as JsonValue;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use serde::{Deserialize, Serialize};
 use utoipa::openapi::extensions::Extensions;
 use utoipa::openapi::path::Operation;
 use utoipa::openapi::{Components, OpenApi as OpenApiDocument, RefOr};
 use utoipa::{OpenApi, PartialSchema, ToSchema};
 
 mod media;
+mod protocols;
 
-const DEFAULT_MAX_TOKENS: u32 = 256;
-const DEFAULT_TEMPERATURE: f32 = 0.8;
-const DEFAULT_TOP_P: f32 = 0.95;
-const DEFAULT_SEED: u32 = 42;
+use protocols::chat::{
+    AllowedToolRequest, AllowedToolsChoiceRequest, AllowedToolsModeRequest, AllowedToolsRequest,
+    AllowedToolsType, ApplyTemplateRequest, ApplyTemplateResponse, ChatCompletionChoice,
+    ChatCompletionChunk, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
+    ChatCompletionStreamEvent, ChatContentPartRequest, ChatContentRequest, ChatMessageRequest,
+    ChatToolCallRequest, ChatToolRequest, ChunkChoice, ChunkDelta, ChunkFunctionDelta,
+    ChunkToolCall, CompletionFunctionCall, CompletionToolCall, FunctionDefinitionRequest,
+    FunctionNameRequest, FunctionToolChoiceRequest, FunctionType, GrammarTriggerResponse,
+    ImageUrlRequest, JsonSchemaRequest, NamedFunctionCallRequest, ReasoningEffortRequest,
+    ResponseFormatRequest, StopRequest, StreamOptions, Timings, ToolChoiceModeRequest,
+    ToolChoiceRequest, Usage, apply_template_response, validate_apply_template_request,
+};
+pub use protocols::responses::ResponseCreateRequest;
+use protocols::responses::ResponseStreamEvent;
+
 const STREAM_EXTENSION: &str = "x-magnitude-stream";
-
-fn deserialize_bool_or_false<'de, D>(deserializer: D) -> Result<bool, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Ok(JsonValue::deserialize(deserializer)?
-        .as_bool()
-        .unwrap_or(false))
-}
-
-const fn default_true() -> bool {
-    true
-}
+static NEXT_HTTP_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -403,8 +399,19 @@ pub fn app(state: AppState) -> Router {
         .route("/api/v1/models/{model_id}/properties", post(props))
         .route("/api/v1/chat/templates/apply", post(apply_template))
         .route("/v1/models", get(standard_models))
-        .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/responses", post(responses))
+        .route(
+            "/v1/chat/completions",
+            post(protocols::chat::chat_completions),
+        )
+        .route("/v1/responses", post(protocols::responses::responses))
+        .route(
+            "/anthropic/v1/messages",
+            post(protocols::anthropic::anthropic_messages),
+        )
+        .route(
+            "/anthropic/v1/messages/count_tokens",
+            post(protocols::anthropic::anthropic_count_tokens),
+        )
         .route("/openapi.json", get(serve_openapi))
         .with_state(state.clone());
     if let Some(capability) = state.authorization.clone() {
@@ -806,449 +813,6 @@ pub struct TemplateCapabilitiesResponse {
     pub enable_thinking: bool,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ApplyTemplateRequest {
-    #[schema(nullable = false)]
-    pub model: Option<String>,
-    pub messages: Vec<ChatMessageRequest>,
-    #[schema(nullable = false)]
-    pub tools: Option<Vec<ChatToolRequest>>,
-    #[schema(nullable = false)]
-    pub tool_choice: Option<ToolChoiceRequest>,
-    #[schema(nullable = false)]
-    pub parallel_tool_calls: Option<bool>,
-    #[schema(nullable = false)]
-    pub response_format: Option<ResponseFormatRequest>,
-    #[schema(nullable = false)]
-    pub chat_template_kwargs: Option<BTreeMap<String, JsonValue>>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ApplyTemplateResponse {
-    pub prompt: String,
-    pub generation_prompt: String,
-    pub grammar: String,
-    pub grammar_lazy: bool,
-    pub grammar_triggers: Vec<GrammarTriggerResponse>,
-    pub preserved_tokens: Vec<String>,
-    pub additional_stops: Vec<String>,
-    pub supports_thinking: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub thinking_start_tag: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub thinking_end_tag: Option<String>,
-    pub template_fingerprint: String,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum GrammarTriggerResponse {
-    Token { value: String, token: i32 },
-    Word { value: String },
-    Pattern { value: String },
-    PatternFull { value: String },
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ChatCompletionRequest {
-    #[schema(nullable = false)]
-    pub model: Option<String>,
-    pub messages: Vec<ChatMessageRequest>,
-    #[schema(nullable = false)]
-    pub max_tokens: Option<u32>,
-    #[schema(nullable = false)]
-    pub max_completion_tokens: Option<u32>,
-    #[schema(nullable = false)]
-    pub temperature: Option<f32>,
-    #[schema(nullable = false)]
-    pub top_p: Option<f32>,
-    #[schema(nullable = false)]
-    pub seed: Option<u32>,
-    #[schema(nullable = false)]
-    pub tools: Option<Vec<ChatToolRequest>>,
-    #[schema(nullable = false)]
-    pub tool_choice: Option<ToolChoiceRequest>,
-    #[schema(nullable = false)]
-    pub parallel_tool_calls: Option<bool>,
-    #[schema(nullable = false)]
-    pub reasoning_effort: Option<ReasoningEffortRequest>,
-    #[schema(nullable = false)]
-    pub thinking_budget_tokens: Option<u32>,
-    #[schema(nullable = false)]
-    pub response_format: Option<ResponseFormatRequest>,
-    #[schema(nullable = false)]
-    pub chat_template_kwargs: Option<BTreeMap<String, JsonValue>>,
-    #[schema(nullable = false)]
-    pub stop: Option<StopRequest>,
-    pub stream: bool,
-    #[schema(nullable = false)]
-    pub stream_options: Option<StreamOptions>,
-    #[serde(default = "default_true")]
-    #[schema(default = true)]
-    pub cache_prompt: bool,
-    #[serde(default, deserialize_with = "deserialize_bool_or_false")]
-    #[schema(default = false)]
-    pub ignore_eos: bool,
-    #[serde(default, deserialize_with = "deserialize_bool_or_false")]
-    #[schema(default = false)]
-    pub timings_per_token: bool,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ResponseCreateRequest {
-    pub model: String,
-    pub input: JsonValue,
-    #[schema(nullable = false)]
-    pub instructions: Option<String>,
-    #[schema(nullable = false)]
-    pub max_output_tokens: Option<u32>,
-    #[schema(nullable = false)]
-    pub temperature: Option<f32>,
-    #[schema(nullable = false)]
-    pub top_p: Option<f32>,
-    #[schema(nullable = false)]
-    pub tools: Option<Vec<JsonValue>>,
-    #[schema(nullable = false)]
-    pub tool_choice: Option<JsonValue>,
-    #[schema(nullable = false)]
-    pub parallel_tool_calls: Option<bool>,
-    #[schema(nullable = false)]
-    pub reasoning: Option<JsonValue>,
-    #[serde(default, deserialize_with = "deserialize_bool_or_false")]
-    pub stream: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ResponseStreamEvent {
-    pub r#type: String,
-    pub sequence_number: u64,
-    #[serde(flatten)]
-    pub data: BTreeMap<String, JsonValue>,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "role", rename_all = "lowercase", deny_unknown_fields)]
-pub enum ChatMessageRequest {
-    System {
-        content: String,
-    },
-    User {
-        content: ChatContentRequest,
-    },
-    Assistant {
-        #[schema(nullable = true)]
-        content: Option<String>,
-        #[serde(default)]
-        #[schema(nullable = false)]
-        reasoning_content: Option<String>,
-        #[serde(default)]
-        tool_calls: Vec<ChatToolCallRequest>,
-    },
-    Tool {
-        tool_call_id: String,
-        content: ChatContentRequest,
-    },
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum ChatContentRequest {
-    Text(String),
-    Parts(Vec<ChatContentPartRequest>),
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ChatContentPartRequest {
-    Text { text: String },
-    ImageUrl { image_url: ImageUrlRequest },
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ImageUrlRequest {
-    pub url: String,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ChatToolCallRequest {
-    pub id: String,
-    pub r#type: FunctionType,
-    pub function: NamedFunctionCallRequest,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct NamedFunctionCallRequest {
-    pub name: String,
-    pub arguments: String,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ChatToolRequest {
-    pub r#type: FunctionType,
-    pub function: FunctionDefinitionRequest,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct FunctionDefinitionRequest {
-    pub name: String,
-    #[schema(nullable = false)]
-    pub description: Option<String>,
-    pub parameters: JsonValue,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum FunctionType {
-    Function,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum ToolChoiceRequest {
-    Mode(ToolChoiceModeRequest),
-    Function(FunctionToolChoiceRequest),
-    AllowedTools(AllowedToolsChoiceRequest),
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolChoiceModeRequest {
-    None,
-    Auto,
-    Required,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct FunctionToolChoiceRequest {
-    pub r#type: FunctionType,
-    pub function: FunctionNameRequest,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct FunctionNameRequest {
-    pub name: String,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AllowedToolsChoiceRequest {
-    pub r#type: AllowedToolsType,
-    pub allowed_tools: AllowedToolsRequest,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum AllowedToolsType {
-    AllowedTools,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AllowedToolsRequest {
-    pub mode: AllowedToolsModeRequest,
-    pub tools: Vec<AllowedToolRequest>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum AllowedToolsModeRequest {
-    Auto,
-    Required,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AllowedToolRequest {
-    pub r#type: FunctionType,
-    pub function: FunctionNameRequest,
-}
-
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-#[serde(transparent)]
-pub struct ReasoningEffortRequest(pub String);
-
-impl ReasoningEffortRequest {
-    fn normalize(&self) -> Result<icn_contracts::NormalizedReasoningEffort, ApiError> {
-        icn_contracts::NormalizedReasoningEffort::parse(&self.0).ok_or_else(|| {
-            ApiError::invalid(format!("unsupported reasoning_effort spelling: {}", self.0))
-        })
-    }
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ResponseFormatRequest {
-    Text,
-    JsonObject,
-    Grammar { grammar: String },
-    JsonSchema { json_schema: JsonSchemaRequest },
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct JsonSchemaRequest {
-    pub name: String,
-    pub schema: JsonValue,
-    #[serde(default)]
-    pub strict: bool,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum StopRequest {
-    One(String),
-    Many(Vec<String>),
-}
-
-#[derive(Debug, Default, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct StreamOptions {
-    #[schema(nullable = false)]
-    pub include_usage: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ChatCompletionChunk {
-    pub id: String,
-    pub object: &'static str,
-    pub created: u64,
-    pub model: String,
-    pub choices: Vec<ChunkChoice>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub progress: Option<ChatCompletionProgress>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub usage: Option<Usage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub timings: Option<Timings>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub error: Option<ApiErrorBody>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(tag = "phase", rename_all = "snake_case")]
-pub enum ChatCompletionProgress {
-    ModelLoading {
-        fraction: f32,
-    },
-    Queued,
-    Preparing,
-    Prefill {
-        completed_tokens: u64,
-        total_tokens: u64,
-        cached_tokens: u64,
-    },
-    Generating,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ChunkChoice {
-    pub index: u32,
-    pub delta: ChunkDelta,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub finish_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ChunkDelta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub role: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<Option<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub reasoning_content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub tool_calls: Option<Vec<ChunkToolCall>>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ChunkToolCall {
-    pub index: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub r#type: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub function: Option<ChunkFunctionDelta>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ChunkFunctionDelta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub arguments: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Usage {
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    pub total_tokens: u64,
-    pub prompt_tokens_details: PromptTokensDetails,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct PromptTokensDetails {
-    pub cached_tokens: u64,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Timings {
-    pub cache_n: u64,
-    pub prompt_n: u64,
-    pub prompt_ms: f64,
-    pub time_to_first_token_ms: f64,
-    pub prompt_per_token_ms: f64,
-    pub prompt_per_second: f64,
-    pub predicted_n: u64,
-    pub predicted_ms: f64,
-    pub predicted_per_token_ms: f64,
-    pub predicted_per_second: f64,
-    /// Time spent inside the native sampler for this request.
-    pub sampler_ms: f64,
-    /// Time spent incrementally parsing generated chat output for this request.
-    pub parser_ms: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub draft_n: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub draft_n_accepted: Option<u64>,
-}
-
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorResponse {
@@ -1260,7 +824,12 @@ pub struct ErrorResponse {
 pub struct ApiErrorBody {
     pub message: String,
     pub r#type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = true)]
+    pub param: Option<String>,
     pub code: String,
+    #[serde(skip)]
+    #[schema(ignore)]
     pub retryable: bool,
 }
 
@@ -1278,6 +847,7 @@ impl ApiError {
                 error: ApiErrorBody {
                     message: message.into(),
                     r#type: "invalid_request_error",
+                    param: None,
                     code: "invalid_request".to_owned(),
                     retryable: false,
                 },
@@ -1292,6 +862,7 @@ impl ApiError {
                 error: ApiErrorBody {
                     message: message.into(),
                     r#type: "server_error",
+                    param: None,
                     code: "backend_error".to_owned(),
                     retryable: true,
                 },
@@ -1386,6 +957,7 @@ impl ApiError {
                 error: ApiErrorBody {
                     message: error.to_string(),
                     r#type: error_type,
+                    param: None,
                     code: code.to_owned(),
                     retryable,
                 },
@@ -1396,8 +968,23 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(self.body)).into_response()
+        let mut response = (self.status, Json(self.body)).into_response();
+        let request_id = format!(
+            "req_icn_{}",
+            NEXT_HTTP_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        if let Ok(value) = request_id.parse() {
+            response.headers_mut().insert("x-request-id", value);
+        }
+        response
     }
+}
+
+fn with_openai_request_id(mut response: Response, request_id: &str) -> Response {
+    if let Ok(value) = request_id.parse() {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
 }
 
 #[utoipa::path(get, path = "/health", operation_id = "health", tag = "system", responses(
@@ -2266,7 +1853,8 @@ async fn apply_template(
         .backend()
         .properties()
         .map_err(ApiError::from_inference)?;
-    let request = validate_apply_template_request(request, &properties.reasoning)?;
+    let request = validate_apply_template_request(request)?;
+    let request = resolve_request(request, &properties.reasoning)?;
     let span = tracing::Span::current();
     let prepared = tokio::task::spawn_blocking(move || {
         span.in_scope(|| lease.backend().apply_template(request))
@@ -2277,1049 +1865,54 @@ async fn apply_template(
     Ok(Json(apply_template_response(prepared)))
 }
 
-fn response_input_messages(
-    input: JsonValue,
-    instructions: Option<String>,
-) -> Result<Vec<JsonValue>, ApiError> {
-    let mut messages = instructions
-        .map(|content| vec![serde_json::json!({ "role": "system", "content": content })])
-        .unwrap_or_default();
-    match input {
-        JsonValue::String(content) => {
-            messages.push(serde_json::json!({ "role": "user", "content": content }));
-        }
-        JsonValue::Array(items) => {
-            for mut item in items {
-                let object = item
-                    .as_object_mut()
-                    .ok_or_else(|| ApiError::invalid("Responses input items must be objects"))?;
-                if object.get("type").and_then(JsonValue::as_str) == Some("function_call_output") {
-                    let call_id = object
-                        .get("call_id")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| {
-                            ApiError::invalid("function_call_output requires call_id")
-                        })?;
-                    let output = object
-                        .get("output")
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| {
-                            ApiError::invalid("function_call_output requires string output")
-                        })?;
-                    messages.push(serde_json::json!({
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": output,
-                    }));
-                    continue;
-                }
-                let role = object
-                    .get("role")
-                    .and_then(JsonValue::as_str)
-                    .map(str::to_owned)
-                    .ok_or_else(|| ApiError::invalid("Responses message input requires role"))?;
-                let content = object
-                    .remove("content")
-                    .ok_or_else(|| ApiError::invalid("Responses message input requires content"))?;
-                let content = match content {
-                    JsonValue::String(text) => JsonValue::String(text),
-                    JsonValue::Array(parts) => JsonValue::Array(
-                        parts
-                            .into_iter()
-                            .map(|part| {
-                                let Some(mut part) = part.as_object().cloned() else {
-                                    return part;
-                                };
-                                match part.get("type").and_then(JsonValue::as_str) {
-                                    Some("input_text") => {
-                                        part.insert(
-                                            "type".to_owned(),
-                                            JsonValue::String("text".to_owned()),
-                                        );
-                                    }
-                                    Some("input_image") => {
-                                        if let Some(url) = part.remove("image_url") {
-                                            part.insert(
-                                                "type".to_owned(),
-                                                JsonValue::String("image_url".to_owned()),
-                                            );
-                                            part.insert(
-                                                "image_url".to_owned(),
-                                                serde_json::json!({ "url": url }),
-                                            );
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                                JsonValue::Object(part)
-                            })
-                            .collect(),
-                    ),
-                    _ => return Err(ApiError::invalid("Responses message content is invalid")),
-                };
-                messages.push(serde_json::json!({ "role": role, "content": content }));
-            }
-        }
-        _ => {
-            return Err(ApiError::invalid(
-                "Responses input must be a string or input array",
-            ));
-        }
-    }
-    Ok(messages)
+struct AdmittedInvocation {
+    lease: ModelInstanceLease,
+    model: String,
+    request: domain::ResolvedInferenceRequest,
 }
 
-fn response_tools(tools: Option<Vec<JsonValue>>) -> Result<Option<Vec<JsonValue>>, ApiError> {
-    tools
-        .map(|tools| {
-            tools
-                .into_iter()
-                .map(|tool| {
-                    let object = tool
-                        .as_object()
-                        .ok_or_else(|| ApiError::invalid("Responses tools must be objects"))?;
-                    if object.get("type").and_then(JsonValue::as_str) != Some("function") {
-                        return Err(ApiError::invalid(
-                            "ICN Responses currently supports function tools only",
-                        ));
-                    }
-                    Ok(serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": object.get("name"),
-                            "description": object.get("description"),
-                            "parameters": object.get("parameters"),
-                            "strict": object.get("strict"),
-                        }
-                    }))
-                })
-                .collect::<Result<Vec<_>, ApiError>>()
-        })
-        .transpose()
-}
-
-fn response_tool_choice(choice: Option<JsonValue>) -> Option<JsonValue> {
-    choice.map(|choice| match choice {
-        JsonValue::Object(object)
-            if object.get("type").and_then(JsonValue::as_str) == Some("function") =>
-        {
-            serde_json::json!({
-                "type": "function",
-                "function": { "name": object.get("name") },
-            })
-        }
-        choice => choice,
-    })
-}
-
-fn response_chat_request(
-    request: ResponseCreateRequest,
-) -> Result<ChatCompletionRequest, ApiError> {
-    if !request.stream {
-        return Err(ApiError::invalid(
-            "ICN's Responses endpoint currently requires stream: true",
-        ));
-    }
-    let reasoning_effort = request
-        .reasoning
-        .as_ref()
-        .and_then(JsonValue::as_object)
-        .and_then(|reasoning| reasoning.get("effort"))
-        .cloned();
-    serde_json::from_value(serde_json::json!({
-        "model": request.model,
-        "messages": response_input_messages(request.input, request.instructions)?,
-        "max_completion_tokens": request.max_output_tokens,
-        "temperature": request.temperature,
-        "top_p": request.top_p,
-        "tools": response_tools(request.tools)?,
-        "tool_choice": response_tool_choice(request.tool_choice),
-        "parallel_tool_calls": request.parallel_tool_calls,
-        "reasoning_effort": reasoning_effort,
-        "stream": true,
-    }))
-    .map_err(|error| ApiError::invalid(format!("Responses request is invalid: {error}")))
-}
-
-fn send_response_event(
-    sender: &mpsc::Sender<Result<Event, Infallible>>,
-    sequence: &AtomicU64,
-    event_type: &'static str,
-    mut data: serde_json::Map<String, JsonValue>,
-) -> bool {
-    data.insert("type".to_owned(), JsonValue::String(event_type.to_owned()));
-    data.insert(
-        "sequence_number".to_owned(),
-        JsonValue::from(sequence.fetch_add(1, Ordering::Relaxed)),
-    );
-    serde_json::to_string(&data)
-        .ok()
-        .and_then(|data| {
-            sender
-                .blocking_send(Ok(Event::default().event(event_type).data(data)))
-                .ok()
-        })
-        .is_some()
-}
-
-async fn send_response_event_async(
-    sender: &mpsc::Sender<Result<Event, Infallible>>,
-    sequence: &AtomicU64,
-    event_type: &'static str,
-    mut data: serde_json::Map<String, JsonValue>,
-) -> bool {
-    data.insert("type".to_owned(), JsonValue::String(event_type.to_owned()));
-    data.insert(
-        "sequence_number".to_owned(),
-        JsonValue::from(sequence.fetch_add(1, Ordering::Relaxed)),
-    );
-    let Ok(data) = serde_json::to_string(&data) else {
-        return false;
-    };
-    sender
-        .send(Ok(Event::default().event(event_type).data(data)))
-        .await
-        .is_ok()
-}
-
-fn response_base(
-    id: &str,
-    created_at: u64,
-    model: &str,
-    status: &str,
-    output: JsonValue,
-) -> JsonValue {
-    serde_json::json!({
-        "id": id,
-        "object": "response",
-        "created_at": created_at,
-        "status": status,
-        "error": null,
-        "incomplete_details": null,
-        "instructions": null,
-        "max_output_tokens": null,
-        "model": model,
-        "output": output,
-        "parallel_tool_calls": true,
-        "previous_response_id": null,
-        "reasoning": { "effort": null, "summary": null },
-        "store": false,
-        "temperature": null,
-        "text": { "format": { "type": "text" } },
-        "tool_choice": "auto",
-        "tools": [],
-        "top_p": null,
-        "truncation": "disabled",
-        "usage": null,
-        "metadata": {},
-    })
-}
-
-#[utoipa::path(post, path = "/v1/responses", operation_id = "createResponse", tag = "inference",
-    request_body(content = ResponseCreateRequest, content_type = "application/json"),
-    params(
-        ("Magnitude-Include-Progress" = Option<bool>, Header, nullable = false, description = "Include Magnitude loading and inference progress events")
-    ),
-    responses(
-        (status = 200, description = "OpenAI-compatible Responses event stream", body = String, content_type = "text/event-stream"),
-        (status = 400, description = "Invalid Responses request", body = ErrorResponse),
-        (status = 404, description = "Requested model is unavailable", body = ErrorResponse),
-        (status = 409, description = "Model unavailable", body = ErrorResponse),
-        (status = 422, description = "Runtime target failed validation", body = ErrorResponse),
-        (status = 500, description = "Inference failed", body = ErrorResponse)
-    )
-)]
-async fn responses(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<ResponseCreateRequest>,
-) -> Result<Response, ApiError> {
-    let request = validate_request(response_chat_request(request)?)?;
-    let model = request
-        .model
-        .clone()
-        .ok_or_else(|| ApiError::invalid("model is required"))?;
-    let controller = state
-        .model_controller
-        .as_ref()
-        .ok_or_else(|| ApiError::server("model control is not configured"))?;
-    let id = format!("resp_icn_{}", state.next_id.fetch_add(1, Ordering::Relaxed));
-    let message_id = format!("msg_{}", &id[5..]);
-    let created_at = unix_timestamp();
-    let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(32);
-    let sequence = Arc::new(AtomicU64::new(0));
-    let include_progress = headers
-        .get("Magnitude-Include-Progress")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-    let progress = include_progress.then(|| {
-        let sender = sender.clone();
-        let sequence = Arc::clone(&sequence);
-        let response_id = id.clone();
-        Arc::new(move |fraction| {
-            let data = serde_json::json!({
-                "type": "response.magnitude_progress",
-                "sequence_number": sequence.fetch_add(1, Ordering::Relaxed),
-                "response_id": response_id,
-                "progress": { "phase": "model_loading", "fraction": fraction },
-            });
-            if let Ok(data) = serde_json::to_string(&data) {
-                let _ = sender.try_send(Ok(Event::default()
-                    .event("response.magnitude_progress")
-                    .data(data)));
-            }
-        }) as ModelLoadingObserver
-    });
-    let admitted_lease = if include_progress {
-        None
-    } else {
-        Some(
-            controller
-                .acquire_for_inference(model.clone(), None)
-                .await
-                .map_err(ApiError::from_inventory)?,
-        )
-    };
-    let controller = Arc::clone(controller);
-    tokio::spawn(async move {
-        let in_progress = response_base(
-            &id,
-            created_at,
-            &model,
-            "in_progress",
-            serde_json::json!([]),
-        );
-        if !send_response_event_async(
-            &sender,
-            &sequence,
-            "response.created",
-            serde_json::json!({ "response": in_progress.clone() })
-                .as_object()
-                .expect("response event object")
-                .clone(),
-        )
-        .await
-        {
-            return;
-        }
-        let lease_result = match admitted_lease {
-            Some(lease) => Ok(lease),
-            None => tokio::select! {
-                result = controller.acquire_for_inference(model.clone(), progress) => result,
-                _ = sender.closed() => return,
-            },
-        };
-        let lease = match lease_result {
-            Ok(lease) => lease,
-            Err(error) => {
-                let error = ApiError::from_inventory(error);
-                let _ = send_response_event_async(&sender, &sequence, "response.failed", serde_json::json!({
-                    "response": response_base(&id, created_at, &model, "failed", serde_json::json!([])),
-                    "error": error.body.error,
-                }).as_object().expect("response event object").clone()).await;
-                return;
-            }
-        };
-        if let Err(error) = validate_model_selection(request.model.as_deref(), &lease) {
-            let _ = send_response_event_async(&sender, &sequence, "response.failed", serde_json::json!({
-                "response": response_base(&id, created_at, &model, "failed", serde_json::json!([])),
-                "error": error.body.error,
-            }).as_object().expect("response event object").clone()).await;
-            return;
-        }
-        let properties = match lease.backend().properties() {
-            Ok(properties) => properties,
-            Err(error) => {
-                let error = ApiError::from_inference(error);
-                let _ = send_response_event_async(&sender, &sequence, "response.failed", serde_json::json!({
-                    "response": response_base(&id, created_at, &model, "failed", serde_json::json!([])),
-                    "error": error.body.error,
-                }).as_object().expect("response event object").clone()).await;
-                return;
-            }
-        };
-        let request = match finalize_request(request, &properties.reasoning) {
-            Ok((request, _)) => request,
-            Err(error) => {
-                let _ = send_response_event_async(&sender, &sequence, "response.failed", serde_json::json!({
-                    "response": response_base(&id, created_at, &model, "failed", serde_json::json!([])),
-                    "error": error.body.error,
-                }).as_object().expect("response event object").clone()).await;
-                return;
-            }
-        };
-        tokio::task::spawn_blocking(move || {
-        if !send_response_event(
-            &sender,
-            &sequence,
-            "response.in_progress",
-            serde_json::json!({ "response": in_progress })
-                .as_object()
-                .expect("response event object")
-                .clone(),
-        ) {
-            return;
-        }
-        let item = serde_json::json!({
-            "id": message_id,
-            "type": "message",
-            "status": "in_progress",
-            "role": "assistant",
-            "content": [],
-        });
-        if !send_response_event(
-            &sender,
-            &sequence,
-            "response.output_item.added",
-            serde_json::json!({
-                "output_index": 0, "item": item,
-            })
-            .as_object()
-            .expect("response event object")
-            .clone(),
-        ) {
-            return;
-        }
-        if !send_response_event(
-            &sender,
-            &sequence,
-            "response.content_part.added",
-            serde_json::json!({
-                "item_id": message_id, "output_index": 0, "content_index": 0,
-                "part": { "type": "output_text", "text": "", "annotations": [] },
-            })
-            .as_object()
-            .expect("response event object")
-            .clone(),
-        ) {
-            return;
-        }
-        let mut text = String::new();
-        let mut tool_calls = BTreeMap::<usize, (String, String, String, String)>::new();
-        let mut callback = |event: InferenceStreamEvent| {
-            match event.delta {
-                InferenceEvent::Progress(progress) => {
-                    if include_progress {
-                        let progress = match progress {
-                            InferenceProgress::Queued => serde_json::json!({ "phase": "queued" }),
-                            InferenceProgress::Preparing => serde_json::json!({ "phase": "preparing" }),
-                            InferenceProgress::Prefill { completed_tokens, total_tokens, cached_tokens } =>
-                                serde_json::json!({ "phase": "prefill", "completed_tokens": completed_tokens, "total_tokens": total_tokens, "cached_tokens": cached_tokens }),
-                            InferenceProgress::Generating => serde_json::json!({ "phase": "generating" }),
-                        };
-                        if !send_response_event(&sender, &sequence, "response.magnitude_progress", serde_json::json!({
-                            "response_id": id, "progress": progress,
-                        }).as_object().expect("response event object").clone()) {
-                            return Err(InferenceError::Callback("stream consumer disconnected".into()));
-                        }
-                    }
-                }
-                InferenceEvent::ContentDelta { text: delta } => {
-                    text.push_str(&delta);
-                    if !send_response_event(&sender, &sequence, "response.output_text.delta", serde_json::json!({
-                        "item_id": message_id, "output_index": 0, "content_index": 0, "delta": delta,
-                    }).as_object().expect("response event object").clone()) {
-                        return Err(InferenceError::Callback("stream consumer disconnected".into()));
-                    }
-                }
-                InferenceEvent::ReasoningDelta { text: delta } => {
-                    if !send_response_event(&sender, &sequence, "response.reasoning_text.delta", serde_json::json!({
-                        "item_id": message_id, "output_index": 0, "content_index": 0, "delta": delta,
-                    }).as_object().expect("response event object").clone()) {
-                        return Err(InferenceError::Callback("stream consumer disconnected".into()));
-                    }
-                }
-                InferenceEvent::ToolCallDelta { index, id: call_id, name, arguments } => {
-                    if !tool_calls.contains_key(&index) {
-                        let item_id = format!("fc_{}_{}", id, index);
-                        let call_id = call_id.clone().unwrap_or_else(|| format!("call_{}_{}", id, index));
-                        let function_name = name.clone().unwrap_or_default();
-                        tool_calls.insert(index, (
-                            item_id.clone(), call_id.clone(), function_name.clone(), String::new(),
-                        ));
-                        if !send_response_event(&sender, &sequence, "response.output_item.added", serde_json::json!({
-                            "output_index": index + 1,
-                            "item": { "id": item_id, "type": "function_call", "status": "in_progress", "call_id": call_id, "name": function_name, "arguments": "" },
-                        }).as_object().expect("response event object").clone()) {
-                            return Err(InferenceError::Callback("stream consumer disconnected".into()));
-                        }
-                    }
-                    let entry = tool_calls.get_mut(&index).expect("tool call was inserted");
-                    if let Some(name) = name { entry.2 = name; }
-                    if !arguments.is_empty() {
-                        entry.3.push_str(&arguments);
-                        if !send_response_event(&sender, &sequence, "response.function_call_arguments.delta", serde_json::json!({
-                            "item_id": entry.0, "output_index": index + 1, "delta": arguments,
-                        }).as_object().expect("response event object").clone()) {
-                            return Err(InferenceError::Callback("stream consumer disconnected".into()));
-                        }
-                    }
-                }
-                InferenceEvent::StreamStart => {}
-            }
-            Ok(())
-        };
-        let generation = match lease.backend().complete(request, &mut callback) {
-            Ok(generation) => generation,
-            Err(error) => {
-                let _ = send_response_event(&sender, &sequence, "response.failed", serde_json::json!({
-                    "response": response_base(&id, created_at, &model, "failed", serde_json::json!([])),
-                    "error": inference_error_body(&error),
-                }).as_object().expect("response event object").clone());
-                return;
-            }
-        };
-        let content =
-            serde_json::json!([{ "type": "output_text", "text": text, "annotations": [] }]);
-        let completed_item = serde_json::json!({
-            "id": message_id, "type": "message", "status": "completed", "role": "assistant", "content": content,
-        });
-        for (event_type, data) in [
-            (
-                "response.output_text.done",
-                serde_json::json!({ "item_id": message_id, "output_index": 0, "content_index": 0, "text": text }),
-            ),
-            (
-                "response.content_part.done",
-                serde_json::json!({ "item_id": message_id, "output_index": 0, "content_index": 0, "part": { "type": "output_text", "text": text, "annotations": [] } }),
-            ),
-            (
-                "response.output_item.done",
-                serde_json::json!({ "output_index": 0, "item": completed_item }),
-            ),
-        ] {
-            if !send_response_event(
-                &sender,
-                &sequence,
-                event_type,
-                data.as_object().expect("response event object").clone(),
-            ) {
-                return;
-            }
-        }
-        let mut output = vec![completed_item];
-        for (index, (item_id, call_id, name, arguments)) in tool_calls {
-            let item = serde_json::json!({
-                "id": item_id, "type": "function_call", "status": "completed",
-                "call_id": call_id, "name": name, "arguments": arguments,
-            });
-            for (event_type, data) in [
-                (
-                    "response.function_call_arguments.done",
-                    serde_json::json!({
-                        "item_id": item_id.clone(), "output_index": index + 1, "arguments": arguments.clone(),
-                    }),
-                ),
-                (
-                    "response.output_item.done",
-                    serde_json::json!({ "output_index": index + 1, "item": item.clone() }),
-                ),
-            ] {
-                if !send_response_event(
-                    &sender,
-                    &sequence,
-                    event_type,
-                    data.as_object().expect("response event object").clone(),
-                ) {
-                    return;
-                }
-            }
-            output.push(item);
-        }
-        let mut completed = response_base(
-            &id,
-            created_at,
-            &model,
-            "completed",
-            JsonValue::Array(output),
-        );
-        completed["usage"] = serde_json::json!({
-            "input_tokens": generation.prompt_tokens,
-            "input_tokens_details": { "cached_tokens": generation.cached_prompt_tokens },
-            "output_tokens": generation.generated_tokens,
-            "output_tokens_details": { "reasoning_tokens": 0 },
-            "total_tokens": generation.prompt_tokens.saturating_add(generation.generated_tokens),
-        });
-        let _ = send_response_event(
-            &sender,
-            &sequence,
-            "response.completed",
-            serde_json::json!({
-                "response": completed,
-            })
-            .as_object()
-            .expect("response event object")
-            .clone(),
-        );
-        }).await.ok();
-    });
-    Ok(Sse::new(ReceiverStream::new(receiver))
-        .keep_alive(KeepAlive::default())
-        .into_response())
-}
-
-#[utoipa::path(post, path = "/v1/chat/completions", operation_id = "createChatCompletion", tag = "chat",
-    request_body = ChatCompletionRequest,
-    params(
-        ("Magnitude-Include-Progress" = Option<bool>, Header, nullable = false, description = "Include Magnitude loading and inference progress events")
-    ),
-    responses(
-        (status = 200, description = "OpenAI-compatible server-sent events", body = String, content_type = "text/event-stream"),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 404, description = "Requested model is unavailable", body = ErrorResponse),
-        (status = 409, description = "Runtime model cannot be admitted", body = ErrorResponse),
-        (status = 422, description = "Runtime target failed validation", body = ErrorResponse),
-        (status = 500, description = "Runtime load or inference failed", body = ErrorResponse)
-    )
-)]
-#[tracing::instrument(
-    name = "icn.chat_completions",
-    skip_all,
-    fields(completion.id = tracing::field::Empty, model.id = tracing::field::Empty),
-    err(Debug)
-)]
-async fn chat_completions(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<ChatCompletionRequest>,
-) -> Result<Response, ApiError> {
-    let request = validate_request(request)?;
-    let model_id = request
-        .model
-        .clone()
-        .filter(|model| !model.is_empty())
-        .ok_or_else(|| ApiError::invalid("model is required"))?;
-    let controller = state
-        .model_controller
-        .as_ref()
-        .ok_or_else(|| ApiError::server("model control is not configured"))?;
-    let include_progress = headers
-        .get("Magnitude-Include-Progress")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-    if include_progress {
-        let id = format!(
-            "chatcmpl-icn-{}",
-            state.next_id.fetch_add(1, Ordering::Relaxed)
-        );
-        let created = unix_timestamp();
-        let model = model_id.clone();
-        let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(16);
-        let progress_sender = sender.clone();
-        let progress_id = id.clone();
-        let progress_model = model.clone();
-        let progress: ModelLoadingObserver = Arc::new(move |fraction| {
-            let chunk = loading_progress_chunk(&progress_id, created, &progress_model, fraction);
-            if let Ok(data) = serde_json::to_string(&chunk) {
-                let _ = progress_sender.try_send(Ok(Event::default().data(data)));
-            }
-        });
-        let controller = Arc::clone(controller);
-        let span = tracing::Span::current();
-        tokio::spawn(async move {
-            let acquisition = tokio::select! {
-                result = controller.acquire_for_inference(model_id, Some(progress)) => result,
-                _ = sender.closed() => return,
-            };
-            let result = match acquisition {
-                Ok(lease) => start_chat_completion(
-                    request,
-                    lease,
-                    id.clone(),
-                    created,
-                    sender.clone(),
-                    span,
-                    true,
-                ),
-                Err(error) => Err(ApiError::from_inventory(error)),
-            };
-            if let Err(error) = result {
-                if let Ok(data) =
-                    serde_json::to_string(&error_chunk(&id, created, &model, error.body.error))
-                {
-                    let _ = sender.send(Ok(Event::default().data(data))).await;
-                }
-                let _ = sender.send(Ok(Event::default().data("[DONE]"))).await;
-            }
-        });
-        return Ok(Sse::new(ReceiverStream::new(receiver))
-            .keep_alive(KeepAlive::default())
-            .into_response());
-    }
+async fn admit_invocation(
+    controller: &Arc<dyn ModelInstanceController>,
+    invocation: domain::InferenceInvocation,
+    progress: Option<ModelLoadingObserver>,
+) -> Result<AdmittedInvocation, ApiError> {
+    let (model, request) = invocation.into_parts();
+    let model = model.into_inner();
     let lease = controller
-        .acquire_for_inference(model_id, None)
+        .acquire_for_inference(model.clone(), progress)
         .await
         .map_err(ApiError::from_inventory)?;
-    chat_completion_with_lease(state, request, lease).await
-}
-
-async fn chat_completion_with_lease(
-    state: AppState,
-    request: ValidatedChatRequest,
-    lease: ModelInstanceLease,
-) -> Result<Response, ApiError> {
-    let id = format!(
-        "chatcmpl-icn-{}",
-        state.next_id.fetch_add(1, Ordering::Relaxed)
-    );
-    let created = unix_timestamp();
-    let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(16);
-    start_chat_completion(
-        request,
-        lease,
-        id,
-        created,
-        sender,
-        tracing::Span::current(),
-        false,
-    )?;
-    Ok(Sse::new(ReceiverStream::new(receiver))
-        .keep_alive(KeepAlive::default())
-        .into_response())
-}
-
-fn start_chat_completion(
-    request: ValidatedChatRequest,
-    lease: ModelInstanceLease,
-    id: String,
-    created: u64,
-    sender: mpsc::Sender<Result<Event, Infallible>>,
-    current_span: tracing::Span,
-    include_progress: bool,
-) -> Result<(), ApiError> {
-    validate_model_selection(request.model.as_deref(), &lease)?;
+    validate_model_selection(Some(&model), &lease)?;
     let properties = lease
         .backend()
         .properties()
         .map_err(ApiError::from_inference)?;
-    let model = request
-        .model
-        .clone()
-        .unwrap_or_else(|| lease.model_id().to_owned());
-    let (request, include_usage) = finalize_request(request, &properties.reasoning)?;
-    current_span.record("completion.id", id.as_str());
-    current_span.record("model.id", model.as_str());
-
-    let span = current_span;
-    tokio::task::spawn_blocking(move || {
-        span.in_scope(|| {
-            let mut callback = |event: InferenceStreamEvent| {
-                let InferenceStreamEvent {
-                    delta: event,
-                    timings,
-                } = event;
-                let timings = timings.map(|snapshot| snapshot_timings(&snapshot));
-                let chunk = match event {
-                    InferenceEvent::Progress(_) if !include_progress => return Ok(()),
-                    InferenceEvent::Progress(progress) => {
-                        progress_chunk(&id, created, &model, progress)
-                    }
-                    event => {
-                        let delta = inference_event_delta(event)?;
-                        choice_chunk(&id, created, &model, delta, None, timings)
-                    }
-                };
-                if emit_chunk(&sender, &chunk) {
-                    Ok(())
-                } else {
-                    Err(InferenceError::Callback(
-                        "stream consumer disconnected".into(),
-                    ))
-                }
-            };
-            let generation = match lease.backend().complete(request, &mut callback) {
-                Ok(generation) => generation,
-                Err(error) => {
-                    tracing::error!(error = %error, "chat completion failed");
-                    if emit_chunk(
-                        &sender,
-                        &error_chunk(&id, created, &model, inference_error_body(&error)),
-                    ) {
-                        emit_done(&sender);
-                    }
-                    return;
-                }
-            };
-            let reason = match generation.finish_reason {
-                FinishReason::Stop => "stop",
-                FinishReason::Length => "length",
-                FinishReason::ToolCalls => "tool_calls",
-            };
-            tracing::info!(
-                completion.id = %id,
-                model.id = %model,
-                finish.reason = reason,
-                input.tokens = generation.prompt_tokens,
-                output.tokens = generation.generated_tokens,
-                queue.ms = generation.metrics.queue_ms,
-                prompt.ms = generation.metrics.prompt_ms,
-                decode.ms = generation.metrics.decode_ms,
-                "chat completion finished"
-            );
-            let terminal_timings = (!include_usage).then(|| generation_timings(&generation));
-            if !emit_chunk(
-                &sender,
-                &choice_chunk(
-                    &id,
-                    created,
-                    &model,
-                    ChunkDelta::default(),
-                    Some(reason.into()),
-                    terminal_timings,
-                ),
-            ) {
-                return;
-            }
-            if include_usage
-                && !emit_chunk(&sender, &usage_chunk(&id, created, &model, &generation))
-            {
-                return;
-            }
-            emit_done(&sender);
-        });
-    });
-    Ok(())
-}
-
-fn choice_chunk(
-    id: &str,
-    created: u64,
-    model: &str,
-    delta: ChunkDelta,
-    finish_reason: Option<String>,
-    timings: Option<Timings>,
-) -> ChatCompletionChunk {
-    ChatCompletionChunk {
-        id: id.into(),
-        object: "chat.completion.chunk",
-        created,
-        model: model.into(),
-        choices: vec![ChunkChoice {
-            index: 0,
-            delta,
-            finish_reason,
-        }],
-        progress: None,
-        usage: None,
-        timings,
-        error: None,
-    }
-}
-
-fn usage_chunk(
-    id: &str,
-    created: u64,
-    model: &str,
-    generation: &Generation,
-) -> ChatCompletionChunk {
-    let prompt_tokens = generation.prompt_tokens as u64;
-    let completion_tokens = generation.generated_tokens as u64;
-    ChatCompletionChunk {
-        id: id.into(),
-        object: "chat.completion.chunk",
-        created,
-        model: model.into(),
-        choices: Vec::new(),
-        progress: None,
-        usage: Some(Usage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: prompt_tokens.saturating_add(completion_tokens),
-            prompt_tokens_details: PromptTokensDetails {
-                cached_tokens: generation.cached_prompt_tokens as u64,
-            },
-        }),
-        timings: Some(generation_timings(generation)),
-        error: None,
-    }
-}
-
-fn error_chunk(id: &str, created: u64, model: &str, error: ApiErrorBody) -> ChatCompletionChunk {
-    ChatCompletionChunk {
-        id: id.into(),
-        object: "chat.completion.chunk",
-        created,
-        model: model.into(),
-        choices: Vec::new(),
-        progress: None,
-        usage: None,
-        timings: None,
-        error: Some(error),
-    }
-}
-
-fn progress_chunk(
-    id: &str,
-    created: u64,
-    model: &str,
-    progress: InferenceProgress,
-) -> ChatCompletionChunk {
-    let progress = match progress {
-        InferenceProgress::Queued => ChatCompletionProgress::Queued,
-        InferenceProgress::Preparing => ChatCompletionProgress::Preparing,
-        InferenceProgress::Prefill {
-            completed_tokens,
-            total_tokens,
-            cached_tokens,
-        } => ChatCompletionProgress::Prefill {
-            completed_tokens: completed_tokens as u64,
-            total_tokens: total_tokens as u64,
-            cached_tokens: cached_tokens as u64,
-        },
-        InferenceProgress::Generating => ChatCompletionProgress::Generating,
-    };
-    ChatCompletionChunk {
-        id: id.into(),
-        object: "chat.completion.chunk",
-        created,
-        model: model.into(),
-        choices: Vec::new(),
-        progress: Some(progress),
-        usage: None,
-        timings: None,
-        error: None,
-    }
-}
-
-fn loading_progress_chunk(
-    id: &str,
-    created: u64,
-    model: &str,
-    fraction: f32,
-) -> ChatCompletionChunk {
-    ChatCompletionChunk {
-        id: id.into(),
-        object: "chat.completion.chunk",
-        created,
-        model: model.into(),
-        choices: Vec::new(),
-        progress: Some(ChatCompletionProgress::ModelLoading {
-            fraction: fraction.clamp(0.0, 1.0),
-        }),
-        usage: None,
-        timings: None,
-        error: None,
-    }
-}
-
-fn generation_timings(generation: &Generation) -> Timings {
-    timing_values(
-        generation.cached_prompt_tokens,
-        generation.prompt_tokens,
-        generation.generated_tokens,
-        &generation.metrics,
-    )
-}
-
-fn snapshot_timings(snapshot: &GenerationSnapshot) -> Timings {
-    timing_values(
-        snapshot.cached_prompt_tokens,
-        snapshot.prompt_tokens,
-        snapshot.generated_tokens,
-        &snapshot.metrics,
-    )
-}
-
-fn timing_values(
-    cached_prompt_tokens: usize,
-    prompt_tokens: usize,
-    generated_tokens: usize,
-    metrics: &GenerationMetrics,
-) -> Timings {
-    let prompt_n = prompt_tokens.saturating_sub(cached_prompt_tokens);
-    Timings {
-        cache_n: cached_prompt_tokens as u64,
-        prompt_n: prompt_n as u64,
-        prompt_ms: metrics.prompt_ms,
-        time_to_first_token_ms: metrics.time_to_first_token_ms,
-        prompt_per_token_ms: per_token_ms(prompt_n, metrics.prompt_ms),
-        prompt_per_second: rate(prompt_n, metrics.prompt_ms),
-        predicted_n: generated_tokens as u64,
-        predicted_ms: metrics.decode_ms,
-        predicted_per_token_ms: per_token_ms(generated_tokens, metrics.decode_ms),
-        predicted_per_second: rate(generated_tokens, metrics.decode_ms),
-        sampler_ms: metrics.sampler_ms,
-        parser_ms: metrics.parser_ms,
-        draft_n: (metrics.draft_tokens > 0).then_some(metrics.draft_tokens as u64),
-        draft_n_accepted: (metrics.draft_tokens > 0)
-            .then_some(metrics.accepted_draft_tokens as u64),
-    }
-}
-
-fn per_token_ms(tokens: usize, elapsed_ms: f64) -> f64 {
-    if tokens == 0 {
-        0.0
-    } else {
-        elapsed_ms / tokens as f64
-    }
-}
-
-fn rate(tokens: usize, elapsed_ms: f64) -> f64 {
-    if tokens == 0 || elapsed_ms <= 0.0 {
-        0.0
-    } else {
-        1_000.0 * tokens as f64 / elapsed_ms
-    }
-}
-
-fn inference_event_delta(event: InferenceEvent) -> Result<ChunkDelta, InferenceError> {
-    Ok(match event {
-        InferenceEvent::Progress(_) => {
-            return Err(InferenceError::Callback(
-                "progress event reached the semantic delta encoder".into(),
-            ));
-        }
-        InferenceEvent::StreamStart => ChunkDelta {
-            role: Some("assistant".into()),
-            content: Some(None),
-            ..ChunkDelta::default()
-        },
-        InferenceEvent::ContentDelta { text } => ChunkDelta {
-            content: Some(Some(text)),
-            ..ChunkDelta::default()
-        },
-        InferenceEvent::ReasoningDelta { text } => ChunkDelta {
-            reasoning_content: Some(text),
-            ..ChunkDelta::default()
-        },
-        InferenceEvent::ToolCallDelta {
-            index,
-            id,
-            name,
-            arguments,
-        } => {
-            let index = u32::try_from(index).map_err(|_| {
-                InferenceError::Callback("tool-call index exceeds the HTTP protocol range".into())
-            })?;
-            let has_function = name.is_some() || !arguments.is_empty();
-            ChunkDelta {
-                tool_calls: Some(vec![ChunkToolCall {
-                    index,
-                    r#type: id.as_ref().map(|_| "function"),
-                    id,
-                    function: has_function.then_some(ChunkFunctionDelta {
-                        name,
-                        arguments: (!arguments.is_empty()).then_some(arguments),
-                    }),
-                }]),
-                ..ChunkDelta::default()
-            }
-        }
+    let request = resolve_request(request, &properties.reasoning)?;
+    Ok(AdmittedInvocation {
+        lease,
+        model,
+        request,
     })
 }
 
-fn emit_chunk(
-    sender: &mpsc::Sender<Result<Event, Infallible>>,
-    chunk: &ChatCompletionChunk,
-) -> bool {
-    serde_json::to_string(chunk)
-        .ok()
-        .and_then(|data| sender.blocking_send(Ok(Event::default().data(data))).ok())
-        .is_some()
-}
-
-fn emit_done(sender: &mpsc::Sender<Result<Event, Infallible>>) {
-    let _ = sender.blocking_send(Ok(Event::default().data("[DONE]")));
+fn execute_with_journal(
+    backend: &dyn CompletionBackend,
+    request: domain::ResolvedInferenceRequest,
+    mut observe: impl FnMut(&domain::InferenceObservation) -> Result<(), InferenceError>,
+) -> Result<domain::InferenceResult, InferenceError> {
+    let mut journal = domain::OutputJournal::default();
+    let completion = backend.complete(request, &mut |observation| {
+        if let domain::InferenceObservationEvent::Output { event } = observation.event() {
+            journal
+                .push(event)
+                .map_err(|error| InferenceError::Backend(error.to_string()))?;
+        }
+        observe(&observation)
+    })?;
+    let output = journal
+        .finish()
+        .map_err(|error| InferenceError::Backend(error.to_string()))?;
+    Ok(completion.into_result(output))
 }
 
 fn inference_error_body(error: &InferenceError) -> ApiErrorBody {
@@ -3335,6 +1928,7 @@ fn inference_error_body(error: &InferenceError) -> ApiErrorBody {
     ApiErrorBody {
         message: error.to_string(),
         r#type: error_type,
+        param: None,
         code: code.to_owned(),
         retryable,
     }
@@ -3351,36 +1945,6 @@ fn validate_model_selection(
         ))),
         _ => Ok(()),
     }
-}
-
-fn validate_apply_template_request(
-    request: ApplyTemplateRequest,
-    reasoning_profile: &icn_contracts::ReasoningProfile,
-) -> Result<ChatTemplateRequest, ApiError> {
-    let validated = validate_request(ChatCompletionRequest {
-        model: request.model,
-        messages: request.messages,
-        max_tokens: None,
-        max_completion_tokens: None,
-        temperature: None,
-        top_p: None,
-        seed: None,
-        tools: request.tools,
-        tool_choice: request.tool_choice,
-        parallel_tool_calls: request.parallel_tool_calls,
-        reasoning_effort: None,
-        thinking_budget_tokens: None,
-        response_format: request.response_format,
-        chat_template_kwargs: request.chat_template_kwargs,
-        stop: None,
-        stream: true,
-        stream_options: None,
-        cache_prompt: true,
-        ignore_eos: false,
-        timings_per_token: false,
-    })?;
-    let (request, _) = finalize_request(validated, reasoning_profile)?;
-    Ok(request.template)
 }
 
 fn props_response(properties: ModelProperties) -> PropsResponse {
@@ -3484,375 +2048,89 @@ fn cache_type_response(cache_type: CacheType) -> CacheTypeResponse {
     }
 }
 
-fn apply_template_response(prepared: PreparedChatInfo) -> ApplyTemplateResponse {
-    ApplyTemplateResponse {
-        prompt: prepared.prompt,
-        generation_prompt: prepared.generation_prompt,
-        grammar: prepared.grammar,
-        grammar_lazy: prepared.grammar_lazy,
-        grammar_triggers: prepared
-            .grammar_triggers
-            .into_iter()
-            .map(|trigger| match trigger {
-                GrammarTrigger::Token { value, token } => {
-                    GrammarTriggerResponse::Token { value, token }
-                }
-                GrammarTrigger::Word(value) => GrammarTriggerResponse::Word { value },
-                GrammarTrigger::Pattern(value) => GrammarTriggerResponse::Pattern { value },
-                GrammarTrigger::PatternFull(value) => GrammarTriggerResponse::PatternFull { value },
-            })
-            .collect(),
-        preserved_tokens: prepared.preserved_tokens,
-        additional_stops: prepared.additional_stops,
-        supports_thinking: prepared.supports_thinking,
-        thinking_start_tag: prepared.thinking_start_tag,
-        thinking_end_tag: prepared.thinking_end_tag,
-        template_fingerprint: prepared.template_fingerprint,
-    }
-}
-
-struct ValidatedChatRequest {
-    model: Option<String>,
-    messages: Vec<ChatMessage>,
-    tools: Vec<ToolDefinition>,
-    tool_choice: ToolChoice,
-    parallel_tool_calls: bool,
-    reasoning_effort: Option<ReasoningEffortRequest>,
-    thinking_budget_tokens: Option<u32>,
-    response_format: ResponseFormat,
-    template_args: BTreeMap<String, JsonValue>,
-    stop: Vec<String>,
-    max_tokens: u32,
-    temperature: f32,
-    top_p: f32,
-    seed: u32,
-    cache_prompt: bool,
-    ignore_eos: bool,
-    timings_per_token: bool,
-    include_usage: bool,
-}
-
-fn validate_request(request: ChatCompletionRequest) -> Result<ValidatedChatRequest, ApiError> {
-    if !request.stream {
-        return Err(ApiError::invalid(
-            "ICN's MVP chat endpoint requires stream: true",
-        ));
-    }
-    if request.messages.is_empty() {
-        return Err(ApiError::invalid("messages must not be empty"));
-    }
-    if request.model.as_deref().is_some_and(str::is_empty) {
-        return Err(ApiError::invalid("model must not be empty"));
-    }
-    if request.max_tokens.is_some() && request.max_completion_tokens.is_some() {
-        return Err(ApiError::invalid(
-            "max_tokens and max_completion_tokens cannot both be set",
-        ));
-    }
-    let max_tokens = request
-        .max_completion_tokens
-        .or(request.max_tokens)
-        .unwrap_or(DEFAULT_MAX_TOKENS);
-    if max_tokens == 0 {
-        return Err(ApiError::invalid("max tokens must be greater than zero"));
-    }
-    let temperature = request.temperature.unwrap_or(DEFAULT_TEMPERATURE);
-    if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
-        return Err(ApiError::invalid(
-            "temperature must be finite and between 0 and 2",
-        ));
-    }
-    let top_p = request.top_p.unwrap_or(DEFAULT_TOP_P);
-    if !top_p.is_finite() || !(0.0..=1.0).contains(&top_p) {
-        return Err(ApiError::invalid(
-            "top_p must be finite and between 0 and 1",
-        ));
-    }
-    let messages = request
-        .messages
-        .into_iter()
-        .map(chat_message)
-        .collect::<Result<Vec<_>, _>>()?;
-    let (tools, tool_names) = tools(request.tools.unwrap_or_default())?;
-    let tool_choice = tool_choice(request.tool_choice, &tool_names)?;
-    let template_args = request.chat_template_kwargs.unwrap_or_default();
-    if template_args.keys().any(String::is_empty) {
-        return Err(ApiError::invalid(
-            "chat_template_kwargs keys must not be empty",
-        ));
-    }
-    let response_format = response_format(request.response_format)?;
-    let stop = stops(request.stop)?;
-    Ok(ValidatedChatRequest {
-        model: request.model,
-        messages,
-        tools,
-        tool_choice,
-        parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
-        reasoning_effort: request.reasoning_effort,
-        thinking_budget_tokens: request.thinking_budget_tokens,
-        response_format,
-        template_args,
-        stop,
-        max_tokens,
-        temperature,
-        top_p,
-        seed: request.seed.unwrap_or(DEFAULT_SEED),
-        cache_prompt: request.cache_prompt,
-        ignore_eos: request.ignore_eos,
-        timings_per_token: request.timings_per_token,
-        include_usage: request
-            .stream_options
-            .and_then(|options| options.include_usage)
-            .unwrap_or(false),
-    })
-}
-
-fn finalize_request(
-    mut validated: ValidatedChatRequest,
-    reasoning_profile: &icn_contracts::ReasoningProfile,
-) -> Result<(ChatRequest, bool), ApiError> {
-    let reasoning = reasoning_control(
-        validated.reasoning_effort,
-        validated.thinking_budget_tokens,
-        &mut validated.template_args,
-        reasoning_profile,
-    )?;
-    Ok((
-        ChatRequest {
-            template: ChatTemplateRequest {
-                messages: validated.messages,
-                tools: validated.tools,
-                tool_choice: validated.tool_choice,
-                parallel_tool_calls: validated.parallel_tool_calls,
-                reasoning,
-                response_format: validated.response_format,
-                template_args: validated.template_args,
-            },
-            stop: validated.stop,
-            max_tokens: validated.max_tokens,
-            temperature: validated.temperature,
-            top_p: validated.top_p,
-            seed: validated.seed,
-            cache_prompt: validated.cache_prompt,
-            ignore_eos: validated.ignore_eos,
-            timings_per_token: validated.timings_per_token,
-        },
-        validated.include_usage,
-    ))
-}
-
-fn chat_message(message: ChatMessageRequest) -> Result<ChatMessage, ApiError> {
-    match message {
-        ChatMessageRequest::System { content } => Ok(ChatMessage::text(ChatRole::System, content)),
-        ChatMessageRequest::User { content } => Ok(ChatMessage {
-            role: ChatRole::User,
-            content: Some(chat_content(content)?),
-            reasoning: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        }),
-        ChatMessageRequest::Assistant {
-            content,
-            reasoning_content,
-            tool_calls,
-        } => {
-            if content.is_none() && reasoning_content.is_none() && tool_calls.is_empty() {
-                return Err(ApiError::invalid(
-                    "assistant messages require content, reasoning_content, or tool_calls",
-                ));
-            }
-            let mut ids = BTreeSet::new();
-            let tool_calls = tool_calls
-                .into_iter()
-                .map(|tool_call| {
-                    let ChatToolCallRequest {
-                        id,
-                        r#type: _,
-                        function,
-                    } = tool_call;
-                    require_non_empty(&id, "assistant tool-call id")?;
-                    require_non_empty(&function.name, "assistant tool-call function name")?;
-                    if !ids.insert(id.clone()) {
-                        return Err(ApiError::invalid(format!(
-                            "duplicate assistant tool-call id: {id}"
-                        )));
-                    }
-                    Ok(ToolCall {
-                        id,
-                        name: function.name,
-                        arguments: function.arguments,
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(ChatMessage {
-                role: ChatRole::Assistant,
-                content: content.map(ChatContent::Text),
-                reasoning: reasoning_content,
-                tool_calls,
-                tool_call_id: None,
-            })
-        }
-        ChatMessageRequest::Tool {
-            tool_call_id,
-            content,
-        } => {
-            require_non_empty(&tool_call_id, "tool_call_id")?;
-            Ok(ChatMessage {
-                role: ChatRole::Tool,
-                content: Some(chat_content(content)?),
-                reasoning: None,
-                tool_calls: Vec::new(),
-                tool_call_id: Some(tool_call_id),
-            })
-        }
-    }
-}
-
-fn chat_content(content: ChatContentRequest) -> Result<ChatContent, ApiError> {
-    match content {
-        ChatContentRequest::Text(text) => Ok(ChatContent::Text(text)),
-        ChatContentRequest::Parts(parts) => {
-            if parts.is_empty() {
-                return Err(ApiError::invalid("message content parts must not be empty"));
-            }
-            Ok(ChatContent::Parts(
-                parts
-                    .into_iter()
-                    .map(|part| match part {
-                        ChatContentPartRequest::Text { text } => Ok(ChatContentPart::Text { text }),
-                        ChatContentPartRequest::ImageUrl { image_url } => {
-                            require_non_empty(&image_url.url, "image_url.url")?;
-                            let image = media::decode_image_data_url(
-                                &image_url.url,
-                                media::MAX_HTTP_IMAGE_BYTES,
-                            )
-                            .map_err(|error| ApiError::invalid(error.to_string()))?;
-                            Ok(ChatContentPart::Image(ImageInput::new(
-                                image.media_type,
-                                image.bytes,
-                            )))
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            ))
-        }
-    }
-}
-
-fn tools(
-    requests: Vec<ChatToolRequest>,
-) -> Result<(Vec<ToolDefinition>, BTreeSet<String>), ApiError> {
-    let mut names = BTreeSet::new();
-    let tools = requests
-        .into_iter()
-        .map(|tool| {
-            let ChatToolRequest {
-                r#type: _,
-                function,
-            } = tool;
-            require_non_empty(&function.name, "tool function name")?;
-            if !names.insert(function.name.clone()) {
-                return Err(ApiError::invalid(format!(
-                    "duplicate tool function name: {}",
-                    function.name
-                )));
-            }
-            require_json_schema(&function.parameters, "tool function parameters")?;
-            Ok(ToolDefinition {
-                name: function.name,
-                description: function.description,
-                parameters: function.parameters,
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((tools, names))
-}
-
-fn tool_choice(
-    request: Option<ToolChoiceRequest>,
-    tool_names: &BTreeSet<String>,
-) -> Result<ToolChoice, ApiError> {
-    let choice = match request {
-        None | Some(ToolChoiceRequest::Mode(ToolChoiceModeRequest::Auto)) => ToolChoice::Auto,
-        Some(ToolChoiceRequest::Mode(ToolChoiceModeRequest::None)) => ToolChoice::None,
-        Some(ToolChoiceRequest::Mode(ToolChoiceModeRequest::Required)) => {
-            if tool_names.is_empty() {
-                return Err(ApiError::invalid("tool_choice required requires tools"));
-            }
-            ToolChoice::Required
-        }
-        Some(ToolChoiceRequest::Function(request)) => {
-            require_non_empty(&request.function.name, "tool_choice function name")?;
-            require_known_tool(&request.function.name, tool_names)?;
-            ToolChoice::Function {
-                name: request.function.name,
-            }
-        }
-        Some(ToolChoiceRequest::AllowedTools(request)) => {
-            if request.allowed_tools.tools.is_empty() {
-                return Err(ApiError::invalid(
-                    "tool_choice allowed_tools requires at least one tool",
-                ));
-            }
-            let mut selected = BTreeSet::new();
-            let names = request
-                .allowed_tools
-                .tools
-                .into_iter()
-                .map(|tool| {
-                    require_non_empty(&tool.function.name, "allowed tool name")?;
-                    require_known_tool(&tool.function.name, tool_names)?;
-                    if !selected.insert(tool.function.name.clone()) {
-                        return Err(ApiError::invalid(format!(
-                            "duplicate allowed tool name: {}",
-                            tool.function.name
-                        )));
-                    }
-                    Ok(tool.function.name)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            ToolChoice::AllowedTools {
-                mode: match request.allowed_tools.mode {
-                    AllowedToolsModeRequest::Auto => AllowedToolsMode::Auto,
-                    AllowedToolsModeRequest::Required => AllowedToolsMode::Required,
-                },
-                names,
-            }
-        }
-    };
-    Ok(choice)
-}
-
-fn reasoning_control(
-    effort: Option<ReasoningEffortRequest>,
-    budget_tokens: Option<u32>,
-    template_args: &mut BTreeMap<String, JsonValue>,
+fn resolve_request(
+    request: domain::InferenceRequest<domain::ReasoningIntent>,
     profile: &icn_contracts::ReasoningProfile,
-) -> Result<ReasoningControl, ApiError> {
-    const OWNED_KEYS: &[&str] = &[
-        "enable_thinking",
-        "thinking",
-        "thinking_mode",
-        "reasoning_effort",
-        "thinking_budget",
-        "preserve_thinking",
-        "clear_thinking",
-        "drop_thinking",
-    ];
-    let raw_reasoning_controls = template_args
-        .keys()
-        .any(|key| OWNED_KEYS.contains(&key.as_str()));
+) -> Result<domain::ResolvedInferenceRequest, ApiError> {
+    let intent = request.reasoning().clone();
+    let reasoning = resolve_reasoning(intent, profile)?;
+    Ok(request.map_reasoning(|_| reasoning))
+}
 
-    let selected = match effort {
-        Some(effort) => {
-            if raw_reasoning_controls {
-                return Err(ApiError::invalid(
-                    "reasoning_effort conflicts with reasoning controls in chat_template_kwargs",
+fn resolve_reasoning(
+    intent: domain::ReasoningIntent,
+    profile: &icn_contracts::ReasoningProfile,
+) -> Result<domain::ResolvedReasoning, ApiError> {
+    let (effort, mut controls, automatic_budget, explicit_budget, template_args) = match intent {
+        domain::ReasoningIntent::Disabled { template_args } => (
+            icn_contracts::NormalizedReasoningEffort("none".into()),
+            icn_contracts::NativeReasoningControls {
+                enable_thinking: Some(false),
+                template_args: BTreeMap::new(),
+            },
+            icn_contracts::AutomaticReasoningBudget::Disabled,
+            None,
+            template_args,
+        ),
+        domain::ReasoningIntent::ModelDefault {
+            template_args,
+            budget,
+        } => {
+            let Some(effort) = profile.default_effort.clone() else {
+                if budget.is_some() {
+                    return Err(ApiError::invalid(
+                        "reasoning budget requires a model with a classified reasoning default",
+                    ));
+                }
+                return Ok(domain::ResolvedReasoning::new(
+                    icn_contracts::NormalizedReasoningEffort("none".into()),
+                    icn_contracts::NativeReasoningControls {
+                        enable_thinking: None,
+                        template_args,
+                    },
+                    icn_contracts::AutomaticReasoningBudget::Disabled,
+                    None,
+                    profile.template_fingerprint.clone(),
                 ));
-            }
-            let normalized = effort.normalize()?;
-            profile.mapping(&normalized).ok_or_else(|| {
+            };
+            let mapping = profile.mapping(&effort).ok_or_else(|| {
+                ApiError::server("reasoning profile default has no compiled mapping")
+            })?;
+            (
+                effort,
+                mapping.controls.clone(),
+                mapping.automatic_budget.clone(),
+                budget,
+                template_args,
+            )
+        }
+        domain::ReasoningIntent::Enabled {
+            template_args,
+            budget,
+        } => {
+            let effort = profile
+                .default_effort
+                .clone()
+                .ok_or_else(|| ApiError::invalid("model has no resolved reasoning default"))?;
+            let mapping = profile.mapping(&effort).ok_or_else(|| {
+                ApiError::server("reasoning profile default has no compiled mapping")
+            })?;
+            let mut controls = mapping.controls.clone();
+            controls.enable_thinking = Some(true);
+            (
+                effort,
+                controls,
+                mapping.automatic_budget.clone(),
+                budget,
+                template_args,
+            )
+        }
+        domain::ReasoningIntent::Effort {
+            effort,
+            template_args,
+            budget,
+        } => {
+            let mapping = profile.mapping(&effort).ok_or_else(|| {
                 let supported = profile
                     .mappings
                     .iter()
@@ -3860,142 +2138,48 @@ fn reasoning_control(
                     .collect::<Vec<_>>()
                     .join(", ");
                 ApiError::invalid(format!(
-                    "reasoning_effort {} is unsupported for this model; supported values: {supported}",
-                    normalized.as_str()
+                    "reasoning effort {} is unsupported for this model; supported values: {supported}",
+                    effort.as_str()
                 ))
-            })?
-        }
-        None if raw_reasoning_controls => {
-            if budget_tokens.is_none() {
-                return Ok(ReasoningControl::ModelDefault);
-            }
-            let explicitly_disabled = matches!(
-                template_args
-                    .get("enable_thinking")
-                    .or_else(|| template_args.get("thinking")),
-                Some(JsonValue::Bool(false))
-            ) || matches!(
-                template_args
-                    .get("thinking_mode")
-                    .and_then(JsonValue::as_str),
-                Some("chat" | "disabled")
-            ) || template_args
-                .get("reasoning_effort")
-                .and_then(JsonValue::as_str)
-                .and_then(icn_contracts::NormalizedReasoningEffort::parse)
-                .is_some_and(|effort| effort.as_str() == "none");
-            if explicitly_disabled {
-                return Err(ApiError::invalid(
-                    "thinking_budget_tokens cannot be used when raw template controls disable reasoning",
-                ));
-            }
-            let effort = profile.default_effort.clone().ok_or_else(|| {
-                ApiError::invalid("thinking_budget_tokens requires a classified reasoning default")
             })?;
-            return Ok(ReasoningControl::Resolved {
+            (
                 effort,
-                controls: icn_contracts::NativeReasoningControls::default(),
-                automatic_budget: icn_contracts::AutomaticReasoningBudget::Disabled,
-                explicit_budget_tokens: budget_tokens,
-                template_fingerprint: profile.template_fingerprint.clone(),
-            });
-        }
-        None => {
-            let Some(default_effort) = profile.default_effort.as_ref() else {
-                if budget_tokens.is_some() {
-                    return Err(ApiError::invalid(
-                        "thinking_budget_tokens requires a classified reasoning default",
-                    ));
-                }
-                return Ok(ReasoningControl::ModelDefault);
-            };
-            profile
-                .mapping(default_effort)
-                .expect("classified reasoning default has a mapping")
+                mapping.controls.clone(),
+                mapping.automatic_budget.clone(),
+                budget,
+                template_args,
+            )
         }
     };
-
-    if budget_tokens.is_some() && selected.effort.as_str() == "none" {
-        return Err(ApiError::invalid(
-            "thinking_budget_tokens cannot be used when reasoning is disabled (reasoning_effort none)",
-        ));
-    }
-    Ok(ReasoningControl::Resolved {
-        effort: selected.effort.clone(),
-        controls: selected.controls.clone(),
-        automatic_budget: selected.automatic_budget.clone(),
-        explicit_budget_tokens: budget_tokens,
-        template_fingerprint: profile.template_fingerprint.clone(),
-    })
-}
-
-fn response_format(request: Option<ResponseFormatRequest>) -> Result<ResponseFormat, ApiError> {
-    match request.unwrap_or(ResponseFormatRequest::Text) {
-        ResponseFormatRequest::Text => Ok(ResponseFormat::Text),
-        ResponseFormatRequest::JsonObject => Ok(ResponseFormat::JsonObject),
-        ResponseFormatRequest::Grammar { grammar } => {
-            require_non_empty(&grammar, "response_format grammar")?;
-            Ok(ResponseFormat::Grammar { grammar })
-        }
-        ResponseFormatRequest::JsonSchema { json_schema } => {
-            require_non_empty(&json_schema.name, "response_format json_schema name")?;
-            require_json_schema(&json_schema.schema, "response_format json_schema schema")?;
-            Ok(ResponseFormat::JsonSchema {
-                name: json_schema.name,
-                schema: json_schema.schema,
-                strict: json_schema.strict,
-            })
+    for (key, value) in template_args {
+        if controls.template_args.insert(key.clone(), value).is_some() {
+            return Err(ApiError::invalid(format!(
+                "chat_template_kwargs conflicts with resolved reasoning control: {key}"
+            )));
         }
     }
+    Ok(domain::ResolvedReasoning::new(
+        effort,
+        controls,
+        automatic_budget,
+        explicit_budget,
+        profile.template_fingerprint.clone(),
+    ))
 }
 
-fn stops(request: Option<StopRequest>) -> Result<Vec<String>, ApiError> {
-    let values = match request {
-        None => Vec::new(),
-        Some(StopRequest::One(stop)) => vec![stop],
-        Some(StopRequest::Many(stops)) => stops,
-    };
-    let mut seen = BTreeSet::new();
-    values
-        .into_iter()
-        .map(|stop| {
-            require_non_empty(&stop, "stop sequence")?;
-            if !seen.insert(stop.clone()) {
-                return Err(ApiError::invalid(format!(
-                    "duplicate stop sequence: {stop}"
-                )));
-            }
-            Ok(stop)
-        })
-        .collect()
+fn non_empty_text(value: String, field: &'static str) -> Result<domain::NonEmptyText, ApiError> {
+    domain::NonEmptyText::try_new(value, field).map_err(domain_error)
 }
 
-fn require_known_tool(name: &str, tool_names: &BTreeSet<String>) -> Result<(), ApiError> {
-    if tool_names.contains(name) {
-        Ok(())
-    } else {
-        Err(ApiError::invalid(format!(
-            "tool_choice references undefined tool: {name}"
-        )))
-    }
+fn non_empty_vec<T>(
+    values: Vec<T>,
+    field: &'static str,
+) -> Result<domain::NonEmptyVec<T>, ApiError> {
+    domain::NonEmptyVec::try_new(values, field).map_err(domain_error)
 }
 
-fn require_json_schema(value: &JsonValue, field: &str) -> Result<(), ApiError> {
-    if value.is_object() || value.is_boolean() {
-        Ok(())
-    } else {
-        Err(ApiError::invalid(format!(
-            "{field} must be a JSON Schema object or boolean"
-        )))
-    }
-}
-
-fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
-    if value.is_empty() {
-        Err(ApiError::invalid(format!("{field} must not be empty")))
-    } else {
-        Ok(())
-    }
+fn domain_error(error: domain::InferenceRequestError) -> ApiError {
+    ApiError::invalid(error.to_string())
 }
 
 #[derive(OpenApi)]
@@ -4029,8 +2213,10 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         set_model_residency_policy,
         props,
         apply_template,
-        chat_completions,
-        responses
+        protocols::chat::chat_completions,
+        protocols::responses::responses,
+        protocols::anthropic::anthropic_messages,
+        protocols::anthropic::anthropic_count_tokens
     ),
     components(schemas(
         HealthResponse,
@@ -4073,6 +2259,7 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         GrammarTriggerResponse,
         ChatCompletionRequest,
         ResponseCreateRequest,
+        protocols::responses::ResponseObject,
         ChatMessageRequest,
         ChatContentRequest,
         ChatContentPartRequest,
@@ -4097,6 +2284,11 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
         StopRequest,
         StreamOptions,
         ChatCompletionChunk,
+        ChatCompletionResponse,
+        ChatCompletionChoice,
+        ChatCompletionMessage,
+        CompletionToolCall,
+        CompletionFunctionCall,
         ChunkChoice,
         ChunkDelta,
         ChunkToolCall,
@@ -4178,7 +2370,7 @@ trait StreamContract {
 struct ChatCompletionStream;
 
 impl StreamContract for ChatCompletionStream {
-    type Event = ChatCompletionChunk;
+    type Event = ChatCompletionStreamEvent;
     const RESPONSE_STATUS: u16 = 200;
     fn metadata() -> StreamMetadata {
         StreamMetadata {
@@ -4434,15 +2626,40 @@ impl CompletionBackend for FakeBackend {
         })
     }
 
+    fn count_tokens(
+        &self,
+        request: domain::ResolvedInferenceRequest,
+    ) -> Result<u64, InferenceError> {
+        Ok(request.context().entries().len() as u64)
+    }
+
     fn apply_template(
         &self,
-        request: ChatTemplateRequest,
+        request: domain::ResolvedInferenceRequest,
     ) -> Result<PreparedChatInfo, InferenceError> {
         Ok(PreparedChatInfo {
             prompt: request
-                .messages
-                .iter()
-                .map(ChatMessage::text_content)
+                .context()
+                .system()
+                .map(|system| system.as_str().to_owned())
+                .into_iter()
+                .chain(request.context().entries().iter().filter_map(|entry| {
+                    match entry {
+                        domain::ContextEntry::User { entry } => Some(
+                            entry
+                                .content()
+                                .iter()
+                                .filter_map(|part| match part {
+                                    domain::UserContent::Text { text } => Some(text.as_str()),
+                                    domain::UserContent::Image { .. } => None,
+                                })
+                                .collect::<String>(),
+                        ),
+                        domain::ContextEntry::Assistant { entry } => {
+                            entry.text().map(|text| text.as_str().to_owned())
+                        }
+                    }
+                }))
                 .collect::<Vec<_>>()
                 .join("\n"),
             generation_prompt: String::new(),
@@ -4459,46 +2676,56 @@ impl CompletionBackend for FakeBackend {
     }
     fn complete(
         &self,
-        request: ChatRequest,
-        on_event: &mut dyn FnMut(InferenceStreamEvent) -> Result<(), InferenceError>,
-    ) -> Result<Generation, InferenceError> {
-        let prompt_tokens = request.template.messages.len();
-        on_event(InferenceStreamEvent {
-            delta: InferenceEvent::StreamStart,
-            timings: None,
-        })?;
+        request: domain::ResolvedInferenceRequest,
+        on_event: &mut dyn FnMut(domain::InferenceObservation) -> Result<(), InferenceError>,
+    ) -> Result<domain::InferenceCompletion, InferenceError> {
+        let prompt_tokens = request.context().entries().len();
+        on_event(domain::InferenceObservation::new(
+            domain::InferenceObservationEvent::Output {
+                event: domain::InferenceOutputEvent::Started,
+            },
+            None,
+        ))?;
         for (index, token) in self.response.split_inclusive(' ').enumerate() {
-            on_event(InferenceStreamEvent {
-                delta: InferenceEvent::ContentDelta {
-                    text: token.to_owned(),
+            on_event(domain::InferenceObservation::new(
+                domain::InferenceObservationEvent::Output {
+                    event: domain::InferenceOutputEvent::TextDelta {
+                        text: domain::NonEmptyText::try_new(token, "fake response delta")
+                            .expect("split_inclusive never yields empty tokens"),
+                    },
                 },
-                timings: request.timings_per_token.then(|| GenerationSnapshot {
+                Some(GenerationSnapshot {
                     cached_prompt_tokens: 0,
                     prompt_tokens,
                     generated_tokens: index + 1,
                     metrics: GenerationMetrics::default(),
                 }),
-            })?;
+            ))?;
         }
-        Ok(Generation {
-            text: self.response.clone(),
-            reasoning: String::new(),
-            tool_calls: Vec::new(),
-            cached_prompt_tokens: 0,
-            prompt_tokens,
-            generated_tokens: self.response.split_whitespace().count(),
-            finish_reason: FinishReason::Stop,
-            metrics: GenerationMetrics::default(),
-        })
+        Ok(domain::InferenceCompletion::new(
+            domain::TokenUsage::new(
+                prompt_tokens as u64,
+                0,
+                self.response.split_whitespace().count() as u64,
+                0,
+            ),
+            domain::Termination::Natural,
+            GenerationMetrics::default(),
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::chat::{
+        adapt_request, finalize_request, timing_values, validate_request,
+    };
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
+    use icn_contracts::InferenceProgress;
+    use serde_json::Value as JsonValue;
     use serde_json::{Value, json};
     use std::sync::atomic::AtomicBool;
     use tower::ServiceExt;
@@ -4741,12 +2968,13 @@ mod tests {
 
     fn validate_test_request(
         request: ChatCompletionRequest,
-    ) -> Result<(ChatRequest, bool), ApiError> {
+    ) -> Result<(domain::ResolvedInferenceRequest, bool), ApiError> {
         let profile = FakeBackend::new("test-model", "")
             .properties()
             .expect("fake properties")
             .reasoning;
-        validate_request(request).and_then(|validated| finalize_request(validated, &profile))
+        let (request, include_usage) = validate_request(request).and_then(finalize_request)?;
+        Ok((resolve_request(request, &profile)?, include_usage))
     }
 
     fn stream_json(body: &str) -> Vec<Value> {
@@ -4755,6 +2983,294 @@ mod tests {
             .filter(|data| *data != "[DONE]")
             .map(|data| serde_json::from_str(data).expect("SSE data must be JSON"))
             .collect()
+    }
+
+    #[test]
+    fn equivalent_wire_dialects_construct_equal_canonical_requests() {
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [
+                { "role": "system", "content": "be concise" },
+                { "role": "user", "content": "hello" }
+            ],
+            "max_tokens": 16,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "seed": 0
+        }))
+        .unwrap();
+        let responses: protocols::responses::ResponseCreateRequest =
+            serde_json::from_value(json!({
+                "model": "test-model",
+                "instructions": "be concise",
+                "input": "hello",
+                "max_output_tokens": 16,
+                "temperature": 1.0,
+                "top_p": 1.0
+            }))
+            .unwrap();
+        let anthropic: protocols::anthropic::MessagesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "system": "be concise",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "max_tokens": 16,
+            "temperature": 1.0,
+            "top_p": 1.0
+        }))
+        .unwrap();
+
+        let (_, chat) = adapt_request(chat).unwrap().invocation.into_parts();
+        let (_, responses) = protocols::responses::adapt(responses)
+            .unwrap()
+            .invocation
+            .into_parts();
+        let (_, anthropic) = protocols::anthropic::adapt(anthropic)
+            .unwrap()
+            .invocation
+            .into_parts();
+        assert_eq!(chat, responses);
+        assert_eq!(responses, anthropic);
+
+        let profile = FakeBackend::new("test-model", "")
+            .properties()
+            .unwrap()
+            .reasoning;
+        let chat = resolve_request(chat, &profile).unwrap();
+        let responses = resolve_request(responses, &profile).unwrap();
+        let anthropic = resolve_request(anthropic, &profile).unwrap();
+        assert_eq!(chat, responses);
+        assert_eq!(responses, anthropic);
+    }
+
+    #[test]
+    fn chat_accepts_empty_assistant_content_when_tool_calls_are_present() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [
+                { "role": "user", "content": "look this up" },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "lookup", "arguments": "{\"q\":\"x\"}" }
+                    }]
+                },
+                { "role": "tool", "tool_call_id": "call_1", "content": "result" },
+                { "role": "user", "content": "continue" }
+            ]
+        }))
+        .expect("request must decode");
+
+        let (_, canonical) = adapt_request(request)
+            .expect("empty content is the wire representation of absent assistant text")
+            .invocation
+            .into_parts();
+        let domain::ContextEntry::Assistant { entry } = &canonical.context().entries()[1] else {
+            panic!("second entry must be the assistant tool-call turn");
+        };
+        assert!(entry.text().is_none());
+        assert_eq!(entry.tool_calls().len(), 1);
+    }
+
+    #[test]
+    fn chat_normalizes_permitted_empty_content_without_placeholder_text() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [
+                { "role": "system", "content": "" },
+                { "role": "user", "content": "" },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "lookup", "arguments": "{}" }
+                    }]
+                },
+                { "role": "tool", "tool_call_id": "call_1", "content": "" }
+            ]
+        }))
+        .expect("request must decode");
+
+        let (_, canonical) = adapt_request(request).unwrap().invocation.into_parts();
+        assert!(canonical.context().system().is_none());
+        let domain::ContextEntry::User { entry } = &canonical.context().entries()[0] else {
+            panic!("first entry must be user");
+        };
+        assert!(entry.content().is_empty());
+        let domain::ContextEntry::Assistant { entry } = &canonical.context().entries()[1] else {
+            panic!("second entry must be assistant");
+        };
+        assert!(entry.text().is_none());
+        assert!(entry.reasoning().is_none());
+        assert!(entry.tool_calls()[0].result().content().is_empty());
+    }
+
+    #[test]
+    fn chat_combines_leading_system_and_developer_instructions() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [
+                { "role": "system", "content": "system" },
+                { "role": "developer", "content": "developer" },
+                { "role": "user", "content": "hello" }
+            ]
+        }))
+        .unwrap();
+        let (_, canonical) = adapt_request(request).unwrap().invocation.into_parts();
+        assert_eq!(
+            canonical
+                .context()
+                .system()
+                .map(domain::NonEmptyText::as_str),
+            Some("system\ndeveloper"),
+        );
+    }
+
+    #[test]
+    fn responses_normalizes_permitted_empty_content_without_placeholder_text() {
+        let request: protocols::responses::ResponseCreateRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "instructions": "",
+            "input": [
+                { "type": "message", "role": "user", "content": "" },
+                { "type": "message", "role": "assistant", "content": "" },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": "{}"
+                },
+                { "type": "function_call_output", "call_id": "call_1", "output": "" }
+            ]
+        }))
+        .expect("request must decode");
+
+        let (_, canonical) = protocols::responses::adapt(request)
+            .unwrap()
+            .invocation
+            .into_parts();
+        assert!(canonical.context().system().is_none());
+        let domain::ContextEntry::User { entry } = &canonical.context().entries()[0] else {
+            panic!("first entry must be user");
+        };
+        assert!(entry.content().is_empty());
+        let domain::ContextEntry::Assistant { entry } = &canonical.context().entries()[1] else {
+            panic!("second entry must be assistant");
+        };
+        assert!(entry.text().is_none());
+        assert!(entry.tool_calls().is_empty());
+        let domain::ContextEntry::Assistant { entry } = &canonical.context().entries()[2] else {
+            panic!("third entry must be assistant tool history");
+        };
+        assert!(entry.tool_calls()[0].result().content().is_empty());
+    }
+
+    #[test]
+    fn anthropic_maps_omitted_tool_result_content_to_an_empty_result() {
+        let request: protocols::anthropic::MessagesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [
+                { "role": "user", "content": "look this up" },
+                { "role": "assistant", "content": [{
+                    "type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}
+                }] },
+                { "role": "user", "content": [{
+                    "type": "tool_result", "tool_use_id": "toolu_1"
+                }] }
+            ]
+        }))
+        .expect("omitted tool result content is valid Anthropic input");
+
+        let (_, canonical) = protocols::anthropic::adapt(request)
+            .unwrap()
+            .invocation
+            .into_parts();
+        let domain::ContextEntry::Assistant { entry } = &canonical.context().entries()[1] else {
+            panic!("second entry must be assistant");
+        };
+        assert!(entry.tool_calls()[0].result().content().is_empty());
+    }
+
+    #[test]
+    fn protocol_forbidden_empty_assistant_forms_remain_invalid() {
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": null }
+            ]
+        }))
+        .unwrap();
+        assert!(adapt_request(chat).is_err());
+
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": "" }
+            ]
+        }))
+        .unwrap();
+        assert!(adapt_request(chat).is_err());
+
+        let anthropic: protocols::anthropic::MessagesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": [] }
+            ]
+        }))
+        .unwrap();
+        assert!(protocols::anthropic::adapt(anthropic).is_err());
+    }
+
+    #[test]
+    fn empty_canonical_output_uses_each_protocols_native_empty_shape() {
+        let result = domain::InferenceResult::new(
+            domain::InferenceOutput::new(None, None, Vec::new()),
+            domain::TokenUsage::default(),
+            domain::Termination::Natural,
+            GenerationMetrics::default(),
+        );
+
+        let chat = serde_json::to_value(protocols::chat::chat_completion_response(
+            "chatcmpl_test".into(),
+            1,
+            "test-model".into(),
+            &result,
+        ))
+        .unwrap();
+        assert!(chat["choices"][0]["message"]["content"].is_null());
+        assert!(chat["choices"][0]["message"].get("tool_calls").is_none());
+
+        let projection = protocols::responses::adapt(
+            serde_json::from_value(json!({ "model": "test-model", "input": "hi" })).unwrap(),
+        )
+        .unwrap()
+        .projection;
+        let responses = serde_json::to_value(protocols::responses::from_result(
+            "resp_test",
+            1,
+            "test-model",
+            &projection,
+            &result,
+        ))
+        .unwrap();
+        assert_eq!(responses["output"], json!([]));
+
+        let anthropic = serde_json::to_value(protocols::anthropic::message(
+            "msg_test",
+            "test-model",
+            &result,
+        ))
+        .unwrap();
+        assert_eq!(anthropic["content"], json!([]));
     }
 
     #[test]
@@ -4816,12 +3332,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_supports_typed_non_streaming_requests() {
+        let response = app(AppState::new(FakeBackend::new("test-model", "hello")))
+            .oneshot(
+                Request::post("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "test-model",
+                            "instructions": "answer precisely",
+                            "max_output_tokens": 17,
+                            "temperature": 0.2,
+                            "top_p": 0.8,
+                            "parallel_tool_calls": false,
+                            "metadata": { "trace": "test" },
+                            "tools": [{
+                                "type": "function",
+                                "name": "lookup",
+                                "description": "Look up a value",
+                                "parameters": { "type": "object" },
+                                "strict": true
+                            }],
+                            "tool_choice": "required",
+                            "input": [{
+                                "type": "message",
+                                "role": "user",
+                                "content": [{
+                                    "type": "input_text",
+                                    "text": "hi"
+                                }]
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["object"], "response");
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["output"][0]["content"][0]["text"], "hello");
+        assert_eq!(body["usage"]["output_tokens"], 1);
+        assert_eq!(body["instructions"], "answer precisely");
+        assert_eq!(body["max_output_tokens"], 17);
+        assert_eq!(body["temperature"], 0.2);
+        assert_eq!(body["top_p"], 0.8);
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["tool_choice"], "required");
+        assert_eq!(body["tools"][0]["name"], "lookup");
+        assert_eq!(body["metadata"]["trace"], "test");
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_echoes_the_gateway_alias_without_leaking_it_to_inference() {
+        let response = app(AppState::new(FakeBackend::new("test-model", "hello")))
+            .oneshot(
+                Request::post("/anthropic/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("anthropic-version", "2023-06-01")
+                    .header("Magnitude-Gateway-Model", "anthropic-local/test-model")
+                    .body(Body::from(
+                        json!({
+                            "model": "test-model",
+                            "max_tokens": 32,
+                            "messages": [{ "role": "user", "content": "hi" }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["type"], "message");
+        assert_eq!(body["model"], "anthropic-local/test-model");
+        assert_eq!(body["content"][0]["type"], "text");
+        assert_eq!(body["content"][0]["text"], "hello");
+        assert_eq!(body["stop_reason"], "end_turn");
+    }
+
+    #[tokio::test]
+    async fn anthropic_count_tokens_uses_the_adapted_native_request() {
+        let response = app(AppState::new(FakeBackend::new("test-model", "hello")))
+            .oneshot(
+                Request::post("/anthropic/v1/messages/count_tokens")
+                    .header("content-type", "application/json")
+                    .header("anthropic-version", "2023-06-01")
+                    .body(Body::from(
+                        json!({
+                            "model": "test-model",
+                            "max_tokens": 32,
+                            "messages": [{ "role": "user", "content": "hi" }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body, json!({ "input_tokens": 1 }));
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_follows_message_and_content_block_lifecycle() {
+        let response = app(AppState::new(FakeBackend::new("test-model", "hello")))
+            .oneshot(
+                Request::post("/anthropic/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("anthropic-version", "2023-06-01")
+                    .body(Body::from(
+                        json!({
+                            "model": "test-model",
+                            "max_tokens": 32,
+                            "stream": true,
+                            "messages": [{ "role": "user", "content": "hi" }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        let start = body.find("event: message_start").unwrap();
+        let block = body.find("event: content_block_start").unwrap();
+        let delta = body.find("event: content_block_delta").unwrap();
+        let stop = body.find("event: content_block_stop").unwrap();
+        let message_stop = body.find("event: message_stop").unwrap();
+        assert!(start < block && block < delta && delta < stop && stop < message_stop);
+        assert!(body.contains("\"input_tokens\":1"));
+    }
+
+    #[tokio::test]
     async fn chat_progress_is_present_only_when_explicitly_requested() {
         let backend = || ScriptedBackend {
             events: vec![
-                stream_event(InferenceEvent::Progress(InferenceProgress::Queued)),
-                stream_event(InferenceEvent::ContentDelta {
-                    text: "hello".into(),
+                progress_event(InferenceProgress::Queued),
+                output_event(domain::InferenceOutputEvent::TextDelta {
+                    text: delta_text("hello"),
                 }),
             ],
             fail: false,
@@ -5108,8 +3777,8 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0]["error"]["type"], "model_error");
         assert_eq!(chunks[0]["error"]["code"], "model_instance_stopped");
-        assert_eq!(chunks[0]["error"]["retryable"], false);
-        assert!(body.contains("data: [DONE]"));
+        assert!(chunks[0]["error"].get("retryable").is_none());
+        assert!(!body.contains("data: [DONE]"));
     }
 
     #[tokio::test]
@@ -5177,25 +3846,26 @@ mod tests {
     }
 
     struct ScriptedBackend {
-        events: Vec<InferenceStreamEvent>,
+        events: Vec<domain::InferenceObservation>,
         fail: bool,
     }
 
-    fn stream_event(delta: InferenceEvent) -> InferenceStreamEvent {
-        InferenceStreamEvent {
-            delta,
-            timings: None,
-        }
+    fn output_event(event: domain::InferenceOutputEvent) -> domain::InferenceObservation {
+        domain::InferenceObservation::new(domain::InferenceObservationEvent::Output { event }, None)
     }
 
-    fn timed_stream_event(
-        delta: InferenceEvent,
+    fn delta_text(value: &str) -> domain::NonEmptyText {
+        domain::NonEmptyText::try_new(value, "scripted delta").expect("nonempty fixture")
+    }
+
+    fn timed_output_event(
+        event: domain::InferenceOutputEvent,
         generated_tokens: usize,
         decode_ms: f64,
-    ) -> InferenceStreamEvent {
-        InferenceStreamEvent {
-            delta,
-            timings: Some(GenerationSnapshot {
+    ) -> domain::InferenceObservation {
+        domain::InferenceObservation::new(
+            domain::InferenceObservationEvent::Output { event },
+            Some(GenerationSnapshot {
                 cached_prompt_tokens: 0,
                 prompt_tokens: 11,
                 generated_tokens,
@@ -5205,7 +3875,14 @@ mod tests {
                     ..GenerationMetrics::default()
                 },
             }),
-        }
+        )
+    }
+
+    fn progress_event(progress: InferenceProgress) -> domain::InferenceObservation {
+        domain::InferenceObservation::new(
+            domain::InferenceObservationEvent::Progress { progress },
+            None,
+        )
     }
 
     impl CompletionBackend for ScriptedBackend {
@@ -5219,17 +3896,16 @@ mod tests {
 
         fn complete(
             &self,
-            _request: ChatRequest,
-            on_event: &mut dyn FnMut(InferenceStreamEvent) -> Result<(), InferenceError>,
-        ) -> Result<Generation, InferenceError> {
+            _request: domain::ResolvedInferenceRequest,
+            on_event: &mut dyn FnMut(domain::InferenceObservation) -> Result<(), InferenceError>,
+        ) -> Result<domain::InferenceCompletion, InferenceError> {
             if !matches!(
-                self.events.first().map(|event| &event.delta),
-                Some(InferenceEvent::StreamStart)
+                self.events.first().map(domain::InferenceObservation::event),
+                Some(domain::InferenceObservationEvent::Output {
+                    event: domain::InferenceOutputEvent::Started
+                })
             ) {
-                on_event(InferenceStreamEvent {
-                    delta: InferenceEvent::StreamStart,
-                    timings: None,
-                })?;
+                on_event(output_event(domain::InferenceOutputEvent::Started))?;
             }
             for event in &self.events {
                 on_event(event.clone())?;
@@ -5237,19 +3913,22 @@ mod tests {
             if self.fail {
                 return Err(InferenceError::Backend("scripted failure".into()));
             }
-            Ok(Generation {
-                text: "answer".into(),
-                reasoning: "thought".into(),
-                tool_calls: vec![ToolCall {
-                    id: "call-1".into(),
-                    name: "lookup".into(),
-                    arguments: "{}".into(),
-                }],
-                cached_prompt_tokens: 0,
-                prompt_tokens: 11,
-                generated_tokens: 7,
-                finish_reason: FinishReason::ToolCalls,
-                metrics: GenerationMetrics {
+            let termination = if self.events.iter().any(|observation| {
+                matches!(
+                    observation.event(),
+                    domain::InferenceObservationEvent::Output {
+                        event: domain::InferenceOutputEvent::ToolCallFinished { .. }
+                    }
+                )
+            }) {
+                domain::Termination::ToolCalls
+            } else {
+                domain::Termination::Natural
+            };
+            Ok(domain::InferenceCompletion::new(
+                domain::TokenUsage::new(11, 0, 7, 1),
+                termination,
+                GenerationMetrics {
                     queue_ms: 1.0,
                     prompt_ms: 2.0,
                     decode_ms: 3.0,
@@ -5264,7 +3943,7 @@ mod tests {
                     verification_ms: 0.0,
                     ..GenerationMetrics::default()
                 },
-            })
+            ))
         }
     }
 
@@ -5275,7 +3954,7 @@ mod tests {
         assert_eq!(contract["framing"], "sse");
         assert_eq!(
             contract["data"]["schema"]["$ref"],
-            "#/components/schemas/ChatCompletionChunk"
+            "#/components/schemas/ChatCompletionStreamEvent"
         );
         assert_eq!(contract["termination"]["type"], "sentinel");
         assert_eq!(
@@ -5287,7 +3966,11 @@ mod tests {
         assert!(schemas["ChatCompletionRequest"]["properties"]["tools"].is_object());
         assert!(schemas["ChunkDelta"]["properties"]["reasoning_content"].is_object());
         assert!(schemas["ChunkDelta"]["properties"]["tool_calls"].is_object());
-        assert!(schemas["ChatCompletionChunk"]["properties"]["error"].is_object());
+        assert!(
+            schemas["ChatCompletionChunk"]["properties"]
+                .get("error")
+                .is_none()
+        );
         assert!(schemas["ChatCompletionChunk"]["properties"]["timings"].is_object());
         assert_eq!(
             schemas["ChatCompletionRequest"]["properties"]["timings_per_token"]["type"],
@@ -5521,7 +4204,7 @@ mod tests {
                 }},
                 {"type": "function", "function": {
                     "name": "other",
-                    "parameters": true
+                    "parameters": {"type": "object"}
                 }}
             ],
             "tool_choice": {
@@ -5557,77 +4240,76 @@ mod tests {
 
         let (request, include_usage) = validate_test_request(request).unwrap();
         assert!(include_usage);
-        assert_eq!(request.template.messages.len(), 4);
-        assert_eq!(request.template.messages[0].role, ChatRole::System);
-        assert_eq!(request.template.messages[1].role, ChatRole::User);
         assert_eq!(
-            request.template.messages[1].content,
-            Some(ChatContent::Parts(vec![
-                ChatContentPart::Text {
-                    text: "look".into()
-                },
-                ChatContentPart::Image(ImageInput::new("image/png", vec![0]))
-            ]))
+            request.context().system().map(domain::NonEmptyText::as_str),
+            Some("system")
         );
+        assert_eq!(request.context().entries().len(), 2);
+        let domain::ContextEntry::User { entry } = &request.context().entries()[0] else {
+            panic!("first entry must be user")
+        };
+        assert!(matches!(
+            entry.content(),
+            [domain::UserContent::Text { text }, domain::UserContent::Image { image }]
+                if text.as_str() == "look" && image.media_type() == "image/png"
+        ));
+        let domain::ContextEntry::Assistant { entry } = &request.context().entries()[1] else {
+            panic!("second entry must be assistant")
+        };
         assert_eq!(
-            request.template.messages[2].reasoning.as_deref(),
+            entry.reasoning().map(domain::NonEmptyText::as_str),
             Some("because")
         );
-        assert_eq!(request.template.messages[2].tool_calls[0].name, "lookup");
-        assert_eq!(
-            request.template.messages[3].tool_call_id.as_deref(),
-            Some("call-1")
-        );
-        assert_eq!(request.template.tools.len(), 2);
-        assert_eq!(request.template.tools[0].name, "lookup");
-        assert_eq!(
-            request.template.tool_choice,
-            ToolChoice::AllowedTools {
-                mode: AllowedToolsMode::Required,
-                names: vec!["lookup".into()]
-            }
-        );
-        assert!(!request.template.parallel_tool_calls);
+        let exchange = &entry.tool_calls()[0];
+        assert_eq!(exchange.call().name().as_str(), "lookup");
+        assert_eq!(exchange.call().id().as_str(), "call-1");
+        assert_eq!(request.tools().definitions().len(), 2);
+        assert_eq!(request.tools().definitions()[0].name().as_str(), "lookup");
         assert!(matches!(
-            &request.template.reasoning,
-            ReasoningControl::Resolved {
-                effort,
-                controls,
-                automatic_budget: icn_contracts::AutomaticReasoningBudget::Disabled,
-                explicit_budget_tokens: Some(64),
-                ..
-            } if effort.as_str() == "high" && controls.enable_thinking == Some(true)
+            request.tools().choice(),
+            domain::ToolChoice::Allowed { names, required: true }
+                if names[0].as_str() == "lookup"
         ));
-        assert!(
-            !request
-                .template
-                .template_args
-                .contains_key("reasoning_effort")
+        assert_eq!(
+            request.tools().parallelism(),
+            domain::ToolParallelism::Sequential
+        );
+        assert_eq!(request.reasoning().effort().as_str(), "high");
+        assert_eq!(request.reasoning().controls().enable_thinking, Some(true));
+        assert_eq!(
+            request.reasoning().explicit_budget().map(NonZeroU32::get),
+            Some(64)
         );
         assert_eq!(
-            request.template.template_args.get("custom"),
+            request.reasoning().controls().template_args.get("custom"),
             Some(&json!(7))
         );
-        match request.template.response_format {
-            ResponseFormat::JsonSchema {
-                name,
-                schema,
-                strict,
-            } => {
-                assert_eq!(name, "answer");
-                assert_eq!(schema["type"], "object");
-                assert!(strict);
+        match request.output() {
+            domain::OutputConstraint::JsonSchema { constraint } => {
+                assert_eq!(constraint.name(), "answer");
+                assert_eq!(constraint.schema().as_map()["type"], "object");
+                assert!(constraint.strict());
             }
             response => panic!("unexpected response format: {response:?}"),
         }
-        assert_eq!(request.stop, ["END", "STOP"]);
-        assert_eq!(request.max_tokens, 99);
-        assert_eq!(request.temperature, 0.25);
-        assert_eq!(request.top_p, 0.75);
-        assert_eq!(request.seed, 9);
-        assert!(!request.cache_prompt);
-        assert!(request.ignore_eos);
-        assert!(request.timings_per_token);
+        assert_eq!(
+            request
+                .generation()
+                .stop_sequences()
+                .iter()
+                .map(domain::StopSequence::as_str)
+                .collect::<Vec<_>>(),
+            ["END", "STOP"]
+        );
+        assert_eq!(request.generation().max_output_tokens().get(), 99);
+        assert_eq!(request.generation().sampling().temperature().get(), 0.25);
+        assert_eq!(request.generation().sampling().top_p().get(), 0.75);
+        assert_eq!(request.generation().sampling().seed(), 9);
+        assert_eq!(request.prompt_reuse(), domain::PromptReusePolicy::Disabled);
+        assert_eq!(
+            request.generation().end_of_generation(),
+            domain::EndOfGenerationPolicy::IgnoreModelEnd
+        );
     }
 
     #[test]
@@ -5652,27 +4334,74 @@ mod tests {
     }
 
     #[test]
+    fn rejects_partial_or_separated_tool_exchanges_before_model_admission() {
+        let mut dangling = minimal_request();
+        dangling["messages"] = json!([
+            {"role": "user", "content": "find it"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"}
+                }]
+            }
+        ]);
+        let error = validate_test_request(request_from_json(dangling)).unwrap_err();
+        assert!(
+            error
+                .body
+                .error
+                .message
+                .contains("no immediately following result")
+        );
+
+        let mut separated = minimal_request();
+        separated["messages"] = json!([
+            {"role": "user", "content": "find it"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"}
+                }]
+            },
+            {"role": "user", "content": "interrupt"},
+            {"role": "tool", "tool_call_id": "call-1", "content": "result"}
+        ]);
+        let error = validate_test_request(request_from_json(separated)).unwrap_err();
+        assert!(
+            error
+                .body
+                .error
+                .message
+                .contains("no immediately following result")
+        );
+    }
+
+    #[test]
     fn preserves_model_defaults_when_optional_controls_are_omitted() {
         let (request, include_usage) =
             validate_test_request(request_from_json(minimal_request())).unwrap();
         assert!(!include_usage);
-        assert_eq!(request.template.tool_choice, ToolChoice::Auto);
-        assert!(request.template.parallel_tool_calls);
-        assert!(matches!(
-            request.template.reasoning,
-            ReasoningControl::Resolved {
-                ref effort,
-                automatic_budget: icn_contracts::AutomaticReasoningBudget::Disabled,
-                explicit_budget_tokens: None,
-                ..
-            } if effort.as_str() == "high"
-        ));
-        assert_eq!(request.template.response_format, ResponseFormat::Text);
-        assert!(request.template.template_args.is_empty());
-        assert!(request.stop.is_empty());
-        assert!(request.cache_prompt);
-        assert!(!request.ignore_eos);
-        assert!(!request.timings_per_token);
+        assert_eq!(request.tools().choice(), &domain::ToolChoice::Auto);
+        assert_eq!(
+            request.tools().parallelism(),
+            domain::ToolParallelism::Parallel
+        );
+        assert_eq!(request.reasoning().effort().as_str(), "high");
+        assert!(request.reasoning().explicit_budget().is_none());
+        assert_eq!(request.output(), &domain::OutputConstraint::Text);
+        assert!(request.reasoning().controls().template_args.is_empty());
+        assert!(request.generation().stop_sequences().is_empty());
+        assert_eq!(request.prompt_reuse(), domain::PromptReusePolicy::Allowed);
+        assert_eq!(
+            request.generation().end_of_generation(),
+            domain::EndOfGenerationPolicy::StopAtModelEnd
+        );
     }
 
     #[test]
@@ -5686,13 +4415,13 @@ mod tests {
         ] {
             let mut request = minimal_request();
             request["timings_per_token"] = value;
-            let (request, _) = validate_test_request(request_from_json(request)).unwrap();
+            let request = validate_request(request_from_json(request)).unwrap();
             assert!(!request.timings_per_token);
         }
 
         let mut request = minimal_request();
         request["timings_per_token"] = json!(true);
-        let (request, _) = validate_test_request(request_from_json(request)).unwrap();
+        let request = validate_request(request_from_json(request)).unwrap();
         assert!(request.timings_per_token);
     }
 
@@ -5705,12 +4434,11 @@ mod tests {
         });
 
         let (request, _) = validate_test_request(request_from_json(request)).unwrap();
-        assert_eq!(
-            request.template.response_format,
-            ResponseFormat::Grammar {
-                grammar: "root ::= \"yes\" | \"no\"".into()
-            }
-        );
+        assert!(matches!(
+            request.output(),
+            domain::OutputConstraint::Grammar { constraint }
+                if constraint.as_str() == "root ::= \"yes\" | \"no\""
+        ));
     }
 
     #[test]
@@ -5778,15 +4506,8 @@ mod tests {
         let mut request = minimal_request();
         request["reasoning_effort"] = json!("off");
         let (request, _) = validate_test_request(request_from_json(request)).unwrap();
-        assert!(matches!(
-            request.template.reasoning,
-            ReasoningControl::Resolved {
-                ref effort,
-                ref controls,
-                automatic_budget: icn_contracts::AutomaticReasoningBudget::Disabled,
-                ..
-            } if effort.as_str() == "none" && controls.enable_thinking == Some(false)
-        ));
+        assert_eq!(request.reasoning().effort().as_str(), "none");
+        assert_eq!(request.reasoning().controls().enable_thinking, Some(false));
     }
 
     #[tokio::test]
@@ -5814,22 +4535,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_defaults_to_one_non_streaming_completion() {
+        let response = app(AppState::new(FakeBackend::new("test-model", "hello world")))
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "test-model",
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["object"], "chat.completion");
+        assert_eq!(body["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(body["choices"][0]["message"]["content"], "hello world");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(body["usage"]["completion_tokens"], 2);
+    }
+
+    #[tokio::test]
     async fn streams_cumulative_native_timings_on_group_terminal_deltas() {
         let backend = ScriptedBackend {
             events: vec![
-                stream_event(InferenceEvent::ReasoningDelta {
-                    text: "buffered group prefix".into(),
+                output_event(domain::InferenceOutputEvent::ReasoningDelta {
+                    text: delta_text("buffered group prefix"),
                 }),
-                timed_stream_event(
-                    InferenceEvent::ContentDelta {
-                        text: "first group end".into(),
+                timed_output_event(
+                    domain::InferenceOutputEvent::TextDelta {
+                        text: delta_text("first group end"),
                     },
                     1,
                     0.001,
                 ),
-                timed_stream_event(
-                    InferenceEvent::ContentDelta {
-                        text: "second group".into(),
+                timed_output_event(
+                    domain::InferenceOutputEvent::TextDelta {
+                        text: delta_text("second group"),
                     },
                     2,
                     4.0,
@@ -5858,7 +4611,7 @@ mod tests {
         assert_eq!(chunks[3]["timings"]["predicted_ms"], 4.0);
 
         let terminal = &chunks[4];
-        assert_eq!(terminal["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
         assert_eq!(terminal["timings"]["predicted_n"], 7);
         let timing_fields = terminal["timings"]
             .as_object()
@@ -5904,7 +4657,11 @@ mod tests {
     #[tokio::test]
     async fn first_sample_without_semantic_delta_attaches_timing_to_role() {
         let backend = ScriptedBackend {
-            events: vec![timed_stream_event(InferenceEvent::StreamStart, 1, 0.001)],
+            events: vec![timed_output_event(
+                domain::InferenceOutputEvent::Started,
+                1,
+                0.001,
+            )],
             fail: false,
         };
         let mut request = minimal_request();
@@ -5920,7 +4677,7 @@ mod tests {
         assert!(chunks[0]["choices"][0]["delta"]["content"].is_null());
         assert_eq!(chunks[0]["timings"]["predicted_n"], 1);
         assert_eq!(chunks[0]["timings"]["predicted_ms"], 0.001);
-        assert_eq!(chunks[1]["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(chunks[1]["choices"][0]["finish_reason"], "stop");
         assert!(chunks[1].get("timings").is_none());
         assert_eq!(chunks[2]["choices"], json!([]));
         assert_eq!(chunks[2]["timings"]["predicted_n"], 7);
@@ -5929,7 +4686,11 @@ mod tests {
     #[tokio::test]
     async fn backend_signaled_stop_word_partial_timing_is_kept_when_flag_is_false() {
         let backend = ScriptedBackend {
-            events: vec![timed_stream_event(InferenceEvent::StreamStart, 1, 0.001)],
+            events: vec![timed_output_event(
+                domain::InferenceOutputEvent::Started,
+                1,
+                0.001,
+            )],
             fail: false,
         };
         let mut request = minimal_request();
@@ -5941,15 +4702,15 @@ mod tests {
 
         assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
         assert_eq!(chunks[0]["timings"]["predicted_n"], 1);
-        assert_eq!(chunks[1]["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(chunks[1]["choices"][0]["finish_reason"], "stop");
         assert_eq!(chunks[1]["timings"]["predicted_n"], 7);
     }
 
     #[tokio::test]
     async fn false_timing_control_suppresses_partial_snapshots_but_not_final_timings() {
         let backend = ScriptedBackend {
-            events: vec![stream_event(InferenceEvent::ContentDelta {
-                text: "answer".into(),
+            events: vec![output_event(domain::InferenceOutputEvent::TextDelta {
+                text: delta_text("answer"),
             })],
             fail: false,
         };
@@ -5968,24 +4729,22 @@ mod tests {
     async fn streams_reasoning_content_tool_calls_finish_usage_and_timings() {
         let backend = ScriptedBackend {
             events: vec![
-                stream_event(InferenceEvent::ReasoningDelta {
-                    text: "thought".into(),
+                output_event(domain::InferenceOutputEvent::ReasoningDelta {
+                    text: delta_text("thought"),
                 }),
-                stream_event(InferenceEvent::ContentDelta {
-                    text: "answer".into(),
+                output_event(domain::InferenceOutputEvent::TextDelta {
+                    text: delta_text("answer"),
                 }),
-                stream_event(InferenceEvent::ToolCallDelta {
+                output_event(domain::InferenceOutputEvent::ToolCallStarted {
                     index: 0,
-                    id: Some("call-1".into()),
-                    name: Some("lookup".into()),
-                    arguments: "{".into(),
+                    id: domain::ToolCallId::try_new("call-1").expect("valid"),
+                    name: domain::ToolName::try_new("lookup").expect("valid"),
                 }),
-                stream_event(InferenceEvent::ToolCallDelta {
+                output_event(domain::InferenceOutputEvent::ToolInputDelta {
                     index: 0,
-                    id: None,
-                    name: None,
-                    arguments: "}".into(),
+                    json_fragment: delta_text("{}"),
                 }),
+                output_event(domain::InferenceOutputEvent::ToolCallFinished { index: 0 }),
             ],
             fail: false,
         };
@@ -6020,19 +4779,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backend_failure_is_an_explicit_stream_error_followed_by_done() {
+    async fn backend_failure_is_an_explicit_stream_error_without_success_sentinel() {
         let backend = ScriptedBackend {
-            events: vec![stream_event(InferenceEvent::ContentDelta {
-                text: "partial".into(),
+            events: vec![output_event(domain::InferenceOutputEvent::TextDelta {
+                text: delta_text("partial"),
             })],
             fail: true,
         };
         let (status, body) = post_chat(backend, minimal_request()).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("data: [DONE]"));
+        assert!(body.contains("event: error"));
+        assert!(!body.contains("data: [DONE]"));
         let chunks = stream_json(&body);
         let error = chunks.last().unwrap();
-        assert_eq!(error["choices"], json!([]));
         assert_eq!(error["error"]["type"], "server_error");
         assert_eq!(error["error"]["code"], "backend_error");
         assert!(

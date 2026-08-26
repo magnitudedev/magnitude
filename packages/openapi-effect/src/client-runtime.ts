@@ -101,7 +101,7 @@ export type HttpOperationInput<A extends HttpOperationDescriptor> =
   OperationInput<A>;
 
 export type StreamOperationEvent<A extends StreamOperationDescriptor> =
-  SchemaType<A["eventSchema"]>;
+  Exclude<SchemaType<A["eventSchema"]>, ErrorBody<A>>;
 
 export interface GeneratedStreamResponse<
   Event,
@@ -372,6 +372,7 @@ const remoteFailure = <A extends RequestOperationDescriptor>(
 interface WireEvent {
   readonly data: string;
   readonly id: Option.Option<string>;
+  readonly event: Option.Option<string>;
 }
 
 const utf8Bytes = (value: string): number =>
@@ -411,6 +412,7 @@ class SseFramer {
 const parseSseBlock = (block: string): Option.Option<WireEvent> => {
   const data: string[] = [];
   let id = Option.none<string>();
+  let event = Option.none<string>();
   for (const line of block.split(/\r\n|\r|\n/)) {
     if (line.startsWith(":")) continue;
     const separator = line.indexOf(":");
@@ -419,10 +421,11 @@ const parseSseBlock = (block: string): Option.Option<WireEvent> => {
     const value = rawValue.startsWith(" ") ? rawValue.slice(1) : rawValue;
     if (field === "data") data.push(value);
     else if (field === "id" && !value.includes("\0")) id = Option.some(value);
+    else if (field === "event") event = Option.some(value);
   }
   return data.length === 0
     ? Option.none()
-    : Option.some({ data: data.join("\n"), id });
+    : Option.some({ data: data.join("\n"), id, event });
 };
 
 class NdjsonFramer {
@@ -441,7 +444,7 @@ class NdjsonFramer {
       if (utf8Bytes(line) > this.maxFrameBytes)
         throw new Error(`NDJSON frame exceeds ${this.maxFrameBytes} bytes`);
       if (line.trim().length > 0)
-        events.push({ data: line, id: Option.none() });
+        events.push({ data: line, id: Option.none(), event: Option.none() });
     }
     if (utf8Bytes(this.buffer) > this.maxFrameBytes)
       throw new Error(`NDJSON frame exceeds ${this.maxFrameBytes} bytes`);
@@ -451,7 +454,9 @@ class NdjsonFramer {
   finish(): ReadonlyArray<WireEvent> {
     const line = this.buffer.replace(/\r$/, "");
     this.buffer = "";
-    return line.trim().length === 0 ? [] : [{ data: line, id: Option.none() }];
+    return line.trim().length === 0
+      ? []
+      : [{ data: line, id: Option.none(), event: Option.none() }];
   }
 }
 
@@ -500,8 +505,33 @@ const responseStream = <A extends StreamOperationDescriptor>(
         operation.termination.type !== "sentinel" ||
         data !== operation.termination.value
     ),
-    Stream.mapEffect(({ data }) =>
-      Schema.decodeUnknown(Schema.parseJson(operation.eventSchema))(data).pipe(
+    Stream.mapEffect(({ data, event }) => {
+      if (Option.getOrUndefined(event) === "error") {
+        const declared = operation.errors[0]
+        if (declared === undefined) {
+          return Effect.fail(new GeneratedClientInvalidResponseError({
+            operationId: operation.operationId,
+            status: response.status,
+            message: "Stream emitted an undeclared error event",
+            cause: Option.none(),
+          }))
+        }
+        return Schema.decodeUnknown(Schema.parseJson(declared.schema))(data).pipe(
+          Effect.mapError((cause) => new GeneratedClientInvalidResponseError({
+            operationId: operation.operationId,
+            status: response.status,
+            message: "Stream error event did not match the declared error schema",
+            cause: Option.some(cause),
+          })),
+          Effect.flatMap((body) => Effect.fail(new GeneratedClientRemoteError({
+            operationId: operation.operationId,
+            status: response.status,
+            headers: response.headers,
+            body,
+          }))),
+        )
+      }
+      return Schema.decodeUnknown(Schema.parseJson(operation.eventSchema))(data).pipe(
         Effect.mapError(
           (cause) =>
             new GeneratedClientInvalidResponseError({
@@ -512,7 +542,7 @@ const responseStream = <A extends StreamOperationDescriptor>(
             })
         )
       )
-    )
+    })
   );
   const verify = Stream.fromEffect(
     Effect.suspend(() => {

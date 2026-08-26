@@ -18,12 +18,13 @@ applies_to:
 
 ```text
 first-party clients -> one Effect Query client -> ACN RPC -> private ICN management
-external inference clients --------------------> ACN /inference/v1/** -> ICN serving
+external inference clients --------------------> ACN /inference/{v1,anthropic}/** -> serving
 ```
 
 ACN is the complete first-party application boundary. Clients do not call ICN management routes,
 consume ICN resource events, or reconstruct ACN product state from native resources. The only
-public inference proxy is the OpenAI-compatible serving data plane under `/inference/v1/**`.
+public inference boundary exposes the OpenAI-compatible data plane under `/inference/v1/**` and
+the Anthropic gateway under `/inference/anthropic/**`.
 `/inference/api/**` is not public.
 
 ## ICN responsibility
@@ -142,7 +143,8 @@ by explicit user action or complete authoritative proof that the referenced iden
 
 - No first-party code accesses `/inference/api/**`, native ICN management operations, or ICN
   events.
-- `/inference/v1/**` remains a transparent streaming proxy.
+- `/inference/v1/**` remains a transparent proxy; `/inference/anthropic/**` routes reserved local
+  aliases to ICN and preserves non-reserved upstream Anthropic request bytes.
 - Every client-visible model query and mutation belongs to the ACN `Models` group.
 - Query successes are direct domain values with no generic revision envelope.
 - No generic mirrored-state helper or schema exists.

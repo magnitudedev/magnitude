@@ -40,6 +40,7 @@ import { IcnClient, type IcnClientService } from "../client.js"
 import * as Generated from "@magnitudedev/icn-protocol/schemas"
 import {
   GeneratedClientInvalidResponseError,
+  GeneratedClientRemoteError,
   type GeneratedClientError,
 } from "@magnitudedev/openapi-effect/client-runtime"
 import type { LocalProviderSource } from "./provider.js"
@@ -113,6 +114,9 @@ const generatedStartFailure = (
   Match.exhaustive,
 )
 
+const isModelInstanceStoppedCode = (code: string | null): boolean =>
+  code === "model_instance_stopped"
+
 const generatedBodyFailure = (
   call: { provider: string; model: string; method: "POST"; url: string },
   response: ReturnType<typeof acceptedHttpResponse>,
@@ -126,7 +130,7 @@ const generatedBodyFailure = (
       type: remote.body.error.type,
       code: remote.body.error.code,
       param: null,
-      retryable: remote.body.error.retryable,
+      retryable: isModelInstanceStoppedCode(remote.body.error.code) ? false : null,
     },
     payload: payloadSample(JSON.stringify(remote.body)),
     progress: { dataPayloadsDecoded: 0, modelEventsEmitted: 0 },
@@ -300,7 +304,7 @@ const bindIcnModel = (
                   ) {
                     return Option.none()
                   }
-                  return Option.getOrNull(error.code) === "model_instance_stopped"
+                  return isModelInstanceStoppedCode(Option.getOrNull(error.code))
                     ? Option.some(ModelRequestTerminal.ModelInstanceStopped())
                     : Option.none()
                 },

@@ -94,7 +94,7 @@ submit
   -> prefill / decode / sample
   -> stop, cancel, disconnect, or fail
   -> retain committed semantic prefix when safe
-  -> terminal result
+  -> terminal usage, termination, and metrics facts
 ```
 
 Prompt progress becomes committed only after target decode and linked speculative processing
@@ -119,7 +119,8 @@ Magnitude does not modify or recreate llama.cpp projector behavior.
 
 Lifecycle observations report queueing, preparation, prefill, and generation start. They are
 coalesced, rate-limited latest-state signals and may be replaced rather than delay inference.
-Semantic output and terminal results retain bounded backpressure.
+Semantic output and terminal facts retain bounded backpressure. The engine never rebuilds semantic
+output from its own events; the caller-owned output journal performs that aggregation once.
 
 ## Bounded concurrency
 
