@@ -50,6 +50,7 @@ import {
   OnboardingModelDownloadProgress,
   ONBOARDING_MODEL_DOWNLOAD_ROWS,
 } from "./model-status"
+import { isWideSetupLayout, SetupFrame, setupBodyWidth, type SetupStage } from "./setup-frame"
 
 const SECTION_VIEWPORT_ROWS = 4
 const MODEL_TITLE_ROWS = 1
@@ -58,7 +59,6 @@ const MODEL_SUMMARY_RADAR_GAP_ROWS = 1
 const RECOMMENDATION_HEADING_ROWS = 1
 const RECOMMENDATION_ROWS = 3
 const WIDE_LIST_WIDTH = 38
-const WIDE_CHOOSER_MIN_WIDTH = 105
 
 const onboardingModelRowId = (selectionId: string): string =>
   `onboarding-model:${selectionId}`
@@ -69,8 +69,6 @@ export const scrollOnboardingModelIntoView = (
 ): void => {
   scrollbox?.scrollChildIntoView(onboardingModelRowId(selectionId))
 }
-
-const setupCardWidth = (width: number): number => Math.max(1, Math.min(110, width - 2))
 
 const intentLabel = (intent: "balanced" | "smartest" | "fastest" | "lightweight"): string => {
   if (intent === "smartest") return "Smartest"
@@ -231,40 +229,40 @@ const OnboardingHardwareContext = ({
 }
 
 const OnboardingSetupCard = ({
-  cardWidth,
+  width,
+  stage,
   title,
   hardware,
   spinnerFrame = spinnerFrameAt(0),
   children,
+  footer,
 }: {
-  readonly cardWidth: number
-  readonly title: string
+  readonly width: number
+  readonly stage: SetupStage
+  readonly title?: string
   readonly hardware: LocalInferenceHardwareResult
   readonly spinnerFrame?: string
   readonly children: ReactNode
+  readonly footer?: ReactNode
 }): ReactNode => {
   const theme = useTheme()
+  const bodyWidth = setupBodyWidth(width)
+  const additionalRows = Result.isSuccess(hardware)
+    ? Math.max(0, describeLocalHardwareSummary(hardware.value).length - 1)
+    : 0
   return (
-    <box style={{ width: "100%", flexGrow: 1, alignItems: "center", justifyContent: "center" }}>
-      <box style={{
-        width: cardWidth,
-        borderStyle: "single",
-        borderColor: theme.border.standard,
-        customBorderChars: BOX_CHARS,
-        paddingLeft: 2,
-        paddingRight: 2,
-        flexDirection: "column",
-      }}>
+    <SetupFrame width={width} stage={stage} footer={footer} additionalRows={additionalRows}>
+      {title !== undefined && (
         <text style={{ fg: theme.text.body }} attributes={TextAttributes.BOLD}>{title}</text>
-        <OnboardingHardwareContext
-          hardware={hardware}
-          width={Math.max(1, cardWidth - 6)}
-          spinnerFrame={spinnerFrame}
-        />
-        <box style={{ height: 1 }} />
-        {children}
-      </box>
-    </box>
+      )}
+      <OnboardingHardwareContext
+        hardware={hardware}
+        width={bodyWidth}
+        spinnerFrame={spinnerFrame}
+      />
+      <box style={{ height: 1 }} />
+      {children}
+    </SetupFrame>
   )
 }
 
@@ -409,8 +407,8 @@ export function OnboardingModelChooser({
     ? Option.none()
     : localModelRadarAxes(detailModel)
   const locked = operation !== null
-  const cardWidth = setupCardWidth(width)
-  const wide = cardWidth >= WIDE_CHOOSER_MIN_WIDTH
+  const cardWidth = setupBodyWidth(width)
+  const wide = isWideSetupLayout(width)
   const leftWidth = wide ? WIDE_LIST_WIDTH : Math.max(1, cardWidth - 6)
   const detailWidth = wide ? Math.max(1, cardWidth - leftWidth - 9) : leftWidth
   const downloadOperation = operation?._tag === "Downloading" ? operation : null
@@ -726,9 +724,15 @@ export function OnboardingModelChooser({
 
   return (
     <OnboardingSetupCard
-      cardWidth={cardWidth}
-      title="Choose a local model"
+      width={width}
+      stage={operation === null ? "choose" : "install"}
       hardware={hardware}
+      footer={(
+        <>
+          <text style={{ fg: theme.text.guidance }} wrapMode="none">You can switch models or download more anytime from /settings.</text>
+          <text style={{ fg: theme.text.supporting }} wrapMode="none">{interactionHint}</text>
+        </>
+      )}
     >
       <box style={{
         flexDirection: wide ? "row" : "column",
@@ -742,9 +746,6 @@ export function OnboardingModelChooser({
         {details}
       </box>
       {error && <text style={{ fg: theme.status.failure, marginTop: 1 }} wrapMode="none">{error}</text>}
-      <box style={{ height: 1 }} />
-      <text style={{ fg: theme.text.guidance }} wrapMode="none">You can switch models or download more anytime from /settings.</text>
-      <text style={{ fg: theme.text.supporting }} wrapMode="none">{interactionHint}</text>
     </OnboardingSetupCard>
   )
 }
@@ -771,7 +772,6 @@ export function OnboardingModelPreparation({
     Result.isInitial(hardware)
       || lines.some(({ state }) => state === "running"),
   )
-  const cardWidth = setupCardWidth(width)
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.name === "escape" && onExit !== undefined) {
       key.preventDefault()
@@ -780,10 +780,16 @@ export function OnboardingModelPreparation({
   }, [onExit]))
   return (
     <OnboardingSetupCard
-      cardWidth={cardWidth}
+      width={width}
+      stage="choose"
       title="Preparing local models"
       hardware={hardware}
       spinnerFrame={spinner}
+      footer={exitKind === null ? undefined : (
+        <text style={{ fg: theme.text.supporting }}>
+          {exitKind === "Close" ? "Esc close setup" : "Esc skip for now"}
+        </text>
+      )}
     >
       {lines.map((line) => (
         <text key={line.id} style={{ fg: line.state === "pending" ? theme.text.supporting : theme.text.body }}>
@@ -794,12 +800,6 @@ export function OnboardingModelPreparation({
         </text>
       ))}
       {error && <text style={{ fg: theme.status.failure }}>{error}</text>}
-      <box style={{ height: 1 }} />
-      {exitKind !== null && (
-        <text style={{ fg: theme.text.supporting }}>
-          {exitKind === "Close" ? "Esc close setup" : "Esc skip for now"}
-        </text>
-      )}
     </OnboardingSetupCard>
   )
 }
@@ -815,14 +815,14 @@ export function OnboardingModelExiting({
   const spinner = useSpinnerFrame(true)
   return (
     <OnboardingSetupCard
-      cardWidth={setupCardWidth(width)}
+      width={width}
+      stage="choose"
       title="Finishing onboarding"
       hardware={hardware}
       spinnerFrame={spinner}
+      footer={<text style={{ fg: theme.text.supporting }}>Setup will close when this finishes.</text>}
     >
       <text style={{ fg: theme.text.body }}>{spinner} Saving onboarding completion…</text>
-      <box style={{ height: 1 }} />
-      <text style={{ fg: theme.text.supporting }}>Setup will close when this finishes.</text>
     </OnboardingSetupCard>
   )
 }

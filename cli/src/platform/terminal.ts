@@ -124,7 +124,8 @@ export const makeTerminalPlatform = (
     Effect.provideService(AcnInstanceManager, manager),
     Effect.provide(FetchHttpClient.layer),
   )
-  yield* Effect.addFinalizer(() => acn.close.pipe(Effect.ignore))
+  const close = yield* Effect.cached(acn.close)
+  yield* Effect.addFinalizer(() => close.pipe(Effect.ignore))
   const runtime = yield* Effect.runtime<never>()
   const runPromise = Runtime.runPromise(runtime)
   const transport = Layer.mergeAll(FetchHttpClient.layer, effectLoggingLayer)
@@ -134,7 +135,7 @@ export const makeTerminalPlatform = (
     id: "terminal",
     protocolLayer,
     acnStartup: acn.startup,
-    shutdown: () => runPromise(acn.close),
+    shutdown: () => runPromise(close),
     clipboard: osc52Clipboard,
     storage: noopStorage,
     notifications: noopNotifications,
@@ -163,5 +164,5 @@ export const makeTerminalPlatform = (
     terminal: terminalCapabilities,
   }
 
-  return { platform, close: acn.close }
+  return { platform, close }
 })

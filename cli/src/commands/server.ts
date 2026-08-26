@@ -16,7 +16,10 @@ import {
 } from "@magnitudedev/sdk"
 import { Data, Effect, Option, Schedule, Schema } from "effect"
 import { homedir } from "node:os"
+import { dirname, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
 import { stopTerminalAcn } from "../platform/terminal"
+import { isDevelopmentBuild } from "../runtime/environment"
 import { writeFileAtomic } from "../utils/atomic-file"
 
 const SERVICE_LABEL = "dev.magnitude.acn"
@@ -99,7 +102,17 @@ export const WINDOWS_RESTART_POLICY_SCRIPT = [
   "Set-ScheduledTask -InputObject $task | Out-Null",
 ].join("; ")
 
-const resolveServiceCommand = Effect.gen(function* () {
+export const developmentServerCommand = (
+  executable = process.execPath,
+): ReadonlyArray<string> => [
+  executable,
+  resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "packages", "acn", "src", "binary.ts"),
+  "serve",
+]
+
+const resolveServiceCommand = isDevelopmentBuild()
+  ? Effect.succeed(developmentServerCommand())
+  : Effect.gen(function* () {
   const resolved = yield* resolveBinaryCommand({
     version: SDK_VERSION,
     acnRevision: SDK_ACN_TARGET.revision,
@@ -148,8 +161,8 @@ const installAndStartService = (command: ReadonlyArray<string>) => Effect.gen(fu
     yield* writeServiceFile(service, renderMacServerService(command))
     const domain = `gui/${process.getuid?.() ?? 0}`
     yield* run(["launchctl", "bootout", domain, service], true)
-    yield* run(["launchctl", "bootstrap", domain, service])
     yield* run(["launchctl", "enable", `${domain}/${SERVICE_LABEL}`])
+    yield* run(["launchctl", "bootstrap", domain, service])
     return
   }
   if (process.platform === "linux") {
@@ -174,6 +187,38 @@ const installAndStartService = (command: ReadonlyArray<string>) => Effect.gen(fu
   }
   return yield* fail(`Unsupported platform: ${process.platform}`)
 })
+
+/** Register the exact release for future user-session startup without
+ * replacing the daemon currently serving an interactive setup flow. */
+export const installServerOnStartup = Effect.gen(function* () {
+  const command = yield* resolveServiceCommand
+  const fs = yield* FileSystem.FileSystem
+  yield* fs.makeDirectory(`${defaultDataDir()}/logs`, { recursive: true, mode: 0o700 })
+  if (process.platform === "darwin") {
+    yield* writeServiceFile(macServicePath(), renderMacServerService(command))
+    const domain = `gui/${process.getuid?.() ?? 0}`
+    yield* run(["launchctl", "enable", `${domain}/${SERVICE_LABEL}`])
+    return
+  }
+  if (process.platform === "linux") {
+    yield* writeServiceFile(linuxServicePath(), renderLinuxServerService(command))
+    yield* run(["systemctl", "--user", "daemon-reload"])
+    yield* run(["systemctl", "--user", "enable", "magnitude.service"])
+    return
+  }
+  if (process.platform === "win32") {
+    const taskCommand = renderWindowsServerCommand(command)
+    yield* run([
+      "schtasks", "/Create", "/TN", "MagnitudeInference", "/TR", taskCommand,
+      "/SC", "ONLOGON", "/RL", "LIMITED", "/F",
+    ])
+    yield* run(["schtasks", "/Change", "/TN", "MagnitudeInference", "/ENABLE"])
+    return
+  }
+  return yield* fail(`Unsupported platform: ${process.platform}`)
+}).pipe(Effect.mapError((error) => error instanceof ServerServiceError
+  ? error
+  : fail(String(error))))
 
 const stopService = Effect.gen(function* () {
   if (process.platform === "darwin") {

@@ -93,6 +93,13 @@ pub struct OpenAiModel {
 pub struct OpenAiModelsResponse {
     pub object: &'static str,
     pub data: Vec<OpenAiModel>,
+    pub models: Vec<MagnitudeModelDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MagnitudeModelDescriptor {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -1458,20 +1465,28 @@ async fn standard_models(
         .list()
         .await
         .map_err(ApiError::from_inventory)?;
-    let data = models
+    let (data, model_names) = models
         .models
         .into_iter()
         .filter(|model| matches!(model.local_state, CatalogModelLocalState::Installed { .. }))
-        .map(|model| OpenAiModel {
-            id: model.id,
-            object: "model",
-            created: 0,
-            owned_by: "magnitude",
+        .map(|model| {
+            let name = format!("{} ({})", model.display_name, model.variant_label);
+            let id = model.id;
+            (
+                OpenAiModel {
+                    id: id.clone(),
+                    object: "model",
+                    created: 0,
+                    owned_by: "magnitude",
+                },
+                MagnitudeModelDescriptor { id, name },
+            )
         })
-        .collect();
+        .unzip();
     Ok(Json(OpenAiModelsResponse {
         object: "list",
         data,
+        models: model_names,
     }))
 }
 
@@ -3043,6 +3058,29 @@ mod tests {
     }
 
     #[test]
+    fn chat_accepts_disabled_store_but_rejects_persistence() {
+        let disabled = request_from_json(json!({
+            "model": "test-model",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "store": false
+        }));
+        assert!(adapt_request(disabled).is_ok());
+
+        let enabled = request_from_json(json!({
+            "model": "test-model",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "store": true
+        }));
+        let Err(error) = adapt_request(enabled) else {
+            panic!("local persistence must be rejected");
+        };
+        assert_eq!(
+            error.body.error.message,
+            "store is not supported by this local runtime"
+        );
+    }
+
+    #[test]
     fn chat_accepts_empty_assistant_content_when_tool_calls_are_present() {
         let request: ChatCompletionRequest = serde_json::from_value(json!({
             "model": "test-model",
@@ -3057,7 +3095,7 @@ mod tests {
                         "function": { "name": "lookup", "arguments": "{\"q\":\"x\"}" }
                     }]
                 },
-                { "role": "tool", "tool_call_id": "call_1", "content": "result" },
+                { "role": "tool", "tool_call_id": "call_1", "name": "lookup", "content": "result" },
                 { "role": "user", "content": "continue" }
             ]
         }))
@@ -3144,7 +3182,12 @@ mod tests {
                     "name": "lookup",
                     "arguments": "{}"
                 },
-                { "type": "function_call_output", "call_id": "call_1", "output": "" }
+                {
+                    "type": "function_call_output",
+                    "id": "out_1",
+                    "call_id": "call_1",
+                    "output": ""
+                }
             ]
         }))
         .expect("request must decode");
@@ -3170,12 +3213,117 @@ mod tests {
     }
 
     #[test]
+    fn responses_accepts_easy_messages_and_replayed_output_messages() {
+        let request: protocols::responses::ResponseCreateRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "prompt_cache_key": "session-1",
+            "input": [
+                { "role": "developer", "content": "be concise" },
+                { "type": "message", "role": "user", "content": "hello" },
+                {
+                    "id": "rs_1",
+                    "type": "reasoning",
+                    "status": "completed",
+                    "summary": [],
+                    "content": [{ "type": "reasoning_text", "text": "brief thought" }]
+                },
+                {
+                    "id": "msg_1",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "hi",
+                        "annotations": []
+                    }]
+                },
+                { "role": "user", "content": "again" }
+            ]
+        }))
+        .expect("standard Responses message forms must decode");
+
+        let (_, canonical) = protocols::responses::adapt(request)
+            .expect("easy and replayed messages must adapt")
+            .invocation
+            .into_parts();
+        assert_eq!(
+            canonical
+                .context()
+                .system()
+                .map(domain::NonEmptyText::as_str),
+            Some("be concise"),
+        );
+        assert_eq!(canonical.context().entries().len(), 3);
+        let domain::ContextEntry::Assistant { entry } = &canonical.context().entries()[1] else {
+            panic!("second entry must be assistant output");
+        };
+        assert_eq!(
+            entry.reasoning().map(domain::NonEmptyText::as_str),
+            Some("brief thought")
+        );
+    }
+
+    #[test]
+    fn responses_accepts_codex_namespace_and_web_search_tools() {
+        let request: protocols::responses::ResponseCreateRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "input": "hello",
+            "reasoning": { "effort": "medium", "summary": "auto" },
+            "include": ["reasoning.encrypted_content"],
+            "client_metadata": { "turn_id": "turn-1" },
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "description": "Run a command",
+                    "parameters": { "type": "object" },
+                    "strict": false
+                },
+                {
+                    "type": "namespace",
+                    "name": "mcp__example",
+                    "description": "Example remote tools",
+                    "tools": [{
+                        "type": "function",
+                        "name": "remote_action",
+                        "parameters": { "type": "object" }
+                    }]
+                },
+                { "type": "web_search", "external_web_access": true }
+            ]
+        }))
+        .expect("current Codex tool declarations must decode");
+
+        let (_, canonical) = protocols::responses::adapt(request)
+            .expect("unsupported hosted tools must not block local function tools")
+            .invocation
+            .into_parts();
+        assert_eq!(canonical.tools().definitions().len(), 1);
+        assert_eq!(
+            canonical.tools().definitions()[0].name().as_str(),
+            "exec_command"
+        );
+    }
+
+    #[test]
     fn anthropic_maps_omitted_tool_result_content_to_an_empty_result() {
         let request: protocols::anthropic::MessagesRequest = serde_json::from_value(json!({
             "model": "test-model",
             "max_tokens": 16,
+            "output_config": { "effort": "high" },
+            "system": [{
+                "type": "text",
+                "text": "be concise",
+                "cache_control": { "type": "ephemeral" }
+            }],
             "messages": [
-                { "role": "user", "content": "look this up" },
+                { "role": "user", "content": [{
+                    "type": "text",
+                    "text": "look this up",
+                    "cache_control": { "type": "ephemeral" }
+                }] },
                 { "role": "assistant", "content": [{
                     "type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}
                 }] },
@@ -3194,6 +3342,41 @@ mod tests {
             panic!("second entry must be assistant");
         };
         assert!(entry.tool_calls()[0].result().content().is_empty());
+    }
+
+    #[test]
+    fn anthropic_maps_system_role_messages_to_positioned_user_entries() {
+        let request: protocols::anthropic::MessagesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "system": "base instructions",
+            "messages": [
+                { "role": "user", "content": "hello" },
+                { "role": "system", "content": [{ "type": "text", "text": "runtime instructions" }] },
+                { "role": "assistant", "content": "hi" }
+            ]
+        }))
+        .expect("Claude Code system-role compatibility input must decode");
+
+        let (_, canonical) = protocols::anthropic::adapt(request)
+            .unwrap()
+            .invocation
+            .into_parts();
+        assert_eq!(
+            canonical
+                .context()
+                .system()
+                .map(domain::NonEmptyText::as_str),
+            Some("base instructions"),
+        );
+        assert_eq!(canonical.context().entries().len(), 3);
+        let domain::ContextEntry::User { entry } = &canonical.context().entries()[1] else {
+            panic!("system-role message must become a user entry at its position");
+        };
+        let [domain::UserContent::Text { text }] = entry.content() else {
+            panic!("system-role message must carry its text content");
+        };
+        assert_eq!(text.as_str(), "runtime instructions");
     }
 
     #[test]
@@ -4200,7 +4383,8 @@ mod tests {
                 {"type": "function", "function": {
                     "name": "lookup",
                     "description": "Look something up",
-                    "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}
+                    "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+                    "strict": true
                 }},
                 {"type": "function", "function": {
                     "name": "other",

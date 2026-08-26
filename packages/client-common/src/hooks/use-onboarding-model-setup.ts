@@ -7,6 +7,7 @@ import {
 } from "@effect-atom/atom-react"
 import { Effect } from "effect"
 import { type ProviderModelId } from "@magnitudedev/sdk"
+import type { HarnessId } from "../harness-connections/service"
 import { OnboardingModelSetup } from "../local-models/setup"
 import { onboardingModelSetupViewAtom } from "../local-models/setup-view"
 import { useAgentClient } from "../state/agent-client-context"
@@ -39,11 +40,28 @@ export const useOnboardingModelSetup = () => {
     () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.exit),
     { concurrent: true },
   ), [client])
+  const backAction = useMemo(() => client.runtime.fn(
+    () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.back),
+    { concurrent: true },
+  ), [client])
+  const continueAction = useMemo(() => client.runtime.fn<{
+    readonly harness: HarnessId
+    readonly launchOnStartup: boolean
+    readonly installSkill: boolean
+  }>()(
+    (input) => Effect.flatMap(
+      OnboardingModelSetup,
+      (setup) => setup.continueWithHarness(input.harness, input),
+    ),
+    { concurrent: true },
+  ), [client])
   const retry = useAtomSet(retryAction)
   const open = useAtomSet(openAction)
   const select = useAtomSet(selectAction)
   const cancel = useAtomSet(cancelAction)
   const exit = useAtomSet(exitAction)
+  const back = useAtomSet(backAction)
+  const continueWithHarness = useAtomSet(continueAction)
 
   return {
     hardware: useAtomValue(hardwareAtom),
@@ -54,6 +72,12 @@ export const useOnboardingModelSetup = () => {
       select(modelId)
     }, [select]),
     cancel: useCallback(() => cancel(), [cancel]),
+    back: useCallback(() => back(), [back]),
+    continueWithHarness: useCallback((input: {
+      readonly harness: HarnessId
+      readonly launchOnStartup: boolean
+      readonly installSkill: boolean
+    }) => continueWithHarness(input), [continueWithHarness]),
     exit: useCallback(() => exit(), [exit]),
   }
 }

@@ -117,6 +117,8 @@ pub struct ChatCompletionRequest {
     #[schema(nullable = false)]
     pub parallel_tool_calls: Option<bool>,
     #[schema(nullable = false)]
+    pub store: Option<bool>,
+    #[schema(nullable = false)]
     pub reasoning_effort: Option<ReasoningEffortRequest>,
     #[schema(nullable = false)]
     pub thinking_budget_tokens: Option<u32>,
@@ -165,6 +167,9 @@ pub enum ChatMessageRequest {
     Tool {
         tool_call_id: String,
         content: ChatContentRequest,
+        #[schema(nullable = false)]
+        #[allow(dead_code)]
+        name: Option<String>,
     },
 }
 
@@ -219,6 +224,9 @@ pub struct FunctionDefinitionRequest {
     #[schema(nullable = false)]
     pub description: Option<String>,
     pub parameters: JsonValue,
+    #[schema(nullable = false)]
+    #[allow(dead_code)]
+    pub strict: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
@@ -876,6 +884,7 @@ pub(crate) fn validate_apply_template_request(
         tools: request.tools,
         tool_choice: request.tool_choice,
         parallel_tool_calls: request.parallel_tool_calls,
+        store: None,
         reasoning_effort: None,
         thinking_budget_tokens: None,
         response_format: request.response_format,
@@ -973,6 +982,11 @@ pub(crate) fn adapt_request(
 pub(crate) fn validate_request(
     request: ChatCompletionRequest,
 ) -> Result<ValidatedChatRequest, ApiError> {
+    if request.store == Some(true) {
+        return Err(ApiError::invalid(
+            "store is not supported by this local runtime",
+        ));
+    }
     if request.messages.is_empty() {
         return Err(ApiError::invalid("messages must not be empty"));
     }
@@ -1155,6 +1169,7 @@ fn chat_context(messages: Vec<ChatMessageRequest>) -> Result<domain::InferenceCo
                         let Some(ChatMessageRequest::Tool {
                             tool_call_id,
                             content,
+                            name: _,
                         }) = messages.pop_front()
                         else {
                             unreachable!("front variant was checked")

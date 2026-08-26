@@ -9,7 +9,7 @@ applies_to:
   - packages/acn/src/inference-gateway.ts
   - packages/acn/src/server.ts
   - packages/sdk/src/inference-client.ts
-  - cli/src/commands/connect.ts
+  - cli/src/harness-connections/**
 ---
 
 # Inference HTTP protocol compatibility
@@ -22,7 +22,9 @@ the HTTP boundary; the runner and engine consume only the canonical inference co
 
 `InferenceContext` contains one optional leading `system` prompt and a nonempty ordered sequence of
 user and assistant entries. A system prompt cannot occur among conversation entries. Protocol
-inputs containing a system or developer instruction after conversation begins are rejected.
+inputs containing a system or developer instruction after conversation begins are rejected. The
+one exception is Anthropic `system` role messages, which are reinterpreted as positioned user
+entries rather than system prompts (see the adapter notes below).
 
 A user entry contains zero or more ordered text/image values. An assistant entry has fixed optional
 reasoning and text fields plus zero or more ordered tool exchanges.
@@ -37,6 +39,36 @@ those forms, preserving protocol-native validation elsewhere. Empty user message
 messages, and tool results remain meaningful empty containers rather than acquiring placeholder
 text. Protocol projection maps absent text and empty collections to that protocol's native wire
 representation without inventing semantic output.
+
+The Responses adapter accepts both explicit `message` input items and the standard easy-message
+form whose `type` discriminator is omitted. Stateless replay accepts output-message metadata and
+reasoning items emitted by the Responses stream. A reasoning item immediately preceding assistant
+text or function calls belongs to that same canonical assistant entry; a standalone reasoning item
+remains a reasoning-only assistant entry. Request hints such as `prompt_cache_key` may be accepted
+without changing canonical inference semantics. Current Codex declarations may also contain
+namespace and web-search tools, `include`, and client metadata. Ordinary function declarations are
+the executable local tool set; hosted namespace and web-search declarations are retained for
+protocol projection but do not become locally executable tools. Replayed function-call outputs may
+include their emitted item ID.
+
+The Chat Completions adapter accepts standard client metadata that does not alter local inference.
+In particular, `store: false` and a function definition's optional `strict` flag are valid input.
+`store: true` is rejected explicitly because the local runtime does not provide server-side
+conversation persistence; it is not rejected as an unknown field.
+Historical Chat Completions tool-result messages may include the function name in addition to the
+required tool-call ID. Anthropic Messages accepts cache-control annotations and output-configuration
+hints used by current Claude Code clients without assigning them unsupported local semantics.
+
+The local Anthropic adapter also accepts text-only `system` role messages. The current Anthropic
+protocol permits system-role messages mid-conversation as an operator channel that leaves the
+cached prompt prefix untouched, and Claude Code uses it to surface text the user types mid-turn.
+Local chat templates have no reliable mid-sequence system turn and canonical context carries
+exactly one leading system prompt, so the adapter reinterprets each system-role message as a user
+entry at its original position. This is Magnitude's deliberate local interpretation: conversation
+order and the local prompt prefix are preserved, and mid-stream operator authority is not claimed.
+Because the mapping is user-authority, a system-role message is accepted anywhere a user message
+is legal — intentionally more lenient than the upstream protocol's placement rules, which exist to
+protect cache and authority semantics this mapping does not carry.
 
 Input context and generated output are separate domains. A context entry is never a generation
 result, and inference output is never a context entry. The inference contract does not own how a
@@ -72,6 +104,11 @@ ACN exposes OpenAI traffic under `/inference/v1/**` and Anthropic traffic under
 `/inference/anthropic/**`. The reserved local namespace is
 `anthropic-local/<canonical-model-id>`.
 
+The OpenAI model-list response retains the standard `data` array and also includes a Magnitude-owned
+`models` array for local clients that need catalog labels. Each installed entry contains its canonical
+model ID and the same `Model Name (Variant Label)` text shown by Magnitude. This extension is discovery
+metadata only and does not change model selection semantics.
+
 For a reserved alias, ACN removes any caller-supplied alias-echo header, rewrites only the request
 model to its canonical ID, removes caller credentials, installs private ICN authorization, and
 sets the validated alias for response model echoing. The alias never enters the canonical
@@ -88,14 +125,10 @@ changed mechanically only at the model string; every other JSON field remains op
 request retains its original bytes, query, public headers, response status, headers, and body
 stream.
 
-Claude Code connection writes only `ANTHROPIC_BASE_URL` and
-`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` to its strict-JSON settings file. It never writes an
-Anthropic credential or pins a model. Magnitude verifies gateway discovery before changing the
-file, requires Claude Code 2.1.129 or later, rejects provider modes and traffic settings that
-disable discovery in the current environment and inspectable user, project, local, or managed
-settings, records the prior owned values, creates a first-change backup, honors
-`CLAUDE_CONFIG_DIR`, and restores a prior value only while the installed value is still present. A
-later user edit is never overwritten during disconnect.
+Claude Code receives the local base URL, fixed local placeholder token, and selected
+`anthropic-local/<canonical-model-id>` alias only in its launch environment. The launch plan also
+passes that alias explicitly, making the selected model active on first launch without changing
+Claude Code's persisted defaults. Disconnect therefore has no Claude Code setting to restore.
 
 ## Ownership
 

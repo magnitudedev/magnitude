@@ -5,7 +5,7 @@ import { registerStopCommand } from "./commands/stop"
 import { registerUpdateCommand } from "./commands/update"
 import { registerServerCommand } from "./commands/server"
 import { registerInferenceCommands } from "./commands/inference"
-import { registerConnectCommand } from "./commands/connect"
+import { registerConnectionsCommand } from "./commands/connections"
 import { CLI_VERSION } from "./version"
 
 const program = new Command()
@@ -15,7 +15,7 @@ const program = new Command()
 registerStopCommand(program)
 registerServerCommand(program)
 registerInferenceCommands(program)
-registerConnectCommand(program)
+registerConnectionsCommand(program)
 registerUpdateCommand(program)
 registerDocsCommand(program)
 registerInteractiveCommand(program)

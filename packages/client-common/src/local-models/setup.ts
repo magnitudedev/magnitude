@@ -17,6 +17,12 @@ import { ModelSlots, sameSlotSelection } from "../model-slots/service"
 import { localModelOptions, type LocalModelOption } from "./options"
 import { LocalModels } from "./service"
 import {
+  HarnessConnection,
+  type HarnessDestination,
+  type HarnessId,
+  type HarnessLaunchPlan,
+} from "../harness-connections/service"
+import {
   OnboardingModelChoiceRejected,
   OnboardingModelResourceChanged,
   OnboardingModelSetupAlreadyActive,
@@ -82,6 +88,22 @@ type OnboardingModelSetupLifecycle =
   | {
       readonly _tag: "Closing"
       readonly invocation: ClosingInvocation
+    }
+  | {
+      readonly _tag: "ChoosingHarness"
+      readonly selected: AssignedModel
+      readonly destinations: ReadonlyArray<HarnessDestination>
+      readonly completeOnFinish: boolean
+    }
+  | {
+      readonly _tag: "ApplyingHarness"
+      readonly selected: AssignedModel
+      readonly harness: HarnessId
+      readonly completeOnFinish: boolean
+    }
+  | {
+      readonly _tag: "HarnessHandoff"
+      readonly plan: HarnessLaunchPlan
     }
 
 export interface OnboardingModelSetupConfig {
@@ -170,6 +192,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
   const localModels = yield* LocalModels
   const slots = yield* ModelSlots
   const onboarding = yield* OnboardingPersistence
+  const harnessConnection = yield* HarnessConnection
   const config = yield* OnboardingModelSetupConfig
   const registry = yield* Registry.AtomRegistry
   const scope = yield* Scope.Scope
@@ -198,6 +221,36 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
           exitKind,
           notice: Option.none(),
           content: { _tag: "Closing" },
+        })
+      }
+      if (current._tag === "HarnessHandoff") {
+        return Result.success<OnboardingModelSetupState>({
+          _tag: "Open",
+          exitKind: "Close",
+          notice: Option.none(),
+          content: { _tag: "HarnessHandoff", plan: current.plan },
+        })
+      }
+      if (current._tag === "ChoosingHarness" || current._tag === "ApplyingHarness") {
+        const selected = current.selected
+        return Result.success<OnboardingModelSetupState>({
+          _tag: "Open",
+          exitKind,
+          notice: Option.none(),
+          content: current._tag === "ChoosingHarness"
+            ? {
+                _tag: "Harness",
+                model: selected.option.model,
+                modelId: selected.modelId,
+                providerModelId: selected.providerModelId,
+                destinations: current.destinations,
+              }
+            : {
+                _tag: "ApplyingHarness",
+                model: selected.option.model,
+                modelId: selected.modelId,
+                harness: current.harness,
+              },
         })
       }
       if (current._tag === "Resting" && completed && !current.retainedOpen) {
@@ -450,29 +503,10 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
     Effect.flatMap((effectiveExit) => Deferred.done(invocation.done, Exit.asVoid(effectiveExit))),
   )
 
-  const beginCompletion = (
-    invocation: SelectionInvocation,
-    selected: AssignedModel,
-  ) => admissionLock.withPermits(1)(Effect.gen(function* () {
-    const current = registry.get(lifecycle)
-    if (current._tag !== "Selecting" || current.invocation !== invocation) return false
-    if (Option.isSome(yield* Deferred.poll(invocation.cancellation))) return false
-    registry.set(lifecycle, {
-      ...current,
-      execution: {
-        _tag: "Completing",
-        option: selected.option,
-        modelId: selected.modelId,
-        providerModelId: selected.providerModelId,
-      },
-    })
-    return true
-  }))
-
   const runSelection = (
     invocation: SelectionInvocation,
     resolved: ResolvedChoice,
-    completeOnSuccess: boolean,
+    completeOnFinish: boolean,
   ) => Effect.gen(function* () {
     const ready = Option.match(resolved.ready, {
       onSome: Effect.succeed,
@@ -482,12 +516,13 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
       ),
     })
     const selected = yield* ready
-    if (completeOnSuccess) {
-      if (!(yield* beginCompletion(invocation, selected))) {
-        return yield* new OnboardingModelSelectionCancelled()
+    const destinations = yield* harnessConnection.list
+    yield* admissionLock.withPermits(1)(Effect.sync(() => {
+      const current = registry.get(lifecycle)
+      if (current._tag === "Selecting" && current.invocation === invocation) {
+        registry.set(lifecycle, { _tag: "ChoosingHarness", selected, destinations, completeOnFinish })
       }
-      yield* onboarding.complete
-    }
+    }))
     return "Completed" as const
   }).pipe(
     Effect.catchTag("OnboardingModelSelectionCancelled", () =>
@@ -540,7 +575,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
 
   const cancel = admissionLock.withPermits(1)(Effect.gen(function* () {
     const current = registry.get(lifecycle)
-    if (current._tag === "Closing") {
+    if (current._tag === "Closing" || current._tag === "ApplyingHarness" || current._tag === "HarnessHandoff") {
       return yield* new OnboardingModelSetupCancellationUnavailable()
     }
     if (current._tag !== "Selecting") return yield* new OnboardingModelSetupNotActive()
@@ -554,6 +589,46 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
     yield* Deferred.succeed(current.invocation.cancellation, undefined)
     return current.invocation.done
   })).pipe(Effect.flatMap(Deferred.await))
+
+  const back = admissionLock.withPermits(1)(Effect.gen(function* () {
+    const current = registry.get(lifecycle)
+    if (current._tag !== "ChoosingHarness") return yield* new OnboardingModelSetupNotActive()
+    registry.set(lifecycle, {
+      _tag: "Resting",
+      retainedOpen: true,
+      notice: Option.none(),
+    })
+  }))
+
+  const continueWithHarness = (
+    harness: HarnessId,
+    options: { readonly launchOnStartup: boolean; readonly installSkill: boolean },
+  ) => admissionLock.withPermits(1)(Effect.gen(function* () {
+    const current = registry.get(lifecycle)
+    if (current._tag !== "ChoosingHarness") return yield* new OnboardingModelSetupNotActive()
+    if (!current.destinations.some((destination) => destination.id === harness && destination.selectable)) {
+      return yield* new OnboardingModelSetupNotActive()
+    }
+    registry.set(lifecycle, { _tag: "ApplyingHarness", selected: current.selected, harness, completeOnFinish: current.completeOnFinish })
+    return { selected: current.selected, completeOnFinish: current.completeOnFinish }
+  })).pipe(Effect.flatMap(({ selected, completeOnFinish }) => Effect.gen(function* () {
+    if (options.launchOnStartup) yield* harnessConnection.installStartup
+    if (options.installSkill) yield* harnessConnection.installSkill(harness)
+    const connection = yield* harnessConnection.connect(harness, { setCurrent: Option.some(selected.modelId) })
+    const plan = Option.getOrThrow(connection.launchPlan)
+    if (completeOnFinish) yield* onboarding.complete
+    yield* admissionLock.withPermits(1)(Effect.sync(() => {
+      registry.set(lifecycle, harness === "magnitude"
+        ? closedLifecycle
+        : { _tag: "HarnessHandoff", plan })
+    }))
+  }).pipe(Effect.catchAll((error) => admissionLock.withPermits(1)(Effect.sync(() => {
+    registry.set(lifecycle, {
+      _tag: "Resting",
+      retainedOpen: true,
+      notice: Option.some(error),
+    })
+  })).pipe(Effect.zipRight(Effect.fail(error)))))))
 
   const terminalizeClosing = (
     invocation: ClosingInvocation,
@@ -601,6 +676,8 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
     open,
     select,
     cancel,
+    back,
+    continueWithHarness,
     exit,
   }
 })

@@ -67,6 +67,12 @@ lifecycle, release, and authority. The platform service manager owns login start
 service remains alive without an RPC client so a saved third-party harness endpoint continues to
 work.
 
+Interactive onboarding may register this service for future user-session startup while its JIT
+runtime is the current foreground client. Registration writes the exact service definition and
+enables it, but does not retire or replace the process serving setup. Normal client close remains
+the leading teardown action; the platform definition takes effect at the next login or through an
+explicit server-start operation.
+
 Fatal, ICN-loss, and startup-failure termination exit unsuccessfully so the
 platform manager restarts the service. Administrative stop, fenced replacement, ownership loss,
 and a rejected pre-admission candidate exit successfully and are not restarted; this prevents an

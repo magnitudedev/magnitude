@@ -57,7 +57,9 @@ Initial onboarding uncertainty remains unavailable and is never interpreted as c
 ```text
 Resting + incomplete ------------------------------> Open chooser (Skip)
 Resting + complete + open -------------------------> Open chooser (Close)
-Open chooser + select -> Prepare -> Install -> Assign -> Ensure resident -> [Complete onboarding] -> Closed
+Open chooser + select -> Prepare -> Install -> Assign -> Ensure resident -> Select harness
+Select harness + Magnitude -> Apply options -> [Complete onboarding] -> Closed
+Select harness + external -> Apply options -> Connect harness -> [Complete onboarding] -> Handoff
 Open operation + cancel -> detach observation --------------------------------> Open chooser
 Open operation + failure -------------------------------------------> Open chooser with notice
 Open + Close --------------------------------------------------------> Closed
@@ -78,7 +80,9 @@ The worker passes exact predecessor outputs through one Effect program:
 3. assign that exact model ID and captured reasoning effort to the primary slot;
 4. admit native residency for that model ID through the shared ICN coordinator;
 5. accept readiness only for the exact returned Instance and model ID; and
-6. complete onboarding only when it was incomplete at admission.
+6. retain that exact model while the user selects a destination;
+7. configure the selected destination through `HarnessConnection`; and
+8. complete onboarding only after all selected destination work succeeds.
 
 A stable snapshot of the submitted option is retained only as historical presentation evidence.
 Canonical queries may replace it for display, but all decisions use exact identities and current
@@ -125,18 +129,51 @@ The public setup view has one top-level answer:
 Closed
 Open {
   exitKind: Skip | Close
-  content: Preparation | Chooser(operation?) | Closing
+  content: Preparation | Chooser(operation?) | Harness | ApplyingHarness | HarnessHandoff | Closing
 }
 ```
 
 Repeated metadata lives on its parent. Choice options exist only on chooser content. The active
-operation carries its model directly. The hook separately exposes hardware because hardware is an
+operation carries its model directly. Harness content carries the captured ready model and one
+ordered detection snapshot. The hook separately exposes hardware because hardware is an
 orthogonal server observation, not setup lifecycle state.
+
+The CLI renders every Open state as the entire application viewport. Chat, its timeline, composer,
+activity rail, file panel, and overlays are not rendered behind setup. Every stage occupies the same
+centered, borderless setup frame so its origin and available bounds do not move as the workflow
+advances. The persistent progress indicator sits directly above the stage content and contains
+`Choose model`, `Install model`, and `Select harness`; upcoming markers are empty, active markers are
+filled in accent blue, and completed markers/connectors are white. It is horizontal while the model
+chooser uses its side-by-side layout and becomes vertical at the chooser's existing stacked-layout
+breakpoint.
+
+Stage content does not repeat the active step as a second title. In particular, the model chooser
+begins with its hardware context beneath the progress indicator rather than rendering a redundant
+`Choose a local model` heading.
+
+The shared frame height is the model chooser's required row count, not a percentage of the terminal.
+Its wide and stacked variants account for their respective progress and chooser layouts, and the
+removed duplicate model title contributes no reserved row. Every later stage reuses that computed
+height.
+
+The frame reserves one shared footer position across stages. Stage guidance and interaction hints
+use the same two-line typography there, so changing stages does not move or restyle the footer. One
+empty row is guaranteed immediately before the footer without changing the frame's total height.
+The harness stage is one unboxed linear menu containing supported destinations followed by the
+startup and skill toggles. Harness rows are ordinary single-choice rows, not checkbox controls.
+Up and Down traverse every enabled control in that order; unavailable destinations remain visible
+but cannot receive focus. Space changes a focused toggle. Enter from any row continues with the
+currently selected harness and the current toggle values; no separate Continue row is rendered.
+
+An external destination produces `HarnessHandoff` only after selected startup and skill work,
+adapter reconciliation, and durable onboarding completion succeed. The CLI runtime observes this
+state outside React, gracefully closes the client lease, unwinds the root and renderer scope, and
+only then starts the returned executable with inherited terminal I/O and the captured model active.
 
 ## Conformance
 
 - Opening never mutates durable onboarding.
-- Successful required selection and Skip are the only setup paths that complete onboarding.
+- Successful required destination application and Skip are the only setup paths that complete onboarding.
 - Requested success and Close send no onboarding mutation.
 - No nonterminal phase exists without a service-scoped terminalizing worker.
 - Hook or renderer unmount does not interrupt an admitted operation.
@@ -148,3 +185,5 @@ orthogonal server observation, not setup lifecycle state.
 - Closed and Closing views do not observe unrelated model or slot queries.
 - Query retry targets the failed participating owner.
 - UI code renders one setup view and never inspects mutation history to derive lifecycle.
+- A ready model advances to harness selection; model readiness alone never completes onboarding.
+- External harness launch never overlaps the Magnitude renderer.

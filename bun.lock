@@ -57,6 +57,7 @@
         "react": "^19.2.0",
         "semver": "^7.7.3",
         "string-width": "^8.1.1",
+        "yaml": "^2.9.0",
       },
       "devDependencies": {
         "@magnitudedev/logger": "workspace:*",

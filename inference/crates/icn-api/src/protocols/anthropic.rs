@@ -46,6 +46,8 @@ pub(crate) struct MessagesRequest {
     #[schema(nullable = false)]
     pub thinking: Option<Thinking>,
     pub metadata: Option<Value>,
+    #[serde(rename = "output_config")]
+    pub _output_config: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -58,7 +60,12 @@ pub(crate) enum SystemPrompt {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum SystemBlock {
-    Text { text: String },
+    Text {
+        text: String,
+        #[serde(default)]
+        #[serde(rename = "cache_control")]
+        _cache_control: Option<Value>,
+    },
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -71,6 +78,7 @@ pub(crate) struct Message {
 #[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Role {
+    System,
     User,
     Assistant,
 }
@@ -87,6 +95,9 @@ pub(crate) enum Content {
 pub(crate) enum ContentBlock {
     Text {
         text: String,
+        #[serde(default)]
+        #[serde(rename = "cache_control")]
+        _cache_control: Option<Value>,
     },
     Thinking {
         thinking: String,
@@ -96,11 +107,17 @@ pub(crate) enum ContentBlock {
     },
     Image {
         source: ImageSource,
+        #[serde(default)]
+        #[serde(rename = "cache_control")]
+        _cache_control: Option<Value>,
     },
     ToolUse {
         id: String,
         name: String,
         input: Map<String, Value>,
+        #[serde(default)]
+        #[serde(rename = "cache_control")]
+        _cache_control: Option<Value>,
     },
     ToolResult {
         tool_use_id: String,
@@ -108,6 +125,9 @@ pub(crate) enum ContentBlock {
         content: Option<ToolResultContent>,
         #[serde(default)]
         is_error: bool,
+        #[serde(default)]
+        #[serde(rename = "cache_control")]
+        _cache_control: Option<Value>,
     },
 }
 
@@ -134,8 +154,18 @@ pub(crate) enum ToolResultContent {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ToolResultBlock {
-    Text { text: String },
-    Image { source: ImageSource },
+    Text {
+        text: String,
+        #[serde(default)]
+        #[serde(rename = "cache_control")]
+        _cache_control: Option<Value>,
+    },
+    Image {
+        source: ImageSource,
+        #[serde(default)]
+        #[serde(rename = "cache_control")]
+        _cache_control: Option<Value>,
+    },
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -144,6 +174,9 @@ pub(crate) struct Tool {
     pub name: String,
     pub description: Option<String>,
     pub input_schema: Map<String, Value>,
+    #[serde(default)]
+    #[serde(rename = "cache_control")]
+    pub _cache_control: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -308,20 +341,22 @@ fn context(
 ) -> Result<domain::InferenceContext, ApiError> {
     let system = system
         .map(|system| match system {
-            SystemPrompt::Text(text) => Ok(text),
-            SystemPrompt::Blocks(blocks) => Ok(blocks
+            SystemPrompt::Text(text) => text,
+            SystemPrompt::Blocks(blocks) => blocks
                 .into_iter()
-                .map(|SystemBlock::Text { text }| text)
+                .map(|SystemBlock::Text { text, .. }| text)
                 .collect::<Vec<_>>()
-                .join("\n")),
+                .join("\n"),
         })
-        .transpose()?
         .map(|text| non_empty_text(text, "system"))
         .transpose()?;
     let mut entries = Vec::new();
     let mut messages = messages.into_iter().peekable();
     while let Some(message) = messages.next() {
         match message.role {
+            Role::System => entries.push(domain::ContextEntry::User {
+                entry: domain::UserEntry::new(system_role_content(message.content)?),
+            }),
             Role::User => entries.push(domain::ContextEntry::User {
                 entry: domain::UserEntry::new(user_content(message.content)?),
             }),
@@ -378,15 +413,38 @@ fn context(
     ))
 }
 
+// System-role messages are the Anthropic protocol's mid-conversation operator
+// channel; Claude Code uses it to surface text the user typed mid-turn. Local
+// chat templates have no mid-sequence system turn and canonical context
+// carries exactly one leading system prompt, so these become user entries at
+// their original position — never part of the leading system prompt. See
+// design/inference/http-protocol-compatibility.md.
+fn system_role_content(content: Content) -> Result<Vec<domain::UserContent>, ApiError> {
+    let mut values = Vec::new();
+    for block in blocks(content) {
+        match block {
+            ContentBlock::Text { text, .. } => values.push(domain::UserContent::Text {
+                text: non_empty_text(text, "system message text")?,
+            }),
+            _ => {
+                return Err(ApiError::invalid(
+                    "system message content must contain only text",
+                ));
+            }
+        }
+    }
+    non_empty_vec(values, "system message content").map(domain::NonEmptyVec::into_vec)
+}
+
 fn user_content(content: Content) -> Result<Vec<domain::UserContent>, ApiError> {
     let blocks = blocks(content);
     let mut values = Vec::new();
     for block in blocks {
         match block {
-            ContentBlock::Text { text } => values.push(domain::UserContent::Text {
+            ContentBlock::Text { text, .. } => values.push(domain::UserContent::Text {
                 text: non_empty_text(text, "user text")?,
             }),
-            ContentBlock::Image { source } => values.push(domain::UserContent::Image {
+            ContentBlock::Image { source, .. } => values.push(domain::UserContent::Image {
                 image: image(source)?,
             }),
             ContentBlock::ToolResult { .. } => {
@@ -420,9 +478,11 @@ fn assistant_content(
     let mut ids = BTreeSet::new();
     for block in blocks(content) {
         match block {
-            ContentBlock::Text { text: value } => text.push(value),
+            ContentBlock::Text { text: value, .. } => text.push(value),
             ContentBlock::Thinking { thinking, .. } => reasoning.push(thinking),
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 if !ids.insert(id.clone()) {
                     return Err(ApiError::invalid(format!("duplicate tool_use id: {id}")));
                 }
@@ -462,15 +522,16 @@ fn tool_results(
             tool_use_id,
             content,
             is_error,
+            ..
         } = block
         else {
             match block {
-                ContentBlock::Text { text } => {
+                ContentBlock::Text { text, .. } => {
                     trailing_content.push(domain::UserContent::Text {
                         text: non_empty_text(text, "user text after tool results")?,
                     });
                 }
-                ContentBlock::Image { source } => {
+                ContentBlock::Image { source, .. } => {
                     trailing_content.push(domain::UserContent::Image {
                         image: image(source)?,
                     });
@@ -497,10 +558,10 @@ fn tool_results(
             Some(ToolResultContent::Blocks(blocks)) => blocks
                 .into_iter()
                 .map(|block| match block {
-                    ToolResultBlock::Text { text } => Ok(domain::ToolResultContent::Text {
+                    ToolResultBlock::Text { text, .. } => Ok(domain::ToolResultContent::Text {
                         text: non_empty_text(text, "tool result text")?,
                     }),
-                    ToolResultBlock::Image { source } => Ok(domain::ToolResultContent::Image {
+                    ToolResultBlock::Image { source, .. } => Ok(domain::ToolResultContent::Image {
                         image: image(source)?,
                     }),
                 })
@@ -525,7 +586,10 @@ fn tool_results(
 
 fn blocks(content: Content) -> Vec<ContentBlock> {
     match content {
-        Content::Text(text) => vec![ContentBlock::Text { text }],
+        Content::Text(text) => vec![ContentBlock::Text {
+            text,
+            _cache_control: None,
+        }],
         Content::Blocks(blocks) => blocks,
     }
 }

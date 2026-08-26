@@ -42,7 +42,14 @@ describe("onboarding model chooser identity", () => {
 
     try {
       await act(view.renderOnce)
-      expect(view.captureCharFrame()).toContain("No compatible models found.")
+      const frame = view.captureCharFrame()
+      expect(frame).toContain("No compatible models found.")
+      expect(frame).not.toContain("Choose a local model")
+      const lines = frame.split("\n")
+      const setupColumn = lines.find((line) => line.includes("MAGNITUDE SETUP"))?.indexOf("MAGNITUDE SETUP")
+      const contentColumn = lines.find((line) => line.includes("Test CPU"))?.indexOf("Test CPU")
+      expect(setupColumn).toBeGreaterThan(0)
+      expect(contentColumn).toBe(setupColumn)
     } finally {
       await act(async () => view.renderer.destroy())
     }

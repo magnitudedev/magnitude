@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use utoipa::ToSchema;
+use utoipa::openapi::Ref;
+use utoipa::openapi::schema::AnyOfBuilder;
+use utoipa::{PartialSchema, ToSchema};
 
 use super::super::{
     ApiError, ApiErrorBody, AppState, ErrorResponse, ModelLoadingObserver, ReasoningEffortRequest,
@@ -41,7 +43,10 @@ pub struct ResponseCreateRequest {
     pub stream: bool,
     pub store: Option<bool>,
     pub metadata: Option<Map<String, Value>>,
+    pub include: Option<Vec<String>>,
+    pub client_metadata: Option<Map<String, Value>>,
     pub previous_response_id: Option<String>,
+    pub prompt_cache_key: Option<String>,
     pub truncation: Option<String>,
 }
 
@@ -737,24 +742,135 @@ pub enum ResponseInput {
     Items(Vec<ResponseInputItem>),
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ResponseInputItem {
+    Message(ResponseInputMessage),
+    Reasoning(ResponseReasoningInput),
+    FunctionCall(ResponseFunctionCall),
+    FunctionCallOutput(ResponseFunctionCallOutput),
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseInputMessage {
+    #[serde(default)]
+    pub r#type: Option<ResponseMessageType>,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub phase: Option<String>,
+    pub role: ResponseRole,
+    pub content: ResponseMessageContent,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseReasoningInput {
+    pub r#type: ResponseReasoningInputType,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub content: Vec<ResponseReasoningInputContent>,
+    #[serde(default)]
+    pub summary: Vec<ResponseReasoningInputContent>,
+    #[serde(default)]
+    pub encrypted_content: Option<String>,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ResponseInputItem {
-    Message {
-        role: ResponseRole,
-        content: ResponseMessageContent,
-    },
-    FunctionCall {
-        #[serde(default)]
-        id: Option<String>,
-        call_id: String,
-        name: String,
-        arguments: String,
-    },
-    FunctionCallOutput {
-        call_id: String,
-        output: FunctionCallOutput,
-    },
+pub enum ResponseReasoningInputContent {
+    ReasoningText { text: String },
+    SummaryText { text: String },
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseFunctionCall {
+    pub r#type: ResponseFunctionCallType,
+    #[serde(default)]
+    pub id: Option<String>,
+    pub call_id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseFunctionCallOutput {
+    pub r#type: ResponseFunctionCallOutputType,
+    #[serde(default)]
+    pub id: Option<String>,
+    pub call_id: String,
+    pub output: FunctionCallOutput,
+}
+
+impl PartialSchema for ResponseInputItem {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        AnyOfBuilder::new()
+            .item(Ref::from_schema_name(ResponseInputMessage::name()))
+            .item(Ref::from_schema_name(ResponseReasoningInput::name()))
+            .item(Ref::from_schema_name(ResponseFunctionCall::name()))
+            .item(Ref::from_schema_name(ResponseFunctionCallOutput::name()))
+            .into()
+    }
+}
+
+impl ToSchema for ResponseInputItem {
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        for (name, schema) in [
+            (ResponseInputMessage::name(), ResponseInputMessage::schema()),
+            (
+                ResponseReasoningInput::name(),
+                ResponseReasoningInput::schema(),
+            ),
+            (ResponseFunctionCall::name(), ResponseFunctionCall::schema()),
+            (
+                ResponseFunctionCallOutput::name(),
+                ResponseFunctionCallOutput::schema(),
+            ),
+        ] {
+            schemas.push((name.into_owned(), schema));
+        }
+        ResponseInputMessage::schemas(schemas);
+        ResponseReasoningInput::schemas(schemas);
+        ResponseFunctionCall::schemas(schemas);
+        ResponseFunctionCallOutput::schemas(schemas);
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseMessageType {
+    Message,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseReasoningInputType {
+    Reasoning,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseFunctionCallType {
+    FunctionCall,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseFunctionCallOutputType {
+    FunctionCallOutput,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -790,25 +906,36 @@ pub enum ResponseMessageContent {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResponseContentPart {
-    InputText { text: String },
-    OutputText { text: String },
-    InputImage { image_url: String },
+    InputText {
+        text: String,
+    },
+    OutputText {
+        text: String,
+        #[serde(default)]
+        annotations: Vec<Value>,
+    },
+    InputImage {
+        image_url: String,
+    },
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ResponseTool {
-    pub r#type: ResponseFunctionType,
-    pub name: String,
-    pub description: Option<String>,
-    pub parameters: Map<String, Value>,
-    pub strict: Option<bool>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ResponseFunctionType {
-    Function,
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseTool {
+    Function {
+        name: String,
+        description: Option<String>,
+        parameters: Map<String, Value>,
+        strict: Option<bool>,
+    },
+    Namespace {
+        name: String,
+        description: String,
+        tools: Vec<Value>,
+    },
+    WebSearch {
+        external_web_access: Option<bool>,
+    },
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -891,11 +1018,20 @@ pub(crate) fn adapt(request: ResponseCreateRequest) -> Result<AdaptedResponseReq
         .tools
         .unwrap_or_default()
         .into_iter()
-        .map(|tool| {
+        .filter_map(|tool| match tool {
+            ResponseTool::Function {
+                name,
+                description,
+                parameters,
+                ..
+            } => Some((name, description, parameters)),
+            ResponseTool::Namespace { .. } | ResponseTool::WebSearch { .. } => None,
+        })
+        .map(|(name, description, parameters)| {
             Ok(domain::ToolDefinition::new(
-                domain::ToolName::try_new(tool.name).map_err(domain_error)?,
-                tool.description,
-                domain::JsonObject::new(tool.parameters),
+                domain::ToolName::try_new(name).map_err(domain_error)?,
+                description,
+                domain::JsonObject::new(parameters),
             ))
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
@@ -926,15 +1062,6 @@ pub(crate) fn adapt(request: ResponseCreateRequest) -> Result<AdaptedResponseReq
     )
     .map_err(domain_error)?;
     let reasoning = request.reasoning;
-    if reasoning
-        .as_ref()
-        .and_then(|value| value.summary.as_deref())
-        .is_some()
-    {
-        return Err(ApiError::invalid(
-            "reasoning summaries are not supported by this local runtime",
-        ));
-    }
     let reasoning = match reasoning.and_then(|value| value.effort) {
         Some(effort) => domain::ReasoningIntent::Effort {
             effort: effort.normalize()?,
@@ -1012,12 +1139,7 @@ fn response_projection(request: &ResponseCreateRequest) -> ResponseProjection {
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .map(|tool| {
-            serde_json::json!({
-                "type": "function", "name": tool.name, "description": tool.description,
-                "parameters": tool.parameters, "strict": tool.strict,
-            })
-        })
+        .map(|tool| serde_json::to_value(tool).expect("response tool is serializable"))
         .collect();
     let format = match request.text.as_ref().map(|text| &text.format) {
         Some(ResponseTextFormat::JsonObject) => ResponseTextFormatResult {
@@ -1081,19 +1203,24 @@ fn context(
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
     let items = match input {
-        ResponseInput::Text(text) => vec![ResponseInputItem::Message {
+        ResponseInput::Text(text) => vec![ResponseInputItem::Message(ResponseInputMessage {
+            r#type: None,
+            id: None,
+            status: None,
+            phase: None,
             role: ResponseRole::User,
             content: ResponseMessageContent::Text(text),
-        }],
+        })],
         ResponseInput::Items(items) => items,
     };
     let mut entries = Vec::new();
+    let mut pending_reasoning = Vec::new();
     let mut index = 0;
     while index < items.len() {
         match &items[index] {
-            ResponseInputItem::Message { role, content } => match role {
+            ResponseInputItem::Message(ResponseInputMessage { role, content, .. }) => match role {
                 ResponseRole::System | ResponseRole::Developer => {
-                    if !entries.is_empty() {
+                    if !entries.is_empty() || !pending_reasoning.is_empty() {
                         return Err(ApiError::invalid(
                             "system and developer messages must precede conversation entries",
                         ));
@@ -1103,25 +1230,48 @@ fn context(
                         system.push(text);
                     }
                 }
-                ResponseRole::User => entries.push(domain::ContextEntry::User {
-                    entry: domain::UserEntry::new(user_content(content)?),
-                }),
+                ResponseRole::User => {
+                    if !pending_reasoning.is_empty() {
+                        entries.push(domain::ContextEntry::Assistant {
+                            entry: domain::AssistantEntry::new(
+                                optional_non_empty_text(
+                                    std::mem::take(&mut pending_reasoning).join("\n"),
+                                    "assistant reasoning",
+                                )?,
+                                None,
+                                Vec::new(),
+                            ),
+                        });
+                    }
+                    entries.push(domain::ContextEntry::User {
+                        entry: domain::UserEntry::new(user_content(content)?),
+                    });
+                }
                 ResponseRole::Assistant => entries.push(domain::ContextEntry::Assistant {
                     entry: domain::AssistantEntry::new(
-                        None,
+                        optional_non_empty_text(
+                            std::mem::take(&mut pending_reasoning).join("\n"),
+                            "assistant reasoning",
+                        )?,
                         optional_non_empty_text(text_content(content)?, "assistant content")?,
                         Vec::new(),
                     ),
                 }),
             },
-            ResponseInputItem::FunctionCall { .. } => {
+            ResponseInputItem::Reasoning(reasoning) => {
+                let text = reasoning_input_text(reasoning);
+                if !text.is_empty() {
+                    pending_reasoning.push(text);
+                }
+            }
+            ResponseInputItem::FunctionCall(_) => {
                 let mut calls = Vec::new();
-                while let Some(ResponseInputItem::FunctionCall {
+                while let Some(ResponseInputItem::FunctionCall(ResponseFunctionCall {
                     call_id,
                     name,
                     arguments,
                     ..
-                }) = items.get(index)
+                })) = items.get(index)
                 {
                     let input =
                         serde_json::from_str::<domain::JsonObject>(arguments).map_err(|error| {
@@ -1137,8 +1287,11 @@ fn context(
                     index += 1;
                 }
                 let mut results = BTreeMap::new();
-                while let Some(ResponseInputItem::FunctionCallOutput { call_id, output }) =
-                    items.get(index)
+                while let Some(ResponseInputItem::FunctionCallOutput(
+                    ResponseFunctionCallOutput {
+                        call_id, output, ..
+                    },
+                )) = items.get(index)
                 {
                     let content = function_output(output)?;
                     if results
@@ -1172,17 +1325,35 @@ fn context(
                     )));
                 }
                 entries.push(domain::ContextEntry::Assistant {
-                    entry: domain::AssistantEntry::new(None, None, exchanges),
+                    entry: domain::AssistantEntry::new(
+                        optional_non_empty_text(
+                            std::mem::take(&mut pending_reasoning).join("\n"),
+                            "assistant reasoning",
+                        )?,
+                        None,
+                        exchanges,
+                    ),
                 });
                 continue;
             }
-            ResponseInputItem::FunctionCallOutput { call_id, .. } => {
+            ResponseInputItem::FunctionCallOutput(ResponseFunctionCallOutput {
+                call_id, ..
+            }) => {
                 return Err(ApiError::invalid(format!(
                     "function_call_output {call_id} has no preceding function_call",
                 )));
             }
         }
         index += 1;
+    }
+    if !pending_reasoning.is_empty() {
+        entries.push(domain::ContextEntry::Assistant {
+            entry: domain::AssistantEntry::new(
+                optional_non_empty_text(pending_reasoning.join("\n"), "assistant reasoning")?,
+                None,
+                Vec::new(),
+            ),
+        });
     }
     let system = if system.is_empty() {
         None
@@ -1195,6 +1366,22 @@ fn context(
     ))
 }
 
+fn reasoning_input_text(reasoning: &ResponseReasoningInput) -> String {
+    let parts = if reasoning.content.is_empty() {
+        &reasoning.summary
+    } else {
+        &reasoning.content
+    };
+    parts
+        .iter()
+        .map(|part| match part {
+            ResponseReasoningInputContent::ReasoningText { text }
+            | ResponseReasoningInputContent::SummaryText { text } => text.as_str(),
+        })
+        .collect::<Vec<_>>()
+        .concat()
+}
+
 fn text_content(content: &ResponseMessageContent) -> Result<String, ApiError> {
     match content {
         ResponseMessageContent::Text(text) => Ok(text.clone()),
@@ -1202,7 +1389,7 @@ fn text_content(content: &ResponseMessageContent) -> Result<String, ApiError> {
             .iter()
             .map(|part| match part {
                 ResponseContentPart::InputText { text }
-                | ResponseContentPart::OutputText { text } => Ok(text.as_str()),
+                | ResponseContentPart::OutputText { text, .. } => Ok(text.as_str()),
                 ResponseContentPart::InputImage { .. } => Err(ApiError::invalid(
                     "images are not valid in system or assistant message content",
                 )),
@@ -1224,7 +1411,7 @@ fn user_content(content: &ResponseMessageContent) -> Result<Vec<domain::UserCont
             for part in parts {
                 match part {
                     ResponseContentPart::InputText { text }
-                    | ResponseContentPart::OutputText { text } => {
+                    | ResponseContentPart::OutputText { text, .. } => {
                         if let Some(text) = optional_non_empty_text(text.clone(), "input text")? {
                             values.push(domain::UserContent::Text { text });
                         }

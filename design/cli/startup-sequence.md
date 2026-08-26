@@ -149,6 +149,11 @@ The product; all further presentation belongs to in-app systems. A discovery res
 after this commit presents one notification line
 ("Update available: {latest} — restart or run `magnitude update`", once per session).
 
+When setup produces an external harness handoff, `Application` ends before the other process is
+started. The client closes, the React root unmounts, and renderer/terminal finalizers run during
+scope unwinding. Only after that unwind does the outer command start the adapter's executable with
+inherited terminal I/O. The two TUIs never render concurrently.
+
 ## Data flow
 
 `AcnLifecycleState` (`Checking | Starting | Installing | Ready | Failed`) is the single feed for
