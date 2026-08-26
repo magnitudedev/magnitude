@@ -8,6 +8,7 @@ import type {
 } from "@magnitudedev/sdk";
 import { formatStorageSize } from "@magnitudedev/client-common";
 import { ProgressBar } from "../../components/progress-bar";
+import { RadarLoader } from "../../components/radar-loader";
 import { useTheme } from "../../hooks/use-theme";
 
 const PHASE_LABELS: Readonly<Record<AcnInstallationPhase, string>> = {
@@ -31,6 +32,9 @@ const startingPhaseLabel = (phase: AcnStartingPhase): string =>
 const INSTALLATION_PANEL_WIDTH = 64;
 const PROGRESS_BAR_WIDTH = 36;
 const PERCENTAGE_WIDTH = 5;
+const STARTING_RADAR_COLUMNS = 12;
+const STARTING_RADAR_ROWS = 6;
+const STARTING_RADAR_TRANSITION_MS = 400;
 
 export function AcnBootstrapScreen({
   state,
@@ -185,9 +189,24 @@ export function AcnBootstrapScreen({
           >
             Starting Magnitude
           </text>
-          <text style={{ fg: theme.text.supporting }}>
-            {startingPhaseLabel(state.phase)}
-          </text>
+          <box>
+            <RadarLoader
+              columns={STARTING_RADAR_COLUMNS}
+              rows={STARTING_RADAR_ROWS}
+              guides={false}
+              transitionMs={STARTING_RADAR_TRANSITION_MS}
+            />
+          </box>
+          <box
+            style={{
+              width: INSTALLATION_PANEL_WIDTH,
+              alignItems: "center",
+            }}
+          >
+            <text style={{ fg: theme.text.supporting }}>
+              {startingPhaseLabel(state.phase)}
+            </text>
+          </box>
         </box>
       )}
     </box>

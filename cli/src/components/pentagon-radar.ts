@@ -1,3 +1,10 @@
+import { Option } from "effect"
+import {
+  interpolateRadarValues,
+  renderRadarCells,
+  type RadarTone,
+} from "./radar"
+
 export const PENTAGON_RADAR_DURATION_MS = 220
 export const PENTAGON_RADAR_COLUMNS = 56
 export const PENTAGON_RADAR_ROWS = 15
@@ -45,40 +52,40 @@ interface Point {
   readonly y: number
 }
 
-interface Radii {
-  readonly x: number
-  readonly y: number
-}
-
 type AxisAlignment = "left" | "center" | "right"
-
-const BRAILLE_BITS = [
-  [0x01, 0x08],
-  [0x02, 0x10],
-  [0x04, 0x20],
-  [0x40, 0x80],
-] as const
 
 const clamp01 = (value: number): number => Math.min(1, Math.max(0, value))
 
-export const pentagonRadarValues = (axes: PentagonRadarAxes): PentagonRadarValues =>
-  axes.map(({ value }) => Option.map(value, clamp01)) as unknown as PentagonRadarValues
+export const pentagonRadarValues = (axes: PentagonRadarAxes): PentagonRadarValues => [
+  Option.map(axes[0].value, clamp01),
+  Option.map(axes[1].value, clamp01),
+  Option.map(axes[2].value, clamp01),
+  Option.map(axes[3].value, clamp01),
+  Option.map(axes[4].value, clamp01),
+]
 
 export const pentagonRadarEase = (progress: number): number =>
   1 - (1 - clamp01(progress)) ** 3
+
+const asPentagonValues = (
+  values: ReturnType<typeof interpolateRadarValues>,
+): PentagonRadarValues => [
+  values[0]!,
+  values[1]!,
+  values[2]!,
+  values[3]!,
+  values[4]!,
+]
 
 export const interpolatePentagonRadar = (
   from: PentagonRadarValues,
   to: PentagonRadarValues,
   progress: number,
-): PentagonRadarValues => {
-  const eased = pentagonRadarEase(progress)
-  return from.map((value, index) => {
-    const next = to[index]!
-    if (Option.isNone(next) || Option.isNone(value)) return next
-    return Option.some(value.value + (next.value - value.value) * eased)
-  }) as unknown as PentagonRadarValues
-}
+): PentagonRadarValues => asPentagonValues(interpolateRadarValues(
+  from,
+  to,
+  pentagonRadarEase(progress),
+))
 
 export const pentagonRadarTransitionValues = (
   transition: PentagonRadarTransition,
@@ -100,67 +107,12 @@ export const retargetPentagonRadar = (
   startedAt: now,
 })
 
-const pointOnAxis = (center: Point, radii: Radii, axis: number): Point => {
+const pointOnAxis = (center: Point, radius: number, axis: number): Point => {
   const angle = -Math.PI / 2 + axis * Math.PI * 2 / 5
   return {
-    x: center.x + Math.cos(angle) * radii.x,
-    y: center.y + Math.sin(angle) * radii.y,
+    x: center.x + Math.cos(angle) * radius,
+    y: center.y + Math.sin(angle) * radius,
   }
-}
-
-const setDot = (buffer: Uint8Array, dotWidth: number, dotHeight: number, x: number, y: number): void => {
-  const roundedX = Math.round(x)
-  const roundedY = Math.round(y)
-  if (roundedX < 0 || roundedY < 0 || roundedX >= dotWidth || roundedY >= dotHeight) return
-  buffer[roundedY * dotWidth + roundedX] = 1
-}
-
-const drawLine = (
-  buffer: Uint8Array,
-  dotWidth: number,
-  dotHeight: number,
-  start: Point,
-  end: Point,
-): void => {
-  let x0 = Math.round(start.x)
-  let y0 = Math.round(start.y)
-  const x1 = Math.round(end.x)
-  const y1 = Math.round(end.y)
-  const dx = Math.abs(x1 - x0)
-  const sx = x0 < x1 ? 1 : -1
-  const dy = -Math.abs(y1 - y0)
-  const sy = y0 < y1 ? 1 : -1
-  let error = dx + dy
-  for (;;) {
-    setDot(buffer, dotWidth, dotHeight, x0, y0)
-    if (x0 === x1 && y0 === y1) break
-    const doubled = error * 2
-    if (doubled >= dy) {
-      error += dy
-      x0 += sx
-    }
-    if (doubled <= dx) {
-      error += dx
-      y0 += sy
-    }
-  }
-}
-
-const brailleMask = (
-  buffer: Uint8Array,
-  dotWidth: number,
-  cellX: number,
-  cellY: number,
-): number => {
-  let mask = 0
-  for (let y = 0; y < 4; y += 1) {
-    for (let x = 0; x < 2; x += 1) {
-      if (buffer[(cellY * 4 + y) * dotWidth + cellX * 2 + x] === 1) {
-        mask |= BRAILLE_BITS[y]![x]!
-      }
-    }
-  }
-  return mask
 }
 
 const writeText = (
@@ -202,18 +154,7 @@ const writeAxis = (
   writeText(characters, tones, axis.detail, alignedStartX(axis.detail, anchorX, alignment), y + 1, "detail")
 }
 
-export const pentagonRadarCell = (
-  profileMask: number,
-  gridMask: number,
-): { readonly character: string; readonly tone: PentagonRadarTone } => {
-  if (profileMask > 0) {
-    return { character: String.fromCodePoint(0x2800 + (profileMask & 0xff)), tone: "profile" }
-  }
-  if (gridMask > 0) {
-    return { character: String.fromCodePoint(0x2800 + (gridMask & 0xff)), tone: "grid" }
-  }
-  return { character: " ", tone: "empty" }
-}
+const pentagonTone = (tone: RadarTone): PentagonRadarTone => tone === "guide" ? "grid" : tone
 
 export const renderPentagonRadar = (
   axes: PentagonRadarAxes,
@@ -224,58 +165,25 @@ export const renderPentagonRadar = (
   const safeColumns = Math.max(44, Math.floor(columns))
   const safeRows = Math.max(13, Math.floor(rows))
   const dotWidth = safeColumns * 2
-  const dotHeight = safeRows * 4
   const chartTop = 8
   const radius = 24
   const upperLabelGap = 2
   const lowerLabelGap = 3
-  const radii = { x: radius, y: radius }
   const center = { x: dotWidth / 2, y: chartTop + radius }
-  const grid = new Uint8Array(dotWidth * dotHeight)
-  const profile = new Uint8Array(dotWidth * dotHeight)
+  const cells = renderRadarCells(values, {
+    columns: safeColumns,
+    rows: safeRows,
+    guides: { ringCount: 3, spokes: true },
+    center,
+    radius,
+  })
+  const characters = cells.map((row) => row.map(({ character }) => character))
+  const tones = cells.map((row) => row.map(({ tone }) => pentagonTone(tone)))
 
-  for (let axis = 0; axis < axes.length; axis += 1) {
-    drawLine(grid, dotWidth, dotHeight, center, pointOnAxis(center, radii, axis))
-  }
-  for (const scale of [1 / 3, 2 / 3, 1]) {
-    const scaledRadii = { x: radii.x * scale, y: radii.y * scale }
-    const points = axes.map((_, axis) => pointOnAxis(center, scaledRadii, axis))
-    for (let axis = 0; axis < axes.length; axis += 1) {
-      drawLine(grid, dotWidth, dotHeight, points[axis]!, points[(axis + 1) % axes.length]!)
-    }
-  }
-  const profilePoints = values.map((value, axis) => Option.map(value, (measurement) =>
-    pointOnAxis(center, {
-      x: radii.x * clamp01(measurement),
-      y: radii.y * clamp01(measurement),
-    }, axis)))
-  for (let axis = 0; axis < axes.length; axis += 1) {
-    const point = profilePoints[axis]
-    const next = profilePoints[(axis + 1) % axes.length]
-    if (Option.isSome(point) && Option.isSome(next)) {
-      drawLine(profile, dotWidth, dotHeight, point.value, next.value)
-    }
-    if (Option.isSome(point)) setDot(profile, dotWidth, dotHeight, point.value.x, point.value.y)
-  }
-
-  const characters = Array.from({ length: safeRows }, () => Array<string>(safeColumns).fill(" "))
-  const tones = Array.from({ length: safeRows }, () =>
-    Array<PentagonRadarTone>(safeColumns).fill("empty"))
-  for (let y = 0; y < safeRows; y += 1) {
-    for (let x = 0; x < safeColumns; x += 1) {
-      const cell = pentagonRadarCell(
-        brailleMask(profile, dotWidth, x, y),
-        brailleMask(grid, dotWidth, x, y),
-      )
-      characters[y]![x] = cell.character
-      tones[y]![x] = cell.tone
-    }
-  }
-
-  const vertices = axes.map((_, axis) => pointOnAxis(center, radii, axis))
+  const vertices = axes.map((_, axis) => pointOnAxis(center, radius, axis))
   writeAxis(characters, tones, axes[0], safeColumns / 2, 0, "center")
   for (const axis of [1, 2] as const) {
-    const vertex = vertices[axis]
+    const vertex = vertices[axis]!
     writeAxis(
       characters,
       tones,
@@ -286,7 +194,7 @@ export const renderPentagonRadar = (
     )
   }
   for (const axis of [3, 4] as const) {
-    const vertex = vertices[axis]
+    const vertex = vertices[axis]!
     writeAxis(
       characters,
       tones,
@@ -312,4 +220,3 @@ export const renderPentagonRadar = (
     return runs
   })
 }
-import { Option } from "effect"

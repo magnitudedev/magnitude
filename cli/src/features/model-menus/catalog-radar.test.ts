@@ -3,13 +3,13 @@ import { Option } from "effect"
 import {
   PENTAGON_RADAR_DURATION_MS,
   interpolatePentagonRadar,
-  pentagonRadarCell,
   pentagonRadarEase,
   pentagonRadarTransitionValues,
   renderPentagonRadar,
   retargetPentagonRadar,
   type PentagonRadarValues,
 } from "../../components/pentagon-radar"
+import { radarCell } from "../../components/radar"
 import { localModelRadarAxes } from "@magnitudedev/client-common"
 import { makeCatalogOnlyModel } from "../local-inference/test-fixtures"
 
@@ -107,14 +107,21 @@ describe("catalog radar", () => {
     }
   })
 
+  test("retains the chart's supported minimum frame", () => {
+    const axes = Option.getOrThrow(localModelRadarAxes(makeCatalogOnlyModel()))
+    const frame = renderPentagonRadar(axes, undefined, 44, 13)
+    expect(frame).toHaveLength(13)
+    expect(frame.every((row) => row.map(({ text }) => text).join("").length === 44)).toBe(true)
+  })
+
   test("never merges guide dots into profile-colored Braille cells", () => {
-    expect(pentagonRadarCell(0x01, 0x80)).toEqual({
+    expect(radarCell(0x01, 0x80)).toEqual({
       character: String.fromCodePoint(0x2801),
       tone: "profile",
     })
-    expect(pentagonRadarCell(0, 0x80)).toEqual({
+    expect(radarCell(0, 0x80)).toEqual({
       character: String.fromCodePoint(0x2880),
-      tone: "grid",
+      tone: "guide",
     })
   })
 })
