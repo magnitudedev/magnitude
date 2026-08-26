@@ -2,7 +2,7 @@ import { FetchHttpClient } from "@effect/platform"
 import * as FileSystem from "@effect/platform/FileSystem"
 import { BunContext } from "@effect/platform-bun"
 import { HARNESS_PRIORITY, HarnessIdSchema } from "@magnitudedev/client-common"
-import { ProviderModelIdSchema } from "@magnitudedev/sdk"
+import { ProviderModelIdSchema, ReasoningEffortSchema } from "@magnitudedev/sdk"
 import { Effect, Option, Schema } from "effect"
 import { parse } from "jsonc-parser"
 import { delimiter } from "node:path"
@@ -15,6 +15,7 @@ import {
   clineModelCatalog,
   clineProviderSettings,
   codexConfig,
+  codexModelCatalog,
   harnessExecutableSearchPath,
   hermesProviderConfig,
   makeHarnessConnectionService,
@@ -30,9 +31,32 @@ import {
 
 const model = ProviderModelIdSchema.make("local/model")
 const secondModel = ProviderModelIdSchema.make("local/second-model")
+const high = ReasoningEffortSchema.make("high")
 const models = [
-  { id: model, name: "Local Model (Q4)" },
-  { id: secondModel, name: "Second Model (Q6)" },
+  {
+    id: model,
+    name: "Local Model (Q4)",
+    description: "A local test model.",
+    contextWindow: 50_000,
+    capabilities: {
+      vision: false,
+      tools: true,
+      structuredOutput: true,
+      reasoning: { supported: true, efforts: [high], defaultEffort: high },
+    },
+  },
+  {
+    id: secondModel,
+    name: "Second Model (Q6)",
+    description: "Another local test model.",
+    contextWindow: 32_768,
+    capabilities: {
+      vision: true,
+      tools: true,
+      structuredOutput: true,
+      reasoning: { supported: false, efforts: [] },
+    },
+  },
 ] as const
 
 const fixturePaths = (root: string): HarnessConnectionPaths => ({
@@ -43,6 +67,7 @@ const fixturePaths = (root: string): HarnessConnectionPaths => ({
   hermes: `${root}/hermes/config.yaml`,
   openclaw: `${root}/openclaw/openclaw.json`,
   codex: `${root}/codex/magnitude.config.toml`,
+  codexModels: `${root}/codex/magnitude.models.json`,
   claude: `${root}/claude/settings.json`,
   ompModels: `${root}/omp/models.yml`,
   ompSettings: `${root}/omp/settings.json`,
@@ -180,7 +205,9 @@ describe("HarnessConnection model-set behavior", () => {
         models: { providers: { magnitude: openClawProviderConfig(models) } },
         agents: { defaults: { model: { primary: "user/model" } }, list: [{ id: "main", model: "user/model" }] },
       })
-      expect(yield* fs.readFileString(paths.codex)).toBe(codexConfig({ models, setCurrent: Option.none() }))
+      const codexSpec = { models, setCurrent: Option.none<typeof model>() }
+      expect(yield* fs.readFileString(paths.codex)).toBe(codexConfig(codexSpec, paths.codexModels))
+      expect(yield* fs.readFileString(paths.codexModels)).toBe(codexModelCatalog(codexSpec))
       expect(readJson(yield* fs.readFileString(paths.claude))).toEqual(readJson(initial[paths.claude]!))
       expect(readYaml(yield* fs.readFileString(paths.ompModels))).toMatchObject({
         providers: { magnitude: ohMyPiProviderConfig(models) },
@@ -212,6 +239,7 @@ describe("HarnessConnection model-set behavior", () => {
       expect(readYaml(yield* fs.readFileString(paths.hermes))).toEqual(readYaml(initial[paths.hermes]!))
       expect(readJson(yield* fs.readFileString(paths.openclaw))).toEqual(readJson(initial[paths.openclaw]!))
       expect(yield* fs.exists(paths.codex)).toBe(false)
+      expect(yield* fs.exists(paths.codexModels)).toBe(false)
       expect(readJson(yield* fs.readFileString(paths.claude))).toEqual(readJson(initial[paths.claude]!))
       expect(readYaml(yield* fs.readFileString(paths.ompModels))).toEqual(readYaml(initial[paths.ompModels]!))
       expect(readJson(yield* fs.readFileString(paths.ompSettings))).toEqual(readJson(initial[paths.ompSettings]!))
@@ -249,6 +277,19 @@ describe("HarnessConnection model-set behavior", () => {
         agents: { list: [{ id: "main", model: "user/model" }, openClawAgentConfig(model)] },
       })
       expect(yield* fs.readFileString(paths.codex)).toContain(`model = "${model}"`)
+      expect(yield* fs.readFileString(paths.codex)).toContain('model_reasoning_effort = "high"')
+      expect(yield* fs.readFileString(paths.codex)).toContain('service_tier = "default"')
+      const codexModels = readJson(yield* fs.readFileString(paths.codexModels)) as {
+        models: ReadonlyArray<Record<string, unknown>>
+      }
+      expect(codexModels.models[0]).toMatchObject({
+        slug: model,
+        display_name: "Local Model (Q4)",
+        context_window: 50_000,
+        default_reasoning_level: "high",
+        supported_reasoning_levels: [{ effort: "high" }],
+        service_tiers: [],
+      })
       expect(readJson(yield* fs.readFileString(paths.ompSettings))).toMatchObject({ model: `magnitude/${model}` })
       expect(readJson(yield* fs.readFileString(paths.clineProviders))).toMatchObject({
         providers: { "openai-compatible": { settings: clineProviderSettings(Option.some(model)) } },
@@ -264,6 +305,7 @@ describe("HarnessConnection model-set behavior", () => {
       expect(readYaml(yield* fs.readFileString(paths.hermes))).toEqual(readYaml(initial[paths.hermes]!))
       expect(readJson(yield* fs.readFileString(paths.openclaw))).toEqual(readJson(initial[paths.openclaw]!))
       expect(yield* fs.exists(paths.codex)).toBe(false)
+      expect(yield* fs.exists(paths.codexModels)).toBe(false)
       expect(readJson(yield* fs.readFileString(paths.claude))).toEqual(readJson(initial[paths.claude]!))
       expect(readYaml(yield* fs.readFileString(paths.ompModels))).toEqual(readYaml(initial[paths.ompModels]!))
       expect(readJson(yield* fs.readFileString(paths.ompSettings))).toEqual({ theme: "dark" })
@@ -337,7 +379,7 @@ describe("HarnessConnection model-set behavior", () => {
           connections: [
             {
               harness: "pi",
-              models: [models[0], { id: secondModel, name: 42 }],
+              models: [models[0], { ...models[1], name: 42 }],
               setCurrent: 42,
               updatedAt: 42,
             },

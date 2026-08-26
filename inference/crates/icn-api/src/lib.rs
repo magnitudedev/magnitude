@@ -97,9 +97,13 @@ pub struct OpenAiModelsResponse {
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct MagnitudeModelDescriptor {
     pub id: String,
     pub name: String,
+    pub description: String,
+    pub context_window: u32,
+    pub capabilities: icn_contracts::models::ModelCapabilities,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -1472,6 +1476,9 @@ async fn standard_models(
         .map(|model| {
             let name = format!("{} ({})", model.display_name, model.variant_label);
             let id = model.id;
+            let description = model.description;
+            let context_window = model.desired_configuration.profile.context_length;
+            let capabilities = model.capabilities;
             (
                 OpenAiModel {
                     id: id.clone(),
@@ -1479,7 +1486,13 @@ async fn standard_models(
                     created: 0,
                     owned_by: "magnitude",
                 },
-                MagnitudeModelDescriptor { id, name },
+                MagnitudeModelDescriptor {
+                    id,
+                    name,
+                    description,
+                    context_window,
+                    capabilities,
+                },
             )
         })
         .unzip();

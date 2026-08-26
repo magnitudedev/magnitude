@@ -501,10 +501,13 @@ impl StreamProjector {
                         let index = self.allocate_output();
                         self.reasoning_output_index = Some(index);
                         let item = reasoning_item(self.reasoning_id(), "in_progress", None);
-                        self.require(self.send("response.output_item.added", object(serde_json::json!({
-                            "output_index": index,
-                            "item": item,
-                        }))))?;
+                        self.require(self.send(
+                            "response.output_item.added",
+                            object(serde_json::json!({
+                                "output_index": index,
+                                "item": item,
+                            })),
+                        ))?;
                         index
                     }
                 };
@@ -526,10 +529,13 @@ impl StreamProjector {
                         let index = self.allocate_output();
                         self.message_output_index = Some(index);
                         let item = message_item(self.message_id.clone(), "in_progress", None);
-                        self.require(self.send("response.output_item.added", object(serde_json::json!({
-                            "output_index": index,
-                            "item": item,
-                        }))))?;
+                        self.require(self.send(
+                            "response.output_item.added",
+                            object(serde_json::json!({
+                                "output_index": index,
+                                "item": item,
+                            })),
+                        ))?;
                         self.require(self.send("response.content_part.added", object(serde_json::json!({
                             "item_id": self.message_id, "output_index": index, "content_index": 0,
                             "part": { "type": "output_text", "text": "", "annotations": [] },
@@ -563,13 +569,7 @@ impl StreamProjector {
                         String::new(),
                     ),
                 );
-                let item = function_call_item(
-                    item_id,
-                    "in_progress",
-                    call_id,
-                    name,
-                    String::new(),
-                );
+                let item = function_call_item(item_id, "in_progress", call_id, name, String::new());
                 self.require(self.send(
                     "response.output_item.added",
                     object(serde_json::json!({

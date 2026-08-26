@@ -37,7 +37,7 @@ export {
   updateYaml,
 } from "./shared"
 export { clineModelCatalog, clineProviderSettings } from "./connectors/cline"
-export { codexConfig } from "./connectors/codex"
+export { codexConfig, codexModelCatalog } from "./connectors/codex"
 export { hermesProviderConfig } from "./connectors/hermes"
 export { ohMyPiProviderConfig } from "./connectors/oh-my-pi"
 export { openClawAgentConfig, openClawProviderConfig } from "./connectors/openclaw"

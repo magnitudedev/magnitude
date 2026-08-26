@@ -8,6 +8,7 @@ export interface HarnessConnectionPaths {
   readonly hermes: string
   readonly openclaw: string
   readonly codex: string
+  readonly codexModels: string
   readonly claude: string
   readonly ompModels: string
   readonly ompSettings: string
@@ -30,6 +31,7 @@ export const harnessConnectionPaths = (): HarnessConnectionPaths => {
     hermes: `${hermesRoot}/config.yaml`,
     openclaw: `${openClawRoot}/openclaw.json`,
     codex: `${codexRoot}/magnitude.config.toml`,
+    codexModels: `${codexRoot}/magnitude.models.json`,
     claude: `${process.env.CLAUDE_CONFIG_DIR ?? `${home}/.claude`}/settings.json`,
     ompModels: `${home}/.omp/agent/models.yml`,
     ompSettings: `${home}/.omp/agent/settings.json`,
