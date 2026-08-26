@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest"
 import { Schema } from "effect"
-import { ModelParameterizationSchema, ModelReleaseDateSchema } from "./model-state"
+import {
+  CatalogIntelligenceSchema,
+  ModelParameterizationSchema,
+  ModelReleaseDateSchema,
+} from "./model-state"
 
 describe("ModelReleaseDateSchema", () => {
   it("accepts real ISO calendar dates", () => {
@@ -41,5 +45,55 @@ describe("ModelParameterizationSchema", () => {
       totalParameters: 3_000_000_000,
       activeParameters: 3_000_000_000,
     })).toThrow()
+  })
+})
+
+describe("CatalogIntelligenceSchema", () => {
+  it("preserves direct and estimated provenance as distinct variants", () => {
+    const direct = {
+      score: 20.4,
+      provenance: {
+        kind: "artificialAnalysisIntelligenceIndex",
+        methodologyVersion: "4.1.1",
+        asOfDate: "2026-08-26",
+        url: "https://artificialanalysis.ai/models/qwen3-5-4b",
+      },
+    }
+    const estimate = {
+      score: 7.3,
+      provenance: {
+        kind: "estimate",
+        target: "artificialAnalysisIntelligenceIndex",
+        methodologyVersion: "4.1.1",
+        asOfDate: "2026-08-26",
+        confidence: "moderate",
+        methodology: "Compared with the exact parent model.",
+        evidenceUrls: ["https://example.com/evidence"],
+      },
+    }
+    expect(Schema.decodeUnknownSync(CatalogIntelligenceSchema)(direct)).toEqual(direct)
+    expect(Schema.decodeUnknownSync(CatalogIntelligenceSchema)(estimate)).toEqual(estimate)
+  })
+
+  it("rejects malformed dates, non-HTTPS evidence, and empty estimate evidence", () => {
+    const provenance = {
+      kind: "estimate",
+      target: "artificialAnalysisIntelligenceIndex",
+      methodologyVersion: "4.1.1",
+      asOfDate: "2026-08-26",
+      confidence: "low",
+      methodology: "Peer comparison.",
+      evidenceUrls: ["https://example.com/evidence"],
+    }
+    for (const invalid of [
+      { ...provenance, asOfDate: "2026-02-29" },
+      { ...provenance, evidenceUrls: ["http://example.com/evidence"] },
+      { ...provenance, evidenceUrls: [] },
+    ]) {
+      expect(() => Schema.decodeUnknownSync(CatalogIntelligenceSchema)({
+        score: 1,
+        provenance: invalid,
+      })).toThrow()
+    }
   })
 })

@@ -9,7 +9,7 @@ import {
 
 const candidate = (input: {
   readonly intelligence?: number
-  readonly quality?: number
+  readonly fidelity?: number
   readonly context?: number
   readonly speed?: number
   readonly includeComparisonSample?: boolean
@@ -19,8 +19,8 @@ const candidate = (input: {
   return {
     model: {
       modelId: "model",
-      qualityScore: input.intelligence ?? 80,
-      fidelityRank: input.quality ?? 60,
+      intelligence: { score: input.intelligence ?? 80 },
+      fidelityRank: input.fidelity ?? 60,
     },
     profile: { contextLength },
     assessment: {
@@ -43,26 +43,26 @@ describe("normalizedModelSpeedScore", () => {
 })
 
 describe("modelRankingScores", () => {
-  it("normalizes intelligence, target speed, and quantization quality independently", async () => {
+  it("normalizes intelligence, target speed, and quantization fidelity independently", async () => {
     const scores = await Effect.runPromise(modelRankingScores(candidate({
       intelligence: 75,
-      quality: 50,
+      fidelity: 50,
       speed: 40,
     })))
     expect(scores).toEqual({
       intelligence: 0.75,
       speed: normalizedModelSpeedScore(40),
-      quality: 0.5,
+      fidelity: 0.5,
     })
   })
 
   it("clamps catalog scores to the normalized range", async () => {
     const scores = await Effect.runPromise(modelRankingScores(candidate({
       intelligence: 150,
-      quality: -10,
+      fidelity: -10,
     })))
     expect(scores.intelligence).toBe(1)
-    expect(scores.quality).toBe(0)
+    expect(scores.fidelity).toBe(0)
   })
 
   it("fails explicitly when the bounded comparison sample is absent", async () => {

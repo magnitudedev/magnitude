@@ -38,6 +38,8 @@ semantics to native facts. It is not an inference authority.
 | **Model assessment** | Recomputable compatibility, capacity, memory, and performance evidence for a Model configuration and Hardware. |
 | **Load plan** | Advisory allocation evidence computed from a Model, current Hardware, and resident Instances. |
 | **Provider offering** | ACN's provider-facing metadata for a callable Model, keyed by the same canonical model ID. |
+| **Intelligence** | Model-level broad capability on the catalog's declared, versioned Artificial Analysis Intelligence Index scale, with direct or explicit-estimate provenance. |
+| **Fidelity** | Artifact-variant preservation of its represented model, derived from the catalog fidelity rank and independent of Intelligence. |
 
 Assessment predicts whether a Model normally fits. ICN admission decides whether it may run now.
 Cached assessment never authorizes loading.

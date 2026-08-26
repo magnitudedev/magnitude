@@ -282,11 +282,9 @@ fn catalog_model(
         license: definition.license.clone(),
         capabilities: definition.capabilities.clone(),
         parameterization: definition.parameterization.clone(),
-        quality_score: definition.quality_score,
-        quality_score_provenance: definition.quality_score_provenance.clone(),
+        intelligence: definition.intelligence.clone(),
         fidelity_rank: definition.fidelity_rank,
         quantization_aware: definition.quantization_aware,
-        quality_evidence: definition.quality_evidence.clone(),
         local_state,
     }
 }
@@ -354,6 +352,8 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    use icn_contracts::models::{CatalogIntelligence, IntelligenceProvenance};
+
     use icn_contracts::models::{
         CatalogModelId, CatalogPackageAffiliation, CatalogPackageRole, CatalogVariantId,
         ModelCapabilities, ModelPackage, ModelPackageInspection, ModelPackageInstallationOrigin,
@@ -409,11 +409,16 @@ mod tests {
             parameterization: icn_contracts::models::ModelParameterization::Dense {
                 total_parameters: 8_000_000_000,
             },
-            quality_score: 1.0,
-            quality_score_provenance: "test".to_owned(),
+            intelligence: CatalogIntelligence {
+                score: 1.0,
+                provenance: IntelligenceProvenance::ArtificialAnalysisIntelligenceIndex {
+                    methodology_version: "test".to_owned(),
+                    as_of_date: "2026-01-01".to_owned(),
+                    url: "https://example.com/model".to_owned(),
+                },
+            },
             fidelity_rank: 1,
             quantization_aware: false,
-            quality_evidence: Vec::new(),
         }
     }
 

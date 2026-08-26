@@ -558,6 +558,56 @@ pub enum ModelParameterization {
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IntelligenceEstimateConfidence {
+    High,
+    Moderate,
+    Low,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IntelligenceTarget {
+    ArtificialAnalysisIntelligenceIndex,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub enum IntelligenceProvenance {
+    #[serde(
+        rename = "artificialAnalysisIntelligenceIndex",
+        rename_all = "camelCase"
+    )]
+    ArtificialAnalysisIntelligenceIndex {
+        methodology_version: String,
+        as_of_date: String,
+        url: String,
+    },
+    #[serde(rename = "estimate", rename_all = "camelCase")]
+    Estimate {
+        #[cfg_attr(feature = "openapi", schema(value_type = String))]
+        target: IntelligenceTarget,
+        methodology_version: String,
+        as_of_date: String,
+        confidence: IntelligenceEstimateConfidence,
+        methodology: String,
+        #[cfg_attr(feature = "openapi", schema(min_items = 1))]
+        evidence_urls: Vec<String>,
+    },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogIntelligence {
+    pub score: f64,
+    pub provenance: IntelligenceProvenance,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RecommendableModel {
@@ -571,11 +621,9 @@ pub struct RecommendableModel {
     pub license: String,
     pub capabilities: ModelCapabilities,
     pub parameterization: ModelParameterization,
-    pub quality_score: f64,
-    pub quality_score_provenance: String,
+    pub intelligence: CatalogIntelligence,
     pub fidelity_rank: u32,
     pub quantization_aware: bool,
-    pub quality_evidence: Vec<String>,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -654,11 +702,9 @@ pub struct InferenceModel {
     pub license: String,
     pub capabilities: ModelCapabilities,
     pub parameterization: ModelParameterization,
-    pub quality_score: f64,
-    pub quality_score_provenance: String,
+    pub intelligence: CatalogIntelligence,
     pub fidelity_rank: u32,
     pub quantization_aware: bool,
-    pub quality_evidence: Vec<String>,
     pub local_state: CatalogModelLocalState,
 }
 

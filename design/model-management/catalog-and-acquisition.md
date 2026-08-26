@@ -37,8 +37,16 @@ quantization-aware-training fact. Each model declaration records the calendar da
 represented upstream model or material named revision was first publicly released. Artifact
 conversions, quantizations, quantization-aware packaging, and provider publication do not change
 that date; every artifact variant inherits the model declaration's date. Each entry publishes one exact default
-`ModelServingConfiguration`, required package components, presentation, and ranking
-evidence. Reviewed model parameterization states whether the architecture is dense or
+`ModelServingConfiguration`, required package components, presentation, and ranking evidence.
+Every active model carries one model-level intelligence assessment on a single declared Artificial
+Analysis Intelligence Index methodology version. A direct assessment records the observation date
+and canonical Artificial Analysis model URL. When no direct result exists, an estimate is a
+structurally distinct value that records its target scale, methodology, confidence, observation
+date, and non-empty primary evidence URLs. Intelligence is shared by every artifact variant;
+variant-specific preservation remains represented only by fidelity rank. Catalog intelligence is
+reviewed immutable release data and is never refreshed from the network at runtime.
+
+Reviewed model parameterization states whether the architecture is dense or
 mixture-of-experts, its positive total parameter count, and, only for mixture-of-experts, a
 positive active parameter count smaller than the total. Parameter counts are factual catalog data;
 clients own their human-readable rounding and formatting. Input modality remains an inspected
@@ -229,6 +237,9 @@ the same continuous derivation.
 - Catalog configurations are not copied into durable model state.
 - Issued catalog configurations remain resolvable after deprecation.
 - Every catalog variant publishes the valid ISO calendar date inherited from its model declaration.
+- Every active catalog model publishes exactly one finite, non-negative intelligence assessment
+  with valid direct or estimated provenance on the catalog's declared Intelligence Index version.
+- Model intelligence and artifact-variant fidelity remain separate catalog authorities.
 - Installed packages without catalog attribution remain inventory and do not become callable models.
 - Installed inventory is derived without network access or hardware assessment.
 - Partial, unsafe, invalid, or digest-mismatched content is not installed.

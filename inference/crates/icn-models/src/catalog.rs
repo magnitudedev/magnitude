@@ -8,11 +8,12 @@ use std::sync::Arc;
 use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, stream};
 use icn_contracts::models::{
-    CatalogDiagnostic, CatalogModelId, CatalogVariantId, ModelFailure, ModelFileRole, ModelPackage,
-    ModelPackageInspection, ModelPackageSource, ModelParameterization, ModelReleaseDate,
-    ModelServingConfiguration, RecommendableModel, RecommendableModelCatalog,
-    RecommendableModelCatalogProvider, ResolvedServableModelBundle, ServableModelBundle,
-    ServableModelBundleKey, ServingProfile, SpeculativeDraftSource, SpeculativeMethod,
+    CatalogDiagnostic, CatalogIntelligence, CatalogModelId, CatalogVariantId,
+    IntelligenceProvenance, ModelFailure, ModelFileRole, ModelPackage, ModelPackageInspection,
+    ModelPackageSource, ModelParameterization, ModelReleaseDate, ModelServingConfiguration,
+    RecommendableModel, RecommendableModelCatalog, RecommendableModelCatalogProvider,
+    ResolvedServableModelBundle, ServableModelBundle, ServableModelBundleKey, ServingProfile,
+    SpeculativeDraftSource, SpeculativeMethod,
 };
 use icn_contracts::{
     ComponentRole, ContentId, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
@@ -62,9 +63,7 @@ struct CatalogModel {
     #[serde(default)]
     speculative_decoding: Option<CatalogSpeculativeDecoding>,
     license: String,
-    quality_score: f64,
-    quality_score_provenance: String,
-    quality_evidence: Vec<String>,
+    intelligence: CatalogIntelligence,
 }
 
 #[derive(Clone, Deserialize)]
@@ -209,6 +208,7 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
     }
     let mut ids = BTreeSet::new();
     let mut presentations = BTreeSet::new();
+    let mut intelligence_methodology_versions = BTreeSet::new();
     for model in &source.models {
         let variant_ids = model
             .variants
@@ -268,10 +268,7 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
                     }
                 })
             || model.license.is_empty()
-            || !model.quality_score.is_finite()
-            || model.quality_score < 0.0
-            || model.quality_score_provenance.is_empty()
-            || model.quality_evidence.is_empty()
+            || !valid_catalog_intelligence(&model.intelligence)
             || !ids.insert(model.id.as_str())
             || model.variants.iter().any(|variant| {
                 !presentations.insert((model.display_name.as_str(), variant.variant_label.as_str()))
@@ -282,8 +279,68 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
                 model.id
             )));
         }
+        intelligence_methodology_versions
+            .insert(intelligence_methodology_version(&model.intelligence));
+    }
+    if intelligence_methodology_versions.len() != 1 {
+        return Err(InventoryError::Integrity(
+            "catalog intelligence assessments must use one methodology version".to_owned(),
+        ));
     }
     Ok(source)
+}
+
+fn valid_catalog_intelligence(intelligence: &CatalogIntelligence) -> bool {
+    if !intelligence.score.is_finite() || intelligence.score < 0.0 {
+        return false;
+    }
+    match &intelligence.provenance {
+        IntelligenceProvenance::ArtificialAnalysisIntelligenceIndex {
+            methodology_version,
+            as_of_date,
+            url,
+        } => {
+            valid_non_empty(methodology_version)
+                && ModelReleaseDate::new(as_of_date.clone()).is_ok()
+                && valid_https_url(url)
+        }
+        IntelligenceProvenance::Estimate {
+            methodology_version,
+            as_of_date,
+            methodology,
+            evidence_urls,
+            ..
+        } => {
+            valid_non_empty(methodology_version)
+                && ModelReleaseDate::new(as_of_date.clone()).is_ok()
+                && valid_non_empty(methodology)
+                && !evidence_urls.is_empty()
+                && evidence_urls.iter().all(|url| valid_https_url(url))
+        }
+    }
+}
+
+fn intelligence_methodology_version(intelligence: &CatalogIntelligence) -> &str {
+    match &intelligence.provenance {
+        IntelligenceProvenance::ArtificialAnalysisIntelligenceIndex {
+            methodology_version,
+            ..
+        }
+        | IntelligenceProvenance::Estimate {
+            methodology_version,
+            ..
+        } => methodology_version,
+    }
+}
+
+fn valid_non_empty(value: &str) -> bool {
+    !value.is_empty() && value.trim() == value
+}
+
+fn valid_https_url(value: &str) -> bool {
+    valid_non_empty(value)
+        && value.starts_with("https://")
+        && !value.chars().any(char::is_whitespace)
 }
 
 fn is_projector_path(path: &Path) -> bool {
@@ -1245,11 +1302,9 @@ fn recommendable_model(
         license: declaration.license.clone(),
         capabilities,
         parameterization: declaration.parameterization.clone(),
-        quality_score: declaration.quality_score,
-        quality_score_provenance: declaration.quality_score_provenance.clone(),
+        intelligence: declaration.intelligence.clone(),
         fidelity_rank: variant.fidelity_rank,
         quantization_aware: variant.quantization_aware,
-        quality_evidence: declaration.quality_evidence.clone(),
     })
 }
 

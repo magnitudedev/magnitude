@@ -11,6 +11,8 @@ import {
   rankedLocalModelOptions,
   LOCAL_MODEL_RANKING_SCALE_INTERVALS,
   LOCAL_MODEL_RANKING_SCALE_LABELS,
+  LOCAL_MODEL_RANKING_SCALE_VALUES,
+  localModelRankingScaleIndex,
   targetPhysicalMemoryBytes,
   type useOnboardingModelSetup,
 } from "@magnitudedev/client-common"
@@ -316,10 +318,10 @@ export function LocalModelOnboarding({
                 step={1}
                 list="local-model-ranking-scale"
                 disabled={operation !== null}
-                value={Math.round(content.rankingControls.fastToSmart * LOCAL_MODEL_RANKING_SCALE_INTERVALS)}
+                value={localModelRankingScaleIndex(content.rankingControls.fastToSmart)}
                 onChange={(event) => setup.setRankingControls({
                   ...content.rankingControls,
-                  fastToSmart: Number(event.currentTarget.value) / LOCAL_MODEL_RANKING_SCALE_INTERVALS,
+                  fastToSmart: LOCAL_MODEL_RANKING_SCALE_VALUES[Number(event.currentTarget.value)]!,
                 })}
               />
               <datalist id="local-model-ranking-scale">

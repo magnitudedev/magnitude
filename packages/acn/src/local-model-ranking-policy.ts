@@ -50,8 +50,8 @@ export const modelRankingScores = (
     }))
   }
   return Effect.succeed({
-    intelligence: clamp01(candidate.model.qualityScore / 100),
+    intelligence: clamp01(candidate.model.intelligence.score / 100),
     speed: normalizedModelSpeedScore(generation.estimatedTokensPerSecond),
-    quality: clamp01(candidate.model.fidelityRank / 100),
+    fidelity: clamp01(candidate.model.fidelityRank / 100),
   })
 }

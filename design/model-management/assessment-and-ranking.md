@@ -138,7 +138,7 @@ configured context are omitted, and the final sample is always the configured co
 
 Ranking scores are present only when the bundle is active in the rankable catalog.
 Deprecated catalog configurations remain resolvable and assessable but receive no fabricated
-intelligence, fidelity, quality, or ranking scores.
+intelligence, fidelity, or ranking scores.
 
 `DoesNotFit` and `Incompatible` are completed evidence but are not selectable. Missing,
 `Assessing`, canceled, or defective work is not published as a successful empty portfolio.

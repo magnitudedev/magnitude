@@ -13,6 +13,8 @@ import {
   type OnboardingModelRankingControls,
   LOCAL_MODEL_RANKING_SCALE_INTERVALS,
   LOCAL_MODEL_RANKING_SCALE_LABELS,
+  LOCAL_MODEL_RANKING_SCALE_VALUES,
+  localModelRankingScaleIndex,
   rankedLocalModelOptions,
   targetPhysicalMemoryBytes,
   wrapTextToWordLines,
@@ -514,9 +516,7 @@ export function OnboardingModelChooser({
   const maximumMemoryBytes = Result.isSuccess(hardware)
     ? targetPhysicalMemoryBytes(hardware.value)
     : null
-  const selectedRankingScaleIndex = Math.round(
-    Math.min(1, Math.max(0, rankingControls.fastToSmart)) * LOCAL_MODEL_RANKING_SCALE_INTERVALS,
-  )
+  const selectedRankingScaleIndex = localModelRankingScaleIndex(rankingControls.fastToSmart)
   const { selections, ranked, local } = useMemo(() => {
     const ranked = maximumMemoryBytes === null
       ? []
@@ -624,11 +624,12 @@ export function OnboardingModelChooser({
   }, [moveSelectionTo])
 
   const adjustControl = useCallback((direction: -1 | 1) => {
+    const nextIndex = Math.min(LOCAL_MODEL_RANKING_SCALE_INTERVALS, Math.max(0,
+      selectedRankingScaleIndex + direction))
     onRankingControlsChange({
-      fastToSmart: Math.min(1, Math.max(0,
-        rankingControls.fastToSmart + direction / LOCAL_MODEL_RANKING_SCALE_INTERVALS)),
+      fastToSmart: LOCAL_MODEL_RANKING_SCALE_VALUES[nextIndex]!,
     })
-  }, [onRankingControlsChange, rankingControls.fastToSmart])
+  }, [onRankingControlsChange, selectedRankingScaleIndex])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (locked) return

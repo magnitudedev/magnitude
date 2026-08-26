@@ -1,6 +1,7 @@
-import { Option } from "effect"
+import { Option, Schema } from "effect"
 import {
   AssessmentEnvironmentIdSchema,
+  CatalogIntelligenceSchema,
   CatalogModelIdSchema,
   CatalogVariantIdSchema,
   LocalInferenceAcceleratorIdSchema,
@@ -182,18 +183,24 @@ export const makeCatalogOnlyModel = (
         variantId: CatalogVariantIdSchema.make("gguf:q4"),
         releaseDate: "2026-01-01" as ModelReleaseDate,
         parameterization: { architecture: "dense", totalParameters: 8_000_000_000 },
-        intelligenceScore: 75,
-        intelligenceScoreSource: "Test catalog score",
+        intelligence: Schema.decodeUnknownSync(CatalogIntelligenceSchema)({
+          score: 75,
+          provenance: {
+            kind: "artificialAnalysisIntelligenceIndex",
+            methodologyVersion: "test",
+            asOfDate: "2026-01-01",
+            url: "https://example.com/model",
+          },
+        }),
         fidelityRank: 75,
         quantizationAware: false,
-        qualityNotes: ["Test quantization notes"],
       },
     },
     acquisitionState: { _tag: "NotInstalled" },
     servingState: {
       ...model.servingState,
       availabilityState: { _tag: "Installable" },
-      rankingScores: Option.some({ intelligence: 0.75, speed: 0.65, quality: 0.75 }),
+      rankingScores: Option.some({ intelligence: 0.75, speed: 0.65, fidelity: 0.75 }),
     },
     presentation: { ...model.presentation, license: Option.some("Apache-2.0") },
     ...overrides,
