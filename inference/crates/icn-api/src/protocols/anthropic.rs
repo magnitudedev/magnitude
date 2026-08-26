@@ -335,21 +335,79 @@ fn parallelism(disabled: bool) -> domain::ToolParallelism {
     }
 }
 
+// Claude Code attribution projection. Claude Code prepends provider-reserved
+// billing metadata as the leading system text —
+// `x-anthropic-billing-header: …; cch=<stamp>;<optional real prompt>` — which
+// api.anthropic.com strips before the model sees it. This adapter is the one
+// place wire bytes become model-visible text, so it owns the same stripping:
+// the per-request cch stamp would otherwise defeat prompt-prefix reuse and
+// the metadata would become model-visible prompt content. Recognition is
+// strict and positional — leading block, exact sentinel, `cch=` plus five
+// bytes plus `;`. Everything else passes through byte-identical; an
+// unrecognized sentinel shape is preserved with a diagnostic, never guessed
+// at. Magnitude-launched Claude Code also sets
+// CLAUDE_CODE_ATTRIBUTION_HEADER=0, so this projection covers only clients
+// Magnitude did not launch.
+const ATTRIBUTION_SENTINEL: &str = "x-anthropic-billing-header:";
+
+fn project_system(mut blocks: Vec<String>) -> Vec<String> {
+    let Some(first) = blocks.first_mut() else {
+        return blocks;
+    };
+    match project_attribution(std::mem::take(first)) {
+        Some(text) => *first = text,
+        None => {
+            blocks.remove(0);
+        }
+    }
+    blocks
+}
+
+fn project_attribution(text: String) -> Option<String> {
+    if !text.starts_with(ATTRIBUTION_SENTINEL) {
+        return Some(text);
+    }
+    let Some(found) = text[ATTRIBUTION_SENTINEL.len()..].find("cch=") else {
+        tracing::warn!("unrecognized Claude Code attribution shape; preserving system content");
+        return Some(text);
+    };
+    let stamp_end = ATTRIBUTION_SENTINEL.len() + found + "cch=".len() + 5;
+    if text.as_bytes().get(stamp_end) != Some(&b';') {
+        tracing::warn!("unrecognized Claude Code attribution shape; preserving system content");
+        return Some(text);
+    }
+    let suffix = &text[stamp_end + 1..];
+    if suffix.is_empty() {
+        None
+    } else {
+        Some(suffix.to_owned())
+    }
+}
+
 fn context(
     system: Option<SystemPrompt>,
     messages: Vec<Message>,
 ) -> Result<domain::InferenceContext, ApiError> {
-    let system = system
-        .map(|system| match system {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(blocks) => blocks
-                .into_iter()
-                .map(|SystemBlock::Text { text, .. }| text)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        })
-        .map(|text| non_empty_text(text, "system"))
-        .transpose()?;
+    let system = match system {
+        None => None,
+        Some(system) => {
+            let blocks: Vec<String> = match system {
+                SystemPrompt::Text(text) => vec![text],
+                SystemPrompt::Blocks(blocks) => blocks
+                    .into_iter()
+                    .map(|SystemBlock::Text { text, .. }| text)
+                    .collect(),
+            };
+            let had_blocks = !blocks.is_empty();
+            let blocks = project_system(blocks);
+            if had_blocks && blocks.is_empty() {
+                // The entire system content was attribution metadata.
+                None
+            } else {
+                Some(non_empty_text(blocks.join("\n"), "system")?)
+            }
+        }
+    };
     let mut entries = Vec::new();
     let mut messages = messages.into_iter().peekable();
     while let Some(message) = messages.next() {

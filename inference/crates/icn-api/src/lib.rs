@@ -3539,6 +3539,136 @@ mod tests {
         assert_eq!(text.as_str(), "runtime instructions");
     }
 
+    fn anthropic_canonical(value: Value) -> domain::InferenceRequest<domain::ReasoningIntent> {
+        let request: protocols::anthropic::MessagesRequest =
+            serde_json::from_value(value).expect("request must decode");
+        protocols::anthropic::adapt(request)
+            .expect("request must adapt")
+            .invocation
+            .into_parts()
+            .1
+    }
+
+    #[test]
+    fn anthropic_strips_claude_code_attribution_before_model_context() {
+        // Inline legacy shape: attribution and the real prompt share a block.
+        let inline = anthropic_canonical(json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "system": "x-anthropic-billing-header: cc_version=2.1.101.e51; cc_entrypoint=cli; cch=a5145;You are Claude Code.",
+            "messages": [{ "role": "user", "content": "hello" }]
+        }));
+        assert_eq!(
+            inline.context().system().map(domain::NonEmptyText::as_str),
+            Some("You are Claude Code."),
+        );
+
+        // Standalone shape: attribution is its own leading block.
+        let standalone = anthropic_canonical(json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "system": [
+                { "type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.181; cc_entrypoint=cli; cch=a5145;" },
+                { "type": "text", "text": "You are Claude Code." }
+            ],
+            "messages": [{ "role": "user", "content": "hello" }]
+        }));
+        assert_eq!(
+            standalone
+                .context()
+                .system()
+                .map(domain::NonEmptyText::as_str),
+            Some("You are Claude Code."),
+        );
+
+        // Attribution-only system leaves no system prompt at all.
+        let only = anthropic_canonical(json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "system": "x-anthropic-billing-header: cch=a5145;",
+            "messages": [{ "role": "user", "content": "hello" }]
+        }));
+        assert_eq!(only.context().system(), None);
+    }
+
+    #[test]
+    fn anthropic_attribution_stripping_is_nonce_invariant_and_idempotent() {
+        let request = |cch: &str| json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "system": format!("x-anthropic-billing-header: cc_version=2.1.101.e51; cc_entrypoint=cli; cch={cch};You are Claude Code."),
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        let first = anthropic_canonical(request("a5145"));
+        let second = anthropic_canonical(request("0beef"));
+        // Requests differing only in the per-request stamp must produce
+        // identical canonical context, or prompt-prefix reuse is defeated.
+        assert_eq!(first.context(), second.context());
+
+        // Idempotent: projecting already-projected content changes nothing.
+        let replayed = anthropic_canonical(json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "system": first.context().system().unwrap().as_str(),
+            "messages": [{ "role": "user", "content": "hello" }]
+        }));
+        assert_eq!(first.context().system(), replayed.context().system());
+    }
+
+    #[test]
+    fn anthropic_attribution_recognition_is_strictly_positional() {
+        // The marker in a later block is ordinary content.
+        let later_block = anthropic_canonical(json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "system": [
+                { "type": "text", "text": "Real instructions." },
+                { "type": "text", "text": "x-anthropic-billing-header: cch=a5145;" }
+            ],
+            "messages": [{ "role": "user", "content": "hello" }]
+        }));
+        assert_eq!(
+            later_block
+                .context()
+                .system()
+                .map(domain::NonEmptyText::as_str),
+            Some("Real instructions.\nx-anthropic-billing-header: cch=a5145;"),
+        );
+
+        // A non-leading mention within the first block is ordinary content.
+        let mention = "Mention of x-anthropic-billing-header: cch=a5145; in prose.";
+        let non_leading = anthropic_canonical(json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "system": mention,
+            "messages": [{ "role": "user", "content": "hello" }]
+        }));
+        assert_eq!(
+            non_leading
+                .context()
+                .system()
+                .map(domain::NonEmptyText::as_str),
+            Some(mention),
+        );
+
+        // A sentinel without the documented stamp is preserved, not rejected
+        // and not guessed at.
+        let malformed = "x-anthropic-billing-header: cc_version=2.1.101; no stamp";
+        let preserved = anthropic_canonical(json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "system": malformed,
+            "messages": [{ "role": "user", "content": "hello" }]
+        }));
+        assert_eq!(
+            preserved
+                .context()
+                .system()
+                .map(domain::NonEmptyText::as_str),
+            Some(malformed),
+        );
+    }
+
     #[test]
     fn protocol_forbidden_empty_assistant_forms_remain_invalid() {
         let chat: ChatCompletionRequest = serde_json::from_value(json!({

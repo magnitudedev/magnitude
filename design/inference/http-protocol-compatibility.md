@@ -77,6 +77,21 @@ Because the mapping is user-authority, a system-role message is accepted anywher
 is legal — intentionally more lenient than the upstream protocol's placement rules, which exist to
 protect cache and authority semantics this mapping does not carry.
 
+The Anthropic adapter also owns the Claude Code attribution projection. Claude Code prepends
+provider-reserved billing metadata as the leading system text
+(`x-anthropic-billing-header: …; cch=<stamp>;<optional real prompt>`), which api.anthropic.com
+strips before the model sees it; the per-request `cch` stamp would otherwise defeat prompt-prefix
+reuse and the metadata would become model-visible prompt content. The projection runs on the
+leading system text before blocks are joined, so Messages and token counting share it through the
+common adaptation path. Recognized attribution is removed and any real prompt suffix is preserved
+exactly; all other content passes through byte-identical; an unrecognized sentinel shape is
+preserved with a content-free diagnostic rather than guessed at. The projection is idempotent and
+exists only in this adapter: the byte-preserving ACN gateway and the canonical inference domain
+never learn this metadata exists. Magnitude-launched Claude Code additionally sets
+`CLAUDE_CODE_ATTRIBUTION_HEADER=0`, so the projection covers only clients Magnitude did not
+launch. The durable rule: provider-reserved attribution is protocol metadata, not prompt content,
+and it dies at the protocol boundary.
+
 Input context and generated output are separate domains. A context entry is never a generation
 result, and inference output is never a context entry. The inference contract does not own how a
 caller constructs a later invocation from an earlier result.
