@@ -54,7 +54,7 @@ magnitude (shell)
     │    · Installing        daemon binary                   secs–mins   bar + % + sizes
     │      "Installing        inference engine                minutes
     │       Magnitude"
-    │    · Starting          daemon spawn                    ~0.5–2s     text only
+    │    · Starting          daemon spawn                    ~0.5–2s     radar loader
     │      "Starting          inference launch + backend prep ~1–5s
     │       Magnitude"
     │    · Failed            stage message                   —           R retry / Q quit
@@ -123,7 +123,10 @@ byte-denominated:
 
 ### `DaemonStartup` · Starting — title "Starting Magnitude"
 
-Text only — no bar, no spinner. Subtext is the phase label from `Starting.phase`:
+Centered stack: title, guide-free five-point radar loader, phase label. There is no progress bar.
+The loader remains mounted across `Starting.phase` changes and is absent from other lifecycle states.
+
+Subtext is the phase label from `Starting.phase`:
 
 | Phase | Subtext label |
 | --- | --- |
