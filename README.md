@@ -8,7 +8,7 @@
 
 <h1 align="center">Magnitude</h1>
 
-<p align="center"><strong>Local models, tuned to your machine.</strong></p>
+<p align="center"><strong>Easy local inference for agents</strong></p>
 
 <p align="center">
   <a href="https://docs.magnitude.dev"><img src="https://img.shields.io/badge/%F0%9F%93%95-Docs-0369a1?style=flat-square&labelColor=0369a1&color=gray" alt="Documentation"></a>
@@ -62,7 +62,7 @@ There's no fixed minimum. Magnitude profiles your hardware and recommends the be
 
 ### How is it different from Ollama or LM Studio?
 
-Ollama and LM Studio run the model you tell them to. Figuring out which model, which quant, whether it fits, and how fast it'll be is on you. Magnitude removes the guesswork. It profiles your machine, shows you exactly what will run well and how fast, then runs it with everything tuned, from speculative decoding to concurrency. Nothing to research, nothing to configure.
+Ollama and LM Studio run the model you tell them to. Figuring out which model, which quant, whether it fits, and how fast it'll be is on you. Magnitude removes the guesswork. It profiles your machine, shows you exactly what will run well and how fast, then runs it with everything tuned, from speculative decoding to concurrency. It's also built for agent workloads. Models load just in time as requests come in, and unload when idle or memory gets tight.
 
 ### Which harnesses work with it?
 
