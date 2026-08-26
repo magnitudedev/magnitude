@@ -16,6 +16,7 @@ import {
   LOCAL_MODEL_RANKING_SCALE_LABELS,
   rankedLocalModelOptions,
   targetPhysicalMemoryBytes,
+  wrapTextToWordLines,
 } from "@magnitudedev/client-common"
 import type {
   LocalModel,
@@ -329,21 +330,50 @@ const OnboardingHardwareContext = ({
 }): ReactNode => {
   const theme = useTheme()
   if (Result.isSuccess(hardware)) return describeLocalHardwareSummary(hardware.value).map((row) => (
-    <text key={`${row.name}:${row.details.join(":")}`} style={{ width }} wrapMode="word">
+    <text key={`${row.name}:${row.details.join(":")}`} style={{ width, flexShrink: 0 }} wrapMode="word">
       <span fg={theme.text.detail}>{row.name}</span>
       <span fg={theme.text.supporting}>{` · ${row.details.join(" · ")}`}</span>
     </text>
   ))
   if (Result.isFailure(hardware)) {
-    return <text style={{ fg: theme.status.failure, width }}>! Hardware detection failed</text>
+    return <text style={{ fg: theme.status.failure, width, flexShrink: 0 }}>! Hardware detection failed</text>
   }
   return (
-    <text style={{ width }}>
+    <text style={{ width, flexShrink: 0 }}>
       <span fg={theme.accent}>{spinnerFrame} </span>
       <span fg={theme.text.detail}>Detecting hardware…</span>
     </text>
   )
 }
+
+const hardwareSummaryText = ({
+  name,
+  details,
+}: ReturnType<typeof describeLocalHardwareSummary>[number]): string =>
+  `${name} · ${details.join(" · ")}`
+
+export const onboardingHardwareContextRows = (
+  hardware: LocalInferenceHardwareResult,
+  width: number,
+): number => {
+  const bodyWidth = setupBodyWidth(width)
+  if (Result.isSuccess(hardware)) {
+    return describeLocalHardwareSummary(hardware.value).reduce(
+      (rows, summary) => rows + wrapTextToWordLines(hardwareSummaryText(summary), bodyWidth).length,
+      0,
+    )
+  }
+  const message = Result.isFailure(hardware)
+    ? "! Hardware detection failed"
+    : `${spinnerFrameAt(0)} Detecting hardware…`
+  return wrapTextToWordLines(message, bodyWidth).length
+}
+
+export const onboardingSetupAdditionalRows = (
+  hardware: LocalInferenceHardwareResult,
+  width: number,
+): number => ONBOARDING_RANKING_CONTROL_ROWS
+  + Math.max(0, onboardingHardwareContextRows(hardware, width) - 1)
 
 const OnboardingSetupCard = ({
   width,
@@ -366,9 +396,7 @@ const OnboardingSetupCard = ({
 }): ReactNode => {
   const theme = useTheme()
   const bodyWidth = setupBodyWidth(width)
-  const additionalRows = ONBOARDING_RANKING_CONTROL_ROWS + (Result.isSuccess(hardware)
-    ? Math.max(0, describeLocalHardwareSummary(hardware.value).length - 1)
-    : 0)
+  const additionalRows = onboardingSetupAdditionalRows(hardware, width)
   return (
     <SetupFrame
       width={width}
@@ -860,7 +888,14 @@ export function OnboardingModelChooser({
     >
       {operation === null
         ? (
-            <box style={{ flexDirection: "column", width: "100%", marginBottom: 1 }}>
+            <box style={{
+              flexDirection: "column",
+              width: "100%",
+              height: ONBOARDING_RANKING_CONTROL_ROWS,
+              minHeight: ONBOARDING_RANKING_CONTROL_ROWS,
+              maxHeight: ONBOARDING_RANKING_CONTROL_ROWS,
+              flexShrink: 0,
+            }}>
               <text selectable={false} style={{ fg: theme.text.body }} wrapMode="none">
                 {" ".repeat(FAST_TO_SMART_TRACK_LEFT_PADDING)}
                 {LOCAL_MODEL_RANKING_SCALE_LABELS.map((_, index) => (
@@ -873,8 +908,12 @@ export function OnboardingModelChooser({
                       : ""}
                   </Fragment>
                 ))}
-                {"    "}
-                <span fg={theme.text.disabled}>←/→ change preference</span>
+                {wide && (
+                  <>
+                    {"    "}
+                    <span fg={theme.text.disabled}>←/→ change preference</span>
+                  </>
+                )}
               </text>
               <text selectable={false} style={{ fg: theme.text.body }} wrapMode="none">
                 {FAST_TO_SMART_LABEL_LAYOUT.map(({ label, leadingSpaces }, index) => (
@@ -884,6 +923,13 @@ export function OnboardingModelChooser({
                   </Fragment>
                 ))}
               </text>
+              {wide ? (
+                <box style={{ height: 1, minHeight: 1, maxHeight: 1, flexShrink: 0 }} />
+              ) : (
+                <text selectable={false} style={{ fg: theme.text.disabled }} wrapMode="none">
+                  {" ".repeat(FAST_TO_SMART_TRACK_LEFT_PADDING)}←/→ change preference
+                </text>
+              )}
             </box>
           )
         : operation._tag === "Downloading"

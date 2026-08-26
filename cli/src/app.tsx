@@ -86,13 +86,12 @@ import {
 } from "./features/sessions/container";
 import {
   OnboardingModelChooser,
-  ONBOARDING_RANKING_CONTROL_ROWS,
+  onboardingSetupAdditionalRows,
   OnboardingModelExiting,
   OnboardingModelPreparation,
   HarnessChooser,
   SetupFrame,
 } from "./features/model-setup";
-import { describeLocalHardwareSummary } from "./features/local-inference/view-model";
 import { registerCliCommands } from "./commands/register";
 import { AcnBootstrapScreen } from "./features/app-shell/acn-bootstrap";
 
@@ -265,9 +264,6 @@ function CliAppContent(
   const { showCopiedToast: clipboardToast } = useSelectionAutoCopy();
   const notificationAreaState = useAtomValue(notificationAreaStateAtom);
   const onboardingSetup = props.onboardingSetup;
-  const setupAdditionalRows = ONBOARDING_RANKING_CONTROL_ROWS + (Result.isSuccess(onboardingSetup.hardware)
-    ? Math.max(0, describeLocalHardwareSummary(onboardingSetup.hardware.value).length - 1)
-    : 0);
   const modelSlotsState = Option.getOrNull(Result.value(useModelSlots()));
   const { rootSlotId } = useSlotProfiles();
   const selectedLocalProviderModelId = modelSlotsState?.slots.primary._tag
@@ -303,6 +299,10 @@ function CliAppContent(
   const slotActions = useModelSlotActions();
   const chatColumn = useLocalWidth();
   const chatColumnWidth = chatColumn.width ?? 80;
+  const setupAdditionalRows = onboardingSetupAdditionalRows(
+    onboardingSetup.hardware,
+    chatColumnWidth,
+  );
   const clientWorkingDirectory = process.cwd();
   const dispatchErrorAction = useCallback(
     (actionId: ActionId) => {

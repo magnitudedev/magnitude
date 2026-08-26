@@ -8,7 +8,8 @@ export type SetupStage = "choose" | "install" | "harness"
 const SETUP_CONTENT_MAX_WIDTH = 110
 const SETUP_WIDE_MIN_WIDTH = 105
 const WIDE_SETUP_FRAME_ROWS = 26
-const NARROW_SETUP_FRAME_ROWS = 42
+const NARROW_SETUP_FRAME_ROWS = 48
+const SETUP_FOOTER_ROWS = 2
 
 export const setupContentWidth = (viewportWidth: number): number =>
   Math.max(1, Math.min(SETUP_CONTENT_MAX_WIDTH, viewportWidth - 2))
@@ -36,9 +37,16 @@ export function SetupStepper({
 
   if (vertical) {
     return (
-      <box style={{ flexDirection: "column", marginBottom: 1 }}>
+      <box style={{
+        flexDirection: "column",
+        height: 5,
+        minHeight: 5,
+        maxHeight: 5,
+        flexShrink: 0,
+        marginBottom: 1,
+      }}>
         {labels.map((label, position) => (
-          <box key={label} style={{ flexDirection: "column" }}>
+          <box key={label} style={{ flexDirection: "column", flexShrink: 0 }}>
             <text style={{ fg: position === activeIndex ? theme.accent : theme.text.body }}>
               {position <= activeIndex ? "●" : "○"} {label}
             </text>
@@ -52,7 +60,14 @@ export function SetupStepper({
   }
 
   return (
-    <box style={{ flexDirection: "row", marginBottom: 1 }}>
+    <box style={{
+      flexDirection: "row",
+      height: 1,
+      minHeight: 1,
+      maxHeight: 1,
+      flexShrink: 0,
+      marginBottom: 1,
+    }}>
       {labels.map((label, position) => (
         <text key={label} style={{ fg: position === activeIndex ? theme.accent : theme.text.body }}>
           {position <= activeIndex ? "●" : "○"} {label}{position < labels.length - 1 ? ` ${position < activeIndex ? "════" : "────"} ` : ""}
@@ -92,12 +107,28 @@ export function SetupFrame({
         paddingLeft: 2,
         paddingRight: 2,
       }}>
-        <text style={{ fg: theme.text.body }} attributes={TextAttributes.BOLD}>MAGNITUDE SETUP</text>
+        <text
+          style={{ fg: theme.text.body, height: 1, minHeight: 1, maxHeight: 1, flexShrink: 0 }}
+          attributes={TextAttributes.BOLD}
+        >
+          MAGNITUDE SETUP
+        </text>
         <SetupStepper stage={stage} vertical={!isWideSetupLayout(width)} />
         {children}
         <box style={{ flexGrow: 1 }} />
         {footer !== undefined && <box style={{ height: 1, minHeight: 1, flexShrink: 0 }} />}
-        {footer}
+        {footer !== undefined && (
+          <box style={{
+            height: SETUP_FOOTER_ROWS,
+            minHeight: SETUP_FOOTER_ROWS,
+            maxHeight: SETUP_FOOTER_ROWS,
+            flexDirection: "column",
+            flexShrink: 0,
+            overflow: "hidden",
+          }}>
+            {footer}
+          </box>
+        )}
         {unexpectedErrorLines.map((line, index) => (
           <text key={`${index}:${line}`} style={{ fg: theme.status.failure }} wrapMode="none">
             {line}

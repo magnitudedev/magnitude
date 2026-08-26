@@ -16,7 +16,7 @@ describe("setup frame layout", () => {
 
   it("uses the model page's required height without the removed title row", () => {
     expect(setupFrameHeight(120)).toBe(26)
-    expect(setupFrameHeight(80)).toBe(42)
+    expect(setupFrameHeight(80)).toBe(48)
     expect(setupFrameHeight(120, 1)).toBe(27)
   })
 })
