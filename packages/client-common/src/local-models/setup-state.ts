@@ -12,6 +12,12 @@ import type {
 } from "@magnitudedev/sdk"
 import type { OnboardingPersistenceError } from "../onboarding/persistence"
 import type {
+  HarnessConnectionError,
+  HarnessDestination,
+  HarnessId,
+  HarnessLaunchPlan,
+} from "../harness-connections/service"
+import type {
   ModelSlotsAssignError,
   ModelSlotsLoadError,
   ModelSlotsStopError,
@@ -65,6 +71,7 @@ export type OnboardingModelSetupFailure =
   | ModelSlotsLoadError
   | ModelSlotsStopError
   | OnboardingPersistenceError
+  | HarnessConnectionError
 
 export type OnboardingModelSetupExitKind = "Skip" | "Close"
 
@@ -102,6 +109,23 @@ export type OnboardingModelSetupContent =
       readonly _tag: "Chooser"
       readonly options: readonly LocalModelOption[]
       readonly operation: Option.Option<OnboardingModelSetupOperation>
+    }
+  | {
+      readonly _tag: "Harness"
+      readonly model: LocalModel
+      readonly modelId: ProviderModelId
+      readonly providerModelId: ProviderModelId
+      readonly destinations: ReadonlyArray<HarnessDestination>
+    }
+  | {
+      readonly _tag: "ApplyingHarness"
+      readonly model: LocalModel
+      readonly modelId: ProviderModelId
+      readonly harness: HarnessId
+    }
+  | {
+      readonly _tag: "HarnessHandoff"
+      readonly plan: HarnessLaunchPlan
     }
   | { readonly _tag: "Closing" }
 

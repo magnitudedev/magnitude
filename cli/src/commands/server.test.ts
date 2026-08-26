@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import {
+  developmentServerCommand,
   renderLinuxServerService,
   renderMacServerService,
   renderWindowsServerCommand,
@@ -7,6 +8,14 @@ import {
 } from "./server"
 
 describe("Magnitude server service definitions", () => {
+  it("registers development startup against the local ACN entrypoint", () => {
+    expect(developmentServerCommand("/opt/bun")).toEqual([
+      "/opt/bun",
+      expect.stringMatching(/packages\/acn\/src\/binary\.ts$/),
+      "serve",
+    ])
+  })
+
   it("renders a launch agent with exact argv and automatic restart", () => {
     const rendered = renderMacServerService(["/Applications/Magnitude & Tools/acn", "server"])
     expect(rendered).toContain("<string>/Applications/Magnitude &amp; Tools/acn</string><string>server</string>")

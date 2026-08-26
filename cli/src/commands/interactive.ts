@@ -75,7 +75,8 @@ export const registerInteractiveCommand = (program: Command): void => {
       return Effect.runPromise(runInteractiveCommand(options).pipe(
         Effect.provide([BunContext.layer, FetchHttpClient.layer]),
         Effect.catchAll((error) => Effect.sync(() => {
-          process.stderr.write(`Failed to start Magnitude: ${error.reason}\n`)
+          const reason = "reason" in error ? error.reason : String(error)
+          process.stderr.write(`Failed to start Magnitude: ${reason}\n`)
           return 1
         })),
       )).then((exitCode) => process.exit(exitCode))

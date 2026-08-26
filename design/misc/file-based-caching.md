@@ -10,6 +10,7 @@ applies_to:
   - inference/catalog/**
   - packages/icn/src/lifecycle/**
   - packages/acn/src/icn/layer.ts
+  - cli/src/harness-connections/service.ts
 ---
 
 # File-based cache, index, and durable-state recovery

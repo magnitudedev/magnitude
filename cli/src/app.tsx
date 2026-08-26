@@ -88,7 +88,10 @@ import {
   OnboardingModelChooser,
   OnboardingModelExiting,
   OnboardingModelPreparation,
+  HarnessChooser,
+  SetupFrame,
 } from "./features/model-setup";
+import { describeLocalHardwareSummary } from "./features/local-inference/view-model";
 import { registerCliCommands } from "./commands/register";
 import { AcnBootstrapScreen } from "./features/app-shell/acn-bootstrap";
 
@@ -261,7 +264,9 @@ function CliAppContent(
   const { showCopiedToast: clipboardToast } = useSelectionAutoCopy();
   const notificationAreaState = useAtomValue(notificationAreaStateAtom);
   const onboardingSetup = props.onboardingSetup;
-  const setupState = Option.getOrNull(Result.value(onboardingSetup.view));
+  const setupAdditionalRows = Result.isSuccess(onboardingSetup.hardware)
+    ? Math.max(0, describeLocalHardwareSummary(onboardingSetup.hardware.value).length - 1)
+    : 0;
   const modelSlotsState = Option.getOrNull(Result.value(useModelSlots()));
   const { rootSlotId } = useSlotProfiles();
   const selectedLocalProviderModelId = modelSlotsState?.slots.primary._tag
@@ -363,6 +368,43 @@ function CliAppContent(
         state.exitKind,
       );
     }
+    if (state.content._tag === "Harness") {
+      return {
+        surface: (
+          <HarnessChooser
+            width={chatColumnWidth}
+            additionalRows={setupAdditionalRows}
+            model={state.content.model}
+            destinations={state.content.destinations}
+            applying={null}
+            onBack={onboardingSetup.back}
+            onContinue={onboardingSetup.continueWithHarness}
+          />
+        ),
+        placeholder: null,
+      };
+    }
+    if (state.content._tag === "ApplyingHarness") {
+      return {
+        surface: (
+          <SetupFrame width={chatColumnWidth} stage="harness" additionalRows={setupAdditionalRows}>
+            <text style={{ fg: theme.accent }}>Connecting {state.content.harness}…</text>
+            <text style={{ fg: theme.text.supporting }}>Configuring the selected harness for {formatLocalModelDisplayName(state.content.model)}</text>
+          </SetupFrame>
+        ),
+        placeholder: null,
+      };
+    }
+    if (state.content._tag === "HarnessHandoff") {
+      return {
+        surface: (
+          <SetupFrame width={chatColumnWidth} stage="harness" additionalRows={setupAdditionalRows}>
+            <text style={{ fg: theme.accent }}>Launching {state.content.plan.harness}…</text>
+          </SetupFrame>
+        ),
+        placeholder: null,
+      };
+    }
     const content = state.content;
     const setupError = Option.match(state.notice, {
       onNone: () => null,
@@ -455,6 +497,13 @@ function CliAppContent(
       });
   const setupSurface = setupPresentation.surface;
   const modelSetupPlaceholder = setupPresentation.placeholder;
+  if (props.onboardingSetupOpen) {
+    return (
+      <box ref={chatColumn.ref} onSizeChange={chatColumn.onSizeChange} style={{ width: "100%", height: "100%", flexDirection: "column", padding: 1 }}>
+        {setupSurface}
+      </box>
+    );
+  }
   const activityRail = (
     <ActivityRailContainer
       modelLoadActivity={localModelLoadActivity}

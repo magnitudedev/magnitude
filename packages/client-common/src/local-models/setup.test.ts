@@ -627,6 +627,13 @@ const makeHarness = (options: HarnessOptions) => {
       () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.cancel),
       { concurrent: true },
     ),
+    continueWithMagnitude: effectQuery.runtime.fn(
+      () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.continueWithHarness(
+        "magnitude" as never,
+        { launchOnStartup: false, installSkill: false },
+      )),
+      { concurrent: true },
+    ),
     exit: effectQuery.runtime.fn(
       () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.exit),
       { concurrent: true },
@@ -767,6 +774,8 @@ describe("OnboardingModelSetup", () => {
       harness.service.select,
       providerModelId,
     ))
+    await Effect.runPromise(waitForView(harness, (state) => state._tag === "Open" && state.content._tag === "Harness"))
+    await Effect.runPromise(execute(harness.registry, harness.service.continueWithMagnitude, undefined))
     await Effect.runPromise(waitForCall(harness.calls, "CompleteOnboarding"))
     await Effect.runPromise(waitForView(harness, (state) => state._tag === "Closed"))
 
@@ -780,6 +789,8 @@ describe("OnboardingModelSetup", () => {
   it("reopens completed onboarding at a fresh requested choice without completing it again", async () => {
     const harness = makeHarness({ installed: true, ready: true })
     await Effect.runPromise(execute(harness.registry, harness.service.select, providerModelId))
+    await Effect.runPromise(waitForView(harness, (state) => state._tag === "Open" && state.content._tag === "Harness"))
+    await Effect.runPromise(execute(harness.registry, harness.service.continueWithMagnitude, undefined))
     await Effect.runPromise(waitForView(harness, (state) => state._tag === "Closed"))
     const completionCalls = () => harness.calls.filter((call) => call === "CompleteOnboarding").length
 
@@ -800,6 +811,9 @@ describe("OnboardingModelSetup", () => {
 
     harness.registry.set(harness.service.select, Atom.Reset)
     await Effect.runPromise(execute(harness.registry, harness.service.select, providerModelId))
+    await Effect.runPromise(waitForView(harness, (state) => state._tag === "Open" && state.content._tag === "Harness"))
+    harness.registry.set(harness.service.continueWithMagnitude, Atom.Reset)
+    await Effect.runPromise(execute(harness.registry, harness.service.continueWithMagnitude, undefined))
     await Effect.runPromise(waitForView(harness, (state) => state._tag === "Closed"))
     expect(Option.getOrThrow(Result.value(harness.registry.get(harness.service.view))))
       .toEqual({ _tag: "Closed" })
@@ -960,6 +974,8 @@ describe("OnboardingModelSetup", () => {
       harness.service.select,
       providerModelId,
     ))
+    await Effect.runPromise(waitForView(harness, (state) => state._tag === "Open" && state.content._tag === "Harness"))
+    harness.registry.set(harness.service.continueWithMagnitude, undefined)
     await Effect.runPromise(waitForCall(harness.calls, "CompleteOnboarding"))
 
     const cancellation = await Effect.runPromiseExit(execute(
@@ -977,6 +993,8 @@ describe("OnboardingModelSetup", () => {
   it("assigns, loads, awaits, and completes an installed non-ready choice", async () => {
     const harness = makeHarness({ installed: true })
     await Effect.runPromise(execute(harness.registry, harness.service.select, providerModelId))
+    await Effect.runPromise(waitForView(harness, (state) => state._tag === "Open" && state.content._tag === "Harness"))
+    await Effect.runPromise(execute(harness.registry, harness.service.continueWithMagnitude, undefined))
     await Effect.runPromise(waitForView(harness, (state) => state._tag === "Closed"))
 
     const mutations = harness.calls.filter((call) => [
@@ -992,6 +1010,8 @@ describe("OnboardingModelSetup", () => {
   it("installs before assignment for an uninstalled choice", async () => {
     const harness = makeHarness({ installed: false })
     await Effect.runPromise(execute(harness.registry, harness.service.select, providerModelId))
+    await Effect.runPromise(waitForView(harness, (state) => state._tag === "Open" && state.content._tag === "Harness"))
+    await Effect.runPromise(execute(harness.registry, harness.service.continueWithMagnitude, undefined))
     await Effect.runPromise(waitForView(harness, (state) => state._tag === "Closed"))
 
     const mutations = harness.calls.filter((call) => [
@@ -1040,6 +1060,8 @@ describe("OnboardingModelSetup", () => {
   it("does not mistake a pre-existing download provider identity for installation", async () => {
     const harness = makeHarness({ installed: false, initiallyDownloading: true })
     await Effect.runPromise(execute(harness.registry, harness.service.select, providerModelId))
+    await Effect.runPromise(waitForView(harness, (state) => state._tag === "Open" && state.content._tag === "Harness"))
+    await Effect.runPromise(execute(harness.registry, harness.service.continueWithMagnitude, undefined))
     await Effect.runPromise(waitForView(harness, (state) => state._tag === "Closed"))
 
     expect(harness.calls.indexOf("InstallLocalModel")).toBeGreaterThanOrEqual(0)

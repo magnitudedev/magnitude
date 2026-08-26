@@ -7,18 +7,21 @@ import {
   Atom,
   Registry,
   RegistryContext,
+  Result,
   scheduleTask,
 } from "@effect-atom/atom-react"
 import type * as FileSystem from "@effect/platform/FileSystem"
 import type * as CommandExecutor from "@effect/platform/CommandExecutor"
 import type * as HttpClient from "@effect/platform/HttpClient"
 import type * as Path from "@effect/platform/Path"
+import * as PlatformCommand from "@effect/platform/Command"
 import {
   createAgentClient,
   deriveCliExitNotice,
   onboardingModelSetupViewAtom,
   pushNotificationAtom,
   stopDisplayViewController,
+  type HarnessLaunchPlan,
 } from "@magnitudedev/client-common"
 import {
   updateActionFor,
@@ -27,6 +30,7 @@ import {
 } from "@magnitudedev/release"
 import { logger } from "@magnitudedev/logger"
 import { acnInstallationPresent, SDK_ACN_TARGET } from "@magnitudedev/sdk"
+import type { StateDocumentError } from "@magnitudedev/storage"
 import {
   Array as Arr,
   Deferred,
@@ -66,6 +70,7 @@ import {
   makeCliRootStateAtom,
   type CliRootState,
 } from "./root"
+import { makeHarnessConnection } from "../harness-connections/service"
 
 export class CliRendererAcquisitionFailed extends Schema.TaggedError<CliRendererAcquisitionFailed>()(
   "CliRendererAcquisitionFailed",
@@ -97,6 +102,10 @@ type InteractiveSessionResult =
         readonly message: string
         readonly stack: Option.Option<string>
       }>
+    }
+  | {
+      readonly _tag: "LaunchHarness"
+      readonly plan: HarnessLaunchPlan
     }
 
 type ExitRace<A> =
@@ -219,8 +228,9 @@ const runInteractiveSession = (
   options: InteractiveLaunchOptions,
 ): Effect.Effect<
   InteractiveSessionResult,
-  CliRendererAcquisitionFailed,
+  CliRendererAcquisitionFailed | StateDocumentError,
   CliUpdater | FileSystem.FileSystem | Path.Path | Scope.Scope
+    | CommandExecutor.CommandExecutor | HttpClient.HttpClient
 > => Effect.gen(function* () {
   const updater = yield* CliUpdater
   const registry = yield* acquireRegistry
@@ -423,8 +433,10 @@ const runInteractiveSession = (
   }
 
   const connected = yield* raceExit(Effect.gen(function* () {
+    const harnessConnection = yield* makeHarnessConnection
     const agentClient = createAgentClient(terminal.platform.protocolLayer, {
       onboardingSetupInitiallyOpen: options.setup,
+      harnessConnection,
     })
     yield* Effect.exit(Registry.getResult(
       registry,
@@ -467,8 +479,25 @@ const runInteractiveSession = (
     ))
   }
 
-  const request = yield* processExit.await
-  return yield* closeApplication(terminal, request)
+  const handoff = Registry.toStream(
+    registry,
+    onboardingModelSetupViewAtom(connected.value),
+  ).pipe(
+    Stream.filterMap((result) => Option.flatMap(Result.value(result), (state) =>
+      state._tag === "Open" && state.content._tag === "HarnessHandoff"
+        ? Option.some(state.content.plan)
+        : Option.none())),
+    Stream.runHead,
+    Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed })),
+  )
+  const outcome = yield* Effect.race(
+    processExit.await.pipe(Effect.map((request) => ({ _tag: "Exit" as const, request }))),
+    handoff.pipe(Effect.map((plan) => ({ _tag: "Launch" as const, plan }))),
+  )
+  if (outcome._tag === "Exit") return yield* closeApplication(terminal, outcome.request)
+  yield* terminal.close.pipe(Effect.ignore)
+  stopDisplayViewController()
+  return { _tag: "LaunchHarness", plan: outcome.plan }
 })
 
 const writeSessionResult = (
@@ -492,7 +521,7 @@ export const runInteractiveCommand = (
   options: InteractiveLaunchOptions,
 ): Effect.Effect<
   number,
-  CliRendererAcquisitionFailed,
+  CliRendererAcquisitionFailed | StateDocumentError,
   | CommandExecutor.CommandExecutor
   | FileSystem.FileSystem
   | HttpClient.HttpClient
@@ -507,6 +536,28 @@ export const runInteractiveCommand = (
   ))
   if (result._tag === "UpdateRequested") {
     return yield* executeUpdate(updater, result.action, { relaunch: true })
+  }
+  if (result._tag === "LaunchHarness") {
+    const command = PlatformCommand.make(result.plan.executable, ...result.plan.args).pipe(
+      PlatformCommand.env({ ...process.env, ...result.plan.environment }),
+      PlatformCommand.stdin("inherit"),
+      PlatformCommand.stdout("inherit"),
+      PlatformCommand.stderr("inherit"),
+    )
+    return Number(yield* PlatformCommand.exitCode(command).pipe(
+      Effect.catchAll((error) => Effect.sync(() => {
+        const manual = [result.plan.executable, ...result.plan.args]
+          .map((part) => /[\s'"\\]/.test(part) ? JSON.stringify(part) : part)
+          .join(" ")
+        process.stderr.write([
+          `Magnitude setup is complete, but ${result.plan.harness} could not be launched.`,
+          String(error),
+          `Run manually: ${manual}`,
+          "",
+        ].join("\n"))
+        return 1
+      })),
+    ))
   }
   yield* writeSessionResult(result)
   return result.code
