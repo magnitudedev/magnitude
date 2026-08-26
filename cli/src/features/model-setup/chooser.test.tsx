@@ -224,12 +224,12 @@ describe("onboarding model chooser identity", () => {
       const frame = view.captureCharFrame()
       expect(frame).toContain("Qwen Test (Q4)")
       expect(frame).toContain("INTELLIGENCE")
-      expect(frame).toContain("Loading model into memory…")
+      expect(frame).toContain("Loading Qwen Test (Q4) into memory…")
       expect(frame).toContain("0%")
       expect(frame).toContain("Cancel (Esc)")
       expect(frame).not.toContain("←/→ change preference")
-      expect(frame.indexOf("Loading model into memory…")).toBeLessThan(frame.indexOf("ON THIS COMPUTER"))
-      expect(frame.indexOf("Loading model into memory…")).toBeLessThan(frame.indexOf("INTELLIGENCE"))
+      expect(frame.indexOf("Loading Qwen Test (Q4) into memory…")).toBeLessThan(frame.indexOf("ON THIS COMPUTER"))
+      expect(frame.indexOf("Loading Qwen Test (Q4) into memory…")).toBeLessThan(frame.indexOf("INTELLIGENCE"))
       const lines = frame.split("\n")
       const setupColumn = lines.find((line) => line.includes("MAGNITUDE SETUP"))
         ?.indexOf("MAGNITUDE SETUP")
@@ -245,6 +245,100 @@ describe("onboarding model chooser identity", () => {
       expect(view.captureCharFrame()).toContain("Cancel loading?  › Yes")
       await act(async () => view.mockInput.pressEnter())
       expect(cancellations).toBe(1)
+    } finally {
+      await act(async () => view.renderer.destroy())
+    }
+  })
+
+  it("renders low memory as a failed load with a red-bar region and recovery controls", async () => {
+    const model = makeModel()
+    let retries = 0
+    let chooseAnother = 0
+    const view = await testRender(
+      <OnboardingModelChooser
+        hardware={Result.success(makeHardware())}
+        options={[{ id: "installed:test", kind: "stored", model }]}
+        rankingControls={rankingControls}
+        onRankingControlsChange={onRankingControlsChange}
+        width={120}
+        error={null}
+        operation={{
+          _tag: "Activating",
+          providerModelId: model.modelId,
+          model,
+          status: {
+            _tag: "Failed",
+            failure: {
+              _tag: "LowMemory",
+              code: "low_memory",
+              message: "not enough memory available",
+              retryable: true,
+              requiredSystemMemoryBytes: 8_000_000_000,
+              allocationHeadroomBytes: 6_000_000_000,
+              systemReserveBytes: 1_000_000_000,
+              loadBoundaryBytes: 9_000_000_000,
+              minimumAdditionalAvailableBytes: 3_000_000_000,
+              parallelSequences: 1,
+            },
+          },
+          onCancel: () => undefined,
+          onRetry: () => { retries += 1 },
+          onChooseAnother: () => { chooseAnother += 1 },
+        }}
+        onSelect={() => undefined}
+        onExit={() => undefined}
+        exitKind="Close"
+      />,
+      { width: 120, height: 44 },
+    )
+
+    try {
+      await act(view.renderOnce)
+      const frame = view.captureCharFrame()
+      expect(frame).toContain("Not enough memory for Qwen Test (Q4) · Free at least 2.8 GB")
+      expect(frame).toContain("█".repeat(8))
+      expect(frame).not.toContain("0%")
+      expect(frame).toContain("Retry loading")
+      expect(frame).toContain("Choose another model")
+      expect(frame).not.toContain("Unable to load model")
+      await act(async () => {
+        view.mockInput.pressEscape()
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      })
+      expect(chooseAnother).toBe(1)
+      await act(async () => view.mockInput.pressArrow("right"))
+      await act(async () => view.mockInput.pressEnter())
+      expect(chooseAnother).toBe(2)
+      await act(async () => view.mockInput.pressArrow("left"))
+      await act(async () => view.mockInput.pressEnter())
+      expect(retries).toBe(1)
+    } finally {
+      await act(async () => view.renderer.destroy())
+    }
+  })
+
+  it("places unexpected setup errors below both footer hints", async () => {
+    const view = await testRender(
+      <OnboardingModelChooser
+        hardware={Result.success(makeHardware())}
+        options={[{ id: "downloadable:test", kind: "downloadable", model: makeCatalogModel() }]}
+        rankingControls={rankingControls}
+        onRankingControlsChange={onRankingControlsChange}
+        width={120}
+        error="Unexpected error loading Qwen Test (Q4) · Worker exited before initialization."
+        operation={null}
+        onSelect={() => undefined}
+        onExit={() => undefined}
+        exitKind="Close"
+      />,
+      { width: 120, height: 44 },
+    )
+
+    try {
+      await act(view.renderOnce)
+      const frame = view.captureCharFrame()
+      expect(frame.indexOf("Unexpected error loading Qwen Test (Q4)"))
+        .toBeGreaterThan(frame.indexOf("↑/↓ choose · Enter to download · Esc close setup"))
     } finally {
       await act(async () => view.renderer.destroy())
     }

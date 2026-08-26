@@ -9,7 +9,7 @@ import {
   type SlotId,
 } from "@magnitudedev/acn-protocol"
 import type { ProviderModelId } from "@magnitudedev/ai"
-import { IcnClient, IcnInstances } from "@magnitudedev/icn"
+import { IcnClient, IcnInstances, type IcnClientService } from "@magnitudedev/icn"
 import { projectInferenceLoadPlan } from "@magnitudedev/sdk"
 import { LocalModels } from "./local-models"
 import { ModelSlotController } from "./model-slot-controller"
@@ -26,11 +26,44 @@ export interface ModelCommandsApi {
 
 export class ModelCommands extends Context.Tag("ModelCommands")<ModelCommands, ModelCommandsApi>() {}
 
-const failed = (operation: string, cause: unknown) => new LocalModelMutationFailed({
-  code: `model_${operation}_failed`,
-  message: `Unable to ${operation.replaceAll("_", " ")}: ${String(cause)}`,
-  retryable: true,
-})
+type IcnModelCommandError = Effect.Effect.Error<
+  ReturnType<IcnClientService["models"]["ensureModelInstance"]>
+>
+
+const externalFailureMessage = (cause: unknown): string => {
+  if (cause instanceof Error && cause.message.length > 0) return cause.message
+  if (typeof cause === "object" && cause !== null && "message" in cause
+    && typeof cause.message === "string" && cause.message.length > 0) return cause.message
+  return "The local inference service did not provide failure details"
+}
+
+export const modelCommandFailure = (
+  operation: string,
+  cause: IcnModelCommandError,
+): LocalModelMutationFailed => {
+  switch (cause._tag) {
+    case "GeneratedClientRemoteError": return new LocalModelMutationFailed({
+      code: cause.body.error.code,
+      message: cause.body.error.message,
+      retryable: cause.status === 409 || cause.status >= 500,
+    })
+    case "GeneratedClientTransportError": return new LocalModelMutationFailed({
+      code: `model_${operation}_transport_failed`,
+      message: externalFailureMessage(cause.cause),
+      retryable: true,
+    })
+    case "GeneratedClientInputError": return new LocalModelMutationFailed({
+      code: `model_${operation}_request_invalid`,
+      message: `Invalid local inference request input at ${cause.location}`,
+      retryable: false,
+    })
+    case "GeneratedClientInvalidResponseError": return new LocalModelMutationFailed({
+      code: `model_${operation}_response_invalid`,
+      message: cause.message,
+      retryable: true,
+    })
+  }
+}
 
 const rejected = (modelId: ProviderModelId, message: string) => new LocalModelMutationFailed({
   code: "model_download_absent",
@@ -65,14 +98,14 @@ export const ModelCommandsLive: Layer.Layer<
       Effect.map((result): CatalogModelReconciliationAdmission => result._tag === "Current"
         ? { _tag: "Current", providerModelId: modelId }
         : { _tag: "DownloadAdmitted", providerModelId: modelId }),
-      Effect.mapError((cause) => failed("install_model", cause)),
+      Effect.mapError((cause) => modelCommandFailure("install_model", cause)),
     ),
     cancelDownload: (modelId) => localModels.currentDownload(modelId).pipe(
       Effect.flatMap(Option.match({
         onNone: () => rejected(modelId, "No download is running"),
         onSome: (download) => download.state._tag === "Pending" || download.state._tag === "Downloading"
           ? client.models.cancelModelDownload({ path: { download_id: download.id } }).pipe(
-              Effect.mapError((cause) => failed("cancel_download", cause)),
+              Effect.mapError((cause) => modelCommandFailure("cancel_download", cause)),
             )
           : rejected(modelId, "No download is running"),
       })),
@@ -83,7 +116,7 @@ export const ModelCommandsLive: Layer.Layer<
         onNone: () => rejected(modelId, "No failed download is awaiting acknowledgement"),
         onSome: (download) => download.state._tag === "Failed" && !download.state.acknowledged
           ? client.models.acknowledgeModelDownloadFailure({ path: { download_id: download.id } }).pipe(
-              Effect.mapError((cause) => failed("acknowledge_download_failure", cause)),
+              Effect.mapError((cause) => modelCommandFailure("acknowledge_download_failure", cause)),
             )
           : rejected(modelId, "No failed download is awaiting acknowledgement"),
       })),
@@ -91,7 +124,7 @@ export const ModelCommandsLive: Layer.Layer<
     ),
     uninstall: (modelId) => client.models.uninstallModel({ payload: { modelId } }).pipe(
       Effect.as({}),
-      Effect.mapError((cause) => failed("uninstall_model", cause)),
+      Effect.mapError((cause) => modelCommandFailure("uninstall_model", cause)),
     ),
     loadSlot: (slotId) => selectedLocalModel(slotId).pipe(
       Effect.flatMap((modelId) => client.models.ensureModelInstance({ payload: { modelId } })),
@@ -99,14 +132,14 @@ export const ModelCommandsLive: Layer.Layer<
       Effect.as({}),
       Effect.mapError((cause) => cause instanceof ModelSlotMutationRejected
         ? cause
-        : failed("load_model", cause)),
+        : modelCommandFailure("load_model", cause)),
     ),
     previewSlotLoad: (slotId) => selectedLocalModel(slotId).pipe(
       Effect.flatMap((modelId) => client.models.previewModelLoad({ path: { model_id: modelId } })),
       Effect.map(projectInferenceLoadPlan),
       Effect.mapError((cause) => cause instanceof ModelSlotMutationRejected
         ? cause
-        : failed("preview_model_load", cause)),
+        : modelCommandFailure("preview_model_load", cause)),
     ),
     stopSlot: (slotId) => Effect.gen(function* () {
       const modelId = yield* selectedLocalModel(slotId)
@@ -120,7 +153,7 @@ export const ModelCommandsLive: Layer.Layer<
         })
       }
       yield* client.models.stopModelInstance({ path: { instance_id: instance.id } }).pipe(
-        Effect.mapError((cause) => failed("stop_model", cause)),
+        Effect.mapError((cause) => modelCommandFailure("stop_model", cause)),
       )
       yield* slots.refresh
       return {}

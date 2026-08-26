@@ -1,5 +1,10 @@
 import type { ModelDownloadFailure } from "@magnitudedev/sdk"
-import type { OnboardingModelSetupFailure } from "./setup-state"
+import type {
+  OnboardingModelSetupFailure,
+  OnboardingModelSetupNotice,
+  OnboardingModelSetupExecution,
+} from "./setup-state"
+import { formatLocalModelDisplayName } from "../utils/model-presentation"
 import { formatStorageSize } from "../utils/format-bytes"
 
 export const modelDownloadFailureMessage = (failure: ModelDownloadFailure): string => {
@@ -20,7 +25,7 @@ export const modelDownloadFailureMessage = (failure: ModelDownloadFailure): stri
   }
 }
 
-export const onboardingModelSetupFailureMessage = (
+const onboardingModelSetupFailureDetail = (
   failure: OnboardingModelSetupFailure,
 ): string => {
   if (typeof failure !== "object" || failure === null) {
@@ -49,4 +54,26 @@ export const onboardingModelSetupFailureMessage = (
         : "The onboarding model setup could not be completed."
     }
   }
+}
+
+const modelOperationVerb = (
+  operation: OnboardingModelSetupExecution["_tag"],
+): string => {
+  switch (operation) {
+    case "Preparing": return "preparing"
+    case "Installing": return "downloading"
+    case "Configuring": return "configuring"
+    case "Loading": return "loading"
+    case "Completing": return "finishing setup for"
+  }
+}
+
+export const onboardingModelSetupNoticeMessage = (
+  notice: OnboardingModelSetupNotice,
+): string => {
+  const detail = onboardingModelSetupFailureDetail(notice.failure)
+  if (notice.subject._tag === "Setup") return `Unexpected setup error · ${detail}`
+  return `Unexpected error ${modelOperationVerb(notice.subject.operation)} ${
+    formatLocalModelDisplayName(notice.subject.model)
+  } · ${detail}`
 }

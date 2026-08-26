@@ -74,6 +74,17 @@ export type OnboardingModelSetupFailure =
   | OnboardingPersistenceError
   | HarnessConnectionError
 
+export type OnboardingModelSetupNotice = {
+  readonly failure: OnboardingModelSetupFailure
+  readonly subject:
+    | { readonly _tag: "Setup" }
+    | {
+        readonly _tag: "ModelOperation"
+        readonly operation: OnboardingModelSetupExecution["_tag"]
+        readonly model: LocalModel
+      }
+}
+
 export type OnboardingModelSetupExitKind = "Skip" | "Close"
 
 export interface OnboardingModelRankingControls {
@@ -165,7 +176,7 @@ export type OnboardingModelSetupState =
   | {
       readonly _tag: "Open"
       readonly exitKind: OnboardingModelSetupExitKind
-      readonly notice: Option.Option<OnboardingModelSetupFailure>
+      readonly notice: Option.Option<OnboardingModelSetupNotice>
       readonly content: OnboardingModelSetupContent
     }
 
@@ -189,6 +200,14 @@ export type OnboardingModelSetupExecution =
       readonly option: LocalModelOption
       readonly modelId: ProviderModelId
       readonly providerModelId: ProviderModelId
+    }
+
+export type OnboardingModelSetupAttempt =
+  | OnboardingModelSetupExecution
+  | {
+      readonly _tag: "LoadFailed"
+      readonly execution: Extract<OnboardingModelSetupExecution, { readonly _tag: "Loading" }>
+      readonly failure: ModelInstanceFailure
     }
 
 export const tagOnboardingModelSetupObservation = <Value, Error>(
@@ -219,12 +238,12 @@ const sameSelection = (left: SlotSelection, right: SlotSelection): boolean =>
   && left.reasoningEffort === right.reasoningEffort
 
 export const projectOnboardingModelSetupContent = (
-  execution: Option.Option<OnboardingModelSetupExecution>,
+  attempt: Option.Option<OnboardingModelSetupAttempt>,
   models: LocalModelsState,
   slots: ModelSlotsState,
   rankingControls: OnboardingModelRankingControls,
 ): OnboardingModelSetupContent => {
-  if (Option.isNone(execution)) {
+  if (Option.isNone(attempt)) {
     if (models.discoveryState._tag === "Loading") {
       return {
         _tag: "Preparation",
@@ -247,17 +266,33 @@ export const projectOnboardingModelSetupContent = (
     }
   }
 
-  const current = execution.value
+  const current = attempt.value
+  const execution = current._tag === "LoadFailed" ? current.execution : current
   const options = localModelOptions(models, slots)
   const currentModel = Option.getOrElse(
     findLocalModelById(
       models.models,
-      current.modelId,
+      execution.modelId,
     ),
-    () => current.option.model,
+    () => execution.option.model,
   )
 
-  if (current._tag === "Completing") {
+  if (current._tag === "LoadFailed") {
+    return {
+      _tag: "Chooser",
+      options,
+      rankingControls,
+      operation: Option.some({
+        _tag: "Loading",
+        model: currentModel,
+        modelId: current.execution.modelId,
+        providerModelId: current.execution.providerModelId,
+        status: { _tag: "Failed", failure: current.failure },
+      }),
+    }
+  }
+
+  if (execution._tag === "Completing") {
     return {
       _tag: "Chooser",
       options,
@@ -265,36 +300,40 @@ export const projectOnboardingModelSetupContent = (
       operation: Option.some({
         _tag: "Completing",
         model: currentModel,
-        modelId: current.modelId,
-        providerModelId: current.providerModelId,
+        modelId: execution.modelId,
+        providerModelId: execution.providerModelId,
       }),
     }
   }
-  if (current._tag !== "Loading") {
+  if (execution._tag !== "Loading") {
     return {
       _tag: "Chooser",
       options,
       rankingControls,
       operation: Option.some({
-        _tag: current._tag,
+        _tag: execution._tag,
         model: currentModel,
-        cancelling: current.cancelling,
+        cancelling: execution.cancelling,
       }),
     }
   }
 
   const slot = slots.slots.primary
   const residency = slot._tag === "ConfiguredLocal"
-    && sameSelection(slot.selection, current.selection)
+    && sameSelection(slot.selection, execution.selection)
     ? Option.some(slot.residency)
     : Option.none()
-  const status: OnboardingModelLoadStatus = current.cancelling
+  const status: OnboardingModelLoadStatus = execution.cancelling
     ? { _tag: "Cancelling" }
     : Option.match(residency, {
         onNone: () => ({ _tag: "Preparing" }),
         onSome: (value) => {
           switch (value._tag) {
-            case "Failed": return { _tag: "Failed" as const, failure: value.failure }
+            // A failed residency becomes interactive only after the selection
+            // fiber has retained it as a LoadFailed operation result. Keeping
+            // the in-flight projection non-terminal avoids exposing retry
+            // controls before that transition is complete.
+            case "Failed": return { _tag: "Preparing" as const }
             case "Stopping":
             case "Unloaded": return { _tag: "Stopping" as const }
             case "Ready": return { _tag: "Ready" as const }
@@ -314,8 +353,8 @@ export const projectOnboardingModelSetupContent = (
     operation: Option.some({
       _tag: "Loading",
       model: currentModel,
-      modelId: current.modelId,
-      providerModelId: current.providerModelId,
+      modelId: execution.modelId,
+      providerModelId: execution.providerModelId,
       status,
     }),
   }

@@ -1,5 +1,6 @@
 import { type ReactNode } from "react"
 import { TextAttributes } from "@opentui/core"
+import { wrapTextToWordLines } from "@magnitudedev/client-common"
 import { useTheme } from "../../hooks/use-theme"
 
 export type SetupStage = "choose" | "install" | "harness"
@@ -66,20 +67,25 @@ export function SetupFrame({
   stage,
   children,
   footer,
+  unexpectedError,
   additionalRows = 0,
 }: {
   readonly width: number
   readonly stage: SetupStage
   readonly children: ReactNode
   readonly footer?: ReactNode
+  readonly unexpectedError?: string | null
   readonly additionalRows?: number
 }): ReactNode {
   const theme = useTheme()
+  const unexpectedErrorLines = unexpectedError === undefined || unexpectedError === null
+    ? []
+    : wrapTextToWordLines(unexpectedError, setupBodyWidth(width))
   return (
     <box style={{ width: "100%", flexGrow: 1, alignItems: "center", justifyContent: "center" }}>
       <box style={{
         width: setupContentWidth(width),
-        height: setupFrameHeight(width, additionalRows),
+        height: setupFrameHeight(width, additionalRows + unexpectedErrorLines.length),
         maxHeight: "100%",
         flexDirection: "column",
         flexShrink: 1,
@@ -92,6 +98,11 @@ export function SetupFrame({
         <box style={{ flexGrow: 1 }} />
         {footer !== undefined && <box style={{ height: 1, minHeight: 1, flexShrink: 0 }} />}
         {footer}
+        {unexpectedErrorLines.map((line, index) => (
+          <text key={`${index}:${line}`} style={{ fg: theme.status.failure }} wrapMode="none">
+            {line}
+          </text>
+        ))}
       </box>
     </box>
   )

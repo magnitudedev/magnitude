@@ -1,12 +1,14 @@
 import { Atom, Registry, Result } from "@effect-atom/atom-react"
-import { Cause, Context, Data, Deferred, Effect, Exit, Layer, Option, Scope, Stream } from "effect"
+import { Cause, Context, Data, Deferred, Effect, Exit, Layer, Option, Schema, Scope, Stream } from "effect"
 import {
   PRIMARY_SLOT_ID,
+  ModelInstanceFailureSchema,
   ProviderIdSchema,
   ReasoningEffortSchema,
   installedAcquisition,
   type CatalogModelReconciliationAdmission,
   type LocalModelsState,
+  type ModelInstanceFailure,
   type ModelSlotsState,
   type ProviderModelId,
   type ReasoningEffort,
@@ -34,7 +36,9 @@ import {
   projectOnboardingModelSetupContent,
   tagOnboardingModelSetupObservation,
   type OnboardingModelSetupExecution,
+  type OnboardingModelSetupAttempt,
   type OnboardingModelSetupFailure,
+  type OnboardingModelSetupNotice,
   type OnboardingModelRankingControls,
   type OnboardingModelSetupState,
 } from "./setup-state"
@@ -66,6 +70,13 @@ type TerminalFact<Value> =
   | { readonly _tag: "Ready"; readonly value: Value }
   | { readonly _tag: "Failed"; readonly failure: OnboardingModelSetupFailure }
 
+const isModelInstanceFailure = (
+  failure: OnboardingModelSetupFailure,
+): failure is ModelInstanceFailure => Schema.is(ModelInstanceFailureSchema)(failure)
+  // ModelFailure is intentionally untagged, so exclude tagged mutation
+  // errors that are structurally compatible with its three fields.
+  && (!("_tag" in failure) || failure._tag === "LowMemory")
+
 class OnboardingModelSelectionCancelled extends Data.TaggedError(
   "OnboardingModelSelectionCancelled",
 )<{}> {}
@@ -81,12 +92,16 @@ type OnboardingModelSetupLifecycle =
   | {
       readonly _tag: "Resting"
       readonly retainedOpen: boolean
-      readonly notice: Option.Option<OnboardingModelSetupFailure>
+      readonly notice: Option.Option<OnboardingModelSetupNotice>
     }
   | {
       readonly _tag: "Selecting"
       readonly invocation: SelectionInvocation
       readonly execution: OnboardingModelSetupExecution
+    }
+  | {
+      readonly _tag: "LoadFailed"
+      readonly attempt: Extract<OnboardingModelSetupAttempt, { readonly _tag: "LoadFailed" }>
     }
   | {
       readonly _tag: "Closing"
@@ -277,7 +292,11 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
           exitKind,
           notice: current._tag === "Resting" ? current.notice : Option.none(),
           content: projectOnboardingModelSetupContent(
-            current._tag === "Selecting" ? Option.some(current.execution) : Option.none(),
+            current._tag === "Selecting"
+              ? Option.some(current.execution)
+              : current._tag === "LoadFailed"
+                ? Option.some(current.attempt)
+                : Option.none(),
             modelState,
             slotState,
             get(rankingControls),
@@ -292,7 +311,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
     if (Result.isFailure(registry.get(onboarding.state))) retries.push(onboarding.retry)
     const current = registry.get(lifecycle)
     const onboardingValue = Result.value(registry.get(onboarding.state))
-    const observesModels = current._tag === "Selecting"
+    const observesModels = current._tag === "Selecting" || current._tag === "LoadFailed"
       || current._tag === "Resting"
         && (!Option.exists(onboardingValue, ({ completed }) => completed) || current.retainedOpen)
     if (observesModels) {
@@ -440,7 +459,10 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
     )
   }
 
-  const awaitReady = (assigned: AssignedModel) => {
+  const awaitReady = (
+    assigned: AssignedModel,
+    options: { readonly waitForLoadAdmission?: boolean } = {},
+  ) => {
     const project = (state: ModelSlotsState): TerminalFact<AssignedModel> => {
         const slot = state.slots.primary
         if (slot._tag !== "ConfiguredLocal" || !sameSlotSelection(slot.selection, assigned.selection)) {
@@ -455,10 +477,12 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
           case "Stopping": return { _tag: "Waiting" }
           case "Ready": return { _tag: "Ready", value: assigned }
           case "Failed": return { _tag: "Failed", failure: slot.residency.failure }
-          case "Unloaded": return { _tag: "Failed", failure: new OnboardingModelResourceChanged({
-            modelId: assigned.modelId,
-            resource: "instance",
-          }) }
+          case "Unloaded": return options.waitForLoadAdmission
+            ? { _tag: "Waiting" }
+            : { _tag: "Failed", failure: new OnboardingModelResourceChanged({
+                modelId: assigned.modelId,
+                resource: "instance",
+              }) }
         }
     }
     return awaitTerminalFact(registry, slots.state, project)
@@ -477,7 +501,19 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
       cancelling: false,
     }).pipe(
       Effect.zipRight(Effect.raceFirst(
-        slots.load(PRIMARY_SLOT_ID).pipe(Effect.zipRight(awaitReady(assigned))),
+        Effect.matchEffect(slots.load(PRIMARY_SLOT_ID), {
+          onFailure: (commandFailure) => commandFailure._tag === "ModelSlotMutationRejected"
+            ? Effect.fail(commandFailure)
+            : awaitReady(assigned, {
+                waitForLoadAdmission: true,
+              }).pipe(
+                Effect.timeoutFail({
+                  duration: "2 seconds",
+                  onTimeout: () => commandFailure,
+                }),
+              ),
+          onSuccess: () => awaitReady(assigned),
+        }),
         Deferred.await(invocation.cancellation).pipe(
           Effect.zipRight(Effect.fail(new OnboardingModelSelectionCancelled())),
         ),
@@ -503,11 +539,36 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
         notice: Option.none(),
       })
     } else {
-      registry.set(lifecycle, {
-        _tag: "Resting",
-        retainedOpen: true,
-        notice: Cause.failureOption(effectiveExit.cause),
-      })
+      const failure = Option.getOrUndefined(Cause.failureOption(effectiveExit.cause))
+      if (failure !== undefined
+        && current.execution._tag === "Loading"
+        && isModelInstanceFailure(failure)) {
+        registry.set(lifecycle, {
+          _tag: "LoadFailed",
+          attempt: {
+            _tag: "LoadFailed",
+            execution: current.execution,
+            failure,
+          },
+        })
+      } else {
+        const notice = Option.map(
+          Cause.failureOption(effectiveExit.cause),
+          (selectionFailure): OnboardingModelSetupNotice => ({
+            failure: selectionFailure,
+            subject: {
+              _tag: "ModelOperation",
+              operation: current.execution._tag,
+              model: current.execution.option.model,
+            },
+          }),
+        )
+        registry.set(lifecycle, {
+          _tag: "Resting",
+          retainedOpen: true,
+          notice,
+        })
+      }
     }
     return effectiveExit
   })).pipe(
@@ -555,9 +616,12 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
   const select = (modelId: ProviderModelId) =>
     admissionLock.withPermits(1)(Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
       const current = registry.get(lifecycle)
-      if (current._tag !== "Resting") return yield* new OnboardingModelSetupAlreadyActive()
+      if (current._tag !== "Resting"
+        && (current._tag !== "LoadFailed" || current.attempt.execution.modelId !== modelId)) {
+        return yield* new OnboardingModelSetupAlreadyActive()
+      }
       const onboardingState = yield* restore(Registry.getResult(registry, onboarding.state))
-      if (onboardingState.completed && !current.retainedOpen) {
+      if (onboardingState.completed && current._tag === "Resting" && !current.retainedOpen) {
         return yield* new OnboardingModelSetupNotOpen()
       }
       const models = yield* restore(Registry.getResult(registry, localModels.state))
@@ -601,6 +665,23 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
     return current.invocation.done
   })).pipe(Effect.flatMap(Deferred.await))
 
+  const chooseAnother = admissionLock.withPermits(1)(Effect.sync(() => {
+    const current = registry.get(lifecycle)
+    if (current._tag !== "LoadFailed") return false
+    registry.set(lifecycle, {
+      _tag: "Resting",
+      retainedOpen: true,
+      notice: Option.none(),
+    })
+    return true
+  })).pipe(
+    Effect.filterOrFail(
+      (dismissed) => dismissed,
+      () => new OnboardingModelSetupNotActive(),
+    ),
+    Effect.asVoid,
+  )
+
   const back = admissionLock.withPermits(1)(Effect.gen(function* () {
     const current = registry.get(lifecycle)
     if (current._tag !== "ChoosingHarness") return yield* new OnboardingModelSetupNotActive()
@@ -637,7 +718,10 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
     registry.set(lifecycle, {
       _tag: "Resting",
       retainedOpen: true,
-      notice: Option.some(error),
+      notice: Option.some<OnboardingModelSetupNotice>({
+        failure: error,
+        subject: { _tag: "Setup" },
+      }),
     })
   })).pipe(Effect.zipRight(Effect.fail(error)))))))
 
@@ -652,7 +736,13 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
       : {
           _tag: "Resting",
           retainedOpen: true,
-          notice: Cause.failureOption(exit.cause),
+          notice: Option.map(
+            Cause.failureOption(exit.cause),
+            (failure): OnboardingModelSetupNotice => ({
+              failure,
+              subject: { _tag: "Setup" },
+            }),
+          ),
         })
   })).pipe(
     Effect.zipRight(Exit.isFailure(exit) && Option.isNone(Cause.failureOption(exit.cause))
@@ -688,6 +778,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
     open,
     select,
     cancel,
+    chooseAnother,
     back,
     continueWithHarness,
     exit,

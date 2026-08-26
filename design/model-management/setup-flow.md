@@ -3,6 +3,7 @@ applies_to:
   - packages/acn-protocol/src/boundary/onboarding.ts
   - packages/acn/src/onboarding/**
   - packages/acn/src/boundary/**
+  - packages/acn/src/model-commands.ts
   - packages/client-common/src/onboarding/**
   - packages/client-common/src/local-models/setup*
   - packages/client-common/src/state/agent-client.ts
@@ -61,7 +62,8 @@ Open chooser + select -> Prepare -> Install -> Assign -> Ensure resident -> Sele
 Select harness + Magnitude -> Apply options -> [Complete onboarding] -> Closed
 Select harness + external -> Apply options -> Connect harness -> [Complete onboarding] -> Handoff
 Open operation + cancel -> detach observation --------------------------------> Open chooser
-Open operation + failure -------------------------------------------> Open chooser with notice
+Open load + expected instance failure ------------------------------> Retained failed load
+Open operation + unexpected failure -------------------------------> Open chooser with notice
 Open + Close --------------------------------------------------------> Closed
 Open + Skip -> Complete onboarding ---------------------------------> Closed
 ```
@@ -101,9 +103,23 @@ permit. After residency admission it detaches this setup waiter and does not sto
 Instance. Completing onboarding cannot be cancelled.
 
 Every terminal update is fenced by invocation identity, so late work cannot overwrite a newer flow.
-Expected lower failures remain typed and become one retained chooser notice. Defects are re-raised
-only after client-owned nonterminal state is removed. The coordinator does not use `orDie` for
-expected cleanup errors.
+An expected model-instance failure remains typed and terminalizes as a retained failed-load result
+containing the exact attempted model. Retry starts a new invocation for that model; Choose another
+returns to the unlocked chooser without changing the installed-model inventory. In particular,
+low-memory is an actionable runtime outcome rather than an unexpected setup error.
+
+ICN command failures remain on the Effect error channel. ACN maps generated-client remote and
+transport errors into the typed mutation failure without stringifying the wrapper object. When a
+load command fails, setup briefly reconciles the canonical slot lifecycle so an authoritative typed
+instance failure wins over the less-specific command failure. A replaced selection is rejected
+immediately, and bounded reconciliation with no instance outcome retains the command failure.
+Defects are re-raised only after client-owned nonterminal state is removed. The coordinator does not
+use `orDie` for expected cleanup errors.
+
+Other terminal setup failures retain both the typed failure and its semantic subject. Model-operation
+subjects include the exact attempted model and operation; setup-wide subjects cover exit and harness
+work. This retained result lets presentation produce a useful unexpected-error sentence rather than
+showing an RPC or generated-client wrapper tag.
 
 Query unavailability remains a failure of the public view, tagged with onboarding, local-model, or
 model-slot ownership. Semantic retry invalidates only failed participating query domains. Query
@@ -183,14 +199,20 @@ Fast-to-Smart control region with a fixed three-row operation region while keepi
 model details and radar visible. The frame therefore has exactly the same height while choosing,
 downloading, and loading. The first operation row contains the status and any useful transfer
 measurements, the second contains the progress bar, and the third contains controls. Loading and
-downloading both expose `Cancel (Esc)` and replace that control with an inline Yes/No confirmation;
-failure replaces the bar with its compact failure message and renders retry/choose actions directly
-beneath it. Stage-explanation subtext is not rendered. Loading begins at zero percent until
+downloading both expose `Cancel (Esc)` and replace that control with an inline Yes/No confirmation.
+A retained failed load keeps the same three rows: the first names the model and concrete failure,
+the second keeps the progress bar but colors it red, and the third offers Retry loading and Choose
+another model. Low-memory text states the additional memory the user must free. Escape chooses
+another model; Left/Right select an available recovery action and Enter performs it. Non-retryable
+failures omit Retry. Stage-explanation subtext is not rendered. Loading begins at zero percent until
 authoritative fractional progress advances it. The active operation label uses an eased shimmer for
 starting, downloading, cancelling, configuring, preparing, stopping, loading, verifying, and
 finishing states. Its cosine highlight scales with the text length, crosses muted text in about
 850 ms, and remains absent for about 950 ms between sweeps; it never changes text weight. Failure
-text remains static.
+text remains static. Unexpected setup errors render in failure color beneath the shared control
+hints, wrapping to the setup body width. Those rows increase the frame only while the error exists;
+normal setup height reserves no error space. The message naturally names the attempted model and
+operation when that context exists and includes the underlying typed failure detail.
 The harness stage is one unboxed linear menu containing supported destinations followed by the
 startup and skill toggles. Harness rows are ordinary single-choice rows, not checkbox controls.
 Up and Down traverse every enabled control in that order; unavailable destinations remain visible
@@ -213,6 +235,8 @@ only then starts the returned executable with inherited terminal I/O and the cap
 - Discovery refresh, failure, or removal cannot mask an active operation.
 - Exact download admission governs observation and cancellation.
 - Readiness must match the captured selection and configuration.
+- Expected instance failures remain typed, retain the exact failed load, and expose recovery in place.
+- Unexpected notices preserve their typed failure and semantic operation/model subject.
 - Cancellation after residency admission never stops shared residency work.
 - Closed and Closing views do not observe unrelated model or slot queries.
 - Query retry targets the failed participating owner.
