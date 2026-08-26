@@ -125,15 +125,18 @@ const containsModel = (models: ReadonlyArray<HarnessModel>, modelId: ProviderMod
 
 const skillContents = `---
 name: magnitude
-description: Use Magnitude for private local model inference and model management.
+description: Instructions for \`magnitude\` cli to discover, install, and manage local models, as well as connect local models to different agents
 ---
 
 # Magnitude
 
-Use Magnitude when local or private inference is preferred. Inspect the available commands with
-\`magnitude --help\` and \`magnitude connections --help\`. Point integrations only at Magnitude's
-public local gateway under \`http://127.0.0.1:10100/inference\`; do not edit Magnitude state files,
-expose credentials, or terminate unrelated processes listening on the service port.
+Magnitude is an inference server with a built-in harness for discovering, managing, and using local models.
+
+Magnitude is accessed via the \`magnitude\` CLI.
+
+## CLI Help
+
+Use \`magnitude --help\` to get more information on using the CLI.
 `
 
 export const makeHarnessConnectionService = (options: HarnessConnectionOptions = {}) => Effect.gen(function* () {
