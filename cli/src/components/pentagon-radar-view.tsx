@@ -1,4 +1,5 @@
-import { memo, useSyncExternalStore } from "react"
+import { memo, useState, useSyncExternalStore } from "react"
+import { Option } from "effect"
 import {
   getAnimationTimeSnapshot,
   subscribeAnimationClock,
@@ -7,11 +8,47 @@ import {
 import { useTheme } from "../hooks/use-theme"
 import {
   PENTAGON_RADAR_DURATION_MS,
+  pentagonRadarValues,
   pentagonRadarTransitionValues,
   renderPentagonRadar,
+  retargetPentagonRadar,
   type PentagonRadarAxes,
   type PentagonRadarTransition,
+  type PentagonRadarValues,
 } from "./pentagon-radar"
+
+interface PentagonRadarAnimation {
+  readonly target: PentagonRadarValues
+  readonly transition: PentagonRadarTransition | null
+}
+
+const radarValuesEqual = (
+  left: PentagonRadarValues,
+  right: PentagonRadarValues,
+): boolean => left.every((value, index) => Option.match(value, {
+  onNone: () => Option.isNone(right[index]!),
+  onSome: (measurement) => Option.contains(right[index]!, measurement),
+}))
+
+const usePentagonRadarAnimation = (target: PentagonRadarValues): PentagonRadarAnimation => {
+  const [animation, setAnimation] = useState<PentagonRadarAnimation>(() => ({
+    target,
+    transition: null,
+  }))
+  if (radarValuesEqual(animation.target, target)) return animation
+
+  const next = {
+    target,
+    transition: retargetPentagonRadar(
+      animation.target,
+      target,
+      animation.transition,
+      getAnimationTimeSnapshot(),
+    ),
+  }
+  setAnimation(next)
+  return next
+}
 
 const useRadarAnimationTime = (transition: PentagonRadarTransition | null): number => {
   const endAt = transition === null
@@ -28,14 +65,13 @@ const useRadarAnimationTime = (transition: PentagonRadarTransition | null): numb
 
 export const PentagonRadarView = memo(function PentagonRadarView({
   axes,
-  transition,
   columns,
 }: {
   readonly axes: PentagonRadarAxes
-  readonly transition: PentagonRadarTransition | null
   readonly columns?: number
 }) {
   const theme = useTheme()
+  const { transition } = usePentagonRadarAnimation(pentagonRadarValues(axes))
   const now = useRadarAnimationTime(transition)
   const values = transition !== null && now < transition.startedAt + PENTAGON_RADAR_DURATION_MS
     ? pentagonRadarTransitionValues(transition, now)

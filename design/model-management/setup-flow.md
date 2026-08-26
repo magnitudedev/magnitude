@@ -199,7 +199,9 @@ empty row is guaranteed immediately before the footer without changing the frame
 The detail pane reserves rows only for the selected model title, one-line summary, radar, and an
 applicable memory warning; it never reserves operation rows. Starting an operation replaces the
 Fast-to-Smart control region with a fixed three-row operation region while keeping the selected
-model details and radar visible. The frame therefore has exactly the same height while choosing,
+model details and radar visible. The radar animates whenever its derived model values change,
+including changes caused by re-ranking at the retained cursor position. The frame therefore has
+exactly the same height while choosing,
 downloading, and loading. The first operation row contains the status and any useful transfer
 measurements, the second contains the progress bar, and the third contains controls. Loading and
 downloading both expose `Cancel (Esc)` and replace that control with an inline Yes/No confirmation.
