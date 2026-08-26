@@ -2244,6 +2244,7 @@ export const ResponseFunctionCall = S.Struct({
   call_id: S.String,
   id: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
   name: S.String,
+  status: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
   type: S.suspend((): S.Schema<ResponseFunctionCallType, ResponseFunctionCallTypeEncoded> => ResponseFunctionCallType),
 })
 export type ResponseFunctionCall = S.Schema.Type<typeof ResponseFunctionCall>
@@ -2253,6 +2254,7 @@ export const ResponseFunctionCallOutput = S.Struct({
   call_id: S.String,
   id: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
   output: S.suspend((): S.Schema<FunctionCallOutput, FunctionCallOutputEncoded> => FunctionCallOutput),
+  status: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
   type: S.suspend(
     (): S.Schema<ResponseFunctionCallOutputType, ResponseFunctionCallOutputTypeEncoded> =>
       ResponseFunctionCallOutputType,
@@ -2268,6 +2270,20 @@ export type ResponseFunctionCallOutputTypeEncoded = S.Schema.Encoded<typeof Resp
 export const ResponseFunctionCallType = S.Literal("function_call")
 export type ResponseFunctionCallType = S.Schema.Type<typeof ResponseFunctionCallType>
 export type ResponseFunctionCallTypeEncoded = S.Schema.Encoded<typeof ResponseFunctionCallType>
+
+export const ResponseFunctionTool = S.Struct({
+  description: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
+  name: S.String,
+  parameters: S.extend(S.Struct({}), S.Record({ key: S.String, value: JsonValue })),
+  strict: S.optionalWith(S.Union(S.Boolean, S.Null), { exact: true, as: "Option" }),
+  type: S.suspend((): S.Schema<ResponseFunctionType, ResponseFunctionTypeEncoded> => ResponseFunctionType),
+})
+export type ResponseFunctionTool = S.Schema.Type<typeof ResponseFunctionTool>
+export type ResponseFunctionToolEncoded = S.Schema.Encoded<typeof ResponseFunctionTool>
+
+export const ResponseFunctionType = S.Literal("function")
+export type ResponseFunctionType = S.Schema.Type<typeof ResponseFunctionType>
+export type ResponseFunctionTypeEncoded = S.Schema.Encoded<typeof ResponseFunctionType>
 
 export const ResponseInput = S.Union(
   S.String,
@@ -2602,32 +2618,8 @@ export type ResponseTextResult = S.Schema.Type<typeof ResponseTextResult>
 export type ResponseTextResultEncoded = S.Schema.Encoded<typeof ResponseTextResult>
 
 export const ResponseTool = S.Union(
-  S.extend(
-    S.Struct({
-      description: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
-      name: S.String,
-      parameters: S.extend(S.Struct({}), S.Record({ key: S.String, value: JsonValue })),
-      strict: S.optionalWith(S.Union(S.Boolean, S.Null), { exact: true, as: "Option" }),
-      type: S.Literal("function"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      description: S.String,
-      name: S.String,
-      tools: S.Array(JsonValue),
-      type: S.Literal("namespace"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      external_web_access: S.optionalWith(S.Union(S.Boolean, S.Null), { exact: true, as: "Option" }),
-      type: S.Literal("web_search"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
+  S.suspend((): S.Schema<ResponseFunctionTool, ResponseFunctionToolEncoded> => ResponseFunctionTool),
+  S.extend(S.Struct({}), S.Record({ key: S.String, value: JsonValue })),
 )
 export type ResponseTool = S.Schema.Type<typeof ResponseTool>
 export type ResponseToolEncoded = S.Schema.Encoded<typeof ResponseTool>

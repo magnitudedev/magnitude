@@ -7200,6 +7200,12 @@
               "null"
             ]
           },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "call_id": {
             "type": "string"
           },
@@ -7229,6 +7235,12 @@
               "null"
             ]
           },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "call_id": {
             "type": "string"
           },
@@ -7248,6 +7260,48 @@
         "type": "string",
         "enum": [
           "function_call"
+        ]
+      },
+      "ResponseFunctionTool": {
+        "type": "object",
+        "required": [
+          "type",
+          "name",
+          "parameters"
+        ],
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/ResponseFunctionType"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parameters": {
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "strict": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "ResponseFunctionType": {
+        "type": "string",
+        "enum": [
+          "function"
         ]
       },
       "ResponseInput": {
@@ -7926,91 +7980,12 @@
         }
       },
       "ResponseTool": {
-        "oneOf": [
+        "anyOf": [
           {
-            "type": "object",
-            "required": [
-              "name",
-              "parameters",
-              "type"
-            ],
-            "properties": {
-              "name": {
-                "type": "string"
-              },
-              "description": {
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "parameters": {
-                "type": "object",
-                "additionalProperties": {},
-                "propertyNames": {
-                  "type": "string"
-                }
-              },
-              "strict": {
-                "type": [
-                  "boolean",
-                  "null"
-                ]
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "function"
-                ]
-              }
-            }
+            "$ref": "#/components/schemas/ResponseFunctionTool"
           },
           {
-            "type": "object",
-            "required": [
-              "name",
-              "description",
-              "tools",
-              "type"
-            ],
-            "properties": {
-              "name": {
-                "type": "string"
-              },
-              "description": {
-                "type": "string"
-              },
-              "tools": {
-                "type": "array",
-                "items": {}
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "namespace"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "type"
-            ],
-            "properties": {
-              "external_web_access": {
-                "type": [
-                  "boolean",
-                  "null"
-                ]
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "web_search"
-                ]
-              }
-            }
+            "type": "object"
           }
         ]
       },

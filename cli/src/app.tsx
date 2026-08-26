@@ -464,23 +464,21 @@ function CliAppContent(
             _tag: "Activating",
             providerModelId: operation.providerModelId,
             model: operation.model,
-            phase: operation.phase,
-            failure: operation.failure,
+            status: operation.status,
             onRetry: () => setupOnboardingModel(operation.modelId),
             onChooseAnother: cancelOnboardingModelSetup,
-          }, operation.phase === "Loading"
+          }, operation.status._tag === "Preparing" || operation.status._tag === "Loading"
             ? `Loading ${formatLocalModelDisplayName(operation.model)}…`
-            : operation.phase === "Stopping"
+            : operation.status._tag === "Stopping"
               ? `Stopping ${formatLocalModelDisplayName(operation.model)}…`
-              : operation.phase === "Ready"
+              : operation.status._tag === "Ready"
                 ? `Finishing setup for ${formatLocalModelDisplayName(operation.model)}…`
                 : `Couldn’t load ${formatLocalModelDisplayName(operation.model)}`);
           case "Completing": return chooser({
             _tag: "Activating",
             providerModelId: operation.providerModelId,
             model: operation.model,
-            phase: "Ready",
-            failure: null,
+            status: { _tag: "Ready" },
             onRetry: () => setupOnboardingModel(operation.modelId),
             onChooseAnother: cancelOnboardingModelSetup,
           }, `Finishing setup for ${formatLocalModelDisplayName(operation.model)}…`);

@@ -45,11 +45,18 @@ form whose `type` discriminator is omitted. Stateless replay accepts output-mess
 reasoning items emitted by the Responses stream. A reasoning item immediately preceding assistant
 text or function calls belongs to that same canonical assistant entry; a standalone reasoning item
 remains a reasoning-only assistant entry. Request hints such as `prompt_cache_key` may be accepted
-without changing canonical inference semantics. Current Codex declarations may also contain
-namespace and web-search tools, `include`, and client metadata. Ordinary function declarations are
-the executable local tool set; hosted namespace and web-search declarations are retained for
-protocol projection but do not become locally executable tools. Replayed function-call outputs may
-include their emitted item ID.
+without changing canonical inference semantics.
+
+Responses tolerance follows one partition rather than per-field patches. Function tool
+declarations are the executable semantic core and are parsed strictly; a function-typed
+declaration that fails strict parsing is a request error, never a silent demotion. Every other
+tool declaration — namespace, web-search, and any future hosted type — is opaque by policy:
+retained verbatim for protocol projection, never locally executable, and requiring no adapter
+change when new hosted types appear. Replayed items obey a closure invariant: every item the
+Responses projection can emit parses back as input, because clients resend emitted output
+(with its item IDs, statuses, and annotations) verbatim as later history. Request hints such as
+`include` and client metadata remain individually enumerated — a hint is accepted and ignored
+only as a reviewed decision, because unknown top-level fields are where new semantics arrive.
 
 The Chat Completions adapter accepts standard client metadata that does not alter local inference.
 In particular, `store: false` and a function definition's optional `strict` flag are valid input.
