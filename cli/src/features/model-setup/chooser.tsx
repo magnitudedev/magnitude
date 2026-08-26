@@ -4,7 +4,6 @@ import { useKeyboard } from "@opentui/react"
 import { Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import {
-  getAnimationTimeSnapshot,
   truncateToDisplayWidth,
   formatLocalModelDisplayName,
   formatMemorySize,
@@ -28,9 +27,6 @@ import { Button } from "../../components/button"
 import {
   PENTAGON_RADAR_COLUMNS,
   PENTAGON_RADAR_ROWS,
-  pentagonRadarValues,
-  retargetPentagonRadar,
-  type PentagonRadarTransition,
 } from "../../components/pentagon-radar"
 import { PentagonRadarView } from "../../components/pentagon-radar-view"
 import { spinnerFrameAt, useSpinnerFrame } from "../../hooks/use-spinner-frame"
@@ -533,7 +529,6 @@ export function OnboardingModelChooser({
   }, [maximumMemoryBytes, options, rankingControls.fastToSmart])
   const [selectedId, setSelectedId] = useState<Option.Option<string>>(Option.none())
   const [cursorIndex, setCursorIndex] = useState(0)
-  const [radarTransition, setRadarTransition] = useState<PentagonRadarTransition | null>(null)
   const localScrollRef = useRef<ScrollBoxRenderable | null>(null)
   const downloadScrollRef = useRef<ScrollBoxRenderable | null>(null)
   const activeCursorIndex = Math.min(cursorIndex, Math.max(0, selections.length - 1))
@@ -601,18 +596,6 @@ export function OnboardingModelChooser({
     const nextIndex = Math.min(Math.max(0, index), Math.max(0, selections.length - 1))
     const selection = selections[nextIndex]
     if (!selection) return
-    const fromAxes = selected === undefined ? Option.none() : localModelRadarAxes(selected.model)
-    const toAxes = localModelRadarAxes(selection.model)
-    if (selection.id !== selected?.id && Option.isSome(fromAxes) && Option.isSome(toAxes)) {
-      setRadarTransition(retargetPentagonRadar(
-        pentagonRadarValues(fromAxes.value),
-        pentagonRadarValues(toAxes.value),
-        radarTransition,
-        getAnimationTimeSnapshot(),
-      ))
-    } else {
-      setRadarTransition(null)
-    }
     setSelectedId(Option.some(selection.id))
     setCursorIndex(nextIndex)
     const rankedIndex = ranked.indexOf(selection)
@@ -634,7 +617,7 @@ export function OnboardingModelChooser({
         localLayout.viewportRows,
       )
     }
-  }, [local, localLayout.viewportRows, radarTransition, ranked, rankedViewportRows, selected, selections])
+  }, [local, localLayout.viewportRows, ranked, rankedViewportRows, selections])
 
   const moveCursorTo = useCallback((index: number) => {
     moveSelectionTo(index)
@@ -813,7 +796,6 @@ export function OnboardingModelChooser({
         onSome: (axes) => (
           <PentagonRadarView
             axes={axes}
-            transition={radarTransition}
             columns={Math.min(PENTAGON_RADAR_COLUMNS, detailWidth)}
           />
         ),

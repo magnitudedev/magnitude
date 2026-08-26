@@ -18,7 +18,6 @@ import {
   formatModelDisplayName,
   modelSlotResidentAllocation,
   getDisplayWidth,
-  getAnimationTimeSnapshot,
   localModelProviderModelId,
   localModelCapabilities,
   localModelSpeculativeMethodLabel,
@@ -80,11 +79,6 @@ import {
   formatCatalogModelLabel,
   type CatalogLayout,
 } from "./catalog-layout"
-import {
-  pentagonRadarValues,
-  retargetPentagonRadar,
-  type PentagonRadarTransition,
-} from "../../components/pentagon-radar"
 import { localModelRadarAxes } from "@magnitudedev/client-common"
 import {
   formatModelClassification,
@@ -1478,7 +1472,6 @@ const CatalogInspector = memo(function CatalogInspector({
   reconciliationState,
   selected,
   selectedSlot,
-  transition,
   actions,
   actionCursor,
   actionsFocused,
@@ -1491,7 +1484,6 @@ const CatalogInspector = memo(function CatalogInspector({
   readonly reconciliationState: CatalogModelReconciliationState
   readonly selected: boolean
   readonly selectedSlot: CatalogPrimarySlot | null
-  readonly transition: PentagonRadarTransition | null
   readonly actions: readonly CatalogInspectorActionId[]
   readonly actionCursor: number
   readonly actionsFocused: boolean
@@ -1544,7 +1536,7 @@ const CatalogInspector = memo(function CatalogInspector({
         <text> </text>
       </box>
       <box style={{ width: "100%", height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.metrics, minHeight: CATALOG_SPLIT_INSPECTOR_HEIGHTS.metrics, flexShrink: 0 }}>
-        <CatalogRadarView axes={radarAxes} transition={transition} />
+        <CatalogRadarView axes={radarAxes} />
       </box>
       <box style={{ height: CATALOG_SPLIT_INSPECTOR_HEIGHTS.info, minHeight: CATALOG_SPLIT_INSPECTOR_HEIGHTS.info, flexShrink: 0, flexDirection: "column" }}>
         <text style={{ fg: theme.text.metadata }} attributes={TextAttributes.BOLD} wrapMode="none">SOURCE</text>
@@ -1647,7 +1639,6 @@ const CatalogMenu = memo(function CatalogMenu({
   const [cursorId, setCursorId] = useState<string | null>(null)
   const [detailId, setDetailId] = useState<string | null>(initialCatalogDetailId)
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
-  const [radarTransition, setRadarTransition] = useState<PentagonRadarTransition | null>(null)
   const [actionHoverTarget, setActionHoverTarget] = useState<CatalogActionHoverTarget | null>(null)
   const modelIdFor = (model: LocalModel) => model.modelId
   const reconciliationStateFor = (model: LocalModel): CatalogModelReconciliationState => {
@@ -1692,23 +1683,9 @@ const CatalogMenu = memo(function CatalogMenu({
     const modelId = model && modelIdFor(model)
     if (!model || modelId === undefined) return
     setActionHoverTarget(null)
-    const fromAxes = cursor === undefined ? Option.none() : localModelRadarAxes(cursor)
-    const toAxes = localModelRadarAxes(model)
-    if (Option.isSome(fromAxes) && Option.isSome(toAxes)
-      && modelIdFor(cursor!) !== modelId) {
-      const now = getAnimationTimeSnapshot()
-      setRadarTransition(retargetPentagonRadar(
-        pentagonRadarValues(fromAxes.value),
-        pentagonRadarValues(toAxes.value),
-        radarTransition,
-        now,
-      ))
-    } else {
-      setRadarTransition(null)
-    }
     setCursorId(modelId)
     scrollCatalogCandidateIntoView(catalogScrollRef.current, modelId)
-  }, [candidates, cursor, radarTransition])
+  }, [candidates])
 
   const primaryAction = useCallback((model: LocalModel) => {
     const modelId = modelIdFor(model)
@@ -1795,7 +1772,6 @@ const CatalogMenu = memo(function CatalogMenu({
       if (key.name === "escape") {
         key.preventDefault()
         setDetailId(null)
-        setRadarTransition(null)
         setRootSwitchingEnabled(true)
       } else if (key.name === "up" && inspectorActions.length > 0) {
         key.preventDefault()
@@ -1838,7 +1814,6 @@ const CatalogMenu = memo(function CatalogMenu({
       moveCursorTo(Math.min(candidates.length - 1, cursorIndex + 1))
     } else if ((key.name === "return" || key.name === "enter") && cursor) {
       key.preventDefault()
-      setRadarTransition(null)
       inspectorActionCursor.reset()
       setDetailId(modelIdFor(cursor))
       setRootSwitchingEnabled(false)
@@ -1874,12 +1849,10 @@ const CatalogMenu = memo(function CatalogMenu({
   const inspectorView = inspected === null ? null : (
     <>
       <CatalogInspector
-        key={inspectedModelId}
         model={inspected}
         reconciliationState={inspectedReconciliationState}
         selected={inspectedSelected}
         selectedSlot={inspectedSlot}
-        transition={detail === null ? radarTransition : null}
         actions={inspectorActions}
         actionCursor={inspectorActionCursor.index}
         actionsFocused={detail !== null}
@@ -1910,7 +1883,6 @@ const CatalogMenu = memo(function CatalogMenu({
           selection={formatLocalModelDisplayName(detail)}
           onSectionClick={() => {
             setDetailId(null)
-            setRadarTransition(null)
             setRootSwitchingEnabled(true)
           }}
           hints={catalogDetailHints(layout.compactHeader)}
@@ -1977,7 +1949,6 @@ const CatalogMenu = memo(function CatalogMenu({
             onClick={() => {
               setPendingDeleteId(null)
               moveCursorTo(index)
-              setRadarTransition(null)
               inspectorActionCursor.reset()
               setDetailId(modelId)
               setRootSwitchingEnabled(false)
@@ -2009,7 +1980,6 @@ const CatalogMenu = memo(function CatalogMenu({
         selection={detail === null ? undefined : formatLocalModelDisplayName(detail)}
         onSectionClick={detail === null ? undefined : () => {
           setDetailId(null)
-          setRadarTransition(null)
           setRootSwitchingEnabled(true)
         }}
         subtitle={detail !== null || layout.compactHeader ? undefined : "Find and download local models"}
