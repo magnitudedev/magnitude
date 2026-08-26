@@ -80,7 +80,10 @@ global priority-tier configuration cannot leak into local requests. Claude Code 
 sole Anthropic Messages consumer. It uses
 `http://127.0.0.1:10100/inference/anthropic`, producing `/inference/anthropic/v1/messages`, and
 receives `anthropic-local/<model-id>` through launch-scoped model environment and `--model`. The reserved
-prefix selects the local Anthropic route instead of the byte-preserving upstream route. Onboarding
+prefix selects the local Anthropic route instead of the byte-preserving upstream route. The launch
+environment also sets `CLAUDE_CODE_ATTRIBUTION_HEADER=0` — Anthropic's documented gateway switch —
+so managed launches never send the billing attribution block whose per-request stamp would defeat
+local prompt-prefix reuse; the local Anthropic adapter strips that block for unmanaged clients. Onboarding
 always supplies `setCurrent` for its selected model, so every external handoff starts on that exact
 model. A CLI connection without `--set-current` changes no current-model selection. Provider-local
 registrations expose the complete Magnitude model set.

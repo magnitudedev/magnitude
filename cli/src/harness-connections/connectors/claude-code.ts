@@ -46,6 +46,9 @@ export const makeClaudeCodeConnector = (paths: HarnessConnectionPaths) => define
       ANTHROPIC_DEFAULT_HAIKU_MODEL: localModelId,
       ANTHROPIC_DEFAULT_SONNET_MODEL: localModelId,
       ANTHROPIC_DEFAULT_OPUS_MODEL: localModelId,
+      // Documented gateway switch: without it Claude Code prepends a billing
+      // attribution block whose per-request stamp defeats prompt-prefix reuse.
+      CLAUDE_CODE_ATTRIBUTION_HEADER: "0",
     })
   },
 })
