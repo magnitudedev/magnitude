@@ -11,12 +11,15 @@
       "contextLength": 50000,
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",
-      "qualityScore": 25.8,
-      "qualityScoreProvenance": "measured_terminal_bench_2.1",
-      "qualityEvidence": [
-        "Quantization fidelity is curated independently from hardware fit.",
-        "https://arxiv.org/abs/2606.19558"
-      ]
+      "intelligence": {
+        "score": 20.4,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-26",
+          "url": "https://artificialanalysis.ai/models/qwen3-5-4b"
+        }
+      }
     },
     {
       "id": "qwen3.5-9b",
@@ -29,12 +32,15 @@
       "contextLength": 50000,
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",
-      "qualityScore": 29.2,
-      "qualityScoreProvenance": "measured_terminal_bench_2.1",
-      "qualityEvidence": [
-        "Quantization fidelity is curated independently from hardware fit.",
-        "https://arxiv.org/abs/2606.19558"
-      ]
+      "intelligence": {
+        "score": 21.8,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-26",
+          "url": "https://artificialanalysis.ai/models/qwen3-5-9b"
+        }
+      }
     },
     {
       "id": "qwen3.6-27b",
@@ -55,12 +61,15 @@
         }
       },
       "license": "apache-2.0",
-      "qualityScore": 60.7,
-      "qualityScoreProvenance": "measured_terminal_bench_2.1",
-      "qualityEvidence": [
-        "Quantization fidelity is curated independently from hardware fit.",
-        "https://arxiv.org/abs/2606.19558"
-      ]
+      "intelligence": {
+        "score": 37.7,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-26",
+          "url": "https://artificialanalysis.ai/models/qwen3-6-27b"
+        }
+      }
     },
     {
       "id": "qwen3.8-27b",
@@ -73,14 +82,15 @@
       "contextLength": 100000,
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",
-      "qualityScore": 73.0,
-      "qualityScoreProvenance": "measured_terminal_bench_2.1",
-      "qualityEvidence": [
-        "Publisher-measured Terminal-Bench v2.1 result using the Terminus harness; not an exact GGUF quantization measurement.",
-        "Quantization fidelity is curated independently from hardware fit.",
-        "https://huggingface.co/Qwen/Qwen3.8-27B",
-        "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF"
-      ]
+      "intelligence": {
+        "score": 52.0,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-26",
+          "url": "https://artificialanalysis.ai/models/qwen3-8-27b"
+        }
+      }
     },
     {
       "id": "qwen3.6-35b-a3b",
@@ -101,12 +111,15 @@
         }
       },
       "license": "apache-2.0",
-      "qualityScore": 44.9,
-      "qualityScoreProvenance": "measured_terminal_bench_2.1",
-      "qualityEvidence": [
-        "Quantization fidelity is curated independently from hardware fit.",
-        "https://arxiv.org/abs/2606.19558"
-      ]
+      "intelligence": {
+        "score": 32.1,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-26",
+          "url": "https://artificialanalysis.ai/models/qwen3-6-35b-a3b"
+        }
+      }
     },
     {
       "id": "muse-glimmer-30b",
@@ -120,14 +133,15 @@
       "projector": { "path": "mmproj-Muse-Glimmer-30B-Q8_0.gguf" },
       "speculativeDecoding": { "method": "dflash", "draft": { "type": "file", "path": "dflash-kquant.gguf" } },
       "license": "apache-2.0",
-      "qualityScore": 51.7,
-      "qualityScoreProvenance": "measured_terminal_bench_2.1",
-      "qualityEvidence": [
-        "Publisher-reported Terminal-Bench v2.1 result using the Terminus-2 harness; not an exact GGUF quantization measurement.",
-        "Quantization fidelity is curated independently from hardware fit.",
-        "https://huggingface.co/meta-models/Muse-Glimmer-30B",
-        "https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF"
-      ]
+      "intelligence": {
+        "score": 35.1,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-26",
+          "url": "https://artificialanalysis.ai/models/muse-glimmer"
+        }
+      }
     },
     {
       "id": "gemma-4-e2b-it-qat",
@@ -140,13 +154,15 @@
       "contextLength": 50000,
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",
-      "qualityScore": 0.4,
-      "qualityScoreProvenance": "measured_terminal_bench_2.1",
-      "qualityEvidence": [
-        "Artificial Analysis measured 0.3745% on Terminal-Bench 2.1 with the reasoning checkpoint; rounded to one decimal for catalog ranking. Quantization fidelity is curated independently from hardware fit.",
-        "https://artificialanalysis.ai/models/gemma-4-e2b/",
-        "https://arxiv.org/abs/2606.19558"
-      ]
+      "intelligence": {
+        "score": 9.5,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-26",
+          "url": "https://artificialanalysis.ai/models/gemma-4-e2b"
+        }
+      }
     },
     {
       "id": "gemma-4-e4b-it-qat",
@@ -159,13 +175,15 @@
       "contextLength": 50000,
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",
-      "qualityScore": 1.9,
-      "qualityScoreProvenance": "measured_terminal_bench_2.1",
-      "qualityEvidence": [
-        "Artificial Analysis measured 1.8727% on Terminal-Bench 2.1 with the reasoning checkpoint; rounded to one decimal for catalog ranking. Quantization fidelity is curated independently from hardware fit.",
-        "https://artificialanalysis.ai/models/gemma-4-e4b/",
-        "https://arxiv.org/abs/2606.19558"
-      ]
+      "intelligence": {
+        "score": 12.2,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-26",
+          "url": "https://artificialanalysis.ai/models/gemma-4-e4b"
+        }
+      }
     },
     {
       "id": "lfm2.5-2.6b",
@@ -177,14 +195,15 @@
       "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "contextLength": 50000,
       "license": "lfm1.0",
-      "qualityScore": 22.0,
-      "qualityScoreProvenance": "estimated_terminal_bench_2.1",
-      "qualityEvidence": [
-        "Estimated against the recent dense Qwen3.5-4B measured at 25.8% on Terminal-Bench 2.1. LFM2.5-2.6B is smaller but matches or exceeds it on the publisher's shared LiveCodeBench, BFCL, ToolSandbox, and agentic benchmarks; the estimate is discounted because Liquid does not position this checkpoint for heavy agentic coding. Quantization fidelity is curated independently from hardware fit.",
-        "https://huggingface.co/LiquidAI/LFM2.5-2.6B",
-        "https://artificialanalysis.ai/models/qwen3-5-4b/",
-        "https://arxiv.org/abs/2606.19558"
-      ]
+      "intelligence": {
+        "score": 11.0,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-26",
+          "url": "https://artificialanalysis.ai/models/lfm2-5-2-6b"
+        }
+      }
     },
     {
       "id": "lfm2.5-8b-a1b",
@@ -196,16 +215,15 @@
       "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "contextLength": 50000,
       "license": "lfm1.0",
-      "qualityScore": 1.2,
-      "qualityScoreProvenance": "estimated_terminal_bench_2.1",
-      "qualityEvidence": [
-        "Estimated from recent small-model analogs: Gemma 4 E2B (5.1B total/2.3B active, 0.4%) and E4B (8B total/4.5B active, 1.9%) bracket its 8.3B total/1.5B active architecture, while Qwen3.5-4B provides an upper capability anchor. LFM2.5-8B-A1B has stronger published tool use but substantially weaker SciCode than those peers, so it is placed between the measured Gemma scores. Terminal-Bench Hard is not used as a numerical proxy.",
-        "https://huggingface.co/LiquidAI/LFM2.5-8B-A1B",
-        "https://artificialanalysis.ai/models/lfm2-5-8b-a1b/",
-        "https://artificialanalysis.ai/models/gemma-4-e2b/",
-        "https://artificialanalysis.ai/models/gemma-4-e4b/",
-        "https://arxiv.org/abs/2606.19558"
-      ]
+      "intelligence": {
+        "score": 8.1,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-26",
+          "url": "https://artificialanalysis.ai/models/lfm2-5-8b-a1b"
+        }
+      }
     },
     {
       "id": "bonsai-8b-q1",
@@ -217,14 +235,21 @@
       "variants": [{"variantId": "gguf:q1-qat", "format": "Q1_0", "variantLabel": "Q1 QAT", "fidelityRank": 20, "quantizationAware": true}],
       "contextLength": 50000,
       "license": "apache-2.0",
-      "qualityScore": 1.9,
-      "qualityScoreProvenance": "estimated_terminal_bench_2.1",
-      "qualityEvidence": [
-        "Estimated from its exact Qwen3-8B parent, measured at 2.2% on Terminal-Bench 2.1, then reduced using Bonsai's published coding and tool-use retention relative to that parent. The parent relationship outweighs looser comparisons to newer unrelated 8B models; Bonsai itself has no Terminal-Bench result.",
-        "https://huggingface.co/prism-ml/Bonsai-8B-gguf",
-        "https://artificialanalysis.ai/models/qwen3-8b-instruct-reasoning",
-        "https://arxiv.org/abs/2606.19558"
-      ]
+      "intelligence": {
+        "score": 7.3,
+        "provenance": {
+          "kind": "estimate",
+          "target": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-26",
+          "confidence": "moderate",
+          "methodology": "Scaled the direct Qwen3 8B reasoning score by the geometric mean of Bonsai's published per-benchmark retention ratios against that exact parent.",
+          "evidenceUrls": [
+            "https://artificialanalysis.ai/models/qwen3-8b-instruct-reasoning",
+            "https://huggingface.co/prism-ml/Bonsai-8B-gguf"
+          ]
+        }
+      }
     },
     {
       "id": "gemma-4-12b-it-qat",
@@ -237,13 +262,15 @@
       "contextLength": 100000,
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",
-      "qualityScore": 27.3,
-      "qualityScoreProvenance": "measured_terminal_bench_2.1",
-      "qualityEvidence": [
-        "Artificial Analysis measured 27.3408% on Terminal-Bench 2.1 with the reasoning checkpoint; rounded to one decimal for catalog ranking. Quantization fidelity is curated independently from hardware fit.",
-        "https://artificialanalysis.ai/models/gemma-4-12b/",
-        "https://arxiv.org/abs/2606.19558"
-      ]
+      "intelligence": {
+        "score": 22.2,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-26",
+          "url": "https://artificialanalysis.ai/models/gemma-4-12b"
+        }
+      }
     },
     {
       "id": "gemma-4-26b-a4b-it-qat",
@@ -256,12 +283,15 @@
       "contextLength": 100000,
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",
-      "qualityScore": 39.0,
-      "qualityScoreProvenance": "measured_terminal_bench_2.1",
-      "qualityEvidence": [
-        "Quantization fidelity is curated independently from hardware fit.",
-        "https://arxiv.org/abs/2606.19558"
-      ]
+      "intelligence": {
+        "score": 26.1,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-26",
+          "url": "https://artificialanalysis.ai/models/gemma-4-26b-a4b"
+        }
+      }
     },
     {
       "id": "gemma-4-31b-it-qat",
@@ -274,12 +304,15 @@
       "contextLength": 100000,
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",
-      "qualityScore": 43.4,
-      "qualityScoreProvenance": "measured_terminal_bench_2.1",
-      "qualityEvidence": [
-        "Quantization fidelity is curated independently from hardware fit.",
-        "https://arxiv.org/abs/2606.19558"
-      ]
+      "intelligence": {
+        "score": 29.7,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-26",
+          "url": "https://artificialanalysis.ai/models/gemma-4-31b"
+        }
+      }
     },
     {
       "id": "laguna-s-2.1",
@@ -291,13 +324,28 @@
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "contextLength": 100000,
       "license": "openmdw-1.1",
-      "qualityScore": 70.2,
-      "qualityScoreProvenance": "measured_terminal_bench_2.1",
-      "qualityEvidence": [
-        "Publisher-measured Terminal-Bench v2.1 checkpoint result; not an exact GGUF quantization measurement.",
-        "https://huggingface.co/poolside/Laguna-S-2.1",
-        "https://arxiv.org/abs/2606.19558"
-      ]
+      "intelligence": {
+        "score": 45.9,
+        "provenance": {
+          "kind": "estimate",
+          "target": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-26",
+          "confidence": "low",
+          "methodology": "Applied a local linear regression between published Terminal-Bench 2.1 results and direct Intelligence Index scores for an aligned seven-model Poolside comparison cohort; DeepSeek V4 Pro was excluded because effort and benchmark configurations could not be aligned.",
+          "evidenceUrls": [
+            "https://huggingface.co/poolside/Laguna-S-2.1",
+            "https://poolside.ai/blog/introducing-laguna-s-2-1",
+            "https://artificialanalysis.ai/models/hy3",
+            "https://artificialanalysis.ai/models/inkling",
+            "https://artificialanalysis.ai/models/nvidia-nemotron-3-ultra-550b-a55b",
+            "https://artificialanalysis.ai/models/kimi-k3",
+            "https://artificialanalysis.ai/models/qwen3-7-max",
+            "https://artificialanalysis.ai/models/muse-spark-1-1",
+            "https://artificialanalysis.ai/models/claude-fable-5"
+          ]
+        }
+      }
     },
     {
       "id": "qwen3.5-122b-a10b",
@@ -310,12 +358,15 @@
       "contextLength": 100000,
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",
-      "qualityScore": 47.6,
-      "qualityScoreProvenance": "measured_terminal_bench_2.1",
-      "qualityEvidence": [
-        "Quantization fidelity is curated independently from hardware fit.",
-        "https://arxiv.org/abs/2606.19558"
-      ]
+      "intelligence": {
+        "score": 32.8,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-26",
+          "url": "https://artificialanalysis.ai/models/qwen3-5-122b-a10b"
+        }
+      }
     },
     {
       "id": "nemotron-3-super-120b-a12b",
@@ -327,12 +378,15 @@
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}, {"variantId": "gguf:mxfp4", "format": "MXFP4_MOE", "variantLabel": "MXFP4 QAT", "fidelityRank": 58, "quantizationAware": true}],
       "contextLength": 100000,
       "license": "nvidia-nemotron-open-model-license",
-      "qualityScore": 38.6,
-      "qualityScoreProvenance": "measured_terminal_bench_2.1",
-      "qualityEvidence": [
-        "Quantization fidelity is curated independently from hardware fit.",
-        "https://arxiv.org/abs/2606.19558"
-      ]
+      "intelligence": {
+        "score": 25.7,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-26",
+          "url": "https://artificialanalysis.ai/models/nvidia-nemotron-3-super-120b-a12b"
+        }
+      }
     },
     {
       "id": "nemotron-3.5-lightning-30b-a3b",
@@ -352,14 +406,15 @@
         }
       },
       "license": "openmdw-1.1",
-      "qualityScore": 24.0,
-      "qualityScoreProvenance": "measured_terminal_bench_2.1",
-      "qualityEvidence": [
-        "NVIDIA reports 24.58 for BF16 and 23.46 for the official NVFP4 checkpoint on Terminal-Bench 2.1; the catalog uses a curated family score of 24.0. The Q4_K_M and Q8_0 GGUF artifacts have not been measured independently.",
-        "NVFP4 is curated in the same fidelity tier as Q6 independently from hardware fit.",
-        "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
-        "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
-      ]
+      "intelligence": {
+        "score": 23.6,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-26",
+          "url": "https://artificialanalysis.ai/models/nemotron-3-5-lightning"
+        }
+      }
     },
     {
       "id": "deepseek-v4-flash",
@@ -372,14 +427,15 @@
       "contextLength": 100000,
       "speculativeDecoding": { "method": "dspark", "draft": { "type": "file", "path": "dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf" } },
       "license": "mit",
-      "qualityScore": 82.7,
-      "qualityScoreProvenance": "measured_terminal_bench_2.1",
-      "qualityEvidence": [
-        "Publisher-reported DeepSeek-V4-Flash-0731 result using the DeepSeek Harness in max-effort mode; not an exact GGUF quantization measurement.",
-        "Quantization fidelity is curated independently from hardware fit.",
-        "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731",
-        "https://arxiv.org/abs/2606.19558"
-      ]
+      "intelligence": {
+        "score": 51.8,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-26",
+          "url": "https://artificialanalysis.ai/models/deepseek-v4-flash"
+        }
+      }
     },
     {
       "id": "nemotron-3-ultra-550b-a55b",
@@ -391,12 +447,15 @@
       "variants": [{"variantId": "gguf:mxfp4", "format": "MXFP4_MOE", "variantLabel": "MXFP4 QAT", "fidelityRank": 58, "quantizationAware": true}],
       "contextLength": 100000,
       "license": "openmdw-1.1",
-      "qualityScore": 53.9,
-      "qualityScoreProvenance": "measured_terminal_bench_2.1",
-      "qualityEvidence": [
-        "Quantization fidelity is curated independently from hardware fit.",
-        "https://arxiv.org/abs/2606.19558"
-      ]
+      "intelligence": {
+        "score": 38.3,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-26",
+          "url": "https://artificialanalysis.ai/models/nvidia-nemotron-3-ultra-550b-a55b"
+        }
+      }
     },
     {
       "id": "glm-5.2",
@@ -409,14 +468,15 @@
       "contextLength": 100000,
       "speculativeDecoding": { "method": "mtp", "draft": { "type": "embedded" } },
       "license": "mit",
-      "qualityScore": 81.0,
-      "qualityScoreProvenance": "measured_terminal_bench_2.1",
-      "qualityEvidence": [
-        "Publisher-reported Terminal-Bench v2.1 result using the Terminus-2 harness; not an exact GGUF quantization measurement.",
-        "Quantization fidelity is curated independently from hardware fit.",
-        "https://huggingface.co/unsloth/GLM-5.2-GGUF",
-        "https://arxiv.org/abs/2606.19558"
-      ]
+      "intelligence": {
+        "score": 52.6,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-26",
+          "url": "https://artificialanalysis.ai/models/glm-5-2"
+        }
+      }
     }
   ]
 }

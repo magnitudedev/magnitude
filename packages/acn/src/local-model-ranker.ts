@@ -257,7 +257,7 @@ export const makeLocalModelRankerLive = (): Layer.Layer<
                 modelId: model.modelId,
                 variantId: model.variantId,
                 configuration: model.configuration,
-                qualityScore: model.qualityScore,
+                intelligenceIndexScore: model.intelligence.score,
                 fidelityRank: model.fidelityRank,
                 tensorStorageBytes: Option.getOrNull(exactBundleTensorStorageBytes(model)),
               })),

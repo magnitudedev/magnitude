@@ -1,10 +1,11 @@
 import { Atom, Registry, Result } from "@effect-atom/atom-react"
-import { Cause, Effect, Layer, Option, Queue, Stream } from "effect"
+import { Cause, Effect, Layer, Option, Queue, Schema, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import { Client as EffectQueryClient } from "@magnitudedev/effect-query"
 import {
   MagnitudeBoundary,
   AssessmentEnvironmentIdSchema,
+  CatalogIntelligenceSchema,
   CatalogModelIdSchema,
   CatalogVariantIdSchema,
   ModelAssessmentIdSchema,
@@ -88,11 +89,17 @@ const makeModel = (installed: boolean): LocalModel => {
         variantId: CatalogVariantIdSchema.make("gguf:q4"),
         releaseDate: ModelReleaseDateSchema.make("2026-01-01"),
         parameterization: { architecture: "dense", totalParameters: 1 },
-        intelligenceScore: 1,
-        intelligenceScoreSource: "test",
+        intelligence: Schema.decodeUnknownSync(CatalogIntelligenceSchema)({
+          score: 1,
+          provenance: {
+            kind: "artificialAnalysisIntelligenceIndex",
+            methodologyVersion: "test",
+            asOfDate: "2026-01-01",
+            url: "https://example.com/model",
+          },
+        }),
         fidelityRank: 1,
         quantizationAware: false,
-        qualityNotes: [],
       },
     },
     acquisitionState: installed
@@ -135,7 +142,7 @@ const makeModel = (installed: boolean): LocalModel => {
         : { _tag: "Installable" },
       rankingScores: installed
         ? Option.none()
-        : Option.some({ intelligence: 0.7, speed: 0.8, quality: 0.9 }),
+        : Option.some({ intelligence: 0.7, speed: 0.8, fidelity: 0.9 }),
     },
   }
 }

@@ -79,11 +79,17 @@ describe("LocalModelAssessor", () => {
           ? packageEntry.inspection.capabilities
           : undefined,
         parameterization: { architecture: "dense" as const, totalParameters: 8_000_000_000 },
-        qualityScore: 1,
-        qualityScoreProvenance: "test",
+        intelligence: {
+          score: 1,
+          provenance: {
+            kind: "artificialAnalysisIntelligenceIndex",
+            methodologyVersion: "test",
+            asOfDate: "2026-01-01",
+            url: "https://example.com/model",
+          },
+        },
         fidelityRank: 1,
         quantizationAware: false,
-        qualityEvidence: [],
       })
       const dependencies = Layer.mergeAll(
         Layer.succeed(IcnModels, IcnModels.of({

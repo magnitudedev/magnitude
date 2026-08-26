@@ -11,7 +11,7 @@ import {
 const option = (
   modelId: string,
   totalRequiredBytes: number,
-  scores: { intelligence: number; speed: number; quality: number },
+  scores: { intelligence: number; speed: number; fidelity: number },
   kind: LocalModelOption["kind"] = "downloadable",
 ): LocalModelOption => ({
   id: `${kind}:${modelId}`,
@@ -30,16 +30,16 @@ const option = (
 })
 
 describe("local model ranking", () => {
-  it("moves utility from speed toward intelligence while quality always contributes", () => {
-    const scores = { intelligence: 0.8, speed: 0.4, quality: 0.5 }
+  it("moves utility from speed toward intelligence while fidelity always contributes", () => {
+    const scores = { intelligence: 0.8, speed: 0.4, fidelity: 0.5 }
     expect(localModelRankingUtility(scores, 0)).toBeCloseTo(0.4 ** 0.9 * 0.5 ** 0.1)
     expect(localModelRankingUtility(scores, 1)).toBeCloseTo(0.8 ** 0.9 * 0.5 ** 0.1)
   })
 
   it("filters by the exact memory budget before sorting and truncating", () => {
-    const fast = option("fast", 8, { intelligence: 0.4, speed: 1, quality: 1 })
-    const smart = option("smart", 8, { intelligence: 1, speed: 0.4, quality: 1 })
-    const overBudget = option("over", 9, { intelligence: 1, speed: 1, quality: 1 })
+    const fast = option("fast", 8, { intelligence: 0.4, speed: 1, fidelity: 1 })
+    const smart = option("smart", 8, { intelligence: 1, speed: 0.4, fidelity: 1 })
+    const overBudget = option("over", 9, { intelligence: 1, speed: 1, fidelity: 1 })
     expect(rankedLocalModelOptions(
       [smart, overBudget, fast],
       { fastToSmart: 0, memoryBudgetBytes: 8 },
@@ -48,7 +48,7 @@ describe("local model ranking", () => {
   })
 
   it("breaks equal utility by canonical model ID", () => {
-    const scores = { intelligence: 0.8, speed: 0.8, quality: 0.8 }
+    const scores = { intelligence: 0.8, speed: 0.8, fidelity: 0.8 }
     const second = option("b", 1, scores)
     const first = option("a", 1, scores)
     expect(rankedLocalModelOptions(
@@ -58,8 +58,8 @@ describe("local model ranking", () => {
   })
 
   it("ranks installed and downloadable choices together", () => {
-    const stored = option("stored", 1, { intelligence: 1, speed: 1, quality: 1 }, "stored")
-    const downloadable = option("downloadable", 1, { intelligence: 0.5, speed: 0.5, quality: 1 })
+    const stored = option("stored", 1, { intelligence: 1, speed: 1, fidelity: 1 }, "stored")
+    const downloadable = option("downloadable", 1, { intelligence: 0.5, speed: 0.5, fidelity: 1 })
 
     expect(rankedLocalModelOptions(
       [downloadable, stored],

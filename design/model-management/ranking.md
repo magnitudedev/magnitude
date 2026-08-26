@@ -21,8 +21,9 @@ selected portfolio.
 
 Every rankable configuration has three normalized scores in `[0, 1]`:
 
-- intelligence is the catalog intelligence score divided by 100;
-- quality is the catalog fidelity rank divided by 100; and
+- intelligence is the catalog intelligence score divided by 100 and clamped to the normalized
+  range;
+- fidelity is the catalog fidelity rank divided by 100; and
 - speed is the normalized expected generation speed at
   `min(50,000, configured context)`.
 
@@ -46,10 +47,12 @@ Let `p` be Fast-to-Smart clamped to `[0, 1]`, with zero meaning Fastest and one 
 ```text
 utility = intelligence ^ (0.9 * p)
         * speed        ^ (0.9 * (1 - p))
-        * quality      ^ 0.1
+        * fidelity     ^ 0.1
 ```
 
-Quality always contributes. Memory is a hard filter and never a utility factor. A candidate is
+Fidelity always contributes. Intelligence is model-level capability on the versioned Artificial
+Analysis Intelligence Index scale; fidelity is artifact-variant preservation and cannot supply or
+alter intelligence provenance. Memory is a hard filter and never a utility factor. A candidate is
 eligible only when its assessed `memory.totalRequiredBytes` does not exceed the machine's normalized
 physical-memory capacity.
 
@@ -66,10 +69,12 @@ to `[0, 1]`; the preference survives renderer remounts for the current connectio
 
 CLI and web render the same controls and recompute results from current hardware, options, and
 control state. Selectable ranked models require an authoritative hardware result. Fast-to-Smart has
-five equidistant semantic positions: Fastest, Faster, Balanced, Smarter, and Smartest, corresponding
-to normalized values `0`, `0.25`, `0.5`, `0.75`, and `1`. The CLI calculates tick spacing from label
-widths so labels cannot overlap. Its track, unselected ticks, and unselected labels use the normal
-white text color; only the selected tick and its label use accent blue, with no separate marker glyph.
+five visually equidistant semantic positions: Fastest, Faster, Balanced, Smarter, and Smartest,
+corresponding to normalized weights `0.05`, `0.25`, `0.5`, `0.75`, and `0.95`. The softened endpoint
+weights ensure both speed and intelligence remain ranking factors at every position. The CLI
+calculates tick spacing from label widths so labels cannot overlap. Its track, unselected ticks, and
+unselected labels use the normal white text color; only the selected tick and its label use accent
+blue, with no separate marker glyph.
 The CLI renders a dim `←/→ change preference` instruction immediately to the track's right.
 The scale is not focusable or pointer-selectable. CLI keyboard traversal contains only model rows;
 Left/Right and `h`/`l` adjust Fast-to-Smart regardless of the selected row. The cursor owns a visible
@@ -80,6 +85,8 @@ There is no memory control.
 
 - ACN publishes `LocalModelRankingScores`, never server-selected preference tiers or explanations.
 - Scores belong to one exact catalog model configuration with a terminal `Fits` assessment.
+- Normalized score fields are named `intelligence`, `speed`, and `fidelity`; `quality` is not a
+  ranking dimension.
 - Missing required speed evidence fails ranking.
 - Fast-to-Smart preference and the physical-memory hard filter are client-common concerns.
 - Filtering and sorting happen before the ten-result limit.

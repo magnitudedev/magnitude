@@ -526,11 +526,9 @@ export const LocalModelsLive: Layer.Layer<
           variantId: curated.variantId,
           releaseDate: curated.releaseDate,
           parameterization: curated.parameterization,
-          intelligenceScore: curated.qualityScore,
-          intelligenceScoreSource: curated.qualityScoreProvenance,
+          intelligence: curated.intelligence,
           fidelityRank: curated.fidelityRank,
           quantizationAware: curated.quantizationAware,
-          qualityNotes: curated.qualityEvidence,
         },
       }
 

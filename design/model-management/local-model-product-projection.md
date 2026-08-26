@@ -94,9 +94,10 @@ Native occurrence identities (download and instance IDs) never appear in the pro
 cancellation and failure acknowledgement are model-addressed commands that ACN resolves to the
 native occurrence.
 
-Catalog membership carries structured branded identity components. Only the local provider adapter
-serializes them into a provider-model identity. Configurations and product rows are derived and
-never persisted.
+Catalog membership carries structured branded identity components and the catalog's complete
+intelligence assessment, including direct or estimated provenance. ACN does not flatten or
+reconstruct that provenance. Only the local provider adapter serializes identity components into a
+provider-model identity. Configurations and product rows are derived and never persisted.
 
 ## Conformance
 

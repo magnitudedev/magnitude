@@ -1,7 +1,8 @@
-import { Effect, Layer, Option, Stream } from "effect"
+import { Effect, Layer, Option, Schema, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   CatalogModelIdSchema,
+  CatalogIntelligenceSchema,
   CatalogVariantIdSchema,
   ModelPackageIdSchema,
   ModelReleaseDateSchema,
@@ -92,11 +93,17 @@ describe("local provider offering projection", () => {
         },
       },
       parameterization: { architecture: "dense", totalParameters: 8_000_000_000 },
-      qualityScore: 1,
-      qualityScoreProvenance: "test",
+      intelligence: Schema.decodeUnknownSync(CatalogIntelligenceSchema)({
+        score: 1,
+        provenance: {
+          kind: "artificialAnalysisIntelligenceIndex",
+          methodologyVersion: "test",
+          asOfDate: "2026-01-01",
+          url: "https://example.com/model",
+        },
+      }),
       fidelityRank: 1,
       quantizationAware: false,
-      qualityEvidence: [],
     }
     const inspectedCapabilities = {
       vision: false,

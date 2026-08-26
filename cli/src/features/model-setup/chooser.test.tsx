@@ -30,7 +30,7 @@ const onRankingControlsChange = () => undefined
 const makeRankedCatalogModel = (
   id: string,
   displayName: string,
-  rankingScores: { intelligence: number; speed: number; quality: number },
+  rankingScores: { intelligence: number; speed: number; fidelity: number },
 ) => {
   const model = makeCatalogModel()
   if (model.servingState._tag !== "Assessed") throw new Error("catalog fixture must be assessed")
@@ -83,6 +83,47 @@ describe("onboarding model chooser identity", () => {
     }
   })
 
+  it("uses softened weights at the Fastest and Smartest endpoints", async () => {
+    const updates: typeof rankingControls[] = []
+    const StatefulChooser = () => {
+      const [controls, setControls] = useState(rankingControls)
+      return (
+        <OnboardingModelChooser
+          hardware={Result.success(makeHardware())}
+          options={[{ id: "downloadable:test", kind: "downloadable", model: makeCatalogModel() }]}
+          rankingControls={controls}
+          onRankingControlsChange={(next) => {
+            updates.push(next)
+            setControls(next)
+          }}
+          width={120}
+          error={null}
+          operation={null}
+          onSelect={() => undefined}
+          onExit={() => undefined}
+          exitKind="Skip"
+        />
+      )
+    }
+    const view = await testRender(<StatefulChooser />, { width: 120, height: 44 })
+
+    try {
+      await act(view.renderOnce)
+      await act(async () => view.mockInput.pressArrow("left"))
+      await act(view.renderOnce)
+      await act(async () => view.mockInput.pressArrow("left"))
+      expect(updates.at(-1)?.fastToSmart).toBeCloseTo(0.05)
+
+      for (let index = 0; index < 4; index += 1) {
+        await act(async () => view.mockInput.pressArrow("right"))
+        await act(view.renderOnce)
+      }
+      expect(updates.at(-1)?.fastToSmart).toBeCloseTo(0.95)
+    } finally {
+      await act(async () => view.renderer.destroy())
+    }
+  })
+
   it("keeps narrow setup regions distinct with full ranked and installed sections", async () => {
     const baseHardware = makeHardware()
     const hardware = makeHardware({
@@ -106,7 +147,7 @@ describe("onboarding model chooser identity", () => {
       model: makeRankedCatalogModel(
         `narrow-${index}`,
         `Narrow Model ${index}`,
-        { intelligence: 0.7, speed: 0.7, quality: 0.7 },
+        { intelligence: 0.7, speed: 0.7, fidelity: 0.7 },
       ),
     }))
     const view = await testRender(
@@ -145,12 +186,12 @@ describe("onboarding model chooser identity", () => {
     const smart = makeRankedCatalogModel(
       "a-smart",
       "Smart Model",
-      { intelligence: 1, speed: 0.4, quality: 1 },
+      { intelligence: 1, speed: 0.4, fidelity: 1 },
     )
     const fast = makeRankedCatalogModel(
       "b-fast",
       "Fast Model",
-      { intelligence: 0.4, speed: 1, quality: 1 },
+      { intelligence: 0.4, speed: 1, fidelity: 1 },
     )
     const StatefulChooser = () => {
       const [controls, setControls] = useState(rankingControls)

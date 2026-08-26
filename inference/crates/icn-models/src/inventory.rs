@@ -1961,10 +1961,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use icn_contracts::models::{
-        CatalogModelId, CatalogVariantId, InstalledModelPackages, ModelCapabilities, ModelFile,
-        ModelFileId, ModelFileRole, ModelPackageInspection, ModelPackageProperties,
-        ModelReasoningCapabilities, ModelReleaseDate, ModelServingConfiguration,
-        RecommendableModel, ServableModelBundle, ServingProfile,
+        CatalogIntelligence, CatalogModelId, CatalogVariantId, InstalledModelPackages,
+        IntelligenceProvenance, ModelCapabilities, ModelFile, ModelFileId, ModelFileRole,
+        ModelPackageInspection, ModelPackageProperties, ModelReasoningCapabilities,
+        ModelReleaseDate, ModelServingConfiguration, RecommendableModel, ServableModelBundle,
+        ServingProfile,
     };
 
     fn catalog_model(package: ModelPackage) -> RecommendableModel {
@@ -1995,11 +1996,16 @@ mod tests {
             parameterization: icn_contracts::models::ModelParameterization::Dense {
                 total_parameters: 8_000_000_000,
             },
-            quality_score: 0.0,
-            quality_score_provenance: "test".to_owned(),
+            intelligence: CatalogIntelligence {
+                score: 0.0,
+                provenance: IntelligenceProvenance::ArtificialAnalysisIntelligenceIndex {
+                    methodology_version: "test".to_owned(),
+                    as_of_date: "2026-01-01".to_owned(),
+                    url: "https://example.com/model".to_owned(),
+                },
+            },
             fidelity_rank: 0,
             quantization_aware: false,
-            quality_evidence: Vec::new(),
         }
     }
     use icn_contracts::{

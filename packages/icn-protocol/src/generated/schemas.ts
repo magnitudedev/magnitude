@@ -187,6 +187,13 @@ export const CatalogDiagnostic = S.Struct({
 export type CatalogDiagnostic = S.Schema.Type<typeof CatalogDiagnostic>
 export type CatalogDiagnosticEncoded = S.Schema.Encoded<typeof CatalogDiagnostic>
 
+export const CatalogIntelligence = S.Struct({
+  provenance: S.suspend((): S.Schema<IntelligenceProvenance, IntelligenceProvenanceEncoded> => IntelligenceProvenance),
+  score: S.Number,
+})
+export type CatalogIntelligence = S.Schema.Type<typeof CatalogIntelligence>
+export type CatalogIntelligenceEncoded = S.Schema.Encoded<typeof CatalogIntelligence>
+
 export const CatalogModelEffectiveConfiguration = S.Union(
   S.extend(
     S.TaggedStruct("Runnable", {
@@ -1243,15 +1250,13 @@ export const InferenceModel = S.Struct({
   displayName: S.String,
   fidelityRank: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   id: S.String,
+  intelligence: S.suspend((): S.Schema<CatalogIntelligence, CatalogIntelligenceEncoded> => CatalogIntelligence),
   license: S.String,
   localState: S.suspend((): S.Schema<CatalogModelLocalState, CatalogModelLocalStateEncoded> => CatalogModelLocalState),
   modelId: S.suspend((): S.Schema<CatalogModelId, CatalogModelIdEncoded> => CatalogModelId),
   parameterization: S.suspend(
     (): S.Schema<ModelParameterization, ModelParameterizationEncoded> => ModelParameterization,
   ),
-  qualityEvidence: S.Array(S.String),
-  qualityScore: S.Number,
-  qualityScoreProvenance: S.String,
   quantizationAware: S.Boolean,
   releaseDate: S.suspend((): S.Schema<ModelReleaseDate, ModelReleaseDateEncoded> => ModelReleaseDate),
   variantId: S.suspend((): S.Schema<CatalogVariantId, CatalogVariantIdEncoded> => CatalogVariantId),
@@ -1337,6 +1342,39 @@ export const InstallModelResponse = S.Union(
 export type InstallModelResponse = S.Schema.Type<typeof InstallModelResponse>
 export type InstallModelResponseEncoded = S.Schema.Encoded<typeof InstallModelResponse>
 
+export const IntelligenceEstimateConfidence = S.Union(S.Literal("high"), S.Literal("moderate"), S.Literal("low"))
+export type IntelligenceEstimateConfidence = S.Schema.Type<typeof IntelligenceEstimateConfidence>
+export type IntelligenceEstimateConfidenceEncoded = S.Schema.Encoded<typeof IntelligenceEstimateConfidence>
+
+export const IntelligenceProvenance = S.Union(
+  S.extend(
+    S.Struct({
+      asOfDate: S.String,
+      kind: S.Literal("artificialAnalysisIntelligenceIndex"),
+      methodologyVersion: S.String,
+      url: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      asOfDate: S.String,
+      confidence: S.suspend(
+        (): S.Schema<IntelligenceEstimateConfidence, IntelligenceEstimateConfidenceEncoded> =>
+          IntelligenceEstimateConfidence,
+      ),
+      evidenceUrls: S.Array(S.String).pipe(S.minItems(1)),
+      kind: S.Literal("estimate"),
+      methodology: S.String,
+      methodologyVersion: S.String,
+      target: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type IntelligenceProvenance = S.Schema.Type<typeof IntelligenceProvenance>
+export type IntelligenceProvenanceEncoded = S.Schema.Encoded<typeof IntelligenceProvenance>
+
 export const JsonSchemaRequest = S.Struct({
   name: S.String,
   schema: S.suspend((): S.Schema<Value, ValueEncoded> => Value),
@@ -1347,6 +1385,9 @@ export type JsonSchemaRequestEncoded = S.Schema.Encoded<typeof JsonSchemaRequest
 
 export const MagnitudeModelDescriptor = S.extend(
   S.Struct({
+    capabilities: S.suspend((): S.Schema<ModelCapabilities, ModelCapabilitiesEncoded> => ModelCapabilities),
+    contextWindow: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    description: S.String,
     id: S.String,
     name: S.String,
   }),

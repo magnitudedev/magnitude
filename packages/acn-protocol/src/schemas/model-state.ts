@@ -453,6 +453,49 @@ export const ModelParameterizationSchema = Schema.Union(
 )
 export type ModelParameterization = typeof ModelParameterizationSchema.Type
 
+const IntelligenceAsOfDateSchema = Schema.String.pipe(
+  Schema.filter(isRealIsoCalendarDate, {
+    message: () => "intelligence observation date must be a real YYYY-MM-DD calendar date",
+  }),
+  Schema.brand("IntelligenceAsOfDate"),
+)
+
+const HttpsEvidenceUrlSchema = Schema.String.pipe(
+  Schema.filter((value) => {
+    try {
+      return new URL(value).protocol === "https:"
+    } catch {
+      return false
+    }
+  }, { message: () => "intelligence evidence URL must be an absolute HTTPS URL" }),
+  Schema.brand("HttpsEvidenceUrl"),
+)
+
+export const IntelligenceProvenanceSchema = Schema.Union(
+  Schema.Struct({
+    kind: Schema.Literal("artificialAnalysisIntelligenceIndex"),
+    methodologyVersion: NonEmptyString,
+    asOfDate: IntelligenceAsOfDateSchema,
+    url: HttpsEvidenceUrlSchema,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("estimate"),
+    target: Schema.Literal("artificialAnalysisIntelligenceIndex"),
+    methodologyVersion: NonEmptyString,
+    asOfDate: IntelligenceAsOfDateSchema,
+    confidence: Schema.Literal("high", "moderate", "low"),
+    methodology: NonEmptyString,
+    evidenceUrls: Schema.NonEmptyArray(HttpsEvidenceUrlSchema),
+  }),
+)
+export type IntelligenceProvenance = typeof IntelligenceProvenanceSchema.Type
+
+export const CatalogIntelligenceSchema = Schema.Struct({
+  score: FiniteNonNegative,
+  provenance: IntelligenceProvenanceSchema,
+})
+export type CatalogIntelligence = typeof CatalogIntelligenceSchema.Type
+
 export const RecommendableModelSchema = Schema.Struct({
   ...CatalogIdentitySchema.fields,
   configuration: ModelServingConfigurationSchema,
@@ -463,11 +506,9 @@ export const RecommendableModelSchema = Schema.Struct({
   license: NonEmptyString,
   capabilities: RecommendableModelCapabilitiesSchema,
   parameterization: ModelParameterizationSchema,
-  qualityScore: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
-  qualityScoreProvenance: NonEmptyString,
+  intelligence: CatalogIntelligenceSchema,
   fidelityRank: NonNegativeSafeInteger,
   quantizationAware: Schema.Boolean,
-  qualityEvidence: Schema.Array(NonEmptyString),
 })
 export type RecommendableModel = typeof RecommendableModelSchema.Type
 
@@ -694,11 +735,9 @@ export const LocalModelCatalogDataSchema = Schema.Struct({
   ...CatalogIdentitySchema.fields,
   releaseDate: ModelReleaseDateSchema,
   parameterization: ModelParameterizationSchema,
-  intelligenceScore: Schema.Number.pipe(Schema.finite(), Schema.nonNegative()),
-  intelligenceScoreSource: NonEmptyString,
+  intelligence: CatalogIntelligenceSchema,
   fidelityRank: NonNegativeSafeInteger,
   quantizationAware: Schema.Boolean,
-  qualityNotes: Schema.Array(NonEmptyString),
 })
 export type LocalModelCatalogData = typeof LocalModelCatalogDataSchema.Type
 
@@ -720,7 +759,7 @@ const NormalizedRankingScoreSchema = Schema.Number.pipe(
 export const LocalModelRankingScoresSchema = Schema.Struct({
   intelligence: NormalizedRankingScoreSchema,
   speed: NormalizedRankingScoreSchema,
-  quality: NormalizedRankingScoreSchema,
+  fidelity: NormalizedRankingScoreSchema,
 })
 export type LocalModelRankingScores = typeof LocalModelRankingScoresSchema.Type
 

@@ -29,7 +29,15 @@ export const LOCAL_MODEL_RANKING_SCALE_LABELS = [
   "Smartest",
 ] as const
 
-export const LOCAL_MODEL_RANKING_SCALE_INTERVALS = LOCAL_MODEL_RANKING_SCALE_LABELS.length - 1
+export const LOCAL_MODEL_RANKING_SCALE_VALUES = [0.05, 0.25, 0.5, 0.75, 0.95] as const
+
+export const LOCAL_MODEL_RANKING_SCALE_INTERVALS = LOCAL_MODEL_RANKING_SCALE_VALUES.length - 1
+
+export const localModelRankingScaleIndex = (value: number): number =>
+  LOCAL_MODEL_RANKING_SCALE_VALUES.reduce((closestIndex, candidate, index) =>
+    Math.abs(candidate - value) < Math.abs(LOCAL_MODEL_RANKING_SCALE_VALUES[closestIndex]! - value)
+      ? index
+      : closestIndex, 0)
 
 const clamp01 = (value: number): number => Number.isFinite(value)
   ? Math.min(1, Math.max(0, value))
@@ -48,7 +56,7 @@ export const localModelRankingUtility = (
   const preference = clamp01(fastToSmart)
   return scores.intelligence ** (0.9 * preference)
     * scores.speed ** (0.9 * (1 - preference))
-    * scores.quality ** 0.1
+    * scores.fidelity ** 0.1
 }
 
 export const targetPhysicalMemoryBytes = (hardware: LocalInferenceHardware): number =>

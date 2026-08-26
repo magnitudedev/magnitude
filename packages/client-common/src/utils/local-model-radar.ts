@@ -156,13 +156,13 @@ export const localModelRadarAxes = (
   const quantization = targetPackage(model).properties.quantization
   const axes: LocalModelRadarAxes = [
     {
-      value: Option.map(catalog, ({ intelligenceScore }) =>
-        clamp01(intelligenceScore / 100)
+      value: Option.map(catalog, ({ intelligence }) =>
+        clamp01(intelligence.score / 100)
       ),
       label: "INTELLIGENCE",
       detail: Option.match(catalog, {
         onNone: () => "Not assessed",
-        onSome: ({ intelligenceScore }) => `${Math.round(intelligenceScore)}%`,
+        onSome: ({ intelligence }) => `${Math.round(intelligence.score)}%`,
       }),
     },
     {
