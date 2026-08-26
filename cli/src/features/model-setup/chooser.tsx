@@ -353,6 +353,7 @@ const OnboardingSetupCard = ({
   spinnerFrame = spinnerFrameAt(0),
   children,
   footer,
+  unexpectedError,
 }: {
   readonly width: number
   readonly stage: SetupStage
@@ -361,6 +362,7 @@ const OnboardingSetupCard = ({
   readonly spinnerFrame?: string
   readonly children: ReactNode
   readonly footer?: ReactNode
+  readonly unexpectedError?: string | null
 }): ReactNode => {
   const theme = useTheme()
   const bodyWidth = setupBodyWidth(width)
@@ -368,7 +370,13 @@ const OnboardingSetupCard = ({
     ? Math.max(0, describeLocalHardwareSummary(hardware.value).length - 1)
     : 0)
   return (
-    <SetupFrame width={width} stage={stage} footer={footer} additionalRows={additionalRows}>
+    <SetupFrame
+      width={width}
+      stage={stage}
+      footer={footer}
+      unexpectedError={unexpectedError}
+      additionalRows={additionalRows}
+    >
       {title !== undefined && (
         <text style={{ fg: theme.text.body }} attributes={TextAttributes.BOLD}>{title}</text>
       )}
@@ -842,6 +850,7 @@ export function OnboardingModelChooser({
       width={width}
       stage={operation === null ? "choose" : "install"}
       hardware={hardware}
+      unexpectedError={error}
       footer={(
         <>
           <text style={{ fg: theme.text.guidance }} wrapMode="none">You can switch models or download more anytime from /settings.</text>
@@ -888,6 +897,7 @@ export function OnboardingModelChooser({
           : operation._tag === "Activating"
             ? (
                 <OnboardingModelLoadProgress
+                  model={operation.model}
                   status={operation.status}
                   width={operationWidth}
                   onCancel={operation.onCancel}
@@ -907,7 +917,6 @@ export function OnboardingModelChooser({
         {list}
         {details}
       </box>
-      {error && <text style={{ fg: theme.status.failure, marginTop: 1 }} wrapMode="none">{error}</text>}
     </OnboardingSetupCard>
   )
 }

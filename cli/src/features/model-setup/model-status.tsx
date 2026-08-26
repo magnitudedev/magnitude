@@ -3,9 +3,11 @@ import { TextAttributes, type KeyEvent } from "@opentui/core"
 import { useKeyboard } from "@opentui/react"
 import { Option } from "effect"
 import {
+  formatLocalModelDisplayName,
   formatMemorySize,
   formatStorageSize,
   formatTransferRate,
+  truncateToDisplayWidth,
   type OnboardingModelLoadStatus,
 } from "@magnitudedev/client-common"
 import { acquisitionProgress, type LocalModel, type ProviderModelId } from "@magnitudedev/sdk"
@@ -26,11 +28,20 @@ const progressBar = (fraction: number, width: number): string => {
 const ModelOperationProgressBar = ({
   progress,
   width,
+  tone = "active",
 }: {
   readonly progress: Option.Option<number>
   readonly width: number
+  readonly tone?: "active" | "failed"
 }): ReactNode => {
   const theme = useTheme()
+  if (tone === "failed") {
+    return (
+      <text style={{ width, fg: theme.status.failure }} wrapMode="none">
+        {progressBar(1, width)}
+      </text>
+    )
+  }
   const percentageLabel = Option.match(progress, {
     onNone: () => "0%",
     onSome: (fraction) => `${Math.round(Math.max(0, Math.min(1, fraction)) * 100)}%`,
@@ -245,20 +256,43 @@ export function OnboardingModelDownloadProgress({
   )
 }
 
-const loadingStatusLabel = (status: OnboardingModelLoadStatus): string => {
+const statusWithModel = (
+  prefix: string,
+  modelName: string,
+  suffix: string,
+  width: number,
+): string => `${prefix}${truncateToDisplayWidth(
+  modelName,
+  Math.max(1, width - prefix.length - suffix.length),
+)}${suffix}`
+
+const loadingStatusLabel = (
+  status: Exclude<OnboardingModelLoadStatus, { readonly _tag: "Failed" }>,
+  modelName: string,
+  width: number,
+): string => {
   switch (status._tag) {
-    case "Preparing": return "Preparing model…"
-    case "Cancelling": return "Cancelling loading…"
-    case "Stopping": return "Stopping current model…"
-    case "Ready": return "Finishing setup…"
-    case "Failed": return "Couldn’t load model"
+    case "Preparing": return statusWithModel("Preparing ", modelName, "…", width)
+    case "Cancelling": return statusWithModel("Cancelling the load of ", modelName, "…", width)
+    case "Stopping": return statusWithModel(
+      "Unloading the current model before loading ",
+      modelName,
+      "…",
+      width,
+    )
+    case "Ready": return statusWithModel("Finishing setup for ", modelName, "…", width)
     case "Loading": {
       switch (status.stage) {
-        case "queued": return "Waiting to load model…"
-        case "resolving": return "Resolving model…"
-        case "unloading": return "Unloading current model…"
-        case "loading": return "Loading model into memory…"
-        case "verifying": return "Verifying model…"
+        case "queued": return statusWithModel("Waiting to load ", modelName, "…", width)
+        case "resolving": return statusWithModel("Resolving ", modelName, "…", width)
+        case "unloading": return statusWithModel(
+          "Unloading the current model before loading ",
+          modelName,
+          "…",
+          width,
+        )
+        case "loading": return statusWithModel("Loading ", modelName, " into memory…", width)
+        case "verifying": return statusWithModel("Verifying ", modelName, "…", width)
       }
     }
   }
@@ -266,17 +300,31 @@ const loadingStatusLabel = (status: OnboardingModelLoadStatus): string => {
 
 const loadingFailureLabel = (
   status: Extract<OnboardingModelLoadStatus, { readonly _tag: "Failed" }>,
+  modelName: string,
+  width: number,
 ): string => "_tag" in status.failure && status.failure._tag === "LowMemory"
-  ? `Couldn’t load model · Free ${formatMemorySize(status.failure.minimumAdditionalAvailableBytes, { rounding: "up" })} and try again`
-  : `Couldn’t load model · ${status.failure.message}`
+  ? statusWithModel(
+      "Not enough memory for ",
+      modelName,
+      ` · Free at least ${formatMemorySize(status.failure.minimumAdditionalAvailableBytes, { rounding: "up" })}`,
+      width,
+    )
+  : statusWithModel(
+      "Couldn’t load ",
+      modelName,
+      ` · ${status.failure.message}`,
+      width,
+    )
 
 export function OnboardingModelLoadProgress({
+  model,
   status,
   width,
   onCancel,
   onRetry,
   onChooseAnother,
 }: {
+  readonly model: LocalModel
   readonly status: OnboardingModelLoadStatus
   readonly width: number
   readonly onCancel: () => void
@@ -284,9 +332,13 @@ export function OnboardingModelLoadProgress({
   readonly onChooseAnother: () => void
 }): ReactNode {
   const theme = useTheme()
+  const modelName = formatLocalModelDisplayName(model)
   const [hovered, setHovered] = useState<"retry" | "choose" | "cancel" | ConfirmationChoice | null>(null)
   const [confirmingCancellation, setConfirmingCancellation] = useState(false)
   const [cancellationChoice, setCancellationChoice] = useState<ConfirmationChoice>("yes")
+  const [failureChoice, setFailureChoice] = useState<"retry" | "choose">("retry")
+  const failureRetryable = status._tag === "Failed" && status.failure.retryable
+  const selectedFailureChoice = failureRetryable ? failureChoice : "choose"
   const cancelable = status._tag !== "Cancelling"
     && status._tag !== "Ready"
     && status._tag !== "Failed"
@@ -301,6 +353,24 @@ export function OnboardingModelLoadProgress({
     onCancel()
   }, [cancelable, onCancel])
   useKeyboard(useCallback((key: KeyEvent) => {
+    if (status._tag === "Failed") {
+      if ((key.name === "left" || key.name === "right") && failureRetryable) {
+        key.preventDefault()
+        setFailureChoice((current) => current === "retry" ? "choose" : "retry")
+        return
+      }
+      if (key.name === "escape") {
+        key.preventDefault()
+        onChooseAnother()
+        return
+      }
+      if (key.name === "return" || key.name === "enter") {
+        key.preventDefault()
+        if (selectedFailureChoice === "retry") onRetry()
+        else onChooseAnother()
+      }
+      return
+    }
     if (!cancelable) return
     if (!confirmingCancellation) {
       if (key.name === "escape") {
@@ -325,7 +395,18 @@ export function OnboardingModelLoadProgress({
       if (cancellationChoice === "yes") confirmCancellation()
       else declineCancellation()
     }
-  }, [cancelable, cancellationChoice, confirmCancellation, confirmingCancellation, declineCancellation]))
+  }, [
+    cancelable,
+    cancellationChoice,
+    confirmCancellation,
+    confirmingCancellation,
+    declineCancellation,
+    failureRetryable,
+    onChooseAnother,
+    onRetry,
+    selectedFailureChoice,
+    status._tag,
+  ]))
   const progress = status._tag === "Loading"
     ? status.progress
     : status._tag === "Ready"
@@ -357,26 +438,40 @@ export function OnboardingModelLoadProgress({
       overflow: "hidden",
     }}>
       {status._tag === "Failed"
-        ? <text style={{ fg: theme.status.failure, width }} wrapMode="none">{loadingFailureLabel(status)}</text>
-        : <ModelOperationStatusText text={loadingStatusLabel(status)} width={width} />}
-      {status._tag !== "Failed" && <ModelOperationProgressBar progress={progress} width={width} />}
+        ? <text style={{ fg: theme.status.failure, width }} wrapMode="none">{loadingFailureLabel(status, modelName, width)}</text>
+        : <ModelOperationStatusText text={loadingStatusLabel(status, modelName, width)} width={width} />}
+      <ModelOperationProgressBar
+        progress={progress}
+        width={width}
+        tone={status._tag === "Failed" ? "failed" : "active"}
+      />
       <box style={{ width, height: 1, minHeight: 1, maxHeight: 1, flexDirection: "row", flexShrink: 0 }}>
         {status._tag === "Failed" ? (
           <>
-            <Button
-              onClick={onRetry}
-              onMouseOver={() => setHovered("retry")}
-              onMouseOut={() => setHovered(null)}
-            >
-              <text style={{ fg: hovered === "retry" ? theme.accent : theme.text.body }}>Retry loading</text>
-            </Button>
-            <box style={{ width: 2, flexShrink: 0 }} />
+            {status.failure.retryable && (
+              <>
+                <Button
+                  onClick={onRetry}
+                  onMouseOver={() => { setHovered("retry"); setFailureChoice("retry") }}
+                  onMouseOut={() => setHovered(null)}
+                >
+                  <text
+                    style={{ fg: selectedFailureChoice === "retry" || hovered === "retry" ? theme.accent : theme.text.body }}
+                    attributes={selectedFailureChoice === "retry" ? TextAttributes.BOLD : TextAttributes.NONE}
+                  >Retry loading</text>
+                </Button>
+                <box style={{ width: 2, flexShrink: 0 }} />
+              </>
+            )}
             <Button
               onClick={onChooseAnother}
-              onMouseOver={() => setHovered("choose")}
+              onMouseOver={() => { setHovered("choose"); setFailureChoice("choose") }}
               onMouseOut={() => setHovered(null)}
             >
-              <text style={{ fg: hovered === "choose" ? theme.accent : theme.text.body }}>Choose another model</text>
+              <text
+                style={{ fg: selectedFailureChoice === "choose" || hovered === "choose" ? theme.accent : theme.text.body }}
+                attributes={selectedFailureChoice === "choose" ? TextAttributes.BOLD : TextAttributes.NONE}
+              >Choose another model</text>
             </Button>
           </>
         ) : confirmingCancellation ? (

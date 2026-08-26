@@ -38,7 +38,7 @@ import {
   useModelSlotActions,
   useAcnLifecycle,
   formatLocalModelDisplayName,
-  onboardingModelSetupFailureMessage,
+  onboardingModelSetupNoticeMessage,
   type OnboardingModelSetupState,
 } from "@magnitudedev/client-common";
 import {
@@ -298,6 +298,7 @@ function CliAppContent(
     : deriveLocalModelLoadActivity(modelSlotsState, rootSlotId);
   const setupOnboardingModel = onboardingSetup.select;
   const cancelOnboardingModelSetup = onboardingSetup.cancel;
+  const chooseAnotherOnboardingModel = onboardingSetup.chooseAnother;
   const exitOnboardingModelSetup = onboardingSetup.exit;
   const slotActions = useModelSlotActions();
   const chatColumn = useLocalWidth();
@@ -358,7 +359,7 @@ function CliAppContent(
       const content = state.content;
       const notice = Option.map(
         state.notice,
-        onboardingModelSetupFailureMessage,
+        onboardingModelSetupNoticeMessage,
       );
       return setupPreparation(
         content.progress,
@@ -409,7 +410,7 @@ function CliAppContent(
     const content = state.content;
     const setupError = Option.match(state.notice, {
       onNone: () => null,
-      onSome: onboardingModelSetupFailureMessage,
+      onSome: onboardingModelSetupNoticeMessage,
     });
     const chooser = (
       operation: Parameters<typeof OnboardingModelChooser>[0]["operation"],
@@ -470,7 +471,7 @@ function CliAppContent(
             status: operation.status,
             onCancel: cancelOnboardingModelSetup,
             onRetry: () => setupOnboardingModel(operation.modelId),
-            onChooseAnother: cancelOnboardingModelSetup,
+            onChooseAnother: chooseAnotherOnboardingModel,
           }, operation.status._tag === "Preparing" || operation.status._tag === "Loading"
             ? `Loading ${formatLocalModelDisplayName(operation.model)}…`
             : operation.status._tag === "Cancelling"
@@ -487,7 +488,7 @@ function CliAppContent(
             status: { _tag: "Ready" },
             onCancel: cancelOnboardingModelSetup,
             onRetry: () => setupOnboardingModel(operation.modelId),
-            onChooseAnother: cancelOnboardingModelSetup,
+            onChooseAnother: chooseAnotherOnboardingModel,
           }, `Finishing setup for ${formatLocalModelDisplayName(operation.model)}…`);
         }
       },

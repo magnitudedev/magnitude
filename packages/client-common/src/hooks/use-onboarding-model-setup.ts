@@ -44,6 +44,10 @@ export const useOnboardingModelSetup = () => {
     () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.cancel),
     { concurrent: true },
   ), [client])
+  const chooseAnotherAction = useMemo(() => client.runtime.fn(
+    () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.chooseAnother),
+    { concurrent: true },
+  ), [client])
   const exitAction = useMemo(() => client.runtime.fn(
     () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.exit),
     { concurrent: true },
@@ -68,6 +72,7 @@ export const useOnboardingModelSetup = () => {
   const select = useAtomSet(selectAction)
   const setRankingControls = useAtomSet(setRankingControlsAction)
   const cancel = useAtomSet(cancelAction)
+  const chooseAnother = useAtomSet(chooseAnotherAction)
   const exit = useAtomSet(exitAction)
   const back = useAtomSet(backAction)
   const continueWithHarness = useAtomSet(continueAction)
@@ -84,6 +89,7 @@ export const useOnboardingModelSetup = () => {
       setRankingControls(controls)
     }, [setRankingControls]),
     cancel: useCallback(() => cancel(), [cancel]),
+    chooseAnother: useCallback(() => chooseAnother(), [chooseAnother]),
     back: useCallback(() => back(), [back]),
     continueWithHarness: useCallback((input: {
       readonly harness: HarnessId

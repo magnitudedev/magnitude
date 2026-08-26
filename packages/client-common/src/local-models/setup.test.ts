@@ -20,6 +20,7 @@ import {
   SECONDARY_SLOT_ID,
   type LocalModel,
   type ModelDownloadFailure,
+  type ModelInstanceFailure,
   type LocalModelsState,
   type ModelSlotsState,
   type SlotSelection,
@@ -32,6 +33,7 @@ import { localModelProviderModelId } from "./projection"
 import { installationAdmissionIsVisible } from "./service"
 import { OnboardingModelSetup } from "./setup"
 import { localModelOptions } from "./options"
+import { onboardingModelSetupNoticeMessage } from "./failure-messages"
 import {
   defaultOnboardingModelRankingControls,
   normalizeOnboardingModelRankingControls,
@@ -154,9 +156,10 @@ const unassignedSlots = (): ModelSlotsState => ({
 })
 
 const configuredSlots = (
-  lifecycle: "None" | "Loading" | "Ready" | "Stopped",
+  lifecycle: "None" | "Loading" | "Ready" | "Stopped" | "Failed",
   id = instanceId,
   loadingProgress: Option.Option<number> = Option.none(),
+  failure?: ModelInstanceFailure,
 ): ModelSlotsState => ({
   ...unassignedSlots(),
   slots: {
@@ -173,6 +176,12 @@ const configuredSlots = (
       availability: { _tag: "Available" },
       residency: lifecycle === "None" || lifecycle === "Stopped"
         ? { _tag: "Unloaded" }
+        : lifecycle === "Failed"
+          ? { _tag: "Failed", failure: failure ?? {
+              code: "load_failed",
+              message: "load failed",
+              retryable: true,
+            } }
         : lifecycle === "Ready"
           ? { _tag: "Ready", allocation }
           : {
@@ -464,6 +473,7 @@ interface HarnessOptions {
   readonly failInitialModelSlotsRead?: boolean
   readonly replaceSelectionBeforeLoad?: boolean
   readonly downloadFailure?: ModelDownloadFailure
+  readonly loadFailure?: ModelInstanceFailure
 }
 
 const makeHarness = (options: HarnessOptions) => {
@@ -630,6 +640,17 @@ const makeHarness = (options: HarnessOptions) => {
             message: "The selected local model changed before load admission",
           })
         }
+        if (options.loadFailure !== undefined) {
+          slots = configuredSlots("Failed", instanceId, Option.none(), options.loadFailure)
+          return Queue.offer(changes, { query: "GetModelSlots" }).pipe(
+            Effect.zipRight(Effect.fail({
+              _tag: "LocalModelMutationFailed" as const,
+              code: options.loadFailure.code,
+              message: options.loadFailure.message,
+              retryable: options.loadFailure.retryable,
+            })),
+          )
+        }
         slots = configuredSlots(
           options.keepLoading ? "Loading" : "Ready",
           instanceId,
@@ -697,6 +718,10 @@ const makeHarness = (options: HarnessOptions) => {
     ),
     cancel: effectQuery.runtime.fn(
       () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.cancel),
+      { concurrent: true },
+    ),
+    chooseAnother: effectQuery.runtime.fn(
+      () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.chooseAnother),
       { concurrent: true },
     ),
     continueWithMagnitude: effectQuery.runtime.fn(
@@ -984,8 +1009,11 @@ describe("OnboardingModelSetup", () => {
     })
     if (state._tag === "Open" && state.content._tag === "Chooser") {
       expect(Option.getOrThrow(state.notice)).toMatchObject({
-        _tag: "OnboardingError",
-        message: "completion failed",
+        failure: {
+          _tag: "OnboardingError",
+          message: "completion failed",
+        },
+        subject: { _tag: "Setup" },
       })
     }
     harness.registry.dispose()
@@ -1079,6 +1107,63 @@ describe("OnboardingModelSetup", () => {
     harness.registry.dispose()
   })
 
+  it("retains an authoritative low-memory load result for retry or choosing another model", async () => {
+    const failure: ModelInstanceFailure = {
+      _tag: "LowMemory",
+      code: "low_memory",
+      message: "not enough memory available",
+      retryable: true,
+      requiredSystemMemoryBytes: 8_000_000_000,
+      allocationHeadroomBytes: 6_000_000_000,
+      systemReserveBytes: 1_000_000_000,
+      loadBoundaryBytes: 9_000_000_000,
+      minimumAdditionalAvailableBytes: 3_000_000_000,
+      parallelSequences: 1,
+    }
+    const harness = makeHarness({ installed: true, loadFailure: failure })
+
+    await Effect.runPromise(execute(harness.registry, harness.service.select, providerModelId))
+    const failed = await Effect.runPromise(waitForView(
+      harness,
+      (state) => state._tag === "Open"
+        && state.content._tag === "Chooser"
+        && Option.exists(
+          state.content.operation,
+          (operation) => operation._tag === "Loading" && operation.status._tag === "Failed",
+        ),
+    ))
+    if (failed._tag !== "Open" || failed.content._tag !== "Chooser") {
+      throw new Error("expected failed load result")
+    }
+    expect(Option.isNone(failed.notice)).toBe(true)
+    expect(Option.getOrThrow(failed.content.operation)).toMatchObject({
+      _tag: "Loading",
+      status: { _tag: "Failed", failure },
+    })
+
+    await Effect.runPromise(execute(harness.registry, harness.service.select, providerModelId))
+    await Effect.runPromise(waitForView(
+      harness,
+      (state) => state._tag === "Open"
+        && state.content._tag === "Chooser"
+        && Option.exists(
+          state.content.operation,
+          (operation) => operation._tag === "Loading" && operation.status._tag === "Failed",
+        )
+        && harness.calls.filter((call) => call === "LoadModelSlot").length === 2,
+    ))
+
+    await Effect.runPromise(execute(harness.registry, harness.service.chooseAnother, undefined))
+    const choosing = await Effect.runPromise(waitForView(
+      harness,
+      (state) => state._tag === "Open"
+        && state.content._tag === "Chooser"
+        && Option.isNone(state.content.operation),
+    ))
+    expect(choosing._tag).toBe("Open")
+    harness.registry.dispose()
+  })
+
   it("installs before assignment for an uninstalled choice", async () => {
     const harness = makeHarness({ installed: false })
     await Effect.runPromise(execute(harness.registry, harness.service.select, providerModelId))
@@ -1123,7 +1208,14 @@ describe("OnboardingModelSetup", () => {
     if (state._tag !== "Open" || state.content._tag !== "Chooser") {
       throw new Error("expected open chooser")
     }
-    expect(Option.getOrThrow(state.notice)).toEqual(failure)
+    expect(Option.getOrThrow(state.notice)).toEqual({
+      failure,
+      subject: {
+        _tag: "ModelOperation",
+        operation: "Installing",
+        model: makeModel(false),
+      },
+    })
     expect(harness.calls).not.toContain("AssignModelSlot")
     expect(harness.calls).not.toContain("LoadModelSlot")
     harness.registry.dispose()
@@ -1149,12 +1241,15 @@ describe("OnboardingModelSetup", () => {
       providerModelId,
     ))
 
-    await Effect.runPromise(waitForView(
+    const failed = await Effect.runPromise(waitForView(
       harness,
       (view) => view._tag === "Open"
         && view.content._tag === "Chooser"
         && Option.isSome(view.notice),
     ))
+    if (failed._tag !== "Open") throw new Error("expected open setup")
+    expect(onboardingModelSetupNoticeMessage(Option.getOrThrow(failed.notice)))
+      .toBe("Unexpected error configuring Setup Model (Q4) · assignment rejected")
     expect(harness.calls).toContain("AssignModelSlot")
     expect(harness.calls).not.toContain("LoadModelSlot")
     expect(harness.calls).not.toContain("CompleteOnboarding")
