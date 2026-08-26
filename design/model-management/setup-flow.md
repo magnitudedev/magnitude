@@ -169,9 +169,11 @@ Stage content does not repeat the active step as a second title. In particular, 
 begins with its hardware context beneath the progress indicator rather than rendering a redundant
 `Choose a local model` heading.
 
-The chooser places the non-focusable Fast-to-Smart scale after hardware and before model rows. It shows
-at most ten ranked eligible models regardless of installation state, followed by every installed
-model under `ON THIS COMPUTER`. An installed model may therefore appear in both groups. Keyboard
+The chooser places the non-focusable Fast-to-Smart scale after hardware and before model rows. Its
+fixed three-row region keeps the interaction hint beside the track in the wide layout and moves it
+onto the third row only in the stacked layout. It shows at most ten ranked eligible models regardless
+of installation state, followed by every installed model under `ON THIS COMPUTER`. An installed
+model may therefore appear in both groups. Keyboard
 traversal visits only model rows; Left/Right and `h`/`l` adjust Fast-to-Smart regardless of which
 model row is selected. Re-ranking preserves the cursor's row/rank position rather than following the
 previous model identity. A ranked row's installation state
@@ -188,7 +190,8 @@ extra height, so the first model always sits immediately below its section headi
 The shared frame height is the model chooser's required row count, not a percentage of the terminal.
 Its wide and stacked variants account for their respective progress and chooser layouts, and the
 removed duplicate model title contributes no reserved row. Every later stage reuses that computed
-height.
+height. Hardware context contributes its actual wrapped row count at the current frame width. Fixed
+title, progress, ranking-control, operation, and footer regions never shrink into overlapping rows.
 
 The frame reserves one shared footer position across stages. Stage guidance and interaction hints
 use the same two-line typography there, so changing stages does not move or restyle the footer. One

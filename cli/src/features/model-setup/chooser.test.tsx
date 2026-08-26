@@ -83,6 +83,64 @@ describe("onboarding model chooser identity", () => {
     }
   })
 
+  it("keeps narrow setup regions distinct with full ranked and installed sections", async () => {
+    const baseHardware = makeHardware()
+    const hardware = makeHardware({
+      platform: "MacOS",
+      architecture: "Arm64",
+      processor: Option.some("Apple M4 Max"),
+      accelerators: baseHardware.accelerators.map((accelerator) => ({
+        ...accelerator,
+        name: "Apple M4 Max",
+        backend: "Metal",
+      })),
+      memoryDomains: baseHardware.memoryDomains.map((domain) => ({
+        ...domain,
+        kind: "UnifiedMemory",
+        sharesSystemMemory: true,
+      })),
+    })
+    const options = Array.from({ length: 14 }, (_, index) => ({
+      id: `${index < 10 ? "downloadable" : "installed"}:${index}`,
+      kind: index < 10 ? "downloadable" as const : "stored" as const,
+      model: makeRankedCatalogModel(
+        `narrow-${index}`,
+        `Narrow Model ${index}`,
+        { intelligence: 0.7, speed: 0.7, quality: 0.7 },
+      ),
+    }))
+    const view = await testRender(
+      <OnboardingModelChooser
+        hardware={Result.success(hardware)}
+        options={options}
+        rankingControls={rankingControls}
+        onRankingControlsChange={onRankingControlsChange}
+        width={60}
+        error={null}
+        operation={null}
+        onSelect={() => undefined}
+        onExit={() => undefined}
+        exitKind="Skip"
+      />,
+      { width: 60, height: 70 },
+    )
+
+    try {
+      await act(view.renderOnce)
+      const lines = view.captureCharFrame().split("\n").map((line) => line.trim())
+      expect(lines).toContain("MAGNITUDE SETUP")
+      expect(lines).toContain("● Choose model")
+      expect(lines).toContain("○ Install model")
+      expect(lines).toContain("○ Select harness")
+      expect(lines).toContain("←/→ change preference")
+      expect(lines.some((line) => line.startsWith("You can switch models"))).toBe(true)
+      expect(lines).toContain("↑/↓ choose · Enter to download · Esc skip for now")
+      expect(lines.find((line) => line.includes("Fastest"))).not.toContain("─")
+    } finally {
+      await act(async () => view.renderer.destroy())
+    }
+  })
+
   it("keeps the cursor on the same rank when preference reorders models", async () => {
     const smart = makeRankedCatalogModel(
       "a-smart",
