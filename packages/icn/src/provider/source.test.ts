@@ -64,6 +64,18 @@ const sseResponse = (
   ),
 )
 
+const sseErrorResponse = (
+  request: Parameters<Parameters<typeof HttpClient.make>[0]>[0],
+  error: { readonly code: string; readonly message: string; readonly type: string },
+  preceding: readonly object[] = [],
+) => HttpClientResponse.fromWeb(
+  request,
+  new Response(
+    `${preceding.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}event: error\ndata: ${JSON.stringify({ error })}\n\n`,
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  ),
+)
+
 describe("ICN local provider", () => {
   it("keeps the local provider catalog product-owned", async () => {
     const http = HttpClient.make((request) =>
@@ -328,7 +340,11 @@ describe("ICN local provider", () => {
 
   it("maps an explicit instance stop before streaming to ModelInstanceStopped", async () => {
     const modelId = ProviderModelIdSchema.make("mdl_test")
-    const http = HttpClient.make((request) => Effect.succeed(sseResponse(request, [
+    const http = HttpClient.make((request) => Effect.succeed(sseErrorResponse(request, {
+      code: "model_instance_stopped",
+      message: "model instance was stopped",
+      type: "model_error",
+    }, [
       {
         id: "request-1",
         object: "chat.completion.chunk",
@@ -336,19 +352,6 @@ describe("ICN local provider", () => {
         model: modelId,
         choices: [],
         progress: { phase: "queued" },
-      },
-      {
-        id: "request-1",
-        object: "chat.completion.chunk",
-        created: 1,
-        model: modelId,
-        choices: [],
-        error: {
-          code: "model_instance_stopped",
-          message: "model instance was stopped",
-          retryable: false,
-          type: "model_error",
-        },
       },
     ])))
 
@@ -376,17 +379,12 @@ describe("ICN local provider", () => {
       model: modelId,
       choices: [],
     }
-    const http = HttpClient.make((request) => Effect.succeed(sseResponse(request, [
+    const http = HttpClient.make((request) => Effect.succeed(sseErrorResponse(request, {
+      code: "model_instance_stopped",
+      message: "model instance was stopped",
+      type: "model_error",
+    }, [
       { ...base, progress: { phase: "generating" } },
-      {
-        ...base,
-        error: {
-          code: "model_instance_stopped",
-          message: "model instance was stopped",
-          retryable: false,
-          type: "model_error",
-        },
-      },
     ])))
 
     const events = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
@@ -402,21 +400,13 @@ describe("ICN local provider", () => {
     })
   })
 
-  it("does not classify a retryable stopped-code error as an explicit request stop", async () => {
+  it("does not classify another model error as an explicit request stop", async () => {
     const modelId = ProviderModelIdSchema.make("mdl_test")
-    const http = HttpClient.make((request) => Effect.succeed(sseResponse(request, [{
-      id: "request-1",
-      object: "chat.completion.chunk",
-      created: 1,
-      model: modelId,
-      choices: [],
-      error: {
-        code: "model_instance_stopped",
-        message: "temporary admission failure",
-        retryable: true,
-        type: "model_error",
-      },
-    }])))
+    const http = HttpClient.make((request) => Effect.succeed(sseErrorResponse(request, {
+      code: "model_unavailable",
+      message: "temporary admission failure",
+      type: "model_error",
+    })))
 
     const events = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const provider = yield* IcnProvider
@@ -434,21 +424,13 @@ describe("ICN local provider", () => {
     })
   })
 
-  it("preserves ICN retry hints on in-stream model admission failures", async () => {
+  it("does not fabricate retry hints absent from the OpenAI error contract", async () => {
     const modelId = ProviderModelIdSchema.make("mdl_test")
-    const http = HttpClient.make((request) => Effect.succeed(sseResponse(request, [{
-      id: "request-1",
-      object: "chat.completion.chunk",
-      created: 1,
-      model: modelId,
-      choices: [],
-      error: {
-        code: "low_memory",
-        message: "Not enough memory to load model",
-        retryable: true,
-        type: "model_error",
-      },
-    }])))
+    const http = HttpClient.make((request) => Effect.succeed(sseErrorResponse(request, {
+      code: "low_memory",
+      message: "Not enough memory to load model",
+      type: "model_error",
+    })))
 
     const events = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const provider = yield* IcnProvider
@@ -465,7 +447,7 @@ describe("ICN local provider", () => {
           _tag: "StreamProviderError",
           providerError: {
             code: "low_memory",
-            retryable: true,
+            retryable: null,
             type: "model_error",
           },
         },

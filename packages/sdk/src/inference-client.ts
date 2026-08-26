@@ -1,12 +1,22 @@
 import * as HttpClient from "@effect/platform/HttpClient"
-import type { GeneratedClientError, GeneratedClientOptions } from "@magnitudedev/openapi-effect/client-runtime"
+import {
+  type GeneratedClientError,
+  type GeneratedClientOptions,
+} from "@magnitudedev/openapi-effect/client-runtime"
 import { makeIcnApiClient } from "@magnitudedev/icn-protocol/client"
 import * as S from "@magnitudedev/icn-protocol/schemas"
 import { Effect, Option, Stream } from "effect"
 import { MAGNITUDE_INFERENCE_BASE_URL } from "./inference-endpoint"
 
-/** Streaming-only client for the public `/inference/v1` data plane. */
+export const ResponseObjectSchema = S.ResponseObject
+
+export type ResponseObject = typeof ResponseObjectSchema.Type
+
+/** Typed client for the public `/inference/v1` data plane. */
 export interface InferenceClient {
+  readonly createChatCompletion: (
+    payload: typeof S.ChatCompletionRequest.Type,
+  ) => Effect.Effect<typeof S.ChatCompletionResponse.Type, GeneratedClientError>
   readonly streamChatCompletion: (
     payload: typeof S.ChatCompletionRequest.Type,
     options?: { readonly includeProgress?: boolean },
@@ -15,6 +25,9 @@ export interface InferenceClient {
     payload: typeof S.ResponseCreateRequest.Type,
     options?: { readonly includeProgress?: boolean },
   ) => Stream.Stream<typeof S.ResponseStreamEvent.Type, GeneratedClientError>
+  readonly createResponse: (
+    payload: typeof S.ResponseCreateRequest.Type,
+  ) => Effect.Effect<ResponseObject, GeneratedClientError>
 }
 
 export const makeInferenceClient = (
@@ -25,6 +38,10 @@ export const makeInferenceClient = (
     "Magnitude-Include-Progress": Option.fromNullable(includeProgress),
   })
   return {
+    createChatCompletion: (payload) => transport.chat.createChatCompletionHttp({
+      payload: { ...payload, stream: Option.some(false) },
+      headers: progressHeaders(false),
+    }),
     streamChatCompletion: (payload, streamOptions) => Stream.unwrap(Effect.map(
       transport.chat.createChatCompletion({
         payload,
@@ -39,5 +56,9 @@ export const makeInferenceClient = (
       }),
       ({ events }) => events,
     )),
+    createResponse: (payload) => transport.inference.createResponseHttp({
+      payload: { ...payload, stream: Option.some(false) },
+      headers: progressHeaders(false),
+    }),
   }
 })

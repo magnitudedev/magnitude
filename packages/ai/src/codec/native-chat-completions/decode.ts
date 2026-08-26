@@ -562,6 +562,25 @@ export function decode<E>(
   // harness dispatcher to report.
   const withErrorHandling = Stream.catchAll(raw, (error) => {
     const streamFailure = options.toStreamFailure(error)
+    if (streamFailure._tag === "StreamProviderError") {
+      const providerError = streamFailure.providerError
+      const stopped = classifyProviderError({
+        message: providerError.message,
+        type: Option.fromNullable(providerError.type),
+        code: Option.fromNullable(providerError.code),
+        param: Option.fromNullable(providerError.param),
+        retryable: Option.fromNullable(providerError.retryable),
+      })
+      if (Option.isSome(stopped)) {
+        const endEvent: ResponseStreamEvent = {
+          _tag: "stream_end",
+          terminal: stopped.value,
+          rawInput: Option.getOrUndefined(lastState.rawInput),
+          rawOutput: Option.getOrUndefined(lastState.rawOutput),
+        }
+        return Stream.make(endEvent)
+      }
+    }
     const endEvent: ResponseStreamEvent = {
       _tag: "stream_end",
       terminal: makeTerminatedStreamTerminal(streamFailure, Option.none()),

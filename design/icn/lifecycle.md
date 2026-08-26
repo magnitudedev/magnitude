@@ -102,7 +102,8 @@ supplies ICN's storage roots and supported binary identity and translates native
 Magnitude-owned catalog, Slot, Instance, environment, recommendation, and provider resources.
 Hardware, Models, Packages, Downloads, and Instances remain native ICN authorities, but their
 generated management contract and event stream are private to ACN. Only the OpenAI-compatible
-`/inference/v1/**` serving data plane is proxied publicly; `/inference/api/**` is not public.
+`/inference/v1/**` and `/inference/anthropic/**` serving data planes are public; private
+`/inference/api/**` management remains inaccessible.
 
 ## Generated API boundary
 
@@ -142,7 +143,8 @@ Every operation in the normalized IR is emitted into the callable client automat
 no allowlist or hand-maintained facade coverage table. At minimum the ICN contract comprises health
 and identity, Hardware, Models, Packages, Downloads, Instances, assessment and load planning,
 Hugging Face discovery, template application, model properties, residency policy, resource-event
-observation, Chat Completions, and Responses. Generator tests
+observation, mixed JSON/SSE Chat Completions and Responses, local Anthropic Messages, and
+Anthropic token counting. Generator tests
 prove that the manifest, descriptors, and callable client contain the same operation set.
 
 The ICN protocol package checks in all generated schemas, operations, server declarations, client,
@@ -164,7 +166,9 @@ semantics are defined by
 [model instance lifecycle](../model-management/instance-lifecycle.md), not by the hardware API.
 
 Chat's `[DONE]` sentinel and download's successful EOF are OpenAPI extension semantics consumed by
-the generator. They are not ICN-specific parser branches.
+the generator. A stream operation that also declares JSON success content produces both generated
+stream and HTTP calls from one operation descriptor family. These are not ICN-specific client
+branches.
 
 ## Configuration
 
@@ -386,7 +390,7 @@ An ordinary inference request names only the canonical model ID. ICN validates i
 or admits residency, and atomically grants `ModelInstanceLease` when the resolved target is Ready.
 It holds the lease until the response stream succeeds, fails, or is canceled. Readiness and lease
 grant occur under the same transition authority, so idle release, Stop, or replacement cannot
-create a pre-stream not-ready race. Chat Completions, Responses, and explicit warm load share this
+create a pre-stream not-ready race. Chat Completions, Responses, local Anthropic Messages, and explicit warm load share this
 coordinator; ACN performs no preparation or load-before-inference step.
 
 `ModelInstancesSnapshot` is authoritative lifecycle. ACN observes it privately and projects
@@ -490,7 +494,7 @@ The lifecycle conforms when:
   pinned-runtime management;
 - the public local provider ID is exactly `local`, and its bound model streams through the scoped
   ordinary generated chat client rather than an endpoint URL adapter;
-- chat and Responses resolve a canonical model ID, join or admit residency, and lease the exact
+- Chat, Responses, and local Anthropic Messages resolve a canonical model ID, join or admit residency, and lease the exact
   Ready Instance through one ICN-owned coordinator;
 - explicit warm load uses that same coordinator; explicit stopping resolves the exact Instance ID
   inside ACN from slot-addressed commands;

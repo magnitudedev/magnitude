@@ -164,6 +164,7 @@ export type Operation = Data.TaggedEnum<{
     readonly responseStatus: number;
     readonly termination: StreamTermination;
     readonly reconnect: StreamReconnect;
+    readonly successes: readonly OperationResponse[];
     readonly errors: readonly OperationResponse[];
   };
 }>;

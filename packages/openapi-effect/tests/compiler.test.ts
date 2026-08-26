@@ -108,6 +108,7 @@ describe("compileOpenApi", () => {
     const client = HashMap.get(result.files, "client.ts");
     const clientSource = client._tag === "Some" ? client.value : "";
     expect(clientSource).toContain("Operations.chatCompletionsOperation");
+    expect(clientSource).toContain("Operations.chatCompletionsHttpOperation");
     expect(clientSource).toContain("Operations.watchLifecycleOperation");
   });
 

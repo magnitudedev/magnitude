@@ -223,8 +223,13 @@ export const sseDocument = {
         },
         responses: {
           "200": {
-            description: "OpenAI-compatible event stream",
-            content: { "text/event-stream": { schema: { type: "string" } } },
+            description: "OpenAI-compatible response or event stream",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/GenerationEvent" },
+              },
+              "text/event-stream": { schema: { type: "string" } },
+            },
           },
           "400": {
             description: "Invalid request",

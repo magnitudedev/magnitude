@@ -7,10 +7,13 @@ export {
 export {
   MAGNITUDE_SERVICE_ORIGIN,
   MAGNITUDE_INFERENCE_BASE_URL,
+  MAGNITUDE_ANTHROPIC_BASE_URL,
 } from "./inference-endpoint"
 export {
   makeInferenceClient,
+  ResponseObjectSchema,
   type InferenceClient,
+  type ResponseObject,
 } from "./inference-client"
 
 export {

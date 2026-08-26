@@ -205,7 +205,7 @@ reports the selected method, effective parameters, and whether drafting actually
 - Provider binding does not load a model.
 - Local preparation is represented only by generic request-local `preparation_update` events with ICN-owned detail.
 - Inference admission remains held until ICN atomically acquires the request's generation lease.
-- Chat, Responses, and explicit warm-load share one residency coordinator.
+- Chat, Responses, local Anthropic Messages, and explicit warm-load share one residency coordinator.
 - Slot selection and recency refer only to stable provider model IDs.
 - Speculative method and embedded/separate draft composition are identical during assessment, load,
   and inference.

@@ -11,17 +11,16 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use icn_contracts::inference as domain;
 use icn_contracts::models::{ModelInstanceAllocation, ModelInstanceMemoryDomain};
 use icn_contracts::output::{StopBuffer, Utf8Buffer};
 use icn_contracts::{
-    AllowedToolsMode, CacheType, ChatContent, ChatContentPart, ChatRequest, ChatTemplateRequest,
-    CompletionBackend, ExecutionConfig, ExecutionConfigReport, ExecutionIntent, FinishReason,
-    FlashAttention, Generation, GenerationMetrics, GenerationSnapshot, GpuLayers, GrammarTrigger,
-    HardwareAssessment, HardwareSnapshot, ImageInput, InferenceError, InferenceEvent,
-    InferenceProgress, InferenceStreamEvent, MemoryAccountant, MemoryBreakdown, MemoryCharge,
-    MemoryChargeOwner, MemoryLocation, MemoryTopology, ModelModalities, ModelProperties,
-    NativeDeviceLocator, PreparedChatInfo, ProjectorConfig, ReasoningControl, ResponseFormat,
-    SplitMode, TemplateCapabilities, ToolCall, ToolChoice,
+    CacheType, CompletionBackend, ExecutionConfig, ExecutionConfigReport, ExecutionIntent,
+    FlashAttention, GenerationMetrics, GenerationSnapshot, GpuLayers, GrammarTrigger,
+    HardwareAssessment, HardwareSnapshot, ImageInput, InferenceError, InferenceProgress,
+    MemoryAccountant, MemoryBreakdown, MemoryCharge, MemoryChargeOwner, MemoryLocation,
+    MemoryTopology, ModelModalities, ModelProperties, NativeDeviceLocator, PreparedChatInfo,
+    ProjectorConfig, SplitMode, TemplateCapabilities,
 };
 use llama_cpp_2::LlamaStateSeqFlags;
 use llama_cpp_2::TokenToStringError;
@@ -277,15 +276,20 @@ impl From<LlamaMemoryBreakdown> for ResidentAllocation {
 
 enum ExecutorCommand {
     Complete {
-        request: ChatRequest,
+        request: domain::ResolvedInferenceRequest,
         events: SyncSender<ExecutorItem>,
         cancelled: Arc<AtomicBool>,
         queued_at: Instant,
         span: tracing::Span,
     },
     ApplyTemplate {
-        request: ChatTemplateRequest,
+        request: domain::ResolvedInferenceRequest,
         response: SyncSender<Result<PreparedChatInfo, InferenceError>>,
+        span: tracing::Span,
+    },
+    CountTokens {
+        request: domain::ResolvedInferenceRequest,
+        response: SyncSender<Result<u64, InferenceError>>,
         span: tracing::Span,
     },
     RunExclusiveNative {
@@ -296,13 +300,13 @@ enum ExecutorCommand {
 }
 
 enum ExecutorItem {
-    Event(InferenceStreamEvent),
-    Completed(Generation),
+    Event(domain::InferenceObservation),
+    Completed(domain::InferenceCompletion),
     Failed(InferenceError),
 }
 
 struct QueuedCompletion {
-    request: ChatRequest,
+    request: domain::ResolvedInferenceRequest,
     prepared: Option<PreparedInput>,
     events: SyncSender<ExecutorItem>,
     cancelled: Arc<AtomicBool>,
@@ -326,6 +330,12 @@ enum RequestPhase {
         position: scheduler::PromptBoundary,
     },
     Terminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionReason {
+    Natural,
+    OutputLimit,
 }
 
 /// Request-state changes earned by one successful target and linked-draft native batch.
@@ -441,6 +451,7 @@ struct ActiveRequest<'model> {
     sampler: CommonSampler<'model>,
     utf8: Utf8Buffer,
     stops: StopBuffer,
+    matched_stop: Option<String>,
     semantic: SemanticStream,
     queue_ms: f64,
     prompt_started_at: Option<Instant>,
@@ -730,48 +741,12 @@ impl LlamaCompletionBackend {
             .recv()
             .map_err(|_| ModelInstanceObservationError::ExecutorStopped)?
     }
-}
 
-impl CompletionBackend for LlamaCompletionBackend {
-    fn model_id(&self) -> &str {
-        &self.model_id
-    }
-
-    fn properties(&self) -> Result<ModelProperties, InferenceError> {
-        Ok(self.properties.clone())
-    }
-
-    fn apply_template(
+    fn complete_inference(
         &self,
-        request: ChatTemplateRequest,
-    ) -> Result<PreparedChatInfo, InferenceError> {
-        let (response, receiver) = sync_channel(1);
-        self.commands
-            .try_send(ExecutorCommand::ApplyTemplate {
-                request,
-                response,
-                span: tracing::Span::current(),
-            })
-            .map_err(|error| match error {
-                TrySendError::Full(_) => InferenceError::Overloaded,
-                TrySendError::Disconnected(_) => InferenceError::ExecutorStopped,
-            })?;
-        receiver
-            .recv()
-            .map_err(|_| InferenceError::ExecutorStopped)?
-    }
-
-    #[tracing::instrument(
-        name = "icn.inference.complete",
-        skip_all,
-        fields(model.id = %self.model_id),
-        err
-    )]
-    fn complete(
-        &self,
-        request: ChatRequest,
-        on_event: &mut dyn FnMut(InferenceStreamEvent) -> Result<(), InferenceError>,
-    ) -> Result<Generation, InferenceError> {
+        request: domain::ResolvedInferenceRequest,
+        on_event: &mut dyn FnMut(domain::InferenceObservation) -> Result<(), InferenceError>,
+    ) -> Result<domain::InferenceCompletion, InferenceError> {
         let (events, event_receiver) = sync_channel(EVENT_QUEUE_CAPACITY);
         let cancelled = Arc::new(AtomicBool::new(false));
         match self.commands.try_send(ExecutorCommand::Complete {
@@ -794,11 +769,75 @@ impl CompletionBackend for LlamaCompletionBackend {
                         return Err(error);
                     }
                 }
-                Ok(ExecutorItem::Completed(generation)) => return Ok(generation),
+                Ok(ExecutorItem::Completed(completion)) => return Ok(completion),
                 Ok(ExecutorItem::Failed(error)) => return Err(error),
                 Err(_) => return Err(InferenceError::ExecutorStopped),
             }
         }
+    }
+}
+
+impl CompletionBackend for LlamaCompletionBackend {
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn properties(&self) -> Result<ModelProperties, InferenceError> {
+        Ok(self.properties.clone())
+    }
+
+    fn apply_template(
+        &self,
+        request: domain::ResolvedInferenceRequest,
+    ) -> Result<PreparedChatInfo, InferenceError> {
+        let (response, receiver) = sync_channel(1);
+        self.commands
+            .try_send(ExecutorCommand::ApplyTemplate {
+                request,
+                response,
+                span: tracing::Span::current(),
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => InferenceError::Overloaded,
+                TrySendError::Disconnected(_) => InferenceError::ExecutorStopped,
+            })?;
+        receiver
+            .recv()
+            .map_err(|_| InferenceError::ExecutorStopped)?
+    }
+
+    fn count_tokens(
+        &self,
+        request: domain::ResolvedInferenceRequest,
+    ) -> Result<u64, InferenceError> {
+        let (response, receiver) = sync_channel(1);
+        self.commands
+            .try_send(ExecutorCommand::CountTokens {
+                request,
+                response,
+                span: tracing::Span::current(),
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => InferenceError::Overloaded,
+                TrySendError::Disconnected(_) => InferenceError::ExecutorStopped,
+            })?;
+        receiver
+            .recv()
+            .map_err(|_| InferenceError::ExecutorStopped)?
+    }
+
+    #[tracing::instrument(
+        name = "icn.inference.complete",
+        skip_all,
+        fields(model.id = %self.model_id),
+        err
+    )]
+    fn complete(
+        &self,
+        request: domain::ResolvedInferenceRequest,
+        on_event: &mut dyn FnMut(domain::InferenceObservation) -> Result<(), InferenceError>,
+    ) -> Result<domain::InferenceCompletion, InferenceError> {
+        self.complete_inference(request, on_event)
     }
 }
 
@@ -1463,8 +1502,9 @@ fn run_scheduler<'model>(
     loop {
         drain_commands(
             commands,
+            model,
             chat_templates,
-            multimodal.as_ref().map(multimodal_marker),
+            multimodal.as_ref(),
             &mut queued,
             &mut exclusive_native,
             &mut model_instance_observations,
@@ -1508,8 +1548,9 @@ fn run_scheduler<'model>(
                 match commands.recv_timeout(remaining) {
                     Ok(command) => handle_command(
                         command,
+                        model,
                         chat_templates,
-                        multimodal.as_ref().map(multimodal_marker),
+                        multimodal.as_ref(),
                         &mut queued,
                         &mut exclusive_native,
                         &mut model_instance_observations,
@@ -1629,8 +1670,9 @@ fn run_scheduler<'model>(
             match commands.recv_timeout(IDLE_POLL_INTERVAL) {
                 Ok(command) => handle_command(
                     command,
+                    model,
                     chat_templates,
-                    multimodal.as_ref().map(multimodal_marker),
+                    multimodal.as_ref(),
                     &mut queued,
                     &mut exclusive_native,
                     &mut model_instance_observations,
@@ -1650,8 +1692,9 @@ fn run_scheduler<'model>(
 #[allow(clippy::too_many_arguments)]
 fn drain_commands(
     commands: &Receiver<ExecutorCommand>,
+    model: &LlamaModel,
     chat_templates: &CommonChatTemplates,
-    media_marker: Option<&str>,
+    multimodal: Option<&MultimodalRuntime<'_>>,
     queued: &mut VecDeque<QueuedCompletion>,
     exclusive_native: &mut VecDeque<ExclusiveNativeTask>,
     model_instance_observations: &mut VecDeque<ModelInstanceObservationRequest>,
@@ -1663,8 +1706,9 @@ fn drain_commands(
         match commands.try_recv() {
             Ok(command) => handle_command(
                 command,
+                model,
                 chat_templates,
-                media_marker,
+                multimodal,
                 queued,
                 exclusive_native,
                 model_instance_observations,
@@ -1684,8 +1728,9 @@ fn drain_commands(
 #[allow(clippy::too_many_arguments)]
 fn handle_command(
     command: ExecutorCommand,
+    model: &LlamaModel,
     chat_templates: &CommonChatTemplates,
-    media_marker: Option<&str>,
+    multimodal: Option<&MultimodalRuntime<'_>>,
     queued: &mut VecDeque<QueuedCompletion>,
     exclusive_native: &mut VecDeque<ExclusiveNativeTask>,
     model_instance_observations: &mut VecDeque<ModelInstanceObservationRequest>,
@@ -1708,10 +1753,12 @@ fn handle_command(
             } else if queued.len() + active_count >= max_tracked {
                 let _ = events.try_send(ExecutorItem::Failed(InferenceError::Overloaded));
             } else {
-                let _ = events.try_send(ExecutorItem::Event(InferenceStreamEvent {
-                    delta: InferenceEvent::Progress(InferenceProgress::Queued),
-                    timings: None,
-                }));
+                let _ = events.try_send(ExecutorItem::Event(domain::InferenceObservation::new(
+                    domain::InferenceObservationEvent::Progress {
+                        progress: InferenceProgress::Queued,
+                    },
+                    None,
+                )));
                 queued.push_back(QueuedCompletion {
                     request,
                     prepared: None,
@@ -1731,8 +1778,24 @@ fn handle_command(
             let result = if *shutting_down {
                 Err(InferenceError::ExecutorStopped)
             } else {
-                prepare_chat(chat_templates, &request, media_marker)
+                prepare_chat(chat_templates, &request, multimodal.map(multimodal_marker))
                     .and_then(|prepared| prepared_chat_info(chat_templates, &prepared))
+            };
+            let _ = response.send(result);
+        }
+        ExecutorCommand::CountTokens {
+            request,
+            response,
+            span,
+        } => {
+            let _entered = span.enter();
+            let result = if *shutting_down {
+                Err(InferenceError::ExecutorStopped)
+            } else {
+                prepare_input(model, chat_templates, multimodal, &request).map(|prepared| {
+                    u64::try_from(prepared.prompt.layout.logical_tokens())
+                        .expect("prompt token count fits u64")
+                })
             };
             let _ = response.send(result);
         }
@@ -1784,12 +1847,15 @@ fn admit_requests<'model>(
             .is_some_and(|queued| queued.prepared.is_none())
         {
             let pending = queued.front_mut().expect("queue front exists");
-            let _ = pending
-                .events
-                .try_send(ExecutorItem::Event(InferenceStreamEvent {
-                    delta: InferenceEvent::Progress(InferenceProgress::Preparing),
-                    timings: None,
-                }));
+            let _ =
+                pending
+                    .events
+                    .try_send(ExecutorItem::Event(domain::InferenceObservation::new(
+                        domain::InferenceObservationEvent::Progress {
+                            progress: InferenceProgress::Preparing,
+                        },
+                        None,
+                    )));
             match prepare_input(model, chat_templates, multimodal, &pending.request) {
                 Ok(prepared) => pending.prepared = Some(prepared),
                 Err(error) => {
@@ -1800,7 +1866,10 @@ fn admit_requests<'model>(
             }
         }
         let queued_front = queued.front().expect("queue front exists");
-        let acquired = if queued_front.request.cache_prompt {
+        let acquired = if matches!(
+            queued_front.request.prompt_reuse(),
+            domain::PromptReusePolicy::Allowed
+        ) {
             sequence_pool.acquire_matching(
                 &queued_front
                     .prepared
@@ -1945,7 +2014,7 @@ fn sample_ready_requests<'model>(
         }
         match request.sample_next(model, context, batch_index) {
             Ok(Some(reason)) => {
-                if let Err(error) = request.complete(reason) {
+                if let Err(error) = request.complete(model, reason) {
                     fail_request(request, error);
                 }
                 release_sequence(context, speculative.as_deref_mut(), sequence_pool, request);
@@ -2363,7 +2432,7 @@ fn verify_speculative_batch<'model>(
             }
         }
         if let Some(reason) = terminal {
-            request.complete(reason)?;
+            request.complete(model, reason)?;
             request.phase = RequestPhase::Terminal;
         } else {
             let continuation = *accepted.last().expect("checked non-empty");
@@ -2577,10 +2646,10 @@ fn flush_outbound(request: &mut ActiveRequest<'_>) -> FlushOutcome {
         if due {
             match request
                 .events
-                .try_send(ExecutorItem::Event(InferenceStreamEvent {
-                    delta: InferenceEvent::Progress(progress),
-                    timings: None,
-                })) {
+                .try_send(ExecutorItem::Event(domain::InferenceObservation::new(
+                    domain::InferenceObservationEvent::Progress { progress },
+                    None,
+                ))) {
                 Ok(()) => {
                     request.pending_progress = None;
                     request.last_progress_emitted_at = Some(Instant::now());
@@ -3058,18 +3127,29 @@ fn fingerprint(value: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
 }
 
-fn request_images(request: &ChatTemplateRequest) -> Vec<ImageInput> {
+fn request_images(request: &domain::ResolvedInferenceRequest) -> Vec<ImageInput> {
     request
-        .messages
+        .context()
+        .entries()
         .iter()
-        .filter_map(|message| match &message.content {
-            Some(ChatContent::Parts(parts)) => Some(parts),
-            None | Some(ChatContent::Text(_)) => None,
-        })
-        .flat_map(|parts| parts.iter())
-        .filter_map(|part| match part {
-            ChatContentPart::Image(image) => Some(image.clone()),
-            ChatContentPart::Text { .. } => None,
+        .flat_map(|entry| match entry {
+            domain::ContextEntry::User { entry } => entry
+                .content()
+                .iter()
+                .filter_map(|part| match part {
+                    domain::UserContent::Image { image } => Some(image.clone()),
+                    domain::UserContent::Text { .. } => None,
+                })
+                .collect::<Vec<_>>(),
+            domain::ContextEntry::Assistant { entry } => entry
+                .tool_calls()
+                .iter()
+                .flat_map(|exchange| exchange.result().content())
+                .filter_map(|part| match part {
+                    domain::ToolResultContent::Image { image } => Some(image.clone()),
+                    domain::ToolResultContent::Text { .. } => None,
+                })
+                .collect(),
         })
         .collect()
 }
@@ -3078,15 +3158,10 @@ fn prepare_input(
     model: &LlamaModel,
     chat_templates: &CommonChatTemplates,
     multimodal: Option<&MultimodalRuntime<'_>>,
-    request: &ChatRequest,
+    request: &domain::ResolvedInferenceRequest,
 ) -> Result<PreparedInput, InferenceError> {
-    validate_request(request)?;
-    let images = request_images(&request.template);
-    let chat = prepare_chat(
-        chat_templates,
-        &request.template,
-        multimodal.map(multimodal_marker),
-    )?;
+    let images = request_images(request);
+    let chat = prepare_chat(chat_templates, request, multimodal.map(multimodal_marker))?;
     let prompt = tokenize_prepared_prompt(model, &chat, multimodal, &images)?;
     Ok(PreparedInput { chat, prompt })
 }
@@ -3209,10 +3284,11 @@ impl<'model> ActiveRequest<'model> {
                 InferenceError::Backend("request reached admission without preparation".into())
             })?;
             let admitted_at = Instant::now();
+            let tools_enabled = !request.tools().definitions().is_empty()
+                && !matches!(request.tools().choice(), domain::ToolChoice::Disabled);
             let parser = prepared
                 .stream_parser(ChatParserOptions {
-                    parse_tool_calls: !request.template.tools.is_empty()
-                        && !matches!(request.template.tool_choice, ToolChoice::None),
+                    parse_tool_calls: tools_enabled,
                     ..ChatParserOptions::default()
                 })
                 .map_err(backend_error)?;
@@ -3228,9 +3304,19 @@ impl<'model> ActiveRequest<'model> {
             sampler
                 .accept_prompt(tokenized.text_tokens.iter())
                 .map_err(backend_error)?;
-            let mut stops = request.stop.clone();
+            let mut stops = request
+                .generation()
+                .stop_sequences()
+                .iter()
+                .map(|stop| stop.as_str().to_owned())
+                .collect::<Vec<_>>();
             stops.extend(prepared.additional_stops().iter().cloned());
-            let mut cached_boundary = if request.cache_prompt {
+            let cache_prompt = matches!(request.prompt_reuse(), domain::PromptReusePolicy::Allowed);
+            let ignore_eos = matches!(
+                request.generation().end_of_generation(),
+                domain::EndOfGenerationPolicy::IgnoreModelEnd
+            );
+            let mut cached_boundary = if cache_prompt {
                 reusable_prefix.map_or_else(scheduler::PromptBoundary::default, |prefix| {
                     prefix.layout.common_prefix(&tokenized.layout)
                 })
@@ -3289,7 +3375,7 @@ impl<'model> ActiveRequest<'model> {
                 pending_checkpoint_prefixes: pending_checkpoint_prefixes.into(),
                 next_boundary: cached_boundary,
                 multimodal_prompt: tokenized.multimodal,
-                generation_limit: (request.max_tokens as usize)
+                generation_limit: (request.generation().max_output_tokens().get() as usize)
                     .min(context_capacity.saturating_sub(prompt_tokens)),
                 generated_tokens: 0,
                 speculative_started: false,
@@ -3300,12 +3386,13 @@ impl<'model> ActiveRequest<'model> {
                 accepted_draft_tokens: 0,
                 draft_ms: 0.0,
                 verification_ms: 0.0,
-                cache_prompt: request.cache_prompt,
-                ignore_eos: request.ignore_eos,
-                timings_per_token: request.timings_per_token,
+                cache_prompt,
+                ignore_eos,
+                timings_per_token: false,
                 sampler,
                 utf8: Utf8Buffer::default(),
                 stops: StopBuffer::new(stops),
+                matched_stop: None,
                 semantic: SemanticStream::new(parser),
                 queue_ms: admitted_at.duration_since(queued_at).as_secs_f64() * 1_000.0,
                 prompt_started_at: None,
@@ -3346,7 +3433,7 @@ impl<'model> ActiveRequest<'model> {
         model: &LlamaModel,
         context: &LlamaContext<'model>,
         batch_index: i32,
-    ) -> Result<Option<FinishReason>, InferenceError> {
+    ) -> Result<Option<CompletionReason>, InferenceError> {
         let token = self
             .sampler
             .sample(context, batch_index, false)
@@ -3370,7 +3457,7 @@ impl<'model> ActiveRequest<'model> {
         &mut self,
         model: &LlamaModel,
         token: LlamaToken,
-    ) -> Result<Option<FinishReason>, InferenceError> {
+    ) -> Result<Option<CompletionReason>, InferenceError> {
         let sampled_at = Instant::now();
         let is_eog = model.is_eog_token(token);
         account_sample(&mut self.generated_tokens);
@@ -3385,16 +3472,16 @@ impl<'model> ActiveRequest<'model> {
                 && !events.is_empty())
             .then(|| self.generation_snapshot());
             self.enqueue_events(events, timings)?;
-            return Ok(Some(FinishReason::Stop));
+            return Ok(Some(CompletionReason::Natural));
         }
 
         let decoded = self.utf8.push(&token_piece_bytes(model, token)?);
         let has_complete_utf8 = !decoded.is_empty() || !self.utf8.has_pending();
         if has_complete_utf8 && self.emit_decoded(decoded, self.timings_per_token, starts_stream)? {
-            return Ok(Some(FinishReason::Stop));
+            return Ok(Some(CompletionReason::Natural));
         }
         if self.generated_tokens >= self.generation_limit {
-            return Ok(Some(FinishReason::Length));
+            return Ok(Some(CompletionReason::OutputLimit));
         }
 
         Ok(None)
@@ -3418,6 +3505,9 @@ impl<'model> ActiveRequest<'model> {
     ) -> Result<bool, InferenceError> {
         let output = self.stops.push(&decoded);
         let matched = output.matched.is_some();
+        if output.matched.is_some() {
+            self.matched_stop = output.matched;
+        }
         self.emit_parsed(
             output.text,
             partial_timing_eligible(with_timings, matched),
@@ -3447,7 +3537,7 @@ impl<'model> ActiveRequest<'model> {
 
     fn enqueue_events(
         &mut self,
-        events: Vec<InferenceEvent>,
+        events: Vec<domain::InferenceOutputEvent>,
         timings: Option<GenerationSnapshot>,
     ) -> Result<(), InferenceError> {
         if self.outbound.len() + events.len() > OUTBOUND_QUEUE_CAPACITY {
@@ -3456,7 +3546,12 @@ impl<'model> ActiveRequest<'model> {
             )));
         }
         for event in stream_events_with_timings(events, timings) {
-            if !matches!(&event.delta, InferenceEvent::StreamStart) {
+            if !matches!(
+                event.event(),
+                domain::InferenceObservationEvent::Output {
+                    event: domain::InferenceOutputEvent::Started
+                }
+            ) {
                 self.first_event_at.get_or_insert_with(Instant::now);
             }
             self.outbound.push_back(ExecutorItem::Event(event));
@@ -3490,7 +3585,11 @@ impl<'model> ActiveRequest<'model> {
         }
     }
 
-    fn complete(&mut self, reason: FinishReason) -> Result<(), InferenceError> {
+    fn complete(
+        &mut self,
+        model: &LlamaModel,
+        reason: CompletionReason,
+    ) -> Result<(), InferenceError> {
         if !self.stops.is_stopped() {
             let final_utf8 = self.utf8.finish();
             let _ = self.emit_decoded(final_utf8, false, false)?;
@@ -3501,151 +3600,80 @@ impl<'model> ActiveRequest<'model> {
         self.enqueue_events(final_events, None)?;
         let snapshot = self.generation_snapshot();
         let ParsedChatMessage {
-            content,
             reasoning_content,
             tool_calls,
             ..
         } = parsed;
         let has_tool_calls = !tool_calls.is_empty();
-        let tool_calls = tool_calls
-            .into_iter()
-            .enumerate()
-            .map(|(index, call)| ToolCall {
-                id: tool_call_id(index, call.id.as_deref()),
-                name: call.name,
-                arguments: call.arguments,
-            })
-            .collect();
-        let generation = Generation {
-            text: content,
-            reasoning: reasoning_content.unwrap_or_default(),
-            tool_calls,
-            cached_prompt_tokens: snapshot.cached_prompt_tokens,
-            prompt_tokens: snapshot.prompt_tokens,
-            generated_tokens: snapshot.generated_tokens,
-            finish_reason: if has_tool_calls {
-                FinishReason::ToolCalls
-            } else {
-                reason
-            },
-            metrics: snapshot.metrics,
+        let reasoning_output_tokens = reasoning_content.map_or(0, |reasoning| {
+            model
+                .str_to_token(&reasoning, AddBos::Never)
+                .map_or(0, |tokens| tokens.len())
+        });
+        let termination = if has_tool_calls {
+            domain::Termination::ToolCalls
+        } else if let Some(sequence) = self.matched_stop.clone() {
+            domain::Termination::StopSequence {
+                sequence: domain::StopSequence::try_new(sequence)
+                    .expect("the stop buffer only records nonempty configured sequences"),
+            }
+        } else {
+            match reason {
+                CompletionReason::Natural => domain::Termination::Natural,
+                CompletionReason::OutputLimit => domain::Termination::OutputLimit,
+            }
         };
+        let completion = domain::InferenceCompletion::new(
+            domain::TokenUsage::new(
+                snapshot.prompt_tokens as u64,
+                snapshot.cached_prompt_tokens as u64,
+                snapshot.generated_tokens as u64,
+                reasoning_output_tokens as u64,
+            ),
+            termination,
+            snapshot.metrics,
+        );
         self.phase = RequestPhase::Terminal;
         if self.outbound.len() == OUTBOUND_QUEUE_CAPACITY {
             return Err(InferenceError::Backend(
                 "completion could not fit in the bounded outbound queue".into(),
             ));
         }
-        self.outbound.push_back(ExecutorItem::Completed(generation));
+        self.outbound.push_back(ExecutorItem::Completed(completion));
         Ok(())
     }
 }
 
-fn validate_request(request: &ChatRequest) -> Result<(), InferenceError> {
-    if request.template.messages.is_empty() {
-        return Err(InferenceError::InvalidConfig(
-            "messages must not be empty".into(),
-        ));
-    }
-    if request.max_tokens == 0 {
-        return Err(InferenceError::InvalidConfig(
-            "max_tokens must be greater than zero".into(),
-        ));
-    }
-    if !request.temperature.is_finite() || request.temperature < 0.0 {
-        return Err(InferenceError::InvalidConfig(
-            "temperature must be finite and non-negative".into(),
-        ));
-    }
-    if !request.top_p.is_finite() || !(0.0..=1.0).contains(&request.top_p) {
-        return Err(InferenceError::InvalidConfig(
-            "top_p must be finite and between zero and one".into(),
-        ));
-    }
-    if request.stop.iter().any(String::is_empty) {
-        return Err(InferenceError::InvalidConfig(
-            "stop strings must not be empty".into(),
-        ));
-    }
-    Ok(())
-}
-
 fn prepare_chat(
     templates: &CommonChatTemplates,
-    request: &ChatTemplateRequest,
+    request: &domain::ResolvedInferenceRequest,
     media_marker: Option<&str>,
 ) -> Result<PreparedChat, InferenceError> {
-    let messages = request
-        .messages
-        .iter()
-        .map(|message| {
-            let content = match &message.content {
-                None => None,
-                Some(ChatContent::Text(text)) => Some(NativeChatContent::Text(text.clone())),
-                Some(ChatContent::Parts(parts)) => {
-                    let parts = parts
-                        .iter()
-                        .map(|part| match part {
-                            ChatContentPart::Text { text } => Ok(NativeChatContentPart {
-                                kind: ChatContentPartKind::Text,
-                                text: text.clone(),
-                            }),
-                            ChatContentPart::Image(_) => {
-                                let marker = media_marker.ok_or_else(|| {
-                                    InferenceError::InvalidConfig(
-                                        "image content requires a multimodal projector configured with --mmproj"
-                                            .into(),
-                                    )
-                                })?;
-                                Ok(NativeChatContentPart {
-                                    kind: ChatContentPartKind::MediaMarker,
-                                    text: marker.to_owned(),
-                                })
-                            }
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Some(NativeChatContent::Parts(parts))
-                }
-            };
-            Ok(NativeChatMessage {
-                role: message.role.as_str().into(),
-                content,
-                tool_calls: message
-                    .tool_calls
-                    .iter()
-                    .map(|call| ChatToolCall {
-                        name: call.name.clone(),
-                        arguments: call.arguments.clone(),
-                        id: Some(call.id.clone()),
-                    })
-                    .collect(),
-                reasoning_content: message.reasoning.clone(),
-                tool_name: None,
-                tool_call_id: message.tool_call_id.clone(),
-            })
-        })
-        .collect::<Result<Vec<_>, InferenceError>>()?;
+    let messages = native_messages(request.context(), media_marker)?;
 
     let (selected_tools, tool_choice) = select_tools(request)?;
     let tools = selected_tools
         .into_iter()
         .map(|tool| {
             Ok(ChatTool {
-                name: tool.name.clone(),
-                description: tool.description.clone().unwrap_or_default(),
-                parameters_json: serde_json::to_string(&tool.parameters).map_err(backend_error)?,
+                name: tool.name().as_str().to_owned(),
+                description: tool.description().unwrap_or_default().to_owned(),
+                parameters_json: serde_json::to_string(tool.input_schema().as_map())
+                    .map_err(backend_error)?,
             })
         })
         .collect::<Result<Vec<_>, InferenceError>>()?;
 
-    let (grammar, json_schema) = match &request.response_format {
-        ResponseFormat::Text => (None, None),
+    let (grammar, json_schema) = match request.output() {
+        domain::OutputConstraint::Text => (None, None),
         // This deliberately matches llama-server's default response_format=json_object schema.
-        ResponseFormat::JsonObject => (None, Some("{}".to_owned())),
-        ResponseFormat::Grammar { grammar } => (Some(grammar.clone()), None),
-        ResponseFormat::JsonSchema { schema, .. } => (
+        domain::OutputConstraint::JsonObject => (None, Some("{}".to_owned())),
+        domain::OutputConstraint::Grammar { constraint } => {
+            (Some(constraint.as_str().to_owned()), None)
+        }
+        domain::OutputConstraint::JsonSchema { constraint } => (
             None,
-            Some(serde_json::to_string(schema).map_err(backend_error)?),
+            Some(serde_json::to_string(constraint.schema().as_map()).map_err(backend_error)?),
         ),
     };
     if grammar.is_some() && !tools.is_empty() && tool_choice != ChatToolChoice::None {
@@ -3654,37 +3682,18 @@ fn prepare_chat(
         ));
     }
 
-    let mut effective_template_args = request.template_args.clone();
-    let enable_thinking = match &request.reasoning {
-        ReasoningControl::ModelDefault => None,
-        ReasoningControl::Disabled => Some(false),
-        ReasoningControl::Enabled { .. } => Some(true),
-        ReasoningControl::Resolved {
-            controls,
-            template_fingerprint,
-            ..
-        } => {
-            let source = templates.source(None).map_err(backend_error)?;
-            let actual_fingerprint = fingerprint(&source);
-            if &actual_fingerprint != template_fingerprint {
-                return Err(InferenceError::InvalidConfig(format!(
-                    "reasoning recipe template fingerprint mismatch: expected {template_fingerprint}, got {actual_fingerprint}"
-                )));
-            }
-            for (key, value) in &controls.template_args {
-                if let Some(existing) = effective_template_args.get(key)
-                    && existing != value
-                {
-                    return Err(InferenceError::InvalidConfig(format!(
-                        "reasoning recipe conflicts with chat_template_kwargs.{key}"
-                    )));
-                }
-                effective_template_args.insert(key.clone(), value.clone());
-            }
-            controls.enable_thinking
-        }
-    };
-    let template_kwargs = effective_template_args
+    let reasoning = request.reasoning();
+    let source = templates.source(None).map_err(backend_error)?;
+    let actual_fingerprint = fingerprint(&source);
+    if actual_fingerprint != reasoning.template_fingerprint() {
+        return Err(InferenceError::InvalidConfig(format!(
+            "reasoning recipe template fingerprint mismatch: expected {}, got {actual_fingerprint}",
+            reasoning.template_fingerprint()
+        )));
+    }
+    let template_kwargs = reasoning
+        .controls()
+        .template_args
         .iter()
         .map(|(key, value)| {
             Ok(ChatTemplateKwarg {
@@ -3700,39 +3709,163 @@ fn prepare_chat(
             json_schema,
             tools,
             tool_choice,
-            parallel_tool_calls: Some(request.parallel_tool_calls),
+            parallel_tool_calls: Some(matches!(
+                request.tools().parallelism(),
+                domain::ToolParallelism::Parallel
+            )),
             reasoning_format: ChatReasoningFormat::DeepSeek,
-            enable_thinking,
+            enable_thinking: reasoning.controls().enable_thinking,
             template_kwargs,
             ..ChatPrepareOptions::default()
         })
         .map_err(backend_error)
 }
 
-fn select_tools(
-    request: &ChatTemplateRequest,
-) -> Result<(Vec<&icn_contracts::ToolDefinition>, ChatToolChoice), InferenceError> {
-    let selected = match &request.tool_choice {
-        ToolChoice::None => return Ok((Vec::new(), ChatToolChoice::None)),
-        ToolChoice::Auto => return Ok((request.tools.iter().collect(), ChatToolChoice::Auto)),
-        ToolChoice::Required => {
-            if request.tools.is_empty() {
-                return Err(InferenceError::InvalidConfig(
-                    "required tool choice needs at least one tool".into(),
-                ));
+fn native_messages(
+    context: &domain::InferenceContext,
+    media_marker: Option<&str>,
+) -> Result<Vec<NativeChatMessage>, InferenceError> {
+    let mut messages = Vec::new();
+    if let Some(system) = context.system() {
+        messages.push(native_message(
+            "system",
+            NativeChatContent::Text(system.as_str().to_owned()),
+        ));
+    }
+    for entry in context.entries() {
+        match entry {
+            domain::ContextEntry::User { entry } => {
+                let content = native_user_content(entry.content(), media_marker)?;
+                messages.push(native_message("user", content));
             }
-            return Ok((request.tools.iter().collect(), ChatToolChoice::Required));
+            domain::ContextEntry::Assistant { entry } => {
+                let mut message = NativeChatMessage {
+                    role: "assistant".to_owned(),
+                    content: entry
+                        .text()
+                        .map(|text| NativeChatContent::Text(text.as_str().to_owned())),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                    tool_name: None,
+                    tool_call_id: None,
+                };
+                message.reasoning_content = entry.reasoning().map(|text| text.as_str().to_owned());
+                message.tool_calls = entry
+                    .tool_calls()
+                    .iter()
+                    .map(|exchange| ChatToolCall {
+                        name: exchange.call().name().as_str().to_owned(),
+                        arguments: serde_json::to_string(exchange.call().input().as_map())
+                            .expect("canonical JSON objects are serializable"),
+                        id: Some(exchange.call().id().as_str().to_owned()),
+                    })
+                    .collect();
+                messages.push(message);
+
+                for exchange in entry.tool_calls() {
+                    let mut result = native_message(
+                        "tool",
+                        native_tool_result_content(exchange.result().content(), media_marker)?,
+                    );
+                    result.tool_call_id = Some(exchange.call().id().as_str().to_owned());
+                    messages.push(result);
+                }
+            }
         }
-        ToolChoice::Function { name } => vec![name.as_str()],
-        ToolChoice::AllowedTools { names, .. } => names.iter().map(String::as_str).collect(),
+    }
+    Ok(messages)
+}
+
+fn native_message(role: &str, content: NativeChatContent) -> NativeChatMessage {
+    NativeChatMessage {
+        role: role.to_owned(),
+        content: Some(content),
+        tool_calls: Vec::new(),
+        reasoning_content: None,
+        tool_name: None,
+        tool_call_id: None,
+    }
+}
+
+fn native_user_content(
+    content: &[domain::UserContent],
+    media_marker: Option<&str>,
+) -> Result<NativeChatContent, InferenceError> {
+    if content.is_empty() {
+        return Ok(NativeChatContent::Text(String::new()));
+    }
+    let parts = content
+        .iter()
+        .map(|part| match part {
+            domain::UserContent::Text { text } => Ok(NativeChatContentPart {
+                kind: ChatContentPartKind::Text,
+                text: text.as_str().to_owned(),
+            }),
+            domain::UserContent::Image { .. } => native_media_part(media_marker),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(NativeChatContent::Parts(parts))
+}
+
+fn native_tool_result_content(
+    content: &[domain::ToolResultContent],
+    media_marker: Option<&str>,
+) -> Result<NativeChatContent, InferenceError> {
+    if content.is_empty() {
+        return Ok(NativeChatContent::Text(String::new()));
+    }
+    let parts = content
+        .iter()
+        .map(|part| match part {
+            domain::ToolResultContent::Text { text } => Ok(NativeChatContentPart {
+                kind: ChatContentPartKind::Text,
+                text: text.as_str().to_owned(),
+            }),
+            domain::ToolResultContent::Image { .. } => native_media_part(media_marker),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(NativeChatContent::Parts(parts))
+}
+
+fn native_media_part(media_marker: Option<&str>) -> Result<NativeChatContentPart, InferenceError> {
+    let marker = media_marker.ok_or_else(|| {
+        InferenceError::InvalidConfig(
+            "image content requires a multimodal projector configured with --mmproj".into(),
+        )
+    })?;
+    Ok(NativeChatContentPart {
+        kind: ChatContentPartKind::MediaMarker,
+        text: marker.to_owned(),
+    })
+}
+
+fn select_tools(
+    request: &domain::ResolvedInferenceRequest,
+) -> Result<(Vec<&domain::ToolDefinition>, ChatToolChoice), InferenceError> {
+    let tools = request.tools();
+    let selected = match tools.choice() {
+        domain::ToolChoice::Disabled => return Ok((Vec::new(), ChatToolChoice::None)),
+        domain::ToolChoice::Auto => {
+            return Ok((tools.definitions().iter().collect(), ChatToolChoice::Auto));
+        }
+        domain::ToolChoice::Required => {
+            return Ok((
+                tools.definitions().iter().collect(),
+                ChatToolChoice::Required,
+            ));
+        }
+        domain::ToolChoice::Specific { name } => vec![name.as_str()],
+        domain::ToolChoice::Allowed { names, .. } => {
+            names.iter().map(domain::ToolName::as_str).collect()
+        }
     };
-    let tools = selected
+    let selected_tools = selected
         .iter()
         .map(|name| {
-            request
-                .tools
+            tools
+                .definitions()
                 .iter()
-                .find(|tool| tool.name == *name)
+                .find(|tool| tool.name().as_str() == *name)
                 .ok_or_else(|| {
                     InferenceError::InvalidConfig(format!(
                         "tool choice references undefined tool: {name}"
@@ -3740,39 +3873,36 @@ fn select_tools(
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let choice = match &request.tool_choice {
-        ToolChoice::Function { .. } => ChatToolChoice::Required,
-        ToolChoice::AllowedTools {
-            mode: AllowedToolsMode::Auto,
-            ..
+    let choice = match tools.choice() {
+        domain::ToolChoice::Specific { .. } => ChatToolChoice::Required,
+        domain::ToolChoice::Allowed {
+            required: false, ..
         } => ChatToolChoice::Auto,
-        ToolChoice::AllowedTools {
-            mode: AllowedToolsMode::Required,
-            ..
-        } => ChatToolChoice::Required,
+        domain::ToolChoice::Allowed { required: true, .. } => ChatToolChoice::Required,
         _ => unreachable!("early-returned tool choice"),
     };
-    Ok((tools, choice))
+    Ok((selected_tools, choice))
 }
 
 fn make_sampler<'model>(
     model: &'model LlamaModel,
-    request: &ChatRequest,
+    request: &domain::ResolvedInferenceRequest,
     prepared: &PreparedChat,
 ) -> Result<CommonSampler<'model>, InferenceError> {
     let grammar = if prepared.grammar().is_empty() {
         None
     } else {
-        let tools_enabled = !request.template.tools.is_empty()
-            && !matches!(request.template.tool_choice, ToolChoice::None);
+        let tools_enabled = !request.tools().definitions().is_empty()
+            && !matches!(request.tools().choice(), domain::ToolChoice::Disabled);
         let kind = if tools_enabled {
             CommonGrammarKind::ToolCalls
         } else {
-            match request.template.response_format {
-                ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. } => {
-                    CommonGrammarKind::OutputFormat
+            match request.output() {
+                domain::OutputConstraint::JsonObject
+                | domain::OutputConstraint::JsonSchema { .. } => CommonGrammarKind::OutputFormat,
+                domain::OutputConstraint::Grammar { .. } | domain::OutputConstraint::Text => {
+                    CommonGrammarKind::User
                 }
-                ResponseFormat::Grammar { .. } | ResponseFormat::Text => CommonGrammarKind::User,
             }
         };
         Some(CommonGrammar {
@@ -3803,20 +3933,15 @@ fn make_sampler<'model>(
             })
             .collect()
     });
-    let reasoning_budget_tokens = match &request.template.reasoning {
-        ReasoningControl::Enabled {
-            budget_tokens: Some(tokens),
-        } => Some(*tokens),
-        ReasoningControl::Resolved {
-            automatic_budget,
-            explicit_budget_tokens,
-            ..
-        } => explicit_budget_tokens.or(match automatic_budget {
-            icn_contracts::AutomaticReasoningBudget::Disabled => None,
-            icn_contracts::AutomaticReasoningBudget::FixedTokens { tokens } => Some(*tokens),
-        }),
-        _ => None,
-    };
+    let reasoning = request.reasoning();
+    let reasoning_budget_tokens =
+        reasoning
+            .explicit_budget()
+            .map(NonZeroU32::get)
+            .or(match reasoning.automatic_budget() {
+                icn_contracts::AutomaticReasoningBudget::Disabled => None,
+                icn_contracts::AutomaticReasoningBudget::FixedTokens { tokens } => Some(*tokens),
+            });
     let reasoning_budget = match reasoning_budget_tokens {
         Some(tokens) => {
             let start_tag = prepared.thinking_start_tag().ok_or_else(|| {
@@ -3844,13 +3969,16 @@ fn make_sampler<'model>(
     CommonSampler::new(
         model,
         &CommonSamplerConfig {
-            seed: Some(request.seed),
+            seed: Some(request.generation().sampling().seed()),
             // Match llama.cpp server semantics: `ignore_eos` suppresses every
             // end-of-generation token in the sampler, rather than allowing a
             // special token to be selected and emitted as ordinary text.
-            ignore_eos: Some(request.ignore_eos),
-            top_p: Some(request.top_p),
-            temperature: Some(request.temperature),
+            ignore_eos: Some(matches!(
+                request.generation().end_of_generation(),
+                domain::EndOfGenerationPolicy::IgnoreModelEnd
+            )),
+            top_p: Some(request.generation().sampling().top_p().get()),
+            temperature: Some(request.generation().sampling().temperature().get()),
             grammar,
             grammar_lazy: (!prepared.grammar().is_empty()).then_some(prepared.grammar_lazy()),
             grammar_triggers,
@@ -3903,28 +4031,30 @@ impl SemanticStream {
         }
     }
 
-    fn push(&mut self, text: String) -> Result<Vec<InferenceEvent>, InferenceError> {
+    fn push(&mut self, text: String) -> Result<Vec<domain::InferenceOutputEvent>, InferenceError> {
         let parse_started = Instant::now();
         let deltas = self.parser.push(&text).map_err(backend_error)?;
         self.parser_time += parse_started.elapsed();
         Ok(self.translate_deltas(deltas, false))
     }
 
-    fn finish(&mut self) -> Result<(ParsedChatMessage, Vec<InferenceEvent>), InferenceError> {
+    fn finish(
+        &mut self,
+    ) -> Result<(ParsedChatMessage, Vec<domain::InferenceOutputEvent>), InferenceError> {
         let parse_started = Instant::now();
         let (mut final_message, deltas) = self.parser.finish().map_err(backend_error)?;
         self.parser_time += parse_started.elapsed();
         let mut events = self.translate_deltas(deltas, true);
 
-        self.reconcile_final_tools(&mut final_message, &mut events);
+        self.reconcile_final_tools(&mut final_message, &mut events)?;
         Ok((final_message, events))
     }
 
     fn reconcile_final_tools(
         &mut self,
         final_message: &mut ParsedChatMessage,
-        events: &mut Vec<InferenceEvent>,
-    ) {
+        events: &mut Vec<domain::InferenceOutputEvent>,
+    ) -> Result<(), InferenceError> {
         // The native parser owns semantic diffing, while ICN owns transport policy. In
         // particular, ICN waits for a useful tool name before emitting a tool header and supplies
         // stable synthetic IDs when the model omits one. Reconcile the terminal snapshot so a tool
@@ -3935,18 +4065,36 @@ impl SemanticStream {
             if tool.name.is_empty() {
                 tool.name.clone_from(&call.name);
             }
-            if !tool.header_sent && !call.name.is_empty() {
-                events.push(InferenceEvent::ToolCallDelta {
+            if tool.name.is_empty() {
+                return Err(InferenceError::Backend(format!(
+                    "native parser returned tool call {index} without a name"
+                )));
+            }
+            if !tool.header_sent {
+                events.push(domain::InferenceOutputEvent::ToolCallStarted {
                     index,
-                    id: Some(tool.id.clone()),
-                    name: Some(call.name.clone()),
-                    arguments: call.arguments.clone(),
+                    id: domain::ToolCallId::try_new(tool.id.clone())
+                        .expect("engine tool IDs are nonempty"),
+                    name: domain::ToolName::try_new(tool.name.clone())
+                        .expect("checked nonempty tool name"),
                 });
+                if let Ok(json_fragment) =
+                    domain::NonEmptyText::try_new(call.arguments.clone(), "tool input delta")
+                {
+                    events.push(domain::InferenceOutputEvent::ToolInputDelta {
+                        index,
+                        json_fragment,
+                    });
+                }
                 tool.header_sent = true;
                 tool.pending_arguments.clear();
             }
             call.id = Some(tool.id.clone());
+            if tool.header_sent {
+                events.push(domain::InferenceOutputEvent::ToolCallFinished { index });
+            }
         }
+        Ok(())
     }
 
     fn parser_ms(&self) -> f64 {
@@ -3957,15 +4105,21 @@ impl SemanticStream {
         &mut self,
         deltas: Vec<ChatSemanticDelta>,
         is_final: bool,
-    ) -> Vec<InferenceEvent> {
+    ) -> Vec<domain::InferenceOutputEvent> {
         let mut events = Vec::new();
         for delta in deltas {
             match delta {
                 ChatSemanticDelta::Reasoning(text) if !text.is_empty() => {
-                    events.push(InferenceEvent::ReasoningDelta { text });
+                    events.push(domain::InferenceOutputEvent::ReasoningDelta {
+                        text: domain::NonEmptyText::try_new(text, "reasoning delta")
+                            .expect("checked nonempty delta"),
+                    });
                 }
                 ChatSemanticDelta::Content(text) if !text.is_empty() => {
-                    events.push(InferenceEvent::ContentDelta { text });
+                    events.push(domain::InferenceOutputEvent::TextDelta {
+                        text: domain::NonEmptyText::try_new(text, "text delta")
+                            .expect("checked nonempty delta"),
+                    });
                 }
                 ChatSemanticDelta::Reasoning(_) | ChatSemanticDelta::Content(_) => {}
                 ChatSemanticDelta::ToolCall {
@@ -3981,23 +4135,35 @@ impl SemanticStream {
                     }
                     if tool.header_sent {
                         if !arguments.is_empty() {
-                            events.push(InferenceEvent::ToolCallDelta {
+                            events.push(domain::InferenceOutputEvent::ToolInputDelta {
                                 index,
-                                id: None,
-                                name: None,
-                                arguments,
+                                json_fragment: domain::NonEmptyText::try_new(
+                                    arguments,
+                                    "tool input delta",
+                                )
+                                .expect("checked nonempty delta"),
                             });
                         }
                     } else {
                         tool.pending_arguments.push_str(&arguments);
                         if !tool.name.is_empty() && (is_final || !tool.pending_arguments.is_empty())
                         {
-                            events.push(InferenceEvent::ToolCallDelta {
+                            events.push(domain::InferenceOutputEvent::ToolCallStarted {
                                 index,
-                                id: Some(tool.id.clone()),
-                                name: Some(tool.name.clone()),
-                                arguments: std::mem::take(&mut tool.pending_arguments),
+                                id: domain::ToolCallId::try_new(tool.id.clone())
+                                    .expect("engine tool IDs are nonempty"),
+                                name: domain::ToolName::try_new(tool.name.clone())
+                                    .expect("checked nonempty tool name"),
                             });
+                            if let Ok(json_fragment) = domain::NonEmptyText::try_new(
+                                std::mem::take(&mut tool.pending_arguments),
+                                "tool input delta",
+                            ) {
+                                events.push(domain::InferenceOutputEvent::ToolInputDelta {
+                                    index,
+                                    json_fragment,
+                                });
+                            }
                             tool.header_sent = true;
                         }
                     }
@@ -4035,29 +4201,28 @@ fn tool_call_id(index: usize, native: Option<&str>) -> String {
 }
 
 fn stream_events_with_timings(
-    events: Vec<InferenceEvent>,
+    events: Vec<domain::InferenceOutputEvent>,
     mut timings: Option<GenerationSnapshot>,
-) -> impl Iterator<Item = InferenceStreamEvent> {
+) -> impl Iterator<Item = domain::InferenceObservation> {
     let last = events.len().checked_sub(1);
-    events
-        .into_iter()
-        .enumerate()
-        .map(move |(index, delta)| InferenceStreamEvent {
-            delta,
-            timings: if Some(index) == last {
+    events.into_iter().enumerate().map(move |(index, event)| {
+        domain::InferenceObservation::new(
+            domain::InferenceObservationEvent::Output { event },
+            if Some(index) == last {
                 timings.take()
             } else {
                 None
             },
-        })
+        )
+    })
 }
 
 fn sampled_result_events(
-    mut semantic_events: Vec<InferenceEvent>,
+    mut semantic_events: Vec<domain::InferenceOutputEvent>,
     starts_stream: bool,
-) -> Vec<InferenceEvent> {
+) -> Vec<domain::InferenceOutputEvent> {
     if starts_stream {
-        semantic_events.insert(0, InferenceEvent::StreamStart);
+        semantic_events.insert(0, domain::InferenceOutputEvent::Started);
     }
     semantic_events
 }
@@ -4094,1137 +4259,155 @@ fn backend_error(error: impl std::fmt::Display) -> InferenceError {
 }
 
 #[cfg(test)]
-mod tests {
+mod canonical_tests {
     use std::collections::BTreeMap;
-
-    use icn_contracts::{ChatMessage, ChatRole, ReasoningControl, ResponseFormat, ToolDefinition};
+    use std::num::NonZeroU32;
 
     use super::*;
 
     const CHATML: &str = r#"{%- for message in messages -%}
 {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>\n' -}}
 {%- endfor -%}
-{%- if add_generation_prompt -%}
-{{- '<|im_start|>assistant\n' -}}
-{%- endif -%}"#;
-
-    const TYPED_CHAT: &str = r#"{%- for message in messages -%}
-{{- '<|im_start|>' + message.role + '\n' -}}
-{%- if message.content is string -%}
-{{- message.content -}}
-{%- else -%}
-{%- for part in message.content -%}{{- part.text -}}{%- endfor -%}
-{%- endif -%}
-{{- '<|im_end|>\n' -}}
-{%- endfor -%}
 {%- if add_generation_prompt -%}{{- '<|im_start|>assistant\n' -}}{%- endif -%}"#;
 
-    const AUTHORED_DISABLED: &str = r#"{% set enable_thinking = enable_thinking | default(false) %}{% for message in messages %}{{ message.role }}: {{ message.content }}\n{% endfor %}{% if enable_thinking %}<think>{% endif %}assistant:"#;
-
-    fn request() -> ChatRequest {
-        ChatRequest {
-            template: ChatTemplateRequest {
-                messages: vec![ChatMessage::text(ChatRole::User, "Hello")],
-                tools: Vec::new(),
-                tool_choice: ToolChoice::Auto,
-                parallel_tool_calls: true,
-                reasoning: ReasoningControl::ModelDefault,
-                response_format: ResponseFormat::Text,
-                template_args: BTreeMap::new(),
-            },
-            stop: Vec::new(),
-            max_tokens: 32,
-            temperature: 0.0,
-            top_p: 0.95,
-            seed: 42,
-            cache_prompt: true,
-            ignore_eos: false,
-            timings_per_token: false,
-        }
+    fn context(entry: domain::ContextEntry) -> domain::InferenceContext {
+        domain::InferenceContext::new(
+            None,
+            domain::NonEmptyVec::try_new(vec![entry], "test context").expect("nonempty"),
+        )
     }
 
-    #[test]
-    fn batch_commit_keeps_repeated_prompt_quanta_local_until_apply() {
-        let mut commit = BatchCommit::new(Instant::now());
-        let boundary = |value| scheduler::PromptBoundary {
-            logical_tokens: value,
-            native_position: i32::try_from(value).unwrap(),
-        };
-        assert_eq!(commit.prompt_start(2, boundary(7)), boundary(7));
-        commit.advance_prompt(2, boundary(9));
-        assert_eq!(commit.prompt_start(2, boundary(7)), boundary(9));
-        commit.advance_prompt(2, boundary(11));
-        assert_eq!(commit.prompt_ends, vec![(2, boundary(11))]);
-    }
-
-    struct NoopLoadObserver;
-
-    impl ModelLoadObserver for NoopLoadObserver {
-        fn phase_started(&self, _phase: ModelLoadPhase) {}
-
-        fn phase_completed(&self, _phase: ModelLoadPhase) {}
-    }
-
-    #[test]
-    #[ignore = "loads the repository's real 18 MB GGUF acceptance fixture"]
-    fn interrupted_generation_reuses_prompt_prefix_with_real_model() {
-        disable_native_diagnostics();
-        let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.parity-models/tinyllamas/stories15M-q4_0.gguf");
-        assert!(model_path.is_file(), "missing {}", model_path.display());
-
-        let native = NativeBackend::initialize().expect("initialize native backend");
-        let hardware = native.discover_hardware(
-            icn_hardware::CapacityPolicy::default(),
-            "real-model-prompt-retention-test",
-            Vec::new(),
-        );
-        let mut defaults = model_plan_defaults();
-        defaults.context_size = 512;
-        defaults.physical_context_size = 512;
-        defaults.batch_size = 128;
-        defaults.ubatch_size = 128;
-        defaults.max_sequences = 1;
-        defaults.prefill_quantum = 32;
-        let intent = execution_intent(model_path, None, &defaults);
-        let prepared = native
-            .prepare_load(
-                "stories15m-retention-test",
-                intent,
-                icn_contracts::SpeculativeDecodingConfig::default(),
-                hardware,
-            )
-            .expect("prepare real model load");
-        let backend = prepared
-            .execute(Arc::new(NoopLoadObserver))
-            .expect("load real model");
-
-        let mut completion = request();
-        completion.template.messages = vec![ChatMessage::text(
-            ChatRole::User,
-            "Write one short continuation for this story. The small red fox walked through the quiet forest every morning. It knew every mossy stone, every narrow path, and every bird song. Today it found a bright blue box beneath the oldest oak tree. The box was warm, and something inside made a gentle ticking sound.",
-        )];
-        completion.max_tokens = 8;
-        completion.ignore_eos = true;
-
-        let mut reached_generation = false;
-        let interrupted = backend.complete(completion.clone(), &mut |event| {
-            if matches!(
-                event.delta,
-                InferenceEvent::StreamStart
-                    | InferenceEvent::ContentDelta { .. }
-                    | InferenceEvent::ReasoningDelta { .. }
-                    | InferenceEvent::ToolCallDelta { .. }
-            ) {
-                reached_generation = true;
-                return Err(InferenceError::Callback(
-                    "intentional real-model interruption".into(),
-                ));
-            }
-            Ok(())
-        });
-        assert!(
-            reached_generation,
-            "request produced no stream event before returning {interrupted:?}"
-        );
-        assert!(matches!(interrupted, Err(InferenceError::Callback(_))));
-
-        let mut observed_cached_tokens = 0;
-        let completed = backend
-            .complete(completion, &mut |event| {
-                if let InferenceEvent::Progress(InferenceProgress::Prefill {
-                    cached_tokens, ..
-                }) = event.delta
-                {
-                    observed_cached_tokens = observed_cached_tokens.max(cached_tokens);
-                }
-                Ok(())
-            })
-            .expect("complete request after interruption");
-
-        assert!(
-            observed_cached_tokens > 0,
-            "follow-up prefill did not report cached prompt tokens"
-        );
-        assert_eq!(completed.cached_prompt_tokens, observed_cached_tokens);
-        assert!(completed.generated_tokens > 0);
-    }
-
-    #[test]
-    #[ignore = "loads an installed vision model selected through ICN_VISION_TEST_* variables"]
-    fn multimodal_prompt_reuse_with_real_model() {
-        disable_native_diagnostics();
-        let model_path = PathBuf::from(
-            std::env::var_os("ICN_VISION_TEST_MODEL")
-                .expect("ICN_VISION_TEST_MODEL must name an installed GGUF"),
-        );
-        let projector_path = PathBuf::from(
-            std::env::var_os("ICN_VISION_TEST_PROJECTOR")
-                .expect("ICN_VISION_TEST_PROJECTOR must name its projector GGUF"),
-        );
-        let image_path = PathBuf::from(
-            std::env::var_os("ICN_VISION_TEST_IMAGE")
-                .expect("ICN_VISION_TEST_IMAGE must name the cache probe image"),
-        );
-        let expected_text =
-            std::env::var("ICN_VISION_TEST_EXPECTED").unwrap_or_else(|_| "7429".into());
-        assert!(model_path.is_file(), "missing {}", model_path.display());
-        assert!(
-            projector_path.is_file(),
-            "missing {}",
-            projector_path.display()
-        );
-        let image = std::fs::read(&image_path)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", image_path.display()));
-
-        let native = NativeBackend::initialize().expect("initialize native backend");
-        let hardware = native.discover_hardware(
-            icn_hardware::CapacityPolicy::default(),
-            "real-multimodal-cache-test",
-            Vec::new(),
-        );
-        let mut defaults = model_plan_defaults();
-        defaults.context_size = 8192;
-        defaults.physical_context_size = 8192;
-        defaults.batch_size = 512;
-        defaults.ubatch_size = 512;
-        defaults.max_sequences = 1;
-        defaults.prefill_quantum = 128;
-        let intent = execution_intent(model_path, Some(projector_path), &defaults);
-        let prepared = native
-            .prepare_load(
-                "installed-vision-cache-test",
-                intent,
-                icn_contracts::SpeculativeDecodingConfig::default(),
-                hardware,
-            )
-            .expect("prepare vision model load");
-        let backend = prepared
-            .execute(Arc::new(NoopLoadObserver))
-            .expect("load vision model");
-
-        let mut completion = request();
-        completion.template.messages = vec![ChatMessage {
-            role: ChatRole::User,
-            content: Some(ChatContent::Parts(vec![
-                ChatContentPart::Image(ImageInput::new("image/png", image)),
-                ChatContentPart::Text {
-                    text: "Transcribe the large verification code in this image. Reply with only the code."
-                        .into(),
+    fn request() -> domain::ResolvedInferenceRequest {
+        let templates = CommonChatTemplates::from_template(CHATML, None, None).expect("template");
+        let source = templates.source(None).expect("template source");
+        domain::InferenceRequest::new(
+            context(domain::ContextEntry::User {
+                entry: domain::UserEntry::new(vec![domain::UserContent::Text {
+                    text: domain::NonEmptyText::try_new("Hello", "test input").expect("nonempty"),
+                }]),
+            }),
+            domain::ToolConfiguration::none(),
+            domain::ResolvedReasoning::new(
+                icn_contracts::NormalizedReasoningEffort("none".into()),
+                icn_contracts::NativeReasoningControls {
+                    enable_thinking: Some(false),
+                    template_args: BTreeMap::new(),
                 },
-            ])),
-            reasoning: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        }];
-        completion.max_tokens = 128;
-
-        let first = backend
-            .complete(completion.clone(), &mut |_| Ok(()))
-            .expect("complete initial vision request");
-        let perceived = format!("{} {}", first.reasoning, first.text);
-        eprintln!(
-            "cold vision response={perceived:?} prompt_tokens={} cached_tokens={} prompt_ms={:.2}",
-            first.prompt_tokens, first.cached_prompt_tokens, first.metrics.prompt_ms
-        );
-        assert!(
-            perceived.contains(&expected_text),
-            "model did not perceive expected image text {expected_text:?}: {perceived:?}"
-        );
-        assert_eq!(first.cached_prompt_tokens, 0);
-
-        let mut observed_cached_tokens = 0usize;
-        let second = backend
-            .complete(completion, &mut |event| {
-                if let InferenceEvent::Progress(InferenceProgress::Prefill {
-                    cached_tokens, ..
-                }) = event.delta
-                {
-                    observed_cached_tokens = observed_cached_tokens.max(cached_tokens);
-                }
-                Ok(())
-            })
-            .expect("complete cached vision request");
-
-        eprintln!(
-            "cached vision response={:?} prompt_tokens={} cached_tokens={} prompt_ms={:.2}",
-            format!("{} {}", second.reasoning, second.text),
-            second.prompt_tokens,
-            second.cached_prompt_tokens,
-            second.metrics.prompt_ms
-        );
-
-        assert_eq!(
-            second.cached_prompt_tokens,
-            second.prompt_tokens.saturating_sub(1),
-            "identical multimodal prompt did not reuse every token except the logits token"
-        );
-        assert_eq!(second.cached_prompt_tokens, observed_cached_tokens);
-        assert!(
-            second.metrics.prompt_ms < first.metrics.prompt_ms,
-            "cached prefill ({:.2} ms) was not faster than cold prefill ({:.2} ms)",
-            second.metrics.prompt_ms,
-            first.metrics.prompt_ms
-        );
-    }
-
-    #[test]
-    #[ignore = "loads an installed vision model selected through ICN_VISION_TEST_* variables"]
-    fn multimodal_multiturn_cache_and_speculation_with_real_model() {
-        disable_native_diagnostics();
-        let required_path = |name: &str| {
-            let path = PathBuf::from(
-                std::env::var_os(name).unwrap_or_else(|| panic!("{name} must name a local file")),
-            );
-            assert!(path.is_file(), "missing {}", path.display());
-            path
-        };
-        let model_path = required_path("ICN_VISION_TEST_MODEL");
-        let projector_path = required_path("ICN_VISION_TEST_PROJECTOR");
-        let first_image = std::fs::read(required_path("ICN_VISION_TEST_IMAGE"))
-            .expect("read first vision test image");
-        let second_image = std::fs::read(required_path("ICN_VISION_TEST_IMAGE_2"))
-            .expect("read second vision test image");
-        let first_expected =
-            std::env::var("ICN_VISION_TEST_EXPECTED").unwrap_or_else(|_| "7429".into());
-        let second_expected =
-            std::env::var("ICN_VISION_TEST_EXPECTED_2").unwrap_or_else(|_| "3816".into());
-
-        let speculative = match std::env::var("ICN_VISION_TEST_SPECULATIVE_METHOD")
-            .unwrap_or_else(|_| "none".into())
-            .as_str()
-        {
-            "none" => icn_contracts::SpeculativeDecodingConfig::default(),
-            method @ ("dflash" | "dspark") => {
-                let draft = required_path("ICN_VISION_TEST_DRAFT");
-                let threshold = std::env::var("ICN_VISION_TEST_SPECULATIVE_THRESHOLD")
-                    .ok()
-                    .and_then(|value| value.parse::<f32>().ok())
-                    .unwrap_or(0.1);
-                let method = if method == "dflash" {
-                    icn_contracts::SpeculativeMethodConfig::DFlash {
-                        min_sample_probability: threshold,
-                    }
-                } else {
-                    icn_contracts::SpeculativeMethodConfig::DSpark {
-                        acceptance_threshold: threshold,
-                    }
-                };
-                icn_contracts::SpeculativeDecodingConfig::Enabled {
-                    source: icn_contracts::SpeculativeDraftSource::Separate { model_path: draft },
-                    method,
-                    n_max: 3,
-                    n_min: 0,
-                    cache_type_k: CacheType::F16,
-                    cache_type_v: CacheType::F16,
-                }
-            }
-            method => panic!("unsupported ICN_VISION_TEST_SPECULATIVE_METHOD {method:?}"),
-        };
-        let speculative_enabled = matches!(
-            speculative,
-            icn_contracts::SpeculativeDecodingConfig::Enabled { .. }
-        );
-
-        let native = NativeBackend::initialize().expect("initialize native backend");
-        let hardware = native.discover_hardware(
-            icn_hardware::CapacityPolicy::default(),
-            "real-multimodal-speculative-test",
-            Vec::new(),
-        );
-        let mut defaults = model_plan_defaults();
-        defaults.context_size = 32_768;
-        defaults.physical_context_size = 32_768;
-        defaults.batch_size = 512;
-        defaults.ubatch_size = 512;
-        defaults.max_sequences = 1;
-        defaults.prefill_quantum = 128;
-        let mut intent = execution_intent(model_path, Some(projector_path), &defaults);
-        intent.speculative = speculative.clone();
-        let prepared = native
-            .prepare_load(
-                "installed-vision-multiturn-test",
-                intent,
-                speculative,
-                hardware,
-            )
-            .expect("prepare vision model load");
-        let backend = prepared
-            .execute(Arc::new(NoopLoadObserver))
-            .expect("load vision model");
-
-        fn image_message(bytes: Vec<u8>) -> ChatMessage {
-            ChatMessage {
-                role: ChatRole::User,
-                content: Some(ChatContent::Parts(vec![
-                    ChatContentPart::Image(ImageInput::new("image/png", bytes)),
-                    ChatContentPart::Text {
-                        text: "Transcribe the large verification code in this image. Reply with only the four-digit code."
-                            .into(),
-                    },
-                ])),
-                reasoning: None,
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            }
-        }
-        let run = |messages: Vec<ChatMessage>| {
-            let mut completion = request();
-            completion.template.messages = messages;
-            completion.template.reasoning = ReasoningControl::Disabled;
-            completion.max_tokens = 64;
-            backend
-                .complete(completion, &mut |_| Ok(()))
-                .expect("complete multimodal turn")
-        };
-
-        let first_message = image_message(first_image);
-        let first = run(vec![first_message.clone()]);
-        let first_text = format!("{} {}", first.reasoning, first.text);
-        assert!(
-            first_text.contains(&first_expected),
-            "first image was not perceived: {first_text:?}"
-        );
-
-        let second_message = image_message(second_image);
-        let conversation = vec![
-            first_message,
-            ChatMessage::text(ChatRole::Assistant, first.text.clone()),
-            second_message,
-        ];
-        let second = run(conversation.clone());
-        let second_text = format!("{} {}", second.reasoning, second.text);
-        assert!(
-            second_text.contains(&second_expected),
-            "second image was not perceived: {second_text:?}"
-        );
-        assert!(
-            second.cached_prompt_tokens > 0,
-            "the second turn did not reuse the first image prefix"
-        );
-
-        let repeated = run(conversation);
-        let repeated_text = format!("{} {}", repeated.reasoning, repeated.text);
-        assert!(
-            repeated_text.contains(&second_expected),
-            "cached second image was not perceived: {repeated_text:?}"
-        );
-        assert_eq!(
-            repeated.cached_prompt_tokens,
-            repeated.prompt_tokens.saturating_sub(1),
-            "the repeated multimodal turn did not reuse both images"
-        );
-        assert!(
-            repeated.metrics.prompt_ms < second.metrics.prompt_ms,
-            "exact cached prefill ({:.2} ms) was not faster than the extended turn ({:.2} ms)",
-            repeated.metrics.prompt_ms,
-            second.metrics.prompt_ms
-        );
-        if speculative_enabled {
-            let drafted = first.metrics.draft_tokens
-                + second.metrics.draft_tokens
-                + repeated.metrics.draft_tokens;
-            let accepted = first.metrics.accepted_draft_tokens
-                + second.metrics.accepted_draft_tokens
-                + repeated.metrics.accepted_draft_tokens;
-            assert!(
-                drafted > 0,
-                "the configured speculative method produced no drafts"
-            );
-            assert!(
-                accepted > 0,
-                "the configured speculative method accepted no draft tokens"
-            );
-        }
-        eprintln!(
-            "vision multiturn first_cached={} second_cached={} repeated_cached={} first_ms={:.2} second_ms={:.2} repeated_ms={:.2} drafted={} accepted={}",
-            first.cached_prompt_tokens,
-            second.cached_prompt_tokens,
-            repeated.cached_prompt_tokens,
-            first.metrics.prompt_ms,
-            second.metrics.prompt_ms,
-            repeated.metrics.prompt_ms,
-            first.metrics.draft_tokens
-                + second.metrics.draft_tokens
-                + repeated.metrics.draft_tokens,
-            first.metrics.accepted_draft_tokens
-                + second.metrics.accepted_draft_tokens
-                + repeated.metrics.accepted_draft_tokens,
-        );
-    }
-
-    #[test]
-    fn common_chat_preparation_is_used_for_plain_messages() {
-        let templates = CommonChatTemplates::from_template(CHATML, None, None).unwrap();
-        let prepared = prepare_chat(&templates, &request().template, None).unwrap();
-        assert_eq!(
-            prepared.prompt(),
-            "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
-        );
-        assert!(!prepared.parser_definition().is_empty());
-    }
-
-    #[test]
-    fn model_default_uses_llama_cpp_thinking_default() {
-        let templates = CommonChatTemplates::from_template(AUTHORED_DISABLED, None, None).unwrap();
-        let prepared = prepare_chat(&templates, &request().template, None).unwrap();
-        assert!(prepared.prompt().contains("<think>"));
-    }
-
-    #[test]
-    fn resolved_recipe_applies_controls_and_checks_fingerprint() {
-        let templates = CommonChatTemplates::from_template(AUTHORED_DISABLED, None, None).unwrap();
-        let mut request = request();
-        request.template.reasoning = ReasoningControl::Resolved {
-            effort: icn_contracts::NormalizedReasoningEffort("high".into()),
-            controls: icn_contracts::NativeReasoningControls {
-                enable_thinking: Some(true),
-                template_args: BTreeMap::new(),
-            },
-            automatic_budget: icn_contracts::AutomaticReasoningBudget::Disabled,
-            explicit_budget_tokens: None,
-            template_fingerprint: fingerprint(AUTHORED_DISABLED),
-        };
-        let prepared = prepare_chat(&templates, &request.template, None).unwrap();
-        assert!(prepared.prompt().contains("<think>"));
-
-        if let ReasoningControl::Resolved {
-            template_fingerprint,
-            ..
-        } = &mut request.template.reasoning
-        {
-            *template_fingerprint = "sha256:stale".into();
-        }
-        let error = prepare_chat(&templates, &request.template, None).unwrap_err();
-        assert!(error.to_string().contains("fingerprint mismatch"));
-    }
-
-    #[test]
-    fn prompt_capacity_reserves_at_least_one_generation_token() {
-        assert!(validate_prompt_capacity(127, 128).is_ok());
-        assert_eq!(
-            validate_prompt_capacity(128, 128).unwrap_err().to_string(),
-            "invalid configuration: prompt (128 tokens) leaves no generation capacity in the effective per-sequence context (128)"
-        );
-    }
-
-    #[test]
-    fn image_parts_become_explicit_native_media_markers_in_order() {
-        let templates = CommonChatTemplates::from_template(TYPED_CHAT, None, None).unwrap();
-        let mut request = request();
-        request.template.messages[0].content = Some(ChatContent::Parts(vec![
-            ChatContentPart::Text {
-                text: "before".into(),
-            },
-            ChatContentPart::Image(ImageInput::new("image/png", vec![1])),
-            ChatContentPart::Text {
-                text: "after".into(),
-            },
-        ]));
-        let images = request_images(&request.template);
-        assert_eq!(images.len(), 1);
-        assert_eq!(images[0].bytes(), [1]);
-        let prepared =
-            prepare_chat(&templates, &request.template, Some("<__media_test__>")).unwrap();
-        assert!(prepared.prompt().contains("before<__media_test__>after"));
-    }
-
-    #[test]
-    fn image_parts_require_a_loaded_projector_marker() {
-        let templates = CommonChatTemplates::from_template(TYPED_CHAT, None, None).unwrap();
-        let mut request = request();
-        request.template.messages[0].content =
-            Some(ChatContent::Parts(vec![ChatContentPart::Image(
-                ImageInput::new("image/png", vec![1]),
-            )]));
-        let error = prepare_chat(&templates, &request.template, None).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("requires a multimodal projector")
-        );
-    }
-
-    fn model_config_with_projector(max_sequences: u32) -> ExecutionIntent {
-        let executable = std::env::current_exe().unwrap();
-        ExecutionIntent {
-            model_path: executable.clone(),
-            context_size: 128,
-            physical_context_size: 128 * max_sequences,
-            batch_size: 32,
-            ubatch_size: 32,
-            max_sequences,
-            prefill_quantum: 16,
-            execution: ExecutionConfig {
-                gpu_layers: GpuLayers::Count(0),
-                threads: NonZeroU32::new(1),
-                threads_batch: NonZeroU32::new(1),
-                ..ExecutionConfig::default()
-            },
-            projector: Some(ProjectorConfig::new(executable)),
-            speculative: icn_contracts::SpeculativeDecodingConfig::default(),
-        }
-    }
-
-    fn model_config() -> ExecutionIntent {
-        let mut config = model_config_with_projector(1);
-        config.projector = None;
-        config
-    }
-
-    #[test]
-    fn execution_validation_rejects_ambiguous_or_native_invalid_combinations() {
-        let mut config = model_config();
-        config.execution.gpu_layers = GpuLayers::All;
-        config.execution.tensor_split = None;
-        config.execution.cache_type_v = CacheType::Q4_0;
-        config.execution.flash_attention = FlashAttention::Disabled;
-        assert!(
-            validate_model_config(&config)
-                .unwrap_err()
-                .to_string()
-                .contains("quantized V cache")
-        );
-    }
-
-    #[test]
-    fn tensor_split_reporting_removes_only_native_padding() {
-        assert_eq!(
-            trimmed_tensor_split(&[3.0, 0.0, 1.0, 0.0, 0.0]),
-            Some(vec![3.0, 0.0, 1.0])
-        );
-        assert_eq!(trimmed_tensor_split(&[0.0, 0.0]), None);
-    }
-
-    #[cfg(feature = "mtmd")]
-    #[test]
-    fn projector_mode_accepts_continuous_batching() {
-        validate_model_config(&model_config_with_projector(4)).unwrap();
-    }
-
-    #[cfg(feature = "mtmd")]
-    #[test]
-    fn projector_mode_rejects_embedded_and_separate_mtp_before_loading() {
-        for source in [
-            icn_contracts::SpeculativeDraftSource::Embedded,
-            icn_contracts::SpeculativeDraftSource::Separate {
-                model_path: "draft.gguf".into(),
-            },
-        ] {
-            let mut config = model_config_with_projector(1);
-            config.speculative = icn_contracts::SpeculativeDecodingConfig::Enabled {
-                source,
-                method: icn_contracts::SpeculativeMethodConfig::Mtp {
-                    min_draft_probability: 0.1,
-                },
-                n_max: 3,
-                n_min: 0,
-                cache_type_k: CacheType::F16,
-                cache_type_v: CacheType::F16,
-            };
-
-            let error = validate_model_config(&config).unwrap_err();
-            assert!(error.to_string().contains("does not support MTP"));
-        }
-    }
-
-    #[cfg(feature = "mtmd")]
-    #[test]
-    fn projector_mode_accepts_embedding_capable_speculative_methods() {
-        for method in [
-            icn_contracts::SpeculativeMethodConfig::DFlash {
-                min_sample_probability: 0.1,
-            },
-            icn_contracts::SpeculativeMethodConfig::DSpark {
-                acceptance_threshold: 0.1,
-            },
-        ] {
-            let mut config = model_config_with_projector(1);
-            config.speculative = icn_contracts::SpeculativeDecodingConfig::Enabled {
-                source: icn_contracts::SpeculativeDraftSource::Separate {
-                    model_path: "draft.gguf".into(),
-                },
-                method,
-                n_max: 3,
-                n_min: 0,
-                cache_type_k: CacheType::F16,
-                cache_type_v: CacheType::F16,
-            };
-            validate_model_config(&config).unwrap();
-        }
-    }
-
-    #[cfg(not(feature = "mtmd"))]
-    #[test]
-    fn feature_disabled_binary_rejects_a_projector() {
-        let error = validate_model_config(&model_config_with_projector(1)).unwrap_err();
-        assert!(error.to_string().contains("without the mtmd feature"));
-    }
-
-    #[test]
-    fn tool_selection_filters_named_and_allowed_tools() {
-        let mut request = request();
-        request.template.tools = ["one", "two"]
-            .into_iter()
-            .map(|name| ToolDefinition {
-                name: name.into(),
-                description: None,
-                parameters: serde_json::json!({"type": "object"}),
-            })
-            .collect();
-        request.template.tool_choice = ToolChoice::Function { name: "two".into() };
-        let (selected, choice) = select_tools(&request.template).unwrap();
-        assert_eq!(choice, ChatToolChoice::Required);
-        assert_eq!(
-            selected
-                .iter()
-                .map(|tool| tool.name.as_str())
-                .collect::<Vec<_>>(),
-            ["two"]
-        );
-
-        request.template.tool_choice = ToolChoice::AllowedTools {
-            mode: AllowedToolsMode::Auto,
-            names: vec!["one".into()],
-        };
-        let (selected, choice) = select_tools(&request.template).unwrap();
-        assert_eq!(choice, ChatToolChoice::Auto);
-        assert_eq!(
-            selected
-                .iter()
-                .map(|tool| tool.name.as_str())
-                .collect::<Vec<_>>(),
-            ["one"]
-        );
-    }
-
-    #[test]
-    fn semantic_stream_is_chunk_invariant_for_content() {
-        let templates = CommonChatTemplates::from_template(CHATML, None, None).unwrap();
-        let prepared = prepare_chat(&templates, &request().template, None).unwrap();
-        let parser = prepared
-            .stream_parser(ChatParserOptions::default())
-            .unwrap();
-        let mut stream = SemanticStream::new(parser);
-        let mut events = stream.push("Hel".into()).unwrap();
-        events.extend(stream.push("lo".into()).unwrap());
-        let (final_message, final_events) = stream.finish().unwrap();
-        events.extend(final_events);
-        assert_eq!(final_message.content, "Hello");
-        let deltas = events
-            .into_iter()
-            .map(|event| match event {
-                InferenceEvent::ContentDelta { text } => text,
-                _ => panic!("unexpected semantic event"),
-            })
-            .collect::<String>();
-        assert_eq!(deltas, "Hello");
-    }
-
-    #[test]
-    fn semantic_stream_keeps_tool_transport_policy_outside_native_parser() {
-        let templates = CommonChatTemplates::from_template(CHATML, None, None).unwrap();
-        let prepared = prepare_chat(&templates, &request().template, None).unwrap();
-        let parser = prepared
-            .stream_parser(ChatParserOptions::default())
-            .unwrap();
-        let mut stream = SemanticStream::new(parser);
-
-        assert!(
-            stream
-                .translate_deltas(
-                    vec![ChatSemanticDelta::ToolCall {
-                        index: 0,
-                        id: None,
-                        name: Some("get_weather".into()),
-                        arguments: String::new(),
-                    }],
-                    false,
-                )
-                .is_empty()
-        );
-
-        assert_eq!(
-            stream.translate_deltas(
-                vec![ChatSemanticDelta::ToolCall {
-                    index: 0,
-                    id: None,
-                    name: None,
-                    arguments: "{\"city\":".into(),
-                }],
-                false,
+                icn_contracts::AutomaticReasoningBudget::Disabled,
+                None,
+                fingerprint(&source),
             ),
-            vec![InferenceEvent::ToolCallDelta {
-                index: 0,
-                id: Some("call_icn_0".into()),
-                name: Some("get_weather".into()),
-                arguments: "{\"city\":".into(),
-            }]
-        );
-
-        assert_eq!(
-            stream.translate_deltas(
-                vec![ChatSemanticDelta::ToolCall {
-                    index: 0,
-                    id: None,
-                    name: None,
-                    arguments: "\"Paris\"}".into(),
-                }],
-                false,
+            domain::OutputConstraint::Text,
+            domain::GenerationParameters::new(
+                NonZeroU32::new(16).expect("positive"),
+                domain::SamplingParameters::new(
+                    domain::Temperature::try_new(0.8).expect("temperature"),
+                    domain::TopP::try_new(0.95).expect("top p"),
+                    42,
+                ),
+                Vec::new(),
+                domain::EndOfGenerationPolicy::StopAtModelEnd,
             ),
-            vec![InferenceEvent::ToolCallDelta {
-                index: 0,
-                id: None,
-                name: None,
-                arguments: "\"Paris\"}".into(),
-            }]
-        );
+            domain::PromptReusePolicy::Allowed,
+        )
+    }
+
+    fn semantic_stream() -> SemanticStream {
+        let templates = CommonChatTemplates::from_template(CHATML, None, None).expect("template");
+        let prepared = prepare_chat(&templates, &request(), None).expect("prepared chat");
+        SemanticStream::new(
+            prepared
+                .stream_parser(ChatParserOptions::default())
+                .expect("stream parser"),
+        )
     }
 
     #[test]
-    fn semantic_stream_adopts_a_late_native_id_before_emitting_the_header() {
-        let templates = CommonChatTemplates::from_template(CHATML, None, None).unwrap();
-        let prepared = prepare_chat(&templates, &request().template, None).unwrap();
-        let parser = prepared
-            .stream_parser(ChatParserOptions::default())
-            .unwrap();
-        let mut stream = SemanticStream::new(parser);
-
-        assert!(
-            stream
-                .translate_deltas(
-                    vec![ChatSemanticDelta::ToolCall {
-                        index: 0,
-                        id: None,
-                        name: Some("get_weather".into()),
-                        arguments: String::new(),
-                    }],
-                    false,
-                )
-                .is_empty()
-        );
-        assert_eq!(
-            stream.translate_deltas(
-                vec![ChatSemanticDelta::ToolCall {
-                    index: 0,
-                    id: Some("native-call-id".into()),
-                    name: None,
-                    arguments: "{}".into(),
-                }],
-                false,
-            ),
-            vec![InferenceEvent::ToolCallDelta {
-                index: 0,
-                id: Some("native-call-id".into()),
-                name: Some("get_weather".into()),
-                arguments: "{}".into(),
-            }]
-        );
-
-        // Once a header is visible its ID is immutable, even if a later native delta disagrees.
-        assert_eq!(
-            stream.translate_deltas(
-                vec![ChatSemanticDelta::ToolCall {
-                    index: 0,
-                    id: Some("different-id".into()),
-                    name: None,
-                    arguments: " ".into(),
-                }],
-                false,
-            ),
-            vec![InferenceEvent::ToolCallDelta {
-                index: 0,
-                id: None,
-                name: None,
-                arguments: " ".into(),
-            }]
-        );
-        assert_eq!(stream.tools[0].id, "native-call-id");
-    }
-
-    #[test]
-    fn semantic_stream_emits_a_tool_found_only_in_the_final_snapshot() {
-        let templates = CommonChatTemplates::from_template(CHATML, None, None).unwrap();
-        let prepared = prepare_chat(&templates, &request().template, None).unwrap();
-        let parser = prepared
-            .stream_parser(ChatParserOptions::default())
-            .unwrap();
-        let mut stream = SemanticStream::new(parser);
-        let mut final_message = ParsedChatMessage {
-            role: "assistant".into(),
-            content: String::new(),
-            reasoning_content: None,
-            tool_calls: vec![ChatToolCall {
-                name: "get_weather".into(),
-                arguments: r#"{"city":"Paris"}"#.into(),
-                id: None,
-            }],
-            tool_name: None,
-            tool_call_id: None,
-        };
-        let mut events = Vec::new();
-
-        stream.reconcile_final_tools(&mut final_message, &mut events);
-
-        assert_eq!(
-            events,
-            vec![InferenceEvent::ToolCallDelta {
-                index: 0,
-                id: Some("call_icn_0".into()),
-                name: Some("get_weather".into()),
-                arguments: r#"{"city":"Paris"}"#.into(),
-            }]
-        );
-        assert_eq!(
-            final_message.tool_calls[0].id.as_deref(),
-            Some("call_icn_0")
-        );
-    }
-
-    #[test]
-    fn semantic_stream_preserves_interleaved_multi_tool_event_order() {
-        let templates = CommonChatTemplates::from_template(CHATML, None, None).unwrap();
-        let prepared = prepare_chat(&templates, &request().template, None).unwrap();
-        let parser = prepared
-            .stream_parser(ChatParserOptions::default())
-            .unwrap();
-        let mut stream = SemanticStream::new(parser);
-
-        let events = stream.translate_deltas(
-            vec![
-                ChatSemanticDelta::Content("Checking both cities. ".into()),
-                ChatSemanticDelta::ToolCall {
-                    index: 0,
-                    id: Some("weather-id".into()),
-                    name: Some("get_weather".into()),
-                    arguments: "{".into(),
-                },
-                ChatSemanticDelta::Reasoning("Need local time too. ".into()),
-                ChatSemanticDelta::ToolCall {
-                    index: 1,
-                    id: None,
-                    name: Some("get_time".into()),
-                    arguments: "{}".into(),
-                },
-                ChatSemanticDelta::ToolCall {
-                    index: 0,
-                    id: None,
-                    name: None,
-                    arguments: "}".into(),
-                },
-            ],
-            false,
-        );
-
-        assert_eq!(
-            events,
-            vec![
-                InferenceEvent::ContentDelta {
-                    text: "Checking both cities. ".into(),
-                },
-                InferenceEvent::ToolCallDelta {
-                    index: 0,
-                    id: Some("weather-id".into()),
-                    name: Some("get_weather".into()),
-                    arguments: "{".into(),
-                },
-                InferenceEvent::ReasoningDelta {
-                    text: "Need local time too. ".into(),
-                },
-                InferenceEvent::ToolCallDelta {
-                    index: 1,
-                    id: Some("call_icn_1".into()),
-                    name: Some("get_time".into()),
-                    arguments: "{}".into(),
-                },
-                InferenceEvent::ToolCallDelta {
-                    index: 0,
-                    id: None,
-                    name: None,
-                    arguments: "}".into(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn sampled_token_accounting_includes_the_eventual_eog_token() {
-        let mut generated_tokens = 0;
-        account_sample(&mut generated_tokens);
-        account_sample(&mut generated_tokens); // the second accepted sample may be EOG
-        assert_eq!(generated_tokens, 2);
-    }
-
-    #[test]
-    fn sampled_token_timings_are_attached_only_to_the_last_semantic_delta() {
-        let snapshot = GenerationSnapshot {
-            cached_prompt_tokens: 0,
-            prompt_tokens: 11,
-            generated_tokens: 3,
-            metrics: GenerationMetrics::default(),
-        };
-        let events = vec![
-            InferenceEvent::StreamStart,
-            InferenceEvent::ReasoningDelta {
-                text: "thinking".into(),
-            },
-            InferenceEvent::ContentDelta {
-                text: "answer".into(),
-            },
-        ];
-
-        let events = stream_events_with_timings(events, Some(snapshot)).collect::<Vec<_>>();
-
-        assert_eq!(events.len(), 3);
-        assert!(events[0].timings.is_none());
-        assert!(events[1].timings.is_none());
-        assert_eq!(events[2].timings.as_ref().unwrap().prompt_tokens, 11);
-        assert_eq!(events[2].timings.as_ref().unwrap().generated_tokens, 3);
-    }
-
-    #[test]
-    fn first_sample_without_semantic_delta_attaches_timing_to_stream_start() {
-        let snapshot = GenerationSnapshot {
-            cached_prompt_tokens: 0,
-            prompt_tokens: 11,
-            generated_tokens: 1,
-            metrics: GenerationMetrics {
-                decode_ms: 0.001,
-                ..GenerationMetrics::default()
-            },
-        };
-
-        let events =
-            stream_events_with_timings(sampled_result_events(Vec::new(), true), Some(snapshot))
-                .collect::<Vec<_>>();
-
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events[0].delta, InferenceEvent::StreamStart));
-        assert_eq!(events[0].timings.as_ref().unwrap().generated_tokens, 1);
-        assert_eq!(events[0].timings.as_ref().unwrap().metrics.decode_ms, 0.001);
-    }
-
-    #[test]
-    fn later_parser_empty_sampled_result_has_no_transport_event() {
-        assert!(sampled_result_events(Vec::new(), false).is_empty());
-    }
-
-    #[test]
-    fn partial_timing_eligibility_matches_llama_stop_detection_order() {
-        assert!(!partial_timing_eligible(false, false));
-        assert!(partial_timing_eligible(true, false));
-        assert!(partial_timing_eligible(false, true));
-        assert!(partial_timing_eligible(true, true));
-    }
-
-    #[test]
-    fn empty_or_final_parser_groups_do_not_emit_per_token_timings() {
-        let snapshot = GenerationSnapshot {
-            cached_prompt_tokens: 0,
-            prompt_tokens: 11,
-            generated_tokens: 3,
-            metrics: GenerationMetrics::default(),
-        };
-        assert_eq!(
-            stream_events_with_timings(Vec::new(), Some(snapshot)).count(),
-            0
-        );
-
-        let final_events = stream_events_with_timings(
-            vec![InferenceEvent::ContentDelta {
-                text: "tail".into(),
-            }],
+    fn empty_user_container_compiles_to_present_empty_native_text() {
+        let messages = native_messages(
+            &context(domain::ContextEntry::User {
+                entry: domain::UserEntry::new(Vec::new()),
+            }),
             None,
         )
-        .collect::<Vec<_>>();
-        assert_eq!(final_events.len(), 1);
-        assert!(final_events[0].timings.is_none());
+        .expect("valid native messages");
+        assert!(matches!(
+            messages[0].content,
+            Some(NativeChatContent::Text(ref text)) if text.is_empty()
+        ));
     }
 
     #[test]
-    fn generation_clock_matches_llama_first_token_floor() {
-        let started = Instant::now();
-        assert_eq!(generation_elapsed_ms(Some(started), Some(started)), 0.001);
+    fn absent_assistant_text_compiles_to_absent_native_content() {
+        let messages = native_messages(
+            &context(domain::ContextEntry::Assistant {
+                entry: domain::AssistantEntry::new(None, None, Vec::new()),
+            }),
+            None,
+        )
+        .expect("valid native messages");
+        assert!(messages[0].content.is_none());
+    }
+
+    #[test]
+    fn sampled_start_is_a_canonical_output_event() {
         assert_eq!(
-            generation_elapsed_ms(Some(started), Some(started + Duration::from_millis(12))),
-            12.0
+            sampled_result_events(Vec::new(), true),
+            vec![domain::InferenceOutputEvent::Started]
         );
-        assert_eq!(generation_elapsed_ms(None, None), 0.0);
     }
 
     #[test]
-    fn resident_allocations_collapse_host_and_metal_into_unified_memory() {
-        use icn_contracts::{
-            HardwareDevice, HardwareDeviceKind, HardwareMemoryDomain, HardwareMemoryDomainKind,
-            HardwareSystemMemory,
-        };
+    fn semantic_stream_is_chunk_invariant_for_text() {
+        let mut stream = semantic_stream();
+        let mut events = stream.push("Hel".into()).expect("first chunk");
+        events.extend(stream.push("lo".into()).expect("second chunk"));
+        let (message, terminal) = stream.finish().expect("terminal parse");
+        events.extend(terminal);
+        assert_eq!(message.content, "Hello");
+        let text = events
+            .into_iter()
+            .filter_map(|event| match event {
+                domain::InferenceOutputEvent::TextDelta { text } => Some(text.into_inner()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "Hello");
+    }
 
-        let snapshot = HardwareSnapshot {
-            captured_at: 1,
-            platform: "macos".to_owned(),
-            architecture: "aarch64".to_owned(),
-            system_product_name: Some("MacBook Pro".to_owned()),
-            cpu_model: Some("Apple".to_owned()),
-            logical_cores: 8,
-            system_memory: HardwareSystemMemory {
-                physical_capacity_bytes: 64,
-                physical_available_bytes: 20,
-                allocation_capacity_bytes: 64,
-                allocation_headroom_bytes: 20,
-                assess_reserve_bytes: 0,
-                abort_reserve_bytes: 0,
-            },
-            native_build: "test".to_owned(),
-            enabled_backends: vec!["MTL".to_owned()],
-            topology_fingerprint: "test".to_owned(),
-            memory_domains: vec![HardwareMemoryDomain {
-                id: icn_contracts::MemoryDomainId::system(),
-                kind: HardwareMemoryDomainKind::UnifiedMemory,
-                total_capacity_bytes: 64,
-                stable_capacity_bytes: 60,
-                current_free_bytes: Some(20),
-                shares_system_memory: true,
-                devices: vec![HardwareDevice {
-                    id: icn_contracts::HardwareDeviceId::new("metal"),
-                    native_index: 1,
-                    backend: "MTL".to_owned(),
-                    physical_id: Some("metal-0".to_owned()),
-                    name: "MTL0".to_owned(),
-                    description: "Apple".to_owned(),
-                    kind: HardwareDeviceKind::Gpu,
-                    memory_limit: None,
-                }],
+    #[test]
+    fn tool_header_waits_for_nonempty_name_and_input() {
+        let mut stream = semantic_stream();
+        assert!(
+            stream
+                .translate_deltas(
+                    vec![ChatSemanticDelta::ToolCall {
+                        index: 0,
+                        id: None,
+                        name: Some("lookup".into()),
+                        arguments: String::new(),
+                    }],
+                    false,
+                )
+                .is_empty()
+        );
+        let events = stream.translate_deltas(
+            vec![ChatSemanticDelta::ToolCall {
+                index: 0,
+                id: Some("native-call".into()),
+                name: None,
+                arguments: "{}".into(),
             }],
-        };
-        let evidence = vec![
-            ResidentAllocation {
-                location: LlamaMemoryLocation::Host,
-                memory: MemoryBreakdown::new(3, 2, 1, 0),
-            },
-            ResidentAllocation {
-                location: LlamaMemoryLocation::Device {
-                    backend: "MTL".to_owned(),
-                    physical_id: Some("metal-0".to_owned()),
-                    native_index: 1,
-                },
-                memory: MemoryBreakdown::new(5, 4, 3, 2),
-            },
-        ];
-
-        let config = model_config_with_projector(4);
-        let resident = model_instance_allocation(&snapshot, &evidence, &config)
-            .expect("exact device identities resolve");
-        assert_eq!(resident.context_window_tokens, 128);
-        assert_eq!(resident.parallel_sequences, 4);
-        assert_eq!(resident.physical_context_tokens, 512);
-        assert_eq!(resident.memory_domains.len(), 1);
-        assert_eq!(
-            resident.memory_domains[0].memory_domain_id,
-            icn_contracts::MemoryDomainId::system()
+            false,
         );
-        assert_eq!(resident.memory_domains[0].model_bytes, 8);
-        assert_eq!(resident.memory_domains[0].context_bytes, 6);
-        assert_eq!(resident.memory_domains[0].compute_bytes, 4);
-        assert_eq!(resident.memory_domains[0].auxiliary_bytes, 2);
+        assert!(matches!(
+            &events[..],
+            [
+                domain::InferenceOutputEvent::ToolCallStarted { id, name, .. },
+                domain::InferenceOutputEvent::ToolInputDelta { json_fragment, .. }
+            ] if id.as_str() == "native-call"
+                && name.as_str() == "lookup"
+                && json_fragment.as_str() == "{}"
+        ));
     }
 }

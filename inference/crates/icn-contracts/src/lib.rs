@@ -1,10 +1,10 @@
-use std::collections::BTreeMap;
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 pub mod bootstrap_protocol;
+pub mod inference;
 pub mod inventory;
 pub mod models;
 pub mod output;
@@ -313,23 +313,7 @@ pub enum FlashAttention {
     Enabled,
 }
 
-#[derive(Debug, Clone)]
-pub struct GenerateRequest {
-    pub prompt: String,
-    pub max_new_tokens: u32,
-    pub temperature: f32,
-    pub top_p: f32,
-    pub seed: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub enum FinishReason {
-    Stop,
-    Length,
-    ToolCalls,
-}
-
-#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct GenerationMetrics {
     pub queue_ms: f64,
     pub prompt_ms: f64,
@@ -345,50 +329,12 @@ pub struct GenerationMetrics {
     pub verification_ms: f64,
 }
 
-#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct GenerationSnapshot {
     pub cached_prompt_tokens: usize,
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
     pub metrics: GenerationMetrics,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct Generation {
-    pub text: String,
-    pub reasoning: String,
-    pub tool_calls: Vec<ToolCall>,
-    pub cached_prompt_tokens: usize,
-    pub prompt_tokens: usize,
-    pub generated_tokens: usize,
-    pub finish_reason: FinishReason,
-    pub metrics: GenerationMetrics,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub enum ChatRole {
-    System,
-    User,
-    Assistant,
-    Tool,
-}
-
-impl ChatRole {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::System => "system",
-            Self::User => "user",
-            Self::Assistant => "assistant",
-            Self::Tool => "tool",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub enum ChatContentPart {
-    Text { text: String },
-    Image(ImageInput),
 }
 
 /// Validated, local image bytes. HTTP/network fetching is intentionally outside the executor.
@@ -468,143 +414,6 @@ impl<'de> serde::Deserialize<'de> for ImageInput {
     }
 }
 
-/// The encoded shape of a chat message's content.
-///
-/// Keeping string content distinct from typed parts matters because Jinja templates can advertise
-/// support for one representation but not the other, and the native backend adapts them differently.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub enum ChatContent {
-    Text(String),
-    Parts(Vec<ChatContentPart>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub struct ChatMessage {
-    pub role: ChatRole,
-    pub content: Option<ChatContent>,
-    pub reasoning: Option<String>,
-    pub tool_calls: Vec<ToolCall>,
-    pub tool_call_id: Option<String>,
-}
-
-impl ChatMessage {
-    #[must_use]
-    pub fn text(role: ChatRole, content: impl Into<String>) -> Self {
-        Self {
-            role,
-            content: Some(ChatContent::Text(content.into())),
-            reasoning: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        }
-    }
-
-    #[must_use]
-    pub fn text_content(&self) -> String {
-        match &self.content {
-            None => String::new(),
-            Some(ChatContent::Text(text)) => text.clone(),
-            Some(ChatContent::Parts(parts)) => parts
-                .iter()
-                .filter_map(|part| match part {
-                    ChatContentPart::Text { text } => Some(text.as_str()),
-                    ChatContentPart::Image(_) => None,
-                })
-                .collect(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub struct ToolCall {
-    pub id: String,
-    pub name: String,
-    pub arguments: String,
-}
-
-#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct ToolDefinition {
-    pub name: String,
-    pub description: Option<String>,
-    pub parameters: serde_json::Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub enum ToolChoice {
-    None,
-    Auto,
-    Required,
-    Function {
-        name: String,
-    },
-    AllowedTools {
-        mode: AllowedToolsMode,
-        names: Vec<String>,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub enum AllowedToolsMode {
-    Auto,
-    Required,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub enum ReasoningControl {
-    ModelDefault,
-    Disabled,
-    Enabled {
-        budget_tokens: Option<u32>,
-    },
-    Resolved {
-        effort: NormalizedReasoningEffort,
-        controls: NativeReasoningControls,
-        automatic_budget: AutomaticReasoningBudget,
-        explicit_budget_tokens: Option<u32>,
-        template_fingerprint: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
-pub enum ResponseFormat {
-    Text,
-    JsonObject,
-    Grammar {
-        grammar: String,
-    },
-    JsonSchema {
-        name: String,
-        schema: serde_json::Value,
-        strict: bool,
-    },
-}
-
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct ChatRequest {
-    pub template: ChatTemplateRequest,
-    pub stop: Vec<String>,
-    pub max_tokens: u32,
-    pub temperature: f32,
-    pub top_p: f32,
-    pub seed: u32,
-    /// Whether a capable endpoint may reuse resident prompt state.
-    pub cache_prompt: bool,
-    /// Continue sampling through model EOG tokens until the explicit generation limit.
-    pub ignore_eos: bool,
-    pub timings_per_token: bool,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct ChatTemplateRequest {
-    pub messages: Vec<ChatMessage>,
-    pub tools: Vec<ToolDefinition>,
-    pub tool_choice: ToolChoice,
-    pub parallel_tool_calls: bool,
-    pub reasoning: ReasoningControl,
-    pub response_format: ResponseFormat,
-    pub template_args: BTreeMap<String, serde_json::Value>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum GrammarTrigger {
     Token { value: String, token: i32 },
@@ -666,28 +475,6 @@ pub struct ModelModalities {
     pub video: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub enum InferenceEvent {
-    Progress(InferenceProgress),
-    /// Begins the assistant stream for the first sampled-token result.
-    ///
-    /// Keeping this in the sampled result group lets transports reproduce native timing
-    /// placement when the first token produces no semantic parser delta.
-    StreamStart,
-    ContentDelta {
-        text: String,
-    },
-    ReasoningDelta {
-        text: String,
-    },
-    ToolCallDelta {
-        index: usize,
-        id: Option<String>,
-        name: Option<String>,
-        arguments: String,
-    },
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum InferenceProgress {
     Queued,
@@ -698,12 +485,6 @@ pub enum InferenceProgress {
         cached_tokens: usize,
     },
     Generating,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct InferenceStreamEvent {
-    pub delta: InferenceEvent,
-    pub timings: Option<GenerationSnapshot>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -724,23 +505,6 @@ pub enum InferenceError {
     Callback(String),
 }
 
-pub trait InferenceEngine {
-    fn generate(
-        &mut self,
-        request: &GenerateRequest,
-        on_token: &mut dyn FnMut(&str) -> Result<(), InferenceError>,
-    ) -> Result<Generation, InferenceError>;
-}
-
-pub trait ChatInferenceEngine {
-    fn generate_chat(
-        &mut self,
-        messages: &[ChatMessage],
-        request: &GenerateRequest,
-        on_token: &mut dyn FnMut(&str) -> Result<(), InferenceError>,
-    ) -> Result<Generation, InferenceError>;
-}
-
 pub trait CompletionBackend: Send + Sync + 'static {
     fn model_id(&self) -> &str;
     fn properties(&self) -> Result<ModelProperties, InferenceError> {
@@ -750,18 +514,27 @@ pub trait CompletionBackend: Send + Sync + 'static {
     }
     fn apply_template(
         &self,
-        request: ChatTemplateRequest,
+        request: inference::ResolvedInferenceRequest,
     ) -> Result<PreparedChatInfo, InferenceError> {
         let _ = request;
         Err(InferenceError::Backend(
             "this inference backend does not expose chat-template preparation".into(),
         ))
     }
+    fn count_tokens(
+        &self,
+        request: inference::ResolvedInferenceRequest,
+    ) -> Result<u64, InferenceError> {
+        let _ = request;
+        Err(InferenceError::Backend(
+            "this inference backend does not expose token counting".into(),
+        ))
+    }
     fn complete(
         &self,
-        request: ChatRequest,
-        on_event: &mut dyn FnMut(InferenceStreamEvent) -> Result<(), InferenceError>,
-    ) -> Result<Generation, InferenceError>;
+        request: inference::ResolvedInferenceRequest,
+        on_event: &mut dyn FnMut(inference::InferenceObservation) -> Result<(), InferenceError>,
+    ) -> Result<inference::InferenceCompletion, InferenceError>;
 }
 
 #[cfg(test)]

@@ -12,9 +12,14 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
   Effect.gen(function* () {
     const http = yield* HttpClient.HttpClient
     return {
+      anthropic: {
+        countAnthropicMessageTokens: makeHttpOperation(http, options, Operations.countAnthropicMessageTokensOperation),
+        createAnthropicMessage: makeHttpOperation(http, options, Operations.createAnthropicMessageOperation),
+      },
       chat: {
         applyChatTemplate: makeHttpOperation(http, options, Operations.applyChatTemplateOperation),
         createChatCompletion: makeStreamOperation(http, options, Operations.createChatCompletionOperation),
+        createChatCompletionHttp: makeHttpOperation(http, options, Operations.createChatCompletionHttpOperation),
       },
       huggingFace: {
         resolveHuggingFaceRepository: makeHttpOperation(
@@ -27,6 +32,7 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
       inference: {
         listServableModels: makeHttpOperation(http, options, Operations.listServableModelsOperation),
         createResponse: makeStreamOperation(http, options, Operations.createResponseOperation),
+        createResponseHttp: makeHttpOperation(http, options, Operations.createResponseHttpOperation),
       },
       models: {
         acknowledgeModelDownloadFailure: makeHttpOperation(
