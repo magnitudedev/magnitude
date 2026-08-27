@@ -129,7 +129,7 @@ failure is not converted into Closed or into an operation failure.
 ## Client integration
 
 Reading, mounting, or remounting setup is observational. `/setup` sends the idempotent open event.
-`--setup` is immutable launch configuration supplied when the connection-scoped client services are
+`magnitude setup` supplies immutable launch configuration when the connection-scoped client services are
 built, so the setup service's initial retained state is already open before its first view can be
 published. There is no post-render launch action, synthetic Result, or second setup state.
 
