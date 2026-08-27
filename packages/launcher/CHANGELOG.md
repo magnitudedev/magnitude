@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.8-alpha.3
+
+### Patch Changes
+
+- [`a35372a`](https://github.com/magnitudedev/magnitude/commit/a35372aeadac5fd6e0ef1bd574116fe504dab3b8) Thanks [@anerli](https://github.com/anerli)! - DSpark support for LFM 2.5 models
+
 ## 0.0.8-alpha.2
 
 ### Patch Changes
