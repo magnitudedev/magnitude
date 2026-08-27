@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.8-alpha.0
+
+### Patch Changes
+
+- [`2f4ce23`](https://github.com/magnitudedev/magnitude/commit/2f4ce23de9fc75a82b652ff60eb96f2fb2508585) Thanks [@anerli](https://github.com/anerli)! - Connect inference to other harnesses, direct CLI controls, more intuitive onboarding
+
 ## 0.0.7
 
 ### Patch Changes
