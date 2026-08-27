@@ -28,6 +28,17 @@ describe("byte formatting", () => {
     expect(formatStorageSize(3_000_000_000_000_000)).toBe("3 PB")
   })
 
+  it("supports context-specific minimum precision from a selected unit", () => {
+    const options = {
+      minimumFractionDigits: { digits: 2, fromUnit: "GB" as const },
+    }
+    expect(formatStorageSize(750_000_000, options)).toBe("750 MB")
+    expect(formatStorageSize(999_999_999, options)).toBe("1.00 GB")
+    expect(formatStorageSize(1_800_000_000, options)).toBe("1.80 GB")
+    expect(formatStorageSize(20_000_000_000, options)).toBe("20.00 GB")
+    expect(formatStorageSize(2_000_000_000_000, options)).toBe("2.00 TB")
+  })
+
   it("promotes values that round across a unit boundary", () => {
     expect(formatStorageSize(999_999)).toBe("1 MB")
     expect(formatMemorySize(1024 ** 3 - 1, { rounding: "up" })).toBe("1 GB")
