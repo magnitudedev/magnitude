@@ -34,8 +34,8 @@ const STATIC_SERVER_SOURCE = `
 const { createServer } = require("node:http")
 const { existsSync, readFileSync, writeFileSync } = require("node:fs")
 const { join } = require("node:path")
-const root = process.argv[1]
-const portPath = process.argv[2]
+const root = process.env.TEST_STATIC_ROOT
+const portPath = process.env.TEST_STATIC_PORT_PATH
 const server = createServer((request, response) => {
   const segments = new URL(request.url, "http://registry.test").pathname
     .split("/").filter(Boolean).map(decodeURIComponent)
@@ -187,11 +187,21 @@ beforeAll(async () => {
   const launcherPath = await buildLauncher(join(root, "build"))
 
   const portPath = join(root, "port.txt")
-  registryServer = spawn("node", ["-e", STATIC_SERVER_SOURCE, serveDirectory, portPath])
+  registryServer = spawn("node", ["-e", STATIC_SERVER_SOURCE], {
+    env: {
+      ...process.env,
+      TEST_STATIC_ROOT: serveDirectory,
+      TEST_STATIC_PORT_PATH: portPath,
+    },
+  })
+  let registryServerError = ""
+  registryServer.stderr?.on("data", (chunk) => {
+    registryServerError += String(chunk)
+  })
   const port = await new Promise<string>((resolve, reject) => {
     registryServer.once("error", reject)
     registryServer.once("exit", (code) =>
-      reject(new Error(`registry server exited with ${code}`)))
+      reject(new Error(`registry server exited with ${code}: ${registryServerError}`)))
     const poll = setInterval(() => {
       readFile(portPath, "utf8").then((value) => {
         clearInterval(poll)
@@ -262,6 +272,89 @@ describe("npm launcher end to end", () => {
     expect(report.managedBy).toBe("npm")
     expect(report.packageRoot).toContain("node_modules/@magnitudedev/cli")
     expect(report.launchProtocolVersion).toBe("1")
+  }, 30000)
+
+  it("keeps the published launcher's native CLI responsive to terminal resizes", async () => {
+    if (process.platform === "win32") return
+    const python = Bun.which("python3")
+    if (python === null) return
+    const script = join(home, "launcher-resize-check.py")
+    const probe = join(home, "native-resize-probe.py")
+    await writeFile(probe, `#!/usr/bin/env python3
+import os, signal
+
+def report_size(_signal, _frame):
+    size = os.get_terminal_size(1)
+    print(f"SIZE {size.columns} {size.lines}", flush=True)
+
+signal.signal(signal.SIGWINCH, report_size)
+print("READY", flush=True)
+while True:
+    signal.pause()
+`)
+    await chmod(probe, 0o700)
+    await writeFile(script, `
+import errno, fcntl, os, pty, select, signal, struct, sys, termios, time
+
+launcher = sys.argv[1]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(launcher, [launcher])
+
+def resize(columns, rows):
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
+
+buffer = b""
+def read_until(needle, timeout):
+    global buffer
+    deadline = time.monotonic() + timeout
+    while needle not in buffer and time.monotonic() < deadline:
+        ready, _, _ = select.select([fd], [], [], min(0.1, deadline - time.monotonic()))
+        if not ready:
+            continue
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError as error:
+            if error.errno == errno.EIO:
+                break
+            raise
+        if not chunk:
+            break
+        buffer += chunk
+    if needle not in buffer:
+        raise RuntimeError("missing " + repr(needle) + " in " + repr(buffer[-1000:]))
+
+try:
+    resize(120, 40)
+    read_until(b"READY", 10)
+    resize(72, 28)
+    read_until(b"SIZE 72 28", 5)
+    resize(132, 44)
+    read_until(b"SIZE 132 44", 5)
+    print("published-launcher-resize-delivered")
+finally:
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+    os.close(fd)
+`)
+
+    const result = spawnSync(
+      python,
+      [script, join(prefix, "bin", "magnitude")],
+      {
+        encoding: "utf8",
+        env: { ...childEnvironment, MAGNITUDE_CLI_BINARY: probe },
+        timeout: 20_000,
+      },
+    )
+    expect(result.status, `${result.stderr}\n${result.stdout}`).toBe(0)
+    expect(result.stdout).toContain("published-launcher-resize-delivered")
   }, 30000)
 
   it("relaunches into the new version within one invocation after a prompt-path update", async () => {

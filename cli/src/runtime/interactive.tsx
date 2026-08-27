@@ -14,7 +14,6 @@ import type * as FileSystem from "@effect/platform/FileSystem"
 import type * as CommandExecutor from "@effect/platform/CommandExecutor"
 import type * as HttpClient from "@effect/platform/HttpClient"
 import type * as Path from "@effect/platform/Path"
-import * as PlatformCommand from "@effect/platform/Command"
 import {
   createAgentClient,
   deriveCliExitNotice,
@@ -30,6 +29,10 @@ import {
 } from "@magnitudedev/release"
 import { logger } from "@magnitudedev/logger"
 import { acnInstallationPresent, SDK_ACN_TARGET } from "@magnitudedev/sdk"
+import {
+  interactiveProcessExitCode,
+  runInteractiveProcess,
+} from "@magnitudedev/utils/process"
 import type { StateDocumentError } from "@magnitudedev/storage"
 import {
   Array as Arr,
@@ -538,13 +541,13 @@ export const runInteractiveCommand = (
     return yield* executeUpdate(updater, result.action, { relaunch: true })
   }
   if (result._tag === "LaunchHarness") {
-    const command = PlatformCommand.make(result.plan.executable, ...result.plan.args).pipe(
-      PlatformCommand.env({ ...process.env, ...result.plan.environment }),
-      PlatformCommand.stdin("inherit"),
-      PlatformCommand.stdout("inherit"),
-      PlatformCommand.stderr("inherit"),
-    )
-    return Number(yield* PlatformCommand.exitCode(command).pipe(
+    return yield* runInteractiveProcess({
+      executable: result.plan.executable,
+      args: result.plan.args,
+      environment: { ...process.env, ...result.plan.environment },
+      workingDirectory: process.cwd(),
+    }).pipe(
+      Effect.map(interactiveProcessExitCode),
       Effect.catchAll((error) => Effect.sync(() => {
         const manual = [result.plan.executable, ...result.plan.args]
           .map((part) => /[\s'"\\]/.test(part) ? JSON.stringify(part) : part)
@@ -557,7 +560,7 @@ export const runInteractiveCommand = (
         ].join("\n"))
         return 1
       })),
-    ))
+    )
   }
   yield* writeSessionResult(result)
   return result.code

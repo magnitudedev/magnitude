@@ -8,6 +8,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./fsm": "./src/fsm/index.ts",
+    "./process": "./src/process/index.ts",
     "./schema": "./src/schema/index.ts",
     "./patch": "./src/patch/index.ts"
   },

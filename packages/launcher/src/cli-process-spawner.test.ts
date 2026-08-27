@@ -1,5 +1,3 @@
-import * as NodeCommandExecutor from "@effect/platform-node/NodeCommandExecutor"
-import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem"
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -60,7 +58,6 @@ const spawnWith = async (options: {
   }).pipe(
     Layer.provide(inspectorStub),
     Layer.provide(cliBinaryResolverPinnedLayer(binary)),
-    Layer.provide(NodeCommandExecutor.layer.pipe(Layer.provide(NodeFileSystem.layer))),
   )
 
   const exitCode = await Effect.runPromise(
