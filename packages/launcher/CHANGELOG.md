@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.8-alpha.2
+
+### Patch Changes
+
+- [`1af97f8`](https://github.com/magnitudedev/magnitude/commit/1af97f8df0110295bec46acdc652ed18cc1b05e3) Thanks [@anerli](https://github.com/anerli)! - move setup from --setup flag to setup subcommand
+
 ## 0.0.8-alpha.1
 
 ### Patch Changes
