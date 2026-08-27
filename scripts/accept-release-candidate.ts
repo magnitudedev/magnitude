@@ -1,11 +1,11 @@
 import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
-import { RpcClient } from "@effect/rpc"
 import {
+  AcnBoundary,
+  AcnRpc,
   BunDetachedChildProcessSpawner,
   ChildProcessSpawner,
   AcnInstanceManager,
-  MagnitudeRpcs,
   makeAcnJitRuntime,
   makeLocalAcnInstanceManager,
 } from "@magnitudedev/sdk"
@@ -211,7 +211,7 @@ const probeBootstrap = Effect.gen(function* () {
     Layer.provide(FetchHttpClient.layer),
   )
   return yield* Effect.gen(function* () {
-    const client = yield* RpcClient.make(MagnitudeRpcs)
+    const client = yield* AcnRpc.makeRpcClient(AcnBoundary)
     return yield* client.Health({})
   }).pipe(
     Effect.provide(protocolLayer),
