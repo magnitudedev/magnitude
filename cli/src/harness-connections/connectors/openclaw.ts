@@ -33,7 +33,7 @@ export const makeOpenClawConnector = (paths: HarnessConnectionPaths) => defineCo
   id: "openclaw",
   name: "OpenClaw",
   executable: "openclaw",
-  skillFile: paths.skills.openclaw!,
+  skillInstallationTarget: "shared-agents",
   configurationFiles: [paths.openclaw],
   connect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.openclaw, "{}\n")

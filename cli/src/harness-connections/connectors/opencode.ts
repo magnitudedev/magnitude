@@ -27,7 +27,7 @@ export const makeOpenCodeConnector = (paths: HarnessConnectionPaths) => defineCo
   id: "opencode",
   name: "OpenCode",
   executable: "opencode",
-  skillFile: paths.skills.opencode!,
+  skillInstallationTarget: "shared-agents",
   configurationFiles: [paths.opencode],
   connect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.opencode, "{}\n")

@@ -10,6 +10,7 @@ import {
   type ProviderModelId,
 } from "@magnitudedev/sdk"
 import { Schema, type Effect, type Option } from "effect"
+import type { SkillInstallationTarget } from "./paths"
 
 const HarnessReasoningCapabilitiesSchema = Schema.Union(
   Schema.Struct({
@@ -60,6 +61,7 @@ export interface HarnessConnector {
   readonly name: string
   readonly recommended?: boolean
   readonly note?: string
+  readonly skillInstallationTarget: SkillInstallationTarget
   readonly configurationFiles: ReadonlyArray<string>
   readonly detect: (searchPath: string) => Effect.Effect<Option.Option<HarnessInstallation>>
   readonly connect: (
@@ -72,7 +74,4 @@ export interface HarnessConnector {
     modelId: ProviderModelId,
     installation: HarnessInstallation,
   ) => HarnessLaunchPlan
-  readonly installSkill: (
-    contents: string,
-  ) => Effect.Effect<void, unknown, FileSystem.FileSystem | Path.Path>
 }

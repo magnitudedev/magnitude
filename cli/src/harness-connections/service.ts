@@ -279,11 +279,14 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     ? error
     : failure("disconnect", String(error), harness))))
 
-  const installSkill: HarnessConnection["installSkill"] = (harness) => provide(
-    registry.get(harness).installSkill(skillContents).pipe(
-      Effect.mapError((error) => failure("skill", String(error), harness)),
-    ),
-  )
+  const installSkill: HarnessConnection["installSkill"] = (harness) => {
+    const target = registry.get(harness).skillInstallationTarget
+    return provide(
+      writeFileAtomic(paths.skillInstallations[target].skillFile, skillContents).pipe(
+        Effect.mapError((error) => failure("skill", String(error), harness)),
+      ),
+    )
+  }
 
   return {
     list,

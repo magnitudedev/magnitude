@@ -38,7 +38,7 @@ export const makeClineConnector = (paths: HarnessConnectionPaths) => defineConne
   id: "cline",
   name: "Cline",
   executable: "cline",
-  skillFile: paths.skills.cline!,
+  skillInstallationTarget: "cline-user",
   configurationFiles: [paths.clineProviders, paths.clineModels],
   connect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.clineProviders, "{}\n")

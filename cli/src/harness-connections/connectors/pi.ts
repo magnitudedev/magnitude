@@ -27,7 +27,7 @@ export const makePiConnector = (paths: HarnessConnectionPaths) => defineConnecto
   id: "pi",
   name: "Pi",
   executable: "pi",
-  skillFile: paths.skills.pi!,
+  skillInstallationTarget: "shared-agents",
   configurationFiles: [paths.piModels, paths.piSettings],
   connect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.piModels, "{}\n")

@@ -35,7 +35,7 @@ export const makeHermesConnector = (paths: HarnessConnectionPaths) => defineConn
   id: "hermes",
   name: "Hermes",
   executable: "hermes",
-  skillFile: paths.skills.hermes!,
+  skillInstallationTarget: "hermes-user",
   configurationFiles: [paths.hermes],
   connect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.hermes, "{}\n")

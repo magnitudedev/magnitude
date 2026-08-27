@@ -15,7 +15,7 @@ export const makeClaudeCodeConnector = (paths: HarnessConnectionPaths) => define
   id: "claude-code",
   name: "Claude Code",
   executable: "claude",
-  skillFile: paths.skills["claude-code"]!,
+  skillInstallationTarget: "claude-user",
   configurationFiles: [paths.claude],
   connect: () => Effect.void,
   disconnect: (spec) => readOr(paths.claude, "{}\n").pipe(
