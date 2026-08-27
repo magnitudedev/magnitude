@@ -518,8 +518,8 @@ describe("onboarding model chooser identity", () => {
       _tag: "Installing",
       progress: {
         stage: "downloading",
-        completedBytes: 1,
-        totalBytes: 2,
+        completedBytes: 1_800_000_000,
+        totalBytes: 20_000_000_000,
         bytesPerSecond: Option.none(),
       },
     })
@@ -546,7 +546,7 @@ describe("onboarding model chooser identity", () => {
     try {
       await act(view.renderOnce)
       const frame = view.captureCharFrame()
-      expect(frame).toContain("Downloading · 1 B / 2 B · Estimating…")
+      expect(frame).toContain("Downloading · 1.80 GB / 20.00 GB · Estimating…")
       expect(frame).toContain("Cancel (Esc)")
       expect(frame).not.toContain("Estimating time remaining")
     } finally {

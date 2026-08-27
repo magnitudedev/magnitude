@@ -20,6 +20,11 @@ const formatEta = (remainingBytes: number, bytesPerSecond: number): string => {
   return `about ${minutes} min remaining`
 }
 
+const formatDownloadSize = (bytes: number): string =>
+  formatStorageSize(bytes, {
+    minimumFractionDigits: { digits: 2, fromUnit: "GB" },
+  })
+
 const progressBar = (fraction: number, width: number): string => {
   const filled = Math.round(Math.max(0, Math.min(1, fraction)) * width)
   return `${"█".repeat(filled)}${"░".repeat(Math.max(0, width - filled))}`
@@ -132,12 +137,12 @@ export function OnboardingModelDownloadProgress({
     : Option.none<number>()
   const rate = activeDownload === null ? null : Option.getOrNull(activeDownload.bytesPerSecond)
   const transferred = activeDownload === null
-    ? formatStorageSize(totalBytes)
-    : `${formatStorageSize(activeDownload.completedBytes)} / ${formatStorageSize(activeDownload.totalBytes)}`
+    ? formatDownloadSize(totalBytes)
+    : `${formatDownloadSize(activeDownload.completedBytes)} / ${formatDownloadSize(activeDownload.totalBytes)}`
   const status = cancelling
     ? `Cancelling download · ${transferred}`
     : starting
-      ? `Starting download · ${formatStorageSize(totalBytes)}`
+      ? `Starting download · ${formatDownloadSize(totalBytes)}`
       : activeDownload?.stage === "verifying" || activeDownload?.stage === "publishing"
         ? `Verifying download · ${transferred}`
         : downloading

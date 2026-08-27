@@ -24,9 +24,10 @@ fraction. Minimum requirements round upward at that precision so guidance never 
 bytes required. This convention applies only to memory, not files or transfer quantities.
 
 Product-facing storage quantities select decimal `B` through `PB`, and transfer rates use decimal
-`MB/s`. Explicitly technical and diagnostic output uses binary scaling with IEC `KiB`, `MiB`,
-`GiB`, or `TiB` labels. A binary-scaled file quantity or technical value cannot carry a decimal-unit
-label.
+`MB/s`. Presentation contexts may request a minimum displayed precision from a selected storage
+unit without changing the underlying byte value or scaling policy. Explicitly technical and
+diagnostic output uses binary scaling with IEC `KiB`, `MiB`, `GiB`, or `TiB` labels. A binary-scaled
+file quantity or technical value cannot carry a decimal-unit label.
 
 Model-selection actions do not show artifact size alongside predicted memory. Download byte counts
 remain visible when operationally relevant: active transfer progress and storage-capacity failures.
