@@ -28,6 +28,7 @@
     "@magnitudedev/client-common": "workspace:*",
     "@magnitudedev/release": "workspace:*",
     "@magnitudedev/storage": "workspace:*",
+    "@magnitudedev/utils": "workspace:*",
     "@magnitudedev/version": "workspace:*",
     "@effect/platform": "^0.96.0",
     "@effect/platform-bun": "^0.90.0",

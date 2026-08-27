@@ -1,5 +1,8 @@
 import { chmod } from "node:fs/promises"
-import { resolve } from "node:path"
+import { dirname, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
+
+const scriptDirectory = dirname(fileURLToPath(import.meta.url))
 
 /**
  * The published bin file must be runnable by whatever the user has: sh execs
@@ -13,7 +16,7 @@ const POLYGLOT_HEADER = `#!/bin/sh
 
 export const buildLauncher = async (outdir: string): Promise<string> => {
   const result = await Bun.build({
-    entrypoints: [resolve(import.meta.dir, "../src/main.ts")],
+    entrypoints: [resolve(scriptDirectory, "../src/main.ts")],
     outdir,
     naming: "magnitude.js",
     format: "cjs",
@@ -30,5 +33,5 @@ export const buildLauncher = async (outdir: string): Promise<string> => {
 }
 
 if (import.meta.main) {
-  await buildLauncher(resolve(import.meta.dir, "../bin"))
+  await buildLauncher(resolve(scriptDirectory, "../bin"))
 }
