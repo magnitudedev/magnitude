@@ -54,6 +54,7 @@ import {
   OnboardingModelConfiguringProgress,
   OnboardingModelDownloadProgress,
   OnboardingModelLoadProgress,
+  OnboardingModelOperationFooter,
 } from "./model-status"
 import { isWideSetupLayout, SetupFrame, setupBodyWidth, type SetupStage } from "./setup-frame"
 
@@ -135,6 +136,24 @@ export const onboardingModelRowName = (
   selection: LocalInferenceSelection,
 ): string => formatLocalModelDisplayName(selection.model)
 
+export type OnboardingModelRowEmphasis = "selected" | "subject" | "muted" | "normal"
+
+export const onboardingModelRowEmphasis = ({
+  selected,
+  operationSubject,
+  disabled,
+}: {
+  readonly selected: boolean
+  readonly operationSubject: boolean
+  readonly disabled: boolean
+}): OnboardingModelRowEmphasis => selected
+  ? "selected"
+  : operationSubject
+    ? "subject"
+    : disabled
+      ? "muted"
+      : "normal"
+
 const matchesOnboardingSelection = (
   selection: LocalInferenceSelection,
   submitted: ProviderModelId,
@@ -143,6 +162,7 @@ const matchesOnboardingSelection = (
 const ModelRow = ({
   selection,
   selected,
+  operationSubject,
   disabled,
   width,
   rowId,
@@ -152,6 +172,7 @@ const ModelRow = ({
 }: {
   readonly selection: LocalInferenceSelection
   readonly selected: boolean
+  readonly operationSubject: boolean
   readonly disabled: boolean
   readonly width: number
   readonly rowId: string
@@ -167,6 +188,12 @@ const ModelRow = ({
   const gap = 2
   const actionWidth = action === null ? 0 : gap + action.length
   const nameWidth = Math.max(1, width - markerWidth - rankLabel.length - actionWidth - 1)
+  const emphasis = onboardingModelRowEmphasis({ selected, operationSubject, disabled })
+  const titleColor = emphasis === "selected"
+    ? theme.accent
+    : emphasis === "muted"
+      ? theme.text.disabled
+      : theme.text.body
   return (
     <Button
       id={rowId}
@@ -176,11 +203,11 @@ const ModelRow = ({
       style={{ width: "100%", flexDirection: "row" }}
     >
       <text
-        style={{ fg: selected ? theme.accent : enabled ? theme.text.body : theme.text.disabled }}
-        attributes={selected ? TextAttributes.BOLD : TextAttributes.NONE}
+        style={{ fg: titleColor }}
+        attributes={emphasis === "selected" ? TextAttributes.BOLD : TextAttributes.NONE}
         wrapMode="none"
       >
-        {selected ? "› " : "  "}
+        {emphasis === "selected" ? "› " : "  "}
         {rankLabel.length > 0 && <span fg={theme.text.detail}>{rankLabel}</span>}
         {truncateToDisplayWidth(onboardingModelRowName(selection), nameWidth).padEnd(nameWidth)}
         {action !== null && (
@@ -451,6 +478,8 @@ export type OnboardingModelChooserOperation =
       readonly onChooseAnother: () => void
     }
 
+export { onboardingModelOperationHint } from "./model-status"
+
 export const onboardingSelectionEnterAction = (
   kind: LocalInferenceSelection["kind"] | undefined,
 ): "download" | "load" | "select" | null => {
@@ -687,7 +716,8 @@ export function OnboardingModelChooser({
             <ModelRow
               key={selection.id}
               selection={selection}
-              selected={selection.id === activeCursorId}
+              selected={!locked && selection.id === activeCursorId}
+              operationSubject={locked && Option.contains(activeSelectionId, selection.id)}
               disabled={locked}
               width={leftWidth}
               rowId={onboardingModelRowId(selection.id)}
@@ -714,7 +744,8 @@ export function OnboardingModelChooser({
             <ModelRow
               key={selection.id}
               selection={selection}
-              selected={selection.id === activeCursorId}
+              selected={!locked && selection.id === activeCursorId}
+              operationSubject={locked && Option.contains(activeSelectionId, selection.id)}
               disabled={locked}
               width={leftWidth}
               rowId={onboardingModelRowId(selection.id)}
@@ -836,23 +867,7 @@ export function OnboardingModelChooser({
     : wide
       ? `←/→ change preferences · ↑/↓ choose models · Enter to ${enterAction} · Ctrl+C to exit`
       : `←→ prefs · ↑↓ models · Enter ${enterAction} · Ctrl+C to exit`
-  const interactionHint = operation?._tag === "Downloading"
-      ? operation.starting
-        ? "Starting download…"
-        : "Download in progress · Esc cancel"
-      : operation?._tag === "Configuring"
-        ? "Configuring model…"
-      : operation?._tag === "Activating"
-        ? operation.status._tag === "Failed"
-          ? "Model loading failed"
-          : operation.status._tag === "Cancelling"
-            ? "Cancelling loading…"
-            : operation.status._tag === "Stopping"
-            ? "Stopping model…"
-            : operation.status._tag === "Preparing" || operation.status._tag === "Loading"
-              ? "Loading model into memory…"
-              : "Finishing setup…"
-    : Option.exists(
+  const interactionHint = Option.exists(
         selectedMemory,
         ({ currentHeadroomState }) => currentHeadroomState._tag === "Insufficient",
       )
@@ -867,7 +882,14 @@ export function OnboardingModelChooser({
       stage={operation === null ? "choose" : "install"}
       hardware={hardware}
       unexpectedError={error}
-      footer={<text style={{ fg: theme.text.supporting }} wrapMode="none">{interactionHint}</text>}
+      footer={operation === null
+        ? <text style={{ fg: theme.text.supporting }} wrapMode="none">{interactionHint}</text>
+        : (
+            <OnboardingModelOperationFooter
+              key={`${operation._tag}:${operation.model.modelId}`}
+              operation={operation}
+            />
+          )}
     >
       {operation === null
         ? (
@@ -917,9 +939,6 @@ export function OnboardingModelChooser({
                   model={operation.model}
                   status={operation.status}
                   width={operationWidth}
-                  onCancel={operation.onCancel}
-                  onRetry={operation.onRetry}
-                  onChooseAnother={operation.onChooseAnother}
                 />
               )
             : <OnboardingModelConfiguringProgress width={operationWidth} />}

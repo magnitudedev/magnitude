@@ -17,6 +17,8 @@ import {
   onboardingModelActionLabel,
   OnboardingModelChooser,
   onboardingModelDetailRows,
+  onboardingModelOperationHint,
+  onboardingModelRowEmphasis,
   onboardingSelectionEnterAction,
   onboardingModelRowName,
   scrollOnboardingModelIntoView,
@@ -43,6 +45,24 @@ const makeRankedCatalogModel = (
 }
 
 describe("onboarding model chooser identity", () => {
+  it("distinguishes keyboard selection from the locked operation subject", () => {
+    expect(onboardingModelRowEmphasis({
+      selected: true,
+      operationSubject: false,
+      disabled: false,
+    })).toBe("selected")
+    expect(onboardingModelRowEmphasis({
+      selected: false,
+      operationSubject: true,
+      disabled: true,
+    })).toBe("subject")
+    expect(onboardingModelRowEmphasis({
+      selected: false,
+      operationSubject: false,
+      disabled: true,
+    })).toBe("muted")
+  })
+
   it("renders a non-focusable scale and adjusts it from any model selection", async () => {
     const updates: typeof rankingControls[] = []
     const view = await testRender(
@@ -399,7 +419,9 @@ describe("onboarding model chooser identity", () => {
       expect(frame).toContain("INTELLIGENCE")
       expect(frame).toContain("Loading Qwen Test (Q4) into memory…")
       expect(frame).toContain("0%")
-      expect(frame).toContain("Cancel (Esc)")
+      expect(frame).not.toContain("Cancel (Esc)")
+      expect(frame).toContain("Esc cancel · Ctrl+C to exit")
+      expect(frame).not.toContain("› ")
       expect(frame).not.toContain("←/→ change preference")
       expect(frame.indexOf("Loading Qwen Test (Q4) into memory…")).toBeLessThan(frame.indexOf("ON THIS COMPUTER"))
       expect(frame.indexOf("Loading Qwen Test (Q4) into memory…")).toBeLessThan(frame.indexOf("INTELLIGENCE"))
@@ -407,13 +429,24 @@ describe("onboarding model chooser identity", () => {
       const setupColumn = lines.find((line) => line.includes("MAGNITUDE SETUP"))
         ?.indexOf("MAGNITUDE SETUP")
       const progressLine = lines.find((line) => line.includes("0%"))
+      const progressLineIndex = lines.findIndex((line) => line.includes("0%"))
       expect(setupColumn).toBeDefined()
       expect(progressLine).toBeDefined()
       expect(progressLine?.trimEnd().length).toBe((setupColumn ?? 0) + 97)
+      expect(lines[progressLineIndex + 1]?.trim()).toBe("")
       await act(async () => {
         view.mockInput.pressEscape()
         await new Promise((resolve) => setTimeout(resolve, 25))
       })
+      await act(view.renderOnce)
+      const confirmationFrame = view.captureCharFrame()
+      expect(confirmationFrame).toContain("Cancel loading?  › Yes")
+      expect(confirmationFrame.indexOf("Cancel loading?"))
+        .toBeGreaterThan(confirmationFrame.indexOf("ON THIS COMPUTER"))
+      await act(async () => view.mockInput.pressArrow("right"))
+      await act(view.renderOnce)
+      expect(view.captureCharFrame()).toContain("Cancel loading?    Yes  › No")
+      await act(async () => view.mockInput.pressArrow("left"))
       await act(view.renderOnce)
       expect(view.captureCharFrame()).toContain("Cancel loading?  › Yes")
       await act(async () => view.mockInput.pressEnter())
@@ -469,8 +502,10 @@ describe("onboarding model chooser identity", () => {
       expect(frame).toContain("Not enough memory for Qwen Test (Q4) · Free at least 2.8 GB")
       expect(frame).toContain("█".repeat(8))
       expect(frame).not.toContain("0%")
-      expect(frame).toContain("Retry loading")
+      expect(frame).toContain("› Retry loading")
       expect(frame).toContain("Choose another model")
+      expect(frame.indexOf("› Retry loading")).toBeGreaterThan(frame.indexOf("ON THIS COMPUTER"))
+      expect(frame).not.toContain("←/→ choose action · Enter confirm · Ctrl+C to exit")
       expect(frame).not.toContain("Unable to load model")
       await act(async () => {
         view.mockInput.pressEscape()
@@ -478,9 +513,13 @@ describe("onboarding model chooser identity", () => {
       })
       expect(chooseAnother).toBe(0)
       await act(async () => view.mockInput.pressArrow("right"))
+      await act(view.renderOnce)
+      expect(view.captureCharFrame()).toContain("› Choose another model")
       await act(async () => view.mockInput.pressEnter())
       expect(chooseAnother).toBe(1)
       await act(async () => view.mockInput.pressArrow("left"))
+      await act(view.renderOnce)
+      expect(view.captureCharFrame()).toContain("› Retry loading")
       await act(async () => view.mockInput.pressEnter())
       expect(retries).toBe(1)
     } finally {
@@ -547,7 +586,10 @@ describe("onboarding model chooser identity", () => {
       await act(view.renderOnce)
       const frame = view.captureCharFrame()
       expect(frame).toContain("Downloading · 1.80 GB / 20.00 GB · Estimating…")
-      expect(frame).toContain("Cancel (Esc)")
+      expect(frame).not.toContain("Cancel (Esc)")
+      expect(frame).toContain("Esc cancel · Ctrl+C to exit")
+      expect(frame.indexOf("Esc cancel · Ctrl+C to exit"))
+        .toBeGreaterThan(frame.indexOf("INTELLIGENCE"))
       expect(frame).not.toContain("Estimating time remaining")
     } finally {
       await act(async () => view.renderer.destroy())
@@ -809,5 +851,6 @@ describe("onboarding model chooser identity", () => {
       onCancel: () => undefined,
     }
     expect(operation._tag === "Downloading" && operation.model).toBe(model)
+    expect(onboardingModelOperationHint(operation)).toBe("Esc cancel · Ctrl+C to exit")
   })
 })

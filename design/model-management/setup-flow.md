@@ -180,8 +180,11 @@ model row is selected. Re-ranking preserves the cursor's row/rank position rathe
 previous model identity. A ranked row shows Loaded for a resident model and Load for an installed
 model. Downloadable rows omit a repeated action label so the model name receives the full available
 row width; Enter remains the download action for the selected downloadable row.
-Ranking input and model input are locked during an active operation. Hardware failure does not
-fabricate a memory maximum or selectable ranked results.
+Ranking input and model input are locked during an active operation, and locked rows render no
+selection marker or selected styling. The operation's model title remains neutral body text while
+every other model title is dimmed. The shared footer continues to describe only the keyboard controls
+available in the current operation instead of repeating its status. Hardware failure does not fabricate
+a memory maximum or selectable ranked results.
 
 Each clipped model section overlays dim overflow affordances within its fixed model-row viewport;
 it reserves no indicator rows. The lower affordance replaces the last otherwise-visible model row
@@ -213,14 +216,17 @@ model details and radar visible. The radar animates whenever its derived model v
 including changes caused by re-ranking at the retained cursor position. The frame therefore has
 exactly the same height while choosing,
 downloading, and loading. The first operation row contains the status and any useful transfer
-measurements, the second contains the progress bar, and the third contains controls. Loading and
-downloading both expose `Cancel (Esc)` and replace that control with an inline Yes/No confirmation.
+measurements, the second contains the progress bar, and the third remains empty. The fixed footer
+shows the operation's available keyboard controls. During loading or downloading, Escape replaces
+that hint with an inline Yes/No cancellation confirmation in the footer.
 A retained failed load keeps the same three rows: the first names the model and concrete failure,
-the second keeps the progress bar but colors it red, and the third offers Retry loading and Choose
-another model. Low-memory text states the additional memory the user must free. Left/Right select an
-available recovery action and Enter performs it. Non-retryable
-failures omit Retry. Stage-explanation subtext is not rendered. Loading begins at zero percent until
-authoritative fractional progress advances it. The active operation label uses an eased shimmer for
+the second keeps the progress bar but colors it red, and the third remains empty. The footer replaces
+its ordinary hint with Retry loading and Choose another model. Low-memory text states the additional
+memory the user must free. Left/Right select an available recovery action and Enter performs it.
+Recovery choices use the same cursor, emphasis,
+arrow navigation, and hover-to-select behavior as download and loading cancellation choices.
+Non-retryable failures omit Retry. Stage-explanation subtext is not rendered. Loading begins at zero
+percent until authoritative fractional progress advances it. The active operation label uses an eased shimmer for
 starting, downloading, cancelling, configuring, preparing, stopping, loading, verifying, and
 finishing states. Its cosine highlight scales with the text length, crosses muted text in about
 850 ms, and remains absent for about 950 ms between sweeps; it never changes text weight. Failure
