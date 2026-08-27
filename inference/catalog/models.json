@@ -194,6 +194,14 @@
       "repository": "LiquidAI/LFM2.5-2.6B-GGUF",
       "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "contextLength": 50000,
+      "speculativeDecoding": {
+        "method": "dspark",
+        "draft": {
+          "type": "file",
+          "repository": "LiquidAI/LFM2.5-2.6B-DSpark-GGUF",
+          "path": "LFM2.5-2.6B-DSpark-Q8_0.gguf"
+        }
+      },
       "license": "lfm1.0",
       "intelligence": {
         "score": 11.0,
@@ -214,6 +222,14 @@
       "repository": "LiquidAI/LFM2.5-8B-A1B-GGUF",
       "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "contextLength": 50000,
+      "speculativeDecoding": {
+        "method": "dspark",
+        "draft": {
+          "type": "file",
+          "repository": "LiquidAI/LFM2.5-8B-A1B-DSpark-GGUF",
+          "path": "LFM2.5-8B-A1B-DSpark-Q8_0.gguf"
+        }
+      },
       "license": "lfm1.0",
       "intelligence": {
         "score": 8.1,

@@ -8,8 +8,14 @@
   "gemma-4-e4b-it-qat": { "target": "8c5a9e4fd5482e2be20fe0bf013b4c262a8f4265" },
   "glm-5.2": { "target": "abc55e72527792c6e77069c99b4cb7de16fa9f23" },
   "laguna-s-2.1": { "target": "750f92f90cf54159c4d7a610cb7b3e74498e75c6" },
-  "lfm2.5-2.6b": { "target": "b421ad1d549afeda6a0fb2ad3a697cb5a7879adc" },
-  "lfm2.5-8b-a1b": { "target": "dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0" },
+  "lfm2.5-2.6b": {
+    "target": "b421ad1d549afeda6a0fb2ad3a697cb5a7879adc",
+    "speculativeDraft": "7bc2896af56d82ccc7e156800197408db464d63b"
+  },
+  "lfm2.5-8b-a1b": {
+    "target": "dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0",
+    "speculativeDraft": "7ba04ee5ff05a4baf2681fe5ddda6d736581ccdf"
+  },
   "muse-glimmer-30b": { "target": "1afeb8e879f60116d206cf724425dbe1e1a2f7f5", "speculativeDraft": "1afeb8e879f60116d206cf724425dbe1e1a2f7f5" },
   "nemotron-3-super-120b-a12b": { "target": "036038fb30334a2d56a146c6f0d4871ab5edccbb" },
   "nemotron-3-ultra-550b-a55b": { "target": "2fb7d5b3f4eae7aedb18b4839b6a6300111e46f6" },
