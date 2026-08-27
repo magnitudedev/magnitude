@@ -80,6 +80,7 @@ import { LocalModelConfigurationResolverLive } from "./local-model-configuration
 import { LocalModelPackagesLive } from "./local-model-packages"
 import { makeLocalModelRankerLive } from "./local-model-ranker"
 import { LocalModelsLive } from "./local-models"
+import { LocalModelSyncsLive } from "./local-model-syncs"
 import { ModelCatalogLive } from "./model-catalog"
 import { ModelCommandsLive } from "./model-commands"
 import { LocalProviderOfferingsLive } from "./local-provider-offerings"
@@ -438,9 +439,10 @@ const addLocalInferenceServices = <A, E, R>(
     withCustomEndpoints
   )
   const withPackages = Layer.provideMerge(LocalModelPackagesLive, withHardware)
+  const withModelSyncs = Layer.provideMerge(LocalModelSyncsLive, withPackages)
   const withAssessments = Layer.provideMerge(
     LocalModelAssessmentsLive,
-    withPackages
+    withModelSyncs
   )
   const withAssessor = Layer.provideMerge(
     LocalModelAssessorLive,

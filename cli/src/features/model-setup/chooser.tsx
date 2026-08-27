@@ -115,6 +115,13 @@ const scrollOnboardingModelPastOverflowIndicators = (
 }
 
 export const onboardingModelActionLabel = (selection: LocalInferenceSelection): string | null => {
+  switch (selection.model.acquisitionState._tag) {
+    case "UpdateAvailable": return "Update"
+    case "UpdateFailed": return "Retry update"
+    case "Updating": return "Updating"
+    case "Removing": return "Removing"
+    case "RemoveFailed": return "Remove failed"
+  }
   if (selection.kind === "running") return "Loaded"
   if (selection.kind === "downloadable") return null
   return "Load"

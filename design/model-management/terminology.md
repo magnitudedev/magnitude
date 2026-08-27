@@ -19,7 +19,8 @@ applies_to:
 | **Model** | A callable model addressed everywhere by its existing canonical model ID, such as `gemma-4-26b-a4b-it-qat:gguf:q4`. It projects release declaration, capabilities, serving configuration, and current installation state. |
 | **Model package** | One immutable content-identified set of files, roles, relationships, inspection, and source evidence. |
 | **Installed package** | The current observation that every required valid file for a Package is present. It is a state, not another resource. |
-| **Download** | One process-local admitted acquisition occurrence created by Model installation. |
+| **Model sync** | ACN's model-addressed application operation for making a Model's desired Packages present; it serves both installation and update. |
+| **Download** | One raw process-local ICN occurrence for acquiring a Bundle, addressed by `ModelDownloadId`. |
 | **Instance** | One physical loaded occurrence of a Model, identified by an ICN-created Instance ID. |
 | **Hardware** | ICN's singleton current topology, capacity, and calibration profile. |
 | **Slot** | ACN-owned durable provider-qualified model selection, reasoning preference, favorites, and recency for a product role. It contains no Instance identity or residency state. |
@@ -50,7 +51,7 @@ Cached assessment never authorizes loading.
 |---|---|---|
 | Canonical model ID | One callable Model across native APIs, `/v1/models`, inference requests, providers, Slots, and harness configuration | Stable release meaning, ICN |
 | `ModelPackageId` | One immutable Package | Content-stable, ICN |
-| `ModelDownloadId` | One acquisition occurrence | ICN process lifetime |
+| `ModelDownloadId` | One raw Bundle-download occurrence; never a client identity | ICN process lifetime |
 | `ModelInstanceId` | One loaded occurrence | ICN controller lifetime |
 | `(ProviderId, ProviderModelId)` | One provider offering; for `local`, `ProviderModelId` is the canonical model ID | Provider boundary; Slot selection may retain it |
 | `SlotId` | One product role assignment | Durable, ACN |
@@ -61,7 +62,7 @@ offerings, assessments, Downloads, and Instances are derived or process-local an
 into durable model state.
 
 `ManagedModelStore` is the exclusive mutation boundary for Magnitude-owned artifacts. Model install
-and uninstall address a canonical model ID; ICN resolves exact Packages, preserves shared or active
+and removal address a canonical model ID; ICN resolves exact Packages, preserves shared or active
 Packages, and never asks clients to reproduce bundle accounting.
 
 ## Runtime relationship

@@ -144,6 +144,7 @@ describe("local provider offering projection", () => {
         state: Effect.succeed({ inventory: { _tag: "Ready" }, entries: [packageEntry], downloads: [] }),
         changes: Stream.never,
         installedPackageIds: Effect.succeed(new Set([packageId])),
+        refresh: Effect.void,
       })),
     )
 
@@ -219,6 +220,7 @@ describe("local provider offering projection", () => {
           state: Effect.succeed({ inventory: { _tag: "Ready" }, entries: [packageEntry], downloads: [] }),
           changes: Stream.never,
           installedPackageIds: Effect.succeed(new Set([packageId])),
+          refresh: Effect.void,
         })),
       )
       yield* Layer.build(LocalProviderOfferingsLive.pipe(Layer.provide(dependencies)))

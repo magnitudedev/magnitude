@@ -323,17 +323,17 @@ export const AcnBoundaryLive = AcnRpc.toLayer(AcnBoundary,
       GetLocalInferenceEnvironment: () =>
         observeRpcDefects("GetLocalInferenceEnvironment", localInferenceHardware.state),
 
-      InstallLocalModel: ({ modelId }) =>
-        observeRpcDefects("InstallLocalModel", modelCommands.install(modelId)),
+      SyncLocalModel: ({ modelId }) =>
+        observeRpcDefects("SyncLocalModel", modelCommands.sync(modelId)),
 
-      CancelModelDownload: ({ modelId }) =>
-        observeRpcDefects("CancelModelDownload", modelCommands.cancelDownload(modelId)),
+      CancelLocalModelSync: ({ modelId }) =>
+        observeRpcDefects("CancelLocalModelSync", modelCommands.cancelSync(modelId)),
 
-      AcknowledgeModelDownloadFailure: ({ modelId }) =>
-        observeRpcDefects("AcknowledgeModelDownloadFailure", modelCommands.acknowledgeDownloadFailure(modelId)),
+      AcknowledgeLocalModelSyncFailure: ({ modelId }) =>
+        observeRpcDefects("AcknowledgeLocalModelSyncFailure", modelCommands.acknowledgeSyncFailure(modelId)),
 
-      UninstallLocalModel: ({ modelId }) =>
-        observeRpcDefects("UninstallLocalModel", modelCommands.uninstall(modelId)),
+      RemoveLocalModel: ({ modelId }) =>
+        observeRpcDefects("RemoveLocalModel", modelCommands.remove(modelId)),
 
       LoadModelSlot: ({ slotId }) =>
         observeRpcDefects("LoadModelSlot", modelCommands.loadSlot(slotId)),

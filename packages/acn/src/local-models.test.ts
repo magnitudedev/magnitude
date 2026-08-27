@@ -13,6 +13,7 @@ import {
 import { ProviderModelIdSchema } from "@magnitudedev/sdk"
 import {
   availabilityFromProviderProjection,
+  correlatedModelSync,
   deriveModelAcquisitionState,
   installedBundleFields,
   resolveBundlePresentation,
@@ -88,10 +89,8 @@ describe("bundle acquisition projection", () => {
     }]
 
     expect(deriveModelAcquisitionState({
-      currentBundle: bundle,
-      desiredBundle: bundle,
       currentInstalled: installedBundleFields(bundle, entries),
-      downloads,
+      download: correlatedModelSync(downloads, downloadId),
       updateAvailable: false,
       priorEntries: [],
       residencyState: { _tag: "Unloaded" },
@@ -130,10 +129,8 @@ describe("bundle acquisition projection", () => {
       },
     }]
     expect(deriveModelAcquisitionState({
-      currentBundle: installedBundle,
-      desiredBundle,
       currentInstalled: installedBundleFields(installedBundle, entries),
-      downloads,
+      download: downloads[0],
       updateAvailable: true,
       priorEntries: [],
       residencyState: { _tag: "Unloaded" },
@@ -152,10 +149,35 @@ describe("bundle acquisition projection", () => {
       state: { _tag: "Cancelled", completedBytes: 1, totalBytes: 2 },
     }]
     expect(deriveModelAcquisitionState({
-      currentBundle: bundle,
-      desiredBundle: bundle,
       currentInstalled: undefined,
-      downloads,
+      download: downloads[0],
+      updateAvailable: false,
+      priorEntries: [],
+      residencyState: { _tag: "Unloaded" },
+    })).toEqual({ _tag: "NotInstalled" })
+  })
+
+  it("does not borrow a shared-bundle transfer from another model", () => {
+    const bundle = standaloneBundle({ _tag: "Local", path: "/models/shared.gguf" })
+    const sharedDownload: ModelBundleDownload = {
+      id: ModelDownloadIdSchema.make("other-model-download"),
+      bundle,
+      state: {
+        _tag: "Downloading",
+        stage: "downloading",
+        completedBytes: 1,
+        totalBytes: 2,
+        bytesPerSecond: Option.none(),
+      },
+    }
+
+    expect(correlatedModelSync(
+      [sharedDownload],
+      ModelDownloadIdSchema.make("this-model-download"),
+    )).toBeUndefined()
+    expect(deriveModelAcquisitionState({
+      currentInstalled: undefined,
+      download: undefined,
       updateAvailable: false,
       priorEntries: [],
       residencyState: { _tag: "Unloaded" },
@@ -171,16 +193,14 @@ describe("bundle acquisition projection", () => {
       state: { _tag: "Failed", completedBytes: 1, totalBytes: 2, failure, acknowledged },
     })
     const inputs = {
-      currentBundle: bundle,
-      desiredBundle: bundle,
       currentInstalled: undefined,
       updateAvailable: false,
       priorEntries: [],
       residencyState: { _tag: "Unloaded" },
     } as const
-    expect(deriveModelAcquisitionState({ ...inputs, downloads: [failedDownload(false)] }))
+    expect(deriveModelAcquisitionState({ ...inputs, download: failedDownload(false) }))
       .toEqual({ _tag: "InstallFailed", failure })
-    expect(deriveModelAcquisitionState({ ...inputs, downloads: [failedDownload(true)] }))
+    expect(deriveModelAcquisitionState({ ...inputs, download: failedDownload(true) }))
       .toEqual({ _tag: "NotInstalled" })
   })
 })

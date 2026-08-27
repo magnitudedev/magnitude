@@ -108,6 +108,7 @@ provider-model identity. Configurations and product rows are derived and never p
 - Any exact desired/current package difference produces update availability.
 - Completed files, not download history or cached state, determine presence.
 - Catalog or attribution failure cannot hide an installed target.
-- Clients consume acquisition, reconciliation, serving, and ranking state from one row.
+- Clients consume acquisition, serving, and ranking state from one row; they do not construct a
+  second reconciliation lifecycle from mutation state.
 - Every installed row carries the exact current filesystem location of every bundle package.
 - Every assessed row and provider offering carries capabilities for its exact effective target.

@@ -3,7 +3,6 @@ import type { ProviderModelId } from "@magnitudedev/ai/provider/model"
 import {
   installedAcquisition,
   type CatalogIdentity,
-  type CatalogModelReconciliationAdmission,
   type LocalModel,
   type LocalModelsState,
   type ModelCapabilities,
@@ -54,37 +53,4 @@ export const findLocalModelByCatalogIdentity = (
 export const installedLocalModels = (
   state: LocalModelsState,
 ): readonly LocalModel[] =>
-  state.models.filter((model) => installedAcquisition(model.acquisitionState) !== undefined
-    && model.servingState._tag === "Assessed"
-    && model.servingState.assessment._tag === "Fits")
-
-const admissionIsVisibleOn = (
-  model: LocalModel,
-  admission: CatalogModelReconciliationAdmission,
-): boolean => {
-  const acquisition = model.acquisitionState
-  if (admission._tag === "Current") return acquisition._tag === "Installed"
-  return acquisition._tag === "Installing"
-    || acquisition._tag === "Updating"
-    || acquisition._tag === "Installed"
-}
-
-/** The admitted reconciliation is visible on the canonical model. */
-export const installationAdmissionIsVisible = (
-  state: LocalModelsState,
-  modelId: ProviderModelId,
-  admission: CatalogModelReconciliationAdmission,
-): boolean => Option.exists(
-  findLocalModelById(state.models, modelId),
-  (model) => admissionIsVisibleOn(model, admission),
-)
-
-/** The admitted reconciliation is visible on the model identified by catalog identity. */
-export const catalogReconciliationIsVisible = (
-  state: LocalModelsState,
-  identity: CatalogIdentity,
-  admission: CatalogModelReconciliationAdmission,
-): boolean => Option.exists(
-  findLocalModelByCatalogIdentity(state.models, identity),
-  (model) => admissionIsVisibleOn(model, admission),
-)
+  state.models.filter((model) => installedAcquisition(model.acquisitionState) !== undefined)

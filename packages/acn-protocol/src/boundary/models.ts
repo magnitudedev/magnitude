@@ -7,7 +7,6 @@ import {
   ModelSlotUpdateError,
 } from "../errors"
 import {
-  CatalogModelReconciliationAdmissionSchema,
   LocalInferenceHardwareSchema,
   ModelCatalogStateSchema,
   ModelLoadPlanSchema,
@@ -38,14 +37,15 @@ const RefreshCatalog = Mutation.make("RefreshModelCatalog", {
   }),
   success: Schema.Struct({}),
   error: Schema.Never,
+  synchronize: () => QueryClient.refetch(GetCatalog.match()),
 })
 
 const slotScope = (slotId: SlotId) => Mutation.MutationScope(`model-slot:${slotId}`)
 const slotMutationScope = (slotId: SlotId) => slotId === "primary"
   ? turnAdmissionScope
   : slotScope(slotId)
-const invalidateCatalog = QueryClient.invalidate(GetCatalog.match())
-const invalidateSlots = QueryClient.invalidate(GetSlots.match())
+const synchronizeCatalog = QueryClient.refetch(GetCatalog.match())
+const synchronizeSlots = QueryClient.refetch(GetSlots.match())
 
 const AssignSlot = Mutation.make("AssignModelSlot", {
   policy: { recovery: "ReplaySafe" },
@@ -53,7 +53,7 @@ const AssignSlot = Mutation.make("AssignModelSlot", {
   success: Schema.Struct({}),
   error: ModelSlotUpdateError,
   scope: ({ slotId }) => slotMutationScope(slotId),
-  synchronize: () => invalidateSlots,
+  synchronize: () => synchronizeSlots,
 })
 
 const ClearSlot = Mutation.make("ClearModelSlot", {
@@ -62,7 +62,7 @@ const ClearSlot = Mutation.make("ClearModelSlot", {
   success: Schema.Struct({}),
   error: ModelSlotUpdateError,
   scope: ({ slotId }) => slotMutationScope(slotId),
-  synchronize: () => invalidateSlots,
+  synchronize: () => synchronizeSlots,
 })
 
 const SetFavorite = Mutation.make("SetModelFavorite", {
@@ -71,43 +71,43 @@ const SetFavorite = Mutation.make("SetModelFavorite", {
   success: Schema.Struct({}),
   error: ModelPreferenceMutationFailed,
   scope: ({ model }) => Mutation.MutationScope(`model-favorite:${model.providerId}:${model.providerModelId}`),
-  synchronize: () => invalidateSlots,
+  synchronize: () => synchronizeSlots,
 })
 
-const InstallLocalModel = Mutation.make("InstallLocalModel", {
-  policy: { recovery: "AtMostOnce" },
-  payload: Schema.Struct({ modelId: ProviderModelIdSchema }),
-  success: CatalogModelReconciliationAdmissionSchema,
-  error: LocalInferenceError,
-  scope: ({ modelId }) => Mutation.MutationScope(`local-model:${modelId}`),
-  synchronize: () => invalidateCatalog,
-})
-
-const CancelModelDownload = Mutation.make("CancelModelDownload", {
+const SyncLocalModel = Mutation.make("SyncLocalModel", {
   policy: { recovery: "AtMostOnce" },
   payload: Schema.Struct({ modelId: ProviderModelIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
   scope: ({ modelId }) => Mutation.MutationScope(`local-model:${modelId}`),
-  synchronize: () => invalidateCatalog,
+  synchronize: () => synchronizeCatalog,
 })
 
-const AcknowledgeModelDownloadFailure = Mutation.make("AcknowledgeModelDownloadFailure", {
+const CancelLocalModelSync = Mutation.make("CancelLocalModelSync", {
   policy: { recovery: "AtMostOnce" },
   payload: Schema.Struct({ modelId: ProviderModelIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
   scope: ({ modelId }) => Mutation.MutationScope(`local-model:${modelId}`),
-  synchronize: () => invalidateCatalog,
+  synchronize: () => synchronizeCatalog,
 })
 
-const UninstallLocalModel = Mutation.make("UninstallLocalModel", {
+const AcknowledgeLocalModelSyncFailure = Mutation.make("AcknowledgeLocalModelSyncFailure", {
   policy: { recovery: "AtMostOnce" },
   payload: Schema.Struct({ modelId: ProviderModelIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
   scope: ({ modelId }) => Mutation.MutationScope(`local-model:${modelId}`),
-  synchronize: () => invalidateCatalog,
+  synchronize: () => synchronizeCatalog,
+})
+
+const RemoveLocalModel = Mutation.make("RemoveLocalModel", {
+  policy: { recovery: "AtMostOnce" },
+  payload: Schema.Struct({ modelId: ProviderModelIdSchema }),
+  success: Schema.Struct({}),
+  error: LocalInferenceError,
+  scope: ({ modelId }) => Mutation.MutationScope(`local-model:${modelId}`),
+  synchronize: () => synchronizeCatalog,
 })
 
 const LoadSlot = Mutation.make("LoadModelSlot", {
@@ -116,7 +116,7 @@ const LoadSlot = Mutation.make("LoadModelSlot", {
   success: Schema.Struct({}),
   error: LocalInferenceError,
   scope: ({ slotId }) => Mutation.MutationScope(`model-slot-instance:${slotId}`),
-  synchronize: () => invalidateSlots,
+  synchronize: () => synchronizeSlots,
 })
 
 const StopSlot = Mutation.make("StopModelSlot", {
@@ -125,7 +125,7 @@ const StopSlot = Mutation.make("StopModelSlot", {
   success: Schema.Struct({}),
   error: LocalInferenceError,
   scope: ({ slotId }) => Mutation.MutationScope(`model-slot-instance:${slotId}`),
-  synchronize: () => invalidateSlots,
+  synchronize: () => synchronizeSlots,
 })
 
 const PreviewSlotLoad = Query.make("PreviewModelSlotLoad", {
@@ -143,10 +143,10 @@ export const Models = Group.make({
   AssignSlot,
   ClearSlot,
   SetFavorite,
-  InstallLocalModel,
-  CancelModelDownload,
-  AcknowledgeModelDownloadFailure,
-  UninstallLocalModel,
+  SyncLocalModel,
+  CancelLocalModelSync,
+  AcknowledgeLocalModelSyncFailure,
+  RemoveLocalModel,
   LoadSlot,
   StopSlot,
 })

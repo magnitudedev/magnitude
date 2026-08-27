@@ -764,6 +764,21 @@ describe("onboarding model chooser identity", () => {
     expect(onboardingModelActionLabel(selection)).toBeNull()
   })
 
+  it("shows update as the model-level action when an installed model is stale", () => {
+    const installed = makeModel()
+    if (installed.acquisitionState._tag !== "Installed") {
+      throw new Error("installed fixture must be installed")
+    }
+    const update = {
+      ...installed,
+      acquisitionState: { ...installed.acquisitionState, _tag: "UpdateAvailable" as const },
+    }
+    const view = makeView({ models: [update], ready: false })
+    const [selection] = buildLocalInferenceSelections(view.models, view.slots)
+
+    expect(selection && onboardingModelActionLabel(selection)).toBe("Update")
+  })
+
   it("scrolls by presentation identity without copying model fields", () => {
     const calls: string[] = []
     scrollOnboardingModelIntoView({

@@ -100,7 +100,9 @@ export const ModelCatalogLive: Layer.Layer<
       onNone: () => Effect.all([providers.refresh(Option.none()), local.refresh], {
         concurrency: "unbounded",
         discard: true,
-      }),
+      }).pipe(Effect.catchAllCause((cause) => Effect.logWarning("Unable to refresh model catalog").pipe(
+        Effect.annotateLogs({ cause: String(cause) }),
+      ))),
       onSome: (id) => providers.refresh(Option.some(id)),
     }),
   })

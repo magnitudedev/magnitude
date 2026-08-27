@@ -9,6 +9,7 @@ import {
 } from "effect"
 import {
   InstalledCatalogAttributionSchema,
+  LocalModelMutationFailed,
   ModelPackagesStateSchema,
   servableModelBundlePackages,
   type ModelPackage,
@@ -74,6 +75,7 @@ export interface LocalModelPackagesApi {
   readonly state: Effect.Effect<ModelPackagesState>
   readonly changes: Stream.Stream<ModelPackagesState>
   readonly installedPackageIds: Effect.Effect<ReadonlySet<string>>
+  readonly refresh: Effect.Effect<void, LocalModelMutationFailed>
 }
 
 export class LocalModelPackages extends Context.Tag("LocalModelPackages")<
@@ -102,7 +104,7 @@ export const LocalModelPackagesLive: Layer.Layer<
   const projectionLock = yield* Effect.makeSemaphore(1)
   const observedCompletions = new Set<string>()
 
-  const project = projectionLock.withPermits(1)(Effect.gen(function* () {
+  const projectCurrent = projectionLock.withPermits(1)(Effect.gen(function* () {
     const catalogModels = yield* Effect.forEach(
       (yield* models.get).state.models,
       catalogModelDefinitionFromIcn,
@@ -171,7 +173,8 @@ export const LocalModelPackagesLive: Layer.Layer<
       entries,
       downloads: bundleDownloads,
     })
-  })).pipe(
+  }))
+  const project = projectCurrent.pipe(
     Effect.catchAllCause((cause) =>
       SubscriptionRef.get(current).pipe(
         Effect.flatMap((state) => publish({
@@ -208,5 +211,20 @@ export const LocalModelPackagesLive: Layer.Layer<
     changes: current.changes,
     installedPackageIds: installed.get.pipe(Effect.map(({ state }) =>
       new Set(state.packages.map(({ package: modelPackage }) => modelPackage.id)))),
+    refresh: Effect.all([
+      models.refresh,
+      downloads.refresh,
+      installed.refresh,
+    ], { discard: true }).pipe(
+      Effect.andThen(projectCurrent),
+      Effect.catchAllCause((cause) => Effect.logWarning("Unable to refresh local model packages").pipe(
+        Effect.annotateLogs({ cause: String(cause) }),
+        Effect.andThen(Effect.fail(new LocalModelMutationFailed({
+          code: "local_model_state_refresh_failed",
+          message: "The local model state could not be refreshed",
+          retryable: true,
+        }))),
+      )),
+    ),
   })
 }))

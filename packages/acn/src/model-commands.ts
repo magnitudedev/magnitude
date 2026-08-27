@@ -1,9 +1,9 @@
 import { Context, Effect, Layer, Option } from "effect"
 import {
   LocalModelMutationFailed,
+  ModelDownloadIdSchema,
   ModelSlotMutationRejected,
   PRIMARY_SLOT_ID,
-  type CatalogModelReconciliationAdmission,
   type LocalInferenceError,
   type ModelLoadPlan,
   type SlotId,
@@ -12,13 +12,14 @@ import type { ProviderModelId } from "@magnitudedev/ai"
 import { IcnClient, IcnInstances, type IcnClientService } from "@magnitudedev/icn"
 import { projectInferenceLoadPlan } from "@magnitudedev/sdk"
 import { LocalModels } from "./local-models"
+import { LocalModelSyncs } from "./local-model-syncs"
 import { ModelSlotController } from "./model-slot-controller"
 
 export interface ModelCommandsApi {
-  readonly install: (modelId: ProviderModelId) => Effect.Effect<CatalogModelReconciliationAdmission, LocalInferenceError>
-  readonly cancelDownload: (modelId: ProviderModelId) => Effect.Effect<{}, LocalInferenceError>
-  readonly acknowledgeDownloadFailure: (modelId: ProviderModelId) => Effect.Effect<{}, LocalInferenceError>
-  readonly uninstall: (modelId: ProviderModelId) => Effect.Effect<{}, LocalInferenceError>
+  readonly sync: (modelId: ProviderModelId) => Effect.Effect<{}, LocalInferenceError>
+  readonly cancelSync: (modelId: ProviderModelId) => Effect.Effect<{}, LocalInferenceError>
+  readonly acknowledgeSyncFailure: (modelId: ProviderModelId) => Effect.Effect<{}, LocalInferenceError>
+  readonly remove: (modelId: ProviderModelId) => Effect.Effect<{}, LocalInferenceError>
   readonly loadSlot: (slotId: SlotId) => Effect.Effect<{}, LocalInferenceError>
   readonly previewSlotLoad: (slotId: SlotId) => Effect.Effect<ModelLoadPlan, LocalInferenceError>
   readonly stopSlot: (slotId: SlotId) => Effect.Effect<{}, LocalInferenceError>
@@ -65,21 +66,17 @@ export const modelCommandFailure = (
   }
 }
 
-const rejected = (modelId: ProviderModelId, message: string) => new LocalModelMutationFailed({
-  code: "model_download_absent",
-  message: `${message} for ${modelId}`,
-  retryable: false,
-})
-
 export const ModelCommandsLive: Layer.Layer<
   ModelCommands,
   never,
-  IcnClient | ModelSlotController | IcnInstances | LocalModels
+  IcnClient | ModelSlotController | IcnInstances | LocalModels | LocalModelSyncs
 > = Layer.effect(ModelCommands, Effect.gen(function* () {
   const client = yield* IcnClient
   const slots = yield* ModelSlotController
   const instances = yield* IcnInstances
   const localModels = yield* LocalModels
+  const syncs = yield* LocalModelSyncs
+  const modelMutationLock = yield* Effect.makeSemaphore(1)
 
   const selectedLocalModel = (slotId: SlotId) => slots.state.pipe(
     Effect.map((state) => state.slots[slotId === PRIMARY_SLOT_ID ? "primary" : "secondary"]),
@@ -92,39 +89,70 @@ export const ModelCommandsLive: Layer.Layer<
     ),
     Effect.map((slot) => slot.selection.providerModelId),
   )
+  const admitSync = (modelId: ProviderModelId) => client.models.installModel({
+    payload: { modelId },
+  }).pipe(
+    Effect.mapError((cause) => modelCommandFailure("install_model", cause)),
+    Effect.tap((result) => result._tag === "DownloadAdmitted"
+      ? syncs.admitted(modelId, ModelDownloadIdSchema.make(result.downloadId))
+      : syncs.current(modelId)),
+  )
 
-  return ModelCommands.of({
-    install: (modelId) => client.models.installModel({ payload: { modelId } }).pipe(
-      Effect.map((result): CatalogModelReconciliationAdmission => result._tag === "Current"
-        ? { _tag: "Current", providerModelId: modelId }
-        : { _tag: "DownloadAdmitted", providerModelId: modelId }),
-      Effect.mapError((cause) => modelCommandFailure("install_model", cause)),
-    ),
-    cancelDownload: (modelId) => localModels.currentDownload(modelId).pipe(
+  const sync = (modelId: ProviderModelId) => modelMutationLock.withPermits(1)(
+    syncs.download(modelId).pipe(
       Effect.flatMap(Option.match({
-        onNone: () => rejected(modelId, "No download is running"),
+        onNone: () => admitSync(modelId),
+        onSome: (download) => download.state._tag === "Pending"
+            || download.state._tag === "Downloading"
+          ? Effect.succeed({ _tag: "DownloadAdmitted" as const, downloadId: download.id })
+          : admitSync(modelId),
+      })),
+      Effect.andThen(localModels.refresh),
+      Effect.as({}),
+    ),
+  )
+  const cancelSync = (modelId: ProviderModelId) => modelMutationLock.withPermits(1)(
+    syncs.download(modelId).pipe(
+      Effect.flatMap(Option.match({
+        onNone: () => Effect.void,
         onSome: (download) => download.state._tag === "Pending" || download.state._tag === "Downloading"
           ? client.models.cancelModelDownload({ path: { download_id: download.id } }).pipe(
               Effect.mapError((cause) => modelCommandFailure("cancel_download", cause)),
             )
-          : rejected(modelId, "No download is running"),
+          : Effect.void,
       })),
+      Effect.andThen(localModels.refresh),
       Effect.as({}),
     ),
-    acknowledgeDownloadFailure: (modelId) => localModels.currentDownload(modelId).pipe(
+  )
+  const acknowledgeSyncFailure = (modelId: ProviderModelId) => modelMutationLock.withPermits(1)(
+    syncs.download(modelId).pipe(
       Effect.flatMap(Option.match({
-        onNone: () => rejected(modelId, "No failed download is awaiting acknowledgement"),
+        onNone: () => Effect.void,
         onSome: (download) => download.state._tag === "Failed" && !download.state.acknowledged
           ? client.models.acknowledgeModelDownloadFailure({ path: { download_id: download.id } }).pipe(
               Effect.mapError((cause) => modelCommandFailure("acknowledge_download_failure", cause)),
             )
-          : rejected(modelId, "No failed download is awaiting acknowledgement"),
+          : Effect.void,
       })),
+      Effect.andThen(localModels.refresh),
       Effect.as({}),
     ),
-    uninstall: (modelId) => client.models.uninstallModel({ payload: { modelId } }).pipe(
-      Effect.as({}),
-      Effect.mapError((cause) => modelCommandFailure("uninstall_model", cause)),
+  )
+
+  return ModelCommands.of({
+    sync,
+    cancelSync,
+    acknowledgeSyncFailure,
+    remove: (modelId) => modelMutationLock.withPermits(1)(
+      Effect.uninterruptible(localModels.removalStarted(modelId).pipe(
+        Effect.andThen(client.models.uninstallModel({ payload: { modelId } }).pipe(
+          Effect.mapError((cause) => modelCommandFailure("uninstall_model", cause)),
+        )),
+        Effect.andThen(localModels.removalFinished(modelId)),
+        Effect.tapError((failure) => localModels.removalFailed(modelId, failure)),
+        Effect.as({}),
+      )),
     ),
     loadSlot: (slotId) => selectedLocalModel(slotId).pipe(
       Effect.flatMap((modelId) => client.models.ensureModelInstance({ payload: { modelId } })),

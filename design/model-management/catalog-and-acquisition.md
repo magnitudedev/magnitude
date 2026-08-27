@@ -132,13 +132,17 @@ servable artifacts.
 
 ## Downloads
 
-A download command carries an exact servable bundle. If every required package is installed, ICN
+A client model-sync command carries only canonical model identity. ACN invokes ICN's existing
+catalog-install operation, which resolves the exact desired bundle. If every required package is installed, ICN
 returns `AlreadyInstalled`. Otherwise ICN creates one process-local `ModelDownload` with a stable
 `ModelDownloadId` and admits missing package work or joins equivalent work already owned by the
 same ICN process.
 
-The model download aggregates bounded progress and one terminal outcome across its bundle. Package
-attempts are process-local ICN details. Equivalent model downloads may share active package work.
+The raw download occurrence retains its bundle and aggregates bounded progress and one terminal
+outcome. It does not retain ACN model identity. ACN records the exact `ModelDownloadId` returned
+for each admitted model sync and uses that causal correlation for projection and later commands.
+Repeated sync for the same model joins its correlated active occurrence at the ACN command
+boundary. Package attempts are process-local ICN details. Equivalent model downloads may share active package work.
 Caller interruption detaches that waiter without abandoning admitted work. Cancellation stops
 shared package work only when no other live occurrence depends on it. A retry creates a new
 occurrence. Restart ends all occurrences, attempt history, cancellation state, and failure
@@ -155,7 +159,9 @@ unavailable network, local storage failure, and corrupt content. Cancellation is
 terminal result. Structured facts, including required and available byte counts, cross boundaries
 without parsing diagnostic prose.
 
-Failure dismissal is process-local presentation state correlated by the exact download identity.
+Failure dismissal is process-local presentation state addressed by canonical model identity at the
+ACN boundary. ACN resolves it to the exact correlated download ID; ICN acknowledges only that raw
+occurrence.
 It does not alter the terminal result and does not survive restart.
 
 Downloads write only to temporary `.incomplete` paths until a component matches its expected size

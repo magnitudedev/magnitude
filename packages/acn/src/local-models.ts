@@ -2,9 +2,10 @@ import { Context, Effect, Layer, Option, Schema, Stream, SubscriptionRef } from 
 import type { NonEmptyReadonlyArray } from "effect/Array"
 import {
   LocalModelsStateSchema,
+  LocalModelMutationFailed,
   ModelServingConfigurationSchema,
   ServableModelBundleSchema,
-  sameServableModelBundleIdentity,
+  installedAcquisition,
   servableModelBundlePackageIds,
   servableModelBundlePackages,
   type LocalInferenceHardware,
@@ -17,6 +18,7 @@ import {
   type LocalModelsState,
   type MemoryAssessment,
   type ModelDownloadFailure,
+  type ModelDownloadId,
   type ModelFailure,
   type ModelBundleDownload,
   type ModelPackageEntry,
@@ -33,6 +35,7 @@ import type * as Generated from "@magnitudedev/icn-protocol/schemas"
 import { LocalInferenceHardware as LocalInferenceHardwareService } from "./local-inference-hardware"
 import { LocalModelPackages } from "./local-model-packages"
 import { LocalModelRanker } from "./local-model-ranker"
+import { LocalModelSyncs } from "./local-model-syncs"
 import { LocalProviderOfferings, localCatalogProviderModelId } from "./local-provider-offerings"
 import {
   providerOfferingPackageEvidence,
@@ -110,18 +113,13 @@ type ModelTransfer =
   | { readonly _tag: "Active"; readonly progress: ModelTransferProgress }
   | { readonly _tag: "Failed"; readonly failure: ModelDownloadFailure }
 
-/** The latest download occurrence targeting any of the model's bundles. */
-export const latestBundleDownload = (
+/** Resolves only the exact ICN occurrence correlated by the ACN. */
+export const correlatedModelSync = (
   downloads: readonly ModelBundleDownload[],
-  bundles: readonly ServableModelBundle[],
-): ModelBundleDownload | undefined => {
-  for (let index = downloads.length - 1; index >= 0; index--) {
-    const candidate = downloads[index]
-    if (candidate !== undefined && bundles.some((bundle) =>
-      sameServableModelBundleIdentity(candidate.bundle, bundle))) return candidate
-  }
-  return undefined
-}
+  downloadId: ModelDownloadId | undefined,
+): ModelBundleDownload | undefined => downloadId === undefined
+  ? undefined
+  : downloads.find(({ id }) => id === downloadId)
 
 const transferOf = (download: ModelBundleDownload | undefined): ModelTransfer | undefined => {
   if (download === undefined) return undefined
@@ -154,13 +152,9 @@ const transferOf = (download: ModelBundleDownload | undefined): ModelTransfer | 
 }
 
 export interface ModelAcquisitionInputs {
-  /** The bundle the current serving resolution targets. */
-  readonly currentBundle: ServableModelBundle
-  /** The bundle the curated catalog currently publishes for the model. */
-  readonly desiredBundle: ServableModelBundle
   /** The current bundle's complete installation, when every package is on disk. */
   readonly currentInstalled: InstalledModelFields | undefined
-  readonly downloads: readonly ModelBundleDownload[]
+  readonly download: ModelBundleDownload | undefined
   /** ICN reports a newer catalog target than the installed current bundle. */
   readonly updateAvailable: boolean
   /** Installed packages attributed to this model that predate the current bundle. */
@@ -176,10 +170,7 @@ export interface ModelAcquisitionInputs {
 export const deriveModelAcquisitionState = (
   inputs: ModelAcquisitionInputs,
 ): LocalModelAcquisitionState => {
-  const transfer = transferOf(latestBundleDownload(
-    inputs.downloads,
-    [inputs.desiredBundle, inputs.currentBundle],
-  ))
+  const transfer = transferOf(inputs.download)
   const current = inputs.currentInstalled
   if (current !== undefined) {
     const installed = { ...current, residencyState: inputs.residencyState }
@@ -362,15 +353,13 @@ export interface LocalModelsApi {
   readonly state: Effect.Effect<LocalModelsState>
   readonly changes: Stream.Stream<LocalModelsState>
   /** Publishes a snapshot from the current lower-domain facts before returning. */
-  readonly refresh: Effect.Effect<void>
-  /**
-   * The native download occurrence currently backing a model's transfer or
-   * unacknowledged failure. Private command plumbing: the occurrence identity
-   * never reaches the client contract.
-   */
-  readonly currentDownload: (
+  readonly refresh: Effect.Effect<void, LocalModelMutationFailed>
+  readonly removalStarted: (modelId: ProviderModelId) => Effect.Effect<void, LocalModelMutationFailed>
+  readonly removalFailed: (
     modelId: ProviderModelId,
-  ) => Effect.Effect<Option.Option<ModelBundleDownload>>
+    failure: ModelFailure,
+  ) => Effect.Effect<void, LocalModelMutationFailed>
+  readonly removalFinished: (modelId: ProviderModelId) => Effect.Effect<void, LocalModelMutationFailed>
 }
 
 export class LocalModels extends Context.Tag("LocalModels")<LocalModels, LocalModelsApi>() {}
@@ -380,7 +369,7 @@ export const LocalModelsLive: Layer.Layer<
   never,
   IcnModels | LocalModelPackages | LocalModelRanker
     | LocalModelConfigurationResolver | LocalProviderOfferings | LocalInferenceHardwareService
-    | IcnInstances
+    | IcnInstances | LocalModelSyncs
 > = Layer.scoped(LocalModels, Effect.gen(function* () {
   const icnModels = yield* IcnModels
   const packages = yield* LocalModelPackages
@@ -389,18 +378,19 @@ export const LocalModelsLive: Layer.Layer<
   const offerings = yield* LocalProviderOfferings
   const hardware = yield* LocalInferenceHardwareService
   const instances = yield* IcnInstances
+  const syncs = yield* LocalModelSyncs
   const current = yield* SubscriptionRef.make<LocalModelsState>({
     inventoryState: { _tag: "Initializing" },
     models: [],
     discoveryState: { _tag: "Loading", progress: [] },
   })
-  const currentDownloads = yield* SubscriptionRef.make<
-    ReadonlyMap<ProviderModelId, ModelBundleDownload>
-  >(new Map())
+  const removals = yield* SubscriptionRef.make<ReadonlyMap<ProviderModelId,
+    { readonly _tag: "Removing" } | { readonly _tag: "RemoveFailed"; readonly failure: ModelFailure }
+  >>(new Map())
   const equivalent = Schema.equivalence(LocalModelsStateSchema)
   const lock = yield* Effect.makeSemaphore(1)
 
-  const project = lock.withPermits(1)(Effect.gen(function* () {
+  const projectCurrent = lock.withPermits(1)(Effect.gen(function* () {
     const packageState = yield* packages.state
     const nativeCatalogModels = (yield* icnModels.get).state.models
     const catalogModels = yield* Effect.forEach(
@@ -415,6 +405,12 @@ export const LocalModelsLive: Layer.Layer<
     const projectedOfferings = yield* offerings.state
     const hardwareState = yield* hardware.state
     const instanceState = yield* instances.get
+    const removalStates = yield* SubscriptionRef.get(removals)
+    const groups = new Map([...resolvedConfigurations].map(([identity, resolution]) => [
+      identity,
+      resolution.servingConfiguration.bundle,
+    ]))
+    const syncDownloads = yield* syncs.downloads
     const packageEntries = new Map(
       packageState.entries.map((entry) => [entry.package.id, entry]),
     )
@@ -442,11 +438,6 @@ export const LocalModelsLive: Layer.Layer<
       }),
     )
 
-    const groups = new Map([...resolvedConfigurations].map(([identity, resolution]) => [
-      identity,
-      resolution.servingConfiguration.bundle,
-    ]))
-
     const catalogByTarget = new Map<string, (typeof catalogModels)[number]>(catalogModels.map((model) => [
       localCatalogProviderModelId(model),
       model,
@@ -461,7 +452,6 @@ export const LocalModelsLive: Layer.Layer<
     const rankingEntries = rankingState._tag === "Ready" ? rankingState.entries : []
     const sameConfiguration = Schema.equivalence(ModelServingConfigurationSchema)
 
-    const downloadIndex = new Map<ProviderModelId, ModelBundleDownload>()
     const models: LocalModel[] = [...groups.entries()].map(([identity, bundle]): LocalModel => {
       const curated = catalogByTarget.get(identity)
       if (curated === undefined) {
@@ -482,26 +472,30 @@ export const LocalModelsLive: Layer.Layer<
       const catalogLocalState = nativeCatalogByTarget.get(identity)?.localState
       const updateAvailable = catalogLocalState?._tag === "Installed"
         && catalogLocalState.updateState._tag === "Available"
-      const modelDownload = latestBundleDownload(
-        packageState.downloads,
-        [curated.configuration.bundle, bundle],
-      )
-      if (modelDownload !== undefined) {
-        downloadIndex.set(localCatalogProviderModelId(curated), modelDownload)
-      }
+      const modelId = localCatalogProviderModelId(curated)
       const modelInstance = instanceState.instances.findLast((candidate) =>
         candidate.modelId === localCatalogProviderModelId(curated))
-      const acquisitionState = deriveModelAcquisitionState({
-        currentBundle: bundle,
-        desiredBundle: curated.configuration.bundle,
+      const derivedAcquisitionState = deriveModelAcquisitionState({
         currentInstalled,
-        downloads: packageState.downloads,
+        download: syncDownloads.get(modelId),
         updateAvailable,
         priorEntries,
         residencyState: modelInstance === undefined
           ? { _tag: "Unloaded" }
           : projectInferenceResidency(modelInstance),
       })
+      const removal = removalStates.get(modelId)
+      const installed = installedAcquisition(derivedAcquisitionState)
+      const installedFields = installed === undefined ? undefined : {
+        installedBytes: installed.installedBytes,
+        packages: installed.packages,
+        residencyState: installed.residencyState,
+      }
+      const acquisitionState: LocalModelAcquisitionState = removal !== undefined && installed !== undefined
+        ? removal._tag === "Removing"
+          ? { _tag: "Removing", ...installedFields! }
+          : { _tag: "RemoveFailed", ...installedFields!, failure: removal.failure }
+        : derivedAcquisitionState
       const bundleEntries = servableModelBundlePackages(bundle).map((modelPackage) =>
         packageEntries.get(modelPackage.id))
       const primaryPackage = bundle._tag === "Standalone" ? bundle.package : bundle.target
@@ -646,13 +640,23 @@ export const LocalModelsLive: Layer.Layer<
       models,
       discoveryState,
     }
-    yield* SubscriptionRef.set(currentDownloads, downloadIndex)
     const previous = yield* SubscriptionRef.get(current)
     if (!equivalent(previous, next)) yield* SubscriptionRef.set(current, next)
-  })).pipe(Effect.catchAllCause((cause) =>
+  }))
+  const project = projectCurrent.pipe(Effect.catchAllCause((cause) =>
     Effect.logWarning("Unable to project local models").pipe(
       Effect.annotateLogs({ cause: String(cause) }),
     )))
+  const projectForMutation = projectCurrent.pipe(
+    Effect.catchAllCause((cause) => Effect.logWarning("Unable to publish refreshed local model state").pipe(
+      Effect.annotateLogs({ cause: String(cause) }),
+      Effect.andThen(Effect.fail(new LocalModelMutationFailed({
+        code: "local_model_state_projection_failed",
+        message: "The refreshed local model state could not be published",
+        retryable: true,
+      }))),
+    )),
+  )
 
   yield* project
   yield* Stream.mergeAll([
@@ -673,9 +677,21 @@ export const LocalModelsLive: Layer.Layer<
   return LocalModels.of({
     state: SubscriptionRef.get(current),
     changes: current.changes,
-    refresh: project,
-    currentDownload: (modelId) => SubscriptionRef.get(currentDownloads).pipe(
-      Effect.map((index) => Option.fromNullable(index.get(modelId))),
-    ),
+    refresh: packages.refresh.pipe(Effect.andThen(projectForMutation)),
+    removalStarted: (modelId) => SubscriptionRef.update(removals, (current) => {
+      const next = new Map(current)
+      next.set(modelId, { _tag: "Removing" })
+      return next
+    }).pipe(Effect.andThen(projectForMutation)),
+    removalFailed: (modelId, failure) => SubscriptionRef.update(removals, (current) => {
+      const next = new Map(current)
+      next.set(modelId, { _tag: "RemoveFailed", failure })
+      return next
+    }).pipe(Effect.andThen(projectForMutation)),
+    removalFinished: (modelId) => SubscriptionRef.update(removals, (current) => {
+      const next = new Map(current)
+      next.delete(modelId)
+      return next
+    }).pipe(Effect.andThen(packages.refresh), Effect.andThen(projectForMutation)),
   })
 }))

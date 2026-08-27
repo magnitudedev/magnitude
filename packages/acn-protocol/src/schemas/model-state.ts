@@ -633,6 +633,11 @@ export const LocalModelAcquisitionStateSchema = Schema.Union(
     ...InstalledModelFields,
     failure: ModelDownloadFailureSchema,
   })),
+  uniqueInstalledPackages(Schema.TaggedStruct("Removing", InstalledModelFields)),
+  uniqueInstalledPackages(Schema.TaggedStruct("RemoveFailed", {
+    ...InstalledModelFields,
+    failure: ModelFailureSchema,
+  })),
 )
 export type LocalModelAcquisitionState = typeof LocalModelAcquisitionStateSchema.Type
 
@@ -648,6 +653,8 @@ export const installedAcquisition = (
   || state._tag === "UpdateAvailable"
   || state._tag === "Updating"
   || state._tag === "UpdateFailed"
+  || state._tag === "Removing"
+  || state._tag === "RemoveFailed"
   ? state
   : undefined
 
@@ -664,17 +671,6 @@ export const acquisitionFailure = (
 ): ModelDownloadFailure | undefined => state._tag === "InstallFailed" || state._tag === "UpdateFailed"
   ? state.failure
   : undefined
-
-export const CatalogModelReconciliationAdmissionSchema = Schema.Union(
-  Schema.TaggedStruct("Current", {
-    providerModelId: ProviderModelIdSchema,
-  }),
-  Schema.TaggedStruct("DownloadAdmitted", {
-    providerModelId: ProviderModelIdSchema,
-  }),
-)
-export type CatalogModelReconciliationAdmission =
-  typeof CatalogModelReconciliationAdmissionSchema.Type
 
 export const ProviderModelDisabledReasonSchema = Schema.Literal(
   "insufficient_resources",

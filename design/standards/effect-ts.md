@@ -17,6 +17,10 @@ Definition: An **Effect boundary** is any boundary between effectful code and no
 
 Principle 1: **Minimize Effect boundaries**
 
+## Service Naming
+
+Name services for their functional role - e.g. `ItemResolver`, not `Items` - rather than for the data they contain or expose.
+
 ## Common anti-patterns
 
 - Excessive use of promises in effect code. Use Effects, not promises.
@@ -83,4 +87,3 @@ export class MyError extends Data.TaggedError("MyError")<{
 If the error variants are finite and known, they should be represented as distinct tagged errors.
 
 If a union of these is needed as a reusable concept, define a type with is an actual union of the tagged errors.
-
