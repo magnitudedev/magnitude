@@ -37,6 +37,7 @@
     "@magnitudedev/version": "0.0.1"
   },
   "changesets": [
+    "fiery-dogs-study",
     "ten-balloons-agree"
   ]
 }
