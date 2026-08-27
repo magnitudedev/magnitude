@@ -52,15 +52,16 @@ One `HarnessConnector` implementation exists for every supported harness. The co
 identity, display metadata, executable, configuration targets, wire dialect, exact active-model
 strategy, skill target, owned removal inverse, and launch plan. The registry is complete and follows
 the canonical priority order. The harness-connection service owns only manifest intent,
-installation observation, transactional file snapshots, registry dispatch, and shared skill/startup
-orchestration. Onboarding and the public `magnitude connections` commands call this same service;
-neither contains connector-specific transforms.
+installation observation, transactional file snapshots, registry dispatch, central skill
+installation, and startup orchestration. Onboarding and the public `magnitude connections`
+commands call this same service; neither contains connector-specific transforms.
 
 The unified connector contract is `detect`, `connect(HarnessConnectionSpec)`,
-`disconnect(HarnessConnectionSpec)`, `launch(modelId, installation)`, and `installSkill`. The spec
-contains the complete harness-facing Magnitude model descriptors plus an optional `setCurrent` model ID. Each harness
-implements this contract in its own module. The registry only composes those modules in canonical
-priority order; it contains no harness configuration logic.
+`disconnect(HarnessConnectionSpec)`, and `launch(modelId, installation)`, plus one declarative skill
+installation target. The spec contains the complete harness-facing Magnitude model descriptors plus
+an optional `setCurrent` model ID. Each harness implements this contract in its own module. The
+registry only composes those modules in canonical priority order; it contains no harness
+configuration logic.
 
 The protocol policy is deliberately narrow: every harness capable of consuming OpenAI Chat
 Completions uses `http://127.0.0.1:10100/inference/v1/chat/completions`. Pi and Oh My Pi declare
@@ -103,9 +104,16 @@ the user's global primary model or other agents.
 
 ## Skill and startup options
 
-Skill installation writes one independently managed `magnitude/SKILL.md` into only the selected
-harness's native user-wide skill root. It never fans out to other detected harnesses and never
-overwrites an unmanaged conflicting skill.
+Skill installation addresses a physical installation target rather than treating every harness as
+the owner of a distinct copy. Magnitude, Pi, OpenCode, OpenClaw, Codex, and Oh My Pi select the
+shared `~/.agents/skills` target. Hermes, Claude Code, and Cline select their harness-specific
+user-wide targets because they do not discover the shared target by default. Selecting multiple
+harnesses that share a target therefore retains one physical `magnitude/SKILL.md`; installation
+never fans out to other targets.
+
+The central installer owns target resolution and atomic publication. Every explicit installation
+replaces the selected target's `magnitude/SKILL.md` with the current bundled skill, including when a
+file is already present. Skill installation is therefore refresh, not create-if-absent behavior.
 
 “Launch Magnitude on startup” means idempotently registering the per-user service for the user's
 operating-system session. The visible copy remains “startup”; implementation and diagnostics may

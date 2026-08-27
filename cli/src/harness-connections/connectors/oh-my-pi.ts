@@ -28,7 +28,7 @@ export const makeOhMyPiConnector = (paths: HarnessConnectionPaths) => defineConn
   id: "oh-my-pi",
   name: "Oh My Pi",
   executable: "omp",
-  skillFile: paths.skills["oh-my-pi"]!,
+  skillInstallationTarget: "shared-agents",
   configurationFiles: [paths.ompModels, paths.ompSettings],
   connect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.ompModels, "{}\n")

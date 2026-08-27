@@ -18,7 +18,7 @@ export interface HarnessConnectorRegistry {
 
 export const makeHarnessConnectorRegistry = (paths: HarnessConnectionPaths): HarnessConnectorRegistry => {
   const ordered = [
-    makeMagnitudeConnector(paths),
+    makeMagnitudeConnector(),
     makePiConnector(paths),
     makeOpenCodeConnector(paths),
     makeHermesConnector(paths),

@@ -73,7 +73,20 @@ const fixturePaths = (root: string): HarnessConnectionPaths => ({
   ompSettings: `${root}/omp/settings.json`,
   clineProviders: `${root}/cline/providers.json`,
   clineModels: `${root}/cline/models.json`,
-  skills: Object.fromEntries(HARNESS_PRIORITY.map((id) => [id, `${root}/skills/${id}/SKILL.md`])),
+  skillInstallations: {
+    "shared-agents": {
+      skillFile: `${root}/skills/agents/magnitude/SKILL.md`,
+    },
+    "hermes-user": {
+      skillFile: `${root}/skills/hermes/magnitude/SKILL.md`,
+    },
+    "claude-user": {
+      skillFile: `${root}/skills/claude/magnitude/SKILL.md`,
+    },
+    "cline-user": {
+      skillFile: `${root}/skills/cline/magnitude/SKILL.md`,
+    },
+  },
 })
 
 const stringifyJson = Schema.encodeSync(Schema.parseJson(Schema.Unknown, { space: 2 }))
@@ -131,8 +144,26 @@ describe("HarnessConnector contract and registry", () => {
       expect(typeof connector.connect).toBe("function")
       expect(typeof connector.disconnect).toBe("function")
       expect(typeof connector.launch).toBe("function")
-      expect(typeof connector.installSkill).toBe("function")
+      expect(connector.skillInstallationTarget.length).toBeGreaterThan(0)
     }
+  })
+
+  it("maps interoperable harnesses to one shared skill target", () => {
+    const registry = makeHarnessConnectorRegistry(fixturePaths("/tmp/skill-targets"))
+    expect(Object.fromEntries(registry.ordered.map(({ id, skillInstallationTarget }) => [
+      id,
+      skillInstallationTarget,
+    ]))).toEqual({
+      magnitude: "shared-agents",
+      pi: "shared-agents",
+      opencode: "shared-agents",
+      hermes: "hermes-user",
+      openclaw: "shared-agents",
+      codex: "shared-agents",
+      "claude-code": "claude-user",
+      "oh-my-pi": "shared-agents",
+      cline: "cline-user",
+    })
   })
 
   it("does not detect repository dependencies as installed harnesses", () => {
@@ -174,6 +205,45 @@ describe("HarnessConnector contract and registry", () => {
     expect(result).toContain("// user comment")
     expect(readJson(result)).toMatchObject({ theme: "dark", provider: { magnitude: { api: "openai-completions" } } })
   })
+})
+
+describe("Magnitude skill installation", () => {
+  it("shares one installation and replaces it on every interoperable-harness install", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-shared-skill-" })
+      const paths = fixturePaths(root)
+      const service = yield* installedService(paths)
+
+      yield* service.installSkill(HarnessIdSchema.make("pi"))
+      const sharedSkill = paths.skillInstallations["shared-agents"].skillFile
+      const installed = yield* fs.readFileString(sharedSkill)
+      expect(installed).toContain("name: magnitude")
+      yield* fs.writeFileString(sharedSkill, "stale contents\n")
+      yield* service.installSkill(HarnessIdSchema.make("codex"))
+
+      expect(yield* fs.readFileString(sharedSkill)).toBe(installed)
+      expect(yield* fs.exists(paths.skillInstallations["hermes-user"].skillFile)).toBe(false)
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
+  it("uses specialized installations only for harnesses that require them", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-specialized-skill-" })
+      const paths = fixturePaths(root)
+      const service = yield* installedService(paths)
+
+      yield* service.installSkill(HarnessIdSchema.make("hermes"))
+
+      expect(yield* fs.readFileString(paths.skillInstallations["hermes-user"].skillFile))
+        .toContain("name: magnitude")
+      expect(yield* fs.exists(paths.skillInstallations["shared-agents"].skillFile)).toBe(false)
+      expect(yield* fs.exists(paths.skillInstallations["claude-user"].skillFile)).toBe(false)
+      expect(yield* fs.exists(paths.skillInstallations["cline-user"].skillFile)).toBe(false)
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
 })
 
 describe("HarnessConnection model-set behavior", () => {

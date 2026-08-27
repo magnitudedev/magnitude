@@ -1,14 +1,13 @@
 import { Effect } from "effect"
-import type { HarnessConnectionPaths } from "../paths"
 import { defineConnector, launchPlan } from "../shared"
 
-export const makeMagnitudeConnector = (paths: HarnessConnectionPaths) => defineConnector({
+export const makeMagnitudeConnector = () => defineConnector({
   id: "magnitude",
   name: "Magnitude Harness",
   executable: "magnitude",
   recommended: true,
   note: "Optimized for local models",
-  skillFile: paths.skills.magnitude!,
+  skillInstallationTarget: "shared-agents",
   configurationFiles: [],
   connect: () => Effect.void,
   disconnect: () => Effect.void,

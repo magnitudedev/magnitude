@@ -87,7 +87,7 @@ export const makeCodexConnector = (paths: HarnessConnectionPaths) => defineConne
   id: "codex",
   name: "Codex",
   executable: "codex",
-  skillFile: paths.skills.codex!,
+  skillInstallationTarget: "shared-agents",
   configurationFiles: [paths.codex, paths.codexModels],
   connect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.codex, "")

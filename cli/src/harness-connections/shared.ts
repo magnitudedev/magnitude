@@ -138,10 +138,9 @@ export const launchPlan = (
   modelId,
 })
 
-interface ConnectorDefinition extends Omit<HarnessConnector, "id" | "detect" | "installSkill"> {
+interface ConnectorDefinition extends Omit<HarnessConnector, "id" | "detect"> {
   readonly id: Parameters<typeof HarnessIdSchema.make>[0]
   readonly executable: string
-  readonly skillFile: string
 }
 
 export const defineConnector = (definition: ConnectorDefinition): HarnessConnector => {
@@ -151,6 +150,7 @@ export const defineConnector = (definition: ConnectorDefinition): HarnessConnect
     name: definition.name,
     ...(definition.recommended === undefined ? {} : { recommended: definition.recommended }),
     ...(definition.note === undefined ? {} : { note: definition.note }),
+    skillInstallationTarget: definition.skillInstallationTarget,
     configurationFiles: definition.configurationFiles,
     connect: definition.connect,
     disconnect: definition.disconnect,
@@ -160,16 +160,6 @@ export const defineConnector = (definition: ConnectorDefinition): HarnessConnect
       : Option.fromNullable(Bun.which(definition.executable, { PATH: searchPath })).pipe(
           Option.map((executable) => ({ executable })),
         )),
-    installSkill: (contents) => Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem
-      const path = yield* Path.Path
-      const existing = yield* readOr(definition.skillFile, "")
-      if (existing.trim() !== "" && !existing.includes("name: magnitude")) {
-        throw new Error(`An unmanaged skill already exists at ${definition.skillFile}`)
-      }
-      yield* fs.makeDirectory(path.dirname(definition.skillFile), { recursive: true, mode: 0o700 })
-      yield* writeFileAtomic(definition.skillFile, contents)
-    }),
   }
 }
 
