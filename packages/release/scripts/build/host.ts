@@ -121,7 +121,7 @@ const smokeIcnServer = async (
     if (!healthBody.ready || healthBody.instanceId !== instance) {
       throw new Error("ICN health returned the wrong identity")
     }
-    const hardware = await fetch(`${ready.origin}/v1/hardware`, {
+    const hardware = await fetch(`${ready.origin}/api/v1/hardware`, {
       headers: { authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(10_000),
     })

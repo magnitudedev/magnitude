@@ -1,9 +1,9 @@
 # ICN model fit assessment
 
 ICN assesses model fit through one native planning pipeline shared by downloaded inventory models
-and remote previews. `POST /v1/models/preview` resolves immutable artifact metadata without
-downloading full weights, inspects the complete component set, and evaluates every requested
-execution profile against `GET /v1/hardware`'s normalized memory domains.
+and load previews. `POST /api/v1/models/{model_id}/load-plan` resolves immutable artifact metadata
+without downloading full weights, inspects the complete component set, and evaluates every requested
+execution profile against `GET /api/v1/hardware`'s normalized memory domains.
 
 A complete result is `Fits` or `DoesNotFit`. Each result identifies the resolved profile and reports
 per-domain model, context, compute, auxiliary, required, available, and margin bytes. ACN does not

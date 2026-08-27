@@ -76,7 +76,7 @@ metric digest.
 
 ## Model assessment
 
-`POST /v1/models/assess` accepts batches of exact bundles and explicit assessment profiles. A bundle
+`POST /api/v1/models/assess` accepts batches of exact bundles and explicit assessment profiles. A bundle
 is one standalone package or one method-identified speculative-decoding bundle with embedded or
 separate draft capability. Each assessment profile specifies maximum context for one sequence and
 the context depths at which performance must be estimated.
