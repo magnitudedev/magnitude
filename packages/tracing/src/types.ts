@@ -25,7 +25,6 @@ export type AgentCallType =
   | 'advisor'
   | 'observer'
   | 'image'
-  | 'title'
   | 'autopilot'
   | 'extract-memory-diff'
 
@@ -34,7 +33,6 @@ export type AgentTraceOperationKind =
   | 'observer'
   | 'advisor'
   | 'autopilot'
-  | 'title'
   | 'image'
   | 'background'
 

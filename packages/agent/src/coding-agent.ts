@@ -64,7 +64,6 @@ import { isRoleId, type RoleId } from './agents/role-validation'
 import { getForkInfo } from './agents/registry'
 import { ROLE_TO_SLOT } from '@magnitudedev/roles'
 import { FileMentionResolver } from './workers/file-mention-resolver'
-import { ChatTitleServiceLive } from './workers/chat-title-service'
 import { ChatTitleWorker } from './workers/chat-title-worker'
 import { AtifWriter } from './workers/atif-writer'
 import { ProcessMetricsWorker } from './workers/process-metrics'
@@ -763,10 +762,6 @@ export function createCodingAgentSession(options: CreateClientOptions) {
     ),
     providerClientLayer,
   )
-  const chatTitleServiceLayer = Layer.provide(
-    ChatTitleServiceLive,
-    Layer.mergeAll(agentModelResolverLayer, FetchHttpClient.layer, options.persistence),
-  )
   const introspectionLayer = options.debug
     ? Introspection.AddressedIntrospectionRegistryLive
     : Layer.empty
@@ -787,7 +782,6 @@ export function createCodingAgentSession(options: CreateClientOptions) {
 
     agentModelResolverLayer,
     providerClientLayer,
-    chatTitleServiceLayer,
     ObserverStateLive,
 
     FetchHttpClient.layer,

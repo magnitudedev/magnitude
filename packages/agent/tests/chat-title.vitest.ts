@@ -1,37 +1,25 @@
-import { FetchHttpClient } from '@effect/platform'
-import { Effect, Layer, Stream } from 'effect'
+import { Effect, Layer } from 'effect'
 import { describe, expect, it } from 'vitest'
 import { EventEngine } from '@magnitudedev/event-core'
-import {
-  ModelRequestTerminal,
-  StreamClientCorrectnessViolation,
-  type BaseCallOptions,
-  type ModelStreamResult,
-  type ResponseStreamEvent,
-} from '@magnitudedev/ai'
 
 import { DEFAULT_CHAT_NAME } from '../src/constants'
 import type { AppEvent } from '../src/events'
-import type { AgentBoundModel } from '../src/model/agent-model'
-import { AgentModelResolver } from '../src/model/model-resolver'
 import {
   ChatPersistence,
   type ChatPersistenceService,
   type SessionMetadata,
 } from '../src/persistence/chat-persistence-service'
 import { ChatTitleProjection } from '../src/projections/chat-title'
-import { UserMessageResolutionProjection } from '../src/projections/user-message-resolution'
-import { fallbackChatTitle } from '../src/util/title-prompts'
 import {
-  CHAT_TITLE_MAX_TOKENS,
-  ChatTitleServiceLive,
-} from '../src/workers/chat-title-service'
+  CHAT_TITLE_MAX_CHARACTERS,
+  deriveChatTitle,
+} from '../src/util/chat-title'
 import { ChatTitleWorker } from '../src/workers/chat-title-worker'
 
 const TestAgent = EventEngine.make<AppEvent>()({
   name: 'ChatTitleTestAgent',
   schemaVersion: 'test',
-  projections: [UserMessageResolutionProjection, ChatTitleProjection],
+  projections: [ChatTitleProjection],
   workers: [ChatTitleWorker],
 })
 
@@ -48,32 +36,28 @@ async function waitFor(assertion: () => boolean, timeoutMs = 1000) {
   throw new Error('Timed out waiting for condition')
 }
 
-function userMessage(messageId: string, text: string): AppEvent {
+function userMessage(
+  messageId: string,
+  text: string,
+  options?: { readonly forkId?: string | null; readonly synthetic?: boolean },
+): AppEvent {
   return {
     type: 'user_message',
-    forkId: null,
+    forkId: options?.forkId ?? null,
     messageId,
     timestamp: Date.now(),
     text,
     mentions: [],
     attachments: [],
     mode: 'text',
-    synthetic: false,
+    synthetic: options?.synthetic ?? false,
     taskMode: false,
-  }
-}
-
-function userMessageReady(messageId: string): AppEvent {
-  return {
-    type: 'user_message_ready',
-    forkId: null,
-    messageId,
-    mentionResolutions: [],
   }
 }
 
 function makePersistence() {
   const now = new Date().toISOString()
+  let saveCount = 0
   let metadata: SessionMetadata = {
     sessionId: 'chat-title-test',
     chatName: DEFAULT_CHAT_NAME,
@@ -93,6 +77,7 @@ function makePersistence() {
     saveProjectionSnapshot: () => Effect.void,
     getSessionMetadata: () => Effect.sync(() => metadata),
     saveSessionMetadata: (update) => Effect.sync(() => {
+      saveCount += 1
       metadata = { ...metadata, ...update, updated: new Date().toISOString() }
     }),
   }
@@ -100,160 +85,56 @@ function makePersistence() {
   return {
     layer: Layer.succeed(ChatPersistence, service),
     metadata: () => metadata,
+    saveCount: () => saveCount,
   }
 }
 
-function makeTitleModel(title: string | null, options?: { failAfterOutput?: boolean }) {
-  let primaryResolutions = 0
-  let secondaryResolutions = 0
-  let streamCalls = 0
-  let maxTokens: number | undefined
+describe('chat titles', () => {
+  it('normalizes whitespace and keeps the first 50 characters', () => {
+    expect(deriveChatTitle('  fix\n\tthe   broken login flow  ')).toBe('fix the broken login flow')
 
-  const events: ResponseStreamEvent[] = title === null
-    ? []
-    : [{ _tag: 'message_delta', text: title }]
-  if (options?.failAfterOutput) {
-    events.push({
-      _tag: 'stream_end',
-      terminal: ModelRequestTerminal.StreamFailed({
-        cause: new StreamClientCorrectnessViolation({
-          call: { provider: 'test', model: 'local-primary', method: 'POST', url: 'http://test' },
-          response: { status: 200, headers: [], requestId: null },
-          component: 'model_event_reducer',
-          message: 'stream ended before the grammar root accepted',
-          evidence: {
-            _tag: 'InvariantViolated',
-            invariant: 'grammar root must be accepted before the stream ends',
-          },
-          progress: { dataPayloadsDecoded: 1, modelEventsEmitted: 1 },
-        }),
-        usage: { _tag: 'UsageNotReported', reason: 'stream_failed_before_usage' },
-      }),
-    })
-  }
-  const result: ModelStreamResult = {
-    events: Stream.fromIterable(events),
-    parsers: new Map(),
-    logprobs: [],
-    requestId: null,
-  }
-  const model: AgentBoundModel = {
-    model: {
-      stream: (_prompt, _tools, options?: BaseCallOptions) => Effect.sync(() => {
-        streamCalls += 1
-        maxTokens = options?.maxTokens
-        return result
-      }),
-    },
-    modelSource: { slotId: 'primary' },
-    modelId: 'local-primary',
-    modelDisplayName: 'Local Primary',
-    providerId: 'local',
-    profile: {
-      contextWindow: 128_000,
-      maxOutputTokens: 4096,
-    },
-  }
-
-  const layer = Layer.succeed(AgentModelResolver, {
-    resolveSlotConfig: () => Effect.succeed(model),
-    resolvePrimary: () => Effect.sync(() => {
-      primaryResolutions += 1
-      return model
-    }),
-    resolveSecondary: () => Effect.sync(() => {
-      secondaryResolutions += 1
-      return model
-    }),
+    const longMessage = '0123456789'.repeat(6)
+    expect(deriveChatTitle(longMessage)).toBe('0123456789'.repeat(5))
+    expect(Array.from(deriveChatTitle(longMessage)!).length).toBe(CHAT_TITLE_MAX_CHARACTERS)
+    expect(deriveChatTitle('   \n\t  ')).toBeNull()
   })
 
-  return {
-    layer,
-    counts: () => ({ primaryResolutions, secondaryResolutions, streamCalls, maxTokens }),
-  }
-}
-
-function requirements(
-  persistenceLayer: Layer.Layer<ChatPersistence>,
-  resolverLayer: Layer.Layer<AgentModelResolver>,
-) {
-  const titleServiceLayer = ChatTitleServiceLive.pipe(
-    Layer.provide(Layer.merge(resolverLayer, FetchHttpClient.layer)),
-  )
-  return Layer.merge(persistenceLayer, titleServiceLayer) as Parameters<typeof TestAgent.createClient>[0]
-}
-
-describe('chat title generation', () => {
-  it('creates concise fallback titles', () => {
-    expect(fallbackChatTitle('  fix   the broken login flow  ')).toBe('Fix the broken login flow')
-    const title = fallbackChatTitle('investigate why every single message starts another secondary model title request')
-    expect(title).toBe('Investigate why every single message starts…')
-    expect(title!.length).toBeLessThanOrEqual(50)
-    expect(fallbackChatTitle('   ')).toBeNull()
+  it('counts Unicode code points without splitting an emoji', () => {
+    const message = `${'a'.repeat(CHAT_TITLE_MAX_CHARACTERS - 1)}🙂suffix`
+    expect(deriveChatTitle(message)).toBe(`${'a'.repeat(CHAT_TITLE_MAX_CHARACTERS - 1)}🙂`)
   })
 
-  it('uses the primary model once and keeps the fallback when generation fails', async () => {
+  it('persists a title from the first real root user message only', async () => {
     const persistence = makePersistence()
-    const titleModel = makeTitleModel(null)
-    const client = await TestAgent.createClient(requirements(persistence.layer, titleModel.layer))
-    const events: AppEvent[] = []
-    const unsubscribe = client.onEvent((event) => events.push(event))
+    const client = await TestAgent.createClient(persistence.layer)
 
     try {
-      await client.send(userMessage('message-1', 'debug duplicate model requests'))
-      await client.send(userMessageReady('message-1'))
-      await waitFor(() => titleModel.counts().streamCalls === 1)
+      await client.send(userMessage('forked', 'fork title', { forkId: 'fork-1' }))
+      await client.send(userMessage('synthetic', 'synthetic title', { synthetic: true }))
+      await client.send(userMessage('first', '  first\n real   title  '))
+      await waitFor(() => persistence.metadata().chatName === 'first real title')
 
-      expect(persistence.metadata().chatName).toBe('Debug duplicate model requests')
-      expect(events.some((event) =>
-        event.type === 'chat_title_generated'
-        && event.title === 'Debug duplicate model requests')).toBe(true)
-      expect(titleModel.counts()).toEqual({
-        primaryResolutions: 1,
-        secondaryResolutions: 0,
-        streamCalls: 1,
-        maxTokens: CHAT_TITLE_MAX_TOKENS,
-      })
-
-      await client.send(userMessage('message-2', 'this must not generate another title'))
-      await client.send(userMessageReady('message-2'))
+      await client.send(userMessage('second', 'second title must be ignored'))
       await sleep(50)
 
-      expect(titleModel.counts().streamCalls).toBe(1)
-    } finally {
-      unsubscribe()
-      await client.dispose()
-    }
-  })
-
-  it('replaces the fallback when the primary model returns a title', async () => {
-    const persistence = makePersistence()
-    const titleModel = makeTitleModel('Debug duplicate title calls')
-    const client = await TestAgent.createClient(requirements(persistence.layer, titleModel.layer))
-
-    try {
-      await client.send(userMessage('message-1', 'please figure out these repeated background requests'))
-      await client.send(userMessageReady('message-1'))
-      await waitFor(() => persistence.metadata().chatName === 'Debug duplicate title calls')
-
-      expect(titleModel.counts().streamCalls).toBe(1)
-      expect(titleModel.counts().secondaryResolutions).toBe(0)
+      expect(persistence.metadata().chatName).toBe('first real title')
+      expect(persistence.saveCount()).toBe(1)
     } finally {
       await client.dispose()
     }
   })
 
-  it('uses generated title text even when the stream truncates afterward', async () => {
+  it('resolves a blank first message without using a later message', async () => {
     const persistence = makePersistence()
-    const titleModel = makeTitleModel('Investigate repeated background calls', { failAfterOutput: true })
-    const client = await TestAgent.createClient(requirements(persistence.layer, titleModel.layer))
+    const client = await TestAgent.createClient(persistence.layer)
 
     try {
-      await client.send(userMessage('message-1', 'why does this call happen every time'))
-      await client.send(userMessageReady('message-1'))
-      await waitFor(() => persistence.metadata().chatName === 'Investigate repeated background calls')
+      await client.send(userMessage('blank', '  \n '))
+      await client.send(userMessage('second', 'must not become the title'))
+      await sleep(50)
 
-      expect(titleModel.counts().streamCalls).toBe(1)
+      expect(persistence.metadata().chatName).toBe(DEFAULT_CHAT_NAME)
+      expect(persistence.saveCount()).toBe(0)
     } finally {
       await client.dispose()
     }

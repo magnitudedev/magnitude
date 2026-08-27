@@ -63,7 +63,6 @@ export type {
   ToolRejected,
 
   SkillActivated,
-  ChatTitleGenerated,
 
   ImageAttachment,
   MentionOccurrence,
@@ -177,7 +176,7 @@ export { GoalProjection } from './projections/goal'
 export type { GoalState, ActiveGoal, FinishedGoal } from './projections/goal'
 
 export { ChatTitleProjection } from './projections/chat-title'
-export type { ChatTitleState, ChatTitleGeneratedSignal } from './projections/chat-title'
+export type { ChatTitleState, ChatTitleResolvedSignal } from './projections/chat-title'
 
 
 export { TaskGraphProjection, canTransition, isTaskStatus } from './projections/task-graph'
@@ -240,8 +239,6 @@ export { LifecycleCoordinator } from './workers/lifecycle-coordinator'
 export { Autopilot } from './workers/autopilot'
 export type { AutopilotState } from './projections/autopilot-state'
 
-export { ChatTitleServiceTag, ChatTitleServiceLive } from './workers/chat-title-service'
-export type { ChatTitleService } from './workers/chat-title-service'
 export { ChatTitleWorker } from './workers/chat-title-worker'
 
 // Persistence

@@ -741,13 +741,6 @@ export type SkillActivated =
 // Note: SkillStarted and SkillCompleted event types removed.
 // Skills are now activated via the `skill` tool which returns content directly.
 
-export interface ChatTitleGenerated {
-  readonly type: 'chat_title_generated'
-  readonly forkId: null
-  readonly title: string
-  readonly timestamp: number
-}
-
 export type AppEvent =
   | SessionInitialized
   | UserMessage
@@ -798,4 +791,3 @@ export type AppEvent =
   | ShellProcessExited
   | ShellCompleted
   | ShellProcessMetrics
-  | ChatTitleGenerated
