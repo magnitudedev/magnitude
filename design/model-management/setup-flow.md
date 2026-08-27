@@ -198,10 +198,10 @@ When the terminal is shorter than that required height, the setup body scrolls w
 viewport while the setup title, progress indicator, and footer remain fixed. Stacked model details,
 including the radar, therefore remain reachable without changing the chooser's row budgets.
 
-The frame reserves one shared footer position across stages. The chooser presents preference,
-model-navigation, selection, and exit controls together on the bottom hint row; other stages may use
-both footer lines for their own guidance and controls. Changing stages does not move or restyle the
-footer. One empty row is guaranteed immediately before the footer without changing the frame's total height.
+The frame provides a shared fixed footer position for stages whose controls must remain visible while
+their body scrolls. The chooser presents preference, model-navigation, selection, and exit controls
+together on its bottom hint row. One empty row is guaranteed immediately before a fixed footer
+without changing the frame's total height.
 Outside an active download or load, Escape has no setup action: it cannot skip or close setup, leave
 preparation, return from harness selection, or dismiss a retained failure. Setup instead presents
 `Ctrl+C to exit`, which exits the CLI even if hidden chat state would normally guard Ctrl+C.
@@ -231,7 +231,10 @@ The harness stage is one unboxed linear menu containing supported destinations f
 startup and skill toggles. Harness rows are ordinary single-choice rows, not checkbox controls.
 Up and Down traverse every enabled control in that order; unavailable destinations remain visible
 but cannot receive focus. Space changes a focused toggle. Enter from any row continues with the
-currently selected harness and the current toggle values; no separate Continue row is rendered.
+currently selected harness and the current toggle values; clicking an available harness row
+continues with that exact harness and the current toggle values. No separate Continue row is rendered.
+Harness guidance follows the toggles after one empty row instead of occupying the frame's fixed
+footer, so short harness content does not create a large empty visual gap.
 
 An external destination produces `HarnessHandoff` only after selected startup and skill work,
 adapter reconciliation, and durable onboarding completion succeed. The CLI runtime observes this

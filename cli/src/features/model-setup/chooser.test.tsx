@@ -3,7 +3,7 @@ import { testRender } from "@opentui/react/test-utils"
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
-import { ProviderModelIdSchema } from "@magnitudedev/sdk"
+import { ProviderModelIdSchema, type ProviderModelId } from "@magnitudedev/sdk"
 import {
   makeAcquiringModel,
   makeCatalogModel,
@@ -77,6 +77,37 @@ describe("onboarding model chooser identity", () => {
       expect(updates.at(-1)?.fastToSmart).toBeCloseTo(0.25)
       await act(async () => view.mockInput.pressArrow("right"))
       expect(updates.at(-1)?.fastToSmart).toBeCloseTo(0.75)
+    } finally {
+      await act(async () => view.renderer.destroy())
+    }
+  })
+
+  it("selects a model when its row is clicked", async () => {
+    const selected: ProviderModelId[] = []
+    const model = makeCatalogModel()
+    const view = await testRender(
+      <OnboardingModelChooser
+        hardware={Result.success(makeHardware())}
+        options={[{ id: "downloadable:test", kind: "downloadable", model }]}
+        rankingControls={rankingControls}
+        onRankingControlsChange={onRankingControlsChange}
+        width={120}
+        error={null}
+        operation={null}
+        onSelect={(modelId) => { selected.push(modelId) }}
+      />,
+      { width: 120, height: 44 },
+    )
+
+    try {
+      await act(view.renderOnce)
+      const lines = view.captureCharFrame().split("\n")
+      const y = lines.findIndex((line) => line.includes("1. Qwen Test (Q4)"))
+      const x = lines[y]?.indexOf("Qwen Test (Q4)") ?? -1
+      expect(x).toBeGreaterThanOrEqual(0)
+      expect(y).toBeGreaterThanOrEqual(0)
+      await act(async () => view.mockMouse.click(x, y))
+      expect(selected).toEqual([model.modelId])
     } finally {
       await act(async () => view.renderer.destroy())
     }

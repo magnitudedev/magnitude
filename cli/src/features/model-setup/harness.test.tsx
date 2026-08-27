@@ -60,7 +60,9 @@ describe("harness chooser layout", () => {
       expect(frame).toContain("↑/↓ choose · Space toggle · Enter continue · Ctrl+C to exit")
       const lines = frame.split("\n")
       const guidanceRow = lines.findIndex((line) => line.includes("You can change harness connections later"))
+      const lastToggleRow = lines.findIndex((line) => line.includes("Install Magnitude skill to help agents"))
       expect(lines[guidanceRow - 1]?.trim()).toBe("")
+      expect(guidanceRow).toBe(lastToggleRow + 2)
     } finally {
       await act(async () => view.renderer.destroy())
     }
@@ -99,6 +101,33 @@ describe("harness chooser layout", () => {
       act(() => keyboard.handler?.(keyEvent("enter")))
       await act(view.renderOnce)
       expect(onContinue).toHaveBeenCalledTimes(2)
+      expect(onContinue).toHaveBeenCalledWith(expect.objectContaining({ harness: "codex" }))
+    } finally {
+      await act(async () => view.renderer.destroy())
+    }
+  })
+
+  it("continues with a harness when its row is clicked", async () => {
+    const onContinue = vi.fn()
+    const view = await testRender(
+      <HarnessChooser
+        width={120}
+        model={makeModel()}
+        destinations={destinations}
+        applying={null}
+        onContinue={onContinue}
+      />,
+      { width: 120, height: 40 },
+    )
+
+    try {
+      await act(view.renderOnce)
+      const lines = view.captureCharFrame().split("\n")
+      const y = lines.findIndex((line) => line.includes("Codex"))
+      const x = lines[y]?.indexOf("Codex") ?? -1
+      expect(x).toBeGreaterThanOrEqual(0)
+      expect(y).toBeGreaterThanOrEqual(0)
+      await act(async () => view.mockMouse.click(x, y))
       expect(onContinue).toHaveBeenCalledWith(expect.objectContaining({ harness: "codex" }))
     } finally {
       await act(async () => view.renderer.destroy())

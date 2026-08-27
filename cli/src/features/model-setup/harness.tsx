@@ -45,9 +45,10 @@ export function HarnessChooser({
   const focusedItem = items[focusedIndex] ?? items[0]
   const selectedRow = destinations.find((row) => row.id === selected) ?? destinations[0]
   const locked = applying !== null
-  const submit = useCallback(() => {
-    if (!locked && selectedRow.selectable) onContinue({ harness: selectedRow.id, launchOnStartup, installSkill })
-  }, [installSkill, launchOnStartup, locked, onContinue, selectedRow])
+  const submit = useCallback((harness: HarnessId = selectedRow.id) => {
+    const row = destinations.find((destination) => destination.id === harness)
+    if (!locked && row?.selectable) onContinue({ harness, launchOnStartup, installSkill })
+  }, [destinations, installSkill, launchOnStartup, locked, onContinue, selectedRow.id])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (locked) return
@@ -84,18 +85,18 @@ export function HarnessChooser({
       && (candidate._tag !== "Harness" || item._tag !== "Harness" || candidate.harness === item.harness))
     if (index >= 0) setFocusedIndex(index)
   }, [items])
+  const chooseHarness = useCallback((row: HarnessDestination) => {
+    if (!row.selectable || locked) return
+    setSelected(row.id)
+    focusItem({ _tag: "Harness", harness: row.id })
+    submit(row.id)
+  }, [focusItem, locked, submit])
 
   return (
     <SetupFrame
       width={width}
       stage="harness"
       additionalRows={additionalRows}
-      footer={(
-        <>
-          <text style={{ fg: theme.text.guidance }} wrapMode="none">You can change harness connections later with magnitude connections.</text>
-          <text style={{ fg: theme.text.supporting }} wrapMode="none">↑/↓ choose · Space toggle · Enter continue · Ctrl+C to exit</text>
-        </>
-      )}
     >
       <text style={{ fg: theme.text.body }} attributes={TextAttributes.BOLD}>
         Where do you want to use {formatLocalModelDisplayName(model)}?
@@ -106,7 +107,7 @@ export function HarnessChooser({
           const item = { _tag: "Harness" as const, harness: row.id }
           const focused = focusedItem?._tag === "Harness" && focusedItem.harness === row.id
           return (
-            <Button key={row.id} cursor={row.selectable ? "pointer" : "default"} onMouseOver={() => { if (row.selectable) { setSelected(row.id); focusItem(item) } }} onClick={() => { if (row.selectable) { setSelected(row.id); focusItem(item) } }}>
+            <Button key={row.id} cursor={row.selectable && !locked ? "pointer" : "default"} onMouseOver={() => { if (row.selectable && !locked) { setSelected(row.id); focusItem(item) } }} onClick={() => chooseHarness(row)}>
               <text style={{ fg: !row.selectable ? theme.text.disabled : focused ? theme.accent : theme.text.body }} attributes={focused ? TextAttributes.BOLD : TextAttributes.NONE}>
                 {focused ? "› " : "  "}{row.name}
                 {row.note ? <span fg={theme.accent}>{`  ${row.note}`}</span> : null}
@@ -123,6 +124,9 @@ export function HarnessChooser({
       <Button onMouseOver={() => focusItem({ _tag: "InstallSkill" })} onClick={() => { focusItem({ _tag: "InstallSkill" }); setInstallSkill((value) => !value) }}>
         <text style={{ fg: focusedItem?._tag === "InstallSkill" ? theme.accent : theme.text.body }}>{focusedItem?._tag === "InstallSkill" ? "› " : "  "}{installSkill ? "[x]" : "[ ]"} Install Magnitude skill to help agents manage local models</text>
       </Button>
+      <box style={{ height: 1, minHeight: 1, flexShrink: 0 }} />
+      <text style={{ fg: theme.text.guidance }} wrapMode="none">You can change harness connections later with magnitude connections.</text>
+      <text style={{ fg: theme.text.supporting }} wrapMode="none">↑/↓ choose · Space toggle · Enter continue · Ctrl+C to exit</text>
     </SetupFrame>
   )
 }
