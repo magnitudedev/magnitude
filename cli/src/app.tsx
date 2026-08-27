@@ -295,7 +295,6 @@ function CliAppContent(
   const setupOnboardingModel = onboardingSetup.select;
   const cancelOnboardingModelSetup = onboardingSetup.cancel;
   const chooseAnotherOnboardingModel = onboardingSetup.chooseAnother;
-  const exitOnboardingModelSetup = onboardingSetup.exit;
   const slotActions = useModelSlotActions();
   const chatColumn = useLocalWidth();
   const chatColumnWidth = chatColumn.width ?? 80;
@@ -321,12 +320,12 @@ function CliAppContent(
   useTerminalKeyboard({
     dispatchErrorAction,
     recentChatsEnabled: !props.onboardingSetupOpen,
+    setupActive: props.onboardingSetupOpen,
   });
 
   const setupPreparation = (
     progress: LocalModelsState["discoveryState"]["progress"],
     error: string | null,
-    exitKind: "Skip" | "Close" | null,
   ) => ({
     surface: (
       <OnboardingModelPreparation
@@ -334,8 +333,6 @@ function CliAppContent(
         progress={progress}
         error={error}
         width={chatColumnWidth}
-        onExit={exitKind === null ? undefined : exitOnboardingModelSetup}
-        exitKind={exitKind}
       />
     ),
     placeholder: "Preparing local models…",
@@ -367,7 +364,6 @@ function CliAppContent(
           notice,
           () => content.discoveryFailure?.message ?? null,
         ),
-        state.exitKind,
       );
     }
     if (state.content._tag === "Harness") {
@@ -379,7 +375,6 @@ function CliAppContent(
             model={state.content.model}
             destinations={state.content.destinations}
             applying={null}
-            onBack={onboardingSetup.back}
             onContinue={onboardingSetup.continueWithHarness}
           />
         ),
@@ -426,8 +421,6 @@ function CliAppContent(
           error={setupError}
           operation={operation}
           onSelect={setupOnboardingModel}
-          onExit={exitOnboardingModelSetup}
-          exitKind={state.exitKind}
         />
       ),
       placeholder,
@@ -497,8 +490,8 @@ function CliAppContent(
   const setupPresentation = !props.onboardingSetupOpen
     ? { surface: undefined, placeholder: null }
     : Result.match(onboardingSetup.view, {
-        onInitial: () => setupPreparation([], null, null),
-        onFailure: () => setupPreparation([], "Local model setup is unavailable.", null),
+        onInitial: () => setupPreparation([], null),
+        onFailure: () => setupPreparation([], "Local model setup is unavailable."),
         onSuccess: ({ value }) => setupWithState(value),
       });
   const setupSurface = setupPresentation.surface;

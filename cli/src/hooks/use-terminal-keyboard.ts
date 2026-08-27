@@ -26,20 +26,23 @@ import type { ActionId } from '../types/ui-actions'
 export interface TerminalKeyboardParams {
   dispatchErrorAction: (actionId: ActionId) => void
   recentChatsEnabled?: boolean
+  setupActive?: boolean
 }
 
 export function shouldExitOnCtrlC(input: {
   readonly overlayActive: boolean
+  readonly setupActive: boolean
   readonly composerHasContent: boolean
   readonly rootMode: string
 }): boolean {
-  if (input.overlayActive) return true
+  if (input.overlayActive || input.setupActive) return true
   return !input.composerHasContent && input.rootMode !== 'streaming'
 }
 
 export function useTerminalKeyboard({
   dispatchErrorAction,
   recentChatsEnabled = true,
+  setupActive = false,
 }: TerminalKeyboardParams): void {
   const composerHasContent = useAtomValue(composerHasContentAtom)
   const { expandedForkStack } = useDisplayViewController()
@@ -76,7 +79,7 @@ export function useTerminalKeyboard({
       const isCtrlR = key.ctrl && key.name === 'r' && !key.meta && !key.option
 
       if (isCtrlC) {
-        if (!shouldExitOnCtrlC({ overlayActive, composerHasContent, rootMode })) return
+        if (!shouldExitOnCtrlC({ overlayActive, setupActive, composerHasContent, rootMode })) return
         key.preventDefault()
         process.kill(process.pid, 'SIGINT')
         return
@@ -99,6 +102,7 @@ export function useTerminalKeyboard({
     }, [
       composerHasContent,
       rootMode,
+      setupActive,
       canToggleRecentChats,
       overlayActive,
       latestErrorCta,

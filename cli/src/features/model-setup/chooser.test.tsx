@@ -55,8 +55,6 @@ describe("onboarding model chooser identity", () => {
         error={null}
         operation={null}
         onSelect={() => undefined}
-        onExit={() => undefined}
-        exitKind="Skip"
       />,
       { width: 120, height: 44 },
     )
@@ -65,7 +63,8 @@ describe("onboarding model chooser identity", () => {
       await act(view.renderOnce)
       const frame = view.captureCharFrame()
       expect(frame).toContain("Fastest   Faster   Balanced   Smarter  Smartest")
-      expect(frame).toContain("┤    ←/→ change preference")
+      expect(frame).not.toContain("┤    ←/→ change preference")
+      expect(frame).toContain("←/→ change preferences · ↑/↓ choose models · Enter to download · Ctrl+C to exit")
       const fastTrack = frame.split("\n")
         .find((line) => line.includes("┼"))
         ?.match(/[├┤┼─]+/)?.[0]
@@ -100,8 +99,6 @@ describe("onboarding model chooser identity", () => {
           error={null}
           operation={null}
           onSelect={() => undefined}
-          onExit={() => undefined}
-          exitKind="Skip"
         />
       )
     }
@@ -160,8 +157,6 @@ describe("onboarding model chooser identity", () => {
         error={null}
         operation={null}
         onSelect={() => undefined}
-        onExit={() => undefined}
-        exitKind="Skip"
       />,
       { width: 60, height: 70 },
     )
@@ -173,10 +168,66 @@ describe("onboarding model chooser identity", () => {
       expect(lines).toContain("● Choose model")
       expect(lines).toContain("○ Install model")
       expect(lines).toContain("○ Select harness")
-      expect(lines).toContain("←/→ change preference")
-      expect(lines.some((line) => line.startsWith("You can switch models"))).toBe(true)
-      expect(lines).toContain("↑/↓ choose · Enter to download · Esc skip for now")
+      expect(lines).not.toContain("←/→ change preference")
+      expect(lines.some((line) => line.startsWith("You can switch models"))).toBe(false)
+      expect(lines).toContain("←→ prefs · ↑↓ models · Enter download · Ctrl+C to exit")
       expect(lines.find((line) => line.includes("Fastest"))).not.toContain("─")
+    } finally {
+      await act(async () => view.renderer.destroy())
+    }
+  })
+
+  it("keeps setup steps horizontal when the chooser stacks but the steps still fit", async () => {
+    const view = await testRender(
+      <OnboardingModelChooser
+        hardware={Result.success(makeHardware())}
+        options={[{ id: "downloadable:test", kind: "downloadable", model: makeCatalogModel() }]}
+        rankingControls={rankingControls}
+        onRankingControlsChange={onRankingControlsChange}
+        width={80}
+        error={null}
+        operation={null}
+        onSelect={() => undefined}
+      />,
+      { width: 80, height: 50 },
+    )
+
+    try {
+      await act(view.renderOnce)
+      const stepperLine = view.captureCharFrame().split("\n")
+        .find((line) => line.includes("Choose model"))
+      expect(stepperLine).toContain("Install model")
+      expect(stepperLine).toContain("Select harness")
+    } finally {
+      await act(async () => view.renderer.destroy())
+    }
+  })
+
+  it("scrolls stacked model details into view in a short terminal", async () => {
+    const view = await testRender(
+      <OnboardingModelChooser
+        hardware={Result.success(makeHardware())}
+        options={[{ id: "downloadable:test", kind: "downloadable", model: makeCatalogModel() }]}
+        rankingControls={rankingControls}
+        onRankingControlsChange={onRankingControlsChange}
+        width={60}
+        error={null}
+        operation={null}
+        onSelect={() => undefined}
+      />,
+      { width: 60, height: 20 },
+    )
+
+    try {
+      await act(view.renderOnce)
+      expect(view.captureCharFrame()).not.toContain("INTELLIGENCE")
+      await act(async () => {
+        for (let step = 0; step < 12; step += 1) {
+          await view.mockMouse.scroll(55, 9, "down", { delayMs: 0 })
+        }
+      })
+      await act(view.renderOnce)
+      expect(view.captureCharFrame()).toContain("INTELLIGENCE")
     } finally {
       await act(async () => view.renderer.destroy())
     }
@@ -208,8 +259,6 @@ describe("onboarding model chooser identity", () => {
           error={null}
           operation={null}
           onSelect={() => undefined}
-          onExit={() => undefined}
-          exitKind="Skip"
         />
       )
     }
@@ -239,8 +288,6 @@ describe("onboarding model chooser identity", () => {
         error={null}
         operation={null}
         onSelect={() => undefined}
-        onExit={() => undefined}
-        exitKind="Skip"
       />,
       { width: 120, height: 40 },
     )
@@ -272,8 +319,6 @@ describe("onboarding model chooser identity", () => {
         error={null}
         operation={{ _tag: "Configuring", model }}
         onSelect={() => undefined}
-        onExit={() => undefined}
-        exitKind="Skip"
       />,
       { width: 120, height: 40 },
     )
@@ -312,8 +357,6 @@ describe("onboarding model chooser identity", () => {
           onChooseAnother: () => undefined,
         }}
         onSelect={() => undefined}
-        onExit={() => undefined}
-        exitKind="Skip"
       />,
       { width: 120, height: 40 },
     )
@@ -385,8 +428,6 @@ describe("onboarding model chooser identity", () => {
           onChooseAnother: () => { chooseAnother += 1 },
         }}
         onSelect={() => undefined}
-        onExit={() => undefined}
-        exitKind="Close"
       />,
       { width: 120, height: 44 },
     )
@@ -404,10 +445,10 @@ describe("onboarding model chooser identity", () => {
         view.mockInput.pressEscape()
         await new Promise((resolve) => setTimeout(resolve, 25))
       })
-      expect(chooseAnother).toBe(1)
+      expect(chooseAnother).toBe(0)
       await act(async () => view.mockInput.pressArrow("right"))
       await act(async () => view.mockInput.pressEnter())
-      expect(chooseAnother).toBe(2)
+      expect(chooseAnother).toBe(1)
       await act(async () => view.mockInput.pressArrow("left"))
       await act(async () => view.mockInput.pressEnter())
       expect(retries).toBe(1)
@@ -416,7 +457,7 @@ describe("onboarding model chooser identity", () => {
     }
   })
 
-  it("places unexpected setup errors below both footer hints", async () => {
+  it("places unexpected setup errors below the combined footer hint", async () => {
     const view = await testRender(
       <OnboardingModelChooser
         hardware={Result.success(makeHardware())}
@@ -427,8 +468,6 @@ describe("onboarding model chooser identity", () => {
         error="Unexpected error loading Qwen Test (Q4) · Worker exited before initialization."
         operation={null}
         onSelect={() => undefined}
-        onExit={() => undefined}
-        exitKind="Close"
       />,
       { width: 120, height: 44 },
     )
@@ -437,7 +476,7 @@ describe("onboarding model chooser identity", () => {
       await act(view.renderOnce)
       const frame = view.captureCharFrame()
       expect(frame.indexOf("Unexpected error loading Qwen Test (Q4)"))
-        .toBeGreaterThan(frame.indexOf("↑/↓ choose · Enter to download · Esc close setup"))
+        .toBeGreaterThan(frame.indexOf("←/→ change preferences · ↑/↓ choose models · Enter to download · Ctrl+C to exit"))
     } finally {
       await act(async () => view.renderer.destroy())
     }
@@ -469,8 +508,6 @@ describe("onboarding model chooser identity", () => {
           onCancel: () => undefined,
         }}
         onSelect={() => undefined}
-        onExit={() => undefined}
-        exitKind="Skip"
       />,
       { width: 120, height: 40 },
     )
@@ -500,8 +537,6 @@ describe("onboarding model chooser identity", () => {
         error={null}
         operation={null}
         onSelect={() => undefined}
-        onExit={() => undefined}
-        exitKind="Skip"
       />,
       { width: 120, height: 40 },
     )
@@ -528,8 +563,6 @@ describe("onboarding model chooser identity", () => {
         error={null}
         operation={null}
         onSelect={() => undefined}
-        onExit={() => undefined}
-        exitKind="Skip"
       />,
       { width: 120, height: 44 },
     )
@@ -540,6 +573,37 @@ describe("onboarding model chooser identity", () => {
       expect(frame).toMatch(/1\. Qwen Test \(Q4\).*Load/)
       const installedSection = frame.slice(frame.indexOf("ON THIS COMPUTER"))
       expect(installedSection).toMatch(/Qwen Test \(Q4\).*Load/)
+    } finally {
+      await act(async () => view.renderer.destroy())
+    }
+  })
+
+  it("omits Download from downloadable rows and gives the space to the model name", async () => {
+    const model = makeRankedCatalogModel(
+      "long-downloadable",
+      "A Downloadable Model Name That Uses The Reclaimed Space",
+      { intelligence: 0.7, speed: 0.7, fidelity: 0.7 },
+    )
+    const view = await testRender(
+      <OnboardingModelChooser
+        hardware={Result.success(makeHardware())}
+        options={[{ id: "downloadable:long", kind: "downloadable", model }]}
+        rankingControls={rankingControls}
+        onRankingControlsChange={onRankingControlsChange}
+        width={120}
+        error={null}
+        operation={null}
+        onSelect={() => undefined}
+      />,
+      { width: 120, height: 44 },
+    )
+
+    try {
+      await act(view.renderOnce)
+      const modelLine = view.captureCharFrame().split("\n")
+        .find((line) => line.includes("A Downloadable Model Name"))
+      expect(modelLine).toContain("A Downloadable Model Name That")
+      expect(modelLine).not.toMatch(/\sDownload\s*$/)
     } finally {
       await act(async () => view.renderer.destroy())
     }
@@ -567,8 +631,6 @@ describe("onboarding model chooser identity", () => {
         error={null}
         operation={null}
         onSelect={() => undefined}
-        onExit={() => undefined}
-        exitKind="Skip"
       />,
       { width: 120, height: 44 },
     )
@@ -662,6 +724,13 @@ describe("onboarding model chooser identity", () => {
     expect(selections).toHaveLength(1)
     expect(installedSelection && onboardingModelActionLabel(installedSelection))
       .toBe("Load")
+  })
+
+  it("omits an action label for a downloadable model", () => {
+    const model = makeCatalogModel()
+    const selection = { id: "downloadable:test", kind: "downloadable", model } as const
+
+    expect(onboardingModelActionLabel(selection)).toBeNull()
   })
 
   it("scrolls by presentation identity without copying model fields", () => {

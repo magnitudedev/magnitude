@@ -22,7 +22,6 @@ export function HarnessChooser({
   model,
   destinations,
   applying,
-  onBack,
   onContinue,
 }: {
   readonly width: number
@@ -30,7 +29,6 @@ export function HarnessChooser({
   readonly model: LocalModel
   readonly destinations: ReadonlyArray<HarnessDestination>
   readonly applying: HarnessId | null
-  readonly onBack: () => void
   readonly onContinue: (input: { harness: HarnessId; launchOnStartup: boolean; installSkill: boolean }) => void
 }): ReactNode {
   const theme = useTheme()
@@ -53,7 +51,6 @@ export function HarnessChooser({
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (locked) return
-    if (key.name === "escape") { key.preventDefault(); onBack(); return }
     if (key.name === "up" || key.name === "k") {
       key.preventDefault()
       const nextIndex = Math.max(0, focusedIndex - 1)
@@ -80,7 +77,7 @@ export function HarnessChooser({
       key.preventDefault()
       submit()
     }
-  }, [focusedIndex, focusedItem, items, locked, onBack, submit]))
+  }, [focusedIndex, focusedItem, items, locked, submit]))
 
   const focusItem = useCallback((item: HarnessChooserItem) => {
     const index = items.findIndex((candidate) => candidate._tag === item._tag
@@ -96,7 +93,7 @@ export function HarnessChooser({
       footer={(
         <>
           <text style={{ fg: theme.text.guidance }} wrapMode="none">You can change harness connections later with magnitude connections.</text>
-          <text style={{ fg: theme.text.supporting }} wrapMode="none">↑/↓ choose · Space toggle · Enter continue · Esc back</text>
+          <text style={{ fg: theme.text.supporting }} wrapMode="none">↑/↓ choose · Space toggle · Enter continue · Ctrl+C to exit</text>
         </>
       )}
     >

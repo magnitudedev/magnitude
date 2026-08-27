@@ -114,9 +114,9 @@ const scrollOnboardingModelPastOverflowIndicators = (
   }
 }
 
-export const onboardingModelActionLabel = (selection: LocalInferenceSelection): string => {
+export const onboardingModelActionLabel = (selection: LocalInferenceSelection): string | null => {
   if (selection.kind === "running") return "Loaded"
-  if (selection.kind === "downloadable") return "Download"
+  if (selection.kind === "downloadable") return null
   return "Load"
 }
 
@@ -158,7 +158,8 @@ const ModelRow = ({
   const markerWidth = 2
   const rankLabel = rank === undefined ? "" : `${rank}. `
   const gap = 2
-  const nameWidth = Math.max(1, width - markerWidth - rankLabel.length - gap - action.length - 1)
+  const actionWidth = action === null ? 0 : gap + action.length
+  const nameWidth = Math.max(1, width - markerWidth - rankLabel.length - actionWidth - 1)
   return (
     <Button
       id={rowId}
@@ -175,14 +176,18 @@ const ModelRow = ({
         {selected ? "› " : "  "}
         {rankLabel.length > 0 && <span fg={theme.text.detail}>{rankLabel}</span>}
         {truncateToDisplayWidth(onboardingModelRowName(selection), nameWidth).padEnd(nameWidth)}
-        {"  "}
-        <span fg={selection.kind === "running"
-          ? theme.status.success
-          : selection.kind === "downloadable" || selected
-            ? theme.accent
-            : theme.text.supporting}>
-          {action}
-        </span>
+        {action !== null && (
+          <>
+            {"  "}
+            <span fg={selection.kind === "running"
+              ? theme.status.success
+              : selected
+                ? theme.accent
+                : theme.text.supporting}>
+              {action}
+            </span>
+          </>
+        )}
       </text>
     </Button>
   )
@@ -498,8 +503,6 @@ export function OnboardingModelChooser({
   error,
   operation,
   onSelect,
-  onExit,
-  exitKind,
 }: {
   readonly hardware: LocalInferenceHardwareResult
   readonly options: readonly LocalModelOption[]
@@ -509,8 +512,6 @@ export function OnboardingModelChooser({
   readonly error: string | null
   readonly operation: OnboardingModelChooserOperation | null
   readonly onSelect: (modelId: ProviderModelId) => void
-  readonly onExit: () => void
-  readonly exitKind: "Skip" | "Close"
 }): ReactNode {
   const theme = useTheme()
   const maximumMemoryBytes = Result.isSuccess(hardware)
@@ -659,11 +660,7 @@ export function OnboardingModelChooser({
       choose(cursorSelection)
       return
     }
-    if (key.name === "escape") {
-      key.preventDefault()
-      onExit()
-    }
-  }, [activeCursorIndex, adjustControl, choose, locked, moveCursorTo, onExit, selections]))
+  }, [activeCursorIndex, adjustControl, choose, locked, moveCursorTo, selections]))
 
   const list = (
     <box style={{ width: wide ? leftWidth : "100%", flexDirection: "column", paddingRight: wide ? 1 : 0 }}>
@@ -827,10 +824,11 @@ export function OnboardingModelChooser({
     </box>
   )
   const enterAction = onboardingSelectionEnterAction(selected?.kind)
-  const exitHint = exitKind === "Close" ? "close setup" : "skip for now"
   const selectionHint = enterAction === null
-    ? `Esc ${exitHint}`
-    : `↑/↓ choose · Enter to ${enterAction} · Esc ${exitHint}`
+    ? "←/→ change preferences · Ctrl+C to exit"
+    : wide
+      ? `←/→ change preferences · ↑/↓ choose models · Enter to ${enterAction} · Ctrl+C to exit`
+      : `←→ prefs · ↑↓ models · Enter ${enterAction} · Ctrl+C to exit`
   const interactionHint = operation?._tag === "Downloading"
       ? operation.starting
         ? "Starting download…"
@@ -862,12 +860,7 @@ export function OnboardingModelChooser({
       stage={operation === null ? "choose" : "install"}
       hardware={hardware}
       unexpectedError={error}
-      footer={(
-        <>
-          <text style={{ fg: theme.text.guidance }} wrapMode="none">You can switch models or download more anytime from /settings.</text>
-          <text style={{ fg: theme.text.supporting }} wrapMode="none">{interactionHint}</text>
-        </>
-      )}
+      footer={<text style={{ fg: theme.text.supporting }} wrapMode="none">{interactionHint}</text>}
     >
       {operation === null
         ? (
@@ -891,12 +884,6 @@ export function OnboardingModelChooser({
                       : ""}
                   </Fragment>
                 ))}
-                {wide && (
-                  <>
-                    {"    "}
-                    <span fg={theme.text.disabled}>←/→ change preference</span>
-                  </>
-                )}
               </text>
               <text selectable={false} style={{ fg: theme.text.body }} wrapMode="none">
                 {FAST_TO_SMART_LABEL_LAYOUT.map(({ label, leadingSpaces }, index) => (
@@ -906,13 +893,7 @@ export function OnboardingModelChooser({
                   </Fragment>
                 ))}
               </text>
-              {wide ? (
-                <box style={{ height: 1, minHeight: 1, maxHeight: 1, flexShrink: 0 }} />
-              ) : (
-                <text selectable={false} style={{ fg: theme.text.disabled }} wrapMode="none">
-                  {" ".repeat(FAST_TO_SMART_TRACK_LEFT_PADDING)}←/→ change preference
-                </text>
-              )}
+              <box style={{ height: 1, minHeight: 1, maxHeight: 1, flexShrink: 0 }} />
             </box>
           )
         : operation._tag === "Downloading"
@@ -955,15 +936,11 @@ export function OnboardingModelPreparation({
   progress,
   error,
   width,
-  onExit,
-  exitKind,
 }: {
   readonly hardware: LocalInferenceHardwareResult
   readonly progress: readonly LocalModelDiscoveryProgressStep[]
   readonly error: string | null
   readonly width: number
-  readonly onExit: (() => void) | undefined
-  readonly exitKind: "Skip" | "Close" | null
 }): ReactNode {
   const theme = useTheme()
   const lines = localInferenceProgressLines(progress)
@@ -972,12 +949,6 @@ export function OnboardingModelPreparation({
     Result.isInitial(hardware)
       || lines.some(({ state }) => state === "running"),
   )
-  useKeyboard(useCallback((key: KeyEvent) => {
-    if (key.name === "escape" && onExit !== undefined) {
-      key.preventDefault()
-      onExit()
-    }
-  }, [onExit]))
   return (
     <OnboardingSetupCard
       width={width}
@@ -985,11 +956,7 @@ export function OnboardingModelPreparation({
       title="Preparing local models"
       hardware={hardware}
       spinnerFrame={spinner}
-      footer={exitKind === null ? undefined : (
-        <text style={{ fg: theme.text.supporting }}>
-          {exitKind === "Close" ? "Esc close setup" : "Esc skip for now"}
-        </text>
-      )}
+      footer={<text style={{ fg: theme.text.supporting }}>Ctrl+C to exit</text>}
     >
       {lines.map((line) => (
         <text key={line.id} style={{ fg: line.state === "pending" ? theme.text.supporting : theme.text.body }}>
