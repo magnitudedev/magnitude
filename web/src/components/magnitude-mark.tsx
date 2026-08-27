@@ -1,5 +1,5 @@
 import type { ReactNode } from "react"
-import magnitudeMarkUrl from "../../../assets/brand/magnitude-mark.svg"
+import magnitudeMarkUrl from "../../../assets/brand/icon-light.svg"
 
 export function MagnitudeMark({
   className,
