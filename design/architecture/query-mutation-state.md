@@ -126,16 +126,17 @@ When submitted input completely determines an immediate user-facing value, prese
 project the latest pending mutation over the authoritative query result. This optimistic value is
 a derived view of command intent, not copied server state and not a query-cache write. Rejection
 removes the pending projection and reveals the unchanged query value. Successful synchronization
-invalidates affected query entries before publishing mutation success. The next observation reads
-the owner's committed value; it does not poll the query to prove an acknowledgement the owner has
-already made.
+makes affected query entries stale before publishing mutation success. When the caller immediately
+continues from that state, synchronization also awaits one fresh read of the owner's
+already-committed value; it never polls a domain predicate to prove the acknowledgement.
 
 The command owner defines the acknowledgement boundary. A committed command returns only after
 its durable or in-memory owner state has been updated. An admitted long-running command returns
 after the external owner accepts the exact occurrence; later progress arrives through ordinary
-resource observation. The client-side synchronization hook only invalidates affected queries. It
-does not perform a post-mutation proof read, retry a domain predicate, or create a second completion
-protocol.
+resource observation. The client-side synchronization hook invalidates affected queries and may
+await their replacement snapshot when immediate cache consistency is part of the client operation.
+It does not perform a post-mutation proof read, retry a domain predicate, or create a second
+completion protocol.
 
 ### Client-side services
 
@@ -413,7 +414,10 @@ It is never represented by a singleton `installingId`, `busy`, or error side cha
 
 Mutation success includes invalidation of every canonical query whose visibility may have changed.
 The command owner, not a client reread, defines acknowledgement: a committed command returns after
-its owner commit; a command admitting a download or instance returns the exact admitted identity.
+its owner commit. An instance command may return its exact admitted identity. Model sync is instead
+model-addressed at the client boundary: ACN retains the exact native occurrence returned by ICN,
+publishes the post-admission `LocalModel.acquisitionState`, and exposes neither that occurrence nor
+its identity to the client.
 Progress, physical completion, and serving readiness remain authoritative query state. Mutation
 synchronization never polls a query until it appears to prove the command response.
 

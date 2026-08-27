@@ -119,25 +119,10 @@ describe("unified models menu projection", () => {
     expect(catalogLocalModels(models)).toEqual([catalogFit])
   })
 
-  it("shows download admission before mirrored acquisition begins", () => {
-    expect(catalogStatus(makeCatalogOnlyModel(), {
-      _tag: "Starting",
-      operation: "Install",
-    })).toBe("Starting download…")
-    expect(catalogStatus(withUpdateAvailable(makeModel()), {
-      _tag: "Starting",
-      operation: "Update",
-    })).toBe("Starting update…")
-  })
-
   it("prefers authoritative download progress once it is visible", () => {
     expect(catalogStatus({
       ...makeCatalogOnlyModel(),
       acquisitionState: { _tag: "Installing", progress: testProgress },
-    }, {
-      _tag: "Transferring",
-      operation: "Install",
-      progress: testProgress,
     })).toBe("Downloading 25%")
   })
 
@@ -154,16 +139,12 @@ describe("unified models menu projection", () => {
       acquisitionState: { _tag: "Installing", progress: testProgress },
     })
 
-    expect(catalogInspectorActions(available, { _tag: "Idle" })).toEqual(["primary"])
-    expect(catalogInspectorActions(installed, { _tag: "Idle" })).toEqual(["select", "uninstall"])
-    expect(catalogInspectorActions(update, { _tag: "Idle" })).toEqual(["select", "primary", "uninstall"])
-    expect(catalogInspectorActions(installed, { _tag: "Idle" }, true, selectedSlot)).toEqual(["stop", "uninstall"])
-    expect(catalogInspectorActions(update, { _tag: "Idle" }, true, selectedSlot)).toEqual(["stop", "primary", "uninstall"])
-    expect(catalogInspectorActions(downloading, { _tag: "Idle" })).toEqual(["cancel"])
-    expect(catalogInspectorActions(available, {
-      _tag: "Starting",
-      operation: "Install",
-    })).toEqual([])
+    expect(catalogInspectorActions(available)).toEqual(["primary"])
+    expect(catalogInspectorActions(installed)).toEqual(["select", "remove"])
+    expect(catalogInspectorActions(update)).toEqual(["select", "primary", "remove"])
+    expect(catalogInspectorActions(installed, true, selectedSlot)).toEqual(["stop", "remove"])
+    expect(catalogInspectorActions(update, true, selectedSlot)).toEqual(["stop", "primary", "remove"])
+    expect(catalogInspectorActions(downloading)).toEqual(["cancel"])
     expect(catalogInspectorActionLabel("primary", available)).toBe("Download")
     expect(catalogInspectorActionLabel("primary", update)).toBe("Update")
     expect(catalogInspectorActionLabel("select", installed)).toBe("Select model")
@@ -312,10 +293,6 @@ describe("unified models menu projection", () => {
     expect(localModelReadinessStatus(withUpdateAvailable(makeModel()))).toBe("Update available")
     const model = withUpdating(makeModel())
     expect(localModelReadinessStatus(model)).toBe("Updating")
-    expect(catalogStatus(model, {
-      _tag: "Transferring",
-      operation: "Update",
-      progress: testProgress,
-    })).toBe("Updating 25%")
+    expect(catalogStatus(model)).toBe("Updating 25%")
   })
 })

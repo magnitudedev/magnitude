@@ -32,7 +32,6 @@ import {
   usePreviewModelLoad,
   useModelConfig,
   useSettingsState,
-  type CatalogModelReconciliationState,
 } from "@magnitudedev/client-common"
 import {
   PRIMARY_SLOT_ID,
@@ -42,6 +41,7 @@ import {
   installedAcquisition,
   servableModelBundlePackages,
   type LocalModel,
+  type LocalModelAcquisitionState,
   type ModelSlotsState,
   type ProviderCatalogEntry,
   type ProviderModelDisabledReason,
@@ -1211,22 +1211,15 @@ export const huggingFaceRepositoryUrls = (
 
 export const catalogStatus = (
   model: LocalModel,
-  reconciliationState: CatalogModelReconciliationState = { _tag: "Idle" },
+  acquisitionState: LocalModelAcquisitionState = model.acquisitionState,
 ): string => {
-  if (reconciliationState._tag === "Removing") return "Removing…"
-  if (reconciliationState._tag === "RemoveFailed") return "Remove failed"
-  if (reconciliationState._tag === "Transferring") {
-    const verb = reconciliationState.operation === "Update" ? "Updating" : "Downloading"
-    return `${verb} ${Math.round(reconciliationState.progress.completedBytes
-      / Math.max(1, reconciliationState.progress.totalBytes) * 100)}%`
+  if (acquisitionState._tag === "Removing") return "Removing…"
+  if (acquisitionState._tag === "RemoveFailed") return "Remove failed"
+  if (acquisitionState._tag === "Installing" || acquisitionState._tag === "Updating") {
+    const verb = acquisitionState._tag === "Updating" ? "Updating" : "Downloading"
+    return `${verb} ${Math.round(acquisitionState.progress.completedBytes
+      / Math.max(1, acquisitionState.progress.totalBytes) * 100)}%`
   }
-  if (reconciliationState._tag === "Starting") {
-    return reconciliationState.operation === "Update" ? "Starting update…" : "Starting download…"
-  }
-  if (reconciliationState._tag === "Failed") {
-    return reconciliationState.operation === "Update" ? "Update failed" : "Download failed"
-  }
-  const acquisitionState = model.acquisitionState
   if (acquisitionState._tag === "UpdateAvailable") return "Update available"
   if (acquisitionState._tag === "UpdateFailed") return "Update failed"
   if (acquisitionState._tag === "NotInstalled") return "Available"
@@ -1245,7 +1238,7 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
   focused,
   selected,
   pendingDelete,
-  reconciliationState,
+  acquisitionState,
   index,
   layout,
   rowId,
@@ -1258,7 +1251,7 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
   readonly focused: boolean
   readonly selected: boolean
   readonly pendingDelete: boolean
-  readonly reconciliationState: CatalogModelReconciliationState
+  readonly acquisitionState: LocalModelAcquisitionState
   readonly index: number
   readonly layout: CatalogLayout
   readonly rowId: string
@@ -1268,16 +1261,17 @@ const CatalogCandidateRow = memo(function CatalogCandidateRow({
   const theme = useTheme()
   const status = pendingDelete
     ? "Remove? ↵/Esc"
-    : catalogStatus(model, reconciliationState)
+    : catalogStatus(model, acquisitionState)
   const statusColor = pendingDelete
     ? theme.status.warning
     : model.acquisitionState._tag === "InstallFailed"
-      || reconciliationState._tag === "Failed"
-      || reconciliationState._tag === "RemoveFailed"
+      || acquisitionState._tag === "InstallFailed"
+      || acquisitionState._tag === "UpdateFailed"
+      || acquisitionState._tag === "RemoveFailed"
       ? theme.status.failure
-      : reconciliationState._tag === "Starting"
-        || reconciliationState._tag === "Transferring"
-        || reconciliationState._tag === "Removing"
+      : acquisitionState._tag === "Installing"
+        || acquisitionState._tag === "Updating"
+        || acquisitionState._tag === "Removing"
         || model.acquisitionState._tag === "Installing"
         || model.acquisitionState._tag === "Installed"
         ? theme.accent
@@ -1339,7 +1333,7 @@ export type CatalogInspectorActionId =
   | "cancel"
   | "load"
   | "stop"
-  | "uninstall"
+  | "remove"
 
 type CatalogPrimarySlot = ModelSlotsState["slots"]["primary"]
 
@@ -1366,15 +1360,12 @@ const catalogSlotForModel = (
 
 export const catalogInspectorActions = (
   model: LocalModel,
-  reconciliationState: CatalogModelReconciliationState,
   selected = false,
   selectedSlot: CatalogPrimarySlot | null = null,
 ): readonly CatalogInspectorActionId[] => {
-  if (reconciliationState._tag === "Removing") return []
-  if (reconciliationState._tag === "Transferring"
-    || model.acquisitionState._tag === "Installing"
+  if (model.acquisitionState._tag === "Removing") return []
+  if (model.acquisitionState._tag === "Installing"
     || model.acquisitionState._tag === "Updating") return ["cancel"]
-  if (reconciliationState._tag === "Starting") return []
   if (installedAcquisition(model.acquisitionState) === undefined) return ["primary"]
 
   const actions: CatalogInspectorActionId[] = []
@@ -1387,7 +1378,7 @@ export const catalogInspectorActions = (
   }
   if (model.acquisitionState._tag === "UpdateAvailable"
     || model.acquisitionState._tag === "UpdateFailed") actions.push("primary")
-  actions.push("uninstall")
+  actions.push("remove")
   return actions
 }
 
@@ -1395,52 +1386,37 @@ export const catalogInspectorActionLabel = (
   action: CatalogInspectorActionId,
   model: LocalModel,
   selectedSlot: CatalogPrimarySlot | null = null,
-  reconciliationState: CatalogModelReconciliationState = { _tag: "Idle" },
 ): string => {
   switch (action) {
     case "select": return "Select model"
     case "primary": {
-      if (reconciliationState._tag === "Failed" && reconciliationState.operation === "Update") {
-        return "Retry update"
-      }
       if (model.acquisitionState._tag === "UpdateAvailable") return "Update"
       if (model.acquisitionState._tag === "UpdateFailed") return "Retry update"
-      const verb = reconciliationState._tag === "Failed" || model.acquisitionState._tag === "InstallFailed"
+      const verb = model.acquisitionState._tag === "InstallFailed"
         ? "Retry download"
         : "Download"
       return verb
     }
-    case "cancel": return reconciliationState._tag === "Transferring"
-      ? reconciliationState.operation === "Update" ? "Cancel update" : "Cancel download"
-      : model.acquisitionState._tag === "Updating" ? "Cancel update" : "Cancel download"
+    case "cancel": return model.acquisitionState._tag === "Updating" ? "Cancel update" : "Cancel download"
     case "load": return selectedSlot?._tag === "ConfiguredLocal"
       && selectedSlot.actions.includes("RetryLoad") ? "Retry loading" : "Load model"
     case "stop": return selectedSlot?._tag === "ConfiguredLocal"
       && (selectedSlot.residency._tag === "Requested"
         || selectedSlot.residency._tag === "Loading")
       ? "Cancel loading" : "Stop model"
-    case "uninstall": return reconciliationState._tag === "RemoveFailed"
-      ? "Retry uninstall"
-      : "Uninstall"
+    case "remove": return model.acquisitionState._tag === "RemoveFailed"
+      ? "Retry removal"
+      : "Remove"
   }
 }
 
 const catalogInspectorStatus = (
   model: LocalModel,
-  reconciliationState: CatalogModelReconciliationState,
   selected: boolean,
   selectedSlot: CatalogPrimarySlot | null,
 ): string => {
-  if (reconciliationState._tag === "Removing") return "REMOVING…"
-  if (reconciliationState._tag === "RemoveFailed") return "REMOVE FAILED"
-  if (reconciliationState._tag === "Transferring") {
-    const label = reconciliationState.operation === "Update" ? "UPDATING" : "DOWNLOADING"
-    return `${label} ${Math.round(reconciliationState.progress.completedBytes / Math.max(1, reconciliationState.progress.totalBytes) * 100)}%`
-  }
-  if (reconciliationState._tag === "Starting") return reconciliationState.operation === "Update"
-    ? "STARTING UPDATE…" : "STARTING DOWNLOAD…"
-  if (reconciliationState._tag === "Failed") return reconciliationState.operation === "Update"
-    ? "UPDATE FAILED" : "DOWNLOAD FAILED"
+  if (model.acquisitionState._tag === "Removing") return "REMOVING…"
+  if (model.acquisitionState._tag === "RemoveFailed") return "REMOVE FAILED"
   if (model.acquisitionState._tag === "Installing") {
     const progress = model.acquisitionState.progress
     return `DOWNLOADING ${Math.round(progress.completedBytes / Math.max(1, progress.totalBytes) * 100)}%`
@@ -1464,31 +1440,29 @@ const catalogInspectorStatus = (
     }
     return `SELECTED${updateSuffix}`
   }
-  return catalogStatus(model, reconciliationState).toUpperCase()
+  return catalogStatus(model).toUpperCase()
 }
 
 const CatalogInspector = memo(function CatalogInspector({
   model,
-  reconciliationState,
   selected,
   selectedSlot,
   actions,
   actionCursor,
   actionsFocused,
   hoveredAction,
-  confirmingUninstall,
+  confirmingRemove,
   onAction,
   onActionHover,
 }: {
   readonly model: LocalModel
-  readonly reconciliationState: CatalogModelReconciliationState
   readonly selected: boolean
   readonly selectedSlot: CatalogPrimarySlot | null
   readonly actions: readonly CatalogInspectorActionId[]
   readonly actionCursor: number
   readonly actionsFocused: boolean
   readonly hoveredAction: CatalogInspectorActionId | null
-  readonly confirmingUninstall: boolean
+  readonly confirmingRemove: boolean
   readonly onAction: (action: CatalogInspectorActionId) => void
   readonly onActionHover: (action: CatalogInspectorActionId | null) => void
 }) {
@@ -1496,7 +1470,7 @@ const CatalogInspector = memo(function CatalogInspector({
   const platform = usePlatform()
   const [sourceHovered, setSourceHovered] = useState(false)
   const radarAxes = localModelRadarAxes(model)
-  const status = catalogInspectorStatus(model, reconciliationState, selected, selectedSlot)
+  const status = catalogInspectorStatus(model, selected, selectedSlot)
   const contentWidth = CATALOG_INSPECTOR_CONTENT_WIDTH
   const repositoryUrl = huggingFaceRepositoryUrls(model)[0]
   const repository = repositoryUrl?.replace("https://", "")
@@ -1520,8 +1494,8 @@ const CatalogInspector = memo(function CatalogInspector({
           <text style={{ fg: theme.text.body, flexGrow: 1 }} attributes={TextAttributes.BOLD} wrapMode="none">
             {truncateToDisplayWidth(formatLocalModelDisplayName(model), Math.max(1, contentWidth - status.length - 1))}
           </text>
-          <text style={{ fg: reconciliationState._tag === "Failed"
-            || reconciliationState._tag === "RemoveFailed"
+          <text style={{ fg: model.acquisitionState._tag === "InstallFailed"
+            || model.acquisitionState._tag === "RemoveFailed"
             || model.acquisitionState._tag === "UpdateFailed" ? theme.status.failure : theme.accent }} wrapMode="none">{status}</text>
         </box>
         <text style={{ fg: theme.text.supporting }} wrapMode="none">
@@ -1571,11 +1545,11 @@ const CatalogInspector = memo(function CatalogInspector({
         <box style={{ flexDirection: "column" }}>
           {actions.length === 0 ? (
             <text style={{ fg: theme.text.disabled }}>
-              {reconciliationState._tag === "Removing" ? "Removing…" : "No actions available"}
+              {model.acquisitionState._tag === "Removing" ? "Removing…" : "No actions available"}
             </text>
           ) : actions.map((action, index) => {
             const focused = hoveredAction === action || (actionsFocused && index === actionCursor)
-            return action === "uninstall" && confirmingUninstall ? (
+            return action === "remove" && confirmingRemove ? (
               <text key={action} wrapMode="none">
                 <span fg={focused ? theme.accent : theme.text.body}>{focused ? "› " : "  "}Remove model? </span>
                 <span fg={theme.text.metadata}>[Enter] confirm · [Esc] cancel</span>
@@ -1583,7 +1557,7 @@ const CatalogInspector = memo(function CatalogInspector({
             ) : (
               <MenuAction
                 key={action}
-                label={catalogInspectorActionLabel(action, model, selectedSlot, reconciliationState)}
+                label={catalogInspectorActionLabel(action, model, selectedSlot)}
                 focused={focused}
                 tone="normal"
                 onClick={() => onAction(action)}
@@ -1615,7 +1589,7 @@ const CatalogMenu = memo(function CatalogMenu({
   const slotActions = useModelSlotActions()
   const catalogModels = Option.match(catalogView, {
     onNone: () => [],
-    onSome: ({ models }) => models.filter(({ model }) =>
+    onSome: ({ models }) => models.filter((model) =>
       model.servingState._tag === "Assessed"
         && model.servingState.assessment._tag === "Fits"),
   })
@@ -1628,7 +1602,7 @@ const CatalogMenu = memo(function CatalogMenu({
       && model.servingState.assessment._tag === "Fits"
       ? model.servingState.assessment.memory.totalRequiredBytes
       : undefined
-  const candidates = catalogModels.map(({ model }) => model).sort((left, right) => {
+  const candidates = [...catalogModels].sort((left, right) => {
     const leftInstalled = installedAcquisition(left.acquisitionState) !== undefined
     const rightInstalled = installedAcquisition(right.acquisitionState) !== undefined
     return (leftInstalled === rightInstalled ? 0 : leftInstalled ? -1 : 1)
@@ -1641,18 +1615,13 @@ const CatalogMenu = memo(function CatalogMenu({
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
   const [actionHoverTarget, setActionHoverTarget] = useState<CatalogActionHoverTarget | null>(null)
   const modelIdFor = (model: LocalModel) => model.modelId
-  const reconciliationStateFor = (model: LocalModel): CatalogModelReconciliationState => {
-    const modelId = modelIdFor(model)
-    return catalogModels.find(({ model: candidate }) =>
-      modelIdFor(candidate) === modelId)?.reconciliationState ?? { _tag: "Idle" }
-  }
   const cursorIndex = Math.max(0, candidates.findIndex((model) =>
     modelIdFor(model) === cursorId))
   const cursor = candidates[cursorIndex]
   const detail = candidates.find((model) => modelIdFor(model) === detailId) ?? null
   const inspected = detail ?? cursor ?? null
   const inspectedModelId = inspected === null ? undefined : modelIdFor(inspected)
-  const confirmingUninstall = inspectedModelId !== undefined
+  const confirmingRemove = inspectedModelId !== undefined
     && pendingDeleteId === inspectedModelId
   const hoveredInspectorAction = inspectedModelId !== undefined
     && actionHoverTarget?.modelId === inspectedModelId
@@ -1665,9 +1634,6 @@ const CatalogMenu = memo(function CatalogMenu({
   })
   const inspectedSelected = inspected !== null && catalogModelIsSelected(inspected, selectedModel)
   const inspectedSlot = inspected === null ? null : catalogSlotForModel(inspected, primarySlot)
-  const inspectedReconciliationState = inspected === null
-    ? { _tag: "Idle" } as const
-    : reconciliationStateFor(inspected)
   const progress = Option.match(catalogView, {
     onNone: () => [],
     onSome: (models) => localInferenceProgressLines(models.discoveryState.progress),
@@ -1676,7 +1642,7 @@ const CatalogMenu = memo(function CatalogMenu({
   const spinner = useSpinnerFrame(runningProgress !== undefined)
   const inspectorActions = inspected === null
     ? []
-    : catalogInspectorActions(inspected, inspectedReconciliationState, inspectedSelected, inspectedSlot)
+    : catalogInspectorActions(inspected, inspectedSelected, inspectedSlot)
   const inspectorActionCursor = useBoundedCursor(inspectorActions.length)
   const moveCursorTo = useCallback((index: number) => {
     const model = candidates[index]
@@ -1692,7 +1658,7 @@ const CatalogMenu = memo(function CatalogMenu({
     if (model.acquisitionState._tag === "Installing"
       || model.acquisitionState._tag === "Updating"
       || model.acquisitionState._tag === "Installed"
-      || reconciliationStateFor(model)._tag === "Starting") return
+      || model.acquisitionState._tag === "Removing") return
     modelActions.install(modelId)
   }, [modelActions, catalogModels])
 
@@ -1717,7 +1683,7 @@ const CatalogMenu = memo(function CatalogMenu({
 
   const runInspectorAction = useCallback((action: CatalogInspectorActionId) => {
     if (inspected === null) return
-    if (action !== "uninstall") setPendingDeleteId(null)
+    if (action !== "remove") setPendingDeleteId(null)
     if (action === "primary") {
       primaryAction(inspected)
       return
@@ -1727,8 +1693,7 @@ const CatalogMenu = memo(function CatalogMenu({
       return
     }
     if (action === "cancel") {
-      if (inspectedReconciliationState._tag === "Transferring"
-        || inspected.acquisitionState._tag === "Installing"
+      if (inspected.acquisitionState._tag === "Installing"
         || inspected.acquisitionState._tag === "Updating") {
         modelActions.cancel(modelIdFor(inspected))
       }
@@ -1742,18 +1707,18 @@ const CatalogMenu = memo(function CatalogMenu({
       void slotActions.stop(PRIMARY_SLOT_ID)
       return
     }
-    if (action === "uninstall" && installedAcquisition(inspected.acquisitionState) !== undefined) {
+    if (action === "remove" && installedAcquisition(inspected.acquisitionState) !== undefined) {
       setPendingDeleteId(modelIdFor(inspected))
     }
-  }, [inspected, inspectedReconciliationState, inspectedSlot, modelActions, primaryAction, selectCandidate, slotActions])
+  }, [inspected, inspectedSlot, modelActions, primaryAction, selectCandidate, slotActions])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.defaultPrevented) return
-    if (confirmingUninstall && pendingDeleteId !== null) {
+    if (confirmingRemove && pendingDeleteId !== null) {
       if (key.name === "return" || key.name === "enter") {
         const model = candidates.find((candidate) => modelIdFor(candidate) === pendingDeleteId)
         if (model !== undefined && installedAcquisition(model.acquisitionState) !== undefined) {
-          modelActions.delete(model.modelId)
+          modelActions.remove(model.modelId)
         }
         setPendingDeleteId(null)
         key.preventDefault()
@@ -1794,7 +1759,7 @@ const CatalogMenu = memo(function CatalogMenu({
       if (confirmsDelete) {
         const model = candidates.find((candidate) => modelIdFor(candidate) === pendingDeleteId)
         if (model !== undefined && installedAcquisition(model.acquisitionState) !== undefined) {
-          modelActions.delete(model.modelId)
+          modelActions.remove(model.modelId)
         }
         setPendingDeleteId(null)
         key.preventDefault()
@@ -1834,7 +1799,7 @@ const CatalogMenu = memo(function CatalogMenu({
         key.preventDefault()
       }
     }
-  }, [candidates, confirmingUninstall, cursor, cursorIndex, detail, inspectorActionCursor, inspectorActions, modelActions, moveCursorTo, pendingDeleteId, primaryAction, runInspectorAction, selectCandidate, setRootSwitchingEnabled]))
+  }, [candidates, confirmingRemove, cursor, cursorIndex, detail, inspectorActionCursor, inspectorActions, modelActions, moveCursorTo, pendingDeleteId, primaryAction, runInspectorAction, selectCandidate, setRootSwitchingEnabled]))
 
   if (menuSize.width === null) {
     return (
@@ -1850,14 +1815,13 @@ const CatalogMenu = memo(function CatalogMenu({
     <>
       <CatalogInspector
         model={inspected}
-        reconciliationState={inspectedReconciliationState}
         selected={inspectedSelected}
         selectedSlot={inspectedSlot}
         actions={inspectorActions}
         actionCursor={inspectorActionCursor.index}
         actionsFocused={detail !== null}
         hoveredAction={hoveredInspectorAction}
-        confirmingUninstall={confirmingUninstall}
+        confirmingRemove={confirmingRemove}
         onAction={runInspectorAction}
         onActionHover={(action) => {
           setActionHoverTarget(action === null || inspectedModelId === undefined
@@ -1942,7 +1906,7 @@ const CatalogMenu = memo(function CatalogMenu({
             focused={highlighted && detail === null}
             selected={catalogModelIsSelected(candidate, selectedModel)}
             pendingDelete={pendingDeleteId === modelId}
-            reconciliationState={reconciliationStateFor(candidate)}
+            acquisitionState={candidate.acquisitionState}
             index={index}
             layout={layout}
             rowId={catalogCandidateRowId(modelId)}

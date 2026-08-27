@@ -78,7 +78,7 @@ is explicitly restored to normal interruption so cancellation races and scope sh
 The worker passes exact predecessor outputs through one Effect program:
 
 1. retain the exact displayed canonical model ID;
-2. install that Model and retain the exact native Download admission when needed;
+2. sync that Model and wait on its authoritative ACN acquisition state;
 3. assign that exact model ID and captured reasoning effort to the primary slot;
 4. admit native residency for that model ID through the shared ICN coordinator;
 5. accept readiness only for the exact returned Instance and model ID; and
@@ -97,9 +97,10 @@ authorities and are joined by canonical model ID for presentation.
 
 ## Cancellation, failure, and retry
 
-Cancellation is cooperative and identity-safe. Before installation admission it interrupts the
-request; after a Download is admitted it cancels only that exact Download where shared-work rules
-permit. After residency admission it detaches this setup waiter and does not stop the shared
+Cancellation is cooperative and identity-safe. Before model-sync admission it interrupts the
+request; after sync is admitted it sends a model-addressed cancellation that ACN resolves to the
+exact ICN download occurrence. ICN preserves package work required by other occurrences. After residency admission
+it detaches this setup waiter and does not stop the shared
 Instance. Completing onboarding cannot be cancelled.
 
 Every terminal update is fenced by invocation identity, so late work cannot overwrite a newer flow.
@@ -250,7 +251,8 @@ only then starts the returned executable with inherited terminal I/O and the cap
 - Hook or renderer unmount does not interrupt an admitted operation.
 - Service scope release interrupts owned work under normal Effect interruption semantics.
 - Discovery refresh, failure, or removal cannot mask an active operation.
-- Exact download admission governs observation and cancellation.
+- The canonical model ID and ACN acquisition state govern sync observation and cancellation;
+  native occurrence identity never enters setup.
 - Readiness must match the captured selection and configuration.
 - Expected instance failures remain typed, retain the exact failed load, and expose recovery in place.
 - Unexpected notices preserve their typed failure and semantic operation/model subject.

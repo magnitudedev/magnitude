@@ -6,7 +6,6 @@ import {
   ProviderIdSchema,
   ReasoningEffortSchema,
   installedAcquisition,
-  type CatalogModelReconciliationAdmission,
   type LocalModelsState,
   type ModelInstanceFailure,
   type ModelSlotsState,
@@ -337,7 +336,6 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
 
   const awaitInstalled = (
     prepared: PreparedModel,
-    admission: CatalogModelReconciliationAdmission,
   ) => {
     const project = (current: LocalModelsState): TerminalFact<InstalledModel> => {
       const model = current.models.find((candidate) => candidate.modelId === prepared.modelId)
@@ -358,7 +356,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
         const providerModelId = availability._tag === "Unavailable"
           ? Option.getOrUndefined(availability.providerModelId)
           : availability.providerModelId
-        if (providerModelId !== admission.providerModelId) {
+        if (providerModelId !== prepared.modelId) {
           return providerModelId === undefined
             ? { _tag: "Waiting" }
             : { _tag: "Failed", failure: new OnboardingModelResourceChanged({
@@ -371,10 +369,10 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
         }
         return {
           _tag: "Ready",
-          value: { ...prepared, providerModelId: admission.providerModelId },
+          value: { ...prepared, providerModelId: prepared.modelId },
         }
       }
-      if (admission._tag === "DownloadAdmitted" && acquisition._tag === "Installing") {
+      if (acquisition._tag === "Installing" || acquisition._tag === "Updating") {
         return { _tag: "Waiting" }
       }
       if (acquisition._tag === "InstallFailed") {
@@ -403,34 +401,29 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
           : Effect.succeed(installed)),
       ),
       onNone: () => localModels.install(resolved.prepared.modelId).pipe(
-        Effect.flatMap((admission) => {
-          const publish = admission._tag === "DownloadAdmitted"
-            ? setExecution(invocation, {
-                _tag: "Installing",
-                option: resolved.prepared.option,
-                modelId: resolved.prepared.modelId,
-                cancelling: false,
-              })
-            : Effect.void
-          const cancel = admission._tag === "DownloadAdmitted"
-            ? localModels.cancelDownload(resolved.prepared.modelId)
-            : Effect.void
+        Effect.flatMap(() => {
+          const publish = setExecution(invocation, {
+            _tag: "Installing",
+            option: resolved.prepared.option,
+            modelId: resolved.prepared.modelId,
+            cancelling: false,
+          })
+          const cancel = localModels.cancelDownload(resolved.prepared.modelId)
+          const wait = Effect.raceFirst(
+            awaitInstalled(resolved.prepared).pipe(
+              Effect.map((installed) => ({ _tag: "Installed" as const, installed })),
+            ),
+            Deferred.await(invocation.cancellation).pipe(
+              Effect.as({ _tag: "Cancelled" as const }),
+            ),
+          ).pipe(Effect.flatMap((outcome) => outcome._tag === "Installed"
+            ? Effect.succeed(outcome.installed)
+            : cancel.pipe(Effect.zipRight(Effect.fail(new OnboardingModelSelectionCancelled())))))
           return publish.pipe(
             Effect.zipRight(cancelled(invocation)),
             Effect.flatMap((isCancelled) => isCancelled
               ? cancel.pipe(Effect.zipRight(Effect.fail(new OnboardingModelSelectionCancelled())))
-              : admission._tag === "DownloadAdmitted"
-                ? Effect.raceFirst(
-                    awaitInstalled(resolved.prepared, admission).pipe(
-                      Effect.map((installed) => ({ _tag: "Installed" as const, installed })),
-                    ),
-                    Deferred.await(invocation.cancellation).pipe(
-                      Effect.as({ _tag: "Cancelled" as const }),
-                    ),
-                  ).pipe(Effect.flatMap((outcome) => outcome._tag === "Installed"
-                    ? Effect.succeed(outcome.installed)
-                    : cancel.pipe(Effect.zipRight(Effect.fail(new OnboardingModelSelectionCancelled())))))
-                : awaitInstalled(resolved.prepared, admission)),
+              : wait),
           )
         }),
       ),

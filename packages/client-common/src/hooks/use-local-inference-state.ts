@@ -109,11 +109,11 @@ export function useLocalModelActions() {
     LocalModels,
     (models) => models.install(modelId),
   ).pipe(
-    Effect.flatMap(({ providerModelId }) => Effect.flatMap(
+    Effect.flatMap(() => Effect.flatMap(
       ModelSlots,
       (slots) => slots.assign(slotId, {
         providerId: ProviderIdSchema.make("local"),
-        providerModelId,
+        providerModelId: modelId,
         reasoningEffort,
       }),
     )),

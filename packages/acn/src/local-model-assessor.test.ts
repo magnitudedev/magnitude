@@ -128,6 +128,7 @@ describe("LocalModelAssessor", () => {
           state: Effect.succeed(packageState),
           changes: Stream.fromPubSub(packageChanges),
           installedPackageIds: Effect.succeed(new Set([packageId])),
+          refresh: Effect.void,
         })),
         Layer.succeed(LocalModelAssessments, LocalModelAssessments.of({
           assess: (requests) => Effect.sync(() => {

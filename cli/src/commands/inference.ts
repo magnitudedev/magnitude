@@ -69,13 +69,13 @@ export const registerInferenceCommands = (program: Commander): void => {
   models.command("install")
     .argument("<model-id>", "Canonical model ID")
     .action((modelId) => runModels((client, registry) => decodeModelId(modelId).pipe(
-      Effect.flatMap((decoded) => Mutation.execute(client.Models.InstallLocalModel, { modelId: decoded })),
+      Effect.flatMap((decoded) => Mutation.execute(client.Models.SyncLocalModel, { modelId: decoded })),
       Effect.provideService(Registry.AtomRegistry, registry),
     )))
-  models.command("uninstall")
+  models.command("remove")
     .argument("<model-id>", "Canonical model ID")
     .action((modelId) => runModels((client, registry) => decodeModelId(modelId).pipe(
-      Effect.flatMap((decoded) => Mutation.execute(client.Models.UninstallLocalModel, { modelId: decoded })),
+      Effect.flatMap((decoded) => Mutation.execute(client.Models.RemoveLocalModel, { modelId: decoded })),
       Effect.provideService(Registry.AtomRegistry, registry),
     )))
 
@@ -87,13 +87,13 @@ export const registerInferenceCommands = (program: Commander): void => {
   downloads.command("cancel")
     .argument("<model-id>", "Canonical model ID whose download to cancel")
     .action((modelId) => runModels((client, registry) => decodeModelId(modelId).pipe(
-      Effect.flatMap((decoded) => Mutation.execute(client.Models.CancelModelDownload, { modelId: decoded })),
+      Effect.flatMap((decoded) => Mutation.execute(client.Models.CancelLocalModelSync, { modelId: decoded })),
       Effect.provideService(Registry.AtomRegistry, registry),
     )))
   downloads.command("acknowledge-failure")
     .argument("<model-id>", "Canonical model ID whose failed download to acknowledge")
     .action((modelId) => runModels((client, registry) => decodeModelId(modelId).pipe(
-      Effect.flatMap((decoded) => Mutation.execute(client.Models.AcknowledgeModelDownloadFailure, { modelId: decoded })),
+      Effect.flatMap((decoded) => Mutation.execute(client.Models.AcknowledgeLocalModelSyncFailure, { modelId: decoded })),
       Effect.provideService(Registry.AtomRegistry, registry),
     )))
 

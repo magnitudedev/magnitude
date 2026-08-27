@@ -118,12 +118,12 @@ application postcondition, or after ICN has admitted a named long-running occurr
 Download or Instance identity is the causal acknowledgement for admitted work; progress remains a
 query concern.
 
-The client mutation invalidates affected queries before reporting success. It does not poll or
-refetch an ACN projection to prove an acknowledgement that the owner already returned. ACN change
-pokes remain necessary for changes caused externally or by continuing native work. These paths are
-complementary:
+The client mutation synchronizes affected queries before reporting success. For model mutations,
+that means one awaited refetch of the ACN snapshot the owner has already committed; it is not a
+poll or a predicate-based proof protocol. ACN change pokes remain necessary for changes caused
+externally or by continuing native work. These paths are complementary:
 
-- mutation invalidation closes the initiating client's causal window;
+- mutation synchronization closes the initiating client's causal window;
 - change pokes converge every client and every non-command transition.
 
 Primary Slot assignment and agent work admission share one serialization scope. This orders the
@@ -149,7 +149,13 @@ by explicit user action or complete authoritative proof that the referenced iden
 - Query successes are direct domain values with no generic revision envelope.
 - No generic mirrored-state helper or schema exists.
 - Derived Catalog, Instance, and Environment views are not stored as parallel authorities.
-- Mutation synchronization invalidates; it does not poll or reread for proof.
+- Model mutation synchronization awaits one fresh committed ACN snapshot; it does not poll or
+  reread for proof.
+- Model sync, cancellation, failure acknowledgement, and removal are addressed by canonical
+  model ID. ACN publishes the resulting `LocalModel.acquisitionState` before returning success;
+  it privately correlates admitted model syncs with exact ICN download IDs. ICN continues to
+  expose raw download-ID operations and never acquires ACN model-sync vocabulary. Native
+  occurrence and Package identities remain private from clients.
 - Automatic chat loading, explicit loading, stopping, switching, installation, cancellation,
   recovery, and multi-client observation converge through the same ACN resources.
 - Model-domain failures leave the same ACN process serving and never render daemon disconnection.

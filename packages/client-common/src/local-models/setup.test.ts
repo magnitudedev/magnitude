@@ -1,5 +1,5 @@
 import { Atom, Registry, Result } from "@effect-atom/atom-react"
-import { Cause, Effect, Layer, Option, Queue, Schema, Stream } from "effect"
+import { Cause, Deferred, Effect, Layer, Option, Queue, Schema, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import { Client as EffectQueryClient } from "@magnitudedev/effect-query"
 import {
@@ -31,7 +31,6 @@ import { clientServicesLayer, type ClientServices } from "../state/client-servic
 import type { AcnClientRequirements } from "../state/agent-client"
 import { fakeAcnImplementationsLayer } from "../state/fake-acn-implementations"
 import { localModelProviderModelId } from "./projection"
-import { installationAdmissionIsVisible } from "./service"
 import { OnboardingModelSetup } from "./setup"
 import { localModelOptions } from "./options"
 import { onboardingModelSetupNoticeMessage } from "./failure-messages"
@@ -360,110 +359,6 @@ describe("projectOnboardingModelSetupContent", () => {
   })
 })
 
-describe("installationAdmissionIsVisible", () => {
-  it("accepts the admitted model transfer before a provider identity exists", () => {
-    const uninstalled = makeModel(false)
-    const downloading: LocalModel = {
-      ...uninstalled,
-      acquisitionState: {
-        _tag: "Installing",
-        progress: {
-          stage: "downloading",
-          completedBytes: 0,
-          totalBytes: 1,
-          bytesPerSecond: Option.none(),
-        },
-      },
-    }
-    const state: LocalModelsState = {
-      inventoryState: { _tag: "Ready" },
-      models: [downloading],
-      discoveryState: { _tag: "Ready", progress: [] },
-    }
-
-    expect(installationAdmissionIsVisible(state, providerModelId, {
-      _tag: "DownloadAdmitted",
-      providerModelId,
-    })).toBe(true)
-    expect(Option.isNone(localModelProviderModelId(downloading))).toBe(true)
-  })
-
-  it("rejects an admitted download whose model shows no remaining transfer", () => {
-    const uninstalled = makeModel(false)
-    const state: LocalModelsState = {
-      inventoryState: { _tag: "Ready" },
-      models: [uninstalled],
-      discoveryState: { _tag: "Ready", progress: [] },
-    }
-
-    expect(installationAdmissionIsVisible(state, providerModelId, {
-      _tag: "DownloadAdmitted",
-      providerModelId,
-    })).toBe(false)
-  })
-
-  it("accepts a current installed configuration while provider publication is pending", () => {
-    const installed = makeModel(true)
-    const publishing = installed.servingState._tag === "Assessed" ? {
-      ...installed,
-      servingState: {
-        ...installed.servingState,
-        availabilityState: { _tag: "Preparing" as const, providerModelId },
-      },
-    } : installed
-
-    expect(installationAdmissionIsVisible({
-      inventoryState: { _tag: "Ready" },
-      models: [publishing],
-      discoveryState: { _tag: "Ready", progress: [] },
-    }, providerModelId, {
-      _tag: "Current",
-      providerModelId,
-    })).toBe(true)
-  })
-
-  it("does not complete update admission until the update transfer is visible", () => {
-    const base = makeModel(true)
-    const installedFields = base.acquisitionState._tag === "Installed"
-      ? base.acquisitionState
-      : (() => { throw new Error("expected an installed fixture") })()
-    const installed: LocalModel = {
-      ...base,
-      acquisitionState: {
-        _tag: "UpdateAvailable",
-        installedBytes: installedFields.installedBytes,
-        packages: installedFields.packages,
-        residencyState: installedFields.residencyState,
-      },
-    }
-    const state = {
-      inventoryState: { _tag: "Ready" as const },
-      models: [installed],
-      discoveryState: { _tag: "Ready" as const, progress: [] },
-    }
-    const admission = { _tag: "DownloadAdmitted" as const, providerModelId }
-    expect(installationAdmissionIsVisible(state, providerModelId, admission)).toBe(false)
-    expect(installationAdmissionIsVisible({
-      ...state,
-      models: [{
-        ...installed,
-        acquisitionState: {
-          _tag: "Updating",
-          installedBytes: installedFields.installedBytes,
-          packages: installedFields.packages,
-          residencyState: installedFields.residencyState,
-          progress: {
-            stage: "downloading",
-            completedBytes: 0,
-            totalBytes: 1,
-            bytesPerSecond: Option.none(),
-          },
-        },
-      }],
-    }, providerModelId, admission)).toBe(true)
-  })
-})
-
 interface HarnessOptions {
   readonly installed: boolean
   readonly onboardingCompleted?: boolean
@@ -479,6 +374,7 @@ interface HarnessOptions {
   readonly failInitialLocalModelsRead?: boolean
   readonly failInitialModelSlotsRead?: boolean
   readonly replaceSelectionBeforeLoad?: boolean
+  readonly postSyncCatalogRead?: Deferred.Deferred<void>
   readonly downloadFailure?: ModelDownloadFailure
   readonly loadFailure?: ModelInstanceFailure
 }
@@ -570,7 +466,9 @@ const makeHarness = (options: HarnessOptions) => {
           && calls.filter((call) => call === "GetModelCatalog").length === 1) {
           return Effect.fail({ _tag: "LocalModelsQueryFailed", message: "temporarily unavailable" })
         }
-        return Effect.succeed(modelCatalog())
+        return options.postSyncCatalogRead !== undefined && calls.includes("SyncLocalModel")
+          ? Deferred.await(options.postSyncCatalogRead).pipe(Effect.as(modelCatalog()))
+          : Effect.succeed(modelCatalog())
       }
       case "GetModelSlots": {
         if (options.failInitialModelSlotsRead
@@ -590,7 +488,7 @@ const makeHarness = (options: HarnessOptions) => {
         }
         return Effect.succeed({ completed: onboardingCompleted })
       }
-      case "InstallLocalModel": {
+      case "SyncLocalModel": {
         model = options.downloadFailure !== undefined
           ? (() => {
               const uninstalled = makeModel(false)
@@ -624,10 +522,7 @@ const makeHarness = (options: HarnessOptions) => {
             })()
           : makeModel(true)
         models = { ...models, models: [model] }
-        return Queue.offer(changes, { query: "GetModelCatalog" }).pipe(Effect.as({
-          _tag: "DownloadAdmitted",
-          providerModelId,
-        }))
+        return Queue.offer(changes, { query: "GetModelCatalog" }).pipe(Effect.as({}))
       }
       case "AssignModelSlot": {
         if (options.failAssign) return Effect.fail({
@@ -672,7 +567,7 @@ const makeHarness = (options: HarnessOptions) => {
         stoppedInstances.push(instanceId)
         slots = configuredSlots("Stopped", instanceId)
         return Queue.offer(changes, { query: "GetModelSlots" }).pipe(Effect.as({}))
-      case "CancelModelDownload":
+      case "CancelLocalModelSync":
         cancelledDownloads.push(payload.modelId)
         models = {
           ...models,
@@ -861,11 +756,11 @@ describe("OnboardingModelSetup", () => {
     secondUnmount()
 
     expect(harness.calls.filter((call) => [
-      "InstallLocalModel",
+      "SyncLocalModel",
       "AssignModelSlot",
       "LoadModelSlot",
       "StopModelSlot",
-      "CancelModelDownload",
+      "CancelLocalModelSync",
       "CompleteOnboarding",
     ].includes(call))).toEqual([])
     harness.registry.dispose()
@@ -884,9 +779,36 @@ describe("OnboardingModelSetup", () => {
     await Effect.runPromise(waitForView(harness, (state) => state._tag === "Closed"))
 
     expect(harness.onboardingCompleted()).toBe(true)
-    expect(harness.calls).not.toContain("InstallLocalModel")
+    expect(harness.calls).not.toContain("SyncLocalModel")
     expect(harness.calls).not.toContain("AssignModelSlot")
     expect(harness.calls).not.toContain("LoadModelSlot")
+    harness.registry.dispose()
+  })
+
+  it("does not consume the stale pre-sync catalog while the replacement read is pending", async () => {
+    const postSyncCatalogRead = Effect.runSync(Deferred.make<void>())
+    const harness = makeHarness({ installed: false, postSyncCatalogRead })
+    const selection = Effect.runFork(execute(
+      harness.registry,
+      harness.service.select,
+      providerModelId,
+    ))
+
+    await Effect.runPromise(waitForCall(harness.calls, "SyncLocalModel"))
+    await Effect.runPromise(Effect.sleep("5 millis"))
+    const pending = Option.getOrThrow(Result.value(harness.registry.get(harness.service.view)))
+    expect(pending).toMatchObject({
+      _tag: "Open",
+      notice: { _tag: "None" },
+      content: { _tag: "Chooser" },
+    })
+
+    await Effect.runPromise(Deferred.succeed(postSyncCatalogRead, undefined))
+    await Effect.runPromise(selection)
+    await Effect.runPromise(waitForView(
+      harness,
+      (state) => state._tag === "Open" && state.content._tag === "Harness",
+    ))
     harness.registry.dispose()
   })
 
@@ -975,7 +897,7 @@ describe("OnboardingModelSetup", () => {
       expect(Cause.pretty(start.cause)).toContain("OnboardingModelSetupNotOpen")
     }
     expect(harness.calls.filter((call) => [
-      "InstallLocalModel",
+      "SyncLocalModel",
       "AssignModelSlot",
       "LoadModelSlot",
       "CompleteOnboarding",
@@ -1105,7 +1027,7 @@ describe("OnboardingModelSetup", () => {
     await Effect.runPromise(waitForView(harness, (state) => state._tag === "Closed"))
 
     const mutations = harness.calls.filter((call) => [
-      "InstallLocalModel",
+      "SyncLocalModel",
       "AssignModelSlot",
       "LoadModelSlot",
       "CompleteOnboarding",
@@ -1179,13 +1101,13 @@ describe("OnboardingModelSetup", () => {
     await Effect.runPromise(waitForView(harness, (state) => state._tag === "Closed"))
 
     const mutations = harness.calls.filter((call) => [
-      "InstallLocalModel",
+      "SyncLocalModel",
       "AssignModelSlot",
       "LoadModelSlot",
       "CompleteOnboarding",
     ].includes(call))
     expect(mutations).toEqual([
-      "InstallLocalModel",
+      "SyncLocalModel",
       "AssignModelSlot",
       "LoadModelSlot",
       "CompleteOnboarding",
@@ -1235,8 +1157,8 @@ describe("OnboardingModelSetup", () => {
     await Effect.runPromise(execute(harness.registry, harness.service.continueWithMagnitude, undefined))
     await Effect.runPromise(waitForView(harness, (state) => state._tag === "Closed"))
 
-    expect(harness.calls.indexOf("InstallLocalModel")).toBeGreaterThanOrEqual(0)
-    expect(harness.calls.indexOf("InstallLocalModel")).toBeLessThan(harness.calls.indexOf("AssignModelSlot"))
+    expect(harness.calls.indexOf("SyncLocalModel")).toBeGreaterThanOrEqual(0)
+    expect(harness.calls.indexOf("SyncLocalModel")).toBeLessThan(harness.calls.indexOf("AssignModelSlot"))
     harness.registry.dispose()
   })
 
@@ -1290,7 +1212,7 @@ describe("OnboardingModelSetup", () => {
       harness.service.select,
       providerModelId,
     ))
-    await Effect.runPromise(waitForCall(harness.calls, "InstallLocalModel"))
+    await Effect.runPromise(waitForCall(harness.calls, "SyncLocalModel"))
     await Effect.runPromise(execute(harness.registry, harness.service.cancel, undefined))
 
     expect(harness.cancelledDownloads).toEqual([providerModelId])
@@ -1319,11 +1241,11 @@ describe("OnboardingModelSetup", () => {
 
     expect(harness.onboardingCompleted()).toBe(true)
     expect(harness.calls.filter((call) => [
-      "InstallLocalModel",
+      "SyncLocalModel",
       "AssignModelSlot",
       "LoadModelSlot",
       "StopModelSlot",
-      "CancelModelDownload",
+      "CancelLocalModelSync",
     ].includes(call))).toEqual([])
     harness.registry.dispose()
   })

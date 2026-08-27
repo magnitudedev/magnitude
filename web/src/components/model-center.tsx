@@ -56,8 +56,6 @@ import {
   useModelSlots,
   usePlatform,
   usePreviewModelLoad,
-  type CatalogModelReconciliationState,
-  type CatalogModelView,
 } from "@magnitudedev/client-common"
 import {
   PRIMARY_SLOT_ID,
@@ -128,6 +126,8 @@ function LoadingNotice({
   )
 }
 const modelFailure = (model: LocalModel): string | null => {
+  if (model.acquisitionState._tag === "RemoveFailed")
+    return model.acquisitionState.failure.message
   const transferFailure = acquisitionFailure(model.acquisitionState)
   if (transferFailure !== undefined)
     return modelDownloadFailureMessage(transferFailure)
@@ -149,35 +149,15 @@ const modelFailure = (model: LocalModel): string | null => {
 const modelTransfer = (model: LocalModel) =>
   acquisitionProgress(model.acquisitionState) ?? null
 type StatusTone = "neutral" | "success" | "progress" | "warning" | "danger"
-const modelStatus = (
-  model: LocalModel,
-  reconciliation: CatalogModelReconciliationState | null = null
-): { readonly label: string; readonly tone: StatusTone } => {
-  if (reconciliation?._tag === "Starting")
-    return {
-      label: "Starting",
-      tone: "progress",
-    }
-  if (reconciliation?._tag === "Removing")
+const modelStatus = (model: LocalModel): { readonly label: string; readonly tone: StatusTone } => {
+  if (model.acquisitionState._tag === "Removing")
     return {
       label: "Removing",
       tone: "progress",
     }
-  if (reconciliation?._tag === "RemoveFailed")
+  if (model.acquisitionState._tag === "RemoveFailed")
     return {
       label: "Remove failed",
-      tone: "danger",
-    }
-  if (reconciliation?._tag === "Transferring")
-    return {
-      label: `${
-        reconciliation.operation === "Update" ? "Updating" : "Downloading"
-      } ${transferProgress(reconciliation.progress)}%`,
-      tone: "progress",
-    }
-  if (reconciliation?._tag === "Failed")
-    return {
-      label: `${reconciliation.operation} failed`,
       tone: "danger",
     }
   if (model.servingState._tag === "Resolving")
@@ -571,29 +551,28 @@ const catalogData = (model: LocalModel) =>
     ? model.catalogMembershipState.catalogData
     : null
 
-const isCatalogVisible = ({ model }: CatalogModelView): boolean =>
+const isCatalogVisible = (model: LocalModel): boolean =>
   model.servingState._tag !== "Assessed" ||
   model.servingState.assessment._tag === "Fits"
 
 const matchesCatalogFilter = (
-  view: CatalogModelView,
+  model: LocalModel,
   filter: CatalogFilter
 ): boolean => {
-  const { model } = view
   if (filter === "all") return true
   return installedAcquisition(model.acquisitionState) !== undefined
 }
 
 const compareCatalogModels = (
-  left: CatalogModelView,
-  right: CatalogModelView,
+  left: LocalModel,
+  right: LocalModel,
   sort: CatalogSort
 ): number => {
-  const leftName = formatLocalModelDisplayName(left.model)
-  const rightName = formatLocalModelDisplayName(right.model)
+  const leftName = formatLocalModelDisplayName(left)
+  const rightName = formatLocalModelDisplayName(right)
   const byName = leftName.localeCompare(rightName)
-  const leftCatalog = catalogData(left.model)
-  const rightCatalog = catalogData(right.model)
+  const leftCatalog = catalogData(left)
+  const rightCatalog = catalogData(right)
   if (sort === "name") return byName
   if (sort === "recent") {
     return (
@@ -609,25 +588,24 @@ const compareCatalogModels = (
     )
   }
   if (sort === "largest") {
-    return right.model.downloadBytes - left.model.downloadBytes || byName
+    return right.downloadBytes - left.downloadBytes || byName
   }
   if (sort === "smallest") {
-    return left.model.downloadBytes - right.model.downloadBytes || byName
+    return left.downloadBytes - right.downloadBytes || byName
   }
   return byName
 }
 
 function CatalogCandidate({
-  view,
+  model,
   selected,
   onSelect,
 }: {
-  readonly view: CatalogModelView
+  readonly model: LocalModel
   readonly selected: boolean
   readonly onSelect: () => void
 }): ReactNode {
-  const { model, reconciliationState } = view
-  const status = modelStatus(model, reconciliationState)
+  const status = modelStatus(model)
   return (
     <Button
       variant="unstyled"
@@ -659,23 +637,17 @@ function CatalogCandidate({
   )
 }
 function CatalogInspector({
-  view,
+  model,
 }: {
-  readonly view: CatalogModelView
+  readonly model: LocalModel
 }): ReactNode {
-  const { model, reconciliationState } = view
   const modelActions = useLocalModelActions()
   const configurationId = model.modelId
-  const status = modelStatus(model, reconciliationState)
+  const status = modelStatus(model)
   const axes = Option.getOrNull(localModelRadarAxes(model))
-  const transfer =
-    reconciliationState._tag === "Transferring"
-      ? reconciliationState.progress
-      : modelTransfer(model)
+  const transfer = modelTransfer(model)
   const installed = installedAcquisition(model.acquisitionState) !== undefined
-  const starting =
-    reconciliationState._tag === "Starting" ||
-    reconciliationState._tag === "Removing"
+  const starting = model.acquisitionState._tag === "Removing"
   const source = repositoryUrl(model)
   const actions = (
     <div className="flex shrink-0 items-center gap-2">
@@ -829,7 +801,7 @@ function CatalogView(): ReactNode {
           (candidate) =>
             matchesCatalogFilter(candidate, filter) &&
             (normalizedQuery.length === 0 ||
-              formatLocalModelDisplayName(candidate.model)
+              formatLocalModelDisplayName(candidate)
                 .toLowerCase()
                 .includes(normalizedQuery))
         )
@@ -837,7 +809,7 @@ function CatalogView(): ReactNode {
     [filter, normalizedQuery, sort, visibleCandidates]
   )
   const selected =
-    candidates.find(({ model }) => modelKey(model) === selectedKey) ??
+    candidates.find((model) => modelKey(model) === selectedKey) ??
     candidates[0] ??
     null
   const discovery = catalog?.discoveryState ?? null
@@ -981,13 +953,13 @@ function CatalogView(): ReactNode {
                   aria-label="Catalog models"
                 >
                   {candidates.map((candidate) => {
-                    const key = modelKey(candidate.model)
+                    const key = modelKey(candidate)
                     return (
                       <CatalogCandidate
                         key={key}
-                        view={candidate}
+                        model={candidate}
                         selected={
-                          selected !== null && modelKey(selected.model) === key
+                          selected !== null && modelKey(selected) === key
                         }
                         onSelect={() => setSelectedKey(key)}
                       />
@@ -995,7 +967,7 @@ function CatalogView(): ReactNode {
                   })}
                 </div>
               </section>
-              {selected && <CatalogInspector view={selected} />}
+              {selected && <CatalogInspector model={selected} />}
             </div>
           ) : null}
         </>
