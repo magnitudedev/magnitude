@@ -362,7 +362,7 @@ function InstalledModelMenu({
               variant="destructive"
               onClick={() => {
                 if (configurationId === null) return
-                actions.delete(configurationId)
+                actions.remove(configurationId)
                 setConfirmingRemoval(false)
               }}
             >
@@ -831,12 +831,6 @@ function CatalogView(): ReactNode {
         />
       ) : (
         <QueryNotice result={catalogResult} label="catalog" />
-      )}
-      {modelActions.latestInstallationFailed && (
-        <div className="flex items-center gap-2 rounded-[7px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-850 px-3 py-2.5 text-slate-600 dark:text-slate-400 text-xs [&.danger]:border-red-300 [&.danger]:text-red-600 dark:[&.danger]:border-red-700 dark:[&.danger]:text-red-400 danger">
-          <AlertTriangle size={14} />
-          The latest model installation or update request failed.
-        </div>
       )}
       {discovery?._tag === "Loading" ? (
         <LoadingNotice

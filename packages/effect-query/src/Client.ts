@@ -67,7 +67,7 @@ interface NotMaterializable<Reason extends string> {
  */
 export type Materializable<G extends Group.Any, Provided> =
   [keyof Group.Members<G> & Reserved] extends [never]
-    ? [Requirements<Group.Operation<G>>] extends [Provided | QueryClient.QueryClient | Reactivity.Reactivity]
+    ? [Requirements<Group.Definition<G>>] extends [Provided | QueryClient.QueryClient | Reactivity.Reactivity]
       ? unknown
       : NotMaterializable<"an operation of the group requires a service the client does not provide">
     : NotMaterializable<"a member of the group is named runtime, query, mutation, or subscription">

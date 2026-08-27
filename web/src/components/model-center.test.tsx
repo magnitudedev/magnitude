@@ -19,7 +19,7 @@ vi.mock("@magnitudedev/client-common", async (importOriginal) => ({
   useLocalModels: () => modelState.localModels,
   useModelSlots: () => modelState.slots,
   useCatalogModels: () => modelState.catalog,
-  useLocalModelActions: () => ({ latestInstallationFailed: false }),
+  useLocalModelActions: () => ({}),
   usePlatform: () => ({
     id: "desktop",
     showItemInFolder: vi.fn(),

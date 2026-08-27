@@ -307,22 +307,7 @@ impl ManagedModelStore {
             installed_packages_observer: Arc::new(RwLock::new(None)),
         };
         manager.request_installed_model_reconciliation();
-        manager.start_installed_model_reconciler();
         Ok(manager)
-    }
-
-    fn start_installed_model_reconciler(&self) {
-        let manager = self.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // Startup reconciliation was requested before this activity was admitted.
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                manager.request_installed_model_reconciliation();
-            }
-        });
     }
 
     pub(crate) fn request_installed_model_reconciliation(&self) {
@@ -608,7 +593,6 @@ impl ManagedModelStore {
             InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
         })? = installed;
         self.ensure_generation.fetch_add(1, Ordering::Release);
-        self.request_installed_model_reconciliation();
         self.notify_installed_packages_changed();
         Ok(model)
     }

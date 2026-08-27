@@ -77,8 +77,10 @@ One ACN local-model assessor owns demand for each catalog model's desired config
 installed effective configuration when different. Desired catalog assessment supports ranking
 and acquisition; effective catalog assessment supports current serving.
 Ranking, provider-offering, and local-model projections consume its state and
-never invoke assessment independently. The ranker consumes only release-catalog
-candidates. Each release-catalog configuration uses its reviewed catalog profile. Installed
+never invoke assessment independently. The ranker consumes only release-catalog models. It scores
+each desired release configuration and, while an update is incomplete, the distinct installed
+effective configuration of that same model. Each configuration uses its reviewed catalog profile
+and may publish scores only after its exact assessment is `Fits`. Installed
 artifacts that are not attributed to a catalog model remain package inventory; they do not become
 callable models with fabricated identities. An installed catalog target remains the effective
 configuration of the same canonical catalog model when its desired bundle changes.

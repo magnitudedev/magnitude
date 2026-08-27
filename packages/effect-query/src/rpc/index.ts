@@ -41,6 +41,14 @@ export type GroupRpcs<
   FiniteMiddleware extends RpcMiddleware.TagClassAny = never,
 > = RpcOf<CoreGroup.Operation<Value>, FiniteMiddleware>
 
+interface TransportOnlyGroup {
+  readonly "@magnitudedev/effect-query/rpc/TransportOnlyGroup":
+    "RPC adapters accept only groups whose definitions are all declared operations"
+}
+
+type TransportGroup<Value extends CoreGroup.Any> =
+  [Exclude<CoreGroup.Definition<Value>, Operation.Any>] extends [never] ? unknown : TransportOnlyGroup
+
 /** Stable derived facts exposed to transport integrations without manual RPC declarations. */
 export interface OperationMetadata {
   readonly name: string
@@ -61,22 +69,22 @@ interface Projection<Rpcs extends Rpc.Any> {
 
 export interface Adapter<FiniteMiddleware extends RpcMiddleware.TagClassAny = never> {
   /** Derive the Effect RPC group. Intended for low-level protocol and test integration. */
-  readonly toRpcGroup: <Value extends CoreGroup.Any>(group: Value) => RpcGroup.RpcGroup<GroupRpcs<Value, FiniteMiddleware>>
+  readonly toRpcGroup: <Value extends CoreGroup.Any>(group: Value & TransportGroup<Value>) => RpcGroup.RpcGroup<GroupRpcs<Value, FiniteMiddleware>>
   readonly implementations: <Value extends CoreGroup.Any>(
-    group: Value,
+    group: Value & TransportGroup<Value>,
     client: RpcClient.RpcClient.Flat<GroupRpcs<Value, FiniteMiddleware>, RpcClientError>,
-  ) => Operation.ImplementationService<RpcClientError>
-  readonly layer: <Value extends CoreGroup.Any>(group: Value) => Layer.Layer<
-    Operation.Implementations<RpcClientError>,
+  ) => Operation.ImplementationService<CoreGroup.Declaration<Value>, RpcClientError>
+  readonly layer: <Value extends CoreGroup.Any>(group: Value & TransportGroup<Value>) => Layer.Layer<
+    Operation.Implementations<Operation.Name<CoreGroup.Declaration<Value>>, RpcClientError>,
     never,
     RpcClient.Protocol | Rpc.MiddlewareClient<GroupRpcs<Value, FiniteMiddleware>> | Rpc.Context<GroupRpcs<Value, FiniteMiddleware>>
   >
-  readonly makeImplementations: <Value extends CoreGroup.Any>(group: Value) => Effect.Effect<
-    Operation.ImplementationService<RpcClientError>,
+  readonly makeImplementations: <Value extends CoreGroup.Any>(group: Value & TransportGroup<Value>) => Effect.Effect<
+    Operation.ImplementationService<CoreGroup.Declaration<Value>, RpcClientError>,
     never,
     RpcClient.Protocol | Rpc.MiddlewareClient<GroupRpcs<Value, FiniteMiddleware>> | Scope.Scope
   >
-  readonly makeRpcClient: <Value extends CoreGroup.Any>(group: Value) => Effect.Effect<
+  readonly makeRpcClient: <Value extends CoreGroup.Any>(group: Value & TransportGroup<Value>) => Effect.Effect<
     RpcClient.RpcClient<GroupRpcs<Value, FiniteMiddleware>, RpcClientError>,
     never,
     RpcClient.Protocol | Rpc.MiddlewareClient<GroupRpcs<Value, FiniteMiddleware>> | Scope.Scope
@@ -88,16 +96,16 @@ export interface Adapter<FiniteMiddleware extends RpcMiddleware.TagClassAny = ne
     Error = never,
     Requirements = never,
   >(
-    group: Value,
+    group: Value & TransportGroup<Value>,
     handlers: Handlers | Effect.Effect<Handlers, Error, Requirements>,
   ) => Layer.Layer<Rpc.ToHandler<Rpcs>, Error, Exclude<Requirements, Scope.Scope> | RpcGroup.HandlersContext<Rpcs, Handlers>>
-  readonly makeRpcServer: <Value extends CoreGroup.Any>(group: Value) => Effect.Effect<
+  readonly makeRpcServer: <Value extends CoreGroup.Any>(group: Value & TransportGroup<Value>) => Effect.Effect<
     never,
     never,
     RpcServer.Protocol | Rpc.ToHandler<GroupRpcs<Value, FiniteMiddleware>> | Rpc.Middleware<GroupRpcs<Value, FiniteMiddleware>> | Rpc.Context<GroupRpcs<Value, FiniteMiddleware>>
   >
-  readonly operations: <Value extends CoreGroup.Any>(group: Value) => ReadonlyArray<OperationMetadata>
-  readonly operation: <Value extends CoreGroup.Any>(group: Value, name: string) => OperationMetadata | undefined
+  readonly operations: <Value extends CoreGroup.Any>(group: Value & TransportGroup<Value>) => ReadonlyArray<OperationMetadata>
+  readonly operation: <Value extends CoreGroup.Any>(group: Value & TransportGroup<Value>, name: string) => OperationMetadata | undefined
 }
 
 const annotate = <R extends Rpc.AnyWithProps>(rpc: R, annotations: Context.Context<never>): R =>
@@ -108,9 +116,13 @@ export const make = <FiniteMiddleware extends RpcMiddleware.TagClassAny = never>
 ): Adapter<FiniteMiddleware> => {
   const projections = new WeakMap<object, Projection<Rpc.Any>>()
 
-  const project = <Value extends CoreGroup.Any>(group: Value): Projection<GroupRpcs<Value, FiniteMiddleware>> => {
+  const project = <Value extends CoreGroup.Any>(group: Value & TransportGroup<Value>): Projection<GroupRpcs<Value, FiniteMiddleware>> => {
     const cached = projections.get(group)
     if (cached !== undefined) return cached as unknown as Projection<GroupRpcs<Value, FiniteMiddleware>>
+
+    if (CoreGroup.definitions(group).length !== CoreGroup.declarations(group).length) {
+      throw new TypeError("Effect Query RPC groups may contain only declared operations")
+    }
 
     const rpcs: Rpc.Any[] = []
     const byOperation = new Map<Operation.Any, Rpc.Any>()
@@ -144,9 +156,9 @@ export const make = <FiniteMiddleware extends RpcMiddleware.TagClassAny = never>
   }
 
   const implementations = <Value extends CoreGroup.Any>(
-    group: Value,
+    group: Value & TransportGroup<Value>,
     client: RpcClient.RpcClient.Flat<GroupRpcs<Value, FiniteMiddleware>, RpcClientError>,
-  ): Operation.ImplementationService<RpcClientError> => {
+  ): Operation.ImplementationService<CoreGroup.Declaration<Value>, RpcClientError> => {
     const projection = project(group)
     return {
       execute: (operation, payload) => {
@@ -167,7 +179,7 @@ export const make = <FiniteMiddleware extends RpcMiddleware.TagClassAny = never>
     implementations,
     layer: (group) => {
       return Layer.scoped(
-        Operation.implementationsTag<RpcClientError>(),
+        Operation.implementationsTag<CoreGroup.Declaration<typeof group>, RpcClientError>(),
         Effect.map(RpcClient.make(project(group).group, { flatten: true }), (client) => implementations(group, client as never)),
       ) as never
     },

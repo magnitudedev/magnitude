@@ -143,7 +143,7 @@ export function make<
   Operation.PayloadConstructor<Payload>,
   Schema.Schema.Type<Success>,
   Schema.Schema.Type<Error>,
-  Operation.Implementations<any>
+  Operation.Implementations<Name, any>
 > & Operation.Declared<Name, "subscription", Payload, Success, Error, Policy>
 export function make(
   name: string,

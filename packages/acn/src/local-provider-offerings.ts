@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Option, Schema, Stream, SubscriptionRef } from "effect"
+import { Context, Effect, Layer, Option, Stream } from "effect"
 import {
   LocalModelMutationFailed,
   type LocalInferenceError,
@@ -8,7 +8,6 @@ import {
   servableModelBundlePackageIds,
   PRIMARY_SLOT_ID,
   SECONDARY_SLOT_ID,
-  ProviderModelCatalogEntrySchema,
   type ProviderModelCatalogEntry,
 } from "@magnitudedev/acn-protocol"
 import type { ProviderModelId } from "@magnitudedev/sdk"
@@ -22,49 +21,7 @@ import { resolveBundlePresentation } from "./local-model-presentation"
 export { localCatalogProviderModelId } from "./local-provider-model-id"
 import { localCatalogProviderModelId } from "./local-provider-model-id"
 
-export type ProviderOfferingPackageEvidence = readonly {
-  readonly providerModelId: LocalProviderOffering["providerModelId"]
-  readonly packages: readonly {
-    readonly packageId: ModelPackageEntry["package"]["id"]
-    readonly installed: boolean
-    readonly inspection: ModelPackageEntry["inspection"]["_tag"]
-  }[]
-}[]
-
-export const providerOfferingPackageEvidence = (
-  offerings: readonly Pick<LocalProviderOffering, "providerModelId" | "configuration">[],
-  entries: ReadonlyMap<ModelPackageEntry["package"]["id"], ModelPackageEntry>,
-): ProviderOfferingPackageEvidence => [...offerings]
-  .sort((left, right) => left.providerModelId.localeCompare(right.providerModelId))
-  .map((offering) => ({
-    providerModelId: offering.providerModelId,
-    packages: servableModelBundlePackageIds(offering.configuration.bundle).map((packageId) => {
-      const entry = entries.get(packageId)
-      return {
-        packageId,
-        installed: entry?.localState._tag === "Installed",
-        inspection: entry?.inspection._tag ?? "Pending",
-      }
-    }).sort((left, right) => left.packageId.localeCompare(right.packageId)),
-  }))
-
-export const sameProviderOfferingPackageEvidence = (
-  left: ProviderOfferingPackageEvidence,
-  right: ProviderOfferingPackageEvidence,
-): boolean => left.length === right.length && left.every((offering, index) => {
-  const other = right[index]
-  return offering.providerModelId === other?.providerModelId
-    && offering.packages.length === other.packages.length
-    && offering.packages.every((modelPackage, packageIndex) => {
-      const otherPackage = other.packages[packageIndex]
-      return modelPackage.packageId === otherPackage?.packageId
-        && modelPackage.installed === otherPackage.installed
-        && modelPackage.inspection === otherPackage.inspection
-    })
-})
-
 export interface LocalProviderOfferingsState {
-  readonly packageEvidence: Option.Option<ProviderOfferingPackageEvidence>
   readonly entries: readonly ProviderModelCatalogEntry[]
   readonly failure: Option.Option<LocalInferenceError>
 }
@@ -117,19 +74,16 @@ const providerAvailability = (
   }
 }
 
-export const LocalProviderOfferingsLive: Layer.Layer<
-  LocalProviderOfferings,
-  never,
-  LocalModelConfigurationResolver | LocalModelPackages
-> = Layer.scoped(LocalProviderOfferings, Effect.gen(function* () {
-  const resolver = yield* LocalModelConfigurationResolver
-  const packages = yield* LocalModelPackages
+export interface ProjectedLocalProviderOfferings {
+  readonly offerings: readonly LocalProviderOffering[]
+  readonly entries: readonly ProviderModelCatalogEntry[]
+}
 
-  const readyOfferingsFrom = (
-    resolved: readonly ResolvedLocalModelConfiguration[],
-  ) => resolved.flatMap((resolution) => resolution.targetInspection._tag === "Inspected"
-    && Option.isSome(resolution.catalogModel)
-    ? [{
+const configuredOfferings = (
+  resolved: readonly ResolvedLocalModelConfiguration[],
+) => resolved.flatMap((resolution) => resolution.targetInspection._tag === "Inspected"
+  && Option.isSome(resolution.catalogModel)
+  ? [{
       resolution,
       offering: {
         providerModelId: localCatalogProviderModelId(resolution.catalogModel.value),
@@ -137,34 +91,99 @@ export const LocalProviderOfferingsLive: Layer.Layer<
         capabilities: resolution.targetInspection.capabilities,
       } satisfies LocalProviderOffering,
     }]
-    : [])
+  : [])
 
-  const list: LocalProviderOfferingsApi["list"] = Effect.gen(function* () {
-    const resolved = [...(yield* resolver.get).values()]
-    return readyOfferingsFrom(resolved).map(({ offering }) => offering)
-  }).pipe(
+type PackageAvailabilityEvidence = readonly {
+  readonly packageId: ModelPackageEntry["package"]["id"]
+  readonly installed: boolean
+  readonly inspectable: boolean
+}[]
+
+const packageAvailabilityEvidence = (
+  entries: readonly ModelPackageEntry[],
+): PackageAvailabilityEvidence => entries.map((entry) => ({
+  packageId: entry.package.id,
+  installed: entry.localState._tag === "Installed",
+  inspectable: entry.inspection._tag === "Inspected",
+}))
+
+const samePackageAvailability = (
+  left: PackageAvailabilityEvidence,
+  right: PackageAvailabilityEvidence,
+): boolean => left.length === right.length && left.every((entry, index) => {
+  const other = right[index]
+  return other !== undefined
+    && entry.packageId === other.packageId
+    && entry.installed === other.installed
+    && entry.inspectable === other.inspectable
+})
+
+export const projectLocalProviderOfferings = (
+  resolved: readonly ResolvedLocalModelConfiguration[],
+  packageEntries: ReadonlyMap<ModelPackageEntry["package"]["id"], ModelPackageEntry>,
+): ProjectedLocalProviderOfferings => {
+  const configured = configuredOfferings(resolved)
+  const offerings = configured.map(({ offering }) => offering)
+  const entries = configured.map(({ offering, resolution }): ProviderModelCatalogEntry => {
+    const bundleEntries = servableModelBundlePackageIds(offering.configuration.bundle)
+      .map((id) => packageEntries.get(id))
+    const installed = bundleEntries.every((entry) => entry?.localState._tag === "Installed")
+    const inspectable = installed
+      && bundleEntries.every((entry) => entry?.inspection._tag === "Inspected")
+    const { bundle, profile } = offering.configuration
+    const assessment = resolution.assessment
+    const curated = Option.getOrUndefined(resolution.catalogModel)
+    const presentation = resolveBundlePresentation(bundle, curated && {
+      displayName: curated.displayName,
+      variantLabel: curated.variantLabel,
+      description: curated.description,
+      license: curated.license,
+    })
+    return {
+      providerId: LOCAL_PROVIDER_ID,
+      providerModelId: offering.providerModelId,
+      modelFamilyId: Option.none(),
+      displayName: presentation.displayName,
+      variantLabel: Option.some(presentation.variantLabel),
+      supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
+      contextWindow: profile.contextLength,
+      maxOutputTokens: profile.contextLength,
+      memory: inspectable && assessment._tag === "Fits"
+        ? Option.some(assessment.assessment.memory)
+        : inspectable && assessment._tag === "DoesNotFit"
+          ? Option.some(assessment.memory)
+          : Option.none(),
+      capabilities: offering.capabilities,
+      availability: providerAvailability(installed, inspectable, assessment),
+      pricing: Option.none(),
+    }
+  })
+  return { offerings, entries }
+}
+
+export const LocalProviderOfferingsLive: Layer.Layer<
+  LocalProviderOfferings,
+  never,
+  LocalModelConfigurationResolver | LocalModelPackages
+> = Layer.effect(LocalProviderOfferings, Effect.gen(function* () {
+  const resolver = yield* LocalModelConfigurationResolver
+  const packages = yield* LocalModelPackages
+
+  const list: LocalProviderOfferingsApi["list"] = resolver.get.pipe(
+    Effect.map((resolved) => configuredOfferings([...resolved.values()]).map(({ offering }) => offering)),
     Effect.mapError((error) => error instanceof LocalModelMutationFailed
       ? error
       : failure("read_local_provider_offerings_failed", error)),
   )
 
-  const changes = resolver.changes
-
-  const current = yield* SubscriptionRef.make<LocalProviderOfferingsState>({
-    packageEvidence: Option.none(),
-    entries: [],
-    failure: Option.none(),
-  })
-  const entriesEquivalent = Schema.equivalence(Schema.Array(ProviderModelCatalogEntrySchema))
-  const stateEquivalent = (
-    left: LocalProviderOfferingsState,
-    right: LocalProviderOfferingsState,
-  ): boolean => Option.match(left.packageEvidence, {
-    onNone: () => Option.isNone(right.packageEvidence),
-    onSome: (evidence) => Option.exists(right.packageEvidence, (other) =>
-      sameProviderOfferingPackageEvidence(evidence, other)),
-  }) && entriesEquivalent(left.entries, right.entries)
-    && Option.getOrUndefined(left.failure)?.message === Option.getOrUndefined(right.failure)?.message
+  const changes = Stream.merge(
+    resolver.changes,
+    packages.changes.pipe(
+      Stream.map((state) => packageAvailabilityEvidence(state.entries)),
+      Stream.changesWith(samePackageAvailability),
+      Stream.map(() => undefined),
+    ),
+  )
 
   const compute = Effect.gen(function* () {
     const resolved = [...(yield* resolver.get).values()]
@@ -172,94 +191,25 @@ export const LocalProviderOfferingsLive: Layer.Layer<
     const packageEntries = new Map(
       packageState.entries.map((entry) => [entry.package.id, entry]),
     )
-    const configured = readyOfferingsFrom(resolved)
-    const offerings = configured.map(({ offering }) => offering)
-    const packageEvidence = providerOfferingPackageEvidence(offerings, packageEntries)
-    const bundleEntries = offerings.map(({ configuration }) =>
-      servableModelBundlePackageIds(configuration.bundle).map((id) => packageEntries.get(id)))
-    const installedBundles = bundleEntries.map((entries) =>
-      entries.every((entry) => entry?.localState._tag === "Installed"))
-    const inspectable = bundleEntries.map((entries, index) => installedBundles[index]
-      && entries.every((entry) => entry?.inspection._tag === "Inspected"))
-    const entries = configured.map(({ offering, resolution }, index): ProviderModelCatalogEntry => {
-      const { bundle, profile } = offering.configuration
-      const installed = installedBundles[index] ?? false
-      const bundleInspectable = inspectable[index] ?? false
-      const assessment = resolution.assessment
-      const curated = Option.getOrUndefined(resolution.catalogModel)
-      const presentation = resolveBundlePresentation(bundle, curated && {
-        displayName: curated.displayName,
-        variantLabel: curated.variantLabel,
-        description: curated.description,
-        license: curated.license,
-      })
-      return {
-        providerId: LOCAL_PROVIDER_ID,
-        providerModelId: offering.providerModelId,
-        modelFamilyId: Option.none(),
-        displayName: presentation.displayName,
-        variantLabel: Option.some(presentation.variantLabel),
-        supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
-        contextWindow: profile.contextLength,
-        maxOutputTokens: profile.contextLength,
-        memory: bundleInspectable && assessment._tag === "Fits"
-          ? Option.some(assessment.assessment.memory)
-          : bundleInspectable && assessment._tag === "DoesNotFit"
-            ? Option.some(assessment.memory)
-            : Option.none(),
-        capabilities: offering.capabilities,
-        availability: providerAvailability(installed, bundleInspectable, assessment),
-        pricing: Option.none(),
-      }
-    })
-    return {
-      entries,
-      packageEvidence,
-    }
+    return projectLocalProviderOfferings(resolved, packageEntries)
   })
-
-  const publishCurrent: Effect.Effect<void, LocalInferenceError> = compute.pipe(
-    Effect.flatMap(({ entries, packageEvidence }) => Effect.gen(function* () {
-      const previous = yield* SubscriptionRef.get(current)
-      const next = {
-        packageEvidence: Option.some(packageEvidence),
-        entries,
-        failure: Option.none<LocalInferenceError>(),
-      }
-      if (!stateEquivalent(previous, next)) yield* SubscriptionRef.set(current, next)
-    })),
-  )
-
-  const project = publishCurrent.pipe(
-    Effect.catchAll((error) => Effect.gen(function* () {
-      const previous = yield* SubscriptionRef.get(current)
-      const next = { ...previous, failure: Option.some(error) }
-      if (!stateEquivalent(previous, next)) yield* SubscriptionRef.set(current, next)
-    })),
-    Effect.catchAllCause((cause) => Effect.logWarning(
-      "Unable to project local provider offerings",
-    ).pipe(Effect.annotateLogs({ cause: String(cause) }))),
-  )
-  // Downstream catalog construction reads this state immediately. Publish the
-  // initial projection before exposing the service so that initialization
-  // cannot race the changes subscription.
-  yield* project
-  yield* changes.pipe(
-    Stream.debounce("25 millis"),
-    Stream.runForEach(() => project),
-    Effect.forkScoped,
-  )
 
   return LocalProviderOfferings.of({
     ready: resolver.settled,
     list,
     changes,
-    catalog: SubscriptionRef.get(current).pipe(Effect.flatMap((state) => Option.match(state.failure, {
-      onNone: () => Effect.succeed(state.entries),
-      onSome: Effect.fail,
-    }))),
-    state: SubscriptionRef.get(current),
-    catalogChanges: current.changes.pipe(Stream.map(() => undefined)),
+    catalog: compute.pipe(Effect.map(({ entries }) => entries)),
+    state: compute.pipe(
+      Effect.map(({ entries }): LocalProviderOfferingsState => ({
+        entries,
+        failure: Option.none(),
+      })),
+      Effect.catchAll((error) => Effect.succeed({
+        entries: [],
+        failure: Option.some(error),
+      })),
+    ),
+    catalogChanges: changes,
     resolve: (providerModelId) => list.pipe(Effect.flatMap((offerings) => {
       const offering = offerings.find((candidate) => candidate.providerModelId === providerModelId)
       return offering

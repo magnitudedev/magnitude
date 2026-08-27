@@ -1,10 +1,10 @@
-import { Context, Effect, Layer, Option, Schema, Stream, SubscriptionRef } from "effect"
+import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import type { NonEmptyReadonlyArray } from "effect/Array"
 import {
   LocalModelsStateSchema,
   LocalModelMutationFailed,
+  ModelPackageIdSchema,
   ModelServingConfigurationSchema,
-  ServableModelBundleSchema,
   installedAcquisition,
   servableModelBundlePackageIds,
   servableModelBundlePackages,
@@ -30,22 +30,26 @@ import {
 } from "@magnitudedev/acn-protocol"
 import type { ProviderModelId } from "@magnitudedev/ai"
 import { projectInferenceResidency } from "@magnitudedev/sdk"
-import { IcnInstances, IcnModels } from "@magnitudedev/icn"
-import type * as Generated from "@magnitudedev/icn-protocol/schemas"
+import { IcnInstances } from "@magnitudedev/icn"
+import * as Generated from "@magnitudedev/icn-protocol/schemas"
 import { LocalInferenceHardware as LocalInferenceHardwareService } from "./local-inference-hardware"
 import { LocalModelPackages } from "./local-model-packages"
 import { LocalModelRanker } from "./local-model-ranker"
-import { LocalModelSyncs } from "./local-model-syncs"
-import { LocalProviderOfferings, localCatalogProviderModelId } from "./local-provider-offerings"
 import {
-  providerOfferingPackageEvidence,
-  sameProviderOfferingPackageEvidence,
+  LocalModelAcquisitionCoordinator,
+  type LocalModelSyncState,
+} from "./local-model-acquisition-coordinator"
+import {
+  localCatalogProviderModelId,
+  projectLocalProviderOfferings,
 } from "./local-provider-offerings"
-import { catalogIdentityFromIcn, catalogModelDefinitionFromIcn } from "./local-model-icn-adapter"
+import { LocalModelCatalogAdapter } from "./local-model-catalog-adapter"
 import {
   LocalModelConfigurationResolver,
+  type ResolvedLocalModelConfiguration,
 } from "./local-model-configuration-resolver"
 import { bundlePackages, resolveBundlePresentation } from "./local-model-presentation"
+import { materializeProjection } from "./materialized-projection"
 export { resolveBundlePresentation } from "./local-model-presentation"
 
 const GIB = 1024 ** 3
@@ -85,26 +89,6 @@ export const installedBundleFields = (
   }
   return {
     installedBytes: bundleDownloadBytes(bundle),
-    packages: [firstPackage, ...remainingPackages],
-  }
-}
-
-const priorInstalledFields = (
-  entries: readonly ModelPackageEntry[],
-): InstalledModelFields | undefined => {
-  const installedPackages = entries.flatMap((entry) => entry.localState._tag === "Installed"
-    ? [{
-        packageId: entry.package.id,
-        path: entry.localState.path,
-        origin: entry.localState.origin,
-      }]
-    : [])
-  const [firstPackage, ...remainingPackages] = installedPackages
-  if (firstPackage === undefined) return undefined
-  return {
-    installedBytes: entries.reduce((total, entry) => entry.localState._tag === "Installed"
-      ? total + entry.package.files.reduce((sum, file) => sum + file.sizeBytes, 0)
-      : total, 0),
     packages: [firstPackage, ...remainingPackages],
   }
 }
@@ -155,10 +139,12 @@ export interface ModelAcquisitionInputs {
   /** The current bundle's complete installation, when every package is on disk. */
   readonly currentInstalled: InstalledModelFields | undefined
   readonly download: ModelBundleDownload | undefined
+  readonly syncState?: LocalModelSyncState | undefined
+  readonly downloadBytes?: number
   /** ICN reports a newer catalog target than the installed current bundle. */
   readonly updateAvailable: boolean
-  /** Installed packages attributed to this model that predate the current bundle. */
-  readonly priorEntries: readonly ModelPackageEntry[]
+  /** The effective installed configuration retained while the desired bundle is incomplete. */
+  readonly priorInstalled: InstalledModelFields | undefined
   readonly residencyState: ModelResidency
 }
 
@@ -170,7 +156,40 @@ export interface ModelAcquisitionInputs {
 export const deriveModelAcquisitionState = (
   inputs: ModelAcquisitionInputs,
 ): LocalModelAcquisitionState => {
-  const transfer = transferOf(inputs.download)
+  const downloadBytes = inputs.downloadBytes ?? 0
+  const transfer = inputs.syncState?._tag === "Admitting"
+    ? {
+        _tag: "Active" as const,
+        progress: {
+          stage: "queued" as const,
+          completedBytes: 0,
+          totalBytes: downloadBytes,
+          bytesPerSecond: Option.none<number>(),
+        },
+      }
+    : inputs.syncState?._tag === "AdmissionFailed"
+      ? { _tag: "Failed" as const, failure: inputs.syncState.failure }
+      : inputs.syncState?._tag === "Correlated" && inputs.download?.state._tag === "Completed"
+        ? {
+            _tag: "Active" as const,
+            progress: {
+              stage: "publishing" as const,
+              completedBytes: downloadBytes,
+              totalBytes: downloadBytes,
+              bytesPerSecond: Option.none<number>(),
+            },
+          }
+        : inputs.syncState?._tag === "Correlated" && inputs.download === undefined
+          ? {
+              _tag: "Active" as const,
+              progress: {
+                stage: "queued" as const,
+                completedBytes: 0,
+                totalBytes: downloadBytes,
+                bytesPerSecond: Option.none<number>(),
+              },
+            }
+          : transferOf(inputs.download)
   const current = inputs.currentInstalled
   if (current !== undefined) {
     const installed = { ...current, residencyState: inputs.residencyState }
@@ -179,7 +198,7 @@ export const deriveModelAcquisitionState = (
     if (transfer?._tag === "Failed") return { _tag: "UpdateFailed", ...installed, failure: transfer.failure }
     return { _tag: "UpdateAvailable", ...installed }
   }
-  const prior = priorInstalledFields(inputs.priorEntries)
+  const prior = inputs.priorInstalled
   if (prior !== undefined) {
     const installed = { ...prior, residencyState: inputs.residencyState }
     if (transfer?._tag === "Active") return { _tag: "Updating", ...installed, progress: transfer.progress }
@@ -196,17 +215,18 @@ type ProviderAvailabilityProjection = Pick<ProviderModelCatalogEntry, "availabil
 export const availabilityFromProviderProjection = (
   providerModelId: Option.Option<ProviderModelId>,
   providerEntries: ReadonlyMap<ProviderModelId, ProviderAvailabilityProjection>,
-  projectionCurrent: boolean,
-  providerProjectionFailure: Option.Option<ModelFailure>,
 ): LocalModelAvailabilityState => {
   if (Option.isNone(providerModelId)) return { _tag: "Installable" }
   const resolvedProviderModelId = providerModelId.value
-  if (!projectionCurrent) return { _tag: "Preparing", providerModelId: resolvedProviderModelId }
   const providerEntry = providerEntries.get(resolvedProviderModelId)
   if (providerEntry?.availability._tag === "Available") {
     return { _tag: "Selectable", providerModelId: resolvedProviderModelId }
   }
   if (providerEntry?.availability._tag === "Disabled") {
+    if (providerEntry.availability.reason === "installation_unavailable"
+      || providerEntry.availability.reason === "provider_unavailable") {
+      return { _tag: "Preparing", providerModelId: resolvedProviderModelId }
+    }
     return {
       _tag: "Unavailable",
       providerModelId,
@@ -219,15 +239,16 @@ export const availabilityFromProviderProjection = (
       },
     }
   }
-  if (Option.isSome(providerProjectionFailure)) {
-    return {
-      _tag: "Unavailable",
-      providerModelId,
-      failure: providerProjectionFailure.value,
-    }
-  }
   return { _tag: "Preparing", providerModelId: resolvedProviderModelId }
 }
+
+/** A prior effective configuration remains selectable while a desired update is incomplete. */
+export const selectableProviderModelId = (
+  modelId: ProviderModelId,
+  effectiveConfigurationInstalled: boolean,
+): Option.Option<ProviderModelId> => effectiveConfigurationInstalled
+  ? Option.some(modelId)
+  : Option.none()
 
 const unavailableAssessment = (
   assessment: Exclude<LocalModelAssessment, { readonly _tag: "Fits" }>,
@@ -351,15 +372,8 @@ export const projectLocalModelMemory = (
 
 export interface LocalModelsApi {
   readonly state: Effect.Effect<LocalModelsState>
-  readonly changes: Stream.Stream<LocalModelsState>
-  /** Publishes a snapshot from the current lower-domain facts before returning. */
+  readonly changes: Stream.Stream<void>
   readonly refresh: Effect.Effect<void, LocalModelMutationFailed>
-  readonly removalStarted: (modelId: ProviderModelId) => Effect.Effect<void, LocalModelMutationFailed>
-  readonly removalFailed: (
-    modelId: ProviderModelId,
-    failure: ModelFailure,
-  ) => Effect.Effect<void, LocalModelMutationFailed>
-  readonly removalFinished: (modelId: ProviderModelId) => Effect.Effect<void, LocalModelMutationFailed>
 }
 
 export class LocalModels extends Context.Tag("LocalModels")<LocalModels, LocalModelsApi>() {}
@@ -367,134 +381,141 @@ export class LocalModels extends Context.Tag("LocalModels")<LocalModels, LocalMo
 export const LocalModelsLive: Layer.Layer<
   LocalModels,
   never,
-  IcnModels | LocalModelPackages | LocalModelRanker
-    | LocalModelConfigurationResolver | LocalProviderOfferings | LocalInferenceHardwareService
-    | IcnInstances | LocalModelSyncs
+  LocalModelCatalogAdapter | LocalModelPackages | LocalModelRanker
+    | LocalModelConfigurationResolver | LocalInferenceHardwareService
+    | IcnInstances | LocalModelAcquisitionCoordinator
 > = Layer.scoped(LocalModels, Effect.gen(function* () {
-  const icnModels = yield* IcnModels
+  const catalog = yield* LocalModelCatalogAdapter
   const packages = yield* LocalModelPackages
   const ranker = yield* LocalModelRanker
   const resolver = yield* LocalModelConfigurationResolver
-  const offerings = yield* LocalProviderOfferings
   const hardware = yield* LocalInferenceHardwareService
   const instances = yield* IcnInstances
-  const syncs = yield* LocalModelSyncs
-  const current = yield* SubscriptionRef.make<LocalModelsState>({
-    inventoryState: { _tag: "Initializing" },
-    models: [],
-    discoveryState: { _tag: "Loading", progress: [] },
-  })
-  const removals = yield* SubscriptionRef.make<ReadonlyMap<ProviderModelId,
-    { readonly _tag: "Removing" } | { readonly _tag: "RemoveFailed"; readonly failure: ModelFailure }
-  >>(new Map())
-  const equivalent = Schema.equivalence(LocalModelsStateSchema)
-  const lock = yield* Effect.makeSemaphore(1)
+  const acquisition = yield* LocalModelAcquisitionCoordinator
 
-  const projectCurrent = lock.withPermits(1)(Effect.gen(function* () {
+  const projectCurrent = Effect.gen(function* () {
     const packageState = yield* packages.state
-    const nativeCatalogModels = (yield* icnModels.get).state.models
-    const catalogModels = yield* Effect.forEach(
-      nativeCatalogModels,
-      catalogModelDefinitionFromIcn,
+    const catalogState = yield* catalog.state
+    const catalogEntries = new Map<string, (typeof catalogState.entries)[number]>(
+      catalogState.entries.map((entry) => [localCatalogProviderModelId(entry.identity), entry]),
     )
     const rankingState = yield* ranker.state
-    const resolvedConfigurations = new Map<string, import("./local-model-configuration-resolver").ResolvedLocalModelConfiguration>(
+    const resolvedConfigurations = new Map<string, ResolvedLocalModelConfiguration>(
       yield* resolver.get,
     )
-    const configured = yield* offerings.list
-    const projectedOfferings = yield* offerings.state
     const hardwareState = yield* hardware.state
     const instanceState = yield* instances.get
-    const removalStates = yield* SubscriptionRef.get(removals)
+    const coordination = yield* acquisition.state
     const groups = new Map([...resolvedConfigurations].map(([identity, resolution]) => [
       identity,
       resolution.servingConfiguration.bundle,
     ]))
-    const syncDownloads = yield* syncs.downloads
+    const downloadsById = new Map(packageState.downloads.map((download) => [download.id, download]))
     const packageEntries = new Map(
       packageState.entries.map((entry) => [entry.package.id, entry]),
     )
-    const sameBundle = Schema.equivalence(ServableModelBundleSchema)
-    const providerEntries = new Map(
-      projectedOfferings.entries.map((entry) => [entry.providerModelId, entry]),
-    )
-    const currentProviderPackageEvidence = providerOfferingPackageEvidence(
-      configured,
+    const providerEntries = new Map(projectLocalProviderOfferings(
+      [...resolvedConfigurations.values()],
       packageEntries,
-    )
-    const providerProjectionCurrent = Option.exists(
-      projectedOfferings.packageEvidence,
-      (evidence) => sameProviderOfferingPackageEvidence(
-        evidence,
-        currentProviderPackageEvidence,
-      ),
-    )
-    const providerProjectionFailure = Option.map(
-      projectedOfferings.failure,
-      (error): ModelFailure => ({
-        code: "local_model_assessment_unavailable",
-        message: error.message,
-        retryable: "retryable" in error ? error.retryable : true,
-      }),
-    )
+    ).entries.map((entry) => [entry.providerModelId, entry]))
 
-    const catalogByTarget = new Map<string, (typeof catalogModels)[number]>(catalogModels.map((model) => [
-      localCatalogProviderModelId(model),
-      model,
-    ]))
-    const nativeCatalogByTarget = new Map<string, (typeof nativeCatalogModels)[number]>(
-      yield* Effect.forEach(nativeCatalogModels, (model) =>
-        catalogIdentityFromIcn(model).pipe(Effect.map((identity) => [
-          localCatalogProviderModelId(identity),
-          model,
-        ] as const))),
-    )
     const rankingEntries = rankingState._tag === "Ready" ? rankingState.entries : []
     const sameConfiguration = Schema.equivalence(ModelServingConfigurationSchema)
+    const sameNativeConfiguration = Schema.equivalence(Generated.ModelServingConfiguration)
 
     const models: LocalModel[] = [...groups.entries()].map(([identity, bundle]): LocalModel => {
-      const curated = catalogByTarget.get(identity)
-      if (curated === undefined) {
+      const catalogEntry = catalogEntries.get(identity)
+      if (catalogEntry === undefined) {
         throw new Error(`Catalog model ${identity} has no definition`)
       }
-      const presentation = resolveBundlePresentation(bundle, curated && {
+      const curated = catalogEntry.model
+      const presentation = resolveBundlePresentation(bundle, {
         displayName: curated.displayName,
         variantLabel: curated.variantLabel,
         description: curated.description,
         license: curated.license,
       })
-      const currentInstalled = installedBundleFields(bundle, packageEntries)
-      const priorEntries = packageState.entries.filter((entry) =>
-        entry.localState._tag === "Installed"
-          && entry.catalogAttribution._tag === "Attributed"
-          && localCatalogProviderModelId(entry.catalogAttribution) === identity
-          && !servableModelBundlePackageIds(bundle).includes(entry.package.id))
-      const catalogLocalState = nativeCatalogByTarget.get(identity)?.localState
+      const catalogLocalState = catalogEntry.source.localState
+      const effectivePackageIds = servableModelBundlePackageIds(bundle)
+      const nativeInstalled = catalogLocalState?._tag === "Installed"
+        ? new Map(catalogLocalState.installation.packages.map((entry) => [entry.package.id, entry]))
+        : new Map<string, never>()
+      const effectiveInstalledPackages = catalogLocalState?._tag === "Installed"
+        ? catalogLocalState.installation.packages.map((entry) => ({
+            packageId: ModelPackageIdSchema.make(entry.package.id),
+            path: entry.path,
+            origin: entry.origin,
+          }))
+        : []
+      const [firstEffectivePackage, ...remainingEffectivePackages] = effectiveInstalledPackages
+      const effectiveInstalled: InstalledModelFields | undefined = firstEffectivePackage === undefined
+        ? undefined
+        : {
+            installedBytes: catalogLocalState?._tag === "Installed"
+              ? catalogLocalState.installation.packages.reduce((total, entry) => total
+                + entry.package.files.reduce((sum, file) => sum + file.sizeBytes, 0), 0)
+              : 0,
+            packages: [firstEffectivePackage, ...remainingEffectivePackages],
+          }
+      const installedPackages = effectivePackageIds.flatMap((packageId) => {
+        const entry = nativeInstalled.get(packageId)
+        return entry === undefined ? [] : [{
+          packageId: ModelPackageIdSchema.make(entry.package.id),
+          path: entry.path,
+          origin: entry.origin,
+        }]
+      })
+      const [firstInstalledPackage, ...remainingInstalledPackages] = installedPackages
+      const currentInstalled: InstalledModelFields | undefined = installedPackages.length === effectivePackageIds.length
+        && firstInstalledPackage !== undefined
+        ? {
+            installedBytes: bundleDownloadBytes(bundle),
+            packages: [firstInstalledPackage, ...remainingInstalledPackages],
+          }
+        : undefined
       const updateAvailable = catalogLocalState?._tag === "Installed"
         && catalogLocalState.updateState._tag === "Available"
       const modelId = localCatalogProviderModelId(curated)
+      const syncState = coordination.syncs.get(modelId)
+      const correlatedDownload = syncState?._tag === "Correlated"
+        ? downloadsById.get(syncState.downloadId)
+        : undefined
+      const effectiveConfiguration = catalogLocalState?._tag === "Installed"
+        && catalogLocalState.installation.effectiveConfiguration._tag === "Runnable"
+        ? catalogLocalState.installation.effectiveConfiguration.configuration
+        : undefined
       const modelInstance = instanceState.instances.findLast((candidate) =>
-        candidate.modelId === localCatalogProviderModelId(curated))
+        candidate.modelId === modelId
+        && effectiveConfiguration !== undefined
+        && sameNativeConfiguration(candidate.configuration, effectiveConfiguration))
       const derivedAcquisitionState = deriveModelAcquisitionState({
         currentInstalled,
-        download: syncDownloads.get(modelId),
+        download: correlatedDownload,
+        syncState,
+        downloadBytes: bundleDownloadBytes(bundle),
         updateAvailable,
-        priorEntries,
+        priorInstalled: effectiveInstalled,
         residencyState: modelInstance === undefined
           ? { _tag: "Unloaded" }
           : projectInferenceResidency(modelInstance),
       })
-      const removal = removalStates.get(modelId)
+      const removal = coordination.removals.get(modelId)
       const installed = installedAcquisition(derivedAcquisitionState)
-      const installedFields = installed === undefined ? undefined : {
-        installedBytes: installed.installedBytes,
-        packages: installed.packages,
-        residencyState: installed.residencyState,
-      }
       const acquisitionState: LocalModelAcquisitionState = removal !== undefined && installed !== undefined
         ? removal._tag === "Removing"
-          ? { _tag: "Removing", ...installedFields! }
-          : { _tag: "RemoveFailed", ...installedFields!, failure: removal.failure }
+          ? {
+              _tag: "Removing",
+              installedBytes: installed.installedBytes,
+              packages: installed.packages,
+              residencyState: installed.residencyState,
+            }
+          : {
+              _tag: "RemoveFailed",
+              installedBytes: installed.installedBytes,
+              packages: installed.packages,
+              residencyState: installed.residencyState,
+              failure: removal.failure,
+            }
         : derivedAcquisitionState
       const bundleEntries = servableModelBundlePackages(bundle).map((modelPackage) =>
         packageEntries.get(modelPackage.id))
@@ -512,7 +533,6 @@ export const LocalModelsLive: Layer.Layer<
         resolution,
         ({ servingConfiguration }) => servingConfiguration,
       )
-      const attribution = packageEntries.get(primaryPackage.id)?.catalogAttribution
       const catalogMembershipState: LocalModel["catalogMembershipState"] = {
         _tag: "InCatalog",
         catalogData: {
@@ -585,18 +605,19 @@ export const LocalModelsLive: Layer.Layer<
                   environmentId: coordinatedAssessment.environmentId,
                   failure: coordinatedAssessment.failure,
                 }
-          const providerModelId = currentInstalled !== undefined
-            ? Option.some(localCatalogProviderModelId(curated))
-            : Option.none<ProviderModelId>()
+          // ICN resolves a canonical model ID to its effective installed
+          // configuration while a desired update remains incomplete.
+          const providerModelId = selectableProviderModelId(
+            localCatalogProviderModelId(curated),
+            effectiveInstalled !== undefined,
+          )
           const availabilityState = assessment._tag !== "Fits"
             ? unavailableAssessment(assessment, providerModelId)
-            : currentInstalled === undefined || Option.isNone(providerModelId)
+            : effectiveInstalled === undefined || Option.isNone(providerModelId)
               ? { _tag: "Installable" as const }
               : availabilityFromProviderProjection(
                   providerModelId,
                   providerEntries,
-                  providerProjectionCurrent,
-                  providerProjectionFailure,
                 )
           servingState = {
             _tag: "Assessed",
@@ -635,63 +656,31 @@ export const LocalModelsLive: Layer.Layer<
             progress: rankingState.progress,
           }
         : { _tag: "Ready" as const, progress: rankingState.progress }
-    const next = {
+    return {
       inventoryState: packageState.inventory,
       models,
       discoveryState,
     }
-    const previous = yield* SubscriptionRef.get(current)
-    if (!equivalent(previous, next)) yield* SubscriptionRef.set(current, next)
-  }))
-  const project = projectCurrent.pipe(Effect.catchAllCause((cause) =>
-    Effect.logWarning("Unable to project local models").pipe(
-      Effect.annotateLogs({ cause: String(cause) }),
-    )))
-  const projectForMutation = projectCurrent.pipe(
-    Effect.catchAllCause((cause) => Effect.logWarning("Unable to publish refreshed local model state").pipe(
-      Effect.annotateLogs({ cause: String(cause) }),
-      Effect.andThen(Effect.fail(new LocalModelMutationFailed({
-        code: "local_model_state_projection_failed",
-        message: "The refreshed local model state could not be published",
-        retryable: true,
-      }))),
-    )),
-  )
-
-  yield* project
-  yield* Stream.mergeAll([
+  })
+  const sourceChanges = Stream.mergeAll([
     packages.changes,
-    icnModels.changes,
+    catalog.changes,
     ranker.changes,
     resolver.changes,
-    offerings.changes,
-    offerings.catalogChanges,
     hardware.changes,
     instances.changes,
-  ], { concurrency: "unbounded" }).pipe(
-    Stream.debounce("25 millis"),
-    Stream.runForEach(() => project),
-    Effect.forkScoped,
-  )
+    acquisition.changes,
+  ], { concurrency: "unbounded" }).pipe(Stream.map(() => undefined))
+
+  const projection = yield* materializeProjection({
+    project: projectCurrent.pipe(Effect.orDie),
+    invalidations: sourceChanges,
+    equivalent: Schema.equivalence(LocalModelsStateSchema),
+  })
 
   return LocalModels.of({
-    state: SubscriptionRef.get(current),
-    changes: current.changes,
-    refresh: packages.refresh.pipe(Effect.andThen(projectForMutation)),
-    removalStarted: (modelId) => SubscriptionRef.update(removals, (current) => {
-      const next = new Map(current)
-      next.set(modelId, { _tag: "Removing" })
-      return next
-    }).pipe(Effect.andThen(projectForMutation)),
-    removalFailed: (modelId, failure) => SubscriptionRef.update(removals, (current) => {
-      const next = new Map(current)
-      next.set(modelId, { _tag: "RemoveFailed", failure })
-      return next
-    }).pipe(Effect.andThen(projectForMutation)),
-    removalFinished: (modelId) => SubscriptionRef.update(removals, (current) => {
-      const next = new Map(current)
-      next.delete(modelId)
-      return next
-    }).pipe(Effect.andThen(packages.refresh), Effect.andThen(projectForMutation)),
+    state: projection.get,
+    changes: projection.changes.pipe(Stream.map(() => undefined)),
+    refresh: packages.refresh,
   })
 }))

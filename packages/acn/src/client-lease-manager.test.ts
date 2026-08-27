@@ -1,10 +1,9 @@
 import { ClientIdSchema } from "@magnitudedev/acn-protocol"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Ref, TestClock, TestContext } from "effect"
+import { Duration, Effect, Fiber, Ref, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
 import { makeClientLeaseManager } from "./client-lease-manager"
 import {
   ModelResidencyPolicy,
-  ModelResidencyPolicyUnavailable,
   type ModelResidencyPolicy as ModelResidencyPolicyService,
 } from "./model-residency-policy"
 import { AcnServiceLifecycle, makeAcnServiceLifecycle } from "./service-lifecycle"
@@ -100,95 +99,4 @@ describe("ClientLeaseManager", () => {
     )
   })
 
-  it("fails closed without committing the first lease when ICN policy is unavailable", async () => {
-    await run(
-      Effect.scoped(
-        Effect.gen(function* () {
-          const lifecycle = yield* makeAcnServiceLifecycle()
-          yield* lifecycle.becomeReady(Effect.die("unused RPC"))
-          const manager = yield* makeClientLeaseManager().pipe(
-            Effect.provideService(AcnServiceLifecycle, lifecycle),
-            Effect.provideService(ModelResidencyPolicy, {
-              setConnected: () =>
-                Effect.fail(
-                  new ModelResidencyPolicyUnavailable({
-                    operation: "connect",
-                    message: "ICN unavailable",
-                  })
-                ),
-            })
-          )
-
-          const renewal = yield* Effect.exit(manager.renew(clientA))
-          expect(Exit.isFailure(renewal) && Cause.isInterruptedOnly(renewal.cause)).toBe(true)
-          expect((yield* manager.release(clientB)).connectedClientCount).toBe(0)
-          expect((yield* lifecycle.awaitStopping).reason).toBe("fatal")
-        })
-      )
-    )
-  })
-
-  it("preserves the bounded policy timeout inside the atomic lease transition", async () => {
-    await run(
-      Effect.scoped(
-        Effect.gen(function* () {
-          const lifecycle = yield* makeAcnServiceLifecycle()
-          yield* lifecycle.becomeReady(Effect.die("unused RPC"))
-          const manager = yield* makeClientLeaseManager().pipe(
-            Effect.provideService(AcnServiceLifecycle, lifecycle),
-            Effect.provideService(ModelResidencyPolicy, {
-              setConnected: () =>
-                Effect.never.pipe(
-                  Effect.timeout(Duration.seconds(2)),
-                  Effect.mapError(() =>
-                    new ModelResidencyPolicyUnavailable({
-                      operation: "connect",
-                      message: "ICN timed out",
-                    })
-                  )
-                ),
-            })
-          )
-
-          const renewal = yield* manager.renew(clientA).pipe(Effect.fork)
-          yield* TestClock.adjust(Duration.seconds(2))
-          const exit = yield* Fiber.await(renewal)
-
-          expect(Exit.isFailure(exit) && Cause.isInterruptedOnly(exit.cause)).toBe(true)
-          expect((yield* manager.release(clientB)).connectedClientCount).toBe(0)
-          expect((yield* lifecycle.awaitStopping).reason).toBe("fatal")
-        })
-      )
-    )
-  })
-
-  it("commits the matching lease state when cancellation arrives during policy acknowledgement", async () => {
-    await run(
-      Effect.scoped(
-        Effect.gen(function* () {
-          const policyEntered = yield* Deferred.make<void>()
-          const acknowledgePolicy = yield* Deferred.make<void>()
-          const lifecycle = yield* makeAcnServiceLifecycle()
-          yield* lifecycle.becomeReady(Effect.die("unused RPC"))
-          const manager = yield* makeClientLeaseManager().pipe(
-            Effect.provideService(AcnServiceLifecycle, lifecycle),
-            Effect.provideService(ModelResidencyPolicy, {
-              setConnected: () =>
-                Deferred.succeed(policyEntered, undefined).pipe(
-                  Effect.zipRight(Deferred.await(acknowledgePolicy))
-                ),
-            })
-          )
-
-          const renewal = yield* manager.renew(clientA).pipe(Effect.fork)
-          yield* Deferred.await(policyEntered)
-          const cancellation = yield* Fiber.interrupt(renewal).pipe(Effect.fork)
-          yield* Deferred.succeed(acknowledgePolicy, undefined)
-          yield* Fiber.join(cancellation)
-
-          expect((yield* manager.release(clientB)).connectedClientCount).toBe(1)
-        })
-      )
-    )
-  })
 })

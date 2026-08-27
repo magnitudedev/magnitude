@@ -62,7 +62,7 @@ const handlers = TestRpc.toLayer(TestOperations, {
 })
 
 const implementationLayer = Layer.scoped(
-  Operation.implementationsTag<RpcClientError.RpcClientError>(),
+  Operation.implementationsTag<Group.Declaration<typeof TestOperations>, RpcClientError.RpcClientError>(),
   Effect.map(
     RpcTest.makeClient(RpcOperations, { flatten: true }),
     (client) => TestRpc.implementations(TestOperations, client),
@@ -72,6 +72,14 @@ const implementationLayer = Layer.scoped(
 const sleep = (millis: number) => Effect.runPromise(Effect.sleep(`${millis} millis`))
 
 describe("effect-query/rpc", () => {
+  it("rejects Effect-backed definitions at the transport projection", () => {
+    const Local = Mutation.make("Local", { effect: () => Effect.void })
+    const mixed = Group.make({ GetUser, Local })
+
+    // @ts-expect-error Mixed application graphs are not transport boundaries.
+    expect(() => TestRpc.toRpcGroup(mixed)).toThrow("only declared operations")
+  })
+
   it("recursively composes base primitives and exposes derived metadata", () => {
     const Reads = Group.make({ GetUser, Counter })
     const Writes = Group.make({ Rename })
@@ -248,7 +256,7 @@ describe("effect-query/rpc group client", () => {
 
   it("hands the group client to the additional Layer", async () => {
     class Seen extends Effect.Tag("Seen")<Seen, { readonly rename: unknown }>() {}
-    const client = Client.make<typeof Boundary, Operation.Implementations<RpcClientError.RpcClientError>, never, Seen>(
+    const client = Client.make<typeof Boundary, Operation.Implementations<Operation.Name<Group.Declaration<typeof Boundary>>, RpcClientError.RpcClientError>, never, Seen>(
       Boundary,
       implementationLayer,
       (client) => Layer.effect(Seen, Effect.sync(() => ({ rename: client.Writes.Rename }))),

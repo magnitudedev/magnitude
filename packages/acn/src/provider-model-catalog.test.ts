@@ -1,4 +1,4 @@
-import { Deferred, Effect, Fiber, Layer, Option, PubSub, Ref, Stream } from "effect"
+import { Deferred, Effect, Fiber, Layer, Option, Ref, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   ModelCatalogError,
@@ -56,8 +56,6 @@ describe("provider model catalog", () => {
       const releaseRefresh = yield* Deferred.make<void>()
       const pauseRefresh = yield* Ref.make(false)
       const defectRefresh = yield* Ref.make(false)
-      const localChanges = yield* PubSub.unbounded<void>()
-      const localReadSignal = yield* Ref.make<Option.Option<Deferred.Deferred<void>>>(Option.none())
       const client: ProviderClientShape = {
         catalog: {
           list: Effect.succeed([model(providerA, "A"), model(providerB, "B")]),
@@ -96,18 +94,13 @@ describe("provider model catalog", () => {
         Layer.succeed(LocalProviderOfferings, LocalProviderOfferings.of({
           ready: Effect.succeed(true),
           list: Effect.succeed([]),
-          catalog: Effect.gen(function* () {
-            const signal = yield* Ref.get(localReadSignal)
-            if (Option.isSome(signal)) yield* Deferred.succeed(signal.value, undefined)
-            return []
-          }),
+          catalog: Effect.succeed([]),
           state: Effect.succeed({
-            packageEvidence: Option.none(),
             entries: [],
             failure: Option.none(),
           }),
           changes: Stream.never,
-          catalogChanges: Stream.fromPubSub(localChanges),
+          catalogChanges: Stream.never,
           resolve: () => Effect.die("unused"),
         })),
         AcnChangesLive,
@@ -136,14 +129,7 @@ describe("provider model catalog", () => {
         yield* Ref.set(outcomes, [{ _tag: "Success", providerId: providerA, models: [model(providerA, "A")] }])
         yield* catalog.refresh(Option.some(providerA))
         const refreshCount = yield* Ref.get(refreshCalls)
-        const localRead = yield* Deferred.make<void>()
-        yield* Ref.set(localReadSignal, Option.some(localRead))
-        yield* PubSub.publish(localChanges, undefined)
-        yield* Deferred.await(localRead)
-        yield* catalog.changes.pipe(
-          Stream.filter((state) => state._tag !== "Refreshing"),
-          Stream.runHead,
-        )
+        yield* catalog.state
         expect(yield* Ref.get(refreshCalls)).toBe(refreshCount)
         yield* Ref.set(defectRefresh, true)
         yield* catalog.refresh(Option.some(providerB))

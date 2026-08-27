@@ -481,7 +481,7 @@ impl ModelDownloads for ManagedModelDownloads {
                 .collect::<Vec<_>>();
             let mut missing = Vec::new();
             for package in candidates {
-                match self.manager.installed_package(&package.id).await {
+                match self.manager.installed_package_from_snapshot(&package.id) {
                     Ok(_) => {}
                     Err(InventoryError::NotFound(_)) | Err(InventoryError::NotReady(_)) => {
                         missing.push(package);

@@ -10,11 +10,10 @@ applies_to:
 
 ## Purpose
 
-Effect Query is the client-common mechanism for observing and changing backend-owned state: every
-client↔ACN interaction is a boundary-group query, mutation, or subscription, reached as a member of
-the connection's Effect Query client (`client.Sessions.GetSession(input)`, `client.Agent.SendMessage`,
-`client.Changes.StreamChanges({})`). The client is made for `AcnBoundary`, so each member is already
-the canonical atom (or, for keyed queries and subscriptions, the function from input to it). A
+Effect Query is client-common's single reactive operation mechanism. Every client↔ACN interaction
+and every client-composed semantic command with a shared invocation lifecycle is a Query, Mutation,
+or Subscription in one application operation graph. The graph extends `AcnBoundary` without
+altering its transport contract, and every member is materialized once on the connection client. A
 feature exposes the product capability built with the mechanism rather than propagating
 mechanism-level representations.
 
@@ -58,10 +57,10 @@ the DI document defines how the services at that boundary are acquired and compo
 ## Ownership
 
 ```text
-core operation definitions (Query / Mutation / Subscription), grouped in AcnBoundary
+declared ACN operations + Effect-backed client-common operations
               |
               v
-   connection Effect Query client (AgentClient = Client.make(AcnBoundary, …))
+   application graph -> connection Effect Query client
    members: client.<Group>.<Operation>
               |
    +----------+-----------------------------+
@@ -79,8 +78,8 @@ query atoms inside the domain's service. There is no second client state mechani
 
 ## When Query and Mutation exist
 
-Query and Mutation represent interaction with an independently owned authority. They are not the
-default vocabulary for every asynchronous function or every layer of an application.
+Query and Mutation represent reusable reactive lifecycles. They are not the default vocabulary for
+every asynchronous function or every layer of an application.
 
 ### Query
 
@@ -109,44 +108,39 @@ A Query is not warranted for:
 
 A Mutation is warranted when all of the following are true:
 
-1. A command requests change from an independently owned authority.
+1. A command requests change from an authority, or represents a semantic use-case command composed
+   from independently complete capabilities.
 2. Submission has an asynchronous acknowledgement or rejection lifecycle useful beyond the
    current Effect call.
 3. Invocations need cache-level behavior such as semantic concurrency scope, retry, observable
    pending/rejection status, retention, or synchronization with affected Queries.
 
 ```text
-command across ownership boundary + tracked asynchronous invocation + query synchronization
-                                      = Mutation
+semantic command + tracked asynchronous invocation + shared lifecycle behavior = Mutation
 ```
 
 A Mutation is not warranted for:
 
 - changing client-owned Atom state;
-- composing existing domain operations into a larger Effect;
+- composing existing operations when only the immediate caller consumes the result;
 - adapting an Effect to a click handler;
 - representing authoritative long-running resource progress; or
-- recreating a lower Mutation at a higher abstraction boundary.
+- recreating a lower Mutation without adding a distinct use-case command.
 
 If a command crosses an ownership boundary but no shared invocation lifecycle is needed, an
 ordinary Effect may be sufficient. If retained client state has meaningful modes and transitions,
 it remains Atom state or a state machine; wrapping it in Query and Mutation would add a cache and
 mutation registry without adding an authority.
 
-### Boundary rule
+### Placement rule
 
-Whether Query and Mutation are needed is decided where authority is crossed. A higher service that
-uses an existing query or mutation does not cross that authority again. It therefore consumes the
-lower service's state and Effects and does not recreate Query definitions, Mutation definitions,
-cache entries, or mutation history.
+Universal product capabilities are implemented by ACN. Use-case-specific orchestration of already
+complete capabilities may be an Effect-backed client-common operation. Implementation placement
+does not change the operation's domain location on the application client.
 
 ```text
-UI -> composed client service -> ACN-backed client service -> ACN
-                                      ^                       ^
-                                      |                       |
-                              Query/Mutation mechanism   authority boundary
-
-No new authority boundary exists between UI, hook, and composed service.
+client.Models.SelectLocalModel -> client-common Effect -> LocalModels + ModelSlots
+client.Models.SyncLocalModel   -> declared operation   -> ACN
 ```
 
 ## Responsibilities
@@ -158,12 +152,11 @@ operation progress. It exposes observational queries, mutations, and invalidatio
 
 ### Effect Query definitions
 
-Query, Mutation, and Subscription definitions live in the ACN boundary groups in
-`packages/acn-protocol` and are constructed with the core Effect Query primitives. Cache identity
-derives from the payload; a mutation's scope and synchronization postcondition are declared with
-the command. The ACN RPC adapter derives RPCs from the root `AcnBoundary` group and supplies an
-implementation layer to clients. Definitions capture no client instance, RPC, Atom registry,
-React lifecycle, or feature workflow.
+Declared Query, Mutation, and Subscription definitions live in the ACN boundary groups in
+`packages/acn-protocol`. Effect-backed application definitions live in client-common and consume
+services through Effect DI. `Group.extend` combines them before client construction. The ACN RPC
+adapter derives RPCs only from `AcnBoundary`; it rejects mixed groups. Definitions capture no
+client instance, RPC, Atom registry, or React lifecycle.
 
 When a domain has a client service (the client-di criteria: connection-lifetime state, a resident
 resource such as a keyed watch, reusable operations with dependencies, or a stateful use case), its
@@ -202,9 +195,9 @@ command RPC ------->| mutation atom  |      |
 ### Composed client service
 
 A use case spanning multiple domains may be a client service when it owns meaningful in-memory
-state, concurrency, or cancellation. It consumes the lower services' observed state and Effect
-operations. It never reaches into their Query definitions, Mutation definitions, materialized
-atoms, caches, or invalidation lifecycle.
+state, concurrency, or cancellation. A stateless semantic command with a reusable invocation
+lifecycle is instead an Effect-backed Mutation in the application graph. Both consume lower
+services through Effect DI and never create another client or registry.
 
 Each command is one Effect program. Values returned by one operation are passed directly into the
 next operation. Authoritative long-running progress is awaited through lower service observation
@@ -231,10 +224,9 @@ complete onboarding
 
 ### Hook
 
-A hook is the terminal React adapter. Inside the same domain implementation boundary, it may set
-and observe a private Mutation atom. It returns callbacks and presentation-relevant command
-outcomes, never that atom or another writable proxy around it. A composed Effect is adapted to a
-user event as an ordinary runtime action, not as another Mutation.
+A hook is the terminal React adapter. It sets and may observe the materialized application Mutation
+for a semantic command. It returns callbacks and presentation-relevant command outcomes, never that
+atom or another writable proxy around it. One-shot Effects may still use a runtime action.
 
 A hook does not return query atoms, mutation atoms, query clients, mutation history, invalidation
 bridges, or watch atoms. It does not require a component to mount synchronization plumbing.
@@ -253,19 +245,15 @@ This example is illustrative; names are domain-specific rather than prescribed i
 ```ts
 interface LocalModels {
   readonly state: Atom<Result<LocalModelsState, LocalModelsError>>
-  readonly reconcile: (
-    identity: CatalogIdentity,
-  ) => Effect<CatalogModelReconciliationAdmission, ReconciliationError>
-  readonly reconciliationFor: (
-    identity: CatalogIdentity,
-  ) => Atom<Result<CatalogModelReconciliationAdmission, ReconciliationError>>
+  readonly sync: (modelId: ProviderModelId) => Effect<void, LocalModelMutationError>
+  readonly remove: (modelId: ProviderModelId) => Effect<void, LocalModelMutationError>
 }
 ```
 
-The service privately implements `reconcile` with `Mutation.execute`. A composed setup service can
-flat-map its returned admission into slot assignment. A hook can adapt the same Effect to a click
-handler and expose `reconciliationFor(identity)` to render pending or rejected command intent. Neither
-caller receives the underlying Mutation atom or its global history.
+The service privately implements `sync` and `remove` with `Mutation.execute`. A composed model-menu
+operation can flat-map `sync` into slot assignment, while authoritative acquisition progress remains
+in `state`. A hook can adapt the same Effects to click handlers. Neither caller receives the
+underlying Mutation atoms or their global history.
 
 Non-conforming shapes include:
 
@@ -282,7 +270,8 @@ mutationStates.at(-1)
 1. A backend domain has one canonical query cache and one materialization owner per connection.
 2. Query and mutation atoms terminate at that owner. They are not passed into another service or
    exported from the package barrel.
-3. Dependencies between operations are represented by Effect composition over exact outputs.
+3. Dependencies between operations are represented by Effect composition over exact outputs;
+   reusable semantic command composition is authored as an Effect-backed Mutation.
 4. Query observation supplies authoritative state; mutation state supplies only command intent and
    outcome.
 5. A public selector expresses domain meaning and hides registry ordering and mutation identity.
@@ -293,8 +282,9 @@ mutationStates.at(-1)
    while observed, closed when unobserved. No hook or component mounts a watch.
 8. A query remains observational. Creating or mounting a service cannot install, assign, load,
    stop, delete, or complete anything.
-9. A composed service exists only for a stateful cross-domain use case. One-shot composition is a
-   plain domain Effect, not a new controller or workflow abstraction.
+9. A composed service exists only for a stateful cross-domain use case. A semantic command with a
+   shared invocation lifecycle is an Effect-backed Mutation; a caller-only composition is a plain
+   Effect.
 
 ## Why this boundary
 
@@ -312,8 +302,7 @@ the type-level dependency chain and the behavior the user observes.
 
 ## Conformance
 
-- No client or composed service imports a domain's Query definition, Mutation definition, or
-  materialized atom.
+- No client or composed service constructs another Effect Query client, cache, or mutation registry.
 - No public client-common barrel exports domain materialization internals.
 - No caller mounts invalidation or watch atoms; keyed watches are dependencies of service query atoms.
 - No caller reads registry-wide mutation history to determine domain state or causal identity.

@@ -42,12 +42,13 @@ connected count. One supervisor sleeps to the nearest monotonic deadline and is 
 revision changes. Exact renewal generations fence stale expiry work; no heartbeat creates its own
 timer fiber.
 
-The first lease publishes connected model-residency policy. The final release or expiry publishes
-disconnected policy and commits the empty set. These transitions are serialized. The bounded policy operation runs in
-an explicitly interruptible child fiber so its timeout remains effective; the serialized mutation
-joins that child uninterruptibly before the matching state commit. Caller cancellation therefore
-cannot split policy acknowledgement from its commit. Definite policy failure fails closed by
-stopping ACN rather than committing mismatched state.
+The first lease records connected model-residency policy. The final release or expiry records
+disconnected policy and commits the empty set. These transitions are serialized, but lease
+membership never waits for ICN policy convergence: client liveness is authoritative ACN state,
+while residency policy is a downstream consequence. One supervised latest-desired-state worker
+publishes that consequence to ICN. Each remote attempt is bounded; failures are logged and retried,
+and a newer client-presence generation supersedes an older retry. Residency-policy failure cannot
+stop ACN, discard model acquisition work, or make a lease RPC hang behind ICN cleanup.
 
 Client absence never retires ACN. The per-user service owns ACN process lifetime; explicit service
 stop or fatal failure ends it. JIT clients coordinate with that same authority rather than creating
@@ -70,8 +71,8 @@ qualifies each idle deadline by exact instance ID and an actor-owned idle genera
 acquisition, lease release, or policy change advances that generation; only a matching deadline
 with zero leases may begin idle drain.
 
-If ACN cannot establish a first/final-client policy after bounded retries, it fails closed instead
-of committing a client count paired with an unproved model timeout.
+If ICN is temporarily unavailable, ACN retains the latest desired policy and continues converging
+without changing the authoritative client count or daemon lifetime.
 
 ## Client presentation
 
@@ -89,6 +90,8 @@ model lifetime. Unknown close observation may show bounded generic service guida
 - Heartbeat and release RPC duration is process-lifecycle neutral.
 - Lease expiry uses monotonic time and exact renewal generations.
 - First/final transitions alone change ICN residency policy.
+- Lease RPCs do not wait for ICN residency-policy convergence.
+- Residency-policy failure cannot terminate ACN or process-local model work.
 - Every disconnected transition gives an idle resident model a fresh 10-minute interval.
 - A stale timer or policy message cannot release a newer model or extend its residency.
 - Foreground client exit never stops the per-user service or infers residency from Slots.

@@ -301,9 +301,6 @@ impl ManagedModelStore {
         &self,
         packages: Vec<ModelPackage>,
     ) -> Result<Vec<DownloadEventStream>, InventoryError> {
-        // Admission is a mutation boundary. Re-observe the store before deciding that any exact
-        // package is already present; the query snapshot is deliberately not mutation authority.
-        self.ensure_installed_model_inventory().await?;
         let packages = packages
             .into_iter()
             .map(|package| {
@@ -314,7 +311,7 @@ impl ManagedModelStore {
             .collect::<Result<Vec<_>, _>>()?;
         let mut resolved_packages = Vec::with_capacity(packages.len());
         for (package_id, key, package) in packages {
-            let installed = match self.installed_package(&package_id).await {
+            let installed = match self.installed_package_from_snapshot(&package_id) {
                 Ok((_package, resolved)) => Some(resolved.model),
                 Err(InventoryError::NotFound(_)) | Err(InventoryError::NotReady(_)) => None,
                 Err(error) => return Err(error),
@@ -1966,7 +1963,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn installed_package_admission_does_not_create_an_upstream_operation() {
+    async fn exact_package_admission_reuses_current_files_and_reacquires_stale_evidence() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let root = directory.path().join("models");
         let cache_root = directory.path().join("cache");
@@ -2017,7 +2014,7 @@ mod tests {
             .package;
 
         let mut streams = manager
-            .start_target_downloads(vec![package])
+            .start_target_downloads(vec![package.clone()])
             .await
             .expect("admission");
         let event = streams
@@ -2032,6 +2029,14 @@ mod tests {
             ModelDownloadEvent::Ready { model: ready, .. } if ready.id == model.id
         ));
         assert!(manager.operations.lock().await.is_empty());
+
+        tokio::fs::remove_file(snapshot.join("model.gguf"))
+            .await
+            .expect("remove installed model after observation");
+        assert!(matches!(
+            manager.installed_package_from_snapshot(&package.id),
+            Err(InventoryError::NotFound(_))
+        ));
     }
 
     #[test]

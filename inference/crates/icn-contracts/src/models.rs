@@ -264,6 +264,8 @@ pub struct ModelInstance {
     pub id: ModelInstanceId,
     /// Canonical callable model identity (for example `model:format:variant`).
     pub model_id: String,
+    /// Exact serving configuration admitted for this physical occurrence.
+    pub configuration: ModelServingConfiguration,
     pub lifecycle: ModelInstanceLifecycle,
 }
 

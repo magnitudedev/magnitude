@@ -18,7 +18,9 @@ Starting(activity, progress?) -> Ready -> Stopping(reason) -> exact exit
 ```
 
 `Exited` is observed externally through exact process identity. `Installing` is a client
-presentation of `Starting`, not an admission mode. Startup or runtime failure enters `Stopping`.
+presentation of `Starting`, not an admission mode. Startup or process-authority failure enters
+`Stopping`; a bounded application resource such as one session runtime cannot determine process
+lifetime.
 
 ## Process admission
 
@@ -38,7 +40,9 @@ owner row still equals the row it admitted. A confirmed missing or changed row b
 proven and fails closed through `Stopping(fatal)`. A manager prepares a successor before asking a
 lower-revision live owner to stop, then proves the predecessor ACN process group absent before the
 successor may commit ownership. Retirement otherwise begins through exact explicit shutdown,
-ownership loss, the ACN's own terminal failure, or process signals.
+ownership loss, loss of a mandatory process-owned subsystem such as ICN, application startup
+failure, or process signals. Failures owned by a session, request, transfer, subscription, or other
+bounded domain remain in that domain.
 
 ## Readiness and admission
 
@@ -118,5 +122,6 @@ belongs to manager-side owner and exact-process revalidation, not a required end
 - A confirmed missing or changed owner row stops the admitted ACN, and any store failure fails
   closed rather than leaving an unfenced service alive.
 - Client absence does not retire the per-user service.
+- A bounded domain failure cannot retire the process or interrupt unrelated domains.
 - The stopping transition is single-flight; cooperative teardown and external exact-process-group escalation
   are independently bounded.

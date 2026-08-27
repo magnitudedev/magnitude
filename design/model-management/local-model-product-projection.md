@@ -65,11 +65,30 @@ current desired target runnable as standalone, or one unique prior attributed ta
 standalone. Multiple prior targets with no current target produce a visible typed unavailability
 failure; they are never hidden or guessed between.
 
+ICN resolves that effective configuration through one catalog-model resolver shared by model
+publication and instance admission. The instance controller depends only on that resolver; the
+catalog manager receives package removal normally at construction. No late-bound callback or
+mutable construction hook closes a dependency cycle.
+
 ## ACN product projection
 
 ACN enriches the ICN model snapshot with assessment, provider publication, ranking scores, and
 live memory observations. Clients consume one `LocalModel` row and do not correlate parallel
 collections.
+
+Shared local-model derivations may be retained as disposable materialized projections. Their reads
+return current projected state without initiating native work or rebuilding the catalog. Source
+notifications are coalesced, rebuilds consume the latest authoritative snapshots, and only
+semantic dependencies invalidate each stage. Transfer-byte progress, for example, cannot
+invalidate configuration resolution because it changes neither package presence nor inspection.
+Materialization changes cost and latency only; ICN and the owning ACN domain states remain the
+authorities.
+
+Each published product row is derived from one captured set of native model, package, assessment,
+and residency facts. ACN does not join separately materialized views whose refreshes may describe
+different moments. When native model and package observations temporarily disagree during an
+install or update handoff, the product remains `Preparing`; that incomplete observation is not a
+terminal availability failure.
 
 The configuration resolver carries the target's `ModelPackageInspection` with the exact effective
 configuration. An installed target uses its package inspection. An uninstalled desired catalog

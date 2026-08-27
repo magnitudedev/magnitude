@@ -1,9 +1,9 @@
 import type { Command as Commander } from "@commander-js/extra-typings"
 import { Atom, Registry } from "@effect-atom/atom"
 import { Client, Mutation } from "@magnitudedev/effect-query"
-import type { AgentClient } from "@magnitudedev/client-common"
 import {
   MagnitudeBoundary,
+  type MagnitudeImplementationError,
   ProviderModelIdSchema,
   SlotIdSchema,
   installedAcquisition,
@@ -14,6 +14,10 @@ import { makeTerminalPlatform } from "../platform/terminal"
 
 const decodeModelId = Schema.decodeUnknown(ProviderModelIdSchema)
 const decodeSlotId = Schema.decodeUnknown(SlotIdSchema)
+type CliModelsClient = Pick<
+  Client.Materialized<typeof MagnitudeBoundary, unknown, MagnitudeImplementationError>,
+  "Models"
+>
 
 const printJson = (value: unknown) => Effect.sync(() => {
   process.stdout.write(`${JSON.stringify(value, (_key, member) => {
@@ -30,7 +34,7 @@ const explain = (error: unknown): string => typeof error === "object"
   : String(error)
 
 const runModels = <Value>(
-  use: (client: Pick<AgentClient, "Models">, registry: Registry.Registry) => Effect.Effect<Value, unknown>,
+  use: (client: CliModelsClient, registry: Registry.Registry) => Effect.Effect<Value, unknown>,
 ) => Effect.runPromise(Effect.scoped(
   Effect.gen(function* () {
     const terminal = yield* makeTerminalPlatform({

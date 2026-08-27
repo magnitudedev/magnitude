@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -40,10 +39,10 @@ use icn_engine::{
 };
 use icn_hardware::CapacityPolicy;
 use icn_models::{
-    InventoryConfig, ManagedCatalogModels, ManagedModelDownloads, ManagedModelStore, ModelCache,
-    ReleaseCatalog, canonical_package_id, load_release_catalog, servable_model_bundle_key,
-    servable_model_bundle_key_for_bundle, serving_configuration_fingerprint,
-    speculative_servable_model_bundle_key,
+    CatalogModelResolver, InventoryConfig, ManagedCatalogModels, ManagedModelDownloads,
+    ManagedModelStore, ModelCache, ReleaseCatalog, canonical_package_id, load_release_catalog,
+    servable_model_bundle_key, servable_model_bundle_key_for_bundle,
+    serving_configuration_fingerprint, speculative_servable_model_bundle_key,
 };
 use llama_cpp_2::model::params::fit::{
     FitCalibration as NativeHardwareCalibration,
@@ -158,9 +157,16 @@ enum ResidencyGrant {
 }
 
 struct AcquisitionWaiter {
-    model_id: String,
+    target: ResolvedResidencyTarget,
     purpose: ResidencyAcquisition,
     reply: tokio::sync::oneshot::Sender<Result<ResidencyGrant, InventoryError>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ResolvedResidencyTarget {
+    model_id: String,
+    configuration: ModelServingConfiguration,
+    configuration_key: String,
 }
 
 trait ResidencyWorker: Send + Sync {
@@ -227,6 +233,7 @@ struct PreparedResidency {
 
 struct LoadingResidency {
     instance: ModelInstance,
+    configuration_key: String,
     operation: tokio::task::JoinHandle<()>,
     worker: Option<Arc<dyn ResidencyWorker>>,
     waiters: Vec<AcquisitionWaiter>,
@@ -234,6 +241,7 @@ struct LoadingResidency {
 
 struct ReadyResidency {
     instance: ModelInstance,
+    configuration_key: String,
     resources: ResidentResources,
     idle_generation: u64,
 }
@@ -357,13 +365,13 @@ struct ResidencyClient {
 impl ResidencyClient {
     async fn acquire(
         &self,
-        model_id: String,
+        target: ResolvedResidencyTarget,
         purpose: ResidencyAcquisition,
     ) -> Result<ResidencyGrant, InventoryError> {
         let (reply, response) = tokio::sync::oneshot::channel();
         self.commands
             .send(ResidencyCommand::Acquire(AcquisitionWaiter {
-                model_id,
+                target,
                 purpose,
                 reply,
             }))
@@ -3126,7 +3134,7 @@ struct NativeModelInstanceController {
     next_worker_generation: Arc<AtomicU64>,
     next_instance_id: Arc<AtomicU64>,
     instance_id_namespace: Arc<str>,
-    model_configurations: Arc<BTreeMap<String, ModelServingConfiguration>>,
+    catalog_models: Arc<CatalogModelResolver>,
     admission_blocked_until: Arc<Mutex<Option<std::time::Instant>>>,
     defaults: ModelPlanDefaults,
     load_progress: Arc<LoadProgressEstimator>,
@@ -3331,7 +3339,7 @@ trait ModelResidencyDriver: Clone + Send + Sync + 'static {
     fn start_model_load(
         &self,
         instance_id: ModelInstanceId,
-        model_id: String,
+        target: ResolvedResidencyTarget,
     ) -> Result<tokio::task::JoinHandle<()>, InventoryError>;
     fn start_worker_release(
         &self,
@@ -3473,11 +3481,17 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         }
         match &mut self.state {
             ResidencyState::Vacant => self.start_loading(waiter),
-            ResidencyState::Loading(loading) if loading.instance.model_id == waiter.model_id => {
+            ResidencyState::Loading(loading)
+                if loading.instance.model_id == waiter.target.model_id
+                    && loading.configuration_key == waiter.target.configuration_key =>
+            {
                 Self::notify_progress(&waiter, &loading.instance.lifecycle);
                 loading.waiters.push(waiter);
             }
-            ResidencyState::Ready(ready) if ready.instance.model_id == waiter.model_id => {
+            ResidencyState::Ready(ready)
+                if ready.instance.model_id == waiter.target.model_id
+                    && ready.configuration_key == waiter.target.configuration_key =>
+            {
                 self.grant_ready(waiter);
             }
             ResidencyState::Loading(_) | ResidencyState::Releasing(_) => {
@@ -3523,7 +3537,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         let instance_id = self.controller.next_instance_id();
         let operation = match self
             .controller
-            .start_model_load(instance_id.clone(), first.model_id.clone())
+            .start_model_load(instance_id.clone(), first.target.clone())
         {
             Ok(operation) => operation,
             Err(error) => {
@@ -3534,7 +3548,8 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         };
         let instance = ModelInstance {
             id: instance_id.clone(),
-            model_id: first.model_id.clone(),
+            model_id: first.target.model_id.clone(),
+            configuration: first.target.configuration.clone(),
             lifecycle: ModelInstanceLifecycle::Loading {
                 stage: ModelLoadStage::Queued,
                 progress: None,
@@ -3544,19 +3559,24 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         Self::notify_progress(&first, &instance.lifecycle);
         self.state = ResidencyState::Loading(LoadingResidency {
             instance,
+            configuration_key: first.target.configuration_key.clone(),
             operation,
             worker: None,
             waiters: vec![first],
         });
         self.publish_current();
 
-        let model_id = match &self.state {
-            ResidencyState::Loading(loading) => loading.instance.model_id.clone(),
+        let target = match &self.state {
+            ResidencyState::Loading(loading) => ResolvedResidencyTarget {
+                model_id: loading.instance.model_id.clone(),
+                configuration: loading.instance.configuration.clone(),
+                configuration_key: loading.configuration_key.clone(),
+            },
             _ => unreachable!(),
         };
         let mut retained = std::collections::VecDeque::new();
         while let Some(waiter) = self.queue.pop_front() {
-            if waiter.model_id == model_id {
+            if waiter.target == target {
                 if let ResidencyState::Loading(loading) = &mut self.state {
                     Self::notify_progress(&waiter, &loading.instance.lifecycle);
                     loading.waiters.push(waiter);
@@ -3576,7 +3596,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         };
         match waiter.purpose {
             ResidencyAcquisition::Inference { .. } => {
-                let lease = self.make_lease(&mut ready, waiter.model_id);
+                let lease = self.make_lease(&mut ready, waiter.target.model_id);
                 let _ = waiter.reply.send(Ok(ResidencyGrant::Lease(lease)));
             }
             ResidencyAcquisition::Warm => {
@@ -3690,6 +3710,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         let stopping = ModelInstance {
             id: loading.instance.id,
             model_id: loading.instance.model_id,
+            configuration: loading.instance.configuration,
             lifecycle: ModelInstanceLifecycle::Stopping {
                 reason: ModelReleaseReason::UserStop,
                 allocation: ModelStoppingAllocation::Planned {
@@ -3795,12 +3816,14 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 let instance = ModelInstance {
                     id: instance_id.clone(),
                     model_id: loading.instance.model_id,
+                    configuration: loading.instance.configuration,
                     lifecycle: ModelInstanceLifecycle::Ready {
                         allocation: prepared.allocation.clone(),
                     },
                 };
                 let mut ready = ReadyResidency {
                     instance,
+                    configuration_key: loading.configuration_key,
                     resources: ResidentResources {
                         package_ids: prepared.package_ids,
                         worker: prepared.worker,
@@ -3812,7 +3835,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 for waiter in loading.waiters.drain(..) {
                     match waiter.purpose {
                         ResidencyAcquisition::Inference { .. } => {
-                            let lease = self.make_lease(&mut ready, waiter.model_id);
+                            let lease = self.make_lease(&mut ready, waiter.target.model_id);
                             let _ = waiter.reply.send(Ok(ResidencyGrant::Lease(lease)));
                         }
                         ResidencyAcquisition::Warm => {
@@ -3839,7 +3862,12 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 for waiter in loading.waiters.drain(..) {
                     let _ = waiter.reply.send(Err(Self::inventory_failure(&failure)));
                 }
-                self.finish_failed(instance_id, loading.instance.model_id, failure);
+                self.finish_failed(
+                    instance_id,
+                    loading.instance.model_id,
+                    loading.instance.configuration,
+                    failure,
+                );
             }
         }
     }
@@ -3857,6 +3885,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         let stopping = ModelInstance {
             id: ready.instance.id.clone(),
             model_id: ready.instance.model_id.clone(),
+            configuration: ready.instance.configuration.clone(),
             lifecycle: ModelInstanceLifecycle::Stopping {
                 reason,
                 allocation: ModelStoppingAllocation::Resident {
@@ -3953,7 +3982,8 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             Ok(()) => self.finish_stopped(instance_id),
             Err(failure) => {
                 let model_id = releasing.instance.model_id.clone();
-                self.finish_failed(instance_id, model_id, failure);
+                let configuration = releasing.instance.configuration.clone();
+                self.finish_failed(instance_id, model_id, configuration, failure);
             }
         }
     }
@@ -3966,7 +3996,8 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             return;
         }
         let model_id = ready.instance.model_id.clone();
-        self.finish_failed(instance_id, model_id, failure);
+        let configuration = ready.instance.configuration.clone();
+        self.finish_failed(instance_id, model_id, configuration, failure);
     }
 
     fn release_requested(&mut self, instance_id: ModelInstanceId, reason: ModelReleaseReason) {
@@ -4021,6 +4052,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         let terminal = ModelInstance {
             id: releasing.instance.id,
             model_id: releasing.instance.model_id,
+            configuration: releasing.instance.configuration,
             lifecycle: ModelInstanceLifecycle::Stopped {
                 reason: releasing.reason,
             },
@@ -4036,6 +4068,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         &mut self,
         instance_id: ModelInstanceId,
         model_id: String,
+        configuration: ModelServingConfiguration,
         failure: ModelOperationFailure,
     ) {
         let state = std::mem::replace(&mut self.state, ResidencyState::Vacant);
@@ -4049,6 +4082,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         self.publish_terminal(ModelInstance {
             id: instance_id,
             model_id,
+            configuration,
             lifecycle: ModelInstanceLifecycle::Failed {
                 failure: failure.into_instance_failure(),
             },
@@ -4261,7 +4295,7 @@ impl NativeModelInstanceController {
         cache: ModelCache,
         native_build: String,
         instance_id_namespace: String,
-        model_configurations: BTreeMap<String, ModelServingConfiguration>,
+        catalog_models: Arc<CatalogModelResolver>,
     ) -> Self {
         let (residency_policy_changes, _) = tokio::sync::broadcast::channel(16);
         let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -4275,7 +4309,7 @@ impl NativeModelInstanceController {
             next_worker_generation: Arc::new(AtomicU64::new(1)),
             next_instance_id: Arc::new(AtomicU64::new(1)),
             instance_id_namespace: Arc::from(instance_id_namespace),
-            model_configurations: Arc::new(model_configurations),
+            catalog_models,
             admission_blocked_until: Arc::new(Mutex::new(None)),
             defaults,
             load_progress: Arc::new(LoadProgressEstimator::new(cache, native_build)),
@@ -4299,10 +4333,23 @@ impl NativeModelInstanceController {
         &self,
         model_id: &str,
     ) -> Result<ModelServingConfiguration, InventoryError> {
-        self.model_configurations
-            .get(model_id)
-            .cloned()
-            .ok_or_else(|| InventoryError::NotFound(format!("model {model_id} is not available")))
+        self.catalog_models.serving_configuration(model_id)
+    }
+
+    fn residency_target(
+        &self,
+        model_id: String,
+    ) -> Result<ResolvedResidencyTarget, InventoryError> {
+        let configuration = self.configuration_for_model(&model_id)?;
+        let configuration_key = serving_configuration_fingerprint(
+            &servable_model_bundle_key_for_bundle(&configuration.bundle),
+            &configuration.profile,
+        );
+        Ok(ResolvedResidencyTarget {
+            model_id,
+            configuration,
+            configuration_key,
+        })
     }
 
     fn profile_defaults(
@@ -5116,10 +5163,9 @@ impl ModelResidencyDriver for NativeModelInstanceController {
     fn start_model_load(
         &self,
         instance_id: ModelInstanceId,
-        model_id: String,
+        target: ResolvedResidencyTarget,
     ) -> Result<tokio::task::JoinHandle<()>, InventoryError> {
-        let configuration = self.configuration_for_model(&model_id)?;
-        Ok(self.spawn_model_load(instance_id, model_id, configuration))
+        Ok(self.spawn_model_load(instance_id, target.model_id, target.configuration))
     }
 
     fn start_worker_release(
@@ -5254,9 +5300,10 @@ impl ModelInstanceController for NativeModelInstanceController {
         model_id: String,
     ) -> BoxFuture<'_, Result<ModelInstance, InventoryError>> {
         Box::pin(async move {
+            let target = self.residency_target(model_id)?;
             match self
                 .residency
-                .acquire(model_id, ResidencyAcquisition::Warm)
+                .acquire(target, ResidencyAcquisition::Warm)
                 .await?
             {
                 ResidencyGrant::Ready(instance) => Ok(instance),
@@ -5326,9 +5373,10 @@ impl ModelInstanceController for NativeModelInstanceController {
         progress: Option<ModelLoadingObserver>,
     ) -> BoxFuture<'_, Result<ModelInstanceLease, InventoryError>> {
         Box::pin(async move {
+            let target = self.residency_target(model_id)?;
             match self
                 .residency
-                .acquire(model_id, ResidencyAcquisition::Inference { progress })
+                .acquire(target, ResidencyAcquisition::Inference { progress })
                 .await?
             {
                 ResidencyGrant::Lease(lease) => Ok(lease),
@@ -5621,22 +5669,14 @@ async fn main() -> anyhow::Result<()> {
                 api_version: 1,
                 native_build: native_build.clone(),
             };
-            let model_configurations = release_catalog
-                .as_ref()
-                .map(|catalog| {
-                    catalog
-                        .catalog()
-                        .models
-                        .iter()
-                        .map(|model| {
-                            let canonical_id =
-                                format!("{}:{}", model.model_id.0, model.variant_id.0);
-                            (canonical_id, model.configuration.clone())
-                        })
-                        .collect::<BTreeMap<_, _>>()
-                })
-                .unwrap_or_default();
-            let model_controller = (!fake).then(|| {
+            let catalog_model_resolver =
+                (!fake)
+                    .then(|| release_catalog.as_ref())
+                    .flatten()
+                    .map(|catalog| {
+                        CatalogModelResolver::new(inventory.clone(), catalog.catalog().clone())
+                    });
+            let model_controller = catalog_model_resolver.as_ref().map(|catalog_models| {
                 let controller = Arc::new(NativeModelInstanceController::new(
                     inventory.clone(),
                     model_assessor.clone(),
@@ -5646,11 +5686,19 @@ async fn main() -> anyhow::Result<()> {
                     inventory.derived_cache().clone(),
                     native_build.clone(),
                     instance_id.clone(),
-                    model_configurations,
+                    catalog_models.clone(),
                 ));
                 controller.start_idle_memory_observer();
                 controller
             });
+            let catalog_models = match (&catalog_model_resolver, &model_controller) {
+                (Some(resolver), Some(model_controller)) => Some(ManagedCatalogModels::new(
+                    resolver.clone(),
+                    model_downloads.clone(),
+                    model_controller.clone(),
+                )?),
+                _ => None,
+            };
             let mut state = if fake {
                 AppState::new(FakeBackend::new("icn-fake", "Hello from ICN."))
             } else {
@@ -5661,13 +5709,8 @@ async fn main() -> anyhow::Result<()> {
             .with_model_downloads(model_downloads.clone())
             .with_identity(identity);
             if let Some(release_catalog) = release_catalog {
-                if let Some(model_controller) = &model_controller {
-                    state = state.with_catalog_models(ManagedCatalogModels::new(
-                        inventory.clone(),
-                        release_catalog.catalog().clone(),
-                        model_downloads,
-                        model_controller.clone(),
-                    )?);
+                if let Some(catalog_models) = catalog_models {
+                    state = state.with_catalog_models(catalog_models);
                 }
                 state = state.with_model_assessor(Arc::new(NativeModelAssessor::new(
                     inventory,
@@ -5787,6 +5830,33 @@ where
 mod tests {
     use super::*;
     use icn_contracts::ModelInventory as _;
+
+    fn test_configuration(model_id: &str) -> ModelServingConfiguration {
+        ModelServingConfiguration {
+            bundle: DomainServableModelBundle::Standalone {
+                package: icn_contracts::models::ModelPackage {
+                    id: ModelPackageId(format!("package:{model_id}")),
+                    source: icn_contracts::models::ModelPackageSource::Local {
+                        path: PathBuf::from(format!("/test/{model_id}.gguf")),
+                    },
+                    files: Vec::new(),
+                    relationships: Vec::new(),
+                    properties: icn_contracts::models::ModelPackageProperties {
+                        format: "gguf".to_owned(),
+                        quantization: "f16".to_owned(),
+                        quantization_name: "F16".to_owned(),
+                        architecture: "test".to_owned(),
+                        maximum_context_length: Some(8_192),
+                        intrinsic_model_id: Some(model_id.to_owned()),
+                        intrinsic_quality_id: None,
+                    },
+                },
+            },
+            profile: icn_contracts::models::ServingProfile {
+                context_length: 8_192,
+            },
+        }
+    }
 
     #[test]
     fn model_transition_preserves_typed_model_operation_failure() {
@@ -6003,8 +6073,9 @@ mod tests {
         fn start_model_load(
             &self,
             instance_id: ModelInstanceId,
-            model_id: String,
+            target: ResolvedResidencyTarget,
         ) -> Result<tokio::task::JoinHandle<()>, InventoryError> {
+            let model_id = target.model_id;
             self.loads
                 .send((instance_id.clone(), model_id.clone()))
                 .expect("test load observer remains alive");
@@ -6113,6 +6184,18 @@ mod tests {
         ));
     }
 
+    fn test_target(model_id: &str) -> ResolvedResidencyTarget {
+        test_target_with_key(model_id, &format!("configuration:{model_id}"))
+    }
+
+    fn test_target_with_key(model_id: &str, configuration_key: &str) -> ResolvedResidencyTarget {
+        ResolvedResidencyTarget {
+            model_id: model_id.to_owned(),
+            configuration: test_configuration(model_id),
+            configuration_key: configuration_key.to_owned(),
+        }
+    }
+
     #[tokio::test]
     async fn equivalent_loading_demand_joins_one_instance_and_stop_terminalizes_every_waiter() {
         let (client, mut loads, _, actor) = test_residency(false);
@@ -6120,7 +6203,7 @@ mod tests {
             let client = client.clone();
             async move {
                 client
-                    .acquire("model-a".to_owned(), ResidencyAcquisition::Warm)
+                    .acquire(test_target("model-a"), ResidencyAcquisition::Warm)
                     .await
             }
         });
@@ -6130,7 +6213,7 @@ mod tests {
             let client = client.clone();
             async move {
                 client
-                    .acquire("model-a".to_owned(), ResidencyAcquisition::Warm)
+                    .acquire(test_target("model-a"), ResidencyAcquisition::Warm)
                     .await
             }
         });
@@ -6165,6 +6248,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn changed_configuration_replaces_residency_for_the_same_model_id() {
+        let (client, mut loads, _, actor) = test_residency(true);
+        let first = client
+            .acquire(
+                test_target_with_key("model-a", "configuration:v1"),
+                ResidencyAcquisition::Warm,
+            )
+            .await
+            .expect("first configuration becomes ready");
+        let ResidencyGrant::Ready(first) = first else {
+            panic!("warm acquisition returned an inference lease");
+        };
+        let _ = loads.recv().await.expect("first configuration load");
+
+        let replacement = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .acquire(
+                        test_target_with_key("model-a", "configuration:v2"),
+                        ResidencyAcquisition::Warm,
+                    )
+                    .await
+            }
+        });
+        let (replacement_id, replacement_model_id) =
+            loads.recv().await.expect("replacement configuration load");
+        assert_eq!(replacement_model_id, "model-a");
+        assert_ne!(replacement_id, first.id);
+        assert!(matches!(
+            replacement.await.expect("replacement task"),
+            Ok(ResidencyGrant::Ready(_))
+        ));
+
+        client.stop(replacement_id).await.expect("replacement stop");
+        actor.abort();
+    }
+
+    #[tokio::test]
     async fn package_removal_admission_excludes_new_model_loads() {
         let (client, mut loads, _, actor) = test_residency(false);
         let permit = client
@@ -6175,7 +6297,7 @@ mod tests {
             let client = client.clone();
             async move {
                 client
-                    .acquire("model-a".to_owned(), ResidencyAcquisition::Warm)
+                    .acquire(test_target("model-a"), ResidencyAcquisition::Warm)
                     .await
             }
         });
@@ -6197,7 +6319,7 @@ mod tests {
             let client = client.clone();
             tokio::spawn(async move {
                 client
-                    .acquire(model_id.to_owned(), ResidencyAcquisition::Warm)
+                    .acquire(test_target(model_id), ResidencyAcquisition::Warm)
                     .await
             })
         };
@@ -6242,7 +6364,7 @@ mod tests {
             let client = client.clone();
             async move {
                 client
-                    .acquire("model-a".to_owned(), ResidencyAcquisition::Warm)
+                    .acquire(test_target("model-a"), ResidencyAcquisition::Warm)
                     .await
             }
         });
@@ -6252,7 +6374,7 @@ mod tests {
             let client = client.clone();
             async move {
                 client
-                    .acquire("model-a".to_owned(), ResidencyAcquisition::Warm)
+                    .acquire(test_target("model-a"), ResidencyAcquisition::Warm)
                     .await
             }
         });
@@ -6270,7 +6392,7 @@ mod tests {
         let (client, mut loads, workers, actor) = test_residency(true);
         let first_lease = match client
             .acquire(
-                "model-a".to_owned(),
+                test_target("model-a"),
                 ResidencyAcquisition::Inference { progress: None },
             )
             .await
@@ -6291,7 +6413,7 @@ mod tests {
 
         let second_lease = match client
             .acquire(
-                "model-a".to_owned(),
+                test_target("model-a"),
                 ResidencyAcquisition::Inference { progress: None },
             )
             .await
@@ -6312,7 +6434,7 @@ mod tests {
         let (client, mut loads, workers, actor) = test_residency(true);
         let lease = match client
             .acquire(
-                "model-a".to_owned(),
+                test_target("model-a"),
                 ResidencyAcquisition::Inference { progress: None },
             )
             .await
@@ -6326,7 +6448,7 @@ mod tests {
             let client = client.clone();
             async move {
                 client
-                    .acquire("model-b".to_owned(), ResidencyAcquisition::Warm)
+                    .acquire(test_target("model-b"), ResidencyAcquisition::Warm)
                     .await
             }
         });

@@ -1,5 +1,5 @@
 import { FetchHttpClient } from "@effect/platform"
-import { Cause, Context, Data, Effect, Either, Exit, Layer, Match, Option, Schema, Scope, Stream, SubscriptionRef } from "effect"
+import { Cause, Context, Data, Effect, Either, Exit, Layer, Match, Option, Schema, Stream, SubscriptionRef } from "effect"
 import {
   PRIMARY_SLOT_ID,
   ProviderModelCatalogLifecycle,
@@ -183,7 +183,6 @@ export const ProviderModelCatalogLive: Layer.Layer<
 > = Layer.scoped(ProviderModelCatalog, Effect.gen(function* () {
   const client = yield* ProviderClient
   const localOfferings = yield* LocalProviderOfferings
-  const scope = yield* Scope.Scope
   const lock = yield* Effect.makeSemaphore(1)
   const stateLock = yield* Effect.makeSemaphore(1)
   const refreshOperations = yield* makeServiceOperationCoordinator<
@@ -240,18 +239,6 @@ export const ProviderModelCatalogLive: Layer.Layer<
         modelsByProvider.set(outcome.providerId, projected.right)
         failuresByProvider.delete(outcome.providerId)
       }
-    }
-
-    const localOfferingsResult = yield* Effect.either(localOfferings.catalog)
-    const localModels = Either.isRight(localOfferingsResult) ? localOfferingsResult.right : []
-    modelsByProvider.set(LOCAL_PROVIDER_ID, localModels)
-    if (Either.isLeft(localOfferingsResult)) {
-      failuresByProvider.set(LOCAL_PROVIDER_ID, providerFailure(
-        LOCAL_PROVIDER_ID,
-        localOfferingsResult.left.message,
-      ))
-    } else {
-      failuresByProvider.delete(LOCAL_PROVIDER_ID)
     }
 
     const providerResult = yield* client.listProviders.pipe(
@@ -352,30 +339,39 @@ export const ProviderModelCatalogLive: Layer.Layer<
       )),
   )
 
-  const reconcileLocalProjection = lock.withPermits(1)(Effect.gen(function* () {
-    yield* beginRefresh
-    yield* reconcile([])
-  })).pipe(
-    Effect.catchAllCause((cause) =>
-      lock.withPermits(1)(terminalizeRefreshFailure(cause)).pipe(
-        Effect.zipRight(Effect.logError("Unable to reconcile local provider offerings").pipe(
-          Effect.annotateLogs({ cause: Cause.pretty(cause).slice(0, 1_000) }),
-        )),
-      )),
+  const state = Effect.zipWith(
+    SubscriptionRef.get(current),
+    Effect.either(localOfferings.catalog),
+    (remote, local): ProviderModelCatalogState => {
+      if (remote._tag === "Loading") return remote
+      const remoteContents = contents(remote)
+      const remoteModels = remoteContents.models.filter(({ providerId }) => providerId !== LOCAL_PROVIDER_ID)
+      const localModels = Either.isRight(local) ? local.right : []
+      const failures = [
+        ...remoteContents.failures.filter((failure) =>
+          failure._tag !== "ProviderFailure" || failure.providerId !== LOCAL_PROVIDER_ID),
+        ...(Either.isLeft(local) ? [providerFailure(LOCAL_PROVIDER_ID, local.left.message)] : []),
+      ]
+      const fields = {
+        providers: remoteContents.providers,
+        models: [...remoteModels, ...localModels],
+        failures,
+      }
+      if (remote._tag === "Refreshing") return { _tag: "Refreshing", ...fields }
+      if (failures.length > 0 || remote._tag === "Degraded" || remote._tag === "Unavailable") {
+        return { _tag: "Degraded", ...fields }
+      }
+      return { _tag: "Ready", providers: fields.providers, models: fields.models }
+    },
   )
-
-  yield* Effect.forkIn(
-    localOfferings.catalogChanges.pipe(
-      // A local offering change only reprojects cached catalog outcomes. It
-      // must not force remote catalog refresh or hold background activity.
-      Stream.runForEach(() => reconcileLocalProjection),
-    ),
-    scope,
+  const changes = Stream.merge(
+    current.changes.pipe(Stream.map(() => undefined)),
+    localOfferings.catalogChanges,
   )
 
   return ProviderModelCatalog.of({
-    state: SubscriptionRef.get(current),
-    changes: current.changes,
+    state,
+    changes: changes.pipe(Stream.mapEffect(() => state)),
     refresh: requestRefresh,
   })
 }))

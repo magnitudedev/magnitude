@@ -222,7 +222,7 @@ export function make<
   Operation.PayloadConstructor<Payload>,
   Schema.Schema.Type<Success>,
   Schema.Schema.Type<Error>,
-  Operation.Implementations<any> | SynchronizationRequirements,
+  Operation.Implementations<Name, any> | SynchronizationRequirements,
   SynchronizationError
 > & Operation.Declared<Name, "mutation", Payload, Success, Error, Policy>
 export function make(

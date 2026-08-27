@@ -66,10 +66,11 @@ root-mount an atom to simulate durability—declare it with `Atom.keepAlive`.
 ## Client ↔ ACN: queries, mutations, subscriptions
 
 Every client↔ACN interaction is a core Effect Query `Query`, `Mutation`, `Subscription`, or
-stream-folded `Query`, composed with `Group.make` in `packages/acn-protocol`.
-`createAgentClient(protocolLayer)` makes the connection's Effect Query client **for** the root
-`AcnBoundary` (`Client.make(AcnBoundary, AcnRpc.layer(AcnBoundary), …)`); `useAgentClient()`
-returns it. Every boundary operation is a member of that client at its group name, already
+stream-folded `Query`, composed into `AcnBoundary` in `packages/acn-protocol`. Client-common may
+recursively extend that boundary with Effect-backed semantic commands under the existing domain
+groups. `createAgentClient(protocolLayer)` makes one client for this application operation graph;
+only `AcnBoundary` is projected to RPC, and client construction must close every RPC implementation
+and embedded Effect requirement. `useAgentClient()` returns it. Every operation is a member of that client at its group name, already
 materialized: a query member is `(input) => QueryAtom` (`client.Sessions.GetSession({ sessionId })`),
 a mutation member is its `MutationAtom` (`client.Agent.SendMessage`), a subscription member is
 `(input) => SubscriptionAtom` (`client.Changes.StreamChanges({})`). Members are the canonical atoms —
@@ -104,6 +105,8 @@ registry, or per-domain invalidation wiring.
 - If the UI displays mutation pending/failure state, read the mutation atom's `Result` with `useAtomValue`. Do not wrap the call with `busy`/`error` `useState` or `try/finally` bookkeeping.
 - Prefer value mode. Use `{ mode: "promise" }` only when the event handler genuinely needs the returned success value for immediate one-shot control flow. A promise is not a state store and must not be used to mirror loading, errors, progress, or query data.
 - For long-running work, the mutation should acknowledge or return an operation ID. Progress and terminal state belong to a query, not to the mutation promise.
+- A combined operation belongs in ACN when it is a universal product capability; client-common composes it only when it is use-case-specific orchestration of independently complete capabilities.
+- Use an Effect-backed Mutation when that composed command has a reusable pending, failure, scope, retry, or synchronization lifecycle; use a plain Effect when only its immediate caller needs the execution result.
 
 ### Services
 

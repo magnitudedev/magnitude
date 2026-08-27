@@ -23,6 +23,11 @@ export type {
 } from "./acn-jit/acn-recovering-client"
 export { isRpcOutcomeUnknown } from "./mutation-outcome"
 export {
+  MagnitudeBoundary,
+  magnitudeImplementationsLayer,
+  type MagnitudeImplementationError,
+} from "./inference"
+export {
   AcnEnsuranceFailed,
   AcnAdministrationFailed,
   BinaryNotFound,

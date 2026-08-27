@@ -5893,6 +5893,7 @@
         "required": [
           "id",
           "modelId",
+          "configuration",
           "lifecycle"
         ],
         "properties": {
@@ -5902,6 +5903,10 @@
           "modelId": {
             "type": "string",
             "description": "Canonical callable model identity (for example `model:format:variant`)."
+          },
+          "configuration": {
+            "$ref": "#/components/schemas/ModelServingConfiguration",
+            "description": "Exact serving configuration admitted for this physical occurrence."
           },
           "lifecycle": {
             "$ref": "#/components/schemas/ModelInstanceLifecycle"

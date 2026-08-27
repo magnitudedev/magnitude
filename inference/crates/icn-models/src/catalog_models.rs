@@ -6,8 +6,8 @@ use futures_util::future::BoxFuture;
 use icn_contracts::InventoryError;
 use icn_contracts::models::{
     CatalogModelEffectiveConfiguration, CatalogModelInstallation, CatalogModelLocalState,
-    CatalogModelUpdateState, CatalogModels, CatalogPackageRemover, InferenceModel,
-    InstallCatalogModelRequest, InstallModelResponse, InstalledCatalogAttribution,
+    CatalogModelUpdateState, CatalogModels, CatalogPackageRemover, CatalogPackageRole,
+    InferenceModel, InstallCatalogModelRequest, InstallModelResponse, InstalledCatalogAttribution,
     InstalledModelPackage, ModelDownloads, ModelFailure, ModelPackageId, ModelServingConfiguration,
     RecommendableModel, RecommendableModelCatalog, ServableModelBundle, StartModelDownloadRequest,
 };
@@ -18,36 +18,54 @@ use crate::inventory::{
 };
 
 #[derive(Clone)]
-pub struct ManagedCatalogModels {
+pub struct CatalogModelResolver {
     inventory: Arc<ManagedModelStore>,
     catalog: RecommendableModelCatalog,
-    downloads: Arc<ManagedModelDownloads>,
-    remover: Arc<dyn CatalogPackageRemover>,
-    maintenance_generation: Arc<AtomicU64>,
-    maintenance_running: Arc<AtomicBool>,
 }
 
-impl ManagedCatalogModels {
+impl CatalogModelResolver {
     #[must_use]
-    pub fn new(
-        inventory: Arc<ManagedModelStore>,
-        catalog: RecommendableModelCatalog,
-        downloads: Arc<ManagedModelDownloads>,
-        remover: Arc<dyn CatalogPackageRemover>,
-    ) -> Result<Arc<Self>, InventoryError> {
-        let service = Arc::new(Self {
-            inventory,
-            catalog,
-            downloads,
-            remover,
-            maintenance_generation: Arc::new(AtomicU64::new(0)),
-            maintenance_running: Arc::new(AtomicBool::new(false)),
-        });
-        let observer: Arc<dyn InstalledPackagesObserver> = service.clone();
-        service
-            .inventory
-            .set_installed_packages_observer(Arc::downgrade(&observer))?;
-        Ok(service)
+    pub fn new(inventory: Arc<ManagedModelStore>, catalog: RecommendableModelCatalog) -> Arc<Self> {
+        Arc::new(Self { inventory, catalog })
+    }
+
+    pub fn serving_configuration(
+        &self,
+        canonical_model_id: &str,
+    ) -> Result<ModelServingConfiguration, InventoryError> {
+        let model = self
+            .snapshot()?
+            .models
+            .into_iter()
+            .find(|model| model.id == canonical_model_id)
+            .ok_or_else(|| {
+                InventoryError::NotFound(format!("model {canonical_model_id} is not available"))
+            })?;
+        match model.local_state {
+            CatalogModelLocalState::Installed {
+                installation:
+                    CatalogModelInstallation {
+                        effective_configuration:
+                            CatalogModelEffectiveConfiguration::Runnable { configuration },
+                        ..
+                    },
+                ..
+            } => Ok(configuration),
+            CatalogModelLocalState::Installed {
+                installation:
+                    CatalogModelInstallation {
+                        effective_configuration:
+                            CatalogModelEffectiveConfiguration::Unavailable { failure },
+                        ..
+                    },
+                ..
+            } => Err(InventoryError::ModelOperation {
+                code: failure.code,
+                message: failure.message,
+                retryable: failure.retryable,
+            }),
+            CatalogModelLocalState::NotInstalled => Ok(model.desired_configuration),
+        }
     }
 
     fn snapshot(&self) -> Result<icn_contracts::models::ModelsResponse, InventoryError> {
@@ -78,6 +96,43 @@ impl ManagedCatalogModels {
             models: catalog_models,
             diagnostics: self.catalog.diagnostics.clone(),
         })
+    }
+}
+
+#[derive(Clone)]
+pub struct ManagedCatalogModels {
+    resolver: Arc<CatalogModelResolver>,
+    downloads: Arc<ManagedModelDownloads>,
+    remover: Arc<dyn CatalogPackageRemover>,
+    maintenance_generation: Arc<AtomicU64>,
+    maintenance_running: Arc<AtomicBool>,
+}
+
+impl ManagedCatalogModels {
+    #[must_use]
+    pub fn new(
+        resolver: Arc<CatalogModelResolver>,
+        downloads: Arc<ManagedModelDownloads>,
+        remover: Arc<dyn CatalogPackageRemover>,
+    ) -> Result<Arc<Self>, InventoryError> {
+        let service = Arc::new(Self {
+            resolver,
+            downloads,
+            remover,
+            maintenance_generation: Arc::new(AtomicU64::new(0)),
+            maintenance_running: Arc::new(AtomicBool::new(false)),
+        });
+        let observer: Arc<dyn InstalledPackagesObserver> = service.clone();
+        service
+            .resolver
+            .inventory
+            .set_installed_packages_observer(Arc::downgrade(&observer))?;
+        service.request_maintenance();
+        Ok(service)
+    }
+
+    fn snapshot(&self) -> Result<icn_contracts::models::ModelsResponse, InventoryError> {
+        self.resolver.snapshot()
     }
 
     async fn cleanup(&self, model: &InferenceModel) -> Result<(), InventoryError> {
@@ -194,7 +249,12 @@ fn catalog_model(
                 &entry.catalog_attribution,
                 InstalledCatalogAttribution::Attributed { model_id, variant_id }
                     if model_id == &definition.model_id && variant_id == &definition.variant_id
-            )
+            ) || affiliations.iter().any(|affiliation| {
+                affiliation.model_id == definition.model_id
+                    && affiliation.variant_id == definition.variant_id
+                    && affiliation.package_id == entry.package.id
+                    && affiliation.role == CatalogPackageRole::Target
+            })
         })
         .copied()
         .collect::<Vec<_>>();
@@ -299,7 +359,6 @@ impl CatalogModels for ManagedCatalogModels {
         request: InstallCatalogModelRequest,
     ) -> BoxFuture<'_, Result<InstallModelResponse, InventoryError>> {
         Box::pin(async move {
-            self.inventory.ensure_installed_model_inventory().await?;
             let model = self
                 .snapshot()?
                 .models
@@ -313,33 +372,16 @@ impl CatalogModels for ManagedCatalogModels {
                         request.model_id.0, request.variant_id.0
                     ))
                 })?;
-            let missing = match &model.local_state {
-                CatalogModelLocalState::NotInstalled => true,
-                CatalogModelLocalState::Installed {
-                    update_state:
-                        CatalogModelUpdateState::Available {
-                            missing_package_ids,
-                            ..
-                        },
-                    ..
-                } => !missing_package_ids.is_empty(),
-                CatalogModelLocalState::Installed {
-                    update_state: CatalogModelUpdateState::Current,
-                    ..
-                } => false,
-            };
-            if missing {
-                let response = self
-                    .downloads
-                    .start(StartModelDownloadRequest {
-                        bundle: model.desired_configuration.bundle.clone(),
-                    })
-                    .await?;
-                if let Some(download) = response.download {
-                    return Ok(InstallModelResponse::DownloadAdmitted {
-                        download_id: download.id,
-                    });
-                }
+            let response = self
+                .downloads
+                .start(StartModelDownloadRequest {
+                    bundle: model.desired_configuration.bundle.clone(),
+                })
+                .await?;
+            if let Some(download) = response.download {
+                return Ok(InstallModelResponse::DownloadAdmitted {
+                    download_id: download.id,
+                });
             }
             self.cleanup(&model).await?;
             Ok(InstallModelResponse::Current)
@@ -438,7 +480,8 @@ mod tests {
     #[test]
     fn attributed_prior_target_remains_visible_and_runnable_when_desired_artifact_is_missing() {
         let desired = package("desired");
-        let prior = installed(package("prior"));
+        let mut prior = installed(package("prior"));
+        prior.catalog_attribution = InstalledCatalogAttribution::NotCatalogTarget;
         let present = BTreeMap::from([(prior.package.id.clone(), &prior)]);
         let affiliations = vec![CatalogPackageAffiliation {
             model_id: CatalogModelId("catalog".to_owned()),

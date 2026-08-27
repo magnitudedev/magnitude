@@ -31,6 +31,7 @@ const setupWithProgress = (
   select: () => {},
   setRankingControls: () => {},
   cancel: () => {},
+  chooseAnother: () => {},
   back: () => {},
   continueWithHarness: () => {},
   exit: () => {},

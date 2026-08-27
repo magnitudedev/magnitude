@@ -22,7 +22,6 @@ import {
   type SessionError,
 } from "@magnitudedev/acn-protocol"
 import { MagnitudeStorage, type StoredSessionMeta } from "@magnitudedev/storage"
-import { AcnServiceLifecycle } from "./service-lifecycle"
 import { AgentFactory } from "./agent-factory"
 import { FileSystemManager } from "./file-system-manager"
 import {
@@ -152,7 +151,6 @@ export const makeAgentRuntimeLive = (
       const storage = yield* MagnitudeStorage
       const fileSystem = yield* FileSystemManager
       const runtimeOptions = yield* SessionRuntimeOptionsStore
-      const lifecycle = yield* Effect.serviceOption(AcnServiceLifecycle)
       const managerScope = yield* Effect.scope
       const entries = yield* Ref.make(new Map<string, SessionRuntimeInternal>())
       const starts = yield* Ref.make(new Map<string, StartDeferred>())
@@ -257,13 +255,6 @@ export const makeAgentRuntimeLive = (
                       generation,
                       cause: String(cause),
                     }),
-                    Effect.zipRight(Option.match(lifecycle, {
-                      onNone: () => Effect.void,
-                      onSome: (serviceLifecycle) => serviceLifecycle.beginStopping({
-                        reason: "fatal",
-                        detail: `session ${request.sessionId} generation ${generation} work-status observation failed`,
-                      }).pipe(Effect.asVoid),
-                    })),
                   ),
               ),
             ),
@@ -495,14 +486,8 @@ export const makeAgentRuntimeLive = (
                 cause: String(closeExit.cause),
               }),
             )
-            if (Option.isSome(lifecycle)) {
-              yield* lifecycle.value.beginStopping({
-                reason: "fatal",
-                detail: `session ${sessionId} generation ${generation} scope close failed`,
-              })
-            }
-            // Never reopen a generation whose scope may be only partially
-            // finalized. Controlled ACN shutdown owns the recovery boundary.
+            // Keep the exact generation quarantined. A partially finalized
+            // session is unsafe to reopen, but it cannot own the ACN process.
             return yield* Effect.never
           }
           yield* logStage("closing-runtime", stageStartedAt)
@@ -525,28 +510,25 @@ export const makeAgentRuntimeLive = (
           }
           return true
         })
-        return Option.match(lifecycle, {
-          onNone: () => retire,
-          onSome: (serviceLifecycle) =>
-            Effect.raceFirst(
-              retire,
-              Effect.sleep(options.retirementShutdownTimeout ?? "15 seconds").pipe(
-                Effect.zipRight(
-                  Effect.logError("Session retirement exceeded its liveness deadline").pipe(
-                    Effect.annotateLogs({ sessionId, generation }),
-                  ),
-                ),
-                Effect.zipRight(
-                  serviceLifecycle.beginStopping({
-                    reason: "fatal",
-                    detail: `session ${sessionId} generation ${generation} retirement stalled`,
-                  }),
-                ),
-                // The retirement result remains authoritative. Requesting a
-                // shutdown does not reopen a partially closed generation.
-                Effect.zipRight(Effect.never),
-              ),
+        return Effect.gen(function* () {
+          const completed = yield* Ref.make(false)
+          yield* Effect.sleep(options.retirementShutdownTimeout ?? "15 seconds").pipe(
+            Effect.zipRight(
+              Effect.gen(function* () {
+                if (yield* Ref.get(completed)) return
+                const current = (yield* Ref.get(entries)).get(sessionId)
+                if (!current || current.generation !== generation) return
+                yield* Effect.logError("Session retirement exceeded its liveness deadline").pipe(
+                  Effect.annotateLogs({ sessionId, generation }),
+                )
+              }),
             ),
+            Effect.interruptible,
+            Effect.forkIn(managerScope),
+          )
+          return yield* retire.pipe(
+            Effect.ensuring(Ref.set(completed, true)),
+          )
         })
       }
 

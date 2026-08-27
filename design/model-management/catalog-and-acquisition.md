@@ -123,7 +123,10 @@ operation. One cached GGUF inspection supplies every derived property
 for an immutable component. Reconciliation publishes complete inventory snapshots and retains the
 previous complete inventory snapshot while a refresh is in flight. Queries return the current materialized snapshot
 and perform no filesystem work. Discovery is hardware-independent and performs no network access,
-assessment, calibration, profile choice, or ranking.
+assessment, calibration, profile choice, or ranking. ICN reconciles once at startup. Product-owned
+artifact mutations publish their exact inventory change before completing and do not trigger a
+global scan. A later global reconciliation is performed only when an operation explicitly requires
+fresh discovery or validation; it is never driven by an unconditional timer.
 
 All inventory indexes, content hashes, inspections, and derived package evidence are optimistic
 caches. Missing, stale, malformed, unreadable, or unwritable cache state causes scoped recomputation
@@ -137,6 +140,11 @@ catalog-install operation, which resolves the exact desired bundle. If every req
 returns `AlreadyInstalled`. Otherwise ICN creates one process-local `ModelDownload` with a stable
 `ModelDownloadId` and admits missing package work or joins equivalent work already owned by the
 same ICN process.
+
+Admission validates each package in the requested bundle against the current materialized package
+record and that package's current exact file evidence. It does not await inventory-wide filesystem
+reconciliation. Global reconciliation remains the discovery path for external filesystem changes;
+it is never a prerequisite for acknowledging a known catalog download.
 
 The raw download occurrence retains its bundle and aggregates bounded progress and one terminal
 outcome. It does not retain ACN model identity. ACN records the exact `ModelDownloadId` returned
@@ -207,8 +215,8 @@ entire desired package set is present. Cleanup failure is logged and may be retr
 authoritative change. There is no request poller and no package-attempt completion trigger.
 
 Download state determines neither configuration, offering, slot identity, nor physical presence.
-On completion ACN refreshes inventory before presenting the occurrence as complete. The filesystem
-observation remains authoritative.
+ICN publishes the completed package into its materialized inventory before emitting the download's
+ready outcome. The filesystem observation remains authoritative.
 
 ## Deletion and garbage collection
 
@@ -233,8 +241,8 @@ may share in-flight hashing and inspection. Package download sharing and cancell
 within the owning ICN process.
 
 Startup derives inventory from current files and callable models from catalog.
-There is no model-state recovery epoch. Later filesystem or catalog observations reconcile through
-the same continuous derivation.
+There is no model-state recovery epoch. Later explicit filesystem observations and product-owned
+artifact mutations update the same materialized derivation.
 
 ## Conformance
 

@@ -7,7 +7,7 @@ import { AlertTriangle, Cpu, HardDrive, Loader2, X } from "lucide-react"
 import {
   formatLocalModelDisplayName,
   modelDownloadFailureMessage,
-  onboardingModelSetupFailureMessage,
+  onboardingModelSetupNoticeMessage,
   rankedLocalModelOptions,
   LOCAL_MODEL_RANKING_SCALE_INTERVALS,
   LOCAL_MODEL_RANKING_SCALE_LABELS,
@@ -132,7 +132,7 @@ export function LocalModelOnboarding({
   if (state === null || state._tag === "Closed") return null
   const notice = Option.match(state.notice, {
     onNone: () => null,
-    onSome: onboardingModelSetupFailureMessage,
+    onSome: onboardingModelSetupNoticeMessage,
   })
   const content = state.content
   const operation =

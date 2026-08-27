@@ -26,7 +26,7 @@ pub use catalog::{
     ResolvingRecommendableCatalog, advance_model_catalog_lock, load_release_catalog,
     model_catalog_lock,
 };
-pub use catalog_models::ManagedCatalogModels;
+pub use catalog_models::{CatalogModelResolver, ManagedCatalogModels};
 pub use download_service::ManagedModelDownloads;
 pub use inventory::{InventoryConfig, ManagedModelStore};
 pub use package_service::{

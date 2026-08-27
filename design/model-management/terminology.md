@@ -76,7 +76,7 @@ release declaration + current Packages
                     +-> inference request ----------+-> residency coordinator -> Instance -> lease
 
 ACN Slot selection by canonical model ID
-  + native Model and Instance Queries
+  + ACN Catalog projection of native Model and Instance Queries
   -> first-party residency presentation
 ```
 

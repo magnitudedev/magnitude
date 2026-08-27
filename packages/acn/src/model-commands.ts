@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Option } from "effect"
+import { Cause, Context, Effect, Layer, Option, Stream } from "effect"
 import {
   LocalModelMutationFailed,
   ModelDownloadIdSchema,
@@ -9,10 +9,10 @@ import {
   type SlotId,
 } from "@magnitudedev/acn-protocol"
 import type { ProviderModelId } from "@magnitudedev/ai"
-import { IcnClient, IcnInstances, type IcnClientService } from "@magnitudedev/icn"
+import { IcnClient, IcnDownloads, IcnInstances, IcnModels, type IcnClientService } from "@magnitudedev/icn"
 import { projectInferenceLoadPlan } from "@magnitudedev/sdk"
-import { LocalModels } from "./local-models"
-import { LocalModelSyncs } from "./local-model-syncs"
+import { LocalModelAcquisitionCoordinator } from "./local-model-acquisition-coordinator"
+import { LocalModelPackages } from "./local-model-packages"
 import { ModelSlotController } from "./model-slot-controller"
 
 export interface ModelCommandsApi {
@@ -69,15 +69,16 @@ export const modelCommandFailure = (
 export const ModelCommandsLive: Layer.Layer<
   ModelCommands,
   never,
-  IcnClient | ModelSlotController | IcnInstances | LocalModels | LocalModelSyncs
-> = Layer.effect(ModelCommands, Effect.gen(function* () {
+  IcnClient | IcnDownloads | IcnModels | ModelSlotController | IcnInstances
+    | LocalModelPackages | LocalModelAcquisitionCoordinator
+> = Layer.scoped(ModelCommands, Effect.gen(function* () {
   const client = yield* IcnClient
+  const downloads = yield* IcnDownloads
+  const models = yield* IcnModels
   const slots = yield* ModelSlotController
   const instances = yield* IcnInstances
-  const localModels = yield* LocalModels
-  const syncs = yield* LocalModelSyncs
-  const modelMutationLock = yield* Effect.makeSemaphore(1)
-
+  const packages = yield* LocalModelPackages
+  const acquisition = yield* LocalModelAcquisitionCoordinator
   const selectedLocalModel = (slotId: SlotId) => slots.state.pipe(
     Effect.map((state) => state.slots[slotId === PRIMARY_SLOT_ID ? "primary" : "secondary"]),
     Effect.filterOrFail(
@@ -89,71 +90,156 @@ export const ModelCommandsLive: Layer.Layer<
     ),
     Effect.map((slot) => slot.selection.providerModelId),
   )
-  const admitSync = (modelId: ProviderModelId) => client.models.installModel({
-    payload: { modelId },
-  }).pipe(
-    Effect.mapError((cause) => modelCommandFailure("install_model", cause)),
-    Effect.tap((result) => result._tag === "DownloadAdmitted"
-      ? syncs.admitted(modelId, ModelDownloadIdSchema.make(result.downloadId))
-      : syncs.current(modelId)),
+  const nativeDownload = (downloadId: string) => downloads.get.pipe(
+    Effect.map(({ state }) => state.downloads.find(({ id }) => id === downloadId)),
+  )
+  const cancelDownload = (downloadId: string) => client.models.cancelModelDownload({
+    path: { download_id: downloadId },
+  }).pipe(Effect.mapError((cause) => modelCommandFailure("cancel_download", cause)))
+
+  const failureMessage = (cause: Cause.Cause<unknown>) => Option.match(
+    Cause.failureOption(cause),
+    {
+      onNone: () => Cause.pretty(cause),
+      onSome: externalFailureMessage,
+    },
+  )
+  const removalFailure = (cause: Cause.Cause<unknown>): LocalModelMutationFailed => Option.match(
+    Cause.failureOption(cause),
+    {
+      onNone: () => new LocalModelMutationFailed({
+        code: "model_uninstall_model_failed",
+        message: Cause.pretty(cause),
+        retryable: true,
+      }),
+      onSome: (failure) => failure instanceof LocalModelMutationFailed
+        ? failure
+        : new LocalModelMutationFailed({
+            code: "model_uninstall_model_failed",
+            message: externalFailureMessage(failure),
+            retryable: true,
+          }),
+    },
   )
 
-  const sync = (modelId: ProviderModelId) => modelMutationLock.withPermits(1)(
-    syncs.download(modelId).pipe(
-      Effect.flatMap(Option.match({
-        onNone: () => admitSync(modelId),
-        onSome: (download) => download.state._tag === "Pending"
-            || download.state._tag === "Downloading"
-          ? Effect.succeed({ _tag: "DownloadAdmitted" as const, downloadId: download.id })
-          : admitSync(modelId),
-      })),
-      Effect.andThen(localModels.refresh),
-      Effect.as({}),
-    ),
+  const runSync = (modelId: ProviderModelId, generation: number) => Effect.gen(function* () {
+    const admission = yield* client.models.installModel({ payload: { modelId } }).pipe(
+      Effect.mapError((cause) => modelCommandFailure("install_model", cause)),
+    )
+    if (admission._tag === "Current") {
+      yield* acquisition.finishSync(modelId, generation)
+      return
+    }
+    const downloadId = ModelDownloadIdSchema.make(admission.downloadId)
+    const correlation = yield* acquisition.correlateSync(modelId, generation, downloadId)
+    if (Option.isSome(correlation) && !correlation.value) return
+    yield* cancelDownload(downloadId).pipe(
+      Effect.zipRight(packages.refresh),
+      Effect.zipRight(acquisition.finishSync(modelId, generation)),
+    )
+  }).pipe(Effect.onError((cause) => acquisition.failSyncAdmission(modelId, generation, {
+    _tag: "Internal",
+    message: failureMessage(cause),
+  })))
+
+  const retireTerminalSynchronizations = Effect.gen(function* () {
+    const coordination = yield* acquisition.state
+    if (coordination.syncs.size === 0) return
+    const nativeDownloads = (yield* downloads.get).state.downloads
+    const nativeModels = (yield* models.get).state.models
+    const downloadsById = new Map(nativeDownloads.map((download) => [download.id, download]))
+    const modelsById = new Map(nativeModels.map((model) => [model.id, model]))
+    yield* Effect.forEach(coordination.syncs, ([modelId, sync]) => {
+      if (sync._tag !== "Correlated") return Effect.void
+      const download = downloadsById.get(sync.downloadId)
+      if (download?.state._tag === "Cancelled"
+        || (download?.state._tag === "Failed" && download.state.acknowledged)) {
+        return acquisition.finishSync(modelId, sync.generation)
+      }
+      const model = modelsById.get(modelId)
+      const isCurrent = model?.localState._tag === "Installed"
+        && model.localState.updateState._tag === "Current"
+      return download?.state._tag === "Completed" && isCurrent
+        ? acquisition.finishSync(modelId, sync.generation)
+        : Effect.void
+    }, { discard: true })
+  })
+
+  yield* Stream.merge(
+    downloads.changes.pipe(Stream.map(() => undefined)),
+    models.changes.pipe(Stream.map(() => undefined)),
+  ).pipe(
+    Stream.runForEach(() => retireTerminalSynchronizations),
+    Effect.forkScoped,
   )
-  const cancelSync = (modelId: ProviderModelId) => modelMutationLock.withPermits(1)(
-    syncs.download(modelId).pipe(
-      Effect.flatMap(Option.match({
-        onNone: () => Effect.void,
-        onSome: (download) => download.state._tag === "Pending" || download.state._tag === "Downloading"
-          ? client.models.cancelModelDownload({ path: { download_id: download.id } }).pipe(
-              Effect.mapError((cause) => modelCommandFailure("cancel_download", cause)),
-            )
-          : Effect.void,
-      })),
-      Effect.andThen(localModels.refresh),
-      Effect.as({}),
-    ),
-  )
-  const acknowledgeSyncFailure = (modelId: ProviderModelId) => modelMutationLock.withPermits(1)(
-    syncs.download(modelId).pipe(
-      Effect.flatMap(Option.match({
-        onNone: () => Effect.void,
-        onSome: (download) => download.state._tag === "Failed" && !download.state.acknowledged
-          ? client.models.acknowledgeModelDownloadFailure({ path: { download_id: download.id } }).pipe(
-              Effect.mapError((cause) => modelCommandFailure("acknowledge_download_failure", cause)),
-            )
-          : Effect.void,
-      })),
-      Effect.andThen(localModels.refresh),
-      Effect.as({}),
-    ),
-  )
+
+  const sync = (modelId: ProviderModelId) => Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
+    const replaceGeneration = yield* restore(Effect.gen(function* () {
+      const existing = (yield* acquisition.state).syncs.get(modelId)
+      const existingDownload = existing?._tag === "Correlated"
+        ? yield* nativeDownload(existing.downloadId)
+        : undefined
+      if (existing === undefined) return Option.none<number>()
+      const replace = existing._tag === "AdmissionFailed"
+        || (existingDownload !== undefined
+          && existingDownload.state._tag !== "Pending"
+          && existingDownload.state._tag !== "Downloading")
+      return replace ? Option.some(existing.generation) : Option.none<number>()
+    }))
+    const admitted = yield* acquisition.admitSync(modelId, replaceGeneration)
+    if (Option.isSome(admitted)) yield* runSync(modelId, admitted.value)
+    return {}
+  }))
+
+  const cancelSync = (modelId: ProviderModelId) => Effect.gen(function* () {
+    const cancellation = yield* acquisition.requestSyncCancellation(modelId)
+    if (Option.isSome(cancellation)) {
+      yield* cancelDownload(cancellation.value.downloadId)
+      yield* packages.refresh
+      yield* acquisition.finishSync(modelId, cancellation.value.generation)
+    }
+    return {}
+  })
+
+  const acknowledgeSyncFailure = (modelId: ProviderModelId) => Effect.gen(function* () {
+    const syncState = (yield* acquisition.state).syncs.get(modelId)
+    if (syncState?._tag === "AdmissionFailed") {
+      yield* acquisition.finishSync(modelId, syncState.generation)
+      return {}
+    }
+    if (syncState?._tag !== "Correlated") return {}
+    const download = yield* nativeDownload(syncState.downloadId)
+    if (download?.state._tag === "Failed" && !download.state.acknowledged) {
+      yield* client.models.acknowledgeModelDownloadFailure({
+        path: { download_id: syncState.downloadId },
+      }).pipe(Effect.mapError((cause) => modelCommandFailure("acknowledge_download_failure", cause)))
+      yield* packages.refresh
+    }
+    yield* acquisition.finishSync(modelId, syncState.generation)
+    return {}
+  })
 
   return ModelCommands.of({
     sync,
     cancelSync,
     acknowledgeSyncFailure,
-    remove: (modelId) => modelMutationLock.withPermits(1)(
-      Effect.uninterruptible(localModels.removalStarted(modelId).pipe(
-        Effect.andThen(client.models.uninstallModel({ payload: { modelId } }).pipe(
-          Effect.mapError((cause) => modelCommandFailure("uninstall_model", cause)),
+    remove: (modelId) => Effect.uninterruptible(Effect.gen(function* () {
+      const admitted = yield* acquisition.admitRemoval(modelId)
+      if (Option.isNone(admitted)) return {}
+      const generation = admitted.value
+      const remove = client.models.uninstallModel({ payload: { modelId } }).pipe(
+        Effect.mapError((cause) => modelCommandFailure("uninstall_model", cause)),
+        Effect.zipRight(packages.refresh),
+        Effect.zipRight(acquisition.finishRemoval(modelId, generation)),
+        Effect.onError((cause) => acquisition.failRemoval(
+          modelId,
+          generation,
+          removalFailure(cause),
         )),
-        Effect.andThen(localModels.removalFinished(modelId)),
-        Effect.tapError((failure) => localModels.removalFailed(modelId, failure)),
-        Effect.as({}),
-      )),
-    ),
+      )
+      yield* remove
+      return {}
+    })),
     loadSlot: (slotId) => selectedLocalModel(slotId).pipe(
       Effect.flatMap((modelId) => client.models.ensureModelInstance({ payload: { modelId } })),
       Effect.tap(() => slots.refresh),

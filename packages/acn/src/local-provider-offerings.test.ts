@@ -1,4 +1,4 @@
-import { Effect, Layer, Option, Schema, Stream } from "effect"
+import { Chunk, Effect, Layer, Option, Schema, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   CatalogModelIdSchema,
@@ -7,7 +7,6 @@ import {
   ModelPackageIdSchema,
   ModelReleaseDateSchema,
   ModelVariantLabelSchema,
-  type LocalProviderOffering,
   type ModelPackageEntry,
   type RecommendableModel,
 } from "@magnitudedev/acn-protocol"
@@ -17,35 +16,73 @@ import { LocalModelConfigurationResolver } from "./local-model-configuration-res
 import {
   LocalProviderOfferings,
   LocalProviderOfferingsLive,
-  providerOfferingPackageEvidence,
-  sameProviderOfferingPackageEvidence,
 } from "./local-provider-offerings"
 
 describe("local provider offering projection", () => {
-  it("tracks package facts under the canonical model identity", () => {
+  it("publishes package-only availability changes", async () => {
     const packageId = ModelPackageIdSchema.make("package-a")
-    const offering = {
-      providerModelId: ProviderModelIdSchema.make("catalog-a:gguf:q4"),
-      configuration: {
-        bundle: { _tag: "Standalone", package: { id: packageId } },
-        profile: { contextLength: 32_768 },
-      },
-      capabilities: {},
-    } as unknown as LocalProviderOffering
     const entry = {
-      package: { id: packageId },
-      localState: { _tag: "Installed", path: "/models/a.gguf", origin: "Magnitude" },
-      inspection: { _tag: "Pending" },
-    } as unknown as ModelPackageEntry
-    const evidence = providerOfferingPackageEvidence(
-      [offering],
-      new Map([[packageId, entry]]),
-    )
-    expect(evidence[0]).toMatchObject({
-      providerModelId: "catalog-a:gguf:q4",
-      packages: [{ packageId: "package-a", installed: true, inspection: "Pending" }],
+      package: {
+        id: packageId,
+        source: { _tag: "Local" as const, path: "/models/a.gguf" },
+        files: [],
+        relationships: [],
+        properties: {
+          format: "gguf",
+          quantization: "Q4_K_M",
+          quantizationName: "4-bit",
+          architecture: "test",
+          maximumContextLength: Option.none(),
+          intrinsicModelId: Option.none(),
+          intrinsicQualityId: Option.none(),
+        },
+      },
+      localState: { _tag: "NotInstalled" as const },
+      inspection: { _tag: "Pending" as const },
+      catalogAttribution: { _tag: "NotCatalogTarget" as const },
+    } satisfies ModelPackageEntry
+    const installed = {
+      ...entry,
+      localState: { _tag: "Installed" as const, path: "/models/a.gguf", origin: "Magnitude" as const },
+      inspection: {
+        _tag: "Inspected" as const,
+        capabilities: {
+          vision: false,
+          tools: false,
+          structuredOutput: false,
+          reasoning: { supported: false as const, efforts: [], defaultEffort: Option.none() },
+        },
+      },
+    } satisfies ModelPackageEntry
+    const packageState = (packageEntry: ModelPackageEntry) => ({
+      inventory: { _tag: "Ready" as const },
+      entries: [packageEntry],
+      downloads: [],
     })
-    expect(sameProviderOfferingPackageEvidence(evidence, evidence)).toBe(true)
+    const dependencies = Layer.mergeAll(
+      Layer.succeed(LocalModelConfigurationResolver, LocalModelConfigurationResolver.of({
+        get: Effect.succeed(new Map()),
+        changes: Stream.never,
+        settled: Effect.succeed(true),
+      })),
+      Layer.succeed(LocalModelPackages, LocalModelPackages.of({
+        initialized: Effect.succeed(true),
+        state: Effect.succeed(packageState(installed)),
+        changes: Stream.fromIterable([packageState(entry), packageState(installed)]),
+        installedPackageIds: Effect.succeed(new Set([packageId])),
+        refresh: Effect.void,
+      })),
+    )
+
+    const changes = await Effect.runPromise(Effect.gen(function* () {
+      const offerings = yield* LocalProviderOfferings
+      return Chunk.toReadonlyArray(yield* offerings.changes.pipe(Stream.take(2), Stream.runCollect))
+    }).pipe(
+      Effect.provide(LocalProviderOfferingsLive.pipe(Layer.provide(dependencies))),
+      Effect.scoped,
+    ))
+
+    expect(changes).toHaveLength(2)
   })
 
   it("uses the capabilities selected by the configuration resolver", async () => {

@@ -274,7 +274,7 @@ export function make<
   Operation.PayloadConstructor<Payload>,
   Schema.Schema.Type<Success>,
   Schema.Schema.Type<Error>,
-  Operation.Implementations<any>
+  Operation.Implementations<Name, any>
 > & Operation.Declared<Name, "query", Payload, Success, Error, Policy>
 export function make(
   name: string,
@@ -333,7 +333,7 @@ export function fromStream<
   Operation.PayloadConstructor<Payload>,
   Data,
   Schema.Schema.Type<Error>,
-  Operation.Implementations<any>
+  Operation.Implementations<Name, any>
 > & Operation.Declared<Name, "queryFromStream", Payload, Success, Error, Policy>
 export function fromStream(
   name: string,

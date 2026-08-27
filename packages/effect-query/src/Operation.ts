@@ -12,25 +12,33 @@ export type PayloadInput = Schema.Schema.AnyNoContext | Schema.Struct.Fields
 export const TypeId: unique symbol = Symbol.for("@magnitudedev/effect-query/Operation")
 /** @internal Type-level failure of a supplied operation implementation. */
 export const ImplementationErrorTypeId: unique symbol = Symbol.for("@magnitudedev/effect-query/Operation/ImplementationError")
+/** @internal Operation-name set covered by a supplied implementation service. */
+export const ImplementedOperationsTypeId: unique symbol = Symbol.for("@magnitudedev/effect-query/Operation/ImplementedOperations")
 
-export interface Implementations<ImplementationError> {
+export interface Implementations<OperationNames extends string, ImplementationError> {
+  readonly [ImplementedOperationsTypeId]: OperationNames
   readonly [ImplementationErrorTypeId]: (_: ImplementationError) => ImplementationError
 }
 
-export type ImplementationError<Value> = Value extends Implementations<infer Error> ? Error : never
+export type ImplementationError<Value> = Value extends Implementations<infer _OperationNames, infer Error> ? Error : never
 
-export interface ImplementationService<ImplementationError> {
-  readonly execute: (operation: Any, payload: unknown) => Effect.Effect<unknown, unknown | ImplementationError>
-  readonly stream: (operation: Any, payload: unknown) => Stream.Stream<unknown, unknown | ImplementationError>
+export interface ImplementationService<Declarations extends Any, ImplementationError> {
+  readonly execute: (operation: Declarations, payload: unknown) => Effect.Effect<unknown, unknown | ImplementationError>
+  readonly stream: (operation: Declarations, payload: unknown) => Stream.Stream<unknown, unknown | ImplementationError>
 }
 
-const ImplementationsTag = Context.GenericTag<ImplementationService<unknown>>(
+const ImplementationsTag = Context.GenericTag<ImplementationService<Any, unknown>>(
   "@magnitudedev/effect-query/Operation/Implementations",
 )
 
 /** @internal The shared DI slot adapters satisfy with local, RPC, or test implementations. */
-export const implementationsTag = <Error>(): Context.Tag<Implementations<Error>, ImplementationService<Error>> =>
-  ImplementationsTag as unknown as Context.Tag<Implementations<Error>, ImplementationService<Error>>
+export const implementationsTag = <Declarations extends Any, Error>(): Context.Tag<
+  Implementations<Name<Declarations>, Error>,
+  ImplementationService<Declarations, Error>
+> => ImplementationsTag as unknown as Context.Tag<
+  Implementations<Name<Declarations>, Error>,
+  ImplementationService<Declarations, Error>
+>
 
 export interface Declaration<
   Name extends string,
@@ -156,9 +164,9 @@ export const payloadKey = (payload: PayloadInput) => (input: unknown): QueryKey 
 }
 
 /** @internal Execute through whichever implementation layer the client supplied. */
-export const execute = <Value extends Any>(value: Value, input: unknown): Effect.Effect<unknown, unknown, Implementations<unknown>> =>
-  Effect.flatMap(implementationsTag<unknown>(), (implementations) => implementations.execute(value, input))
+export const execute = <Value extends Any>(value: Value, input: unknown): Effect.Effect<unknown, unknown, Implementations<Name<Value>, any>> =>
+  Effect.flatMap(implementationsTag<Value, any>(), (implementations) => implementations.execute(value, input))
 
 /** @internal Stream through whichever implementation layer the client supplied. */
-export const stream = <Value extends Any>(value: Value, input: unknown): Stream.Stream<unknown, unknown, Implementations<unknown>> =>
-  Stream.unwrap(Effect.map(implementationsTag<unknown>(), (implementations) => implementations.stream(value, input)))
+export const stream = <Value extends Any>(value: Value, input: unknown): Stream.Stream<unknown, unknown, Implementations<Name<Value>, any>> =>
+  Stream.unwrap(Effect.map(implementationsTag<Value, any>(), (implementations) => implementations.stream(value, input)))

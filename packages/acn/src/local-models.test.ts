@@ -17,6 +17,7 @@ import {
   deriveModelAcquisitionState,
   installedBundleFields,
   resolveBundlePresentation,
+  selectableProviderModelId,
 } from "./local-models"
 
 const standaloneBundle = (
@@ -92,7 +93,7 @@ describe("bundle acquisition projection", () => {
       currentInstalled: installedBundleFields(bundle, entries),
       download: correlatedModelSync(downloads, downloadId),
       updateAvailable: false,
-      priorEntries: [],
+      priorInstalled: undefined,
       residencyState: { _tag: "Unloaded" },
     })).toMatchObject({
       _tag: "Installing",
@@ -132,12 +133,32 @@ describe("bundle acquisition projection", () => {
       currentInstalled: installedBundleFields(installedBundle, entries),
       download: downloads[0],
       updateAvailable: true,
-      priorEntries: [],
+      priorInstalled: undefined,
       residencyState: { _tag: "Unloaded" },
     })).toMatchObject({
       _tag: "Updating",
       packages: [{ path: "/models/current.gguf" }],
       progress: { completedBytes: 5, totalBytes: 10 },
+    })
+  })
+
+  it("reports an available update when a newly desired dependency is missing", () => {
+    expect(deriveModelAcquisitionState({
+      currentInstalled: undefined,
+      download: undefined,
+      updateAvailable: true,
+      priorInstalled: {
+        installedBytes: 10,
+        packages: [{
+          packageId: ModelPackageIdSchema.make("installed-target"),
+          path: "/models/target.gguf",
+          origin: "Magnitude",
+        }],
+      },
+      residencyState: { _tag: "Unloaded" },
+    })).toMatchObject({
+      _tag: "UpdateAvailable",
+      packages: [{ path: "/models/target.gguf" }],
     })
   })
 
@@ -152,9 +173,50 @@ describe("bundle acquisition projection", () => {
       currentInstalled: undefined,
       download: downloads[0],
       updateAvailable: false,
-      priorEntries: [],
+      priorInstalled: undefined,
       residencyState: { _tag: "Unloaded" },
     })).toEqual({ _tag: "NotInstalled" })
+  })
+
+  it("publishes queued installation immediately after ACN admission", () => {
+    expect(deriveModelAcquisitionState({
+      currentInstalled: undefined,
+      download: undefined,
+      syncState: { _tag: "Admitting", generation: 1, cancelRequested: false },
+      downloadBytes: 10,
+      updateAvailable: false,
+      priorInstalled: undefined,
+      residencyState: { _tag: "Unloaded" },
+    })).toEqual({
+      _tag: "Installing",
+      progress: {
+        stage: "queued",
+        completedBytes: 0,
+        totalBytes: 10,
+        bytesPerSecond: Option.none(),
+      },
+    })
+  })
+
+  it("keeps a completed download active until ICN publishes disk truth", () => {
+    const bundle = standaloneBundle({ _tag: "Local", path: "/models/target.gguf" })
+    const downloadId = ModelDownloadIdSchema.make("completed-download")
+    expect(deriveModelAcquisitionState({
+      currentInstalled: undefined,
+      download: {
+        id: downloadId,
+        bundle,
+        state: { _tag: "Completed" },
+      },
+      syncState: { _tag: "Correlated", generation: 1, downloadId },
+      downloadBytes: 10,
+      updateAvailable: false,
+      priorInstalled: undefined,
+      residencyState: { _tag: "Unloaded" },
+    })).toMatchObject({
+      _tag: "Installing",
+      progress: { stage: "publishing", completedBytes: 10, totalBytes: 10 },
+    })
   })
 
   it("does not borrow a shared-bundle transfer from another model", () => {
@@ -179,7 +241,7 @@ describe("bundle acquisition projection", () => {
       currentInstalled: undefined,
       download: undefined,
       updateAvailable: false,
-      priorEntries: [],
+      priorInstalled: undefined,
       residencyState: { _tag: "Unloaded" },
     })).toEqual({ _tag: "NotInstalled" })
   })
@@ -195,7 +257,7 @@ describe("bundle acquisition projection", () => {
     const inputs = {
       currentInstalled: undefined,
       updateAvailable: false,
-      priorEntries: [],
+      priorInstalled: undefined,
       residencyState: { _tag: "Unloaded" },
     } as const
     expect(deriveModelAcquisitionState({ ...inputs, download: failedDownload(false) }))
@@ -212,8 +274,6 @@ describe("local model availability", () => {
     expect(availabilityFromProviderProjection(
       Option.some(modelId),
       new Map([[modelId, { availability: { _tag: "Available" } }]]),
-      true,
-      Option.none(),
     )).toEqual({ _tag: "Selectable", providerModelId: modelId })
   })
 
@@ -221,9 +281,19 @@ describe("local model availability", () => {
     expect(availabilityFromProviderProjection(
       Option.none(),
       new Map(),
-      false,
-      Option.none(),
     )).toEqual({ _tag: "Installable" })
+  })
+
+  it("keeps an installed model preparing while package publication catches up", () => {
+    expect(availabilityFromProviderProjection(
+      Option.some(modelId),
+      new Map([[modelId, { availability: { _tag: "Disabled", reason: "installation_unavailable" } }]]),
+    )).toEqual({ _tag: "Preparing", providerModelId: modelId })
+  })
+
+  it("keeps an installed fallback selectable while its update is available", () => {
+    expect(selectableProviderModelId(modelId, true)).toEqual(Option.some(modelId))
+    expect(selectableProviderModelId(modelId, false)).toEqual(Option.none())
   })
 })
 
