@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.8-alpha.1
+
+### Patch Changes
+
+- [`5e46594`](https://github.com/magnitudedev/magnitude/commit/5e4659408029d20ec056fad8c3967a37c553c2fb) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Improve onboarding model selection, responsive layout, and mouse interactions
+
 ## 0.0.8-alpha.0
 
 ### Patch Changes
