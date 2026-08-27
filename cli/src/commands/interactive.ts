@@ -17,7 +17,7 @@ const resolveEnvAuth = (): AuthSource => {
 }
 
 export const registerInteractiveCommand = (program: Command): void => {
-  program
+  const interactiveCommand = program
     .option(
       "--resume [id]",
       "Resume the most recent chat session or a specific session by ID",
@@ -41,44 +41,54 @@ export const registerInteractiveCommand = (program: Command): void => {
       "--system-override <text>",
       "Override leader system prompt with raw text",
     )
-    .option("--setup", "Rerun Local Models and Cloud Fallback setup")
-    .action((opts) => {
-      if (opts.headless) {
-        process.stderr.write(
-          "Error: --headless is temporarily disabled. Use the TUI mode.\n",
-        )
-        process.exit(1)
-      }
 
-      const options: InteractiveLaunchOptions = {
-        debug: opts.debug === true,
-        setup: opts.setup ?? false,
-        developmentBuild: isDevelopmentBuild(),
-        sessionStart: opts.resume === undefined
-          ? { _tag: "new" }
-          : opts.resume === true
-            ? { _tag: "latest" }
-            : { _tag: "resume", sessionId: opts.resume },
-        initialPrompt: opts.prompt,
-        goal: opts.goal,
-        envAuth: resolveEnvAuth(),
-        sessionOptions: {
-          disableShellSafeguards: opts.disableShellSafeguards ?? false,
-          disableCwdSafeguards: opts.disableCwdSafeguards ?? false,
-          atifPath: opts.atif,
-          solo: opts.solo ?? false,
-          headless: false,
-          systemPromptOverride: opts.systemOverride,
-        },
-      }
+  const runInteractive = (
+    opts: ReturnType<typeof interactiveCommand.opts>,
+    setup: boolean,
+  ) => {
+    if (opts.headless) {
+      process.stderr.write(
+        "Error: --headless is temporarily disabled. Use the TUI mode.\n",
+      )
+      process.exit(1)
+    }
 
-      return Effect.runPromise(runInteractiveCommand(options).pipe(
-        Effect.provide([BunContext.layer, FetchHttpClient.layer]),
-        Effect.catchAll((error) => Effect.sync(() => {
-          const reason = "reason" in error ? error.reason : String(error)
-          process.stderr.write(`Failed to start Magnitude: ${reason}\n`)
-          return 1
-        })),
-      )).then((exitCode) => process.exit(exitCode))
-    })
+    const options: InteractiveLaunchOptions = {
+      debug: opts.debug === true,
+      setup,
+      developmentBuild: isDevelopmentBuild(),
+      sessionStart: opts.resume === undefined
+        ? { _tag: "new" }
+        : opts.resume === true
+          ? { _tag: "latest" }
+          : { _tag: "resume", sessionId: opts.resume },
+      initialPrompt: opts.prompt,
+      goal: opts.goal,
+      envAuth: resolveEnvAuth(),
+      sessionOptions: {
+        disableShellSafeguards: opts.disableShellSafeguards ?? false,
+        disableCwdSafeguards: opts.disableCwdSafeguards ?? false,
+        atifPath: opts.atif,
+        solo: opts.solo ?? false,
+        headless: false,
+        systemPromptOverride: opts.systemOverride,
+      },
+    }
+
+    return Effect.runPromise(runInteractiveCommand(options).pipe(
+      Effect.provide([BunContext.layer, FetchHttpClient.layer]),
+      Effect.catchAll((error) => Effect.sync(() => {
+        const reason = "reason" in error ? error.reason : String(error)
+        process.stderr.write(`Failed to start Magnitude: ${reason}\n`)
+        return 1
+      })),
+    )).then((exitCode) => process.exit(exitCode))
+  }
+
+  interactiveCommand.action((opts) => runInteractive(opts, false))
+
+  program
+    .command("setup")
+    .description("Interactive first time setup for installing a model and connecting it to a harness")
+    .action(() => runInteractive(interactiveCommand.opts(), true))
 }
