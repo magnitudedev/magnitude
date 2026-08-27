@@ -11,7 +11,11 @@ import {
 } from "../../components/pentagon-radar"
 import { radarCell } from "../../components/radar"
 import { localModelRadarAxes } from "@magnitudedev/client-common"
-import { makeCatalogOnlyModel } from "../local-inference/test-fixtures"
+import {
+  GIB,
+  makeCatalogOnlyModel,
+  TEST_MEMORY_DOMAIN_ID,
+} from "../local-inference/test-fixtures"
 
 const zero: PentagonRadarValues = [0, 0, 0, 0, 0].map(Option.some) as unknown as PentagonRadarValues
 const one: PentagonRadarValues = [1, 1, 1, 1, 1].map(Option.some) as unknown as PentagonRadarValues
@@ -22,7 +26,7 @@ describe("catalog radar", () => {
     expect(Option.getOrThrow(axes[0].value)).toBe(0.75)
     expect(Option.getOrThrow(axes[1].value)).toBeGreaterThanOrEqual(0)
     expect(Option.getOrThrow(axes[2].value)).toBe(0)
-    expect(Option.getOrThrow(axes[3].value)).toBe(1)
+    expect(Option.getOrThrow(axes[3].value)).toBe(0)
     expect(Option.getOrThrow(axes[4].value)).toBe(0.75)
     expect(axes.map(({ label }) => label)).toEqual([
       "INTELLIGENCE",
@@ -73,6 +77,42 @@ describe("catalog radar", () => {
     }))
 
     expect(axes[3].detail).toBe("Tiny (3.4 GB)")
+  })
+
+  test("plots larger memory footprints farther from the center", () => {
+    const model = makeCatalogOnlyModel()
+    if (model.servingState._tag !== "Assessed"
+      || model.servingState.assessment._tag !== "Fits") {
+      throw new Error("Catalog radar fixture must have a fitting assessment")
+    }
+    const assessed = model.servingState.assessment
+    const servingState = { ...model.servingState, assessment: assessed }
+    const memoryValue = (requiredBytes: number) => {
+      const axes = Option.getOrThrow(localModelRadarAxes({
+        ...model,
+        servingState: {
+          ...servingState,
+          assessment: {
+            ...assessed,
+            memory: {
+              ...assessed.memory,
+              domains: [{
+                memoryDomainId: TEST_MEMORY_DOMAIN_ID,
+                capacityBytes: 12 * GIB,
+                compatibilityReserveBytes: 2 * GIB,
+                remainingBytes: 10 * GIB - requiredBytes,
+                requiredBytes,
+              }],
+              totalRequiredBytes: requiredBytes,
+            },
+          },
+        },
+      }))
+      return Option.getOrThrow(axes[3].value)
+    }
+
+    expect(memoryValue(2 * GIB)).toBeCloseTo(0.2)
+    expect(memoryValue(8 * GIB)).toBeCloseTo(0.8)
   })
 
   test("uses cubic ease-out and clamps interpolation", () => {

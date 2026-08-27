@@ -178,7 +178,7 @@ export const localModelRadarAxes = (
       detail: speculation,
     },
     {
-      value: Option.some(1 - memoryUseRatio(assessment)),
+      value: Option.some(memoryUseRatio(assessment)),
       label: "MEMORY",
       detail: `${memoryFootprintLabel(assessment)} (${formatMemorySize(
         assessment.memory.totalRequiredBytes
