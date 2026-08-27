@@ -1,4 +1,4 @@
-import { useCallback, useState, type ReactNode } from "react"
+import { useCallback, useEffect, useState, type ReactNode } from "react"
 import { TextAttributes, type KeyEvent } from "@opentui/core"
 import { useKeyboard } from "@opentui/react"
 import { Option } from "effect"
@@ -10,7 +10,7 @@ import {
   truncateToDisplayWidth,
   type OnboardingModelLoadStatus,
 } from "@magnitudedev/client-common"
-import { acquisitionProgress, type LocalModel, type ProviderModelId } from "@magnitudedev/sdk"
+import { acquisitionProgress, type LocalModel } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
 import { ShimmerText } from "../../components/shimmer-text"
 import { useTheme } from "../../hooks/use-theme"
@@ -83,10 +83,244 @@ const ModelOperationStatusText = ({
 
 type ConfirmationChoice = "yes" | "no"
 
+const moveInlineChoice = <Choice extends string>(
+  choices: readonly Choice[],
+  selected: Choice,
+  direction: -1 | 1,
+): Choice => {
+  const currentIndex = Math.max(0, choices.indexOf(selected))
+  return choices[(currentIndex + direction + choices.length) % choices.length]!
+}
+
+const InlineChoiceButton = <Choice extends string>({
+  value,
+  label,
+  selected,
+  destructive = false,
+  onSelect,
+  onChoose,
+}: {
+  readonly value: Choice
+  readonly label: string
+  readonly selected: boolean
+  readonly destructive?: boolean
+  readonly onSelect: (value: Choice) => void
+  readonly onChoose: () => void
+}): ReactNode => {
+  const theme = useTheme()
+  return (
+    <Button
+      onClick={onChoose}
+      onMouseOver={() => onSelect(value)}
+    >
+      <text
+        style={{
+          fg: selected
+            ? destructive ? theme.status.failure : theme.accent
+            : theme.text.body,
+        }}
+        attributes={selected ? TextAttributes.BOLD : TextAttributes.NONE}
+      >
+        {selected ? "› " : "  "}{label}
+      </text>
+    </Button>
+  )
+}
+
 export interface OnboardingModelDownloadOperation {
   readonly starting: boolean
   readonly cancelling: boolean
   readonly onCancel: () => void
+}
+
+export type OnboardingModelOperationFooterOperation =
+  | {
+      readonly _tag: "Downloading"
+      readonly cancelling: boolean
+      readonly onCancel: () => void
+    }
+  | { readonly _tag: "Configuring" }
+  | {
+      readonly _tag: "Activating"
+      readonly status: OnboardingModelLoadStatus
+      readonly onCancel: () => void
+      readonly onRetry: () => void
+      readonly onChooseAnother: () => void
+    }
+
+export const onboardingModelOperationHint = (
+  operation: OnboardingModelOperationFooterOperation,
+): string => {
+  switch (operation._tag) {
+    case "Configuring": return "Ctrl+C to exit"
+    case "Downloading": return operation.cancelling
+      ? "Ctrl+C to exit"
+      : "Esc cancel · Ctrl+C to exit"
+    case "Activating": {
+      switch (operation.status._tag) {
+        case "Failed": return operation.status.failure.retryable
+          ? "←/→ choose action · Enter confirm · Ctrl+C to exit"
+          : "Enter choose another model · Ctrl+C to exit"
+        case "Cancelling":
+        case "Ready": return "Ctrl+C to exit"
+        case "Preparing":
+        case "Stopping":
+        case "Loading": return "Esc cancel · Ctrl+C to exit"
+      }
+    }
+  }
+}
+
+export function OnboardingModelOperationFooter({
+  operation,
+}: {
+  readonly operation: OnboardingModelOperationFooterOperation
+}): ReactNode {
+  const theme = useTheme()
+  const [confirmingCancellation, setConfirmingCancellation] = useState(false)
+  const [cancellationChoice, setCancellationChoice] = useState<ConfirmationChoice>("yes")
+  const [failureChoice, setFailureChoice] = useState<"retry" | "choose">("retry")
+  const failureRetryable = operation._tag === "Activating"
+    && operation.status._tag === "Failed"
+    && operation.status.failure.retryable
+  const selectedFailureChoice = failureRetryable ? failureChoice : "choose"
+  const cancelable = operation._tag === "Downloading"
+    ? !operation.cancelling
+    : operation._tag === "Activating"
+      && operation.status._tag !== "Cancelling"
+      && operation.status._tag !== "Ready"
+      && operation.status._tag !== "Failed"
+  const confirming = confirmingCancellation && cancelable
+  useEffect(() => {
+    if (cancelable) return
+    setConfirmingCancellation(false)
+    setCancellationChoice("yes")
+  }, [cancelable])
+  const declineCancellation = useCallback(() => {
+    setConfirmingCancellation(false)
+    setCancellationChoice("yes")
+  }, [])
+  const confirmCancellation = useCallback(() => {
+    if (!cancelable || operation._tag === "Configuring") return
+    setConfirmingCancellation(false)
+    setCancellationChoice("yes")
+    operation.onCancel()
+  }, [cancelable, operation])
+
+  useKeyboard(useCallback((key: KeyEvent) => {
+    if (operation._tag === "Activating" && operation.status._tag === "Failed") {
+      if ((key.name === "left" || key.name === "right") && failureRetryable) {
+        key.preventDefault()
+        setFailureChoice((current) => moveInlineChoice(
+          ["retry", "choose"],
+          current,
+          key.name === "left" ? -1 : 1,
+        ))
+        return
+      }
+      if (key.name === "return" || key.name === "enter") {
+        key.preventDefault()
+        if (selectedFailureChoice === "retry") operation.onRetry()
+        else operation.onChooseAnother()
+      }
+      return
+    }
+    if (confirming) {
+      if (key.name === "escape") {
+        key.preventDefault()
+        declineCancellation()
+        return
+      }
+      if (key.name === "left" || key.name === "right") {
+        key.preventDefault()
+        setCancellationChoice((current) => moveInlineChoice(
+          ["yes", "no"],
+          current,
+          key.name === "left" ? -1 : 1,
+        ))
+        return
+      }
+      if (key.name === "return" || key.name === "enter") {
+        key.preventDefault()
+        if (cancellationChoice === "yes") confirmCancellation()
+        else declineCancellation()
+      }
+      return
+    }
+    if (key.name === "escape" && cancelable) {
+      key.preventDefault()
+      setCancellationChoice("yes")
+      setConfirmingCancellation(true)
+    }
+  }, [
+    cancelable,
+    cancellationChoice,
+    confirmCancellation,
+    confirming,
+    declineCancellation,
+    failureRetryable,
+    operation,
+    selectedFailureChoice,
+  ]))
+
+  if (operation._tag === "Activating" && operation.status._tag === "Failed") {
+    return (
+      <box style={{ flexDirection: "row" }}>
+        {operation.status.failure.retryable && (
+          <>
+            <InlineChoiceButton
+              value="retry"
+              label="Retry loading"
+              selected={selectedFailureChoice === "retry"}
+              onSelect={setFailureChoice}
+              onChoose={operation.onRetry}
+            />
+            <box style={{ width: 2, flexShrink: 0 }} />
+          </>
+        )}
+        <InlineChoiceButton
+          value="choose"
+          label="Choose another model"
+          selected={selectedFailureChoice === "choose"}
+          onSelect={setFailureChoice}
+          onChoose={operation.onChooseAnother}
+        />
+      </box>
+    )
+  }
+
+  if (confirming) {
+    return (
+      <box style={{ flexDirection: "row" }}>
+        <text style={{ fg: theme.text.body, flexShrink: 0 }} wrapMode="none">
+          {operation._tag === "Downloading" ? "Cancel download?" : "Cancel loading?"}
+        </text>
+        <box style={{ width: 2, flexShrink: 0 }} />
+        <InlineChoiceButton
+          value="yes"
+          label="Yes"
+          selected={cancellationChoice === "yes"}
+          destructive
+          onSelect={setCancellationChoice}
+          onChoose={confirmCancellation}
+        />
+        <box style={{ width: 2, flexShrink: 0 }} />
+        <InlineChoiceButton
+          value="no"
+          label="No"
+          selected={cancellationChoice === "no"}
+          onSelect={setCancellationChoice}
+          onChoose={declineCancellation}
+        />
+      </box>
+    )
+  }
+
+  return (
+    <text style={{ fg: theme.text.supporting }} wrapMode="none">
+      {onboardingModelOperationHint(operation)}
+    </text>
+  )
 }
 
 export const ONBOARDING_MODEL_OPERATION_ROWS = 3
@@ -120,17 +354,11 @@ export function OnboardingModelDownloadProgress({
   readonly width: number
   readonly operation: OnboardingModelDownloadOperation
 }): ReactNode {
-  const theme = useTheme()
-  const [confirmationModelId, setConfirmationModelId] = useState<ProviderModelId | null>(null)
-  const [choice, setChoice] = useState<ConfirmationChoice>("yes")
-  const [hovered, setHovered] = useState<string | null>(null)
   const starting = operation.starting
   const activeDownload = starting ? null : acquisitionProgress(model.acquisitionState) ?? null
   const downloading = activeDownload !== null
   const active = starting || downloading
   const cancelling = operation.cancelling
-  const cancelable = active && !cancelling
-  const confirming = cancelable && confirmationModelId === model.modelId
   const totalBytes = activeDownload?.totalBytes ?? model.downloadBytes
   const progress = activeDownload !== null
     ? Option.some(activeDownload.completedBytes / Math.max(1, activeDownload.totalBytes))
@@ -150,62 +378,7 @@ export function OnboardingModelDownloadProgress({
             ? `Downloading · ${transferred} · Estimating…`
             : `Downloading · ${transferred} · ${formatTransferRate(rate)} · ${formatEta(activeDownload.totalBytes - activeDownload.completedBytes, rate)}`
           : null
-  const declineCancellation = useCallback(() => {
-    setConfirmationModelId(null)
-    setChoice("yes")
-  }, [])
-
-  const confirmCancellation = useCallback(() => {
-    if (!cancelable) return
-    setConfirmationModelId(null)
-    setChoice("yes")
-    operation.onCancel()
-  }, [cancelable, operation])
-
-  useKeyboard(useCallback((key: KeyEvent) => {
-    if (cancelling) return
-    if (!confirming) {
-      if (key.name === "escape" && cancelable) {
-        key.preventDefault()
-        setChoice("yes")
-        setConfirmationModelId(model.modelId)
-      }
-      return
-    }
-    if (key.name === "escape") {
-      key.preventDefault()
-      declineCancellation()
-      return
-    }
-    if (key.name === "left" || key.name === "right") {
-      key.preventDefault()
-      setChoice((current) => current === "yes" ? "no" : "yes")
-      return
-    }
-    if (key.name === "return" || key.name === "enter") {
-      key.preventDefault()
-      if (choice === "yes") confirmCancellation()
-      else declineCancellation()
-    }
-  }, [model.modelId, cancelable, cancelling, choice, confirmCancellation, confirming, declineCancellation]))
-
   if (!active || status === null) return null
-
-  const choiceButton = (value: ConfirmationChoice, label: string) => (
-    <Button
-      onClick={() => value === "yes" ? confirmCancellation() : declineCancellation()}
-      onMouseOver={() => { setChoice(value); setHovered(value) }}
-      onMouseOut={() => setHovered((current) => current === value ? null : current)}
-    >
-      <text style={{
-        fg: value === "yes"
-          ? choice === value || hovered === value ? theme.status.failure : theme.text.body
-          : choice === value || hovered === value ? theme.accent : theme.text.body,
-      }} attributes={choice === value ? TextAttributes.BOLD : TextAttributes.NONE}>
-        {choice === value ? "› " : "  "}{label}
-      </text>
-    </Button>
-  )
 
   return (
     <box style={{
@@ -219,44 +392,6 @@ export function OnboardingModelDownloadProgress({
     }}>
       <ModelOperationStatusText text={status} width={width} />
       <ModelOperationProgressBar progress={progress} width={width} />
-      <box style={{
-        width,
-        height: 1,
-        minHeight: 1,
-        maxHeight: 1,
-        flexDirection: "row",
-        flexShrink: 0,
-        overflow: "hidden",
-      }}>
-        {confirming ? (
-          <>
-            <text style={{ fg: theme.text.body, flexShrink: 0 }} wrapMode="none">
-              Cancel download?
-            </text>
-            <box style={{ width: 2, flexShrink: 0 }} />
-            {choiceButton("yes", "Yes")}
-            <box style={{ width: 2, flexShrink: 0 }} />
-            {choiceButton("no", "No")}
-          </>
-        ) : (
-          <>
-            {cancelable && (
-              <Button
-                onClick={() => {
-                  setChoice("yes")
-                  setConfirmationModelId(model.modelId)
-                }}
-                onMouseOver={() => setHovered("cancel")}
-                onMouseOut={() => setHovered((current) => current === "cancel" ? null : current)}
-              >
-                <text style={{ fg: hovered === "cancel" ? theme.status.failure : theme.text.supporting }}>
-                  Cancel (Esc)
-                </text>
-              </Button>
-            )}
-          </>
-        )}
-      </box>
     </box>
   )
 }
@@ -325,108 +460,18 @@ export function OnboardingModelLoadProgress({
   model,
   status,
   width,
-  onCancel,
-  onRetry,
-  onChooseAnother,
 }: {
   readonly model: LocalModel
   readonly status: OnboardingModelLoadStatus
   readonly width: number
-  readonly onCancel: () => void
-  readonly onRetry: () => void
-  readonly onChooseAnother: () => void
 }): ReactNode {
   const theme = useTheme()
   const modelName = formatLocalModelDisplayName(model)
-  const [hovered, setHovered] = useState<"retry" | "choose" | "cancel" | ConfirmationChoice | null>(null)
-  const [confirmingCancellation, setConfirmingCancellation] = useState(false)
-  const [cancellationChoice, setCancellationChoice] = useState<ConfirmationChoice>("yes")
-  const [failureChoice, setFailureChoice] = useState<"retry" | "choose">("retry")
-  const failureRetryable = status._tag === "Failed" && status.failure.retryable
-  const selectedFailureChoice = failureRetryable ? failureChoice : "choose"
-  const cancelable = status._tag !== "Cancelling"
-    && status._tag !== "Ready"
-    && status._tag !== "Failed"
-  const declineCancellation = useCallback(() => {
-    setConfirmingCancellation(false)
-    setCancellationChoice("yes")
-  }, [])
-  const confirmCancellation = useCallback(() => {
-    if (!cancelable) return
-    setConfirmingCancellation(false)
-    setCancellationChoice("yes")
-    onCancel()
-  }, [cancelable, onCancel])
-  useKeyboard(useCallback((key: KeyEvent) => {
-    if (status._tag === "Failed") {
-      if ((key.name === "left" || key.name === "right") && failureRetryable) {
-        key.preventDefault()
-        setFailureChoice((current) => current === "retry" ? "choose" : "retry")
-        return
-      }
-      if (key.name === "return" || key.name === "enter") {
-        key.preventDefault()
-        if (selectedFailureChoice === "retry") onRetry()
-        else onChooseAnother()
-      }
-      return
-    }
-    if (!cancelable) return
-    if (!confirmingCancellation) {
-      if (key.name === "escape") {
-        key.preventDefault()
-        setCancellationChoice("yes")
-        setConfirmingCancellation(true)
-      }
-      return
-    }
-    if (key.name === "escape") {
-      key.preventDefault()
-      declineCancellation()
-      return
-    }
-    if (key.name === "left" || key.name === "right") {
-      key.preventDefault()
-      setCancellationChoice((current) => current === "yes" ? "no" : "yes")
-      return
-    }
-    if (key.name === "return" || key.name === "enter") {
-      key.preventDefault()
-      if (cancellationChoice === "yes") confirmCancellation()
-      else declineCancellation()
-    }
-  }, [
-    cancelable,
-    cancellationChoice,
-    confirmCancellation,
-    confirmingCancellation,
-    declineCancellation,
-    failureRetryable,
-    onChooseAnother,
-    onRetry,
-    selectedFailureChoice,
-    status._tag,
-  ]))
   const progress = status._tag === "Loading"
     ? status.progress
     : status._tag === "Ready"
       ? Option.some(1)
       : Option.none<number>()
-  const cancellationChoiceButton = (value: ConfirmationChoice, label: string) => (
-    <Button
-      onClick={() => value === "yes" ? confirmCancellation() : declineCancellation()}
-      onMouseOver={() => setHovered(value)}
-      onMouseOut={() => setHovered(null)}
-    >
-      <text style={{
-        fg: value === "yes"
-          ? cancellationChoice === value || hovered === value ? theme.status.failure : theme.text.body
-          : cancellationChoice === value || hovered === value ? theme.accent : theme.text.body,
-      }} attributes={cancellationChoice === value ? TextAttributes.BOLD : TextAttributes.NONE}>
-        {cancellationChoice === value ? "› " : "  "}{label}
-      </text>
-    </Button>
-  )
   return (
     <box style={{
       width,
@@ -445,60 +490,6 @@ export function OnboardingModelLoadProgress({
         width={width}
         tone={status._tag === "Failed" ? "failed" : "active"}
       />
-      <box style={{ width, height: 1, minHeight: 1, maxHeight: 1, flexDirection: "row", flexShrink: 0 }}>
-        {status._tag === "Failed" ? (
-          <>
-            {status.failure.retryable && (
-              <>
-                <Button
-                  onClick={onRetry}
-                  onMouseOver={() => { setHovered("retry"); setFailureChoice("retry") }}
-                  onMouseOut={() => setHovered(null)}
-                >
-                  <text
-                    style={{ fg: selectedFailureChoice === "retry" || hovered === "retry" ? theme.accent : theme.text.body }}
-                    attributes={selectedFailureChoice === "retry" ? TextAttributes.BOLD : TextAttributes.NONE}
-                  >Retry loading</text>
-                </Button>
-                <box style={{ width: 2, flexShrink: 0 }} />
-              </>
-            )}
-            <Button
-              onClick={onChooseAnother}
-              onMouseOver={() => { setHovered("choose"); setFailureChoice("choose") }}
-              onMouseOut={() => setHovered(null)}
-            >
-              <text
-                style={{ fg: selectedFailureChoice === "choose" || hovered === "choose" ? theme.accent : theme.text.body }}
-                attributes={selectedFailureChoice === "choose" ? TextAttributes.BOLD : TextAttributes.NONE}
-              >Choose another model</text>
-            </Button>
-          </>
-        ) : confirmingCancellation ? (
-          <>
-            <text style={{ fg: theme.text.body, flexShrink: 0 }} wrapMode="none">
-              Cancel loading?
-            </text>
-            <box style={{ width: 2, flexShrink: 0 }} />
-            {cancellationChoiceButton("yes", "Yes")}
-            <box style={{ width: 2, flexShrink: 0 }} />
-            {cancellationChoiceButton("no", "No")}
-          </>
-        ) : cancelable ? (
-          <Button
-            onClick={() => {
-              setCancellationChoice("yes")
-              setConfirmingCancellation(true)
-            }}
-            onMouseOver={() => setHovered("cancel")}
-            onMouseOut={() => setHovered(null)}
-          >
-            <text style={{ fg: hovered === "cancel" ? theme.status.failure : theme.text.supporting }}>
-              Cancel (Esc)
-            </text>
-          </Button>
-        ) : null}
-      </box>
     </box>
   )
 }
