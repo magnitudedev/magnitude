@@ -359,11 +359,6 @@ export function OnboardingModelLoadProgress({
         setFailureChoice((current) => current === "retry" ? "choose" : "retry")
         return
       }
-      if (key.name === "escape") {
-        key.preventDefault()
-        onChooseAnother()
-        return
-      }
       if (key.name === "return" || key.name === "enter") {
         key.preventDefault()
         if (selectedFailureChoice === "retry") onRetry()

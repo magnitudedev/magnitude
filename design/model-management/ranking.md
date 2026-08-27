@@ -75,8 +75,9 @@ weights ensure both speed and intelligence remain ranking factors at every posit
 calculates tick spacing from label widths so labels cannot overlap. Its track, unselected ticks, and
 unselected labels use the normal white text color; only the selected tick and its label use accent
 blue, with no separate marker glyph.
-The CLI renders a dim `←/→ change preference` instruction immediately to the track's right.
-The scale is not focusable or pointer-selectable. CLI keyboard traversal contains only model rows;
+The CLI renders the Left/Right preference instruction in the chooser's shared bottom control row
+alongside model navigation, selection, and exit controls. The scale is not focusable or
+pointer-selectable. CLI keyboard traversal contains only model rows;
 Left/Right and `h`/`l` adjust Fast-to-Smart regardless of the selected row. The cursor owns a visible
 row position, so re-ranking keeps it on the same rank while the model and details at that rank change.
 There is no memory control.

@@ -42,7 +42,6 @@ describe("harness chooser layout", () => {
         model={makeModel()}
         destinations={destinations}
         applying={null}
-        onBack={() => undefined}
         onContinue={vi.fn()}
       />,
       { width: 120, height: 40 },
@@ -58,7 +57,7 @@ describe("harness chooser layout", () => {
       expect(frame).toContain("  [x] Launch Magnitude server on startup")
       expect(frame).not.toContain("[x] Magnitude Harness  Optimized")
       expect(frame).not.toContain("Continue with Magnitude")
-      expect(frame).toContain("↑/↓ choose · Space toggle · Enter continue · Esc back")
+      expect(frame).toContain("↑/↓ choose · Space toggle · Enter continue · Ctrl+C to exit")
       const lines = frame.split("\n")
       const guidanceRow = lines.findIndex((line) => line.includes("You can change harness connections later"))
       expect(lines[guidanceRow - 1]?.trim()).toBe("")
@@ -75,7 +74,6 @@ describe("harness chooser layout", () => {
         model={makeModel()}
         destinations={destinations}
         applying={null}
-        onBack={() => undefined}
         onContinue={onContinue}
       />,
       { width: 120, height: 40 },
@@ -83,6 +81,10 @@ describe("harness chooser layout", () => {
 
     try {
       await act(view.renderOnce)
+      const escape = keyEvent("escape")
+      act(() => keyboard.handler?.(escape))
+      expect(escape.defaultPrevented).toBe(false)
+      expect(onContinue).not.toHaveBeenCalled()
       act(() => keyboard.handler?.(keyEvent("enter")))
       expect(onContinue).toHaveBeenCalledWith(expect.objectContaining({ harness: "magnitude" }))
       for (const expected of [

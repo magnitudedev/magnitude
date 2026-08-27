@@ -7,8 +7,16 @@ export type SetupStage = "choose" | "install" | "harness"
 
 const SETUP_CONTENT_MAX_WIDTH = 110
 const SETUP_WIDE_MIN_WIDTH = 105
+const SETUP_STEP_LABELS = ["Choose model", "Install model", "Select harness"] as const
+const SETUP_STEP_MARKER_COLUMNS = 2
+const SETUP_STEP_CONNECTOR_COLUMNS = 6
+const HORIZONTAL_SETUP_STEPPER_COLUMNS = SETUP_STEP_LABELS.reduce(
+  (columns, label) => columns + SETUP_STEP_MARKER_COLUMNS + label.length,
+  SETUP_STEP_CONNECTOR_COLUMNS * (SETUP_STEP_LABELS.length - 1),
+)
 const WIDE_SETUP_FRAME_ROWS = 26
-const NARROW_SETUP_FRAME_ROWS = 48
+const STACKED_SETUP_FRAME_ROWS = 44
+const VERTICAL_STEPPER_ADDITIONAL_ROWS = 4
 const SETUP_FOOTER_ROWS = 2
 
 export const setupContentWidth = (viewportWidth: number): number =>
@@ -20,8 +28,14 @@ export const setupBodyWidth = (viewportWidth: number): number =>
 export const isWideSetupLayout = (viewportWidth: number): boolean =>
   setupContentWidth(viewportWidth) >= SETUP_WIDE_MIN_WIDTH
 
+export const isHorizontalSetupStepper = (viewportWidth: number): boolean =>
+  setupBodyWidth(viewportWidth) >= HORIZONTAL_SETUP_STEPPER_COLUMNS
+
 export const setupFrameHeight = (viewportWidth: number, additionalRows = 0): number =>
-  (isWideSetupLayout(viewportWidth) ? WIDE_SETUP_FRAME_ROWS : NARROW_SETUP_FRAME_ROWS)
+  (isWideSetupLayout(viewportWidth)
+    ? WIDE_SETUP_FRAME_ROWS
+    : STACKED_SETUP_FRAME_ROWS
+      + (isHorizontalSetupStepper(viewportWidth) ? 0 : VERTICAL_STEPPER_ADDITIONAL_ROWS))
     + additionalRows
 
 export function SetupStepper({
@@ -33,7 +47,6 @@ export function SetupStepper({
 }): ReactNode {
   const theme = useTheme()
   const activeIndex = stage === "choose" ? 0 : stage === "install" ? 1 : 2
-  const labels = ["Choose model", "Install model", "Select harness"]
 
   if (vertical) {
     return (
@@ -45,12 +58,12 @@ export function SetupStepper({
         flexShrink: 0,
         marginBottom: 1,
       }}>
-        {labels.map((label, position) => (
+        {SETUP_STEP_LABELS.map((label, position) => (
           <box key={label} style={{ flexDirection: "column", flexShrink: 0 }}>
             <text style={{ fg: position === activeIndex ? theme.accent : theme.text.body }}>
               {position <= activeIndex ? "●" : "○"} {label}
             </text>
-            {position < labels.length - 1 && (
+            {position < SETUP_STEP_LABELS.length - 1 && (
               <text style={{ fg: position < activeIndex ? theme.text.body : theme.text.supporting }}>│</text>
             )}
           </box>
@@ -68,9 +81,9 @@ export function SetupStepper({
       flexShrink: 0,
       marginBottom: 1,
     }}>
-      {labels.map((label, position) => (
+      {SETUP_STEP_LABELS.map((label, position) => (
         <text key={label} style={{ fg: position === activeIndex ? theme.accent : theme.text.body }}>
-          {position <= activeIndex ? "●" : "○"} {label}{position < labels.length - 1 ? ` ${position < activeIndex ? "════" : "────"} ` : ""}
+          {position <= activeIndex ? "●" : "○"} {label}{position < SETUP_STEP_LABELS.length - 1 ? ` ${position < activeIndex ? "════" : "────"} ` : ""}
         </text>
       ))}
     </box>
@@ -113,9 +126,28 @@ export function SetupFrame({
         >
           MAGNITUDE SETUP
         </text>
-        <SetupStepper stage={stage} vertical={!isWideSetupLayout(width)} />
-        {children}
-        <box style={{ flexGrow: 1 }} />
+        <SetupStepper stage={stage} vertical={!isHorizontalSetupStepper(width)} />
+        <scrollbox
+          focusable={false}
+          scrollX={false}
+          scrollbarOptions={{ visible: false }}
+          verticalScrollbarOptions={{ visible: false }}
+          style={{
+            flexGrow: 1,
+            minHeight: 0,
+            rootOptions: {
+              flexGrow: 1,
+              minHeight: 0,
+              backgroundColor: "transparent",
+            },
+            wrapperOptions: { border: false, backgroundColor: "transparent" },
+            viewportOptions: { backgroundColor: "transparent" },
+            contentOptions: { flexDirection: "column" },
+          }}
+        >
+          {children}
+          <box style={{ flexGrow: 1 }} />
+        </scrollbox>
         {footer !== undefined && <box style={{ height: 1, minHeight: 1, flexShrink: 0 }} />}
         {footer !== undefined && (
           <box style={{

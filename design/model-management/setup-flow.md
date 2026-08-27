@@ -162,22 +162,23 @@ centered, borderless setup frame so its origin and available bounds do not move 
 advances. The persistent progress indicator sits directly above the stage content and contains
 `Choose model`, `Install model`, and `Select harness`; upcoming markers are empty, active markers are
 filled in accent blue, and completed markers/connectors are white. It is horizontal while the model
-chooser uses its side-by-side layout and becomes vertical at the chooser's existing stacked-layout
-breakpoint.
+chooser uses its side-by-side layout and remains horizontal in the stacked chooser whenever all
+three steps fit. It becomes vertical only when its own labels and connectors no longer fit.
 
 Stage content does not repeat the active step as a second title. In particular, the model chooser
 begins with its hardware context beneath the progress indicator rather than rendering a redundant
 `Choose a local model` heading.
 
 The chooser places the non-focusable Fast-to-Smart scale after hardware and before model rows. Its
-fixed three-row region keeps the interaction hint beside the track in the wide layout and moves it
-onto the third row only in the stacked layout. It shows at most ten ranked eligible models regardless
-of installation state, followed by every installed model under `ON THIS COMPUTER`. An installed
-model may therefore appear in both groups. Keyboard
+fixed three-row region keeps the scale stable across layouts while the shared footer presents its
+keyboard instruction with the model-selection controls. It shows at most ten ranked eligible
+models regardless of installation state, followed by every installed model under `ON THIS
+COMPUTER`. An installed model may therefore appear in both groups. Keyboard
 traversal visits only model rows; Left/Right and `h`/`l` adjust Fast-to-Smart regardless of which
 model row is selected. Re-ranking preserves the cursor's row/rank position rather than following the
-previous model identity. A ranked row's installation state
-determines whether its action is Loaded, Load, or Download.
+previous model identity. A ranked row shows Loaded for a resident model and Load for an installed
+model. Downloadable rows omit a repeated action label so the model name receives the full available
+row width; Enter remains the download action for the selected downloadable row.
 Ranking input and model input are locked during an active operation. Hardware failure does not
 fabricate a memory maximum or selectable ranked results.
 
@@ -188,14 +189,22 @@ model row and reports the exact number above. An absent affordance leaves neithe
 extra height, so the first model always sits immediately below its section heading at the top.
 
 The shared frame height is the model chooser's required row count, not a percentage of the terminal.
-Its wide and stacked variants account for their respective progress and chooser layouts, and the
-removed duplicate model title contributes no reserved row. Every later stage reuses that computed
-height. Hardware context contributes its actual wrapped row count at the current frame width. Fixed
-title, progress, ranking-control, operation, and footer regions never shrink into overlapping rows.
+Its side-by-side and stacked variants account independently for the chooser and progress-indicator
+layouts, and the removed duplicate model title contributes no reserved row. Every later stage reuses
+that computed height. Hardware context contributes its actual wrapped row count at the current frame
+width. Fixed title, progress, ranking-control, operation, and footer regions never shrink into
+overlapping rows.
+When the terminal is shorter than that required height, the setup body scrolls within the available
+viewport while the setup title, progress indicator, and footer remain fixed. Stacked model details,
+including the radar, therefore remain reachable without changing the chooser's row budgets.
 
-The frame reserves one shared footer position across stages. Stage guidance and interaction hints
-use the same two-line typography there, so changing stages does not move or restyle the footer. One
-empty row is guaranteed immediately before the footer without changing the frame's total height.
+The frame reserves one shared footer position across stages. The chooser presents preference,
+model-navigation, selection, and exit controls together on the bottom hint row; other stages may use
+both footer lines for their own guidance and controls. Changing stages does not move or restyle the
+footer. One empty row is guaranteed immediately before the footer without changing the frame's total height.
+Outside an active download or load, Escape has no setup action: it cannot skip or close setup, leave
+preparation, return from harness selection, or dismiss a retained failure. Setup instead presents
+`Ctrl+C to exit`, which exits the CLI even if hidden chat state would normally guard Ctrl+C.
 The detail pane reserves rows only for the selected model title, one-line summary, radar, and an
 applicable memory warning; it never reserves operation rows. Starting an operation replaces the
 Fast-to-Smart control region with a fixed three-row operation region while keeping the selected
@@ -207,8 +216,8 @@ measurements, the second contains the progress bar, and the third contains contr
 downloading both expose `Cancel (Esc)` and replace that control with an inline Yes/No confirmation.
 A retained failed load keeps the same three rows: the first names the model and concrete failure,
 the second keeps the progress bar but colors it red, and the third offers Retry loading and Choose
-another model. Low-memory text states the additional memory the user must free. Escape chooses
-another model; Left/Right select an available recovery action and Enter performs it. Non-retryable
+another model. Low-memory text states the additional memory the user must free. Left/Right select an
+available recovery action and Enter performs it. Non-retryable
 failures omit Retry. Stage-explanation subtext is not rendered. Loading begins at zero percent until
 authoritative fractional progress advances it. The active operation label uses an eased shimmer for
 starting, downloading, cancelling, configuring, preparing, stopping, loading, verifying, and

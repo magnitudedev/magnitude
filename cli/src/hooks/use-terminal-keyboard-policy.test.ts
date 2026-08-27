@@ -6,6 +6,16 @@ describe('terminal Ctrl+C policy', () => {
   it('always exits while an overlay is active', () => {
     expect(shouldExitOnCtrlC({
       overlayActive: true,
+      setupActive: false,
+      composerHasContent: true,
+      rootMode: 'streaming',
+    })).toBe(true)
+  })
+
+  it('always exits while setup owns the application surface', () => {
+    expect(shouldExitOnCtrlC({
+      overlayActive: false,
+      setupActive: true,
       composerHasContent: true,
       rootMode: 'streaming',
     })).toBe(true)
@@ -14,16 +24,19 @@ describe('terminal Ctrl+C policy', () => {
   it('preserves composer and streaming guards on the chat screen', () => {
     expect(shouldExitOnCtrlC({
       overlayActive: false,
+      setupActive: false,
       composerHasContent: true,
       rootMode: 'idle',
     })).toBe(false)
     expect(shouldExitOnCtrlC({
       overlayActive: false,
+      setupActive: false,
       composerHasContent: false,
       rootMode: 'streaming',
     })).toBe(false)
     expect(shouldExitOnCtrlC({
       overlayActive: false,
+      setupActive: false,
       composerHasContent: false,
       rootMode: 'idle',
     })).toBe(true)
