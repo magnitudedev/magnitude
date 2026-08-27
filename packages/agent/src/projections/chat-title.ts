@@ -1,14 +1,18 @@
 import { Projection, Signal } from '@magnitudedev/event-core'
 import { Schema } from 'effect'
 import type { AppEvent } from '../events'
+import { deriveChatTitle } from '../util/chat-title'
 
-export interface ChatTitleGeneratedSignal {
+export interface ChatTitleResolvedSignal {
   readonly title: string
 }
 
-export const ChatTitleStateSchema = Schema.Struct({
-  chatName: Schema.NullOr(Schema.String),
-})
+export const ChatTitleStateSchema = Schema.Union(
+  Schema.TaggedStruct('Pending', {}),
+  Schema.TaggedStruct('Resolved', {
+    chatName: Schema.NullOr(Schema.String),
+  }),
+)
 
 export type ChatTitleState = typeof ChatTitleStateSchema.Type
 
@@ -16,18 +20,23 @@ export const ChatTitleProjection = Projection.define<AppEvent>()({
   name: 'ChatTitle',
   state: ChatTitleStateSchema,
 
-  initial: {
-    chatName: null,
-  },
+  initial: { _tag: 'Pending' },
 
   signals: {
-    chatTitleGenerated: Signal.create<ChatTitleGeneratedSignal>('ChatTitle/chatTitleGenerated'),
+    chatTitleResolved: Signal.create<ChatTitleResolvedSignal>('ChatTitle/chatTitleResolved'),
   },
 
   eventHandlers: {
-    chat_title_generated: ({ event, state, emit }) => {
-      emit.chatTitleGenerated({ title: event.title })
-      return { ...state, chatName: event.title }
+    user_message: ({ event, state, emit }) => {
+      if (state._tag === 'Resolved' || event.forkId !== null || event.synthetic) {
+        return state
+      }
+
+      const chatName = deriveChatTitle(event.text)
+      if (chatName !== null) {
+        emit.chatTitleResolved({ title: chatName })
+      }
+      return { _tag: 'Resolved' as const, chatName }
     },
   },
 })

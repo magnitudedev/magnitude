@@ -137,7 +137,7 @@ export const buildDisplayViewSnapshot = (
     const state: DisplayState = {
       session: materializeDisplaySession({
         sessionId: sessionOptions.sessionId ?? '',
-        title: chatTitle.state.chatName,
+        title: chatTitle.state._tag === 'Resolved' ? chatTitle.state.chatName : null,
         cwd: sessionContext.state.context?.cwd ?? '',
       }),
       timelines,

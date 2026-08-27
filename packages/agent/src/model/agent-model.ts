@@ -32,7 +32,6 @@ export type AgentModelOperationKind =
   | 'observer'
   | 'advisor'
   | 'autopilot'
-  | 'title'
   | 'image'
   | 'background'
 
@@ -149,7 +148,6 @@ function defaultCallType(
 ): AgentCallType {
   if (operation?.operationKind === 'compact') return 'compact'
   if (operation?.operationKind === 'image') return 'image'
-  if (operation?.operationKind === 'title') return 'title'
   if (operation?.operationKind === 'observer') return 'observer'
   if (operation?.operationKind === 'autopilot') return 'autopilot'
   if (operation?.operationKind === 'advisor') return 'advisor'
@@ -166,8 +164,6 @@ function defaultOperationKind(callType: AgentCallType): AgentModelOperationKind 
       return 'observer'
     case 'autopilot':
       return 'autopilot'
-    case 'title':
-      return 'title'
     case 'image':
       return 'image'
     case 'chat':
