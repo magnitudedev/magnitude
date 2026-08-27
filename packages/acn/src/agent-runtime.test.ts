@@ -30,10 +30,6 @@ import {
   SessionOperationFailed,
   type DirectoryPath,
 } from "@magnitudedev/acn-protocol"
-import {
-  AcnServiceLifecycle,
-  type AcnServiceLifecycleApi,
-} from "./service-lifecycle"
 import { AgentFactory, type AgentFactoryApi } from "./agent-factory"
 import {
   AgentRuntime,
@@ -155,7 +151,6 @@ const makeSetup = (input: {
   readonly storedRuntimeOptions?: ReadonlyMap<string, SessionRuntimeOptions>
   readonly retirementAdmissionTimeout?: Duration.DurationInput
   readonly retirementShutdownTimeout?: Duration.DurationInput
-  readonly lifecycle?: AcnServiceLifecycleApi
 }): Effect.Effect<TestSetup> =>
   Effect.gen(function* () {
     const root = yield* Effect.promise(() => mkdtemp(join(tmpdir(), "magnitude-runtime-")))
@@ -178,9 +173,6 @@ const makeSetup = (input: {
           } satisfies SessionRuntimeOptionsStoreApi
         }),
       ),
-      ...(input.lifecycle
-        ? [Layer.succeed(AcnServiceLifecycle, input.lifecycle)]
-        : []),
     )
     const withSeed = Layer.tap(dependencies, (context) => Effect.gen(function* () {
       const storage = Context.get(context, MagnitudeStorage)
@@ -414,25 +406,14 @@ describe("AgentRuntime", () => {
     await Effect.runPromise(program)
   })
 
-  it("stops ACN when retirement remains stalled", async () => {
+  it("contains stalled retirement to its exact session", async () => {
     const program = Effect.gen(function* () {
       const retirementStarted = yield* Deferred.make<void>()
-      const shutdownRequest = yield* Ref.make<string | null>(null)
-      const lifecycle: AcnServiceLifecycleApi = {
-        state: Effect.die("unused"),
-        dispatchRpc: Effect.die("unused"),
-        reportStarting: () => Effect.die("unused"),
-        becomeReady: () => Effect.die("unused"),
-        beginStopping: (request) =>
-          Ref.set(shutdownRequest, request.detail ?? request.reason).pipe(Effect.as(true)),
-        awaitStopping: Effect.never,
-        setClientPresence: () => Effect.die("unused"),
-      }
       const setup = yield* makeSetup({
         factory: { createSession: () => Effect.succeed(idleSession) },
         storedSessionIds: ["stalled-shutdown"],
+        retirementAdmissionTimeout: "1 second",
         retirementShutdownTimeout: "3 seconds",
-        lifecycle,
       })
       yield* Effect.gen(function* () {
         const runtime = yield* AgentRuntime
@@ -449,31 +430,31 @@ describe("AgentRuntime", () => {
         yield* Deferred.await(retirementStarted)
         yield* TestClock.adjust("3 seconds")
         yield* Effect.yieldNow()
-        expect(yield* Ref.get(shutdownRequest)).toContain(
-          "session stalled-shutdown generation 1 retirement stalled",
-        )
+        expect(
+          yield* Effect.scoped(
+            runtime.acquireSessionRequest(setup.request("unrelated"), "unrelated"),
+          ).pipe(Effect.map((entry) => entry.entry.id)),
+        ).toBe("unrelated")
+
+        const blocked = yield* runtime
+          .acquireSession("stalled-shutdown", "blocked")
+          .pipe(Effect.scoped, Effect.either, Effect.fork)
+        yield* TestClock.adjust("1 second")
+        const blockedResult = yield* Fiber.join(blocked)
+        expect(Either.isLeft(blockedResult)).toBe(true)
+        if (Either.isLeft(blockedResult)) {
+          expect(blockedResult.left._tag).toBe("SessionOperationFailed")
+        }
       }).pipe(Effect.provide(setup.layer))
     })
     await Effect.runPromise(program)
   })
 
-  it("cancels the retirement watchdog after successful retirement", async () => {
+  it("completes successful retirement before its watchdog", async () => {
     const program = Effect.gen(function* () {
-      const shutdownRequest = yield* Ref.make<string | null>(null)
-      const lifecycle: AcnServiceLifecycleApi = {
-        state: Effect.die("unused"),
-        dispatchRpc: Effect.die("unused"),
-        reportStarting: () => Effect.die("unused"),
-        becomeReady: () => Effect.die("unused"),
-        beginStopping: (request) =>
-          Ref.set(shutdownRequest, request.detail ?? request.reason).pipe(Effect.as(true)),
-        awaitStopping: Effect.never,
-        setClientPresence: () => Effect.die("unused"),
-      }
       const setup = yield* makeSetup({
         factory: { createSession: () => Effect.succeed(idleSession) },
         retirementShutdownTimeout: "3 seconds",
-        lifecycle,
       })
       yield* Effect.gen(function* () {
         const runtime = yield* AgentRuntime
@@ -483,7 +464,7 @@ describe("AgentRuntime", () => {
         yield* runtime.dispose("successful-retirement")
         yield* TestClock.adjust("3 seconds")
         yield* Effect.yieldNow()
-        expect(yield* Ref.get(shutdownRequest)).toBeNull()
+        expect(yield* residentCount(runtime)).toBe(0)
       }).pipe(Effect.provide(setup.layer))
     })
     await Effect.runPromise(program)

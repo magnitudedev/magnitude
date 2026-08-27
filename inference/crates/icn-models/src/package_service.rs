@@ -986,34 +986,47 @@ impl ManagedModelStore {
         self.cache.write_model_assessment(evidence, assessment);
     }
 
+    pub(crate) fn installed_package_from_snapshot(
+        &self,
+        package_id: &ModelPackageId,
+    ) -> Result<(ModelPackage, ResolvedModel), InventoryError> {
+        let record = self
+            .installed_packages
+            .read()
+            .map_err(|_| {
+                InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
+            })?
+            .records
+            .get(package_id)
+            .cloned()
+            .ok_or_else(|| InventoryError::NotFound(package_id.0.clone()))?;
+        let resolved = ResolvedModel {
+            components: crate::service::resolve_components(&self.config.root, &record.model)
+                .map_err(|error| match error {
+                    InventoryError::Io(_) => InventoryError::NotFound(package_id.0.clone()),
+                    other => other,
+                })?,
+            model: record.model,
+        };
+        let observed = self.inspect_package_from_resolved(&resolved)?;
+        if observed.package.id != record.installed.package.id {
+            return Err(InventoryError::NotFound(package_id.0.clone()));
+        }
+        Ok((record.installed.package, resolved))
+    }
+
     pub(crate) async fn installed_package(
         &self,
         package_id: &ModelPackageId,
     ) -> Result<(ModelPackage, ResolvedModel), InventoryError> {
-        let find = || {
-            self.installed_packages
-                .read()
-                .map_err(|_| {
-                    InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
-                })?
-                .records
-                .get(package_id)
-                .cloned()
-                .ok_or_else(|| InventoryError::NotFound(package_id.0.clone()))
-        };
-        let record = match find() {
-            Ok(record) => record,
+        match self.installed_package_from_snapshot(package_id) {
+            Ok(installed) => Ok(installed),
             Err(InventoryError::NotFound(_)) => {
                 self.ensure_installed_model_inventory().await?;
-                find()?
+                self.installed_package_from_snapshot(package_id)
             }
-            Err(error) => return Err(error),
-        };
-        let resolved = ResolvedModel {
-            components: crate::service::resolve_components(&self.config.root, &record.model)?,
-            model: record.model,
-        };
-        Ok((record.installed.package, resolved))
+            Err(error) => Err(error),
+        }
     }
 
     async fn resolve_package_operand(

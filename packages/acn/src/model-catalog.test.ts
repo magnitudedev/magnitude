@@ -43,8 +43,13 @@ const local = (overrides: Partial<LocalModelsState> = {}): LocalModelsState => (
 })
 
 describe("ACN model catalog projection", () => {
-  it("does not publish a partial catalog before provider discovery initializes", () => {
-    expect(projectModelCatalog({ _tag: "Loading" }, local())).toEqual({ _tag: "Initializing" })
+  it("keeps local model state visible while remote provider discovery initializes", () => {
+    expect(projectModelCatalog({ _tag: "Loading" }, local())).toMatchObject({
+      _tag: "Refreshing",
+      providers: [],
+      models: [],
+      localInventoryState: { _tag: "Ready" },
+    })
   })
 
   it("publishes remote rows once and does not duplicate native local offerings", () => {

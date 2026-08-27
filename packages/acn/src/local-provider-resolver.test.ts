@@ -16,7 +16,6 @@ describe("local provider model resolution", () => {
       changes: Stream.never,
       catalog: Effect.succeed([]),
       state: Effect.succeed({
-        packageEvidence: Option.none(),
         entries: [],
         failure: Option.none(),
       }),

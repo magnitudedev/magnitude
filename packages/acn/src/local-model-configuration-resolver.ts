@@ -1,7 +1,10 @@
 import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import {
+  LocalModelConfigurationAssessmentSchema,
   LocalModelMutationFailed,
+  ModelPackageInspectionSchema,
   ModelServingConfigurationSchema,
+  RecommendableModelSchema,
   servableModelBundleTargetPackageId,
   type LocalInferenceError,
   type CatalogIdentity,
@@ -11,18 +14,14 @@ import {
   type ModelServingConfiguration,
   type RecommendableModel,
 } from "@magnitudedev/acn-protocol"
-import { IcnModels } from "@magnitudedev/icn"
-import {
-  catalogIdentityFromIcn,
-  catalogModelDefinitionFromIcn,
-  catalogModelEffectiveConfigurationFromIcn,
-} from "./local-model-icn-adapter"
+import { LocalModelCatalogAdapter } from "./local-model-catalog-adapter"
 import {
   LocalModelAssessor,
   type CoordinatedLocalModelAssessment,
 } from "./local-model-assessor"
 import { LocalModelPackages } from "./local-model-packages"
 import { localCatalogProviderModelId } from "./local-provider-model-id"
+import { materializeProjection } from "./materialized-projection"
 
 export interface ResolvedLocalModelConfiguration {
   readonly servingConfiguration: ModelServingConfiguration
@@ -56,6 +55,13 @@ export class LocalModelConfigurationResolver extends Context.Tag(
 )<LocalModelConfigurationResolver, LocalModelConfigurationResolverApi>() {}
 
 const sameConfiguration = Schema.equivalence(ModelServingConfigurationSchema)
+const sameCompletedAssessment = Schema.equivalence(LocalModelConfigurationAssessmentSchema)
+const sameInspection = Schema.equivalence(ModelPackageInspectionSchema)
+const sameCatalogModel = Schema.equivalence(RecommendableModelSchema)
+const encodeConfiguration = Schema.encodeSync(ModelServingConfigurationSchema)
+
+const configurationKey = (configuration: ModelServingConfiguration): string =>
+  JSON.stringify(encodeConfiguration(configuration))
 
 export const resolveLocalModelConfigurations = (input: {
   readonly catalog: readonly RecommendableModel[]
@@ -75,6 +81,10 @@ export const resolveLocalModelConfigurations = (input: {
     LocalModelTargetIdentitySchema.make(localCatalogProviderModelId(entry.identity)),
     entry.configuration,
   ]))
+  const assessedByConfiguration = new Map(input.assessed.map((entry) => [
+    configurationKey(entry.configuration),
+    entry,
+  ]))
   for (const [identity, model] of catalogByIdentity) {
     configurations.set(
       identity,
@@ -82,10 +92,8 @@ export const resolveLocalModelConfigurations = (input: {
     )
   }
   return new Map([...configurations].map(([identity, servingConfiguration]) => {
-    const assessed = input.assessed.find((entry) =>
-      sameConfiguration(entry.configuration, servingConfiguration))
+    const assessed = assessedByConfiguration.get(configurationKey(servingConfiguration))
     const assessment: CoordinatedLocalModelAssessment["assessment"] = assessed !== undefined
-      && sameConfiguration(assessed.configuration, servingConfiguration)
       ? assessed.assessment
       : { _tag: "Assessing" }
     const catalogModel = catalogByIdentity.get(identity)
@@ -113,62 +121,101 @@ const failure = (error: unknown) => new LocalModelMutationFailed({
   retryable: true,
 })
 
+const sameOptionalCatalogModel = (
+  left: Option.Option<RecommendableModel>,
+  right: Option.Option<RecommendableModel>,
+): boolean => Option.isNone(left)
+  ? Option.isNone(right)
+  : Option.isSome(right) && sameCatalogModel(left.value, right.value)
+
+const sameAssessment = (
+  left: CoordinatedLocalModelAssessment["assessment"],
+  right: CoordinatedLocalModelAssessment["assessment"],
+): boolean => left._tag === "Assessing"
+  ? right._tag === "Assessing"
+  : right._tag !== "Assessing" && sameCompletedAssessment(left, right)
+
+const sameResolvedConfigurations = (
+  left: ReadonlyMap<LocalModelTargetIdentity, ResolvedLocalModelConfiguration>,
+  right: ReadonlyMap<LocalModelTargetIdentity, ResolvedLocalModelConfiguration>,
+): boolean => left.size === right.size && [...left].every(([identity, value]) => {
+  const other = right.get(identity)
+  return other !== undefined
+    && sameConfiguration(value.servingConfiguration, other.servingConfiguration)
+    && sameOptionalCatalogModel(value.catalogModel, other.catalogModel)
+    && sameAssessment(value.assessment, other.assessment)
+    && sameInspection(value.targetInspection, other.targetInspection)
+})
+
+type PackageResolutionEvidence = readonly {
+  readonly packageId: ModelPackageId
+  readonly installed: boolean
+  readonly inspection: ModelPackageInspection
+}[]
+
+const packageResolutionEvidence = (
+  entries: readonly ModelPackageEntry[],
+): PackageResolutionEvidence => entries.map((entry) => ({
+  packageId: entry.package.id,
+  installed: entry.localState._tag === "Installed",
+  inspection: entry.inspection,
+}))
+
+const samePackageResolutionEvidence = (
+  left: PackageResolutionEvidence,
+  right: PackageResolutionEvidence,
+): boolean => left.length === right.length && left.every((entry, index) => {
+  const other = right[index]
+  return other !== undefined
+    && entry.packageId === other.packageId
+    && entry.installed === other.installed
+    && sameInspection(entry.inspection, other.inspection)
+})
+
 export const LocalModelConfigurationResolverLive: Layer.Layer<
   LocalModelConfigurationResolver,
   never,
-  IcnModels | LocalModelAssessor | LocalModelPackages
-> = Layer.effect(LocalModelConfigurationResolver, Effect.gen(function* () {
-  const models = yield* IcnModels
+  LocalModelCatalogAdapter | LocalModelAssessor | LocalModelPackages
+> = Layer.scoped(LocalModelConfigurationResolver, Effect.gen(function* () {
+  const catalog = yield* LocalModelCatalogAdapter
   const assessor = yield* LocalModelAssessor
   const packages = yield* LocalModelPackages
 
-  const get = Effect.gen(function* () {
-    const nativeCatalogModels = (yield* models.initialized)
-      ? (yield* models.get).state.models
-      : []
-    const catalogModels = yield* Effect.forEach(
-      nativeCatalogModels,
-      catalogModelDefinitionFromIcn,
-    )
-    const effectiveCatalogConfigurationOptions = yield* Effect.forEach(
-      nativeCatalogModels,
-      (model) =>
-        Effect.all([
-          catalogIdentityFromIcn(model),
-          catalogModelEffectiveConfigurationFromIcn(model),
-        ]).pipe(Effect.map(([identity, configuration]) => Option.map(
-          configuration,
-          (effective) => [
-            identity,
-            effective,
-          ] as const,
-        ))),
-    )
-    const effectiveCatalogConfigurations = effectiveCatalogConfigurationOptions.flatMap((entry) =>
-      Option.isSome(entry)
-        ? [{ identity: entry.value[0], configuration: entry.value[1] }]
-        : [])
+  const project = Effect.gen(function* () {
+    const catalogState = yield* catalog.state
     const packageState = yield* packages.state
     const packageEntries = new Map(packageState.entries.map((entry) => [entry.package.id, entry]))
     return resolveLocalModelConfigurations({
-      catalog: catalogModels,
-      effectiveCatalogConfigurations,
+      catalog: catalogState.entries.map((entry) => entry.model),
+      effectiveCatalogConfigurations: catalogState.entries.flatMap((entry) =>
+        Option.isSome(entry.effectiveConfiguration)
+          ? [{ identity: entry.identity, configuration: entry.effectiveConfiguration.value }]
+          : []),
       assessed: yield* assessor.state,
       packageEntries,
     })
   }).pipe(Effect.mapError(failure))
 
-  const changes = Stream.mergeAll([
-    models.changes.pipe(Stream.map(() => undefined)),
+  const sourceChanges = Stream.mergeAll([
+    catalog.changes.pipe(Stream.map(() => undefined)),
     assessor.changes.pipe(Stream.map(() => undefined)),
-    packages.changes.pipe(Stream.map(() => undefined)),
+    packages.changes.pipe(
+      Stream.map((state) => packageResolutionEvidence(state.entries)),
+      Stream.changesWith(samePackageResolutionEvidence),
+      Stream.map(() => undefined),
+    ),
   ], { concurrency: "unbounded" })
+  const projection = yield* materializeProjection({
+    project: project.pipe(Effect.orDie),
+    invalidations: sourceChanges,
+    equivalent: sameResolvedConfigurations,
+  })
 
   return LocalModelConfigurationResolver.of({
-    get,
-    changes,
+    get: projection.get,
+    changes: projection.changes.pipe(Stream.map(() => undefined)),
     settled: Effect.gen(function* () {
-      return (yield* models.initialized) && (yield* assessor.settled)
+      return (yield* catalog.state).reconciliationComplete && (yield* assessor.settled)
     }),
   })
 }))

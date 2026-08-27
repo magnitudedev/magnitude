@@ -142,8 +142,10 @@ completion protocol.
 
 A client-owned use case may span several backend domains without becoming an ACN operation. When
 that use case has meaningful in-memory state, concurrency, and cancellation, client-common owns one
-client-lifetime service. The service represents its owned state with keep-alive Effect Atoms,
-exposes passive derived state and Effect operations, and composes semantic lower client services.
+client-lifetime service. When it is a semantic command whose pending, failure, scope, or retry
+lifecycle is useful beyond its immediate caller, client-common defines one Effect-backed Mutation
+in the application operation graph. A one-shot composition whose result matters only to its caller
+remains an ordinary Effect.
 
 Each command is one Effect program. Every step consumes the exact value returned by the preceding
 step; it never infers identity from mutation recency or an unrelated query fact. The public state
@@ -151,11 +153,9 @@ atom joins only service-owned causal identities with canonical lower queries. It
 and it never copies lower lifecycle or progress into writable client state.
 
 Client-owned in-memory state is not put into Effect Query merely to make the API resemble a remote
-domain: that would create a redundant cache and mutation registry. This pattern introduces neither
-a workflow engine nor a second query runtime. The Effect Query client composition root may host
-ordinary service Layers, but Query and Mutation semantics gain no workflow or composition
-primitive. A concrete service is justified only by a real stateful client-owned use case. Ordinary
-one-shot composition remains an ordinary Effect.
+domain. Effect-backed definitions use the existing query cache and mutation registry; they never
+create a second runtime or transport side channel. A concrete service remains justified only by a
+real stateful client-owned use case.
 
 The materialization boundary and responsibilities of lower ACN-backed services, composed services,
 hooks, and UI are defined by
@@ -221,6 +221,14 @@ mount / read / refetch / watch
 
 Advisory queries may perform effects. Their result informs a later mutation; it does not authorize
 that mutation against stale reality. The owner validates again at admission.
+
+An expensive shared derivation may be retained as a disposable materialized projection. Source
+notifications are coalesced invalidations: the projection rereads the latest authoritative
+snapshots, rebuilds serially, and publishes only semantic changes. Its current-state read returns
+the retained value and never performs reconciliation or expensive derivation. Invalidation depends
+only on facts that can change the result; high-frequency incidental changes such as transfer bytes
+cannot trigger unrelated projection work. The retained value remains a cache and is fully
+rebuildable from its authorities.
 
 ## Observation
 
@@ -388,16 +396,20 @@ local interaction  -> presentation atom
 - CLI, web, and desktop share state behavior through client-common.
 
 Effect Query is the client cache and command-state authority for every first-party client
-interaction with ACN RPC and native inference HTTP.
+interaction with ACN and every client-common semantic command requiring a shared invocation
+lifecycle.
 Each interaction is defined once with the core Effect Query primitives: `Query.make`,
 `Query.fromStream`, `Mutation.make`, or `Subscription.make`. Domain definitions compose through
-the core `Group.make`. The root client boundary composes `AcnBoundary` with the authored
-`Inference` group. The ACN RPC adapter derives only the RPC projection; generated ICN OpenAPI
-operations implement the inference group without becoming RPCs. Neither transport provides another
-operation-definition or grouping mechanism. Queries declare freshness, while mutations declare
+`Group.make`, and `Group.extend` recursively adds use-case operations under existing domain groups.
+`AcnBoundary` is the declared transport graph; the application graph extends it with Effect-backed
+client-common definitions before constructing `AgentClient`. The ACN RPC adapter accepts only the
+declared transport graph and supplies exact compile-time implementation coverage. Queries declare
+freshness, while mutations declare
 their scope, recovery policy, and synchronization postcondition on the same values. One
-connection-scoped Effect Query client (the `AgentClient`) is made for the composed boundary with a
-merged RPC and inference implementation Layer. It carries every member of the group, materialized,
+connection-scoped Effect Query client (the `AgentClient`) is made for the application graph with the
+RPC implementation Layer and client-common service Layers. Client construction fails to typecheck
+unless those Layers close every declared implementation and embedded Effect requirement. It carries
+every member of the group, materialized,
 at its name — a query member
 is `(input) => QueryAtom` (`client.Sessions.GetSession(input)`), a mutation member is its
 `MutationAtom` (`client.Agent.SendMessage`), a subscription member is `(input) => SubscriptionAtom`
@@ -430,6 +442,7 @@ not the transport; callers know the three primitives, not the transport.
 ```text
 component
    +-- ACN domain member ------> Effect Query client ----> ACN RPC
+   +-- composed member --------> Effect Query client ----> client-common services
                                            ^
                                            +-- StreamChanges invalidates query
 ```
@@ -439,8 +452,8 @@ component
   that knows Effect RPC. Native ICN management and observation remain private to ACN.
 - One Effect Query client per connection owns the Atom runtime, query cache, mutation history, and
   the domain service Layers.
-- Definitions are transport-neutral values requiring a generic operation implementation through
-  Effect DI. The connection installs the RPC-backed implementation layer.
+- Declared definitions require generic operation implementations through Effect DI; Effect-backed
+  definitions contribute their own Effect requirements. The connection closes both sets.
 - Freshness is owned by the connection: `StreamChanges` invalidates ACN Queries. Reconnect rereads
   every covered authoritative snapshot.
 - A keyed subscription that keeps queries fresh (`WatchFile`, `WatchProjectFiles`) is a dependency

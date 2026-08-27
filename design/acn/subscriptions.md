@@ -56,6 +56,12 @@ data may have changed. The ACN change registry multiplexes every source: an owne
 query; a storage commit names every query it backs. Multiplexing neither combines state nor creates
 a cross-domain authority. Pokes carry no snapshot, revision, acknowledgement, or ordering claim.
 
+Each connected observer retains a bounded pending set keyed by query and optional query key.
+Repeated invalidations for the same identity coalesce. When one query accumulates more keyed
+invalidations than the bound permits, they broaden to one unkeyed invalidation for that query;
+this may cause extra reads but cannot lose freshness. A slow observer therefore cannot create an
+unbounded event backlog.
+
 The client drains `StreamChanges` once per connection and invalidates the named query; every
 (re)connection after the first invalidates everything, since pokes may have been missed. Nothing
 else is derived from pokes and no domain code interprets them.
@@ -78,4 +84,5 @@ subscription is consumed by the display controller.
 - Reconnection obtains current truth rather than replaying controls as history.
 - One observer's cancellation cannot affect another observer or domain state.
 - Connection-global invalidations consume one transport subscription without mixing cache authority.
+- Slow observers receive coalesced or broadened invalidations without losing query freshness.
 - Subscriber backpressure cannot retain ACN shutdown.

@@ -77,10 +77,11 @@ import { makeAcnIcn } from "./icn"
 import { LocalModelAssessmentsLive } from "./local-model-assessments"
 import { LocalModelAssessorLive } from "./local-model-assessor"
 import { LocalModelConfigurationResolverLive } from "./local-model-configuration-resolver"
+import { LocalModelCatalogAdapterLive } from "./local-model-catalog-adapter"
 import { LocalModelPackagesLive } from "./local-model-packages"
+import { LocalModelAcquisitionCoordinatorLive } from "./local-model-acquisition-coordinator"
 import { makeLocalModelRankerLive } from "./local-model-ranker"
 import { LocalModelsLive } from "./local-models"
-import { LocalModelSyncsLive } from "./local-model-syncs"
 import { ModelCatalogLive } from "./model-catalog"
 import { ModelCommandsLive } from "./model-commands"
 import { LocalProviderOfferingsLive } from "./local-provider-offerings"
@@ -438,11 +439,15 @@ const addLocalInferenceServices = <A, E, R>(
     LocalInferenceHardwareLive,
     withCustomEndpoints
   )
-  const withPackages = Layer.provideMerge(LocalModelPackagesLive, withHardware)
-  const withModelSyncs = Layer.provideMerge(LocalModelSyncsLive, withPackages)
+  const withCatalogAdapter = Layer.provideMerge(LocalModelCatalogAdapterLive, withHardware)
+  const withPackages = Layer.provideMerge(LocalModelPackagesLive, withCatalogAdapter)
+  const withAcquisition = Layer.provideMerge(
+    LocalModelAcquisitionCoordinatorLive,
+    withPackages,
+  )
   const withAssessments = Layer.provideMerge(
     LocalModelAssessmentsLive,
-    withModelSyncs
+    withAcquisition,
   )
   const withAssessor = Layer.provideMerge(
     LocalModelAssessorLive,

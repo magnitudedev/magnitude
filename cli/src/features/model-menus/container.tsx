@@ -857,7 +857,6 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
   const detailActionCursor = useBoundedCursor(detailActions.length)
   const emptyActionCursor = useBoundedCursor(EMPTY_MODEL_ACTIONS.length)
   const focusedDetailAction = detailActions[detailActionCursor.index]
-  const installationFailed = modelActions.latestInstallationFailed
 
   const statusFor = (entry: ModelsMenuEntry): string => {
     const selectedEntry = isSelected(entry)
@@ -884,7 +883,7 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
     }
     if (selectedEntry) return "Selected"
     return entry._tag === "Local"
-      ? localModelInstalledStatus(entry.model)
+      ? localModelReadinessStatus(entry.model)
       : "Available"
   }
 
@@ -1189,9 +1188,6 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
         )}
         {Result.isFailure(slotActions.assignResult) && (
           <text style={{ fg: theme.status.failure }}>Failed to update model selection.</text>
-        )}
-        {installationFailed && (
-          <text style={{ fg: theme.status.failure }}>Failed to install the local model.</text>
         )}
         {Result.isFailure(config.favoriteUpdate) && (
           <text style={{ fg: theme.status.failure }}>Failed to update model favorite.</text>

@@ -41,7 +41,6 @@ export const projectModelCatalog = (
   providers: ProviderModelCatalogState,
   local: LocalModelsState,
 ): ModelCatalogState => {
-  if (providers._tag === "Loading") return { _tag: "Initializing" }
   const contents = providerContents(providers)
   const localOfferings = new Map(contents.models
     .filter((model) => model.providerId === LOCAL_PROVIDER_ID)
@@ -71,7 +70,7 @@ export const projectModelCatalog = (
     localDiscoveryState: local.discoveryState,
   }
   if (failures.length > 0) return { _tag: "Degraded", ...fields }
-  if (providers._tag === "Refreshing" || local.discoveryState._tag === "Loading") {
+  if (providers._tag === "Loading" || providers._tag === "Refreshing" || local.discoveryState._tag === "Loading") {
     return { _tag: "Refreshing", ...fields }
   }
   return { _tag: "Ready", ...fields }

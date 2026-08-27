@@ -8,15 +8,12 @@ import {
   type ModelServingConfiguration,
   type ServableModelBundle,
 } from "@magnitudedev/acn-protocol"
-import { IcnHardware, IcnModels } from "@magnitudedev/icn"
+import { IcnHardware } from "@magnitudedev/icn"
 import {
   LocalModelAssessments,
   type LocalModelAssessmentResult,
 } from "./local-model-assessments"
-import {
-  catalogModelDefinitionFromIcn,
-  catalogModelEffectiveConfigurationFromIcn,
-} from "./local-model-icn-adapter"
+import { LocalModelCatalogAdapter } from "./local-model-catalog-adapter"
 import { LocalModelPackages } from "./local-model-packages"
 
 const CoordinatedLocalModelAssessmentStateSchema = Schema.Union(
@@ -52,6 +49,7 @@ interface AssessorState {
   readonly desired: ReadonlyMap<AssessmentDemandKey, DesiredAssessment>
   readonly published: ReadonlyMap<AssessmentDemandKey, CoordinatedLocalModelAssessment>
   readonly completedKeys: ReadonlyMap<AssessmentDemandKey, string>
+  readonly runningKeys: ReadonlyMap<AssessmentDemandKey, string>
 }
 
 const configurationEquivalent = Schema.equivalence(ModelServingConfigurationSchema)
@@ -82,6 +80,8 @@ const sameCompleted = (
 ): boolean => left.size === right.size
   && [...left].every(([id, key]) => right.get(id) === key)
 
+const sameRunning = sameCompleted
+
 const assessmentFailure = (error: unknown) => {
   const record = typeof error === "object" && error !== null
     ? error as Record<string, unknown>
@@ -107,11 +107,11 @@ const assessmentCauseFailure = (cause: Cause.Cause<unknown>) => Option.match(
   },
 )
 
-const authoredDemandKey = (
+const assessmentExecutionKey = (
   configuration: ModelServingConfiguration,
-): AssessmentDemandKey => `Authored\0${bundleDemandKey(configuration.bundle)}\0${configuration.profile.contextLength}`
+): string => `${bundleExecutionKey(configuration.bundle)}\0${configuration.profile.contextLength}`
 
-const bundleDemandKey = (bundle: ServableModelBundle): string =>
+const bundleExecutionKey = (bundle: ServableModelBundle): string =>
   bundle._tag === "Standalone"
     ? `Standalone\0${bundle.package.id}`
     : bundle.draftSource._tag === "Embedded"
@@ -142,8 +142,21 @@ const completedAssessment = (
       assessment: { _tag: "Failed", failure: result.failure },
     }
   }
-  const resultForConfiguration = result.assessments[0]!
   const configuration = request.configuration
+  const resultForConfiguration = result.assessments[0]
+  if (resultForConfiguration === undefined) {
+    return {
+      configuration,
+      assessment: {
+        _tag: "Failed",
+        failure: {
+          code: "missing_model_profile_assessment",
+          message: "Native assessment returned no result for the requested serving profile",
+          retryable: true,
+        },
+      },
+    }
+  }
   if (resultForConfiguration._tag === "Fits") {
     return {
       configuration,
@@ -186,9 +199,9 @@ const completedAssessment = (
 export const LocalModelAssessorLive: Layer.Layer<
   LocalModelAssessor,
   never,
-  IcnModels | IcnHardware | LocalModelAssessments | LocalModelPackages
+  LocalModelCatalogAdapter | IcnHardware | LocalModelAssessments | LocalModelPackages
 > = Layer.scoped(LocalModelAssessor, Effect.gen(function* () {
-  const models = yield* IcnModels
+  const catalog = yield* LocalModelCatalogAdapter
   const hardware = yield* IcnHardware
   const assessments = yield* LocalModelAssessments
   const packages = yield* LocalModelPackages
@@ -196,22 +209,15 @@ export const LocalModelAssessorLive: Layer.Layer<
     desired: new Map(),
     published: new Map(),
     completedKeys: new Map(),
+    runningKeys: new Map(),
   })
   const lock = yield* Effect.makeSemaphore(1)
 
   const readDesired = Effect.gen(function* () {
-    const catalogModels = (yield* models.initialized)
-      ? (yield* models.get).state.models
-      : []
-    const desiredCatalogConfigurations = yield* Effect.forEach(
-      catalogModels,
-      (model) => catalogModelDefinitionFromIcn(model).pipe(
-        Effect.map(({ configuration }) => configuration),
-      ),
-    )
-    const effectiveCatalogConfigurations = (
-      yield* Effect.forEach(catalogModels, catalogModelEffectiveConfigurationFromIcn)
-    ).flatMap((configuration) => Option.isSome(configuration) ? [configuration.value] : [])
+    const catalogEntries = (yield* catalog.state).entries
+    const desiredCatalogConfigurations = catalogEntries.map(({ model }) => model.configuration)
+    const effectiveCatalogConfigurations = catalogEntries.flatMap(({ effectiveConfiguration }) =>
+      Option.isSome(effectiveConfiguration) ? [effectiveConfiguration.value] : [])
     const catalogConfigurations = [
       ...desiredCatalogConfigurations,
       ...effectiveCatalogConfigurations,
@@ -228,6 +234,9 @@ export const LocalModelAssessorLive: Layer.Layer<
     }
     const desired = new Map<AssessmentDemandKey, DesiredAssessment>()
     for (const configuration of catalogConfigurations) {
+      const configurationKey = yield* Schema.encode(
+        Schema.parseJson(ModelServingConfigurationSchema),
+      )(configuration)
       const packageEvidence = servableModelBundlePackageIds(configuration.bundle).map((packageId) => {
         const entry = packageEntries.get(packageId)
         return {
@@ -241,7 +250,7 @@ export const LocalModelAssessorLive: Layer.Layer<
         hardware: hardwareEvidence,
         material: packageEvidence,
       })
-      desired.set(authoredDemandKey(configuration), {
+      desired.set(configurationKey, {
         configuration,
         semanticKey: semanticInput,
       })
@@ -254,48 +263,38 @@ export const LocalModelAssessorLive: Layer.Layer<
     const equivalent = publishedEquivalent(previous.published, state.published)
       && sameDesired(previous.desired, state.desired)
       && sameCompleted(previous.completedKeys, state.completedKeys)
+      && sameRunning(previous.runningKeys, state.runningKeys)
     if (!equivalent) yield* SubscriptionRef.set(current, state)
   })
 
-  const reconcile = lock.withPermits(1)(Effect.gen(function* () {
-    const desired = yield* readDesired
-    const state = yield* SubscriptionRef.get(current)
-    const pending = [...desired].filter(([demandKey, { semanticKey }]) =>
-      state.completedKeys.get(demandKey) !== semanticKey)
-    const published = new Map(
-      [...state.published].filter(([demandKey]) => desired.has(demandKey)),
-    )
-    for (const [demandKey, entry] of published) {
-      const next = desired.get(demandKey)
-      if (next !== undefined) {
-        published.set(demandKey, {
-          ...entry,
-          configuration: next.configuration,
-        })
-      }
-    }
-    for (const [demandKey, request] of pending) {
-      published.set(demandKey, {
-        configuration: request.configuration,
-        assessment: { _tag: "Assessing" },
-      })
-    }
-    yield* publish({ ...state, desired, published })
-    if (pending.length === 0) return
+  type PendingAssessment = readonly [AssessmentDemandKey, DesiredAssessment]
+  type AssessmentBatch = readonly [PendingAssessment, ...PendingAssessment[]]
 
-    const outcome = yield* Effect.exit(assessments.assess(
-      pending.map(([, request]) => ({
-        bundle: request.configuration.bundle,
-        profiles: [request.configuration.profile],
-      })),
-      () => Effect.void,
-    ))
+  const batchesFor = (pending: readonly PendingAssessment[]): readonly AssessmentBatch[] => {
+    const pendingBatches = new Map<string, AssessmentBatch>()
+    for (const entry of pending) {
+      const key = assessmentExecutionKey(entry[1].configuration)
+      const batch = pendingBatches.get(key)
+      pendingBatches.set(key, batch === undefined ? [entry] : [...batch, entry])
+    }
+    return [...pendingBatches.values()]
+  }
+
+  const complete = (
+    pending: readonly PendingAssessment[],
+    batches: readonly AssessmentBatch[],
+    assessmentExit: Exit.Exit<readonly LocalModelAssessmentResult[], unknown>,
+  ) => lock.withPermits(1)(Effect.gen(function* () {
     const latestDesired = yield* readDesired
     const latest = yield* SubscriptionRef.get(current)
     const nextPublished = new Map(latest.published)
     const completedKeys = new Map(latest.completedKeys)
-    if (Exit.isFailure(outcome)) {
-      const failure = assessmentCauseFailure(outcome.cause)
+    const runningKeys = new Map(latest.runningKeys)
+    for (const [demandKey, request] of pending) {
+      if (runningKeys.get(demandKey) === request.semanticKey) runningKeys.delete(demandKey)
+    }
+    if (Exit.isFailure(assessmentExit)) {
+      const failure = assessmentCauseFailure(assessmentExit.cause)
       for (const [demandKey, request] of pending) {
         const latestRequest = latestDesired.get(demandKey)
         if (latestRequest?.semanticKey !== request.semanticKey) continue
@@ -306,29 +305,31 @@ export const LocalModelAssessorLive: Layer.Layer<
         completedKeys.set(demandKey, request.semanticKey)
       }
     } else {
-      pending.forEach(([demandKey, request], index) => {
-        const latestRequest = latestDesired.get(demandKey)
-        if (latestRequest?.semanticKey !== request.semanticKey) return
-        const result = outcome.value[index]
-        const completed = result === undefined
-          ? {
-              configuration: latestRequest.configuration,
-              assessment: {
-                _tag: "Failed",
-                failure: {
-                  code: "missing_model_assessment_result",
-                  message: "Native assessment returned no result for this configuration",
-                  retryable: true,
-                },
-              } as const,
-            }
-          : completedAssessment(result, latestRequest)
-        if (completed === undefined) return
-        nextPublished.set(demandKey, {
-          configuration: completed.configuration,
-          assessment: completed.assessment,
+      batches.forEach((batch, index) => {
+        const result = assessmentExit.value[index]
+        batch.forEach(([demandKey, request]) => {
+          const latestRequest = latestDesired.get(demandKey)
+          if (latestRequest?.semanticKey !== request.semanticKey) return
+          const completed = result === undefined
+            ? {
+                configuration: latestRequest.configuration,
+                assessment: {
+                  _tag: "Failed",
+                  failure: {
+                    code: "missing_model_assessment_result",
+                    message: "Native assessment returned no result for this configuration",
+                    retryable: true,
+                  },
+                } as const,
+              }
+            : completedAssessment(result, latestRequest)
+          if (completed === undefined) return
+          nextPublished.set(demandKey, {
+            configuration: completed.configuration,
+            assessment: completed.assessment,
+          })
+          completedKeys.set(demandKey, request.semanticKey)
         })
-        completedKeys.set(demandKey, request.semanticKey)
       })
     }
     for (const demandKey of nextPublished.keys()) {
@@ -337,19 +338,72 @@ export const LocalModelAssessorLive: Layer.Layer<
     for (const demandKey of completedKeys.keys()) {
       if (!latestDesired.has(demandKey)) completedKeys.delete(demandKey)
     }
-    yield* publish({ desired: latestDesired, published: nextPublished, completedKeys })
+    for (const demandKey of runningKeys.keys()) {
+      if (!latestDesired.has(demandKey)) runningKeys.delete(demandKey)
+    }
+    yield* publish({
+      desired: latestDesired,
+      published: nextPublished,
+      completedKeys,
+      runningKeys,
+    })
+  }))
+
+  const assessPending = (
+    pending: readonly PendingAssessment[],
+    batches: readonly AssessmentBatch[],
+  ) => Effect.exit(assessments.assess(
+    batches.map((batch) => ({
+      bundle: batch[0][1].configuration.bundle,
+      profiles: [batch[0][1].configuration.profile],
+    })),
+    () => Effect.void,
+  )).pipe(Effect.flatMap((outcome) => complete(pending, batches, outcome)))
+
+  const reconcile = lock.withPermits(1)(Effect.gen(function* () {
+    const desired = yield* readDesired
+    const state = yield* SubscriptionRef.get(current)
+    const pending = [...desired].filter(([demandKey, { semanticKey }]) =>
+      state.completedKeys.get(demandKey) !== semanticKey
+        && state.runningKeys.get(demandKey) !== semanticKey)
+    const published = new Map(
+      [...state.published].filter(([demandKey]) => desired.has(demandKey)),
+    )
+    const runningKeys = new Map(
+      [...state.runningKeys].filter(([demandKey]) => desired.has(demandKey)),
+    )
+    for (const [demandKey, entry] of published) {
+      const next = desired.get(demandKey)
+      if (next !== undefined) published.set(demandKey, { ...entry, configuration: next.configuration })
+    }
+    for (const [demandKey, request] of pending) {
+      published.set(demandKey, {
+        configuration: request.configuration,
+        assessment: { _tag: "Assessing" },
+      })
+      runningKeys.set(demandKey, request.semanticKey)
+    }
+    yield* publish({ ...state, desired, published, runningKeys })
+    return pending
   })).pipe(
+    Effect.flatMap((pending) => pending.length === 0
+      ? Effect.void
+      : assessPending(pending, batchesFor(pending)).pipe(Effect.forkScoped, Effect.asVoid)),
     Effect.catchAllCause((cause) => Effect.logWarning(
       "Unable to coordinate local model assessment",
     ).pipe(Effect.annotateLogs({ cause: String(cause) }))),
   )
 
-  yield* Stream.make(undefined).pipe(
-    Stream.concat(Stream.mergeAll([
-      models.changes.pipe(Stream.map(() => undefined)),
-      packages.changes.pipe(Stream.map(() => undefined)),
-      hardware.assessmentChanges.pipe(Stream.map(() => undefined)),
-    ], { concurrency: "unbounded" }).pipe(Stream.debounce("25 millis"))),
+  const changes = Stream.mergeAll([
+    catalog.changes.pipe(Stream.map(() => undefined)),
+    packages.changes.pipe(Stream.map(() => undefined)),
+    hardware.assessmentChanges.pipe(Stream.map(() => undefined)),
+  ], { concurrency: "unbounded" }).pipe(
+    Stream.debounce("25 millis"),
+  )
+  yield* reconcile
+  yield* changes.pipe(
+    Stream.buffer({ capacity: 1, strategy: "sliding" }),
     Stream.runForEach(() => reconcile),
     Effect.forkScoped,
   )

@@ -190,6 +190,7 @@ describe("Anthropic inference gateway", () => {
       icn,
       async () => Response.json({
         object: "list",
+        models: [],
         data: [{
           id: "local:model",
           object: "model",
@@ -207,6 +208,7 @@ describe("Anthropic inference gateway", () => {
   test("paginates the local alias catalog without an upstream dependency", async () => {
     const catalog = {
       object: "list",
+      models: [],
       data: ["c", "a", "b"].map((id) => ({
         id,
         object: "model",

@@ -101,9 +101,11 @@ browser SVG remain separate presentations of the same model evidence.
 
 Install and update use the canonical model ID. Cancellation and failure dismissal use
 the exact ICN-issued Download ID. Selection assigns that same model ID to a slot. Warm load uses the
-model ID and exact stop uses the ICN Instance ID; neither operation is routed through Slot state. Long
-running state is always rendered from refreshed service queries, while mutation state represents
-only local invocation admission.
+model ID and exact stop uses the ICN Instance ID; neither operation is routed through Slot state.
+Long-running progress is rendered from refreshed service queries. During the gap between local
+command acceptance and ACN's first authoritative snapshot, client-common projects the mutation's
+queued admission into the same local-model view; it never fabricates progress beyond that queued
+state.
 
 Chat submission requires a selected local model. When no model is selected, the composer routes the
 user to Models in Settings instead of discarding the attempt. A selected model does not need to be

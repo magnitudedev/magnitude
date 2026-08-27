@@ -1,4 +1,4 @@
-import { Effect, Layer, Option, PubSub, Stream } from "effect"
+import { Deferred, Effect, Layer, Option, Stream, SubscriptionRef } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   AssessmentEnvironmentIdSchema,
@@ -10,18 +10,17 @@ import {
 import { IcnHardware, IcnModels } from "@magnitudedev/icn"
 import { LocalModelAssessments } from "./local-model-assessments"
 import { LocalModelAssessor, LocalModelAssessorLive } from "./local-model-assessor"
+import { LocalModelCatalogAdapterLive } from "./local-model-catalog-adapter"
 import { LocalModelPackages } from "./local-model-packages"
 
 describe("LocalModelAssessor", () => {
   it("correlates native evidence to authored configuration without reassessing unchanged evidence", async () => {
     let assessmentCalls = 0
+    const assessmentRequestCounts: number[] = []
 
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const packageChanges = yield* PubSub.unbounded<{
-        readonly inventory: { readonly _tag: "Ready" }
-        readonly entries: readonly ModelPackageEntry[]
-        readonly downloads: readonly never[]
-      }>()
+      const firstAssessmentStarted = yield* Deferred.make<void>()
+      const releaseFirstAssessment = yield* Deferred.make<void>()
       const packageId = ModelPackageIdSchema.make("package-test")
       const modelPackage = {
         id: packageId,
@@ -59,10 +58,24 @@ describe("LocalModelAssessor", () => {
         },
         catalogAttribution: { _tag: "NotCatalogTarget" },
       }
-      const packageState = { inventory: { _tag: "Ready" as const }, entries: [packageEntry], downloads: [] }
+      let packageState = { inventory: { _tag: "Ready" as const }, entries: [packageEntry], downloads: [] }
+      const packageStateRef = yield* SubscriptionRef.make(packageState)
       const configuration = {
         bundle: { _tag: "Standalone" as const, package: modelPackage },
         profile: { contextLength: 32_768 },
+      }
+      const configurationWithSameMaterialIdentity = {
+        ...configuration,
+        bundle: {
+          _tag: "Standalone" as const,
+          package: {
+            ...modelPackage,
+            properties: {
+              ...modelPackage.properties,
+              quantizationName: "alternate authored configuration",
+            },
+          },
+        },
       }
       const catalogModel = (id: string, desiredConfiguration: typeof configuration) => ({
         id: `${id}:gguf:q4`,
@@ -100,6 +113,7 @@ describe("LocalModelAssessor", () => {
               reconciliationComplete: true,
               models: [
                 catalogModel("recommendable-test", configuration),
+                catalogModel("same-material-test", configurationWithSameMaterialIdentity),
               ] as never,
               diagnostics: [],
             },
@@ -125,14 +139,19 @@ describe("LocalModelAssessor", () => {
         })),
         Layer.succeed(LocalModelPackages, LocalModelPackages.of({
           initialized: Effect.succeed(true),
-          state: Effect.succeed(packageState),
-          changes: Stream.fromPubSub(packageChanges),
+          state: SubscriptionRef.get(packageStateRef),
+          changes: packageStateRef.changes,
           installedPackageIds: Effect.succeed(new Set([packageId])),
           refresh: Effect.void,
         })),
         Layer.succeed(LocalModelAssessments, LocalModelAssessments.of({
-          assess: (requests) => Effect.sync(() => {
+          assess: (requests) => Effect.gen(function* () {
             assessmentCalls += 1
+            assessmentRequestCounts.push(requests.length)
+            if (assessmentCalls === 1) {
+              yield* Deferred.succeed(firstAssessmentStarted, undefined)
+              yield* Deferred.await(releaseFirstAssessment)
+            }
             return requests.map((_, index) => index === 0
               ? {
                   _tag: "Assessed",
@@ -154,14 +173,25 @@ describe("LocalModelAssessor", () => {
           }),
         })),
       )
-      const testLayer = LocalModelAssessorLive.pipe(Layer.provide(dependencies))
+      const testLayer = LocalModelAssessorLive.pipe(
+        Layer.provide(LocalModelCatalogAdapterLive.pipe(Layer.provideMerge(dependencies))),
+        Layer.provide(dependencies),
+      )
 
       yield* Effect.gen(function* () {
         const assessor = yield* LocalModelAssessor
-        yield* Effect.sleep("100 millis")
-        expect(assessmentCalls).toBe(1)
+        yield* Deferred.await(firstAssessmentStarted)
+        packageState = {
+          ...packageState,
+          entries: [{ ...packageEntry, inspection: { _tag: "Pending" as const } }],
+        }
+        yield* SubscriptionRef.set(packageStateRef, packageState)
+        yield* Deferred.succeed(releaseFirstAssessment, undefined)
+        yield* Effect.sleep("150 millis")
+        expect(assessmentCalls).toBe(2)
+        expect(assessmentRequestCounts).toEqual([1, 1])
         const initialState = yield* assessor.state
-        expect(initialState).toHaveLength(1)
+        expect(initialState).toHaveLength(2)
         expect(initialState[0]?.configuration).toEqual(configuration)
         expect(initialState[0]?.assessment).toEqual({
           _tag: "Incompatible",
@@ -172,11 +202,11 @@ describe("LocalModelAssessor", () => {
             retryable: false,
           },
         })
-        yield* PubSub.publish(packageChanges, packageState)
-        yield* PubSub.publish(packageChanges, packageState)
+        yield* SubscriptionRef.set(packageStateRef, packageState)
+        yield* SubscriptionRef.set(packageStateRef, packageState)
         yield* Effect.sleep("100 millis")
 
-        expect(assessmentCalls).toBe(1)
+        expect(assessmentCalls).toBe(2)
         expect((yield* assessor.state)[0]?.assessment._tag)
           .toBe("Incompatible")
       }).pipe(Effect.provide(testLayer))

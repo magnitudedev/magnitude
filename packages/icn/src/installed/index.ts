@@ -1,4 +1,4 @@
-import { Context, Duration, Effect, Layer, Schema } from "effect"
+import { Context, Duration, Effect, Layer, Schedule, Schema } from "effect"
 import { InstalledModelPackagesResponse } from "@magnitudedev/icn-protocol/schemas"
 import { IcnClient, type IcnClientService } from "../client.js"
 import { makeIcnObservedState, type IcnObservedState } from "../observed-state.js"
@@ -30,6 +30,7 @@ export const makeIcnInstalledModels = (
       const events = yield* IcnEvents
       const invalidations = yield* events.subscribe
       const read = client.models.listInstalledModels({})
+      const retryInterval = options.retryInterval ?? "1 second"
       const initial = yield* read
       const observed = yield* makeIcnObservedState(
         initial,
@@ -40,8 +41,8 @@ export const makeIcnInstalledModels = (
       if (!initial.reconciliationComplete) {
         yield* Effect.iterate(false, {
           while: (complete) => !complete,
-          body: () => Effect.sleep(options.retryInterval ?? "1 second").pipe(
-            Effect.zipRight(observed.refresh),
+          body: () => Effect.sleep(retryInterval).pipe(
+            Effect.zipRight(observed.refresh.pipe(Effect.retry(Schedule.spaced(retryInterval)))),
             Effect.zipRight(observed.get),
             Effect.map(({ state }) => state.reconciliationComplete),
           ),
@@ -52,7 +53,7 @@ export const makeIcnInstalledModels = (
         new Set(["packages"]),
         observed.refresh,
         "installed model packages",
-        options.retryInterval ?? "1 second",
+        retryInterval,
       ).pipe(
         Effect.forkScoped,
       )

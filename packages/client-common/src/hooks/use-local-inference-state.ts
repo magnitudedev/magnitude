@@ -1,8 +1,7 @@
 import { useCallback, useMemo } from "react"
-import { Effect, Option, type Equivalence } from "effect"
+import { Option, type Equivalence } from "effect"
 import { Atom, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import {
-  ProviderIdSchema,
   type LocalModelsState,
   type ProviderModelId,
   type SlotId,
@@ -101,24 +100,7 @@ export function usePreviewModelLoad(slotId: SlotId) {
 export function useLocalModelActions() {
   const client = useAgentClient()
   const mutations = useLocalModelMutations()
-  const installAndAssignAction = useMemo(() => Atom.keepAlive(client.runtime.fn<{
-    readonly modelId: ProviderModelId
-    readonly slotId: SlotId
-    readonly reasoningEffort: SlotSelection["reasoningEffort"]
-  }>()(({ modelId, slotId, reasoningEffort }) => Effect.flatMap(
-    LocalModels,
-    (models) => models.install(modelId),
-  ).pipe(
-    Effect.flatMap(() => Effect.flatMap(
-      ModelSlots,
-      (slots) => slots.assign(slotId, {
-        providerId: ProviderIdSchema.make("local"),
-        providerModelId: modelId,
-        reasoningEffort,
-      }),
-    )),
-  ))), [client])
-  const installAndAssign = useAtomSet(installAndAssignAction)
+  const selectLocalModel = useAtomSet(client.Models.SelectLocalModel)
 
   return {
     ...mutations,
@@ -127,8 +109,8 @@ export function useLocalModelActions() {
       slotId: SlotId,
       reasoningEffort: SlotSelection["reasoningEffort"],
     ) => {
-      installAndAssign({ modelId, slotId, reasoningEffort })
-    }, [installAndAssign]),
+      selectLocalModel({ modelId, slotId, reasoningEffort })
+    }, [selectLocalModel]),
   }
 }
 

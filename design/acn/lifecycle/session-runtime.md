@@ -47,8 +47,9 @@ claims.
 Resolving a session under the runtime admission lock never waits for that session's retirement, so
 one wedged runtime cannot block unrelated sessions. Work arriving behind abnormal retirement fails
 after a bounded wait and before accepting a session event, allowing the client to restore unsent
-input. Persistent retirement failure requests controlled ACN replacement; a partially closed
-runtime is never reopened.
+input. A partially closed runtime is never reopened. Retirement failure is contained to that exact
+session generation: it cannot stop ACN, ICN, model acquisition, inference, another session, or
+another client.
 
 ## Drafts, creation, and deletion
 
@@ -106,6 +107,8 @@ snapshot.
 - A `SessionRuntime` remains loaded exactly while it has a scoped user or aggregate work is
   `Working`, followed by its configured idle interval.
 - Admission and retirement cannot cross, and old cleanup cannot affect a replacement.
+- A stuck or failed retirement quarantines only its exact session generation and cannot determine
+  process lifetime.
 - Draft cancellation cannot strand preloading or claiming.
 - Deletion accepts no work after its commit point.
 - Display recovery cannot publish late events from a retired generation.

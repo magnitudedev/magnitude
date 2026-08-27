@@ -1,5 +1,5 @@
 import { type ClientId, type ClientLeaseMutationResult } from "@magnitudedev/acn-protocol"
-import { Clock, Context, Deferred, Duration, Effect, Fiber, Layer, Option, Ref, Scope } from "effect"
+import { Clock, Context, Deferred, Duration, Effect, Layer, Option, Ref, Scope } from "effect"
 import {
   dueClientLeases,
   emptyClientLeaseSet,
@@ -52,38 +52,6 @@ export const makeClientLeaseManager = (
       connectedClientCount: leaseSet.leases.size,
     })
 
-    const failClosedPolicyUpdate = (connected: boolean) =>
-      residencyPolicy.setConnected(connected).pipe(
-        Effect.catchTag("ModelResidencyPolicyUnavailable", (error) =>
-          Effect.logError("Failed to establish model residency policy").pipe(
-            Effect.annotateLogs({
-              connected,
-              operation: error.operation,
-              message: error.message,
-            }),
-            Effect.zipRight(
-              lifecycle.beginStopping({
-                reason: "fatal",
-                detail: "Magnitude could not establish the local-model residency policy",
-              })
-            ),
-            Effect.zipRight(Effect.interrupt)
-          )
-        )
-      )
-
-    // Caller interruption is deferred through the matching ACN commit. Run
-    // the bounded policy operation in an interruptible child so its own
-    // timeout remains effective, then join it from the atomic mutation.
-    const completePolicyUpdate = (connected: boolean) =>
-      Effect.gen(function* () {
-        const update = yield* failClosedPolicyUpdate(connected).pipe(
-          Effect.interruptible,
-          Effect.fork
-        )
-        yield* Fiber.join(update)
-      })
-
     const commit = (
       previous: ClientLeaseManagerState,
       leaseSet: ClientLeaseSet,
@@ -110,8 +78,8 @@ export const makeClientLeaseManager = (
             }
 
             if (!(yield* lifecycle.setClientPresence(true))) return yield* Effect.interrupt
-            yield* completePolicyUpdate(true)
             yield* commit(previous, transition.state)
+            yield* residencyPolicy.setConnected(true)
             return asResult(transition.state)
           })
         )
@@ -130,9 +98,9 @@ export const makeClientLeaseManager = (
               return asResult(transition.state)
             }
 
-            yield* completePolicyUpdate(false)
             yield* commit(previous, transition.state)
             yield* lifecycle.setClientPresence(false)
+            yield* residencyPolicy.setConnected(false)
             return asResult(transition.state)
           })
         )

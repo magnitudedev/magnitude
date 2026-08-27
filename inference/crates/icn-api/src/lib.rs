@@ -25,10 +25,9 @@ use icn_contracts::models::{
     AssessModelsRequest, AssessModelsResponse, CatalogModelLocalState, CatalogModels,
     InferenceModel, InstallCatalogModelRequest, InstallModelResponse, InstalledModelPackage,
     InstalledModelPackages, InstalledModelPackagesResponse, ModelAssessor, ModelDownload,
-    ModelDownloadId, ModelDownloads, ModelDownloadsResponse, ModelInstance,
-    ModelInstanceAllocation, ModelInstanceId, ModelInstanceLifecycle, ModelInstancesInvalidation,
-    ModelInstancesSnapshot, ModelLoadPlan, ModelPackageId, ModelsResponse,
-    RemoveInstalledModelPackageResponse,
+    ModelDownloadId, ModelDownloads, ModelDownloadsResponse, ModelInstance, ModelInstanceId,
+    ModelInstanceLifecycle, ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadPlan,
+    ModelPackageId, ModelsResponse, RemoveInstalledModelPackageResponse,
 };
 use icn_contracts::{
     CacheType, CompletionBackend, ExecutionConfig, ExecutionConfigReport, FlashAttention,
@@ -581,16 +580,12 @@ impl ModelInstanceController for StaticModelInstanceController {
 
     fn ensure_resident(
         &self,
-        model_id: String,
+        _model_id: String,
     ) -> BoxFuture<'_, Result<ModelInstance, InventoryError>> {
-        Box::pin(async move {
-            let lease = self.acquire_for_inference(model_id, None).await?;
-            self.instances()
-                .await
-                .instances
-                .into_iter()
-                .find(|instance| instance.id == lease.instance_id)
-                .ok_or_else(|| InventoryError::NotReady("model instance is not ready".to_owned()))
+        Box::pin(async {
+            Err(InventoryError::Unsupported(
+                "static backends do not expose managed model instances".to_owned(),
+            ))
         })
     }
 
@@ -606,22 +601,10 @@ impl ModelInstanceController for StaticModelInstanceController {
     }
 
     fn instances(&self) -> BoxFuture<'_, ModelInstancesSnapshot> {
-        let model_id = self.backend.model_id().to_owned();
-        Box::pin(async move {
+        Box::pin(async {
             ModelInstancesSnapshot {
                 revision: 0,
-                instances: vec![ModelInstance {
-                    id: ModelInstanceId(Self::INSTANCE_ID.to_owned()),
-                    model_id,
-                    lifecycle: ModelInstanceLifecycle::Ready {
-                        allocation: ModelInstanceAllocation {
-                            context_window_tokens: 1,
-                            parallel_sequences: 1,
-                            physical_context_tokens: 1,
-                            memory_domains: Vec::new(),
-                        },
-                    },
-                }],
+                instances: Vec::new(),
             }
         })
     }
@@ -2753,10 +2736,38 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use icn_contracts::InferenceProgress;
+    use icn_contracts::models::ModelInstanceAllocation;
     use serde_json::Value as JsonValue;
     use serde_json::{Value, json};
     use std::sync::atomic::AtomicBool;
     use tower::ServiceExt;
+
+    fn test_model_serving_configuration() -> icn_contracts::models::ModelServingConfiguration {
+        icn_contracts::models::ModelServingConfiguration {
+            bundle: icn_contracts::models::ServableModelBundle::Standalone {
+                package: icn_contracts::models::ModelPackage {
+                    id: ModelPackageId("test-package".to_owned()),
+                    source: icn_contracts::models::ModelPackageSource::Local {
+                        path: std::path::PathBuf::from("/test/model.gguf"),
+                    },
+                    files: Vec::new(),
+                    relationships: Vec::new(),
+                    properties: icn_contracts::models::ModelPackageProperties {
+                        format: "gguf".to_owned(),
+                        quantization: "f16".to_owned(),
+                        quantization_name: "F16".to_owned(),
+                        architecture: "test".to_owned(),
+                        maximum_context_length: Some(8_192),
+                        intrinsic_model_id: Some("test-model".to_owned()),
+                        intrinsic_quality_id: None,
+                    },
+                },
+            },
+            profile: icn_contracts::models::ServingProfile {
+                context_length: 8_192,
+            },
+        }
+    }
 
     #[tokio::test]
     async fn direct_resource_invalidations_are_published_with_monotonic_revisions() {
@@ -3333,7 +3344,10 @@ mod tests {
         let Err(error) = protocols::responses::adapt(request) else {
             panic!("a function declaration missing parameters must not silently become opaque");
         };
-        assert_eq!(error.body.error.message, "malformed function tool declaration");
+        assert_eq!(
+            error.body.error.message,
+            "malformed function tool declaration"
+        );
     }
 
     fn full_output_result() -> domain::InferenceResult {
@@ -3376,7 +3390,9 @@ mod tests {
             .as_array()
             .expect("output is an array")
             .clone();
-        input.push(json!({ "type": "function_call_output", "call_id": "call_1", "output": "result" }));
+        input.push(
+            json!({ "type": "function_call_output", "call_id": "call_1", "output": "result" }),
+        );
         input.push(json!({ "role": "user", "content": "continue" }));
 
         let request: protocols::responses::ResponseCreateRequest = serde_json::from_value(json!({
@@ -3593,12 +3609,14 @@ mod tests {
 
     #[test]
     fn anthropic_attribution_stripping_is_nonce_invariant_and_idempotent() {
-        let request = |cch: &str| json!({
-            "model": "test-model",
-            "max_tokens": 16,
-            "system": format!("x-anthropic-billing-header: cc_version=2.1.101.e51; cc_entrypoint=cli; cch={cch};You are Claude Code."),
-            "messages": [{ "role": "user", "content": "hello" }]
-        });
+        let request = |cch: &str| {
+            json!({
+                "model": "test-model",
+                "max_tokens": 16,
+                "system": format!("x-anthropic-billing-header: cc_version=2.1.101.e51; cc_entrypoint=cli; cch={cch};You are Claude Code."),
+                "messages": [{ "role": "user", "content": "hello" }]
+            })
+        };
         let first = anthropic_canonical(request("a5145"));
         let second = anthropic_canonical(request("0beef"));
         // Requests differing only in the per-request stamp must produce
@@ -4080,6 +4098,7 @@ mod tests {
                     instances: vec![ModelInstance {
                         id: ModelInstanceId("test-instance".to_owned()),
                         model_id: "test-model".to_owned(),
+                        configuration: test_model_serving_configuration(),
                         lifecycle: ModelInstanceLifecycle::Ready {
                             allocation: ModelInstanceAllocation {
                                 context_window_tokens: 1,

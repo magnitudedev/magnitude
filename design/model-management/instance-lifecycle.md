@@ -79,18 +79,19 @@ Stop instead interrupts the worker and every active lease-dependent request imme
 
 ## First-party projection
 
-The ACN Slot Query returns selection intent only. Client-common composes it with the native Models
-and Instances Queries to present availability, residency, and permitted actions. Native resource
-invalidations cause those Queries to reread, so agent, CLI, Python, and third-party harness activity
-becomes visible without writing through ACN Slot state.
+The ACN Slot Query returns selection intent. The ACN Catalog projects current ICN Instance truth
+into each local model's installed-family acquisition state, so clients receive availability,
+residency, and permitted actions without consuming native resources or joining separate model and
+instance snapshots. Native invalidations cause ACN to reread and reproject, so agent, CLI, Python,
+and third-party harness activity becomes visible without writing through Slot state.
 
 Instance changes also invalidate the live Hardware snapshot and load preview because resident
 allocation changes current headroom. They do not invalidate stable model assessment, which is
 defined against stable capacity rather than live availability.
 
-Changing Slot selection never implicitly stops a shared Instance. Explicit warm-load and stop
-actions call native Instance operations through the generated inference client and the authored
-Effect Query layer.
+Changing Slot selection never implicitly stops a shared Instance. Clients issue model-addressed
+load and stop commands to ACN; ACN resolves the configured Slot and invokes ICN's raw Instance
+operations.
 
 ## Conformance
 
@@ -100,7 +101,8 @@ Effect Query layer.
 - Equivalent demand joins; conflicting residency is serialized.
 - Request cancellation cannot abandon admitted shared work.
 - Stop and replacement cannot race past accepted inference demand or active leases.
-- ACN never stores or projects Instance residency inside Slot state.
+- ACN never stores Instance residency inside Slot state; it projects current residency into the
+  client-facing local model.
 - Agent and external inference requests follow the same ICN acquisition path.
 - Loading-instance Stop terminalizes every joined preparation waiter without admitting a
   replacement.

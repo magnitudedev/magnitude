@@ -86,6 +86,8 @@ There is no memory control.
 
 - ACN publishes `LocalModelRankingScores`, never server-selected preference tiers or explanations.
 - Scores belong to one exact catalog model configuration with a terminal `Fits` assessment.
+- A model with distinct desired and effective installed configurations may temporarily have scores
+  for both; the local product row uses the scores matching the configuration it currently exposes.
 - Normalized score fields are named `intelligence`, `speed`, and `fidelity`; `quality` is not a
   ranking dimension.
 - Missing required speed evidence fails ranking.

@@ -66,14 +66,21 @@ results for presentation without creating another authority.
 Queries return their domain value directly. There is no public `{ revision, state }` envelope, no
 generic mirrored-state abstraction, and no client-visible source revision.
 
-A service may retain state only when it owns a real domain lifecycle that cannot be derived from a
-current authoritative read. Such state has a domain-specific representation and invariants. Views
-fully determined by current inputs are computed directly and are not stored:
+A service retains authoritative state only when it owns a real domain lifecycle that cannot be
+derived from a current authoritative read. Such state has a domain-specific representation and
+invariants. Views fully determined by current inputs are computed directly when cheap or retained
+as disposable materialized projections when shared or expensive. A retained projection is never a
+parallel authority: it coalesces semantic invalidations, rebuilds from current authorities, and
+serves its current value without doing reconciliation in the read path:
 
 - hardware queries and per-model residency project current ICN observations directly;
-- the unified Catalog is a pure union of the current remote catalog and local product projection;
+- the unified Catalog is a pure union of the current remote catalog and local product projection,
+  regardless of whether that derived projection is materialized for efficient observation;
 - Slots retain their real resolved lifecycle because ACN owns durable selection, reference
   reconciliation, and admitted agent configuration together; and
+- model acquisition retains only admitted sync/removal intent and exact native occurrence
+  correlation until ICN truth represents the outcome; the client-facing Catalog remains a direct
+  projection rather than retained model state; and
 - onboarding reads durable storage directly.
 
 Subscription references are an implementation primitive, not an architecture or wire contract.
@@ -88,6 +95,10 @@ as an explicit load command:
 ICN transition -> native invalidation -> authoritative ICN read -> ACN projection change
                -> ACN query-name poke -> client query invalidation and reread
 ```
+
+An ICN snapshot explicitly marked as incomplete startup reconciliation is provisional. Its observer
+continues refreshing until a complete authoritative snapshot is obtained even if no invalidation
+event arrives. Provisional emptiness cannot become stable ACN product truth.
 
 The inference response stream and resource observation have independent lifetimes. Cancelling a
 chat request does not corrupt ACN observation, and an observation failure does not terminate or
@@ -114,9 +125,14 @@ presentation. `Resolving` is explicit and never displayed as a raw-ID fallback.
 ## Mutation causality
 
 An ACN mutation acknowledges only after its owning ACN service has committed the immediate
-application postcondition, or after ICN has admitted a named long-running occurrence. The returned
-Download or Instance identity is the causal acknowledgement for admitted work; progress remains a
-query concern.
+application postcondition, or after ICN has admitted a named long-running occurrence. ACN command
+effects own and await native admission or removal; they do not detach that work into
+fire-and-forget fibers. Native Download or Instance identity is the private causal acknowledgement
+for admitted work; progress remains a query concern.
+
+Once ACN publishes sync or removal intent, caller interruption cannot cancel the finite native
+admission/removal step and strand that intent. Before intent admission, the command remains
+interruptible.
 
 The client mutation synchronizes affected queries before reporting success. For model mutations,
 that means one awaited refetch of the ACN snapshot the owner has already committed; it is not a
@@ -138,6 +154,8 @@ may select the daemon-disconnection presentation.
 
 Retained state is not cleared by transient or incomplete evidence. Slot intent may be cleared only
 by explicit user action or complete authoritative proof that the referenced identity is invalid.
+Likewise, failure or stalled cleanup of one session runtime is confined to that exact session
+generation and cannot restart ACN or interrupt ICN-owned transfers.
 
 ## Conformance
 
@@ -147,7 +165,9 @@ by explicit user action or complete authoritative proof that the referenced iden
   aliases to ICN and preserves non-reserved upstream Anthropic request bytes.
 - Every client-visible model query and mutation belongs to the ACN `Models` group.
 - Query successes are direct domain values with no generic revision envelope.
-- No generic mirrored-state helper or schema exists.
+- No generic mirrored-resource service or wire schema exists. Private derived projections may
+  share only the mechanical coalescing and publication primitive; their inputs, derivation, and
+  lifecycle remain explicit in the owning domain service.
 - Derived Catalog, Instance, and Environment views are not stored as parallel authorities.
 - Model mutation synchronization awaits one fresh committed ACN snapshot; it does not poll or
   reread for proof.
@@ -156,6 +176,8 @@ by explicit user action or complete authoritative proof that the referenced iden
   it privately correlates admitted model syncs with exact ICN download IDs. ICN continues to
   expose raw download-ID operations and never acquires ACN model-sync vocabulary. Native
   occurrence and Package identities remain private from clients.
+- Incomplete ICN startup snapshots are retried to completion and cannot permanently erase installed
+  or update state.
 - Automatic chat loading, explicit loading, stopping, switching, installation, cancellation,
   recovery, and multi-client observation converge through the same ACN resources.
 - Model-domain failures leave the same ACN process serving and never render daemon disconnection.

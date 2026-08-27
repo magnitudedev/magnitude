@@ -1718,6 +1718,9 @@ export type ModelIdentityRequest = S.Schema.Type<typeof ModelIdentityRequest>
 export type ModelIdentityRequestEncoded = S.Schema.Encoded<typeof ModelIdentityRequest>
 
 export const ModelInstance = S.Struct({
+  configuration: S.suspend(
+    (): S.Schema<ModelServingConfiguration, ModelServingConfigurationEncoded> => ModelServingConfiguration,
+  ),
   id: S.suspend((): S.Schema<ModelInstanceId, ModelInstanceIdEncoded> => ModelInstanceId),
   lifecycle: S.suspend((): S.Schema<ModelInstanceLifecycle, ModelInstanceLifecycleEncoded> => ModelInstanceLifecycle),
   modelId: S.String,

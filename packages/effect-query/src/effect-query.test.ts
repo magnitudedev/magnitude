@@ -349,6 +349,33 @@ describe("Query", () => {
     registry.dispose()
   })
 
+  it("notifies an already-subscribed derived atom when refetch replaces query data", async () => {
+    const registry = Registry.make()
+    const effectQuery = Client.make(Layer.empty)
+    const client = await clientFor(registry, effectQuery)
+    let server = 1
+    const query = Query.make("ReactiveRefetch", {
+      key: () => Data.struct({ singleton: true }),
+      effect: () => Effect.succeed(server),
+      staleTime: Duration.infinity,
+      gcTime: Duration.infinity
+    })
+    const source = effectQuery.query(query, undefined)
+    const selected = Atom.make((get) => AtomResult.value(get(source).result))
+    const values: Array<Option.Option<number>> = []
+    const unsubscribe = registry.subscribe(selected, (value) => values.push(value), { immediate: true })
+
+    await Effect.runPromise(client.refetch(query.match()))
+    server = 2
+    await Effect.runPromise(client.refetch(query.match()))
+    await Effect.runPromise(Effect.yieldNow())
+
+    expect(values.at(-1)).toEqual(Option.some(2))
+    expect(AtomResult.value(registry.get(source).result)).toEqual(Option.some(2))
+    unsubscribe()
+    registry.dispose()
+  })
+
   it("terminalizes a refetch waiter when its fetch is cancelled", async () => {
     const registry = Registry.make()
     const effectQuery = Client.make(Layer.empty)

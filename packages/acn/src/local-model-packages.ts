@@ -22,14 +22,14 @@ import {
 import {
   IcnDownloads,
   IcnInstalledModels,
-  IcnModels,
 } from "@magnitudedev/icn"
 import {
   modelDownloadFromIcn,
   modelPackageFromIcn,
   packageInspectionFromIcn,
-  catalogModelDefinitionFromIcn,
 } from "./local-model-icn-adapter"
+import { LocalModelCatalogAdapter } from "./local-model-catalog-adapter"
+import { coalesceInvalidations } from "./materialized-projection"
 
 const packagesInCatalog = (
   catalog: readonly RecommendableModel[],
@@ -86,9 +86,9 @@ export class LocalModelPackages extends Context.Tag("LocalModelPackages")<
 export const LocalModelPackagesLive: Layer.Layer<
   LocalModelPackages,
   never,
-  IcnModels | IcnDownloads | IcnInstalledModels
+  LocalModelCatalogAdapter | IcnDownloads | IcnInstalledModels
 > = Layer.scoped(LocalModelPackages, Effect.gen(function* () {
-  const models = yield* IcnModels
+  const catalog = yield* LocalModelCatalogAdapter
   const installed = yield* IcnInstalledModels
   const downloads = yield* IcnDownloads
   const current = yield* SubscriptionRef.make<ModelPackagesState>({
@@ -101,14 +101,10 @@ export const LocalModelPackagesLive: Layer.Layer<
     const previous = yield* SubscriptionRef.get(current)
     if (!equivalent(previous, next)) yield* SubscriptionRef.set(current, next)
   })
-  const projectionLock = yield* Effect.makeSemaphore(1)
   const observedCompletions = new Set<string>()
 
-  const projectCurrent = projectionLock.withPermits(1)(Effect.gen(function* () {
-    const catalogModels = yield* Effect.forEach(
-      (yield* models.get).state.models,
-      catalogModelDefinitionFromIcn,
-    )
+  const projectCurrent = Effect.gen(function* () {
+    const catalogModels = (yield* catalog.state).entries.map((entry) => entry.model)
     const downloadsState = (yield* downloads.get).state
     const newlyCompleted = downloadsState.downloads.filter(({ id, state }) =>
       state._tag === "Completed" && !observedCompletions.has(id))
@@ -173,7 +169,7 @@ export const LocalModelPackagesLive: Layer.Layer<
       entries,
       downloads: bundleDownloads,
     })
-  }))
+  })
   const project = projectCurrent.pipe(
     Effect.catchAllCause((cause) =>
       SubscriptionRef.get(current).pipe(
@@ -195,12 +191,13 @@ export const LocalModelPackagesLive: Layer.Layer<
     ),
   )
 
-  yield* project
-  yield* Stream.mergeAll([
-    models.changes.pipe(Stream.map(() => undefined)),
+  const invalidations = yield* coalesceInvalidations(Stream.mergeAll([
+    catalog.changes.pipe(Stream.map(() => undefined)),
     installed.changes.pipe(Stream.map(() => undefined)),
     downloads.changes.pipe(Stream.map(() => undefined)),
-  ], { concurrency: "unbounded" }).pipe(
+  ], { concurrency: "unbounded" }))
+  yield* project
+  yield* invalidations.pipe(
     Stream.runForEach(() => project),
     Effect.forkScoped,
   )
@@ -212,7 +209,7 @@ export const LocalModelPackagesLive: Layer.Layer<
     installedPackageIds: installed.get.pipe(Effect.map(({ state }) =>
       new Set(state.packages.map(({ package: modelPackage }) => modelPackage.id)))),
     refresh: Effect.all([
-      models.refresh,
+      catalog.refresh,
       downloads.refresh,
       installed.refresh,
     ], { discard: true }).pipe(

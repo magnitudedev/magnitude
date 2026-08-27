@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, PubSub, Stream } from "effect"
+import { Context, Effect, Layer, Queue, Ref, Stream } from "effect"
 import {
   Projects,
   Sessions,
@@ -10,8 +10,9 @@ import { SessionInspector } from "./session-inspector"
 /**
  * The ACN change registry: every change source publishes pokes in the
  * clients' query-identity space, and `StreamChanges` serves the multiplexed
- * stream. Publishing is fire-and-forget; the stream is bounded and coalescing,
- * so a late subscriber rereads authoritative state instead of replaying history.
+ * stream. Each connected subscriber retains bounded, query-keyed invalidations;
+ * repeated keys coalesce and excessive keyed entries broaden to one whole-query
+ * invalidation. Reconnect rereads authoritative state instead of replaying history.
  */
 export interface AcnChangesApi {
   readonly publish: (change: Change) => Effect.Effect<void>
@@ -20,13 +21,85 @@ export interface AcnChangesApi {
 
 export class AcnChanges extends Context.Tag("AcnChanges")<AcnChanges, AcnChangesApi>() {}
 
+const MAX_PENDING_KEYS_PER_QUERY = 64
+
+interface PendingQueryInvalidation {
+  readonly all: boolean
+  readonly keyed: ReadonlyMap<string, Change>
+}
+
+interface ChangeSubscriber {
+  readonly offer: (change: Change) => Effect.Effect<void>
+  readonly stream: Stream.Stream<Change>
+  readonly shutdown: Effect.Effect<void>
+}
+
+const keyOf = (change: Change): string => JSON.stringify(change.key)
+
+const addPending = (
+  pending: ReadonlyMap<string, PendingQueryInvalidation>,
+  change: Change,
+): ReadonlyMap<string, PendingQueryInvalidation> => {
+  const existing = pending.get(change.query)
+  if (existing?.all === true) return pending
+  const next = new Map(pending)
+  if (change.key === undefined) {
+    next.set(change.query, { all: true, keyed: new Map() })
+    return next
+  }
+  const keyed = new Map(existing?.keyed)
+  keyed.set(keyOf(change), change)
+  next.set(change.query, keyed.size > MAX_PENDING_KEYS_PER_QUERY
+    ? { all: true, keyed: new Map() }
+    : { all: false, keyed })
+  return next
+}
+
+const makeSubscriber = Effect.gen(function* () {
+  const pending = yield* Ref.make<ReadonlyMap<string, PendingQueryInvalidation>>(new Map())
+  const available = yield* Queue.sliding<void>(1)
+  const take = Ref.getAndSet(pending, new Map()).pipe(
+    Effect.map((queries) => [...queries].flatMap(([query, invalidation]) =>
+      invalidation.all ? [{ query }] : [...invalidation.keyed.values()])),
+  )
+  return {
+    offer: (change: Change) => Ref.update(pending, (current) => addPending(current, change)).pipe(
+      Effect.zipRight(Queue.offer(available, undefined)),
+      Effect.asVoid,
+    ),
+    stream: Stream.fromQueue(available).pipe(
+      Stream.mapEffect(() => take),
+      Stream.flatMap(Stream.fromIterable),
+    ),
+    shutdown: Queue.shutdown(available),
+  } satisfies ChangeSubscriber
+})
+
 export const AcnChangesLive: Layer.Layer<AcnChanges> = Layer.effect(
   AcnChanges,
   Effect.gen(function* () {
-    const events = yield* PubSub.sliding<Change>(256)
+    const subscribers = yield* Ref.make<ReadonlySet<ChangeSubscriber>>(new Set())
+    const stream = Stream.unwrapScoped(Effect.acquireRelease(
+      makeSubscriber.pipe(Effect.tap((subscriber) => Ref.update(subscribers, (current) => {
+        const next = new Set(current)
+        next.add(subscriber)
+        return next
+      }))),
+      (subscriber) => Ref.update(subscribers, (current) => {
+        const next = new Set(current)
+        next.delete(subscriber)
+        return next
+      }).pipe(Effect.zipRight(subscriber.shutdown)),
+    ).pipe(Effect.map((subscriber) => subscriber.stream)))
     return AcnChanges.of({
-      publish: (change) => PubSub.publish(events, change).pipe(Effect.asVoid),
-      stream: Stream.fromPubSub(events),
+      publish: (change) => Ref.get(subscribers).pipe(
+        Effect.flatMap((current) => Effect.forEach(
+          current,
+          (subscriber) => subscriber.offer(change),
+          { concurrency: "unbounded", discard: true },
+        )),
+      ),
+      stream,
     })
   }),
 )
