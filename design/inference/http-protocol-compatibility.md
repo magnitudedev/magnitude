@@ -155,10 +155,11 @@ changed mechanically only at the model string; every other JSON field remains op
 request retains its original bytes, query, public headers, response status, headers, and body
 stream.
 
-Claude Code receives the local base URL, fixed local placeholder token, and selected
-`anthropic-local/<canonical-model-id>` alias only in its launch environment. The launch plan also
-passes that alias explicitly, making the selected model active on first launch without changing
-Claude Code's persisted defaults. Disconnect therefore has no Claude Code setting to restore.
+Claude Code receives the local base URL and gateway discovery switch through its user-wide settings.
+Magnitude writes no persistent Claude credential or model default: ordinary Claude models retain
+the user's authentication and pass through the gateway to Anthropic, while discovered
+`anthropic-local/<canonical-model-id>` aliases route to ICN. The handoff launch plan passes the
+selected local alias explicitly without changing Claude Code's persisted model selection.
 
 ## Ownership
 

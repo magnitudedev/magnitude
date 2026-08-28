@@ -1,54 +1,35 @@
-import { Effect, Option } from "effect"
+import { Effect } from "effect"
 import type { HarnessConnectionPaths } from "../paths"
 import {
   ANTHROPIC_BASE_URL,
-  LOCAL_TOKEN,
-  anthropicLocalModelId,
   defineConnector,
   launchPlan,
   readOr,
   removeOwnedJsonc,
+  updateJsonc,
   writeIfChanged,
 } from "../shared"
+
+export const CLAUDE_GATEWAY_DISCOVERY = "1"
 
 export const makeClaudeCodeConnector = (paths: HarnessConnectionPaths) => defineConnector({
   id: "claude-code",
   name: "Claude Code",
   executable: "claude",
+  requiresStartup: true,
   skillInstallationTarget: "claude-user",
   configurationFiles: [paths.claude],
-  connect: () => Effect.void,
-  disconnect: (spec) => readOr(paths.claude, "{}\n").pipe(
-    Effect.flatMap((source) => {
-      const owned = Option.match(spec.setCurrent, {
-        onNone: () => [],
-        onSome: (modelId) => {
-          const localModelId = anthropicLocalModelId(modelId)
-          return [
-            [["env", "ANTHROPIC_BASE_URL"], ANTHROPIC_BASE_URL] as const,
-            [["env", "ANTHROPIC_AUTH_TOKEN"], LOCAL_TOKEN] as const,
-            [["env", "ANTHROPIC_MODEL"], localModelId] as const,
-            [["env", "ANTHROPIC_DEFAULT_HAIKU_MODEL"], localModelId] as const,
-            [["env", "ANTHROPIC_DEFAULT_SONNET_MODEL"], localModelId] as const,
-            [["env", "ANTHROPIC_DEFAULT_OPUS_MODEL"], localModelId] as const,
-          ]
-        },
-      })
-      return writeIfChanged(paths.claude, source, removeOwnedJsonc(source, owned))
-    }),
-  ),
+  connect: () => readOr(paths.claude, "{}\n").pipe(Effect.flatMap((source) =>
+    writeIfChanged(paths.claude, source, updateJsonc(source, [
+      [["env", "ANTHROPIC_BASE_URL"], ANTHROPIC_BASE_URL],
+      [["env", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"], CLAUDE_GATEWAY_DISCOVERY],
+    ])))),
+  disconnect: () => readOr(paths.claude, "{}\n").pipe(Effect.flatMap((source) =>
+    writeIfChanged(paths.claude, source, removeOwnedJsonc(source, [
+      [["env", "ANTHROPIC_BASE_URL"], ANTHROPIC_BASE_URL],
+      [["env", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"], CLAUDE_GATEWAY_DISCOVERY],
+    ])))),
   launch(modelId, installation) {
-    const localModelId = anthropicLocalModelId(modelId)
-    return launchPlan(this, installation, modelId, ["--model", localModelId], {
-      ANTHROPIC_BASE_URL,
-      ANTHROPIC_AUTH_TOKEN: LOCAL_TOKEN,
-      ANTHROPIC_MODEL: localModelId,
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: localModelId,
-      ANTHROPIC_DEFAULT_SONNET_MODEL: localModelId,
-      ANTHROPIC_DEFAULT_OPUS_MODEL: localModelId,
-      // Documented gateway switch: without it Claude Code prepends a billing
-      // attribution block whose per-request stamp defeats prompt-prefix reuse.
-      CLAUDE_CODE_ATTRIBUTION_HEADER: "0",
-    })
+    return launchPlan(this, installation, modelId, ["--model", `anthropic-local/${modelId}`])
   },
 })

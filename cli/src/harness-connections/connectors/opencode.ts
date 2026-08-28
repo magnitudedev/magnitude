@@ -1,4 +1,4 @@
-import { Effect, Option } from "effect"
+import { Effect } from "effect"
 import type { HarnessConnectionSpec } from "../contract"
 import type { HarnessConnectionPaths } from "../paths"
 import {
@@ -6,13 +6,10 @@ import {
   OPENAI_BASE_URL,
   OPENAI_COMPATIBLE_PACKAGE,
   defineConnector,
-  jsonObject,
   launchPlan,
-  ownedVariant,
   readOr,
-  removeOwnedJsonc,
+  removeJsoncPaths,
   updateJsonc,
-  valueAt,
   writeIfChanged,
 } from "../shared"
 
@@ -31,30 +28,12 @@ export const makeOpenCodeConnector = (paths: HarnessConnectionPaths) => defineCo
   configurationFiles: [paths.opencode],
   connect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.opencode, "{}\n")
-    const existing = valueAt(jsonObject(source), ["provider", "magnitude"])
-    if (existing !== undefined && (
-      typeof existing !== "object"
-      || valueAt(existing, ["options", "baseURL"]) !== OPENAI_BASE_URL
-      || valueAt(existing, ["npm"]) !== OPENAI_COMPATIBLE_PACKAGE
-    )) throw new Error("OpenCode already contains a conflicting provider.magnitude")
-    const changes: Array<readonly [ReadonlyArray<string>, unknown]> = [[
+    yield* writeIfChanged(paths.opencode, source, updateJsonc(source, [[
       ["provider", "magnitude"], openCodeProviderConfig(spec.models),
-    ]]
-    if (Option.isSome(spec.setCurrent)) changes.push([["model"], `magnitude/${spec.setCurrent.value}`])
-    yield* writeIfChanged(paths.opencode, source, updateJsonc(source, changes))
+    ]]))
   }),
-  disconnect: (spec) => readOr(paths.opencode, "{}\n").pipe(
-    Effect.flatMap((source) => {
-      const provider = valueAt(jsonObject(source), ["provider", "magnitude"])
-      return writeIfChanged(paths.opencode, source, removeOwnedJsonc(source, [
-        ...ownedVariant(["provider", "magnitude"], provider, [openCodeProviderConfig(spec.models)]),
-        ...Option.match(spec.setCurrent, {
-          onNone: () => [],
-          onSome: (modelId) => [[["model"], `magnitude/${modelId}`] as const],
-        }),
-      ]))
-    }),
-  ),
+  disconnect: () => readOr(paths.opencode, "{}\n").pipe(Effect.flatMap((source) =>
+    writeIfChanged(paths.opencode, source, removeJsoncPaths(source, [["provider", "magnitude"]])))),
   launch(modelId, installation) {
     return launchPlan(this, installation, modelId, ["--model", `magnitude/${modelId}`])
   },

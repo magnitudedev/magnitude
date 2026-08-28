@@ -32,11 +32,11 @@ export {
   OPENAI_BASE_URL,
   anthropicLocalModelId,
   removeOwnedJsonc,
-  removeOwnedYaml,
   updateJsonc,
   updateYaml,
 } from "./shared"
-export { clineModelCatalog, clineProviderSettings } from "./connectors/cline"
+export { clineModelCatalog, clineModelRegistryEntry, clineProviderSettings } from "./connectors/cline"
+export { CLAUDE_GATEWAY_DISCOVERY } from "./connectors/claude-code"
 export { codexConfig, codexModelCatalog } from "./connectors/codex"
 export { hermesProviderConfig } from "./connectors/hermes"
 export { ohMyPiProviderConfig } from "./connectors/oh-my-pi"
@@ -77,6 +77,11 @@ export interface HarnessConnectionOptions {
   readonly detect?: (connector: HarnessConnector) => Effect.Effect<Option.Option<HarnessInstallation>>
   readonly resolveModels?: Effect.Effect<ReadonlyArray<HarnessModel>, unknown, HttpClient.HttpClient>
   readonly now?: () => Date
+  readonly installStartup?: Effect.Effect<
+    void,
+    unknown,
+    FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor
+  >
 }
 
 const upsertManifest = (
@@ -157,6 +162,7 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
   const updateManifest = manifestState.update
   const detect = options.detect ?? ((connector: HarnessConnector) => connector.detect(harnessExecutableSearchPath()))
   const resolveModels = options.resolveModels ?? discoverMagnitudeModels
+  const mutationLock = yield* Effect.makeSemaphore(1)
   const provide = <A, E>(effect: Effect.Effect<
     A,
     E,
@@ -212,6 +218,13 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     Effect.mapError((error) => failure("list", String(error))),
   ))
 
+  const installStartup = provide(options.installStartup ?? installServerOnStartup).pipe(
+    Effect.mapError((error) => failure("startup", String(error))),
+  )
+
+  const withMutationLock = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    mutationLock.withPermits(1)(effect)
+
   const connect: HarnessConnection["connect"] = (harness, connectOptions) => provide(Effect.gen(function* () {
     const connector = registry.get(harness)
     const installation = yield* installed(connector)
@@ -225,6 +238,7 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     if (connector.recommended) {
       return { launchPlan: Option.map(spec.setCurrent, (modelId) => connector.launch(modelId, installation.value)) }
     }
+    if (connector.requiresStartup) yield* installStartup
     const snapshots = yield* snapshotFiles(connector.configurationFiles)
     yield* connectorOperation("connect", connector, connector.connect(spec)).pipe(
       Effect.zipRight(updateManifest((manifest) => upsertManifest(manifest, harness, spec, now))),
@@ -251,6 +265,7 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
         return yield* failure("sync", `Magnitude model is not installed: ${entry.setCurrent.value}`, entry.harness)
       }
       const spec: HarnessConnectionSpec = { models, setCurrent: entry.setCurrent }
+      if (connector.requiresStartup) yield* installStartup
       const snapshots = yield* snapshotFiles(connector.configurationFiles)
       yield* connectorOperation("sync", connector, connector.connect(spec)).pipe(
         Effect.zipRight(updateManifest((current) => upsertManifest(current, entry.harness, spec, now))),
@@ -290,13 +305,11 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
 
   return {
     list,
-    connect,
-    sync,
-    disconnect,
+    connect: (harness, options) => withMutationLock(connect(harness, options)),
+    sync: (harness) => withMutationLock(sync(harness)),
+    disconnect: (harness) => withMutationLock(disconnect(harness)),
     installSkill,
-    installStartup: provide(installServerOnStartup).pipe(
-      Effect.mapError((error) => failure("startup", String(error))),
-    ),
+    installStartup,
   } satisfies HarnessConnection
 })
 
