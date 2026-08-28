@@ -6,7 +6,7 @@ import { Data, Effect, Schema, Stream } from "effect"
 import { arch, cpus, hostname, platform, release, totalmem } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { prepareCorpus } from "./corpus"
-import type { ModelIdentity } from "./domain"
+import type { LogicalModelIdentity } from "./domain"
 import {
   type ExperimentDefinition,
   loadExperiment,
@@ -14,7 +14,7 @@ import {
   type VariantId,
 } from "./experiment"
 import { digestObject } from "./hash"
-import { hashFileSha256, resolveModelIdentity } from "./model"
+import { hashFileSha256 } from "./model"
 import { resolveIcnExecutable, resolveLlamaCppExecutable } from "./target"
 
 const NonEmptyString = Schema.String.pipe(Schema.minLength(1))
@@ -44,17 +44,44 @@ export interface PreparedArtifact {
   readonly digest: string
   readonly manifestPath?: string
   readonly manifestDigest?: string
-  readonly tokenizerQualification?: string
+  readonly qualification?: PreparedArtifactQualification
 }
 
+type OmlxQualification = {
+  readonly kind: "omlx"
+  readonly modelSnapshotComplete: true
+  readonly tokenizerLoaded: true
+  readonly chatTemplateLoaded: true
+  readonly toolsRendered: true
+  readonly toolCallParsed: true
+  readonly contextCapacity: number
+  readonly parallelSequences: number
+  readonly actualBackend: "none" | "mtp" | "dflash" | "dspark"
+  readonly terminalTimingEvidence: true
+} & (
+  | { readonly expectedBackend: "none" }
+  | {
+      readonly expectedBackend: "mtp" | "dflash" | "dspark"
+      readonly draftTokens: number
+      readonly acceptedDraftTokens: number
+    }
+)
+
+export type PreparedArtifactQualification =
+  | { readonly kind: "mlx-lm"; readonly output: string }
+  | { readonly kind: "mlx-vlm"; readonly managedReadiness: true }
+  | OmlxQualification
+
+export const PREPARED_EXPERIMENT_VERSION = 5 as const
+
 export interface PreparedExperiment {
-  readonly version: 4
+  readonly version: typeof PREPARED_EXPERIMENT_VERSION
   readonly experimentPath: string
   readonly experiment: ExperimentDefinition
   readonly preparedAt: string
   readonly corpusRoot: string
   readonly corpusDigest: string
-  readonly planModel: ModelIdentity
+  readonly planModel: LogicalModelIdentity
   readonly artifacts: readonly PreparedArtifact[]
   readonly engines: readonly PreparedEngineEnvironment[]
   readonly host: {
@@ -72,6 +99,12 @@ export interface PreparedExperiment {
 export type PreparedEngineEnvironment =
   | { readonly variantId: VariantId; readonly kind: "mlx-lm"; readonly pythonProject: string; readonly lockDigest: string; readonly adapterDigest: string; readonly version: string }
   | { readonly variantId: VariantId; readonly kind: "mlx-vlm"; readonly pythonProject: string; readonly lockDigest: string; readonly version: string }
+  | {
+      readonly variantId: VariantId; readonly kind: "omlx"; readonly pythonProject: string
+      readonly omlxVersion: string; readonly omlxRevision: string; readonly mlxVersion: string
+      readonly mlxLmRevision: string; readonly mlxVlmRevision: string; readonly dflashRevision: string
+      readonly lockDigest: string; readonly adapterDigest: string
+    }
   | { readonly variantId: VariantId; readonly kind: "llama.cpp"; readonly executable: string; readonly version: string }
   | { readonly variantId: VariantId; readonly kind: "icn"; readonly executable: string; readonly version: string }
   | { readonly variantId: VariantId; readonly kind: "existing-endpoint"; readonly endpoint: string }
@@ -191,6 +224,42 @@ const runString = (executable: string, args: readonly string[], cwd?: string) =>
   operation: `run-${executable}`, message: error instanceof Error ? error.message : String(error),
 })))
 
+const OmlxRuntimeIdentitySchema = Schema.Struct({
+  omlx_version: NonEmptyString,
+  omlx_revision: NonEmptyString,
+  mlx_version: NonEmptyString,
+  mlx_lm_revision: NonEmptyString,
+  mlx_vlm_revision: NonEmptyString,
+  dflash_revision: NonEmptyString,
+})
+
+const OmlxQualificationFields = {
+  kind: Schema.Literal("omlx"),
+  modelSnapshotComplete: Schema.Literal(true),
+  tokenizerLoaded: Schema.Literal(true),
+  chatTemplateLoaded: Schema.Literal(true),
+  toolsRendered: Schema.Literal(true),
+  toolCallParsed: Schema.Literal(true),
+  contextCapacity: PositiveInt,
+  parallelSequences: PositiveInt,
+  actualBackend: Schema.Literal("none", "mtp", "dflash", "dspark"),
+  terminalTimingEvidence: Schema.Literal(true),
+} as const
+const OmlxQualificationSchema = Schema.Union(
+  Schema.Struct({ ...OmlxQualificationFields, expectedBackend: Schema.Literal("none") }),
+  Schema.Struct({
+    ...OmlxQualificationFields,
+    expectedBackend: Schema.Literal("mtp", "dflash", "dspark"),
+    draftTokens: PositiveInt,
+    acceptedDraftTokens: Schema.Int.pipe(Schema.nonNegative()),
+  }),
+)
+
+const decodeJson = <A, I>(schema: Schema.Schema<A, I>, value: string, operation: string) => Effect.try({
+  try: () => Schema.decodeUnknownSync(Schema.parseJson(schema))(value),
+  catch: (error) => new PreparationError({ operation, message: error instanceof Error ? error.message : String(error) }),
+})
+
 const prepareUv = (pythonProject: string) => Effect.gen(function* () {
   yield* runString("uv", ["sync", "--frozen", "--project", pythonProject])
   const version = yield* runString("uv", [
@@ -202,6 +271,7 @@ const prepareUv = (pythonProject: string) => Effect.gen(function* () {
   )
   const sourceRoot = join(pythonProject, "src")
   const sourcePaths = yield* listRelativeFiles(sourceRoot).pipe(
+    Effect.map((paths) => paths.filter((path) => !path.split(/[\\/]/).includes("__pycache__") && !path.endsWith(".pyc"))),
     Effect.mapError((error) => new PreparationError({ operation: "hash-adapter", message: String(error) })),
   )
   const sourceFiles = yield* Effect.forEach(sourcePaths, (path) => hashFileSha256(join(sourceRoot, path)).pipe(
@@ -226,6 +296,67 @@ const prepareMlxVlmUv = (pythonProject: string) => Effect.gen(function* () {
   )
   return { version, lockDigest }
 })
+
+const prepareOmlxUv = (pythonProject: string) => Effect.gen(function* () {
+  yield* runString("uv", ["sync", "--frozen", "--project", pythonProject])
+  const rawIdentity = yield* runString("uv", [
+    "run", "--frozen", "--no-sync", "--project", pythonProject,
+    "magnitude-omlx-benchmark-identity",
+  ])
+  const identity = yield* decodeJson(OmlxRuntimeIdentitySchema, rawIdentity, "identify-omlx")
+  return { identity, ...(yield* currentOwnedEnvironmentDigests(pythonProject)) }
+})
+
+export const currentOwnedEnvironmentDigests = (pythonProject: string) => Effect.gen(function* () {
+  const lockDigest = yield* hashFileSha256(join(pythonProject, "uv.lock")).pipe(
+    Effect.mapError((error) => new PreparationError({ operation: "hash-uv-lock", message: error.message })),
+  )
+  const sourceRoot = join(pythonProject, "src")
+  const sourcePaths = yield* listRelativeFiles(sourceRoot).pipe(
+    Effect.map((paths) => paths.filter((path) => !path.split(/[\\/]/).includes("__pycache__") && !path.endsWith(".pyc"))),
+    Effect.mapError((error) => new PreparationError({ operation: "hash-adapter", message: String(error) })),
+  )
+  const sourceFiles = yield* Effect.forEach(sourcePaths, (path) => hashFileSha256(join(sourceRoot, path)).pipe(
+    Effect.map((sha256) => ({ path, sha256 })),
+    Effect.mapError((error) => new PreparationError({ operation: "hash-adapter", message: error.message })),
+  ), { concurrency: 4 })
+  const pyprojectDigest = yield* hashFileSha256(join(pythonProject, "pyproject.toml")).pipe(
+    Effect.mapError((error) => new PreparationError({ operation: "hash-adapter", message: error.message })),
+  )
+  return { lockDigest, adapterDigest: digestObject({ pyprojectDigest, sourceFiles }) }
+})
+
+export const verifyPreparedEngineEnvironments = (
+  prepared: PreparedExperiment,
+): Effect.Effect<void, PreparationError, FileSystem.FileSystem | CommandExecutor.CommandExecutor> =>
+  Effect.forEach(prepared.engines, (engine) => {
+    if (engine.kind !== "omlx") return Effect.void
+    return Effect.gen(function* () {
+      const digests = yield* currentOwnedEnvironmentDigests(engine.pythonProject)
+      if (digests.lockDigest !== engine.lockDigest || digests.adapterDigest !== engine.adapterDigest) {
+        return yield* new PreparationError({
+          operation: "verify-engine-environment",
+          message: `oMLX environment for ${engine.variantId} changed after preparation; run prepare again`,
+        })
+      }
+      const raw = yield* runString("uv", [
+        "run", "--frozen", "--no-sync", "--project", engine.pythonProject,
+        "magnitude-omlx-benchmark-identity",
+      ])
+      const identity = yield* decodeJson(OmlxRuntimeIdentitySchema, raw, "identify-omlx")
+      if (identity.omlx_version !== engine.omlxVersion
+        || identity.omlx_revision !== engine.omlxRevision
+        || identity.mlx_version !== engine.mlxVersion
+        || identity.mlx_lm_revision !== engine.mlxLmRevision
+        || identity.mlx_vlm_revision !== engine.mlxVlmRevision
+        || identity.dflash_revision !== engine.dflashRevision) {
+        return yield* new PreparationError({
+          operation: "verify-engine-environment",
+          message: `installed oMLX runtime for ${engine.variantId} changed after preparation; run prepare again`,
+        })
+      }
+    })
+  }, { concurrency: 1 }).pipe(Effect.asVoid)
 
 const prepareGguf = (variantId: VariantId, role: PreparedArtifact["role"], artifact: Extract<ExperimentDefinition["variants"][number]["artifact"], { kind: "gguf" }>) =>
   Effect.gen(function* () {
@@ -308,6 +439,21 @@ const prepareEngine = (variant: ExperimentDefinition["variants"][number]): Effec
       lockDigest,
     })))
   }
+  if (engine.kind === "omlx") {
+    return prepareOmlxUv(engine.pythonProject).pipe(Effect.map(({ identity, lockDigest, adapterDigest }) => ({
+      variantId: variant.id,
+      kind: engine.kind,
+      pythonProject: engine.pythonProject,
+      omlxVersion: identity.omlx_version,
+      omlxRevision: identity.omlx_revision,
+      mlxVersion: identity.mlx_version,
+      mlxLmRevision: identity.mlx_lm_revision,
+      mlxVlmRevision: identity.mlx_vlm_revision,
+      dflashRevision: identity.dflash_revision,
+      lockDigest,
+      adapterDigest,
+    })))
+  }
   if (engine.kind === "existing-endpoint") {
     return Effect.succeed({ variantId: variant.id, kind: engine.kind, endpoint: engine.endpoint })
   }
@@ -333,12 +479,28 @@ const prepareEngine = (variant: ExperimentDefinition["variants"][number]): Effec
   )
 }
 
+export function planningModelFor(experiment: ExperimentDefinition): LogicalModelIdentity {
+  const artifact = experiment.variants[0]?.artifact
+  if (!artifact) throw new PreparationError({ operation: "plan-model", message: "experiment has no target artifact" })
+  return { id: artifact.modelId, contextLimit: artifact.modelContextLimit }
+}
+
 export const prepareExperiment = (experimentPath: string): Effect.Effect<PreparedExperiment, PreparationError, FileSystem.FileSystem | CommandExecutor.CommandExecutor> =>
   Effect.gen(function* () {
     const loaded = yield* loadExperiment(experimentPath).pipe(Effect.mapError((error) => new PreparationError({ operation: error.operation, message: error.message })))
     const experiment = resolveExperimentPaths(loaded, experimentPath)
     const engines = yield* Effect.forEach(experiment.variants, prepareEngine, { concurrency: 1 })
     const downloadedArtifacts = yield* Effect.forEach(experiment.variants, (variant) => prepareArtifact(variant, "target"), { concurrency: 1 })
+    const draftArtifacts = yield* Effect.forEach(experiment.variants, (variant) => {
+      const engine = variant.engine
+      if ((engine.kind === "llama.cpp" || engine.kind === "mlx-vlm") && engine.speculativeDecoding.kind === "mtp") {
+        return prepareArtifact(variant, "drafter", engine.speculativeDecoding.draftArtifact)
+      }
+      if (engine.kind === "omlx" && engine.speculativeDecoding.kind === "dflash") {
+        return prepareArtifact(variant, "drafter", engine.speculativeDecoding.draftArtifact)
+      }
+      return Effect.succeed(null)
+    }, { concurrency: 1 }).pipe(Effect.map((values) => values.filter((value): value is PreparedArtifact => value !== null)))
     const artifacts = yield* Effect.forEach(downloadedArtifacts, (artifact) => {
       if (artifact.kind !== "mlx") return Effect.succeed(artifact)
       const variant = experiment.variants.find(({ id }) => id === artifact.variantId)
@@ -348,8 +510,47 @@ export const prepareExperiment = (experimentPath: string): Effect.Effect<Prepare
       if (variant.engine.kind === "mlx-vlm") {
         return Effect.succeed({
           ...artifact,
-          tokenizerQualification: "MLX-VLM tokenizer, tool parser, and MTP drafter are qualified by managed readiness before measurement",
+          qualification: { kind: "mlx-vlm" as const, managedReadiness: true as const },
         })
+      }
+      if (variant.engine.kind === "omlx") {
+        const speculation = variant.engine.speculativeDecoding
+        const draft = speculation.kind === "dflash"
+          ? draftArtifacts.find((candidate) => candidate.variantId === variant.id && candidate.role === "drafter")
+          : undefined
+        const args = [
+          "run", "--frozen", "--no-sync", "--project", variant.engine.pythonProject,
+          "magnitude-omlx-benchmark-qualify",
+          "--model", artifact.path,
+          "--artifact-manifest", artifact.manifestPath!,
+          "--served-model", variant.artifact.modelId,
+          "--context-capacity", String(experiment.requestPolicy.contextTokensPerSequence),
+          "--max-concurrent-requests", String(experiment.requestPolicy.parallelSequences),
+          "--speculative-method", speculation.kind,
+        ]
+        if (speculation.kind === "mtp" || speculation.kind === "dspark") args.push("--max-draft-tokens", String(speculation.maxDraftTokens))
+        if (speculation.kind === "dflash") {
+          if (!draft) return Effect.fail(new PreparationError({ operation: "qualify-omlx", message: `missing DFlash draft for ${variant.id}` }))
+          if (!draft.manifestPath) return Effect.fail(new PreparationError({ operation: "qualify-omlx", message: `DFlash draft for ${variant.id} has no artifact manifest` }))
+          args.push(
+            "--dflash-draft", draft.path,
+            "--dflash-draft-manifest", draft.manifestPath,
+            "--dflash-block-size", String(speculation.blockSize),
+          )
+        }
+        return runString("uv", args).pipe(
+          Effect.flatMap((output) => decodeJson(OmlxQualificationSchema, output, "qualify-omlx")),
+          Effect.flatMap((qualification) => {
+            if (qualification.actualBackend !== speculation.kind) {
+              return Effect.fail(new PreparationError({ operation: "qualify-omlx", message: `expected ${speculation.kind}, received ${qualification.actualBackend}` }))
+            }
+            if (qualification.expectedBackend !== "none"
+              && qualification.acceptedDraftTokens > qualification.draftTokens) {
+              return Effect.fail(new PreparationError({ operation: "qualify-omlx", message: "accepted draft tokens exceed drafted tokens" }))
+            }
+            return Effect.succeed({ ...artifact, qualification })
+          }),
+        )
       }
       if (variant.engine.kind !== "mlx-lm") {
         return Effect.fail(new PreparationError({ operation: "qualify-tokenizer", message: `missing MLX engine for ${artifact.variantId}` }))
@@ -357,26 +558,13 @@ export const prepareExperiment = (experimentPath: string): Effect.Effect<Prepare
       return runString("uv", [
         "run", "--frozen", "--no-sync", "--project", variant.engine.pythonProject,
         "magnitude-mlx-benchmark-qualify", "--model", artifact.path,
-      ]).pipe(Effect.map((tokenizerQualification) => ({ ...artifact, tokenizerQualification })))
+      ]).pipe(Effect.map((output) => ({ ...artifact, qualification: { kind: "mlx-lm" as const, output } })))
     }, { concurrency: 1 })
-    const draftArtifacts = yield* Effect.forEach(experiment.variants, (variant) => {
-      const engine = variant.engine
-      return (engine.kind === "llama.cpp" || engine.kind === "mlx-vlm") && engine.speculativeDecoding.kind === "mtp"
-        ? prepareArtifact(variant, "drafter", engine.speculativeDecoding.draftArtifact)
-        : Effect.succeed(null)
-    }, { concurrency: 1 }).pipe(Effect.map((values) => values.filter((value): value is PreparedArtifact => value !== null)))
     const allArtifacts = [...artifacts, ...draftArtifacts]
-    const gguf = allArtifacts.find((artifact) => artifact.role === "target" && artifact.kind === "gguf")
-    if (!gguf) return yield* new PreparationError({ operation: "plan-model", message: "experiment requires a GGUF artifact for plan metadata" })
-    const planModel = yield* resolveModelIdentity({
-      id: experiment.variants[0]!.artifact.modelId,
-      artifactPath: gguf.path,
-      verifiedArtifactSha256: gguf.digest,
-      maxContextTokens: experiment.requestPolicy.contextTokensPerSequence,
-    }).pipe(Effect.mapError((error) => new PreparationError({ operation: error.operation, message: error.message })))
+    const planModel = planningModelFor(experiment)
     const corpus = yield* prepareCorpus().pipe(Effect.mapError((error) => new PreparationError({ operation: "prepare-corpus", message: String(error) })))
     const identity = {
-      version: 4 as const,
+      version: PREPARED_EXPERIMENT_VERSION,
       experimentPath: resolve(experimentPath), experiment, preparedAt: new Date().toISOString(),
       corpusRoot: corpus.root, corpusDigest: corpus.digest, planModel, artifacts: allArtifacts,
       engines,
@@ -403,7 +591,7 @@ export const loadPreparedExperiment = (experimentId: string): Effect.Effect<Prep
       try: () => JSON.parse(text) as PreparedExperiment,
       catch: (error) => new PreparationError({ operation: "load-prepared", message: error instanceof Error ? error.message : String(error) }),
     })
-    if (prepared.version !== 4) {
+    if (prepared.version !== PREPARED_EXPERIMENT_VERSION) {
       return yield* new PreparationError({ operation: "load-prepared", message: "prepared experiment format changed; run prepare again" })
     }
     const { digest, ...identity } = prepared

@@ -94,6 +94,7 @@ const RawTerminalEvidence = Schema.Struct({
     predicted_ms: NonNegativeFinite,
     draft_n: Schema.optionalWith(NonNegativeInt, { as: "Option", exact: true }),
     draft_n_accepted: Schema.optionalWith(NonNegativeInt, { as: "Option", exact: true }),
+    speculative_backend: Schema.optionalWith(Schema.Literal("mtp", "dflash", "dspark"), { as: "Option", exact: true }),
   }),
 })
 
@@ -123,6 +124,7 @@ export function parseTerminalEvidence(payload: unknown): TerminalEvidence {
       generationMs: terminal.timings.predicted_ms,
       ...(Option.isSome(terminal.timings.draft_n) ? { draftTokens: terminal.timings.draft_n.value } : {}),
       ...(Option.isSome(terminal.timings.draft_n_accepted) ? { acceptedDraftTokens: terminal.timings.draft_n_accepted.value } : {}),
+      ...(Option.isSome(terminal.timings.speculative_backend) ? { speculativeBackend: terminal.timings.speculative_backend.value } : {}),
     },
   }
   if (evidence.usage.totalTokens !== evidence.usage.promptTokens + evidence.usage.completionTokens) {
@@ -136,6 +138,17 @@ export function parseTerminalEvidence(payload: unknown): TerminalEvidence {
   }
   if (evidence.usage.completionTokens !== evidence.timings.generatedTokens) {
     throw new EndpointError({ operation: "terminal-evidence", message: "completion token counts disagree" })
+  }
+  const hasDraft = evidence.timings.draftTokens !== undefined || evidence.timings.acceptedDraftTokens !== undefined
+  if (hasDraft && (evidence.timings.draftTokens === undefined || evidence.timings.acceptedDraftTokens === undefined)) {
+    throw new EndpointError({ operation: "terminal-evidence", message: "speculative draft counters must be supplied together" })
+  }
+  if (evidence.timings.acceptedDraftTokens !== undefined && evidence.timings.draftTokens !== undefined
+    && evidence.timings.acceptedDraftTokens > evidence.timings.draftTokens) {
+    throw new EndpointError({ operation: "terminal-evidence", message: "accepted draft tokens exceed drafted tokens" })
+  }
+  if (evidence.timings.speculativeBackend !== undefined && !hasDraft) {
+    throw new EndpointError({ operation: "terminal-evidence", message: "a speculative backend requires draft counters" })
   }
   return evidence
 }
@@ -197,7 +210,14 @@ async function requestWithFetch(config: EndpointConfiguration, request: PlannedR
       buffer = blocks.pop() ?? ""
       if (done && buffer.trim().length > 0) blocks.push(buffer)
       for (const block of blocks) for (const data of parseSseBlock(block)) {
-        if (data === "[DONE]") { sawDone = true; continue }
+        if (data === "[DONE]") {
+          if (sawDone) throw new EndpointError({ operation: "stream", message: "stream emitted [DONE] more than once" })
+          if (terminalPayload === undefined) throw new EndpointError({ operation: "terminal-evidence", message: "[DONE] arrived before terminal usage and timings" })
+          sawDone = true
+          continue
+        }
+        if (sawDone) throw new EndpointError({ operation: "stream", message: "stream emitted data after [DONE]" })
+        if (terminalPayload !== undefined) throw new EndpointError({ operation: "terminal-evidence", message: "terminal usage and timings must be immediately followed by [DONE]" })
         let payload: unknown
         try { payload = JSON.parse(data) } catch { throw new EndpointError({ operation: "decode-sse", message: `invalid SSE JSON: ${data.slice(0, 256)}` }) }
         const atMs = performance.now() - started
