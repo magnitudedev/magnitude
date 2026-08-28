@@ -24,7 +24,6 @@ use super::super::{
 const LOCAL_THINKING_SIGNATURE: &str = "magnitude-local-v1";
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct MessagesRequest {
     pub model: String,
     pub messages: Vec<Message>,
@@ -58,7 +57,7 @@ pub(crate) enum SystemPrompt {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum SystemBlock {
     Text {
         text: String,
@@ -69,7 +68,6 @@ pub(crate) enum SystemBlock {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct Message {
     pub role: Role,
     pub content: Content,
@@ -91,7 +89,7 @@ pub(crate) enum Content {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ContentBlock {
     Text {
         text: String,
@@ -132,7 +130,7 @@ pub(crate) enum ContentBlock {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ImageSource {
     Base64 {
         media_type: String,
@@ -152,7 +150,7 @@ pub(crate) enum ToolResultContent {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ToolResultBlock {
     Text {
         text: String,
@@ -169,7 +167,6 @@ pub(crate) enum ToolResultBlock {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct Tool {
     pub name: String,
     pub description: Option<String>,
@@ -180,7 +177,7 @@ pub(crate) struct Tool {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ToolChoice {
     Auto {
         #[serde(default)]
@@ -199,7 +196,7 @@ pub(crate) enum ToolChoice {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum Thinking {
     Enabled { budget_tokens: u32 },
     Adaptive,

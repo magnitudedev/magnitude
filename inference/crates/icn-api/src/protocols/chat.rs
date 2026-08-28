@@ -95,7 +95,6 @@ pub enum GrammarTriggerResponse {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ChatCompletionRequest {
     #[schema(nullable = false)]
     pub model: Option<String>,
@@ -144,7 +143,7 @@ pub struct ChatCompletionRequest {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "role", rename_all = "lowercase", deny_unknown_fields)]
+#[serde(tag = "role", rename_all = "lowercase")]
 pub enum ChatMessageRequest {
     System {
         content: String,
@@ -181,20 +180,18 @@ pub enum ChatContentRequest {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChatContentPartRequest {
     Text { text: String },
     ImageUrl { image_url: ImageUrlRequest },
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ImageUrlRequest {
     pub url: String,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ChatToolCallRequest {
     pub id: String,
     #[allow(dead_code)]
@@ -203,14 +200,12 @@ pub struct ChatToolCallRequest {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct NamedFunctionCallRequest {
     pub name: String,
     pub arguments: String,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ChatToolRequest {
     #[allow(dead_code)]
     pub r#type: FunctionType,
@@ -218,7 +213,6 @@ pub struct ChatToolRequest {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct FunctionDefinitionRequest {
     pub name: String,
     #[schema(nullable = false)]
@@ -252,7 +246,6 @@ pub enum ToolChoiceModeRequest {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct FunctionToolChoiceRequest {
     #[allow(dead_code)]
     pub r#type: FunctionType,
@@ -260,13 +253,11 @@ pub struct FunctionToolChoiceRequest {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct FunctionNameRequest {
     pub name: String,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct AllowedToolsChoiceRequest {
     #[allow(dead_code)]
     pub r#type: AllowedToolsType,
@@ -280,7 +271,6 @@ pub enum AllowedToolsType {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct AllowedToolsRequest {
     pub mode: AllowedToolsModeRequest,
     pub tools: Vec<AllowedToolRequest>,
@@ -294,7 +284,6 @@ pub enum AllowedToolsModeRequest {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct AllowedToolRequest {
     #[allow(dead_code)]
     pub r#type: FunctionType,
@@ -314,7 +303,7 @@ impl ReasoningEffortRequest {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseFormatRequest {
     Text,
     JsonObject,
@@ -323,7 +312,6 @@ pub enum ResponseFormatRequest {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct JsonSchemaRequest {
     pub name: String,
     pub schema: JsonValue,
@@ -339,7 +327,6 @@ pub enum StopRequest {
 }
 
 #[derive(Debug, Default, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct StreamOptions {
     #[schema(nullable = false)]
     pub include_usage: Option<bool>,
@@ -1418,9 +1405,6 @@ fn reasoning_intent(
         "thinking_mode",
         "reasoning_effort",
         "thinking_budget",
-        "preserve_thinking",
-        "clear_thinking",
-        "drop_thinking",
     ];
     let raw_reasoning_controls = template_args
         .keys()
