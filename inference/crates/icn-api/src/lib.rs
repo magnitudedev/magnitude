@@ -40,6 +40,7 @@ use icn_contracts::{
 use serde::{Deserialize, Serialize};
 use utoipa::openapi::extensions::Extensions;
 use utoipa::openapi::path::Operation;
+use utoipa::openapi::schema::{AdditionalProperties, Schema};
 use utoipa::openapi::{Components, OpenApi as OpenApiDocument, RefOr};
 use utoipa::{OpenApi, PartialSchema, ToSchema};
 
@@ -133,7 +134,6 @@ pub enum InferenceResourceTopic {
     Packages,
     Downloads,
     Instances,
-    ResidencyPolicy,
 }
 
 impl InferenceResourceTopic {
@@ -144,7 +144,6 @@ impl InferenceResourceTopic {
             Self::Packages => "packages",
             Self::Downloads => "downloads",
             Self::Instances => "instances",
-            Self::ResidencyPolicy => "residency-policy",
         }
     }
 
@@ -155,7 +154,6 @@ impl InferenceResourceTopic {
             "packages" => Some(Self::Packages),
             "downloads" => Some(Self::Downloads),
             "instances" => Some(Self::Instances),
-            "residency-policy" => Some(Self::ResidencyPolicy),
             _ => None,
         }
     }
@@ -383,10 +381,6 @@ pub fn app(state: AppState) -> Router {
         .route("/api/v1/instances/{instance_id}", get(model_instance))
         .route("/api/v1/events", get(watch_inference_events))
         .route(
-            "/api/v1/residency-policy",
-            get(model_residency_policy).put(set_model_residency_policy),
-        )
-        .route(
             "/api/v1/instances/{instance_id}/stop",
             post(stop_model_instance),
         )
@@ -472,33 +466,7 @@ pub struct HealthResponse {
     native_build: String,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SetModelResidencyPolicyRequest {
-    pub generation: u64,
-    pub idle_timeout_seconds: u64,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelResidencyPolicyResponse {
-    pub generation: u64,
-    pub idle_timeout_seconds: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ModelResidencyPolicyInvalidation {
-    pub revision: u64,
-}
-
 pub trait ModelInstanceController: Send + Sync + 'static {
-    fn residency_policy(&self) -> Result<ModelResidencyPolicyResponse, InventoryError>;
-    fn watch_residency_policy(&self) -> BoxStream<'static, ModelResidencyPolicyInvalidation>;
-    fn set_residency_policy(
-        &self,
-        generation: u64,
-        idle_timeout: std::time::Duration,
-    ) -> BoxFuture<'_, Result<(), InventoryError>>;
     fn preview_load(
         &self,
         model_id: String,
@@ -546,27 +514,6 @@ impl StaticModelInstanceController {
 }
 
 impl ModelInstanceController for StaticModelInstanceController {
-    fn residency_policy(&self) -> Result<ModelResidencyPolicyResponse, InventoryError> {
-        Ok(ModelResidencyPolicyResponse {
-            generation: 0,
-            idle_timeout_seconds: 600,
-        })
-    }
-
-    fn watch_residency_policy(&self) -> BoxStream<'static, ModelResidencyPolicyInvalidation> {
-        Box::pin(futures_util::stream::once(async {
-            ModelResidencyPolicyInvalidation { revision: 0 }
-        }))
-    }
-
-    fn set_residency_policy(
-        &self,
-        _generation: u64,
-        _idle_timeout: std::time::Duration,
-    ) -> BoxFuture<'_, Result<(), InventoryError>> {
-        Box::pin(async { Ok(()) })
-    }
-
     fn preview_load(
         &self,
         _model_id: String,
@@ -995,56 +942,6 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-#[utoipa::path(get, path = "/api/v1/residency-policy", operation_id = "getModelResidencyPolicy", tag = "models",
-    responses(
-        (status = 200, description = "Current model residency policy", body = ModelResidencyPolicyResponse),
-        (status = 500, description = "Runtime control unavailable", body = ErrorResponse)
-    )
-)]
-async fn model_residency_policy(
-    State(state): State<AppState>,
-) -> Result<Json<ModelResidencyPolicyResponse>, ApiError> {
-    state
-        .model_controller
-        .as_ref()
-        .ok_or_else(|| ApiError::server("model control is not configured"))?
-        .residency_policy()
-        .map(Json)
-        .map_err(ApiError::from_inventory)
-}
-
-#[utoipa::path(put, path = "/api/v1/residency-policy", operation_id = "setModelResidencyPolicy", tag = "models",
-    request_body(content = SetModelResidencyPolicyRequest, content_type = "application/json"),
-    responses(
-        (status = 204, description = "The model residency policy is established"),
-        (status = 400, description = "The policy is invalid or conflicts with its generation", body = ErrorResponse),
-        (status = 500, description = "Runtime control unavailable", body = ErrorResponse)
-    )
-)]
-#[tracing::instrument(name = "icn.model_residency_policy.set", skip_all, err(Debug))]
-async fn set_model_residency_policy(
-    State(state): State<AppState>,
-    Json(request): Json<SetModelResidencyPolicyRequest>,
-) -> Result<StatusCode, ApiError> {
-    if request.idle_timeout_seconds == 0 {
-        return Err(ApiError::invalid(
-            "idleTimeoutSeconds must be greater than zero",
-        ));
-    }
-    let controller = state
-        .model_controller
-        .as_ref()
-        .ok_or_else(|| ApiError::server("model control is not configured"))?;
-    controller
-        .set_residency_policy(
-            request.generation,
-            std::time::Duration::from_secs(request.idle_timeout_seconds),
-        )
-        .await
-        .map(|()| StatusCode::NO_CONTENT)
-        .map_err(ApiError::from_inventory)
-}
-
 #[utoipa::path(post, path = "/api/v1/instances", operation_id = "ensureModelInstance", tag = "models",
     request_body(content = EnsureModelInstanceRequest, content_type = "application/json"),
     responses(
@@ -1235,13 +1132,6 @@ async fn watch_inference_events(
             }),
         )
     });
-    let policy_events =
-        futures_util::StreamExt::map(controller.watch_residency_policy(), |event| {
-            InferenceResourceInvalidation {
-                topic: InferenceResourceTopic::ResidencyPolicy,
-                revision: event.revision,
-            }
-        });
     let direct_events = futures_util::stream::unfold(
         state.resource_changes.subscribe(),
         |mut receiver| async move {
@@ -1255,10 +1145,7 @@ async fn watch_inference_events(
         },
     );
     let events = futures_util::stream::select(
-        futures_util::stream::select(
-            futures_util::stream::select(instance_events, download_events),
-            policy_events,
-        ),
+        futures_util::stream::select(instance_events, download_events),
         direct_events,
     );
     let events = futures_util::StreamExt::filter(events, move |event| {
@@ -2220,8 +2107,6 @@ fn domain_error(error: domain::InferenceRequestError) -> ApiError {
         model_instance,
         watch_inference_events,
         stop_model_instance,
-        model_residency_policy,
-        set_model_residency_policy,
         props,
         apply_template,
         protocols::chat::chat_completions,
@@ -2231,8 +2116,6 @@ fn domain_error(error: domain::InferenceRequestError) -> ApiError {
     ),
     components(schemas(
         HealthResponse,
-        SetModelResidencyPolicyRequest,
-        ModelResidencyPolicyResponse,
         HardwareSnapshot,
         ModelsResponse,
         ModelIdentityRequest,
@@ -2467,6 +2350,7 @@ pub enum OpenApiExportError {
 
 pub fn openapi() -> Result<OpenApiDocument, OpenApiExportError> {
     let mut document = IcnOpenApi::openapi();
+    preserve_typed_request_client_contract(&mut document);
     attach_stream_contract::<ChatCompletionStream>(
         &mut document,
         "createChatCompletion",
@@ -2483,6 +2367,43 @@ pub fn openapi() -> Result<OpenApiDocument, OpenApiExportError> {
         "text/event-stream",
     )?;
     Ok(document)
+}
+
+fn preserve_typed_request_client_contract(document: &mut OpenApiDocument) {
+    const TYPED_REQUEST_SCHEMAS: [&str; 24] = [
+        "AllowedToolRequest",
+        "AllowedToolsChoiceRequest",
+        "AllowedToolsRequest",
+        "ChatCompletionRequest",
+        "ChatToolCallRequest",
+        "ChatToolRequest",
+        "FunctionDefinitionRequest",
+        "FunctionNameRequest",
+        "FunctionToolChoiceRequest",
+        "ImageUrlRequest",
+        "JsonSchemaRequest",
+        "Message",
+        "MessagesRequest",
+        "NamedFunctionCallRequest",
+        "ResponseCreateRequest",
+        "ResponseFunctionCall",
+        "ResponseFunctionCallOutput",
+        "ResponseFunctionTool",
+        "ResponseInputMessage",
+        "ResponseReasoning",
+        "ResponseReasoningInput",
+        "ResponseText",
+        "StreamOptions",
+        "Tool",
+    ];
+    let Some(components) = document.components.as_mut() else {
+        return;
+    };
+    for name in TYPED_REQUEST_SCHEMAS {
+        if let Some(RefOr::T(Schema::Object(schema))) = components.schemas.get_mut(name) {
+            schema.additional_properties = Some(Box::new(AdditionalProperties::FreeForm(false)));
+        }
+    }
 }
 
 fn attach_stream_contract<C: StreamContract>(
@@ -2921,36 +2842,6 @@ mod tests {
                 .unwrap();
         assert_eq!(body["topology_fingerprint"], "topology");
         assert_eq!(body["memory_domains"][0]["stable_capacity_bytes"], 768);
-    }
-
-    #[tokio::test]
-    async fn residency_policy_endpoint_accepts_positive_seconds_and_rejects_zero() {
-        let state = AppState::new(FakeBackend::new("test-model", ""));
-        let accepted = app(state.clone())
-            .oneshot(
-                Request::put("/api/v1/residency-policy")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({ "generation": 1, "idleTimeoutSeconds": 600 }).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
-
-        let rejected = app(state)
-            .oneshot(
-                Request::put("/api/v1/residency-policy")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({ "generation": 2, "idleTimeoutSeconds": 0 }).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -4202,27 +4093,6 @@ mod tests {
     }
 
     impl ModelInstanceController for StubModelInstanceController {
-        fn residency_policy(&self) -> Result<ModelResidencyPolicyResponse, InventoryError> {
-            Ok(ModelResidencyPolicyResponse {
-                generation: 0,
-                idle_timeout_seconds: 600,
-            })
-        }
-
-        fn watch_residency_policy(&self) -> BoxStream<'static, ModelResidencyPolicyInvalidation> {
-            Box::pin(futures_util::stream::once(async {
-                ModelResidencyPolicyInvalidation { revision: 0 }
-            }))
-        }
-
-        fn set_residency_policy(
-            &self,
-            _generation: u64,
-            _idle_timeout: std::time::Duration,
-        ) -> BoxFuture<'_, Result<(), InventoryError>> {
-            Box::pin(async { Ok(()) })
-        }
-
         fn preview_load(
             &self,
             _model_id: String,

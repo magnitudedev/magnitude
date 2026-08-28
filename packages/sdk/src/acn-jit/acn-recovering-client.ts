@@ -1,7 +1,5 @@
 import * as HttpClient from "@effect/platform/HttpClient"
-import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import {
-  ClientIdSchema,
   AcnRpc,
   AcnBoundary,
   AcnReady,
@@ -9,24 +7,18 @@ import {
   type AcnInstance,
   type AcnIdentity,
   type AcnTarget,
-  type ClientId,
-  type ClientLeaseMutationResult,
 } from "@magnitudedev/acn-protocol"
-import { RpcClient, RpcClientError, RpcSerialization } from "@effect/rpc"
+import { RpcClient, RpcClientError } from "@effect/rpc"
 import {
   Cause,
   Context,
   Data,
   Deferred,
-  Duration,
   Effect,
-  Either,
   Exit,
-  Fiber,
   Layer,
   Option,
   Ref,
-  Schedule,
   Scope,
   Stream,
   SubscriptionRef,
@@ -44,7 +36,6 @@ import { makeAcnLifecycle, type AcnLifecycle, type AcnLifecycleState } from "./l
 
 type ReadyInstance = AcnInstance<AcnReady>
 
-const makeAcnRpcClient = () => AcnRpc.makeRpcClient(AcnBoundary)
 const recoveryPolicy = (tag: string) => {
   const operation = AcnRpc.operation(AcnBoundary, tag)
   if (operation === undefined) throw new TypeError(`Unknown ACN operation ${tag}`)
@@ -53,89 +44,17 @@ const recoveryPolicy = (tag: string) => {
   return policy.value
 }
 
-const CLIENT_LEASE_RENEWAL_INTERVAL = Duration.seconds(15)
-const CLIENT_LEASE_ESTABLISH_TIMEOUT = Duration.seconds(5)
-const CLIENT_LEASE_ESTABLISH_RETRY_DELAY = Duration.millis(250)
-const CLIENT_LEASE_RELEASE_TIMEOUT = Duration.seconds(2)
-
-type ReleaseClientLeaseThrough = (client: ClientLeaseRpcClient) => Effect.Effect<
-  ClientLeaseMutationResult,
-  RpcClientError.RpcClientError | Cause.TimeoutException
->
-/** The transport-internal RPC client; lease and close observation run through it. */
-type AcnClient = Effect.Effect.Success<ReturnType<typeof makeAcnRpcClient>>
-type ClientLeaseRpcClient = Pick<AcnClient, "RenewClientLease" | "ReleaseClientLease">
-
-export interface AcnClientLeaseOwner {
-  readonly clientId: ClientId
-  readonly establishThrough: (
-    client: ClientLeaseRpcClient,
-  ) => Effect.Effect<void, RpcClientError.RpcClientError>
-  readonly stop: Effect.Effect<void>
-  readonly releaseThrough: ReleaseClientLeaseThrough
-}
-
-export const makeAcnClientLeaseOwner = (
-  clientId: ClientId,
-): Effect.Effect<AcnClientLeaseOwner, never, Scope.Scope> =>
-  Effect.gen(function* () {
-    const released = yield* Ref.make(Option.none<ClientLeaseMutationResult>())
-    const releaseLock = yield* Effect.makeSemaphore(1)
-    const started = yield* Deferred.make<void>()
-    const currentClient = yield* Ref.make(Option.none<ClientLeaseRpcClient>())
-    const renew = Ref.get(currentClient).pipe(Effect.flatMap(Option.match({
-      onNone: () => Effect.void,
-      onSome: (client) => client.RenewClientLease({ clientId }).pipe(
-      Effect.tapError((error) => Effect.logWarning("Failed to renew ACN client lease").pipe(
-        Effect.annotateLogs({ clientId, error: String(error) }),
-      )),
-      Effect.ignore,
-      ),
-    })))
-    const heartbeat = yield* Deferred.await(started).pipe(
-      Effect.zipRight(Effect.sleep(CLIENT_LEASE_RENEWAL_INTERVAL)),
-      Effect.zipRight(renew.pipe(Effect.repeat(Schedule.spaced(CLIENT_LEASE_RENEWAL_INTERVAL)))),
-      Effect.forkScoped,
-    )
-    const establishThrough: AcnClientLeaseOwner["establishThrough"] = (client) =>
-      client.RenewClientLease({ clientId }).pipe(
-        Effect.tap(() => Ref.set(currentClient, Option.some(client))),
-        Effect.tap(() => Deferred.succeed(started, undefined)),
-        Effect.asVoid,
-      )
-    const stop = Fiber.interrupt(heartbeat)
-    const releaseThrough: ReleaseClientLeaseThrough = (releaseClient) =>
-      releaseLock.withPermits(1)(Ref.get(released).pipe(
-        Effect.flatMap(Option.match({
-          onSome: Effect.succeed,
-          onNone: () => stop.pipe(
-            Effect.zipRight(releaseClient.ReleaseClientLease({ clientId }).pipe(
-              Effect.timeout(CLIENT_LEASE_RELEASE_TIMEOUT),
-            )),
-            Effect.tap((result) => Ref.set(released, Option.some(result))),
-          ),
-        })),
-      ))
-    yield* Effect.addFinalizer(() => stop)
-    return { clientId, establishThrough, stop, releaseThrough }
-  })
-
 export interface AcnStartup {
   readonly state: AcnLifecycle
   readonly prepare: Effect.Effect<AcnLifecycleState>
   readonly retry: Effect.Effect<void, AcnEnsuranceError>
 }
 
-export interface AcnClientCloseReport {
-  readonly connectedClientCount: number
-}
-export type AcnClientCloseResult = Option.Option<AcnClientCloseReport>
-
 export interface AcnJitRuntime {
   readonly identity: Effect.Effect<AcnIdentity>
   readonly identityChanges: Stream.Stream<AcnIdentity>
   readonly protocolLayer: Layer.Layer<RpcClient.Protocol, never, HttpClient.HttpClient>
-  readonly close: Effect.Effect<AcnClientCloseResult>
+  readonly close: Effect.Effect<void>
   readonly startup: AcnStartup
 }
 
@@ -153,12 +72,6 @@ const sameReadyOccurrence = (left: ReadyInstance, right: ReadyInstance): boolean
   left.pid === right.pid &&
   left.processStartIdentity === right.processStartIdentity
 
-const resultOption = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<Option.Option<A>, never, R> =>
-  effect.pipe(
-    Effect.exit,
-    Effect.map((exit) => Exit.isSuccess(exit) ? Option.some(exit.value) : Option.none()),
-  )
-
 const { RpcClientError: TransportError } = RpcClientError
 const unavailableError = (cause: SelectionError): RpcClientError.RpcClientError =>
   new TransportError({
@@ -172,10 +85,9 @@ const unavailableError = (cause: SelectionError): RpcClientError.RpcClientError 
 export const makeAcnJitRuntime = (): Effect.Effect<
   AcnJitRuntime,
   never,
-  AcnInstanceManager | HttpClient.HttpClient | Scope.Scope
+  AcnInstanceManager | Scope.Scope
 > => Effect.gen(function* () {
   const manager = yield* AcnInstanceManager
-  const httpClient = yield* HttpClient.HttpClient
   const selectionScope = yield* Scope.make()
   yield* Effect.addFinalizer(() => Scope.close(selectionScope, Exit.void))
   const lifecycle = yield* makeAcnLifecycle()
@@ -189,27 +101,6 @@ export const makeAcnJitRuntime = (): Effect.Effect<
   )
   const open = yield* Ref.make(true)
   yield* Effect.addFinalizer(() => Ref.set(open, false))
-  const clientId = ClientIdSchema.make(globalThis.crypto.randomUUID())
-  const owner = yield* makeAcnClientLeaseOwner(clientId)
-
-  const exactClient = (instance: ReadyInstance) => Layer.buildWithScope(
-    RpcClient.layerProtocolHttp({
-      url: `${instance.url}/rpc`,
-      transformClient: HttpClient.mapRequest(
-        HttpClientRequest.setHeader("x-magnitude-acn-id", instance.id),
-      ),
-    }).pipe(
-      Layer.provide(RpcSerialization.layerNdjson),
-      Layer.provide(Layer.succeed(HttpClient.HttpClient, httpClient)),
-    ),
-    selectionScope,
-  ).pipe(
-    Effect.flatMap((context) => makeAcnRpcClient().pipe(
-      Effect.provide(context),
-      Effect.provideService(Scope.Scope, selectionScope),
-    )),
-  )
-
   const finishFailedSelection = (
     deferred: Deferred.Deferred<ReadyInstance, SelectionError>,
     cause: Cause.Cause<AcnEnsuranceError>,
@@ -229,21 +120,15 @@ export const makeAcnJitRuntime = (): Effect.Effect<
   const finishReadySelection = (
     deferred: Deferred.Deferred<ReadyInstance, SelectionError>,
     ready: ReadyInstance,
-    client: ClientLeaseRpcClient,
-  ): Effect.Effect<boolean> => admission.withPermits(1)(
-    Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
+  ): Effect.Effect<void> => admission.withPermits(1)(
+    Effect.gen(function* () {
       const current = yield* Ref.get(activeSelection)
-      if (Option.isNone(current) || current.value !== deferred) return true
+      if (Option.isNone(current) || current.value !== deferred) return
       if (!(yield* Ref.get(open))) {
         yield* Ref.set(activeSelection, Option.none())
         yield* Deferred.fail(deferred, runtimeClosed())
-        return true
+        return
       }
-      const established = yield* restore(owner.establishThrough(client).pipe(
-        Effect.timeout(CLIENT_LEASE_ESTABLISH_TIMEOUT),
-        Effect.either,
-      ))
-      if (Either.isLeft(established)) return false
       const previous = yield* SubscriptionRef.get(association)
       const target = ready.revision > previous.target.revision
         ? { revision: ready.revision, identity: ready.identity }
@@ -252,8 +137,7 @@ export const makeAcnJitRuntime = (): Effect.Effect<
       yield* SubscriptionRef.set(association, { target, selected: Option.some(ready) })
       yield* lifecycle.ready
       yield* Deferred.succeed(deferred, ready)
-      return true
-    })),
+    }).pipe(Effect.uninterruptible),
   )
 
   const launchSelection = (
@@ -267,14 +151,7 @@ export const makeAcnJitRuntime = (): Effect.Effect<
     Effect.exit,
     Effect.flatMap((exit) => {
       if (Exit.isFailure(exit)) return finishFailedSelection(deferred, exit.cause)
-      return exactClient(exit.value).pipe(
-        Effect.flatMap((client) => finishReadySelection(deferred, exit.value, client)),
-        Effect.flatMap((finished) => finished
-          ? Effect.void
-          : Effect.sleep(CLIENT_LEASE_ESTABLISH_RETRY_DELAY).pipe(
-            Effect.zipRight(launchSelection(deferred, target)),
-          )),
-      )
+      return finishReadySelection(deferred, exit.value)
     }),
   ))
 
@@ -357,41 +234,11 @@ export const makeAcnJitRuntime = (): Effect.Effect<
     Effect.asVoid,
   )
 
-  const closeResult = yield* Ref.make(Option.none<AcnClientCloseResult>())
-  const closeLock = yield* Effect.makeSemaphore(1)
-  const close: AcnJitRuntime["close"] = closeLock.withPermits(1)(Ref.get(closeResult).pipe(
-    Effect.flatMap(Option.match({
-      onSome: Effect.succeed,
-      onNone: () => Effect.gen(function* () {
-        yield* admission.withPermits(1)(Ref.set(open, false))
-        yield* Scope.close(selectionScope, Exit.void)
-        yield* owner.stop
-        const selected = (yield* SubscriptionRef.get(association)).selected
-        if (Option.isNone(selected)) {
-          const result = Option.none<AcnClientCloseReport>()
-          yield* Ref.set(closeResult, Option.some(result))
-          return result
-        }
-        const result = yield* Effect.scoped(Effect.gen(function* () {
-          const closeClient = yield* makeAcnRpcClient()
-          const release = yield* resultOption(owner.releaseThrough(closeClient))
-          return Option.map(release, ({ connectedClientCount }) => ({ connectedClientCount }))
-        }).pipe(
-          Effect.provide(jitRecoveringProtocolLayer({
-            endpoint: Effect.succeed(selected.value),
-            recover: () => Effect.fail(runtimeClosed()),
-            rpcPath: "/rpc",
-            streamProtocol: acnSubscriptionProtocol,
-            isEndpointRetirementExit: isInterruptedExit,
-            classifyInfraError: unavailableError,
-            recoveryPolicy,
-          }).pipe(Layer.provide(Layer.succeed(HttpClient.HttpClient, httpClient))),
-        )))
-        yield* Ref.set(closeResult, Option.some(result))
-        return result
-      }),
-    })),
-  ))
+  const close = yield* Effect.cached(
+    admission.withPermits(1)(Ref.set(open, false)).pipe(
+      Effect.zipRight(Scope.close(selectionScope, Exit.void)),
+    ),
+  )
 
   return {
     identity: SubscriptionRef.get(association).pipe(Effect.map((current) => current.target.identity)),

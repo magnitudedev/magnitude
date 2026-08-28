@@ -35,7 +35,7 @@ policy, and inference execution. ICN operations revalidate native preconditions 
 
 ICN does not own Magnitude Slots, favorites, ranking preference, provider policy, presentation
 states, or client interaction flows. Native changes may originate from ACN commands, chat
-completions, residency policy, recovery, or another internal caller, so ACN observes them
+completions, fixed residency lifecycle, recovery, or another internal caller, so ACN observes them
 independently of command attribution.
 
 ## ACN responsibility

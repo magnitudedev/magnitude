@@ -617,8 +617,5 @@ app.on("will-quit", () => {
   )
 })
 
-// ── Client lease release on quit (spec §5.6) ─────────────────────────
-//
-// The renderer owns its ClientLease and attempts scoped release before unload.
-// The main process has no client lease of its own. Lease expiry remains the
-// correctness path if the renderer cannot finish asynchronous unload cleanup.
+// The renderer releases its local ACN client resources before unload. Renderer
+// teardown does not mutate ACN lifetime.

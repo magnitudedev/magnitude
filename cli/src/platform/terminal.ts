@@ -24,7 +24,6 @@ import type {
   Dialogs,
   TerminalCapabilities,
 } from "@magnitudedev/client-common"
-import type { AcnClientCloseResult } from "@magnitudedev/sdk"
 import { makeCliEffectLoggingLayer } from "./effect-logger"
 
 const noopStorage: Storage = {
@@ -79,7 +78,7 @@ export interface TerminalPlatformOptions {
 
 export interface TerminalPlatformRuntime {
   readonly platform: Platform
-  readonly close: Effect.Effect<AcnClientCloseResult>
+  readonly close: Effect.Effect<void>
 }
 
 const makeTerminalAcnInstanceManager = (

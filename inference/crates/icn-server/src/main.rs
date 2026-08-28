@@ -2,14 +2,14 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
 use icn_api::{
     AppState, FakeBackend, ModelInstanceController, ModelInstanceLease, ModelLoadingObserver,
-    ModelResidencyPolicyInvalidation, ModelResidencyPolicyResponse, ServerIdentity, app,
+    ServerIdentity, app,
 };
 use icn_contracts::bootstrap_protocol::{
     IcnInstallationBackend, IcnStartupBackend, IcnStartupProgressRecord,
@@ -243,7 +243,7 @@ struct ReadyResidency {
     instance: ModelInstance,
     configuration_key: String,
     resources: ResidentResources,
-    idle_generation: u64,
+    idle_deadline: Option<tokio::time::Instant>,
 }
 
 struct ResidentResources {
@@ -337,10 +337,6 @@ enum ResidencyCommand {
         instance_id: ModelInstanceId,
         token: u64,
     },
-    IdleExpired {
-        instance_id: ModelInstanceId,
-        generation: u64,
-    },
     ReleaseFinished {
         instance_id: ModelInstanceId,
         result: Result<(), ModelOperationFailure>,
@@ -353,7 +349,6 @@ enum ResidencyCommand {
         instance_id: ModelInstanceId,
         reason: ModelReleaseReason,
     },
-    PolicyChanged,
 }
 
 #[derive(Clone)]
@@ -3140,46 +3135,6 @@ struct NativeModelInstanceController {
     load_progress: Arc<LoadProgressEstimator>,
     loaded_configurations: Arc<Mutex<std::collections::BTreeSet<String>>>,
     residency: ResidencyClient,
-    residency_policy: Arc<RwLock<ModelResidencyPolicyState>>,
-    residency_policy_revision: Arc<AtomicU64>,
-    residency_policy_changes: tokio::sync::broadcast::Sender<ModelResidencyPolicyInvalidation>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ModelResidencyPolicyState {
-    generation: u64,
-    idle_timeout: std::time::Duration,
-}
-
-fn next_model_residency_policy(
-    current: ModelResidencyPolicyState,
-    generation: u64,
-    idle_timeout: std::time::Duration,
-) -> Result<ModelResidencyPolicyState, InventoryError> {
-    if idle_timeout.is_zero() {
-        return Err(InventoryError::InvalidRequest(
-            "model residency idle timeout must be greater than zero".to_owned(),
-        ));
-    }
-    if generation < current.generation {
-        return Err(InventoryError::InvalidRequest(format!(
-            "model residency policy generation {generation} is older than {}",
-            current.generation,
-        )));
-    }
-    if generation == current.generation {
-        return if idle_timeout == current.idle_timeout {
-            Ok(current)
-        } else {
-            Err(InventoryError::InvalidRequest(format!(
-                "model residency policy generation {generation} conflicts with the established timeout",
-            )))
-        };
-    }
-    Ok(ModelResidencyPolicyState {
-        generation,
-        idle_timeout,
-    })
 }
 
 #[derive(Clone)]
@@ -3380,8 +3335,27 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
     }
 
     async fn run(mut self, mut receiver: tokio::sync::mpsc::UnboundedReceiver<ResidencyCommand>) {
-        while let Some(command) = receiver.recv().await {
+        loop {
+            let idle_deadline = match &self.state {
+                ResidencyState::Ready(ready) => ready.idle_deadline,
+                _ => None,
+            };
+            let command = match idle_deadline {
+                Some(deadline) => tokio::select! {
+                    biased;
+                    command = receiver.recv() => command,
+                    _ = tokio::time::sleep_until(deadline) => {
+                        self.idle_expired();
+                        continue;
+                    }
+                },
+                None => receiver.recv().await,
+            };
+            let Some(command) = command else {
+                break;
+            };
             self.handle(command);
+            self.idle_expired();
         }
         self.shutdown();
     }
@@ -3454,10 +3428,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             ResidencyCommand::LeaseReleased { instance_id, token } => {
                 self.lease_released(instance_id, token);
             }
-            ResidencyCommand::IdleExpired {
-                instance_id,
-                generation,
-            } => self.idle_expired(instance_id, generation),
             ResidencyCommand::ReleaseFinished {
                 instance_id,
                 result,
@@ -3470,7 +3440,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 instance_id,
                 reason,
             } => self.release_requested(instance_id, reason),
-            ResidencyCommand::PolicyChanged => self.schedule_idle_if_needed(),
         }
     }
 
@@ -3600,14 +3569,13 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 let _ = waiter.reply.send(Ok(ResidencyGrant::Lease(lease)));
             }
             ResidencyAcquisition::Warm => {
-                ready.idle_generation = ready.idle_generation.saturating_add(1);
                 let _ = waiter
                     .reply
                     .send(Ok(ResidencyGrant::Ready(ready.instance.clone())));
             }
         }
         self.state = ResidencyState::Ready(ready);
-        self.schedule_idle_if_needed();
+        self.refresh_idle_deadline();
     }
 
     fn make_lease(
@@ -3618,7 +3586,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         let token = self.next_lease_token;
         self.next_lease_token = self.next_lease_token.saturating_add(1);
         ready.resources.leases.insert(token);
-        ready.idle_generation = ready.idle_generation.saturating_add(1);
+        ready.idle_deadline = None;
         let commands = self.controller.client().commands.clone();
         let instance_id = ready.instance.id.clone();
         ModelInstanceLease::new(
@@ -3830,7 +3798,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                         backend: prepared.backend,
                         leases: std::collections::BTreeSet::new(),
                     },
-                    idle_generation: 0,
+                    idle_deadline: None,
                 };
                 for waiter in loading.waiters.drain(..) {
                     match waiter.purpose {
@@ -3852,7 +3820,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 self.admit_package_removal();
                 if !self.package_removal_active {
                     if self.queue.is_empty() {
-                        self.schedule_idle_if_needed();
+                        self.refresh_idle_deadline();
                     } else {
                         self.begin_ready_release(ModelReleaseReason::Replacement, Vec::new());
                     }
@@ -3922,10 +3890,11 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
     }
 
     fn lease_released(&mut self, instance_id: ModelInstanceId, token: u64) {
+        let mut refresh_idle_deadline = false;
         match &mut self.state {
             ResidencyState::Ready(ready) if ready.instance.id == instance_id => {
                 if ready.resources.leases.remove(&token) {
-                    self.schedule_idle_if_needed();
+                    refresh_idle_deadline = ready.resources.leases.is_empty();
                 }
             }
             ResidencyState::Releasing(ReleasingResidency {
@@ -3942,6 +3911,9 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 }
             }
             _ => {}
+        }
+        if refresh_idle_deadline {
+            self.refresh_idle_deadline();
         }
     }
 
@@ -4006,37 +3978,28 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         }
     }
 
-    fn idle_expired(&mut self, instance_id: ModelInstanceId, generation: u64) {
+    fn idle_expired(&mut self) {
+        let now = tokio::time::Instant::now();
         if matches!(
             &self.state,
             ResidencyState::Ready(ready)
-                if ready.instance.id == instance_id
-                    && ready.idle_generation == generation
-                    && ready.resources.leases.is_empty()
+                if ready.resources.leases.is_empty()
+                    && ready.idle_deadline.is_some_and(|deadline| deadline <= now)
         ) {
             self.begin_ready_release(ModelReleaseReason::IdleTimeout, Vec::new());
         }
     }
 
-    fn schedule_idle_if_needed(&mut self) {
+    fn refresh_idle_deadline(&mut self) {
+        let timeout = self.controller.idle_timeout();
         let ResidencyState::Ready(ready) = &mut self.state else {
             return;
         };
-        if !ready.resources.leases.is_empty() {
-            return;
-        }
-        ready.idle_generation = ready.idle_generation.saturating_add(1);
-        let generation = ready.idle_generation;
-        let instance_id = ready.instance.id.clone();
-        let timeout = self.controller.idle_timeout();
-        let commands = self.controller.client().commands.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(timeout).await;
-            let _ = commands.send(ResidencyCommand::IdleExpired {
-                instance_id,
-                generation,
-            });
-        });
+        ready.idle_deadline = ready
+            .resources
+            .leases
+            .is_empty()
+            .then(|| tokio::time::Instant::now() + timeout);
     }
 
     fn finish_stopped(&mut self, instance_id: ModelInstanceId) {
@@ -4131,7 +4094,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             ResidencyState::Ready(_) if !self.queue.is_empty() => {
                 self.begin_ready_release(ModelReleaseReason::Replacement, Vec::new());
             }
-            ResidencyState::Ready(_) => self.schedule_idle_if_needed(),
+            ResidencyState::Ready(_) => {}
             ResidencyState::Loading(_) | ResidencyState::Releasing(_) => {}
         }
     }
@@ -4284,7 +4247,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
 }
 
 impl NativeModelInstanceController {
-    const DISCONNECTED_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
     fn new(
         inventory: Arc<ManagedModelStore>,
@@ -4297,7 +4260,6 @@ impl NativeModelInstanceController {
         instance_id_namespace: String,
         catalog_models: Arc<CatalogModelResolver>,
     ) -> Self {
-        let (residency_policy_changes, _) = tokio::sync::broadcast::channel(16);
         let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
         let (changes, _) = tokio::sync::broadcast::channel(16);
         let residency = ResidencyClient { commands, changes };
@@ -4315,12 +4277,6 @@ impl NativeModelInstanceController {
             load_progress: Arc::new(LoadProgressEstimator::new(cache, native_build)),
             loaded_configurations: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             residency: residency.clone(),
-            residency_policy: Arc::new(RwLock::new(ModelResidencyPolicyState {
-                generation: 0,
-                idle_timeout: Self::DISCONNECTED_IDLE_TIMEOUT,
-            })),
-            residency_policy_revision: Arc::new(AtomicU64::new(0)),
-            residency_policy_changes,
         };
         residency_binding
             .set(residency)
@@ -5182,79 +5138,11 @@ impl ModelResidencyDriver for NativeModelInstanceController {
     }
 
     fn idle_timeout(&self) -> std::time::Duration {
-        self.residency_policy
-            .read()
-            .expect("model residency policy lock poisoned")
-            .idle_timeout
+        Self::IDLE_TIMEOUT
     }
 }
 
 impl ModelInstanceController for NativeModelInstanceController {
-    fn residency_policy(&self) -> Result<ModelResidencyPolicyResponse, InventoryError> {
-        let policy = *self.residency_policy.read().map_err(|_| {
-            InventoryError::Internal("model residency policy lock poisoned".to_owned())
-        })?;
-        Ok(ModelResidencyPolicyResponse {
-            generation: policy.generation,
-            idle_timeout_seconds: policy.idle_timeout.as_secs(),
-        })
-    }
-
-    fn watch_residency_policy(&self) -> BoxStream<'static, ModelResidencyPolicyInvalidation> {
-        let receiver = self.residency_policy_changes.subscribe();
-        let revision = Arc::clone(&self.residency_policy_revision);
-        let changes = futures_util::stream::unfold(receiver, |mut receiver| async move {
-            loop {
-                match receiver.recv().await {
-                    Ok(event) => return Some((event, receiver)),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-                }
-            }
-        });
-        Box::pin(
-            futures_util::stream::once(async move {
-                ModelResidencyPolicyInvalidation {
-                    revision: revision.load(Ordering::Acquire),
-                }
-            })
-            .chain(changes),
-        )
-    }
-
-    fn set_residency_policy(
-        &self,
-        generation: u64,
-        idle_timeout: std::time::Duration,
-    ) -> BoxFuture<'_, Result<(), InventoryError>> {
-        Box::pin(async move {
-            {
-                let current = *self.residency_policy.read().map_err(|_| {
-                    InventoryError::Internal("model residency policy lock poisoned".to_owned())
-                })?;
-                let next = next_model_residency_policy(current, generation, idle_timeout)?;
-                if next == current {
-                    return Ok(());
-                }
-                *self.residency_policy.write().map_err(|_| {
-                    InventoryError::Internal("model residency policy lock poisoned".to_owned())
-                })? = next;
-            }
-            let revision = self
-                .residency_policy_revision
-                .fetch_add(1, Ordering::AcqRel)
-                .saturating_add(1);
-            let _ = self
-                .residency_policy_changes
-                .send(ModelResidencyPolicyInvalidation { revision });
-            let _ = self
-                .residency
-                .commands
-                .send(ResidencyCommand::PolicyChanged);
-            Ok(())
-        })
-    }
-
     fn preview_load(
         &self,
         model_id: String,
@@ -6028,6 +5916,7 @@ mod tests {
         loads: tokio::sync::mpsc::UnboundedSender<(ModelInstanceId, String)>,
         auto_ready: bool,
         workers: Arc<Mutex<Vec<Arc<TestResidencyWorker>>>>,
+        idle_timeout: std::time::Duration,
     }
 
     #[derive(Default)]
@@ -6145,12 +6034,24 @@ mod tests {
         }
 
         fn idle_timeout(&self) -> std::time::Duration {
-            std::time::Duration::from_secs(600)
+            self.idle_timeout
         }
     }
 
     fn test_residency(
         auto_ready: bool,
+    ) -> (
+        ResidencyClient,
+        tokio::sync::mpsc::UnboundedReceiver<(ModelInstanceId, String)>,
+        Arc<Mutex<Vec<Arc<TestResidencyWorker>>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        test_residency_with_idle_timeout(auto_ready, std::time::Duration::from_secs(600))
+    }
+
+    fn test_residency_with_idle_timeout(
+        auto_ready: bool,
+        idle_timeout: std::time::Duration,
     ) -> (
         ResidencyClient,
         tokio::sync::mpsc::UnboundedReceiver<(ModelInstanceId, String)>,
@@ -6168,6 +6069,7 @@ mod tests {
             loads,
             auto_ready,
             workers: Arc::clone(&workers),
+            idle_timeout,
         };
         let actor = tokio::spawn(ModelResidency::new(driver).run(receiver));
         (client, load_events, workers, actor)
@@ -6486,6 +6388,135 @@ mod tests {
         actor.abort();
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn inference_lease_blocks_idle_release_and_final_release_starts_a_full_interval() {
+        let timeout = std::time::Duration::from_secs(60);
+        let (client, mut loads, workers, actor) = test_residency_with_idle_timeout(true, timeout);
+        let lease = match client
+            .acquire(
+                test_target("model-a"),
+                ResidencyAcquisition::Inference { progress: None },
+            )
+            .await
+            .expect("inference acquisition")
+        {
+            ResidencyGrant::Lease(lease) => lease,
+            ResidencyGrant::Ready(_) => panic!("inference acquisition returned warm result"),
+        };
+        let _ = loads.recv().await.expect("model load");
+
+        tokio::time::advance(timeout * 2).await;
+        assert!(matches!(
+            client
+                .snapshot()
+                .await
+                .instances
+                .last()
+                .map(|instance| &instance.lifecycle),
+            Some(ModelInstanceLifecycle::Ready { .. })
+        ));
+
+        drop(lease);
+        tokio::task::yield_now().await;
+        tokio::time::advance(timeout - std::time::Duration::from_secs(1)).await;
+        assert!(matches!(
+            client
+                .snapshot()
+                .await
+                .instances
+                .last()
+                .map(|instance| &instance.lifecycle),
+            Some(ModelInstanceLifecycle::Ready { .. })
+        ));
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            client
+                .snapshot()
+                .await
+                .instances
+                .last()
+                .map(|instance| &instance.lifecycle),
+            Some(ModelInstanceLifecycle::Stopped {
+                reason: ModelReleaseReason::IdleTimeout
+            })
+        ));
+        assert_eq!(
+            workers.lock().expect("test worker lock")[0]
+                .shutdown
+                .load(Ordering::Acquire),
+            1,
+        );
+        actor.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn equivalent_warm_demand_restarts_the_idle_interval() {
+        let timeout = std::time::Duration::from_secs(60);
+        let (client, mut loads, _, actor) = test_residency_with_idle_timeout(true, timeout);
+        let first = client
+            .acquire(test_target("model-a"), ResidencyAcquisition::Warm)
+            .await
+            .expect("warm acquisition");
+        assert!(matches!(first, ResidencyGrant::Ready(_)));
+        let _ = loads.recv().await.expect("model load");
+
+        tokio::time::advance(timeout - std::time::Duration::from_secs(1)).await;
+        let second = client
+            .acquire(test_target("model-a"), ResidencyAcquisition::Warm)
+            .await
+            .expect("equivalent warm acquisition");
+        assert!(matches!(second, ResidencyGrant::Ready(_)));
+        tokio::time::advance(timeout - std::time::Duration::from_secs(1)).await;
+        assert!(matches!(
+            client
+                .snapshot()
+                .await
+                .instances
+                .last()
+                .map(|instance| &instance.lifecycle),
+            Some(ModelInstanceLifecycle::Ready { .. })
+        ));
+        actor.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unrelated_package_removal_does_not_restart_the_idle_interval() {
+        let timeout = std::time::Duration::from_secs(60);
+        let (client, mut loads, _, actor) = test_residency_with_idle_timeout(true, timeout);
+        let ready = client
+            .acquire(test_target("model-a"), ResidencyAcquisition::Warm)
+            .await
+            .expect("warm acquisition");
+        assert!(matches!(ready, ResidencyGrant::Ready(_)));
+        let _ = loads.recv().await.expect("model load");
+
+        tokio::time::advance(timeout / 2).await;
+        let permit = client
+            .acquire_package_removal(ModelPackageId("unrelated-package".to_owned()))
+            .await
+            .expect("unrelated package removal admitted");
+        drop(permit);
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(timeout / 2).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            client
+                .snapshot()
+                .await
+                .instances
+                .last()
+                .map(|instance| &instance.lifecycle),
+            Some(ModelInstanceLifecycle::Stopped {
+                reason: ModelReleaseReason::IdleTimeout
+            })
+        ));
+        actor.abort();
+    }
+
     #[test]
     fn performance_evidence_preserves_the_exact_requested_context_and_bounds() {
         let evidence = performance_result(GenerationPerformanceAssessment {
@@ -6657,29 +6688,6 @@ mod tests {
             }
             error => panic!("unexpected stopped-instance result: {error:?}"),
         }
-    }
-
-    #[test]
-    fn residency_policy_generations_are_idempotent_and_monotonic() {
-        let current = ModelResidencyPolicyState {
-            generation: 4,
-            idle_timeout: std::time::Duration::from_secs(600),
-        };
-        assert_eq!(
-            next_model_residency_policy(current, 4, current.idle_timeout).unwrap(),
-            current,
-        );
-        assert!(
-            next_model_residency_policy(current, 4, std::time::Duration::from_secs(3600),).is_err()
-        );
-        assert!(next_model_residency_policy(current, 3, current.idle_timeout).is_err());
-        assert_eq!(
-            next_model_residency_policy(current, 5, std::time::Duration::from_secs(3600),).unwrap(),
-            ModelResidencyPolicyState {
-                generation: 5,
-                idle_timeout: std::time::Duration::from_secs(3600),
-            },
-        );
     }
 
     #[test]

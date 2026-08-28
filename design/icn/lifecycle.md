@@ -142,7 +142,7 @@ response metadata.
 Every operation in the normalized IR is emitted into the callable client automatically. There is
 no allowlist or hand-maintained facade coverage table. At minimum the ICN contract comprises health
 and identity, Hardware, Models, Packages, Downloads, Instances, assessment and load planning,
-Hugging Face discovery, template application, model properties, residency policy, resource-event
+Hugging Face discovery, template application, model properties, resource-event
 observation, mixed JSON/SSE Chat Completions and Responses, local Anthropic Messages, and
 Anthropic token counting. Generator tests
 prove that the manifest, descriptors, and callable client contain the same operation set.
@@ -501,7 +501,7 @@ The lifecycle conforms when:
 - `ModelInstancesSnapshot` owns lifecycle; ACN projects it into catalog-row and Slot residency
   without becoming the authority for the native resource;
 - loading one local model terminalizes the prior instance before the replacement becomes Ready;
-- a resident model remains loaded until its current idle-residency policy expires, explicit
+- a resident model remains loaded until its fixed one-hour zero-inference-lease deadline expires, explicit
   replacement, exact-instance Stop, memory-pressure eviction, inference-worker loss, or ICN
   process exit;
 - replacement, load, and Stop serialize through native mutation authority and cannot

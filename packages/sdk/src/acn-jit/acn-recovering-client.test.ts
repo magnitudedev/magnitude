@@ -77,11 +77,7 @@ const rpcClient = (
         pid: instance.pid,
         state: instance.lifecycle,
       }
-    : message.tag === "RenewClientLease"
-      ? { connectedClientCount: 1 }
-      : message.tag === "ReleaseClientLease"
-        ? { connectedClientCount: 0 }
-        : message.tag === "GetModelSlots"
+    : message.tag === "GetModelSlots"
           ? {
               revision: 0,
               state: {
@@ -111,7 +107,7 @@ const rpcClient = (
 }))
 
 describe("AcnJitRuntime", () => {
-  it("single-flights bootstrap and retry, then starts one lease", async () => {
+  it("single-flights bootstrap and retry", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const release = yield* Deferred.make<void>()
       let calls = 0
@@ -131,19 +127,14 @@ describe("AcnJitRuntime", () => {
       const retry = yield* runtime.startup.retry.pipe(Effect.fork)
       while (calls === 0) yield* Effect.sleep(Duration.millis(1))
       expect(calls).toBe(1)
-      expect(tags).not.toContain("RenewClientLease")
       yield* Deferred.succeed(release, undefined)
       const joined = yield* Fiber.join(retry).pipe(Effect.timeoutOption("1 second"))
       expect(Option.isSome(joined), `calls=${calls} tags=${tags.join(",")}`).toBe(true)
-      yield* Effect.gen(function* () {
-        while (!tags.includes("RenewClientLease")) yield* Effect.sleep(Duration.millis(1))
-      }).pipe(Effect.timeout(Duration.seconds(1)))
       expect(calls).toBe(1)
-      expect(tags.filter((tag) => tag === "RenewClientLease")).toHaveLength(1)
     })))
   })
 
-  it("scope finalization before readiness does not create a lease", async () => {
+  it("scope finalization interrupts selection before readiness", async () => {
     const tags: string[] = []
     await Effect.runPromise(Effect.scoped(makeAcnJitRuntime().pipe(
       Effect.provideService(AcnInstanceManager, AcnInstanceManager.of({
@@ -153,7 +144,7 @@ describe("AcnJitRuntime", () => {
       Effect.provideService(HttpClient.HttpClient, rpcClient(tags)),
       Effect.asVoid,
     )))
-    expect(tags).not.toContain("RenewClientLease")
+    expect(tags).toHaveLength(0)
   })
 
   it("closes an admitted runtime from its owning scope finalizer", async () => {
@@ -174,12 +165,10 @@ describe("AcnJitRuntime", () => {
       yield* runtime.startup.retry
     })))
 
-    expect(tags.filter((tag) => tag === "RenewClientLease")).toHaveLength(1)
     expect(tags.filter((tag) => tag === "GetModelSlots")).toHaveLength(0)
-    expect(tags.filter((tag) => tag === "ReleaseClientLease")).toHaveLength(1)
   })
 
-  it("close interrupts initial selection without starting a lease", async () => {
+  it("close interrupts initial selection", async () => {
     const tags: string[] = []
     let entered = 0
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
@@ -194,41 +183,8 @@ describe("AcnJitRuntime", () => {
         Effect.provideService(HttpClient.HttpClient, rpcClient(tags)),
       )
       while (entered === 0) yield* Effect.sleep(Duration.millis(1))
-      expect(Option.isNone(yield* runtime.close)).toBe(true)
-      expect(tags).not.toContain("RenewClientLease")
-    })))
-  })
-
-  it("serializes close with lease establishment and releases the admitted lease", async () => {
-    const tags: string[] = []
-    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const leaseEntered = yield* Deferred.make<void>()
-      const releaseRenewal = yield* Deferred.make<void>()
-      const base = rpcClient(tags)
-      const http = HttpClient.make((request) => {
-        const message = JSON.parse(bodyText(request).split("\n")[0]!) as { tag: string }
-        return message.tag === "RenewClientLease"
-          ? Deferred.succeed(leaseEntered, undefined).pipe(
-              Effect.zipRight(Deferred.await(releaseRenewal)),
-              Effect.zipRight(base.execute(request)),
-            )
-          : base.execute(request)
-      })
-      const runtime = yield* makeAcnJitRuntime().pipe(
-        Effect.provideService(AcnInstanceManager, AcnInstanceManager.of({
-          ensure: () => Stream.succeed({ _tag: "Ready" as const, instance: ready }),
-          stop: Effect.void,
-        })),
-        Effect.provideService(HttpClient.HttpClient, http),
-      )
-      yield* Deferred.await(leaseEntered)
-      const closing = yield* runtime.close.pipe(Effect.fork)
-      yield* Effect.yieldNow()
-      expect(Option.isNone(yield* Fiber.poll(closing))).toBe(true)
-      yield* Deferred.succeed(releaseRenewal, undefined)
-      yield* Fiber.join(closing)
-      expect(tags.filter((tag) => tag === "RenewClientLease")).toHaveLength(1)
-      expect(tags.filter((tag) => tag === "ReleaseClientLease")).toHaveLength(1)
+      yield* runtime.close
+      expect(tags).toHaveLength(0)
     })))
   })
 
@@ -317,56 +273,11 @@ describe("AcnJitRuntime", () => {
       expect(health.id).toBe(successor.id)
       expect(ensures).toBe(2)
       expect(tags.filter((tag) => tag === "Health")).toHaveLength(2)
-      expect(tags.filter((tag) => tag === "RenewClientLease")).toHaveLength(2)
       expect((yield* runtime.startup.state.get)._tag).toBe("Ready")
     })))
   })
 
-  it("treats lease loss after readiness as convergence instead of startup failure", async () => {
-    const successor: ReadyInstance = {
-      ...ready,
-      id: AcnInstanceIdSchema.make("lease-successor-acn"),
-      url: "http://lease-successor-acn",
-      pid: 789,
-      processStartIdentity: ProcessStartIdentitySchema.make("lease-successor-process"),
-    }
-    let ensures = 0
-    let refusedFirstLease = false
-    const manager = AcnInstanceManager.of({
-      ensure: () => Stream.succeed({
-        _tag: "Ready" as const,
-        instance: ensures++ === 0 ? ready : successor,
-      }),
-      stop: Effect.void,
-    })
-    const tags: string[] = []
-    const healthy = rpcClient(tags, [ready, successor])
-    const http = HttpClient.make((request) => {
-      const message = JSON.parse(bodyText(request).split("\n")[0]!) as { tag: string }
-      if (message.tag === "RenewClientLease" && request.url.startsWith(ready.url) && !refusedFirstLease) {
-        refusedFirstLease = true
-        return Effect.fail(new HttpClientError.RequestError({
-          request,
-          reason: "Transport",
-          cause: new Error("owner retired before lease establishment"),
-        }))
-      }
-      return healthy.execute(request)
-    })
-
-    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const runtime = yield* makeAcnJitRuntime().pipe(
-        Effect.provideService(AcnInstanceManager, manager),
-        Effect.provideService(HttpClient.HttpClient, http),
-      )
-      yield* runtime.startup.retry.pipe(Effect.timeout(Duration.seconds(2)))
-      expect((yield* runtime.startup.state.get)._tag).toBe("Ready")
-      expect(ensures).toBe(2)
-      expect(refusedFirstLease).toBe(true)
-    })))
-  })
-
-  it("releases one lease without a slot observation and never ensures again", async () => {
+  it("closes idempotently without an RPC and never ensures again", async () => {
     const tags: string[] = []
     let ensures = 0
     const manager = AcnInstanceManager.of({
@@ -387,9 +298,9 @@ describe("AcnJitRuntime", () => {
         )),
       )
       yield* runtime.startup.retry
-      expect(Option.isSome(yield* runtime.close)).toBe(true)
-      expect(Option.isSome(yield* runtime.close)).toBe(true)
-      expect(tags.filter((tag) => tag === "ReleaseClientLease")).toHaveLength(1)
+      yield* runtime.close
+      yield* runtime.close
+      expect(tags).toHaveLength(0)
       expect(Exit.isFailure(yield* Effect.exit(runtime.startup.retry))).toBe(true)
       expect(ensures).toBe(1)
     })))

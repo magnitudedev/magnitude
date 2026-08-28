@@ -701,31 +701,6 @@ export const getModelPropertiesOperation = {
   pathParameters: S.Struct({ model_id: S.String }),
 } as const
 
-export const getModelResidencyPolicyOperation = {
-  operationId: "getModelResidencyPolicy",
-  transport: "http",
-  method: "GET",
-  path: "/api/v1/residency-policy",
-  group: "models",
-  successes: [
-    {
-      status: 200,
-      schema: S.suspend(
-        (): S.Schema<Schemas.ModelResidencyPolicyResponse, Schemas.ModelResidencyPolicyResponseEncoded> =>
-          Schemas.ModelResidencyPolicyResponse,
-      ),
-      mediaType: "application/json",
-    },
-  ],
-  errors: [
-    {
-      status: 500,
-      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-      mediaType: "application/json",
-    },
-  ],
-} as const
-
 export const healthOperation = {
   operationId: "health",
   transport: "http",
@@ -1043,33 +1018,6 @@ export const searchHuggingFaceModelsOperation = {
   payload: S.suspend(
     (): S.Schema<Schemas.HuggingFaceModelSearchRequest, Schemas.HuggingFaceModelSearchRequestEncoded> =>
       Schemas.HuggingFaceModelSearchRequest,
-  ),
-  payloadMediaType: "application/json",
-  payloadRequired: true,
-} as const
-
-export const setModelResidencyPolicyOperation = {
-  operationId: "setModelResidencyPolicy",
-  transport: "http",
-  method: "PUT",
-  path: "/api/v1/residency-policy",
-  group: "models",
-  successes: [{ status: 204, schema: S.Void }],
-  errors: [
-    {
-      status: 400,
-      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-      mediaType: "application/json",
-    },
-    {
-      status: 500,
-      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-      mediaType: "application/json",
-    },
-  ],
-  payload: S.suspend(
-    (): S.Schema<Schemas.SetModelResidencyPolicyRequest, Schemas.SetModelResidencyPolicyRequestEncoded> =>
-      Schemas.SetModelResidencyPolicyRequest,
   ),
   payloadMediaType: "application/json",
   payloadRequired: true,

@@ -5,8 +5,7 @@
  * creates the AgentClient (the connection's Effect Query client) over the daemon transport, and mounts App
  * inside PlatformProvider + RegistryProvider + AgentClientProvider.
  *
- * The scoped client lease is the first RPC consumer and establishes ACN
- * selection as the interactive client lifetime starts.
+ * The scoped runtime selects the exact ACN before application queries are exposed.
  *
  * On window close, interrupts the renderer stream and notifies main (§5.6).
  */

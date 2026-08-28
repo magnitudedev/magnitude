@@ -46,7 +46,7 @@ bounded domain remain in that domain.
 
 ## Readiness and admission
 
-Health, lifecycle observation, application RPC dispatch, client presence, and shutdown read
+Health, lifecycle observation, application RPC dispatch, and shutdown read
 one lifecycle value. The control server exists throughout startup. Application RPC rejects until
 the complete application and private ICN exist.
 
@@ -60,7 +60,7 @@ ceiling and separately bounds loss of observable health. ACN independently owns 
 absolute application-startup ceiling that never restarts. Expiry commits
 `Stopping(startup-failed)`.
 
-## Per-user service and client presence
+## Per-user service
 
 ACN is installed as a per-user login service and, after owner admission, binds the stable public
 loopback endpoint `127.0.0.1:10100`. Its cross-version health, shutdown, and RPC coordination
@@ -84,10 +84,9 @@ old installed service definition from fighting a newer admitted release.
 
 RPCs, subscriptions, session work, inference, status/file watches, display streams, ICN
 observation, telemetry, and introspection do not participate in process idleness. They remain
-bounded by their own caller, operation, session, model, and application scopes. Client leases still
-report interactive application presence and may inform application policy, but they do not
-determine process lifetime. Inference request leases independently protect a resident Instance
-while a harness request is active.
+bounded by their own caller, operation, session, model, and application scopes. There is no
+client-presence lifecycle or policy. Inference request leases independently protect a resident
+Instance while a harness request is active.
 
 ## Shutdown
 

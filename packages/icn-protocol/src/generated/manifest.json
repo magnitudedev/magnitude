@@ -1,7 +1,7 @@
 {
   "generator": "@magnitudedev/openapi-effect",
   "generatorVersion": "0.0.1",
-  "protocolHash": "dea9525d669659a132e6500ded00e95fa75a28a6c792c6c64999b1517ef2957e",
+  "protocolHash": "f3f3a7142f211727ef10b5ccf5a65cafcf842308c3d775f06252c2ef062eaedc",
   "configHash": "35eaa09ad05c284228c67845b4e6f4db4aa545ca4a74ee0d812d04c6af53ee75",
   "files": [
     "api.ts",
@@ -28,7 +28,6 @@
     "getModelInstance",
     "getModelInstances",
     "getModelProperties",
-    "getModelResidencyPolicy",
     "health",
     "installModel",
     "listInstalledModels",
@@ -39,7 +38,6 @@
     "removeInstalledModel",
     "resolveHuggingFaceRepository",
     "searchHuggingFaceModels",
-    "setModelResidencyPolicy",
     "stopModelInstance",
     "uninstallModel",
     "watchInferenceEvents"

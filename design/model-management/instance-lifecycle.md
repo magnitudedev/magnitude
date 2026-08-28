@@ -54,6 +54,12 @@ Caller cancellation after admission detaches that waiter. It does not cancel sha
 stop the admitted Instance. Explicit exact-instance stop, idle policy, memory pressure, worker
 failure, replacement, or ICN teardown control physical lifetime.
 
+The idle policy is fixed and client-independent. One actor-owned monotonic deadline exists only
+while the Instance is Ready with zero inference leases. Readiness without leases, final lease
+release, and equivalent explicit warm demand each start a full one-hour interval. Acquiring any
+lease clears the deadline. Expiration is serialized with inference admission and rechecks Ready
+state and zero leases before beginning graceful `IdleTimeout` release.
+
 An explicit Stop during Loading transitions the exact occurrence through Stopping to
 `Stopped(UserStop)`. Every inference waiter joined to that occurrence receives the same canonical
 non-retryable `model_instance_stopped` result. A Ready occurrence has active inference leases;
@@ -108,3 +114,4 @@ operations.
   replacement.
 - Ready-instance explicit Stop interrupts active semantic output as `ModelInstanceStopped`.
 - Graceful replacement and idle release drain active inference leases.
+- Client connection or presence state cannot change model residency.

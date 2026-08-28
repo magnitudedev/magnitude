@@ -245,7 +245,7 @@ footer, so short harness content does not create a large empty visual gap.
 
 An external destination produces `HarnessHandoff` only after selected startup and skill work,
 adapter reconciliation, and durable onboarding completion succeed. The CLI runtime observes this
-state outside React, gracefully closes the client lease, unwinds the root and renderer scope, and
+state outside React, closes client-owned ACN resources, unwinds the root and renderer scope, and
 only then starts the returned executable with inherited terminal I/O and the captured model active.
 
 ## Conformance

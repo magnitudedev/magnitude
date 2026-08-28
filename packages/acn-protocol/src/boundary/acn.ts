@@ -1,7 +1,6 @@
 import { Group } from "@magnitudedev/effect-query"
 import { Agent } from "./agent"
 import { Changes } from "./changes"
-import { ClientLease } from "./client-lease"
 import { Configuration } from "./configuration"
 import { Connection } from "./connection"
 import { Display } from "./display"
@@ -30,6 +29,5 @@ export const AcnBoundary = Group.make({
   Shell,
   Display,
   Onboarding,
-  ClientLease,
   Changes,
 })

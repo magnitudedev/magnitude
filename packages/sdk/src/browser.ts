@@ -17,8 +17,6 @@ export {
   makeAcnJitRuntime,
 } from "./acn-jit/acn-recovering-client"
 export type {
-  AcnClientCloseReport,
-  AcnClientCloseResult,
   AcnJitRuntime,
 } from "./acn-jit/acn-recovering-client"
 export { isRpcOutcomeUnknown } from "./mutation-outcome"

@@ -113,7 +113,7 @@ Monitor loss for one second also terminates the worker. After a pressure termina
 stays closed until availability exceeds `B + 512 MiB` for five seconds. There is no automatic
 reload.
 
-Separately, a resident generation is released normally after ten continuous minutes with no
+Separately, a resident generation is released normally after one continuous hour with no
 accepted inference lease. The monotonic interval begins when the generation becomes ready without
 a lease or when its final lease ends. Metadata and observation do not count as activity.
 
@@ -121,8 +121,9 @@ Inference admission and idle release share the backend mutation boundary. A requ
 a lease first runs to completion and starts a fresh full interval after the final lease. Idle
 release that closes admission first rechecks the exact generation, zero active leases, and the
 complete elapsed interval before publishing `IdleTimeout` releasing state and gracefully reaping
-the worker. A stale deadline cannot affect a replacement generation, and idle release does not
-enter pressure recovery.
+the worker. The residency actor owns one deadline and serializes it with admission; it does not
+spawn sleeper tasks or use timer generations. A stale deadline cannot affect a replacement
+generation, and idle release does not enter pressure recovery.
 
 ## Memory domains
 
