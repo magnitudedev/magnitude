@@ -34,5 +34,6 @@
     "target": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",
     "speculativeDraft": "0e8061d252dbac5a1b4abe506bf2b7613d438f87"
   },
-  "qwen3.8-27b": { "target": "27af057ecb382ddfea5d12837360a8980560e3ed" }
+  "qwen3.8-27b": { "target": "27af057ecb382ddfea5d12837360a8980560e3ed" },
+  "qwen3.8-flash-next": { "target": "83cadfda58d30be06c110518208d1bb918b33f10" }
 }

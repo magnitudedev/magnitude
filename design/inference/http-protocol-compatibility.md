@@ -47,16 +47,20 @@ text or function calls belongs to that same canonical assistant entry; a standal
 remains a reasoning-only assistant entry. Request hints such as `prompt_cache_key` may be accepted
 without changing canonical inference semantics.
 
+External compatibility request objects tolerate unknown members recursively. Local adapters
+discard those members; known fields retain their type and value validation, and tagged protocol
+objects retain strict discriminator values. Arbitrary map-valued protocol fields remain data and
+follow their field-specific handling. Unsupported semantics represented by known fields still fail
+before generation rather than being silently reinterpreted.
+
 Responses tolerance follows one partition rather than per-field patches. Function tool
-declarations are the executable semantic core and are parsed strictly; a function-typed
-declaration that fails strict parsing is a request error, never a silent demotion. Every other
-tool declaration — namespace, web-search, and any future hosted type — is opaque by policy:
-retained verbatim for protocol projection, never locally executable, and requiring no adapter
-change when new hosted types appear. Replayed items obey a closure invariant: every item the
-Responses projection can emit parses back as input, because clients resend emitted output
-(with its item IDs, statuses, and annotations) verbatim as later history. Request hints such as
-`include` and client metadata remain individually enumerated — a hint is accepted and ignored
-only as a reviewed decision, because unknown top-level fields are where new semantics arrive.
+declarations are the executable semantic core: their required fields and discriminator are parsed
+strictly while additional members are ignored. Every other tool declaration — namespace,
+web-search, and any future hosted type — is opaque by policy: retained verbatim for protocol
+projection, never locally executable, and requiring no adapter change when new hosted types appear.
+Replayed items obey a closure invariant: every item the Responses projection can emit parses back
+as input, because clients resend emitted output (with its item IDs, statuses, and annotations)
+verbatim as later history.
 
 The Chat Completions adapter accepts standard client metadata that does not alter local inference.
 In particular, `store: false` and a function definition's optional `strict` flag are valid input.
@@ -65,6 +69,9 @@ conversation persistence; it is not rejected as an unknown field.
 Historical Chat Completions tool-result messages may include the function name in addition to the
 required tool-call ID. Anthropic Messages accepts cache-control annotations and output-configuration
 hints used by current Claude Code clients without assigning them unsupported local semantics.
+
+Reasoning-history controls are independent from current-turn reasoning effort. Chat Completions
+passes explicitly supplied history controls through to the effective template unchanged.
 
 The local Anthropic adapter also accepts text-only `system` role messages. The current Anthropic
 protocol permits system-role messages mid-conversation as an operator channel that leaves the

@@ -25,7 +25,6 @@ use super::super::{
 };
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ResponseCreateRequest {
     pub model: String,
     pub input: ResponseInput,
@@ -813,7 +812,7 @@ pub enum ResponseInput {
 // parse here, because clients replay our output verbatim as later input
 // (pinned by `responses_output_items_replay_as_input`).
 #[derive(Debug, Deserialize)]
-#[serde(untagged, deny_unknown_fields)]
+#[serde(untagged)]
 pub enum ResponseInputItem {
     Message(ResponseInputMessage),
     Reasoning(ResponseReasoningInput),
@@ -822,7 +821,6 @@ pub enum ResponseInputItem {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ResponseInputMessage {
     #[serde(default)]
     pub r#type: Option<ResponseMessageType>,
@@ -837,7 +835,6 @@ pub struct ResponseInputMessage {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ResponseReasoningInput {
     pub r#type: ResponseReasoningInputType,
     #[serde(default)]
@@ -853,14 +850,13 @@ pub struct ResponseReasoningInput {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseReasoningInputContent {
     ReasoningText { text: String },
     SummaryText { text: String },
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ResponseFunctionCall {
     pub r#type: ResponseFunctionCallType,
     #[serde(default)]
@@ -873,7 +869,6 @@ pub struct ResponseFunctionCall {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ResponseFunctionCallOutput {
     pub r#type: ResponseFunctionCallOutputType,
     #[serde(default)]
@@ -955,7 +950,7 @@ pub enum FunctionCallOutput {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum FunctionCallOutputPart {
     InputText { text: String },
     InputImage { image_url: String },
@@ -978,7 +973,7 @@ pub enum ResponseMessageContent {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseContentPart {
     InputText {
         text: String,
@@ -1006,7 +1001,6 @@ pub enum ResponseTool {
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ResponseFunctionTool {
     pub r#type: ResponseFunctionType,
     pub name: String,
@@ -1061,26 +1055,24 @@ pub enum ResponseToolChoiceMode {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseFunctionChoice {
     Function { name: String },
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ResponseReasoning {
     pub effort: Option<ReasoningEffortRequest>,
     pub summary: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ResponseText {
     pub format: ResponseTextFormat,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseTextFormat {
     Text,
     JsonObject,

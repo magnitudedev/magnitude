@@ -3082,6 +3082,154 @@ mod tests {
     }
 
     #[test]
+    fn compatibility_requests_ignore_unknown_object_fields_recursively() {
+        let chat = serde_json::from_value::<ChatCompletionRequest>(json!({
+            "model": "test-model",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,AA==",
+                        "future_image_option": true
+                    },
+                    "future_content_option": true
+                }],
+                "future_message_option": true
+            }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {"type": "object"},
+                    "future_function_option": true
+                },
+                "future_tool_option": true
+            }],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "lookup", "future_choice_name_option": true},
+                "future_choice_option": true
+            },
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {"type": "object"},
+                    "future_schema_option": true
+                },
+                "future_format_option": true
+            },
+            "stream_options": {"include_usage": true, "future_stream_option": true},
+            "preserve_thinking": true
+        }));
+        assert!(chat.is_ok());
+
+        let responses =
+            serde_json::from_value::<protocols::responses::ResponseCreateRequest>(json!({
+                "model": "test-model",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "hello",
+                        "future_content_option": true
+                    }],
+                    "future_message_option": true
+                }],
+                "tools": [{
+                    "type": "function",
+                    "name": "lookup",
+                    "parameters": {"type": "object"},
+                    "future_tool_option": true
+                }],
+                "tool_choice": {
+                    "type": "function",
+                    "name": "lookup",
+                    "future_choice_option": true
+                },
+                "reasoning": {"effort": "high", "future_reasoning_option": true},
+                "text": {
+                    "format": {"type": "text", "future_format_option": true},
+                    "future_text_option": true
+                },
+                "future_request_option": true
+            }));
+        assert!(responses.is_ok());
+
+        let anthropic = serde_json::from_value::<protocols::anthropic::MessagesRequest>(json!({
+            "model": "test-model",
+            "system": [{
+                "type": "text",
+                "text": "system",
+                "future_system_option": true
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "AA==",
+                        "future_source_option": true
+                    },
+                    "future_content_option": true
+                }],
+                "future_message_option": true
+            }],
+            "max_tokens": 16,
+            "tools": [{
+                "name": "lookup",
+                "input_schema": {"type": "object"},
+                "future_tool_option": true
+            }],
+            "tool_choice": {"type": "auto", "future_choice_option": true},
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": 8,
+                "future_thinking_option": true
+            },
+            "future_request_option": true
+        }));
+        assert!(anthropic.is_ok());
+    }
+
+    #[test]
+    fn compatibility_requests_keep_known_shapes_strict() {
+        assert!(
+            serde_json::from_value::<ChatCompletionRequest>(json!({
+                "model": "test-model",
+                "messages": [{"role": "future_role", "content": "hello"}]
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<protocols::responses::ResponseContentPart>(json!({
+                "type": "future_content",
+                "text": "hello"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<protocols::anthropic::ContentBlock>(json!({
+                "type": "future_content",
+                "text": "hello"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ChatCompletionRequest>(json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream_options": {"include_usage": "yes"}
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn chat_accepts_disabled_store_but_rejects_persistence() {
         let disabled = request_from_json(json!({
             "model": "test-model",
@@ -4894,6 +5042,25 @@ mod tests {
         assert_eq!(
             request.generation().end_of_generation(),
             domain::EndOfGenerationPolicy::StopAtModelEnd
+        );
+    }
+
+    #[test]
+    fn history_preservation_does_not_conflict_with_reasoning_effort() {
+        let mut request = minimal_request();
+        request["reasoning_effort"] = json!("high");
+        request["chat_template_kwargs"] = json!({"preserve_thinking": false});
+
+        let (request, _) = validate_test_request(request_from_json(request)).unwrap();
+
+        assert_eq!(request.reasoning().effort().as_str(), "high");
+        assert_eq!(
+            request
+                .reasoning()
+                .controls()
+                .template_args
+                .get("preserve_thinking"),
+            Some(&json!(false))
         );
     }
 
