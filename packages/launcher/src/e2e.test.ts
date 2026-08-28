@@ -64,6 +64,7 @@ server.listen(0, "127.0.0.1", () => writeFileSync(portPath, String(server.addres
 const fakeCliSource = (version: string) => `#!/usr/bin/env node
 const { spawnSync } = require("node:child_process")
 if (process.argv[2] === "--version") {
+  if (process.env.TEST_REJECT_VERSION_PROBE === "1") process.exit(42)
   console.log(${JSON.stringify(version)})
   process.exit(0)
 }
@@ -272,6 +273,13 @@ describe("npm launcher end to end", () => {
     expect(report.managedBy).toBe("npm")
     expect(report.packageRoot).toContain("node_modules/@magnitudedev/cli")
     expect(report.launchProtocolVersion).toBe("1")
+  }, 30000)
+
+  it("launches a published cached CLI without probing its version again", async () => {
+    const run = runInstalledLauncher([], { TEST_REJECT_VERSION_PROBE: "1" })
+    expect(run.status, run.stderr).toBe(0)
+    const report = JSON.parse(await readFile(outputPath, "utf8"))
+    expect(report.version).toBe(V1)
   }, 30000)
 
   it("keeps the published launcher's native CLI responsive to terminal resizes", async () => {
