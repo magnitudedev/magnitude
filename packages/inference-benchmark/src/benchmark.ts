@@ -231,9 +231,19 @@ function comparisonDifferences(
   return [...new Set(differences)]
 }
 
+export function comparisonKindFor(
+  protocol: ComparisonResult["comparisonProtocol"],
+  differences: readonly string[],
+): ComparisonResult["comparisonKind"] {
+  return protocol === "speculative-decoding"
+    ? "controlled-speculative-decoding"
+    : differences.length === 0 ? "strict" : "product"
+}
+
 export const compare = (
   plan: TrialPlan,
   targets: readonly TargetConfiguration[],
+  comparisonProtocol: ComparisonResult["comparisonProtocol"],
 ): Effect.Effect<
   ComparisonResult,
   EvaluationError,
@@ -255,7 +265,8 @@ export const compare = (
     )
     const differences = comparisonDifferences(plan, results)
     return {
-      comparisonKind: differences.length === 0 ? "strict" : "product",
+      comparisonKind: comparisonKindFor(comparisonProtocol, differences),
+      comparisonProtocol,
       differences,
       plan,
       results,

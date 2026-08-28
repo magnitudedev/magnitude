@@ -43,6 +43,7 @@ export function renderBenchmarkMarkdown(result: BenchmarkResult): string {
     `# Inference benchmark: ${result.target.id}`,
     "",
     `Plan: \`${result.planDigest}\``,
+    ...(result.target.speculativeBackend !== undefined ? [`Speculative method: **${result.target.speculativeBackend}**`] : []),
     "",
     "| Trial | Pattern | Measured | Semantically valid | Non-valid | Actual input p50 (tokens) | Actual output p50 (tokens) | TTFT p50 (ms) | TTFT p95 (ms) | Native prefill p50 (tok/s) | Native decode p50 (tok/s) | Achieved output (tok/s) | Cache reuse | Completion p95 (ms) | Peak attributed footprint |",
     "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -84,6 +85,10 @@ export function renderComparisonMarkdown(comparison: ComparisonResult): string {
     `Model: \`${comparison.plan.model.id}\``,
     `Profile: \`${comparison.plan.profile}\``,
     `Comparison kind: **${comparison.comparisonKind}**`,
+    `Comparison protocol: **${comparison.comparisonProtocol}**`,
+    ...(comparison.comparisonProtocol === "speculative-decoding"
+      ? ["Methods: " + comparison.results.map(({ target }) => `\`${target.id}\`=${target.speculativeBackend ?? "unreported"}`).join(", ")]
+      : []),
     ...(comparison.differences.length > 0
       ? ["", "Differences:", "", ...comparison.differences.map((difference) => `- ${difference}`)]
       : []),

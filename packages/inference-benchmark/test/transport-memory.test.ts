@@ -33,13 +33,15 @@ const server = Bun.serve({
           timings: { cache_n: 4, prompt_n: 16, prompt_ms: 8, predicted_n: 6, predicted_ms: 12 },
         },
       ]
+      const frames = body.benchmark_test_stream_order === "done-before-terminal"
+        ? [...chunks.slice(0, -1).map((chunk) => JSON.stringify(chunk)), "[DONE]", JSON.stringify(chunks.at(-1))]
+        : [...chunks.map((chunk) => JSON.stringify(chunk)), "[DONE]"]
       return new Response(new ReadableStream({
         async start(controller) {
-          for (const chunk of chunks) {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+          for (const frame of frames) {
+            controller.enqueue(encoder.encode(`data: ${frame}\n\n`))
             await Bun.sleep(2)
           }
-          controller.enqueue(encoder.encode("data: [DONE]\n\n"))
           controller.close()
         },
       }), { headers: { "content-type": "text/event-stream" } })
@@ -139,6 +141,28 @@ describe("endpoint and memory observation", () => {
       choices: [],
       usage: { prompt_tokens: 20, completion_tokens: 6, total_tokens: 26, prompt_tokens_details: { cached_tokens: 4 } },
     })).toThrow('"timings"]')
+    expect(() => parseTerminalEvidence({
+      choices: [],
+      usage: { prompt_tokens: 20, completion_tokens: 6, total_tokens: 26, prompt_tokens_details: { cached_tokens: 4 } },
+      timings: { cache_n: 4, prompt_n: 16, prompt_ms: 8, predicted_n: 6, predicted_ms: 12, draft_n: 2 },
+    })).toThrow("draft counters must be supplied together")
+    expect(() => parseTerminalEvidence({
+      choices: [],
+      usage: { prompt_tokens: 20, completion_tokens: 6, total_tokens: 26, prompt_tokens_details: { cached_tokens: 4 } },
+      timings: { cache_n: 4, prompt_n: 16, prompt_ms: 8, predicted_n: 6, predicted_ms: 12, draft_n: 1, draft_n_accepted: 2, speculative_backend: "mtp" },
+    })).toThrow("accepted draft tokens exceed drafted tokens")
+  })
+
+  it("requires terminal evidence immediately before [DONE]", async () => {
+    const observation = await Effect.runPromise(
+      executeRequest({
+        endpoint: server.url.toString(),
+        servedModel: "test",
+        requestBody: { benchmark_test_stream_order: "done-before-terminal" },
+      }, planned).pipe(Effect.provide(EndpointClientLive)),
+    )
+    expect(observation.outcome).toBe("protocol-error")
+    expect(observation.error).toContain("[DONE] arrived before terminal")
   })
 
   it("samples the live managed process without restarting it", async () => {
