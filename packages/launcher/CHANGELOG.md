@@ -1,5 +1,19 @@
 # @magnitudedev/cli
 
+## 0.0.8
+
+### Patch Changes
+
+- [`0c82137`](https://github.com/magnitudedev/magnitude/commit/0c82137eb9a4d5042a42accfb3235b0505e479fd) Thanks [@anerli](https://github.com/anerli)! - Add Qwen 3.8 Flash Next to catalog
+
+- [`5e46594`](https://github.com/magnitudedev/magnitude/commit/5e4659408029d20ec056fad8c3967a37c553c2fb) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Improve onboarding model selection, responsive layout, and mouse interactions
+
+- [`a35372a`](https://github.com/magnitudedev/magnitude/commit/a35372aeadac5fd6e0ef1bd574116fe504dab3b8) Thanks [@anerli](https://github.com/anerli)! - DSpark support for LFM 2.5 models
+
+- [`1af97f8`](https://github.com/magnitudedev/magnitude/commit/1af97f8df0110295bec46acdc652ed18cc1b05e3) Thanks [@anerli](https://github.com/anerli)! - move setup from --setup flag to setup subcommand
+
+- [`2f4ce23`](https://github.com/magnitudedev/magnitude/commit/2f4ce23de9fc75a82b652ff60eb96f2fb2508585) Thanks [@anerli](https://github.com/anerli)! - Connect inference to other harnesses, direct CLI controls, more intuitive onboarding
+
 ## 0.0.8-alpha.3
 
 ### Patch Changes
