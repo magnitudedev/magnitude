@@ -129,7 +129,7 @@ After admission, the ACN installs a mandatory scoped monitor before application 
 The monitor continuously compares the complete current owner row with the exact row it admitted.
 A confirmed missing or changed owner begins `ownership-lost` shutdown; any surfaced store failure
 fails closed as fatal shutdown. The monitor runs for the complete admitted lifetime, independent of
-startup phase, readiness, client leases, or idle retention.
+startup phase, readiness, client presence, or idle retention.
 
 Only after admission may the ACN initialize application and ICN services. Replacement is initiated
 by a manager that has observed a lower live revision and prepared its successor; an ACN does not

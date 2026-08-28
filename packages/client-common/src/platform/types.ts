@@ -9,7 +9,7 @@
 
 import type { Layer } from "effect"
 import { RpcClient } from "@effect/rpc"
-import type { AcnClientCloseResult, AcnStartup } from "@magnitudedev/sdk"
+import type { AcnStartup } from "@magnitudedev/sdk"
 import type { MenuAction } from "../types/menu-action"
 import type { EmbeddedBrowserCapability } from "./embedded-browser"
 
@@ -53,7 +53,7 @@ export interface Platform {
   readonly id: "web" | "desktop" | "terminal"
   readonly protocolLayer: Layer.Layer<RpcClient.Protocol, never, never>
   readonly acnStartup: AcnStartup
-  readonly shutdown: () => Promise<AcnClientCloseResult>
+  readonly shutdown: () => Promise<void>
   readonly clipboard: Clipboard
   readonly storage: Storage
   readonly notifications: Notification

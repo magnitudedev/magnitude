@@ -56,8 +56,6 @@ export {
 export {
   makeAcnJitRuntime,
   type AcnStartup,
-  type AcnClientCloseReport,
-  type AcnClientCloseResult,
   type AcnJitRuntime,
 } from "./acn-jit/acn-recovering-client"
 export {

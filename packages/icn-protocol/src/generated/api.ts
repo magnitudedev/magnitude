@@ -310,19 +310,6 @@ export const getModelProperties = HttpApiEndpoint.post("getModelProperties", "/a
     { status: 500 },
   )
 
-export const getModelResidencyPolicy = HttpApiEndpoint.get("getModelResidencyPolicy", "/api/v1/residency-policy")
-  .addSuccess(
-    S.suspend(
-      (): S.Schema<Schemas.ModelResidencyPolicyResponse, Schemas.ModelResidencyPolicyResponseEncoded> =>
-        Schemas.ModelResidencyPolicyResponse,
-    ),
-    { status: 200 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 500 },
-  )
-
 export const health = HttpApiEndpoint.get("health", "/health").addSuccess(
   S.suspend((): S.Schema<Schemas.HealthResponse, Schemas.HealthResponseEncoded> => Schemas.HealthResponse),
   { status: 200 },
@@ -518,23 +505,6 @@ export const searchHuggingFaceModels = HttpApiEndpoint.post(
     { status: 500 },
   )
 
-export const setModelResidencyPolicy = HttpApiEndpoint.put("setModelResidencyPolicy", "/api/v1/residency-policy")
-  .setPayload(
-    S.suspend(
-      (): S.Schema<Schemas.SetModelResidencyPolicyRequest, Schemas.SetModelResidencyPolicyRequestEncoded> =>
-        Schemas.SetModelResidencyPolicyRequest,
-    ),
-  )
-  .addSuccess(S.Void, { status: 204 })
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 400 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 500 },
-  )
-
 export const stopModelInstance = HttpApiEndpoint.post("stopModelInstance", "/api/v1/instances/:instance_id/stop")
   .setPath(S.Struct({ instance_id: S.String }))
   .addSuccess(S.Void, { status: 204 })
@@ -612,14 +582,12 @@ export const ModelsGroup = HttpApiGroup.make("models")
   .add(getModelInstance)
   .add(getModelInstances)
   .add(getModelProperties)
-  .add(getModelResidencyPolicy)
   .add(installModel)
   .add(listInstalledModels)
   .add(listModelDownloads)
   .add(listModels)
   .add(previewModelLoad)
   .add(removeInstalledModel)
-  .add(setModelResidencyPolicy)
   .add(stopModelInstance)
   .add(uninstallModel)
 

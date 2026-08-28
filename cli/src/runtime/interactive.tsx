@@ -16,7 +16,6 @@ import type * as HttpClient from "@effect/platform/HttpClient"
 import type * as Path from "@effect/platform/Path"
 import {
   createAgentClient,
-  deriveCliExitNotice,
   onboardingModelSetupViewAtom,
   pushNotificationAtom,
   stopDisplayViewController,
@@ -209,10 +208,8 @@ const closeApplication = (
 ): Effect.Effect<InteractiveSessionResult> => request._tag === "Fatal"
   ? Effect.succeed(fatalResult(request))
   : terminal.close.pipe(
-      Effect.map((observation) => {
+      Effect.map(() => {
         const notices: string[] = []
-        const modelNotice = Option.getOrUndefined(deriveCliExitNotice(observation))
-        if (modelNotice) notices.push(modelNotice)
         const activeSessionId = getLastSessionId()
         if (activeSessionId) {
           notices.push(`Resume this session with:\nmagnitude --resume ${activeSessionId}`)

@@ -27,16 +27,4 @@ describe("AcnServiceLifecycle", () => {
     })))
   })
 
-  it("does not tie process lifetime to RPC client presence", async () => {
-    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const lifecycle = yield* makeAcnServiceLifecycle()
-      yield* lifecycle.becomeReady(Effect.die("unused RPC"))
-      expect(yield* lifecycle.setClientPresence(true)).toBe(true)
-      expect((yield* lifecycle.state)._tag).toBe("Ready")
-      expect(yield* lifecycle.setClientPresence(false)).toBe(true)
-      expect((yield* lifecycle.state)._tag).toBe("Ready")
-      expect(yield* lifecycle.beginStopping({ reason: "administrative" })).toBe(true)
-      expect(yield* lifecycle.setClientPresence(true)).toBe(false)
-    })))
-  })
 })

@@ -1281,7 +1281,6 @@ export const InferenceResourceTopic = S.Union(
   S.Literal("packages"),
   S.Literal("downloads"),
   S.Literal("instances"),
-  S.Literal("residency-policy"),
 )
 export type InferenceResourceTopic = S.Schema.Type<typeof InferenceResourceTopic>
 export type InferenceResourceTopicEncoded = S.Schema.Encoded<typeof InferenceResourceTopic>
@@ -1991,13 +1990,6 @@ export const ModelReleaseReason = S.Union(
 )
 export type ModelReleaseReason = S.Schema.Type<typeof ModelReleaseReason>
 export type ModelReleaseReasonEncoded = S.Schema.Encoded<typeof ModelReleaseReason>
-
-export const ModelResidencyPolicyResponse = S.Struct({
-  generation: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  idleTimeoutSeconds: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-})
-export type ModelResidencyPolicyResponse = S.Schema.Type<typeof ModelResidencyPolicyResponse>
-export type ModelResidencyPolicyResponseEncoded = S.Schema.Encoded<typeof ModelResidencyPolicyResponse>
 
 export const ModelServingConfiguration = S.Struct({
   bundle: S.suspend((): S.Schema<ServableModelBundle, ServableModelBundleEncoded> => ServableModelBundle),
@@ -2715,13 +2707,6 @@ export const ServingProfile = S.Struct({
 })
 export type ServingProfile = S.Schema.Type<typeof ServingProfile>
 export type ServingProfileEncoded = S.Schema.Encoded<typeof ServingProfile>
-
-export const SetModelResidencyPolicyRequest = S.Struct({
-  generation: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  idleTimeoutSeconds: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-})
-export type SetModelResidencyPolicyRequest = S.Schema.Type<typeof SetModelResidencyPolicyRequest>
-export type SetModelResidencyPolicyRequestEncoded = S.Schema.Encoded<typeof SetModelResidencyPolicyRequest>
 
 export const SpeculativeDraftSource = S.Union(
   S.extend(S.TaggedStruct("Embedded", {}), S.Record({ key: S.String, value: JsonValue })),

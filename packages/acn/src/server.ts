@@ -113,8 +113,6 @@ import {
   makeAcnServiceLifecycle,
   type AcnServiceLifecycleApi,
 } from "./service-lifecycle"
-import { ClientLeaseManagerLive } from "./client-lease-manager"
-import { ModelResidencyPolicyLive } from "./model-residency-policy"
 import {
   type InferenceProxyTarget,
   makeAnthropicGateway,
@@ -419,13 +417,9 @@ const addLocalInferenceServices = <A, E, R>(
   dataDir: string
 ) => {
   const withIcn = Layer.provideMerge(makeAcnIcn(dataDir), base)
-  const withResidencyPolicy = Layer.provideMerge(
-    ModelResidencyPolicyLive,
-    withIcn,
-  )
   const withSelection = Layer.provideMerge(
     ModelSelectionLive,
-    withResidencyPolicy
+    withIcn
   )
   const withConfigurationCoordinator = Layer.provideMerge(
     LocalModelConfigurationCoordinatorLive,
@@ -480,8 +474,7 @@ const addLocalInferenceServices = <A, E, R>(
 }
 
 const addCommonAcnServices = <A, E, R>(services: Layer.Layer<A, E, R>) => {
-  const withClientLeases = Layer.provideMerge(ClientLeaseManagerLive, services)
-  const withMentionSearcher = Layer.provideMerge(FileMentionSearcherLive, withClientLeases)
+  const withMentionSearcher = Layer.provideMerge(FileMentionSearcherLive, services)
   const withCommands = Layer.provideMerge(SessionCommandsLive, withMentionSearcher)
   const withLifecycle = Layer.provideMerge(SessionLifecycleLive, withCommands)
   const withProjectManager = Layer.provideMerge(ProjectManagerLive, withLifecycle)

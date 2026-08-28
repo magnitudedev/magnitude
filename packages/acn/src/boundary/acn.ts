@@ -29,7 +29,6 @@ import { AcnChanges } from "../changes";
 import { ModelCatalog } from "../model-catalog";
 import { ModelCommands } from "../model-commands";
 import { LocalInferenceHardware } from "../local-inference-hardware";
-import { ClientLeaseManager } from "../client-lease-manager";
 import { FileMentionSearcher } from "../file-mention-searcher";
 import { FileSystemManager } from "../file-system-manager";
 import { GitInspector } from "../git-inspector";
@@ -71,7 +70,6 @@ export const AcnBoundaryLive = AcnRpc.toLayer(AcnBoundary,
     const modelCatalog = yield* ModelCatalog;
     const modelCommands = yield* ModelCommands;
     const localInferenceHardware = yield* LocalInferenceHardware;
-    const clientLeases = yield* ClientLeaseManager;
     const displayViewIntrospector = yield* Effect.serviceOption(
       AcnDisplayViewIntrospector
     );
@@ -138,9 +136,6 @@ export const AcnBoundaryLive = AcnRpc.toLayer(AcnBoundary,
       Health: () => lifecycle.state.pipe(
         Effect.map((state) => makeHealthResponse(ACN_VERSION, state)),
       ),
-      RenewClientLease: ({ clientId }) => clientLeases.renew(clientId),
-      ReleaseClientLease: ({ clientId }) => clientLeases.release(clientId),
-
       // Session lifecycle
       PreloadSession: ({ cwd, options, draftOwnerId }) =>
         observeRpcDefects(

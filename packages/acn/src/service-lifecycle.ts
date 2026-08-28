@@ -24,7 +24,6 @@ export interface AcnStopRequest {
 interface AcnRuntimeState {
   readonly lifecycle: AcnHealthState
   readonly rpc: Option.Option<AcnRpcApplication>
-  readonly clientsPresent: boolean
 }
 
 export interface AcnServiceLifecycleApi {
@@ -35,7 +34,6 @@ export interface AcnServiceLifecycleApi {
     progress: Option.Option<AcnStartupProgress>,
   ) => Effect.Effect<void>
   readonly becomeReady: (rpc: AcnRpcApplication) => Effect.Effect<void>
-  readonly setClientPresence: (present: boolean) => Effect.Effect<boolean>
   readonly beginStopping: (request: AcnStopRequest) => Effect.Effect<boolean>
   readonly awaitStopping: Effect.Effect<AcnStopping>
 }
@@ -62,7 +60,6 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
         progress: Option.none(),
       }),
       rpc: Option.none(),
-      clientsPresent: false,
     })
     const transitionLock = yield* Effect.makeSemaphore(1)
     const stopping = yield* Deferred.make<AcnStopping>()
@@ -86,7 +83,6 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
       yield* replaceState({
         lifecycle: next,
         rpc: Option.none(),
-        clientsPresent: current.clientsPresent,
       })
       yield* Deferred.succeed(stopping, next)
       return true
@@ -117,7 +113,6 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
                 progress,
               }),
               rpc: current.rpc,
-              clientsPresent: current.clientsPresent,
             })
           }),
         )
@@ -137,23 +132,7 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
               {},
             ),
             rpc: Option.some(rpc),
-            clientsPresent: current.clientsPresent,
           })
-        }).pipe(Effect.uninterruptible),
-      )
-
-    const setClientPresence: AcnServiceLifecycleApi["setClientPresence"] = (present) =>
-      transitionLock.withPermits(1)(
-        Effect.gen(function* () {
-          const current = yield* Ref.get(runtime)
-          if (current.lifecycle._tag === "Stopping") return false
-          if (current.clientsPresent === present) return true
-          yield* replaceState({
-            lifecycle: current.lifecycle,
-            rpc: current.rpc,
-            clientsPresent: present,
-          })
-          return true
         }).pipe(Effect.uninterruptible),
       )
 
@@ -172,7 +151,6 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
       ),
       reportStarting,
       becomeReady,
-      setClientPresence,
       beginStopping,
       awaitStopping: Deferred.await(stopping),
     })
