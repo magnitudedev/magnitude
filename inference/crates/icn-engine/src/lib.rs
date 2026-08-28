@@ -3353,6 +3353,14 @@ impl<'model> ActiveRequest<'model> {
             pending_checkpoint_prefixes.sort_unstable_by_key(|boundary| boundary.logical_tokens);
             pending_checkpoint_prefixes.dedup();
 
+            let remaining_context_tokens = context_capacity.saturating_sub(prompt_tokens);
+            let generation_limit = request
+                .generation()
+                .max_output_tokens()
+                .map_or(remaining_context_tokens, |limit| {
+                    (limit.get() as usize).min(remaining_context_tokens)
+                });
+
             Ok(Self {
                 sequence: None,
                 events: events.clone(),
@@ -3375,8 +3383,7 @@ impl<'model> ActiveRequest<'model> {
                 pending_checkpoint_prefixes: pending_checkpoint_prefixes.into(),
                 next_boundary: cached_boundary,
                 multimodal_prompt: tokenized.multimodal,
-                generation_limit: (request.generation().max_output_tokens().get() as usize)
-                    .min(context_capacity.saturating_sub(prompt_tokens)),
+                generation_limit,
                 generated_tokens: 0,
                 speculative_started: false,
                 speculative_draft: Vec::new(),
@@ -4299,7 +4306,7 @@ mod canonical_tests {
             ),
             domain::OutputConstraint::Text,
             domain::GenerationParameters::new(
-                NonZeroU32::new(16).expect("positive"),
+                Some(NonZeroU32::new(16).expect("positive")),
                 domain::SamplingParameters::new(
                     domain::Temperature::try_new(0.8).expect("temperature"),
                     domain::TopP::try_new(0.95).expect("top p"),

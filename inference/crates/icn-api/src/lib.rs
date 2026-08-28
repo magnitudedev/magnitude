@@ -3082,6 +3082,25 @@ mod tests {
     }
 
     #[test]
+    fn openai_adapters_do_not_invent_output_token_limits() {
+        let chat = request_from_json(minimal_request());
+        let (_, chat) = adapt_request(chat).unwrap().invocation.into_parts();
+        assert_eq!(chat.generation().max_output_tokens(), None);
+
+        let responses: protocols::responses::ResponseCreateRequest =
+            serde_json::from_value(json!({
+                "model": "test-model",
+                "input": "hello"
+            }))
+            .unwrap();
+        let (_, responses) = protocols::responses::adapt(responses)
+            .unwrap()
+            .invocation
+            .into_parts();
+        assert_eq!(responses.generation().max_output_tokens(), None);
+    }
+
+    #[test]
     fn compatibility_requests_ignore_unknown_object_fields_recursively() {
         let chat = serde_json::from_value::<ChatCompletionRequest>(json!({
             "model": "test-model",
@@ -4942,7 +4961,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["END", "STOP"]
         );
-        assert_eq!(request.generation().max_output_tokens().get(), 99);
+        assert_eq!(
+            request
+                .generation()
+                .max_output_tokens()
+                .map(NonZeroU32::get),
+            Some(99)
+        );
         assert_eq!(request.generation().sampling().temperature().get(), 0.25);
         assert_eq!(request.generation().sampling().top_p().get(), 0.75);
         assert_eq!(request.generation().sampling().seed(), 9);

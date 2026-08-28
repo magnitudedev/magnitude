@@ -1186,8 +1186,13 @@ pub(crate) fn adapt(request: ResponseCreateRequest) -> Result<AdaptedResponseReq
             ),
         },
     };
-    let max_tokens = NonZeroU32::new(request.max_output_tokens.unwrap_or(256))
-        .ok_or_else(|| ApiError::invalid("max_output_tokens must be positive"))?;
+    let max_tokens = request
+        .max_output_tokens
+        .map(|value| {
+            NonZeroU32::new(value)
+                .ok_or_else(|| ApiError::invalid("max_output_tokens must be positive"))
+        })
+        .transpose()?;
     let generation = domain::GenerationParameters::new(
         max_tokens,
         domain::SamplingParameters::new(
