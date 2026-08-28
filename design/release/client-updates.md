@@ -6,6 +6,7 @@ applies_to:
   - packages/storage/src/types/config.ts
   - cli/src/index.tsx
   - cli/src/commands/update.ts
+  - cli/src/commands/update-runtime.ts
   - cli/src/features/update/**
   - cli/src/runtime/**
   - cli/src/platform/process-exit.ts

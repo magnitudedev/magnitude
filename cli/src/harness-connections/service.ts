@@ -14,7 +14,7 @@ import { ProviderModelIdSchema, type ProviderModelId } from "@magnitudedev/sdk"
 import { makeStateDocument } from "@magnitudedev/storage"
 import { Data, Effect, Option, Schema } from "effect"
 import { delimiter } from "node:path"
-import { installServerOnStartup } from "../commands/server"
+import { installServerOnStartup } from "../server/service"
 import { writeFileAtomic } from "../utils/atomic-file"
 import {
   HarnessModelSchema,

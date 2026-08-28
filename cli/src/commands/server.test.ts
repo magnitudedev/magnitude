@@ -6,7 +6,7 @@ import {
   renderMacServerService,
   renderWindowsServerCommand,
   WINDOWS_RESTART_POLICY_SCRIPT,
-} from "./server"
+} from "../server/service"
 
 describe("Magnitude server service definitions", () => {
   it("registers development startup against the local ACN entrypoint", () => {

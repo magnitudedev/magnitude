@@ -6,6 +6,8 @@ applies_to:
   - packages/acn/src/acn-subscriptions.ts
   - packages/acn/src/icn/**
   - cli/src/commands/server.ts
+  - cli/src/commands/server-runtime.ts
+  - cli/src/server/service.ts
   - packages/acn-protocol/src/schemas/acn-health.ts
 ---
 
