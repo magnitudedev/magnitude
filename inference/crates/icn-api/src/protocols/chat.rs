@@ -29,7 +29,6 @@ use super::super::{
     non_empty_text, non_empty_vec, unix_timestamp, with_openai_request_id,
 };
 
-const DEFAULT_MAX_TOKENS: u32 = 256;
 const DEFAULT_TEMPERATURE: f32 = 0.8;
 const DEFAULT_TOP_P: f32 = 0.95;
 const DEFAULT_SEED: u32 = 42;
@@ -925,7 +924,7 @@ pub(crate) struct ValidatedChatRequest {
     response_format: domain::OutputConstraint,
     template_args: BTreeMap<String, JsonValue>,
     stop: Vec<String>,
-    max_tokens: u32,
+    max_tokens: Option<NonZeroU32>,
     temperature: f32,
     top_p: f32,
     seed: u32,
@@ -988,10 +987,11 @@ pub(crate) fn validate_request(
     let max_tokens = request
         .max_completion_tokens
         .or(request.max_tokens)
-        .unwrap_or(DEFAULT_MAX_TOKENS);
-    if max_tokens == 0 {
-        return Err(ApiError::invalid("max tokens must be greater than zero"));
-    }
+        .map(|value| {
+            NonZeroU32::new(value)
+                .ok_or_else(|| ApiError::invalid("max tokens must be greater than zero"))
+        })
+        .transpose()?;
     let temperature = request.temperature.unwrap_or(DEFAULT_TEMPERATURE);
     if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
         return Err(ApiError::invalid(
@@ -1065,7 +1065,7 @@ pub(crate) fn finalize_request(
         .map(|stop| domain::StopSequence::try_new(stop).map_err(domain_error))
         .collect::<Result<Vec<_>, _>>()?;
     let generation = domain::GenerationParameters::new(
-        NonZeroU32::new(validated.max_tokens).expect("max tokens were validated as nonzero"),
+        validated.max_tokens,
         domain::SamplingParameters::new(
             domain::Temperature::try_new(validated.temperature).map_err(domain_error)?,
             domain::TopP::try_new(validated.top_p).map_err(domain_error)?,

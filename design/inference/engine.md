@@ -101,6 +101,8 @@ Prompt progress becomes committed only after target decode and linked speculativ
 succeed, including every token or embedding sub-batch in a multimodal prompt.
 Batch effects are staged separately from requests until that boundary. A sampled token becomes
 committed only when a later decode or speculative-verification step accepts it.
+Generation is always bounded by the request's remaining configured context capacity. A caller may
+add a smaller output-token limit; when it does not, remaining context capacity is the sole limit.
 Multimodal projector execution supports only speculative methods that can advance from embedding
 sub-batches; MTP is rejected during configuration validation.
 

@@ -446,7 +446,7 @@ impl<'de> serde::Deserialize<'de> for GrammarConstraint {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GenerationParameters {
-    max_output_tokens: NonZeroU32,
+    max_output_tokens: Option<NonZeroU32>,
     sampling: SamplingParameters,
     stop_sequences: Vec<StopSequence>,
     end_of_generation: EndOfGenerationPolicy,
@@ -455,7 +455,7 @@ pub struct GenerationParameters {
 impl GenerationParameters {
     #[must_use]
     pub fn new(
-        max_output_tokens: NonZeroU32,
+        max_output_tokens: Option<NonZeroU32>,
         sampling: SamplingParameters,
         stop_sequences: Vec<StopSequence>,
         end_of_generation: EndOfGenerationPolicy,
@@ -469,7 +469,7 @@ impl GenerationParameters {
     }
 
     #[must_use]
-    pub fn max_output_tokens(&self) -> NonZeroU32 {
+    pub fn max_output_tokens(&self) -> Option<NonZeroU32> {
         self.max_output_tokens
     }
 

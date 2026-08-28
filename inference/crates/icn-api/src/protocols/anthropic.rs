@@ -298,7 +298,7 @@ pub(crate) fn adapt(request: MessagesRequest) -> Result<AdaptedRequest, ApiError
     let temperature = request.temperature.unwrap_or(1.0);
     let top_p = request.top_p.unwrap_or(1.0);
     let generation = domain::GenerationParameters::new(
-        max_tokens,
+        Some(max_tokens),
         domain::SamplingParameters::new(
             domain::Temperature::try_new(temperature).map_err(domain_error)?,
             domain::TopP::try_new(top_p).map_err(domain_error)?,

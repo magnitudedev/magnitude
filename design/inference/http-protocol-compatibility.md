@@ -112,6 +112,13 @@ the inventory `ModelId`, whose syntax identifies only canonical installed artifa
 backend accepts only a model-resolved request. Model-native message and template construction are
 private to the engine's template compiler.
 
+An output-token limit is caller policy, not an adapter default. Chat Completions carries
+`max_completion_tokens` or `max_tokens` when supplied, Responses carries `max_output_tokens` when
+supplied, and omission remains absence in the canonical request. The engine then permits generation
+through the model's remaining context capacity. Anthropic Messages is unchanged: its protocol
+requires `max_tokens`, so the adapter always supplies that explicit limit. No adapter invents a
+finite limit for a request that omitted one.
+
 The engine emits fixed reasoning, text, and tool-call output phases plus terminal usage,
 termination, and metrics facts. It does not construct an aggregate output. Lifecycle progress is
 observation, not semantic output. One bounded output journal validates the event lifecycle,
