@@ -1,20 +1,6 @@
 import type { Command } from "@commander-js/extra-typings"
-import { FetchHttpClient } from "@effect/platform"
-import { BunContext } from "@effect/platform-bun"
-import { Effect } from "effect"
-import type { AuthSource } from "../state/cli-atoms"
-import {
-  runInteractiveCommand,
-  type InteractiveLaunchOptions,
-} from "../runtime/interactive"
-import { isDevelopmentBuild } from "../runtime/environment"
 
-const resolveEnvAuth = (): AuthSource => {
-  const envKey = process.env.MAGNITUDE_API_KEY
-  return envKey && envKey.trim()
-    ? { source: "env", key: envKey, envVarName: "MAGNITUDE_API_KEY" }
-    : { source: "none" }
-}
+const loadRuntime = () => import("./interactive-runtime")
 
 export const registerInteractiveCommand = (program: Command): void => {
   const interactiveCommand = program
@@ -42,53 +28,12 @@ export const registerInteractiveCommand = (program: Command): void => {
       "Override leader system prompt with raw text",
     )
 
-  const runInteractive = (
-    opts: ReturnType<typeof interactiveCommand.opts>,
-    setup: boolean,
-  ) => {
-    if (opts.headless) {
-      process.stderr.write(
-        "Error: --headless is temporarily disabled. Use the TUI mode.\n",
-      )
-      process.exit(1)
-    }
-
-    const options: InteractiveLaunchOptions = {
-      debug: opts.debug === true,
-      setup,
-      developmentBuild: isDevelopmentBuild(),
-      sessionStart: opts.resume === undefined
-        ? { _tag: "new" }
-        : opts.resume === true
-          ? { _tag: "latest" }
-          : { _tag: "resume", sessionId: opts.resume },
-      initialPrompt: opts.prompt,
-      goal: opts.goal,
-      envAuth: resolveEnvAuth(),
-      sessionOptions: {
-        disableShellSafeguards: opts.disableShellSafeguards ?? false,
-        disableCwdSafeguards: opts.disableCwdSafeguards ?? false,
-        atifPath: opts.atif,
-        solo: opts.solo ?? false,
-        headless: false,
-        systemPromptOverride: opts.systemOverride,
-      },
-    }
-
-    return Effect.runPromise(runInteractiveCommand(options).pipe(
-      Effect.provide([BunContext.layer, FetchHttpClient.layer]),
-      Effect.catchAll((error) => Effect.sync(() => {
-        const reason = "reason" in error ? error.reason : String(error)
-        process.stderr.write(`Failed to start Magnitude: ${reason}\n`)
-        return 1
-      })),
-    )).then((exitCode) => process.exit(exitCode))
-  }
-
-  interactiveCommand.action((opts) => runInteractive(opts, false))
+  interactiveCommand.action((opts) =>
+    loadRuntime().then(({ runInteractive }) => runInteractive(opts, false)))
 
   program
     .command("setup")
     .description("Interactive first time setup for installing a model and connecting it to a harness")
-    .action(() => runInteractive(interactiveCommand.opts(), true))
+    .action(() => loadRuntime().then(({ runInteractive }) =>
+      runInteractive(interactiveCommand.opts(), true)))
 }

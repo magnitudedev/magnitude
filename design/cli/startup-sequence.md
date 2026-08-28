@@ -2,6 +2,7 @@
 applies_to:
   - cli/src/index.tsx
   - cli/src/commands/interactive.ts
+  - cli/src/commands/interactive-runtime.ts
   - cli/src/runtime/**
   - cli/src/features/app-shell/acn-bootstrap.tsx
   - cli/src/features/update/**
@@ -76,6 +77,11 @@ interrupting one is free.
 Warm launch is silent end to end and starts the CLI binary once. The launcher trusts an existing
 digest-addressed installation that was verified before its atomic publication. Cold-cold total is
 minutes, dominated by the inference engine download, all narrated under `DaemonStartup`.
+
+The process entrypoint eagerly constructs only the command surface: names, arguments, options, and
+help. Each heavy command family loads its runtime at its single execution boundary, after Commander
+selects that command. Noninteractive metadata paths therefore do not initialize the interactive
+renderer, application, SDK client, or unrelated command runtimes.
 
 ## Presentation
 

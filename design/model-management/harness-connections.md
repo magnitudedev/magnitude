@@ -3,6 +3,8 @@ applies_to:
   - packages/client-common/src/harness-connections/**
   - cli/src/harness-connections/**
   - cli/src/commands/connections.ts
+  - cli/src/commands/connections-runtime.ts
+  - cli/src/server/service.ts
   - cli/src/runtime/interactive.tsx
   - cli/src/features/model-setup/harness.tsx
 ---
