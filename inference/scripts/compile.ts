@@ -6,6 +6,7 @@ import {
 import { basename, delimiter, dirname, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { IcnBinaryIdentity } from "@magnitudedev/icn-protocol"
+import { ICN_EXECUTABLE_NAME } from "@magnitudedev/release/executables"
 import { Schema } from "effect"
 import { getTargetInfo } from "../../scripts/release-target"
 
@@ -302,7 +303,7 @@ export const buildIcnBinary = async ({
   }
   const binaryMessages = messages.filter((message) =>
     message.reason === "compiler-artifact" &&
-    message.target?.name === "magnitude-icn" &&
+    message.target?.name === ICN_EXECUTABLE_NAME &&
     typeof message.executable === "string"
   )
   if (binaryMessages.length !== 1) {

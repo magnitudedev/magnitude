@@ -60,7 +60,7 @@ Compile the development binary:
 bun icn:build
 ```
 
-The executable is now at `inference/target/debug/magnitude-icn`. Start it with the deterministic fake
+The executable is now at `inference/target/debug/magnitude-inference`. Start it with the deterministic fake
 backend, which does not need a model file:
 
 ```sh
@@ -118,7 +118,7 @@ Useful commands from the monorepo root:
 ```sh
 bun icn:check                 # type-check the Rust workspace without linking a final binary
 bun icn:build                 # debug binary, fastest normal development build
-bun icn:build:release         # optimized binary at inference/target/release/magnitude-icn
+bun icn:build:release         # optimized binary at inference/target/release/magnitude-inference
 bun icn:build:reference       # selected pinned tests, official tools, and native oracle
 bun icn:test                  # Rust API, SSE, backend, and workspace tests
 bun icn:parity:validate       # validate cases, fixtures, profiles, targets, and model registry

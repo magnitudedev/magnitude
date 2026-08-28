@@ -4,6 +4,7 @@ import {
   developmentBuildProfile,
 } from "./build-local"
 import { readCargoMessages } from "./compile"
+import { ICN_EXECUTABLE_NAME } from "@magnitudedev/release/executables"
 
 const stream = (...chunks: readonly string[]): ReadableStream<Uint8Array> => {
   const encoder = new TextEncoder()
@@ -57,14 +58,14 @@ describe("ICN compilation", () => {
     await expect(
       readCargoMessages(
         stream(
-          '{"reason":"compiler-artifact","target":{"name":"magnitude-icn"}}',
+          `{"reason":"compiler-artifact","target":{"name":"${ICN_EXECUTABLE_NAME}"}}`,
         ),
         () => {},
       ),
     ).resolves.toEqual([
       {
         reason: "compiler-artifact",
-        target: { name: "magnitude-icn" },
+        target: { name: ICN_EXECUTABLE_NAME },
       },
     ])
   })

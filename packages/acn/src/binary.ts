@@ -7,6 +7,7 @@ import { launchAcnServer } from "./server"
 import { ACN_REVISION, ACN_VERSION } from "./version"
 import { resolveRgPath } from "@magnitudedev/ripgrep"
 import { defaultDataDir } from "./data-dir"
+import { ACN_EXECUTABLE_NAME } from "@magnitudedev/release/executables"
 
 const debug = Options.boolean("debug")
 const parentBound = Options.boolean("parent-bound")
@@ -69,7 +70,7 @@ const doctor = Command.make("doctor", {}, () =>
   ),
 ).pipe(Command.withDescription("Verify packaged ACN runtime dependencies"))
 
-const acn = Command.make("magnitude-acn", { parentBound, debug, dataDir }, launchServer).pipe(
+const acn = Command.make(ACN_EXECUTABLE_NAME, { parentBound, debug, dataDir }, launchServer).pipe(
   Command.withDescription("Magnitude Agent Control Node"),
   Command.withSubcommands([serve, server, version, coordinationRevision, doctor]),
 )

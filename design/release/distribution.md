@@ -1,6 +1,7 @@
 ---
 applies_to:
   - packages/release/src/contracts.ts
+  - packages/release/src/executables.ts
   - packages/release/src/targets.ts
   - packages/release/scripts/assemble.ts
   - packages/release/scripts/build/**
@@ -17,8 +18,8 @@ artifacts. The release graph is product configuration, not a plugin system.
 | Artifact | Published for | Contents |
 | --- | --- | --- |
 | CLI | every host | one `bin/magnitude-cli` executable |
-| ACN | every host | one `bin/magnitude-acn` executable with embedded ripgrep |
-| ICN base | every host | ICN executable, planner inputs, common runtime libraries, and CPU modules |
+| ACN | every host | one `bin/magnitude-service` executable with embedded ripgrep |
+| ICN base | every host | one `bin/magnitude-inference` executable, planner inputs, common runtime libraries, and CPU modules |
 | ICN backend pack | compatible hosts | one Metal, CUDA, or Vulkan module family and its redistributable runtime libraries |
 
 Published hosts are Apple arm64, Apple x64, Linux GNU arm64, and Linux GNU x64. Windows artifacts

@@ -5,6 +5,10 @@ use icn_contracts::bootstrap_protocol::{IcnInstallationBackend, IcnInstallationD
 
 const MAX_DECLARATION_BYTES: u64 = 64 * 1024;
 
+pub(crate) fn executable_name() -> String {
+    format!("{}{}", env!("CARGO_BIN_NAME"), std::env::consts::EXE_SUFFIX)
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Installation {
     root: PathBuf,
@@ -52,11 +56,7 @@ impl Installation {
     }
 
     pub(crate) fn executable(&self) -> PathBuf {
-        self.root.join("bin").join(if cfg!(windows) {
-            "magnitude-icn.exe"
-        } else {
-            "magnitude-icn"
-        })
+        self.root.join("bin").join(executable_name())
     }
 
     pub(crate) fn planner_bundle(&self) -> PathBuf {

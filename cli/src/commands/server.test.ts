@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest"
+import { ACN_EXECUTABLE_NAME } from "@magnitudedev/sdk"
 import {
   developmentServerCommand,
   renderLinuxServerService,
@@ -17,8 +18,11 @@ describe("Magnitude server service definitions", () => {
   })
 
   it("renders a launch agent with exact argv and automatic restart", () => {
-    const rendered = renderMacServerService(["/Applications/Magnitude & Tools/acn", "server"])
-    expect(rendered).toContain("<string>/Applications/Magnitude &amp; Tools/acn</string><string>server</string>")
+    const executable = `/Applications/Magnitude & Tools/${ACN_EXECUTABLE_NAME}`
+    const rendered = renderMacServerService([executable, "server"])
+    expect(rendered).toContain(
+      `<string>/Applications/Magnitude &amp; Tools/${ACN_EXECUTABLE_NAME}</string><string>server</string>`,
+    )
     expect(rendered).toContain("<key>RunAtLoad</key><true/>")
     expect(rendered).toContain("<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>")
   })
@@ -31,12 +35,13 @@ describe("Magnitude server service definitions", () => {
   })
 
   it("renders a Windows task command with native argv quoting and restart policy", () => {
+    const executable = `C:\\Users\\Magnitude User\\${ACN_EXECUTABLE_NAME}.exe`
     expect(renderWindowsServerCommand([
-      "C:\\Users\\Magnitude User\\magnitude-acn.exe",
+      executable,
       "serve",
       "a\\\"b",
       "trailing \\",
-    ])).toBe('"C:\\Users\\Magnitude User\\magnitude-acn.exe" serve "a\\\\\\\"b" "trailing \\\\"')
+    ])).toBe(`"${executable}" serve "a\\\\\\\"b" "trailing \\\\"`)
     expect(WINDOWS_RESTART_POLICY_SCRIPT).toContain("ExecutionTimeLimit = 'PT0S'")
     expect(WINDOWS_RESTART_POLICY_SCRIPT).toContain("RestartCount = 999")
     expect(WINDOWS_RESTART_POLICY_SCRIPT).toContain("RestartInterval = 'PT1M'")

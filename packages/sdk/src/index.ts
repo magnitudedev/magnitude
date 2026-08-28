@@ -89,6 +89,7 @@ export { createRoles, isRoleId, ROLE_IDS, ROLE_TO_SLOT, DEFAULT_REASONING_EFFORT
 export type { RoleId } from "@magnitudedev/roles"
 
 export { acnInstallationPresent, resolveBinaryCommand, defaultBinaryPath, defaultDataDir, type ResolveBinaryOptions, type ResolvedBinaryCommand } from "./binary"
+export { ACN_EXECUTABLE_NAME } from "@magnitudedev/release/executables"
 export { SDK_VERSION, SDK_REVISION, SDK_ACN_TARGET } from "./version"
 export {
   AcnAdministrationFailed,

@@ -14,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { ICN_EXECUTABLE_NAME } from "@magnitudedev/release/executables";
 import {
   IcnBinaryResolutionConfig,
   IcnBinaryResolver,
@@ -107,7 +108,7 @@ describe("ICN managed launch", () => {
     "resolves and verifies an explicit binary before publication",
     async () => {
       const directory = await mkdtemp(join(tmpdir(), "icn-resolver-test-"));
-      const executable = join(directory, "bin", "magnitude-icn");
+      const executable = join(directory, "bin", ICN_EXECUTABLE_NAME);
       const installation = join(directory, "installation.json");
       await mkdir(join(directory, "bin"), { recursive: true });
       await mkdir(join(directory, "runtime"), { recursive: true });
@@ -192,7 +193,7 @@ describe("ICN managed launch", () => {
         path: join(
           "/definitely-missing/magnitude",
           "bin",
-          `magnitude-icn${process.platform === "win32" ? ".exe" : ""}`,
+          `${ICN_EXECUTABLE_NAME}${process.platform === "win32" ? ".exe" : ""}`,
         ),
       },
     });

@@ -1,4 +1,8 @@
 import { Data, Effect } from "effect"
+import {
+  ACN_EXECUTABLE_NAME,
+  ICN_EXECUTABLE_NAME,
+} from "@magnitudedev/release/executables"
 
 export type MagnitudeProcessKind = "ICN" | "ACN" | "CLI"
 
@@ -26,8 +30,8 @@ const scriptInvocation = (path: string): RegExp =>
     "i",
   )
 
-const icnExecutable = executable("(?:magnitude-icn|icn-server)")
-const acnExecutable = executable("magnitude-acn")
+const icnExecutable = executable(`(?:${ICN_EXECUTABLE_NAME}|icn-server)`)
+const acnExecutable = executable(ACN_EXECUTABLE_NAME)
 const cliExecutable = executable("magnitude-cli")
 const acnSource = scriptInvocation("packages/acn/src/binary\\.ts")
 const cliSource = scriptInvocation("cli/src/index\\.tsx")

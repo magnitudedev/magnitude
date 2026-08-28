@@ -22,6 +22,7 @@ import { buildBackendArtifact } from "./build/backend"
 import { buildCliBinary } from "./build/cli"
 import { buildHostArtifacts } from "./build/host"
 import { buildArchive, run } from "./build/common"
+import { ACN_EXECUTABLE_NAME } from "../src/executables"
 
 /**
  * A release built from the local worktree instead of published: byte-for-byte
@@ -204,7 +205,7 @@ const packageRuntimeArtifacts = (
           backendModuleAbi: Option.none(),
           compatibility: Option.none(),
         }, [{
-          path: `bin/magnitude-acn${host.executableExtension}`,
+          path: `bin/${ACN_EXECUTABLE_NAME}${host.executableExtension}`,
           source: binaries.acn,
           mode: 0o755,
         }]),

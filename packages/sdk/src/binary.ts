@@ -10,6 +10,7 @@ import {
   acquireRelease,
   currentHost,
   installArtifact,
+  ACN_EXECUTABLE_NAME,
   NodeArchiveExtractor,
   releaseBaseUrl,
   releaseBundleSizes,
@@ -53,7 +54,7 @@ export interface ResolvedBinaryCommand {
 
 export const defaultDataDir = (): string => join(homedir(), ".magnitude");
 export const defaultBinaryPath = (dataDir: string = defaultDataDir()): string =>
-  join(dataDir, "bin", "magnitude-acn");
+  join(dataDir, "bin", ACN_EXECUTABLE_NAME);
 
 const releaseRoot = (dataDir: string) => join(dataDir, "releases");
 const acnRoot = (dataDir: string, version: string) =>
@@ -61,7 +62,7 @@ const acnRoot = (dataDir: string, version: string) =>
 const pointerPath = (dataDir: string, version: string) =>
   join(acnRoot(dataDir, version), "current.txt");
 const executableName = () =>
-  process.platform === "win32" ? "magnitude-acn.exe" : "magnitude-acn";
+  `${ACN_EXECUTABLE_NAME}${process.platform === "win32" ? ".exe" : ""}`;
 
 const validateBinaryVersion = (
   binaryPath: string,

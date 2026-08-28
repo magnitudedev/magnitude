@@ -27,6 +27,10 @@ import {
 } from "../src/targets"
 import { fileSha256, run } from "./build/common"
 import { verifyLinuxElfArchives } from "./build/linux-elf"
+import {
+  ACN_EXECUTABLE_NAME,
+  ICN_EXECUTABLE_NAME,
+} from "../src/executables"
 
 const PROJECT_ROOT = resolve(import.meta.dir, "../../..")
 const input = resolve(process.argv[2] ?? "release-artifacts")
@@ -92,7 +96,9 @@ const validateLayout = async (
   const host = Option.getOrThrow(artifact.host)
   const extension = host === "windows-x64-msvc" ? ".exe" : ""
   if (artifact.kind === "cli" || artifact.kind === "acn") {
-    const expected = [`bin/magnitude-${artifact.kind}${extension}`]
+    const expected = [artifact.kind === "cli"
+      ? `bin/magnitude-cli${extension}`
+      : `bin/${ACN_EXECUTABLE_NAME}${extension}`]
     if (JSON.stringify(listing) !== JSON.stringify(expected)) {
       throw new Error(`${artifact.id} has an invalid executable archive layout`)
     }
@@ -107,7 +113,7 @@ const validateLayout = async (
   }
   if (artifact.kind === "icn-base") {
     for (const requiredPath of [
-      `bin/magnitude-icn${extension}`,
+      `bin/${ICN_EXECUTABLE_NAME}${extension}`,
       "catalog/model-planner-inputs.bundle",
     ]) {
       if (!listing.includes(requiredPath)) {
