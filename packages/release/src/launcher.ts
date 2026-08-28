@@ -46,7 +46,7 @@ const cachedCli = (
 ): Effect.Effect<
   Option.Option<string>,
   never,
-  FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor
+  FileSystem.FileSystem | Path.Path
 > =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
@@ -68,20 +68,10 @@ const cachedCli = (
       "bin",
       `magnitude-cli${extension}`,
     )
-    const valid = yield* fs.exists(executable).pipe(
-      Effect.flatMap((exists) =>
-        exists
-          ? smokeCli(executable, version)
-          : Effect.fail(new ReleaseAcquisitionError({
-            stage: "verify",
-            message: "cached CLI is missing",
-            transient: false,
-          }))
-      ),
-      Effect.as(true),
-      Effect.orElseSucceed(() => false),
+    return yield* fs.exists(executable).pipe(
+      Effect.map((exists) => exists ? Option.some(executable) : Option.none()),
+      Effect.orElseSucceed(() => Option.none()),
     )
-    return valid ? Option.some(executable) : Option.none()
   })
 
 const publishPointer = (
@@ -197,4 +187,3 @@ export const ensureBinaryEffect = (
     yield* publishPointer(version, artifact.sha256)
     return executable
   })
-

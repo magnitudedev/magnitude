@@ -30,8 +30,9 @@ These responsibilities do not overlap.
 - Downloads and extraction are bounded. Range responses must identify the exact requested bytes and
   one consistent representation; unsupported ranges fall back to bounded sequential transfer.
 - Archives accept regular files only at validated relative paths.
-- Installations are addressed by artifact digest and published atomically. Corrupt or incomplete
-  installations are replaced as complete units and are never used.
+- Installations are addressed by artifact digest and published atomically only after acquisition
+  integrity and executable identity are verified. Published cache entries are trusted on subsequent
+  launches; a missing executable is a cache miss.
 - A valid cached installation remains usable offline. A missing or invalid installation that cannot
   be repaired fails explicitly.
 

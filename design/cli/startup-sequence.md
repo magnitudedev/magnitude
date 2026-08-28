@@ -73,9 +73,9 @@ version it would replace, and an install path never paints `DaemonStartup` only 
 with the prompt. Spawn-only cold starts keep the race — the check usually outruns a spawn, and
 interrupting one is free.
 
-Warm-launch total ≈ half a second, silent end to end, dominated by two binary boots (the
-resolution smoke test and the CLI itself). Cold-cold total is minutes, dominated by the inference
-engine download, all narrated under `DaemonStartup`.
+Warm launch is silent end to end and starts the CLI binary once. The launcher trusts an existing
+digest-addressed installation that was verified before its atomic publication. Cold-cold total is
+minutes, dominated by the inference engine download, all narrated under `DaemonStartup`.
 
 ## Presentation
 
