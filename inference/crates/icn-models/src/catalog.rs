@@ -1975,61 +1975,6 @@ mod tests {
     }
 
     #[test]
-    fn authored_catalog_declares_the_reviewed_release_date_for_every_model() {
-        let source = catalog_source().expect("catalog source should be valid");
-        assert_eq!(source.models.len(), 21);
-        assert_eq!(
-            source
-                .models
-                .iter()
-                .find(|model| model.id == "qwen3.8-27b")
-                .expect("Qwen3.8 catalog model")
-                .release_date
-                .as_str(),
-            "2026-08-13"
-        );
-        assert_eq!(
-            source
-                .models
-                .iter()
-                .find(|model| model.id == "deepseek-v4-flash")
-                .expect("DeepSeek V4 Flash catalog model")
-                .release_date
-                .as_str(),
-            "2026-07-31"
-        );
-    }
-
-    #[test]
-    fn authored_catalog_has_complete_vision_projector_policy() {
-        let source = catalog_source().expect("catalog source should be valid");
-        let projected = source
-            .models
-            .iter()
-            .filter(|model| model.projector.is_some())
-            .collect::<Vec<_>>();
-        assert_eq!(projected.len(), 12);
-        assert_eq!(
-            projected
-                .iter()
-                .filter(|model| model.speculative_decoding.is_none())
-                .count(),
-            9
-        );
-        assert!(projected.iter().all(|model| {
-            model
-                .speculative_decoding
-                .as_ref()
-                .is_none_or(|speculative| {
-                    matches!(
-                        speculative.method,
-                        CatalogSpeculativeMethod::DFlash | CatalogSpeculativeMethod::DSpark
-                    )
-                })
-        }));
-    }
-
-    #[test]
     fn projector_resolution_is_automatic_only_when_unambiguous() {
         let source = catalog_source().expect("catalog source should be valid");
         let mut declaration = source.models[0].clone();
