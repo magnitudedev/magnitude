@@ -93,6 +93,27 @@
       }
     },
     {
+      "id": "qwen3.8-flash-next",
+      "displayName": "Qwen3.8 Flash Next",
+      "description": "Large multimodal MoE preview of Qwen's next-generation architecture with strong agentic reasoning and low active compute.",
+      "releaseDate": "2026-08-26",
+      "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 180000000000, "activeParameters": 6000000000 },
+      "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+      "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+      "contextLength": 100000,
+      "projector": { "path": "mmproj-BF16.gguf" },
+      "license": "qwen-community-1.0",
+      "intelligence": {
+        "score": 56.0,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.1.1",
+          "asOfDate": "2026-08-27",
+          "url": "https://artificialanalysis.ai/models/qwen3-8-flash-next"
+        }
+      }
+    },
+    {
       "id": "qwen3.6-35b-a3b",
       "displayName": "Qwen3.6 35B-A3B",
       "description": "Efficient MoE coding model with a large knowledge footprint and low active compute.",

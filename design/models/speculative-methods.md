@@ -17,6 +17,7 @@ configured artifact; `Best known method` intentionally contains no links.
 | Qwen3.5 9B | MTP | None | — | — |
 | Qwen3.6 27B | DFlash | DFlash | Separate file, draft repo | [Qwen3.6-27B-DFlash-Q8_0.gguf](https://huggingface.co/magnitudedev/Qwen3.6-27B-DFlash-GGUF/blob/main/Qwen3.6-27B-DFlash-Q8_0.gguf) |
 | Qwen3.8 27B | MTP | None | — | — |
+| Qwen3.8 Flash Next | MTP | None | — | — |
 | Qwen3.6 35B-A3B | DFlash | DFlash | Separate file, draft repo | [Qwen3.6-35B-A3B-DFlash-Q8_0.gguf](https://huggingface.co/magnitudedev/Qwen3.6-35B-A3B-DFlash-GGUF/blob/main/Qwen3.6-35B-A3B-DFlash-Q8_0.gguf) |
 | Muse Glimmer 30B | DFlash | DFlash | Separate file, target repo | [dflash-kquant.gguf](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF/blob/main/dflash-kquant.gguf) |
 | Gemma 4 E2B | MTP | None | — | — |
