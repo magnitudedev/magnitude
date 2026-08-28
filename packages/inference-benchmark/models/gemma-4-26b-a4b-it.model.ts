@@ -3,6 +3,7 @@ import { defineModel } from "../src/experiment"
 
 export const gemma4 = defineModel({
   id: "gemma-4-26b-a4b-it",
+  contextLimit: 131_072,
   source: {
     repository: "google/gemma-4-26B-A4B-it",
     revision: "4d7ae4984b7db7de8f8457170b3f1a419ee76d52",

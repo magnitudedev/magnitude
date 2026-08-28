@@ -25,6 +25,13 @@ contribute to performance summaries.
 A **strict comparison** uses identical weights, quantization, tokenizer, chat template, speculation
 policy, and device placement. Otherwise the result is a labeled **product comparison**. Differing
 prompt-token counts for corresponding requests necessarily make a comparison product-level.
+This observed classification is separate from the experiment's comparison protocol. The normal
+`defineExperiment` constructor holds speculative policy constant. An experiment that intentionally
+compares baseline, embedded MTP or DSpark, and DFlash uses the explicit
+`defineSpeculativeDecodingComparison` constructor. That protocol fixes one oMLX target artifact and
+every non-speculative setting. Its result is labeled a **controlled speculative-decoding**
+comparison, never a strict comparison or a generic product comparison. Reports carry the protocol
+and each configured method.
 
 ## Required endpoint evidence
 
@@ -99,13 +106,15 @@ records its workload, checkpoint, repetition, and cache state.
 
 ## Inputs and identity
 
-- **Model:** Logical weights and architecture shared by comparable artifacts.
+- **Model:** Logical weights and architecture shared by comparable artifacts, identified by a stable
+  logical model ID and declared context limit. Trial planning needs no engine artifact.
 - **Model artifact:** An immutable engine-loadable representation. Each artifact pins repository,
   commit, quantization, files, sizes, and digests. Multi-file snapshots use a complete committed
   lock. Artifact differences make a result product-level rather than invalid.
 - **Engine:** A serving implementation with engine-specific settings and an owned launch adapter.
-- **Acceleration policy:** The decoding mode shared by comparable variants. It is explicitly either
-  no speculation or MTP with an immutable drafter artifact and a candidate-token limit.
+- **Acceleration policy:** A discriminated decoding mode. oMLX supports ordinary decoding, embedded
+  MTP, embedded DSpark when the checkpoint is natively identified as such, and DFlash with a
+  separately locked MLX draft snapshot. Embedded modes do not declare a separate drafter artifact.
 - **Variant:** One model artifact, one engine, and the complete serving settings evaluated together.
 - **Experiment:** A TypeScript-authored, serializable definition of variants, workload profile,
   request policy, and execution order. TypeScript is the only authoring format.
@@ -121,6 +130,12 @@ records its workload, checkpoint, repetition, and cache state.
 Preparation is distinct from measurement. It resolves immutable revisions, downloads and verifies
 artifacts, freezes engine environments, qualifies tokenizer metadata, and records executable
 versions. A measured run never installs dependencies, downloads files, or updates a revision.
+The managed oMLX environment pins oMLX to one immutable Git revision and freezes MLX, MLX-LM,
+MLX-VLM, and DFlash in `uv.lock`. Prepared evidence records those identities, the lock digest, and
+the owned adapter-source digest; a run re-verifies both digests and the installed identity before
+launch. oMLX qualification loads the locked snapshot and verifies its tokenizer, chat template,
+tool rendering and parsing, context capacity, selected decoding backend, terminal native timings,
+and request-local speculative counters. Installation and qualification belong to preparation only.
 `bun benchmark models lock-mlx` is the canonical way to create a complete MLX artifact lock; it
 uses the standard Hugging Face cache and creates no model database.
 Reusable TypeScript model definitions own logical model identity and artifact pins; experiments
@@ -147,24 +162,34 @@ outcome with complete protocol evidence, because the workload measures engine be
 selected prompt size rather than task accuracy. Transport, protocol, rejection, timeout, and
 cancellation outcomes never contribute performance metrics.
 
-Managed memory sampling covers the target process tree. Observations record their source, scope, and
-limitations; measurements from unlike source classes are not compared as byte ratios.
+Managed memory sampling covers the complete target process tree. Shutdown sends SIGINT first, waits
+for every captured process to exit, and kills only the owned tree if graceful termination fails.
+Observations record their source, scope, and limitations; measurements from unlike source classes
+are not compared as byte ratios.
 
-An MLX-LM target is a UV-frozen Python package that imports MLX-LM as a library. Its adapter owns
-request validation, standard SSE conversion, cancellation, and terminal evidence; MLX-LM owns model
-loading, tokenization, chat templating, sampling, prompt caches, generation, and tool parsing. The
-adapter serializes generation in its initial capacity-one implementation and reports native MLX
-rates and counts rather than deriving native timings from HTTP latency. Model construction and all
-MLX operations run on one persistent generation thread because MLX streams are thread-local. The
-prepared engine identity includes the frozen UV lock and the owned adapter source digest, so local
-adapter changes invalidate preparation rather than silently reusing prior evidence.
+oMLX is the owned unified MLX serving path. Every managed process receives one run-scoped private
+base directory, deterministic global and per-model settings, and one symlink to the prepared target
+snapshot. Hugging Face discovery, fallback models, persistent caches, memory guarding, burst decode,
+SpecPrefill, TurboQuant, ANE prefill, and unrequested speculative paths are explicitly disabled.
+The adapter imports pinned oMLX as a library; it never starts stock MLX-LM or MLX-VLM servers and
+never reads or writes `~/.omlx`. Readiness is stronger than health: the expected alias must be the
+only discovered model, its engine must be loaded, configured context and concurrency must match,
+the exact requested backend must be active, and an internal tool-calling qualification request must
+complete with canonical evidence.
 
-MTP is an experiment-level comparison constraint, not an implicit engine default. Every comparable
-variant must select MTP, pin its engine-native drafter, and use the same semantic maximum number of
-draft candidates. Adapters may translate that value into a native block size when the native API
-counts its verification token. Terminal evidence must contain native drafted and accepted-token
-counts for every request, accepted counts may not exceed drafted counts, and the run must demonstrate
-nonzero drafting. A target that merely starts with MTP flags does not satisfy this requirement.
+The owned adapter instruments the narrow native execution seams. It measures scheduler prompt
+evaluation of the uncached suffix, including the first batch step where oMLX evaluates the final
+prompt token, then measures scheduler generation work from that boundary. It converts native
+seconds to milliseconds and combines those durations with oMLX's terminal token counts. It
+deliberately does not use HTTP latency as prompt evaluation time. The canonical terminal SSE event
+has empty choices and is followed by `[DONE]`.
+
+Speculative evidence is method-neutral at the benchmark boundary and method-specific at the oMLX
+adapter. Embedded MTP and DSpark use request-local native MTP statistics; DSpark readiness also
+validates the loaded checkpoint's native DSpark heads. DFlash uses its structured cycle and summary
+events and a separately locked MLX draft snapshot. Every speculative request reports the actual
+backend plus drafted and accepted counts, accepted cannot exceed drafted, and every measured
+speculative run must demonstrate nonzero drafting. Logs and server-global counters are not evidence.
 
 Context sweeps are distinct from server context capacity. The experiment configures one capacity
 large enough for its maximum checkpoint, then constructs separate cache-disjoint requests by
@@ -172,22 +197,25 @@ stacking canonical completed BFCL interactions. Planning counts the stable seria
 messages and tools and requires no tokenizer. Approximate targets choose content only; terminal
 engine evidence remains authoritative for actual prompt tokens and all rates.
 
-Released MLX-LM is the owned MLX text-engine path for non-speculative comparisons. MLX-VLM is a
-separate, UV-frozen managed engine used for Qwen and Gemma MTP because it implements those drafter
-architectures. Reports must identify that engine change; they may compare like-mode products across
-engines, but must not present MLX-LM-to-MLX-VLM differences as a controlled speculation-only delta.
+Legacy MLX-LM and MLX-VLM adapters remain engine types for historical product comparisons, but they
+must not be mixed into the standardized oMLX result set. A speculative-decoding comparison uses
+fresh oMLX processes for the same locked target artifact in baseline and selected speculative modes.
 
 ## Runs and interfaces
 
-A run is one immutable resolved execution of an experiment. Balanced blocks reverse variant order
-on alternating blocks, and only one model is loaded at a time. Before launch, the run writes a
+A run is one immutable resolved execution of an experiment. Default balanced blocks reverse variant
+order on alternating blocks. Speculative-decoding comparisons rotate every variant through each
+block position and therefore require a block count divisible by the number of variants. Only one
+model is loaded at a time. Every oMLX variant and block gets a fresh process and private base
+directory so process-global patches and caches cannot cross variants. Before launch, the run writes a
 manifest containing the resolved experiment, plan, artifacts, engine environments, host identity,
 and execution order. It appends lifecycle events while active and writes raw results and derived
 Markdown only after evaluation. A workspace lock permits one managed run at a time.
 
 The agent-facing CLI owns explicit corpus fetch/status, experiment preparation, planning, execution,
-inspection, watching, and cancellation. Existing endpoints, ICN, llama.cpp, and MLX-LM are variant
-engine types over the same evaluator rather than separate run modes. JSON is not an experiment
+inspection, watching, and cancellation. Existing endpoints, ICN, llama.cpp, legacy MLX adapters,
+and managed oMLX are variant engine types over the same evaluator rather than separate run modes.
+JSON is not an experiment
 authoring format and there is no second model-profile registry.
 The local dashboard discovers the same TypeScript experiments and reads the same filesystem run
 evidence. Dashboard actions spawn the non-interactive CLI; browser lifetime does not own a run. The

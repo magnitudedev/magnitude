@@ -57,18 +57,17 @@ bun benchmark dashboard
 The dashboard is served at `http://127.0.0.1:5187`; its API is at
 `http://127.0.0.1:4897`. It has no separate configuration or database.
 
-Experiment variants support managed ICN, managed llama.cpp, the UV-frozen MLX-LM adapter, and
-conforming existing endpoints. MTP experiments additionally use a UV-frozen MLX-VLM adapter because
-released MLX-LM cannot load the Qwen or Gemma MTP architectures used here. Managed targets use the
-same port sequentially, so only one model is loaded at once. The model stays loaded throughout that
-target's entire evaluation. Memory is sampled from the managed process tree; no server metrics or
-memory endpoint is used.
+Managed oMLX is the unified MLX serving path for new standardized results. Its UV environment pins
+oMLX and all material MLX dependencies, imports oMLX through an owned adapter, and exposes exactly
+one locked snapshot through a private run-scoped base directory. Preparation may install and
+qualify that environment; measurement runs use `--frozen --no-sync` and cannot install or download.
+Every variant and block gets a fresh process. Memory is sampled from the complete managed process
+tree.
 
-Speculative decoding is an explicit engine setting. Comparable variants must all declare the same
-mode: either `{ kind: "none" }` or MTP with an immutable drafter artifact and a shared candidate-token
-limit. MTP runs are rejected unless every request returns native drafted and accepted-token counters
-and the target demonstrates nonzero drafting. This prevents launch configuration from being mistaken
-for evidence that speculation actually ran.
+Speculative decoding is an explicit discriminated setting. Embedded MTP and DSpark weights belong
+to the target snapshot; DFlash declares a separately locked MLX draft snapshot. Readiness fails if
+oMLX selects a different backend, and speculative runs fail unless every request returns exact
+request-local drafted and accepted counts and the run demonstrates nonzero drafting.
 
 `requestPolicy.contextTokensPerSequence` is logical context per sequence and
 `requestPolicy.parallelSequences` is serving capacity. Both values are part of the plan digest. The
@@ -105,9 +104,9 @@ still summarized. Protocol and transport failures are never measured.
 Experiments may set `requestPolicy.requestTimeoutMs` for trials expected to exceed the five-minute
 default, such as 200K-context prefills.
 
-For a GGUF artifact, the trained context limit and chat-template digest are read directly from model
-metadata. The experiment's context policy is an upper bound. Existing endpoints still reference an
-exact artifact in the TypeScript experiment; that artifact establishes the claimed model identity.
+Trial planning uses the reusable model definition's logical model ID and declared context limit, so
+an all-MLX experiment needs no GGUF. Artifact locks and qualifications remain separate prepared
+evidence. The experiment's context policy is an upper bound.
 
 Reusable model definitions separate a logical model from its concrete artifacts. Experiments import
 those artifacts and bind each one to an engine:
@@ -140,6 +139,38 @@ export default defineExperiment({
   ],
   execution: { blocks: 2, variantOrder: "balanced" },
 })
+```
+
+A minimal managed baseline binds an MLX artifact to the frozen adapter:
+
+```ts
+{
+  id: "omlx-baseline",
+  artifact: model.artifacts.mlx4,
+  engine: omlx({
+    pythonProject: "../engines/omlx",
+    cache: { kind: "disabled" },
+    memoryGuard: { kind: "off" },
+    speculativeDecoding: { kind: "none" },
+  }),
+}
+```
+
+An embedded-MTP variant changes only the speculative policy. Put it alongside the baseline in a
+`defineSpeculativeDecodingComparison({...})` definition, with balanced blocks divisible by the
+number of variants. Normal `defineExperiment({...})` definitions hold speculative policy constant.
+
+```ts
+{
+  id: "omlx-mtp",
+  artifact: model.artifacts.mlx4,
+  engine: omlx({
+    pythonProject: "../engines/omlx",
+    cache: { kind: "disabled" },
+    memoryGuard: { kind: "off" },
+    speculativeDecoding: { kind: "mtp", maxDraftTokens: 3 },
+  }),
+}
 ```
 
 The public library exports `prepareCorpus`, `compileTrialPlan`, `evaluate`, `compare`, target
