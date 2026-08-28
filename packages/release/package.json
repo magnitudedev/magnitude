@@ -7,6 +7,7 @@
     ".": "./src/index.ts",
     "./targets": "./src/targets.ts",
     "./contracts": "./src/contracts.ts",
+    "./executables": "./src/executables.ts",
     "./acquisition": "./src/acquisition.ts",
     "./launcher": "./src/launcher.ts",
     "./trust": "./src/trust.ts"

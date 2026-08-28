@@ -28,6 +28,7 @@ import {
   SubscriptionRef,
 } from "effect";
 import { installationLoaderEnvironment } from "./installation-environment.js";
+import { ICN_EXECUTABLE_NAME } from "@magnitudedev/release/executables";
 import {
   IcnApiIncompatible,
   IcnBinaryNotExecutable,
@@ -135,7 +136,7 @@ const resolveCandidate = (
         path: join(
           root,
           "bin",
-          `magnitude-icn${process.platform === "win32" ? ".exe" : ""}`,
+          `${ICN_EXECUTABLE_NAME}${process.platform === "win32" ? ".exe" : ""}`,
         ),
         installation: source.path,
         environment: installationLoaderEnvironment(join(root, "runtime")),

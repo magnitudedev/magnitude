@@ -114,6 +114,7 @@
         "@magnitudedev/generate-id": "workspace:*",
         "@magnitudedev/icn": "workspace:*",
         "@magnitudedev/icn-protocol": "workspace:*",
+        "@magnitudedev/release": "workspace:*",
         "@magnitudedev/ripgrep": "workspace:*",
         "@magnitudedev/roles": "workspace:*",
         "@magnitudedev/skills": "workspace:*",
@@ -339,6 +340,7 @@
         "@huggingface/hub": "2.13.3",
         "@magnitudedev/ai": "workspace:*",
         "@magnitudedev/icn-protocol": "workspace:*",
+        "@magnitudedev/release": "workspace:*",
         "effect": "3.21.2",
       },
       "devDependencies": {

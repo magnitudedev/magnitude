@@ -37,6 +37,10 @@ import {
 } from "./common"
 import { buildIcnBinary } from "../../../../inference/scripts/compile"
 import { ACN_COORDINATION_REVISION } from "@magnitudedev/version"
+import {
+  ACN_EXECUTABLE_NAME,
+  ICN_EXECUTABLE_NAME,
+} from "../../src/executables"
 
 const PROJECT_ROOT = resolve(import.meta.dir, "../../../..")
 
@@ -189,18 +193,18 @@ export const smokeHostArchives = async (
     ) throw new Error(`${host.id} CLI archive returned the wrong version`)
     if (
       (await run([
-        resolve(acnRoot, `bin/magnitude-acn${extension}`),
+        resolve(acnRoot, `bin/${ACN_EXECUTABLE_NAME}${extension}`),
         "version",
       ])).trim() !== version
     ) throw new Error(`${host.id} ACN archive returned the wrong version`)
     if (
       Number((await run([
-        resolve(acnRoot, `bin/magnitude-acn${extension}`),
+        resolve(acnRoot, `bin/${ACN_EXECUTABLE_NAME}${extension}`),
         "coordination-revision",
       ])).trim()) !== ACN_COORDINATION_REVISION
     ) throw new Error(`${host.id} ACN archive returned the wrong coordination revision`)
     if (!(await run([
-      resolve(acnRoot, `bin/magnitude-acn${extension}`),
+      resolve(acnRoot, `bin/${ACN_EXECUTABLE_NAME}${extension}`),
       "doctor",
     ])).includes("ripgrep")) {
       throw new Error(`${host.id} ACN archive has no working embedded ripgrep`)
@@ -228,7 +232,7 @@ export const smokeHostArchives = async (
           ? { DYLD_LIBRARY_PATH: "" }
           : { LD_LIBRARY_PATH: "" }),
       }
-    const icnBinary = resolve(icnRoot, `bin/magnitude-icn${extension}`)
+    const icnBinary = resolve(icnRoot, `bin/${ICN_EXECUTABLE_NAME}${extension}`)
     await smokeIcnServer(icnBinary, declaration, icnRoot, environment)
   } finally {
     await rm(root, { recursive: true, force: true })
@@ -359,7 +363,7 @@ export const buildHostArtifacts = async (
       compatibility: Option.none(),
     },
     [{
-      path: `bin/magnitude-acn${host.executableExtension}`,
+      path: `bin/${ACN_EXECUTABLE_NAME}${host.executableExtension}`,
       source: acn,
       mode: 0o755,
     }],
@@ -379,7 +383,7 @@ export const buildHostArtifacts = async (
     },
     [
       {
-        path: `bin/magnitude-icn${host.executableExtension}`,
+        path: `bin/${ICN_EXECUTABLE_NAME}${host.executableExtension}`,
         source: icn.binary,
         mode: 0o755,
       },

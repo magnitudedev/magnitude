@@ -10,6 +10,7 @@ import {
   getTargetInfo,
 } from "../../../../scripts/release-target"
 import { run } from "./common"
+import { ACN_EXECUTABLE_NAME } from "../../src/executables"
 
 const PROJECT_ROOT = resolve(import.meta.dir, "../../../..")
 const RG_EMBED = resolve(PROJECT_ROOT, "packages/ripgrep/src/rg-embed.ts")
@@ -37,7 +38,7 @@ export const buildAcnBinary = async (target: string): Promise<string> => {
   const binary = resolve(
     PROJECT_ROOT,
     "bin",
-    `magnitude-acn${info.executableExt}`,
+    `${ACN_EXECUTABLE_NAME}${info.executableExt}`,
   )
   await mkdir(resolve(PROJECT_ROOT, "bin"), { recursive: true })
   await downloadRg(

@@ -9,6 +9,10 @@ import { Context, Effect, Either, Layer, Option, Runtime } from "effect"
 import type { ReleaseArtifact } from "./contracts"
 import { ReleaseAcquisitionError } from "./errors"
 import type { ArtifactByteProgress } from "./installation-progress"
+import {
+  ACN_EXECUTABLE_NAME,
+  ICN_EXECUTABLE_NAME,
+} from "./executables"
 
 const EXPANDED_LIMIT = 8 * 1024 * 1024 * 1024
 const ENTRY_LIMIT = 65_536
@@ -61,7 +65,9 @@ const validateLayout = (
     (host) => host === "windows-x64-msvc",
   ) ? ".exe" : ""
   if (artifact.kind === "cli" || artifact.kind === "acn") {
-    const expected = `bin/magnitude-${artifact.kind}${extension}`
+    const expected = artifact.kind === "cli"
+      ? `bin/magnitude-cli${extension}`
+      : `bin/${ACN_EXECUTABLE_NAME}${extension}`
     if (paths.size !== 1 || !paths.has(expected)) {
       return archiveError(
         `${artifact.id} has an invalid ${artifact.kind} layout`,
@@ -71,7 +77,7 @@ const validateLayout = (
   }
   if (artifact.kind === "icn-base") {
     for (const required of [
-      `bin/magnitude-icn${extension}`,
+      `bin/${ICN_EXECUTABLE_NAME}${extension}`,
       "catalog/model-planner-inputs.bundle",
     ]) {
       if (!paths.has(required)) {

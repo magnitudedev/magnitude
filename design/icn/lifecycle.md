@@ -263,7 +263,7 @@ Startup is one scoped acquisition:
 
 1. Validate launch configuration, resolve the executable, and verify its identity.
 2. Create a fresh opaque instance ID and child-only authorization capability.
-3. Spawn `magnitude-icn serve` as a private child with a writable stdin pipe retained by the ACN
+3. Spawn `magnitude-inference serve` as a private child with a writable stdin pipe retained by the ACN
    process scope. Before telemetry, native initialization, storage, workers, or HTTP startup, ICN
    installs an EOF guard on that pipe so abrupt ACN loss terminates it immediately.
 4. Before spawn acquisition becomes interruptible, construct the complete single-flight

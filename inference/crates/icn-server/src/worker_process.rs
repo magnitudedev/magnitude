@@ -171,11 +171,9 @@ mod tests {
         }
         for (path, contents) in [
             (
-                root.path().join("bin").join(if cfg!(windows) {
-                    "magnitude-icn.exe"
-                } else {
-                    "magnitude-icn"
-                }),
+                root.path()
+                    .join("bin")
+                    .join(crate::installation::executable_name()),
                 b"executable".as_slice(),
             ),
             (

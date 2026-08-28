@@ -3,6 +3,7 @@ import * as CommandExecutor from "@effect/platform/CommandExecutor"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as HttpClient from "@effect/platform/HttpClient"
 import { makeIcnApiClient } from "@magnitudedev/icn-protocol/client"
+import { ICN_EXECUTABLE_NAME } from "@magnitudedev/release/executables"
 import { Context, Data, Effect, Layer, Option, Ref, Schedule, Scope, Stream } from "effect"
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
@@ -308,15 +309,15 @@ export const resolveIcnExecutable = (
   firstExecutable([
     explicit,
     process.env.MAGNITUDE_ICN_SERVER,
-    Bun.which("magnitude-icn"),
-    "inference/target/benchmark-release/bin/magnitude-icn",
-    "inference/target/development/bin/magnitude-icn",
+    Bun.which(ICN_EXECUTABLE_NAME),
+    `inference/target/benchmark-release/bin/${ICN_EXECUTABLE_NAME}`,
+    `inference/target/development/bin/${ICN_EXECUTABLE_NAME}`,
   ]).pipe(Effect.flatMap(Option.match({
     onSome: Effect.succeed,
     onNone: () => Effect.fail(new TargetError({
       targetId: "icn",
       operation: "resolve-executable",
-      message: "magnitude-icn was not found; build it or pass --icn-executable",
+      message: `${ICN_EXECUTABLE_NAME} was not found; build it or pass --icn-executable`,
     })),
   })))
 
@@ -366,7 +367,7 @@ export const resolveLlamaCppExecutable = (
 
 export function managedIcnTarget(options: ManagedComparisonOptions): ManagedTarget {
   const port = options.port ?? 8091
-  const executablePath = options.icnExecutable ?? resolve("inference/target/development/bin/magnitude-icn")
+  const executablePath = options.icnExecutable ?? resolve(`inference/target/development/bin/${ICN_EXECUTABLE_NAME}`)
   return {
     kind: "managed",
     engine: "icn",

@@ -20,6 +20,7 @@
     "@magnitudedev/generate-id": "workspace:*",
     "@magnitudedev/icn": "workspace:*",
     "@magnitudedev/icn-protocol": "workspace:*",
+    "@magnitudedev/release": "workspace:*",
     "@magnitudedev/acn-protocol": "workspace:*",
     "@magnitudedev/ripgrep": "workspace:*",
     "@magnitudedev/roles": "workspace:*",

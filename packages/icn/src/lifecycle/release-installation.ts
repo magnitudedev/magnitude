@@ -13,6 +13,7 @@ import {
   acquireRelease,
   currentHost,
   installArtifact,
+  ICN_EXECUTABLE_NAME,
   NodeArchiveExtractor,
   releaseBundleSizes,
   selectArtifact,
@@ -47,7 +48,7 @@ const installationError = (
 ) => new ReleaseIcnInstallationError({ stage, message })
 
 const executableName = () =>
-  process.platform === "win32" ? "magnitude-icn.exe" : "magnitude-icn"
+  `${ICN_EXECUTABLE_NAME}${process.platform === "win32" ? ".exe" : ""}`
 
 const MAXIMUM_COMMAND_OUTPUT = 64 * 1024
 

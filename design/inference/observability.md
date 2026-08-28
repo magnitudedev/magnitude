@@ -12,7 +12,7 @@ applies_to:
 
 ICN emits structured diagnostics through Rust's `tracing` facade and exports both OpenTelemetry
 traces and OpenTelemetry log records from the server binary. Domain crates create spans and events
-without knowing the exporter. The `magnitude-icn` binary exclusively owns subscriber installation,
+without knowing the exporter. The `magnitude-inference` binary exclusively owns subscriber installation,
 OTLP configuration, batching, resource identity, and shutdown flushing.
 
 ## Service identity and activation

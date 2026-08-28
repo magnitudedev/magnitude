@@ -2,7 +2,7 @@
  * Electron main entry — spec §5.1
  *
  * Responsibilities:
- * 1. Bundle path discovery — find the magnitude-acn binary
+ * 1. Bundle path discovery — find the magnitude-service binary
  * 2. ACN process management through one Effect-native service
  * 3. OS shell integration — BrowserWindow, preload, menu shortcuts
  *
@@ -41,6 +41,7 @@ import {
   AcnCandidateBootstrapProcessStopFailed,
   AcnCandidateParentChannelReleaseFailed,
   AcnCandidateSpawnFailed,
+  ACN_EXECUTABLE_NAME,
   SDK_ACN_TARGET,
   type AcnInstanceManager as AcnInstanceManagerService,
 } from "@magnitudedev/sdk"
@@ -228,7 +229,7 @@ function storageRemove(key: string): void {
 }
 
 /**
- * Find the magnitude-acn binary path.
+ * Find the magnitude-service binary path.
  * In production, it's bundled in process.resourcesPath.
  * In development, let the SDK or source launch command resolve the binary.
  */
@@ -236,13 +237,13 @@ function findBinaryPath(): Option.Option<string> {
   // Check for bundled binary in resources (production)
   const resourcesPath = process.resourcesPath
   if (resourcesPath) {
-    const bundledPath = nodePath.join(resourcesPath, "magnitude-acn")
+    const bundledPath = nodePath.join(resourcesPath, ACN_EXECUTABLE_NAME)
     if (nodeFs.existsSync(bundledPath)) {
       return Option.some(bundledPath)
     }
     // Also check platform-specific subdirectory
     const platformName = `${process.platform}-${process.arch}`
-    const platformPath = nodePath.join(resourcesPath, "bin", platformName, "magnitude-acn")
+    const platformPath = nodePath.join(resourcesPath, "bin", platformName, ACN_EXECUTABLE_NAME)
     if (nodeFs.existsSync(platformPath)) {
       return Option.some(platformPath)
     }
