@@ -9,7 +9,7 @@ import type { ComparisonResult, ExperimentRunResult, TargetConfiguration, TrialP
 import { loadExperiment, resolveExecutionOrder, resolveExperimentPaths, type ExperimentDefinition } from "./experiment"
 import { digestObject } from "./hash"
 import { compileTrialPlan } from "./plan"
-import { loadPreparedExperiment, type PreparedArtifact, type PreparedExperiment } from "./preparation"
+import { loadPreparedExperiment, type PreparedArtifact, type PreparedExperiment, verifyPreparedEngineEnvironments } from "./preparation"
 import { renderComparisonMarkdown } from "./report"
 import { managedIcnTarget } from "./target"
 
@@ -72,7 +72,13 @@ function engineFor(prepared: PreparedExperiment, variantId: string) {
   return engine
 }
 
-function targetFor(prepared: PreparedExperiment, variantId: string, port: number, logPath: string): TargetConfiguration {
+export function targetFor(
+  prepared: PreparedExperiment,
+  variantId: string,
+  port: number,
+  logPath: string,
+  evidenceDirectory = join(dirname(logPath), `${variantId}.omlx`),
+): TargetConfiguration {
   const variant = prepared.experiment.variants.find((candidate) => candidate.id === variantId)
   if (!variant) throw new RunError({ operation: "resolve-target", message: `unknown variant ${variantId}` })
   const artifact = artifactFor(prepared, variantId, "target")
@@ -91,7 +97,7 @@ function targetFor(prepared: PreparedExperiment, variantId: string, port: number
     id: variant.id,
     endpoint: `http://127.0.0.1:${port}`,
     servedModel: variant.artifact.modelId,
-    readinessPath: "/health",
+    readiness: { kind: "http" as const, path: "/health" },
     parallelSequences: prepared.experiment.requestPolicy.parallelSequences,
     requestTimeoutMs: prepared.experiment.requestPolicy.requestTimeoutMs,
     logPath,
@@ -173,6 +179,52 @@ function targetFor(prepared: PreparedExperiment, variantId: string, port: number
       ],
     }
   }
+  if (variant.engine.kind === "omlx" && preparedEngine.kind === "omlx") {
+    if (artifact.kind !== "mlx" || !artifact.manifestPath) {
+      throw new RunError({ operation: "resolve-target", message: `oMLX target ${variantId} requires a prepared MLX snapshot` })
+    }
+    const speculation = variant.engine.speculativeDecoding
+    const args = [
+      "run", "--frozen", "--no-sync", "--project", variant.engine.pythonProject,
+      "magnitude-omlx-benchmark-server",
+      "--model", artifact.path,
+      "--served-model", variant.artifact.modelId,
+      "--host", "127.0.0.1", "--port", String(port),
+      "--base-path", evidenceDirectory,
+      "--max-concurrent-requests", String(prepared.experiment.requestPolicy.parallelSequences),
+      "--context-capacity", String(prepared.experiment.requestPolicy.contextTokensPerSequence),
+      "--cache-policy", variant.engine.cache.kind,
+      "--memory-guard", variant.engine.memoryGuard.kind,
+      "--speculative-method", speculation.kind,
+    ]
+    if (speculation.kind === "mtp" || speculation.kind === "dspark") {
+      args.push("--max-draft-tokens", String(speculation.maxDraftTokens))
+    }
+    if (speculation.kind === "dflash") {
+      const drafter = artifactFor(prepared, variantId, "drafter")
+      if (drafter.kind !== "mlx") {
+        throw new RunError({ operation: "resolve-target", message: `oMLX DFlash target ${variantId} requires a prepared MLX drafter` })
+      }
+      args.push("--dflash-draft", drafter.path, "--dflash-block-size", String(speculation.blockSize))
+    }
+    return {
+      ...common,
+      engine: "omlx",
+      speculativeBackend: speculation.kind,
+      executable: "uv",
+      args,
+      readiness: {
+        kind: "omlx",
+        path: "/magnitude/benchmark/readiness",
+        expected: {
+          servedModel: variant.artifact.modelId,
+          contextCapacity: prepared.experiment.requestPolicy.contextTokensPerSequence,
+          parallelSequences: prepared.experiment.requestPolicy.parallelSequences,
+          speculativeBackend: speculation.kind,
+        },
+      },
+    }
+  }
   if (variant.engine.kind !== "mlx-lm" || preparedEngine.kind !== "mlx-lm") {
     throw new RunError({ operation: "resolve-target", message: `unsupported engine for ${variantId}` })
   }
@@ -192,41 +244,61 @@ function targetFor(prepared: PreparedExperiment, variantId: string, port: number
   }
 }
 
-export function assertMtpEvidence(experiment: ExperimentDefinition, comparison: ComparisonResult): void {
-  const mtpVariants = new Set<string>(experiment.variants.flatMap((variant) =>
-    (variant.engine.kind === "llama.cpp" || variant.engine.kind === "mlx-vlm")
-      && variant.engine.speculativeDecoding.kind === "mtp"
-      ? [variant.id]
-      : []))
+export function assertSpeculativeEvidence(experiment: ExperimentDefinition, comparison: ComparisonResult): void {
+  const expected = new Map<string, { readonly method: "none" | "mtp" | "dflash" | "dspark"; readonly requireBackend: boolean }>(experiment.variants.map((variant) => {
+    const speculation = variant.engine.kind === "llama.cpp" || variant.engine.kind === "mlx-vlm" || variant.engine.kind === "mlx-lm" || variant.engine.kind === "omlx"
+      ? variant.engine.speculativeDecoding.kind
+      : "none"
+    return [variant.id, { method: speculation, requireBackend: variant.engine.kind === "omlx" }] as const
+  }))
   for (const result of comparison.results) {
-    if (!mtpVariants.has(result.target.id)) continue
+    const policy = expected.get(result.target.id)
+    if (!policy) continue
     const requests = result.trials.flatMap((trial) => [
       ...(trial.setupRequests ?? []),
       ...trial.requests,
     ])
+    if (policy.method === "none") {
+      const unexpected = requests.find((request) => request.terminal?.timings.speculativeBackend !== undefined
+        || request.terminal?.timings.draftTokens !== undefined
+        || request.terminal?.timings.acceptedDraftTokens !== undefined)
+      if (unexpected) {
+        throw new RunError({
+          operation: "validate-speculative-evidence",
+          message: `${result.target.id} baseline request ${unexpected.requestId} reported speculative evidence`,
+        })
+      }
+      continue
+    }
     let drafted = 0
     for (const request of requests) {
       const draftTokens = request.terminal?.timings.draftTokens
       const acceptedDraftTokens = request.terminal?.timings.acceptedDraftTokens
       if (draftTokens === undefined || acceptedDraftTokens === undefined) {
         throw new RunError({
-          operation: "validate-mtp-evidence",
-          message: `${result.target.id} request ${request.requestId} did not return native MTP draft counters`,
+          operation: "validate-speculative-evidence",
+          message: `${result.target.id} request ${request.requestId} did not return native ${policy.method} draft counters`,
+        })
+      }
+      if (policy.requireBackend && request.terminal?.timings.speculativeBackend !== policy.method) {
+        throw new RunError({
+          operation: "validate-speculative-evidence",
+          message: `${result.target.id} request ${request.requestId} expected ${policy.method} but reported ${request.terminal?.timings.speculativeBackend ?? "no backend"}`,
         })
       }
       if (!Number.isSafeInteger(draftTokens) || !Number.isSafeInteger(acceptedDraftTokens)
         || draftTokens < 0 || acceptedDraftTokens < 0 || acceptedDraftTokens > draftTokens) {
         throw new RunError({
-          operation: "validate-mtp-evidence",
-          message: `${result.target.id} request ${request.requestId} returned inconsistent MTP draft counters`,
+          operation: "validate-speculative-evidence",
+          message: `${result.target.id} request ${request.requestId} returned inconsistent ${policy.method} draft counters`,
         })
       }
       drafted += draftTokens
     }
     if (requests.length === 0 || drafted === 0) {
       throw new RunError({
-        operation: "validate-mtp-evidence",
-        message: `${result.target.id} did not demonstrate active MTP drafting`,
+        operation: "validate-speculative-evidence",
+        message: `${result.target.id} did not demonstrate active ${policy.method} drafting`,
       })
     }
   }
@@ -277,6 +349,9 @@ export const runExperiment = (experimentPath: string): Effect.Effect<ExperimentR
     if (digestObject(prepared.experiment) !== digestObject(resolved)) {
       return yield* new RunError({ operation: "validate-prepared", message: "experiment changed after preparation; run prepare again" })
     }
+    yield* verifyPreparedEngineEnvironments(prepared).pipe(
+      Effect.mapError((error) => new RunError({ operation: error.operation, message: error.message })),
+    )
     const corpus = yield* prepareCorpus({ root: prepared.corpusRoot, offline: true }).pipe(Effect.mapError((error) => new RunError({ operation: "load-corpus", message: String(error) })))
     const plan = yield* compileTrialPlan(corpus, prepared.planModel, {
       ...(prepared.experiment.suite.kind === "agent-core"
@@ -316,20 +391,27 @@ export const runExperiment = (experimentPath: string): Effect.Effect<ExperimentR
         activeBlock = block
         const variantOrder = order[block]!
         yield* appendEvent(eventsPath, { type: "block-started", at: new Date().toISOString(), runId: id, block })
-        const targets = variantOrder.map((variantId) => targetFor(prepared, variantId, 8091, join(logs, `${variantId}.block-${block}.log`)))
+        const targets = variantOrder.map((variantId) => targetFor(
+          prepared,
+          variantId,
+          8091,
+          join(logs, `${variantId}.block-${block}.log`),
+          join(directory, "targets", `block-${block}`, variantId, "omlx"),
+        ))
         const executeTargets = targets.length === 1
           ? evaluate(plan, targets[0]!).pipe(Effect.map((result) => ({
               comparisonKind: "strict" as const,
+              comparisonProtocol: prepared.experiment.comparisonProtocol.kind,
               differences: [] as const,
               plan,
               results: [result],
             })))
-          : compare(plan, targets)
+          : compare(plan, targets, prepared.experiment.comparisonProtocol.kind)
         const comparison = yield* executeTargets.pipe(
           Effect.provideService(EvaluationReporter, reporter),
           Effect.mapError((error) => new RunError({ operation: error.operation, message: error.message })),
         )
-        assertMtpEvidence(prepared.experiment, comparison)
+        assertSpeculativeEvidence(prepared.experiment, comparison)
         blocks.push({ index: block, variantOrder, comparison })
         yield* appendEvent(eventsPath, { type: "block-completed", at: new Date().toISOString(), runId: id, block })
       }

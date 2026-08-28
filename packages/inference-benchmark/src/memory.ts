@@ -35,6 +35,11 @@ function processTree(rootPid: number, rows: readonly ProcessRow[]): readonly Pro
   return [...selected.values()]
 }
 
+export function processTreePids(rootPid: number): readonly number[] {
+  if (!Number.isSafeInteger(rootPid) || rootPid <= 1) return []
+  return processTree(rootPid, processRows()).map(({ pid }) => pid)
+}
+
 const libproc = process.platform === "darwin"
   ? dlopen("/usr/lib/libproc.dylib", {
       proc_pid_rusage: { args: [FFIType.i32, FFIType.i32, FFIType.ptr], returns: FFIType.i32 },

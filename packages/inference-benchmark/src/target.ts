@@ -3,14 +3,14 @@ import * as CommandExecutor from "@effect/platform/CommandExecutor"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as HttpClient from "@effect/platform/HttpClient"
 import { makeIcnApiClient } from "@magnitudedev/icn-protocol/client"
-import { Context, Data, Effect, Layer, Option, Ref, Schedule, Scope, Stream } from "effect"
+import { Context, Data, Effect, Layer, Option, Ref, Schedule, Schema, Scope, Stream } from "effect"
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { createWriteStream } from "node:fs"
 import type {
   ExistingTarget,
   ManagedTarget,
-  ModelIdentity,
+  LogicalModelIdentity,
   TargetConfiguration,
 } from "./domain"
 import {
@@ -18,6 +18,7 @@ import {
   type EndpointConfiguration,
   probeEndpoint,
 } from "./transport"
+import { processTreePids } from "./memory"
 
 export class TargetError extends Data.TaggedError("TargetError")<{
   readonly targetId: string
@@ -45,20 +46,72 @@ const appendBounded = (output: Ref.Ref<string>, chunk: string, limit = 1_000_000
     return next.length <= limit ? next : next.slice(next.length - limit)
   })
 
+const OmlxReadinessSchema = Schema.Struct({
+  ready: Schema.Literal(true),
+  discovered_model: Schema.String,
+  served_model: Schema.String,
+  loaded: Schema.Literal(true),
+  context_capacity: Schema.Int.pipe(Schema.greaterThan(0)),
+  max_concurrent_requests: Schema.Int.pipe(Schema.greaterThan(0)),
+  speculative_backend: Schema.Literal("none", "mtp", "dflash", "dspark"),
+  qualification_completed: Schema.Literal(true),
+})
+
+const probeOmlxReadiness = (
+  target: ManagedTarget,
+  endpoint: EndpointConfiguration,
+): Effect.Effect<void, TargetError> => Effect.tryPromise({
+  try: async () => {
+    if (target.readiness.kind !== "omlx") throw new Error("invalid oMLX readiness policy")
+    const response = await fetch(`${endpoint.endpoint.replace(/\/+$/, "")}/${target.readiness.path.replace(/^\/+/, "")}`)
+    if (!response.ok) throw new Error(`readiness returned ${response.status}`)
+    const status = Schema.decodeUnknownSync(OmlxReadinessSchema)(await response.json())
+    const expected = target.readiness.expected
+    if (status.discovered_model !== expected.servedModel || status.served_model !== expected.servedModel) {
+      throw new Error(`expected model ${expected.servedModel}, received ${status.discovered_model}/${status.served_model}`)
+    }
+    if (status.context_capacity !== expected.contextCapacity) {
+      throw new Error(`expected context ${expected.contextCapacity}, received ${status.context_capacity}`)
+    }
+    if (status.max_concurrent_requests !== expected.parallelSequences) {
+      throw new Error(`expected concurrency ${expected.parallelSequences}, received ${status.max_concurrent_requests}`)
+    }
+    if (status.speculative_backend !== expected.speculativeBackend) {
+      throw new Error(`expected ${expected.speculativeBackend}, received ${status.speculative_backend}`)
+    }
+  },
+  catch: (error) => targetError(target.id, "readiness-pending", error),
+})
+
 const stopProcess = (
   target: ManagedTarget,
   processHandle: CommandExecutor.Process,
 ): Effect.Effect<void> =>
   Effect.gen(function* () {
     if (!(yield* processHandle.isRunning)) return
+    const rootPid = Number(processHandle.pid)
+    const initialTree = [...new Set([rootPid, ...processTreePids(rootPid)])]
     yield* processHandle.kill("SIGINT").pipe(Effect.ignore)
-    const stopped = yield* processHandle.isRunning.pipe(
-      Effect.flatMap((running) => running ? Effect.fail(undefined) : Effect.succeed(true)),
+    const stopped = yield* Effect.sync(() => initialTree.every((pid) => {
+      try {
+        process.kill(pid, 0)
+        return false
+      } catch {
+        return true
+      }
+    })).pipe(
+      Effect.flatMap((done) => done ? Effect.succeed(true) : Effect.fail(undefined)),
       Effect.retry(Schedule.spaced("100 millis").pipe(Schedule.compose(Schedule.recurs(99)))),
       Effect.catchAll(() => Effect.succeed(false)),
     )
     if (stopped) return
-    yield* processHandle.kill("SIGKILL").pipe(Effect.ignore)
+    yield* Effect.sync(() => {
+      const remaining = new Set([...initialTree, ...processTreePids(rootPid)])
+      for (const pid of [...remaining].sort((left, right) => right - left)) {
+        if (pid <= 1) continue
+        try { process.kill(pid, "SIGKILL") } catch { /* already stopped */ }
+      }
+    })
   }).pipe(
     Effect.catchAll((error) =>
       Effect.logWarning(`Failed to stop managed target ${target.id}`).pipe(
@@ -84,9 +137,12 @@ const waitForReady = (
         message: `process exited with ${code}`,
       })
     }
-    yield* probeEndpoint(endpoint, target.readinessPath).pipe(
-      Effect.mapError((error) => targetError(target.id, "readiness-pending", error)),
-    )
+    if (target.readiness.kind === "omlx") yield* probeOmlxReadiness(target, endpoint)
+    else {
+      yield* probeEndpoint(endpoint, target.readiness.path).pipe(
+        Effect.mapError((error) => targetError(target.id, "readiness-pending", error)),
+      )
+    }
   })
   return attempt.pipe(
     Effect.retry({
@@ -274,7 +330,7 @@ export const openTarget = (
   Effect.flatMap(TargetLauncher, (launcher) => launcher.open(target))
 
 export interface ManagedComparisonOptions {
-  readonly model: ModelIdentity
+  readonly model: LogicalModelIdentity & { readonly artifactPath: string; readonly artifactSha256: string }
   readonly icnExecutable?: string
   readonly llamaExecutable?: string
   readonly port?: number
@@ -374,7 +430,7 @@ export function managedIcnTarget(options: ManagedComparisonOptions): ManagedTarg
     executable: executablePath,
     endpoint: `http://127.0.0.1:${port}`,
     servedModel: options.model.id,
-    readinessPath: "/health",
+    readiness: { kind: "http", path: "/health" },
     args: [
       "serve",
       "--bind", `127.0.0.1:${port}`,
@@ -399,7 +455,7 @@ export function managedLlamaCppTarget(options: ManagedComparisonOptions): Manage
     executable: options.llamaExecutable ?? "llama-server",
     endpoint: `http://127.0.0.1:${port}`,
     servedModel: options.model.id,
-    readinessPath: "/health",
+    readiness: { kind: "http", path: "/health" },
     args: [
       "--host", "127.0.0.1",
       "--port", String(port),

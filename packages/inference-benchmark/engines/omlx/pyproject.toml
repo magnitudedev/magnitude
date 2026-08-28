@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "magnitude-omlx-benchmark"
+version = "0.1.0"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "omlx @ git+https://github.com/jundot/omlx.git@85708e4b9a585df42241c826b6be2b4dba018406",
+]
+
+[project.scripts]
+magnitude-omlx-benchmark-server = "magnitude_omlx_benchmark.server:main"
+magnitude-omlx-benchmark-qualify = "magnitude_omlx_benchmark.qualify:main"
+magnitude-omlx-benchmark-identity = "magnitude_omlx_benchmark.identity:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/magnitude_omlx_benchmark"]
+
+[tool.hatch.metadata]
+allow-direct-references = true

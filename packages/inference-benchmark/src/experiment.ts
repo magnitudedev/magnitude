@@ -21,6 +21,7 @@ export interface GgufArtifactDefinition {
   readonly kind: "gguf"
   readonly modelId: ModelId
   readonly modelSource: { readonly repository: string; readonly revision: string }
+  readonly modelContextLimit: number
   readonly repository: string
   readonly revision: string
   readonly file: string
@@ -33,6 +34,7 @@ export interface MlxArtifactDefinition {
   readonly kind: "mlx"
   readonly modelId: ModelId
   readonly modelSource: { readonly repository: string; readonly revision: string }
+  readonly modelContextLimit: number
   readonly repository: string
   readonly revision: string
   readonly manifest: string
@@ -43,16 +45,18 @@ export interface MlxArtifactDefinition {
 
 export type ModelArtifactDefinition = GgufArtifactDefinition | MlxArtifactDefinition
 export type ModelArtifactInput =
-  | Omit<GgufArtifactDefinition, "modelId" | "modelSource">
-  | Omit<MlxArtifactDefinition, "modelId" | "modelSource">
+  | Omit<GgufArtifactDefinition, "modelId" | "modelSource" | "modelContextLimit">
+  | Omit<MlxArtifactDefinition, "modelId" | "modelSource" | "modelContextLimit">
 
 export interface ModelDefinition<Artifacts extends Readonly<Record<string, ModelArtifactInput>>> {
   readonly id: ModelId
   readonly source: { readonly repository: string; readonly revision: string }
+  readonly contextLimit: number
   readonly artifacts: {
     readonly [K in keyof Artifacts]: Artifacts[K] & {
       readonly modelId: ModelId
       readonly modelSource: { readonly repository: string; readonly revision: string }
+      readonly modelContextLimit: number
     }
   }
 }
@@ -101,7 +105,25 @@ export interface ExistingEndpointEngineDefinition {
   readonly requestBody: JsonRecord
 }
 
-export type EngineDefinition = LlamaCppEngineDefinition | MlxLmEngineDefinition | MlxVlmEngineDefinition | IcnEngineDefinition | ExistingEndpointEngineDefinition
+export type OmlxSpeculation =
+  | { readonly kind: "none" }
+  | { readonly kind: "mtp"; readonly maxDraftTokens: number }
+  | { readonly kind: "dspark"; readonly maxDraftTokens: number }
+  | { readonly kind: "dflash"; readonly draftArtifact: MlxArtifactDefinition; readonly blockSize: number }
+
+export interface OmlxEngineDefinition {
+  readonly kind: "omlx"
+  readonly pythonProject: string
+  readonly cache: { readonly kind: "disabled" }
+  readonly memoryGuard: { readonly kind: "off" }
+  readonly speculativeDecoding: OmlxSpeculation
+}
+
+export type EngineDefinition = LlamaCppEngineDefinition | MlxLmEngineDefinition | MlxVlmEngineDefinition | OmlxEngineDefinition | IcnEngineDefinition | ExistingEndpointEngineDefinition
+
+export type ComparisonProtocol =
+  | { readonly kind: "fixed-speculative-policy" }
+  | { readonly kind: "speculative-decoding" }
 
 export interface ContextSweepDefinition {
   readonly kind: "context-sweep"
@@ -113,6 +135,7 @@ export interface ContextSweepDefinition {
 export interface ExperimentDefinition {
   readonly id: ExperimentId
   readonly title: string
+  readonly comparisonProtocol: ComparisonProtocol
   readonly suite:
     | { readonly kind: "agent-core"; readonly profile: ProfileName }
     | ContextSweepDefinition
@@ -134,7 +157,7 @@ export interface ExperimentDefinition {
   readonly execution: { readonly variantOrder: "balanced" | "declared"; readonly blocks: number }
 }
 
-export type ExperimentInput = Omit<ExperimentDefinition, "id" | "variants" | "requestPolicy"> & {
+export type ExperimentInput = Omit<ExperimentDefinition, "id" | "variants" | "requestPolicy" | "comparisonProtocol"> & {
   readonly id: string
   readonly requestPolicy: Omit<ExperimentDefinition["requestPolicy"], "requestTimeoutMs"> & {
     readonly requestTimeoutMs?: number
@@ -146,6 +169,7 @@ const Artifact = Schema.Union(
   Schema.Struct({
     kind: Schema.Literal("gguf"), modelId: ModelId,
     modelSource: Schema.Struct({ repository: NonEmptyString, revision: NonEmptyString }),
+    modelContextLimit: PositiveInt,
     repository: NonEmptyString,
     revision: NonEmptyString, file: NonEmptyString, sizeBytes: PositiveInt, sha256: Sha256,
     quantization: Schema.Struct({ family: Schema.Literal("gguf"), scheme: NonEmptyString }),
@@ -153,6 +177,7 @@ const Artifact = Schema.Union(
   Schema.Struct({
     kind: Schema.Literal("mlx"), modelId: ModelId,
     modelSource: Schema.Struct({ repository: NonEmptyString, revision: NonEmptyString }),
+    modelContextLimit: PositiveInt,
     repository: NonEmptyString,
     revision: NonEmptyString, manifest: NonEmptyString,
     quantization: Schema.Union(
@@ -167,6 +192,18 @@ const SpeculativeMtp = Schema.Struct({
   draftArtifact: Artifact,
   maxDraftTokens: PositiveInt,
 })
+const OmlxSpeculationSchema = Schema.Union(
+  SpeculativeNone,
+  Schema.Struct({ kind: Schema.Literal("mtp"), maxDraftTokens: PositiveInt }),
+  Schema.Struct({ kind: Schema.Literal("dspark"), maxDraftTokens: PositiveInt }),
+  Schema.Struct({
+    kind: Schema.Literal("dflash"),
+    draftArtifact: Artifact.pipe(Schema.filter((artifact): artifact is MlxArtifactDefinition => artifact.kind === "mlx", {
+      message: () => "oMLX DFlash requires an MLX draft artifact",
+    })),
+    blockSize: PositiveInt,
+  }),
+)
 const Engine = Schema.Union(
   Schema.Struct({
     kind: Schema.Literal("llama.cpp"), executable: NonEmptyString,
@@ -187,6 +224,12 @@ const Engine = Schema.Union(
     speculativeDecoding: SpeculativeMtp,
   }),
   Schema.Struct({
+    kind: Schema.Literal("omlx"), pythonProject: NonEmptyString,
+    cache: Schema.Struct({ kind: Schema.Literal("disabled") }),
+    memoryGuard: Schema.Struct({ kind: Schema.Literal("off") }),
+    speculativeDecoding: OmlxSpeculationSchema,
+  }),
+  Schema.Struct({
     kind: Schema.Literal("icn"), executable: NonEmptyString,
   }),
   Schema.Struct({
@@ -201,6 +244,10 @@ const Engine = Schema.Union(
 export const ExperimentDefinitionSchema = Schema.Struct({
   id: ExperimentId,
   title: NonEmptyString,
+  comparisonProtocol: Schema.Union(
+    Schema.Struct({ kind: Schema.Literal("fixed-speculative-policy") }),
+    Schema.Struct({ kind: Schema.Literal("speculative-decoding") }),
+  ),
   suite: Schema.Union(
     Schema.Struct({ kind: Schema.Literal("agent-core"), profile: Schema.Literal("smoke", "standard", "full") }),
     Schema.Struct({
@@ -245,16 +292,22 @@ function assertSerializable(value: unknown, seen = new Set<object>(), path = "ex
 export function defineModel<const Artifacts extends Readonly<Record<string, ModelArtifactInput>>>(definition: {
   readonly id: string
   readonly source: { readonly repository: string; readonly revision: string }
+  readonly contextLimit: number
   readonly artifacts: Artifacts
 }): ModelDefinition<Artifacts> {
+  if (!Number.isSafeInteger(definition.contextLimit) || definition.contextLimit <= 0) {
+    throw new Error("model context limit must be a positive integer")
+  }
   const id = definition.id as ModelId
   return {
     id,
     source: definition.source,
+    contextLimit: definition.contextLimit,
     artifacts: Object.fromEntries(Object.entries(definition.artifacts).map(([key, artifact]) => [key, {
       ...artifact,
       modelId: id,
       modelSource: definition.source,
+      modelContextLimit: definition.contextLimit,
     }])) as unknown as ModelDefinition<Artifacts>["artifacts"],
   }
 }
@@ -264,16 +317,23 @@ export const contextSweep = (options: Omit<ContextSweepDefinition, "kind">): Con
 export const llamaCpp = (options: Omit<LlamaCppEngineDefinition, "kind">): LlamaCppEngineDefinition => ({ kind: "llama.cpp", ...options })
 export const mlxLm = (options: Omit<MlxLmEngineDefinition, "kind">): MlxLmEngineDefinition => ({ kind: "mlx-lm", ...options })
 export const mlxVlm = (options: Omit<MlxVlmEngineDefinition, "kind">): MlxVlmEngineDefinition => ({ kind: "mlx-vlm", ...options })
+export const omlx = (options: Omit<OmlxEngineDefinition, "kind">): OmlxEngineDefinition => ({ kind: "omlx", ...options })
 export const icn = (options: Omit<IcnEngineDefinition, "kind">): IcnEngineDefinition => ({ kind: "icn", ...options })
 export const existingEndpoint = (options: Omit<ExistingEndpointEngineDefinition, "kind">): ExistingEndpointEngineDefinition => ({ kind: "existing-endpoint", ...options })
 
-export function defineExperiment(definition: ExperimentInput): ExperimentDefinition {
+function validateExperimentDefinition(definition: unknown): ExperimentDefinition {
   assertSerializable(definition)
   const decoded = Schema.decodeUnknownSync(ExperimentDefinitionSchema)(definition) as ExperimentDefinition
   const ids = new Set(decoded.variants.map(({ id }) => id))
   if (ids.size !== decoded.variants.length) throw new Error("variant ids must be unique")
   const models = new Set(decoded.variants.map(({ artifact }) => artifact.modelId))
   if (models.size !== 1) throw new Error("the first benchmark implementation requires one logical model")
+  const modelContexts = new Set(decoded.variants.map(({ artifact }) => artifact.modelContextLimit))
+  if (modelContexts.size !== 1) throw new Error("comparable artifacts must declare the same logical model context limit")
+  const modelContextLimit = decoded.variants[0]!.artifact.modelContextLimit
+  if (decoded.requestPolicy.contextTokensPerSequence > modelContextLimit) {
+    throw new Error("configured context per sequence exceeds the logical model context limit")
+  }
   if (decoded.suite.kind === "context-sweep") {
     const checkpoints = decoded.suite.checkpoints
     if (new Set(checkpoints).size !== checkpoints.length
@@ -284,6 +344,14 @@ export function defineExperiment(definition: ExperimentInput): ExperimentDefinit
     if (maximum + decoded.requestPolicy.maxOutputTokens > decoded.requestPolicy.contextTokensPerSequence) {
       throw new Error("context-sweep maximum plus output allowance exceeds the configured context window")
     }
+  }
+  const omlxVariants = decoded.variants.filter(({ engine }) => engine.kind === "omlx")
+  if (omlxVariants.length > 0 && omlxVariants.length !== decoded.variants.length) {
+    throw new Error("managed oMLX variants cannot be mixed with another serving runtime")
+  }
+  if (omlxVariants.length > 0
+    && new Set(omlxVariants.map(({ engine }) => (engine as OmlxEngineDefinition).pythonProject)).size !== 1) {
+    throw new Error("managed oMLX variants must use one frozen Python project")
   }
   for (const variant of decoded.variants) {
     if (variant.engine.kind === "icn" && variant.artifact.kind !== "gguf") {
@@ -300,18 +368,66 @@ export function defineExperiment(definition: ExperimentInput): ExperimentDefinit
       && variant.engine.speculativeDecoding.draftArtifact.modelId !== variant.artifact.modelId) {
       throw new Error(`MTP variant ${variant.id} requires a drafter for the same logical model`)
     }
+    if (variant.engine.kind === "omlx" && variant.artifact.kind !== "mlx") {
+      throw new Error(`oMLX variant ${variant.id} requires an MLX target artifact`)
+    }
+    if (variant.engine.kind === "omlx" && variant.engine.speculativeDecoding.kind === "dflash"
+      && variant.engine.speculativeDecoding.draftArtifact.modelId !== variant.artifact.modelId) {
+      throw new Error(`oMLX DFlash variant ${variant.id} requires a draft for the same logical model`)
+    }
+    if (variant.engine.kind === "omlx" && variant.engine.speculativeDecoding.kind === "dflash"
+      && decoded.requestPolicy.parallelSequences !== 1) {
+      throw new Error(`oMLX DFlash variant ${variant.id} requires parallelSequences=1`)
+    }
   }
-  const acceleration = new Set(decoded.variants.map(({ engine }) =>
-    engine.kind === "llama.cpp" || engine.kind === "mlx-lm" || engine.kind === "mlx-vlm"
-      ? engine.speculativeDecoding.kind
-      : "unspecified"))
-  if (acceleration.size !== 1) throw new Error("all comparable variants must use the same speculative-decoding mode")
-  const draftLimits = new Set(decoded.variants.flatMap(({ engine }) =>
-    (engine.kind === "llama.cpp" || engine.kind === "mlx-vlm") && engine.speculativeDecoding.kind === "mtp"
-      ? [engine.speculativeDecoding.maxDraftTokens]
-      : []))
-  if (draftLimits.size > 1) throw new Error("all MTP variants must use the same maximum draft-token count")
+  if (decoded.comparisonProtocol.kind === "fixed-speculative-policy") {
+    const acceleration = new Set(decoded.variants.map(({ engine }) =>
+      engine.kind === "llama.cpp" || engine.kind === "mlx-lm" || engine.kind === "mlx-vlm" || engine.kind === "omlx"
+        ? engine.speculativeDecoding.kind
+        : "unspecified"))
+    if (acceleration.size !== 1) throw new Error("fixed-speculative-policy comparisons require the same speculative-decoding mode")
+    const draftLimits = new Set(decoded.variants.flatMap(({ engine }) =>
+      ((engine.kind === "llama.cpp" || engine.kind === "mlx-vlm") && engine.speculativeDecoding.kind === "mtp")
+        || (engine.kind === "omlx" && (engine.speculativeDecoding.kind === "mtp" || engine.speculativeDecoding.kind === "dspark"))
+        ? [engine.speculativeDecoding.maxDraftTokens]
+        : []))
+    if (draftLimits.size > 1) throw new Error("fixed-speculative-policy comparisons require the same maximum draft-token count")
+  } else {
+    if (decoded.variants.length < 2 || decoded.variants.some(({ engine }) => engine.kind !== "omlx")) {
+      throw new Error("speculative-decoding comparisons require at least two oMLX variants")
+    }
+    const omlxEngines = decoded.variants.map(({ engine }) => engine as OmlxEngineDefinition)
+    const modes = new Set(omlxEngines.map(({ speculativeDecoding }) => speculativeDecoding.kind))
+    if (!modes.has("none") || modes.size < 2) {
+      throw new Error("speculative-decoding comparisons require a baseline and a speculative method")
+    }
+    const targetIdentity = digestComparableArtifact(decoded.variants[0]!.artifact)
+    if (decoded.variants.some(({ artifact }) => digestComparableArtifact(artifact) !== targetIdentity)) {
+      throw new Error("speculative-decoding comparisons require the exact same target artifact")
+    }
+    const engineIdentity = JSON.stringify({
+      pythonProject: omlxEngines[0]!.pythonProject,
+      cache: omlxEngines[0]!.cache,
+      memoryGuard: omlxEngines[0]!.memoryGuard,
+    })
+    if (omlxEngines.some((engine) => JSON.stringify({ pythonProject: engine.pythonProject, cache: engine.cache, memoryGuard: engine.memoryGuard }) !== engineIdentity)) {
+      throw new Error("speculative-decoding comparisons may differ only by speculative policy")
+    }
+    if (decoded.execution.variantOrder !== "balanced" || decoded.execution.blocks % decoded.variants.length !== 0) {
+      throw new Error("speculative-decoding comparisons require balanced blocks divisible by the variant count")
+    }
+  }
   return Object.freeze(decoded)
+}
+
+export const defineExperiment = (definition: ExperimentInput): ExperimentDefinition =>
+  validateExperimentDefinition({ ...definition, comparisonProtocol: { kind: "fixed-speculative-policy" } })
+
+export const defineSpeculativeDecodingComparison = (definition: ExperimentInput): ExperimentDefinition =>
+  validateExperimentDefinition({ ...definition, comparisonProtocol: { kind: "speculative-decoding" } })
+
+function digestComparableArtifact(artifact: ModelArtifactDefinition): string {
+  return JSON.stringify(artifact)
 }
 
 export const loadExperiment = (path: string): Effect.Effect<ExperimentDefinition, ExperimentError, FileSystem.FileSystem> =>
@@ -326,7 +442,7 @@ export const loadExperiment = (path: string): Effect.Effect<ExperimentDefinition
       catch: (error) => new ExperimentError({ path: absolute, operation: "load", message: error instanceof Error ? error.message : String(error) }),
     })
     return yield* Effect.try({
-      try: () => defineExperiment(module.default),
+      try: () => validateExperimentDefinition(module.default),
       catch: (error) => new ExperimentError({ path: absolute, operation: "validate", message: error instanceof Error ? error.message : String(error) }),
     })
   })
@@ -370,6 +486,14 @@ export function resolveExperimentPaths(experiment: ExperimentDefinition, experim
                 draftArtifact: resolveArtifact(variant.engine.speculativeDecoding.draftArtifact),
               },
             }
+        : variant.engine.kind === "omlx"
+          ? {
+              ...variant.engine,
+              pythonProject: resolve(root, variant.engine.pythonProject),
+              speculativeDecoding: variant.engine.speculativeDecoding.kind === "dflash"
+                ? { ...variant.engine.speculativeDecoding, draftArtifact: resolveArtifact(variant.engine.speculativeDecoding.draftArtifact) as MlxArtifactDefinition }
+                : variant.engine.speculativeDecoding,
+            }
         : variant.engine.kind === "llama.cpp" && variant.engine.speculativeDecoding.kind === "mtp"
           ? { ...variant.engine, speculativeDecoding: { ...variant.engine.speculativeDecoding, draftArtifact: resolveArtifact(variant.engine.speculativeDecoding.draftArtifact) } }
           : variant.engine,
@@ -379,6 +503,12 @@ export function resolveExperimentPaths(experiment: ExperimentDefinition, experim
 
 export function resolveExecutionOrder(experiment: ExperimentDefinition): readonly (readonly VariantId[])[] {
   const declared = experiment.variants.map(({ id }) => id)
+  if (experiment.comparisonProtocol.kind === "speculative-decoding" && experiment.execution.variantOrder === "balanced") {
+    return Array.from({ length: experiment.execution.blocks }, (_, block) => [
+      ...declared.slice(block % declared.length),
+      ...declared.slice(0, block % declared.length),
+    ])
+  }
   return Array.from({ length: experiment.execution.blocks }, (_, block) =>
     experiment.execution.variantOrder === "balanced" && block % 2 === 1
       ? [...declared].reverse()

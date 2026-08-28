@@ -114,6 +114,7 @@ export interface ExistingTarget {
   readonly requestBody?: JsonRecord
   readonly requestTimeoutMs?: number
   readonly parallelSequences: number
+  readonly speculativeBackend?: "none" | "mtp" | "dflash" | "dspark"
   readonly artifact?: {
     readonly kind: "gguf" | "mlx"
     readonly repository: string
@@ -124,7 +125,7 @@ export interface ExistingTarget {
 
 export interface ManagedTarget {
   readonly kind: "managed"
-  readonly engine: "icn" | "llama.cpp" | "mlx-lm" | "mlx-vlm" | "vllm" | "sglang" | "generic"
+  readonly engine: "icn" | "llama.cpp" | "mlx-lm" | "mlx-vlm" | "omlx" | "vllm" | "sglang" | "generic"
   readonly id: string
   readonly executable: string
   readonly args: readonly string[]
@@ -134,7 +135,18 @@ export interface ManagedTarget {
   readonly requestBody?: JsonRecord
   readonly requestTimeoutMs?: number
   readonly env?: Readonly<Record<string, string>>
-  readonly readinessPath?: string
+  readonly readiness:
+    | { readonly kind: "http"; readonly path: string }
+    | {
+        readonly kind: "omlx"
+        readonly path: string
+        readonly expected: {
+          readonly servedModel: string
+          readonly contextCapacity: number
+          readonly parallelSequences: number
+          readonly speculativeBackend: "none" | "mtp" | "dflash" | "dspark"
+        }
+      }
   readonly cwd?: string
   readonly modelLoad?: {
     readonly artifactSha256: string
@@ -142,6 +154,7 @@ export interface ManagedTarget {
     readonly instanceId: string
   }
   readonly parallelSequences: number
+  readonly speculativeBackend?: "none" | "mtp" | "dflash" | "dspark"
   readonly artifact?: {
     readonly kind: "gguf" | "mlx"
     readonly repository: string
@@ -195,6 +208,7 @@ export interface NativeTimings {
   readonly generationMs: number
   readonly draftTokens?: number
   readonly acceptedDraftTokens?: number
+  readonly speculativeBackend?: "mtp" | "dflash" | "dspark"
 }
 
 export interface TerminalEvidence {
@@ -272,7 +286,8 @@ export interface BenchmarkResult {
 }
 
 export interface ComparisonResult {
-  readonly comparisonKind: "strict" | "product"
+  readonly comparisonKind: "strict" | "product" | "controlled-speculative-decoding"
+  readonly comparisonProtocol: "fixed-speculative-policy" | "speculative-decoding"
   readonly differences: readonly string[]
   readonly plan: TrialPlan
   readonly results: readonly BenchmarkResult[]

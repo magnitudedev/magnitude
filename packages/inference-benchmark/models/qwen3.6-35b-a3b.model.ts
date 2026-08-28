@@ -3,6 +3,7 @@ import { resolve } from "node:path"
 
 export const qwen36 = defineModel({
   id: "qwen3.6-35b-a3b",
+  contextLimit: 262_144,
   source: {
     repository: "Qwen/Qwen3.6-35B-A3B",
     revision: "995ad96eacd98c81ed38be0c5b274b04031597b0",
