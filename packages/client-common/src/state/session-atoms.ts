@@ -101,9 +101,9 @@ export const composerHasContentAtom = Atom.make(false)
 export const pendingUserSubmitAtom = Atom.make(false)
 
 /**
- * Options applied when a client lazily creates a session (safeguard flags,
- * ATIF path, solo mode, system prompt override). The terminal app sets this
- * from CLI flags at startup; other clients leave the default (none).
+ * Options applied when a client lazily creates a session. The terminal app
+ * sets its supported launch options at startup; other clients leave the
+ * default (none).
  * Read by useComposerState's CreateSession path — atom-driven so the shared
  * hook has no optional parameters.
  */

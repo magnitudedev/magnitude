@@ -85,7 +85,6 @@ export interface InteractiveLaunchOptions {
   readonly developmentBuild: boolean
   readonly sessionStart: SessionStart
   readonly initialPrompt: string | undefined
-  readonly goal: string | undefined
   readonly envAuth: AuthSource
   readonly sessionOptions: SessionOptions
 }
@@ -449,7 +448,6 @@ const runInteractiveSession = (
   const app: CliAppProps = {
     sessionStart: options.sessionStart,
     initialPrompt: options.initialPrompt,
-    goal: options.goal,
     envAuth: options.envAuth,
     initialAcnLifecycle: yield* terminal.platform.acnStartup.state.get,
     sessionOptions: options.sessionOptions,
