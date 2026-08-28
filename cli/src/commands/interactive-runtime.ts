@@ -17,14 +17,8 @@ const resolveEnvAuth = (): AuthSource => {
 
 export interface InteractiveCommandOptions {
   readonly resume?: true | string
-  readonly debug?: boolean
   readonly prompt?: string
-  readonly headless?: boolean
-  readonly disableShellSafeguards?: boolean
-  readonly disableCwdSafeguards?: boolean
   readonly atif?: string
-  readonly goal?: string
-  readonly solo?: boolean
   readonly systemOverride?: string
 }
 
@@ -32,30 +26,24 @@ export const runInteractive = (
   opts: InteractiveCommandOptions,
   setup: boolean,
 ) => {
-  if (opts.headless) {
-    process.stderr.write(
-      "Error: --headless is temporarily disabled. Use the TUI mode.\n",
-    )
-    process.exit(1)
-  }
+  const developmentBuild = isDevelopmentBuild()
 
   const options: InteractiveLaunchOptions = {
-    debug: opts.debug === true,
+    debug: developmentBuild,
     setup,
-    developmentBuild: isDevelopmentBuild(),
+    developmentBuild,
     sessionStart: opts.resume === undefined
       ? { _tag: "new" }
       : opts.resume === true
         ? { _tag: "latest" }
         : { _tag: "resume", sessionId: opts.resume },
     initialPrompt: opts.prompt,
-    goal: opts.goal,
     envAuth: resolveEnvAuth(),
     sessionOptions: {
-      disableShellSafeguards: opts.disableShellSafeguards ?? false,
-      disableCwdSafeguards: opts.disableCwdSafeguards ?? false,
+      disableShellSafeguards: false,
+      disableCwdSafeguards: false,
       atifPath: opts.atif,
-      solo: opts.solo ?? false,
+      solo: false,
       headless: false,
       systemPromptOverride: opts.systemOverride,
     },

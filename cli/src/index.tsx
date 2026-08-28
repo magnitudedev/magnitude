@@ -10,7 +10,7 @@ import { CLI_VERSION } from "./version"
 
 const program = new Command()
   .name("magnitude")
-  .version(CLI_VERSION)
+  .version(CLI_VERSION, "-v, --version")
 
 registerStopCommand(program)
 registerServerCommand(program)

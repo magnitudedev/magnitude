@@ -102,7 +102,6 @@ export type { SessionStart };
 export interface CliAppProps {
   sessionStart: SessionStart;
   initialPrompt: string | undefined;
-  goal: string | undefined;
   envAuth: AuthSource;
   sessionOptions: SessionOptions;
   initialAcnLifecycle: AcnLifecycleState;
@@ -240,7 +239,6 @@ function CliAppContent(
   useSessionStartup({
     sessionStart: props.sessionStart,
     initialPrompt: props.initialPrompt,
-    goal: props.goal,
     modelsConfigured:
       props.modelsAvailableForInitialWork && !props.onboardingSetupOpen,
   });

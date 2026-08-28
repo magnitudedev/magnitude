@@ -46,7 +46,7 @@ if (explicit) {
 }
 
 const clientExit = await run(
-  ["bun", "run", "cli/src/index.tsx", "--debug", ...process.argv.slice(2)],
+  ["bun", "run", "cli/src/index.tsx", ...process.argv.slice(2)],
   {
     ...process.env,
     MAGNITUDE_ICN_PATH: icnPath,

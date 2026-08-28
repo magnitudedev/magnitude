@@ -6,7 +6,7 @@
  *    ListSessions), or new (null). Selects the display controller session once.
  * 2. Session attach side effects on every session change: skill command
  *    registration, session logger, terminal title.
- * 3. One-shot --prompt / --goal send after the first display arrives.
+ * 3. One-shot --prompt send after the first display arrives.
  *
  * Reads are contract queries (declarative). Mutations use useAtomSet with
  * { mode: "promise" } where the return value is needed.
@@ -41,13 +41,12 @@ export type SessionStart =
 export interface SessionStartupParams {
   sessionStart: SessionStart
   initialPrompt: string | undefined
-  goal: string | undefined
   modelsConfigured: boolean
 }
 
 const idleAtom = Atom.make(() => null)
 
-export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsConfigured }: SessionStartupParams): void {
+export function useSessionStartup({ sessionStart, initialPrompt, modelsConfigured }: SessionStartupParams): void {
   const client = useAgentClient()
   const renderer = useRenderer()
   const controller = useDisplayViewControllerCore()
@@ -143,8 +142,7 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
   )
   useAtomMount(skillRegistrationAtom)
 
-  // ── 3. One-shot --prompt / --goal — true mutations needing return value
-  const startGoalMutation = useAtomSet(client.Agent.StartGoal, { mode: 'promise' })
+  // ── 3. One-shot --prompt — true mutations needing return value
   const sendMessageMutation = useAtomSet(client.Agent.SendMessage, { mode: 'promise' })
   const createSessionMutation = useAtomSet(client.Sessions.CreateSession, { mode: 'promise' })
 
@@ -154,36 +152,30 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
         Effect.gen(function* () {
           if (!hasReceivedDisplay || !Result.isSuccess(runtimeResult)) return
           if (!modelsConfigured) return
-          const goalObjective = goal?.trim()
           const prompt = initialPrompt?.trim()
-          if (!goalObjective && !prompt) return
-          const messagePrompt = prompt ?? ''
+          if (!prompt) return
 
           setPendingUserSubmit(true)
-          const initial = goalObjective
-            ? { _tag: 'goal' as const, objective: goalObjective }
-            : {
-                _tag: 'message' as const,
+          const initial = {
+            _tag: 'message' as const,
+            messageId: Option.none<string>(),
+            content: prompt,
+            visibleMessage: Option.some(prompt),
+            taskMode: false,
+            uploads: [],
+            mentions: [],
+          }
+
+          const work = sessionId
+            ? sendMessageMutation({
+                sessionId,
                 messageId: Option.none<string>(),
-                content: messagePrompt,
-                visibleMessage: Option.some(messagePrompt),
+                content: prompt,
+                visibleMessage: Option.some(prompt),
                 taskMode: false,
                 uploads: [],
                 mentions: [],
-              }
-
-          const work = sessionId
-            ? goalObjective
-              ? startGoalMutation({ sessionId, objective: goalObjective })
-              : sendMessageMutation({
-                  sessionId,
-                  messageId: Option.none<string>(),
-                  content: messagePrompt,
-                  visibleMessage: Option.some(messagePrompt),
-                  taskMode: false,
-                  uploads: [],
-                  mentions: [],
-                })
+              })
             : createSessionMutation({
                 cwd: selectedCwd ?? process.cwd(),
                 sessionId: Option.none(),
@@ -203,7 +195,7 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
             work.catch((error) => {
               logger.error(
                 { error: error instanceof Error ? error.message : String(error) },
-                'Failed to send initial prompt/goal',
+                'Failed to send initial prompt',
               )
               setPendingUserSubmit(false)
             }),
@@ -213,7 +205,6 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
     [
       hasReceivedDisplay,
       modelsConfigured,
-      goal,
       initialPrompt,
       sessionId,
       selectedCwd,
@@ -221,7 +212,6 @@ export function useSessionStartup({ sessionStart, initialPrompt, goal, modelsCon
       sessionCreateOptions,
       controller,
       setPendingUserSubmit,
-      startGoalMutation,
       sendMessageMutation,
       createSessionMutation,
     ],
