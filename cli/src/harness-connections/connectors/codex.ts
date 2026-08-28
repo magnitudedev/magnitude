@@ -2,7 +2,7 @@ import * as FileSystem from "@effect/platform/FileSystem"
 import { Effect, Option } from "effect"
 import type { HarnessConnectionSpec } from "../contract"
 import type { HarnessConnectionPaths } from "../paths"
-import { OPENAI_BASE_URL, defineConnector, launchPlan, readOr } from "../shared"
+import { OPENAI_BASE_URL, defineConnector, launchPlan } from "../shared"
 import { writeFileAtomic } from "../../utils/atomic-file"
 
 const CODEX_BASE_INSTRUCTIONS = "You are a coding agent running in Codex CLI. Work with the user in the current workspace until their request is resolved. Inspect relevant files before changing them, follow repository instructions, make focused edits, verify consequential changes, and communicate progress and results concisely. Use the available tools when they are needed and preserve user work unrelated to the request."
@@ -76,13 +76,6 @@ requires_openai_auth = false
 `
 }
 
-const removeExact = (path: string, expected: string) => FileSystem.FileSystem.pipe(
-  Effect.flatMap((fs) => fs.readFileString(path).pipe(
-    Effect.flatMap((source) => source === expected ? fs.remove(path) : Effect.void),
-    Effect.catchTag("SystemError", (error) => error.reason === "NotFound" ? Effect.void : Effect.fail(error)),
-  )),
-)
-
 export const makeCodexConnector = (paths: HarnessConnectionPaths) => defineConnector({
   id: "codex",
   name: "Codex",
@@ -90,17 +83,15 @@ export const makeCodexConnector = (paths: HarnessConnectionPaths) => defineConne
   skillInstallationTarget: "shared-agents",
   configurationFiles: [paths.codex, paths.codexModels],
   connect: (spec) => Effect.gen(function* () {
-    const source = yield* readOr(paths.codex, "")
-    if (source.trim() !== "" && !source.includes("[model_providers.magnitude]")) {
-      throw new Error(`Codex profile file is not Magnitude-owned: ${paths.codex}`)
-    }
     yield* writeFileAtomic(paths.codexModels, codexModelCatalog(spec))
     yield* writeFileAtomic(paths.codex, codexConfig(spec, paths.codexModels))
   }),
-  disconnect: (spec) => Effect.all([
-    removeExact(paths.codex, codexConfig(spec, paths.codexModels)),
-    removeExact(paths.codexModels, codexModelCatalog(spec)),
-  ], { discard: true }),
+  disconnect: () => Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    yield* Effect.forEach([paths.codex, paths.codexModels], (path) => fs.remove(path).pipe(
+      Effect.catchTag("SystemError", (error) => error.reason === "NotFound" ? Effect.void : Effect.fail(error)),
+    ), { discard: true })
+  }),
   launch(modelId, installation) {
     return launchPlan(this, installation, modelId, ["--profile", "magnitude"])
   },

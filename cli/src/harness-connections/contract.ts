@@ -61,6 +61,7 @@ export interface HarnessConnector {
   readonly name: string
   readonly recommended?: boolean
   readonly note?: string
+  readonly requiresStartup?: boolean
   readonly skillInstallationTarget: SkillInstallationTarget
   readonly configurationFiles: ReadonlyArray<string>
   readonly detect: (searchPath: string) => Effect.Effect<Option.Option<HarnessInstallation>>

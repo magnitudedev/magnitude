@@ -65,22 +65,6 @@ export const valueAt = (value: unknown, segments: ReadonlyArray<string>): unknow
 
 export type OwnedValue = readonly [ReadonlyArray<string>, unknown]
 
-export const ownedWhen = (
-  segments: ReadonlyArray<string>,
-  value: unknown,
-  isOwned: boolean,
-): ReadonlyArray<OwnedValue> => isOwned ? [[segments, value]] : []
-
-export const ownedVariant = (
-  segments: ReadonlyArray<string>,
-  value: unknown,
-  variants: ReadonlyArray<unknown>,
-): ReadonlyArray<OwnedValue> => ownedWhen(
-  segments,
-  value,
-  variants.some((variant) => isDeepStrictEqual(value, variant)),
-)
-
 export const removeOwnedJsonc = (source: string, owned: ReadonlyArray<OwnedValue>): string => {
   const value = jsonObject(source)
   return owned.reduce((current, [segments, expected]) => {
@@ -90,6 +74,16 @@ export const removeOwnedJsonc = (source: string, owned: ReadonlyArray<OwnedValue
     }))
   }, source)
 }
+
+export const removeJsoncPaths = (
+  source: string,
+  paths: ReadonlyArray<ReadonlyArray<string>>,
+): string => paths.reduce((current, segments) => applyEdits(current, modify(
+  current,
+  [...segments],
+  undefined,
+  { formattingOptions: { insertSpaces: true, tabSize: 2, eol: "\n" } },
+)), source)
 
 export const updateYaml = (
   source: string,
@@ -111,12 +105,13 @@ const deleteYamlPath = (document: ReturnType<typeof parseDocument>, segments: Re
   }
 }
 
-export const removeOwnedYaml = (source: string, owned: ReadonlyArray<OwnedValue>): string => {
+export const removeYamlPaths = (
+  source: string,
+  paths: ReadonlyArray<ReadonlyArray<string>>,
+): string => {
   const document = parseDocument(source.trim() === "" ? "{}\n" : source)
   if (document.errors.length > 0) throw new Error("configuration is not valid YAML")
-  for (const [segments, expected] of owned) {
-    if (isDeepStrictEqual(valueAt(document.toJS(), segments), expected)) deleteYamlPath(document, segments)
-  }
+  for (const segments of paths) deleteYamlPath(document, segments)
   return String(document)
 }
 
@@ -150,6 +145,7 @@ export const defineConnector = (definition: ConnectorDefinition): HarnessConnect
     name: definition.name,
     ...(definition.recommended === undefined ? {} : { recommended: definition.recommended }),
     ...(definition.note === undefined ? {} : { note: definition.note }),
+    ...(definition.requiresStartup === undefined ? {} : { requiresStartup: definition.requiresStartup }),
     skillInstallationTarget: definition.skillInstallationTarget,
     configurationFiles: definition.configurationFiles,
     connect: definition.connect,
