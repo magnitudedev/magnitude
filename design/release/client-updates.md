@@ -66,15 +66,17 @@ the prior answer intact, and never delay or prevent startup. Admissibility, newn
 dismissal floor are re-applied when the cache is read: the running binary — and so its channel —
 may have changed since the write.
 
-The check result is consumed by a race:
+The check result is consumed before OpenTUI is created:
 
-- Known from cache → the update prompt precedes all daemon work.
-- No installed daemon build (fresh machine, wiped cache) → startup awaits this launch's check
+- Known from cache → the inline update prompt precedes all service work.
+- No installed service build (fresh machine, wiped cache) → startup awaits this launch's check
   result before the install sequence begins: an offer always prompts before any download, and a
   multi-minute install of a version about to be replaced never starts. The wait is bounded by the
   check's own ceiling and costs nothing real — installation needs the network regardless.
-- Fresh result arrives while daemon startup work is still running (cold spawn — the check
-  usually outruns it) → the prompt is shown this launch, before expensive work proceeds.
+- Fresh result arrives while service startup work is still running (cold spawn — the check
+  usually outruns it) → the inline presentation is interrupted to show the prompt. The shared
+  startup occurrence remains supervised; declining resumes its current presentation, while
+  accepting closes the startup scope before package-manager execution.
 - Fresh result arrives from daemon readiness on (typical warm start) → one in-session
   notification line, and the now-cached answer prompts first thing next launch. Startup latency
   is never added to wait for the network.
@@ -90,12 +92,13 @@ update command ignores dismissals entirely. Source and development builds do not
 
 ## Startup interaction
 
-When an update is offered, the prompt renders as a phase of the single startup root — before any
-daemon work — with three choices: update now, skip this launch, skip until the next version.
+When a cached update is offered, the prompt renders inline before service work. A fresh offer may
+interrupt an in-progress inline startup, but always renders before OpenTUI is created. The prompt
+has three choices: update now, skip this launch, skip until the next version.
 Noninteractive launches and launches with an initial prompt never show it.
 
-Accepting an update completes the interactive scope — React unmount, renderer destruction, terminal
-restoration, listener removal, supervised-fiber interruption — before invoking the package manager.
+Accepting an update completes the inline terminal scope before invoking the package manager; no
+React root or OpenTUI renderer exists yet.
 A failed update reports the command failure and exits nonzero.
 
 The global `checkForUpdateOnStartup` configuration value defaults behaviorally to true when absent.
@@ -111,10 +114,11 @@ manual restart as the guaranteed floor:
 - After the package manager succeeds, the CLI exits with the reserved relaunch exit code — but only
   when the environment's protocol version matches its own. On mismatch or absence it prints the
   manual-restart message instead: version skew degrades by definition, never by accident.
-- The launcher honors the relaunch code **at most once per process**: it re-runs its own pipeline —
-  locate the installation fresh, resolve the now-installed version's binary, spawn it. Any failure
-  in that iteration prints "update installed — run `magnitude`" and exits. A second relaunch code
-  passes through as an ordinary exit.
+- The launcher honors a relaunch request **at most once per process**: it re-runs its own pipeline —
+  locate the installation fresh, resolve the now-installed version's binary, and spawn it. An
+  interactive prompt update repeats the original arguments; an explicit `magnitude update` runs the
+  new binary as `magnitude service start`. Any failure prints the matching manual command and exits.
+  A second relaunch request passes through as an ordinary exit.
 
 The degraded outcome of every relaunch failure — incompatible new release, broken binary, unchanged
 version — is exactly the manual-restart behavior, plus one fast failed resolution attempt.
@@ -143,7 +147,8 @@ unknown installation methods.
 - Discovery failure never prevents startup or discards the previous known answer.
 - An offered version has a matching native CLI artifact for the current host.
 - Package-manager execution occurs only after an explicit user choice or `magnitude update`.
-- ACN does not start before the update prompt is resolved.
+- Cached offers and fresh-install offers are resolved before service work begins; a later fresh
+  offer may interrupt an already-supervised startup occurrence.
 - The package-manager command is run only after terminal restoration.
 - The launcher relaunches at most once per process; every relaunch failure degrades to the
   manual-restart message.

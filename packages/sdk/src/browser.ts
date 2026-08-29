@@ -13,11 +13,12 @@ export {
 } from "./acn-jit/acn-instance-manager"
 export type { AcnEnsureEvent, AcnEnsureRequest, AcnInstance } from "./acn-jit/acn-instance-manager"
 export { makeRemoteAcnInstanceManager } from "./acn-jit/remote-acn-instance-manager"
+export { formatAcnEnsuranceError } from "./acn-jit/lifecycle"
 export {
-  makeAcnJitRuntime,
+  makeAcnConnection,
 } from "./acn-jit/acn-recovering-client"
 export type {
-  AcnJitRuntime,
+  AcnConnection,
 } from "./acn-jit/acn-recovering-client"
 export { isRpcOutcomeUnknown } from "./mutation-outcome"
 export {

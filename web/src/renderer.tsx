@@ -7,14 +7,17 @@
  */
 import { createRoot } from "react-dom/client"
 import { RegistryProvider } from "@effect-atom/atom-react"
-import { Effect } from "effect"
+import { Effect, Layer } from "effect"
+import { FetchHttpClient } from "@effect/platform"
 import {
   App,
   PlatformProvider,
   createAgentClient,
   AgentClientProvider,
+  AcnStartupProvider,
   initializeAppearance,
   createBrowserPlatform,
+  createBrowserAcnConnection,
   stopDisplayViewController,
 } from "@magnitudedev/web"
 import "./styles/tailwind.css"
@@ -24,19 +27,24 @@ initializeAppearance()
 const root = createRoot(document.getElementById("root")!)
 
 async function main() {
-  const platform = await createBrowserPlatform("")
+  const platform = createBrowserPlatform()
+  const connection = await createBrowserAcnConnection("")
   const initialAcnLifecycle = await Effect.runPromise(
-    platform.acnStartup.prepare
+    connection.startup.prepare
   )
-  const agentClientTag = createAgentClient(platform.protocolLayer)
+  const agentClientTag = createAgentClient(connection.protocolLayer.pipe(
+    Layer.provide(FetchHttpClient.layer),
+  ))
 
   root.render(
     <PlatformProvider platform={platform}>
-      <RegistryProvider defaultIdleTTL={5000}>
-        <AgentClientProvider tag={agentClientTag}>
-          <App initialAcnLifecycle={initialAcnLifecycle} />
-        </AgentClientProvider>
-      </RegistryProvider>
+      <AcnStartupProvider startup={connection.startup}>
+        <RegistryProvider defaultIdleTTL={5000}>
+          <AgentClientProvider tag={agentClientTag}>
+            <App initialAcnLifecycle={initialAcnLifecycle} />
+          </AgentClientProvider>
+        </RegistryProvider>
+      </AcnStartupProvider>
     </PlatformProvider>
   )
 }

@@ -13,7 +13,7 @@ import {
 import { ProviderModelIdSchema } from "@magnitudedev/sdk"
 import { Data, Effect, Option, Schema } from "effect"
 import { makeHarnessConnection } from "../harness-connections/service"
-import { startServer } from "../server/service"
+import { existingAcnConnection } from "../server/acn-connection"
 
 class ConnectionsCommandError extends Data.TaggedError("ConnectionsCommandError")<{
   readonly message: string
@@ -42,17 +42,25 @@ const printRows = (rows: ReadonlyArray<HarnessDestination>): void => {
 type CommandRequirements = FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor | HttpClient.HttpClient
 
 const execute = <A>(use: (service: HarnessConnection) => Effect.Effect<A, unknown, CommandRequirements>) =>
-  Effect.runPromise(Effect.gen(function* () {
+  Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     const service = yield* makeHarnessConnection
     return yield* use(service)
-  }).pipe(
+  })).pipe(
     Effect.provide([BunContext.layer, FetchHttpClient.layer]),
     Effect.catchAll((error) => Effect.sync(() => {
-      const message = error instanceof Error && "message" in error ? error.message : String(error)
+      const message = typeof error === "object" && error !== null
+        && "reason" in error && typeof error.reason === "string"
+        ? error.reason
+        : error instanceof Error ? error.message : String(error)
       process.stderr.write(`${message}\n`)
       process.exitCode = 1
     })),
   ))
+
+const requireRunningService = Effect.gen(function* () {
+  const connection = yield* existingAcnConnection
+  yield* connection.startup.awaitReady
+})
 
 export const listConnections = () => execute((service) => service.list.pipe(
   Effect.tap((rows) => Effect.sync(() => printRows(rows))),
@@ -63,7 +71,7 @@ export const addConnection = (
   harnessInput: string,
   setCurrentInput: string | undefined,
 ) => execute((service) => Effect.gen(function* () {
-  yield* startServer
+  yield* Effect.scoped(requireRunningService)
   const harness = yield* parseHarness(harnessInput)
   const setCurrent = yield* parseCurrentModel(setCurrentInput)
   const result = yield* service.connect(harness, { setCurrent })
@@ -80,7 +88,7 @@ export const addConnection = (
 
 export const syncConnections = (harnessInput: string | undefined) =>
   execute((service) => Effect.gen(function* () {
-    yield* startServer
+    yield* Effect.scoped(requireRunningService)
     const harness: HarnessId | undefined = harnessInput === undefined
       ? undefined
       : yield* parseHarness(harnessInput)

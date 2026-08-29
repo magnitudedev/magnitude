@@ -1,37 +1,42 @@
 /**
  * Desktop renderer entry — spec §5.2
  *
- * Reads `window.__magnitudeDesktop`, creates the DesktopPlatform,
- * creates the AgentClient (the connection's Effect Query client) over the daemon transport, and mounts App
- * inside PlatformProvider + RegistryProvider + AgentClientProvider.
+ * Reads `window.__magnitudeDesktop`, creates the AcnConnection and the
+ * DesktopPlatform, creates the AgentClient (the connection's Effect Query client)
+ * over the connection's transport, and mounts App inside PlatformProvider +
+ * AcnStartupProvider + RegistryProvider + AgentClientProvider.
  *
- * The scoped runtime selects the exact ACN before application queries are exposed.
+ * The connection selects the exact ACN before application queries are exposed.
  *
  * On window close, interrupts the renderer stream and notifies main (§5.6).
  */
 import { createRoot } from "react-dom/client"
 import { RegistryProvider } from "@effect-atom/atom-react"
-import { Effect } from "effect"
+import { Effect, Layer } from "effect"
+import { FetchHttpClient } from "@effect/platform"
+import type { AcnConnection } from "@magnitudedev/sdk"
 import {
   App,
   PlatformProvider,
   createAgentClient,
   AgentClientProvider,
+  AcnStartupProvider,
   initializeAppearance,
   MagnitudeMark,
   stopDisplayViewController,
 } from "@magnitudedev/web"
 import { DaemonConnectionError } from "@magnitudedev/web"
-import { createDesktopPlatform } from "./platform"
+import {
+  createDesktopAcnConnection,
+  createDesktopPlatform,
+} from "./platform"
 import "@web-styles/tailwind.css"
 
 initializeAppearance()
 
 const desktopApi = window.__magnitudeDesktop
 const root = createRoot(document.getElementById("root")!)
-let activePlatform:
-  | Awaited<ReturnType<typeof createDesktopPlatform>>
-  | undefined
+let activeConnection: AcnConnection | undefined
 
 document.documentElement.dataset.desktopPlatform = desktopApi.platform
 
@@ -67,19 +72,24 @@ function renderDaemonError(message: string) {
 }
 
 async function renderApp() {
-  const platform = await createDesktopPlatform(desktopApi)
-  activePlatform = platform
+  const connection = await createDesktopAcnConnection(desktopApi)
+  activeConnection = connection
+  const platform = await createDesktopPlatform(desktopApi, connection)
   const initialAcnLifecycle = await Effect.runPromise(
-    platform.acnStartup.prepare
+    connection.startup.prepare
   )
-  const agentClientTag = createAgentClient(platform.protocolLayer)
+  const agentClientTag = createAgentClient(connection.protocolLayer.pipe(
+    Layer.provide(FetchHttpClient.layer),
+  ))
   root.render(
     <PlatformProvider platform={platform}>
-      <RegistryProvider defaultIdleTTL={5000}>
-        <AgentClientProvider tag={agentClientTag}>
-          <App initialAcnLifecycle={initialAcnLifecycle} />
-        </AgentClientProvider>
-      </RegistryProvider>
+      <AcnStartupProvider startup={connection.startup}>
+        <RegistryProvider defaultIdleTTL={5000}>
+          <AgentClientProvider tag={agentClientTag}>
+            <App initialAcnLifecycle={initialAcnLifecycle} />
+          </AgentClientProvider>
+        </RegistryProvider>
+      </AcnStartupProvider>
     </PlatformProvider>
   )
 }
@@ -87,7 +97,7 @@ async function renderApp() {
 // On window close, interrupt the stream fiber and notify main (§5.6)
 window.addEventListener("beforeunload", () => {
   stopDisplayViewController()
-  void activePlatform?.shutdown()
+  if (activeConnection !== undefined) Effect.runFork(activeConnection.close)
   desktopApi.interruptStream()
 })
 

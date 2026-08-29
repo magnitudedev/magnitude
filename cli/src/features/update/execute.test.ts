@@ -1,6 +1,7 @@
 import {
   LAUNCH_PROTOCOL_VERSION,
   LAUNCH_PROTOCOL_VERSION_VARIABLE,
+  POST_UPDATE_SERVICE_START_EXIT_CODE,
   RELAUNCH_EXIT_CODE,
   type UpdateAction,
 } from "@magnitudedev/release"
@@ -64,6 +65,18 @@ describe("executeUpdate", () => {
     ))
 
     expect(exitCode).toBe(RELAUNCH_EXIT_CODE)
+  })
+
+  it("asks a compatible launcher to start the service after an explicit update", async () => {
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true)
+    process.env[LAUNCH_PROTOCOL_VERSION_VARIABLE] = String(LAUNCH_PROTOCOL_VERSION)
+
+    const exitCode = await Effect.runPromise(executeUpdate(
+      updaterWith(() => Effect.void),
+      action,
+    ))
+
+    expect(exitCode).toBe(POST_UPDATE_SERVICE_START_EXIT_CODE)
   })
 
   it("returns failure without mutating process exit state", async () => {

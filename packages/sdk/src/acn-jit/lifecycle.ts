@@ -284,9 +284,9 @@ const shutdownControlFailureMessage = (
   const failure = error.failure;
   switch (failure._tag) {
     case "AcnOwnerRecordReadUnavailable":
-      return `could not reread the ACN owner record at ${failure.path}: ${failure.message}`;
+      return `could not reread the service owner record at ${failure.path}: ${failure.message}`;
     case "AcnOwnerRecordInvalid":
-      return `the ACN owner record at ${failure.path} is invalid: ${failure.message}`;
+      return `the service owner record at ${failure.path} is invalid: ${failure.message}`;
     case "ExactProcessIdentityObservationFailed":
       return `could not observe exact identity of PID ${failure.pid}: ${failure.message}`;
     case "ProcessGroupObservationFailed":
@@ -300,59 +300,61 @@ const shutdownControlFailureMessage = (
   }
 };
 
-const ensuranceErrorMessage = (error: AcnEnsuranceError): string => {
+/** Formats an ensurance failure without imposing a client-specific heading. */
+export const formatAcnEnsuranceError = (error: AcnEnsuranceError): string => {
   switch (error._tag) {
     case "AcnEnsuranceFailed":
       return error.reason;
     case "AcnOwnerRecordReadUnavailable":
-      return `Could not read ACN owner record at ${error.path}: ${error.message}`;
+      return `Could not read the Magnitude service owner record at ${error.path}: ${error.message}`;
     case "AcnOwnerRecordInvalid":
-      return `Invalid ACN owner record at ${error.path}: ${error.message}`;
+      return `Invalid Magnitude service owner record at ${error.path}: ${error.message}`;
     case "ExactProcessIdentityObservationFailed":
     case "ProcessGroupObservationFailed":
       return error.message;
     case "ProcessGroupSignalPermissionDenied":
-      return `Permission denied signaling ACN process group ${error.group.leader.pid}: ${error.message}`;
+      return `Could not stop the previous Magnitude service: ${error.message}`;
     case "ProcessGroupSignalFailed":
-      return `Could not signal ACN process group ${error.group.leader.pid}: ${error.message}`;
+      return `Could not stop the previous Magnitude service: ${error.message}`;
     case "ProcessGroupAbsenceUnproven":
-      return `ACN process group ${error.group.leader.pid} remained observable after kill`;
+      return "The previous Magnitude service did not stop";
     case "AcnProcessIdentityObservationTimedOut":
-      return `Exact process inspection remained unavailable for PID ${error.pid}`;
+      return "Could not verify the running Magnitude service process";
     case "AcnCandidateSpawnFailed":
-      return `Could not spawn the ACN candidate: ${error.message}`;
+      return `Could not start the Magnitude service: ${error.message}`;
     case "AcnCandidateIdentityUnavailable":
-      return `ACN candidate ${error.pid} was not available for exact identity observation`;
+      return "Magnitude service failed to start because its process could not be verified";
     case "AcnCandidateExitedBeforeAdmission":
-      return `Magnitude daemon ${error.pid} exited with code ${error.code} before startup admission${error.stderr ? `:\n${error.stderr}` : ""}`;
     case "AcnCandidateExitedAfterAdmission":
-      return `Magnitude daemon ${error.pid} exited with code ${error.code} after admission before it became ready${error.stderr ? `:\n${error.stderr}` : ""}`;
+      return error.stderr.trim().length > 0
+        ? error.stderr.trim()
+        : "The service process exited before becoming ready";
     case "AcnCandidateAdmissionTimedOut":
-      return `Magnitude daemon ${error.pid} did not complete startup admission`;
+      return "Magnitude service failed to start in time";
     case "AcnCandidateParentChannelReleaseFailed":
-      return `Could not release the parent channel for ACN candidate ${error.pid}: ${error.message}`;
+      return `Could not release the parent channel for Magnitude service process ${error.pid}: ${error.message}`;
     case "AcnCandidateOwnershipLost":
-      return `Magnitude daemon ${error.pid} lost ownership after startup admission`;
+      return "Magnitude service stopped unexpectedly during startup";
     case "AcnCandidateBootstrapProcessStopFailed":
-      return `Could not stop ACN bootstrap process ${error.pid}: ${error.message}`;
+      return `Magnitude service startup cleanup failed: ${error.message}`;
     case "AcnCandidateBootstrapProcessExitUnproven":
-      return `Could not prove ACN bootstrap process ${error.pid} exited`;
+      return "Magnitude service startup cleanup did not finish";
     case "AcnDaemonShutdownFailed":
-      return `Could not shut down Magnitude daemon ${error.owner.pid}: ${shutdownControlFailureMessage(error)}`;
+      return `Could not stop the previous Magnitude service: ${shutdownControlFailureMessage(error)}`;
     case "AcnDaemonStartupTimedOut":
-      return `Magnitude daemon ${error.owner.pid} did not become ready within the startup deadline`;
+      return "Magnitude service failed to start in time";
     case "AcnEnsuranceConvergenceTimedOut":
-      return "ACN ensurance did not converge within its absolute deadline";
+      return "Magnitude service startup did not converge within its deadline";
     case "AcnDaemonTargetUnsupported":
-      return `This client supports ACN revision ${error.supported.revision}, not requested revision ${error.requested.revision}`;
+      return `This client supports Magnitude service revision ${error.supported.revision}, not requested revision ${error.requested.revision}`;
     case "AcnLaunchOverrideTargetMismatch":
-      return `The ACN launch override targets revision ${error.override.revision}, not requested revision ${error.requested.revision}`;
+      return `The Magnitude service launch override targets revision ${error.override.revision}, not requested revision ${error.requested.revision}`;
     case "BinaryNotFound":
       return `Magnitude executable was not found at ${error.path}`;
     case "BinaryVersionMismatch":
       return `Magnitude executable ${error.path} has version ${error.actual}; expected ${error.expected}`;
     case "BinaryRevisionMismatch":
-      return `Magnitude executable ${error.path} has ACN revision ${error.actual}; expected ${error.expected}`;
+      return `Magnitude executable ${error.path} has service revision ${error.actual}; expected ${error.expected}`;
     case "DownloadFailed":
       return error.reason;
     case "ChecksumMismatch":
@@ -361,7 +363,7 @@ const ensuranceErrorMessage = (error: AcnEnsuranceError): string => {
 };
 
 const nonEmptyFailureMessage = (error: AcnEnsuranceError): string => {
-  const message = ensuranceErrorMessage(error).trim();
+  const message = formatAcnEnsuranceError(error).trim();
   return message.length > 0 ? message : "Magnitude is unavailable";
 };
 

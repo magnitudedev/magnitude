@@ -576,7 +576,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
             <text style={{ fg: theme.status.failure }}>
               {Option.isSome(catalogSnapshot)
                 ? 'Lost contact with the model catalog; showing the last received state.'
-                : 'Unable to read the model catalog from the daemon.'}
+                : 'Unable to read the model catalog from the service.'}
             </text>
           </box>
         )}

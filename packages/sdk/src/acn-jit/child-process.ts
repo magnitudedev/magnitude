@@ -28,6 +28,8 @@ export interface SpawnedAcnCandidate {
   readonly confirmExactProcess: (process: ExactProcess) => Effect.Effect<void>
   readonly admit: Effect.Effect<void, AcnCandidateParentChannelReleaseFailed>
   readonly stopAndReap: Effect.Effect<void, AcnCandidateCleanupError>
+  /** Retires the exact admitted group when ownership or startup fails before readiness. */
+  readonly retireAdmittedGroup: Effect.Effect<void, AcnCandidateCleanupError>
 }
 
 interface ScopedAcnCandidate {
@@ -45,7 +47,7 @@ type CandidateOwnershipState =
   | { readonly _tag: "AwaitingExactProcess" }
   | { readonly _tag: "Armed"; readonly process: ExactProcess }
   | { readonly _tag: "AdmissionAttempted"; readonly process: ExactProcess }
-  | { readonly _tag: "Admitted" }
+  | { readonly _tag: "Admitted"; readonly process: ExactProcess }
   | { readonly _tag: "Retired" }
 
 /** Installs the candidate cleanup/admission boundary shared by platform spawners. */
@@ -104,8 +106,20 @@ export const scopeAcnCandidate = (
       }
       yield* Ref.set(state, { _tag: "AdmissionAttempted", process: current.process })
       yield* restore(candidate.releaseParentChannel)
-      yield* Ref.set(state, { _tag: "Admitted" })
+      yield* Ref.set(state, { _tag: "Admitted", process: current.process })
     })))
+
+    const retireAdmittedGroup = lock.withPermits(1)(Effect.gen(function* () {
+      const current = yield* Ref.get(state)
+      if (current._tag === "Retired") return
+      if (current._tag !== "Admitted") {
+        return yield* Effect.dieMessage(
+          `admitted ACN group retirement attempted in state ${current._tag}`,
+        )
+      }
+      yield* processes.stop({ leader: current.process })
+      yield* Ref.set(state, { _tag: "Retired" })
+    }))
 
     return {
       pid: candidate.pid,
@@ -113,6 +127,7 @@ export const scopeAcnCandidate = (
       confirmExactProcess,
       admit,
       stopAndReap,
+      retireAdmittedGroup,
     }
   })
 

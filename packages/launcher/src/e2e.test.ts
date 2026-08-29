@@ -78,6 +78,11 @@ if (process.env.TEST_TRIGGER_UPDATE === ${JSON.stringify(version)}) {
   if (status === 0 && process.env.MAGNITUDE_LAUNCH_PROTOCOL_VERSION === "1") process.exit(75)
   process.exit(status ?? 1)
 }
+if (process.env.TEST_TRIGGER_SERVICE_UPDATE === ${JSON.stringify(version)}) {
+  const status = runNpmUpdate()
+  if (status === 0 && process.env.MAGNITUDE_LAUNCH_PROTOCOL_VERSION === "1") process.exit(76)
+  process.exit(status ?? 1)
+}
 if (process.env.TEST_RELAUNCH_WITHOUT_UPDATE === ${JSON.stringify(version)}) {
   process.exit(process.env.MAGNITUDE_LAUNCH_PROTOCOL_VERSION === "1" ? 75 : 1)
 }
@@ -86,6 +91,7 @@ require("node:fs").writeFileSync(process.env.TEST_MAGNITUDE_OUTPUT, JSON.stringi
   managedBy: process.env.MAGNITUDE_MANAGED_BY,
   packageRoot: process.env.MAGNITUDE_MANAGED_PACKAGE_ROOT,
   launchProtocolVersion: process.env.MAGNITUDE_LAUNCH_PROTOCOL_VERSION,
+  args: process.argv.slice(2),
 }))
 `
 
@@ -371,6 +377,21 @@ finally:
     const report = JSON.parse(await readFile(outputPath, "utf8"))
     expect(report.version).toBe(V2)
     expect(report.managedBy).toBe("npm")
+  }, 30000)
+
+  it("starts the service with the new version after an explicit update", async () => {
+    const install = spawnSync(
+      "npm",
+      ["install", "-g", `@magnitudedev/cli@${V1}`],
+      { encoding: "utf8", env: childEnvironment },
+    )
+    expect(install.status, install.stderr).toBe(0)
+
+    const run = runInstalledLauncher([], { TEST_TRIGGER_SERVICE_UPDATE: V1 })
+    expect(run.status, run.stderr).toBe(0)
+    const report = JSON.parse(await readFile(outputPath, "utf8"))
+    expect(report.version).toBe(V2)
+    expect(report.args).toEqual(["service", "start"])
   }, 30000)
 
   it("refuses the relaunch with the floor message when the installation did not change", async () => {

@@ -249,6 +249,7 @@ describe("LocalAcnInstanceManager", () => {
             confirmExactProcess: () => Effect.void,
             admit: Effect.void,
             stopAndReap: Effect.void,
+            retireAdmittedGroup: Effect.void,
           }
         }).pipe(Effect.mapError((error) => new AcnCandidateSpawnFailed({ message: String(error) }))),
       })
@@ -297,6 +298,7 @@ describe("LocalAcnInstanceManager", () => {
                 processFixture.stop()
               }),
               stopAndReap: Effect.void,
+              retireAdmittedGroup: Effect.void,
             }
           }).pipe(Effect.mapError((error) => new AcnCandidateSpawnFailed({ message: String(error) }))),
         })),
@@ -382,6 +384,7 @@ describe("LocalAcnInstanceManager", () => {
                   : Effect.dieMessage("successor did not replace admitted candidate")),
               ),
               stopAndReap: Effect.void,
+              retireAdmittedGroup: Effect.void,
             }
           }).pipe(Effect.mapError((error) => new AcnCandidateSpawnFailed({ message: String(error) }))),
         })),
@@ -437,6 +440,7 @@ describe("LocalAcnInstanceManager", () => {
             confirmExactProcess: () => Effect.void,
             admit: Effect.void,
             stopAndReap: Effect.void,
+            retireAdmittedGroup: Effect.void,
           }),
         ),
       })))

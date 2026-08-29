@@ -19,6 +19,7 @@ import {
   Layer,
   Option,
   Ref,
+  Schema,
   Scope,
   Stream,
   SubscriptionRef,
@@ -32,7 +33,13 @@ import {
 } from "./acn-instance-manager"
 import { acnSubscriptionProtocol } from "./acn-subscription-protocol"
 import { type AcnEnsuranceError, AcnEnsuranceFailed } from "./errors"
-import { makeAcnLifecycle, type AcnLifecycle, type AcnLifecycleState } from "./lifecycle"
+import {
+  AcnLifecycleStateSchema,
+  makeAcnLifecycle,
+  type AcnLifecycle,
+  type AcnLifecycleOwner,
+  type AcnLifecycleState,
+} from "./lifecycle"
 
 type ReadyInstance = AcnInstance<AcnReady>
 
@@ -47,10 +54,38 @@ const recoveryPolicy = (tag: string) => {
 export interface AcnStartup {
   readonly state: AcnLifecycle
   readonly prepare: Effect.Effect<AcnLifecycleState>
+  readonly awaitReady: Effect.Effect<void, AcnEnsuranceError>
   readonly retry: Effect.Effect<void, AcnEnsuranceError>
+  readonly recovery: AcnRecovery
 }
 
-export interface AcnJitRuntime {
+export class AcnRecoveryInactive extends Schema.TaggedClass<AcnRecoveryInactive>()(
+  "Inactive",
+  {},
+) {}
+export class AcnRecovering extends Schema.TaggedClass<AcnRecovering>()(
+  "Recovering",
+  {
+    occurrence: Schema.Number.pipe(Schema.int(), Schema.positive()),
+    lifecycle: AcnLifecycleStateSchema,
+  },
+) {}
+export class AcnRecovered extends Schema.TaggedClass<AcnRecovered>()(
+  "Recovered",
+  { occurrence: Schema.Number.pipe(Schema.int(), Schema.positive()) },
+) {}
+
+export type AcnRecoveryState =
+  | AcnRecoveryInactive
+  | AcnRecovering
+  | AcnRecovered
+
+export interface AcnRecovery {
+  readonly get: Effect.Effect<AcnRecoveryState>
+  readonly changes: Stream.Stream<AcnRecoveryState>
+}
+
+export interface AcnConnection {
   readonly identity: Effect.Effect<AcnIdentity>
   readonly identityChanges: Stream.Stream<AcnIdentity>
   readonly protocolLayer: Layer.Layer<RpcClient.Protocol, never, HttpClient.HttpClient>
@@ -58,14 +93,19 @@ export interface AcnJitRuntime {
   readonly startup: AcnStartup
 }
 
+interface SelectionPresentation {
+  readonly lifecycle: AcnLifecycleOwner
+  readonly recoveryOccurrence: Option.Option<number>
+}
+
 interface AcnAssociation {
   readonly target: AcnTarget
   readonly selected: Option.Option<ReadyInstance>
 }
 
-class AcnRuntimeClosed extends Data.TaggedError("AcnRuntimeClosed") {}
-type SelectionError = AcnEnsuranceError | AcnRuntimeClosed
-const runtimeClosed = () => new AcnRuntimeClosed()
+class AcnConnectionClosed extends Data.TaggedError("AcnConnectionClosed") {}
+type SelectionError = AcnEnsuranceError | AcnConnectionClosed
+const connectionClosed = () => new AcnConnectionClosed()
 
 const sameReadyOccurrence = (left: ReadyInstance, right: ReadyInstance): boolean =>
   left.id === right.id &&
@@ -76,14 +116,14 @@ const { RpcClientError: TransportError } = RpcClientError
 const unavailableError = (cause: SelectionError): RpcClientError.RpcClientError =>
   new TransportError({
     reason: "Unknown",
-    message: cause._tag === "AcnRuntimeClosed"
-      ? "ACN client runtime is closed"
-      : `ACN unavailable: ${cause._tag}${"reason" in cause ? `: ${String(cause.reason)}` : ""}`,
+    message: cause._tag === "AcnConnectionClosed"
+      ? "Magnitude service client is closed"
+      : `Magnitude service unavailable: ${cause._tag}${"reason" in cause ? `: ${String(cause.reason)}` : ""}`,
     cause,
   })
 
-export const makeAcnJitRuntime = (): Effect.Effect<
-  AcnJitRuntime,
+export const makeAcnConnection = (): Effect.Effect<
+  AcnConnection,
   never,
   AcnInstanceManager | Scope.Scope
 > => Effect.gen(function* () {
@@ -91,6 +131,9 @@ export const makeAcnJitRuntime = (): Effect.Effect<
   const selectionScope = yield* Scope.make()
   yield* Effect.addFinalizer(() => Scope.close(selectionScope, Exit.void))
   const lifecycle = yield* makeAcnLifecycle()
+  const recoveryState = yield* SubscriptionRef.make<AcnRecoveryState>(new AcnRecoveryInactive({}))
+  const hasSelected = yield* Ref.make(false)
+  const recoveryOccurrence = yield* Ref.make(0)
   const association = yield* SubscriptionRef.make<AcnAssociation>({
     target: SDK_ACN_TARGET,
     selected: Option.none(),
@@ -104,29 +147,39 @@ export const makeAcnJitRuntime = (): Effect.Effect<
   const finishFailedSelection = (
     deferred: Deferred.Deferred<ReadyInstance, SelectionError>,
     cause: Cause.Cause<AcnEnsuranceError>,
+    presentation: SelectionPresentation,
   ) => admission.withPermits(1)(Effect.gen(function* () {
     const current = yield* Ref.get(activeSelection)
     if (Option.isNone(current) || current.value !== deferred) return
     yield* Ref.set(activeSelection, Option.none())
     if (!(yield* Ref.get(open))) {
-      yield* Deferred.fail(deferred, runtimeClosed())
+      yield* Deferred.fail(deferred, connectionClosed())
       return
     }
     const failure = Option.getOrUndefined(Cause.failureOption(cause))
-    if (failure !== undefined) yield* lifecycle.fail(failure)
+    if (failure !== undefined) {
+      yield* presentation.lifecycle.fail(failure)
+      if (Option.isSome(presentation.recoveryOccurrence)) {
+        yield* SubscriptionRef.set(recoveryState, new AcnRecovering({
+          occurrence: presentation.recoveryOccurrence.value,
+          lifecycle: yield* presentation.lifecycle.get,
+        }))
+      }
+    }
     yield* Deferred.failCause(deferred, cause)
   })).pipe(Effect.uninterruptible)
 
   const finishReadySelection = (
     deferred: Deferred.Deferred<ReadyInstance, SelectionError>,
     ready: ReadyInstance,
+    presentation: SelectionPresentation,
   ): Effect.Effect<void> => admission.withPermits(1)(
     Effect.gen(function* () {
       const current = yield* Ref.get(activeSelection)
       if (Option.isNone(current) || current.value !== deferred) return
       if (!(yield* Ref.get(open))) {
         yield* Ref.set(activeSelection, Option.none())
-        yield* Deferred.fail(deferred, runtimeClosed())
+        yield* Deferred.fail(deferred, connectionClosed())
         return
       }
       const previous = yield* SubscriptionRef.get(association)
@@ -135,7 +188,14 @@ export const makeAcnJitRuntime = (): Effect.Effect<
         : previous.target
       yield* Ref.set(activeSelection, Option.none())
       yield* SubscriptionRef.set(association, { target, selected: Option.some(ready) })
-      yield* lifecycle.ready
+      yield* presentation.lifecycle.ready
+      yield* Ref.set(hasSelected, true)
+      if (Option.isSome(presentation.recoveryOccurrence)) {
+        yield* SubscriptionRef.set(
+          recoveryState,
+          new AcnRecovered({ occurrence: presentation.recoveryOccurrence.value }),
+        )
+      }
       yield* Deferred.succeed(deferred, ready)
     }).pipe(Effect.uninterruptible),
   )
@@ -143,22 +203,33 @@ export const makeAcnJitRuntime = (): Effect.Effect<
   const launchSelection = (
     deferred: Deferred.Deferred<ReadyInstance, SelectionError>,
     target: AcnTarget,
+    presentation: SelectionPresentation,
   ): Effect.Effect<void> => Effect.suspend(() => runAcnEnsure(manager.ensure({ target }).pipe(
     Stream.tap((event) => event._tag === "Observation"
-      ? lifecycle.report(event.observation)
+      ? presentation.lifecycle.report(event.observation).pipe(
+          Effect.zipRight(Option.match(presentation.recoveryOccurrence, {
+            onNone: () => Effect.void,
+            onSome: (occurrence) => presentation.lifecycle.get.pipe(
+              Effect.flatMap((current) => SubscriptionRef.set(recoveryState, new AcnRecovering({
+                occurrence,
+                lifecycle: current,
+              }))),
+            ),
+          })),
+        )
       : Effect.void),
   )).pipe(
     Effect.exit,
     Effect.flatMap((exit) => {
-      if (Exit.isFailure(exit)) return finishFailedSelection(deferred, exit.cause)
-      return finishReadySelection(deferred, exit.value)
+      if (Exit.isFailure(exit)) return finishFailedSelection(deferred, exit.cause, presentation)
+      return finishReadySelection(deferred, exit.value, presentation)
     }),
   ))
 
   const admitSelectionUnlocked: Effect.Effect<
     Effect.Effect<ReadyInstance, SelectionError>
   > = Effect.gen(function* () {
-    if (!(yield* Ref.get(open))) return yield* Effect.succeed(Effect.fail(runtimeClosed()))
+    if (!(yield* Ref.get(open))) return yield* Effect.succeed(Effect.fail(connectionClosed()))
     const selected = (yield* SubscriptionRef.get(association)).selected
     if (Option.isSome(selected)) return yield* Effect.succeed(
       Effect.succeed(selected.value) as Effect.Effect<ReadyInstance, SelectionError>,
@@ -167,15 +238,30 @@ export const makeAcnJitRuntime = (): Effect.Effect<
     if (Option.isSome(active)) return yield* Effect.succeed(Deferred.await(active.value))
     const deferred = yield* Deferred.make<ReadyInstance, SelectionError>()
     const target = (yield* SubscriptionRef.get(association)).target
+    const recovering = yield* Ref.get(hasSelected)
+    const selectionLifecycle = recovering ? yield* makeAcnLifecycle() : lifecycle
+    const occurrence = recovering
+      ? Option.some(yield* Ref.updateAndGet(recoveryOccurrence, (value) => value + 1))
+      : Option.none<number>()
+    const presentation: SelectionPresentation = {
+      lifecycle: selectionLifecycle,
+      recoveryOccurrence: occurrence,
+    }
+    if (Option.isSome(occurrence)) {
+      yield* SubscriptionRef.set(recoveryState, new AcnRecovering({
+        occurrence: occurrence.value,
+        lifecycle: yield* selectionLifecycle.get,
+      }))
+    }
     yield* Ref.set(activeSelection, Option.some(deferred))
-    const selection = launchSelection(deferred, target).pipe(
+    const selection = launchSelection(deferred, target, presentation).pipe(
       Effect.timeoutFail({
         duration: ACN_ENSURE_TIMEOUT,
         onTimeout: () => new AcnEnsuranceFailed({
           reason: "ACN client selection did not converge within its absolute deadline",
         }),
       }),
-      Effect.catchAll((error) => finishFailedSelection(deferred, Cause.fail(error))),
+      Effect.catchAll((error) => finishFailedSelection(deferred, Cause.fail(error), presentation)),
     )
     yield* Effect.forkIn(selection, selectionScope)
     return yield* Effect.succeed(Deferred.await(deferred))
@@ -187,7 +273,7 @@ export const makeAcnJitRuntime = (): Effect.Effect<
 
   const recover = (failed: ReadyInstance): Effect.Effect<ReadyInstance, SelectionError> =>
     Effect.flatten(admission.withPermits(1)(Effect.gen(function* () {
-      if (!(yield* Ref.get(open))) return yield* Effect.succeed(Effect.fail(runtimeClosed()))
+      if (!(yield* Ref.get(open))) return yield* Effect.succeed(Effect.fail(connectionClosed()))
       const current = yield* SubscriptionRef.get(association)
       if (Option.isSome(current.selected) && !sameReadyOccurrence(current.selected.value, failed)) {
         return yield* Effect.succeed(
@@ -210,7 +296,6 @@ export const makeAcnJitRuntime = (): Effect.Effect<
     recoveryPolicy,
   })
 
-  yield* lifecycle.report({ _tag: "Starting", phase: "PreparingAcn" })
   yield* Effect.forkIn(endpoint.pipe(Effect.ignore), selectionScope)
 
   const prepare = lifecycle.get.pipe(
@@ -226,10 +311,9 @@ export const makeAcnJitRuntime = (): Effect.Effect<
       : Effect.succeed(state)),
   )
 
-  const retry = lifecycle.report({ _tag: "Starting", phase: "PreparingAcn" }).pipe(
-    Effect.zipRight(endpoint),
-    Effect.mapError((error) => error._tag === "AcnRuntimeClosed"
-      ? new AcnEnsuranceFailed({ reason: "ACN client runtime is closed" })
+  const retry = endpoint.pipe(
+    Effect.mapError((error) => error._tag === "AcnConnectionClosed"
+      ? new AcnEnsuranceFailed({ reason: "Magnitude service connection is closed" })
       : error),
     Effect.asVoid,
   )
@@ -246,7 +330,21 @@ export const makeAcnJitRuntime = (): Effect.Effect<
       Stream.map((current) => current.target.identity),
       Stream.changes,
     ),
-    startup: { state: lifecycle, prepare, retry },
+    startup: {
+      state: lifecycle,
+      prepare,
+      awaitReady: endpoint.pipe(
+        Effect.mapError((error) => error._tag === "AcnConnectionClosed"
+          ? new AcnEnsuranceFailed({ reason: "Magnitude service connection is closed" })
+          : error),
+        Effect.asVoid,
+      ),
+      retry,
+      recovery: {
+        get: SubscriptionRef.get(recoveryState),
+        changes: recoveryState.changes,
+      },
+    },
     close,
     protocolLayer: recoveringProtocolLayer,
   }

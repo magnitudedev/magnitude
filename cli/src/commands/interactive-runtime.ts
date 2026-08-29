@@ -7,6 +7,7 @@ import {
   type InteractiveLaunchOptions,
 } from "../runtime/interactive"
 import { isDevelopmentBuild } from "../runtime/environment"
+import { explainInteractiveFailure } from "../startup/service-startup-error"
 
 const resolveEnvAuth = (): AuthSource => {
   const envKey = process.env.MAGNITUDE_API_KEY
@@ -52,8 +53,7 @@ export const runInteractive = (
   return Effect.runPromise(runInteractiveCommand(options).pipe(
     Effect.provide([BunContext.layer, FetchHttpClient.layer]),
     Effect.catchAll((error) => Effect.sync(() => {
-      const reason = "reason" in error ? error.reason : String(error)
-      process.stderr.write(`Failed to start Magnitude: ${reason}\n`)
+      process.stderr.write(`${explainInteractiveFailure(error)}\n`)
       return 1
     })),
   )).then((exitCode) => process.exit(exitCode))

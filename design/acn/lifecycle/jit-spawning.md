@@ -22,7 +22,7 @@ projects the one shared fact from SQLite; it is neither a daemon nor a generic c
 service.
 
 ```text
-client runtime --ensure(target)--> AcnInstanceManager <--> AcnOwnerStore
+ACN connection --ensure(target)--> AcnInstanceManager <--> AcnOwnerStore
                                                            |
                                                            +--> exact live owner ACN
 ```
@@ -61,7 +61,7 @@ newer owner but never launches a binary under that newer revision.
 
 The complete immutable cross-version surface is defined only by
 [ACN cross-version coordination protocol](./cross-version-coordination-protocol.md). This document
-defines how `AcnInstance`, `AcnInstanceManager`, `AcnJitRuntime`, and `AcnServiceLifecycle` use that
+defines how `AcnInstance`, `AcnInstanceManager`, `AcnConnection`, and `AcnServiceLifecycle` use that
 protocol; it does not define or extend the shared protocol surface.
 
 Schema, statements, decoding, transaction ordering, and typed error translation exist once in the
@@ -141,10 +141,16 @@ pending/exited/stalled candidate, and launchable absence. Every state has an exp
 fixed deadline. One ensurance occurrence launches at most one candidate and cannot silently turn a
 failed launch into a respawn.
 
-Candidate stderr is drained while the process runs and retained only as a bounded tail. Admission
-disarms candidate cleanup but does not discard the spawning manager's exit observation. Until
-readiness, an exit before or after admission reports its exit code and retained diagnostic instead
-of being collapsed into generic coordination loss.
+Candidate stderr is drained by a best-effort Effect fiber while the process runs and retained only as
+a bounded tail. Candidate exit observation is governed by the root process's OS exit callback, never
+by pipe EOF: descendants may inherit the descriptor without delaying failure observation or client
+scope shutdown. Root exit requests diagnostic-capture interruption and snapshots the retained tail.
+Admission disarms ordinary scoped
+candidate cleanup but does not discard the spawning manager's exit observation or exact group
+identity. If an admitted candidate exits or loses its owner row before readiness, the manager stops
+and proves absence of that exact process group before it publishes the terminal failure. Until
+readiness, an exit before or after admission reports its exit
+code and retained diagnostic instead of being collapsed into generic coordination loss.
 
 Mutation and final ready adoption reread the complete owner required by their action. Health
 revision has authority only while exact process inspection proves that same owner occurrence live.
@@ -188,6 +194,8 @@ group is still retired and exact group absence is required before replacement.
 - Every known pre-admission terminal path joins cleanup; finalizer cleanup failure is reported and
   never becomes an unchecked defect.
 - Every admitted ACN continuously proves that the owner row still names it.
+- An admitted candidate that exits or loses ownership before readiness has its exact process group
+  retired before failure is published.
 - No stale manager action targets a changed owner.
 - Existing-daemon mutation exists only inside `AcnDaemonShutdownSupervisor`.
 - Shutdown-control failures remain typed in the supervisor Effect error channel.

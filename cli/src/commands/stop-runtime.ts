@@ -1,12 +1,12 @@
 import { Effect } from "effect"
-import { stopTerminalAcn } from "../platform/terminal"
+import { stopLocalAcn } from "../server/acn-instance-manager"
 
-export const runStop = () => Effect.runPromise(stopTerminalAcn.pipe(
+export const runStop = () => Effect.runPromise(stopLocalAcn.pipe(
   Effect.tap(() => Effect.sync(() => {
-    process.stdout.write("Magnitude daemon stopped.\n")
+    process.stdout.write("Magnitude service stopped.\n")
   })),
   Effect.catchAll((error) => Effect.sync(() => {
-    process.stderr.write(`Failed to stop Magnitude daemon: ${String(error)}\n`)
+    process.stderr.write(`Failed to stop Magnitude service: ${String(error)}\n`)
     process.exitCode = 1
   })),
 ))

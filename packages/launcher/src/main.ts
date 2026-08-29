@@ -2,7 +2,11 @@ import * as FetchHttpClient from "@effect/platform/FetchHttpClient"
 import * as NodeCommandExecutor from "@effect/platform-node/NodeCommandExecutor"
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem"
 import * as NodePath from "@effect/platform-node/NodePath"
-import { NodeArchiveExtractor, RELAUNCH_EXIT_CODE } from "@magnitudedev/release"
+import {
+  NodeArchiveExtractor,
+  POST_UPDATE_SERVICE_START_EXIT_CODE,
+  RELAUNCH_EXIT_CODE,
+} from "@magnitudedev/release"
 import { Effect, Either, Layer, Option, Schema } from "effect"
 import {
   cliBinaryResolverLayer,
@@ -46,8 +50,8 @@ const resolverLayer = pinnedBinary !== undefined
   ? cliBinaryResolverPinnedLayer(pinnedBinary)
   : cliBinaryResolverLayer
 
-const MainLive = Layer.mergeAll(
-  cliProcessSpawnerLayer({ args, environment }).pipe(
+const mainLive = (launchArgs: ReadonlyArray<string>) => Layer.mergeAll(
+  cliProcessSpawnerLayer({ args: launchArgs, environment }).pipe(
     Layer.provide(resolverLayer),
     Layer.provide(inspectorLayer),
   ),
@@ -63,9 +67,12 @@ const launchOnce = Effect.gen(function* () {
   const installation = yield* inspector.inspect
   const code = yield* spawner.spawn
   return { version: installation.version, code: Number(code) }
-}).pipe(Effect.provide(MainLive))
+}).pipe(Effect.provide(mainLive(args)))
 
-const relaunchOnce = (previousVersion: string) => Effect.gen(function* () {
+const relaunchOnce = (
+  previousVersion: string,
+  launchArgs: ReadonlyArray<string>,
+) => Effect.gen(function* () {
   const inspector = yield* LauncherInstallationInspector
   const spawner = yield* CliProcessSpawner
   const installation = yield* inspector.inspect
@@ -73,9 +80,10 @@ const relaunchOnce = (previousVersion: string) => Effect.gen(function* () {
   // installation; running the old version again would only prompt again.
   if (installation.version === previousVersion) return Option.none<number>()
   return Option.some(Number(yield* spawner.spawn))
-}).pipe(Effect.provide(MainLive))
+}).pipe(Effect.provide(mainLive(launchArgs)))
 
 const FLOOR_MESSAGE = "Update installed — run `magnitude` to start the new version."
+const SERVICE_START_FLOOR_MESSAGE = "Update installed — run `magnitude service start` to activate it."
 
 const main = Effect.gen(function* () {
   const first = yield* Effect.either(launchOnce)
@@ -83,19 +91,26 @@ const main = Effect.gen(function* () {
     console.error("Failed to launch Magnitude:", first.left.reason)
     return 1
   }
-  if (first.right.code !== RELAUNCH_EXIT_CODE) return first.right.code
+  if (first.right.code !== RELAUNCH_EXIT_CODE
+    && first.right.code !== POST_UPDATE_SERVICE_START_EXIT_CODE) return first.right.code
   // The CLI updated the installation and asked to be run again — honored at
   // most once; any failure or an unchanged installation degrades to a manual
   // restart.
-  const second = yield* relaunchOnce(first.right.version).pipe(
+  const nextArgs = first.right.code === POST_UPDATE_SERVICE_START_EXIT_CODE
+    ? ["service", "start"]
+    : args
+  const floorMessage = first.right.code === POST_UPDATE_SERVICE_START_EXIT_CODE
+    ? SERVICE_START_FLOOR_MESSAGE
+    : FLOOR_MESSAGE
+  const second = yield* relaunchOnce(first.right.version, nextArgs).pipe(
     Effect.catchAll(() => Effect.sync(() => {
-      console.error(FLOOR_MESSAGE)
+      console.error(floorMessage)
       return Option.some(0)
     })),
   )
   return Option.match(second, {
     onNone: () => {
-      console.error(FLOOR_MESSAGE)
+      console.error(floorMessage)
       return 0
     },
     onSome: (code) => code,

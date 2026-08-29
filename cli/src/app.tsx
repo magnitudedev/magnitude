@@ -33,10 +33,11 @@ import {
   deriveSelectedModelResidencyNotificationState,
   notificationStatesEquivalent,
   resolveActiveNotificationState,
+  deriveAcnRecoveryNotificationState,
+  useAcnRecoveryState,
   useLocalModelsSelector,
   useModelSlots,
   useModelSlotActions,
-  useAcnLifecycle,
   formatLocalModelDisplayName,
   onboardingModelSetupNoticeMessage,
   type OnboardingModelSetupState,
@@ -44,7 +45,6 @@ import {
 import {
   type LocalModelsState,
   type SessionOptions,
-  type AcnLifecycleState,
 } from "@magnitudedev/sdk";
 import {
   authSourceAtom,
@@ -93,7 +93,6 @@ import {
   SetupFrame,
 } from "./features/model-setup";
 import { registerCliCommands } from "./commands/register";
-import { AcnBootstrapScreen } from "./features/app-shell/acn-bootstrap";
 
 registerCliCommands();
 
@@ -104,7 +103,6 @@ export interface CliAppProps {
   initialPrompt: string | undefined;
   envAuth: AuthSource;
   sessionOptions: SessionOptions;
-  initialAcnLifecycle: AcnLifecycleState;
 }
 
 export function CliApp(props: CliAppProps): ReactNode {
@@ -113,16 +111,7 @@ export function CliApp(props: CliAppProps): ReactNode {
     [selectedCwdAtom, process.cwd()],
     [sessionCreateOptionsAtom, Option.some(props.sessionOptions)],
   ]);
-  const { state, retry } = useAcnLifecycle(props.initialAcnLifecycle);
-  return state._tag === "Ready" ? (
-    <CliAppGates {...props} />
-  ) : (
-    <AcnBootstrapScreen
-      state={state}
-      onRetry={retry}
-      onQuit={() => process.kill(process.pid, "SIGINT")}
-    />
-  );
+  return <CliAppGates {...props} />;
 }
 
 function CliAppGates(props: CliAppProps): ReactNode {
@@ -197,7 +186,7 @@ function OnboardingGate(
     if (Result.isFailure(slots)) {
       return (
         <FatalErrorScreen
-          error="Failed to load model configuration from the daemon."
+          error="Failed to load model configuration from the service."
           onRetry={retryProfiles}
           onQuit={props.onExitApp}
         />
@@ -261,6 +250,7 @@ function CliAppContent(
   const widget = useRecentChatsWidgetState();
   const { showCopiedToast: clipboardToast } = useSelectionAutoCopy();
   const notificationAreaState = useAtomValue(notificationAreaStateAtom);
+  const acnRecoveryState = useAcnRecoveryState();
   const onboardingSetup = props.onboardingSetup;
   const modelSlotsState = Option.getOrNull(Result.value(useModelSlots()));
   const { rootSlotId } = useSlotProfiles();
@@ -283,6 +273,7 @@ function CliAppContent(
   const notificationState = resolveActiveNotificationState(
     notificationAreaState,
     [
+      deriveAcnRecoveryNotificationState(acnRecoveryState),
       ...Option.getOrElse(persistentNotificationStates, () => []),
       deriveSelectedModelResidencyNotificationState(modelSlotsState, rootSlotId),
     ],

@@ -1,6 +1,7 @@
 import { Atom } from "@effect-atom/atom-react"
 import { createId } from "@magnitudedev/generate-id"
 import type {
+  AcnRecoveryState,
   LocalModelsState,
   ModelSlotsState,
   ProviderModelId,
@@ -127,6 +128,45 @@ const persistentNotificationState = (
   action,
   createdAt: 0,
 })
+
+const recoveryActivity = (state: AcnRecoveryState): string | null => {
+  if (state._tag !== "Recovering") return null
+  const lifecycle = state.lifecycle
+  if (lifecycle._tag === "Checking") return "Reconnecting to Magnitude service…"
+  if (lifecycle._tag === "Ready" || lifecycle._tag === "Failed") return null
+  if (lifecycle._tag === "Installing") {
+    if (lifecycle.phase === "StartingMagnitude") return "Starting Magnitude service…"
+    const phase = lifecycle.phase === "DownloadingDaemon"
+      ? "Downloading Magnitude service"
+      : "Downloading inference engine"
+    const percentage = Option.match(lifecycle.detail, {
+      onNone: () => Math.floor(lifecycle.overallProgress * 100),
+      onSome: (progress) => Math.floor(
+        Math.max(0, Math.min(1, progress.completed / progress.totalBytes)) * 100,
+      ),
+    })
+    return `${phase} · ${percentage}%`
+  }
+  if (typeof lifecycle.phase !== "string") {
+    const backend = lifecycle.phase.backend
+    return `Preparing ${backend._tag} backend for ${backend.hardwareLabel}…`
+  }
+  switch (lifecycle.phase) {
+    case "PreparingAcn": return "Preparing Magnitude service…"
+    case "WaitingForOwner": return "Waiting for previous Magnitude service…"
+    case "ResolvingLocalInference": return "Preparing local inference…"
+    case "LaunchingLocalInference": return "Starting local inference…"
+  }
+}
+
+export const deriveAcnRecoveryNotificationState = (
+  state: AcnRecoveryState,
+): NotificationState | null => {
+  const message = recoveryActivity(state)
+  return message === null
+    ? null
+    : persistentNotificationState("acn-recovery", message, "activity")
+}
 
 export const deriveModelDownloadNotificationState = (
   modelsState: LocalModelsState | null,

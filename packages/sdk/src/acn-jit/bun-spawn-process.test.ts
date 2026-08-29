@@ -30,8 +30,56 @@ describe("BunDetachedChildProcessSpawner", () => {
     )
   })
 
+  it("remains observable after a pre-exit poll times out", async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const spawned = yield* BunDetachedChildProcessSpawner.spawn([
+            globalThis.process.execPath,
+            "-e",
+            "await Bun.sleep(50); process.stderr.write('candidate failed', () => process.exit(7))",
+          ])
+          const early = yield* spawned.exited.pipe(Effect.timeoutOption(Duration.millis(1)))
+          expect(Option.isNone(early)).toBe(true)
+          const exit = yield* spawned.exited.pipe(Effect.timeout(Duration.seconds(2)))
+          expect(exit).toEqual({ code: 7, stderr: "candidate failed" })
+          expect(yield* spawned.exited).toEqual(exit)
+        }),
+      ).pipe(Effect.provideService(ProcessGroupController, ProcessGroupControllerLive)),
+    )
+  })
+
+  it("does not make scope closure wait for an admitted process stderr pipe", async () => {
+    let admitted: Option.Option<Parameters<typeof ProcessGroupControllerLive.stop>[0]["leader"]> = Option.none()
+    try {
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const spawned = yield* BunDetachedChildProcessSpawner.spawn([
+              globalThis.process.execPath,
+              "-e",
+              "process.stdin.resume(); await new Promise((resolve) => process.stdin.once('end', resolve)); setInterval(() => {}, 1000)",
+            ])
+            const identity = yield* ProcessGroupControllerLive.inspect(spawned.pid)
+            if (Option.isNone(identity)) return yield* Effect.dieMessage("spawned candidate identity is absent")
+            admitted = identity
+            yield* spawned.confirmExactProcess(identity.value)
+            yield* spawned.admit
+          }),
+        ).pipe(
+          Effect.provideService(ProcessGroupController, ProcessGroupControllerLive),
+          Effect.timeout(Duration.seconds(2)),
+        ),
+      )
+    } finally {
+      if (Option.isSome(admitted)) {
+        await Effect.runPromise(ProcessGroupControllerLive.stop({ leader: admitted.value }))
+      }
+    }
+  })
+
   it.skipIf(process.platform === "win32")(
-    "reaps the candidate group when the root exits before its descendant",
+    "observes and reaps an admitted root exit when a descendant inherited stderr",
     async () => {
       const root = await mkdtemp(join(tmpdir(), "magnitude-candidate-tree-"))
       const childPidPath = join(root, "child-pid")
@@ -41,7 +89,7 @@ describe("BunDetachedChildProcessSpawner", () => {
           const spawned = yield* BunDetachedChildProcessSpawner.spawn([
             process.execPath,
             "-e",
-            "const child = Bun.spawn([process.execPath, '-e', 'setInterval(() => {}, 1000)'], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' }); child.unref(); await Bun.write(process.argv.at(-1), String(child.pid));",
+            "const child = Bun.spawn([process.execPath, '-e', 'setInterval(() => {}, 1000)'], { stdin: 'ignore', stdout: 'ignore', stderr: 'inherit' }); child.unref(); await Bun.write(process.argv.at(-1), String(child.pid)); process.stdin.resume(); await new Promise((resolve) => process.stdin.once('end', resolve)); process.stderr.write('candidate exited'); process.exit(9);",
             childPidPath,
           ])
           const identity = yield* ProcessGroupControllerLive.inspect(spawned.pid)
@@ -51,7 +99,11 @@ describe("BunDetachedChildProcessSpawner", () => {
             yield* Effect.sleep(Duration.millis(5))
           }
           childPid = Number(yield* Effect.promise(() => readFile(childPidPath, "utf8")))
-          yield* spawned.exited
+          yield* spawned.admit
+          const exit = yield* spawned.exited.pipe(Effect.timeout(Duration.seconds(2)))
+          expect(exit.code).toBe(9)
+          expect(exit.stderr).toBe("candidate exited")
+          yield* spawned.retireAdmittedGroup
         }).pipe(Effect.provideService(ProcessGroupController, ProcessGroupControllerLive))))
         expect(Option.isNone(await Effect.runPromise(
           ProcessGroupControllerLive.inspect(childPid),

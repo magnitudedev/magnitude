@@ -7,12 +7,13 @@ import {
   SDK_ACN_TARGET,
   SDK_VERSION,
   MAGNITUDE_SERVICE_ORIGIN,
+  type BinaryAcquisitionEvent,
 } from "@magnitudedev/sdk"
 import { Data, Effect, Option, Schedule, Schema } from "effect"
 import { homedir } from "node:os"
 import { dirname, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
-import { stopTerminalAcn } from "../platform/terminal"
+import { stopLocalAcn } from "./acn-instance-manager"
 import { isDevelopmentBuild } from "../runtime/environment"
 import { writeFileAtomic } from "../utils/atomic-file"
 
@@ -104,17 +105,23 @@ export const developmentServerCommand = (
   "serve",
 ]
 
-const resolveServiceCommand = isDevelopmentBuild()
+export interface ServiceAcquisitionObserver {
+  readonly report: (event: BinaryAcquisitionEvent) => Effect.Effect<void>
+}
+
+const resolveServiceCommand = (
+  acquisitionObserver: Option.Option<ServiceAcquisitionObserver> = Option.none(),
+) => isDevelopmentBuild()
   ? Effect.succeed(developmentServerCommand())
   : Effect.gen(function* () {
-  const resolved = yield* resolveBinaryCommand({
-    version: SDK_VERSION,
-    acnRevision: SDK_ACN_TARGET.revision,
-    dataDir: defaultDataDir(),
-    acquisitionObserver: Option.none(),
-  })
-  return resolved.command
-}).pipe(Effect.mapError((error) => fail(String(error))))
+      const resolved = yield* resolveBinaryCommand({
+        version: SDK_VERSION,
+        acnRevision: SDK_ACN_TARGET.revision,
+        dataDir: defaultDataDir(),
+        acquisitionObserver,
+      })
+      return resolved.command
+    }).pipe(Effect.mapError((error) => fail(String(error))))
 
 const writeServiceFile = (file: string, contents: string) =>
   writeFileAtomic(file, contents).pipe(Effect.mapError((error) => fail(String(error))))
@@ -183,9 +190,9 @@ const installAndStartService = (command: ReadonlyArray<string>) => Effect.gen(fu
 })
 
 /** Register the exact release for future user-session startup without
- * replacing the daemon currently serving an interactive setup flow. */
-export const installServerOnStartup = Effect.gen(function* () {
-  const command = yield* resolveServiceCommand
+ * replacing the service currently serving an interactive setup flow. */
+export const installServiceOnStartup = Effect.gen(function* () {
+  const command = yield* resolveServiceCommand()
   const fs = yield* FileSystem.FileSystem
   yield* fs.makeDirectory(`${defaultDataDir()}/logs`, { recursive: true, mode: 0o700 })
   if (process.platform === "darwin") {
@@ -214,7 +221,7 @@ export const installServerOnStartup = Effect.gen(function* () {
   ? error
   : fail(String(error))))
 
-export const stopServer = Effect.gen(function* () {
+export const stopService = Effect.gen(function* () {
   if (process.platform === "darwin") {
     const domain = `gui/${process.getuid?.() ?? 0}`
     yield* run(["launchctl", "disable", `${domain}/${SERVICE_LABEL}`], true)
@@ -225,18 +232,17 @@ export const stopServer = Effect.gen(function* () {
     yield* run(["schtasks", "/End", "/TN", "MagnitudeInference"], true)
     yield* run(["schtasks", "/Change", "/TN", "MagnitudeInference", "/DISABLE"], true)
   }
-  yield* stopTerminalAcn.pipe(Effect.ignore)
+  yield* stopLocalAcn.pipe(Effect.ignore)
 })
 
 const probeReady = Effect.tryPromise({
   try: (signal) => fetch(PUBLIC_HEALTH, { signal }).then(async (response) => {
     if (!response.ok) throw new Error(`health returned ${response.status}`)
     const health = Schema.decodeUnknownSync(AcnHealthResponseSchema)(await response.json())
-    if (health.version !== SDK_ACN_TARGET.identity
-      || health.revision !== SDK_ACN_TARGET.revision
-      || health.state._tag !== "Ready") {
-      throw new Error("the fixed port is not serving the requested Magnitude release")
+    if (health.revision < SDK_ACN_TARGET.revision || health.state._tag !== "Ready") {
+      throw new Error("the fixed port is not serving a compatible Magnitude release")
     }
+    return health
   }),
   catch: (error) => fail(String(error)),
 })
@@ -246,7 +252,11 @@ const awaitReady = probeReady.pipe(
 )
 
 const managedServiceIsCurrent = (command: ReadonlyArray<string>) => Effect.gen(function* () {
-  if (Option.isNone(yield* Effect.option(probeReady))) return false
+  const compatible = yield* Effect.option(probeReady)
+  if (Option.isNone(compatible)) return false
+  // Never replace or downgrade a newer compatible service. Its installed
+  // definition belongs to that newer release, not to this older CLI.
+  if (compatible.value.revision > SDK_ACN_TARGET.revision) return true
   const fs = yield* FileSystem.FileSystem
   if (process.platform === "darwin") {
     const service = macServicePath()
@@ -266,8 +276,10 @@ const managedServiceIsCurrent = (command: ReadonlyArray<string>) => Effect.gen(f
   return false
 })
 
-export const startServer = Effect.gen(function* () {
-  const command = yield* resolveServiceCommand
+export const startServiceManager = (
+  acquisitionObserver: Option.Option<ServiceAcquisitionObserver> = Option.none(),
+) => Effect.gen(function* () {
+  const command = yield* resolveServiceCommand(acquisitionObserver)
   // Connecting another harness must not bounce a healthy service whose
   // persisted definition already names this exact release.
   if (yield* managedServiceIsCurrent(command)) return
@@ -275,11 +287,12 @@ export const startServer = Effect.gen(function* () {
   yield* fs.makeDirectory(`${defaultDataDir()}/logs`, { recursive: true, mode: 0o700 })
   // A JIT-owned process may already own the fixed port. Retire it before the
   // platform manager starts the release-matched persistent service.
-  yield* stopTerminalAcn.pipe(Effect.ignore)
+  yield* stopLocalAcn.pipe(Effect.ignore)
   yield* installAndStartService(command).pipe(
-    Effect.zipRight(awaitReady),
-    Effect.onError(() => stopServer.pipe(Effect.ignore)),
+    Effect.onError(() => stopService.pipe(Effect.ignore)),
   )
 }).pipe(Effect.mapError((error) => error instanceof ServerServiceError
   ? error
   : fail(String(error))))
+
+export const confirmServicePublicReady = awaitReady

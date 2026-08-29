@@ -3,190 +3,174 @@ applies_to:
   - cli/src/index.tsx
   - cli/src/commands/interactive.ts
   - cli/src/commands/interactive-runtime.ts
+  - cli/src/commands/server.ts
+  - cli/src/commands/server-runtime.ts
   - cli/src/runtime/**
-  - cli/src/features/app-shell/acn-bootstrap.tsx
+  - cli/src/startup/**
   - cli/src/features/update/**
   - cli/src/platform/terminal.ts
+  - cli/src/server/acn-connection.ts
+  - cli/src/server/acn-instance-manager.ts
   - cli/src/platform/process-exit.ts
   - cli/src/platform/terminal-appearance.ts
-  - packages/sdk/src/acn-jit/lifecycle.ts
+  - packages/sdk/src/acn-jit/acn-recovering-client.ts
+  - packages/sdk/src/acn-jit/local-acn-require-running-manager.ts
 ---
 
 # CLI startup sequence
 
-Nothing paints until there is an answer, and an answer is one of three things: the app, real
-progress, or a question. Startup is one sequential Effect program owning one scoped terminal
-session with one React root; only the Effect program writes presentation state, and every wait
-races the typed process-exit request.
+Service startup and update choice are inline terminal work owned by the command runtime. OpenTUI is
+not a bootstrap surface. The interactive command creates its renderer only after the update choice,
+exact service readiness, and onboarding preflight have completed. Consequently, a warm launch makes
+no terminal writes before the application's first frame.
 
-Naming discipline: **states** are code identifiers, **titles/labels** are user copy, **phases**
-are protocol literals; they are never conflated. The TUI has exactly three states —
-`UpdatePrompt | DaemonStartup | Application` — and the renderer (with the alternate screen) is
-acquired at the first moment one of them must render, never earlier.
+User-facing copy always says **service**. `ACN`, `daemon`, `server`, JIT, ownership, and endpoint
+selection remain implementation terms.
 
-## Startup tree
+## Service acquisition
 
-```
-magnitude (shell)
-│
-├─ LAUNCHER ──────────────────────────────────── surface: plain terminal
-│   InstallationInspection   locate installed package        ~1–5ms      silent
-│   CliBinaryResolution      resolve CLI binary              ~100–300ms  silent when cached
-│     └ download + verify    (fresh install / just updated)  secs–mins   printed progress lines
-│
-└─ CLI ─────────────────────────────────────────(process boot ~100–200ms)
-    AppearanceProbe          terminal color queries          ~1–10ms     silent, concurrent with
-    │                        (100ms cap on silent ttys)                  everything below;
-    │                                                                   joined before first paint
-    UpdateDiscovery          version check                   ~200ms–1s   silent, concurrent with
-    │                        (30s ceiling, silent failure)               everything below
-    UpdatePrompt ─────────────────────────────── TUI state   user-paced  only when an offer exists
-    │    Update → relaunch protocol · Skip / Dismiss → continue
-    InstallationProbe        installed daemon build present? ~1–5ms      silent
-    │    absent ──▶ await UpdateDiscovery's result (bounded by its ceiling) — an offer
-    │              prompts before any download; installs need the network regardless
-    PlatformConstruction     manager/runtime wiring          ~10ms       silent
-    DaemonCheck              coordination read → probe →     ~10–100ms   silent
-    │                        adopt
-    │    daemon ready ────────────────▶ SessionConnect
-    │    work needed ─────────────────▶ DaemonStartup
-    DaemonStartup ────────────────────────────── TUI state
-    │    driven by AcnLifecycleState:
-    │    · Installing        daemon binary                   secs–mins   bar + % + sizes
-    │      "Installing        inference engine                minutes
-    │       Magnitude"
-    │    · Starting          daemon spawn                    ~0.5–2s     radar loader
-    │      "Starting          inference launch + backend prep ~1–5s
-    │       Magnitude"
-    │    · Failed            stage message                   —           R retry / Q quit
-    │    lifecycle Ready ─────────────▶ SessionConnect
-    SessionConnect           client connect + onboarding     warm ~10–100ms   silent
-    │                        preflight                       (cold: absorbed above)
-    Application ──────────────────────────────── TUI state   the product
+Every service-backed command explicitly constructs the mechanism appropriate to its operation:
+
+| Commands | Acquisition mechanism | Service absent |
+| --- | --- | --- |
+| Bare `magnitude` interactive launch | Bootstrapping `AcnInstanceManager` followed by an `AcnConnection` | Install, launch, and await exact readiness inline |
+| `magnitude service start` | Explicit platform-service installation/start followed by an observing `AcnConnection` | Install/register/start and await exact readiness inline |
+| Hardware, models, downloads, instances, slots, and connection mutations | Existing-service observer followed by an `AcnConnection` | Fail with `Magnitude service is not running. Run \`magnitude service start\`.` |
+
+The terminal adapter contains only terminal and OS operations. It never selects a service-acquisition
+mechanism and contains no RPC transport, startup lifecycle, recovery lifecycle, or connection close.
+Noninteractive commands do not construct it.
+
+`magnitude update` updates the package and, under a compatible launcher, asks the newly installed
+CLI to run `magnitude service start`. Without the launcher protocol, success prints the explicit
+service-start command as the degradation floor.
+
+## Interactive launch
+
+```text
+shell launcher
+  -> resolve native CLI (silent when cached; inline artifact progress when needed)
+  -> probe terminal appearance and begin update discovery
+  -> resolve an available update inline, if any
+  -> construct the bootstrapping instance manager and ACN connection
+  -> await exact Ready service occurrence inline
+  -> run onboarding preflight
+  -> create OpenTUI renderer
+  -> first frame is Application
 ```
 
-Discovery race: a result arriving while daemon startup work is still running presents
-`UpdatePrompt`; from daemon readiness on, a result presents one notification line, and the cached
-answer prompts first thing next launch (`design/release/client-updates.md`).
-An install-needed launch does not race at all: the probe holds the install sequence until the
-discovery result answers, so an update is always offered before a multi-minute download of the
-version it would replace, and an install path never paints `DaemonStartup` only to replace it
-with the prompt. Spawn-only cold starts keep the race — the check usually outruns a spawn, and
-interrupting one is free.
+The ready check itself is silent. If the service is already warm, no lifecycle phase is printed and
+the renderer opens directly into chat. If work is necessary, lifecycle observations drive an inline
+active region. Completed phases remain as stable lines; the current phase is replaced in place.
+Redirected output uses durable milestone lines and no cursor control codes.
 
-Warm launch is silent end to end and starts the CLI binary once. The launcher trusts an existing
-digest-addressed installation that was verified before its atomic publication. Cold-cold total is
-minutes, dominated by the inference engine download, all narrated under `DaemonStartup`.
+`Checking` never renders. There is no synthetic generic startup phase before an authoritative
+observation. A critical startup failure freezes the current progress as a durable transcript,
+prints `Magnitude service failed to start:` followed immediately by the underlying error, and exits
+nonzero. There is no retry/quit prompt; such a failure is treated as a product error.
 
-The process entrypoint eagerly constructs only the command surface: names, arguments, options, and
-help. Each heavy command family loads its runtime at its single execution boundary, after Commander
-selects that command. Noninteractive metadata paths therefore do not initialize the interactive
-renderer, application, SDK client, or unrelated command runtimes.
+## Inline update choice
 
-## Presentation
+The prompt uses the detected Magnitude theme and plain terminal input. Numbers are labels, not
+shortcuts. Up/down changes the selected row, Enter confirms, Escape skips this launch, and Ctrl-C is
+a normal process interruption. There are no j/k or direct-number controls.
 
-Every renderable state, phase, and subphase with its exact user copy. Titles are per substate —
-"Installing Magnitude" while installing, "Starting Magnitude" while starting — with all
-further variation in the subtext. Internal architecture terms (ACN, ICN, JIT, daemon, platform,
-preflight) are never user copy.
+```text
+Update available! 1.3.0 → 1.4.0
 
-### Launcher (plain terminal, no TUI)
+Release notes: https://github.com/magnitudedev/magnitude/releases/tag/@magnitudedev/cli@1.4.0
 
-| Phase | Copy | Indicator |
-| --- | --- | --- |
-| InstallationInspection, cached CliBinaryResolution | none | none — silent |
-| CLI download (fresh install / just updated) | printed download lines with sizes | printed percentages, from artifact byte progress vs. manifest `bytes` |
+› 1. Update now (runs `npm install -g @magnitudedev/cli@1.4.0`)
+  2. Skip
+  3. Skip until next version
 
-### `UpdatePrompt` (TUI)
+Press enter to continue
+```
 
-One centered panel; data source is the discovery result plus `updateActionFor(installMethod)`:
+The selector and selected number are theme-accent-colored and bold. The URL uses the theme link
+color. Completed checks use the same sea-foam token as Markdown inline code. The URL stays on the label's line and
+has no arrow glyph. Confirming erases the active prompt and leaves a short durable summary before
+continuing or handing off to the updater.
 
-| Element | Exact copy |
+## Inline service progress
+
+The presenter projects the existing typed lifecycle as one nested service-start operation; it does
+not own service decisions. The parent uses a static theme-blue `○` while active and `●` when ready.
+Only the current child uses the animated Braille spinner.
+
+| Lifecycle observation | Inline copy |
 | --- | --- |
-| Title | "Update available! {current} -> {latest}" (accent bold on "Update available!") |
-| Release-notes label | "Release notes:" |
-| Release-notes link | `https://github.com/magnitudedev/magnitude/releases/tag/{tag}↗` — own line, underlined, supporting color, link-blue on hover, clickable |
-| Option 1 | "1. Update now (runs \`{update command}\`)" |
-| Option 2 | "2. Skip" |
-| Option 3 | "3. Skip until next version" |
-| Footer | "Press Enter to continue" |
+| `Checking` | Nothing |
+| `Installing / DownloadingDaemon` | `Downloading Magnitude service... 63% (24.8 MB / 39.4 MB)` when exact bytes are known |
+| `Installing / DownloadingInferenceEngine` | `Downloading inference engine... 63% (3.1 GB / 4.9 GB)` when exact bytes are known |
+| `Installing / StartingMagnitude` | Child `Starting inference engine` |
+| `Starting / WaitingForOwner` | `Waiting for previous Magnitude service` |
+| `Starting / ResolvingLocalInference` | No child; absorbed into the parent operation |
+| `Starting / LaunchingLocalInference` | Child `Starting inference engine` |
+| `Starting / PreparingBackend` | Child `Preparing <backend> backend for <hardware>` |
+| `Ready` | Complete the active child and change the parent `○` to `●` |
+| `Failed` | Preserve the current progress; outer boundary prints the actual error and exits nonzero |
 
-Indicator: `›` plus accent bold on the highlighted option; ↑/↓/j/k move, 1–3 select directly,
-Enter confirms, Esc/Ctrl-C skip.
+Service-binary acquisition feeds the same parent presenter before the lifecycle is observable. TTY
+output rewrites the nested block with no progress bar; redirected output emits coarse percentage
+milestones without ANSI animation.
 
-### `DaemonStartup` · Installing — title "Installing Magnitude"
+```text
+○ Starting Magnitude service
+  ✓ Magnitude service downloaded 100% (39.4 MB / 39.4 MB)
+  ✓ Inference engine downloaded 100% (4.9 GB / 4.9 GB)
+  ✓ Inference engine started
+  ⠹ Preparing CUDA backend for NVIDIA RTX 4090
+```
 
-Progress bar + percentage under the title on every phase, driven by `Installing.overallProgress`
-(0–1, weighted across the installation plan, monotonic across phases). Subtext is the phase
-label, plus " · {A} of {B}" sizes when the phase's `AcnStartupProgress` detail is exact and
-byte-denominated:
+At readiness:
 
-| Phase (protocol literal) | Subtext label | Sizes shown |
-| --- | --- | --- |
-| `DownloadingDaemon` | "Downloading daemon" | yes, when exact |
-| `DownloadingInferenceEngine` | "Downloading inference engine" | yes, when exact |
-| `StartingMagnitude` | "Starting Magnitude" | never — time-based synthetic progress (first launch of the freshly installed inference engine; wire value only, never a state name) |
+```text
+● Magnitude service is ready at 127.0.0.1:10100
+  ✓ Magnitude service downloaded 100% (39.4 MB / 39.4 MB)
+  ✓ Inference engine downloaded 100% (4.9 GB / 4.9 GB)
+  ✓ Inference engine started
+  ✓ CUDA backend ready for NVIDIA RTX 4090
+```
 
-### `DaemonStartup` · Starting — title "Starting Magnitude"
+The launcher uses the same one-line Braille grammar but shows measurements only for the transfer:
 
-Centered stack: title, guide-free five-point radar loader, phase label. There is no progress bar.
-The loader remains mounted across `Starting.phase` changes and is absent from other lifecycle states.
+```text
+⠹ Downloading Magnitude CLI... 63% (24.8 MB / 39.4 MB)
+⠹ Verifying Magnitude CLI...
+⠹ Installing Magnitude CLI...
+✓ Magnitude CLI installed
+```
 
-Subtext is the phase label from `Starting.phase`:
+## `magnitude service start`
 
-| Phase | Subtext label |
-| --- | --- |
-| `PreparingAcn` | "Preparing background server" |
-| `WaitingForOwner` | "Waiting for previous Magnitude process" |
-| `ResolvingLocalInference` | "Preparing local inference" |
-| `LaunchingLocalInference` | "Starting local inference" |
-| `PreparingBackend { backend, hardwareLabel }` | "Preparing {CPU\|Metal\|CUDA\|Vulkan} backend for {hardwareLabel}" |
+This command is noninteractive. It installs or refreshes the per-user service definition, starts it,
+uses the same lifecycle and inline presenter as interactive startup, and waits for the same exact
+readiness guarantee. It then prints:
 
-### `DaemonStartup` · Failed
+```text
+Magnitude service is ready at 127.0.0.1:10100
+```
 
-Title in failure color by `Failed.stage`; subtext is `Failed.message` verbatim; footer
-"R Retry Q Quit":
+Update discovery runs concurrently. If an update is available, the command reports the same version
+transition and full release-notes URL without prompting:
 
-| Stage | Title |
-| --- | --- |
-| `InstallDaemon`, `PrepareLocalInference` | "Magnitude failed to install" |
-| `LaunchDaemon`, `Connect` | "Magnitude failed to start" |
+```text
+Update available! 1.3.0 → 1.4.0
+Release notes: https://github.com/magnitudedev/magnitude/releases/tag/@magnitudedev/cli@1.4.0
+Run `magnitude update` to install it.
+```
 
-### `Application`
+## Post-start recovery
 
-The product; all further presentation belongs to in-app systems. A discovery result arriving
-after this commit presents one notification line
-("Update available: {latest} — restart or run `magnitude update`", once per session).
+After the application starts, transport recovery retains the existing single-flight selection and
+request retry semantics. Each recovery occurrence uses a fresh lifecycle projection, but it never
+re-enters startup UI and never unmounts chat. Active recovery is projected into the shared
+notification area; success publishes the ephemeral notice `Reconnected to Magnitude service`.
 
-When setup produces an external harness handoff, `Application` ends before the other process is
-started. The client closes, the React root unmounts, and renderer/terminal finalizers run during
-scope unwinding. Only after that unwind does the outer command start the adapter's executable with
-inherited terminal I/O. The two TUIs never render concurrently.
+## Exit and ownership
 
-## Data flow
-
-`AcnLifecycleState` (`Checking | Starting | Installing | Ready | Failed`) is the single feed for
-`DaemonStartup`. Client-side ensure work (daemon binary download, spawn) reports it directly;
-daemon-side work (inference engine download, backend preparation) is projected into it from the
-daemon's health state. `Checking` renders nothing by definition — it is `DaemonCheck`, the
-question, not the answer. `overallProgress` is normalized against the installation plan so the
-bar is monotonic across phases; byte subtext appears only when the underlying detail is exact.
-
-## Appearance
-
-Appearance is probed before the renderer exists, with OpenTUI's standalone palette detector on
-the raw process streams (raw mode and stdin flow are the probe's to manage there — no renderer
-owns the terminal yet). The probe starts with the session, concurrent with discovery and daemon
-work, and settles on the first terminal reply or a 100ms bound on silent ttys — so its answer is
-in before anything paints and the first frame is themed from live detection. No appearance state
-is persisted. Corrections continue to apply live through the appearance observation runtime
-(renderer theme, palette, and focus events).
-
-## Exit
-
-All exit paths — signal, fatal event, in-app quit — resolve one typed exit request. The graceful
-path closes the client/platform exactly once, derives exit notices, and unwinds scope finalizers
-in LIFO order (root, listeners, appearance observation, renderer and terminal, registry). Notices
-print after terminal restoration. The completed command returns one exit code to the outermost CLI
-boundary, which explicitly terminates the process. A successful compatible update returns the
-reserved relaunch code through the same boundary; no inner runtime mutates process exit state.
+All startup work is one scoped Effect program. Signals and fatal events use the typed process-exit
+path. Package-manager execution begins only after startup terminal resources are restored. The outer
+command owns the exit code; nested startup logic does not mutate it. The launcher may honor one
+post-update relaunch request, re-inspecting the installation before resolving the new binary.

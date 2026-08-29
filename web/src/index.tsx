@@ -8,6 +8,7 @@ export {
   usePlatform,
   createAgentClient,
   AgentClientProvider,
+  AcnStartupProvider,
   useAgentClient,
   type AgentClient,
   type Platform,
@@ -22,7 +23,7 @@ export {
   type BrowserTabId,
   stopDisplayViewController,
 } from "@magnitudedev/client-common"
-export { createBrowserPlatform } from "./platform/browser"
+export { createBrowserAcnConnection, createBrowserPlatform } from "./platform/browser"
 export { DaemonConnectionError } from "./components/daemon-connection-error"
 export { MagnitudeMark } from "./components/magnitude-mark"
 export { initializeAppearance } from "./stores/appearance-store"
