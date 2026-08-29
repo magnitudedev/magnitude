@@ -1,66 +1,61 @@
 ---
 title: Get Started
-description: "Install Magnitude and run your first local model"
+description: "Install Magnitude and set up local inference"
 icon: rocket
 ---
 
-## Install
+## Install and set up
 
 <Tabs>
   <Tab title="npm">
     ```sh
     npm install -g @magnitudedev/cli
+    magnitude setup
     ```
   </Tab>
   <Tab title="bun">
     ```sh
     bun add -g @magnitudedev/cli
+    magnitude setup
     ```
   </Tab>
   <Tab title="pnpm">
     ```sh
     pnpm add -g @magnitudedev/cli
+    magnitude setup
     ```
   </Tab>
   <Tab title="yarn">
     ```sh
     yarn global add @magnitudedev/cli
+    magnitude setup
     ```
   </Tab>
 </Tabs>
 
-## Run Magnitude
+Setup:
 
-From the directory you want Magnitude to work in:
+1. Profiles your processor, memory, and memory bandwidth.
+2. Ranks model, quantization, and context combinations for your hardware.
+3. Shows the speed, intelligence, and memory trade-offs.
+4. Downloads and configures the model you choose.
+5. Connects the model to your chosen harness.
+6. Launches the harness with the model ready to use.
 
-```sh
-cd your-project
-magnitude
-```
+Magnitude supports the Magnitude Harness, Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline.
 
-On first launch, Magnitude profiles your hardware and ranks compatible models. Tune Fast-to-Smart, choose a model, and Magnitude downloads, configures, and runs it inside the agent. [Learn about local models →](/models)
+## Start working
 
-Once the model is ready, ask Magnitude to work in the current directory. It can inspect and edit files, run commands, and execute scripts. Add [skills](/skills) to extend it with support for browsers, spreadsheets, presentations, documents, PDFs, and more.
+Continue in the harness that setup launches. Magnitude runs headlessly in the background, loads the model when your agent requests it, and manages memory and concurrency automatically.
+
+You do not need to learn the Magnitude CLI. Setup can install a Magnitude skill that lets your agent inspect Magnitude and find or install other local models later. Choose between installed models from your harness model dropdown.
 
 ## Windows
 
-Magnitude requires WSL on Windows. Native Windows is not currently supported.
+Magnitude supports macOS and Linux. On Windows, use WSL:
 
 ```powershell
 wsl --install
 ```
 
-Restart your computer, open WSL, and follow the installation steps above.
-
-## Terminal
-
-Magnitude renders best in a modern terminal emulator such as [Ghostty](https://ghostty.org) or [Kitty](https://sw.kovidgoyal.net/kitty/). The default macOS Terminal has limited color support and may look different.
-
-## Enable web search
-
-Magnitude can use [Exa](https://exa.ai) to search the web. Create an Exa API key, then set it before starting Magnitude:
-
-```sh
-export EXA_API_KEY="your-api-key"
-magnitude
-```
+Restart the computer, open WSL, then follow the installation steps above.

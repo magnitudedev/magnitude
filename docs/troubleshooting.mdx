@@ -1,140 +1,69 @@
 ---
 title: Troubleshooting
-description: "Resolve installation, local model, memory, and performance problems"
+description: "Resolve setup, connection, model, memory, and performance problems"
 icon: wrench
 ---
 
-## Quick checks
-
-Start with the check that matches your problem:
-
-- **Magnitude won't open:** Exit it completely, launch it again from your project directory, then [update or reinstall it](/get-started#install) if the problem continues.
-- **Setup was skipped or did not finish:** Run `magnitude --setup` to set up local models again.
-- **A local model will not download or load:** Check the exact message, then see [Model setup and downloads](#model-setup-and-downloads) or [Model loading and memory](#model-loading-and-memory).
-- **Magnitude appears stuck:** Check the current status against [Magnitude is waiting or running slowly](#magnitude-is-waiting-or-running-slowly).
+If your harness is available, ask the agent to inspect Magnitude and fix the problem. Setup can install the Magnitude skill so the agent knows how to use the CLI.
 
 <Warning>
-  Do not delete `~/.magnitude` as a general troubleshooting step. It contains downloaded models, conversations, settings, and disposable caches.
+  Do not delete `~/.magnitude`. It contains downloaded models, settings, harness connections, and Magnitude Harness sessions.
 </Warning>
 
-## Logs and local data
+## Setup did not finish
 
-Runtime logs are stored with each session:
+Run `magnitude setup` again. Completed hardware profiling and model downloads are reused when possible.
 
-```text
-~/.magnitude/sessions/<session-id>/logs.jsonl
+If the command does not start, check `magnitude --version`, then update or reinstall the CLI. On Windows, run Magnitude inside WSL.
+
+## Harness cannot use Magnitude
+
+Ask the agent to check that the Magnitude service is running and resync the harness connection. For manual recovery:
+
+```sh
+magnitude service start
+magnitude connections sync
 ```
 
-When Magnitude exits an active session, it prints a resume command containing the session ID. Review the log before sharing it because it may contain paths, errors, and other project information.
+If the harness is not connected, rerun `magnitude setup` or add the connection from the CLI reference.
 
-| Path | Contents | Effect if removed |
+## Model download failed
+
+Magnitude retries temporary network and server failures. If retries are exhausted, retry after checking network access and disk space. Partial downloads can resume instead of starting again.
+
+A GGUF model downloaded outside Magnitude must be complete and stored in a recognized Hugging Face Hub cache. Restart Magnitude after the download finishes.
+
+## Model will not load
+
+| Message | Meaning | Action |
 |---|---|---|
-| `~/.magnitude/cache/` | Derived model metadata, profiling results, and other caches | Magnitude recomputes the data when needed |
-| `~/.magnitude/models/` | Magnitude-managed local models | Models must be downloaded again |
-| `~/.magnitude/sessions/` | Conversations and session state | Conversation history is lost |
-| `~/.magnitude/config.json` | Settings and model selections | Settings and selections are reset |
+| **Too large** | The configuration cannot fit while preserving system memory | Choose a smaller model, quantization, or context |
+| **Not enough memory available** | The model normally fits, but other applications are using too much memory | Close memory-intensive applications and try again |
+| **Model stopped · Low memory** | Available memory became unsafe while the model was running | Free memory; the next request can load the model again |
 
-Clearing `~/.magnitude/cache` does not delete downloaded models, but it may cause hardware profiling and model evaluation to run again. It does not restore a missing bundled model catalog. See [Files and directories](/reference#files-and-directories) for the complete storage reference.
+A downloaded model does not use inference memory until Magnitude loads it for a request.
 
-<Warning>
-  Do not upload a session's `events.jsonl`; it can contain prompts, conversation history, and project information.
-</Warning>
+## Model was unloaded
 
-## Magnitude won't start
+This is normally expected. Magnitude unloads inactive models and can stop a model when the machine needs memory. The model remains downloaded and selected. The next agent request loads it again.
 
-1. Confirm that `magnitude --version` works. If the command is missing, reinstall Magnitude using the instructions in [Get Started](/get-started#install).
-2. Update or reinstall the CLI if it exits before opening.
-3. On Windows, confirm that you are running Magnitude inside WSL. Native Windows is not supported.
-4. If initial setup did not finish, run `magnitude --setup`.
+## Inference is slow or queued
 
-If Magnitude still does not start, include the startup error and version when [getting help](#get-help).
+The first request may wait for the model to load. Long prompts also require prefill before generation begins. Concurrent requests wait when the machine has no free inference capacity.
 
-## Model setup and downloads
+Actual generation speed varies with prompt length, concurrent work, other applications, and model revision. Ask the agent to compare the active configuration with faster recommendations if sustained generation is slower than expected.
 
-### The model catalog is unavailable
+## Logs and recovery
 
-The catalog is installed with Magnitude rather than rebuilt from the internet during setup. Restart Magnitude once. If the message remains, update or reinstall the CLI so its bundled inference files and model catalog are restored together.
+On macOS, service logs are in `~/.magnitude/logs/acn-service.log`. On Linux, use `journalctl --user -u magnitude.service`. Magnitude Harness session logs are stored with each session under `~/.magnitude/sessions`.
 
-Deleting `~/.magnitude/cache` does not restore a missing catalog.
+Use the least disruptive recovery:
 
-### A model download failed
+1. Retry the request.
+2. Restart the harness.
+3. Start or restart the Magnitude service.
+4. Run `magnitude setup` again.
+5. Clear only `~/.magnitude/cache` when derived hardware or catalog data is the problem.
+6. Reinstall the CLI if bundled inference files are missing.
 
-Magnitude automatically retries temporary network and server failures. If those retries are exhausted, the download view shows the failure and a **Retry** action.
-
-| Error shown | What to do |
-|---|---|
-| Temporary network or server failure | Wait for automatic retries, then use **Retry** |
-| Insufficient disk space | Free disk space, then retry |
-| Verification failure | Retry the download or choose another model |
-
-Retrying can continue a resumable partial download instead of starting from zero. You can also cancel the download and choose another model.
-
-### An existing Hugging Face model is not shown
-
-Magnitude checks one standard Hugging Face Hub cache location. Open [Reference](/reference#environment-variables) and confirm which cache path applies to your environment.
-
-The model must be a compatible GGUF package. Incomplete, invalid, and incompatible packages are not available to load. After downloading a model with external Hugging Face tools, restart Magnitude to force a fresh inventory check.
-
-### A downloaded model is not using memory
-
-A model can be downloaded and selected without being loaded. This is normal after it has been stopped or remained inactive for an extended period.
-
-Open `/settings → Models` to check its state and choose **Load model**. Loading places the model and its context into memory; it does not download the files again.
-
-## Model loading and memory
-
-| What you see | What it means | What to do |
-|---|---|---|
-| **Too large** | The configuration cannot fit while preserving the memory Magnitude reserves for the operating system and other applications | Choose a smaller model, lighter quantization, or configuration with less context |
-| **Not enough memory available** | The model normally fits, but other applications are currently using too much memory | Close memory-intensive applications and try loading it again |
-| **Model stopped · Low memory** | Available memory became dangerously low while local inference was running | Close memory-intensive applications, then load the selected model again from `/settings → Models` |
-| Downloaded but unloaded | The model files exist, but the model is not resident in memory | Load it from `/settings → Models` |
-
-**Too large** does not change when other applications close. **Not enough memory available** can clear when more memory becomes free. A model stopped for low memory remains selected and downloaded.
-
-## Magnitude is waiting or running slowly
-
-### What the current status means
-
-| Status | Meaning |
-|---|---|
-| **Loading model into memory** | Magnitude is loading the selected model and context; the percentage is native load progress |
-| **Waiting for the local model** | The request is queued for available inference capacity |
-| **Loading conversation into the model** | Magnitude is preparing the request |
-| **Prefilling** | The engine is processing the displayed number of input tokens |
-| **Using cached tokens** | The engine reused compatible prompt state |
-| **Working** | The model is generating or the agent is executing work |
-
-### Prefill takes a long time
-
-Longer conversations require more input processing before generation begins. The displayed token counts show prefill progress, and **Using cached tokens** shows how much compatible prompt state was reused. Prefill is separate from the generation speed reported after work completes.
-
-### Generation is slower than expected
-
-Catalog speed is an estimate at the displayed context size. Actual performance varies with prompt length, other work running on the computer, and the exact model revision. Compare the completed work summary's `tok/s` with the catalog estimate. Rerun `/setup` and move Fast-to-Smart toward **Fast** to prioritize response speed, or lower **Memory** to restrict choices to smaller runtime allocations.
-
-## Reset and reinstall
-
-Use the least disruptive recovery that applies to the problem:
-
-1. Restart Magnitude.
-2. Update Magnitude.
-3. Run `magnitude --setup` if local model setup needs to be rerun.
-4. Clear only `~/.magnitude/cache` when the problem concerns derived profiling or model-evaluation data.
-5. Reinstall the CLI if bundled inference files or the bundled model catalog are missing.
-
-Do not remove models, sessions, or `config.json` unless you intentionally want the data described in [Logs and local data](#logs-and-local-data) to be removed.
-
-## Get help
-
-If the problem remains, include:
-
-- Magnitude version from `magnitude --version`
-- Operating system and version
-- Chip or GPU and total memory for local-model problems
-- Exact error message
-- Selected model and configuration, when relevant
-- Steps that reproduce the problem
-- Relevant, reviewed lines from the session's `logs.jsonl`
-
-Open a [GitHub issue](https://github.com/magnitudedev/magnitude/issues) or ask in [Discord](https://discord.gg/EHt48pPWdC). Before sharing diagnostics, remove private files, prompts, project contents, and sensitive paths.
+Before sharing logs, remove prompts, project contents, private paths, and credentials. Open a [GitHub issue](https://github.com/magnitudedev/magnitude/issues) or ask in [Discord](https://discord.gg/EHt48pPWdC).

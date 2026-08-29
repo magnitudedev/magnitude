@@ -1,0 +1,65 @@
+---
+title: Magnitude Harness
+description: "Use the optional Magnitude Harness"
+icon: terminal
+---
+
+Magnitude includes a built-in harness optimized for local models.
+
+- **Uses smaller contexts well:** Keeps context focused instead of burying the model in irrelevant history.
+- **Compacts without stopping:** Local models compact more often, so compaction runs in the background with no waiting.
+- **Makes tool calls reliable:** Validates calls and gives clear recovery feedback when the model gets them wrong.
+- **Breaks doom loops:** Stops repeated or runaway tool behavior before the model gets stuck.
+- **Prevents overthinking:** Cuts off excessive reasoning and gets the model back on task.
+
+Select **Magnitude Harness** during setup, or run `magnitude` from the directory you want the agent to work in.
+
+<video
+  autoPlay
+  muted
+  loop
+  playsInline
+  preload="metadata"
+  title="Choosing and running a recommended local model with Magnitude Harness"
+  className="w-full rounded-xl"
+  src="/videos/maglocaldemo.mp4"
+></video>
+
+## Work with a project
+
+The harness can inspect and edit files, run commands, and execute scripts in the current directory. Type `@` to mention a file or directory. You can paste or drag images into the composer.
+
+Enter bash mode with `/bash` or start a message with `!` to run a shell command directly.
+
+Run `/init` to create an `AGENTS.md` file for project conventions, architecture, tests, and other instructions.
+
+## Sessions
+
+Conversations are saved automatically. Use `/resume` or `Ctrl+R` to open a recent conversation and `/new` to start another one.
+
+When a conversation approaches the model context limit, Magnitude compacts older work into a summary and continues the session.
+
+## Commands and shortcuts
+
+Type `/` to browse available commands. Common commands include `/models`, `/catalog`, `/hardware`, `/setup`, `/bash`, `/init`, `/resume`, and `/new`.
+
+| Shortcut | Action |
+|---|---|
+| `Enter` | Send or confirm |
+| `Shift+Enter` | Add a new line |
+| `Ctrl+T` | Select reasoning level |
+| `Ctrl+R` | Open recent conversations |
+| `Esc` | Close a menu or interrupt work |
+| `Ctrl+C` | Clear input or exit while idle |
+
+## Skills
+
+Skills add reusable capabilities to the harness. Install them in the current project or globally with a compatible skill installer such as `npx skills add`.
+
+Magnitude loads skills from `.claude/skills`, `.agents/skills`, and `.magnitude/skills` in the current project and from the matching directories in your home directory. Project skills take priority over global skills with the same name.
+
+Review a skill before installing it. Skills can run commands, install dependencies, open websites, and interact with external services.
+
+## Web search
+
+Set `EXA_API_KEY` before starting the harness to enable web search through Exa.
