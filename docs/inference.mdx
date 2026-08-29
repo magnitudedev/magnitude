@@ -1,0 +1,35 @@
+---
+title: Inference
+description: "On-demand local inference built for agent workloads"
+icon: cpu
+---
+
+Magnitude runs a headless local inference server. Your harness sends requests to it, and Magnitude manages the model process, memory, context, and concurrency.
+
+## On-demand model loading
+
+Downloaded models stay on disk until they are needed. When an agent sends a request, Magnitude loads the configured model into memory if it is not already running.
+
+Magnitude keeps an active model available while it is being used. It can unload the model after inactivity or when the machine needs memory. Unloading releases inference memory without deleting the downloaded model or changing the selection. A later request loads it again.
+
+The first request after an unload includes model loading time. Requests made while the model is active begin inference immediately.
+
+## Tuned for your hardware
+
+Magnitude configures hardware acceleration, model placement, context, speculative decoding, and runtime settings for the current machine. It checks available memory again before every load so a model that normally fits is not started when other applications are using too much memory.
+
+## Context and concurrency
+
+Magnitude preserves the configured context for each request. It uses remaining capacity for concurrent work rather than silently reducing context to fit more requests.
+
+During ongoing agent sessions, Magnitude reuses compatible prompt state and processes only new input when possible. This reduces repeated prefill work.
+
+## Memory protection
+
+Magnitude monitors memory while a model is loading or running. If available memory becomes dangerously low, it stops the model before inference destabilizes the computer. The model remains downloaded and selected.
+
+## Consistent agent interface
+
+Local models use different reasoning formats, tool-call formats, chat templates, and conversation-history conventions. Magnitude normalizes these differences so harnesses can switch models without implementing model-specific behavior.
+
+The inference engine is written in Rust on top of llama.cpp. It is installed and managed with Magnitude, so there is no separate inference runtime to configure.

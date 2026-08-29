@@ -2,7 +2,7 @@
     "$schema": "https://mintlify.com/docs.json",
     "name": "Magnitude",
     "theme": "linden",
-    "description": "The open source agent with local models built in",
+    "description": "Easy local inference for agents",
     "logo": {
         "light": "/wordmark-black.svg",
         "dark": "/wordmark-white.svg"
@@ -63,14 +63,13 @@
             ]
         },
         "pages": [
-            "why-magnitude",
+            "introduction",
             "get-started",
             "models",
-            "custom-endpoints",
-            "inference-engine",
-            "skills",
-            "reference",
+            "inference",
+            "magnitude-harness",
             "troubleshooting",
+            "reference",
             "faq"
         ]
     },

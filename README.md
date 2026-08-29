@@ -68,6 +68,14 @@ Ollama and LM Studio run the model you tell them to. Figuring out which model, w
 
 Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline. After downloading a model, continue with the built-in harness or launch another supported harness with that model already loaded in Magnitude.
 
+### Do I need to manage Magnitude after setup?
+
+No. Magnitude runs in the background and manages the selected model automatically. Revisit it when you want to try a new or different model or need to diagnose a problem. Your agent can use the Magnitude CLI for you.
+
+### Does the model stay in memory all the time?
+
+No. Magnitude loads the model when an agent requests it, keeps it available while active, and unloads it after inactivity or when memory is needed. The model remains downloaded and selected.
+
 ### Does my data go to the cloud?
 
 No. Prompts, files, and models stay on your machine.

@@ -1,96 +1,70 @@
 ---
 title: Reference
-description: "Commands, shortcuts, input, sessions, and local files"
+description: "CLI, inference APIs, configuration, and local files"
 icon: book-open
 ---
 
-## Slash commands
+Magnitude normally configures and manages these interfaces automatically. This reference is for agents, automation, advanced integrations, and manual recovery.
 
-| Command | Aliases | Description |
-|---|---|---|
-| `/new` | | Start a new conversation |
-| `/resume` | | Open recent conversations |
-| `/models` | | Choose a ready model |
-| `/catalog` | | Find and download local models |
-| `/hardware` | | Inspect local inference hardware |
-| `/settings` | `/s` | Open model settings |
-| `/bash` | | Enter bash mode |
-| `/init` | | Generate `AGENTS.md` for the project |
-| `/transcript` | | Toggle transcript display mode |
-| `/exit` | `/quit`, `/q` | Exit Magnitude |
+## CLI
 
-Type `/` to see available commands with autocomplete. Installed skills may add their own commands to the same menu.
-
-## Keyboard shortcuts
-
-| Shortcut | Action |
+| Command | Purpose |
 |---|---|
-| `Enter` | Send a message or confirm a selection |
-| `Shift+Enter` | Add a new line |
-| `Ctrl+T` | Open the reasoning-level selector; press again to move through its options |
-| `Ctrl+R` | Open or close recent conversations |
-| `Esc` | Close the active menu or interrupt active agent work |
-| `Ctrl+C` | Clear composer text, or exit while idle with an empty composer |
+| `magnitude setup` | Profile hardware, install a model, and connect a harness |
+| `magnitude hardware` | Show the local inference environment |
+| `magnitude models list` | Show the model catalog |
+| `magnitude models install <model-id>` | Install a model |
+| `magnitude models remove <model-id>` | Remove a model |
+| `magnitude downloads list` | Show model downloads |
+| `magnitude downloads cancel <model-id>` | Cancel a download |
+| `magnitude instances list` | Show model residency |
+| `magnitude instances load <slot-id>` | Load a configured model slot |
+| `magnitude instances stop <slot-id>` | Stop a configured model slot |
+| `magnitude slots` | Show configured model slots |
+| `magnitude connections list` | Show supported and installed harnesses |
+| `magnitude connections add <harness>` | Connect installed Magnitude models to a harness |
+| `magnitude connections sync [harness]` | Refresh connected harness configuration |
+| `magnitude connections remove <harness>` | Remove a harness connection |
+| `magnitude service start` | Install and start the user service |
+| `magnitude service stop` | Stop and disable the user service |
+| `magnitude stop` | Stop the current service and release its models |
+| `magnitude update` | Update Magnitude |
 
-When the reasoning selector is open, use the arrow keys or `J`/`K` to move, `Enter` to apply the selection, and `Esc` to close it without applying the pending change.
+Run `magnitude --help` or append `--help` to a command for its complete options.
 
-Menus use the arrow keys to move, `Enter` to choose, and `Esc` to close. The models settings menu also uses `Tab` and `Shift+Tab` to move between models, catalog, and hardware.
+## Inference APIs
 
-### Input editing
+The background service listens on loopback at `http://127.0.0.1:10100`.
 
-| Shortcut | Action |
+| API | Base URL |
 |---|---|
-| `Ctrl+A` | Move to the start of the current line |
-| `Ctrl+E` | Move to the end of the current line |
-| `Ctrl+U` | Delete before the cursor on the current line |
-| `Ctrl+K` | Delete after the cursor on the current line |
-| `Ctrl+W` | Delete the word before the cursor |
-| `Ctrl+D` | Delete the word after the cursor |
-| `Ctrl+Y` | Restore the last deleted text |
+| OpenAI-compatible | `http://127.0.0.1:10100/inference/v1` |
+| Anthropic-compatible | `http://127.0.0.1:10100/inference/anthropic` |
 
-## Files and input
-
-Type `@` in the composer to mention a file or directory. Mentioned files are included as context for the agent.
-
-You can paste or drag images into the composer. Large text pastes are collapsed into paste segments instead of filling the input.
-
-Enter bash mode with `/bash` or start a message with `!` to run a shell command directly.
-
-## Sessions
-
-Magnitude saves conversations automatically. Use `/resume` or `Ctrl+R` to open recent conversations, or start a new one with `/new`.
-
-When a conversation becomes too long for its model context, Magnitude compacts older work into a summary and continues the session.
-
-## Project instructions
-
-Run `/init` to generate an `AGENTS.md` file for the current project. Use it to describe repository conventions, architecture, test commands, and anything agents should do or avoid.
-
-Edit `AGENTS.md` like any other project file. Magnitude reads applicable instructions when working in the repository.
+The OpenAI-compatible API supports model listing, Chat Completions, and Responses. The Anthropic-compatible API supports Messages and token counting. Harness setup configures the correct interface automatically.
 
 ## Environment variables
 
 | Variable | Purpose |
 |---|---|
-| `EXA_API_KEY` | Enable web search through Exa |
+| `EXA_API_KEY` | Enable web search in Magnitude Harness |
 | `HF_HUB_CACHE` | Set the Hugging Face Hub cache directory |
 | `HUGGINGFACE_HUB_CACHE` | Legacy Hugging Face Hub cache override |
-| `HF_HOME` | Set the Hugging Face data directory; Magnitude checks its `hub` directory |
-| `XDG_CACHE_HOME` | Set the base cache directory; Magnitude checks `huggingface/hub` within it |
+| `HF_HOME` | Set the Hugging Face data directory |
+| `XDG_CACHE_HOME` | Set the base cache directory |
 
-Magnitude checks those Hugging Face cache settings in the order shown. If none is set, it checks `~/.cache/huggingface/hub`.
+Hugging Face cache settings are checked in the order shown. If none is set, Magnitude checks `~/.cache/huggingface/hub`.
 
 ## Files and directories
-
-Magnitude creates `~/.magnitude` automatically.
 
 | Path | Purpose |
 |---|---|
 | `~/.magnitude/models/` | Magnitude-managed local models |
-| `~/.magnitude/cache/` | Disposable model metadata, profiling results, and other caches |
-| `~/.magnitude/sessions/` | Conversation history |
-| `~/.magnitude/logs/` | Application logs |
+| `~/.magnitude/cache/` | Model metadata, hardware profiles, and disposable caches |
+| `~/.magnitude/sessions/` | Magnitude Harness conversations and session logs |
+| `~/.magnitude/logs/` | CLI logs and macOS service logs |
 | `~/.magnitude/traces/` | Local trace data when tracing is enabled |
 | `~/.magnitude/config.json` | User settings and model selections |
+| `~/.magnitude/harness-connections.json` | Managed harness connections |
 
-Deleting `~/.magnitude/cache` may cause hardware profiling and model evaluation to run again, but it does not delete downloaded models. Models managed by Magnitude are stored separately under `~/.magnitude/models`.
+Deleting `~/.magnitude/cache` causes derived data to be rebuilt but does not delete downloaded models. Do not delete the complete `~/.magnitude` directory as a general troubleshooting step.
