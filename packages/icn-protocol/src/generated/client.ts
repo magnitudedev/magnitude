@@ -40,7 +40,6 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
           options,
           Operations.acknowledgeModelDownloadFailureOperation,
         ),
-        assessModels: makeHttpOperation(http, options, Operations.assessModelsOperation),
         cancelModelDownload: makeHttpOperation(http, options, Operations.cancelModelDownloadOperation),
         ensureModelInstance: makeHttpOperation(http, options, Operations.ensureModelInstanceOperation),
         getInstalledModelPackage: makeHttpOperation(http, options, Operations.getInstalledModelPackageOperation),
@@ -57,6 +56,7 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         removeInstalledModel: makeHttpOperation(http, options, Operations.removeInstalledModelOperation),
         stopModelInstance: makeHttpOperation(http, options, Operations.stopModelInstanceOperation),
         uninstallModel: makeHttpOperation(http, options, Operations.uninstallModelOperation),
+        assessModels: makeStreamOperation(http, options, Operations.assessModelsOperation),
       },
       system: {
         getHardware: makeHttpOperation(http, options, Operations.getHardwareOperation),

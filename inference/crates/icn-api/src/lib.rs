@@ -6,14 +6,17 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, Request, State};
+use axum::http::HeaderValue;
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures_util::{future::BoxFuture, stream::BoxStream};
+use futures_util::{StreamExt as _, future::BoxFuture, stream::BoxStream};
 use icn_contracts::bootstrap_protocol::{
     BackendEligibilityReport, CudaEligibility, IcnBinaryIdentity, IcnInstallationBackend,
     IcnInstallationDeclaration, IcnStartupBackend, IcnStartupProgressRecord,
@@ -22,8 +25,8 @@ use icn_contracts::bootstrap_protocol::{
 };
 use icn_contracts::inference as domain;
 use icn_contracts::models::{
-    AssessModelsRequest, AssessModelsResponse, CatalogModelLocalState, CatalogModels,
-    InferenceModel, InstallCatalogModelRequest, InstallModelResponse, InstalledModelPackage,
+    AssessModelsEvent, AssessModelsRequest, CatalogModelLocalState, CatalogModels, InferenceModel,
+    InstallCatalogModelRequest, InstallModelResponse, InstalledModelPackage,
     InstalledModelPackages, InstalledModelPackagesResponse, ModelAssessor, ModelDownload,
     ModelDownloadId, ModelDownloads, ModelDownloadsResponse, ModelInstance, ModelInstanceId,
     ModelInstanceLifecycle, ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadPlan,
@@ -1549,7 +1552,7 @@ async fn remove_installed_model(
 #[utoipa::path(post, path = "/api/v1/models/assess", operation_id = "assessModels", tag = "models",
     request_body(content = AssessModelsRequest, content_type = "application/json"),
     responses(
-        (status = 200, description = "Exact target and profile assessments", body = AssessModelsResponse),
+        (status = 200, description = "Exact target and profile assessment events", body = String, content_type = "application/x-ndjson"),
         (status = 400, description = "Invalid assessment request", body = ErrorResponse),
         (status = 404, description = "Assessment target not found", body = ErrorResponse),
         (status = 409, description = "Model assessment could not be completed", body = ErrorResponse),
@@ -1561,16 +1564,29 @@ async fn remove_installed_model(
 async fn assess_models(
     State(state): State<AppState>,
     Json(request): Json<AssessModelsRequest>,
-) -> Result<Json<AssessModelsResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let assessor = state
         .model_assessor
         .as_ref()
         .ok_or_else(|| ApiError::server("model assessment is not configured"))?;
-    assessor
+    let events = assessor
         .assess(request)
         .await
-        .map(Json)
-        .map_err(ApiError::from_inventory)
+        .map_err(ApiError::from_inventory)?;
+    let encoded = events.map(|event| {
+        serde_json::to_vec(&event)
+            .map(|mut bytes| {
+                bytes.push(b'\n');
+                Bytes::from(bytes)
+            })
+            .map_err(std::io::Error::other)
+    });
+    let mut response = Response::new(Body::from_stream(encoded));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    Ok(response)
 }
 
 #[utoipa::path(get, path = "/api/v1/downloads", operation_id = "listModelDownloads", tag = "models",
@@ -2131,7 +2147,7 @@ fn domain_error(error: domain::InferenceRequestError) -> ApiError {
         InstalledModelPackagesResponse,
         RemoveInstalledModelPackageResponse,
         AssessModelsRequest,
-        AssessModelsResponse,
+        AssessModelsEvent,
         ModelDownloadsResponse,
         ModelDownload,
         ModelLoadPlan,
@@ -2329,6 +2345,29 @@ impl StreamContract for InferenceEventsStream {
     }
 }
 
+struct ModelAssessmentStream;
+
+impl StreamContract for ModelAssessmentStream {
+    type Event = AssessModelsEvent;
+    const RESPONSE_STATUS: u16 = 200;
+
+    fn metadata() -> StreamMetadata {
+        StreamMetadata {
+            version: 1,
+            response_status: Self::RESPONSE_STATUS,
+            framing: StreamFraming::Ndjson,
+            data: StreamData {
+                encoding: "json",
+                schema: StreamSchemaRef {
+                    reference: format!("#/components/schemas/{}", Self::Event::name()),
+                },
+            },
+            termination: StreamTermination::Eof,
+            reconnect: StreamReconnect::None,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum OpenApiExportError {
     #[error("OpenAPI operation {0} was not generated")]
@@ -2365,6 +2404,11 @@ pub fn openapi() -> Result<OpenApiDocument, OpenApiExportError> {
         &mut document,
         "watchInferenceEvents",
         "text/event-stream",
+    )?;
+    attach_stream_contract::<ModelAssessmentStream>(
+        &mut document,
+        "assessModels",
+        "application/x-ndjson",
     )?;
     Ok(document)
 }
@@ -2822,6 +2866,62 @@ mod tests {
                 .map_err(|error| InventoryError::Internal(error.to_string()))
             })
         }
+    }
+
+    struct StubModelAssessor;
+
+    impl ModelAssessor for StubModelAssessor {
+        fn assess(
+            &self,
+            request: AssessModelsRequest,
+        ) -> BoxFuture<'_, Result<icn_contracts::models::ModelAssessmentStream, InventoryError>>
+        {
+            Box::pin(async move {
+                let total_targets = u32::try_from(request.requests.len()).unwrap();
+                let environment_id =
+                    icn_contracts::models::AssessmentEnvironmentId("test-environment".to_owned());
+                Ok(futures_util::stream::iter([
+                    AssessModelsEvent::Started {
+                        environment_id: environment_id.clone(),
+                        total_targets,
+                    },
+                    AssessModelsEvent::Completed {
+                        environment_id,
+                        total_targets,
+                    },
+                ])
+                .boxed())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn assessment_endpoint_streams_finite_ndjson_lifecycle() {
+        let response = app(AppState::model_free().with_model_assessor(Arc::new(StubModelAssessor)))
+            .oneshot(
+                Request::post("/api/v1/models/assess")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"requests":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/x-ndjson"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let lines = std::str::from_utf8(&body)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["_tag"], "Started");
+        assert_eq!(lines[0]["totalTargets"], 0);
+        assert_eq!(lines[1]["_tag"], "Completed");
     }
 
     #[tokio::test]
@@ -4537,9 +4637,17 @@ mod tests {
     #[test]
     fn exported_assessment_operation_declares_conflict_response() {
         let value = serde_json::to_value(openapi().unwrap()).unwrap();
+        let operation = &value["paths"]["/api/v1/models/assess"]["post"];
+        let contract = &operation[STREAM_EXTENSION];
+        assert_eq!(contract["framing"], "ndjson");
+        assert_eq!(contract["termination"]["type"], "eof");
+        assert_eq!(contract["reconnect"]["type"], "none");
         assert_eq!(
-            value["paths"]["/api/v1/models/assess"]["post"]["responses"]["409"]["content"]["application/json"]
-                ["schema"]["$ref"],
+            contract["data"]["schema"]["$ref"],
+            "#/components/schemas/AssessModelsEvent"
+        );
+        assert_eq!(
+            operation["responses"]["409"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/ErrorResponse"
         );
     }

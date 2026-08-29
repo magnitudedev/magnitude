@@ -900,11 +900,24 @@ pub enum AssessModelResult {
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AssessModelsResponse {
-    pub environment_id: AssessmentEnvironmentId,
-    pub results: Vec<AssessModelResult>,
+#[serde(tag = "_tag", rename_all = "PascalCase")]
+pub enum AssessModelsEvent {
+    #[serde(rename_all = "camelCase")]
+    Started {
+        environment_id: AssessmentEnvironmentId,
+        total_targets: u32,
+    },
+    Result {
+        result: AssessModelResult,
+    },
+    #[serde(rename_all = "camelCase")]
+    Completed {
+        environment_id: AssessmentEnvironmentId,
+        total_targets: u32,
+    },
 }
+
+pub type ModelAssessmentStream = BoxStream<'static, AssessModelsEvent>;
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1071,7 +1084,7 @@ pub trait ModelAssessor: Send + Sync + 'static {
     fn assess(
         &self,
         request: AssessModelsRequest,
-    ) -> BoxFuture<'_, Result<AssessModelsResponse, InventoryError>>;
+    ) -> BoxFuture<'_, Result<ModelAssessmentStream, InventoryError>>;
 }
 
 pub trait ModelDownloads: Send + Sync + 'static {

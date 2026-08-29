@@ -88,19 +88,20 @@ export const applyChatTemplateOperation = {
 
 export const assessModelsOperation = {
   operationId: "assessModels",
-  transport: "http",
+  transport: "ndjson",
   method: "POST",
   path: "/api/v1/models/assess",
   group: "models",
-  successes: [
-    {
-      status: 200,
-      schema: S.suspend(
-        (): S.Schema<Schemas.AssessModelsResponse, Schemas.AssessModelsResponseEncoded> => Schemas.AssessModelsResponse,
-      ),
-      mediaType: "application/json",
-    },
-  ],
+  mediaType: "application/x-ndjson",
+  responseStatus: 200,
+  eventSchema: Schemas.AssessModelsEvent,
+  termination: { type: "eof" },
+  reconnect: { type: "none" },
+  payload: S.suspend(
+    (): S.Schema<Schemas.AssessModelsRequest, Schemas.AssessModelsRequestEncoded> => Schemas.AssessModelsRequest,
+  ),
+  payloadMediaType: "application/json",
+  payloadRequired: true,
   errors: [
     {
       status: 400,
@@ -128,11 +129,6 @@ export const assessModelsOperation = {
       mediaType: "application/json",
     },
   ],
-  payload: S.suspend(
-    (): S.Schema<Schemas.AssessModelsRequest, Schemas.AssessModelsRequestEncoded> => Schemas.AssessModelsRequest,
-  ),
-  payloadMediaType: "application/json",
-  payloadRequired: true,
 } as const
 
 export const cancelModelDownloadOperation = {

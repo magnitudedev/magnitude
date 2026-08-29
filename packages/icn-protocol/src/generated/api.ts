@@ -62,39 +62,6 @@ export const applyChatTemplate = HttpApiEndpoint.post("applyChatTemplate", "/api
     { status: 500 },
   )
 
-export const assessModels = HttpApiEndpoint.post("assessModels", "/api/v1/models/assess")
-  .setPayload(
-    S.suspend(
-      (): S.Schema<Schemas.AssessModelsRequest, Schemas.AssessModelsRequestEncoded> => Schemas.AssessModelsRequest,
-    ),
-  )
-  .addSuccess(
-    S.suspend(
-      (): S.Schema<Schemas.AssessModelsResponse, Schemas.AssessModelsResponseEncoded> => Schemas.AssessModelsResponse,
-    ),
-    { status: 200 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 400 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 404 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 409 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 422 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 500 },
-  )
-
 export const cancelModelDownload = HttpApiEndpoint.post("cancelModelDownload", "/api/v1/downloads/:download_id/cancel")
   .setPath(S.Struct({ download_id: S.String }))
   .addSuccess(
@@ -573,7 +540,6 @@ export const InferenceGroup = HttpApiGroup.make("inference").add(listServableMod
 
 export const ModelsGroup = HttpApiGroup.make("models")
   .add(acknowledgeModelDownloadFailure)
-  .add(assessModels)
   .add(cancelModelDownload)
   .add(ensureModelInstance)
   .add(getInstalledModelPackage)

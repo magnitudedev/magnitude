@@ -184,6 +184,7 @@ export const LocalModelConfigurationResolverLive: Layer.Layer<
   const project = Effect.gen(function* () {
     const catalogState = yield* catalog.state
     const packageState = yield* packages.state
+    const assessmentSnapshot = yield* assessor.snapshot
     const packageEntries = new Map(packageState.entries.map((entry) => [entry.package.id, entry]))
     return resolveLocalModelConfigurations({
       catalog: catalogState.entries.map((entry) => entry.model),
@@ -191,7 +192,7 @@ export const LocalModelConfigurationResolverLive: Layer.Layer<
         Option.isSome(entry.effectiveConfiguration)
           ? [{ identity: entry.identity, configuration: entry.effectiveConfiguration.value }]
           : []),
-      assessed: yield* assessor.state,
+      assessed: assessmentSnapshot.assessments,
       packageEntries,
     })
   }).pipe(Effect.mapError(failure))
@@ -215,7 +216,9 @@ export const LocalModelConfigurationResolverLive: Layer.Layer<
     get: projection.get,
     changes: projection.changes.pipe(Stream.map(() => undefined)),
     settled: Effect.gen(function* () {
-      return (yield* catalog.state).reconciliationComplete && (yield* assessor.settled)
+      const lifecycle = (yield* assessor.snapshot).lifecycle
+      return (yield* catalog.state).reconciliationComplete
+        && (lifecycle._tag === "Ready" || lifecycle._tag === "Failed")
     }),
   })
 }))

@@ -104,6 +104,12 @@ The inference response stream and resource observation have independent lifetime
 chat request does not corrupt ACN observation, and an observation failure does not terminate or
 reinterpret the response proxy.
 
+Finite ICN operations that report incremental native work, including model assessment, use the
+generated streaming client and the framing declared by OpenAPI. ACN validates semantic lifecycle
+events and correlates results; it does not parse NDJSON/SSE bytes or duplicate transport code.
+Dropping an assessment consumer detaches that consumer but does not declare native worker capacity
+available while accepted work is still running.
+
 ## Client and SDK responsibility
 
 The SDK owns typed transport and daemon lifecycle. Client-common owns one connection-scoped Effect
@@ -161,6 +167,8 @@ generation and cannot restart ACN or interrupt ICN-owned transfers.
 
 - No first-party code accesses `/inference/api/**`, native ICN management operations, or ICN
   events.
+- Every ICN stream, including finite assessment streams, is generated from OpenAPI metadata; ACN
+  contains no handwritten streaming transport.
 - `/inference/v1/**` remains a transparent proxy; `/inference/anthropic/**` routes reserved local
   aliases to ICN and preserves non-reserved upstream Anthropic request bytes.
 - Every client-visible model query and mutation belongs to the ACN `Models` group.

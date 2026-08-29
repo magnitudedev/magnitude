@@ -792,11 +792,11 @@
         },
         "responses": {
           "200": {
-            "description": "Exact target and profile assessments",
+            "description": "Exact target and profile assessment events",
             "content": {
-              "application/json": {
+              "application/x-ndjson": {
                 "schema": {
-                  "$ref": "#/components/schemas/AssessModelsResponse"
+                  "type": "string"
                 }
               }
             }
@@ -851,6 +851,23 @@
               }
             }
           }
+        },
+        "x-magnitude-stream": {
+          "data": {
+            "encoding": "json",
+            "schema": {
+              "$ref": "#/components/schemas/AssessModelsEvent"
+            }
+          },
+          "framing": "ndjson",
+          "reconnect": {
+            "type": "none"
+          },
+          "responseStatus": 200,
+          "termination": {
+            "type": "eof"
+          },
+          "version": 1
         }
       }
     },
@@ -2054,6 +2071,76 @@
           }
         ]
       },
+      "AssessModelsEvent": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "environmentId",
+              "totalTargets",
+              "_tag"
+            ],
+            "properties": {
+              "environmentId": {
+                "$ref": "#/components/schemas/AssessmentEnvironmentId"
+              },
+              "totalTargets": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Started"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "result",
+              "_tag"
+            ],
+            "properties": {
+              "result": {
+                "$ref": "#/components/schemas/AssessModelResult"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Result"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "environmentId",
+              "totalTargets",
+              "_tag"
+            ],
+            "properties": {
+              "environmentId": {
+                "$ref": "#/components/schemas/AssessmentEnvironmentId"
+              },
+              "totalTargets": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Completed"
+                ]
+              }
+            }
+          }
+        ]
+      },
       "AssessModelsRequest": {
         "type": "object",
         "required": [
@@ -2064,25 +2151,6 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/AssessModelRequest"
-            }
-          }
-        },
-        "additionalProperties": false
-      },
-      "AssessModelsResponse": {
-        "type": "object",
-        "required": [
-          "environmentId",
-          "results"
-        ],
-        "properties": {
-          "environmentId": {
-            "$ref": "#/components/schemas/AssessmentEnvironmentId"
-          },
-          "results": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/AssessModelResult"
             }
           }
         },

@@ -141,20 +141,40 @@ export const AssessModelResult = S.Union(
 export type AssessModelResult = S.Schema.Type<typeof AssessModelResult>
 export type AssessModelResultEncoded = S.Schema.Encoded<typeof AssessModelResult>
 
+export const AssessModelsEvent = S.Union(
+  S.extend(
+    S.TaggedStruct("Started", {
+      environmentId: S.suspend(
+        (): S.Schema<AssessmentEnvironmentId, AssessmentEnvironmentIdEncoded> => AssessmentEnvironmentId,
+      ),
+      totalTargets: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Result", {
+      result: S.suspend((): S.Schema<AssessModelResult, AssessModelResultEncoded> => AssessModelResult),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Completed", {
+      environmentId: S.suspend(
+        (): S.Schema<AssessmentEnvironmentId, AssessmentEnvironmentIdEncoded> => AssessmentEnvironmentId,
+      ),
+      totalTargets: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type AssessModelsEvent = S.Schema.Type<typeof AssessModelsEvent>
+export type AssessModelsEventEncoded = S.Schema.Encoded<typeof AssessModelsEvent>
+
 export const AssessModelsRequest = S.Struct({
   requests: S.Array(S.suspend((): S.Schema<AssessModelRequest, AssessModelRequestEncoded> => AssessModelRequest)),
 })
 export type AssessModelsRequest = S.Schema.Type<typeof AssessModelsRequest>
 export type AssessModelsRequestEncoded = S.Schema.Encoded<typeof AssessModelsRequest>
-
-export const AssessModelsResponse = S.Struct({
-  environmentId: S.suspend(
-    (): S.Schema<AssessmentEnvironmentId, AssessmentEnvironmentIdEncoded> => AssessmentEnvironmentId,
-  ),
-  results: S.Array(S.suspend((): S.Schema<AssessModelResult, AssessModelResultEncoded> => AssessModelResult)),
-})
-export type AssessModelsResponse = S.Schema.Type<typeof AssessModelsResponse>
-export type AssessModelsResponseEncoded = S.Schema.Encoded<typeof AssessModelsResponse>
 
 export const BackendEligibilityReport = S.Struct({
   cuda: S.suspend((): S.Schema<CudaEligibility, CudaEligibilityEncoded> => CudaEligibility),

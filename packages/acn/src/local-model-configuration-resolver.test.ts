@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { Effect, Layer, Stream, SubscriptionRef } from "effect"
 import { IcnModels } from "@magnitudedev/icn"
-import { LocalModelAssessor } from "./local-model-assessor"
+import { LocalModelAssessmentReady, LocalModelAssessor } from "./local-model-assessor"
 import { LocalModelCatalogAdapterLive } from "./local-model-catalog-adapter"
 import {
   LocalModelConfigurationResolver,
@@ -34,12 +34,21 @@ describe("LocalModelConfigurationResolver", () => {
         refresh: Effect.void,
       })),
       Layer.succeed(LocalModelAssessor, LocalModelAssessor.of({
-        state: Effect.sync(() => {
+        snapshot: Effect.sync(() => {
           assessmentReads += 1
-          return []
+          return {
+            assessments: [],
+            lifecycle: new LocalModelAssessmentReady({
+              cycle: {
+                startedAtMs: 0,
+                durationMs: 0,
+                completedTargets: 0,
+                totalTargets: 0,
+              },
+            }),
+          }
         }),
         changes: Stream.never,
-        settled: Effect.succeed(true),
       })),
       Layer.effect(LocalModelPackages, Effect.gen(function* () {
         const state = yield* SubscriptionRef.make({

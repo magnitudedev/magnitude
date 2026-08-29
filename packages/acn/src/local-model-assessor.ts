@@ -1,7 +1,10 @@
-import { Cause, Context, Effect, Exit, Layer, Option, Schema, Stream, SubscriptionRef } from "effect"
+import { Cause, Context, Data, Effect, Equal, Exit, Layer, Option, Schema, Stream, SubscriptionRef } from "effect"
+import { FSM } from "@magnitudedev/utils"
 import {
   LocalModelConfigurationAssessmentSchema,
+  ModelFailureSchema,
   ModelServingConfigurationSchema,
+  ServingProfileSchema,
   servableModelBundlePackageIds,
   type ModelPackageId,
   type LocalModelConfigurationAssessment,
@@ -28,10 +31,64 @@ export interface CoordinatedLocalModelAssessment {
   readonly assessment: CoordinatedLocalModelAssessmentState
 }
 
+export class LocalModelAssessmentDiscovering extends Data.TaggedClass("Discovering")<{}> {}
+
+export class LocalModelAssessmentAssessing extends Data.TaggedClass("Assessing")<{
+  readonly cycle: {
+    readonly startedAtMs: number
+    readonly completedTargets: number
+    readonly totalTargets: number
+  }
+}> {}
+
+export class LocalModelAssessmentReady extends Data.TaggedClass("Ready")<{
+  readonly cycle: {
+    readonly startedAtMs: number
+    readonly durationMs: number
+    readonly completedTargets: number
+    readonly totalTargets: number
+  }
+}> {}
+
+export class LocalModelAssessmentFailed extends Data.TaggedClass("Failed")<{
+  readonly cycle: {
+    readonly startedAtMs: number
+    readonly durationMs: number
+    readonly completedTargets: number
+    readonly totalTargets: number
+    readonly failure: typeof ModelFailureSchema.Type
+  }
+}> {}
+
+export const LocalModelAssessmentLifecycle = FSM.defineFSM(
+  {
+    Discovering: LocalModelAssessmentDiscovering,
+    Assessing: LocalModelAssessmentAssessing,
+    Ready: LocalModelAssessmentReady,
+    Failed: LocalModelAssessmentFailed,
+  },
+  {
+    Discovering: ["Assessing", "Ready"],
+    Assessing: ["Ready", "Failed"],
+    Ready: ["Assessing"],
+    Failed: ["Assessing", "Ready"],
+  } as const,
+)
+
+export type LocalModelAssessmentLifecycleState =
+  | LocalModelAssessmentDiscovering
+  | LocalModelAssessmentAssessing
+  | LocalModelAssessmentReady
+  | LocalModelAssessmentFailed
+
+export interface LocalModelAssessmentSnapshot {
+  readonly assessments: readonly CoordinatedLocalModelAssessment[]
+  readonly lifecycle: LocalModelAssessmentLifecycleState
+}
+
 export interface LocalModelAssessorApi {
-  readonly state: Effect.Effect<readonly CoordinatedLocalModelAssessment[]>
-  readonly changes: Stream.Stream<readonly CoordinatedLocalModelAssessment[]>
-  readonly settled: Effect.Effect<boolean>
+  readonly snapshot: Effect.Effect<LocalModelAssessmentSnapshot>
+  readonly changes: Stream.Stream<LocalModelAssessmentSnapshot>
 }
 
 export class LocalModelAssessor extends Context.Tag(
@@ -45,42 +102,45 @@ type DesiredAssessment = {
   readonly semanticKey: string
 }
 
-interface AssessorState {
-  readonly desired: ReadonlyMap<AssessmentDemandKey, DesiredAssessment>
-  readonly published: ReadonlyMap<AssessmentDemandKey, CoordinatedLocalModelAssessment>
-  readonly completedKeys: ReadonlyMap<AssessmentDemandKey, string>
-  readonly runningKeys: ReadonlyMap<AssessmentDemandKey, string>
+type AssessmentDemand = DesiredAssessment & {
+  readonly assessment: CoordinatedLocalModelAssessmentState
 }
+
+interface DiscoveringCoordinatorState {
+  readonly lifecycle: LocalModelAssessmentDiscovering
+  readonly demands: ReadonlyMap<AssessmentDemandKey, AssessmentDemand>
+}
+
+interface AssessingCoordinatorState {
+  readonly lifecycle: LocalModelAssessmentAssessing
+  readonly demands: ReadonlyMap<AssessmentDemandKey, AssessmentDemand>
+  readonly cycleDemandKeys: ReadonlySet<AssessmentDemandKey>
+}
+
+interface SettledCoordinatorState {
+  readonly lifecycle: LocalModelAssessmentReady | LocalModelAssessmentFailed
+  readonly demands: ReadonlyMap<AssessmentDemandKey, AssessmentDemand>
+}
+
+type AssessorState = DiscoveringCoordinatorState | AssessingCoordinatorState | SettledCoordinatorState
+
+const isAssessingState = (state: AssessorState): state is AssessingCoordinatorState =>
+  state.lifecycle._tag === "Assessing"
 
 const configurationEquivalent = Schema.equivalence(ModelServingConfigurationSchema)
 const assessmentEquivalent = Schema.equivalence(CoordinatedLocalModelAssessmentStateSchema)
+const profileEquivalent = Schema.equivalence(ServingProfileSchema)
 
-const publishedEquivalent = (
-  left: ReadonlyMap<AssessmentDemandKey, CoordinatedLocalModelAssessment>,
-  right: ReadonlyMap<AssessmentDemandKey, CoordinatedLocalModelAssessment>,
+const demandsEquivalent = (
+  left: ReadonlyMap<AssessmentDemandKey, AssessmentDemand>,
+  right: ReadonlyMap<AssessmentDemandKey, AssessmentDemand>,
 ): boolean => left.size === right.size && [...left].every(([id, value]) => {
   const other = right.get(id)
     return other !== undefined
     && configurationEquivalent(value.configuration, other.configuration)
+    && value.semanticKey === other.semanticKey
     && assessmentEquivalent(value.assessment, other.assessment)
 })
-
-const sameDesired = (
-  left: ReadonlyMap<AssessmentDemandKey, DesiredAssessment>,
-  right: ReadonlyMap<AssessmentDemandKey, DesiredAssessment>,
-): boolean => left.size === right.size
-  && [...left].every(([id, value]) => {
-    const other = right.get(id)
-    return other?.semanticKey === value.semanticKey
-  })
-
-const sameCompleted = (
-  left: ReadonlyMap<AssessmentDemandKey, string>,
-  right: ReadonlyMap<AssessmentDemandKey, string>,
-): boolean => left.size === right.size
-  && [...left].every(([id, key]) => right.get(id) === key)
-
-const sameRunning = sameCompleted
 
 const assessmentFailure = (error: unknown) => {
   const record = typeof error === "object" && error !== null
@@ -106,10 +166,6 @@ const assessmentCauseFailure = (cause: Cause.Cause<unknown>) => Option.match(
     onSome: assessmentFailure,
   },
 )
-
-const assessmentExecutionKey = (
-  configuration: ModelServingConfiguration,
-): string => `${bundleExecutionKey(configuration.bundle)}\0${configuration.profile.contextLength}`
 
 const bundleExecutionKey = (bundle: ServableModelBundle): string =>
   bundle._tag === "Standalone"
@@ -143,7 +199,11 @@ const completedAssessment = (
     }
   }
   const configuration = request.configuration
-  const resultForConfiguration = result.assessments[0]
+  const resultForConfiguration = result.assessments.find((assessment) =>
+    profileEquivalent(
+      assessment.configuration.profile,
+      request.configuration.profile,
+    ))
   if (resultForConfiguration === undefined) {
     return {
       configuration,
@@ -206,12 +266,11 @@ export const LocalModelAssessorLive: Layer.Layer<
   const assessments = yield* LocalModelAssessments
   const packages = yield* LocalModelPackages
   const current = yield* SubscriptionRef.make<AssessorState>({
-    desired: new Map(),
-    published: new Map(),
-    completedKeys: new Map(),
-    runningKeys: new Map(),
+    lifecycle: new LocalModelAssessmentDiscovering(),
+    demands: new Map(),
   })
   const lock = yield* Effect.makeSemaphore(1)
+  const coordinationLock = yield* Effect.makeSemaphore(1)
 
   const readDesired = Effect.gen(function* () {
     const catalogEntries = (yield* catalog.state).entries
@@ -260,135 +319,206 @@ export const LocalModelAssessorLive: Layer.Layer<
 
   const publish = (state: AssessorState) => Effect.gen(function* () {
     const previous = yield* SubscriptionRef.get(current)
-    const equivalent = publishedEquivalent(previous.published, state.published)
-      && sameDesired(previous.desired, state.desired)
-      && sameCompleted(previous.completedKeys, state.completedKeys)
-      && sameRunning(previous.runningKeys, state.runningKeys)
+    const sameCycle = !isAssessingState(previous)
+      || !isAssessingState(state)
+      || previous.cycleDemandKeys.size === state.cycleDemandKeys.size
+        && [...previous.cycleDemandKeys].every((key) => state.cycleDemandKeys.has(key))
+    const equivalent = Equal.equals(previous.lifecycle, state.lifecycle)
+      && demandsEquivalent(previous.demands, state.demands)
+      && sameCycle
     if (!equivalent) yield* SubscriptionRef.set(current, state)
   })
 
   type PendingAssessment = readonly [AssessmentDemandKey, DesiredAssessment]
-  type AssessmentBatch = readonly [PendingAssessment, ...PendingAssessment[]]
-
-  const batchesFor = (pending: readonly PendingAssessment[]): readonly AssessmentBatch[] => {
-    const pendingBatches = new Map<string, AssessmentBatch>()
-    for (const entry of pending) {
-      const key = assessmentExecutionKey(entry[1].configuration)
-      const batch = pendingBatches.get(key)
-      pendingBatches.set(key, batch === undefined ? [entry] : [...batch, entry])
+  interface AssessmentTarget {
+    readonly demands: readonly [PendingAssessment, ...PendingAssessment[]]
+    readonly request: {
+      readonly bundle: ServableModelBundle
+      readonly profiles: readonly [ModelServingConfiguration["profile"], ...ModelServingConfiguration["profile"][]]
     }
-    return [...pendingBatches.values()]
   }
 
-  const complete = (
-    pending: readonly PendingAssessment[],
-    batches: readonly AssessmentBatch[],
-    assessmentExit: Exit.Exit<readonly LocalModelAssessmentResult[], unknown>,
-  ) => lock.withPermits(1)(Effect.gen(function* () {
-    const latestDesired = yield* readDesired
-    const latest = yield* SubscriptionRef.get(current)
-    const nextPublished = new Map(latest.published)
-    const completedKeys = new Map(latest.completedKeys)
-    const runningKeys = new Map(latest.runningKeys)
-    for (const [demandKey, request] of pending) {
-      if (runningKeys.get(demandKey) === request.semanticKey) runningKeys.delete(demandKey)
+  const targetsFor = (pending: readonly PendingAssessment[]): readonly AssessmentTarget[] => {
+    const demandsByBundle = new Map<string, PendingAssessment[]>()
+    for (const entry of pending) {
+      const key = bundleExecutionKey(entry[1].configuration.bundle)
+      const demands = demandsByBundle.get(key)
+      demandsByBundle.set(key, demands === undefined ? [entry] : [...demands, entry])
     }
-    if (Exit.isFailure(assessmentExit)) {
-      const failure = assessmentCauseFailure(assessmentExit.cause)
-      for (const [demandKey, request] of pending) {
-        const latestRequest = latestDesired.get(demandKey)
-        if (latestRequest?.semanticKey !== request.semanticKey) continue
-        nextPublished.set(demandKey, {
-          configuration: latestRequest.configuration,
-          assessment: { _tag: "Failed", failure },
-        })
-        completedKeys.set(demandKey, request.semanticKey)
+    return [...demandsByBundle.values()].map((demands) => {
+      const profiles = demands.reduce<ModelServingConfiguration["profile"][]>((unique, demand) => {
+        const profile = demand[1].configuration.profile
+        return unique.some((other) => profileEquivalent(other, profile))
+          ? unique
+          : [...unique, profile]
+      }, [])
+      return {
+        demands: demands as [PendingAssessment, ...PendingAssessment[]],
+        request: {
+          bundle: demands[0]![1].configuration.bundle,
+          profiles: profiles as [
+            ModelServingConfiguration["profile"],
+            ...ModelServingConfiguration["profile"][],
+          ],
+        },
       }
-    } else {
-      batches.forEach((batch, index) => {
-        const result = assessmentExit.value[index]
-        batch.forEach(([demandKey, request]) => {
-          const latestRequest = latestDesired.get(demandKey)
-          if (latestRequest?.semanticKey !== request.semanticKey) return
-          const completed = result === undefined
-            ? {
-                configuration: latestRequest.configuration,
-                assessment: {
-                  _tag: "Failed",
-                  failure: {
-                    code: "missing_model_assessment_result",
-                    message: "Native assessment returned no result for this configuration",
-                    retryable: true,
-                  },
-                } as const,
-              }
-            : completedAssessment(result, latestRequest)
-          if (completed === undefined) return
-          nextPublished.set(demandKey, {
-            configuration: completed.configuration,
-            assessment: completed.assessment,
-          })
-          completedKeys.set(demandKey, request.semanticKey)
-        })
+    })
+  }
+
+  const completeTarget = (
+    target: AssessmentTarget,
+    result: LocalModelAssessmentResult,
+  ) => lock.withPermits(1)(Effect.gen(function* () {
+    const latest = yield* SubscriptionRef.get(current)
+    if (!isAssessingState(latest)) return
+    const demands = new Map(latest.demands)
+    for (const [demandKey, request] of target.demands) {
+      if (!latest.cycleDemandKeys.has(demandKey)) continue
+      const demand = demands.get(demandKey)
+      if (demand?.semanticKey !== request.semanticKey || demand.assessment._tag !== "Assessing") continue
+      const completed = completedAssessment(result, demand)
+      if (completed === undefined) continue
+      demands.set(demandKey, {
+        configuration: completed.configuration,
+        semanticKey: demand.semanticKey,
+        assessment: completed.assessment,
       })
     }
-    for (const demandKey of nextPublished.keys()) {
-      if (!latestDesired.has(demandKey)) nextPublished.delete(demandKey)
-    }
-    for (const demandKey of completedKeys.keys()) {
-      if (!latestDesired.has(demandKey)) completedKeys.delete(demandKey)
-    }
-    for (const demandKey of runningKeys.keys()) {
-      if (!latestDesired.has(demandKey)) runningKeys.delete(demandKey)
-    }
+    const completedTargets = [...latest.cycleDemandKeys].filter((key) =>
+      demands.get(key)?.assessment._tag !== "Assessing").length
     yield* publish({
-      desired: latestDesired,
-      published: nextPublished,
-      completedKeys,
-      runningKeys,
+      lifecycle: LocalModelAssessmentLifecycle.hold(latest.lifecycle, {
+        cycle: { ...latest.lifecycle.cycle, completedTargets },
+      }),
+      demands,
+      cycleDemandKeys: latest.cycleDemandKeys,
     })
   }))
 
-  const assessPending = (
-    pending: readonly PendingAssessment[],
-    batches: readonly AssessmentBatch[],
-  ) => Effect.exit(assessments.assess(
-    batches.map((batch) => ({
-      bundle: batch[0][1].configuration.bundle,
-      profiles: [batch[0][1].configuration.profile],
-    })),
-    () => Effect.void,
-  )).pipe(Effect.flatMap((outcome) => complete(pending, batches, outcome)))
+  const finishAssessment = (
+    targets: readonly AssessmentTarget[],
+    received: ReadonlySet<number>,
+    outcome: Exit.Exit<void, unknown>,
+  ) => lock.withPermits(1)(Effect.gen(function* () {
+    const latest = yield* SubscriptionRef.get(current)
+    if (!isAssessingState(latest)) return
+    const demands = new Map(latest.demands)
+    const terminalFailure = Exit.isFailure(outcome)
+      ? assessmentCauseFailure(outcome.cause)
+      : received.size === targets.length
+        ? undefined
+        : {
+            code: "incomplete_model_assessment_response",
+            message: "Native assessment completed without every requested target.",
+            retryable: true,
+          }
+    const completedTargets = latest.lifecycle.cycle.completedTargets
+    if (terminalFailure !== undefined) {
+      for (const [targetIndex, target] of targets.entries()) {
+        if (received.has(targetIndex)) continue
+        for (const [demandKey, request] of target.demands) {
+          const demand = demands.get(demandKey)
+          if (demand?.semanticKey !== request.semanticKey || demand.assessment._tag !== "Assessing") continue
+          demands.set(demandKey, {
+            configuration: demand.configuration,
+            semanticKey: demand.semanticKey,
+            assessment: { _tag: "Failed", failure: terminalFailure },
+          })
+        }
+      }
+    }
+    const durationMs = Math.max(0, Date.now() - latest.lifecycle.cycle.startedAtMs)
+    yield* publish({
+      lifecycle: terminalFailure === undefined
+        ? LocalModelAssessmentLifecycle.transition(latest.lifecycle, "Ready", {
+            cycle: {
+              ...latest.lifecycle.cycle,
+              durationMs,
+              completedTargets: latest.lifecycle.cycle.totalTargets,
+            },
+          })
+        : LocalModelAssessmentLifecycle.transition(latest.lifecycle, "Failed", {
+            cycle: {
+              ...latest.lifecycle.cycle,
+              durationMs,
+              completedTargets,
+              failure: terminalFailure,
+            },
+          }),
+      demands,
+    })
+  }))
 
-  const reconcile = lock.withPermits(1)(Effect.gen(function* () {
-    const desired = yield* readDesired
-    const state = yield* SubscriptionRef.get(current)
-    const pending = [...desired].filter(([demandKey, { semanticKey }]) =>
-      state.completedKeys.get(demandKey) !== semanticKey
-        && state.runningKeys.get(demandKey) !== semanticKey)
-    const published = new Map(
-      [...state.published].filter(([demandKey]) => desired.has(demandKey)),
-    )
-    const runningKeys = new Map(
-      [...state.runningKeys].filter(([demandKey]) => desired.has(demandKey)),
-    )
-    for (const [demandKey, entry] of published) {
-      const next = desired.get(demandKey)
-      if (next !== undefined) published.set(demandKey, { ...entry, configuration: next.configuration })
-    }
-    for (const [demandKey, request] of pending) {
-      published.set(demandKey, {
-        configuration: request.configuration,
-        assessment: { _tag: "Assessing" },
+  const assessPending = (targets: readonly AssessmentTarget[]) => Effect.gen(function* () {
+    const received = new Set<number>()
+    const outcome = yield* Effect.exit(assessments.assess(
+      targets.map(({ request }) => request),
+      (targetIndex, result) => Effect.gen(function* () {
+        yield* completeTarget(targets[targetIndex]!, result)
+        received.add(targetIndex)
+      }),
+    ))
+    yield* finishAssessment(targets, received, outcome)
+  })
+
+  const reconcile = coordinationLock.withPermits(1)(Effect.gen(function* () {
+    const targets = yield* lock.withPermits(1)(Effect.gen(function* () {
+      const desired = yield* readDesired
+      const state = yield* SubscriptionRef.get(current)
+      if (isAssessingState(state)) {
+        return yield* Effect.dieMessage("Assessment reconciliation entered during an active cycle")
+      }
+      const demands = new Map<AssessmentDemandKey, AssessmentDemand>()
+      const pending: PendingAssessment[] = []
+      for (const [demandKey, request] of desired) {
+        const retained = state.demands.get(demandKey)
+        if (retained?.semanticKey === request.semanticKey && retained.assessment._tag !== "Assessing") {
+          demands.set(demandKey, { ...retained, configuration: request.configuration })
+        } else {
+          const demand = { ...request, assessment: { _tag: "Assessing" as const } }
+          demands.set(demandKey, demand)
+          pending.push([demandKey, request])
+        }
+      }
+      const targets = targetsFor(pending)
+      if (pending.length === 0) {
+        const now = Date.now()
+        const lifecycle = state.lifecycle._tag === "Ready"
+          ? LocalModelAssessmentLifecycle.hold(state.lifecycle, {
+              cycle: {
+                ...state.lifecycle.cycle,
+                completedTargets: demands.size,
+                totalTargets: demands.size,
+              },
+            })
+          : LocalModelAssessmentLifecycle.transition(state.lifecycle, "Ready", {
+              cycle: {
+                startedAtMs: now,
+                durationMs: 0,
+                completedTargets: demands.size,
+                totalTargets: demands.size,
+              },
+            })
+        yield* publish({ lifecycle, demands })
+        return targets
+      }
+      const startedAtMs = Date.now()
+      const lifecycle = LocalModelAssessmentLifecycle.transition(state.lifecycle, "Assessing", {
+        cycle: {
+          startedAtMs,
+          completedTargets: 0,
+          totalTargets: pending.length,
+        },
       })
-      runningKeys.set(demandKey, request.semanticKey)
-    }
-    yield* publish({ ...state, desired, published, runningKeys })
-    return pending
+      yield* publish({
+        lifecycle,
+        demands,
+        cycleDemandKeys: new Set(pending.map(([demandKey]) => demandKey)),
+      })
+      return targets
+    }))
+    if (targets.length > 0) yield* assessPending(targets)
   })).pipe(
-    Effect.flatMap((pending) => pending.length === 0
-      ? Effect.void
-      : assessPending(pending, batchesFor(pending)).pipe(Effect.forkScoped, Effect.asVoid)),
     Effect.catchAllCause((cause) => Effect.logWarning(
       "Unable to coordinate local model assessment",
     ).pipe(Effect.annotateLogs({ cause: String(cause) }))),
@@ -401,23 +531,23 @@ export const LocalModelAssessorLive: Layer.Layer<
   ], { concurrency: "unbounded" }).pipe(
     Stream.debounce("25 millis"),
   )
-  yield* reconcile
+  yield* reconcile.pipe(Effect.forkScoped)
   yield* changes.pipe(
     Stream.buffer({ capacity: 1, strategy: "sliding" }),
     Stream.runForEach(() => reconcile),
     Effect.forkScoped,
   )
 
-  const publicState = (published: AssessorState["published"]) => [...published.values()]
+  const snapshot = (state: AssessorState): LocalModelAssessmentSnapshot => ({
+    assessments: [...state.demands.values()].map(({ configuration, assessment }) => ({
+      configuration,
+      assessment,
+    })),
+    lifecycle: state.lifecycle,
+  })
 
   return LocalModelAssessor.of({
-    state: SubscriptionRef.get(current).pipe(Effect.map((state) => publicState(state.published))),
-    changes: current.changes.pipe(Stream.map((state) => publicState(state.published))),
-    settled: Effect.gen(function* () {
-      const desired = yield* readDesired
-      const { completedKeys } = yield* SubscriptionRef.get(current)
-      return [...desired].every(([demandKey, { semanticKey }]) =>
-        completedKeys.get(demandKey) === semanticKey)
-    }).pipe(Effect.orElseSucceed(() => false)),
+    snapshot: SubscriptionRef.get(current).pipe(Effect.map(snapshot)),
+    changes: current.changes.pipe(Stream.map(snapshot)),
   })
 }))

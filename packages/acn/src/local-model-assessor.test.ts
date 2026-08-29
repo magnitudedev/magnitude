@@ -2,6 +2,7 @@ import { Deferred, Effect, Layer, Option, Stream, SubscriptionRef } from "effect
 import { describe, expect, it } from "vitest"
 import {
   AssessmentEnvironmentIdSchema,
+  LocalModelMutationFailed,
   ModelFileIdSchema,
   ModelPackageIdSchema,
   ModelReleaseDateSchema,
@@ -104,21 +105,24 @@ describe("LocalModelAssessor", () => {
         fidelityRank: 1,
         quantizationAware: false,
       })
+      const modelState = {
+        revision: 1,
+        reconciliationComplete: true,
+        models: [
+          catalogModel("recommendable-test", configuration),
+          catalogModel("same-material-test", configurationWithSameMaterialIdentity),
+        ] as never,
+        diagnostics: [],
+      }
+      const modelStateRef = yield* SubscriptionRef.make(modelState)
       const dependencies = Layer.mergeAll(
         Layer.succeed(IcnModels, IcnModels.of({
-          get: Effect.succeed({
-            revision: 1,
-            state: {
-              revision: 1,
-              reconciliationComplete: true,
-              models: [
-                catalogModel("recommendable-test", configuration),
-                catalogModel("same-material-test", configurationWithSameMaterialIdentity),
-              ] as never,
-              diagnostics: [],
-            },
-          }),
-          changes: Stream.never,
+          get: SubscriptionRef.get(modelStateRef).pipe(
+            Effect.map((state) => ({ revision: state.revision, state })),
+          ),
+          changes: modelStateRef.changes.pipe(
+            Stream.map((state) => ({ revision: state.revision, state })),
+          ),
           initialized: Effect.succeed(true),
           refresh: Effect.void,
         })),
@@ -145,31 +149,33 @@ describe("LocalModelAssessor", () => {
           refresh: Effect.void,
         })),
         Layer.succeed(LocalModelAssessments, LocalModelAssessments.of({
-          assess: (requests) => Effect.gen(function* () {
+          assess: (requests, onResult) => Effect.gen(function* () {
             assessmentCalls += 1
             assessmentRequestCounts.push(requests.length)
             if (assessmentCalls === 1) {
               yield* Deferred.succeed(firstAssessmentStarted, undefined)
               yield* Deferred.await(releaseFirstAssessment)
             }
-            return requests.map((_, index) => index === 0
-              ? {
-                  _tag: "Assessed",
-                  environmentId: AssessmentEnvironmentIdSchema.make("environment-test"),
-                  assessments: [{
-                    _tag: "Incompatible",
-                    configuration,
-                    failure: {
-                      code: "unsupported_architecture",
-                      message: "Unsupported architecture",
-                      retryable: false,
-                    },
-                  }],
-                }
-              : {
-                  _tag: "InvalidBundle",
-                  message: "terminal test result",
-                })
+            if (assessmentCalls === 3) {
+              return yield* new LocalModelMutationFailed({
+                code: "planner_unavailable",
+                message: "Planning worker stopped",
+                retryable: true,
+              })
+            }
+            yield* Effect.forEach(requests, (_, index) => onResult(index, {
+              _tag: "Assessed",
+              environmentId: AssessmentEnvironmentIdSchema.make("environment-test"),
+              assessments: [{
+                _tag: "Incompatible",
+                configuration,
+                failure: {
+                  code: "unsupported_architecture",
+                  message: "Unsupported architecture",
+                  retryable: false,
+                },
+              }],
+            }), { discard: true })
           }),
         })),
       )
@@ -181,6 +187,10 @@ describe("LocalModelAssessor", () => {
       yield* Effect.gen(function* () {
         const assessor = yield* LocalModelAssessor
         yield* Deferred.await(firstAssessmentStarted)
+        expect((yield* assessor.snapshot).lifecycle).toMatchObject({
+          _tag: "Assessing",
+          cycle: { completedTargets: 0, totalTargets: 2 },
+        })
         packageState = {
           ...packageState,
           entries: [{ ...packageEntry, inspection: { _tag: "Pending" as const } }],
@@ -190,7 +200,11 @@ describe("LocalModelAssessor", () => {
         yield* Effect.sleep("150 millis")
         expect(assessmentCalls).toBe(2)
         expect(assessmentRequestCounts).toEqual([1, 1])
-        const initialState = yield* assessor.state
+        expect((yield* assessor.snapshot).lifecycle).toMatchObject({
+          _tag: "Ready",
+          cycle: { completedTargets: 2, totalTargets: 2 },
+        })
+        const initialState = (yield* assessor.snapshot).assessments
         expect(initialState).toHaveLength(2)
         expect(initialState[0]?.configuration).toEqual(configuration)
         expect(initialState[0]?.assessment).toEqual({
@@ -207,8 +221,23 @@ describe("LocalModelAssessor", () => {
         yield* Effect.sleep("100 millis")
 
         expect(assessmentCalls).toBe(2)
-        expect((yield* assessor.state)[0]?.assessment._tag)
+        expect((yield* assessor.snapshot).assessments[0]?.assessment._tag)
           .toBe("Incompatible")
+
+        packageState = { ...packageState, entries: [packageEntry] }
+        yield* SubscriptionRef.set(packageStateRef, packageState)
+        yield* Effect.sleep("100 millis")
+        expect((yield* assessor.snapshot).lifecycle._tag).toBe("Failed")
+
+        yield* SubscriptionRef.set(modelStateRef, {
+          ...modelState,
+          revision: 2,
+          models: [] as never,
+        })
+        yield* Effect.sleep("100 millis")
+        const afterRemoval = yield* assessor.snapshot
+        expect(afterRemoval.lifecycle._tag).toBe("Ready")
+        expect(afterRemoval.assessments).toEqual([])
       }).pipe(Effect.provide(testLayer))
     })))
   })
