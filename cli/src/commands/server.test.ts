@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { Command } from "@commander-js/extra-typings"
 import { ACN_EXECUTABLE_NAME } from "@magnitudedev/sdk"
+import { Option } from "effect"
 import {
   developmentServerCommand,
   renderLinuxServerService,
@@ -9,6 +10,7 @@ import {
   WINDOWS_RESTART_POLICY_SCRIPT,
 } from "../server/service"
 import { registerServiceCommand } from "./server"
+import { renderServiceStatus } from "./server-runtime"
 
 describe("Magnitude service definitions", () => {
   it("registers only the public service command group", () => {
@@ -59,5 +61,22 @@ describe("Magnitude service definitions", () => {
     expect(WINDOWS_RESTART_POLICY_SCRIPT).toContain("ExecutionTimeLimit = 'PT0S'")
     expect(WINDOWS_RESTART_POLICY_SCRIPT).toContain("RestartCount = 999")
     expect(WINDOWS_RESTART_POLICY_SCRIPT).toContain("RestartInterval = 'PT1M'")
+  })
+
+  it("renders service status as the five user-facing fields", () => {
+    expect(renderServiceStatus({
+      status: "Ready",
+      address: "127.0.0.1:10100",
+      version: Option.some("0.0.2"),
+      startsAutomaticallyOnLogin: true,
+      activeModel: Option.none(),
+    })).toBe([
+      "Status: Ready",
+      "Address: 127.0.0.1:10100",
+      "Version: 0.0.2",
+      "Starts automatically on login: Yes",
+      "Active model: None",
+      "",
+    ].join("\n"))
   })
 })

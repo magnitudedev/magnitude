@@ -1,3 +1,4 @@
+import { Atom, Registry } from "@effect-atom/atom"
 import { FetchHttpClient } from "@effect/platform"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as CommandExecutor from "@effect/platform/CommandExecutor"
@@ -5,7 +6,15 @@ import * as HttpClient from "@effect/platform/HttpClient"
 import * as Path from "@effect/platform/Path"
 import * as Terminal from "@effect/platform/Terminal"
 import { BunContext } from "@effect/platform-bun"
-import { Effect, Option, Schema } from "effect"
+import { formatLocalModelDisplayName } from "@magnitudedev/client-common"
+import { Client } from "@magnitudedev/effect-query"
+import {
+  MAGNITUDE_SERVICE_ORIGIN,
+  MagnitudeBoundary,
+  ProviderModelIdSchema,
+  magnitudeImplementationsLayer,
+} from "@magnitudedev/sdk"
+import { Effect, Layer, Option, Schema } from "effect"
 import {
   confirmServicePublicReady,
   installService,
@@ -22,30 +31,29 @@ import { resolveCliTheme } from "../utils/theme"
 import { makeCliUpdater, updateReleaseNotesUrl } from "../features/update/updater"
 import { CLI_VERSION } from "../version"
 import { isDevelopmentBuild } from "../runtime/environment"
-import { startingAcnConnection } from "../server/acn-connection"
+import { existingAcnConnection, startingAcnConnection } from "../server/acn-connection"
 import { explainServiceStartupFailure } from "../startup/service-startup-error"
 import { runCommand } from "./output"
 
 const ServiceActionSchema = Schema.Struct({
   action: Schema.Literal("install", "uninstall", "stop"),
 })
-const ServiceStatusSchema = Schema.Union(
-  Schema.Struct({
-    installed: Schema.Boolean,
-    enabled: Schema.Boolean,
-    managed: Schema.Boolean,
-    running: Schema.Literal(false),
-    state: Schema.Literal("Stopped"),
-  }),
-  Schema.Struct({
-    installed: Schema.Boolean,
-    enabled: Schema.Boolean,
-    managed: Schema.Boolean,
-    running: Schema.Literal(true),
-    revision: Schema.Number,
-    state: Schema.Literal("Starting", "Ready", "Stopping"),
-  }),
-)
+const ActiveModelSchema = Schema.Struct({
+  modelId: ProviderModelIdSchema,
+  displayName: Schema.String,
+  status: Schema.Literal("Loading", "Ready", "Stopping"),
+})
+type ActiveModel = typeof ActiveModelSchema.Type
+
+const ServiceStatusSchema = Schema.Struct({
+  status: Schema.Literal("Stopped", "Starting", "Ready", "Stopping"),
+  address: Schema.String,
+  version: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  startsAutomaticallyOnLogin: Schema.Boolean,
+  activeModel: Schema.optionalWith(ActiveModelSchema, { as: "Option", exact: true }),
+})
+
+const serviceAddress = new URL(MAGNITUDE_SERVICE_ORIGIN).host
 
 const runServiceStartEffect = Effect.scoped(Effect.gen(function* () {
   const appearance = yield* probeTerminalAppearance()
@@ -127,16 +135,76 @@ export const runServiceInstall = () => action("install", installService)
 export const runServiceUninstall = () => action("uninstall", uninstallService)
 export const runServiceStart = () => run(runServiceStartEffect, explainServiceStartupFailure)
 export const runServiceStop = () => action("stop", stopService)
+
+const readActiveModel = Effect.scoped(Effect.gen(function* () {
+  const connection = yield* existingAcnConnection
+  const registry = Registry.make()
+  yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+  const client = Client.make(
+    MagnitudeBoundary,
+    magnitudeImplementationsLayer(connection.protocolLayer.pipe(
+      Layer.provide(FetchHttpClient.layer),
+    )),
+  )
+  const catalog = yield* Registry.getResult(
+    registry,
+    Atom.make((get) => get(client.Models.GetCatalog({})).result),
+  )
+  if (catalog._tag === "Initializing") return Option.none<ActiveModel>()
+  for (const entry of catalog.models) {
+    if (entry._tag !== "Local") continue
+    const model = entry.product
+    const acquisition = model.acquisitionState
+    if (!("residencyState" in acquisition)) continue
+    const residency = acquisition.residencyState
+    if (residency._tag !== "Requested"
+      && residency._tag !== "Loading"
+      && residency._tag !== "Ready"
+      && residency._tag !== "Stopping") continue
+    return Option.some({
+      modelId: model.modelId,
+      displayName: formatLocalModelDisplayName(model),
+      status: residency._tag === "Requested" ? "Loading" as const : residency._tag,
+    })
+  }
+  return Option.none<ActiveModel>()
+}))
+
+const publicServiceStatus = live(serviceStatus).pipe(
+  Effect.flatMap((status) => {
+    const activeModel = status.running && status.state === "Ready"
+      ? readActiveModel.pipe(
+          Effect.timeoutOption("2 seconds"),
+          Effect.map(Option.flatten),
+          Effect.orElseSucceed(() => Option.none<ActiveModel>()),
+        )
+      : Effect.succeed(Option.none<ActiveModel>())
+    return activeModel.pipe(Effect.map((model) => ({
+      status: status.state,
+      address: serviceAddress,
+      version: status.running ? Option.some(String(status.version)) : Option.none<string>(),
+      startsAutomaticallyOnLogin: status.enabled,
+      activeModel: model,
+    })))
+  }),
+)
+
+export const renderServiceStatus = (status: typeof ServiceStatusSchema.Type): string => [
+  `Status: ${status.status}`,
+  `Address: ${status.address}`,
+  `Version: ${Option.getOrElse(status.version, () => "Unknown")}`,
+  `Starts automatically on login: ${status.startsAutomaticallyOnLogin ? "Yes" : "No"}`,
+  `Active model: ${Option.match(status.activeModel, {
+    onNone: () => "None",
+    onSome: (model) => model.status === "Ready"
+      ? model.displayName
+      : `${model.displayName} (${model.status})`,
+  })}`,
+  "",
+].join("\n")
+
 export const runServiceStatus = () => runCommand({
-  effect: live(serviceStatus),
+  effect: publicServiceStatus,
   schema: ServiceStatusSchema,
-  render: (status) => [
-    `Installed: ${status.installed ? "yes" : "no"}`,
-    `Enabled: ${status.enabled ? "yes" : "no"}`,
-    `Managed runtime: ${status.managed ? "yes" : "no"}`,
-    `Running: ${status.running ? "yes" : "no"}`,
-    `State: ${status.state}`,
-    ...("revision" in status ? [`Revision: ${status.revision}`] : []),
-    "",
-  ].join("\n"),
+  render: renderServiceStatus,
 })
