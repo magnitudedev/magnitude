@@ -60,9 +60,10 @@ joins the service through the shared inline lifecycle, performs concurrent updat
 discovery, and succeeds only after public readiness. `service stop` stops the
 exact Magnitude runtime, including a JIT-owned runtime, without disabling or
 deleting the definition. `service uninstall` stops the runtime, disables and
-deletes the definition, and preserves user data. `service status` observes and
-reports installation, enablement, platform-manager ownership, runtime, and
-revision facts separately.
+deletes the definition, and preserves user data. `service status` reports the
+user-facing runtime state, stable address, running service version, whether it
+starts automatically on login, and the active model. Its JSON result exposes
+those same semantic values without platform-manager implementation details.
 
 ## Model operations
 

@@ -358,11 +358,12 @@ export const serviceStatus = Effect.gen(function* () {
     && managerPid.value === health.value.pid
   return Option.match(health, {
     onNone: () => ({ installed, enabled, managed, running: false as const, state: "Stopped" as const }),
-    onSome: ({ revision, state }) => ({
+    onSome: ({ version, revision, state }) => ({
       installed,
       enabled,
       managed,
       running: true as const,
+      version,
       revision,
       state: state._tag,
     }),
