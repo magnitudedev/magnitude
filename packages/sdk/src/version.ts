@@ -10,7 +10,7 @@ import {
 
 /**
  * SDK version, overridable via `MAGNITUDE_ACN_VERSION` env var for dev/testing.
- * This is only the client's initial ACN identity. `AcnJitRuntime` owns the
+ * This is only the client's initial ACN identity. `AcnConnection` owns the
  * effective identity after construction and advances it when the client adopts
  * a newer ACN.
  */

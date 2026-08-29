@@ -44,6 +44,11 @@ export {
   type AcnLaunchOverride,
 } from "./acn-jit/local-acn-instance-manager"
 export {
+  makeLocalAcnRequireRunningInstanceManager,
+  makeLocalAcnStartingInstanceManager,
+  type LocalAcnObservationOptions,
+} from "./acn-jit/local-acn-require-running-manager"
+export {
   ChildProcessSpawner,
   scopeAcnCandidate,
   type SpawnedAcnCandidate,
@@ -54,9 +59,14 @@ export {
   RemoteAcnErrorResponseSchema,
 } from "./acn-jit/remote-acn-instance-manager"
 export {
-  makeAcnJitRuntime,
+  makeAcnConnection,
+  AcnRecoveryInactive,
+  AcnRecovering,
+  AcnRecovered,
   type AcnStartup,
-  type AcnJitRuntime,
+  type AcnRecovery,
+  type AcnRecoveryState,
+  type AcnConnection,
 } from "./acn-jit/acn-recovering-client"
 export {
   AcnLifecycleStateSchema,
@@ -69,6 +79,7 @@ export {
   type AcnInstallationPhase,
   type AcnFailureStage,
   type AcnStartupProgress,
+  formatAcnEnsuranceError,
 } from "./acn-jit/lifecycle"
 
 export { TracingLayer, makeTracingLayer, type MakeTracingLayerOptions } from "./tracing"
@@ -88,7 +99,7 @@ export {
 export { createRoles, isRoleId, ROLE_IDS, ROLE_TO_SLOT, DEFAULT_REASONING_EFFORT, SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS } from "@magnitudedev/roles"
 export type { RoleId } from "@magnitudedev/roles"
 
-export { acnInstallationPresent, resolveBinaryCommand, defaultBinaryPath, defaultDataDir, type ResolveBinaryOptions, type ResolvedBinaryCommand } from "./binary"
+export { acnInstallationPresent, resolveBinaryCommand, defaultBinaryPath, defaultDataDir, type BinaryAcquisitionEvent, type ResolveBinaryOptions, type ResolvedBinaryCommand } from "./binary"
 export { ACN_EXECUTABLE_NAME } from "@magnitudedev/release/executables"
 export { SDK_VERSION, SDK_REVISION, SDK_ACN_TARGET } from "./version"
 export {

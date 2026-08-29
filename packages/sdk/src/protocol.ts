@@ -2,7 +2,7 @@
  * Base protocol layer for known daemon URLs.
  *
  * This module is browser-safe: it builds the HTTP RPC protocol only and does
- * not spawn or discover daemons. Interactive clients use `makeAcnJitRuntime`
+ * not spawn or discover services. Interactive clients use `makeAcnConnection`
  * from the SDK entrypoint; this layer serves tests and fixed-URL tooling.
  */
 import { RpcClient, RpcSerialization } from "@effect/rpc"

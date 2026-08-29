@@ -4,7 +4,6 @@ import type { CliRenderer } from "@opentui/core"
 import { createCliRenderer } from "@opentui/core"
 import { createRoot } from "@opentui/react"
 import {
-  Atom,
   Registry,
   RegistryContext,
   Result,
@@ -14,6 +13,8 @@ import type * as FileSystem from "@effect/platform/FileSystem"
 import type * as CommandExecutor from "@effect/platform/CommandExecutor"
 import type * as HttpClient from "@effect/platform/HttpClient"
 import type * as Path from "@effect/platform/Path"
+import type * as Terminal from "@effect/platform/Terminal"
+import { FetchHttpClient } from "@effect/platform"
 import {
   createAgentClient,
   onboardingModelSetupViewAtom,
@@ -27,23 +28,18 @@ import {
   type UpdateAction,
 } from "@magnitudedev/release"
 import { logger } from "@magnitudedev/logger"
-import { acnInstallationPresent, SDK_ACN_TARGET } from "@magnitudedev/sdk"
+import {
+  acnInstallationPresent,
+  SDK_ACN_TARGET,
+  type AcnConnection,
+  type AcnEnsuranceError,
+} from "@magnitudedev/sdk"
 import {
   interactiveProcessExitCode,
   runInteractiveProcess,
 } from "@magnitudedev/utils/process"
 import type { StateDocumentError } from "@magnitudedev/storage"
-import {
-  Array as Arr,
-  Deferred,
-  Effect,
-  Fiber,
-  Option,
-  Runtime,
-  Schema,
-  Scope,
-  Stream,
-} from "effect"
+import { Array as Arr, Effect, Fiber, Layer, Option, Schema, Scope, Stream } from "effect"
 import type { SessionOptions } from "@magnitudedev/sdk"
 import type { CliAppProps, SessionStart } from "../app"
 import type { AuthSource } from "../state/cli-atoms"
@@ -55,8 +51,7 @@ import {
   probeTerminalAppearance,
 } from "../platform/terminal-appearance"
 import {
-  makeTerminalPlatform,
-  type TerminalPlatformRuntime,
+  makeTerminalAdapter,
 } from "../platform/terminal"
 import {
   makeProcessExitSource,
@@ -64,15 +59,15 @@ import {
   type ProcessExitRequest,
 } from "../platform/process-exit"
 import { terminalAppearanceAtom } from "../hooks/use-theme"
-import type { UpdatePromptOutcome } from "../features/update/prompt"
 import { executeUpdate } from "../features/update/execute"
 import { CliUpdater, makeCliUpdater } from "../features/update/updater"
-import {
-  CliStartupRoot,
-  makeCliRootStateAtom,
-  type CliRootState,
-} from "./root"
+import { CliApplicationRoot } from "./root"
 import { makeHarnessConnection } from "../harness-connections/service"
+import { makeAcnConnectionWithInstanceManager } from "../server/acn-connection"
+import { makeBootstrappingAcnInstanceManager } from "../server/acn-instance-manager"
+import { resolveCliTheme } from "../utils/theme"
+import { runInlineUpdatePrompt } from "../startup/inline-update-prompt"
+import { makeInlineServiceStartupPresenter } from "../startup/inline-service-lifecycle"
 
 export class CliRendererAcquisitionFailed extends Schema.TaggedError<CliRendererAcquisitionFailed>()(
   "CliRendererAcquisitionFailed",
@@ -113,12 +108,6 @@ type ExitRace<A> =
   | { readonly _tag: "Value"; readonly value: A }
   | { readonly _tag: "Exit"; readonly request: ProcessExitRequest }
 
-interface RootCallbacks {
-  readonly onUpdateSelect: (outcome: UpdatePromptOutcome) => void
-  readonly onDaemonRetry: () => void
-  readonly onDaemonQuit: () => void
-}
-
 const acquireRegistry = Effect.acquireRelease(
   Effect.sync(() => Registry.make({
     scheduleTask,
@@ -156,16 +145,18 @@ const acquireRoot = (renderer: CliRenderer) => Effect.acquireRelease(
 const renderRoot = (
   root: Root,
   registry: ReturnType<typeof Registry.make>,
-  stateAtom: Atom.Atom<CliRootState>,
-  callbacks: RootCallbacks,
+  platform: Parameters<typeof CliApplicationRoot>[0]["platform"],
+  agentClient: Parameters<typeof CliApplicationRoot>[0]["agentClient"],
+  startup: Parameters<typeof CliApplicationRoot>[0]["startup"],
+  app: CliAppProps,
 ): Effect.Effect<void> => Effect.sync(() => {
   root.render(
     <RegistryContext.Provider value={registry}>
-      <CliStartupRoot
-        stateAtom={stateAtom}
-        onUpdateSelect={callbacks.onUpdateSelect}
-        onDaemonRetry={callbacks.onDaemonRetry}
-        onDaemonQuit={callbacks.onDaemonQuit}
+      <CliApplicationRoot
+        platform={platform}
+        agentClient={agentClient}
+        startup={startup}
+        app={app}
       />
     </RegistryContext.Provider>,
   )
@@ -202,11 +193,11 @@ const preApplicationExit = (
   : { _tag: "Exit", code: 0, notices: [], fatal: Option.none() }
 
 const closeApplication = (
-  terminal: TerminalPlatformRuntime,
+  connection: AcnConnection,
   request: ProcessExitRequest,
 ): Effect.Effect<InteractiveSessionResult> => request._tag === "Fatal"
   ? Effect.succeed(fatalResult(request))
-  : terminal.close.pipe(
+  : connection.close.pipe(
       Effect.map(() => {
         const notices: string[] = []
         const activeSessionId = getLastSessionId()
@@ -227,9 +218,9 @@ const runInteractiveSession = (
   options: InteractiveLaunchOptions,
 ): Effect.Effect<
   InteractiveSessionResult,
-  CliRendererAcquisitionFailed | StateDocumentError,
+  CliRendererAcquisitionFailed | StateDocumentError | AcnEnsuranceError,
   CliUpdater | FileSystem.FileSystem | Path.Path | Scope.Scope
-    | CommandExecutor.CommandExecutor | HttpClient.HttpClient
+    | CommandExecutor.CommandExecutor | HttpClient.HttpClient | Terminal.Terminal
 > => Effect.gen(function* () {
   const updater = yield* CliUpdater
   const registry = yield* acquireRegistry
@@ -240,49 +231,13 @@ const runInteractiveSession = (
     },
   })
   const processExit = yield* makeProcessExitSource
-  const runtime = yield* Effect.runtime<never>()
 
   // The appearance probe starts with the session — concurrent with discovery
-  // and daemon work — and self-terminates within one terminal roundtrip
+  // and service work — and self-terminates within one terminal roundtrip
   // (fence) or its 100ms ceiling, so its answer is in long before anything
   // paints. It owns terminal input until then; the renderer is only created
   // after it is joined.
   const appearanceProbe = yield* Effect.forkScoped(probeTerminalAppearance())
-
-  let updateSelectionHandler: (outcome: UpdatePromptOutcome) => void = () => {}
-  let daemonRetryHandler: () => void = () => {}
-  const callbacks: RootCallbacks = {
-    onUpdateSelect: (outcome) => { updateSelectionHandler(outcome) },
-    onDaemonRetry: () => { daemonRetryHandler() },
-    onDaemonQuit: () => { process.kill(process.pid, "SIGINT") },
-  }
-
-  // The renderer (and with it the alternate screen) is acquired at the first
-  // moment a state must render, never earlier; the root is created once.
-  const mountedAtom: { current: Atom.Writable<CliRootState> | null } = {
-    current: null,
-  }
-  const mountPresentation = (initial: CliRootState) => Effect.gen(function* () {
-    registry.set(terminalAppearanceAtom, yield* Fiber.join(appearanceProbe))
-    const renderer = yield* acquireRenderer
-    yield* installTerminalAppearanceRuntime(renderer, registry)
-    const stateAtom = makeCliRootStateAtom(initial)
-    const root = yield* acquireRoot(renderer)
-    yield* renderRoot(root, registry, stateAtom, callbacks)
-    mountedAtom.current = stateAtom
-  })
-  const present = (
-    state: CliRootState,
-  ): Effect.Effect<
-    void,
-    CliRendererAcquisitionFailed,
-    FileSystem.FileSystem | Path.Path | Scope.Scope
-  > => Effect.suspend(() => {
-    const stateAtom = mountedAtom.current
-    return stateAtom !== null
-      ? Effect.sync(() => registry.set(stateAtom, state))
-      : mountPresentation(state)
-  })
 
   // Update interaction happens only on plain interactive launches with a
   // known owning package manager; discovery itself still runs and caches.
@@ -300,17 +255,13 @@ const runInteractiveSession = (
 
   const presentUpdatePrompt = (latestVersion: string, action: UpdateAction) =>
     Effect.gen(function* () {
-      const selection = yield* Deferred.make<UpdatePromptOutcome>()
-      updateSelectionHandler = (outcome) => {
-        Deferred.unsafeDone(selection, Effect.succeed(outcome))
-      }
-      yield* present({
-        _tag: "UpdatePrompt",
+      const appearance = yield* Fiber.join(appearanceProbe)
+      const selected = yield* raceExit(runInlineUpdatePrompt({
         currentVersion: CLI_VERSION,
         latestVersion,
         action,
-      })
-      const selected = yield* raceExit(Deferred.await(selection), processExit.await)
+        theme: resolveCliTheme(appearance),
+      }), processExit.await)
       if (selected._tag === "Exit") {
         return { _tag: "Exit", request: selected.request } as const
       }
@@ -331,7 +282,7 @@ const runInteractiveSession = (
     }
   }
 
-  // The installation gate: with no installed daemon build this launch is about
+  // The installation gate: with no installed service build this launch is about
   // to download one, so it awaits the version check first — an offer must
   // prompt before any download of the version it would replace. Installation
   // needs the network regardless, so the wait costs nothing real.
@@ -351,89 +302,72 @@ const runInteractiveSession = (
     }
   }
 
-  const platformResult = yield* raceExit(
-    makeTerminalPlatform({
-      launchCommand: developmentLaunchCommand(options),
-      debug: options.debug,
-      effectLoggingLayer: Option.some(effectLoggingLayer),
+  const connectionResult = yield* raceExit(
+    Effect.gen(function* () {
+      const manager = yield* makeBootstrappingAcnInstanceManager({
+        launchCommand: developmentLaunchCommand(options),
+        debug: options.debug,
+      })
+      return yield* makeAcnConnectionWithInstanceManager(manager)
     }),
     processExit.await,
   )
-  if (platformResult._tag === "Exit") return preApplicationExit(platformResult.request)
-  const terminal = platformResult.value
-  daemonRetryHandler = () => {
-    Runtime.runFork(runtime)(terminal.platform.acnStartup.retry.pipe(Effect.ignore))
-  }
+  if (connectionResult._tag === "Exit") return preApplicationExit(connectionResult.request)
+  const connection = connectionResult.value
+  const appearance = yield* Fiber.join(appearanceProbe)
+  const startupTheme = resolveCliTheme(appearance)
+  const serviceStartup = yield* makeInlineServiceStartupPresenter(startupTheme)
 
-  const prepared = yield* raceExit(
-    terminal.platform.acnStartup.prepare,
-    processExit.await,
-  )
-  if (prepared._tag === "Exit") return preApplicationExit(prepared.request)
+  type ServiceWaitOutcome =
+    | { readonly _tag: "Ready" }
+    | { readonly _tag: "FreshOffer"; readonly version: string }
+    | { readonly _tag: "Exit"; readonly request: ProcessExitRequest }
 
-  if (prepared.value._tag !== "Ready") {
-    yield* present({ _tag: "DaemonStartup", lifecycle: prepared.value })
-
-    const driveToReady = terminal.platform.acnStartup.state.changes.pipe(
-      Stream.tap((state) => state._tag === "Ready"
-        ? Effect.void
-        : present({ _tag: "DaemonStartup", lifecycle: state })),
-      Stream.filter((state) => state._tag === "Ready"),
-      Stream.runHead,
-      Effect.asVoid,
+  // A fresh update offer may interrupt terminal presentation, but it does not
+  // interrupt the shared SDK ensurance occurrence. Declining resumes from the
+  // current authoritative lifecycle state.
+  let starting = true
+  while (starting) {
+    const readiness = Effect.race(
+      serviceStartup.run(connection.startup).pipe(
+        Effect.map((): ServiceWaitOutcome => ({ _tag: "Ready" })),
+      ),
+      processExit.await.pipe(Effect.map(
+        (request): ServiceWaitOutcome => ({ _tag: "Exit", request }),
+      )),
     )
-
-    type DaemonWaitOutcome =
-      | { readonly _tag: "Ready" }
-      | { readonly _tag: "FreshAnswer"; readonly latest: Option.Option<string> }
-      | { readonly _tag: "Exit"; readonly request: ProcessExitRequest }
-
-    // The daemon work races the discovery answer: an offer arriving before the
-    // app commits presents the prompt, and daemon work continues behind it —
-    // declining loses nothing, accepting interrupts old-version work by
-    // closing the scope.
-    let starting = true
-    while (starting) {
-      const waiters: Array<Effect.Effect<
-        DaemonWaitOutcome,
-        CliRendererAcquisitionFailed,
-        FileSystem.FileSystem | Path.Path | Scope.Scope
-      >> = [
-        driveToReady.pipe(Effect.map((): DaemonWaitOutcome => ({ _tag: "Ready" }))),
-        processExit.await.pipe(Effect.map(
-          (request): DaemonWaitOutcome => ({ _tag: "Exit", request }),
-        )),
-      ]
-      if (Option.isSome(updateMethod) && freshPending) {
-        waiters.push(discovery.fresh.pipe(Effect.map(
-          (latest): DaemonWaitOutcome => ({ _tag: "FreshAnswer", latest }),
-        )))
-      }
-      const outcome = yield* Effect.raceAll(waiters)
-      if (outcome._tag === "Exit") return preApplicationExit(outcome.request)
-      if (outcome._tag === "Ready") {
-        starting = false
-        continue
-      }
-      freshPending = false
-      const offer = offerable(outcome.latest)
-      if (Option.isNone(offer) || Option.isNone(updateMethod)) continue
-      const action = updateActionFor(updateMethod.value, offer.value)
-      const resolution = yield* presentUpdatePrompt(offer.value, action)
-      if (resolution._tag === "Exit") return preApplicationExit(resolution.request)
-      if (resolution._tag === "Update") {
-        return { _tag: "UpdateRequested", action }
-      }
-      yield* present({
-        _tag: "DaemonStartup",
-        lifecycle: yield* terminal.platform.acnStartup.state.get,
-      })
+    const outcome = Option.isSome(updateMethod) && freshPending
+      ? yield* Effect.race(readiness, discovery.fresh.pipe(
+        Effect.flatMap((latest) => Option.match(offerable(latest), {
+          onNone: () => Effect.never,
+          onSome: (offer): Effect.Effect<ServiceWaitOutcome> => Effect.succeed({
+            _tag: "FreshOffer",
+            version: offer,
+          }),
+        })),
+      ))
+      : yield* readiness
+    if (outcome._tag === "Exit") return preApplicationExit(outcome.request)
+    if (outcome._tag === "Ready") {
+      starting = false
+      continue
+    }
+    freshPending = false
+    if (Option.isNone(updateMethod)) continue
+    const action = updateActionFor(updateMethod.value, outcome.version)
+    const resolution = yield* presentUpdatePrompt(outcome.version, action)
+    if (resolution._tag === "Exit") return preApplicationExit(resolution.request)
+    if (resolution._tag === "Update") {
+      return { _tag: "UpdateRequested", action }
     }
   }
 
   const connected = yield* raceExit(Effect.gen(function* () {
     const harnessConnection = yield* makeHarnessConnection
-    const agentClient = createAgentClient(terminal.platform.protocolLayer, {
+    const protocolLayer = connection.protocolLayer.pipe(Layer.provide(
+      Layer.mergeAll(FetchHttpClient.layer, effectLoggingLayer),
+    ))
+    const agentClient = createAgentClient(protocolLayer, {
       onboardingSetupInitiallyOpen: options.setup,
       harnessConnection,
     })
@@ -449,15 +383,20 @@ const runInteractiveSession = (
     sessionStart: options.sessionStart,
     initialPrompt: options.initialPrompt,
     envAuth: options.envAuth,
-    initialAcnLifecycle: yield* terminal.platform.acnStartup.state.get,
     sessionOptions: options.sessionOptions,
   }
-  yield* present({
-    _tag: "Application",
-    platform: terminal.platform,
-    agentClient: connected.value,
+  registry.set(terminalAppearanceAtom, appearance)
+  const renderer = yield* acquireRenderer
+  yield* installTerminalAppearanceRuntime(renderer, registry)
+  const root = yield* acquireRoot(renderer)
+  yield* renderRoot(
+    root,
+    registry,
+    makeTerminalAdapter(),
+    connected.value,
+    connection.startup,
     app,
-  })
+  )
 
   // A discovery answer arriving after the app committed surfaces as one
   // notification line; the prompt would interrupt real work now.
@@ -492,8 +431,8 @@ const runInteractiveSession = (
     processExit.await.pipe(Effect.map((request) => ({ _tag: "Exit" as const, request }))),
     handoff.pipe(Effect.map((plan) => ({ _tag: "Launch" as const, plan }))),
   )
-  if (outcome._tag === "Exit") return yield* closeApplication(terminal, outcome.request)
-  yield* terminal.close.pipe(Effect.ignore)
+  if (outcome._tag === "Exit") return yield* closeApplication(connection, outcome.request)
+  yield* connection.close.pipe(Effect.ignore)
   stopDisplayViewController()
   return { _tag: "LaunchHarness", plan: outcome.plan }
 })
@@ -519,11 +458,12 @@ export const runInteractiveCommand = (
   options: InteractiveLaunchOptions,
 ): Effect.Effect<
   number,
-  CliRendererAcquisitionFailed | StateDocumentError,
+  CliRendererAcquisitionFailed | StateDocumentError | AcnEnsuranceError,
   | CommandExecutor.CommandExecutor
   | FileSystem.FileSystem
   | HttpClient.HttpClient
   | Path.Path
+  | Terminal.Terminal
 > => Effect.gen(function* () {
   const updater = yield* makeCliUpdater({
     currentVersion: CLI_VERSION,

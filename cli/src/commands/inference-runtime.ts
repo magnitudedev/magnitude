@@ -1,4 +1,5 @@
 import { Atom, Registry } from "@effect-atom/atom"
+import { FetchHttpClient } from "@effect/platform"
 import { Client, Mutation } from "@magnitudedev/effect-query"
 import {
   MagnitudeBoundary,
@@ -8,8 +9,8 @@ import {
   installedAcquisition,
   magnitudeImplementationsLayer,
 } from "@magnitudedev/sdk"
-import { Effect, Option, Schema } from "effect"
-import { makeTerminalPlatform } from "../platform/terminal"
+import { Effect, Layer, Schema } from "effect"
+import { existingAcnConnection } from "../server/acn-connection"
 
 const decodeModelId = Schema.decodeUnknown(ProviderModelIdSchema)
 const decodeSlotId = Schema.decodeUnknown(SlotIdSchema)
@@ -27,25 +28,26 @@ const printJson = (value: unknown) => Effect.sync(() => {
 
 const explain = (error: unknown): string => typeof error === "object"
   && error !== null
-  && "message" in error
-  && typeof error.message === "string"
-  ? error.message
+  && "reason" in error
+  && typeof error.reason === "string"
+  ? error.reason
+  : typeof error === "object" && error !== null
+    && "message" in error && typeof error.message === "string"
+    ? error.message
   : String(error)
 
 const runModels = <Value>(
   use: (client: CliModelsClient, registry: Registry.Registry) => Effect.Effect<Value, unknown>,
 ) => Effect.runPromise(Effect.scoped(
   Effect.gen(function* () {
-    const terminal = yield* makeTerminalPlatform({
-      launchCommand: Option.none(),
-      debug: false,
-      effectLoggingLayer: Option.none(),
-    })
+    const connection = yield* existingAcnConnection
     const registry = Registry.make()
     yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
     const client = Client.make(
       MagnitudeBoundary,
-      magnitudeImplementationsLayer(terminal.platform.protocolLayer),
+      magnitudeImplementationsLayer(connection.protocolLayer.pipe(
+        Layer.provide(FetchHttpClient.layer),
+      )),
     )
     return yield* use(client, registry)
   }).pipe(

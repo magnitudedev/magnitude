@@ -1,6 +1,7 @@
 import { Effect, Option, TestClock, TestContext } from "effect";
 import { describe, expect, it } from "vitest";
-import { makeAcnLifecycle } from "./lifecycle";
+import { AcnCandidateExitedAfterAdmission } from "./errors";
+import { formatAcnEnsuranceError, makeAcnLifecycle } from "./lifecycle";
 
 const plan = {
   daemonBytes: 100,
@@ -12,6 +13,19 @@ const run = <A, E>(effect: Effect.Effect<A, E>) =>
   Effect.runPromise(effect.pipe(Effect.provide(TestContext.TestContext)));
 
 describe("ACN installation lifecycle", () => {
+  it("formats candidate exits as diagnostics without duplicating the CLI heading", () => {
+    expect(formatAcnEnsuranceError(new AcnCandidateExitedAfterAdmission({
+      pid: 42,
+      code: 1,
+      stderr: "  local inference failed  ",
+    }))).toBe("local inference failed");
+    expect(formatAcnEnsuranceError(new AcnCandidateExitedAfterAdmission({
+      pid: 42,
+      code: 1,
+      stderr: "",
+    }))).toBe("The service process exited before becoming ready");
+  });
+
   it("weights download progress by bundle size without regressing on retry", async () => {
     await run(
       Effect.gen(function* () {

@@ -119,7 +119,7 @@ export function HarnessChooser({
       </box>
       <box style={{ height: 1 }} />
       <Button onMouseOver={() => focusItem({ _tag: "LaunchOnStartup" })} onClick={() => { focusItem({ _tag: "LaunchOnStartup" }); setLaunchOnStartup((value) => !value) }}>
-        <text style={{ fg: focusedItem?._tag === "LaunchOnStartup" ? theme.accent : theme.text.body }}>{focusedItem?._tag === "LaunchOnStartup" ? "› " : "  "}{launchOnStartup ? "[x]" : "[ ]"} Launch Magnitude server on startup</text>
+        <text style={{ fg: focusedItem?._tag === "LaunchOnStartup" ? theme.accent : theme.text.body }}>{focusedItem?._tag === "LaunchOnStartup" ? "› " : "  "}{launchOnStartup ? "[x]" : "[ ]"} Launch Magnitude service on startup</text>
       </Button>
       <Button onMouseOver={() => focusItem({ _tag: "InstallSkill" })} onClick={() => { focusItem({ _tag: "InstallSkill" }); setInstallSkill((value) => !value) }}>
         <text style={{ fg: focusedItem?._tag === "InstallSkill" ? theme.accent : theme.text.body }}>{focusedItem?._tag === "InstallSkill" ? "› " : "  "}{installSkill ? "[x]" : "[ ]"} Install Magnitude skill to help agents manage local models</text>

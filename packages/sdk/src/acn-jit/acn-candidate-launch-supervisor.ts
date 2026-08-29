@@ -216,22 +216,26 @@ export const makeAcnCandidateLaunchSupervisor = (
 
       if (current._tag === "Admitted" && !Option.exists(owner, (value) => ownerNamesProcess(value, process))) {
         const exited = yield* child.exited.pipe(Effect.timeoutOption(CANDIDATE_EXIT_DIAGNOSTIC_TIMEOUT))
-        return yield* failFrom(current, Option.match(exited, {
+        yield* child.retireAdmittedGroup
+        const failed = yield* failFrom(current, Option.match(exited, {
           onNone: () => new AcnCandidateOwnershipLost({ pid: process.pid }),
           onSome: (exit): AcnCandidateFailure => new AcnCandidateExitedAfterAdmission({
             pid: process.pid,
             ...exit,
           }),
         }))
+        return failed
       }
 
       if (current._tag === "Admitted") {
         const exited = yield* child.exited.pipe(Effect.timeoutOption(Duration.millis(1)))
         if (Option.isSome(exited)) {
-          return yield* failFrom(current, new AcnCandidateExitedAfterAdmission({
+          yield* child.retireAdmittedGroup
+          const failed = yield* failFrom(current, new AcnCandidateExitedAfterAdmission({
             pid: process.pid,
             ...exited.value,
           }))
+          return failed
         }
       }
       return current

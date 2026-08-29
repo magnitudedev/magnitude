@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest"
+import { Command } from "@commander-js/extra-typings"
 import { ACN_EXECUTABLE_NAME } from "@magnitudedev/sdk"
 import {
   developmentServerCommand,
@@ -7,8 +8,18 @@ import {
   renderWindowsServerCommand,
   WINDOWS_RESTART_POLICY_SCRIPT,
 } from "../server/service"
+import { registerServiceCommand } from "./server"
 
-describe("Magnitude server service definitions", () => {
+describe("Magnitude service definitions", () => {
+  it("registers only the public service command group", () => {
+    const program = new Command().name("magnitude")
+    registerServiceCommand(program)
+    expect(program.commands.map((command) => command.name())).toEqual(["service"])
+    expect(program.commands[0]!.commands.map((command) => command.name())).toEqual([
+      "start",
+      "stop",
+    ])
+  })
   it("registers development startup against the local ACN entrypoint", () => {
     expect(developmentServerCommand("/opt/bun")).toEqual([
       "/opt/bun",

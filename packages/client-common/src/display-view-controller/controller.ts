@@ -256,7 +256,7 @@ export class DisplayViewControllerCore {
       ...this.snapshot,
       phase: "reconnecting",
       connectionError: {
-        message: "Reconnecting to daemon...",
+        message: "Reconnecting to Magnitude service...",
         reconnecting: true,
         invariantViolation: false,
       },
@@ -446,7 +446,7 @@ export class DisplayViewControllerCore {
           ...this.snapshot,
           phase: "reconnecting",
           connectionError: {
-            message: "Reconnecting to daemon...",
+            message: "Reconnecting to Magnitude service...",
             reconnecting: true,
             invariantViolation: false,
           },

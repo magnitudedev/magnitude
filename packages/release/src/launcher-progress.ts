@@ -17,6 +17,7 @@ export interface LauncherInstallationProgress {
 
 const DECIMAL_MEGABYTE = 1_000_000
 const DECIMAL_KILOBYTE = 1_000
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const
 
 const formatBytes = (bytes: number): string =>
   bytes < DECIMAL_MEGABYTE
@@ -52,6 +53,7 @@ export const makeLauncherInstallationProgress = (
 ): LauncherInstallationProgress => {
   const interactive = output.isTTY === true
   let lastInteractiveUpdate = ""
+  let spinnerFrame = 0
   const reportedStages = new Set<ArtifactInstallationEvent["_tag"]>()
 
   const clear = Effect.sync(() => {
@@ -66,6 +68,7 @@ export const makeLauncherInstallationProgress = (
       report: (event) =>
         Effect.sync(() => {
           const label = eventLabel(event)
+          const { completed, total } = eventProgress(event)
           if (!interactive) {
             if (!reportedStages.has(event._tag)) {
               reportedStages.add(event._tag)
@@ -74,24 +77,24 @@ export const makeLauncherInstallationProgress = (
             return
           }
 
-          const { completed, total } = eventProgress(event)
-          const percent = Math.min(
-            100,
-            Math.floor((completed / Math.max(1, total)) * 100),
-          )
-          const updateKey = `${event._tag}:${percent}`
+          const percent = event._tag === "Downloading"
+            ? Math.min(100, Math.floor((completed / Math.max(1, total)) * 100))
+            : null
+          const updateKey = percent === null ? event._tag : `${event._tag}:${percent}`
           if (updateKey === lastInteractiveUpdate) return
           lastInteractiveUpdate = updateKey
+          const spinner = SPINNER_FRAMES[spinnerFrame++ % SPINNER_FRAMES.length]!
+          const measurement = percent === null
+            ? ""
+            : ` ${percent}% (${formatBytes(completed)} / ${formatBytes(total)})`
           output.write(
-            `\r\u001b[2K${label}... ${percent}% (${formatBytes(completed)} / ${formatBytes(total)})`,
+            `\r\u001b[2K${spinner} ${label}...${measurement}`,
           )
         }),
     },
-    succeeded: interactive
-      ? clear
-      : Effect.sync(() => {
-          output.write("Magnitude CLI installed.\n")
-        }),
+    succeeded: clear.pipe(Effect.zipRight(Effect.sync(() => {
+      output.write("✓ Magnitude CLI installed\n")
+    }))),
     failed: clear,
   }
 }

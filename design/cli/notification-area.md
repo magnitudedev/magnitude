@@ -1,6 +1,7 @@
 ---
 applies_to:
   - packages/client-common/src/state/notification-area-state.ts
+  - packages/client-common/src/state/acn-recovery.ts
   - cli/src/app.tsx
   - cli/src/runtime/interactive.tsx
   - cli/src/platform/effect-logger.ts
@@ -33,6 +34,12 @@ occurrence.
 The area stores semantic priority and action values, never terminal colors, callbacks, server
 state, or duplicated lifecycle counters. Terminal rendering owns layout, theme colors, hover state,
 and action dispatch.
+
+Service recovery follows the same ownership rule. The SDK owns the typed recovery occurrence and
+its fresh lifecycle; client-common projects an active occurrence as persistent activity in this
+area. Completion removes that projection and publishes the ephemeral notice `Reconnected to
+Magnitude service`. Recovery never creates a parallel overlay or returns the application to startup
+UI.
 
 ## Resolution
 

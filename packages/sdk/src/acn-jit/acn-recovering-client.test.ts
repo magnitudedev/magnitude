@@ -29,7 +29,7 @@ import {
 } from "effect"
 import { AcnEnsuranceFailed } from "./errors"
 import { AcnInstanceManager } from "./acn-instance-manager"
-import { makeAcnJitRuntime } from "./acn-recovering-client"
+import { makeAcnConnection } from "./acn-recovering-client"
 import { SDK_VERSION } from "../version"
 
 type ReadyInstance = AcnInstance<AcnReady>
@@ -106,7 +106,26 @@ const rpcClient = (
   })}\n`, { status: 200 })))
 }))
 
-describe("AcnJitRuntime", () => {
+describe("AcnConnection", () => {
+  it("publishes no visible startup observation before an already-ready selection", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const connection = yield* makeAcnConnection().pipe(
+        Effect.provideService(AcnInstanceManager, AcnInstanceManager.of({
+          ensure: () => Stream.succeed({ _tag: "Ready" as const, instance: ready }),
+          stop: Effect.void,
+        })),
+        Effect.provideService(HttpClient.HttpClient, rpcClient([])),
+      )
+      yield* connection.startup.awaitReady
+      expect((yield* connection.startup.state.get)._tag).toBe("Ready")
+      const states = yield* connection.startup.state.changes.pipe(
+        Stream.take(1),
+        Stream.runCollect,
+      )
+      expect(Array.from(states).map((state) => state._tag)).toEqual(["Ready"])
+    })))
+  })
+
   it("single-flights bootstrap and retry", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const release = yield* Deferred.make<void>()
@@ -120,11 +139,11 @@ describe("AcnJitRuntime", () => {
         stop: Effect.void,
       })
       const tags: string[] = []
-      const runtime = yield* makeAcnJitRuntime().pipe(
+      const connection = yield* makeAcnConnection().pipe(
         Effect.provideService(AcnInstanceManager, manager),
         Effect.provideService(HttpClient.HttpClient, rpcClient(tags)),
       )
-      const retry = yield* runtime.startup.retry.pipe(Effect.fork)
+      const retry = yield* connection.startup.retry.pipe(Effect.fork)
       while (calls === 0) yield* Effect.sleep(Duration.millis(1))
       expect(calls).toBe(1)
       yield* Deferred.succeed(release, undefined)
@@ -136,7 +155,7 @@ describe("AcnJitRuntime", () => {
 
   it("scope finalization interrupts selection before readiness", async () => {
     const tags: string[] = []
-    await Effect.runPromise(Effect.scoped(makeAcnJitRuntime().pipe(
+    await Effect.runPromise(Effect.scoped(makeAcnConnection().pipe(
       Effect.provideService(AcnInstanceManager, AcnInstanceManager.of({
         ensure: () => Stream.never,
         stop: Effect.void,
@@ -147,10 +166,10 @@ describe("AcnJitRuntime", () => {
     expect(tags).toHaveLength(0)
   })
 
-  it("closes an admitted runtime from its owning scope finalizer", async () => {
+  it("closes an admitted connection from its owning scope finalizer", async () => {
     const tags: string[] = []
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const runtime = yield* makeAcnJitRuntime().pipe(
+      const connection = yield* makeAcnConnection().pipe(
         Effect.provideService(AcnInstanceManager, AcnInstanceManager.of({
           ensure: () => Stream.succeed({ _tag: "Ready" as const, instance: ready }),
           stop: Effect.void,
@@ -158,11 +177,11 @@ describe("AcnJitRuntime", () => {
         Effect.provideService(HttpClient.HttpClient, rpcClient(tags)),
       )
 
-      // TerminalPlatform owns the runtime this way. Accepting an update exits
+      // The CLI startup scope owns the connection this way. Accepting an update exits
       // its scope without calling close first, so this finalizer performs the
       // first close after the owning scope has begun finalization.
-      yield* Effect.addFinalizer(() => runtime.close.pipe(Effect.asVoid))
-      yield* runtime.startup.retry
+      yield* Effect.addFinalizer(() => connection.close.pipe(Effect.asVoid))
+      yield* connection.startup.retry
     })))
 
     expect(tags.filter((tag) => tag === "GetModelSlots")).toHaveLength(0)
@@ -172,7 +191,7 @@ describe("AcnJitRuntime", () => {
     const tags: string[] = []
     let entered = 0
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const runtime = yield* makeAcnJitRuntime().pipe(
+      const connection = yield* makeAcnConnection().pipe(
         Effect.provideService(AcnInstanceManager, AcnInstanceManager.of({
           ensure: () => Stream.unwrap(Effect.sync(() => {
             entered += 1
@@ -183,7 +202,7 @@ describe("AcnJitRuntime", () => {
         Effect.provideService(HttpClient.HttpClient, rpcClient(tags)),
       )
       while (entered === 0) yield* Effect.sleep(Duration.millis(1))
-      yield* runtime.close
+      yield* connection.close
       expect(tags).toHaveLength(0)
     })))
   })
@@ -200,14 +219,14 @@ describe("AcnJitRuntime", () => {
         })),
         stop: Effect.void,
       })
-      const runtime = yield* makeAcnJitRuntime().pipe(
+      const connection = yield* makeAcnConnection().pipe(
         Effect.provideService(AcnInstanceManager, manager),
         Effect.provideService(HttpClient.HttpClient, rpcClient([])),
       )
       const waiters = yield* Effect.all([
-        runtime.startup.retry.pipe(Effect.exit),
-        runtime.startup.retry.pipe(Effect.exit),
-        runtime.startup.retry.pipe(Effect.exit),
+        connection.startup.retry.pipe(Effect.exit),
+        connection.startup.retry.pipe(Effect.exit),
+        connection.startup.retry.pipe(Effect.exit),
       ], { concurrency: "unbounded" }).pipe(Effect.fork)
       while (calls === 0) yield* Effect.sleep(Duration.millis(1))
       yield* Effect.yieldNow()
@@ -227,15 +246,15 @@ describe("AcnJitRuntime", () => {
         ),
         stop: Effect.void,
       })
-      const runtime = yield* makeAcnJitRuntime().pipe(
+      const connection = yield* makeAcnConnection().pipe(
         Effect.provideService(AcnInstanceManager, manager),
         Effect.provideService(HttpClient.HttpClient, rpcClient([])),
       )
-      const waiting = yield* runtime.startup.retry.pipe(Effect.exit, Effect.fork)
+      const waiting = yield* connection.startup.retry.pipe(Effect.exit, Effect.fork)
       yield* Deferred.await(entered)
       yield* TestClock.adjust(Duration.minutes(10))
       expect(Exit.isFailure(yield* Fiber.join(waiting))).toBe(true)
-      expect((yield* runtime.startup.state.get)._tag).toBe("Failed")
+      expect((yield* connection.startup.state.get)._tag).toBe("Failed")
     })).pipe(Effect.provide(TestContext.TestContext)))
   })
 
@@ -258,22 +277,33 @@ describe("AcnJitRuntime", () => {
     const tags: string[] = []
     const http = rpcClient(tags, [ready, successor], new Set([ready.id]))
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const runtime = yield* makeAcnJitRuntime().pipe(
+      const connection = yield* makeAcnConnection().pipe(
         Effect.provideService(AcnInstanceManager, manager),
         Effect.provideService(HttpClient.HttpClient, http),
       )
-      yield* runtime.startup.retry
-      expect((yield* runtime.startup.state.get)._tag).toBe("Ready")
+      yield* connection.startup.retry
+      expect((yield* connection.startup.state.get)._tag).toBe("Ready")
       const client = yield* AcnRpc.makeRpcClient(AcnBoundary).pipe(
-        Effect.provide(runtime.protocolLayer.pipe(
+        Effect.provide(connection.protocolLayer.pipe(
           Layer.provide(Layer.succeed(HttpClient.HttpClient, http)),
         )),
       )
+      const recoveryStates = yield* connection.startup.recovery.changes.pipe(
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.fork,
+      )
+      yield* Effect.yieldNow()
       const health = yield* client.Health({})
       expect(health.id).toBe(successor.id)
       expect(ensures).toBe(2)
       expect(tags.filter((tag) => tag === "Health")).toHaveLength(2)
-      expect((yield* runtime.startup.state.get)._tag).toBe("Ready")
+      expect((yield* connection.startup.state.get)._tag).toBe("Ready")
+      expect(Array.from(yield* Fiber.join(recoveryStates)).map((state) => state._tag)).toEqual([
+        "Inactive",
+        "Recovering",
+        "Recovered",
+      ])
     })))
   })
 
@@ -288,7 +318,7 @@ describe("AcnJitRuntime", () => {
       stop: Effect.void,
     })
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const runtime = yield* makeAcnJitRuntime().pipe(
+      const connection = yield* makeAcnConnection().pipe(
         Effect.provideService(AcnInstanceManager, manager),
         Effect.provideService(HttpClient.HttpClient, rpcClient(
           tags,
@@ -297,11 +327,11 @@ describe("AcnJitRuntime", () => {
           new Set(["GetModelSlots"]),
         )),
       )
-      yield* runtime.startup.retry
-      yield* runtime.close
-      yield* runtime.close
+      yield* connection.startup.retry
+      yield* connection.close
+      yield* connection.close
       expect(tags).toHaveLength(0)
-      expect(Exit.isFailure(yield* Effect.exit(runtime.startup.retry))).toBe(true)
+      expect(Exit.isFailure(yield* Effect.exit(connection.startup.retry))).toBe(true)
       expect(ensures).toBe(1)
     })))
   })

@@ -49,6 +49,12 @@ const observationOwner = (observation: AcnOwnerObservation): Option.Option<AcnOw
   }
 }
 
+/** Ownership recorded for a process that this observation proves is still present. */
+const liveObservationOwner = (observation: AcnOwnerObservation): Option.Option<AcnOwnerRecord> =>
+  observation._tag === "AcnRecordedOwnerAbsent"
+    ? Option.none()
+    : Option.some(observation.owner)
+
 const observationContinuity = (observation: AcnOwnerObservation): ObservationContinuity => {
   switch (observation._tag) {
     case "AcnRecordedOwnerAbsent": return { _tag: "OwnerAbsent" }
@@ -140,7 +146,7 @@ export const makeAcnEnsuranceCoordinator = (
         const next = updateMemory(previous, observation, now)
         return [next, next]
       })
-      const candidate = yield* options.candidateSupervisor.reconcile(observationOwner(observation))
+      const candidate = yield* options.candidateSupervisor.reconcile(liveObservationOwner(observation))
 
       if (observation._tag === "AcnRecordedOwnerLiveWithHealth") {
         const progress = acnLifecycleObservationFromHealthState(observation.health.health.state)

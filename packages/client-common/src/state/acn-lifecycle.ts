@@ -7,7 +7,7 @@ import {
 } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import type { AcnLifecycleState } from "@magnitudedev/sdk"
-import { usePlatform } from "../platform/platform-context"
+import { useAcnStartup } from "./acn-startup"
 
 export function useAcnLifecycle(
   initialState: AcnLifecycleState,
@@ -15,17 +15,14 @@ export function useAcnLifecycle(
   readonly state: AcnLifecycleState
   readonly retry: () => void
 } {
-  const { acnStartup } = usePlatform()
+  const startup = useAcnStartup()
   const stateAtom = useMemo(
-    () =>
-      Atom.make(acnStartup.state.changes, {
-        initialValue: initialState,
-      }),
-    [acnStartup, initialState],
+    () => Atom.make(startup.state.changes, { initialValue: initialState }),
+    [startup, initialState],
   )
   const retryAtom = useMemo(
-    () => Atom.fn<"RetryAcn">()(() => acnStartup.retry),
-    [acnStartup],
+    () => Atom.fn<"RetryAcn">()(() => startup.retry),
+    [startup],
   )
   const state = Option.getOrElse(
     Result.value(useAtomValue(stateAtom)),

@@ -70,6 +70,20 @@ describe("scopeAcnCandidate", () => {
     expect(groupStops).toBe(0)
   })
 
+  it("reaps the exact admitted group when its root exits before readiness", async () => {
+    let groupStops = 0
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const child = yield* candidate({
+        releaseParentChannel: Effect.void,
+        stopBootstrapProcess: Effect.void,
+      })
+      yield* child.confirmExactProcess(exact)
+      yield* child.admit
+      yield* child.retireAdmittedGroup
+    })).pipe(Effect.provideService(ProcessGroupController, controller(() => { groupStops += 1 }))))
+    expect(groupStops).toBe(1)
+  })
+
   it("runs exact process-group cleanup when admission acknowledgement fails", async () => {
     let groupStops = 0
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {

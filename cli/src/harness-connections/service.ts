@@ -14,7 +14,7 @@ import { ProviderModelIdSchema, type ProviderModelId } from "@magnitudedev/sdk"
 import { makeStateDocument } from "@magnitudedev/storage"
 import { Data, Effect, Option, Schema } from "effect"
 import { delimiter } from "node:path"
-import { installServerOnStartup } from "../server/service"
+import { installServiceOnStartup } from "../server/service"
 import { writeFileAtomic } from "../utils/atomic-file"
 import {
   HarnessModelSchema,
@@ -135,7 +135,7 @@ description: Instructions for \`magnitude\` cli to discover, install, and manage
 
 # Magnitude
 
-Magnitude is an inference server with a built-in harness for discovering, managing, and using local models.
+Magnitude is a local inference service with a built-in harness for discovering, managing, and using local models.
 
 Magnitude is accessed via the \`magnitude\` CLI.
 
@@ -218,7 +218,7 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     Effect.mapError((error) => failure("list", String(error))),
   ))
 
-  const installStartup = provide(options.installStartup ?? installServerOnStartup).pipe(
+  const installStartup = provide(options.installStartup ?? installServiceOnStartup).pipe(
     Effect.mapError((error) => failure("startup", String(error))),
   )
 

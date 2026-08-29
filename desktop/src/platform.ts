@@ -4,14 +4,15 @@
  * Wraps the `__magnitudeDesktop` DesktopApi exposed by the preload bridge.
  * ACN ensurance remains one contract across the Electron boundary.
  */
-import { Effect, Exit, Layer, Schema, Scope, Stream } from "effect"
+import { Effect, Exit, Schema, Scope, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import {
   AcnEnsuranceFailed,
   AcnAdministrationFailed,
   AcnEnsuranceError,
   AcnInstanceManager,
-  makeAcnJitRuntime,
+  makeAcnConnection,
+  type AcnConnection,
   type AcnEnsureEvent,
   type AcnInstanceManager as AcnInstanceManagerService,
 } from "@magnitudedev/sdk"
@@ -111,8 +112,27 @@ function createDesktopAcnManager(
   })
 }
 
+export async function createDesktopAcnConnection(
+  desktopApi: DesktopApi,
+): Promise<AcnConnection> {
+  const manager = createDesktopAcnManager(desktopApi)
+  const acnScope = await Effect.runPromise(Scope.make())
+  const connection = await Effect.runPromise(
+    makeAcnConnection().pipe(
+      Effect.provideService(AcnInstanceManager, manager),
+      Effect.provideService(Scope.Scope, acnScope),
+      Effect.provide(FetchHttpClient.layer),
+    ),
+  )
+  const close = await Effect.runPromise(Effect.cached(
+    connection.close.pipe(Effect.ensuring(Scope.close(acnScope, Exit.void))),
+  ))
+  return { ...connection, close }
+}
+
 export async function createDesktopPlatform(
   desktopApi: DesktopApi,
+  connection: AcnConnection,
 ): Promise<Platform> {
   api = desktopApi
   let browserSnapshot: BrowserWorkspaceState | null = null
@@ -188,30 +208,8 @@ export async function createDesktopPlatform(
     cancelDownload: (downloadId) => desktopApi.browser.cancelDownload(downloadId),
     revealDownload: (downloadId) => desktopApi.browser.revealDownload(downloadId),
   }
-  const manager = createDesktopAcnManager(desktopApi)
-  const acnScope = await Effect.runPromise(Scope.make())
-  const acn = await Effect.runPromise(
-    makeAcnJitRuntime().pipe(
-      Effect.provideService(AcnInstanceManager, manager),
-      Effect.provideService(Scope.Scope, acnScope),
-      Effect.provide(FetchHttpClient.layer),
-    ),
-  )
-  const protocolLayer = acn.protocolLayer.pipe(
-    Layer.provide(FetchHttpClient.layer),
-  )
-  const shutdown = () => {
-    unsubscribeBrowser()
-    browserListeners.clear()
-    return Effect.runPromise(
-      acn.close.pipe(Effect.ensuring(Scope.close(acnScope, Exit.void))),
-    )
-  }
   return {
     id: "desktop",
-    protocolLayer,
-    acnStartup: acn.startup,
-    shutdown,
     clipboard: desktopClipboard,
     storage: desktopStorage,
     notifications: desktopNotifications,
@@ -237,7 +235,9 @@ export async function createDesktopPlatform(
       return api.onMenuAction(cb)
     },
     quit(): void {
-      void shutdown().finally(() => {
+      unsubscribeBrowser()
+      browserListeners.clear()
+      void Effect.runPromise(connection.close).finally(() => {
         api.quit()
       })
     },

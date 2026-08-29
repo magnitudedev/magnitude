@@ -3,12 +3,13 @@
  *
  * Uses browser APIs: localStorage, navigator.clipboard, window.open, fetch.
  */
-import { Effect, Exit, Layer, Scope } from "effect"
+import { Effect, Exit, Scope } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import {
   AcnInstanceManager,
-  makeAcnJitRuntime,
+  makeAcnConnection,
   makeRemoteAcnInstanceManager,
+  type AcnConnection,
 } from "@magnitudedev/sdk"
 import type {
   Platform,
@@ -118,40 +119,36 @@ const browserDialogs: Dialogs = {
   },
 }
 
-export async function createBrowserPlatform(
+export async function createBrowserAcnConnection(
   proxyUrl: string = window.location.origin
-): Promise<Platform> {
+): Promise<AcnConnection> {
   const manager = await Effect.runPromise(
     makeRemoteAcnInstanceManager(proxyUrl).pipe(
       Effect.provide(FetchHttpClient.layer)
     )
   )
   const acnScope = await Effect.runPromise(Scope.make())
-  const acn = await Effect.runPromise(
-    makeAcnJitRuntime().pipe(
+  const connection = await Effect.runPromise(
+    makeAcnConnection().pipe(
       Effect.provideService(AcnInstanceManager, manager),
       Effect.provideService(Scope.Scope, acnScope),
       Effect.provide(FetchHttpClient.layer)
     )
   )
+  const close = await Effect.runPromise(Effect.cached(
+    connection.close.pipe(Effect.ensuring(Scope.close(acnScope, Exit.void))),
+  ))
+  const scopedConnection: AcnConnection = { ...connection, close }
   window.addEventListener("pagehide", (event) => {
     if (event.persisted) return
-    Effect.runFork(
-      acn.close.pipe(Effect.ensuring(Scope.close(acnScope, Exit.void)))
-    )
+    Effect.runFork(scopedConnection.close)
   })
-  const protocolLayer = acn.protocolLayer.pipe(
-    Layer.provide(FetchHttpClient.layer)
-  )
-  const shutdown = () =>
-    Effect.runPromise(
-      acn.close.pipe(Effect.ensuring(Scope.close(acnScope, Exit.void)))
-    )
+  return scopedConnection
+}
+
+export function createBrowserPlatform(): Platform {
   return {
     id: "web",
-    protocolLayer,
-    acnStartup: acn.startup,
-    shutdown,
     clipboard: browserClipboard,
     storage: browserStorage,
     notifications: browserNotifications,

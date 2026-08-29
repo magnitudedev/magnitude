@@ -54,7 +54,7 @@ describe("harness chooser layout", () => {
       expect(frame).toContain("› Magnitude Harness  Optimized for local models")
       expect(frame).not.toContain("Recommended")
       expect(frame).not.toContain("Magnitude Harness  Optimized for local models  Installed")
-      expect(frame).toContain("  [x] Launch Magnitude server on startup")
+      expect(frame).toContain("  [x] Launch Magnitude service on startup")
       expect(frame).not.toContain("[x] Magnitude Harness  Optimized")
       expect(frame).not.toContain("Continue with Magnitude")
       expect(frame).toContain("↑/↓ choose · Space toggle · Enter continue · Ctrl+C to exit")
@@ -91,7 +91,7 @@ describe("harness chooser layout", () => {
       expect(onContinue).toHaveBeenCalledWith(expect.objectContaining({ harness: "magnitude" }))
       for (const expected of [
         "› Codex",
-        "› [x] Launch Magnitude server on startup",
+        "› [x] Launch Magnitude service on startup",
         "› [x] Install Magnitude skill to help agents manage local models",
       ]) {
         act(() => keyboard.handler?.(keyEvent("down")))

@@ -209,7 +209,7 @@ export function useComposerState(commandContext: CommandContext): UseComposerSta
         setPendingUserSubmit(false)
         activationPromiseRef.current = null
         commandContext.showSystemMessage(
-          "The connection was lost after sending. Magnitude will keep this message visible while it reconciles with the daemon.",
+          "The connection was lost after sending. Magnitude will keep this message visible while it reconnects to the service.",
         )
         return
       }

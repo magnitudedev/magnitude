@@ -22,6 +22,8 @@ export const LAUNCH_PROTOCOL_VERSION_VARIABLE = "MAGNITUDE_LAUNCH_PROTOCOL_VERSI
 export const LAUNCH_PROTOCOL_VERSION = 1
 /** BSD EX_TEMPFAIL: the installation changed under this launcher; run again. */
 export const RELAUNCH_EXIT_CODE = 75
+/** The installation changed; run the new CLI once as `magnitude service start`. */
+export const POST_UPDATE_SERVICE_START_EXIT_CODE = 76
 
 export const PackageManagerSchema = Schema.Literal("npm", "bun", "pnpm")
 export type PackageManager = typeof PackageManagerSchema.Type

@@ -6,7 +6,8 @@ applies_to:
   - packages/sdk/src/acn-jit/acn-ensurance-coordinator.ts
   - packages/sdk/src/acn-jit/remote-acn-instance-manager.ts
   - packages/sdk/src/jit-rpc/**
-  - packages/client-common/src/state/acn-lifecycle.ts
+  - packages/client-common/src/state/acn-recovery.ts
+  - packages/client-common/src/state/acn-startup.ts
   - cli/src/features/app-shell/**
   - cli/src/platform/**
   - desktop/src/*.ts
@@ -16,11 +17,12 @@ applies_to:
 
 # ACN client lifecycle
 
-Each interactive client owns one `AcnJitRuntime`. The runtime owns the client's effective ACN
+Each interactive client owns one `AcnConnection`. The connection owns the client's effective ACN
 identity, exact selected `AcnInstance<AcnReady>`, single-flight selection, recovering transport,
-bootstrap presentation, and one-way close. It does not interpret
+startup lifecycle observation, recovery occurrences, and one-way close. It does not interpret
 coordination state, probe health, choose replacement, or manage processes; those belong to
-`AcnInstanceManager`.
+`AcnInstanceManager`. Host adapters such as the terminal and browser platforms contain only
+environment operations; they do not own service acquisition, transport, startup, or recovery.
 
 These are presentation states, not another ACN service lifecycle.
 
@@ -53,18 +55,17 @@ initial
     `-- retry fails -------------------------------> [Failed]
 
 [Ready]
-    `-- terminal; endpoint recovery does not move presentation backward
+    `-- terminal for startup; endpoint recovery uses a fresh occurrence lifecycle
 ```
 
 Any non-ready state may reach `Ready` when exact endpoint selection succeeds.
 
 ## Bootstrap presentation phases
 
-The bootstrap presentation is a projection of the latest authoritative observation available to
-the client. A parent phase remains visible while work below it has not yet published a more specific
-observation. In particular, `PreparingAcn` means that endpoint selection is active but the instance
-manager or daemon has not yet published a finer startup observation; it does not mean that the
-manager is only reading the owner store.
+The startup lifecycle is a projection of authoritative observations available to the client. An
+already-ready selection may move directly from `Checking` to `Ready`; selection does not synthesize
+`PreparingAcn` merely to prove that it is active. This preserves the warm-start guarantee that the
+CLI can check readiness without painting transient progress.
 
 ```text
 Client bootstrap
@@ -169,6 +170,12 @@ Every RPC carries both URL and exact ACN instance ID. ACN dispatch rejects anoth
 Transport failure clears only the matching failed selection, joins or starts the same selection
 single-flight, then retries the exact request according to its transport contract. Domain failure
 and caller cancellation do not trigger recovery.
+
+Once initial selection has succeeded, every replacement selection owns a fresh lifecycle and a
+monotonic recovery occurrence. The runtime exposes `Inactive | Recovering(lifecycle) | Recovered`
+separately from startup. Clients may project that occurrence into their existing notification area;
+they must not move startup presentation backward, remount application UI, or duplicate selection
+and retry logic.
 
 A successful selection is a point-in-time fact. Retirement may begin after selection; exact request
 addressing prevents misrouting and recovery handles that unavoidable race. Desktop and web preserve

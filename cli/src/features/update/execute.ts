@@ -1,6 +1,7 @@
 import {
   LAUNCH_PROTOCOL_VERSION,
   LAUNCH_PROTOCOL_VERSION_VARIABLE,
+  POST_UPDATE_SERVICE_START_EXIT_CODE,
   RELAUNCH_EXIT_CODE,
   updateCommandString,
   type UpdateAction,
@@ -27,7 +28,10 @@ export const executeUpdate = (
         // The launcher re-runs its pipeline and starts the new version.
         return RELAUNCH_EXIT_CODE
       }
-      process.stdout.write("\nUpdate ran successfully. Please restart Magnitude.\n")
+      if (!options.relaunch && launcherSpeaksRelaunch()) {
+        return POST_UPDATE_SERVICE_START_EXIT_CODE
+      }
+      process.stdout.write("\nUpdate ran successfully. Run `magnitude service start` to activate it.\n")
       return 0
     })
   }).pipe(
