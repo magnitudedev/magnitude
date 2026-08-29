@@ -1,4 +1,4 @@
-import { Effect, Schema } from "effect"
+import { Effect, Layer, Schema, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 
 import {
@@ -6,6 +6,8 @@ import {
   formatLocalModelAssessmentFailure,
   localModelAssessmentProfiles,
   localModelAssessmentResultFromIcn,
+  LocalModelAssessments,
+  LocalModelAssessmentsLive,
   performanceSampleContextTokens,
   type LocalModelAssessment,
 } from "./local-model-assessments"
@@ -15,10 +17,12 @@ import {
   ServableModelBundleSchema,
   type ServableModelBundle,
 } from "@magnitudedev/acn-protocol"
+import { IcnClient, type IcnClientService } from "@magnitudedev/icn"
 import {
   ModelServingConfiguration as NativeModelServingConfigurationSchema,
   type ModelServingConfiguration as NativeModelServingConfiguration,
 } from "@magnitudedev/icn-protocol/schemas"
+import { LocalModelPackages } from "./local-model-packages"
 
 const modelPackage = (id: string, maximumContextLength: number) =>
   Schema.decodeUnknownSync(ModelPackageSchema)({
@@ -262,6 +266,97 @@ describe("localModelAssessmentResultFromIcn", () => {
       [{ contextLength: 50_000 }, { contextLength: 50_000 }],
       [],
     ))).toThrow()
+  })
+})
+
+describe("LocalModelAssessments stream lifecycle", () => {
+  const environmentId = "environment-test"
+  const request = (id: string) => ({
+    bundle: standaloneBundle(100_000),
+    profiles: [{ contextLength: id === "first" ? 50_000 : 100_000 }],
+  })
+  const failedResult = (index: number) => ({
+    _tag: "Result" as const,
+    result: {
+      _tag: "Failed" as const,
+      requestId: `assessment-${index}`,
+      failure: {
+        code: `failure-${index}`,
+        message: `failure ${index}`,
+        retryable: false,
+      },
+    },
+  })
+  const runAssessment = (
+    events: Stream.Stream<unknown>,
+    requests = [request("first"), request("second")],
+  ) => {
+    let calls = 0
+    const client = {
+      models: {
+        assessModels: () => {
+          calls += 1
+          return Effect.succeed({ status: 200, headers: {}, events })
+        },
+      },
+    } as unknown as IcnClientService
+    const dependencies = Layer.merge(
+      Layer.succeed(IcnClient, client),
+      Layer.succeed(LocalModelPackages, LocalModelPackages.of({
+        initialized: Effect.succeed(true),
+        state: Effect.die("unused package state"),
+        changes: Stream.never,
+        installedPackageIds: Effect.succeed(new Set(["package-test"])),
+        refresh: Effect.void,
+      })),
+    )
+    const received: number[] = []
+    const effect = Effect.gen(function* () {
+      const assessments = yield* LocalModelAssessments
+      yield* assessments.assess(requests, (index) => Effect.sync(() => {
+        received.push(index)
+      }))
+    }).pipe(Effect.provide(LocalModelAssessmentsLive.pipe(Layer.provide(dependencies))))
+    return { effect, received, calls: () => calls }
+  }
+
+  it("submits every target once and publishes results in stream order", async () => {
+    const operation = runAssessment(Stream.fromIterable([
+      { _tag: "Started", environmentId, totalTargets: 2 },
+      failedResult(1),
+      failedResult(0),
+      { _tag: "Completed", environmentId, totalTargets: 2 },
+    ]))
+
+    await Effect.runPromise(operation.effect)
+
+    expect(operation.calls()).toBe(1)
+    expect(operation.received).toEqual([1, 0])
+  })
+
+  it("preserves received results and rejects EOF before Completed", async () => {
+    const operation = runAssessment(Stream.fromIterable([
+      { _tag: "Started", environmentId, totalTargets: 2 },
+      failedResult(0),
+    ]))
+
+    const error = await Effect.runPromise(operation.effect.pipe(Effect.flip))
+
+    expect(operation.received).toEqual([0])
+    expect(error).toMatchObject({ code: "incomplete_model_assessment_response" })
+  })
+
+  it("rejects duplicate target results", async () => {
+    const operation = runAssessment(Stream.fromIterable([
+      { _tag: "Started", environmentId, totalTargets: 2 },
+      failedResult(0),
+      failedResult(0),
+    ]))
+
+    const error = await Effect.runPromise(operation.effect.pipe(Effect.flip))
+
+    expect(operation.received).toEqual([0])
+    expect(error).toMatchObject({ code: "invalid_model_assessment_response" })
   })
 })
 

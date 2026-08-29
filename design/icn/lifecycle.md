@@ -368,7 +368,10 @@ incompatible mutations are serialized by `ModelInstanceController`; they
 never rely on ACN-side locking. Ready state carries the actual selected parallelism, physical
 context allocation, and memory-domain allocation. Hardware snapshots do not own that evidence.
 The ICN composition root initializes native discovery and the calibration planning worker before
-hardware calibration and readiness. Additional persistent planning workers are created on demand.
+hardware calibration and readiness. One pool actor owns the actual initialized planning-worker
+processes; unused capacity is numeric and additional workers are activated one at a time on demand.
+Only warm workers execute concurrently. A canceled waiter cannot return a still-running worker to
+the pool, and a failed worker is retired before replacement capacity is admitted.
 Each resident load creates one private `inference-worker` child; that child initializes its own process-lifetime
 native-backend capability, prepares and loads exactly one topology, and owns the executor until it
 exits. Persistent ICN exposes the loaded backend through a bounded framed-IPC proxy. Template

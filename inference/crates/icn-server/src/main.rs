@@ -16,13 +16,14 @@ use icn_contracts::bootstrap_protocol::{
     IcnStartupProgressRecordType, IcnStartupRecord, IcnStartupRecordType,
 };
 use icn_contracts::models::{
-    AssessModelRequest, AssessModelResult, AssessModelsRequest, AssessModelsResponse,
+    AssessModelRequest, AssessModelResult, AssessModelsEvent, AssessModelsRequest,
     AssessmentEnvironmentId, InstalledModelPackages as _, MemoryAssessment, ModelAssessment,
-    ModelAssessmentId, ModelAssessmentProfile as DomainModelAssessmentProfile, ModelAssessor,
-    ModelBundleInput, ModelFailure as DomainModelFailure, ModelInstance, ModelInstanceFailure,
-    ModelInstanceId, ModelInstanceLifecycle, ModelInstancesInvalidation, ModelInstancesSnapshot,
-    ModelLoadPlan, ModelLoadStage, ModelPackageId, ModelPackageOperand, ModelReleaseReason,
-    ModelServingConfiguration, ModelStoppingAllocation, PerformanceConfidence, PerformanceEvidence,
+    ModelAssessmentId, ModelAssessmentProfile as DomainModelAssessmentProfile,
+    ModelAssessmentStream, ModelAssessor, ModelBundleInput, ModelFailure as DomainModelFailure,
+    ModelInstance, ModelInstanceFailure, ModelInstanceId, ModelInstanceLifecycle,
+    ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadPlan, ModelLoadStage,
+    ModelPackageId, ModelPackageOperand, ModelReleaseReason, ModelServingConfiguration,
+    ModelStoppingAllocation, PerformanceConfidence, PerformanceEvidence,
     RemoveInstalledModelPackageResponse, ServableModelBundle as DomainServableModelBundle,
     SpeculativeDraftSource as ModelSpeculativeDraftSource, SpeculativeDraftSourceInput,
     SpeculativeMethod,
@@ -680,11 +681,11 @@ impl PlanningExecutor {
     }
 }
 
-struct PlanningJob {
-    command: PlanningWorkerCommand,
+struct PendingPlanningJob {
+    request: PlanningWorkerRequest,
     enqueued_at: std::time::Instant,
     deadline: tokio::time::Instant,
-    response: tokio::sync::oneshot::Sender<Result<PlanningWorkerReply, InventoryError>>,
+    response: tokio::sync::oneshot::Sender<Result<PlanningWorkerResponse, InventoryError>>,
 }
 
 struct PlanningWorkerProcess {
@@ -701,181 +702,92 @@ impl PlanningWorkerProcess {
             .unwrap_or_else(|_| "planning worker diagnostic buffer was poisoned".to_owned())
     }
 
-    fn terminate(mut self) -> String {
-        let diagnostics = self.diagnostics();
+    async fn retire(mut self) {
         let _ = self.child.start_kill();
-        tokio::spawn(async move {
-            let _ = tokio::time::timeout(PLANNING_WORKER_REAP_TIMEOUT, self.child.wait()).await;
-            self.stderr_reader.abort();
-            let _ = self.stderr_reader.await;
-        });
-        diagnostics
+        let _ = tokio::time::timeout(PLANNING_WORKER_REAP_TIMEOUT, self.child.wait()).await;
+        self.stderr_reader.abort();
+        let _ = self.stderr_reader.await;
     }
 }
 
-#[derive(Clone)]
-struct PersistentPlanningWorker {
-    jobs: tokio::sync::mpsc::Sender<PlanningJob>,
+enum PlanningPoolCommand {
+    Assess(PendingPlanningJob),
 }
 
-impl PersistentPlanningWorker {
-    fn start(
-        launcher: NativeWorkerLauncher,
-        hardware_calibration: Arc<std::sync::OnceLock<NativeHardwareCalibration>>,
-        initialization_gate: Arc<tokio::sync::Mutex<()>>,
-    ) -> Self {
-        let (jobs, receiver) = tokio::sync::mpsc::channel(32);
-        tokio::spawn(run_planning_worker_supervisor(
-            launcher,
-            receiver,
-            hardware_calibration,
-            initialization_gate,
-        ));
-        Self { jobs }
-    }
-
-    async fn execute(
-        &self,
-        command: PlanningWorkerCommand,
-    ) -> Result<PlanningWorkerReply, InventoryError> {
-        let now = tokio::time::Instant::now();
-        let hard_deadline = now + MODEL_ASSESSMENT_TIMEOUT;
-        let operation_deadline = match &command {
-            PlanningWorkerCommand::Assess { request } => request.deadline_at_ms.map(|deadline| {
-                now + std::time::Duration::from_millis(deadline.saturating_sub(unix_time_millis()))
-            }),
-            PlanningWorkerCommand::Initialize { .. } => None,
-        };
-        let deadline =
-            operation_deadline.map_or(hard_deadline, |deadline| deadline.min(hard_deadline));
-        let (response, result) = tokio::sync::oneshot::channel();
-        tokio::time::timeout_at(
-            deadline,
-            self.jobs.send(PlanningJob {
-                command,
-                enqueued_at: std::time::Instant::now(),
-                deadline,
-                response,
-            }),
-        )
-        .await
-        .map_err(|_| {
-            planning_worker_failure("planning_deadline", "model assessment deadline expired")
-        })?
-        .map_err(|_| {
-            planning_worker_failure("planner_unavailable", "planning worker is unavailable")
-        })?;
-        tokio::time::timeout_at(deadline, result)
-            .await
-            .map_err(|_| {
-                planning_worker_failure("planning_deadline", "model assessment deadline expired")
-            })?
-            .map_err(|_| {
-                planning_worker_failure("planner_unavailable", "planning worker stopped")
-            })?
-    }
-
-    async fn initialize(
-        &self,
-        hardware_calibration: Option<NativeHardwareCalibration>,
-    ) -> Result<NativeHardwareCalibration, InventoryError> {
-        match self
-            .execute(PlanningWorkerCommand::Initialize {
-                hardware_calibration,
-            })
-            .await?
-        {
-            PlanningWorkerReply::Initialized {
-                hardware_calibration,
-            } => Ok(hardware_calibration),
-            PlanningWorkerReply::Defect { message } => Err(InventoryError::Internal(format!(
-                "planning worker defect: {message}"
-            ))),
-            PlanningWorkerReply::Assessed { .. } => Err(InventoryError::Internal(
-                "planning worker returned assessment during initialization".to_owned(),
-            )),
-        }
-    }
-
-    async fn assess(
-        &self,
-        request: PlanningWorkerRequest,
-    ) -> Result<PlanningWorkerResponse, InventoryError> {
-        match self
-            .execute(PlanningWorkerCommand::Assess { request })
-            .await?
-        {
-            PlanningWorkerReply::Assessed { response } => Ok(response),
-            PlanningWorkerReply::Defect { message } => Err(InventoryError::Internal(format!(
-                "model assessment defect: {message}"
-            ))),
-            PlanningWorkerReply::Initialized { .. } => Err(InventoryError::Internal(
-                "planning worker returned initialization during assessment".to_owned(),
-            )),
-        }
-    }
+struct PlanningActivationFailure {
+    error: InventoryError,
+    process: Option<PlanningWorkerProcess>,
 }
 
 #[derive(Clone)]
 struct PersistentPlanningWorkerPool {
-    workers: Arc<Vec<PersistentPlanningWorker>>,
-    hardware_calibration: Arc<std::sync::OnceLock<NativeHardwareCalibration>>,
-    available: tokio::sync::mpsc::UnboundedSender<usize>,
-    available_receiver: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<usize>>>,
+    commands: tokio::sync::mpsc::Sender<PlanningPoolCommand>,
 }
 
-struct PlanningWorkerLease {
-    index: usize,
-    available: tokio::sync::mpsc::UnboundedSender<usize>,
+enum PlanningPoolTask {
+    Activated(Result<PlanningWorkerProcess, PlanningActivationFailure>),
+    Executed {
+        worker: PlanningWorkerProcess,
+        result: Result<PlanningWorkerResponse, InventoryError>,
+        response: tokio::sync::oneshot::Sender<Result<PlanningWorkerResponse, InventoryError>>,
+        queue_microseconds: u64,
+        worker_microseconds: u64,
+    },
+    Retired,
 }
 
-impl Drop for PlanningWorkerLease {
-    fn drop(&mut self) {
-        let _ = self.available.send(self.index);
-    }
+struct PlanningWorkerPoolOwner {
+    launcher: NativeWorkerLauncher,
+    hardware_calibration: NativeHardwareCalibration,
+    maximum_workers: usize,
+    idle: Vec<PlanningWorkerProcess>,
+    pending: std::collections::VecDeque<PendingPlanningJob>,
+    active_workers: usize,
+    retiring_workers: usize,
+    expansion: PlanningExpansionState,
+    tasks: tokio::task::JoinSet<PlanningPoolTask>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlanningExpansionState {
+    Ready,
+    Activating,
+    DeferredWhileWarm,
 }
 
 impl PersistentPlanningWorkerPool {
-    fn start(launcher: NativeWorkerLauncher, size: usize) -> Self {
-        let size = size.max(1);
-        let hardware_calibration = Arc::new(std::sync::OnceLock::new());
-        let initialization_gate = Arc::new(tokio::sync::Mutex::new(()));
-        let workers = (0..size)
-            .map(|_| {
-                PersistentPlanningWorker::start(
-                    launcher.clone(),
-                    hardware_calibration.clone(),
-                    initialization_gate.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let (available, available_receiver) = tokio::sync::mpsc::unbounded_channel();
-        for index in 0..workers.len() {
-            available
-                .send(index)
-                .expect("planning-worker availability receiver exists");
-        }
-        Self {
-            workers: Arc::new(workers),
-            hardware_calibration,
-            available,
-            available_receiver: Arc::new(tokio::sync::Mutex::new(available_receiver)),
-        }
-    }
-
-    async fn initialize(
-        &self,
+    async fn start(
+        launcher: NativeWorkerLauncher,
+        maximum_workers: usize,
         hardware_calibration: Option<NativeHardwareCalibration>,
-    ) -> Result<NativeHardwareCalibration, InventoryError> {
-        let established = self.workers[0].initialize(hardware_calibration).await?;
-        self.hardware_calibration
-            .set(established.clone())
-            .map_err(|_| {
-                InventoryError::Internal(
-                    "planning worker pool was initialized more than once".to_owned(),
-                )
-            })?;
-        Ok(established)
+    ) -> Result<(Self, NativeHardwareCalibration), InventoryError> {
+        let deadline = tokio::time::Instant::now() + MODEL_ASSESSMENT_TIMEOUT;
+        let (worker, hardware_calibration) =
+            match activate_planning_worker(&launcher, hardware_calibration, deadline).await {
+                Ok(activated) => activated,
+                Err(failure) => {
+                    if let Some(process) = failure.process {
+                        process.retire().await;
+                    }
+                    return Err(failure.error);
+                }
+            };
+        let (commands, receiver) = tokio::sync::mpsc::channel(32);
+        tokio::spawn(run_planning_worker_pool(
+            PlanningWorkerPoolOwner {
+                launcher,
+                hardware_calibration: hardware_calibration.clone(),
+                maximum_workers: maximum_workers.max(1),
+                idle: vec![worker],
+                pending: std::collections::VecDeque::new(),
+                active_workers: 0,
+                retiring_workers: 0,
+                expansion: PlanningExpansionState::Ready,
+                tasks: tokio::task::JoinSet::new(),
+            },
+            receiver,
+        ));
+        Ok((Self { commands }, hardware_calibration))
     }
 
     async fn assess(
@@ -888,21 +800,32 @@ impl PersistentPlanningWorkerPool {
             (now + std::time::Duration::from_millis(deadline.saturating_sub(unix_time_millis())))
                 .min(hard_deadline)
         });
-        let index = tokio::time::timeout_at(deadline, async {
-            self.available_receiver.lock().await.recv().await
-        })
+        let (response, result) = tokio::sync::oneshot::channel();
+        tokio::time::timeout_at(
+            deadline,
+            self.commands
+                .send(PlanningPoolCommand::Assess(PendingPlanningJob {
+                    request,
+                    enqueued_at: std::time::Instant::now(),
+                    deadline,
+                    response,
+                })),
+        )
         .await
         .map_err(|_| {
             planning_worker_failure("planning_deadline", "model assessment deadline expired")
         })?
-        .ok_or_else(|| {
+        .map_err(|_| {
             planning_worker_failure("planner_unavailable", "planning worker pool stopped")
         })?;
-        let _lease = PlanningWorkerLease {
-            index,
-            available: self.available.clone(),
-        };
-        self.workers[index].assess(request).await
+        tokio::time::timeout_at(deadline, result)
+            .await
+            .map_err(|_| {
+                planning_worker_failure("planning_deadline", "model assessment deadline expired")
+            })?
+            .map_err(|_| {
+                planning_worker_failure("planner_unavailable", "planning worker pool stopped")
+            })?
     }
 }
 
@@ -1148,23 +1071,24 @@ async fn discover_startup_hardware(
 async fn establish_hardware_calibration(
     cache: &ModelCache,
     snapshot: &HardwareSnapshot,
-    planning_workers: &PersistentPlanningWorkerPool,
-) -> Result<NativeHardwareCalibration, InventoryError> {
+    launcher: NativeWorkerLauncher,
+    maximum_workers: usize,
+) -> Result<(PersistentPlanningWorkerPool, NativeHardwareCalibration), InventoryError> {
     let input_identity = hardware_calibration_input_identity(snapshot)?;
     let now = unix_time_seconds();
-    if let Some(hardware_calibration) = cached_hardware_calibration(cache, snapshot, now)? {
-        let hardware_calibration = planning_workers
-            .initialize(Some(hardware_calibration))
-            .await?;
+    let cached = cached_hardware_calibration(cache, snapshot, now)?;
+    let cache_hit = cached.is_some();
+    let (planning_workers, hardware_calibration) =
+        PersistentPlanningWorkerPool::start(launcher, maximum_workers, cached).await?;
+    if cache_hit {
         tracing::info!(
             cache = "hit",
             metrics = hardware_calibration.metrics.len(),
             "hardware calibration established"
         );
-        return Ok(hardware_calibration);
+        return Ok((planning_workers, hardware_calibration));
     }
 
-    let hardware_calibration = planning_workers.initialize(None).await?;
     if !hardware_calibration_is_valid(&hardware_calibration)
         || !hardware_calibration_covers_snapshot(&hardware_calibration, snapshot)
     {
@@ -1203,7 +1127,7 @@ async fn establish_hardware_calibration(
             hardware_calibration_identity,
         },
     );
-    Ok(hardware_calibration)
+    Ok((planning_workers, hardware_calibration))
 }
 
 impl NativeResolvedModelAssessor {
@@ -1631,6 +1555,7 @@ fn load_candidate_assessment_evidence(
         .map_err(|error| InventoryError::Internal(error.to_string()))
 }
 
+#[derive(Clone)]
 struct NativeModelAssessor {
     models: Arc<ManagedModelStore>,
     assessor: Arc<NativeResolvedModelAssessor>,
@@ -2305,53 +2230,104 @@ impl ModelAssessor for NativeModelAssessor {
     fn assess(
         &self,
         request: AssessModelsRequest,
-    ) -> BoxFuture<'_, Result<AssessModelsResponse, InventoryError>> {
+    ) -> BoxFuture<'_, Result<ModelAssessmentStream, InventoryError>> {
         Box::pin(async move {
-            let remaining = MODEL_ASSESSMENT_TIMEOUT;
-            let deadline_at_ms = unix_time_millis()
-                .saturating_add(u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX));
-            tokio::time::timeout(remaining, async move {
-                let environment = self.environment().await?;
-                let release_catalog = Arc::clone(&self.release_catalog);
-                let evaluated =
-                    futures_util::stream::iter(request.requests.into_iter().enumerate())
-                        .map(|(index, item)| {
+            const FINALIZATION_RESERVE: std::time::Duration = std::time::Duration::from_secs(5);
+            const MAX_TARGETS: usize = 256;
+            if request.requests.len() > MAX_TARGETS {
+                return Err(InventoryError::InvalidRequest(format!(
+                    "model assessment accepts at most {MAX_TARGETS} targets"
+                )));
+            }
+            let environment = self.environment().await?;
+            let total_targets = u32::try_from(request.requests.len()).map_err(|_| {
+                InventoryError::InvalidRequest(
+                    "model assessment target count is too large".to_owned(),
+                )
+            })?;
+            let stream_deadline = tokio::time::Instant::now() + MODEL_ASSESSMENT_TIMEOUT;
+            let target_deadline = stream_deadline - FINALIZATION_RESERVE;
+            let deadline_at_ms = unix_time_millis().saturating_add(
+                u64::try_from(
+                    MODEL_ASSESSMENT_TIMEOUT
+                        .saturating_sub(FINALIZATION_RESERVE)
+                        .as_millis(),
+                )
+                .unwrap_or(u64::MAX),
+            );
+            let assessor = self.clone();
+            let environment_id = environment.id.clone();
+            let concurrency = self.assessor.assessment_concurrency.concurrency();
+            let (events, receiver) = tokio::sync::mpsc::channel(concurrency.max(1));
+            tokio::spawn(async move {
+                let operation = async {
+                    if events
+                        .send(AssessModelsEvent::Started {
+                            environment_id: environment_id.clone(),
+                            total_targets,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let release_catalog = Arc::clone(&assessor.release_catalog);
+                    let mut evaluated = futures_util::stream::iter(request.requests)
+                        .map(|item| {
+                            let assessor = assessor.clone();
                             let environment = environment.clone();
                             let release_catalog = Arc::clone(&release_catalog);
                             let failed_request_id = item.request_id.clone();
                             async move {
-                                self.assess_request(
-                                    item,
-                                    &environment,
-                                    release_catalog,
-                                    deadline_at_ms,
+                                let evaluated = tokio::time::timeout_at(
+                                    target_deadline,
+                                    assessor.assess_request(
+                                        item,
+                                        &environment,
+                                        release_catalog,
+                                        deadline_at_ms,
+                                    ),
                                 )
                                 .await
-                            }
-                            .map(move |evaluated| {
-                                let result = evaluated.unwrap_or_else(|error| {
-                                    failed_assessment_result(failed_request_id, error)
+                                .unwrap_or_else(|_| {
+                                    Err(planning_worker_failure(
+                                        "planning_deadline",
+                                        "model assessment target deadline expired",
+                                    ))
                                 });
-                                (index, result)
-                            })
+                                evaluated.unwrap_or_else(|error| {
+                                    failed_assessment_result(failed_request_id, error)
+                                })
+                            }
                         })
-                        .buffer_unordered(self.assessor.assessment_concurrency.concurrency())
-                        .collect::<Vec<_>>()
+                        .buffer_unordered(concurrency);
+                    while let Some(result) = evaluated.next().await {
+                        if events
+                            .send(AssessModelsEvent::Result { result })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    let _ = events
+                        .send(AssessModelsEvent::Completed {
+                            environment_id,
+                            total_targets,
+                        })
                         .await;
-                let mut results = evaluated;
-                results.sort_unstable_by_key(|(index, _)| *index);
-                Ok(AssessModelsResponse {
-                    environment_id: environment.id,
-                    results: results.into_iter().map(|(_, result)| result).collect(),
-                })
-            })
-            .await
-            .map_err(|_| {
-                planning_worker_failure(
-                    "planning_deadline",
-                    "model assessment operation deadline expired",
-                )
-            })?
+                };
+                if tokio::time::timeout_at(stream_deadline, operation)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        total_targets,
+                        "model assessment stream finalization deadline expired"
+                    );
+                }
+            });
+            Ok(tokio_stream::wrappers::ReceiverStream::new(receiver).boxed())
         })
     }
 }
@@ -2466,127 +2442,297 @@ fn test_native_backend() -> NativeBackend {
         .clone()
 }
 
-async fn run_planning_worker_supervisor(
-    launcher: NativeWorkerLauncher,
-    mut jobs: tokio::sync::mpsc::Receiver<PlanningJob>,
-    shared_hardware_calibration: Arc<std::sync::OnceLock<NativeHardwareCalibration>>,
-    initialization_gate: Arc<tokio::sync::Mutex<()>>,
-) {
-    let mut child: Option<PlanningWorkerProcess> = None;
-    let mut initialized = false;
-    let mut hardware_calibration: Option<NativeHardwareCalibration> = None;
-    while let Some(job) = jobs.recv().await {
-        let queue_microseconds =
-            u64::try_from(job.enqueued_at.elapsed().as_micros()).unwrap_or(u64::MAX);
-        let worker_started = std::time::Instant::now();
-        let mut result = async {
-            if tokio::time::Instant::now() >= job.deadline {
-                return Err(planning_worker_failure(
+async fn activate_planning_worker(
+    launcher: &NativeWorkerLauncher,
+    hardware_calibration: Option<NativeHardwareCalibration>,
+    deadline: tokio::time::Instant,
+) -> Result<(PlanningWorkerProcess, NativeHardwareCalibration), PlanningActivationFailure> {
+    let mut process =
+        spawn_planning_worker(launcher).map_err(|error| PlanningActivationFailure {
+            error,
+            process: None,
+        })?;
+    let reply = match exchange_planning_frame(
+        &mut process.child,
+        &PlanningWorkerCommand::Initialize {
+            hardware_calibration,
+        },
+        deadline,
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(error) => {
+            return Err(PlanningActivationFailure {
+                error,
+                process: Some(process),
+            });
+        }
+    };
+    match reply {
+        PlanningWorkerReply::Initialized {
+            hardware_calibration,
+        } => Ok((process, hardware_calibration)),
+        PlanningWorkerReply::Defect { message } => Err(PlanningActivationFailure {
+            error: InventoryError::Internal(format!(
+                "planning worker initialization defect: {message}"
+            )),
+            process: Some(process),
+        }),
+        PlanningWorkerReply::Assessed { .. } => Err(PlanningActivationFailure {
+            error: InventoryError::Internal(
+                "planning worker assessed before initialization".to_owned(),
+            ),
+            process: Some(process),
+        }),
+    }
+}
+
+async fn assess_with_planning_worker(
+    worker: &mut PlanningWorkerProcess,
+    request: PlanningWorkerRequest,
+    deadline: tokio::time::Instant,
+) -> Result<PlanningWorkerResponse, InventoryError> {
+    match exchange_planning_frame(
+        &mut worker.child,
+        &PlanningWorkerCommand::Assess { request },
+        deadline,
+    )
+    .await?
+    {
+        PlanningWorkerReply::Assessed { response } => Ok(response),
+        PlanningWorkerReply::Defect { message } => Err(InventoryError::Internal(format!(
+            "model assessment defect: {message}"
+        ))),
+        PlanningWorkerReply::Initialized { .. } => Err(InventoryError::Internal(
+            "planning worker returned initialization during assessment".to_owned(),
+        )),
+    }
+}
+
+impl PlanningWorkerPoolOwner {
+    fn live_workers(&self) -> usize {
+        self.idle.len()
+            + self.active_workers
+            + self.retiring_workers
+            + usize::from(self.expansion == PlanningExpansionState::Activating)
+    }
+
+    fn recover_deferred_expansion_after_capacity_loss(&mut self) {
+        if self.expansion == PlanningExpansionState::DeferredWhileWarm
+            && self.idle.is_empty()
+            && self.active_workers == 0
+        {
+            self.expansion = PlanningExpansionState::Ready;
+        }
+    }
+
+    fn expire_pending(&mut self) {
+        let now = tokio::time::Instant::now();
+        let mut retained = std::collections::VecDeque::with_capacity(self.pending.len());
+        while let Some(job) = self.pending.pop_front() {
+            if job.response.is_closed() {
+                continue;
+            }
+            if job.deadline <= now {
+                let _ = job.response.send(Err(planning_worker_failure(
                     "planning_deadline",
                     "model assessment deadline expired in the planning queue",
-                ));
-            }
-            if child.is_none() {
-                child = Some(spawn_planning_worker(&launcher)?);
-                initialized = false;
-            }
-            let initialization_guard = if initialized {
-                None
-            } else {
-                Some(initialization_gate.lock().await)
-            };
-            if !initialized && !matches!(job.command, PlanningWorkerCommand::Initialize { .. }) {
-                let calibration = hardware_calibration
-                    .clone()
-                    .or_else(|| shared_hardware_calibration.get().cloned())
-                    .ok_or_else(|| {
-                        planning_worker_failure(
-                            "planner_unavailable",
-                            "planning worker has no hardware calibration",
-                        )
-                    })?;
-                let reply = exchange_planning_frame(
-                    &mut child
-                        .as_mut()
-                        .expect("planning child was established")
-                        .child,
-                    &PlanningWorkerCommand::Initialize {
-                        hardware_calibration: Some(calibration),
-                    },
-                    job.deadline,
-                )
-                .await?;
-                match reply {
-                    PlanningWorkerReply::Initialized {
-                        hardware_calibration: restored,
-                    } => {
-                        hardware_calibration = Some(restored);
-                        initialized = true;
-                    }
-                    PlanningWorkerReply::Defect { message } => {
-                        return Err(InventoryError::Internal(format!(
-                            "planning worker initialization defect: {message}"
-                        )));
-                    }
-                    PlanningWorkerReply::Assessed { .. } => {
-                        return Err(InventoryError::Internal(
-                            "planning worker assessed before initialization".to_owned(),
-                        ));
-                    }
-                }
-                drop(initialization_guard);
-            }
-            let reply = exchange_planning_frame(
-                &mut child
-                    .as_mut()
-                    .expect("planning child was established")
-                    .child,
-                &job.command,
-                job.deadline,
-            )
-            .await?;
-            if let PlanningWorkerReply::Defect { message } = &reply {
-                return Err(InventoryError::Internal(format!(
-                    "planning worker defect: {message}"
                 )));
+                continue;
             }
-            if let PlanningWorkerReply::Initialized {
-                hardware_calibration: established,
-            } = &reply
-            {
-                hardware_calibration = Some(established.clone());
-                initialized = true;
-            }
-            Ok(reply)
+            retained.push_back(job);
         }
-        .await;
-        let worker_microseconds =
-            u64::try_from(worker_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-        tracing::info!(
-            queue_microseconds,
-            worker_microseconds,
-            outcome = if result.is_ok() { "success" } else { "failure" },
-            "planning worker command completed"
-        );
-        if result.is_err() {
-            if let Some(failed) = child.take() {
-                let diagnostics = failed.terminate();
-                if !diagnostics.is_empty() {
-                    tracing::warn!(
-                        diagnostics,
-                        "planning worker failed with native diagnostics"
-                    );
-                    result = result
-                        .map_err(|error| planning_failure_with_diagnostics(error, &diagnostics));
+        self.pending = retained;
+    }
+
+    fn schedule(&mut self) {
+        self.expire_pending();
+        while !self.idle.is_empty() && !self.pending.is_empty() {
+            let mut worker = self.idle.pop().expect("idle worker was checked");
+            let job = self.pending.pop_front().expect("pending job was checked");
+            self.active_workers += 1;
+            self.tasks.spawn(async move {
+                let queue_microseconds =
+                    u64::try_from(job.enqueued_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+                let worker_started = std::time::Instant::now();
+                let result =
+                    assess_with_planning_worker(&mut worker, job.request, job.deadline).await;
+                PlanningPoolTask::Executed {
+                    worker,
+                    result,
+                    response: job.response,
+                    queue_microseconds,
+                    worker_microseconds: u64::try_from(worker_started.elapsed().as_micros())
+                        .unwrap_or(u64::MAX),
+                }
+            });
+            self.expire_pending();
+        }
+        self.recover_deferred_expansion_after_capacity_loss();
+        if self.pending.is_empty() && self.expansion == PlanningExpansionState::DeferredWhileWarm {
+            self.expansion = PlanningExpansionState::Ready;
+        }
+        if !self.pending.is_empty()
+            && self.expansion == PlanningExpansionState::Ready
+            && self.live_workers() < self.maximum_workers
+        {
+            self.expansion = PlanningExpansionState::Activating;
+            let launcher = self.launcher.clone();
+            let hardware_calibration = self.hardware_calibration.clone();
+            let deadline = tokio::time::Instant::now() + MODEL_ASSESSMENT_TIMEOUT;
+            self.tasks.spawn(async move {
+                PlanningPoolTask::Activated(
+                    activate_planning_worker(&launcher, Some(hardware_calibration), deadline)
+                        .await
+                        .map(|(worker, _)| worker),
+                )
+            });
+        }
+    }
+
+    fn retire(&mut self, process: PlanningWorkerProcess) {
+        self.retiring_workers += 1;
+        self.tasks.spawn(async move {
+            process.retire().await;
+            PlanningPoolTask::Retired
+        });
+    }
+
+    fn fail_one_pending(&mut self, error: InventoryError) {
+        self.expire_pending();
+        if let Some(job) = self.pending.pop_front() {
+            let _ = job.response.send(Err(error));
+        }
+    }
+
+    fn handle_task(&mut self, task: PlanningPoolTask) {
+        match task {
+            PlanningPoolTask::Activated(result) => {
+                assert_eq!(
+                    self.expansion,
+                    PlanningExpansionState::Activating,
+                    "activation completion requires an activating planning pool",
+                );
+                self.expansion = PlanningExpansionState::Ready;
+                match result {
+                    Ok(worker) => self.idle.push(worker),
+                    Err(failure) => {
+                        let mut error = failure.error;
+                        if let Some(process) = failure.process {
+                            let diagnostics = process.diagnostics();
+                            if !diagnostics.is_empty() {
+                                tracing::warn!(
+                                    diagnostics,
+                                    "planning worker activation failed with native diagnostics"
+                                );
+                                error = planning_failure_with_diagnostics(error, &diagnostics);
+                            }
+                            self.retire(process);
+                        }
+                        if self.idle.is_empty() && self.active_workers == 0 {
+                            self.fail_one_pending(error);
+                        } else {
+                            self.expansion = PlanningExpansionState::DeferredWhileWarm;
+                            tracing::warn!(
+                                error = %error,
+                                "planning worker capacity expansion failed; warm workers remain available"
+                            );
+                        }
+                    }
                 }
             }
-            initialized = false;
+            PlanningPoolTask::Executed {
+                worker,
+                mut result,
+                response,
+                queue_microseconds,
+                worker_microseconds,
+            } => {
+                self.active_workers = self
+                    .active_workers
+                    .checked_sub(1)
+                    .expect("completed planning work must have an active worker");
+                tracing::info!(
+                    queue_microseconds,
+                    worker_microseconds,
+                    outcome = if result.is_ok() { "success" } else { "failure" },
+                    "planning worker command completed"
+                );
+                if result.is_ok() {
+                    self.idle.push(worker);
+                } else {
+                    let diagnostics = worker.diagnostics();
+                    if !diagnostics.is_empty() {
+                        tracing::warn!(
+                            diagnostics,
+                            "planning worker failed with native diagnostics"
+                        );
+                        result = result.map_err(|error| {
+                            planning_failure_with_diagnostics(error, &diagnostics)
+                        });
+                    }
+                    self.retire(worker);
+                }
+                let _ = response.send(result);
+            }
+            PlanningPoolTask::Retired => {
+                self.retiring_workers = self
+                    .retiring_workers
+                    .checked_sub(1)
+                    .expect("completed retirement must have a retiring worker");
+            }
         }
-        let _ = job.response.send(result);
     }
-    if let Some(child) = child {
-        child.terminate();
+
+    async fn shutdown(mut self) {
+        for job in self.pending.drain(..) {
+            let _ = job.response.send(Err(planning_worker_failure(
+                "planner_unavailable",
+                "planning worker pool stopped",
+            )));
+        }
+        self.tasks.abort_all();
+        while self.tasks.join_next().await.is_some() {}
+        let retirements = self.idle.drain(..).map(PlanningWorkerProcess::retire);
+        let _ = tokio::time::timeout(
+            PLANNING_WORKER_REAP_TIMEOUT,
+            futures_util::future::join_all(retirements),
+        )
+        .await;
     }
+}
+
+async fn run_planning_worker_pool(
+    mut owner: PlanningWorkerPoolOwner,
+    mut commands: tokio::sync::mpsc::Receiver<PlanningPoolCommand>,
+) {
+    loop {
+        owner.schedule();
+        let next_deadline = owner.pending.iter().map(|job| job.deadline).min();
+        let deadline = async move {
+            match next_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            command = commands.recv() => match command {
+                Some(PlanningPoolCommand::Assess(job)) => owner.pending.push_back(job),
+                None => break,
+            },
+            task = owner.tasks.join_next(), if !owner.tasks.is_empty() => match task {
+                Some(Ok(task)) => owner.handle_task(task),
+                Some(Err(error)) => {
+                    tracing::error!(%error, "planning worker pool task failed");
+                    break;
+                }
+                None => {}
+            },
+            () = deadline => {}
+        }
+    }
+    owner.shutdown().await;
 }
 
 fn spawn_planning_worker(
@@ -5520,20 +5666,20 @@ async fn main() -> anyhow::Result<()> {
                     .flush()
                     .context("failed to publish backend preparation progress")?;
             }
-            let planning_workers = PersistentPlanningWorkerPool::start(
-                worker_launcher.clone(),
-                planning_worker_pool_size(),
-            );
-            let hardware_calibration = if fake {
-                planning_workers
-                    .initialize(Some(fixture_hardware_calibration()))
-                    .await
-                    .context("failed to initialize planning workers")?
+            let (planning_workers, hardware_calibration) = if fake {
+                PersistentPlanningWorkerPool::start(
+                    worker_launcher.clone(),
+                    planning_worker_pool_size(),
+                    Some(fixture_hardware_calibration()),
+                )
+                .await
+                .context("failed to initialize planning workers")?
             } else {
                 establish_hardware_calibration(
                     inventory.derived_cache(),
                     &startup_hardware,
-                    &planning_workers,
+                    worker_launcher.clone(),
+                    planning_worker_pool_size(),
                 )
                 .await
                 .context("hardware calibration failed during ICN startup")?
@@ -5907,6 +6053,53 @@ mod tests {
 
         assert_eq!(retained.len(), MAX_PLANNING_DIAGNOSTIC_BYTES);
         assert!(retained.ends_with(b"terminal failure"));
+    }
+
+    #[test]
+    fn planning_pool_capacity_counts_only_real_worker_lifecycles() {
+        let mut owner = PlanningWorkerPoolOwner {
+            launcher: NativeWorkerLauncher::development(),
+            hardware_calibration: fixture_hardware_calibration(),
+            maximum_workers: MAX_PLANNING_WORKERS,
+            idle: Vec::new(),
+            pending: std::collections::VecDeque::new(),
+            active_workers: 0,
+            retiring_workers: 0,
+            expansion: PlanningExpansionState::Ready,
+            tasks: tokio::task::JoinSet::new(),
+        };
+
+        assert_eq!(owner.live_workers(), 0);
+        owner.active_workers = 2;
+        owner.retiring_workers = 1;
+        owner.expansion = PlanningExpansionState::Activating;
+        assert_eq!(owner.live_workers(), 4);
+        assert_ne!(owner.live_workers(), owner.maximum_workers);
+        owner.schedule();
+        assert_eq!(owner.expansion, PlanningExpansionState::Activating);
+    }
+
+    #[test]
+    fn planning_pool_deferred_expansion_becomes_ready_when_last_warm_worker_is_lost() {
+        let mut owner = PlanningWorkerPoolOwner {
+            launcher: NativeWorkerLauncher::development(),
+            hardware_calibration: fixture_hardware_calibration(),
+            maximum_workers: MAX_PLANNING_WORKERS,
+            idle: Vec::new(),
+            pending: std::collections::VecDeque::new(),
+            active_workers: 1,
+            retiring_workers: 0,
+            expansion: PlanningExpansionState::DeferredWhileWarm,
+            tasks: tokio::task::JoinSet::new(),
+        };
+
+        assert_eq!(owner.expansion, PlanningExpansionState::DeferredWhileWarm);
+
+        owner.active_workers = 0;
+        owner.retiring_workers = 1;
+        owner.recover_deferred_expansion_after_capacity_loss();
+
+        assert_eq!(owner.expansion, PlanningExpansionState::Ready);
     }
 
     #[derive(Clone)]

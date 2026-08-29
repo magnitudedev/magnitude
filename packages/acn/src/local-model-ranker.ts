@@ -19,8 +19,6 @@ import {
   type ModelFailure,
   type ModelServingConfiguration,
   type RecommendableModel,
-  type ServableModelBundle,
-  servableModelBundlePackages,
 } from "@magnitudedev/acn-protocol"
 import { ProviderModelIdSchema, type ProviderModelId } from "@magnitudedev/ai"
 import { IcnHardware } from "@magnitudedev/icn"
@@ -75,27 +73,6 @@ export class LocalModelRanker extends Context.Tag("LocalModelRanker")<
   LocalModelRankerApi
 >() {}
 
-export const exactBundleTensorStorageBytes = (
-  model: RecommendableModel,
-): Option.Option<number> => exactTensorStorageBytes(model.configuration.bundle)
-
-const exactTensorStorageBytes = (bundle: ServableModelBundle): Option.Option<number> => {
-  const files = new Map(
-    servableModelBundlePackages(bundle)
-      .flatMap(({ files }) => files)
-      .filter((file) => file.role === "weights")
-      .map((file) => [file.sha256, file]),
-  )
-  if (files.size === 0) return Option.none()
-  let total = 0
-  for (const file of files.values()) {
-    if (Option.isNone(file.tensorStorageBytes)) return Option.none()
-    total += file.tensorStorageBytes.value
-    if (!Number.isSafeInteger(total)) return Option.none()
-  }
-  return Option.some(total)
-}
-
 export const localModelRankingCandidates = (
   entries: readonly AdaptedLocalModelCatalogEntry[],
 ): readonly RecommendableModel[] => {
@@ -108,24 +85,15 @@ export const localModelRankingCandidates = (
 
 const progressStep = (
   id: LocalModelDiscoveryProgressStepId,
-  complete: boolean,
-  startedAtMs: number,
+  status: LocalModelDiscoveryProgressStep["status"],
   counts?: { readonly completed: number; readonly total: number },
-): LocalModelDiscoveryProgressStep => complete
-  ? {
-      id,
-      status: { _tag: "Completed", startedAtMs, durationMs: 0, cached: true },
-      completedItems: counts ? Option.some(counts.completed) : Option.none(),
-      totalItems: counts ? Option.some(counts.total) : Option.none(),
-      estimatedRemainingMs: Option.none(),
-    }
-  : {
-      id,
-      status: { _tag: "Running", startedAtMs },
-      completedItems: counts ? Option.some(counts.completed) : Option.none(),
-      totalItems: counts ? Option.some(counts.total) : Option.none(),
-      estimatedRemainingMs: Option.none(),
-    }
+): LocalModelDiscoveryProgressStep => ({
+  id,
+  status,
+  completedItems: counts ? Option.some(counts.completed) : Option.none(),
+  totalItems: counts ? Option.some(counts.total) : Option.none(),
+  estimatedRemainingMs: Option.none(),
+})
 
 export const makeLocalModelRankerLive = (): Layer.Layer<
   LocalModelRanker,
@@ -143,54 +111,86 @@ export const makeLocalModelRankerLive = (): Layer.Layer<
     const catalog = catalogState.entries.map((entry) => entry.model)
     const candidates = localModelRankingCandidates(catalogState.entries)
     const hardwareState = (yield* hardware.get).state
-    const coordinated = yield* assessments.state
+    const assessmentSnapshot = yield* assessments.snapshot
+    const coordinated = assessmentSnapshot.assessments
     const installed = catalogState.entries.filter(({ source }) =>
       source.localState._tag === "Installed").length
-    const aggregateCapacity = hardwareState.memory_domains.reduce(
-      (total, domain) => total + domain.stable_capacity_bytes,
-      0,
-    )
-    const assessable = catalog.filter((model) => {
-      const bytes = exactBundleTensorStorageBytes(model)
-      return Option.isNone(bytes) || bytes.value <= aggregateCapacity
-    })
     const assessmentFor = (configuration: ModelServingConfiguration) => coordinated.find((entry) =>
       sameConfiguration(entry.configuration, configuration))?.assessment
-    const completed = assessable.filter(({ configuration }) => {
-      const result = assessmentFor(configuration)
-      return result !== undefined && result._tag !== "Assessing"
-    })
-    const rejected = catalog.length - assessable.length
-    const assessmentComplete = completed.length === assessable.length
+    const assessmentLifecycle = assessmentSnapshot.lifecycle
+    const assessmentCounts = assessmentLifecycle._tag === "Discovering"
+      ? undefined
+      : {
+          completed: assessmentLifecycle.cycle.completedTargets,
+          total: assessmentLifecycle.cycle.totalTargets,
+        }
+    const assessmentStatus: LocalModelDiscoveryProgressStep["status"] =
+      assessmentLifecycle._tag === "Assessing"
+        ? { _tag: "Running", startedAtMs: assessmentLifecycle.cycle.startedAtMs }
+        : assessmentLifecycle._tag === "Ready"
+          ? {
+              _tag: "Completed",
+              startedAtMs: assessmentLifecycle.cycle.startedAtMs,
+              durationMs: assessmentLifecycle.cycle.durationMs,
+              cached: false,
+            }
+          : assessmentLifecycle._tag === "Failed"
+            ? {
+                _tag: "Failed",
+                startedAtMs: assessmentLifecycle.cycle.startedAtMs,
+                durationMs: assessmentLifecycle.cycle.durationMs,
+                failure: assessmentLifecycle.cycle.failure,
+              }
+            : { _tag: "Pending" }
     const baseProgress = [
-      progressStep("hardware", true, startedAtMs, {
+      progressStep("hardware", {
+        _tag: "Completed",
+        startedAtMs,
+        durationMs: 0,
+        cached: true,
+      }, {
         completed: hardwareState.memory_domains.length,
         total: hardwareState.memory_domains.length,
       }),
-      progressStep("inventory", catalogState.reconciliationComplete, startedAtMs, {
+      progressStep("inventory", catalogState.reconciliationComplete
+        ? { _tag: "Completed", startedAtMs, durationMs: 0, cached: true }
+        : { _tag: "Running", startedAtMs }, {
         completed: installed,
         total: installed,
       }),
-      progressStep("assessment", assessmentComplete, startedAtMs, {
-        completed: rejected + completed.length,
-        total: catalog.length,
-      }),
+      progressStep("assessment", assessmentStatus, assessmentCounts),
     ]
-    const failed = assessable.flatMap(({ configuration }) => {
+    const failed = candidates.flatMap(({ configuration }) => {
       const result = assessmentFor(configuration)
       return result?._tag === "Failed" ? [result.failure] : []
-    })[0]
+    })[0] ?? (assessmentLifecycle._tag === "Failed" ? assessmentLifecycle.cycle.failure : undefined)
     if (failed !== undefined) {
       return {
         _tag: "Failed" as const,
         failure: failed,
-        progress: [...baseProgress, progressStep("ranking", false, startedAtMs)],
+        progress: [
+          ...baseProgress.slice(0, 2),
+          progressStep("assessment", {
+            _tag: "Failed",
+            startedAtMs: assessmentLifecycle._tag === "Discovering"
+              ? startedAtMs
+              : assessmentLifecycle.cycle.startedAtMs,
+            durationMs: assessmentLifecycle._tag === "Ready"
+              || assessmentLifecycle._tag === "Failed"
+              ? assessmentLifecycle.cycle.durationMs
+              : 0,
+            failure: failed,
+          }, assessmentCounts),
+          progressStep("ranking", { _tag: "Pending" }),
+        ],
       }
     }
-    if (!catalogState.reconciliationComplete || !assessmentComplete) {
+    if (!catalogState.reconciliationComplete
+      || assessmentLifecycle._tag === "Discovering"
+      || assessmentLifecycle._tag === "Assessing") {
       return {
         _tag: "Loading" as const,
-        progress: [...baseProgress, progressStep("ranking", false, startedAtMs)],
+        progress: [...baseProgress, progressStep("ranking", { _tag: "Pending" })],
       }
     }
     const entries = (yield* Effect.forEach(candidates, (model) => {
@@ -210,7 +210,12 @@ export const makeLocalModelRankerLive = (): Layer.Layer<
     return {
       _tag: "Ready" as const,
       entries,
-      progress: [...baseProgress, progressStep("ranking", true, startedAtMs, {
+      progress: [...baseProgress, progressStep("ranking", {
+        _tag: "Completed",
+        startedAtMs,
+        durationMs: 0,
+        cached: true,
+      }, {
         completed: entries.length,
         total: candidates.length,
       })],
@@ -220,10 +225,10 @@ export const makeLocalModelRankerLive = (): Layer.Layer<
       _tag: "Failed" as const,
       failure: localModelRankingFailure(Option.getOrUndefined(Cause.failureOption(cause))),
       progress: [
-        progressStep("hardware", false, startedAtMs),
-        progressStep("inventory", false, startedAtMs),
-        progressStep("assessment", false, startedAtMs),
-        progressStep("ranking", false, startedAtMs),
+        progressStep("hardware", { _tag: "Pending" }),
+        progressStep("inventory", { _tag: "Pending" }),
+        progressStep("assessment", { _tag: "Pending" }),
+        progressStep("ranking", { _tag: "Pending" }),
       ],
     })),
   )

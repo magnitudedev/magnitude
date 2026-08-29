@@ -6,6 +6,7 @@ import {
   Option,
   ParseResult,
   Schema,
+  Stream,
 } from "effect"
 import {
   FitsModelAssessmentSchema,
@@ -280,11 +281,11 @@ export const correlateLocalModelAssessmentProfiles = (
 export interface LocalModelAssessmentsApi {
   readonly assess: (
     requests: readonly LocalModelAssessmentRequest[],
-    onProgress: (
-      completed: number,
-      total: number,
+    onResult: (
+      requestIndex: number,
+      result: LocalModelAssessmentResult,
     ) => Effect.Effect<void>,
-  ) => Effect.Effect<readonly LocalModelAssessmentResult[], LocalInferenceError>
+  ) => Effect.Effect<void, LocalInferenceError>
 }
 
 export class LocalModelAssessments extends Context.Tag("LocalModelAssessments")<
@@ -303,11 +304,11 @@ export const LocalModelAssessmentsLive: Layer.Layer<
 
   const assess: LocalModelAssessmentsApi["assess"] = (
     requests,
-    onProgress,
+    onResult,
   ) => {
     const deadlineAtMs = Date.now() + ASSESSMENT_OPERATION_TIMEOUT_MS
     const operation = operationLock.withPermits(1)(Effect.gen(function* () {
-      if (requests.length === 0) return []
+      if (requests.length === 0) return
       const run = Effect.gen(function* () {
         const installedIds = yield* packages.installedPackageIds
         const nativeRequests = yield* Effect.forEach(
@@ -321,81 +322,87 @@ export const LocalModelAssessmentsLive: Layer.Layer<
             }
           }),
         )
-        const batchSize = 8
-        const nativeResults: Array<{
-          readonly environmentId: AssessmentEnvironmentId
-          readonly result: AssessModelResult
-        }> = []
-        let expectedEnvironmentId = Option.none<AssessmentEnvironmentId>()
-        for (let offset = 0; offset < nativeRequests.length; offset += batchSize) {
-          const batch = nativeRequests.slice(offset, offset + batchSize)
-          const response = yield* client.models.assessModels({
-            payload: {
-              requests: batch.map(({ index, nativeBundle, profiles }) => ({
-                requestId: `assessment-${index}`,
-                bundle: nativeBundle,
-                profiles: profiles.map((profile) => ({
-                  profile: servingProfileToIcn(profile),
-                  performanceContextTokens: performanceSampleContextTokens(profile),
-                })),
+        const byRequestId = new Map(nativeRequests.map((request) => [
+          `assessment-${request.index}`,
+          request,
+        ]))
+        const response = yield* client.models.assessModels({
+          payload: {
+            requests: nativeRequests.map(({ index, nativeBundle, profiles }) => ({
+              requestId: `assessment-${index}`,
+              bundle: nativeBundle,
+              profiles: profiles.map((profile) => ({
+                profile: servingProfileToIcn(profile),
+                performanceContextTokens: performanceSampleContextTokens(profile),
               })),
-            },
-          })
-          const environmentId = AssessmentEnvironmentIdSchema.make(response.environmentId)
-          if (
-            Option.isSome(expectedEnvironmentId)
-            && expectedEnvironmentId.value !== environmentId
-          ) {
-            return yield* new LocalModelMutationFailed({
-              code: "model_assessment_environment_changed",
-              message: "The hardware assessment environment changed during model assessment.",
-              retryable: true,
-            })
+            })),
+          },
+        })
+        let environmentId = Option.none<AssessmentEnvironmentId>()
+        let completed = false
+        const received = new Set<string>()
+        yield* response.events.pipe(Stream.runForEach((event) => Effect.gen(function* () {
+          if (event._tag === "Started") {
+            if (Option.isSome(environmentId) || event.totalTargets !== nativeRequests.length) {
+              return yield* failure(
+                "invalid_model_assessment_response",
+                "Native assessment returned an invalid start event.",
+              )
+            }
+            environmentId = Option.some(AssessmentEnvironmentIdSchema.make(event.environmentId))
+            return
           }
-          expectedEnvironmentId = Option.some(environmentId)
-          const expectedRequestIds = new Set(batch.map(({ index }) => `assessment-${index}`))
-          const returnedRequestIds = response.results.map(({ requestId }) => String(requestId))
+          if (event._tag === "Completed") {
+            if (
+              Option.isNone(environmentId)
+              || completed
+              || event.environmentId !== environmentId.value
+              || event.totalTargets !== nativeRequests.length
+              || received.size !== nativeRequests.length
+            ) {
+              return yield* failure(
+                "invalid_model_assessment_response",
+                "Native assessment completed without exactly one result for every request.",
+              )
+            }
+            completed = true
+            return
+          }
+          const requestId = String(event.result.requestId)
+          const request = byRequestId.get(requestId)
           if (
-            returnedRequestIds.length !== expectedRequestIds.size
-            || new Set(returnedRequestIds).size !== returnedRequestIds.length
-            || returnedRequestIds.some((requestId) => !expectedRequestIds.has(requestId))
+            Option.isNone(environmentId)
+            || completed
+            || request === undefined
+            || received.has(requestId)
           ) {
             return yield* failure(
               "invalid_model_assessment_response",
-              "Native assessment returned missing, duplicate, or unrequested request results.",
+              "Native assessment returned a result outside the declared request set.",
             )
           }
-          nativeResults.push(...response.results.map((result) => ({ environmentId, result })))
-          yield* onProgress(Math.min(offset + batch.length, requests.length), requests.length)
+          received.add(requestId)
+          const decoded = yield* localModelAssessmentResultFromIcn(
+            event.result,
+            environmentId.value,
+          ).pipe(Effect.orDie)
+          const result = decoded._tag !== "Assessed"
+            ? decoded
+            : {
+                ...decoded,
+                assessments: yield* correlateLocalModelAssessmentProfiles(
+                  request.profiles,
+                  decoded.assessments,
+                ),
+              }
+          yield* onResult(request.index, result)
+        })))
+        if (!completed) {
+          return yield* failure(
+            "incomplete_model_assessment_response",
+            "Native assessment ended before all requested models were assessed.",
+          )
         }
-        const byRequest = new Map(nativeResults.map(({ environmentId, result }) => [
-          String(result.requestId),
-          { environmentId, result },
-        ]))
-        return yield* Effect.forEach(
-          nativeRequests,
-          ({ index, profiles }) => Effect.gen(function* () {
-            const found = Option.fromNullable(byRequest.get(`assessment-${index}`))
-            if (Option.isNone(found)) {
-              return yield* failure(
-                "invalid_model_assessment_response",
-                `Native assessment returned no result for request assessment-${index}.`,
-              )
-            }
-            const decoded = yield* localModelAssessmentResultFromIcn(
-              found.value.result,
-              found.value.environmentId,
-            ).pipe(Effect.orDie)
-            if (decoded._tag !== "Assessed") return decoded
-            return {
-              ...decoded,
-              assessments: yield* correlateLocalModelAssessmentProfiles(
-                profiles,
-                decoded.assessments,
-              ),
-            }
-          }),
-        )
       })
       return yield* run
     }))

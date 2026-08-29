@@ -18,20 +18,21 @@ applies_to:
 
 ## Ownership
 
-| Concern | Owner |
-|---|---|
-| Hardware discovery, calibration, native planning, memory and performance evidence | ICN |
-| Serving-configuration construction, canonical identity, validation | ICN |
-| Profile policy, assessment orchestration, ranking scores | ACN |
-| Presentation | Clients |
+| Concern                                                                           | Owner   |
+| --------------------------------------------------------------------------------- | ------- |
+| Hardware discovery, calibration, native planning, memory and performance evidence | ICN     |
+| Serving-configuration construction, canonical identity, validation                | ICN     |
+| Profile policy, assessment demand reconciliation, ranking scores                  | ACN     |
+| Target filtering, cache reuse, scheduling, concurrency, native work               | ICN     |
+| Presentation                                                                      | Clients |
 
 ## Terms
 
-| Term | Meaning |
-|---|---|
-| **Hardware calibration** | Model-free, serializable backend-performance evidence |
-| **Model assessment** | Native evaluation of one exact servable bundle at one exact serving profile |
-| **Assessing** | Ephemeral observable state while an admitted assessment scope is alive |
+| Term                     | Meaning                                                                     |
+| ------------------------ | --------------------------------------------------------------------------- |
+| **Hardware calibration** | Model-free, serializable backend-performance evidence                       |
+| **Model assessment**     | Native evaluation of one exact servable bundle at one exact serving profile |
+| **Assessing**            | Ephemeral observable state while an admitted assessment scope is alive      |
 
 ## Hardware calibration
 
@@ -76,7 +77,7 @@ metric digest.
 
 ## Model assessment
 
-`POST /api/v1/models/assess` accepts batches of exact bundles and explicit assessment profiles. A bundle
+`POST /api/v1/models/assess` accepts one complete set of exact bundles and explicit assessment profiles. A bundle
 is one standalone package or one method-identified speculative-decoding bundle with embedded or
 separate draft capability. Each assessment profile specifies maximum context for one sequence and
 the context depths at which performance must be estimated.
@@ -108,17 +109,30 @@ object.
 
 Every requested profile produces one result:
 
-| Result | Meaning |
-|---|---|
-| `Fits` | Exact configuration value, memory accounting, and ordered performance samples |
-| `DoesNotFit` | Exact configuration value, memory accounting, limiting resource, and deficit |
-| `Incompatible` | The artifact/runtime combination cannot execute |
+| Result         | Meaning                                                                       |
+| -------------- | ----------------------------------------------------------------------------- |
+| `Fits`         | Exact configuration value, memory accounting, and ordered performance samples |
+| `DoesNotFit`   | Exact configuration value, memory accounting, limiting resource, and deficit  |
+| `Incompatible` | The artifact/runtime combination cannot execute                               |
+
+The response is a finite generated NDJSON event stream:
+
+```text
+Started(environmentId, totalTargets)
+Result(result) × exactly totalTargets
+Completed(environmentId, totalTargets)
+EOF
+```
+
+Results are emitted as individual targets finish and may arrive out of request order. Request IDs
+provide correlation. `Completed` is the only successful terminal marker; EOF before `Completed` is
+an incomplete operation. The stream has no reconnect behavior.
 
 Malformed or unresolved input produces target-level `InvalidTarget`. An operational failure while
 assessing one requested target produces `Failed` for that request ID; sibling results remain valid.
 `Failed` is not a compatibility or capacity result and creates no cache entry. A failure of shared
-batch setup, or a failure that prevents ICN from constructing a valid complete response envelope,
-fails the endpoint.
+admission fails the endpoint before streaming. A later shared failure truncates the stream; results
+already emitted remain valid and only unresolved request IDs fail in ACN.
 
 ## Profiles
 
@@ -132,18 +146,19 @@ ordered sample list is nonempty and always ends at the full configured context.
 
 ## Broad rejection proof
 
-ACN may skip native assessment only when:
+ICN may complete a target without expensive native planning only when:
 
 ```text
 exact storage of tensors required by every execution
     > aggregate stable capacity of unique physical memory domains
 ```
 
-Tensor storage is computed from GGUF tensor shapes and types and deduplicated by immutable content
+Tensor storage is computed from ICN-owned GGUF tensor shapes and types and deduplicated by immutable content
 identity. Optional components are excluded, making this a lower bound on required bytes. Aggregate
 stable capacity ignores context, compute, workspace, reserves, and placement constraints, making it
-a permissive upper bound. Uncertain targets pass. File size, parameter estimates, model names, and
-empirical multipliers cannot reject a target.
+a permissive upper bound. Uncertain targets continue through ordinary native planning. ACN performs
+no capacity pre-filter. File size, parameter estimates, model names, and empirical multipliers
+cannot reject a target.
 
 ## Capacity semantics
 
@@ -161,17 +176,22 @@ binding-level facility; it must not require changes to the nested llama.cpp core
 
 ## Planning-worker pool
 
-ICN owns a small persistent pool:
+One ICN actor owns a small persistent pool:
 
 - capacity is eight workers, subject to available hardware parallelism;
 - only the calibration worker exists at startup; other native children are created on demand;
-- cold backend initialization is serialized; initialized workers execute concurrently;
+- configured unused capacity is a number, never a claim that a process exists;
+- at most one cold backend activation is in flight; initialized workers execute concurrently;
+- expansion has one explicit state: ready, activating, or deferred while a warm worker remains;
+  losing the last usable warm worker transitions deferred expansion back to ready, so queued work
+  remains eligible for replacement activation;
 - each created worker retains process-local CUDA/Metal/Vulkan state;
 - all profiles for one target execute as one worker job;
 - different targets use the next available worker concurrently;
 - pool size is bounded by hardware parallelism and a fixed safety cap;
 - every job has one absolute caller-visible deadline covering queue and native work;
-- a failed or timed-out worker is killed and replaced;
+- a caller that stops waiting detaches from its reply but does not release or reuse its running worker;
+- a failed or timed-out worker replies once, retires, and is replaced only after retirement when demand remains;
 - child reaping and diagnostic-reader cleanup cannot delay caller completion.
 
 Inference workers remain separate and model-resident. Backend initialization and ordinary warm-up
@@ -196,8 +216,9 @@ inside the scoped assessment Effect:
 - never persist it;
 - serialize overlapping owners so stale completion is structurally impossible.
 
-ICN independently bounds the complete endpoint and every worker job. A caller finishes at its
-deadline even if child termination or reaping stalls.
+ICN independently bounds the complete stream and every worker job. Target work ends before the
+stream deadline, reserving time to emit terminal events. A caller finishes at its deadline even if
+child termination or reaping stalls.
 
 ## Assessment cache and single-flight
 
@@ -227,6 +248,11 @@ plus that exact configuration and requested performance-depth policy. Provider, 
 and product projections consume the resulting per-configuration state and do not invoke this
 endpoint directly.
 
+One reconciliation submits every distinct pending bundle target in one ICN request. Profiles for
+the same bundle are combined into that target. ACN does not batch, throttle, or pre-filter the set;
+ICN owns target scheduling and native concurrency. ACN validates `Started`, exact request-ID
+cardinality, environment stability, and `Completed`, then publishes each result immediately.
+
 Source revisions and notifications only request reconciliation. Download progress, attempt state,
 semantically equivalent inventory observations, catalog presentation, live memory, and client
 activity cannot admit assessment. A genuine semantic-key change admits work only for affected
@@ -248,6 +274,9 @@ configurations, and completion publishes only if that key remains current.
 
 - ICN cannot become ready without hardware calibration and an operational worker pool.
 - One same-bundle job returns one result per requested profile.
+- One reconciliation uses one HTTP assessment request regardless of target count.
+- Progress begins at zero, counts exact submitted targets, and advances once per streamed result.
+- Stream truncation preserves emitted results and fails only unresolved targets.
 - Every profile result carries the exact ICN-constructed serving configuration it assessed.
 - Serving configurations cross the boundary as exact values without a separate configuration ID.
 - Every `Fits` result contains ordered performance samples ending at the profile context.
@@ -258,5 +287,6 @@ configurations, and completion publishes only if that key remains current.
 - A stale assessment completion cannot overwrite state for a newer semantic key.
 - No domain result represents an operational defect.
 - `Assessing` cannot survive its owning Effect scope.
+- ACN contains no broad capacity filter or fixed assessment batch size.
 - Queueing, native work, caller completion, and child cleanup are all bounded.
 - Nested llama.cpp core files remain unmodified.

@@ -18,12 +18,13 @@ Terms follow [Model-management terminology](./terminology.md). Native mechanics 
 
 ## Ownership
 
-| Concern | Owner |
-|---|---|
-| Native compatibility, memory, placement, performance | ICN |
-| Native serving-configuration resolution and validation | ICN |
-| Profile set, assessment orchestration, normalized ranking scores | ACN |
-| Rendering | Clients |
+| Concern                                                       | Owner   |
+| ------------------------------------------------------------- | ------- |
+| Native compatibility, memory, placement, performance          | ICN     |
+| Native serving-configuration resolution and validation        | ICN     |
+| Profile set, demand reconciliation, normalized ranking scores | ACN     |
+| Assessment filtering, scheduling, and native concurrency      | ICN     |
+| Rendering                                                     | Clients |
 
 ## Pipeline
 
@@ -40,10 +41,12 @@ sequenceDiagram
     Catalog->>ACN: Reviewed model identity and configuration (bundle, profile)
     ACN->>ACN: Preserve reviewed profile
 
-    ACN->>ICN: Assess exact bundle at profile with sampling policy
+    ACN->>ICN: One request containing every distinct pending bundle target
     ICN->>ICN: Resolve and validate bundle and profile
     ICN->>ICN: Assess compatibility, memory, and performance
-    ICN-->>ACN: Request-correlated terminal result
+    ICN-->>ACN: Started(totalTargets)
+    ICN-->>ACN: Request-correlated Result as each target finishes
+    ICN-->>ACN: Completed(totalTargets)
 
     ACN->>ACN: Attach evidence to submitted catalog model
 
@@ -58,7 +61,7 @@ correlated first by exact request identity and then by exact profile identity wi
 ACN attaches returned evidence to the canonical catalog model ID. A serving configuration is a
 value, not a separately addressable entity.
 
-The rejection proof compares exact, content-deduplicated tensor storage with aggregate stable
+ICN owns the rejection proof comparing exact, content-deduplicated tensor storage with aggregate stable
 physical capacity. Uncertain bundles proceed. File/download size is not rejection evidence.
 GGUF-derived identity and tensor storage share one optimistic inspection cache per immutable
 component. Package capabilities compose the inspected primary artifact with exact component roles,
@@ -67,8 +70,10 @@ component and cannot change artifact presence.
 
 ## Assessment service
 
-ACN exposes one assessment executor accepting exact bundles and profiles. It owns the
-scoped lifecycle, deadline, ICN batching, result decoding, cardinality checks, and finalization.
+ACN exposes one assessment executor accepting exact bundles and profiles. It owns the scoped demand
+lifecycle, result decoding, stream-lifecycle validation, correlation, and publication. It sends the
+entire target set once; it owns no fixed batch size, native concurrency, or capacity filter. ICN
+owns admission, cache reuse, filtering, scheduling, concurrency, and native deadlines.
 Every executor request carries one bundle and one or more unique profiles so ICN can share model
 opening across their assessment. Missing, duplicate, or unrequested profile outcomes violate the
 assessment operation contract; they fail the operation rather than becoming a model compatibility
@@ -92,6 +97,20 @@ assessment.
 The assessor is a scoped background owner. Constructing ACN services publishes initial
 observable state without waiting for assessment; only the admitted operation owner awaits its
 bounded native request.
+
+The coordinator publishes one atomic snapshot containing every current demanded configuration and
+exactly one lifecycle state: `Discovering`, `Assessing`, `Ready`, or `Failed`. Consumers never join
+assessment entries, progress, and completion from independent reads. Each demand is either being
+assessed or carries one terminal result for its current semantic key.
+
+During `Assessing`, `totalTargets` is the number of distinct demanded configurations admitted to
+that cycle and `completedTargets` advances as each configuration receives its native result. Native
+bundle/profile sharing may complete several demands from one streamed result, but transport batches
+and catalog row counts never manufacture progress. `Ready` means every current demand has a
+terminal result. `Failed` is the terminal outcome of one exact cycle, not a sticky coordinator
+flag; reconciliation that removes or supersedes its failed demands also removes that failure.
+Ranking remains pending while assessment runs. Assessment failure is terminal and never appears as
+an active ranking step.
 
 ## Demand and invalidation
 
@@ -149,7 +168,9 @@ independently of assessment and offering publication.
 
 ## Assessment lifecycle
 
-ACN owns one shared assessment coordinator per structural bundle-and-profile value. While admitted work for the current
+ACN owns one serialized assessment coordinator. It groups current demands by structural bundle,
+submits all distinct pending bundle targets in one operation, and combines unique profiles within a
+target. While admitted work for the current
 semantic key is running, its internal state is `Assessing`. Completion publishes `Failed`, `Fits`,
 `DoesNotFit`, or `Incompatible` for that key. Serialized reconciliation plus key validation makes
 stale completion unrepresentable. Unchanged configurations retain their terminal state while
@@ -159,6 +180,8 @@ The product projection never publishes an absent assessment as a configuration r
 installed model without a terminal result for its decided configuration has model-level readiness
 `Assessing`; an assessed model contains exactly that configuration and its terminal result.
 
+Each streamed target result is published immediately. If the stream ends without `Completed`,
+already received terminal results remain published and only unresolved targets become `Failed`.
 An assessment-operation defect publishes `Failed` with its typed failure. It is not converted into
 `DoesNotFit` or `Incompatible`, and it cannot replace the local-model collection with an empty
 snapshot.
@@ -192,6 +215,13 @@ Cached assessment never authorizes loading.
 - A package already participating in a catalog bundle is assessed only through that
   bundle. Separate speculative companions are never submitted again as standalone targets.
 - All missing profiles for one bundle are submitted together.
+- All distinct pending bundles are submitted in one ICN request.
+- Assessment progress counts the exact demanded configurations in the active cycle and advances as
+  each receives its native result; it is not a transport-batch count or inferred catalog total.
+- Assessment entries and lifecycle are one atomic snapshot; no consumer can combine different
+  generations of results, progress, or completion.
+- Removing or superseding the demands from a failed cycle removes that cycle failure.
+- A truncated stream retains every result received before truncation and fails only unresolved targets.
 - Equivalent concurrent misses perform one native assessment.
 - Download progress and semantically equivalent newer source revisions perform no assessment.
 - A changed semantic key reassesses only the affected configurations.
