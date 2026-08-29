@@ -330,6 +330,12 @@ export const AcnBoundaryLive = AcnRpc.toLayer(AcnBoundary,
       RemoveLocalModel: ({ modelId }) =>
         observeRpcDefects("RemoveLocalModel", modelCommands.remove(modelId)),
 
+      LoadLocalModel: ({ modelId }) =>
+        observeRpcDefects("LoadLocalModel", modelCommands.loadModel(modelId)),
+
+      StopActiveLocalModel: () =>
+        observeRpcDefects("StopActiveLocalModel", modelCommands.stopActiveModel),
+
       LoadModelSlot: ({ slotId }) =>
         observeRpcDefects("LoadModelSlot", modelCommands.loadSlot(slotId)),
 

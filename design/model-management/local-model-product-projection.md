@@ -102,8 +102,8 @@ The resolver likewise carries the assessment state directly: absence before an a
 represented by `Assessing`, not by an optional assessment beside the state machine.
 
 `acquisitionState` is one flat union covering the model's whole materialization lifecycle:
-`NotInstalled`, `Installing`, `InstallFailed`, `Installed`, `UpdateAvailable`, `Updating`, and
-`UpdateFailed`. Every variant is a reachable product state, and each payload exists only under the
+`NotInstalled`, `Installing`, `InstallFailed`, `Installed`, `UpdateAvailable`, `Updating`,
+`UpdateFailed`, `Removing`, and `RemoveFailed`. Every variant is a reachable product state, and each payload exists only under the
 state it belongs to: transfer progress on `Installing`/`Updating`, an unacknowledged transfer
 failure on the failed states, and — on every installed-family variant — the exact package
 identity, filesystem path, and installation origin for every installed package plus the model's

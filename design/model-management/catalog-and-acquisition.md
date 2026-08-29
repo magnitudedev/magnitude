@@ -135,7 +135,10 @@ servable artifacts.
 
 ## Downloads
 
-A client model-sync command carries only canonical model identity. ACN invokes ICN's existing
+A client model-sync command — the CLI's `catalog pull` — carries only canonical model identity
+and converges that model to present-and-current: it is admitted from `NotInstalled`,
+`InstallFailed`, `UpdateAvailable`, or `UpdateFailed`, succeeds immediately as `AlreadyCurrent`
+for an installed, current model, and is rejected from removal states. ACN invokes ICN's existing
 catalog-install operation, which resolves the exact desired bundle. If every required package is installed, ICN
 returns `AlreadyInstalled`. Otherwise ICN creates one process-local `ModelDownload` with a stable
 `ModelDownloadId` and admits missing package work or joins equivalent work already owned by the
@@ -149,8 +152,10 @@ it is never a prerequisite for acknowledging a known catalog download.
 The raw download occurrence retains its bundle and aggregates bounded progress and one terminal
 outcome. It does not retain ACN model identity. ACN records the exact `ModelDownloadId` returned
 for each admitted model sync and uses that causal correlation for projection and later commands.
-Repeated sync for the same model joins its correlated active occurrence at the ACN command
-boundary. Package attempts are process-local ICN details. Equivalent model downloads may share active package work.
+The admission receipt reports only whether work started or the model was already current; it
+never exposes the native download ID. A repeated sync while the model has active acquisition
+work is rejected as busy at the ACN command boundary; package attempts remain process-local ICN
+details. Equivalent model downloads may share active package work.
 Caller interruption detaches that waiter without abandoning admitted work. Cancellation stops
 shared package work only when no other live occurrence depends on it. A retry creates a new
 occurrence. Restart ends all occurrences, attempt history, cancellation state, and failure

@@ -35,7 +35,7 @@ Every service-backed command explicitly constructs the mechanism appropriate to 
 | --- | --- | --- |
 | Bare `magnitude` interactive launch | Bootstrapping `AcnInstanceManager` followed by an `AcnConnection` | Install, launch, and await exact readiness inline |
 | `magnitude service start` | Explicit platform-service installation/start followed by an observing `AcnConnection` | Install/register/start and await exact readiness inline |
-| Hardware, models, downloads, instances, slots, and connection mutations | Existing-service observer followed by an `AcnConnection` | Fail with `Magnitude service is not running. Run \`magnitude service start\`.` |
+| Catalog, model, and connection operations | Existing-service observer followed by an `AcnConnection` | Fail with `Magnitude service is not running. Run \`magnitude service start\`.` |
 
 The terminal adapter contains only terminal and OS operations. It never selects a service-acquisition
 mechanism and contains no RPC transport, startup lifecycle, recovery lifecycle, or connection close.

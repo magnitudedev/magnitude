@@ -5,11 +5,14 @@ import * as HttpClient from "@effect/platform/HttpClient"
 import * as Path from "@effect/platform/Path"
 import * as Terminal from "@effect/platform/Terminal"
 import { BunContext } from "@effect/platform-bun"
-import { Effect, Option } from "effect"
+import { Effect, Option, Schema } from "effect"
 import {
   confirmServicePublicReady,
+  installService,
+  serviceStatus,
   startServiceManager,
   stopService,
+  uninstallService,
 } from "../server/service"
 import { probeTerminalAppearance } from "../platform/terminal-appearance"
 import {
@@ -20,10 +23,29 @@ import { makeCliUpdater, updateReleaseNotesUrl } from "../features/update/update
 import { CLI_VERSION } from "../version"
 import { isDevelopmentBuild } from "../runtime/environment"
 import { startingAcnConnection } from "../server/acn-connection"
-import {
-  explainError,
-  explainServiceStartupFailure,
-} from "../startup/service-startup-error"
+import { explainServiceStartupFailure } from "../startup/service-startup-error"
+import { runCommand } from "./output"
+
+const ServiceActionSchema = Schema.Struct({
+  action: Schema.Literal("install", "uninstall", "stop"),
+})
+const ServiceStatusSchema = Schema.Union(
+  Schema.Struct({
+    installed: Schema.Boolean,
+    enabled: Schema.Boolean,
+    managed: Schema.Boolean,
+    running: Schema.Literal(false),
+    state: Schema.Literal("Stopped"),
+  }),
+  Schema.Struct({
+    installed: Schema.Boolean,
+    enabled: Schema.Boolean,
+    managed: Schema.Boolean,
+    running: Schema.Literal(true),
+    revision: Schema.Number,
+    state: Schema.Literal("Starting", "Ready", "Stopping"),
+  }),
+)
 
 const runServiceStartEffect = Effect.scoped(Effect.gen(function* () {
   const appearance = yield* probeTerminalAppearance()
@@ -60,12 +82,6 @@ const runServiceStartEffect = Effect.scoped(Effect.gen(function* () {
   }
 }))
 
-const runServiceStopEffect = stopService.pipe(
-  Effect.tap(() => Effect.sync(() => {
-    process.stdout.write("Magnitude service stopped.\n")
-  })),
-)
-
 type ServiceRequirements =
   | FileSystem.FileSystem
   | CommandExecutor.CommandExecutor
@@ -84,6 +100,43 @@ const run = (
   })),
 ))
 
-export const runServiceStart = () => run(runServiceStartEffect, explainServiceStartupFailure)
+type ServiceActionRequirements =
+  | FileSystem.FileSystem
+  | CommandExecutor.CommandExecutor
+  | Path.Path
+  | HttpClient.HttpClient
 
-export const runServiceStop = () => run(runServiceStopEffect, explainError)
+const live = <A, E>(effect: Effect.Effect<A, E, ServiceActionRequirements>) => effect.pipe(
+  Effect.provide([BunContext.layer, FetchHttpClient.layer]),
+)
+
+const action = (
+  name: "install" | "uninstall" | "stop",
+  effect: Effect.Effect<unknown, unknown, ServiceActionRequirements>,
+) => runCommand({
+  effect: live(effect).pipe(Effect.as({ action: name })),
+  schema: ServiceActionSchema,
+  render: () => `Magnitude service ${{
+    install: "installed",
+    uninstall: "uninstalled",
+    stop: "stopped",
+  }[name]}.\n`,
+})
+
+export const runServiceInstall = () => action("install", installService)
+export const runServiceUninstall = () => action("uninstall", uninstallService)
+export const runServiceStart = () => run(runServiceStartEffect, explainServiceStartupFailure)
+export const runServiceStop = () => action("stop", stopService)
+export const runServiceStatus = () => runCommand({
+  effect: live(serviceStatus),
+  schema: ServiceStatusSchema,
+  render: (status) => [
+    `Installed: ${status.installed ? "yes" : "no"}`,
+    `Enabled: ${status.enabled ? "yes" : "no"}`,
+    `Managed runtime: ${status.managed ? "yes" : "no"}`,
+    `Running: ${status.running ? "yes" : "no"}`,
+    `State: ${status.state}`,
+    ...("revision" in status ? [`Revision: ${status.revision}`] : []),
+    "",
+  ].join("\n"),
+})
