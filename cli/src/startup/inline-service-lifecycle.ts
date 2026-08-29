@@ -8,11 +8,10 @@ import type {
 } from "@magnitudedev/sdk"
 import { formatStorageSize } from "@magnitudedev/client-common"
 import ansis from "ansis"
-import { Duration, Effect, Exit, Fiber, Option, Stream } from "effect"
+import { Clock, Duration, Effect, Exit, Fiber, Option, Stream } from "effect"
 import type { CliTheme } from "../types/theme-system"
+import { spinnerFrameAt } from "../utils/spinner"
 import { serviceAcquisitionChildPhase } from "./inline-service-acquisition"
-
-const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const
 
 export const inlineServiceCompletionColor = (theme: CliTheme): string =>
   theme.markdown.inlineCode
@@ -135,7 +134,6 @@ export const makeInlineServiceStartupPresenter = (
   const rows = new Map<ChildKey, ChildRow>()
   let activeLines = 0
   let visible = false
-  let spinnerFrame = 0
   let nonTtyParentShown = false
   let nonTtyActiveCopy = ""
   let ready = false
@@ -146,17 +144,17 @@ export const makeInlineServiceStartupPresenter = (
     activeLines = 0
     return display(erased)
   })
-  const snapshot = (): ReadonlyArray<string> => {
+  const snapshot = (timeMs: number): ReadonlyArray<string> => {
     const parent = ready
       ? `${accent("●")} ${readyLabel}`
       : `${accent("○")} Starting Magnitude service`
     return [parent, ...rows.values().map((row) => row.status === "completed"
       ? `  ${success("✓")} ${row.completed}`
-      : `  ${accent(SPINNER_FRAMES[spinnerFrame++ % SPINNER_FRAMES.length]!)} ${row.active}`)]
+      : `  ${accent(spinnerFrameAt(timeMs))} ${row.active}`)]
   }
   const renderTty = Effect.gen(function* () {
     yield* clear
-    const lines = snapshot()
+    const lines = snapshot(yield* Clock.currentTimeMillis)
     activeLines = lines.length
     visible = true
     yield* display(`${lines.join("\n")}\n`)
