@@ -50,6 +50,41 @@ const commandSucceeds = (command: ReadonlyArray<string>) => {
   )
 }
 
+const commandString = (command: ReadonlyArray<string>) => {
+  const [executable, ...args] = command
+  if (executable === undefined) return Effect.fail(fail("Empty service command"))
+  return PlatformCommand.make(executable, ...args).pipe(
+    PlatformCommand.string,
+    Effect.mapError((error) => fail(String(error))),
+  )
+}
+
+const positivePid = (value: string | undefined): Option.Option<number> => {
+  if (value === undefined) return Option.none()
+  const pid = Number(value)
+  return Number.isSafeInteger(pid) && pid > 0 ? Option.some(pid) : Option.none()
+}
+
+const platformServicePid = process.platform === "darwin"
+  ? commandString([
+      "launchctl",
+      "print",
+      `gui/${process.getuid?.() ?? 0}/${SERVICE_LABEL}`,
+    ]).pipe(
+      Effect.map((output) => positivePid(output.match(/^\s*pid = (\d+)$/m)?.[1])),
+      Effect.orElseSucceed(() => Option.none<number>()),
+    )
+  : process.platform === "linux"
+    ? commandString([
+        "systemctl", "--user", "show", "--property", "MainPID", "--value", "magnitude.service",
+      ]).pipe(
+        Effect.map((output) => positivePid(output.trim())),
+        Effect.orElseSucceed(() => Option.none<number>()),
+      )
+    : Effect.succeed(Option.none<number>())
+
+const platformServiceIsActive = platformServicePid.pipe(Effect.map(Option.isSome))
+
 const xml = (value: string) => value
   .replaceAll("&", "&amp;")
   .replaceAll("<", "&lt;")
@@ -224,32 +259,115 @@ export const installServiceOnStartup = Effect.gen(function* () {
 export const stopService = Effect.gen(function* () {
   if (process.platform === "darwin") {
     const domain = `gui/${process.getuid?.() ?? 0}`
-    yield* run(["launchctl", "disable", `${domain}/${SERVICE_LABEL}`], true)
     yield* run(["launchctl", "bootout", domain, macServicePath()], true)
   } else if (process.platform === "linux") {
-    yield* run(["systemctl", "--user", "disable", "--now", "magnitude.service"], true)
+    yield* run(["systemctl", "--user", "stop", "magnitude.service"], true)
   } else if (process.platform === "win32") {
     yield* run(["schtasks", "/End", "/TN", "MagnitudeInference"], true)
-    yield* run(["schtasks", "/Change", "/TN", "MagnitudeInference", "/DISABLE"], true)
   }
   yield* stopLocalAcn.pipe(Effect.ignore)
 })
 
-const probeReady = Effect.tryPromise({
+const probeHealth = Effect.tryPromise({
   try: (signal) => fetch(PUBLIC_HEALTH, { signal }).then(async (response) => {
     if (!response.ok) throw new Error(`health returned ${response.status}`)
-    const health = Schema.decodeUnknownSync(AcnHealthResponseSchema)(await response.json())
-    if (health.revision < SDK_ACN_TARGET.revision || health.state._tag !== "Ready") {
-      throw new Error("the fixed port is not serving a compatible Magnitude release")
-    }
-    return health
+    return Schema.decodeUnknownSync(AcnHealthResponseSchema)(await response.json())
   }),
   catch: (error) => fail(String(error)),
 })
 
+const probeReady = probeHealth.pipe(
+  Effect.flatMap((health) => {
+    if (health.revision < SDK_ACN_TARGET.revision || health.state._tag !== "Ready") {
+      return Effect.fail(fail("the fixed port is not serving a compatible Magnitude release"))
+    }
+    return Effect.succeed(health)
+  }),
+)
+
 const awaitReady = probeReady.pipe(
   Effect.retry(Schedule.spaced("250 millis").pipe(Schedule.intersect(Schedule.recurs(240)))),
 )
+
+export const installService = Effect.gen(function* () {
+  const healthy = yield* Effect.option(probeHealth)
+  if (Option.isSome(healthy) && healthy.value.revision > SDK_ACN_TARGET.revision) {
+    return yield* fail("A newer Magnitude service is running; refusing to replace its service definition")
+  }
+  yield* installServiceOnStartup
+})
+
+export const startInstalledService = Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const installed = process.platform === "darwin"
+    ? yield* fs.exists(macServicePath())
+    : process.platform === "linux"
+      ? yield* fs.exists(linuxServicePath())
+      : process.platform === "win32"
+        ? yield* commandSucceeds(["schtasks", "/Query", "/TN", "MagnitudeInference"])
+        : false
+  if (!installed) return yield* fail("Magnitude service is not installed; run `magnitude service install`")
+  const platformActive = yield* platformServiceIsActive
+  if (platformActive && Option.isSome(yield* Effect.option(probeReady))) return
+  yield* stopLocalAcn.pipe(Effect.ignore)
+  if (process.platform === "darwin") {
+    const domain = `gui/${process.getuid?.() ?? 0}`
+    yield* run(["launchctl", "enable", `${domain}/${SERVICE_LABEL}`])
+    yield* run(["launchctl", "bootstrap", domain, macServicePath()], true)
+    yield* run(["launchctl", "kickstart", `${domain}/${SERVICE_LABEL}`], true)
+  } else if (process.platform === "linux") {
+    yield* run(["systemctl", "--user", "start", "magnitude.service"])
+  } else if (process.platform === "win32") {
+    yield* run(["schtasks", "/Change", "/TN", "MagnitudeInference", "/ENABLE"])
+    yield* run(["schtasks", "/Run", "/TN", "MagnitudeInference"])
+  } else return yield* fail(`Unsupported platform: ${process.platform}`)
+  yield* awaitReady
+})
+
+export const uninstallService = Effect.gen(function* () {
+  yield* stopService
+  const fs = yield* FileSystem.FileSystem
+  if (process.platform === "darwin") {
+    const domain = `gui/${process.getuid?.() ?? 0}`
+    yield* run(["launchctl", "disable", `${domain}/${SERVICE_LABEL}`], true)
+    yield* fs.remove(macServicePath()).pipe(Effect.ignore)
+  } else if (process.platform === "linux") {
+    yield* run(["systemctl", "--user", "disable", "magnitude.service"], true)
+    yield* fs.remove(linuxServicePath()).pipe(Effect.ignore)
+    yield* run(["systemctl", "--user", "daemon-reload"], true)
+  } else if (process.platform === "win32") {
+    yield* run(["schtasks", "/Delete", "/TN", "MagnitudeInference", "/F"], true)
+  } else return yield* fail(`Unsupported platform: ${process.platform}`)
+})
+
+export const serviceStatus = Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const installed = process.platform === "darwin"
+    ? yield* fs.exists(macServicePath())
+    : process.platform === "linux"
+      ? yield* fs.exists(linuxServicePath())
+      : process.platform === "win32"
+        ? yield* commandSucceeds(["schtasks", "/Query", "/TN", "MagnitudeInference"])
+        : false
+  const enabled = !installed ? false : process.platform === "linux"
+    ? yield* commandSucceeds(["systemctl", "--user", "is-enabled", "--quiet", "magnitude.service"])
+    : true
+  const health = yield* Effect.option(probeHealth)
+  const managerPid = yield* platformServicePid
+  const managed = installed && Option.isSome(managerPid) && Option.isSome(health)
+    && managerPid.value === health.value.pid
+  return Option.match(health, {
+    onNone: () => ({ installed, enabled, managed, running: false as const, state: "Stopped" as const }),
+    onSome: ({ revision, state }) => ({
+      installed,
+      enabled,
+      managed,
+      running: true as const,
+      revision,
+      state: state._tag,
+    }),
+  })
+})
 
 const managedServiceIsCurrent = (command: ReadonlyArray<string>) => Effect.gen(function* () {
   const compatible = yield* Effect.option(probeReady)

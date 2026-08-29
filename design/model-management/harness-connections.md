@@ -87,8 +87,10 @@ sole Anthropic Messages consumer. It uses
 receives `anthropic-local/<model-id>` through `--model`. The reserved prefix selects the local
 Anthropic route instead of the byte-preserving upstream route. Onboarding always supplies
 `setCurrent` for its selected model, so every external handoff starts on that exact model through
-the connector's launch plan. A CLI connection without `--set-current` changes no current-model
-selection. Provider-local registrations expose the complete Magnitude model set.
+the connector's launch plan. The optional `--set-current <model-id>` CLI input supplies
+`setCurrent`, selects that model, and returns the connector's launch plan; omitting it leaves the
+current-model selection unchanged.
+Provider-local registrations expose the complete Magnitude model set.
 The model name is Magnitude's catalog display name followed by its variant label in parentheses.
 Pi, OpenCode, OpenClaw, Oh My Pi, and Cline receive that name through their native per-model display
 field. Codex receives it through its connector-owned native model catalog. Hermes and Claude Code

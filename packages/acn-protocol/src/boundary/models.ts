@@ -77,7 +77,7 @@ const SetFavorite = Mutation.make("SetModelFavorite", {
 const SyncLocalModel = Mutation.make("SyncLocalModel", {
   policy: { recovery: "AtMostOnce" },
   payload: Schema.Struct({ modelId: ProviderModelIdSchema }),
-  success: Schema.Struct({}),
+  success: Schema.Struct({ outcome: Schema.Literal("Started", "AlreadyCurrent") }),
   error: LocalInferenceError,
   scope: ({ modelId }) => Mutation.MutationScope(`local-model:${modelId}`),
   synchronize: () => synchronizeCatalog,
@@ -107,6 +107,24 @@ const RemoveLocalModel = Mutation.make("RemoveLocalModel", {
   success: Schema.Struct({}),
   error: LocalInferenceError,
   scope: ({ modelId }) => Mutation.MutationScope(`local-model:${modelId}`),
+  synchronize: () => synchronizeCatalog,
+})
+
+const LoadLocalModel = Mutation.make("LoadLocalModel", {
+  policy: { recovery: "AtMostOnce" },
+  payload: Schema.Struct({ modelId: ProviderModelIdSchema }),
+  success: Schema.Struct({}),
+  error: LocalInferenceError,
+  scope: ({ modelId }) => Mutation.MutationScope(`local-model-residency:${modelId}`),
+  synchronize: () => synchronizeCatalog,
+})
+
+const StopActiveLocalModel = Mutation.make("StopActiveLocalModel", {
+  policy: { recovery: "AtMostOnce" },
+  payload: Schema.Struct({}),
+  success: Schema.Struct({}),
+  error: LocalInferenceError,
+  scope: () => Mutation.MutationScope("active-local-model-residency"),
   synchronize: () => synchronizeCatalog,
 })
 
@@ -147,6 +165,8 @@ export const Models = Group.make({
   CancelLocalModelSync,
   AcknowledgeLocalModelSyncFailure,
   RemoveLocalModel,
+  LoadLocalModel,
+  StopActiveLocalModel,
   LoadSlot,
   StopSlot,
 })

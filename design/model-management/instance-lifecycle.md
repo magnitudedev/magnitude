@@ -95,9 +95,11 @@ Instance changes also invalidate the live Hardware snapshot and load preview bec
 allocation changes current headroom. They do not invalidate stable model assessment, which is
 defined against stable capacity rather than live availability.
 
-Changing Slot selection never implicitly stops a shared Instance. Clients issue model-addressed
-load and stop commands to ACN; ACN resolves the configured Slot and invokes ICN's raw Instance
-operations.
+Changing Slot selection never implicitly stops a shared Instance. Slot-oriented clients may ask
+ACN to load or stop the model selected by a configured Slot. The non-interactive CLI loads by
+canonical model ID and exposes one zero-argument stop for the singleton active Instance. ACN
+resolves either product intent to ICN's exact Instance operations; callers never supply a native
+Instance ID.
 
 ## Conformance
 

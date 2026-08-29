@@ -1,10 +1,11 @@
-import { BunContext } from "@effect/platform-bun"
 import { FetchHttpClient } from "@effect/platform"
 import type * as FileSystem from "@effect/platform/FileSystem"
 import type * as Path from "@effect/platform/Path"
 import type * as CommandExecutor from "@effect/platform/CommandExecutor"
 import type * as HttpClient from "@effect/platform/HttpClient"
+import { BunContext } from "@effect/platform-bun"
 import {
+  HarnessAvailabilitySchema,
   HarnessIdSchema,
   type HarnessConnection,
   type HarnessDestination,
@@ -14,91 +15,133 @@ import { ProviderModelIdSchema } from "@magnitudedev/sdk"
 import { Data, Effect, Option, Schema } from "effect"
 import { makeHarnessConnection } from "../harness-connections/service"
 import { existingAcnConnection } from "../server/acn-connection"
+import { ensureTrailingNewline, runCommand } from "./output"
+
+const HarnessDestinationSchema = Schema.Struct({
+  id: HarnessIdSchema,
+  name: Schema.String,
+  availability: HarnessAvailabilitySchema,
+  selectable: Schema.Boolean,
+  note: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+})
+const ConnectionsResultSchema = Schema.Struct({
+  connections: Schema.Array(HarnessDestinationSchema),
+})
+const HarnessLaunchPlanSchema = Schema.Struct({
+  harness: HarnessIdSchema,
+  executable: Schema.String,
+  args: Schema.Array(Schema.String),
+  environment: Schema.Record({ key: Schema.String, value: Schema.String }),
+  modelId: ProviderModelIdSchema,
+})
+const AddConnectionResultSchema = Schema.Struct({
+  action: Schema.Literal("add"),
+  harness: HarnessIdSchema,
+  launchPlan: Schema.optionalWith(HarnessLaunchPlanSchema, { as: "Option", exact: true }),
+})
+const RemoveConnectionResultSchema = Schema.Struct({
+  action: Schema.Literal("remove"),
+  harness: HarnessIdSchema,
+})
 
 class ConnectionsCommandError extends Data.TaggedError("ConnectionsCommandError")<{
+  readonly code: string
   readonly message: string
+  readonly retryable: boolean
 }> {}
 
 const parseHarness = (input: string) => Schema.decodeUnknown(HarnessIdSchema)(input).pipe(
-  Effect.mapError(() => new ConnectionsCommandError({ message: `Unsupported harness: ${input}` })),
+  Effect.mapError(() => new ConnectionsCommandError({
+    code: "unsupported_harness",
+    message: `Unsupported harness: ${input}`,
+    retryable: false,
+  })),
 )
-
 const parseCurrentModel = (input: string | undefined) => input === undefined
   ? Effect.succeed(Option.none())
   : Schema.decodeUnknown(ProviderModelIdSchema)(input).pipe(
       Effect.map(Option.some),
-      Effect.mapError(() => new ConnectionsCommandError({ message: `Invalid model ID: ${input}` })),
+      Effect.mapError(() => new ConnectionsCommandError({
+        code: "invalid_model_id",
+        message: `Invalid model ID: ${input}`,
+        retryable: false,
+      })),
     )
-
-const printRows = (rows: ReadonlyArray<HarnessDestination>): void => {
-  const width = Math.max(...rows.map(({ name }) => name.length))
-  for (const row of rows) {
-    process.stdout.write(`${row.name.padEnd(width)}  ${row.availability}\n`)
-  }
-}
-
-// Kept local so Commander actions all acquire the same concrete implementation
-// shape as onboarding without creating command-specific adapter paths.
-type CommandRequirements = FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor | HttpClient.HttpClient
-
-const execute = <A>(use: (service: HarnessConnection) => Effect.Effect<A, unknown, CommandRequirements>) =>
-  Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-    const service = yield* makeHarnessConnection
-    return yield* use(service)
-  })).pipe(
-    Effect.provide([BunContext.layer, FetchHttpClient.layer]),
-    Effect.catchAll((error) => Effect.sync(() => {
-      const message = typeof error === "object" && error !== null
-        && "reason" in error && typeof error.reason === "string"
-        ? error.reason
-        : error instanceof Error ? error.message : String(error)
-      process.stderr.write(`${message}\n`)
-      process.exitCode = 1
-    })),
-  ))
-
 const requireRunningService = Effect.gen(function* () {
   const connection = yield* existingAcnConnection
   yield* connection.startup.awaitReady
 })
+type CommandRequirements = FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor | HttpClient.HttpClient
+const withService = <A>(use: (service: HarnessConnection) => Effect.Effect<A, unknown, CommandRequirements>) =>
+  Effect.scoped(Effect.gen(function* () {
+    const service = yield* makeHarnessConnection
+    return yield* use(service)
+  })).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))
 
-export const listConnections = () => execute((service) => service.list.pipe(
-  Effect.tap((rows) => Effect.sync(() => printRows(rows))),
-  Effect.asVoid,
-))
+const projectDestination = (row: HarnessDestination) => ({
+  ...row,
+  note: Option.fromNullable(row.note),
+})
+type CommandDestination = ReturnType<typeof projectDestination>
+
+const renderRows = (rows: ReadonlyArray<CommandDestination>): string => {
+  if (rows.length === 0) return "No harness connections.\n"
+  const width = Math.max(...rows.map(({ name }) => name.length))
+  return ensureTrailingNewline(rows.map((row) =>
+    `${row.name.padEnd(width)}  ${row.availability}`
+  ).join("\n"))
+}
+
+export const listConnections = () => runCommand({
+  effect: withService((service) => service.list.pipe(Effect.map((connections) => ({
+    connections: connections.map(projectDestination),
+  })))),
+  schema: ConnectionsResultSchema,
+  render: ({ connections }) => renderRows(connections),
+})
 
 export const addConnection = (
   harnessInput: string,
   setCurrentInput: string | undefined,
-) => execute((service) => Effect.gen(function* () {
-  yield* Effect.scoped(requireRunningService)
-  const harness = yield* parseHarness(harnessInput)
-  const setCurrent = yield* parseCurrentModel(setCurrentInput)
-  const result = yield* service.connect(harness, { setCurrent })
-  yield* Effect.sync(() => {
-    process.stdout.write(`Connected all Magnitude models to ${harness}.\n`)
-    if (Option.isSome(result.launchPlan)) {
-      const plan = result.launchPlan.value
-      process.stdout.write(
-        `Current model: ${plan.modelId}\nLaunch: ${[plan.executable, ...plan.args].join(" ")}\n`,
-      )
-    }
-  })
-}))
+) => runCommand({
+  effect: withService((service) => Effect.gen(function* () {
+    yield* Effect.scoped(requireRunningService)
+    const harness = yield* parseHarness(harnessInput)
+    const setCurrent = yield* parseCurrentModel(setCurrentInput)
+    const result = yield* service.connect(harness, { setCurrent })
+    return { action: "add" as const, harness, launchPlan: result.launchPlan }
+  })),
+  schema: AddConnectionResultSchema,
+  render: ({ harness, launchPlan }) => Option.match(launchPlan, {
+    onNone: () => `Connected all Magnitude models to ${harness}.\n`,
+    onSome: (plan) => [
+      `Connected all Magnitude models to ${harness}.`,
+      `Current model: ${plan.modelId}`,
+      `Launch: ${[plan.executable, ...plan.args].join(" ")}`,
+      "",
+    ].join("\n"),
+  }),
+})
 
-export const syncConnections = (harnessInput: string | undefined) =>
-  execute((service) => Effect.gen(function* () {
+export const syncConnections = (harnessInput: string | undefined) => runCommand({
+  effect: withService((service) => Effect.gen(function* () {
     yield* Effect.scoped(requireRunningService)
     const harness: HarnessId | undefined = harnessInput === undefined
       ? undefined
       : yield* parseHarness(harnessInput)
-    const rows = yield* service.sync(harness)
-    yield* Effect.sync(() => printRows(rows))
-  }))
+    const connections = yield* service.sync(harness)
+    return { connections: connections.map(projectDestination) }
+  })),
+  schema: ConnectionsResultSchema,
+  render: ({ connections }) => renderRows(connections),
+})
 
-export const removeConnection = (harnessInput: string) =>
-  execute((service) => Effect.gen(function* () {
+export const removeConnection = (harnessInput: string) => runCommand({
+  effect: withService((service) => Effect.gen(function* () {
     const harness = yield* parseHarness(harnessInput)
     yield* service.disconnect(harness)
-    yield* Effect.sync(() => process.stdout.write(`Removed ${harness}.\n`))
-  }))
+    return { action: "remove" as const, harness }
+  })),
+  schema: RemoveConnectionResultSchema,
+  render: ({ harness }) => `Removed ${harness}.\n`,
+})

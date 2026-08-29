@@ -14,15 +14,22 @@ import { projectInferenceLoadPlan } from "@magnitudedev/sdk"
 import { LocalModelAcquisitionCoordinator } from "./local-model-acquisition-coordinator"
 import { LocalModelPackages } from "./local-model-packages"
 import { ModelSlotController } from "./model-slot-controller"
+import { ModelCatalog } from "./model-catalog"
+
+export type LocalModelSyncOutcome = "Started" | "AlreadyCurrent"
 
 export interface ModelCommandsApi {
-  readonly sync: (modelId: ProviderModelId) => Effect.Effect<{}, LocalInferenceError>
+  readonly sync: (modelId: ProviderModelId) => Effect.Effect<{
+    readonly outcome: LocalModelSyncOutcome
+  }, LocalInferenceError>
   readonly cancelSync: (modelId: ProviderModelId) => Effect.Effect<{}, LocalInferenceError>
   readonly acknowledgeSyncFailure: (modelId: ProviderModelId) => Effect.Effect<{}, LocalInferenceError>
   readonly remove: (modelId: ProviderModelId) => Effect.Effect<{}, LocalInferenceError>
   readonly loadSlot: (slotId: SlotId) => Effect.Effect<{}, LocalInferenceError>
   readonly previewSlotLoad: (slotId: SlotId) => Effect.Effect<ModelLoadPlan, LocalInferenceError>
   readonly stopSlot: (slotId: SlotId) => Effect.Effect<{}, LocalInferenceError>
+  readonly loadModel: (modelId: ProviderModelId) => Effect.Effect<{}, LocalInferenceError>
+  readonly stopActiveModel: Effect.Effect<{}, LocalInferenceError>
 }
 
 export class ModelCommands extends Context.Tag("ModelCommands")<ModelCommands, ModelCommandsApi>() {}
@@ -70,7 +77,7 @@ export const ModelCommandsLive: Layer.Layer<
   ModelCommands,
   never,
   IcnClient | IcnDownloads | IcnModels | ModelSlotController | IcnInstances
-    | LocalModelPackages | LocalModelAcquisitionCoordinator
+    | LocalModelPackages | LocalModelAcquisitionCoordinator | ModelCatalog
 > = Layer.scoped(ModelCommands, Effect.gen(function* () {
   const client = yield* IcnClient
   const downloads = yield* IcnDownloads
@@ -79,6 +86,21 @@ export const ModelCommandsLive: Layer.Layer<
   const instances = yield* IcnInstances
   const packages = yield* LocalModelPackages
   const acquisition = yield* LocalModelAcquisitionCoordinator
+  const catalog = yield* ModelCatalog
+
+  const localProduct = (modelId: ProviderModelId) => catalog.state.pipe(
+    Effect.flatMap((state) => {
+      const entry = state._tag === "Initializing" ? undefined : state.models.find((candidate) =>
+        candidate._tag === "Local" && candidate.product.modelId === modelId)
+      return entry?._tag === "Local"
+        ? Effect.succeed(entry.product)
+        : Effect.fail(new LocalModelMutationFailed({
+            code: "model_not_found",
+            message: `Unknown local model: ${modelId}`,
+            retryable: false,
+          }))
+    }),
+  )
   const selectedLocalModel = (slotId: SlotId) => slots.state.pipe(
     Effect.map((state) => state.slots[slotId === PRIMARY_SLOT_ID ? "primary" : "secondary"]),
     Effect.filterOrFail(
@@ -174,6 +196,18 @@ export const ModelCommandsLive: Layer.Layer<
   )
 
   const sync = (modelId: ProviderModelId) => Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
+    const product = yield* restore(localProduct(modelId))
+    if (product.acquisitionState._tag === "Installed") {
+      return { outcome: "AlreadyCurrent" as const }
+    }
+    if (product.acquisitionState._tag === "Removing"
+      || product.acquisitionState._tag === "RemoveFailed") {
+      return yield* new LocalModelMutationFailed({
+        code: "model_not_pullable",
+        message: `${modelId} cannot be pulled from state ${product.acquisitionState._tag}`,
+        retryable: false,
+      })
+    }
     const replaceGeneration = yield* restore(Effect.gen(function* () {
       const existing = (yield* acquisition.state).syncs.get(modelId)
       const existingDownload = existing?._tag === "Correlated"
@@ -187,17 +221,37 @@ export const ModelCommandsLive: Layer.Layer<
       return replace ? Option.some(existing.generation) : Option.none<number>()
     }))
     const admitted = yield* acquisition.admitSync(modelId, replaceGeneration)
-    if (Option.isSome(admitted)) yield* runSync(modelId, admitted.value)
-    return {}
+    if (Option.isNone(admitted)) {
+      return yield* new LocalModelMutationFailed({
+        code: "model_sync_busy",
+        message: `${modelId} already has active acquisition work`,
+        retryable: true,
+      })
+    }
+    yield* runSync(modelId, admitted.value)
+    return { outcome: "Started" as const }
   }))
 
   const cancelSync = (modelId: ProviderModelId) => Effect.gen(function* () {
-    const cancellation = yield* acquisition.requestSyncCancellation(modelId)
-    if (Option.isSome(cancellation)) {
-      yield* cancelDownload(cancellation.value.downloadId)
-      yield* packages.refresh
-      yield* acquisition.finishSync(modelId, cancellation.value.generation)
+    const existing = (yield* acquisition.state).syncs.get(modelId)
+    if (existing === undefined || existing._tag === "AdmissionFailed"
+      || (existing._tag === "Admitting" && existing.cancelRequested)) {
+      return yield* new LocalModelMutationFailed({
+        code: "model_sync_not_active",
+        message: `${modelId} has no cancellable pull`,
+        retryable: false,
+      })
     }
+    const cancellation = yield* acquisition.requestSyncCancellation(modelId)
+    if (Option.isNone(cancellation)) {
+      // Admission has not produced its native download identity yet. The
+      // coordinator records intent and runSync cancels immediately after
+      // correlation, without exposing that native identity to the caller.
+      return {}
+    }
+    yield* cancelDownload(cancellation.value.downloadId)
+    yield* packages.refresh
+    yield* acquisition.finishSync(modelId, cancellation.value.generation)
     return {}
   })
 
@@ -224,8 +278,37 @@ export const ModelCommandsLive: Layer.Layer<
     cancelSync,
     acknowledgeSyncFailure,
     remove: (modelId) => Effect.uninterruptible(Effect.gen(function* () {
+      const product = yield* localProduct(modelId)
+      const state = product.acquisitionState
+      if (!("packages" in state) || state._tag === "Removing") {
+        return yield* new LocalModelMutationFailed({
+          code: "model_not_removable",
+          message: `${modelId} cannot be removed from state ${state._tag}`,
+          retryable: false,
+        })
+      }
+      if (state.residencyState._tag !== "Unloaded" && state.residencyState._tag !== "Failed") {
+        return yield* new LocalModelMutationFailed({
+          code: "model_active",
+          message: `${modelId} is active; run \`magnitude models stop\` before removing it`,
+          retryable: false,
+        })
+      }
+      if ((yield* acquisition.state).syncs.has(modelId)) {
+        return yield* new LocalModelMutationFailed({
+          code: "model_sync_active",
+          message: `${modelId} has an active pull; cancel it first`,
+          retryable: false,
+        })
+      }
       const admitted = yield* acquisition.admitRemoval(modelId)
-      if (Option.isNone(admitted)) return {}
+      if (Option.isNone(admitted)) {
+        return yield* new LocalModelMutationFailed({
+          code: "model_removal_active",
+          message: `${modelId} is already being removed`,
+          retryable: false,
+        })
+      }
       const generation = admitted.value
       const remove = client.models.uninstallModel({ payload: { modelId } }).pipe(
         Effect.mapError((cause) => modelCommandFailure("uninstall_model", cause)),
@@ -270,6 +353,36 @@ export const ModelCommandsLive: Layer.Layer<
         Effect.mapError((cause) => modelCommandFailure("stop_model", cause)),
       )
       yield* slots.refresh
+      return {}
+    }),
+    loadModel: (modelId) => Effect.gen(function* () {
+      const product = yield* localProduct(modelId)
+      if (!("packages" in product.acquisitionState)
+        || product.acquisitionState._tag === "Removing") {
+        return yield* new LocalModelMutationFailed({
+            code: "model_not_installed",
+            message: `${modelId} is not installed`,
+            retryable: false,
+          })
+      }
+      yield* client.models.ensureModelInstance({ payload: { modelId } }).pipe(
+        Effect.mapError((cause) => modelCommandFailure("load_model", cause)),
+      )
+      return {}
+    }),
+    stopActiveModel: Effect.gen(function* () {
+      const instance = (yield* instances.get).instances.findLast((candidate) =>
+        candidate.lifecycle._tag === "Loading" || candidate.lifecycle._tag === "Ready")
+      if (instance === undefined) {
+        return yield* new LocalModelMutationFailed({
+          code: "no_active_model",
+          message: "There is no active local model to stop",
+          retryable: false,
+        })
+      }
+      yield* client.models.stopModelInstance({ path: { instance_id: instance.id } }).pipe(
+        Effect.mapError((cause) => modelCommandFailure("stop_model", cause)),
+      )
       return {}
     }),
   })

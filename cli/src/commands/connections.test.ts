@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest"
 import { registerConnectionsCommand } from "./connections"
 
 describe("connections command contract", () => {
-  it("connects all models by default and exposes current selection only as an option", () => {
+  it("connects all models and optionally changes the harness current selection", () => {
     const program = new Command()
     registerConnectionsCommand(program)
     const connections = program.commands.find((command) => command.name() === "connections")

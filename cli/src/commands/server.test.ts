@@ -16,8 +16,11 @@ describe("Magnitude service definitions", () => {
     registerServiceCommand(program)
     expect(program.commands.map((command) => command.name())).toEqual(["service"])
     expect(program.commands[0]!.commands.map((command) => command.name())).toEqual([
+      "install",
+      "uninstall",
       "start",
       "stop",
+      "status",
     ])
   })
   it("registers development startup against the local ACN entrypoint", () => {

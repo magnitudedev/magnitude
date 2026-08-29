@@ -522,7 +522,9 @@ const makeHarness = (options: HarnessOptions) => {
             })()
           : makeModel(true)
         models = { ...models, models: [model] }
-        return Queue.offer(changes, { query: "GetModelCatalog" }).pipe(Effect.as({}))
+        return Queue.offer(changes, { query: "GetModelCatalog" }).pipe(
+          Effect.as({ outcome: "Started" as const }),
+        )
       }
       case "AssignModelSlot": {
         if (options.failAssign) return Effect.fail({
