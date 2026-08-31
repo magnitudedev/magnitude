@@ -42,8 +42,7 @@ Magnitude supports macOS and Linux. Windows is supported through WSL.
 
 - **Knows your hardware:** profiles your chip, memory, and bandwidth
 - **Recommends what fits:** the best models for your machine, with estimated tok/s
-- **No separate server:** our own inference engine, optimized for agent workloads
-- **Manages models for you:** loaded on request, unloaded when idle or memory fills
+- **Models on demand:** loaded on request, unloaded when idle or memory fills
 - **Tuned end to end:** speculative decoding, concurrency, all set for your machine
 - **Set up in one command:** pick a recommended model, then launch your harness
 - **Fully private and offline:** models, prompts, and files stay on your machine
