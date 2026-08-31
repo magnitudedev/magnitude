@@ -15,9 +15,7 @@ use icn_contracts::models::{
 };
 
 use crate::catalog_installations::ManagedCatalogInstallations;
-use crate::discovered_models::{
-    SelectedDiscovery, discovered_profile, selected_discovered_packages,
-};
+use crate::discovered_models::{discovered_profile, selected_discovered_packages};
 use crate::inventory::{InstalledPackagesObserver, catalog_packages, catalog_target};
 use crate::model_domains::{ModelDomainResolver, domain_changes};
 use crate::model_projection::{
@@ -66,7 +64,6 @@ impl ModelDomainResolver {
                 })?;
                 let selected = selected_discovered_packages(&installed)
                     .remove(model_id)
-                    .and_then(SelectedDiscovery::ready)
                     .ok_or_else(|| InventoryError::NotFound(model_id.to_string()))?;
                 if matches!(
                     selected.catalog_attribution,

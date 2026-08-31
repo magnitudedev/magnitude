@@ -778,13 +778,9 @@ const DiscoveredUnavailableLocalModelStateSchema = Schema.TaggedStruct("Unavaila
   installation: ResolvedModelInstallationSchema,
   failure: ModelFailureSchema,
 })
-const DiscoveredAmbiguousLocalModelStateSchema = Schema.TaggedStruct("Ambiguous", {
-  failure: ModelFailureSchema,
-})
 export const DiscoveredLocalModelStateSchema = Schema.Union(
   DiscoveredReadyLocalModelStateSchema,
   DiscoveredUnavailableLocalModelStateSchema,
-  DiscoveredAmbiguousLocalModelStateSchema,
 )
 export type DiscoveredLocalModelState = typeof DiscoveredLocalModelStateSchema.Type
 

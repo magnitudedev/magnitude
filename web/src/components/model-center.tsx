@@ -155,8 +155,6 @@ const modelTransfer = (model: LocalModel) =>
   model._tag === "Catalog" ? acquisitionProgress(model.acquisitionState) ?? null : null
 type StatusTone = "neutral" | "success" | "progress" | "warning" | "danger"
 const modelStatus = (model: LocalModel): { readonly label: string; readonly tone: StatusTone } => {
-  if (model._tag === "Discovered" && model.state._tag === "Ambiguous")
-    return { label: "Ambiguous", tone: "danger" }
   if (model._tag === "Discovered" && model.state._tag === "Unavailable")
     return { label: "Unavailable", tone: "danger" }
   const acquisition = model._tag === "Catalog" ? model.acquisitionState : undefined
@@ -290,9 +288,7 @@ function ModelTransferProgress({
   )
 }
 const installedModelTargetPath = (model: LocalModel): string | null => {
-  if (model._tag === "Discovered") return model.state._tag !== "Ambiguous"
-    ? model.state.installation.primaryPath
-    : null
+  if (model._tag === "Discovered") return model.state.installation.primaryPath
   const installation = installedAcquisition(model.acquisitionState)?.installation
   return installation?._tag === "Resolved" ? installation.primaryPath : null
 }

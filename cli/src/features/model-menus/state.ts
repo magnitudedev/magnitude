@@ -95,8 +95,7 @@ const alignUndisplayedHeadroom = (
         },
       }
     }
-    case "Unavailable":
-    case "Ambiguous": return nextModel
+    case "Unavailable": return nextModel
   }
 }
 

@@ -1173,18 +1173,13 @@ pub enum DiscoveredModelCatalogAttribution {
 pub enum DiscoveredModelState {
     #[serde(rename_all = "camelCase")]
     Ready {
-        selected_revision: String,
         installation: ResolvedModelInstallation,
         model: ReadyModel,
         catalog_attribution: DiscoveredModelCatalogAttribution,
     },
     #[serde(rename_all = "camelCase")]
     Unavailable {
-        selected_revision: String,
         installation: ResolvedModelInstallation,
-        failure: ModelFailure,
-    },
-    Ambiguous {
         failure: ModelFailure,
     },
 }

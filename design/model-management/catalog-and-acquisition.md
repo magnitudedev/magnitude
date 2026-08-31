@@ -129,12 +129,13 @@ projector. Multiple quantizations therefore remain distinct when they occupy dis
 paths. Quantization presentation comes from GGUF inspection rather than filename parsing.
 
 When several cached revisions or configured roots provide the same repository and selector, exact
-identical packages collapse. The candidate selected by the repository's cached `main` ref wins;
-without one, exactly one distinct candidate wins. Every other case is an explicit ambiguity and is
-not callable. Selection precedes inspection, so an invalid selected revision never falls back to a
-stale revision. An exact catalog target that is successfully attributed publishes only under its
-catalog identity; failed attribution remains visible through discovery so the installed artifact
-does not disappear from inventory.
+identical packages collapse. Candidates referenced by a cached `main` ref outrank other candidates.
+Within the same ref priority, the most recently modified cached revision wins; its immutable commit
+provides the deterministic final tie-break. This is local cache recency, not a claim about upstream
+commit chronology. Selection precedes inspection, so an invalid selected revision never falls back
+to a stale revision. An exact catalog target that is successfully attributed publishes only under
+its catalog identity; failed attribution remains visible through discovery so the installed
+artifact does not disappear from inventory.
 
 Inventory retains source occurrences by `InventoryEntryId` until this selection is complete.
 Package-content deduplication therefore never erases the repository, selector, root, revision, or

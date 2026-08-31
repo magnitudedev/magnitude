@@ -216,9 +216,7 @@ const discoveredModel = (
             ? { _tag: "NotInCatalog" as const }
             : { _tag: "AttributionFailed" as const, failure: state.catalogAttribution.failure },
           servingState: discoveredModelServingState(state.model, assessment) }
-      : state._tag === "Unavailable"
-        ? { _tag: "Unavailable" as const, installation: state.installation, failure: state.failure }
-        : { _tag: "Ambiguous" as const, failure: state.failure },
+      : { _tag: "Unavailable" as const, installation: state.installation, failure: state.failure },
   })
 }
 
