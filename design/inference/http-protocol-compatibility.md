@@ -67,8 +67,21 @@ In particular, `store: false` and a function definition's optional `strict` flag
 `store: true` is rejected explicitly because the local runtime does not provide server-side
 conversation persistence; it is not rejected as an unknown field.
 Historical Chat Completions tool-result messages may include the function name in addition to the
-required tool-call ID. Anthropic Messages accepts cache-control annotations and output-configuration
-hints used by current Claude Code clients without assigning them unsupported local semantics.
+required tool-call ID. Anthropic Messages accepts cache-control annotations and current Claude Code
+output configuration. Unknown output-configuration members remain compatibility hints, while
+`output_config.effort` is a semantic input owned by the Anthropic adapter.
+
+An Anthropic output effort that exactly names a model behavior selects that behavior. Current
+Claude gateway discovery cannot advertise a local model's effort domain: it retains only ID,
+display name, and description. The Anthropic adapter therefore owns a `RoundUpOrClamp` admission
+policy over the ordinal scale `minimal < low < medium < high < xhigh < max`. An unsupported ordinal
+selects the least supported enabled ordinal at or above it; if none exists, it clamps to the
+greatest supported enabled ordinal below it. A model with only named enabled behavior uses its
+enabled default. This is Anthropic-protocol compatibility, not generic gateway rounding.
+Omitted/adaptive effort selects the model default, and disabled thinking is accepted only when the
+model supports `none`. The adapter represents this interpretation as a transient admission policy
+beside the canonical invocation. Admission applies it after leasing exposes the model profile; it
+is not a canonical reasoning intent or a serializable domain value.
 
 Reasoning-history controls are independent from current-turn reasoning effort. Chat Completions
 passes explicitly supplied history controls through to the effective template unchanged.
@@ -171,14 +184,20 @@ Magnitude writes no persistent Claude credential or model default: ordinary Clau
 the user's authentication and pass through the gateway to Anthropic, while discovered
 `anthropic-local/<canonical-model-id>` aliases route to ICN. The handoff launch plan passes the
 selected local alias explicitly without changing Claude Code's persisted model selection.
+The discovery response uses the model's ordinary description and does not encode capability
+metadata as prose. Claude Code's current gateway schema cannot consume a machine-readable effort
+domain, so effort interpretation remains in the local Anthropic adapter after model resolution;
+ACN continues to rewrite only the routing alias.
 
 ## Ownership
 
 - ICN contracts own input, execution, output, usage, termination, and failure facts.
-- ICN API adapters own DTO validation, request conversion, protocol IDs, wire event ordering, and
-  protocol-specific errors.
-- The shared runner owns exact model leasing, reasoning resolution, execution, cancellation, and
-  bounded output delivery.
+- ICN API adapters own DTO validation, request conversion, protocol IDs, wire event ordering,
+  protocol-specific errors, and any transient admission policy required to interpret their wire
+  controls against a resolved model.
+- The shared runner owns exact model leasing, strict reasoning resolution, application of the
+  adapter-supplied admission policy, execution, cancellation, and bounded output delivery. Admission
+  policies are API-local and never extend the canonical inference contract.
 - ACN owns public Anthropic model routing, local aliases, discovery projection, credential
   isolation, and byte-preserving upstream proxying. Its only local request mutation is replacing
   the routing alias with the canonical model ID.

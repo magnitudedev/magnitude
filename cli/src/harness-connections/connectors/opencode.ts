@@ -1,6 +1,7 @@
 import { Effect } from "effect"
 import type { HarnessConnectionSpec } from "../contract"
 import type { HarnessConnectionPaths } from "../paths"
+import { modelInput, modelMaxTokens } from "../model-fields"
 import {
   LOCAL_TOKEN,
   OPENAI_BASE_URL,
@@ -13,11 +14,26 @@ import {
   writeIfChanged,
 } from "../shared"
 
+const reasoningVariants = (model: HarnessConnectionSpec["models"][number]) => Object.fromEntries(
+  model.capabilities.reasoning.efforts.map((effort) => [
+    effort === "none" ? "off" : effort,
+    { reasoningEffort: effort },
+  ]),
+)
+
 export const openCodeProviderConfig = (models: HarnessConnectionSpec["models"]) => ({
   npm: OPENAI_COMPATIBLE_PACKAGE,
   name: "Magnitude",
   options: { baseURL: OPENAI_BASE_URL, apiKey: LOCAL_TOKEN },
-  models: Object.fromEntries(models.map(({ id, name }) => [id, { name }])),
+  models: Object.fromEntries(models.map((model) => [model.id, {
+    name: model.name,
+    limit: { context: model.contextWindow, output: modelMaxTokens(model) },
+    modalities: {
+      input: modelInput(model),
+      output: ["text"],
+    },
+    variants: reasoningVariants(model),
+  }])),
 })
 
 export const makeOpenCodeConnector = (paths: HarnessConnectionPaths) => defineConnector({

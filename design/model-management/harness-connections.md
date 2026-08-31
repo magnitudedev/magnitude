@@ -68,9 +68,29 @@ commands call this same service; neither contains connector-specific transforms.
 The unified connector contract is `detect`, `connect(HarnessConnectionSpec)`,
 `disconnect(HarnessConnectionSpec)`, and `launch(modelId, installation)`, plus one declarative skill
 installation target. The spec contains the complete harness-facing Magnitude model descriptors plus
-an optional `setCurrent` model ID. Each harness implements this contract in its own module. The
+an optional `setCurrent` model ID. During sync it also contains the prior manifest descriptors so a
+connector can replace only its previous model-relative projection. Each harness implements this
+contract in its own module. The
 registry only composes those modules in canonical priority order; it contains no harness
 configuration logic.
+
+Reasoning validity is model-relative. Magnitude owns the exact normalized model domain; every
+connector separately owns its harness's control vocabulary and the projection from those controls
+to normalized efforts. Shared projection logic may operate on a connector-supplied control surface,
+but no common list is treated as universally native. A projected default is always a harness
+control whose mapping resolves to the model default, never an effort name copied into a control
+field. Connect and sync preserve user-owned global and session preferences. Launch selects only the
+provider/profile/agent and exact model, so the same persisted projection applies when a connected
+harness is opened independently. A fixed-scale harness may give a differently named control to a
+normalized named mode, or map its sole enabled control to a model's sole enabled behavior. ICN never
+rounds an ordinary explicit unsupported OpenAI effort. If a user bypasses native validation, ICN
+returns the supported-domain error.
+
+Pi and OpenClaw receive per-model thinking-level maps, Cline receives per-model reasoning options,
+OpenCode receives exact model variants, Oh My Pi receives native thinking configurations, Codex
+receives exact catalog domains/defaults, and Hermes receives per-model default overrides that take
+precedence over its preserved global effort. Magnitude already stores model and effort together per
+slot. A connector does not publish `none` when the model cannot disable reasoning.
 
 The protocol policy is deliberately narrow: every harness capable of consuming OpenAI Chat
 Completions uses `http://127.0.0.1:10100/inference/v1/chat/completions`. Pi and Oh My Pi declare
@@ -84,8 +104,9 @@ Codex is the sole Responses consumer. Its separately owned profile uses the base
 `wire_api = "responses"`. The connector also owns a Codex-native model catalog derived from the
 shared descriptors and points the profile's `model_catalog_json` at it. This prevents fallback
 metadata and supplies Codex with exact display names, context windows, input modalities, and
-reasoning domains. When `setCurrent` is present, the profile selects that model and its advertised
-default reasoning effort. The profile explicitly selects the default service tier so unrelated
+reasoning domains. When `setCurrent` is present, the profile selects that model; Codex obtains its
+advertised default from the catalog instead of a profile-level `model_reasoning_effort` that could
+become stale after model switching. The profile explicitly selects the default service tier so unrelated
 global priority-tier configuration cannot leak into local requests. Claude Code is the
 sole Anthropic Messages consumer. It uses
 `http://127.0.0.1:10100/inference/anthropic`, producing `/inference/anthropic/v1/messages`, and
@@ -111,8 +132,10 @@ plan passes that directory through `--data-dir` together with `--provider openai
 <id>` and `--tui`. The user's normal Cline data directory and provider settings remain untouched.
 OpenClaw launches `openclaw tui --local --session agent:magnitude:main`, using its embedded runtime so handoff neither requires
 nor starts an OpenClaw Gateway daemon. Its connector owns a dedicated `magnitude` agent whose model
-is the selected Magnitude model and launches the `agent:magnitude:main` session. It does not change
-the user's global primary model or other agents.
+is the selected Magnitude model and whose native `thinkingDefault` is the OpenClaw control that maps
+to that model's advertised default. Per-model thinking maps clamp that agent preference after later model switches. The
+connector launches the `agent:magnitude:main` session and does not change the user's global primary
+model or other agents.
 
 ## Skill and startup options
 
@@ -143,6 +166,17 @@ model-alias, or attribution default. An ordinary later `claude` launch therefore
 `anthropic-local/` aliases through Magnitude while retaining the user's normal Claude authentication
 and model selection. Disconnect removes either setting only while it still equals Magnitude's
 installed value, preserving subsequent user edits.
+
+Claude Code 2.1.175 gateway discovery retains only model ID, display name, and description; it has
+no discovery field through which Magnitude can install a per-model effort domain. Magnitude therefore
+does not write or launch with a Claude effort. Both a Magnitude handoff and a later manual Claude
+selection pass Claude's sticky `output_config.effort` through the local Anthropic adapter. Exact
+supported values remain exact. When the selected model exposes exactly one enabled behavior, a
+different enabled Claude label maps to that behavior. For a multi-effort model, an unsupported
+ordinal label rounds upward to the least supported enabled ordinal or clamps to the greatest one
+when the requested label exceeds the model's range. This `RoundUpOrClamp` rule is a scoped
+Anthropic/Claude protocol translation, not generic gateway request rewriting. Disabled thinking
+still requires the model to support `none`.
 
 ## Handoff
 

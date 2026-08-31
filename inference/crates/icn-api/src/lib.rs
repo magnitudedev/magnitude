@@ -1665,10 +1665,32 @@ struct AdmittedInvocation {
     request: domain::ResolvedInferenceRequest,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) enum ReasoningEffortResolution {
+    #[default]
+    Exact,
+    RoundUpOrClamp,
+}
+
 async fn admit_invocation(
     controller: &Arc<dyn ModelInstanceController>,
     invocation: domain::InferenceInvocation,
     progress: Option<ModelLoadingObserver>,
+) -> Result<AdmittedInvocation, ApiError> {
+    admit_invocation_with_effort_resolution(
+        controller,
+        invocation,
+        progress,
+        ReasoningEffortResolution::Exact,
+    )
+    .await
+}
+
+async fn admit_invocation_with_effort_resolution(
+    controller: &Arc<dyn ModelInstanceController>,
+    invocation: domain::InferenceInvocation,
+    progress: Option<ModelLoadingObserver>,
+    effort_resolution: ReasoningEffortResolution,
 ) -> Result<AdmittedInvocation, ApiError> {
     let (model, request) = invocation.into_parts();
     let model = model.into_inner();
@@ -1681,6 +1703,8 @@ async fn admit_invocation(
         .backend()
         .properties()
         .map_err(ApiError::from_inference)?;
+    let request =
+        apply_reasoning_effort_resolution(request, &properties.reasoning, effort_resolution);
     let request = resolve_request(request, &properties.reasoning)?;
     Ok(AdmittedInvocation {
         lease,
@@ -1851,21 +1875,114 @@ fn resolve_request(
     Ok(request.map_reasoning(|_| reasoning))
 }
 
+fn apply_reasoning_effort_resolution(
+    request: domain::InferenceRequest<domain::ReasoningIntent>,
+    profile: &icn_contracts::ReasoningProfile,
+    resolution: ReasoningEffortResolution,
+) -> domain::InferenceRequest<domain::ReasoningIntent> {
+    request.map_reasoning(|intent| match intent {
+        domain::ReasoningIntent::Effort {
+            effort,
+            template_args,
+            budget,
+        } if profile.mapping(&effort).is_none()
+            && matches!(resolution, ReasoningEffortResolution::RoundUpOrClamp) =>
+        {
+            domain::ReasoningIntent::Effort {
+                effort: round_up_or_clamp_reasoning_effort(&effort, profile).unwrap_or(effort),
+                template_args,
+                budget,
+            }
+        }
+        other => other,
+    })
+}
+
+fn reasoning_effort_rank(effort: &icn_contracts::NormalizedReasoningEffort) -> Option<usize> {
+    match effort.as_str() {
+        "minimal" => Some(0),
+        "low" => Some(1),
+        "medium" => Some(2),
+        "high" => Some(3),
+        "xhigh" => Some(4),
+        "max" => Some(5),
+        "none" | "adaptive" => None,
+        _ => None,
+    }
+}
+
+fn round_up_or_clamp_reasoning_effort(
+    requested: &icn_contracts::NormalizedReasoningEffort,
+    profile: &icn_contracts::ReasoningProfile,
+) -> Option<icn_contracts::NormalizedReasoningEffort> {
+    let enabled = profile
+        .mappings
+        .iter()
+        .filter(|mapping| mapping.effort.as_str() != "none")
+        .collect::<Vec<_>>();
+    let rounded = reasoning_effort_rank(requested).and_then(|requested_rank| {
+        let ranked = || {
+            enabled.iter().filter_map(|mapping| {
+                reasoning_effort_rank(&mapping.effort).map(|rank| (rank, mapping))
+            })
+        };
+        ranked()
+            .filter(|(rank, _)| *rank >= requested_rank)
+            .min_by_key(|(rank, _)| *rank)
+            .or_else(|| ranked().max_by_key(|(rank, _)| *rank))
+            .map(|(_, mapping)| mapping.effort.clone())
+    });
+    rounded.or_else(|| {
+        profile
+            .default_effort
+            .as_ref()
+            .filter(|effort| effort.as_str() != "none" && profile.mapping(effort).is_some())
+            .cloned()
+            .or_else(|| enabled.first().map(|mapping| mapping.effort.clone()))
+    })
+}
+
 fn resolve_reasoning(
     intent: domain::ReasoningIntent,
     profile: &icn_contracts::ReasoningProfile,
 ) -> Result<domain::ResolvedReasoning, ApiError> {
+    let unsupported_effort = |effort: &icn_contracts::NormalizedReasoningEffort| {
+        let supported = profile
+            .mappings
+            .iter()
+            .map(|mapping| mapping.effort.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        ApiError::invalid(format!(
+            "reasoning effort {} is unsupported for this model; supported values: {supported}",
+            effort.as_str()
+        ))
+    };
     let (effort, mut controls, automatic_budget, explicit_budget, template_args) = match intent {
-        domain::ReasoningIntent::Disabled { template_args } => (
-            icn_contracts::NormalizedReasoningEffort("none".into()),
-            icn_contracts::NativeReasoningControls {
-                enable_thinking: Some(false),
-                template_args: BTreeMap::new(),
-            },
-            icn_contracts::AutomaticReasoningBudget::Disabled,
-            None,
-            template_args,
-        ),
+        domain::ReasoningIntent::Disabled { template_args } => {
+            let effort = icn_contracts::NormalizedReasoningEffort("none".into());
+            if !profile.mappings.is_empty() && profile.mapping(&effort).is_none() {
+                let supported = profile
+                    .mappings
+                    .iter()
+                    .map(|mapping| mapping.effort.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(ApiError::invalid(format!(
+                    "reasoning cannot be disabled for this model; supported values: {supported}"
+                )));
+            }
+            (
+                effort,
+                icn_contracts::NativeReasoningControls {
+                    enable_thinking: Some(false),
+                    template_args: BTreeMap::new(),
+                },
+                icn_contracts::AutomaticReasoningBudget::Disabled,
+                None,
+                template_args,
+            )
+        }
         domain::ReasoningIntent::ModelDefault {
             template_args,
             budget,
@@ -1924,18 +2041,9 @@ fn resolve_reasoning(
             template_args,
             budget,
         } => {
-            let mapping = profile.mapping(&effort).ok_or_else(|| {
-                let supported = profile
-                    .mappings
-                    .iter()
-                    .map(|mapping| mapping.effort.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                ApiError::invalid(format!(
-                    "reasoning effort {} is unsupported for this model; supported values: {supported}",
-                    effort.as_str()
-                ))
-            })?;
+            let mapping = profile
+                .mapping(&effort)
+                .ok_or_else(|| unsupported_effort(&effort))?;
             (
                 effort,
                 mapping.controls.clone(),
@@ -3454,6 +3562,111 @@ mod tests {
             panic!("second entry must be assistant");
         };
         assert!(entry.tool_calls()[0].result().content().is_empty());
+    }
+
+    #[test]
+    fn anthropic_effort_rounds_up_or_clamps_to_the_model_domain() {
+        let base_profile = FakeBackend::new("test-model", "")
+            .properties()
+            .expect("fake properties")
+            .reasoning;
+        let enabled = base_profile
+            .mapping(&icn_contracts::NormalizedReasoningEffort("high".into()))
+            .expect("fake profile must have an enabled mapping")
+            .clone();
+        let profile = |efforts: &[&str], default: &str| icn_contracts::ReasoningProfile {
+            default_effort: Some(icn_contracts::NormalizedReasoningEffort(default.into())),
+            mappings: efforts
+                .iter()
+                .map(|effort| {
+                    let mut mapping = enabled.clone();
+                    mapping.effort = icn_contracts::NormalizedReasoningEffort((*effort).into());
+                    mapping
+                })
+                .collect(),
+            template_fingerprint: base_profile.template_fingerprint.clone(),
+        };
+
+        for (efforts, default, wire_effort, expected) in [
+            (vec!["low", "xhigh"], "low", "low", "low"),
+            (vec!["low", "xhigh"], "low", "medium", "xhigh"),
+            (vec!["low", "medium", "xhigh"], "medium", "high", "xhigh"),
+            (vec!["low", "high"], "high", "xhigh", "high"),
+            (vec!["low", "xhigh"], "xhigh", "max", "xhigh"),
+            (vec!["high"], "high", "medium", "high"),
+            (vec!["adaptive"], "adaptive", "medium", "adaptive"),
+        ] {
+            let profile = profile(&efforts, default);
+            let request: protocols::anthropic::MessagesRequest = serde_json::from_value(json!({
+                "model": "test-model",
+                "max_tokens": 16,
+                "output_config": { "effort": wire_effort },
+                "messages": [{ "role": "user", "content": "hello" }]
+            }))
+            .expect("Anthropic effort must decode");
+            let adapted =
+                protocols::anthropic::adapt(request).expect("Anthropic effort must adapt");
+            let (_, request) = adapted.invocation.into_parts();
+            let request = apply_reasoning_effort_resolution(
+                request,
+                &profile,
+                adapted.reasoning_effort_resolution,
+            );
+            let resolved = resolve_request(request, &profile).expect("effort must resolve");
+            assert_eq!(resolved.reasoning().effort().as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn strict_efforts_and_thinking_disable_do_not_use_anthropic_rounding() {
+        let mut profile = FakeBackend::new("test-model", "")
+            .properties()
+            .expect("fake properties")
+            .reasoning;
+        profile
+            .mappings
+            .retain(|mapping| mapping.effort.as_str() != "none");
+
+        let explicit = domain::ReasoningIntent::Effort {
+            effort: icn_contracts::NormalizedReasoningEffort("medium".into()),
+            template_args: BTreeMap::new(),
+            budget: None,
+        };
+        assert!(resolve_reasoning(explicit, &profile).is_err());
+        assert!(
+            resolve_reasoning(
+                domain::ReasoningIntent::Disabled {
+                    template_args: BTreeMap::new(),
+                },
+                &profile,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn anthropic_rejects_effort_when_thinking_is_disabled() {
+        let request: protocols::anthropic::MessagesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "thinking": { "type": "disabled" },
+            "output_config": { "effort": "high" },
+            "messages": [{ "role": "user", "content": "hello" }]
+        }))
+        .expect("request must decode");
+        assert!(protocols::anthropic::adapt(request).is_err());
+    }
+
+    #[test]
+    fn anthropic_output_effort_cannot_select_none() {
+        let request: protocols::anthropic::MessagesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "output_config": { "effort": "none" },
+            "messages": [{ "role": "user", "content": "hello" }]
+        }))
+        .expect("request must decode");
+        assert!(protocols::anthropic::adapt(request).is_err());
     }
 
     #[test]

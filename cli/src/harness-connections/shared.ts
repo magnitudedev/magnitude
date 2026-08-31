@@ -11,7 +11,7 @@ import { applyEdits, modify, parse, type ParseError } from "jsonc-parser"
 import { isDeepStrictEqual } from "node:util"
 import { parseDocument } from "yaml"
 import { writeFileAtomic } from "../utils/atomic-file"
-import type { HarnessConnectionSpec, HarnessConnector, HarnessInstallation, HarnessModel } from "./contract"
+import type { HarnessConnectionSpec, HarnessConnector, HarnessInstallation } from "./contract"
 
 export const OPENAI_BASE_URL = new URL("v1", MAGNITUDE_INFERENCE_BASE_URL).href.replace(/\/$/, "")
 export const ANTHROPIC_BASE_URL = MAGNITUDE_ANTHROPIC_BASE_URL.replace(/\/$/, "")
@@ -115,6 +115,20 @@ export const removeYamlPaths = (
   return String(document)
 }
 
+export const removeOwnedYaml = (
+  source: string,
+  owned: ReadonlyArray<OwnedValue>,
+): string => {
+  const document = parseDocument(source.trim() === "" ? "{}\n" : source)
+  if (document.errors.length > 0) throw new Error("configuration is not valid YAML")
+  for (const [segments, expected] of owned) {
+    if (isDeepStrictEqual(valueAt(document.toJS(), segments), expected)) {
+      deleteYamlPath(document, segments)
+    }
+  }
+  return String(document)
+}
+
 export const writeIfChanged = (file: string, source: string, next: string) => next === source
   ? Effect.void
   : writeFileAtomic(file, next)
@@ -160,5 +174,3 @@ export const defineConnector = (definition: ConnectorDefinition): HarnessConnect
 }
 
 export const currentModel = (spec: HarnessConnectionSpec): Option.Option<ProviderModelId> => spec.setCurrent
-
-export const modelEntries = (models: ReadonlyArray<HarnessModel>): ReadonlyArray<HarnessModel> => models

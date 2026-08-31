@@ -6,10 +6,14 @@ import {
   defineConnector,
   launchPlan,
   readOr,
+  removeOwnedYaml,
   removeYamlPaths,
   updateYaml,
+  valueAt,
   writeIfChanged,
 } from "../shared"
+import { parseDocument } from "yaml"
+import type { HarnessConnectionSpec } from "../contract"
 
 export const hermesProviderConfig = () => ({
   name: "Magnitude",
@@ -18,20 +22,46 @@ export const hermesProviderConfig = () => ({
   transport: "chat_completions",
 })
 
+export const hermesReasoningOverrides = (models: HarnessConnectionSpec["models"]) => Object.fromEntries(
+  models.map((model) => [
+    model.id,
+    model.capabilities.reasoning.supported ? model.capabilities.reasoning.defaultEffort : "none",
+  ]),
+)
+
 export const makeHermesConnector = (paths: HarnessConnectionPaths) => defineConnector({
   id: "hermes",
   name: "Hermes",
   executable: "hermes",
   skillInstallationTarget: "hermes-user",
   configurationFiles: [paths.hermes],
-  connect: () => Effect.gen(function* () {
-    const source = yield* readOr(paths.hermes, "{}\n")
-    yield* writeIfChanged(paths.hermes, source, updateYaml(source, [[
+  connect: (spec) => Effect.gen(function* () {
+    const original = yield* readOr(paths.hermes, "{}\n")
+    const source = removeOwnedYaml(original, Object.entries(hermesReasoningOverrides(spec.previousModels ?? [])).map(
+      ([modelId, effort]) => [["agent", "reasoning_overrides", modelId], effort] as const,
+    ))
+    const existing = parseDocument(source.trim() === "" ? "{}\n" : source).toJS()
+    const changes: Array<readonly [ReadonlyArray<string>, unknown]> = [[
       ["providers", "magnitude"], hermesProviderConfig(),
-    ]]))
+    ]]
+    for (const [modelId, effort] of Object.entries(hermesReasoningOverrides(spec.models))) {
+      const current = valueAt(existing, ["agent", "reasoning_overrides", modelId])
+      if (current === undefined) {
+        changes.push([["agent", "reasoning_overrides", modelId], effort])
+      }
+    }
+    yield* writeIfChanged(paths.hermes, original, updateYaml(source, changes))
   }),
-  disconnect: () => readOr(paths.hermes, "{}\n").pipe(Effect.flatMap((source) =>
-    writeIfChanged(paths.hermes, source, removeYamlPaths(source, [["providers", "magnitude"]])))),
+  disconnect: (spec) => readOr(paths.hermes, "{}\n").pipe(Effect.flatMap((source) => {
+    const withoutOverrides = removeOwnedYaml(source, Object.entries(hermesReasoningOverrides(spec.models)).map(
+      ([modelId, effort]) => [["agent", "reasoning_overrides", modelId], effort] as const,
+    ))
+    return writeIfChanged(
+      paths.hermes,
+      source,
+      removeYamlPaths(withoutOverrides, [["providers", "magnitude"]]),
+    )
+  })),
   launch(modelId, installation) {
     return launchPlan(this, installation, modelId, ["--provider", "custom:magnitude", "--model", modelId])
   },

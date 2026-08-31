@@ -17,9 +17,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use utoipa::ToSchema;
 
 use super::super::{
-    ApiError, AppState, ImageInput, admit_invocation, domain, domain_error, execute_with_journal,
+    ApiError, AppState, ImageInput, ReasoningEffortResolution,
+    admit_invocation_with_effort_resolution, domain, domain_error, execute_with_journal,
     non_empty_text, non_empty_vec,
 };
+use super::chat::ReasoningEffortRequest;
 
 const LOCAL_THINKING_SIGNATURE: &str = "magnitude-local-v1";
 
@@ -45,8 +47,13 @@ pub(crate) struct MessagesRequest {
     #[schema(nullable = false)]
     pub thinking: Option<Thinking>,
     pub metadata: Option<Value>,
-    #[serde(rename = "output_config")]
-    pub _output_config: Option<Value>,
+    pub output_config: Option<OutputConfig>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct OutputConfig {
+    #[schema(nullable = false)]
+    pub effort: Option<ReasoningEffortRequest>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -206,6 +213,7 @@ pub(crate) enum Thinking {
 pub(crate) struct AdaptedRequest {
     pub(crate) invocation: domain::InferenceInvocation,
     pub(crate) stream: bool,
+    pub(crate) reasoning_effort_resolution: ReasoningEffortResolution,
 }
 
 pub(crate) fn adapt(request: MessagesRequest) -> Result<AdaptedRequest, ApiError> {
@@ -274,18 +282,45 @@ pub(crate) fn adapt(request: MessagesRequest) -> Result<AdaptedRequest, ApiError
     };
     let tools = domain::ToolConfiguration::try_new(definitions, choice, parallelism)
         .map_err(domain_error)?;
-    let reasoning = match request.thinking {
-        Some(Thinking::Enabled { budget_tokens }) => domain::ReasoningIntent::Enabled {
+    let effort = request
+        .output_config
+        .and_then(|config| config.effort)
+        .map(|effort| effort.normalize())
+        .transpose()?;
+    if effort
+        .as_ref()
+        .is_some_and(|effort| effort.as_str() == "none")
+    {
+        return Err(ApiError::invalid(
+            "output_config.effort must select an enabled reasoning behavior",
+        ));
+    }
+    let budget = match request.thinking {
+        Some(Thinking::Enabled { budget_tokens }) => Some(
+            NonZeroU32::new(budget_tokens)
+                .ok_or_else(|| ApiError::invalid("thinking budget_tokens must be positive"))?,
+        ),
+        Some(Thinking::Adaptive) | Some(Thinking::Disabled) | None => None,
+    };
+    let reasoning = match (request.thinking, effort) {
+        (Some(Thinking::Disabled), Some(_)) => {
+            return Err(ApiError::invalid(
+                "output_config.effort cannot be used when thinking is disabled",
+            ));
+        }
+        (Some(Thinking::Disabled), None) => domain::ReasoningIntent::Disabled {
             template_args: BTreeMap::new(),
-            budget: Some(
-                NonZeroU32::new(budget_tokens)
-                    .ok_or_else(|| ApiError::invalid("thinking budget_tokens must be positive"))?,
-            ),
         },
-        Some(Thinking::Disabled) => domain::ReasoningIntent::Disabled {
+        (_, Some(effort)) => domain::ReasoningIntent::Effort {
+            effort,
             template_args: BTreeMap::new(),
+            budget,
         },
-        Some(Thinking::Adaptive) | None => domain::ReasoningIntent::ModelDefault {
+        (Some(Thinking::Enabled { .. }), None) => domain::ReasoningIntent::Enabled {
+            template_args: BTreeMap::new(),
+            budget,
+        },
+        (Some(Thinking::Adaptive) | None, None) => domain::ReasoningIntent::ModelDefault {
             template_args: BTreeMap::new(),
             budget: None,
         },
@@ -321,6 +356,7 @@ pub(crate) fn adapt(request: MessagesRequest) -> Result<AdaptedRequest, ApiError
             ),
         ),
         stream: request.stream,
+        reasoning_effort_resolution: ReasoningEffortResolution::RoundUpOrClamp,
     })
 }
 
@@ -1123,7 +1159,13 @@ pub(crate) async fn anthropic_count_tokens(
             .model_controller
             .as_ref()
             .ok_or_else(|| ApiError::server("model control is not configured"))?;
-        let admitted = admit_invocation(controller, adapted.invocation, None).await?;
+        let admitted = admit_invocation_with_effort_resolution(
+            controller,
+            adapted.invocation,
+            None,
+            adapted.reasoning_effort_resolution,
+        )
+        .await?;
         let count = tokio::task::spawn_blocking(move || {
             admitted.lease.backend().count_tokens(admitted.request)
         })
@@ -1219,7 +1261,13 @@ async fn anthropic_messages_inner(
         .as_ref()
         .ok_or_else(|| ApiError::server("model control is not configured"))?;
     let stream = adapted.stream;
-    let admitted = admit_invocation(controller, adapted.invocation, None).await?;
+    let admitted = admit_invocation_with_effort_resolution(
+        controller,
+        adapted.invocation,
+        None,
+        adapted.reasoning_effort_resolution,
+    )
+    .await?;
     let lease = admitted.lease;
     let request = admitted.request;
     let id = format!("msg_icn_{}", state.next_id.fetch_add(1, Ordering::Relaxed));

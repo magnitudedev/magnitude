@@ -4987,7 +4987,16 @@
             "$ref": "#/components/schemas/Thinking"
           },
           "metadata": {},
-          "output_config": {}
+          "output_config": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OutputConfig"
+              }
+            ]
+          }
         },
         "additionalProperties": false
       },
@@ -6183,6 +6192,14 @@
             "items": {
               "$ref": "#/components/schemas/MagnitudeModelDescriptor"
             }
+          }
+        }
+      },
+      "OutputConfig": {
+        "type": "object",
+        "properties": {
+          "effort": {
+            "$ref": "#/components/schemas/ReasoningEffortRequest"
           }
         }
       },

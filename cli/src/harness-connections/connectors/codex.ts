@@ -9,11 +9,6 @@ const CODEX_BASE_INSTRUCTIONS = "You are a coding agent running in Codex CLI. Wo
 
 const reasoningDescription = (effort: string): string => `Use the model's ${effort} reasoning effort.`
 
-const currentModel = (spec: HarnessConnectionSpec) => Option.flatMap(
-  spec.setCurrent,
-  (modelId) => Option.fromNullable(spec.models.find(({ id }) => id === modelId)),
-)
-
 export const codexModelCatalog = (spec: HarnessConnectionSpec): string => `${JSON.stringify({
   models: spec.models.map((model, priority) => ({
     slug: model.id,
@@ -58,15 +53,12 @@ export const codexModelCatalog = (spec: HarnessConnectionSpec): string => `${JSO
 }, null, 2)}\n`
 
 export const codexConfig = (spec: HarnessConnectionSpec, modelCatalogPath: string): string => {
-  const selected = currentModel(spec)
   return `model_provider = "magnitude"
 model_catalog_json = ${JSON.stringify(modelCatalogPath)}
 service_tier = "default"
-${Option.match(selected, {
+${Option.match(spec.setCurrent, {
   onNone: () => "",
-  onSome: (model) => `model = ${JSON.stringify(model.id)}\n${model.capabilities.reasoning.supported
-    ? `model_reasoning_effort = ${JSON.stringify(model.capabilities.reasoning.defaultEffort)}\n`
-    : `model_reasoning_effort = "none"\n`}`,
+  onSome: (modelId) => `model = ${JSON.stringify(modelId)}\n`,
 })}
 [model_providers.magnitude]
 name = "Magnitude"
