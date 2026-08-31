@@ -37,6 +37,7 @@ const HarnessLaunchPlanSchema = Schema.Struct({
 const AddConnectionResultSchema = Schema.Struct({
   action: Schema.Literal("add"),
   harness: HarnessIdSchema,
+  skillInstalled: Schema.Boolean,
   launchPlan: Schema.optionalWith(HarnessLaunchPlanSchema, { as: "Option", exact: true }),
 })
 const RemoveConnectionResultSchema = Schema.Struct({
@@ -103,19 +104,22 @@ export const listConnections = () => runCommand({
 export const addConnection = (
   harnessInput: string,
   setCurrentInput: string | undefined,
+  installSkill: boolean,
 ) => runCommand({
   effect: withService((service) => Effect.gen(function* () {
     yield* Effect.scoped(requireRunningService)
     const harness = yield* parseHarness(harnessInput)
     const setCurrent = yield* parseCurrentModel(setCurrentInput)
+    if (installSkill) yield* service.installSkill(harness)
     const result = yield* service.connect(harness, { setCurrent })
-    return { action: "add" as const, harness, launchPlan: result.launchPlan }
+    return { action: "add" as const, harness, skillInstalled: installSkill, launchPlan: result.launchPlan }
   })),
   schema: AddConnectionResultSchema,
-  render: ({ harness, launchPlan }) => Option.match(launchPlan, {
-    onNone: () => `Connected all Magnitude models to ${harness}.\n`,
+  render: ({ harness, launchPlan, skillInstalled }) => Option.match(launchPlan, {
+    onNone: () => `Connected all Magnitude models to ${harness}.${skillInstalled ? " Installed the Magnitude skill." : ""}\n`,
     onSome: (plan) => [
       `Connected all Magnitude models to ${harness}.`,
+      ...(skillInstalled ? ["Installed the Magnitude skill."] : []),
       `Current model: ${plan.modelId}`,
       `Launch: ${[plan.executable, ...plan.args].join(" ")}`,
       "",

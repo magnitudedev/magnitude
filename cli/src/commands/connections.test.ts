@@ -10,6 +10,7 @@ describe("connections command contract", () => {
     const add = connections?.commands.find((command) => command.name() === "add")
     expect(add?.registeredArguments.map((argument) => argument.name())).toEqual(["harness"])
     expect(add?.options.map(({ long }) => long)).toContain("--set-current")
+    expect(add?.options.map(({ long }) => long)).toContain("--install-skill")
     expect(add?.description()).toBe("Connect every installed Magnitude model to a harness")
   })
 })

@@ -223,6 +223,7 @@ describe("Magnitude skill installation", () => {
       const sharedSkill = paths.skillInstallations["shared-agents"].skillFile
       const installed = yield* fs.readFileString(sharedSkill)
       expect(installed).toContain("name: magnitude")
+      expect(installed).toContain("magnitude docs onboarding")
       yield* fs.writeFileString(sharedSkill, "stale contents\n")
       yield* service.installSkill(HarnessIdSchema.make("codex"))
 

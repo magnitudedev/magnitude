@@ -121,6 +121,9 @@ never fans out to other targets.
 The central installer owns target resolution and atomic publication. Every explicit installation
 replaces the selected target's `magnitude/SKILL.md` with the current bundled skill, including when a
 file is already present. Skill installation is therefore refresh, not create-if-absent behavior.
+Interactive setup and `connections add --install-skill` invoke that same installer before applying
+the harness configuration. The installed skill routes agents to the CLI-bundled onboarding topic so
+all harnesses receive one portable CLI-only workflow rather than harness-specific instructions.
 
 “Launch Magnitude on startup” means idempotently registering the per-user service for the user's
 operating-system session. The visible copy remains “startup”; implementation and diagnostics may
