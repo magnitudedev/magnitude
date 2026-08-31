@@ -25,7 +25,7 @@ hardware
 catalog list | show <model-id> | recommendations [--preference <value>] [--limit <count>]
 catalog pull <model-id> | cancel <model-id> | remove <model-id>
 models status [model-id] | load <model-id> | stop
-connections list | add <harness> [--set-current <model-id>] [--install-skill]
+connections list | add <harness> [--set-model <model-id>] [--install-skill]
 connections sync [harness] | remove <harness>
 docs [topic-id]
 ```

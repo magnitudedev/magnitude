@@ -14,7 +14,7 @@ magnitude models status [model-id]
 magnitude models load <model-id>
 magnitude models stop
 magnitude connections list
-magnitude connections add <harness> [--set-current <model-id>] [--install-skill]
+magnitude connections add <harness> [--set-model <model-id>] [--install-skill]
 magnitude connections sync [harness]
 magnitude connections remove <harness>
 magnitude docs [topic-id]

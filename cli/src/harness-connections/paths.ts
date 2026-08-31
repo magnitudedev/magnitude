@@ -14,11 +14,11 @@ export interface HarnessConnectionPaths {
   readonly hermes: string
   readonly openclaw: string
   readonly codex: string
+  readonly codexUser: string
   readonly codexModels: string
   readonly claude: string
   readonly ompModels: string
   readonly ompSettings: string
-  readonly clineDataDir: string
   readonly clineProviders: string
   readonly clineModels: string
   readonly skillInstallations: Readonly<Record<SkillInstallationTarget, SkillInstallationPaths>>
@@ -26,7 +26,7 @@ export interface HarnessConnectionPaths {
 
 export const harnessConnectionPaths = (): HarnessConnectionPaths => {
   const home = homedir()
-  const clineRoot = `${home}/.magnitude/harnesses/cline`
+  const clineRoot = `${home}/.cline/data`
   const hermesRoot = process.env.HERMES_HOME ?? `${home}/.hermes`
   const openClawRoot = process.env.OPENCLAW_STATE_DIR ?? `${home}/.openclaw`
   const codexRoot = process.env.CODEX_HOME ?? `${home}/.codex`
@@ -41,11 +41,11 @@ export const harnessConnectionPaths = (): HarnessConnectionPaths => {
     hermes: `${hermesRoot}/config.yaml`,
     openclaw: `${openClawRoot}/openclaw.json`,
     codex: `${codexRoot}/magnitude.config.toml`,
+    codexUser: `${codexRoot}/config.toml`,
     codexModels: `${codexRoot}/magnitude.models.json`,
     claude: `${process.env.CLAUDE_CONFIG_DIR ?? `${home}/.claude`}/settings.json`,
     ompModels: `${home}/.omp/agent/models.yml`,
-    ompSettings: `${home}/.omp/agent/settings.json`,
-    clineDataDir: clineRoot,
+    ompSettings: `${home}/.omp/agent/config.yml`,
     clineProviders: `${clineRoot}/settings/providers.json`,
     clineModels: `${clineRoot}/settings/models.json`,
     skillInstallations: {

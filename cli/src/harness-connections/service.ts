@@ -27,6 +27,8 @@ import {
   type HarnessConnector,
   type HarnessInstallation,
   type HarnessModel,
+  type HarnessRestore,
+  HarnessRestoreSchema,
 } from "./contract"
 import { harnessConnectionPaths, type HarnessConnectionPaths } from "./paths"
 import { makeHarnessConnectorRegistry } from "./registry"
@@ -56,7 +58,7 @@ export type { HarnessConnectionSpec, HarnessConnector, HarnessInstallation, Harn
 const ManifestEntrySchema = Schema.Struct({
   harness: HarnessIdSchema,
   models: Schema.optionalWith(Schema.Array(HarnessModelSchema), { default: () => [] }),
-  setCurrent: Schema.optionalWith(ProviderModelIdSchema, { as: "Option", exact: true }),
+  restore: Schema.optionalWith(HarnessRestoreSchema, { as: "Option", exact: true }),
   updatedAt: Schema.optionalWith(Schema.String, { default: () => "1970-01-01T00:00:00.000Z" }),
 })
 const ManifestSchema = Schema.Struct({
@@ -93,18 +95,19 @@ export interface HarnessConnectionOptions {
 const upsertManifest = (
   manifest: Manifest,
   harness: HarnessId,
-  spec: HarnessConnectionSpec,
+  models: ReadonlyArray<HarnessModel>,
+  restore: Option.Option<HarnessRestore>,
   now: () => Date,
 ) => ({
   connections: [
     ...manifest.connections.filter((entry) => entry.harness !== harness),
-    { harness, models: [...spec.models], setCurrent: spec.setCurrent, updatedAt: now().toISOString() },
+    { harness, models: [...models], restore, updatedAt: now().toISOString() },
   ],
 }) satisfies Manifest
 
-const entrySpec = (entry: ManifestEntry): HarnessConnectionSpec => ({
+const entrySpec = (entry: ManifestEntry) => ({
   models: entry.models,
-  setCurrent: entry.setCurrent,
+  restore: entry.restore,
 })
 
 const toHarnessModel = (model: InferenceModel): HarnessModel => {
@@ -188,10 +191,10 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     ),
   }), { discard: true })
 
-  const connectorOperation = (
+  const connectorOperation = <A>(
     operation: HarnessConnectionError["operation"],
     connector: HarnessConnector,
-    effect: Effect.Effect<void, unknown, FileSystem.FileSystem | Path.Path>,
+    effect: Effect.Effect<A, unknown, FileSystem.FileSystem | Path.Path>,
   ) => effect.pipe(
     Effect.mapError((error) => error instanceof HarnessConnectionError
       ? error
@@ -236,29 +239,41 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     if (Option.isNone(installation)) return yield* failure("connect", `${connector.name} is not installed`, harness)
     const models = uniqueModels(yield* resolveModels)
     if (models.length === 0) return yield* failure("connect", "No installed Magnitude models are available", harness)
-    if (Option.isSome(connectOptions.setCurrent) && !containsModel(models, connectOptions.setCurrent.value)) {
-      return yield* failure("connect", `Magnitude model is not installed: ${connectOptions.setCurrent.value}`, harness)
+    if (Option.isSome(connectOptions.model) && !containsModel(models, connectOptions.model.value)) {
+      return yield* failure("connect", `Magnitude model is not installed: ${connectOptions.model.value}`, harness)
     }
     const manifest = yield* readManifest
-    const previousModels = manifest.connections.find((entry) => entry.harness === harness)?.models
+    const existing = manifest.connections.find((entry) => entry.harness === harness)
+    const previousModels = existing?.models
     const spec: HarnessConnectionSpec = {
       models,
-      setCurrent: connectOptions.setCurrent,
+      model: connectOptions.model,
       ...(previousModels === undefined ? {} : { previousModels }),
     }
-    if (connector.recommended) {
-      return { launchPlan: Option.map(spec.setCurrent, (modelId) => connector.launch(modelId, installation.value)) }
-    }
+    if (connector.recommended) return
     if (connector.requiresStartup) yield* installStartup
     const snapshots = yield* snapshotFiles(connector.configurationFiles)
-    yield* connectorOperation("connect", connector, connector.connect(spec)).pipe(
-      Effect.zipRight(updateManifest((manifest) => upsertManifest(manifest, harness, spec, now))),
+    const captured = yield* connectorOperation("connect", connector, connector.connect(spec)).pipe(
       Effect.onError(() => restoreFiles(snapshots).pipe(Effect.ignore)),
     )
-    return { launchPlan: Option.map(spec.setCurrent, (modelId) => connector.launch(modelId, installation.value)) }
+    const restore = existing !== undefined && Option.isSome(existing.restore)
+      ? existing.restore
+      : captured
+    yield* updateManifest((manifest) => upsertManifest(manifest, harness, models, restore, now)).pipe(
+      Effect.onError(() => restoreFiles(snapshots).pipe(Effect.ignore)),
+    )
   }).pipe(Effect.mapError((error) => error instanceof HarnessConnectionError
     ? error
     : failure("connect", String(error), harness))))
+
+  const launch: HarnessConnection["launch"] = (harness, modelId) => provide(Effect.gen(function* () {
+    const connector = registry.get(harness)
+    const installation = yield* installed(connector)
+    if (Option.isNone(installation)) return yield* failure("launch", `${connector.name} is not installed`, harness)
+    return connector.launch(modelId, installation.value)
+  }).pipe(Effect.mapError((error) => error instanceof HarnessConnectionError
+    ? error
+    : failure("launch", String(error), harness))))
 
   const sync: HarnessConnection["sync"] = (harness) => provide(Effect.gen(function* () {
     let manifest = yield* readManifest
@@ -272,18 +287,21 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     if (models.length === 0) return yield* failure("sync", "No installed Magnitude models are available", harness)
     for (const entry of entries) {
       const connector = registry.get(entry.harness)
-      if (Option.isSome(entry.setCurrent) && !containsModel(models, entry.setCurrent.value)) {
-        return yield* failure("sync", `Magnitude model is not installed: ${entry.setCurrent.value}`, entry.harness)
-      }
       const spec: HarnessConnectionSpec = {
         models,
-        setCurrent: entry.setCurrent,
+        model: Option.none(),
         previousModels: entry.models,
       }
       if (connector.requiresStartup) yield* installStartup
       const snapshots = yield* snapshotFiles(connector.configurationFiles)
       yield* connectorOperation("sync", connector, connector.connect(spec)).pipe(
-        Effect.zipRight(updateManifest((current) => upsertManifest(current, entry.harness, spec, now))),
+        Effect.zipRight(updateManifest((current) => upsertManifest(
+          current,
+          entry.harness,
+          models,
+          entry.restore,
+          now,
+        ))),
         Effect.onError(() => restoreFiles(snapshots).pipe(Effect.ignore)),
       )
       manifest = yield* readManifest
@@ -321,7 +339,8 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
   return {
     list,
     connect: (harness, options) => withMutationLock(connect(harness, options)),
-    sync: (harness) => withMutationLock(sync(harness)),
+    launch,
+    sync: (harness?: HarnessId) => withMutationLock(sync(harness)),
     disconnect: (harness) => withMutationLock(disconnect(harness)),
     installSkill,
     installStartup,

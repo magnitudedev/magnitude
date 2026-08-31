@@ -25,7 +25,7 @@ const parseHarness = (input: string) => Schema.decodeUnknown(HarnessIdSchema)(in
   Effect.mapError(() => new ConnectionsCommandError({ message: `Unsupported harness: ${input}` })),
 )
 
-const parseCurrentModel = (input: string | undefined) => input === undefined
+const parseModel = (input: string | undefined) => input === undefined
   ? Effect.succeed(Option.none())
   : Schema.decodeUnknown(ProviderModelIdSchema)(input).pipe(
       Effect.map(Option.some),
@@ -83,23 +83,27 @@ const renderLaunchPlan = (plan: HarnessLaunchPlan): string => {
 
 export const addConnection = (
   harnessInput: string,
-  setCurrentInput: string | undefined,
+  modelInput: string | undefined,
   installSkill: boolean,
 ) => runCommand({
   effect: withService((service) => Effect.gen(function* () {
     yield* Effect.scoped(requireRunningService)
     const harness = yield* parseHarness(harnessInput)
-    const setCurrent = yield* parseCurrentModel(setCurrentInput)
+    const model = yield* parseModel(modelInput)
     if (installSkill) yield* service.installSkill(harness)
-    const result = yield* service.connect(harness, { setCurrent })
-    return { harness, setCurrent, skillInstalled: installSkill, ...result }
+    yield* service.connect(harness, { model })
+    const launchPlan = yield* Option.match(model, {
+      onNone: () => Effect.succeed(Option.none()),
+      onSome: (modelId) => service.launch(harness, modelId).pipe(Effect.map(Option.some)),
+    })
+    return { harness, model, skillInstalled: installSkill, launchPlan }
   })),
-  render: ({ harness, setCurrent, skillInstalled, launchPlan }) => {
+  render: ({ harness, model, skillInstalled, launchPlan }) => {
     const heading = harness === "magnitude"
       ? "Magnitude Harness is built in."
       : `Connected ${harness} to Magnitude.`
     const fields: (readonly [string, string])[] = [
-      ...(Option.isSome(setCurrent) ? [["Current model", setCurrent.value]] as const : []),
+      ...(Option.isSome(model) ? [["Selected model", model.value]] as const : []),
       ...(skillInstalled ? [["Skill", "Installed"]] as const : []),
     ]
     return [

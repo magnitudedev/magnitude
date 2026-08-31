@@ -50,15 +50,12 @@ export interface HarnessLaunchPlan {
 }
 
 export interface HarnessConnectOptions {
-  readonly setCurrent: Option.Option<ProviderModelId>
-}
-
-export interface HarnessConnectionResult {
-  readonly launchPlan: Option.Option<HarnessLaunchPlan>
+  /** Persist this model as the harness selection for ordinary new sessions. */
+  readonly model: Option.Option<ProviderModelId>
 }
 
 export class HarnessConnectionError extends Data.TaggedError("HarnessConnectionError")<{
-  readonly operation: "list" | "connect" | "sync" | "disconnect" | "skill" | "startup"
+  readonly operation: "list" | "connect" | "sync" | "disconnect" | "launch" | "skill" | "startup"
   readonly harness?: HarnessId
   readonly message: string
 }> {}
@@ -68,7 +65,11 @@ export interface HarnessConnection {
   readonly connect: (
     harness: HarnessId,
     options: HarnessConnectOptions,
-  ) => Effect.Effect<HarnessConnectionResult, HarnessConnectionError>
+  ) => Effect.Effect<void, HarnessConnectionError>
+  readonly launch: (
+    harness: HarnessId,
+    model: ProviderModelId,
+  ) => Effect.Effect<HarnessLaunchPlan, HarnessConnectionError>
   readonly sync: (
     harness?: HarnessId,
   ) => Effect.Effect<ReadonlyArray<HarnessDestination>, HarnessConnectionError>
@@ -92,11 +93,12 @@ const magnitudeDestination: HarnessDestination = {
 
 export const UnavailableHarnessConnection: HarnessConnection = {
   list: Effect.succeed([magnitudeDestination]),
-  connect: (harness, options) => harness === "magnitude"
-    ? Effect.succeed({ launchPlan: Option.map(options.setCurrent, (modelId) => ({
-        harness, executable: "magnitude", args: [], environment: {}, modelId,
-      })) })
+  connect: (harness) => harness === "magnitude"
+    ? Effect.void
     : Effect.fail(new HarnessConnectionError({ operation: "connect", harness, message: "External harness connections are unavailable in this client" })),
+  launch: (harness, modelId) => harness === "magnitude"
+    ? Effect.succeed({ harness, executable: "magnitude", args: [], environment: {}, modelId })
+    : Effect.fail(new HarnessConnectionError({ operation: "launch", harness, message: "External harness connections are unavailable in this client" })),
   sync: () => Effect.succeed([magnitudeDestination]),
   disconnect: (harness) => Effect.fail(new HarnessConnectionError({ operation: "disconnect", harness, message: "Harness connections are unavailable in this client" })),
   installSkill: (harness) => Effect.fail(new HarnessConnectionError({ operation: "skill", harness, message: "Skill installation is unavailable in this client" })),
