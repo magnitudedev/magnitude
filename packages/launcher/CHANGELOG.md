@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.9-alpha.0
+
+### Patch Changes
+
+- [`7f0ef1b`](https://github.com/magnitudedev/magnitude/commit/7f0ef1bcc83fc80e2b606b7f48aee85ed7316457) Thanks [@anerli](https://github.com/anerli)! - Load heavy CLI command runtimes only when their command is selected, reducing version and help startup overhead.
+
 ## 0.0.8
 
 ### Patch Changes
