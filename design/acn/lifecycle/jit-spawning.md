@@ -38,8 +38,9 @@ the instance ID is its RPC identity. Revision is one positive safe integer repor
 owner and used to order it against a client's target.
 
 Each versioned release source allocates one checked-in scalar revision, advanced by one whenever
-Changesets changes the CLI version. Development generation increments the machine-local counter
-at `~/.magnitude/acn/development-revision-counter` and adds it to that allocation. The
+Changesets changes the CLI version. Development generation adds a development counter to that
+allocation. It uses an explicitly configured non-negative counter when present; otherwise it
+increments the machine-local counter at `~/.magnitude/acn/development-revision-counter`. The
 counter is ephemeral build state. ACN processes observe only the resulting scalar revision; no
 revision is persisted as coordination authority.
 
