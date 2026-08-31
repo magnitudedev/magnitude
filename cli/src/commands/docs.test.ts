@@ -26,6 +26,16 @@ describe("Magnitude documentation", () => {
     expect(result.output).toMatch(/[^\n]\n$/)
   })
 
+  it("publishes the complete agent-guided onboarding workflow", () => {
+    const result = resolveDocumentationCommand("onboarding")
+
+    expect(result._tag).toBe("Success")
+    if (result._tag === "Failure") return
+    expect(result.output).toContain("# Agent-guided Magnitude onboarding")
+    expect(result.output).toContain("magnitude catalog list --json")
+    expect(result.output).toContain("--install-skill")
+  })
+
   it("rejects unknown topic IDs and lists the available IDs", () => {
     const result = resolveDocumentationCommand("CUSTOM-ENDPOINTS")
 

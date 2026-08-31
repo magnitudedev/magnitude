@@ -14,8 +14,9 @@ export const registerConnectionsCommand = (program: Command): void => {
     .description("Connect every installed Magnitude model to a harness")
     .argument("<harness>", "Harness ID")
     .option("--set-current <model-id>", "Also select this Magnitude model in the harness")
+    .option("--install-skill", "Install or refresh the Magnitude skill for this harness")
     .action((harness, options) => loadRuntime().then(({ addConnection }) =>
-      addConnection(harness, options.setCurrent)))
+      addConnection(harness, options.setCurrent, options.installSkill === true)))
 
   connections.command("sync")
     .description("Reconcile configured harnesses with their Magnitude bindings")

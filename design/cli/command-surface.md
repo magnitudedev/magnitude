@@ -19,7 +19,7 @@ update
 service install | uninstall | start | stop | status
 catalog list | pull <model-id> | remove <model-id> | cancel <model-id>
 models status | load <model-id> | stop
-connections list | add <harness> [--set-current <model-id>] | sync [harness] | remove <harness>
+connections list | add <harness> [--set-current <model-id>] [--install-skill] | sync [harness] | remove <harness>
 docs [topic-id]
 ```
 
@@ -83,6 +83,10 @@ calling client and is observed through the catalog projection.
 including incomplete assessment counts, provenance, compatibility,
 acquisition, and residency. `models status` is a filtered projection of those
 same local product rows; it does not define a second state model.
+
+`connections add --install-skill` refreshes the selected harness's Magnitude skill through the same
+central installer used by interactive onboarding before applying the harness connection. The typed
+result reports whether skill installation was requested and completed.
 
 ## Conformance
 

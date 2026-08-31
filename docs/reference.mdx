@@ -11,26 +11,28 @@ Magnitude normally configures and manages these interfaces automatically. This r
 | Command | Purpose |
 |---|---|
 | `magnitude setup` | Profile hardware, install a model, and connect a harness |
-| `magnitude hardware` | Show the local inference environment |
-| `magnitude models list` | Show the model catalog |
-| `magnitude models install <model-id>` | Install a model |
-| `magnitude models remove <model-id>` | Remove a model |
-| `magnitude downloads list` | Show model downloads |
-| `magnitude downloads cancel <model-id>` | Cancel a download |
-| `magnitude instances list` | Show model residency |
-| `magnitude instances load <slot-id>` | Load a configured model slot |
-| `magnitude instances stop <slot-id>` | Stop a configured model slot |
-| `magnitude slots` | Show configured model slots |
+| `magnitude service install` | Install and enable the per-user service without starting it |
+| `magnitude service start` | Install or refresh, start, and await the user service |
+| `magnitude service status` | Show installation, startup, runtime, and active-model status |
+| `magnitude service stop` | Stop the service without uninstalling it |
+| `magnitude service uninstall` | Stop and remove the service definition while preserving user data |
+| `magnitude catalog list` | Show catalog, assessment, acquisition, and residency state |
+| `magnitude catalog pull <model-id>` | Install or update a catalog model |
+| `magnitude catalog remove <model-id>` | Remove an installed catalog model |
+| `magnitude catalog cancel <model-id>` | Cancel active acquisition work |
+| `magnitude models status` | Show installed models and their residency state |
+| `magnitude models load <model-id>` | Load a model by canonical model ID |
+| `magnitude models stop` | Stop the active local model |
 | `magnitude connections list` | Show supported and installed harnesses |
-| `magnitude connections add <harness>` | Connect installed Magnitude models to a harness |
+| `magnitude connections add <harness> [--set-current <model-id>] [--install-skill]` | Connect installed models and optionally select a model and refresh the harness skill |
 | `magnitude connections sync [harness]` | Refresh connected harness configuration |
 | `magnitude connections remove <harness>` | Remove a harness connection |
-| `magnitude service start` | Install and start the user service |
-| `magnitude service stop` | Stop and disable the user service |
-| `magnitude stop` | Stop the current service and release its models |
+| `magnitude docs [topic-id]` | List or read bundled documentation for agents |
 | `magnitude update` | Update Magnitude |
 
-Run `magnitude --help` or append `--help` to a command for its complete options.
+Run `magnitude --help` or append `--help` to a command for its complete options. Every
+non-interactive observation command supports `--json`; agents should begin with
+`magnitude docs onboarding` for the complete CLI-only setup and model-selection workflow.
 
 ## Inference APIs
 

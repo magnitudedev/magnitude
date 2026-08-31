@@ -26,6 +26,7 @@ import {
 import { harnessConnectionPaths, type HarnessConnectionPaths } from "./paths"
 import { makeHarnessConnectorRegistry } from "./registry"
 import { OPENAI_BASE_URL, readOr } from "./shared"
+import skillContents from "./magnitude-skill.md" with { type: "text" }
 
 export {
   ANTHROPIC_BASE_URL,
@@ -127,22 +128,6 @@ const uniqueModels = (models: ReadonlyArray<HarnessModel>): ReadonlyArray<Harnes
 
 const containsModel = (models: ReadonlyArray<HarnessModel>, modelId: ProviderModelId): boolean =>
   models.some(({ id }) => id === modelId)
-
-const skillContents = `---
-name: magnitude
-description: Instructions for \`magnitude\` cli to discover, install, and manage local models, as well as connect local models to different agents
----
-
-# Magnitude
-
-Magnitude is a local inference service with a built-in harness for discovering, managing, and using local models.
-
-Magnitude is accessed via the \`magnitude\` CLI.
-
-## CLI Help
-
-Use \`magnitude --help\` to get more information on using the CLI.
-`
 
 export const makeHarnessConnectionService = (options: HarnessConnectionOptions = {}) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
