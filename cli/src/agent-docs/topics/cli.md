@@ -1,31 +1,33 @@
 # Magnitude CLI
 
-Run `magnitude` without a subcommand for the interactive experience. The
-non-interactive command surface is:
+Run `magnitude` without a subcommand for the interactive experience. Use these commands for a
+non-interactive shell workflow:
 
 ```text
 magnitude update
 magnitude service install|uninstall|start|stop|status
+magnitude hardware
 magnitude catalog list
-magnitude catalog pull|remove|cancel <model-id>
-magnitude models status
+magnitude catalog show|pull|cancel|remove <model-id>
+magnitude catalog recommendations [--preference <value>] [--limit <count>]
+magnitude models status [model-id]
 magnitude models load <model-id>
 magnitude models stop
 magnitude connections list
 magnitude connections add <harness> [--set-current <model-id>] [--install-skill]
-magnitude connections remove <harness>
 magnitude connections sync [harness]
+magnitude connections remove <harness>
 magnitude docs [topic-id]
 ```
 
-`catalog` owns model discovery and on-disk acquisition. `catalog pull` installs
-a model or brings an installed one up to date; pulling a model that is already
-current succeeds and reports that. `models` owns runtime residency.
-`magnitude models stop` takes no model ID and stops the active local model.
+Each command prints only the product information relevant to that operation. Collection commands
+use borderless tables when the rows are directly comparable; detail commands use labeled fields.
+Exact model and harness IDs are always printed so their output can be used in later commands.
 
-`connections add --install-skill` atomically installs or refreshes the Magnitude skill in the
-selected harness's supported user-wide skill location before applying its connection.
+`catalog` owns reviewed model choices, recommendation evidence, and download operations. `models`
+owns models on this computer and their current installation or runtime state. Catalog assessment and
+model loading are background work: observation commands return the current state and never wait for
+either to settle.
 
-Every non-interactive leaf command accepts `--json`, before or after the
-subcommand. JSON success is written as one document to stdout. JSON failure is
-written as one `{ "error": ... }` document to stderr with a nonzero exit code.
+`connections add --install-skill` installs or refreshes the bundled Magnitude skill in the selected
+harness's supported user-wide location before applying the connection.

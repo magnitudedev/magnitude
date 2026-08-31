@@ -63,7 +63,7 @@ describe("Magnitude service definitions", () => {
     expect(WINDOWS_RESTART_POLICY_SCRIPT).toContain("RestartInterval = 'PT1M'")
   })
 
-  it("renders service status as the five user-facing fields", () => {
+  it("renders service status as a labeled product summary", () => {
     expect(renderServiceStatus({
       status: "Ready",
       address: "127.0.0.1:10100",
@@ -71,11 +71,12 @@ describe("Magnitude service definitions", () => {
       startsAutomaticallyOnLogin: true,
       activeModel: Option.none(),
     })).toBe([
-      "Status: Ready",
-      "Address: 127.0.0.1:10100",
-      "Version: 0.0.2",
-      "Starts automatically on login: Yes",
-      "Active model: None",
+      "Magnitude service",
+      "  Runtime         Ready",
+      "  Starts at login Yes",
+      "  Version         0.0.2",
+      "  Address         127.0.0.1:10100",
+      "  Active model    None",
       "",
     ].join("\n"))
   })

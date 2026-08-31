@@ -31,6 +31,11 @@ presented first with “Optimized for local models” as its blue supporting lab
 priority order. Supported but absent harnesses stay in the same list, move below all selectable
 rows, display Not installed, and are disabled.
 
+Non-interactive connection observation combines executable detection with durable manifest intent.
+It reports Magnitude as `Built in`, a manifest-owned external connection as `Connected`, an
+installed unconnected harness as `Available`, and an absent harness as `Not installed`. Installation
+alone never implies a connection.
+
 ## Durable connection and connector ownership
 
 The user manifest records desired harness connections. It contains no gateway credential or

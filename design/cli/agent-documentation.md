@@ -13,8 +13,7 @@ Magnitude ships a small directory of product documentation for language models o
 the agent's shell. Each topic has a stable identifier, a short description, and Markdown content.
 
 `magnitude docs` prints the complete topic directory. `magnitude docs <topic-id>` prints the exact
-Markdown for one topic. With `--json`, either is represented by the same typed documentation result
-used by the human renderer. Both operations are local to the CLI process: they do not initialize the
+Markdown for one topic. Both operations are local to the CLI process: they do not initialize the
 interactive client, connect to ACN, read user state, or use the network.
 
 The topic corpus is distinct from the public documentation site and from internal engineering

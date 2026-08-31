@@ -4,94 +4,116 @@ applies_to:
   - cli/src/index.tsx
   - cli/src/server/service.ts
   - cli/src/agent-docs/**
-  - packages/acn-protocol/src/boundary/**
-  - packages/acn/src/model-commands.ts
-  - packages/acn/src/boundary/acn.ts
-  - packages/client-common/src/local-models/service.ts
+  - packages/client-common/src/harness-connections/**
+  - cli/src/harness-connections/**
 ---
 
 # Non-interactive CLI contract
 
-The non-interactive CLI has one public command vocabulary:
+## Scope
+
+The non-interactive CLI is a human-readable, agent-usable projection of Magnitude product state.
+It does not expose transport documents or internal state graphs. Bare `magnitude` and `magnitude
+setup` remain interactive entrypoints and are outside this presentation contract.
+
+The public command vocabulary is:
 
 ```text
 update
 service install | uninstall | start | stop | status
-catalog list | pull <model-id> | remove <model-id> | cancel <model-id>
-models status | load <model-id> | stop
-connections list | add <harness> [--set-current <model-id>] [--install-skill] | sync [harness] | remove <harness>
+hardware
+catalog list | show <model-id> | recommendations [--preference <value>] [--limit <count>]
+catalog pull <model-id> | cancel <model-id> | remove <model-id>
+models status [model-id] | load <model-id> | stop
+connections list | add <harness> [--set-current <model-id>] [--install-skill]
+connections sync [harness] | remove <harness>
 docs [topic-id]
 ```
 
-`catalog` owns discovery and on-disk acquisition. `models` owns runtime
-residency. The zero-argument `models stop` operation stops the current active
-local model; it is not model- or slot-addressed. Removed command names are not
-aliases. Running `magnitude` without a subcommand remains the interactive
-entrypoint.
+Removed output flags are not retained as aliases. The acquisition command remains `catalog pull`,
+and there is no global JSON mode.
 
-`magnitude setup` is a second interactive entrypoint that opens onboarding
-setup directly. It is intentionally outside the non-interactive result and
-JSON contracts described below.
+## Domain ownership
 
-## Result contract
+- `service` reports runtime readiness and login-startup intent.
+- `hardware` reports the local inference topology, current memory use, and current allocation.
+- `catalog` reports reviewed model choices, machine-specific assessment evidence, recommendations,
+  and download operations.
+- `models` reports models present or undergoing local operations and controls runtime residency.
+- `connections` reports harness installation and durable Magnitude connection intent.
 
-Every non-interactive leaf command produces one typed, Effect-Schema-backed
-result before presentation. Human output and JSON output are renderings of
-that same result. `--json` is inherited globally and may occur before or after
-the subcommand. The established `update` and `service start` terminal workflows
-remain outside this contract until their JSON behavior is designed separately.
+Catalog output never includes acquisition or residency state. Model-status output never includes
+catalog ranking or provenance. The focused `models status <model-id>` view is the observation point
+for download and load progress.
 
-A successful JSON command writes exactly one compact JSON document and one
-trailing newline to stdout, writes nothing to stderr, and exits successfully.
-A failed JSON command writes nothing to stdout, writes exactly one document of
-the form `{ "error": { "code", "message", "retryable" } }` plus a trailing
-newline to stderr, and exits unsuccessfully. Logs, ANSI presentation,
-subprocess output, and transient progress never contaminate JSON streams.
-Exact machine values such as byte counts and progress fractions remain numeric;
-human renderers own unit and percentage formatting.
+## Presentation
 
-## Service operations
+Comparable collections use borderless tables. Heterogeneous details use labeled fields. Mutations
+use concise acknowledgements and include an exact observation command when work continues in the
+background. A table that does not fit the terminal becomes labeled row blocks; canonical model and
+harness IDs are never truncated.
 
-Installation state and runtime state are independent. `service install` writes
-and enables the exact per-user service definition without starting or replacing
-the runtime. It never overwrites a definition owned by a newer compatible
-running release. `service start` installs or refreshes the definition, starts or
-joins the service through the shared inline lifecycle, performs concurrent update
-discovery, and succeeds only after public readiness. `service stop` stops the
-exact Magnitude runtime, including a JIT-owned runtime, without disabling or
-deleting the definition. `service uninstall` stops the runtime, disables and
-deletes the definition, and preserves user data. `service status` reports the
-user-facing runtime state, stable address, running service version, whether it
-starts automatically on login, and the active model. Its JSON result exposes
-those same semantic values without platform-manager implementation details.
+Output uses friendly names as the primary identity and prints the exact canonical ID whenever an
+object can be addressed by another command. Empty state is a successful, explicit sentence. Normal
+errors write one actionable product message to stderr and exit nonzero. Redirected output contains
+no cursor control, animation, or ANSI dependency.
+
+Normal output excludes ACN/ICN terminology, assessment and environment IDs, package identities,
+cache paths, native device indices, source revisions, raw tags, ranking utility, operation IDs,
+retryability flags, and stack traces.
+
+Memory uses hardware-conventional units; storage and transfer use decimal units; context uses
+compact token counts; generation speed uses `tok/s`. Rounded values are presentation only.
+
+## Catalog and recommendation behavior
+
+`catalog list` displays only assessed catalog configurations that fit the current machine. It shows
+friendly identity, predicted memory, baseline speed, configured context, speculative acceleration,
+and canonical ID. Outstanding or failed assessments are summarized after the useful rows.
+
+`catalog recommendations` reuses the shared onboarding eligibility and ranking policy. Preference
+is one of Fastest, Faster, Balanced, Smarter, or Smartest and defaults to Balanced; limit defaults
+to ten. Recommendation evidence includes speed, memory, context, intelligence, artifact accuracy,
+acceleration, capabilities, and canonical ID. Raw ranking scores and aggregate utility remain
+private. The command is a client projection over existing catalog and hardware authorities, not a
+second server recommendation authority.
+
+`catalog show` supplies one model's useful curated and machine-specific evidence.
+
+No catalog or model observation command waits for assessment or residency to settle. Service health
+and `service start` completion are likewise independent of background assessment.
 
 ## Model operations
 
-Pull is the one acquisition verb. It converges a model to present-and-current
-on disk: it installs from `NotInstalled` or `InstallFailed`, updates from
-`UpdateAvailable` or `UpdateFailed`, and succeeds by reporting `AlreadyCurrent`
-for an installed, current model — under pull's contract that is the goal state
-already reached, not a masked error. Pull during active acquisition work is
-rejected as busy, and pull during removal states is rejected as unpullable;
-genuinely wrong-state requests still fail as typed domain rejections rather
-than succeeding as no-ops. Cancel is valid only while that model has admitted
-pull work. Remove is valid only for an installed family with no active
-transfer, removal, or resident instance. Acquisition admission may outlive the
-calling client and is observed through the catalog projection.
+`catalog pull` converges a catalog model to installed and current. It acknowledges admitted
+download or update work and directs the caller to focused model status. Pull, cancel, and removal
+validate only model-ID syntax before delegating directly to their authoritative mutations.
 
-`catalog list` exposes the authoritative local discovery and assessment state,
-including incomplete assessment counts, provenance, compatibility,
-acquisition, and residency. `models status` is a filtered projection of those
-same local product rows; it does not define a second state model.
+`models status` lists catalog-attributed and externally discovered models together when they are on
+the computer or have relevant acquisition/removal work. One status field applies product priority:
+removal, transfer, failures, load/stop, ready, update availability, then unloaded. The addressed
+form reports installation, transfer progress, runtime, memory, context, and actionable failure
+details without historical or internal operation state.
 
-`connections add --install-skill` refreshes the selected harness's Magnitude skill through the same
-central installer used by interactive onboarding before applying the harness connection. The typed
-result reports whether skill installation was requested and completed.
+Load and stop delegate directly to their authoritative mutations. Magnitude has one active local
+residency slot, so stop remains unaddressed.
+
+## Connections
+
+Connection observation distinguishes `Built in`, `Connected`, `Available`, and `Not installed`.
+`Connected` comes from the durable connection manifest, not from executable detection. Connection
+mutations delegate directly to the existing service operations. Handoff output is copyable shell
+text rather than raw argv or environment structures, and Magnitude does not launch it from a
+non-interactive command.
 
 ## Conformance
 
-- Command-tree tests prove the exact nouns, verbs, and argument arity.
-- Every leaf has success and failure JSON tests that parse exactly one document.
-- Acquisition tests prove pull-state validation and admitted work ownership.
-- Lifecycle tests distinguish install, start, stop, uninstall, and status.
-- Removed nouns and verbs fail command parsing and are never retained as aliases.
+- Every public command and option has useful help.
+- Collection ordering is deterministic and every collection has an explicit empty state.
+- Addressable rows preserve exact canonical IDs at every terminal width.
+- Recommendations match shared onboarding ranking and memory eligibility.
+- No observation command waits for assessment or residency completion.
+- Mutation commands acknowledge authoritative completion without adding preflight state
+  interpretations.
+- Agent documentation completes onboarding using only the human command surface.
+- Tests cover collection, detail, narrow-width, empty, partial, failure, and redirected forms.
