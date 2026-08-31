@@ -153,12 +153,16 @@ ACN exposes OpenAI traffic under `/inference/v1/**` and Anthropic traffic under
 `/inference/anthropic/**`. The reserved local namespace is
 `anthropic-local/<canonical-model-id>`.
 
-The OpenAI model-list response retains the standard `data` array and also includes a Magnitude-owned
-`models` array for local clients that need harness-facing metadata. Each installed entry contains its
-canonical model ID, the same `Model Name (Variant Label)` text shown by Magnitude, description,
-configured context window, input and tool capabilities, and reasoning effort domain and default.
+The OpenAI model-list response is one standard `object: "list"` envelope with an enriched `data`
+array. Each model entry retains the standard identity fields and follows the OpenRouter discovery
+conventions for `name`, `description`, `context_length`, `architecture`,
+`supported_parameters`, `top_provider`, and optional `reasoning`. `reasoning` publishes the exact
+normalized effort domain and default plus whether the default is enabled and whether reasoning is
+mandatory. `top_provider.max_completion_tokens` is the connector-facing output ceiling, bounded
+to 32,768 tokens and never greater than the configured context window. There is no parallel
+Magnitude-owned descriptor array; SDK, ACN, CLI, and external harnesses consume the same rows.
 This extension is discovery metadata only and does not change model selection semantics.
-Runnable external Hugging Face models appear in both arrays under the exact canonical
+Runnable external Hugging Face models appear in the array under the exact canonical
 `hf:<owner>/<repository>/<artifact-selector>` identity. Path transport percent-encodes that whole
 identity where it occupies one URL segment; JSON bodies and model-list values do not encode or
 rewrite it.

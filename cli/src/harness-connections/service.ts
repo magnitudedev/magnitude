@@ -1,7 +1,6 @@
 import * as CommandExecutor from "@effect/platform/CommandExecutor"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as HttpClient from "@effect/platform/HttpClient"
-import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import * as Path from "@effect/platform/Path"
 import {
   HarnessConnectionError,
@@ -10,9 +9,15 @@ import {
   type HarnessDestination,
   type HarnessId,
 } from "@magnitudedev/client-common"
-import { ProviderModelIdSchema, type ProviderModelId } from "@magnitudedev/sdk"
+import {
+  makeInferenceClient,
+  ProviderModelIdSchema,
+  ReasoningEffortSchema,
+  type InferenceModel,
+  type ProviderModelId,
+} from "@magnitudedev/sdk"
 import { makeStateDocument } from "@magnitudedev/storage"
-import { Data, Effect, Option, Schema } from "effect"
+import { Effect, Option, Schema } from "effect"
 import { delimiter } from "node:path"
 import { installServiceOnStartup } from "../server/service"
 import { writeFileAtomic } from "../utils/atomic-file"
@@ -102,24 +107,34 @@ const entrySpec = (entry: ManifestEntry): HarnessConnectionSpec => ({
   setCurrent: entry.setCurrent,
 })
 
-const ModelsResponseSchema = Schema.Struct({
-  models: Schema.Array(HarnessModelSchema),
-})
-
-class HarnessModelDiscoveryFailed extends Data.TaggedError("HarnessModelDiscoveryFailed")<{
-  readonly message: string
-}> {}
+const toHarnessModel = (model: InferenceModel): HarnessModel => {
+  const reasoning = Option.match(Option.filter(model.reasoning, (value) => value !== null), {
+    onNone: () => ({ supported: false as const, efforts: [] as const }),
+    onSome: (value) => ({
+      supported: true as const,
+      efforts: value.supported_efforts.map((effort) => Schema.decodeSync(ReasoningEffortSchema)(effort)),
+      defaultEffort: Schema.decodeSync(ReasoningEffortSchema)(value.default_effort),
+    }),
+  })
+  return Schema.decodeSync(HarnessModelSchema)({
+    id: model.id,
+    name: model.name,
+    description: model.description,
+    contextWindow: model.context_length,
+    maxOutputTokens: model.top_provider.max_completion_tokens,
+    capabilities: {
+      vision: model.architecture.input_modalities.includes("image"),
+      tools: model.supported_parameters.includes("tools"),
+      structuredOutput: model.supported_parameters.includes("structured_outputs"),
+      reasoning,
+    },
+  })
+}
 
 const discoverMagnitudeModels = Effect.gen(function* () {
-  const http = yield* HttpClient.HttpClient
-  const response = yield* http.execute(HttpClientRequest.get(`${OPENAI_BASE_URL}/models`))
-  if (response.status < 200 || response.status >= 300) {
-    return yield* new HarnessModelDiscoveryFailed({
-      message: `Magnitude model discovery returned HTTP ${response.status}`,
-    })
-  }
-  const decoded = yield* response.json.pipe(Effect.flatMap(Schema.decodeUnknown(ModelsResponseSchema)))
-  return decoded.models
+  const client = yield* makeInferenceClient()
+  const response = yield* client.listModels()
+  return response.data.map(toHarnessModel)
 })
 
 const uniqueModels = (models: ReadonlyArray<HarnessModel>): ReadonlyArray<HarnessModel> => models.filter(

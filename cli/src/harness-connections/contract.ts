@@ -9,7 +9,7 @@ import {
   ReasoningEffortSchema,
   type ProviderModelId,
 } from "@magnitudedev/sdk"
-import { Schema, type Effect, type Option } from "effect"
+import { Option, Schema, type Effect } from "effect"
 import type { SkillInstallationTarget } from "./paths"
 
 const HarnessReasoningCapabilitiesSchema = Schema.Union(
@@ -34,17 +34,38 @@ const HarnessModelCapabilitiesSchema = Schema.Struct({
   reasoning: HarnessReasoningCapabilitiesSchema,
 })
 
-export const HarnessModelSchema = Schema.Struct({
+const ContextWindowSchema = Schema.Number.pipe(
+  Schema.int(),
+  Schema.positive(),
+  Schema.lessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
+)
+
+const HarnessModelFields = {
   id: ProviderModelIdSchema,
   name: Schema.NonEmptyString,
   description: Schema.String,
-  contextWindow: Schema.Number.pipe(
-    Schema.int(),
-    Schema.positive(),
-    Schema.lessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
-  ),
+  contextWindow: ContextWindowSchema,
   capabilities: HarnessModelCapabilitiesSchema,
-})
+} as const
+
+export const HarnessModelSchema = Schema.transform(
+  Schema.Struct({
+    ...HarnessModelFields,
+    maxOutputTokens: Schema.optionalWith(ContextWindowSchema, { as: "Option", exact: true }),
+  }),
+  Schema.typeSchema(Schema.Struct({ ...HarnessModelFields, maxOutputTokens: ContextWindowSchema })),
+  {
+    strict: true,
+    decode: (model) => ({
+      ...model,
+      maxOutputTokens: Option.getOrElse(
+        model.maxOutputTokens,
+        () => Math.min(model.contextWindow, 32_768),
+      ),
+    }),
+    encode: (model) => ({ ...model, maxOutputTokens: Option.some(model.maxOutputTokens) }),
+  },
+)
 export type HarnessModel = typeof HarnessModelSchema.Type
 
 export interface HarnessConnectionSpec {

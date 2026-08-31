@@ -9,11 +9,16 @@ import { Effect, Option, Stream } from "effect"
 import { MAGNITUDE_INFERENCE_BASE_URL } from "./inference-endpoint"
 
 export const ResponseObjectSchema = S.ResponseObject
+export const InferenceModelSchema = S.OpenAiModel
+export const InferenceModelsResponseSchema = S.OpenAiModelsResponse
 
 export type ResponseObject = typeof ResponseObjectSchema.Type
+export type InferenceModel = typeof InferenceModelSchema.Type
+export type InferenceModelsResponse = typeof InferenceModelsResponseSchema.Type
 
 /** Typed client for the public `/inference/v1` data plane. */
 export interface InferenceClient {
+  readonly listModels: () => Effect.Effect<InferenceModelsResponse, GeneratedClientError>
   readonly createChatCompletion: (
     payload: typeof S.ChatCompletionRequest.Type,
   ) => Effect.Effect<typeof S.ChatCompletionResponse.Type, GeneratedClientError>
@@ -38,6 +43,7 @@ export const makeInferenceClient = (
     "Magnitude-Include-Progress": Option.fromNullable(includeProgress),
   })
   return {
+    listModels: () => transport.inference.listServableModels({}),
     createChatCompletion: (payload) => transport.chat.createChatCompletionHttp({
       payload: { ...payload, stream: Option.some(false) },
       headers: progressHeaders(false),

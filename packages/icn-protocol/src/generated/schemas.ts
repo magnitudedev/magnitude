@@ -1415,19 +1415,6 @@ export const JsonSchemaRequest = S.Struct({
 export type JsonSchemaRequest = S.Schema.Type<typeof JsonSchemaRequest>
 export type JsonSchemaRequestEncoded = S.Schema.Encoded<typeof JsonSchemaRequest>
 
-export const MagnitudeModelDescriptor = S.extend(
-  S.Struct({
-    capabilities: S.suspend((): S.Schema<ModelCapabilities, ModelCapabilitiesEncoded> => ModelCapabilities),
-    contextWindow: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-    description: S.String,
-    id: S.String,
-    name: S.String,
-  }),
-  S.Record({ key: S.String, value: JsonValue }),
-)
-export type MagnitudeModelDescriptor = S.Schema.Type<typeof MagnitudeModelDescriptor>
-export type MagnitudeModelDescriptorEncoded = S.Schema.Encoded<typeof MagnitudeModelDescriptor>
-
 export const MemoryAssessment = S.Struct({
   capacityBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   compatibilityReserveBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -1966,28 +1953,72 @@ export type NamedFunctionCallRequestEncoded = S.Schema.Encoded<typeof NamedFunct
 
 export const OpenAiModel = S.extend(
   S.Struct({
+    architecture: S.suspend(
+      (): S.Schema<OpenAiModelArchitecture, OpenAiModelArchitectureEncoded> => OpenAiModelArchitecture,
+    ),
+    context_length: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
     created: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    description: S.String,
     id: S.String,
+    name: S.String,
     object: S.String,
     owned_by: S.String,
+    reasoning: S.optionalWith(
+      S.Union(
+        S.Null,
+        S.suspend((): S.Schema<OpenAiModelReasoning, OpenAiModelReasoningEncoded> => OpenAiModelReasoning),
+      ),
+      { exact: true, as: "Option" },
+    ),
+    supported_parameters: S.Array(S.String),
+    top_provider: S.suspend((): S.Schema<OpenAiTopProvider, OpenAiTopProviderEncoded> => OpenAiTopProvider),
   }),
   S.Record({ key: S.String, value: JsonValue }),
 )
 export type OpenAiModel = S.Schema.Type<typeof OpenAiModel>
 export type OpenAiModelEncoded = S.Schema.Encoded<typeof OpenAiModel>
 
+export const OpenAiModelArchitecture = S.extend(
+  S.Struct({
+    input_modalities: S.Array(S.String),
+    output_modalities: S.Array(S.String),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type OpenAiModelArchitecture = S.Schema.Type<typeof OpenAiModelArchitecture>
+export type OpenAiModelArchitectureEncoded = S.Schema.Encoded<typeof OpenAiModelArchitecture>
+
+export const OpenAiModelReasoning = S.extend(
+  S.Struct({
+    default_effort: S.String,
+    default_enabled: S.Boolean,
+    mandatory: S.Boolean,
+    supported_efforts: S.Array(S.String),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type OpenAiModelReasoning = S.Schema.Type<typeof OpenAiModelReasoning>
+export type OpenAiModelReasoningEncoded = S.Schema.Encoded<typeof OpenAiModelReasoning>
+
 export const OpenAiModelsResponse = S.extend(
   S.Struct({
     data: S.Array(S.suspend((): S.Schema<OpenAiModel, OpenAiModelEncoded> => OpenAiModel)),
-    models: S.Array(
-      S.suspend((): S.Schema<MagnitudeModelDescriptor, MagnitudeModelDescriptorEncoded> => MagnitudeModelDescriptor),
-    ),
     object: S.String,
   }),
   S.Record({ key: S.String, value: JsonValue }),
 )
 export type OpenAiModelsResponse = S.Schema.Type<typeof OpenAiModelsResponse>
 export type OpenAiModelsResponseEncoded = S.Schema.Encoded<typeof OpenAiModelsResponse>
+
+export const OpenAiTopProvider = S.extend(
+  S.Struct({
+    context_length: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    max_completion_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type OpenAiTopProvider = S.Schema.Type<typeof OpenAiTopProvider>
+export type OpenAiTopProviderEncoded = S.Schema.Encoded<typeof OpenAiTopProvider>
 
 export const OutputConfig = S.extend(
   S.Struct({

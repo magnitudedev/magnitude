@@ -40,9 +40,12 @@ alone never implies a connection.
 
 The user manifest records desired harness connections. It contains no gateway credential or
 historical harness settings. Each entry contains the harness, complete installed Magnitude model
-set as harness-facing descriptors, optional handoff-model selection, and update time. A descriptor
-contains identity, display name, description, context window, modalities and tool capabilities, and
-the model's reasoning domain and default. `add` connects every installed Magnitude model and may
+set as harness-facing descriptors, optional handoff-model selection, and update time. The CLI derives
+each descriptor through the SDK from the enriched OpenAI model-list `data` entry; no second
+Magnitude-only model-list array exists. A descriptor contains identity, display name, description,
+context window, advertised output ceiling, modalities and tool capabilities, and the model's
+reasoning domain and default. Existing persisted descriptors without an output ceiling migrate to
+the lesser of their context window and 32,768 tokens. `add` connects every installed Magnitude model and may
 select one for the immediate handoff; `sync` refreshes the complete model set without launching
 anything; and `remove` deletes the connector's Magnitude-owned provider, agent, profile, or catalog.
 Applying a connection is an unconditional idempotent upsert of Magnitude-owned state. Existing,

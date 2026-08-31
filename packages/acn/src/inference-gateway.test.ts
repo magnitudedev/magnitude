@@ -215,27 +215,23 @@ describe("Anthropic inference gateway", () => {
       icn,
       async () => Response.json({
         object: "list",
-        models: [{
-          id: "local:model",
-          name: "Local Model",
-          description: "A local fixture.",
-          contextWindow: 32_768,
-          capabilities: {
-            vision: false,
-            tools: true,
-            structuredOutput: true,
-            reasoning: {
-              supported: true,
-              efforts: ["none", "high"],
-              defaultEffort: "high",
-            },
-          },
-        }],
         data: [{
           id: "local:model",
           object: "model",
           created: 0,
           owned_by: "magnitude",
+          name: "Local Model",
+          description: "A local fixture.",
+          context_length: 32_768,
+          architecture: { input_modalities: ["text"], output_modalities: ["text"] },
+          supported_parameters: ["max_tokens", "tools", "tool_choice", "reasoning"],
+          reasoning: {
+            supported_efforts: ["none", "high"],
+            default_effort: "high",
+            default_enabled: true,
+            mandatory: false,
+          },
+          top_provider: { context_length: 32_768, max_completion_tokens: 32_768 },
         }],
       }),
     )
@@ -253,12 +249,17 @@ describe("Anthropic inference gateway", () => {
   test("paginates the local alias catalog without an upstream dependency", async () => {
     const catalog = {
       object: "list",
-      models: [],
       data: ["c", "a", "b"].map((id) => ({
         id,
         object: "model",
         created: 0,
         owned_by: "magnitude",
+        name: id,
+        description: `Local ${id}.`,
+        context_length: 32_768,
+        architecture: { input_modalities: ["text"], output_modalities: ["text"] },
+        supported_parameters: ["max_tokens"],
+        top_provider: { context_length: 32_768, max_completion_tokens: 32_768 },
       })),
     }
     const fetchCatalog = async () => Response.json(catalog)
