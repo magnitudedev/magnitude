@@ -156,7 +156,6 @@ const recoveryActivity = (state: AcnRecoveryState): string | null => {
     case "WaitingForOwner": return "Waiting for previous Magnitude service…"
     case "ResolvingLocalInference": return "Preparing local inference…"
     case "LaunchingLocalInference": return "Starting local inference…"
-    case "DiscoveringLocalModels": return "Discovering local models…"
   }
 }
 

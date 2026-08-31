@@ -1,6 +1,7 @@
 import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import {
   LocalModelsStateSchema,
+  LocalModelAssessmentSchema,
   CatalogLocalModelSchema,
   DiscoveredLocalModelSchema,
   LocalModelPresentationSchema,
@@ -12,26 +13,89 @@ import {
   type CatalogLocalModelServingState,
   type DiscoveredLocalModelServingState,
   type LocalModelRankingScores,
+  type LocalModelAssessment,
   type LocalModel,
   type LocalModelsState,
   type ModelId,
   type ModelFailure,
   type ModelResidency,
 } from "@magnitudedev/acn-protocol"
-import { IcnCatalogInstallations, IcnInstances } from "@magnitudedev/icn"
+import { IcnCatalogInstallations, IcnInstances, IcnModelAssessments } from "@magnitudedev/icn"
 import { projectInferenceResidency } from "@magnitudedev/sdk"
-import type { CatalogInstallationOperation, CatalogModel, CatalogModelUpdate, ReadyModel } from "@magnitudedev/icn-protocol/schemas"
+import type {
+  CatalogInstallationOperation,
+  CatalogModel,
+  CatalogModelUpdate,
+  ModelAssessment,
+  ModelAssessmentDomainSnapshot,
+  ModelAssessmentsSnapshot,
+  ReadyModel,
+} from "@magnitudedev/icn-protocol/schemas"
 import {
   LocalModelSources,
   type CatalogModelSource,
   type DiscoveredModelSource,
 } from "./local-model-sources"
-import { LocalModelAssessor, type CoordinatedLocalModelAssessment } from "./local-model-assessor"
 import { materializeProjection } from "./materialized-projection"
 import { modelRankingScores } from "./local-model-ranking-policy"
 import { LocalModelRemovals, type LocalModelRemovalState } from "./local-model-removals"
 
 const failure = (code: string, message: string, retryable = false): ModelFailure => ({ code, message, retryable })
+
+type CoordinatedLocalModelAssessment =
+  | { readonly _tag: "Assessing" }
+  | { readonly _tag: "Assessed"; readonly assessment: LocalModelAssessment }
+  | { readonly _tag: "Failed"; readonly failure: ModelFailure }
+
+const projectAssessment = (environmentId: string, assessment: ModelAssessment): LocalModelAssessment => {
+  if (assessment._tag === "Fits") {
+    const totalRequiredBytes = assessment.memory.reduce((total, item) => total + item.requiredBytes, 0)
+    const requiredSystemMemoryBytes = assessment.memory.filter((item) => item.memoryDomainId === "system")
+      .reduce((total, item) => total + item.requiredBytes, 0)
+    return Schema.decodeUnknownSync(LocalModelAssessmentSchema)({
+      _tag: "Fits", assessmentId: assessment.assessmentId, environmentId,
+      profile: assessment.profile,
+      memory: {
+        domains: assessment.memory, totalRequiredBytes, requiredSystemMemoryBytes,
+        systemUseState: { _tag: "NotObserved" },
+        currentHeadroomState: { _tag: "NotObserved" },
+      },
+      performance: assessment.performance,
+    })
+  }
+  if (assessment._tag === "DoesNotFit") {
+    return Schema.decodeUnknownSync(LocalModelAssessmentSchema)({
+      _tag: "DoesNotFit", assessmentId: assessment.assessmentId, environmentId,
+      profile: assessment.profile,
+      memoryDomains: assessment.memory,
+      totalRequiredBytes: assessment.memory.reduce((total, item) => total + item.requiredBytes, 0),
+      deficitBytes: assessment.deficitBytes, limitingResource: assessment.limitingResource,
+    })
+  }
+  return Schema.decodeUnknownSync(LocalModelAssessmentSchema)({
+    _tag: "Incompatible", environmentId, profile: assessment.profile, failure: assessment.failure,
+  })
+}
+
+export const coordinatedAssessment = (
+  snapshot: ModelAssessmentsSnapshot,
+  sourceRevision: number,
+  source: "catalog" | "discovered",
+  modelId: ModelId,
+): CoordinatedLocalModelAssessment | undefined => {
+  if (snapshot.state._tag === "Failed") return { _tag: "Failed", failure: snapshot.state.failure }
+  if (snapshot.state._tag !== "Ready") return undefined
+  const domain: ModelAssessmentDomainSnapshot = snapshot.state[source]
+  if (domain.sourceRevision !== sourceRevision || domain._tag === "Pending") return undefined
+  if (domain._tag === "Failed") return { _tag: "Failed", failure: domain.failure }
+  const entry = domain.entries.find(({ subject }) => subject.modelId === modelId)
+  if (entry === undefined || entry.state._tag === "Assessing") return undefined
+  if (entry.state._tag === "Failed") return { _tag: "Failed", failure: entry.state.failure }
+  const assessment = entry.state.profiles[0]
+  return assessment === undefined
+    ? { _tag: "Failed", failure: failure("missing_assessment", "ICN returned no model assessment", true) }
+    : { _tag: "Assessed", assessment: projectAssessment(snapshot.state.environmentId, assessment) }
+}
 
 const residencyFor = (modelId: string, instances: readonly import("@magnitudedev/icn-protocol/schemas").ModelInstance[]): ModelResidency => {
   const instance = instances.findLast((candidate) => candidate.modelId === modelId)
@@ -230,16 +294,16 @@ export class LocalModels extends Context.Tag("LocalModels")<LocalModels, LocalMo
 export const LocalModelsLive: Layer.Layer<
   LocalModels,
   never,
-  LocalModelSources | LocalModelAssessor | IcnCatalogInstallations | IcnInstances | LocalModelRemovals
+  LocalModelSources | IcnModelAssessments | IcnCatalogInstallations | IcnInstances | LocalModelRemovals
 > = Layer.scoped(LocalModels, Effect.gen(function* () {
   const sources = yield* LocalModelSources
-  const assessor = yield* LocalModelAssessor
+  const assessments = yield* IcnModelAssessments
   const installations = yield* IcnCatalogInstallations
   const instances = yield* IcnInstances
   const removalService = yield* LocalModelRemovals
   const project = Effect.gen(function* () {
     const source = yield* sources.state
-    const assessment = yield* assessor.snapshot
+    const assessment = (yield* assessments.get).state
     const operations = (yield* installations.get).state.operations
     const runtime = (yield* instances.get).instances
     const removals = yield* removalService.state
@@ -249,16 +313,16 @@ export const LocalModelsLive: Layer.Layer<
       models: [
         ...source.catalogModels.map((entry) => catalogModel(entry, latestOperation.get(entry.id),
           removals.get(entry.id),
-          assessment.assessments.get(entry.id), runtime)),
+          coordinatedAssessment(assessment, source.catalogRevision, "catalog", entry.id), runtime)),
         ...source.discoveredModels.map((entry) => discoveredModel(entry,
-          assessment.assessments.get(entry.id), runtime)),
+          coordinatedAssessment(assessment, source.discoveryRevision, "discovered", entry.id), runtime)),
       ],
     } satisfies LocalModelsState
   })
   const projection = yield* materializeProjection({
     project,
     invalidations: Stream.mergeAll([
-      sources.changes.pipe(Stream.map(() => undefined)), assessor.changes.pipe(Stream.map(() => undefined)),
+      sources.changes.pipe(Stream.map(() => undefined)), assessments.changes.pipe(Stream.map(() => undefined)),
       installations.changes.pipe(Stream.map(() => undefined)), instances.changes.pipe(Stream.map(() => undefined)),
       removalService.changes,
     ], { concurrency: "unbounded" }),

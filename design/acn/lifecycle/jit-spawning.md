@@ -160,7 +160,7 @@ Policy uses Effect `Duration`, monotonic `Clock`, bounded `Schedule`, and `TestC
 are one second polling, two seconds per health request, thirty seconds without an observable health
 response, thirty seconds for candidate admission, five minutes absolute application startup while
 health remains `Starting` (including phases with unchanged optional diagnostics, such as Resolving,
-PreparingBackend, DiscoveringModels, and Starting), five seconds for stopping, two seconds after TERM, two
+PreparingBackend and Starting), five seconds for stopping, two seconds after TERM, two
 seconds after KILL, and ten minutes absolute per ensurance occurrence. Store contention is bounded
 inside each store operation rather than by its consumers. A live `Starting` owner is not retired
 merely because its phase or measured progress is unchanged; only the absolute startup ceiling and

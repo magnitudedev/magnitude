@@ -23,7 +23,6 @@ macro_rules! string_id {
 string_id!(ModelFileId);
 string_id!(ModelPackageId);
 string_id!(ModelDownloadId);
-string_id!(ModelAssessmentRequestId);
 string_id!(ModelAssessmentId);
 string_id!(AssessmentEnvironmentId);
 string_id!(ModelInstanceId);
@@ -1327,7 +1326,7 @@ pub struct ModelAssessmentProfile {
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum CatalogModelSelection {
     Desired,
@@ -1335,42 +1334,7 @@ pub enum CatalogModelSelection {
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CatalogAssessmentTarget {
-    pub request_id: ModelAssessmentRequestId,
-    pub model_id: ModelId,
-    pub selection: CatalogModelSelection,
-    pub profiles: Vec<ModelAssessmentProfile>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CatalogAssessmentsRequest {
-    pub revision: u64,
-    pub targets: Vec<CatalogAssessmentTarget>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DiscoveryAssessmentTarget {
-    pub request_id: ModelAssessmentRequestId,
-    pub model_id: ModelId,
-    pub profiles: Vec<ModelAssessmentProfile>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DiscoveryAssessmentsRequest {
-    pub revision: u64,
-    pub targets: Vec<DiscoveryAssessmentTarget>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
 pub enum ModelAssessmentSubject {
     #[serde(rename_all = "camelCase")]
@@ -1389,23 +1353,6 @@ impl ModelAssessmentSubject {
             Self::Catalog { model_id, .. } | Self::Discovery { model_id } => model_id,
         }
     }
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AssessModelRequest {
-    pub request_id: ModelAssessmentRequestId,
-    pub subject: ModelAssessmentSubject,
-    pub profiles: Vec<ModelAssessmentProfile>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AssessModelsRequest {
-    pub revision: u64,
-    pub requests: Vec<AssessModelRequest>,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -1493,49 +1440,83 @@ impl ModelAssessment {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum AssessModelResult {
+pub enum ModelAssessmentEntryState {
+    Assessing,
     #[serde(rename_all = "camelCase")]
     Assessed {
-        request_id: ModelAssessmentRequestId,
-        subject: ModelAssessmentSubject,
         profiles: Vec<ModelAssessment>,
     },
     #[serde(rename_all = "camelCase")]
-    Unavailable {
-        request_id: ModelAssessmentRequestId,
-        subject: ModelAssessmentSubject,
-        failure: ModelFailure,
-    },
-    #[serde(rename_all = "camelCase")]
     Failed {
-        request_id: ModelAssessmentRequestId,
-        subject: ModelAssessmentSubject,
         failure: ModelFailure,
     },
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum AssessModelsEvent {
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelAssessmentEntry {
+    pub subject: ModelAssessmentSubject,
+    pub state: ModelAssessmentEntryState,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum ModelAssessmentDomainSnapshot {
     #[serde(rename_all = "camelCase")]
-    Started {
-        revision: u64,
-        environment_id: AssessmentEnvironmentId,
+    Pending { source_revision: u64 },
+    #[serde(rename_all = "camelCase")]
+    Assessing {
+        source_revision: u64,
         total_targets: u32,
-    },
-    Result {
-        result: AssessModelResult,
+        settled_targets: u32,
+        failed_targets: u32,
+        entries: Vec<ModelAssessmentEntry>,
     },
     #[serde(rename_all = "camelCase")]
-    Completed {
-        revision: u64,
-        environment_id: AssessmentEnvironmentId,
+    Complete {
+        source_revision: u64,
         total_targets: u32,
+        failed_targets: u32,
+        entries: Vec<ModelAssessmentEntry>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Failed {
+        source_revision: u64,
+        failure: ModelFailure,
     },
 }
 
-pub type ModelAssessmentStream = BoxStream<'static, AssessModelsEvent>;
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum ModelAssessmentPoolState {
+    Preparing,
+    #[serde(rename_all = "camelCase")]
+    Ready {
+        environment_id: AssessmentEnvironmentId,
+        catalog: ModelAssessmentDomainSnapshot,
+        discovered: ModelAssessmentDomainSnapshot,
+    },
+    #[serde(rename_all = "camelCase")]
+    Failed {
+        failure: ModelFailure,
+    },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelAssessmentsSnapshot {
+    pub revision: u64,
+    pub state: ModelAssessmentPoolState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelAssessmentsInvalidation {
+    pub revision: u64,
+}
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1724,11 +1705,9 @@ pub trait CatalogPackageRemover: Send + Sync + 'static {
     ) -> BoxFuture<'_, Result<u64, InventoryError>>;
 }
 
-pub trait ModelAssessor: Send + Sync + 'static {
-    fn assess(
-        &self,
-        request: AssessModelsRequest,
-    ) -> BoxFuture<'_, Result<ModelAssessmentStream, InventoryError>>;
+pub trait ModelAssessments: Send + Sync + 'static {
+    fn snapshot(&self) -> BoxFuture<'_, Result<ModelAssessmentsSnapshot, InventoryError>>;
+    fn watch(&self) -> BoxStream<'static, ModelAssessmentsInvalidation>;
 }
 
 pub trait ModelDownloads: Send + Sync + 'static {

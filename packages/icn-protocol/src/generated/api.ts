@@ -199,6 +199,14 @@ export const getHardware = HttpApiEndpoint.get("getHardware", "/api/v1/hardware"
     { status: 500 },
   )
 
+export const getModelAssessments = HttpApiEndpoint.get("getModelAssessments", "/api/v1/model-assessments").addSuccess(
+  S.suspend(
+    (): S.Schema<Schemas.ModelAssessmentsSnapshot, Schemas.ModelAssessmentsSnapshotEncoded> =>
+      Schemas.ModelAssessmentsSnapshot,
+  ),
+  { status: 200 },
+)
+
 export const getModelInstance = HttpApiEndpoint.get("getModelInstance", "/api/v1/instances/:instance_id")
   .setPath(S.Struct({ instance_id: S.String }))
   .addSuccess(
@@ -489,6 +497,7 @@ export const InferenceGroup = HttpApiGroup.make("inference").add(listServableMod
 
 export const ModelsGroup = HttpApiGroup.make("models")
   .add(ensureModelInstance)
+  .add(getModelAssessments)
   .add(getModelInstance)
   .add(getModelInstances)
   .add(getModelProperties)

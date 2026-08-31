@@ -140,103 +140,6 @@
         }
       }
     },
-    "/api/v1/catalog/assessments": {
-      "post": {
-        "tags": [
-          "catalog"
-        ],
-        "operationId": "assessCatalogModels",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CatalogAssessmentsRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Exact target and profile assessment events",
-            "content": {
-              "application/x-ndjson": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid assessment request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Assessment target not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Model assessment could not be completed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Assessment target failed integrity validation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Assessment operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        },
-        "x-magnitude-stream": {
-          "data": {
-            "encoding": "json",
-            "schema": {
-              "$ref": "#/components/schemas/AssessModelsEvent"
-            }
-          },
-          "framing": "ndjson",
-          "reconnect": {
-            "type": "none"
-          },
-          "responseStatus": 200,
-          "termination": {
-            "type": "eof"
-          },
-          "version": 1
-        }
-      }
-    },
     "/api/v1/catalog/installations": {
       "get": {
         "tags": [
@@ -660,103 +563,6 @@
         }
       }
     },
-    "/api/v1/discovery/assessments": {
-      "post": {
-        "tags": [
-          "discovery"
-        ],
-        "operationId": "assessDiscoveredModels",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/DiscoveryAssessmentsRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Exact discovered-model profile assessment events",
-            "content": {
-              "application/x-ndjson": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid assessment request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Discovered model not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Discovery snapshot is stale",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Discovered model failed integrity validation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Assessment operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        },
-        "x-magnitude-stream": {
-          "data": {
-            "encoding": "json",
-            "schema": {
-              "$ref": "#/components/schemas/AssessModelsEvent"
-            }
-          },
-          "framing": "ndjson",
-          "reconnect": {
-            "type": "none"
-          },
-          "responseStatus": 200,
-          "termination": {
-            "type": "eof"
-          },
-          "version": 1
-        }
-      }
-    },
     "/api/v1/discovery/models": {
       "get": {
         "tags": [
@@ -1111,6 +917,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/model-assessments": {
+      "get": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "getModelAssessments",
+        "responses": {
+          "200": {
+            "description": "Current automatic model-assessment pool",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelAssessmentsSnapshot"
                 }
               }
             }
@@ -1851,173 +1677,6 @@
         },
         "additionalProperties": false
       },
-      "AssessModelResult": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "requestId",
-              "subject",
-              "profiles",
-              "_tag"
-            ],
-            "properties": {
-              "requestId": {
-                "$ref": "#/components/schemas/ModelAssessmentRequestId"
-              },
-              "subject": {
-                "$ref": "#/components/schemas/ModelAssessmentSubject"
-              },
-              "profiles": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/ModelAssessment"
-                }
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Assessed"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "requestId",
-              "subject",
-              "failure",
-              "_tag"
-            ],
-            "properties": {
-              "requestId": {
-                "$ref": "#/components/schemas/ModelAssessmentRequestId"
-              },
-              "subject": {
-                "$ref": "#/components/schemas/ModelAssessmentSubject"
-              },
-              "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Unavailable"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "requestId",
-              "subject",
-              "failure",
-              "_tag"
-            ],
-            "properties": {
-              "requestId": {
-                "$ref": "#/components/schemas/ModelAssessmentRequestId"
-              },
-              "subject": {
-                "$ref": "#/components/schemas/ModelAssessmentSubject"
-              },
-              "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Failed"
-                ]
-              }
-            }
-          }
-        ]
-      },
-      "AssessModelsEvent": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "revision",
-              "environmentId",
-              "totalTargets",
-              "_tag"
-            ],
-            "properties": {
-              "revision": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "environmentId": {
-                "$ref": "#/components/schemas/AssessmentEnvironmentId"
-              },
-              "totalTargets": {
-                "type": "integer",
-                "format": "int32",
-                "minimum": 0
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Started"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "result",
-              "_tag"
-            ],
-            "properties": {
-              "result": {
-                "$ref": "#/components/schemas/AssessModelResult"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Result"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "revision",
-              "environmentId",
-              "totalTargets",
-              "_tag"
-            ],
-            "properties": {
-              "revision": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "environmentId": {
-                "$ref": "#/components/schemas/AssessmentEnvironmentId"
-              },
-              "totalTargets": {
-                "type": "integer",
-                "format": "int32",
-                "minimum": 0
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Completed"
-                ]
-              }
-            }
-          }
-        ]
-      },
       "AssessmentEnvironmentId": {
         "type": "string"
       },
@@ -2061,54 +1720,6 @@
           "q5_0",
           "q5_1"
         ]
-      },
-      "CatalogAssessmentTarget": {
-        "type": "object",
-        "required": [
-          "requestId",
-          "modelId",
-          "selection",
-          "profiles"
-        ],
-        "properties": {
-          "requestId": {
-            "$ref": "#/components/schemas/ModelAssessmentRequestId"
-          },
-          "modelId": {
-            "$ref": "#/components/schemas/ModelId"
-          },
-          "selection": {
-            "$ref": "#/components/schemas/CatalogModelSelection"
-          },
-          "profiles": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ModelAssessmentProfile"
-            }
-          }
-        },
-        "additionalProperties": false
-      },
-      "CatalogAssessmentsRequest": {
-        "type": "object",
-        "required": [
-          "revision",
-          "targets"
-        ],
-        "properties": {
-          "revision": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "targets": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/CatalogAssessmentTarget"
-            }
-          }
-        },
-        "additionalProperties": false
       },
       "CatalogInstallationAdmission": {
         "oneOf": [
@@ -3663,50 +3274,6 @@
         },
         "additionalProperties": false
       },
-      "DiscoveryAssessmentTarget": {
-        "type": "object",
-        "required": [
-          "requestId",
-          "modelId",
-          "profiles"
-        ],
-        "properties": {
-          "requestId": {
-            "$ref": "#/components/schemas/ModelAssessmentRequestId"
-          },
-          "modelId": {
-            "$ref": "#/components/schemas/ModelId"
-          },
-          "profiles": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ModelAssessmentProfile"
-            }
-          }
-        },
-        "additionalProperties": false
-      },
-      "DiscoveryAssessmentsRequest": {
-        "type": "object",
-        "required": [
-          "revision",
-          "targets"
-        ],
-        "properties": {
-          "revision": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "targets": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/DiscoveryAssessmentTarget"
-            }
-          }
-        },
-        "additionalProperties": false
-      },
       "DownloadFailure": {
         "oneOf": [
           {
@@ -5119,6 +4686,7 @@
           "hardware",
           "catalog",
           "discovery",
+          "model-assessments",
           "catalog-installations",
           "instances"
         ]
@@ -5580,32 +5148,275 @@
           }
         ]
       },
-      "ModelAssessmentId": {
-        "type": "string"
+      "ModelAssessmentDomainSnapshot": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "sourceRevision",
+              "_tag"
+            ],
+            "properties": {
+              "sourceRevision": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Pending"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "sourceRevision",
+              "totalTargets",
+              "settledTargets",
+              "failedTargets",
+              "entries",
+              "_tag"
+            ],
+            "properties": {
+              "sourceRevision": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "totalTargets": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "settledTargets": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "failedTargets": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "entries": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ModelAssessmentEntry"
+                }
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Assessing"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "sourceRevision",
+              "totalTargets",
+              "failedTargets",
+              "entries",
+              "_tag"
+            ],
+            "properties": {
+              "sourceRevision": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "totalTargets": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "failedTargets": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "entries": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ModelAssessmentEntry"
+                }
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Complete"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "sourceRevision",
+              "failure",
+              "_tag"
+            ],
+            "properties": {
+              "sourceRevision": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "failure": {
+                "$ref": "#/components/schemas/ModelFailure"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Failed"
+                ]
+              }
+            }
+          }
+        ]
       },
-      "ModelAssessmentProfile": {
+      "ModelAssessmentEntry": {
         "type": "object",
         "required": [
-          "profile",
-          "performanceContextTokens"
+          "subject",
+          "state"
         ],
         "properties": {
-          "profile": {
-            "$ref": "#/components/schemas/ServingProfile"
+          "subject": {
+            "$ref": "#/components/schemas/ModelAssessmentSubject"
           },
-          "performanceContextTokens": {
-            "type": "array",
-            "items": {
-              "type": "integer",
-              "format": "int32",
-              "minimum": 0
-            }
+          "state": {
+            "$ref": "#/components/schemas/ModelAssessmentEntryState"
           }
         },
         "additionalProperties": false
       },
-      "ModelAssessmentRequestId": {
+      "ModelAssessmentEntryState": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Assessing"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "profiles",
+              "_tag"
+            ],
+            "properties": {
+              "profiles": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ModelAssessment"
+                }
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Assessed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "failure",
+              "_tag"
+            ],
+            "properties": {
+              "failure": {
+                "$ref": "#/components/schemas/ModelFailure"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Failed"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ModelAssessmentId": {
         "type": "string"
+      },
+      "ModelAssessmentPoolState": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Preparing"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "environmentId",
+              "catalog",
+              "discovered",
+              "_tag"
+            ],
+            "properties": {
+              "environmentId": {
+                "$ref": "#/components/schemas/AssessmentEnvironmentId"
+              },
+              "catalog": {
+                "$ref": "#/components/schemas/ModelAssessmentDomainSnapshot"
+              },
+              "discovered": {
+                "$ref": "#/components/schemas/ModelAssessmentDomainSnapshot"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Ready"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "failure",
+              "_tag"
+            ],
+            "properties": {
+              "failure": {
+                "$ref": "#/components/schemas/ModelFailure"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Failed"
+                ]
+              }
+            }
+          }
+        ]
       },
       "ModelAssessmentSubject": {
         "oneOf": [
@@ -5650,6 +5461,24 @@
             }
           }
         ]
+      },
+      "ModelAssessmentsSnapshot": {
+        "type": "object",
+        "required": [
+          "revision",
+          "state"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "state": {
+            "$ref": "#/components/schemas/ModelAssessmentPoolState"
+          }
+        },
+        "additionalProperties": false
       },
       "ModelCapabilities": {
         "type": "object",

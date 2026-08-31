@@ -50,20 +50,6 @@ describe("notification area state", () => {
       priority: "activity",
     })
   })
-  test("identifies model discovery during service recovery", () => {
-    const state = new AcnRecovering({
-      occurrence: 1,
-      lifecycle: Schema.decodeUnknownSync(AcnLifecycleStateSchema)({
-        _tag: "Starting",
-        phase: "DiscoveringLocalModels",
-      }),
-    })
-    expect(deriveAcnRecoveryNotificationState(state)).toMatchObject({
-      id: "acn-recovery",
-      message: "Discovering local models…",
-      priority: "activity",
-    })
-  })
   test("projects the authoritative selected-model load request into the footer", () => {
     const providerId = ProviderIdSchema.make("local")
     const providerModelId = ProviderModelIdSchema.make("model")

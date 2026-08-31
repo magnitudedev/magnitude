@@ -5,6 +5,7 @@ applies_to:
   - packages/acn/src/session-*.ts
   - packages/acn/src/model-*.ts
   - packages/icn/src/**
+  - inference/crates/icn-server/**
   - packages/sdk/src/jit-rpc/**
   - packages/acn-protocol/src/boundary/**
 ---

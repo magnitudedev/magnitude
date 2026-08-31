@@ -26,7 +26,6 @@ const STARTING_PHASE_LABELS: Readonly<
   WaitingForOwner: "Waiting for previous Magnitude process",
   ResolvingLocalInference: "Preparing local inference",
   LaunchingLocalInference: "Starting local inference",
-  DiscoveringLocalModels: "Discovering local models",
 }
 
 const backendLabel = (

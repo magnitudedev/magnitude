@@ -50,7 +50,7 @@ export const AcnInstallingActivitySchema = Schema.TaggedStruct("Installing", {
 export type AcnInstallingActivity = typeof AcnInstallingActivitySchema.Type;
 
 export const AcnStartupActivitySchema = Schema.Union(
-  Schema.Literal("WaitingForOwnership", "Resolving", "Starting", "DiscoveringModels"),
+  Schema.Literal("WaitingForOwnership", "Resolving", "Starting"),
   Schema.TaggedStruct("PreparingBackend", { backend: StartupBackendSchema }),
   AcnInstallingActivitySchema,
 );

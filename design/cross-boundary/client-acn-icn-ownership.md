@@ -96,19 +96,18 @@ ICN transition -> native invalidation -> authoritative ICN read -> ACN projectio
                -> ACN query-name poke -> client query invalidation and reread
 ```
 
-An ICN snapshot explicitly marked as incomplete startup reconciliation is provisional. Its observer
-continues refreshing until a complete authoritative snapshot is obtained even if no invalidation
-event arrives. Provisional emptiness cannot become stable ACN product truth.
+An ICN discovery snapshot explicitly marked as incomplete reconciliation is provisional.
+Provisional emptiness cannot become stable ACN product truth, but it does not delay service health.
+The automatic assessment snapshot is separately observed; catalog and discovery assessment slices
+remain pending or assessing until their current exact targets settle.
 
 The inference response stream and resource observation have independent lifetimes. Cancelling a
 chat request does not corrupt ACN observation, and an observation failure does not terminate or
 reinterpret the response proxy.
 
-Finite ICN operations that report incremental native work, including model assessment, use the
-generated streaming client and the framing declared by OpenAPI. ACN validates semantic lifecycle
-events and correlates results; it does not parse NDJSON/SSE bytes or duplicate transport code.
-Dropping an assessment consumer detaches that consumer but does not declare native worker capacity
-available while accepted work is still running.
+Model assessment is not an ACN-driven finite operation. ICN owns the automatic work and exposes a
+read-only snapshot plus invalidations; observing or dropping that snapshot never starts, stops, or
+waits for assessment.
 
 ## Client and SDK responsibility
 
@@ -167,8 +166,8 @@ generation and cannot restart ACN or interrupt ICN-owned transfers.
 
 - No first-party code accesses `/inference/api/**`, native ICN management operations, or ICN
   events.
-- Every ICN stream, including finite assessment streams, is generated from OpenAPI metadata; ACN
-  contains no handwritten streaming transport.
+- Every ICN stream is generated from OpenAPI metadata; ACN contains no handwritten streaming
+  transport. Automatic model assessment is observed as a snapshot, not a finite stream.
 - `/inference/v1/**` remains a transparent proxy; `/inference/anthropic/**` routes reserved local
   aliases to ICN and preserves non-reserved upstream Anthropic request bytes.
 - Every client-visible model query and mutation belongs to the ACN `Models` group.

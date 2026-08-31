@@ -82,7 +82,7 @@ warm-up proves synchronized backend execution and may trigger CUDA PTX JIT befor
 
 Assessment never calibrates lazily. Missing exact operation calibration may use a conservative
 same-device fallback with lower confidence. Missing all applicable evidence, invalid metrics, or
-invalid arithmetic fails the assessment request.
+invalid arithmetic fails the exact assessment target.
 
 ## Identity and caching
 

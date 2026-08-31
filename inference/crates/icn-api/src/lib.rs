@@ -6,17 +6,14 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, Request, State};
-use axum::http::HeaderValue;
 use axum::http::StatusCode;
-use axum::http::header::CONTENT_TYPE;
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures_util::{StreamExt as _, future::BoxFuture, stream::BoxStream};
+use futures_util::{future::BoxFuture, stream::BoxStream};
 use icn_contracts::bootstrap_protocol::{
     BackendEligibilityReport, CudaEligibility, IcnBinaryIdentity, IcnInstallationBackend,
     IcnInstallationDeclaration, IcnStartupBackend, IcnStartupProgressRecord,
@@ -25,12 +22,11 @@ use icn_contracts::bootstrap_protocol::{
 };
 use icn_contracts::inference as domain;
 use icn_contracts::models::{
-    AssessModelRequest, AssessModelsEvent, AssessModelsRequest, CatalogAssessmentsRequest,
     CatalogInstallationAdmission, CatalogInstallationOperation, CatalogInstallationOperationId,
     CatalogInstallationRemoval, CatalogInstallations, CatalogInstallationsResponse, CatalogModel,
     CatalogModelState, CatalogModels, CatalogModelsResponse, DiscoveredModel, DiscoveredModelState,
-    DiscoveredModels, DiscoveredModelsResponse, DiscoveryAssessmentsRequest, EffectiveModel,
-    ModelAssessmentSubject, ModelAssessor, ModelDownloads, ModelId, ModelInstance, ModelInstanceId,
+    DiscoveredModels, DiscoveredModelsResponse, EffectiveModel, ModelAssessments,
+    ModelAssessmentsSnapshot, ModelDownloads, ModelId, ModelInstance, ModelInstanceId,
     ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadPlan, ParsedModelId,
 };
 use icn_contracts::{
@@ -74,7 +70,7 @@ pub struct AppState {
     catalog_models: Option<Arc<dyn CatalogModels>>,
     discovered_models: Option<Arc<dyn DiscoveredModels>>,
     catalog_installations: Option<Arc<dyn CatalogInstallations>>,
-    model_assessor: Option<Arc<dyn ModelAssessor>>,
+    model_assessments: Option<Arc<dyn ModelAssessments>>,
     model_downloads: Option<Arc<dyn ModelDownloads>>,
     hardware: Option<Arc<dyn HardwareProvider>>,
     hugging_face_catalog: Option<Arc<dyn HuggingFaceModelCatalog>>,
@@ -123,6 +119,7 @@ pub enum InferenceResourceTopic {
     Hardware,
     Catalog,
     Discovery,
+    ModelAssessments,
     CatalogInstallations,
     Instances,
 }
@@ -133,6 +130,7 @@ impl InferenceResourceTopic {
             Self::Hardware => "hardware",
             Self::Catalog => "catalog",
             Self::Discovery => "discovery",
+            Self::ModelAssessments => "model-assessments",
             Self::CatalogInstallations => "catalog-installations",
             Self::Instances => "instances",
         }
@@ -143,6 +141,7 @@ impl InferenceResourceTopic {
             "hardware" => Some(Self::Hardware),
             "catalog" => Some(Self::Catalog),
             "discovery" => Some(Self::Discovery),
+            "model-assessments" => Some(Self::ModelAssessments),
             "catalog-installations" => Some(Self::CatalogInstallations),
             "instances" => Some(Self::Instances),
             _ => None,
@@ -245,7 +244,7 @@ impl AppState {
             catalog_models: None,
             discovered_models: None,
             catalog_installations: None,
-            model_assessor: None,
+            model_assessments: None,
             model_downloads: None,
             hardware: None,
             hugging_face_catalog: None,
@@ -264,7 +263,7 @@ impl AppState {
             catalog_models: None,
             discovered_models: None,
             catalog_installations: None,
-            model_assessor: None,
+            model_assessments: None,
             model_downloads: None,
             hardware: None,
             hugging_face_catalog: None,
@@ -299,8 +298,8 @@ impl AppState {
         self
     }
 
-    pub fn with_model_assessor(mut self, model_assessor: Arc<dyn ModelAssessor>) -> Self {
-        self.model_assessor = Some(model_assessor);
+    pub fn with_model_assessments(mut self, model_assessments: Arc<dyn ModelAssessments>) -> Self {
+        self.model_assessments = Some(model_assessments);
         self
     }
 
@@ -375,11 +374,7 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/api/v1/discovery/models", get(discovered_models))
         .route("/api/v1/discovery/refresh", post(refresh_discovery))
-        .route("/api/v1/catalog/assessments", post(assess_catalog_models))
-        .route(
-            "/api/v1/discovery/assessments",
-            post(assess_discovered_models),
-        )
+        .route("/api/v1/model-assessments", get(model_assessments))
         .route(
             "/api/v1/models/{model_id}/load-plan",
             post(preview_model_load),
@@ -1103,6 +1098,10 @@ async fn watch_inference_events(
         .discovered_models
         .as_ref()
         .ok_or_else(|| ApiError::server("discovered models are not configured"))?;
+    let assessments = state
+        .model_assessments
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model assessments are not configured"))?;
     let instance_events =
         futures_util::StreamExt::flat_map(controller.watch_instances(), |event| {
             futures_util::stream::iter(
@@ -1136,6 +1135,11 @@ async fn watch_inference_events(
             revision: event.revision,
         }
     });
+    let assessment_events =
+        futures_util::StreamExt::map(assessments.watch(), |event| InferenceResourceInvalidation {
+            topic: InferenceResourceTopic::ModelAssessments,
+            revision: event.revision,
+        });
     let direct_events = futures_util::stream::unfold(
         state.resource_changes.subscribe(),
         |mut receiver| async move {
@@ -1156,7 +1160,7 @@ async fn watch_inference_events(
             ),
             discovery_events,
         ),
-        direct_events,
+        futures_util::stream::select(assessment_events, direct_events),
     );
     let events = futures_util::StreamExt::filter(events, move |event| {
         std::future::ready(
@@ -1459,6 +1463,22 @@ async fn refresh_discovery(
     Ok(Json(result))
 }
 
+#[utoipa::path(get, path = "/api/v1/model-assessments", operation_id = "getModelAssessments", tag = "models",
+    responses((status = 200, description = "Current automatic model-assessment pool", body = ModelAssessmentsSnapshot))
+)]
+async fn model_assessments(
+    State(state): State<AppState>,
+) -> Result<Json<ModelAssessmentsSnapshot>, ApiError> {
+    state
+        .model_assessments
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model assessments are not configured"))?
+        .snapshot()
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
 #[utoipa::path(get, path = "/v1/models", operation_id = "listServableModels", tag = "inference",
     responses(
         (status = 200, description = "Installed models available for inference", body = OpenAiModelsResponse),
@@ -1549,107 +1569,6 @@ async fn standard_models(
         data,
         models: model_names,
     }))
-}
-
-#[utoipa::path(post, path = "/api/v1/catalog/assessments", operation_id = "assessCatalogModels", tag = "catalog",
-    request_body(content = CatalogAssessmentsRequest, content_type = "application/json"),
-    responses(
-        (status = 200, description = "Exact target and profile assessment events", body = String, content_type = "application/x-ndjson"),
-        (status = 400, description = "Invalid assessment request", body = ErrorResponse),
-        (status = 404, description = "Assessment target not found", body = ErrorResponse),
-        (status = 409, description = "Model assessment could not be completed", body = ErrorResponse),
-        (status = 422, description = "Assessment target failed integrity validation", body = ErrorResponse),
-        (status = 500, description = "Assessment operation failed", body = ErrorResponse)
-    )
-)]
-#[tracing::instrument(name = "icn.catalog.assess", skip_all, err(Debug))]
-async fn assess_catalog_models(
-    State(state): State<AppState>,
-    Json(request): Json<CatalogAssessmentsRequest>,
-) -> Result<Response, ApiError> {
-    assessment_response(
-        state,
-        AssessModelsRequest {
-            revision: request.revision,
-            requests: request
-                .targets
-                .into_iter()
-                .map(|target| AssessModelRequest {
-                    request_id: target.request_id,
-                    subject: ModelAssessmentSubject::Catalog {
-                        model_id: target.model_id,
-                        selection: target.selection,
-                    },
-                    profiles: target.profiles,
-                })
-                .collect(),
-        },
-    )
-    .await
-}
-
-#[utoipa::path(post, path = "/api/v1/discovery/assessments", operation_id = "assessDiscoveredModels", tag = "discovery",
-    request_body(content = DiscoveryAssessmentsRequest, content_type = "application/json"),
-    responses(
-        (status = 200, description = "Exact discovered-model profile assessment events", body = String, content_type = "application/x-ndjson"),
-        (status = 400, description = "Invalid assessment request", body = ErrorResponse),
-        (status = 404, description = "Discovered model not found", body = ErrorResponse),
-        (status = 409, description = "Discovery snapshot is stale", body = ErrorResponse),
-        (status = 422, description = "Discovered model failed integrity validation", body = ErrorResponse),
-        (status = 500, description = "Assessment operation failed", body = ErrorResponse)
-    )
-)]
-#[tracing::instrument(name = "icn.discovery.assess", skip_all, err(Debug))]
-async fn assess_discovered_models(
-    State(state): State<AppState>,
-    Json(request): Json<DiscoveryAssessmentsRequest>,
-) -> Result<Response, ApiError> {
-    assessment_response(
-        state,
-        AssessModelsRequest {
-            revision: request.revision,
-            requests: request
-                .targets
-                .into_iter()
-                .map(|target| AssessModelRequest {
-                    request_id: target.request_id,
-                    subject: ModelAssessmentSubject::Discovery {
-                        model_id: target.model_id,
-                    },
-                    profiles: target.profiles,
-                })
-                .collect(),
-        },
-    )
-    .await
-}
-
-async fn assessment_response(
-    state: AppState,
-    request: AssessModelsRequest,
-) -> Result<Response, ApiError> {
-    let assessor = state
-        .model_assessor
-        .as_ref()
-        .ok_or_else(|| ApiError::server("model assessment is not configured"))?;
-    let events = assessor
-        .assess(request)
-        .await
-        .map_err(ApiError::from_inventory)?;
-    let encoded = events.map(|event| {
-        serde_json::to_vec(&event)
-            .map(|mut bytes| {
-                bytes.push(b'\n');
-                Bytes::from(bytes)
-            })
-            .map_err(std::io::Error::other)
-    });
-    let mut response = Response::new(Body::from_stream(encoded));
-    response.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("application/x-ndjson"),
-    );
-    Ok(response)
 }
 
 #[utoipa::path(post, path = "/api/v1/models/{model_id}/properties", operation_id = "getModelProperties", tag = "models",
@@ -2073,11 +1992,10 @@ fn domain_error(error: domain::InferenceRequestError) -> ApiError {
         acknowledge_catalog_installation_failure,
         discovered_models,
         refresh_discovery,
+        model_assessments,
         standard_models,
         search_hugging_face_models,
         resolve_hugging_face_repository,
-        assess_catalog_models,
-        assess_discovered_models,
         preview_model_load,
         ensure_model_instance,
         model_instances,
@@ -2096,6 +2014,7 @@ fn domain_error(error: domain::InferenceRequestError) -> ApiError {
         HardwareSnapshot,
         CatalogModelsResponse,
         DiscoveredModelsResponse,
+        ModelAssessmentsSnapshot,
         CatalogInstallationsResponse,
         CatalogInstallationAdmission,
         CatalogInstallationRemoval,
@@ -2106,9 +2025,6 @@ fn domain_error(error: domain::InferenceRequestError) -> ApiError {
         HuggingFaceModelSearchResults,
         HuggingFaceRepositoryRequest,
         HuggingFaceRepositorySnapshot,
-        CatalogAssessmentsRequest,
-        DiscoveryAssessmentsRequest,
-        AssessModelsEvent,
         ModelLoadPlan,
         ModelInstancesSnapshot,
         ModelInstancesInvalidation,
@@ -2304,29 +2220,6 @@ impl StreamContract for InferenceEventsStream {
     }
 }
 
-struct ModelAssessmentStream;
-
-impl StreamContract for ModelAssessmentStream {
-    type Event = AssessModelsEvent;
-    const RESPONSE_STATUS: u16 = 200;
-
-    fn metadata() -> StreamMetadata {
-        StreamMetadata {
-            version: 1,
-            response_status: Self::RESPONSE_STATUS,
-            framing: StreamFraming::Ndjson,
-            data: StreamData {
-                encoding: "json",
-                schema: StreamSchemaRef {
-                    reference: format!("#/components/schemas/{}", Self::Event::name()),
-                },
-            },
-            termination: StreamTermination::Eof,
-            reconnect: StreamReconnect::None,
-        }
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum OpenApiExportError {
     #[error("OpenAPI operation {0} was not generated")]
@@ -2363,16 +2256,6 @@ pub fn openapi() -> Result<OpenApiDocument, OpenApiExportError> {
         &mut document,
         "watchInferenceEvents",
         "text/event-stream",
-    )?;
-    attach_stream_contract::<ModelAssessmentStream>(
-        &mut document,
-        "assessCatalogModels",
-        "application/x-ndjson",
-    )?;
-    attach_stream_contract::<ModelAssessmentStream>(
-        &mut document,
-        "assessDiscoveredModels",
-        "application/x-ndjson",
     )?;
     Ok(document)
 }
@@ -2665,7 +2548,9 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use icn_contracts::InferenceProgress;
-    use icn_contracts::models::{ModelInstanceAllocation, ModelInstanceLifecycle};
+    use icn_contracts::models::{
+        ModelAssessmentsInvalidation, ModelInstanceAllocation, ModelInstanceLifecycle,
+    };
     use serde_json::Value as JsonValue;
     use serde_json::{Value, json};
     use std::sync::atomic::AtomicBool;
@@ -2700,6 +2585,18 @@ mod tests {
     }
 
     struct StubHardware;
+
+    struct StubModelAssessments(ModelAssessmentsSnapshot);
+
+    impl ModelAssessments for StubModelAssessments {
+        fn snapshot(&self) -> BoxFuture<'_, Result<ModelAssessmentsSnapshot, InventoryError>> {
+            Box::pin(async { Ok(self.0.clone()) })
+        }
+
+        fn watch(&self) -> BoxStream<'static, ModelAssessmentsInvalidation> {
+            Box::pin(futures_util::stream::empty())
+        }
+    }
 
     struct StubHuggingFaceCatalog;
 
@@ -2803,64 +2700,6 @@ mod tests {
                 .map_err(|error| InventoryError::Internal(error.to_string()))
             })
         }
-    }
-
-    struct StubModelAssessor;
-
-    impl ModelAssessor for StubModelAssessor {
-        fn assess(
-            &self,
-            request: AssessModelsRequest,
-        ) -> BoxFuture<'_, Result<icn_contracts::models::ModelAssessmentStream, InventoryError>>
-        {
-            Box::pin(async move {
-                let total_targets = u32::try_from(request.requests.len()).unwrap();
-                let environment_id =
-                    icn_contracts::models::AssessmentEnvironmentId("test-environment".to_owned());
-                Ok(futures_util::stream::iter([
-                    AssessModelsEvent::Started {
-                        revision: request.revision,
-                        environment_id: environment_id.clone(),
-                        total_targets,
-                    },
-                    AssessModelsEvent::Completed {
-                        revision: request.revision,
-                        environment_id,
-                        total_targets,
-                    },
-                ])
-                .boxed())
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn assessment_endpoint_streams_finite_ndjson_lifecycle() {
-        let response = app(AppState::model_free().with_model_assessor(Arc::new(StubModelAssessor)))
-            .oneshot(
-                Request::post("/api/v1/catalog/assessments")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"revision":0,"targets":[]}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(CONTENT_TYPE).unwrap(),
-            "application/x-ndjson"
-        );
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let lines = std::str::from_utf8(&body)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0]["_tag"], "Started");
-        assert_eq!(lines[0]["totalTargets"], 0);
-        assert_eq!(lines[1]["_tag"], "Completed");
     }
 
     #[tokio::test]
@@ -4267,6 +4106,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exposes_the_automatic_model_assessment_snapshot() {
+        let assessments = Arc::new(StubModelAssessments(ModelAssessmentsSnapshot {
+            revision: 7,
+            state: icn_contracts::models::ModelAssessmentPoolState::Preparing,
+        }));
+        let response = app(AppState::model_free().with_model_assessments(assessments))
+            .oneshot(
+                Request::get("/api/v1/model-assessments")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["revision"], 7);
+        assert_eq!(body["state"]["_tag"], "Preparing");
+    }
+
+    #[tokio::test]
     async fn ordinary_chat_leases_the_requested_resident_model_before_streaming() {
         let leases = Arc::new(AtomicU64::new(0));
         let controller = Arc::new(StubModelInstanceController {
@@ -4558,29 +4420,6 @@ mod tests {
         let contract = &value["paths"]["/api/v1/events"]["get"][STREAM_EXTENSION];
         assert_eq!(contract["termination"]["type"], "long-lived");
         assert_eq!(contract["reconnect"]["type"], "none");
-    }
-
-    #[test]
-    fn exported_assessment_operation_declares_conflict_response() {
-        let value = serde_json::to_value(openapi().unwrap()).unwrap();
-        for path in [
-            "/api/v1/catalog/assessments",
-            "/api/v1/discovery/assessments",
-        ] {
-            let operation = &value["paths"][path]["post"];
-            let contract = &operation[STREAM_EXTENSION];
-            assert_eq!(contract["framing"], "ndjson");
-            assert_eq!(contract["termination"]["type"], "eof");
-            assert_eq!(contract["reconnect"]["type"], "none");
-            assert_eq!(
-                contract["data"]["schema"]["$ref"],
-                "#/components/schemas/AssessModelsEvent"
-            );
-            assert_eq!(
-                operation["responses"]["409"]["content"]["application/json"]["schema"]["$ref"],
-                "#/components/schemas/ErrorResponse"
-            );
-        }
     }
 
     #[test]

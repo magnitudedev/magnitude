@@ -44,14 +44,14 @@ alias, or bundle key at the ICN–ACN boundary.
 | Package / bundle | Exact files and private servable structure; ICN implementation only |
 | Inventory entry | One source-location/content observation; ICN implementation only |
 | Catalog installation operation | One model-addressed install/update synchronization occurrence; ICN |
-| Assessment | Recomputable compatibility, memory, and performance evidence for a model snapshot; ICN computes, ACN coordinates |
+| Assessment | Recomputable compatibility, memory, and performance evidence for exact model work; ICN owns computation and coordination |
 | Instance | One physical loaded occurrence identified by `ModelInstanceId`; ICN |
 | Local model product | ACN application projection combining catalog or discovery facts with assessment, acquisition, ranking, and residency |
 | Provider offering | Selectable ACN projection keyed by the same canonical `ModelId` |
 | Slot | Durable ACN provider-qualified selection; never an instance or material identity |
 
-Packages, content IDs, source revisions, operation IDs, assessment request IDs, and instance IDs
-identify genuinely different material or occurrences. None substitutes for `ModelId` in a user
+Packages, content IDs, source revisions, assessment IDs, operation IDs, and instance IDs identify
+genuinely different material, evidence, or occurrences. None substitutes for `ModelId` in a user
 selection.
 
 ## Authority

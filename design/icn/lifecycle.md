@@ -191,9 +191,10 @@ import/source roots. ACN resolves the active Hugging Face hub cache from `HF_HUB
 `HUGGINGFACE_HUB_CACHE`, `HF_HOME`, `XDG_CACHE_HOME`, or the platform home default and supplies
 that one root explicitly; ICN never discovers another host cache implicitly.
 
-After native backend preparation, ACN reports `DiscoveringModels` while it requests the initial
-explicit discovery reconciliation. A scan failure fails application startup and enters
-`startup-failed`; it cannot leave health indefinitely reporting backend preparation.
+Opening the native model store automatically starts discovery reconciliation. Discovery and model
+assessment are background model-domain work: neither delays listener binding, ICN readiness, ACN
+readiness, nor health. Their revisioned snapshots explicitly remain provisional while work is in
+progress, and model-domain failure does not make the otherwise operational ICN unhealthy.
 
 Per-request context length belongs to an explicit model serving configuration supplied to
 assessment and load. ACN resolves that configuration from catalog authority and projects its
@@ -292,8 +293,9 @@ ICN's HTTP listener is created before it emits the startup record. Its readiness
 successful only after storage, inventory recovery, native runtime registration, normalized
 topology, an operational planning-worker pool, complete hardware calibration for every enabled assessment
 backend, and API state are usable. Hardware calibration is loaded from validated disposable evidence
-or measured by the bounded pool before readiness; it is never deferred to an assessment request. Startup does not
-perform an inventory-wide model inspection or model assessment. Startup retry applies only to
+or measured by the bounded pool before readiness; it is never deferred to model assessment. After
+the server state is constructed, ICN starts inventory discovery and the automatic assessment pool
+without awaiting either. Startup retry applies only to
 transient connection/unready outcomes. Authentication failure, instance mismatch, incompatible
 identity, malformed response, and child exit fail immediately.
 
