@@ -30,7 +30,7 @@ describe("byte formatting", () => {
 
   it("supports context-specific minimum precision from a selected unit", () => {
     const options = {
-      minimumFractionDigits: { digits: 2, fromUnit: "GB" as const },
+      minimumFractionDigits: { digits: 2 as const, fromUnit: "GB" as const },
     }
     expect(formatStorageSize(750_000_000, options)).toBe("750 MB")
     expect(formatStorageSize(999_999_999, options)).toBe("1.00 GB")

@@ -2,8 +2,10 @@ import { Option } from "effect"
 import {
   installedLocalModels,
   localModelProviderModelId,
+  localModelStorageBytes,
+  localModelServingState,
+  localModelServingProfile,
   formatLocalModelDisplayName,
-  localModelBundleKey,
   localModelOptions,
   localModelSpeculativeMethodLabel,
   formatStorageSize,
@@ -14,7 +16,6 @@ export {
   installedLocalModels,
   findLocalModelById,
   localModelProviderModelId,
-  localModelBundleKey,
   modelDownloadFailureMessage,
 } from "@magnitudedev/client-common"
 import {
@@ -22,29 +23,24 @@ import {
   type LocalInferenceMemoryDomainId,
   type LocalModel,
   type LocalModelsState,
-  type LocalModelDiscoveryProgressStep,
   type ModelAssessmentId,
+  type ModelId,
   type ModelSlotsState,
   type ProviderModelId,
   type ReasoningEffort,
-  servableModelBundlePackages,
 } from "@magnitudedev/sdk"
 
 export type LocalInferenceSelection = LocalModelOption
 
-const modelPackages = (model: LocalModel) => servableModelBundlePackages(model.bundle)
-
 export const localModelMaximumContextLength = (model: LocalModel): Option.Option<number> => {
-  const known = modelPackages(model).flatMap(({ properties }) =>
-    Option.match(properties.maximumContextLength, {
-      onNone: () => [],
-      onSome: (maximum) => [maximum],
-    }))
-  return known.length === 0 ? Option.none() : Option.some(Math.min(...known))
+  return Option.flatMap(localModelServingState(model), (serving) => {
+    if (serving._tag === "Assessed") {
+      return Option.orElse(serving.metadata.maximumContextLength, () => Option.some(serving.assessment.profile.contextLength))
+    }
+    if (serving._tag === "Assessing") return Option.some(serving.profile.contextLength)
+    return Option.map(localModelServingProfile(model), ({ contextLength }) => contextLength)
+  })
 }
-
-export const localModelDownloadBytes = (model: LocalModel): number =>
-  model.downloadBytes
 
 export const buildLocalInferenceSelections = (
   models: LocalModelsState,
@@ -64,7 +60,7 @@ export const selectedInferenceIndex = (
 
 export const selectionModelId = (
   selection: LocalInferenceSelection,
-): ProviderModelId => selection.model.modelId
+): ModelId => selection.model.modelId
 
 export const selectionProviderModelId = (
   selection: LocalInferenceSelection,
@@ -72,16 +68,15 @@ export const selectionProviderModelId = (
 
 export const selectionReasoningEffort = (
   selection: LocalInferenceSelection,
-): Option.Option<ReasoningEffort> => selection.model.servingState._tag === "Assessed"
-  ? selection.model.servingState.capabilities.reasoning.defaultEffort
-  : Option.none()
+): Option.Option<ReasoningEffort> => Option.flatMap(localModelServingState(selection.model), (serving) =>
+  serving._tag === "Assessed" ? serving.capabilities.reasoning.defaultEffort : Option.none())
 
 export const selectionAssessmentId = (
   selection: LocalInferenceSelection,
-): Option.Option<ModelAssessmentId> => selection.model.servingState._tag === "Assessed"
-  && selection.model.servingState.assessment._tag !== "Incompatible"
-    ? Option.some(selection.model.servingState.assessment.assessmentId)
-    : Option.none()
+): Option.Option<ModelAssessmentId> => Option.flatMap(localModelServingState(selection.model), (serving) =>
+  serving._tag === "Assessed" && serving.assessment._tag !== "Incompatible"
+    ? Option.some(serving.assessment.assessmentId)
+    : Option.none())
 
 export const formatContext = (tokens: number): string => tokens < 1_000
   ? String(tokens)
@@ -97,11 +92,12 @@ export const performanceRange = (
   readonly lowerTokensPerSecond: number
   readonly upperTokensPerSecond: number
 } => {
-  if (model.servingState._tag !== "Assessed"
-    || model.servingState.assessment._tag !== "Fits") {
+  const serving = Option.getOrUndefined(localModelServingState(model))
+  if (serving?._tag !== "Assessed"
+    || serving.assessment._tag !== "Fits") {
     throw new Error("Performance requires a fitting assessed local model")
   }
-  const { assessment } = model.servingState
+  const { assessment } = serving
   const lowerContext = Math.min(25_000, assessment.profile.contextLength)
   const upperContext = Math.min(75_000, assessment.profile.contextLength)
   const lowerSample = assessment.performance.find(({ contextTokens }) =>
@@ -132,84 +128,6 @@ export const performanceRangeSpeedLabel = (
     : `~${Math.round(range.lowerTokensPerSecond)}–${Math.round(range.upperTokensPerSecond)} ${unit}`
 }
 
-const progressLabel = (
-  step: LocalModelDiscoveryProgressStep,
-  completed: boolean,
-): string => {
-  if (step.id === "hardware") return completed ? "Detected hardware" : "Detecting hardware"
-  if (step.id === "inventory") {
-    if (!completed) return "Checking downloaded models"
-    const count = Option.getOrElse(step.completedItems, () => 0)
-    return `Found ${count} downloaded ${count === 1 ? "model" : "models"}`
-  }
-  if (step.id === "assessment") {
-    if (!completed) return "Assessing models for this machine"
-    const count = Option.getOrElse(step.completedItems, () => 0)
-    return `Assessed ${count} models for this machine`
-  }
-  if (!completed) return "Ranking models"
-  const count = Option.getOrElse(step.completedItems, () => 0)
-  return `Ranked ${count} models`
-}
-
-const formatDurationMs = (durationMs: number): string => durationMs < 1_000
-  ? `${(durationMs / 1_000).toFixed(1)}s`
-  : durationMs < 60_000
-    ? `${Math.round(durationMs / 1_000)}s`
-    : `${Math.floor(durationMs / 60_000)}m ${Math.round(durationMs % 60_000 / 1_000)}s`
-
-export interface LocalInferenceProgressLine {
-  readonly id: LocalModelDiscoveryProgressStep["id"]
-  readonly state: "pending" | "running" | "completed" | "failed"
-  readonly label: string
-  readonly metadata: string
-}
-
-export const localInferenceProgressLines = (
-  steps: readonly LocalModelDiscoveryProgressStep[],
-): readonly LocalInferenceProgressLine[] => steps.map((step) => {
-  const completed = step.status._tag === "Completed"
-  const label = progressLabel(step, completed)
-  const showCount = step.id === "assessment" && step.status._tag === "Running"
-  const count = showCount ? Option.match(step.totalItems, {
-    onNone: () => "",
-    onSome: (total) => Option.match(step.completedItems, {
-      onNone: () => ` · ${total}`,
-      onSome: (value) => ` · ${value}/${total}`,
-    }),
-  }) : ""
-  if (step.status._tag === "Pending") {
-    return { id: step.id, state: "pending", label, metadata: "" }
-  }
-  if (step.status._tag === "Running") {
-    const estimate = Option.match(step.estimatedRemainingMs, {
-      onNone: () => "",
-      onSome: (remainingMs) => ` · about ${formatDurationMs(remainingMs)} left`,
-    })
-    return {
-      id: step.id,
-      state: "running",
-      label,
-      metadata: `${count}${estimate}`,
-    }
-  }
-  if (step.status._tag === "Failed") {
-    return {
-      id: step.id,
-      state: "failed",
-      label: `${label} failed`,
-      metadata: ` · ${step.status.failure.message}`,
-    }
-  }
-  return {
-    id: step.id,
-    state: "completed",
-    label,
-    metadata: step.id === "assessment" && !step.status.cached
-      ? ` · ${formatDurationMs(step.status.durationMs)}`
-      : "",
-  }
-})
 
 export interface LocalHardwarePresentation {
   readonly system: { readonly name: string; readonly details: readonly string[] }
@@ -316,30 +234,30 @@ export const selectionTitle = ({ model }: LocalInferenceSelection): string =>
   formatLocalModelDisplayName(model)
 
 export const selectionContextLabel = ({ model }: LocalInferenceSelection): Option.Option<string> => {
-  const configuration = model.servingState._tag === "Resolving"
-    ? Option.none()
-    : model.servingState._tag === "Failed"
-      ? model.servingState.configuration
-      : Option.some(model.servingState.configuration)
-  return Option.match(configuration, {
-    onNone: () => localModelMaximumContextLength(model),
-    onSome: ({ profile }) => Option.some(profile.contextLength),
-  }).pipe(Option.map(formatContext))
+  const serving = Option.getOrUndefined(localModelServingState(model))
+  if (serving === undefined) return localModelMaximumContextLength(model).pipe(Option.map(formatContext))
+  const context = serving._tag === "Failed"
+    ? Option.map(localModelServingProfile(model), ({ contextLength }) => contextLength)
+    : Option.some(serving._tag === "Assessed"
+        ? serving.assessment.profile.contextLength
+        : serving.profile.contextLength)
+  return Option.orElse(context, () => localModelMaximumContextLength(model)).pipe(Option.map(formatContext))
 }
 
 export const selectionMetadata = (selection: LocalInferenceSelection): string => {
   const { model } = selection
   const speculativeMethod = Option.getOrNull(localModelSpeculativeMethodLabel(model))
   return [
-    formatStorageSize(model.downloadBytes),
+    Option.map(localModelStorageBytes(model), formatStorageSize).pipe(Option.getOrNull),
     Option.map(selectionContextLabel(selection), (context) => `${context} ctx`).pipe(Option.getOrNull),
     speculativeMethod,
   ].filter((value): value is string => value !== null).join(" · ")
 }
 
 export const selectionCapacityWarning = ({ model }: LocalInferenceSelection): string | null =>
-  model.servingState._tag === "Assessed"
-    && model.servingState.availabilityState._tag === "Unavailable"
-    && model.servingState.availabilityState.failure.code === "insufficient_resources"
-    ? model.servingState.availabilityState.failure.message
-    : null
+  Option.match(localModelServingState(model), {
+    onNone: () => null,
+    onSome: (serving) => serving._tag === "Assessed" && serving.assessment._tag === "DoesNotFit"
+      ? "This model does not fit available hardware."
+      : null,
+  })

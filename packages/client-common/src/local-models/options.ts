@@ -6,7 +6,6 @@ import type {
   LocalModelsState,
   ModelSlotsState,
 } from "@magnitudedev/sdk"
-import { servableModelBundlePackages } from "@magnitudedev/sdk"
 import { formatLocalModelDisplayName } from "../utils/model-presentation"
 import { installedLocalModels, localModelProviderModelId } from "./projection"
 
@@ -68,9 +67,11 @@ export const rankedLocalModelOptions = (
   limit = 10,
 ): readonly LocalModelOption[] => options
   .flatMap((option): readonly { readonly option: LocalModelOption; readonly utility: number }[] => {
+    if (option.model._tag !== "Catalog") return []
     const serving = option.model.servingState
     if (serving._tag !== "Assessed"
       || serving.assessment._tag !== "Fits"
+      || !("rankingScores" in serving)
       || Option.isNone(serving.rankingScores)
       || !Number.isFinite(preference.memoryBudgetBytes)
       || serving.assessment.memory.totalRequiredBytes > Math.max(0, preference.memoryBudgetBytes)) return []
@@ -83,13 +84,6 @@ export const rankedLocalModelOptions = (
     || left.option.model.modelId.localeCompare(right.option.model.modelId))
   .slice(0, Math.max(0, Math.floor(limit)))
   .map(({ option }) => option)
-
-export const localModelBundleKey = (model: LocalModel): string =>
-  model.bundle._tag === "Standalone"
-    ? `package:${model.bundle.package.id}`
-    : `speculative:${model.bundle.method._tag}:${model.bundle.draftSource._tag}:${servableModelBundlePackages(model.bundle)
-      .map(({ id }) => id)
-      .join(":")}`
 
 export const localModelOptions = (
   models: LocalModelsState,
@@ -108,12 +102,13 @@ export const localModelOptions = (
       runningProviderModelIds.has(providerModelId)) ? "running" : "stored",
     model,
   }))
-  const representedBundles = new Set(installed.map(({ model }) => localModelBundleKey(model)))
+  const representedModelIds = new Set(installed.map(({ model }) => model.modelId))
   const downloadable = models.models.flatMap((model): readonly LocalModelOption[] => {
-    if (representedBundles.has(localModelBundleKey(model))
-      || model.catalogMembershipState._tag !== "InCatalog"
+    if (model._tag !== "Catalog"
+      || representedModelIds.has(model.modelId)
       || model.servingState._tag !== "Assessed"
       || model.servingState.assessment._tag !== "Fits"
+      || !("rankingScores" in model.servingState)
       || Option.isNone(model.servingState.rankingScores)) return []
     return [{
       id: `downloadable:${model.modelId}`,

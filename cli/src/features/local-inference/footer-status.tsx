@@ -2,6 +2,7 @@ import { Option } from "effect"
 import {
   formatMemorySize,
   formatLocalModelDisplayName,
+  localModelProviderModelId,
   modelSlotResidentAllocation,
 } from "@magnitudedev/client-common"
 import { PRIMARY_SLOT_ID, ProviderIdSchema } from "@magnitudedev/sdk"
@@ -57,15 +58,16 @@ export const deriveLocalInferenceFooterView = (
     ? selectedSlot
     : undefined
   const activeModel = slot && models !== null
-    ? models.models.find((model) => model.servingState._tag === "Assessed"
-      && model.servingState.availabilityState._tag === "Selectable"
-      && model.servingState.availabilityState.providerModelId === slot.selection.providerModelId)
+    ? models.models.find((model) => Option.contains(
+        localModelProviderModelId(model),
+        slot.selection.providerModelId,
+      ))
     : undefined
-  const download = models?.models.find(({ acquisitionState }) =>
-    acquisitionState._tag === "Installing"
-    || acquisitionState._tag === "InstallFailed"
-    || acquisitionState._tag === "Updating"
-    || acquisitionState._tag === "UpdateFailed")
+  const download = models?.models.find((model) => model._tag === "Catalog"
+    && (model.acquisitionState._tag === "Installing"
+      || model.acquisitionState._tag === "InstallFailed"
+      || model.acquisitionState._tag === "Updating"
+      || model.acquisitionState._tag === "UpdateFailed"))
   const currentResidency = slot?._tag === "ConfiguredLocal"
     ? slot.residency
     : undefined

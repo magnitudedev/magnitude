@@ -6,26 +6,21 @@ import * as HttpApiSchema from "@effect/platform/HttpApiSchema"
 import * as S from "effect/Schema"
 import * as Schemas from "./schemas.js"
 
-export const acknowledgeModelDownloadFailure = HttpApiEndpoint.post(
-  "acknowledgeModelDownloadFailure",
-  "/api/v1/downloads/:download_id/acknowledge-failure",
+export const acknowledgeCatalogInstallationFailure = HttpApiEndpoint.post(
+  "acknowledgeCatalogInstallationFailure",
+  "/api/v1/catalog/installations/:operation_id/acknowledge-failure",
 )
-  .setPath(S.Struct({ download_id: S.String }))
+  .setPath(S.Struct({ operation_id: S.String }))
   .addSuccess(
-    S.suspend((): S.Schema<Schemas.ModelDownload, Schemas.ModelDownloadEncoded> => Schemas.ModelDownload),
+    S.suspend(
+      (): S.Schema<Schemas.CatalogInstallationOperation, Schemas.CatalogInstallationOperationEncoded> =>
+        Schemas.CatalogInstallationOperation,
+    ),
     { status: 200 },
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 400 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
     { status: 404 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 500 },
   )
 
 export const applyChatTemplate = HttpApiEndpoint.post("applyChatTemplate", "/api/v1/chat/templates/apply")
@@ -62,23 +57,21 @@ export const applyChatTemplate = HttpApiEndpoint.post("applyChatTemplate", "/api
     { status: 500 },
   )
 
-export const cancelModelDownload = HttpApiEndpoint.post("cancelModelDownload", "/api/v1/downloads/:download_id/cancel")
-  .setPath(S.Struct({ download_id: S.String }))
+export const cancelCatalogInstallation = HttpApiEndpoint.post(
+  "cancelCatalogInstallation",
+  "/api/v1/catalog/installations/:operation_id/cancel",
+)
+  .setPath(S.Struct({ operation_id: S.String }))
   .addSuccess(
-    S.suspend((): S.Schema<Schemas.ModelDownload, Schemas.ModelDownloadEncoded> => Schemas.ModelDownload),
+    S.suspend(
+      (): S.Schema<Schemas.CatalogInstallationOperation, Schemas.CatalogInstallationOperationEncoded> =>
+        Schemas.CatalogInstallationOperation,
+    ),
     { status: 200 },
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 400 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
     { status: 404 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 500 },
   )
 
 export const countAnthropicMessageTokens = HttpApiEndpoint.post(
@@ -164,22 +157,15 @@ export const ensureModelInstance = HttpApiEndpoint.post("ensureModelInstance", "
     { status: 500 },
   )
 
-export const getHardware = HttpApiEndpoint.get("getHardware", "/api/v1/hardware")
-  .addSuccess(
-    S.suspend((): S.Schema<Schemas.HardwareSnapshot, Schemas.HardwareSnapshotEncoded> => Schemas.HardwareSnapshot),
-    { status: 200 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 500 },
-  )
-
-export const getInstalledModelPackage = HttpApiEndpoint.get("getInstalledModelPackage", "/api/v1/packages/:package_id")
-  .setPath(S.Struct({ package_id: S.String }))
+export const getCatalogInstallation = HttpApiEndpoint.get(
+  "getCatalogInstallation",
+  "/api/v1/catalog/installations/:operation_id",
+)
+  .setPath(S.Struct({ operation_id: S.String }))
   .addSuccess(
     S.suspend(
-      (): S.Schema<Schemas.InstalledModelPackage, Schemas.InstalledModelPackageEncoded> =>
-        Schemas.InstalledModelPackage,
+      (): S.Schema<Schemas.CatalogInstallationOperation, Schemas.CatalogInstallationOperationEncoded> =>
+        Schemas.CatalogInstallationOperation,
     ),
     { status: 200 },
   )
@@ -187,15 +173,11 @@ export const getInstalledModelPackage = HttpApiEndpoint.get("getInstalledModelPa
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
     { status: 404 },
   )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 500 },
-  )
 
-export const getModel = HttpApiEndpoint.get("getModel", "/api/v1/models/:model_id")
+export const getCatalogModel = HttpApiEndpoint.get("getCatalogModel", "/api/v1/catalog/models/:model_id")
   .setPath(S.Struct({ model_id: S.String }))
   .addSuccess(
-    S.suspend((): S.Schema<Schemas.InferenceModel, Schemas.InferenceModelEncoded> => Schemas.InferenceModel),
+    S.suspend((): S.Schema<Schemas.CatalogModel, Schemas.CatalogModelEncoded> => Schemas.CatalogModel),
     { status: 200 },
   )
   .addError(
@@ -207,15 +189,10 @@ export const getModel = HttpApiEndpoint.get("getModel", "/api/v1/models/:model_i
     { status: 500 },
   )
 
-export const getModelDownload = HttpApiEndpoint.get("getModelDownload", "/api/v1/downloads/:download_id")
-  .setPath(S.Struct({ download_id: S.String }))
+export const getHardware = HttpApiEndpoint.get("getHardware", "/api/v1/hardware")
   .addSuccess(
-    S.suspend((): S.Schema<Schemas.ModelDownload, Schemas.ModelDownloadEncoded> => Schemas.ModelDownload),
+    S.suspend((): S.Schema<Schemas.HardwareSnapshot, Schemas.HardwareSnapshotEncoded> => Schemas.HardwareSnapshot),
     { status: 200 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 404 },
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
@@ -282,21 +259,17 @@ export const health = HttpApiEndpoint.get("health", "/health").addSuccess(
   { status: 200 },
 )
 
-export const installModel = HttpApiEndpoint.post("installModel", "/api/v1/models/install")
-  .setPayload(
-    S.suspend(
-      (): S.Schema<Schemas.ModelIdentityRequest, Schemas.ModelIdentityRequestEncoded> => Schemas.ModelIdentityRequest,
-    ),
-  )
+export const installCatalogModel = HttpApiEndpoint.post(
+  "installCatalogModel",
+  "/api/v1/catalog/models/:model_id/install",
+)
+  .setPath(S.Struct({ model_id: S.String }))
   .addSuccess(
     S.suspend(
-      (): S.Schema<Schemas.InstallModelResponse, Schemas.InstallModelResponseEncoded> => Schemas.InstallModelResponse,
+      (): S.Schema<Schemas.CatalogInstallationAdmission, Schemas.CatalogInstallationAdmissionEncoded> =>
+        Schemas.CatalogInstallationAdmission,
     ),
     { status: 200 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 400 },
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
@@ -308,18 +281,25 @@ export const installModel = HttpApiEndpoint.post("installModel", "/api/v1/models
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 422 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
     { status: 500 },
   )
 
-export const listInstalledModels = HttpApiEndpoint.get("listInstalledModels", "/api/v1/packages")
+export const listCatalogInstallations = HttpApiEndpoint.get(
+  "listCatalogInstallations",
+  "/api/v1/catalog/installations",
+).addSuccess(
+  S.suspend(
+    (): S.Schema<Schemas.CatalogInstallationsResponse, Schemas.CatalogInstallationsResponseEncoded> =>
+      Schemas.CatalogInstallationsResponse,
+  ),
+  { status: 200 },
+)
+
+export const listCatalogModels = HttpApiEndpoint.get("listCatalogModels", "/api/v1/catalog/models")
   .addSuccess(
     S.suspend(
-      (): S.Schema<Schemas.InstalledModelPackagesResponse, Schemas.InstalledModelPackagesResponseEncoded> =>
-        Schemas.InstalledModelPackagesResponse,
+      (): S.Schema<Schemas.CatalogModelsResponse, Schemas.CatalogModelsResponseEncoded> =>
+        Schemas.CatalogModelsResponse,
     ),
     { status: 200 },
   )
@@ -328,28 +308,13 @@ export const listInstalledModels = HttpApiEndpoint.get("listInstalledModels", "/
     { status: 500 },
   )
 
-export const listModelDownloads = HttpApiEndpoint.get("listModelDownloads", "/api/v1/downloads")
-  .addSuccess(
-    S.suspend(
-      (): S.Schema<Schemas.ModelDownloadsResponse, Schemas.ModelDownloadsResponseEncoded> =>
-        Schemas.ModelDownloadsResponse,
-    ),
-    { status: 200 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 500 },
-  )
-
-export const listModels = HttpApiEndpoint.get("listModels", "/api/v1/models")
-  .addSuccess(
-    S.suspend((): S.Schema<Schemas.ModelsResponse, Schemas.ModelsResponseEncoded> => Schemas.ModelsResponse),
-    { status: 200 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 500 },
-  )
+export const listDiscoveredModels = HttpApiEndpoint.get("listDiscoveredModels", "/api/v1/discovery/models").addSuccess(
+  S.suspend(
+    (): S.Schema<Schemas.DiscoveredModelsResponse, Schemas.DiscoveredModelsResponseEncoded> =>
+      Schemas.DiscoveredModelsResponse,
+  ),
+  { status: 200 },
+)
 
 export const listServableModels = HttpApiEndpoint.get("listServableModels", "/v1/models")
   .addSuccess(
@@ -390,18 +355,28 @@ export const previewModelLoad = HttpApiEndpoint.post("previewModelLoad", "/api/v
     { status: 500 },
   )
 
-export const removeInstalledModel = HttpApiEndpoint.del("removeInstalledModel", "/api/v1/packages/:package_id")
-  .setPath(S.Struct({ package_id: S.String }))
+export const refreshDiscoveredModels = HttpApiEndpoint.post(
+  "refreshDiscoveredModels",
+  "/api/v1/discovery/refresh",
+).addSuccess(
+  S.suspend(
+    (): S.Schema<Schemas.DiscoveredModelsResponse, Schemas.DiscoveredModelsResponseEncoded> =>
+      Schemas.DiscoveredModelsResponse,
+  ),
+  { status: 200 },
+)
+
+export const removeCatalogModelInstallation = HttpApiEndpoint.del(
+  "removeCatalogModelInstallation",
+  "/api/v1/catalog/models/:model_id/installation",
+)
+  .setPath(S.Struct({ model_id: S.String }))
   .addSuccess(
     S.suspend(
-      (): S.Schema<Schemas.RemoveInstalledModelPackageResponse, Schemas.RemoveInstalledModelPackageResponseEncoded> =>
-        Schemas.RemoveInstalledModelPackageResponse,
+      (): S.Schema<Schemas.CatalogInstallationRemoval, Schemas.CatalogInstallationRemovalEncoded> =>
+        Schemas.CatalogInstallationRemoval,
     ),
     { status: 200 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 400 },
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
@@ -410,10 +385,6 @@ export const removeInstalledModel = HttpApiEndpoint.del("removeInstalledModel", 
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
     { status: 409 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 422 },
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
@@ -492,45 +463,23 @@ export const stopModelInstance = HttpApiEndpoint.post("stopModelInstance", "/api
     { status: 500 },
   )
 
-export const uninstallModel = HttpApiEndpoint.post("uninstallModel", "/api/v1/models/uninstall")
-  .setPayload(
-    S.suspend(
-      (): S.Schema<Schemas.ModelIdentityRequest, Schemas.ModelIdentityRequestEncoded> => Schemas.ModelIdentityRequest,
-    ),
-  )
-  .addSuccess(
-    S.suspend(
-      (): S.Schema<Schemas.UninstallModelResponse, Schemas.UninstallModelResponseEncoded> =>
-        Schemas.UninstallModelResponse,
-    ),
-    { status: 200 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 400 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 404 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 409 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 422 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 500 },
-  )
-
 export const AnthropicGroup = HttpApiGroup.make("anthropic")
   .add(countAnthropicMessageTokens)
   .add(createAnthropicMessage)
 
+export const CatalogGroup = HttpApiGroup.make("catalog")
+  .add(acknowledgeCatalogInstallationFailure)
+  .add(cancelCatalogInstallation)
+  .add(getCatalogInstallation)
+  .add(getCatalogModel)
+  .add(installCatalogModel)
+  .add(listCatalogInstallations)
+  .add(listCatalogModels)
+  .add(removeCatalogModelInstallation)
+
 export const ChatGroup = HttpApiGroup.make("chat").add(applyChatTemplate)
+
+export const DiscoveryGroup = HttpApiGroup.make("discovery").add(listDiscoveredModels).add(refreshDiscoveredModels)
 
 export const HuggingFaceGroup = HttpApiGroup.make("huggingFace")
   .add(resolveHuggingFaceRepository)
@@ -539,29 +488,20 @@ export const HuggingFaceGroup = HttpApiGroup.make("huggingFace")
 export const InferenceGroup = HttpApiGroup.make("inference").add(listServableModels)
 
 export const ModelsGroup = HttpApiGroup.make("models")
-  .add(acknowledgeModelDownloadFailure)
-  .add(cancelModelDownload)
   .add(ensureModelInstance)
-  .add(getInstalledModelPackage)
-  .add(getModel)
-  .add(getModelDownload)
   .add(getModelInstance)
   .add(getModelInstances)
   .add(getModelProperties)
-  .add(installModel)
-  .add(listInstalledModels)
-  .add(listModelDownloads)
-  .add(listModels)
   .add(previewModelLoad)
-  .add(removeInstalledModel)
   .add(stopModelInstance)
-  .add(uninstallModel)
 
 export const SystemGroup = HttpApiGroup.make("system").add(getHardware).add(health)
 
 export const IcnApi = HttpApi.make("IcnApi")
   .add(AnthropicGroup)
+  .add(CatalogGroup)
   .add(ChatGroup)
+  .add(DiscoveryGroup)
   .add(HuggingFaceGroup)
   .add(InferenceGroup)
   .add(ModelsGroup)

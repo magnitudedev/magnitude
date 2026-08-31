@@ -10,7 +10,7 @@ use icn_contracts::{
     ComponentRelationship, ComponentRole, ContentIdentity, HardwareProvider,
     HuggingFaceModelCatalog, HuggingFaceModelSearchRequest, HuggingFaceModelSearchResult,
     HuggingFaceModelSearchResults, HuggingFaceRepositoryFile, HuggingFaceRepositoryRequest,
-    HuggingFaceRepositorySnapshot, Integrity, InventoryError, ModelComponent, ModelId,
+    HuggingFaceRepositorySnapshot, Integrity, InventoryEntryId, InventoryError, ModelComponent,
     ModelLocation, ModelPreview, ModelPreviewAssessment, ModelPreviewProfile, ModelPreviewRequest,
     ModelPreviewSource, ModelPreviewer, ModelSource, ResolvedComponent, ResolvedModel,
     ResolvedModelAssessor,
@@ -1133,7 +1133,7 @@ impl ManagedModelStore {
         let content = content_id(&components);
         let source_fingerprint =
             format!("{}:{}:{}", artifact.repository, artifact.commit, content.0);
-        let id = ModelId(format!(
+        let id = InventoryEntryId(format!(
             "mdl_{:x}",
             Sha256::digest(source_fingerprint.as_bytes())
         ));
@@ -2581,7 +2581,7 @@ mod tests {
                 ..preview_component
             };
             let full = build_model(
-                ModelId(format!("mdl_{index:064x}")),
+                InventoryEntryId(format!("mdl_{index:064x}")),
                 content_id(std::slice::from_ref(&full_component)),
                 1,
                 1,

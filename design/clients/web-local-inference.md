@@ -63,7 +63,8 @@ The ordinary shell contains a dedicated Settings surface for local inference:
 
 - Models is the searchable installed-model library. It lists downloaded model artifacts and exposes
   only artifact-level actions: reveal the daemon-published installed target path or remove the
-  download. Slot selection, residency, favorites, transfer activity, and load controls do not belong
+  download. Externally managed Hugging Face cache artifacts may be revealed but do not expose a
+  removal action. Slot selection, residency, favorites, transfer activity, and load controls do not belong
   on this surface.
 - Catalog presents the unified assessed local catalog. Its index may be searched by model identity,
   filtered to installed models, and sorted by intelligence (the default), release date, download

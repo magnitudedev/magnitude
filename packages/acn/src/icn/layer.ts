@@ -10,12 +10,12 @@ import {
   IcnBinaryResolutionConfig,
   IcnLifecycleConfig,
   IcnProcess,
-  makeIcnModels,
+  makeIcnCatalog,
+  makeIcnCatalogInstallations,
+  makeIcnDiscovery,
   makeIcnClient,
-  makeIcnDownloads,
   makeIcnProcess,
   makeIcnHardware,
-  makeIcnInstalledModels,
   makeIcnEvents,
   IcnInstancesLive,
   IcnStorageConfig,
@@ -214,12 +214,13 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
   const withClient = Layer.provideMerge(makeIcnClient(), supervisedProcess);
   const withEvents = Layer.provideMerge(makeIcnEvents(), withClient);
   const withHardware = Layer.provideMerge(makeIcnHardware(), withEvents);
-  const withModels = Layer.provideMerge(makeIcnModels(), withHardware);
-  const withInstalled = Layer.provideMerge(
-    makeIcnInstalledModels(),
-    withModels
-  );
-  const withInstances = Layer.provideMerge(IcnInstancesLive, withInstalled);
-  const withDownloads = Layer.provideMerge(makeIcnDownloads(), withInstances);
-  return withDownloads.pipe(Layer.orDie);
+  const withCatalog = Layer.provideMerge(makeIcnCatalog(), withHardware);
+  const discovery = Layer.unwrapEffect(Effect.gen(function* () {
+    const lifecycle = yield* AcnServiceLifecycle;
+    yield* lifecycle.reportStarting("DiscoveringModels", Option.none());
+    return makeIcnDiscovery();
+  }));
+  const withModels = Layer.provideMerge(discovery, withCatalog);
+  const withInstallations = Layer.provideMerge(makeIcnCatalogInstallations(), withModels);
+  return Layer.provideMerge(IcnInstancesLive, withInstallations).pipe(Layer.orDie);
 };

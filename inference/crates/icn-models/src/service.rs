@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use futures_util::future::BoxFuture;
 use icn_contracts::{
-    DeletePlan, DeletedModel, InventoryError, InventoryModel, ModelAvailability, ModelId,
+    DeletePlan, DeletedModel, InventoryEntryId, InventoryError, InventoryModel, ModelAvailability,
     ModelInventory, ModelLocation, ModelSource, ResolvedComponent, ResolvedModel,
 };
 
@@ -31,7 +31,7 @@ impl ModelInventory for ManagedModelStore {
         })
     }
 
-    fn get(&self, id: &ModelId) -> BoxFuture<'_, Result<InventoryModel, InventoryError>> {
+    fn get(&self, id: &InventoryEntryId) -> BoxFuture<'_, Result<InventoryModel, InventoryError>> {
         let id = id.clone();
         Box::pin(async move {
             let model = self
@@ -45,7 +45,10 @@ impl ModelInventory for ManagedModelStore {
         })
     }
 
-    fn plan_delete(&self, id: &ModelId) -> BoxFuture<'_, Result<DeletePlan, InventoryError>> {
+    fn plan_delete(
+        &self,
+        id: &InventoryEntryId,
+    ) -> BoxFuture<'_, Result<DeletePlan, InventoryError>> {
         let id = id.clone();
         Box::pin(async move {
             let model = self
@@ -77,7 +80,7 @@ impl ModelInventory for ManagedModelStore {
         })
     }
 
-    fn delete(&self, id: &ModelId) -> BoxFuture<'_, Result<DeletedModel, InventoryError>> {
+    fn delete(&self, id: &InventoryEntryId) -> BoxFuture<'_, Result<DeletedModel, InventoryError>> {
         let id = id.clone();
         Box::pin(async move {
             self.ensure_installed_model_inventory().await?;
@@ -149,7 +152,10 @@ impl ModelInventory for ManagedModelStore {
         })
     }
 
-    fn resolve_ready(&self, id: &ModelId) -> BoxFuture<'_, Result<ResolvedModel, InventoryError>> {
+    fn resolve_ready(
+        &self,
+        id: &InventoryEntryId,
+    ) -> BoxFuture<'_, Result<ResolvedModel, InventoryError>> {
         let id = id.clone();
         Box::pin(async move {
             let model = self
@@ -581,8 +587,8 @@ fn io_error(error: impl std::fmt::Display) -> InventoryError {
 mod tests {
     use super::*;
     use icn_contracts::{
-        ComponentRole, ContentId, ContentIdentity, Integrity, InventoryProperties, ModelComponent,
-        ModelId,
+        ComponentRole, ContentId, ContentIdentity, Integrity, InventoryEntryId,
+        InventoryProperties, ModelComponent,
     };
 
     #[cfg(unix)]
@@ -625,7 +631,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let model = InventoryModel {
-            id: ModelId("mdl_split".to_owned()),
+            id: InventoryEntryId("mdl_split".to_owned()),
             content_id: ContentId("content_split".to_owned()),
             created: 1,
             name: "split".to_owned(),

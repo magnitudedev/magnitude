@@ -42,12 +42,11 @@ independently of command attribution.
 
 ACN owns the complete client-facing model contract:
 
-- `ModelCatalog`: the unified local and remote product view. Each local row carries one
-  `acquisitionState` union covering the model's whole materialization lifecycle — disk truth,
-  the single transfer that may exist for it, unacknowledged transfer failure, update
-  availability, and (once any version is installed) runtime residency. Every variant is a
-  reachable product state; progress and failure payloads exist only under the states they
-  belong to, and native occurrence identities (download and instance ids) never appear;
+- `ModelCatalog`: the unified local and remote product view. A catalog local row carries one
+  `acquisitionState` union covering managed installation, update, transfer failure, removal, and
+  residency. A discovered local row instead carries observed discovery truth and no managed
+  acquisition lifecycle. Every variant is a reachable product state; progress and failure payloads
+  exist only under the states they belong to, and native occurrence identities never appear;
 - `ModelSlots`: durable selection resolved to truthful client-ready Slot states;
 - `LocalInferenceEnvironment`: normalized hardware and memory presentation facts; and
 - model-management commands and their application-level validation. Commands are addressed by
@@ -78,9 +77,10 @@ serves its current value without doing reconciliation in the read path:
   regardless of whether that derived projection is materialized for efficient observation;
 - Slots retain their real resolved lifecycle because ACN owns durable selection, reference
   reconciliation, and admitted agent configuration together; and
-- model acquisition retains only admitted sync/removal intent and exact native occurrence
-  correlation until ICN truth represents the outcome; the client-facing Catalog remains a direct
-  projection rather than retained model state; and
+- model acquisition observes ICN's model-addressed catalog-installation occurrences. ACN retains
+  only its finite in-flight removal presentation because that application transition is not
+  otherwise observable while the removal call runs; the client-facing Catalog remains a derived
+  projection rather than retained model authority; and
 - onboarding reads durable storage directly.
 
 Subscription references are an implementation primitive, not an architecture or wire contract.
@@ -130,11 +130,11 @@ presentation. `Resolving` is explicit and never displayed as a raw-ID fallback.
 
 ## Mutation causality
 
-An ACN mutation acknowledges only after its owning ACN service has committed the immediate
-application postcondition, or after ICN has admitted a named long-running occurrence. ACN command
-effects own and await native admission or removal; they do not detach that work into
-fire-and-forget fibers. Native Download or Instance identity is the private causal acknowledgement
-for admitted work; progress remains a query concern.
+An ACN mutation acknowledges after ICN has admitted or completed the requested native action. ACN
+command effects do not detach admission or removal into fire-and-forget fibers.
+`CatalogInstallationOperationId` is the private causal identity for admitted catalog work;
+`ModelInstanceId` identifies runtime work. Progress remains a query concern, and neither identity
+crosses the ACN client boundary.
 
 Once ACN publishes sync or removal intent, caller interruption cannot cancel the finite native
 admission/removal step and strand that intent. Before intent admission, the command remains
@@ -180,10 +180,10 @@ generation and cannot restart ACN or interrupt ICN-owned transfers.
 - Model mutation synchronization awaits one fresh committed ACN snapshot; it does not poll or
   reread for proof.
 - Model sync, cancellation, failure acknowledgement, and removal are addressed by canonical
-  model ID. ACN publishes the resulting `LocalModel.acquisitionState` before returning success;
-  it privately correlates admitted model syncs with exact ICN download IDs. ICN continues to
-  expose raw download-ID operations and never acquires ACN model-sync vocabulary. Native
-  occurrence and Package identities remain private from clients.
+  model ID. ICN exposes model-addressed catalog installation and removal plus
+  `CatalogInstallationOperationId`-addressed occurrence control; raw download and Package
+  identities remain private inside ICN. The authoritative native observation subsequently updates
+  ACN product state.
 - Incomplete ICN startup snapshots are retried to completion and cannot permanently erase installed
   or update state.
 - Automatic chat loading, explicit loading, stopping, switching, installation, cancellation,

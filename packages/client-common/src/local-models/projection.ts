@@ -1,9 +1,12 @@
 /** Local-model projections are part of the contract; re-exported for client consumers. */
 export {
-  findLocalModelByCatalogIdentity,
   findLocalModelById,
   installedLocalModels,
   localModelCapabilities,
-  localModelCatalogIdentity,
+  localModelInstalledBytes,
+  localModelIsInstalled,
   localModelProviderModelId,
+  localModelServingState,
+  localModelServingProfile,
+  localModelStorageBytes,
 } from "@magnitudedev/sdk"

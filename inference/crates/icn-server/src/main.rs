@@ -20,11 +20,11 @@ use icn_contracts::models::{
     AssessmentEnvironmentId, InstalledModelPackages as _, MemoryAssessment, ModelAssessment,
     ModelAssessmentId, ModelAssessmentProfile as DomainModelAssessmentProfile,
     ModelAssessmentStream, ModelAssessor, ModelBundleInput, ModelFailure as DomainModelFailure,
-    ModelInstance, ModelInstanceFailure, ModelInstanceId, ModelInstanceLifecycle,
+    ModelId, ModelInstance, ModelInstanceFailure, ModelInstanceId, ModelInstanceLifecycle,
     ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadPlan, ModelLoadStage,
     ModelPackageId, ModelPackageOperand, ModelReleaseReason, ModelServingConfiguration,
     ModelStoppingAllocation, PerformanceConfidence, PerformanceEvidence,
-    RemoveInstalledModelPackageResponse, ServableModelBundle as DomainServableModelBundle,
+    ServableModelBundle as DomainServableModelBundle,
     SpeculativeDraftSource as ModelSpeculativeDraftSource, SpeculativeDraftSourceInput,
     SpeculativeMethod,
 };
@@ -40,10 +40,9 @@ use icn_engine::{
 };
 use icn_hardware::CapacityPolicy;
 use icn_models::{
-    CatalogModelResolver, InventoryConfig, ManagedCatalogModels, ManagedModelDownloads,
-    ManagedModelStore, ModelCache, ReleaseCatalog, canonical_package_id, load_release_catalog,
-    servable_model_bundle_key, servable_model_bundle_key_for_bundle,
-    serving_configuration_fingerprint, speculative_servable_model_bundle_key,
+    InventoryConfig, ManagedModelDownloads, ManagedModelStore, ModelCache, ModelDomainResolver,
+    ReleaseCatalog, load_release_catalog, managed_model_services,
+    servable_model_bundle_key_for_bundle, serving_configuration_fingerprint,
 };
 use llama_cpp_2::model::params::fit::{
     FitCalibration as NativeHardwareCalibration,
@@ -165,7 +164,7 @@ struct AcquisitionWaiter {
 
 #[derive(Clone, PartialEq, Eq)]
 struct ResolvedResidencyTarget {
-    model_id: String,
+    model_id: ModelId,
     configuration: ModelServingConfiguration,
     configuration_key: String,
 }
@@ -234,6 +233,7 @@ struct PreparedResidency {
 
 struct LoadingResidency {
     instance: ModelInstance,
+    configuration: ModelServingConfiguration,
     configuration_key: String,
     operation: tokio::task::JoinHandle<()>,
     worker: Option<Arc<dyn ResidencyWorker>>,
@@ -1558,6 +1558,7 @@ fn load_candidate_assessment_evidence(
 #[derive(Clone)]
 struct NativeModelAssessor {
     models: Arc<ManagedModelStore>,
+    model_domains: Arc<ModelDomainResolver>,
     assessor: Arc<NativeResolvedModelAssessor>,
     release_catalog: Arc<ReleaseCatalog>,
 }
@@ -1572,11 +1573,13 @@ struct AssessmentEnvironment {
 impl NativeModelAssessor {
     fn new(
         models: Arc<ManagedModelStore>,
+        model_domains: Arc<ModelDomainResolver>,
         assessor: Arc<NativeResolvedModelAssessor>,
         release_catalog: Arc<ReleaseCatalog>,
     ) -> Self {
         Self {
             models,
+            model_domains,
             assessor,
             release_catalog,
         }
@@ -1631,22 +1634,11 @@ impl NativeModelAssessor {
         deadline_at_ms: u64,
     ) -> Result<AssessModelResult, InventoryError> {
         let request_id = item.request_id;
-        let bundle_key = match bundle_input_key(&item.bundle) {
-            Ok(bundle_key) => bundle_key,
-            Err(message) => {
-                return Ok(AssessModelResult::InvalidBundle {
-                    request_id,
-                    failure: DomainModelFailure {
-                        code: "invalid_target".to_owned(),
-                        message,
-                        retryable: false,
-                    },
-                });
-            }
-        };
+        let subject = item.subject;
         if let Err(message) = validate_model_assessment_profiles(&item.profiles) {
-            return Ok(AssessModelResult::InvalidBundle {
+            return Ok(AssessModelResult::Failed {
                 request_id,
+                subject,
                 failure: DomainModelFailure {
                     code: "invalid_profiles".to_owned(),
                     message,
@@ -1654,12 +1646,24 @@ impl NativeModelAssessor {
                 },
             });
         }
+        let configuration = match self.model_domains.assessment_configuration(&subject) {
+            Ok(configuration) => configuration,
+            Err(error) => {
+                return Ok(AssessModelResult::Unavailable {
+                    request_id,
+                    subject,
+                    failure: assessment_bundle_failure(error)?,
+                });
+            }
+        };
+        let bundle_key = servable_model_bundle_key_for_bundle(&configuration.bundle);
         let cached = self
             .cached_profiles(&bundle_key, &item.profiles, environment)
             .await?;
         if let Some(profiles) = cached {
             return Ok(AssessModelResult::Assessed {
                 request_id,
+                subject,
                 profiles,
             });
         }
@@ -1676,23 +1680,23 @@ impl NativeModelAssessor {
                 })??;
         let resolved = match release_bundle {
             Some(resolved) => Ok(resolved),
-            None if bundle_uses_only_installed_packages(&item.bundle) => {
-                self.models.resolve_bundle(item.bundle).await
+            None => {
+                self.models
+                    .resolve_bundle(bundle_input(configuration.bundle))
+                    .await
             }
-            None => Err(InventoryError::InvalidRequest(format!(
-                "bundle {} is not installed or part of the release catalog",
-                bundle_key.0
-            ))),
         };
         match resolved {
             Ok(resolved) => Ok(AssessModelResult::Assessed {
                 request_id,
+                subject,
                 profiles: self
                     .assess_profiles(&resolved, &item.profiles, environment, deadline_at_ms)
                     .await?,
             }),
-            Err(error) => Ok(AssessModelResult::InvalidBundle {
+            Err(error) => Ok(AssessModelResult::Unavailable {
                 request_id,
+                subject,
                 failure: assessment_bundle_failure(error)?,
             }),
         }
@@ -1784,7 +1788,7 @@ impl NativeModelAssessor {
 
     async fn assessment_evidence(
         &self,
-        bundle_key: &icn_contracts::models::ServableModelBundleKey,
+        bundle_key: &icn_models::ServableModelBundleKey,
         profiles: &[DomainModelAssessmentProfile],
         environment: &AssessmentEnvironment,
     ) -> Result<Vec<String>, InventoryError> {
@@ -1815,7 +1819,7 @@ impl NativeModelAssessor {
 
     async fn cached_profiles(
         &self,
-        bundle_key: &icn_contracts::models::ServableModelBundleKey,
+        bundle_key: &icn_models::ServableModelBundleKey,
         profiles: &[DomainModelAssessmentProfile],
         environment: &AssessmentEnvironment,
     ) -> Result<Option<Vec<ModelAssessment>>, InventoryError> {
@@ -1848,13 +1852,14 @@ impl NativeModelAssessor {
         let hardware = &environment.snapshot;
         let thresholds =
             icn_hardware::system_memory_thresholds(hardware.system_memory.physical_capacity_bytes);
+        let bundle_key = servable_model_bundle_key_for_bundle(&resolved.bundle);
         let evidence = self
-            .assessment_evidence(&resolved.bundle_key, profiles, environment)
+            .assessment_evidence(&bundle_key, profiles, environment)
             .await?;
         // Serialize misses for one immutable target in one assessment environment. The waiter
         // rechecks every exact profile key after admission, so overlapping requests reuse results
         // produced by the current owner instead of opening the same model concurrently.
-        let gate_key = serde_json::to_string(&(&resolved.bundle_key.0, &environment.id.0))
+        let gate_key = serde_json::to_string(&(&bundle_key.0, &environment.id.0))
             .map_err(|error| InventoryError::Internal(error.to_string()))?;
         let gate = self
             .assessor
@@ -1879,7 +1884,7 @@ impl NativeModelAssessor {
                 .filter_map(|(index, assessment)| assessment.is_none().then_some(index))
                 .collect::<Vec<_>>();
             tracing::info!(
-                target.id = %resolved.bundle_key.0,
+                target.id = %bundle_key.0,
                 profile_count = profiles.len(),
                 missing_profile_count = missing.len(),
                 cache_hit_count = profiles.len().saturating_sub(missing.len()),
@@ -1916,8 +1921,7 @@ impl NativeModelAssessor {
             }
             for (index, assessment) in missing.into_iter().zip(assessed) {
                 let assessment = model_assessment(
-                    &resolved.bundle_key,
-                    &resolved.bundle,
+                    &bundle_key,
                     profiles[index].clone(),
                     &environment.id,
                     ASSESSMENT_RESERVE_BYTES_PER_DEDICATED_DOMAIN,
@@ -1946,8 +1950,7 @@ impl NativeModelAssessor {
 }
 
 fn model_assessment(
-    bundle_key: &icn_contracts::models::ServableModelBundleKey,
-    bundle: &DomainServableModelBundle,
+    bundle_key: &icn_models::ServableModelBundleKey,
     assessment_profile: DomainModelAssessmentProfile,
     environment_id: &AssessmentEnvironmentId,
     reserve_bytes: u64,
@@ -1958,10 +1961,6 @@ fn model_assessment(
         profile,
         performance_context_tokens,
     } = assessment_profile;
-    let configuration = ModelServingConfiguration {
-        bundle: bundle.clone(),
-        profile: profile.clone(),
-    };
     let mut digest = Sha256::new();
     digest.update(bundle_key.0.as_bytes());
     digest.update(profile.context_length.to_le_bytes());
@@ -1992,7 +1991,7 @@ fn model_assessment(
                 ));
             }
             Ok(ModelAssessment::Fits {
-                configuration,
+                profile,
                 assessment_id,
                 memory: memory
                     .domains
@@ -2022,7 +2021,7 @@ fn model_assessment(
             limiting_resource,
             ..
         } => Ok(ModelAssessment::DoesNotFit {
-            configuration,
+            profile,
             assessment_id,
             memory: memory
                 .domains
@@ -2047,7 +2046,7 @@ fn model_assessment(
         }),
         HardwareAssessment::InvalidArtifact { code, message } => {
             Ok(ModelAssessment::Incompatible {
-                configuration,
+                profile,
                 failure: DomainModelFailure {
                     code,
                     message,
@@ -2057,7 +2056,7 @@ fn model_assessment(
         }
         HardwareAssessment::IncompatibleArtifact { code, message } => {
             Ok(ModelAssessment::Incompatible {
-                configuration,
+                profile,
                 failure: DomainModelFailure {
                     code,
                     message,
@@ -2087,38 +2086,27 @@ fn performance_result(assessment: GenerationPerformanceAssessment) -> Performanc
     }
 }
 
-fn package_operand_id(operand: &ModelPackageOperand) -> Result<&ModelPackageId, String> {
-    match operand {
-        ModelPackageOperand::Installed { package_id } => Ok(package_id),
-        ModelPackageOperand::SourceBacked { package } => {
-            let canonical = canonical_package_id(&package.files, &package.relationships);
-            if canonical != package.id {
-                return Err("source-backed package identity does not match its files".to_owned());
-            }
-            Ok(&package.id)
-        }
-    }
-}
-
-fn bundle_input_key(
-    bundle: &ModelBundleInput,
-) -> Result<icn_contracts::models::ServableModelBundleKey, String> {
+fn bundle_input(bundle: DomainServableModelBundle) -> ModelBundleInput {
     match bundle {
-        ModelBundleInput::Standalone { package } => {
-            Ok(servable_model_bundle_key(&[package_operand_id(package)?]))
-        }
-        ModelBundleInput::SpeculativeDecoding {
+        DomainServableModelBundle::Standalone { package } => ModelBundleInput::Standalone {
+            package: ModelPackageOperand::SourceBacked { package },
+        },
+        DomainServableModelBundle::SpeculativeDecoding {
             target,
             draft_source,
             method,
-        } => Ok(speculative_servable_model_bundle_key(
-            package_operand_id(target)?,
-            match draft_source {
-                SpeculativeDraftSourceInput::Embedded => None,
-                SpeculativeDraftSourceInput::Separate { draft } => Some(package_operand_id(draft)?),
+        } => ModelBundleInput::SpeculativeDecoding {
+            target: ModelPackageOperand::SourceBacked { package: target },
+            draft_source: match draft_source {
+                ModelSpeculativeDraftSource::Embedded => SpeculativeDraftSourceInput::Embedded,
+                ModelSpeculativeDraftSource::Separate { draft } => {
+                    SpeculativeDraftSourceInput::Separate {
+                        draft: ModelPackageOperand::SourceBacked { package: draft },
+                    }
+                }
             },
             method,
-        )),
+        },
     }
 }
 
@@ -2145,27 +2133,6 @@ fn validate_model_assessment_profiles(
         }
     }
     Ok(())
-}
-
-fn bundle_uses_only_installed_packages(bundle: &ModelBundleInput) -> bool {
-    match bundle {
-        ModelBundleInput::Standalone { package } => {
-            matches!(package, ModelPackageOperand::Installed { .. })
-        }
-        ModelBundleInput::SpeculativeDecoding {
-            target,
-            draft_source,
-            ..
-        } => {
-            matches!(target, ModelPackageOperand::Installed { .. })
-                && match draft_source {
-                    SpeculativeDraftSourceInput::Embedded => true,
-                    SpeculativeDraftSourceInput::Separate { draft } => {
-                        matches!(draft, ModelPackageOperand::Installed { .. })
-                    }
-                }
-        }
-    }
 }
 
 fn assessment_bundle_failure(error: InventoryError) -> Result<DomainModelFailure, InventoryError> {
@@ -2218,10 +2185,12 @@ fn inventory_model_failure(error: InventoryError) -> DomainModelFailure {
 
 fn failed_assessment_result(
     request_id: icn_contracts::models::ModelAssessmentRequestId,
+    subject: icn_contracts::models::ModelAssessmentSubject,
     error: InventoryError,
 ) -> AssessModelResult {
     AssessModelResult::Failed {
         request_id,
+        subject,
         failure: inventory_model_failure(error),
     }
 }
@@ -2239,6 +2208,12 @@ impl ModelAssessor for NativeModelAssessor {
                     "model assessment accepts at most {MAX_TARGETS} targets"
                 )));
             }
+            if self.model_domains.revision()? != request.revision {
+                return Err(InventoryError::ConcurrentMutation(
+                    "model domain revision changed; refresh the domain before assessing".to_owned(),
+                ));
+            }
+            let revision = request.revision;
             let environment = self.environment().await?;
             let total_targets = u32::try_from(request.requests.len()).map_err(|_| {
                 InventoryError::InvalidRequest(
@@ -2263,6 +2238,7 @@ impl ModelAssessor for NativeModelAssessor {
                 let operation = async {
                     if events
                         .send(AssessModelsEvent::Started {
+                            revision,
                             environment_id: environment_id.clone(),
                             total_targets,
                         })
@@ -2278,6 +2254,7 @@ impl ModelAssessor for NativeModelAssessor {
                             let environment = environment.clone();
                             let release_catalog = Arc::clone(&release_catalog);
                             let failed_request_id = item.request_id.clone();
+                            let failed_subject = item.subject.clone();
                             async move {
                                 let evaluated = tokio::time::timeout_at(
                                     target_deadline,
@@ -2296,7 +2273,11 @@ impl ModelAssessor for NativeModelAssessor {
                                     ))
                                 });
                                 evaluated.unwrap_or_else(|error| {
-                                    failed_assessment_result(failed_request_id, error)
+                                    failed_assessment_result(
+                                        failed_request_id,
+                                        failed_subject,
+                                        error,
+                                    )
                                 })
                             }
                         })
@@ -2312,6 +2293,7 @@ impl ModelAssessor for NativeModelAssessor {
                     }
                     let _ = events
                         .send(AssessModelsEvent::Completed {
+                            revision,
                             environment_id,
                             total_targets,
                         })
@@ -3275,7 +3257,7 @@ struct NativeModelInstanceController {
     next_worker_generation: Arc<AtomicU64>,
     next_instance_id: Arc<AtomicU64>,
     instance_id_namespace: Arc<str>,
-    catalog_models: Arc<CatalogModelResolver>,
+    model_variants: Arc<ModelDomainResolver>,
     admission_blocked_until: Arc<Mutex<Option<std::time::Instant>>>,
     defaults: ModelPlanDefaults,
     load_progress: Arc<LoadProgressEstimator>,
@@ -3664,7 +3646,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         let instance = ModelInstance {
             id: instance_id.clone(),
             model_id: first.target.model_id.clone(),
-            configuration: first.target.configuration.clone(),
             lifecycle: ModelInstanceLifecycle::Loading {
                 stage: ModelLoadStage::Queued,
                 progress: None,
@@ -3674,6 +3655,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         Self::notify_progress(&first, &instance.lifecycle);
         self.state = ResidencyState::Loading(LoadingResidency {
             instance,
+            configuration: first.target.configuration.clone(),
             configuration_key: first.target.configuration_key.clone(),
             operation,
             worker: None,
@@ -3684,7 +3666,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         let target = match &self.state {
             ResidencyState::Loading(loading) => ResolvedResidencyTarget {
                 model_id: loading.instance.model_id.clone(),
-                configuration: loading.instance.configuration.clone(),
+                configuration: loading.configuration.clone(),
                 configuration_key: loading.configuration_key.clone(),
             },
             _ => unreachable!(),
@@ -3711,7 +3693,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         };
         match waiter.purpose {
             ResidencyAcquisition::Inference { .. } => {
-                let lease = self.make_lease(&mut ready, waiter.target.model_id);
+                let lease = self.make_lease(&mut ready, waiter.target.model_id.to_string());
                 let _ = waiter.reply.send(Ok(ResidencyGrant::Lease(lease)));
             }
             ResidencyAcquisition::Warm => {
@@ -3769,7 +3751,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             )));
         }
         let model_id = ready.instance.model_id.clone();
-        let lease = self.make_lease(&mut ready, model_id);
+        let lease = self.make_lease(&mut ready, model_id.to_string());
         self.state = ResidencyState::Ready(ready);
         Ok(lease)
     }
@@ -3824,7 +3806,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         let stopping = ModelInstance {
             id: loading.instance.id,
             model_id: loading.instance.model_id,
-            configuration: loading.instance.configuration,
             lifecycle: ModelInstanceLifecycle::Stopping {
                 reason: ModelReleaseReason::UserStop,
                 allocation: ModelStoppingAllocation::Planned {
@@ -3930,7 +3911,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 let instance = ModelInstance {
                     id: instance_id.clone(),
                     model_id: loading.instance.model_id,
-                    configuration: loading.instance.configuration,
                     lifecycle: ModelInstanceLifecycle::Ready {
                         allocation: prepared.allocation.clone(),
                     },
@@ -3949,7 +3929,8 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 for waiter in loading.waiters.drain(..) {
                     match waiter.purpose {
                         ResidencyAcquisition::Inference { .. } => {
-                            let lease = self.make_lease(&mut ready, waiter.target.model_id);
+                            let lease =
+                                self.make_lease(&mut ready, waiter.target.model_id.to_string());
                             let _ = waiter.reply.send(Ok(ResidencyGrant::Lease(lease)));
                         }
                         ResidencyAcquisition::Warm => {
@@ -3976,12 +3957,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 for waiter in loading.waiters.drain(..) {
                     let _ = waiter.reply.send(Err(Self::inventory_failure(&failure)));
                 }
-                self.finish_failed(
-                    instance_id,
-                    loading.instance.model_id,
-                    loading.instance.configuration,
-                    failure,
-                );
+                self.finish_failed(instance_id, loading.instance.model_id, failure);
             }
         }
     }
@@ -3999,7 +3975,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         let stopping = ModelInstance {
             id: ready.instance.id.clone(),
             model_id: ready.instance.model_id.clone(),
-            configuration: ready.instance.configuration.clone(),
             lifecycle: ModelInstanceLifecycle::Stopping {
                 reason,
                 allocation: ModelStoppingAllocation::Resident {
@@ -4100,8 +4075,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             Ok(()) => self.finish_stopped(instance_id),
             Err(failure) => {
                 let model_id = releasing.instance.model_id.clone();
-                let configuration = releasing.instance.configuration.clone();
-                self.finish_failed(instance_id, model_id, configuration, failure);
+                self.finish_failed(instance_id, model_id, failure);
             }
         }
     }
@@ -4114,8 +4088,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             return;
         }
         let model_id = ready.instance.model_id.clone();
-        let configuration = ready.instance.configuration.clone();
-        self.finish_failed(instance_id, model_id, configuration, failure);
+        self.finish_failed(instance_id, model_id, failure);
     }
 
     fn release_requested(&mut self, instance_id: ModelInstanceId, reason: ModelReleaseReason) {
@@ -4161,7 +4134,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         let terminal = ModelInstance {
             id: releasing.instance.id,
             model_id: releasing.instance.model_id,
-            configuration: releasing.instance.configuration,
             lifecycle: ModelInstanceLifecycle::Stopped {
                 reason: releasing.reason,
             },
@@ -4176,8 +4148,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
     fn finish_failed(
         &mut self,
         instance_id: ModelInstanceId,
-        model_id: String,
-        configuration: ModelServingConfiguration,
+        model_id: ModelId,
         failure: ModelOperationFailure,
     ) {
         let state = std::mem::replace(&mut self.state, ResidencyState::Vacant);
@@ -4191,7 +4162,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         self.publish_terminal(ModelInstance {
             id: instance_id,
             model_id,
-            configuration,
             lifecycle: ModelInstanceLifecycle::Failed {
                 failure: failure.into_instance_failure(),
             },
@@ -4404,7 +4374,7 @@ impl NativeModelInstanceController {
         cache: ModelCache,
         native_build: String,
         instance_id_namespace: String,
-        catalog_models: Arc<CatalogModelResolver>,
+        model_variants: Arc<ModelDomainResolver>,
     ) -> Self {
         let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
         let (changes, _) = tokio::sync::broadcast::channel(16);
@@ -4417,7 +4387,7 @@ impl NativeModelInstanceController {
             next_worker_generation: Arc::new(AtomicU64::new(1)),
             next_instance_id: Arc::new(AtomicU64::new(1)),
             instance_id_namespace: Arc::from(instance_id_namespace),
-            catalog_models,
+            model_variants,
             admission_blocked_until: Arc::new(Mutex::new(None)),
             defaults,
             load_progress: Arc::new(LoadProgressEstimator::new(cache, native_build)),
@@ -4433,15 +4403,18 @@ impl NativeModelInstanceController {
 
     fn configuration_for_model(
         &self,
-        model_id: &str,
+        model_id: &ModelId,
     ) -> Result<ModelServingConfiguration, InventoryError> {
-        self.catalog_models.serving_configuration(model_id)
+        self.model_variants.serving_configuration(model_id)
     }
 
     fn residency_target(
         &self,
         model_id: String,
     ) -> Result<ResolvedResidencyTarget, InventoryError> {
+        let model_id = model_id
+            .parse::<ModelId>()
+            .map_err(|error| InventoryError::InvalidId(error.to_string()))?;
         let configuration = self.configuration_for_model(&model_id)?;
         let configuration_key = serving_configuration_fingerprint(
             &servable_model_bundle_key_for_bundle(&configuration.bundle),
@@ -5267,7 +5240,11 @@ impl ModelResidencyDriver for NativeModelInstanceController {
         instance_id: ModelInstanceId,
         target: ResolvedResidencyTarget,
     ) -> Result<tokio::task::JoinHandle<()>, InventoryError> {
-        Ok(self.spawn_model_load(instance_id, target.model_id, target.configuration))
+        Ok(self.spawn_model_load(
+            instance_id,
+            target.model_id.to_string(),
+            target.configuration,
+        ))
     }
 
     fn start_worker_release(
@@ -5294,6 +5271,9 @@ impl ModelInstanceController for NativeModelInstanceController {
         model_id: String,
     ) -> BoxFuture<'_, Result<ModelLoadPlan, InventoryError>> {
         Box::pin(async move {
+            let model_id = model_id
+                .parse::<ModelId>()
+                .map_err(|error| InventoryError::InvalidId(error.to_string()))?;
             let configuration = self.configuration_for_model(&model_id)?;
             let profile = ModelExecutionProfile {
                 context_length: configuration.profile.context_length,
@@ -5381,19 +5361,6 @@ impl ModelInstanceController for NativeModelInstanceController {
         )
     }
 
-    fn remove_installed(
-        &self,
-        package_id: ModelPackageId,
-    ) -> BoxFuture<'_, Result<RemoveInstalledModelPackageResponse, InventoryError>> {
-        Box::pin(async move {
-            let _permit = self
-                .residency
-                .acquire_package_removal(package_id.clone())
-                .await?;
-            self.inventory.remove_installed(&package_id).await
-        })
-    }
-
     fn lease(
         &self,
         instance_id: ModelInstanceId,
@@ -5423,14 +5390,30 @@ impl ModelInstanceController for NativeModelInstanceController {
 }
 
 impl icn_contracts::models::CatalogPackageRemover for NativeModelInstanceController {
-    fn remove_catalog_package(
+    fn remove_catalog_packages(
         &self,
-        package_id: ModelPackageId,
-    ) -> BoxFuture<'_, Result<(), InventoryError>> {
+        package_ids: Vec<ModelPackageId>,
+    ) -> BoxFuture<'_, Result<u64, InventoryError>> {
         Box::pin(async move {
-            <Self as ModelInstanceController>::remove_installed(self, package_id)
-                .await
-                .map(|_| ())
+            let mut permits = Vec::with_capacity(package_ids.len());
+            for package_id in &package_ids {
+                permits.push(
+                    self.residency
+                        .acquire_package_removal(package_id.clone())
+                        .await?,
+                );
+            }
+            let mut reclaimed_bytes = 0_u64;
+            for package_id in package_ids {
+                reclaimed_bytes = reclaimed_bytes.saturating_add(
+                    self.inventory
+                        .remove_installed(&package_id)
+                        .await?
+                        .freed_bytes,
+                );
+            }
+            drop(permits);
+            Ok(reclaimed_bytes)
         })
     }
 }
@@ -5703,14 +5686,14 @@ async fn main() -> anyhow::Result<()> {
                 api_version: 1,
                 native_build: native_build.clone(),
             };
-            let catalog_model_resolver =
+            let model_variant_resolver =
                 (!fake)
                     .then(|| release_catalog.as_ref())
                     .flatten()
                     .map(|catalog| {
-                        CatalogModelResolver::new(inventory.clone(), catalog.catalog().clone())
+                        ModelDomainResolver::new(inventory.clone(), catalog.catalog().clone())
                     });
-            let model_controller = catalog_model_resolver.as_ref().map(|catalog_models| {
+            let model_controller = model_variant_resolver.as_ref().map(|model_variants| {
                 let controller = Arc::new(NativeModelInstanceController::new(
                     inventory.clone(),
                     model_assessor.clone(),
@@ -5720,17 +5703,20 @@ async fn main() -> anyhow::Result<()> {
                     inventory.derived_cache().clone(),
                     native_build.clone(),
                     instance_id.clone(),
-                    catalog_models.clone(),
+                    model_variants.clone(),
                 ));
                 controller.start_idle_memory_observer();
                 controller
             });
-            let catalog_models = match (&catalog_model_resolver, &model_controller) {
-                (Some(resolver), Some(model_controller)) => Some(ManagedCatalogModels::new(
-                    resolver.clone(),
-                    model_downloads.clone(),
-                    model_controller.clone(),
-                )?),
+            let model_services = match (&model_variant_resolver, &model_controller) {
+                (Some(resolver), Some(controller)) => Some(
+                    managed_model_services(
+                        resolver.clone(),
+                        model_downloads.clone(),
+                        controller.clone(),
+                    )
+                    .context("failed to initialize model domains")?,
+                ),
                 _ => None,
             };
             let mut state = if fake {
@@ -5738,16 +5724,22 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 AppState::model_free()
             }
-            .with_installed_packages(inventory.clone())
             .with_hardware(model_assessor.clone())
             .with_model_downloads(model_downloads.clone())
             .with_identity(identity);
             if let Some(release_catalog) = release_catalog {
-                if let Some(catalog_models) = catalog_models {
-                    state = state.with_catalog_models(catalog_models);
+                if let Some(model_services) = model_services {
+                    state = state.with_model_domains(
+                        model_services.catalog,
+                        model_services.discovered,
+                        model_services.installations,
+                    );
                 }
                 state = state.with_model_assessor(Arc::new(NativeModelAssessor::new(
                     inventory,
+                    model_variant_resolver
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("model domain resolver is unavailable"))?,
                     model_assessor,
                     release_catalog.clone(),
                 )));
@@ -5932,6 +5924,11 @@ mod tests {
 
         let result = failed_assessment_result(
             icn_contracts::models::ModelAssessmentRequestId("request-failed".to_owned()),
+            icn_contracts::models::ModelAssessmentSubject::Discovery {
+                model_id: "hf:test/model/model.gguf"
+                    .parse()
+                    .expect("valid discovery model ID"),
+            },
             operational,
         );
         assert!(matches!(
@@ -5943,6 +5940,7 @@ mod tests {
                     retryable: true,
                     ..
                 },
+                ..
             } if request_id.0 == "request-failed" && code == "planning_deadline"
         ));
     }
@@ -6159,7 +6157,7 @@ mod tests {
         ) -> Result<tokio::task::JoinHandle<()>, InventoryError> {
             let model_id = target.model_id;
             self.loads
-                .send((instance_id.clone(), model_id.clone()))
+                .send((instance_id.clone(), model_id.to_string()))
                 .expect("test load observer remains alive");
             if self.auto_ready {
                 let worker = Arc::new(TestResidencyWorker::default());
@@ -6187,7 +6185,8 @@ mod tests {
                             },
                             worker,
                             backend: ResidentBackend::Test(Arc::new(FakeBackend::new(
-                                model_id, "test",
+                                model_id.to_string(),
+                                "test",
                             ))),
                         }),
                     });
@@ -6285,7 +6284,9 @@ mod tests {
 
     fn test_target_with_key(model_id: &str, configuration_key: &str) -> ResolvedResidencyTarget {
         ResolvedResidencyTarget {
-            model_id: model_id.to_owned(),
+            model_id: format!("{model_id}:gguf:test")
+                .parse()
+                .expect("valid test model ID"),
             configuration: test_configuration(model_id),
             configuration_key: configuration_key.to_owned(),
         }
@@ -6303,7 +6304,7 @@ mod tests {
             }
         });
         let (instance_id, model_id) = loads.recv().await.expect("first load admitted");
-        assert_eq!(model_id, "model-a");
+        assert_eq!(model_id, "model-a:gguf:test");
         let second = tokio::spawn({
             let client = client.clone();
             async move {
@@ -6370,7 +6371,7 @@ mod tests {
         });
         let (replacement_id, replacement_model_id) =
             loads.recv().await.expect("replacement configuration load");
-        assert_eq!(replacement_model_id, "model-a");
+        assert_eq!(replacement_model_id, "model-a:gguf:test");
         assert_ne!(replacement_id, first.id);
         assert!(matches!(
             replacement.await.expect("replacement task"),
@@ -6401,7 +6402,7 @@ mod tests {
 
         drop(permit);
         let (instance_id, model_id) = loads.recv().await.expect("load admitted after removal");
-        assert_eq!(model_id, "model-a");
+        assert_eq!(model_id, "model-a:gguf:test");
         client.stop(instance_id).await.expect("load stopped");
         assert_explicit_stop(request.await.expect("request waiter"));
         actor.abort();
@@ -6427,7 +6428,7 @@ mod tests {
 
         client.stop(first_id.clone()).await.expect("first stop");
         let (second_id, second_model) = loads.recv().await.expect("second load admitted");
-        assert_eq!(second_model, "model-b");
+        assert_eq!(second_model, "model-b:gguf:test");
         client
             .stop(first_id)
             .await
@@ -6444,7 +6445,7 @@ mod tests {
 
         client.stop(second_id).await.expect("second stop");
         let (third_id, third_model) = loads.recv().await.expect("third load admitted");
-        assert_eq!(third_model, "model-c");
+        assert_eq!(third_model, "model-c:gguf:test");
         client.stop(third_id).await.expect("third stop");
         assert_explicit_stop(first.await.expect("first task"));
         assert_explicit_stop(second.await.expect("second task"));
@@ -6558,7 +6559,7 @@ mod tests {
 
         drop(lease);
         let (_, model_id) = loads.recv().await.expect("replacement load");
-        assert_eq!(model_id, "model-b");
+        assert_eq!(model_id, "model-b:gguf:test");
         assert!(matches!(
             replacement.await.expect("replacement task"),
             Ok(ResidencyGrant::Ready(_))

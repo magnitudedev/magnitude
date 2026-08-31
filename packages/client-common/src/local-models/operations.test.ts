@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest"
 import { Client, Group, Mutation } from "@magnitudedev/effect-query"
 import {
   PRIMARY_SLOT_ID,
-  ProviderModelIdSchema,
+  CatalogFormModelIdSchema,
   ReasoningEffortSchema,
 } from "@magnitudedev/sdk"
 import { ModelSlots } from "../model-slots/service"
@@ -14,7 +14,7 @@ import { LocalModelOperations } from "./operations"
 describe("SelectLocalModel", () => {
   it("runs synchronization before slot assignment through one tracked Mutation", async () => {
     const calls: string[] = []
-    const modelId = ProviderModelIdSchema.make("selected-model")
+    const modelId = CatalogFormModelIdSchema.make("selected-model:gguf:q4")
     const localModels = {
       install: (selected: typeof modelId) => Effect.sync(() => {
         calls.push(`sync:${selected}`)

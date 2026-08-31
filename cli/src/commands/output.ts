@@ -22,8 +22,10 @@ export type CliErrorDocument = typeof CliErrorSchema.Type
 
 const messageOf = (error: unknown): string => {
   if (typeof error === "object" && error !== null) {
-    if ("reason" in error && typeof error.reason === "string") return error.reason
-    if ("message" in error && typeof error.message === "string") return error.message
+    const candidate = error as { readonly message?: unknown; readonly reason?: unknown }
+    if (Object.hasOwn(candidate, "message") && typeof candidate.message === "string") return candidate.message
+    if (typeof candidate.reason === "string") return candidate.reason
+    if (typeof candidate.message === "string") return candidate.message
   }
   return String(error)
 }

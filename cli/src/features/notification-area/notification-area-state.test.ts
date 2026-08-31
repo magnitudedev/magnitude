@@ -26,17 +26,19 @@ describe("notification area model projections", () => {
 
   test("derives low memory for the selected model only while insufficient", () => {
     const ordinaryModel = makeModel()
-    if (ordinaryModel.servingState._tag !== "Assessed"
-      || ordinaryModel.servingState.assessment._tag !== "Fits") {
+    if (ordinaryModel.state.servingState._tag !== "Assessed"
+      || ordinaryModel.state.servingState.assessment._tag !== "Fits") {
       throw new Error("fixture must be an assessed fitting model")
     }
     const lowMemoryModel = makeModel({
-      servingState: {
-        ...ordinaryModel.servingState,
-        assessment: {
-          ...ordinaryModel.servingState.assessment,
-          memory: {
-            ...ordinaryModel.servingState.assessment.memory,
+      state: {
+        ...ordinaryModel.state,
+        servingState: {
+          ...ordinaryModel.state.servingState,
+          assessment: {
+            ...ordinaryModel.state.servingState.assessment,
+            memory: {
+              ...ordinaryModel.state.servingState.assessment.memory,
             currentHeadroomState: {
               _tag: "Insufficient",
               observation: {
@@ -46,6 +48,7 @@ describe("notification area model projections", () => {
                 loadBoundaryBytes: 22,
               },
               minimumAdditionalAvailableBytes: 2 * 1024 ** 3 + 1,
+            },
             },
           },
         },

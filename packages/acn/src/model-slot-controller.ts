@@ -1,4 +1,4 @@
-import { Context, Either, Effect, Layer, Option, Schema, Scope, Stream, SubscriptionRef } from "effect"
+import { Context, Effect, Layer, Option, Schema, Scope, Stream, SubscriptionRef } from "effect"
 import {
   buildConfigStateFromSlots,
   sameConfigStateValue,
@@ -6,7 +6,6 @@ import {
 } from "@magnitudedev/agent"
 import {
   modelSlotActions,
-  servableModelBundlePackageIds,
   ModelPreferenceMutationFailed,
   ModelSlotLifecycle,
   ModelSlotMutationFailed,
@@ -40,8 +39,8 @@ import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
 import { IcnInstances } from "@magnitudedev/icn"
 import { ModelSelection } from "./model-selection"
 import { AcnChanges } from "./changes"
-import { LocalModelPackages } from "./local-model-packages"
 import { LocalProviderOfferings } from "./local-provider-offerings"
+import { LocalModels } from "./local-models"
 import { ProviderModelCatalog } from "./provider-model-catalog"
 import {
   localModelSlotAvailability,
@@ -78,6 +77,9 @@ const sameSelection = (left: SlotSelection, right: SlotSelection): boolean =>
   left.providerId === right.providerId
   && left.providerModelId === right.providerModelId
   && left.reasoningEffort === right.reasoningEffort
+
+const slotKey = (slotId: SlotId): "primary" | "secondary" =>
+  slotId === PRIMARY_SLOT_ID ? "primary" : "secondary"
 
 const normalizeSelectionReasoning = (
   selection: SlotSelection,
@@ -119,12 +121,12 @@ const modelFailure = (
 export const ModelSlotControllerLive: Layer.Layer<
   ModelSlotController,
   never,
-  ModelSelection | MagnitudeStorage | LocalModelPackages | LocalProviderOfferings
+  ModelSelection | MagnitudeStorage | LocalModels | LocalProviderOfferings
     | ProviderModelCatalog | IcnInstances | AcnChanges
 > = Layer.scoped(ModelSlotController, Effect.gen(function* () {
   const modelSelection = yield* ModelSelection
   const storage = yield* MagnitudeStorage
-  const localPackages = yield* LocalModelPackages
+  const localModels = yield* LocalModels
   const localOfferings = yield* LocalProviderOfferings
   const catalog = yield* ProviderModelCatalog
   const instances = yield* IcnInstances
@@ -253,11 +255,9 @@ export const ModelSlotControllerLive: Layer.Layer<
     const catalogState = yield* catalog.state
     const contents = catalogContents(catalogState)
     const localOfferingsReady = yield* localOfferings.ready
-    const packageState = yield* localPackages.state
-    const packages = yield* localPackages.installedPackageIds
     const previousAggregate = yield* SubscriptionRef.get(aggregate)
     const previous = previousAggregate.state
-    const offerings = yield* localOfferings.list.pipe(Effect.orElseSucceed(() => []))
+    const offerings = yield* localOfferings.list
     const instanceState = yield* instances.get
 
     const buildSlot = (slotId: SlotId, selection: Option.Option<SlotSelection>): ModelSlot =>
@@ -302,15 +302,10 @@ export const ModelSlotControllerLive: Layer.Layer<
           }
           const offering = offerings.find((item) =>
             item.providerModelId === selected.providerModelId)
-          const downloaded = offering !== undefined
-            && servableModelBundlePackageIds(offering.configuration.bundle)
-              .every((packageId) => packages.has(packageId))
           const availability = localModelSlotAvailability({
             catalogIdentityPending: baseAvailability._tag === "Pending",
             offeringsReady: localOfferingsReady,
-            inventory: packageState.inventory,
             offeringExists: offering !== undefined,
-            installed: downloaded,
           })
           const instance = instanceState.instances.findLast((candidate) =>
             candidate.modelId === selected.providerModelId)
@@ -364,10 +359,7 @@ export const ModelSlotControllerLive: Layer.Layer<
     const catalogState = yield* catalog.state
     const contents = catalogContents(catalogState)
     const localReady = yield* localOfferings.ready
-    const localResult = yield* Effect.either(localOfferings.list)
-    const localIds = Either.isRight(localResult)
-      ? new Set(localResult.right.map(({ providerModelId }) => providerModelId))
-      : undefined
+    const localIds = new Set<string>((yield* localModels.state).models.map(({ modelId }) => modelId))
     for (const slotId of [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID] as const) {
       const selected = configured.slots[slotKey(slotId)]
       if (Option.isNone(selected)) continue
@@ -375,7 +367,7 @@ export const ModelSlotControllerLive: Layer.Layer<
       if (selection.providerId === LOCAL_PROVIDER_ID && !localReady) continue
       if (!providerIdentityIsAuthoritative(selection.providerId, catalogState)) continue
       const exists = selection.providerId === LOCAL_PROVIDER_ID
-        ? localIds?.has(selection.providerModelId)
+        ? localIds.has(selection.providerModelId)
         : contents.models.some((model) => model.providerId === selection.providerId
           && model.providerModelId === selection.providerModelId)
       if (exists === false) {
@@ -390,7 +382,6 @@ export const ModelSlotControllerLive: Layer.Layer<
   yield* Effect.forkIn(modelSelection.changes.pipe(
     Stream.runForEach(() => reconcileAndRebuild),
   ), scope)
-  yield* Effect.forkIn(localPackages.changes.pipe(Stream.runForEach(() => rebuild)), scope)
   yield* Effect.forkIn(localOfferings.changes.pipe(
     Stream.runForEach(() => reconcileAndRebuild),
   ), scope)
@@ -493,5 +484,3 @@ export const ModelSlotControllerLive: Layer.Layer<
     setModelFavorite,
   })
 }))
-  const slotKey = (slotId: SlotId): "primary" | "secondary" =>
-    slotId === PRIMARY_SLOT_ID ? "primary" : "secondary"

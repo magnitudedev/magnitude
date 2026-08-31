@@ -12,75 +12,53 @@ applies_to:
 
 # Model-management terminology
 
-## Authoritative resources
+## Callable identity
 
-| Term | Meaning |
-|---|---|
-| **Model** | A callable model addressed everywhere by its existing canonical model ID, such as `gemma-4-26b-a4b-it-qat:gguf:q4`. It projects release declaration, capabilities, serving configuration, and current installation state. |
-| **Model package** | One immutable content-identified set of files, roles, relationships, inspection, and source evidence. |
-| **Installed package** | The current observation that every required valid file for a Package is present. It is a state, not another resource. |
-| **Model sync** | ACN's model-addressed application operation for making a Model's desired Packages present; it serves both installation and update. |
-| **Download** | One raw process-local ICN occurrence for acquiring a Bundle, addressed by `ModelDownloadId`. |
-| **Instance** | One physical loaded occurrence of a Model, identified by an ICN-created Instance ID. |
-| **Hardware** | ICN's singleton current topology, capacity, and calibration profile. |
-| **Slot** | ACN-owned durable provider-qualified model selection, reasoning preference, favorites, and recency for a product role. It contains no Instance identity or residency state. |
+`ModelId` identifies one stable callable local-model variant everywhere: ICN catalog and discovery
+operations, assessment, runtime admission, ACN products, local-provider offerings, Slots, harnesses,
+and inference. The local provider preserves its serialized value unchanged as `ProviderModelId`.
 
-Catalog is a source of Model declarations, not a parallel collection. A local product view is a
-read-only ACN projection adding Magnitude assessment, provider, ranking, update, and warning
-semantics to native facts. It is not an inference authority.
-
-## Derived values
-
-| Term | Meaning |
-|---|---|
-| **Servable model bundle** | Structural set of one standalone Package or a method-identified speculative target and draft relationship. It has no public resource lifecycle. |
-| **Serving profile** | Serving intent for a bundle, currently context length. |
-| **Model serving configuration** | The exact bundle and profile ICN currently resolves for a Model. Callers do not construct or persist it. |
-| **Model assessment** | Recomputable compatibility, capacity, memory, and performance evidence for a Model configuration and Hardware. |
-| **Load plan** | Advisory allocation evidence computed from a Model, current Hardware, and resident Instances. |
-| **Provider offering** | ACN's provider-facing metadata for a callable Model, keyed by the same canonical model ID. |
-| **Intelligence** | Model-level broad capability on the catalog's declared, versioned Artificial Analysis Intelligence Index scale, with direct or explicit-estimate provenance. |
-| **Fidelity** | Artifact-variant preservation of its represented model, derived from the catalog fidelity rank and independent of Intelligence. |
-
-Assessment predicts whether a Model normally fits. ICN admission decides whether it may run now.
-Cached assessment never authorizes loading.
-
-## Identity and durability
-
-| Identity | Identifies | Lifetime and owner |
-|---|---|---|
-| Canonical model ID | One callable Model across native APIs, `/v1/models`, inference requests, providers, Slots, and harness configuration | Stable release meaning, ICN |
-| `ModelPackageId` | One immutable Package | Content-stable, ICN |
-| `ModelDownloadId` | One raw Bundle-download occurrence; never a client identity | ICN process lifetime |
-| `ModelInstanceId` | One loaded occurrence | ICN controller lifetime |
-| `(ProviderId, ProviderModelId)` | One provider offering; for `local`, `ProviderModelId` is the canonical model ID | Provider boundary; Slot selection may retain it |
-| `SlotId` | One product role assignment | Durable, ACN |
-
-Magnitude persists Slot selection, recency, favorites, and onboarding completion. Model files are
-authoritative artifacts; catalog declarations are release data. Package inventory, configurations,
-offerings, assessments, Downloads, and Instances are derived or process-local and are not copied
-into durable model state.
-
-`ManagedModelStore` is the exclusive mutation boundary for Magnitude-owned artifacts. Model install
-and removal address a canonical model ID; ICN resolves exact Packages, preserves shared or active
-Packages, and never asks clients to reproduce bundle accounting.
-
-## Runtime relationship
+Catalog IDs compose two authored identities:
 
 ```text
-release declaration + current Packages
-              -> Model -> serving configuration -> assessment / load plan
-                    |
-                    +-> install -> Download
-                    +-> explicit warm load --------+
-                    +-> inference request ----------+-> residency coordinator -> Instance -> lease
-
-ACN Slot selection by canonical model ID
-  + ACN Catalog projection of native Model and Instance Queries
-  -> first-party residency presentation
+CatalogBaseId    = qwen3.5-4b
+CatalogVariantId = gguf:q4
+ModelId          = qwen3.5-4b:gguf:q4
 ```
 
-Equivalent explicit and inference demand joins one admitted load. ICN creates Instance identity,
-serializes incompatible replacement, and protects active inference with exact request leases.
-Display names, paths, repositories, filenames, cache keys, and array positions are never operational
-identities.
+External Hugging Face discoveries use:
+
+```text
+ModelId = hf:<owner>/<repository>/<repository-relative-GGUF-selector>
+```
+
+There is no `ModelVariantId`, `ModelTargetId`, catalog identity object, package-derived provider
+alias, or bundle key at the ICN–ACN boundary.
+
+## Different entities
+
+| Term | Meaning and owner |
+|---|---|
+| Catalog model | Reviewed callable variant that exists whether installed or not; ICN catalog domain |
+| Discovered model | Non-catalog callable candidate observed in an external source; ICN discovery domain |
+| Package / bundle | Exact files and private servable structure; ICN implementation only |
+| Inventory entry | One source-location/content observation; ICN implementation only |
+| Catalog installation operation | One model-addressed install/update synchronization occurrence; ICN |
+| Assessment | Recomputable compatibility, memory, and performance evidence for a model snapshot; ICN computes, ACN coordinates |
+| Instance | One physical loaded occurrence identified by `ModelInstanceId`; ICN |
+| Local model product | ACN application projection combining catalog or discovery facts with assessment, acquisition, ranking, and residency |
+| Provider offering | Selectable ACN projection keyed by the same canonical `ModelId` |
+| Slot | Durable ACN provider-qualified selection; never an instance or material identity |
+
+Packages, content IDs, source revisions, operation IDs, assessment request IDs, and instance IDs
+identify genuinely different material or occurrences. None substitutes for `ModelId` in a user
+selection.
+
+## Authority
+
+ICN owns catalog, discovery, packages, inventory, material resolution, acquisition, assessment, and
+runtime instances. It exposes catalog and discovery separately. ACN alone creates the combined
+application product and provider projections. Clients consume those projections through the SDK.
+
+Assessment predicts fit; current runtime admission decides whether a model can load now. Cached
+assessment never authorizes loading.

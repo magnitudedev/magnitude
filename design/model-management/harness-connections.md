@@ -91,6 +91,9 @@ the connector's launch plan. The optional `--set-current <model-id>` CLI input s
 `setCurrent`, selects that model, and returns the connector's launch plan; omitting it leaves the
 current-model selection unchanged.
 Provider-local registrations expose the complete Magnitude model set.
+That set includes callable external Hugging Face models using their exact canonical `hf:` identity.
+Connectors preserve the identity as an opaque model key; Claude-facing discovery adds only the
+reserved `anthropic-local/` routing prefix and removes only that prefix before native inference.
 The model name is Magnitude's catalog display name followed by its variant label in parentheses.
 Pi, OpenCode, OpenClaw, Oh My Pi, and Cline receive that name through their native per-model display
 field. Codex receives it through its connector-owned native model catalog. Hermes and Claude Code

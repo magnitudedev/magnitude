@@ -158,8 +158,8 @@ revision has authority only while exact process inspection proves that same owne
 Policy uses Effect `Duration`, monotonic `Clock`, bounded `Schedule`, and `TestClock`. Initial bounds
 are one second polling, two seconds per health request, thirty seconds without an observable health
 response, thirty seconds for candidate admission, five minutes absolute application startup while
-health remains `Starting` (including long install phases with unchanged optional diagnostics, such as
-Resolving, PreparingBackend, and Starting), five seconds for stopping, two seconds after TERM, two
+health remains `Starting` (including phases with unchanged optional diagnostics, such as Resolving,
+PreparingBackend, DiscoveringModels, and Starting), five seconds for stopping, two seconds after TERM, two
 seconds after KILL, and ten minutes absolute per ensurance occurrence. Store contention is bounded
 inside each store operation rather than by its consumers. A live `Starting` owner is not retired
 merely because its phase or measured progress is unchanged; only the absolute startup ceiling and

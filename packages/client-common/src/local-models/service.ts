@@ -4,7 +4,7 @@ import { Context, Effect, Layer } from "effect"
 import { Mutation, QueryClient } from "@magnitudedev/effect-query"
 import {
   Models,
-  type ProviderModelId,
+  type CatalogFormModelId,
 } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 import { ClientEffectQuery } from "../state/client-effect-query"
@@ -24,7 +24,7 @@ const makeLocalModels = Effect.gen(function* () {
     get(state),
     (models) => ({
       ...models,
-      models: models.models.filter((model) => model.catalogMembershipState._tag === "InCatalog"),
+      models: models.models.filter((model) => model._tag === "Catalog"),
     }),
   ))
   const provideRegistry = Effect.provideService(Registry.AtomRegistry, registry)
@@ -33,16 +33,16 @@ const makeLocalModels = Effect.gen(function* () {
     state,
     catalog,
     retry: queryClient.invalidate(Models.GetCatalog.match()),
-    install: (modelId: ProviderModelId) => Mutation.execute(install, { modelId }).pipe(provideRegistry),
-    cancelDownload: (modelId: ProviderModelId) =>
+    install: (modelId: CatalogFormModelId) => Mutation.execute(install, { modelId }).pipe(provideRegistry),
+    cancelDownload: (modelId: CatalogFormModelId) =>
       Mutation.execute(cancelDownload, { modelId }).pipe(
         provideRegistry,
       ),
-    dismissDownloadFailure: (modelId: ProviderModelId) =>
+    dismissDownloadFailure: (modelId: CatalogFormModelId) =>
       Mutation.execute(dismissDownloadFailure, { modelId }).pipe(
         provideRegistry,
       ),
-    remove: (modelId: ProviderModelId) => Mutation.execute(remove, { modelId }).pipe(provideRegistry),
+    remove: (modelId: CatalogFormModelId) => Mutation.execute(remove, { modelId }).pipe(provideRegistry),
   }
 })
 
@@ -63,16 +63,16 @@ export function useLocalModelMutations() {
   const removeModel = useAtomSet(client.Models.RemoveLocalModel)
 
   return {
-    install: useCallback((modelId: ProviderModelId) => {
+    install: useCallback((modelId: CatalogFormModelId) => {
       install({ modelId })
     }, [install]),
-    cancel: useCallback((modelId: ProviderModelId) => {
+    cancel: useCallback((modelId: CatalogFormModelId) => {
       cancel({ modelId })
     }, [cancel]),
-    dismissFailure: useCallback((modelId: ProviderModelId) => {
+    dismissFailure: useCallback((modelId: CatalogFormModelId) => {
       dismissFailure({ modelId })
     }, [dismissFailure]),
-    remove: useCallback((modelId: ProviderModelId) => {
+    remove: useCallback((modelId: CatalogFormModelId) => {
       removeModel({ modelId })
     }, [removeModel]),
   }

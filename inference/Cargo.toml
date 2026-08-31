@@ -43,6 +43,7 @@ serde_json = "1.0.149"
 sha2 = "0.10.9"
 sysinfo = { version = "0.38.4", default-features = false, features = ["system"] }
 thiserror = "2.0.17"
+unicode-normalization = "0.1.24"
 toml = "0.9.8"
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tokio-stream = "0.1.18"

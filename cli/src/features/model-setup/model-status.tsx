@@ -7,6 +7,7 @@ import {
   formatMemorySize,
   formatStorageSize,
   formatTransferRate,
+  localModelServingState,
   truncateToDisplayWidth,
   type OnboardingModelLoadStatus,
 } from "@magnitudedev/client-common"
@@ -355,11 +356,19 @@ export function OnboardingModelDownloadProgress({
   readonly operation: OnboardingModelDownloadOperation
 }): ReactNode {
   const starting = operation.starting
-  const activeDownload = starting ? null : acquisitionProgress(model.acquisitionState) ?? null
+  const activeDownload = starting || model._tag !== "Catalog"
+    ? null
+    : acquisitionProgress(model.acquisitionState) ?? null
   const downloading = activeDownload !== null
   const active = starting || downloading
   const cancelling = operation.cancelling
-  const totalBytes = activeDownload?.totalBytes ?? model.downloadBytes
+  const totalBytes = activeDownload?.totalBytes
+    ?? (model._tag === "Catalog"
+      ? model.storageBytes
+      : Option.match(localModelServingState(model), {
+          onNone: () => 0,
+          onSome: (serving) => serving._tag === "Assessed" ? serving.metadata.storageBytes : 0,
+        }))
   const progress = activeDownload !== null
     ? Option.some(activeDownload.completedBytes / Math.max(1, activeDownload.totalBytes))
     : Option.none<number>()

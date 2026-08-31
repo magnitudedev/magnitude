@@ -1,9 +1,10 @@
 import { Option } from "effect"
 import {
   formatModelDisplayName,
+  localModelServingState,
   type LocalModel,
-  type SpeculativeMethod,
   type ModelVariantLabel,
+  type SpeculativeMethod,
 } from "@magnitudedev/sdk"
 
 export { formatModelDisplayName }
@@ -19,6 +20,7 @@ export const formatSpeculativeMethod = (method: SpeculativeMethod): string =>
   method._tag === "Mtp" ? "MTP" : method._tag
 
 export const localModelSpeculativeMethodLabel = (model: LocalModel): Option.Option<string> =>
-  model.bundle._tag === "Standalone"
-    ? Option.none()
-    : Option.some(formatSpeculativeMethod(model.bundle.method))
+  Option.flatMap(localModelServingState(model), (serving) =>
+    serving._tag === "Assessed"
+      ? Option.map(serving.speculativeMethod, formatSpeculativeMethod)
+      : Option.none())

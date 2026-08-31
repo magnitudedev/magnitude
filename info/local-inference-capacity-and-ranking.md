@@ -10,10 +10,11 @@ memory, and generation-speed estimates. No model weights are downloaded until th
 model.
 
 For each active catalog configuration, ICN assesses exact runtime memory and expected performance at
-its reviewed context. ACN's `LocalModelRanker` converts completed fitting assessments into normalized
-intelligence, speed, and quality scores. Speed compares expected generation at 50K occupied context,
-bounded by the configured context for shorter models. Scores belong to that exact configuration;
-incompatible, non-fitting, unresolved, deprecated, and uncurated models do not receive them.
+its reviewed context. ACN's local-model projection converts completed fitting assessments into
+normalized intelligence, speed, and quality scores using a pure ranking policy. Speed compares
+expected generation at 50K occupied context, bounded by the configured context for shorter models.
+Scores belong to that exact configuration; incompatible, non-fitting, unresolved, deprecated, and
+uncurated models do not receive them.
 
 The setup UI combines those stable scores with two connection-scoped controls:
 

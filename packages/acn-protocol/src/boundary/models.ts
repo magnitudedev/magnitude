@@ -1,6 +1,6 @@
 import { Option, Schema } from "effect"
 import { Group, Mutation, Query, QueryClient } from "@magnitudedev/effect-query"
-import { ProviderIdSchema, ProviderModelIdSchema } from "@magnitudedev/ai/provider/model"
+import { ProviderIdSchema } from "@magnitudedev/ai/provider/model"
 import {
   LocalInferenceError,
   ModelPreferenceMutationFailed,
@@ -8,6 +8,8 @@ import {
 } from "../errors"
 import {
   LocalInferenceHardwareSchema,
+  CatalogFormModelIdSchema,
+  ModelIdSchema,
   ModelCatalogStateSchema,
   ModelLoadPlanSchema,
   ModelSlotsStateSchema,
@@ -76,7 +78,7 @@ const SetFavorite = Mutation.make("SetModelFavorite", {
 
 const SyncLocalModel = Mutation.make("SyncLocalModel", {
   policy: { recovery: "AtMostOnce" },
-  payload: Schema.Struct({ modelId: ProviderModelIdSchema }),
+  payload: Schema.Struct({ modelId: CatalogFormModelIdSchema }),
   success: Schema.Struct({ outcome: Schema.Literal("Started", "AlreadyCurrent") }),
   error: LocalInferenceError,
   scope: ({ modelId }) => Mutation.MutationScope(`local-model:${modelId}`),
@@ -85,7 +87,7 @@ const SyncLocalModel = Mutation.make("SyncLocalModel", {
 
 const CancelLocalModelSync = Mutation.make("CancelLocalModelSync", {
   policy: { recovery: "AtMostOnce" },
-  payload: Schema.Struct({ modelId: ProviderModelIdSchema }),
+  payload: Schema.Struct({ modelId: CatalogFormModelIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
   scope: ({ modelId }) => Mutation.MutationScope(`local-model:${modelId}`),
@@ -94,7 +96,7 @@ const CancelLocalModelSync = Mutation.make("CancelLocalModelSync", {
 
 const AcknowledgeLocalModelSyncFailure = Mutation.make("AcknowledgeLocalModelSyncFailure", {
   policy: { recovery: "AtMostOnce" },
-  payload: Schema.Struct({ modelId: ProviderModelIdSchema }),
+  payload: Schema.Struct({ modelId: CatalogFormModelIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
   scope: ({ modelId }) => Mutation.MutationScope(`local-model:${modelId}`),
@@ -103,7 +105,7 @@ const AcknowledgeLocalModelSyncFailure = Mutation.make("AcknowledgeLocalModelSyn
 
 const RemoveLocalModel = Mutation.make("RemoveLocalModel", {
   policy: { recovery: "AtMostOnce" },
-  payload: Schema.Struct({ modelId: ProviderModelIdSchema }),
+  payload: Schema.Struct({ modelId: CatalogFormModelIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
   scope: ({ modelId }) => Mutation.MutationScope(`local-model:${modelId}`),
@@ -112,7 +114,7 @@ const RemoveLocalModel = Mutation.make("RemoveLocalModel", {
 
 const LoadLocalModel = Mutation.make("LoadLocalModel", {
   policy: { recovery: "AtMostOnce" },
-  payload: Schema.Struct({ modelId: ProviderModelIdSchema }),
+  payload: Schema.Struct({ modelId: ModelIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
   scope: ({ modelId }) => Mutation.MutationScope(`local-model-residency:${modelId}`),

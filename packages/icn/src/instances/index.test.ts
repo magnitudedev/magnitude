@@ -7,7 +7,6 @@ import {
   Option,
   PubSub,
   Ref,
-  Schema,
   Stream,
 } from "effect"
 import { IcnClient, type IcnClientService } from "../client.js"
@@ -15,7 +14,6 @@ import type {
   InferenceResourceInvalidation,
   ModelInstancesSnapshot,
 } from "@magnitudedev/icn-protocol/schemas"
-import { ModelServingConfiguration } from "@magnitudedev/icn-protocol/schemas"
 import { IcnInstances, makeIcnInstances } from "./index.js"
 import { makeIcnEvents } from "../events/index.js"
 
@@ -23,31 +21,11 @@ class TestFailure extends Data.TaggedError("TestFailure")<{
   readonly message: string
 }> {}
 
-const configuration = Schema.decodeUnknownSync(ModelServingConfiguration)({
-  bundle: {
-    _tag: "Standalone",
-    package: {
-      id: "package-test",
-      source: { _tag: "Local", path: "/test/model.gguf" },
-      files: [],
-      relationships: [],
-      properties: {
-        format: "gguf",
-        quantization: "f16",
-        quantizationName: "F16",
-        architecture: "test",
-      },
-    },
-  },
-  profile: { contextLength: 8_192 },
-})
-
 const instances = (revision: number): ModelInstancesSnapshot => ({
   revision,
   instances: [{
     id: "instance-test",
     modelId: "model-test",
-    configuration,
     lifecycle: {
       _tag: "Ready",
       allocation: {

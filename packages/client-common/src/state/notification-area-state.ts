@@ -8,7 +8,7 @@ import type {
   SlotId,
 } from "@magnitudedev/sdk"
 import { Effect, Option, Schema } from "effect"
-import { localModelProviderModelId } from "../local-models/projection"
+import { localModelProviderModelId, localModelServingState } from "../local-models/projection"
 import { formatMemorySize } from "../utils/format-bytes"
 
 export const NotificationIdSchema = Schema.NonEmptyString.pipe(
@@ -156,6 +156,7 @@ const recoveryActivity = (state: AcnRecoveryState): string | null => {
     case "WaitingForOwner": return "Waiting for previous Magnitude service…"
     case "ResolvingLocalInference": return "Preparing local inference…"
     case "LaunchingLocalInference": return "Starting local inference…"
+    case "DiscoveringLocalModels": return "Discovering local models…"
   }
 }
 
@@ -172,8 +173,8 @@ export const deriveModelDownloadNotificationState = (
   modelsState: LocalModelsState | null,
 ): NotificationState | null => {
   if (modelsState === null) return null
-  const count = modelsState.models.filter(({ acquisitionState }) =>
-    acquisitionState._tag === "Installing" || acquisitionState._tag === "Updating").length
+  const count = modelsState.models.filter((model) => model._tag === "Catalog"
+    && (model.acquisitionState._tag === "Installing" || model.acquisitionState._tag === "Updating")).length
   if (count === 0) return null
   return persistentNotificationState(
     "local-model-download",
@@ -231,10 +232,11 @@ export const deriveSelectedModelLowMemoryNotificationStateByProviderModelId = (
       localModelProviderModelId(model),
       selectedProviderModelId,
     ))
-  if (selectedModel?.servingState._tag !== "Assessed"
-    || selectedModel.servingState.assessment._tag !== "Fits") return null
+  if (selectedModel === undefined) return null
+  const serving = Option.getOrUndefined(localModelServingState(selectedModel))
+  if (serving?._tag !== "Assessed" || serving.assessment._tag !== "Fits") return null
   const currentHeadroomState =
-    selectedModel.servingState.assessment.memory.currentHeadroomState
+    serving.assessment.memory.currentHeadroomState
   if (currentHeadroomState._tag !== "Insufficient") return null
   const additionalMemory = formatMemorySize(
     currentHeadroomState.minimumAdditionalAvailableBytes,

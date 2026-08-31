@@ -1,4 +1,4 @@
-import { Effect, Queue, Stream, SubscriptionRef, type Equivalence, type Scope } from "effect"
+import { Effect, Exit, Queue, Stream, SubscriptionRef, type Equivalence, type Scope } from "effect"
 
 export interface MaterializedProjection<A> {
   readonly get: Effect.Effect<A>
@@ -23,20 +23,22 @@ export const materializeProjection = <A, R, R2>(options: {
   readonly equivalent: Equivalence.Equivalence<A>
 }): Effect.Effect<MaterializedProjection<A>, never, R | R2 | Scope.Scope> => Effect.gen(function* () {
   const invalidations = yield* coalesceInvalidations(options.invalidations)
-  const current = yield* SubscriptionRef.make(yield* options.project)
+  const current = yield* SubscriptionRef.make<Exit.Exit<A>>(Exit.succeed(yield* options.project))
+  const restore = (exit: Exit.Exit<A>): Effect.Effect<A> => Exit.match(exit, {
+    onFailure: Effect.failCause,
+    onSuccess: Effect.succeed,
+  })
   yield* invalidations.pipe(
-    Stream.runForEach(() => options.project.pipe(
-      Effect.flatMap((next) => SubscriptionRef.get(current).pipe(
-        Effect.flatMap((previous) => options.equivalent(previous, next)
+    Stream.runForEach(() => options.project.pipe(Effect.exit, Effect.flatMap((next) =>
+      SubscriptionRef.get(current).pipe(Effect.flatMap((previous) =>
+        Exit.isSuccess(previous) && Exit.isSuccess(next) && options.equivalent(previous.value, next.value)
           ? Effect.void
-          : SubscriptionRef.set(current, next)),
-      )),
-    )),
+          : SubscriptionRef.set(current, next)))))),
     Effect.forkScoped,
   )
 
   return {
-    get: SubscriptionRef.get(current),
-    changes: current.changes.pipe(Stream.drop(1)),
+    get: SubscriptionRef.get(current).pipe(Effect.flatMap(restore)),
+    changes: current.changes.pipe(Stream.drop(1), Stream.mapEffect(restore)),
   }
 })

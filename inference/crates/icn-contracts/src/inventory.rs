@@ -70,14 +70,14 @@ impl std::fmt::Display for HardwareDeviceId {
 /// Source-scoped identity of one runnable model at one local location.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct ModelId(pub String);
+pub struct InventoryEntryId(pub String);
 
 /// Content-derived identity shared by equivalent models at different locations.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ContentId(pub String);
 
-impl ModelId {
+impl InventoryEntryId {
     pub fn parse(value: impl Into<String>) -> Result<Self, InventoryError> {
         let value = value.into();
         validate_prefixed_digest(&value, "mdl_")?;
@@ -1435,7 +1435,7 @@ pub struct HuggingFaceRepositorySnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InventoryModel {
-    pub id: ModelId,
+    pub id: InventoryEntryId,
     pub content_id: ContentId,
     pub created: u64,
     pub name: String,
@@ -1480,7 +1480,7 @@ pub enum ModelDownloadEvent {
     },
     CheckingSpace {
         operation_id: String,
-        model_id: ModelId,
+        model_id: InventoryEntryId,
         required_bytes: u64,
         available_bytes: u64,
         completed_bytes: u64,
@@ -1488,7 +1488,7 @@ pub enum ModelDownloadEvent {
     },
     Progress {
         operation_id: String,
-        model_id: ModelId,
+        model_id: InventoryEntryId,
         stage: DownloadStage,
         completed_bytes: u64,
         total_bytes: u64,
@@ -1502,13 +1502,13 @@ pub enum ModelDownloadEvent {
     },
     Cancelled {
         operation_id: String,
-        model_id: Option<ModelId>,
+        model_id: Option<InventoryEntryId>,
         completed_bytes: u64,
         total_bytes: u64,
     },
     Failed {
         operation_id: String,
-        model_id: Option<ModelId>,
+        model_id: Option<InventoryEntryId>,
         error: DownloadFailure,
         completed_bytes: u64,
         total_bytes: u64,
@@ -1548,7 +1548,7 @@ pub enum DownloadFailure {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeletePlan {
-    pub model_id: ModelId,
+    pub model_id: InventoryEntryId,
     pub supported: bool,
     pub reason: Option<String>,
     pub reclaimable_bytes: u64,
@@ -1559,7 +1559,7 @@ pub struct DeletePlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeletedModel {
-    pub id: ModelId,
+    pub id: InventoryEntryId,
     pub deleted: bool,
     pub freed_bytes: u64,
     pub retained_shared_bytes: u64,
@@ -1571,10 +1571,16 @@ pub type DownloadEventStream = BoxStream<'static, ModelDownloadEvent>;
 /// Model inventory boundary consumed by the HTTP API and server composition root.
 pub trait ModelInventory: Send + Sync + 'static {
     fn list(&self) -> BoxFuture<'_, Result<Vec<InventoryModel>, InventoryError>>;
-    fn get(&self, id: &ModelId) -> BoxFuture<'_, Result<InventoryModel, InventoryError>>;
-    fn plan_delete(&self, id: &ModelId) -> BoxFuture<'_, Result<DeletePlan, InventoryError>>;
-    fn delete(&self, id: &ModelId) -> BoxFuture<'_, Result<DeletedModel, InventoryError>>;
-    fn resolve_ready(&self, id: &ModelId) -> BoxFuture<'_, Result<ResolvedModel, InventoryError>>;
+    fn get(&self, id: &InventoryEntryId) -> BoxFuture<'_, Result<InventoryModel, InventoryError>>;
+    fn plan_delete(
+        &self,
+        id: &InventoryEntryId,
+    ) -> BoxFuture<'_, Result<DeletePlan, InventoryError>>;
+    fn delete(&self, id: &InventoryEntryId) -> BoxFuture<'_, Result<DeletedModel, InventoryError>>;
+    fn resolve_ready(
+        &self,
+        id: &InventoryEntryId,
+    ) -> BoxFuture<'_, Result<ResolvedModel, InventoryError>>;
 }
 
 pub trait HardwareProvider: Send + Sync + 'static {
@@ -1874,11 +1880,11 @@ mod tests {
     #[test]
     fn ids_require_the_exact_versioned_prefix_and_lowercase_digest() {
         let digest = "a".repeat(64);
-        assert!(ModelId::parse(format!("mdl_{digest}")).is_ok());
+        assert!(InventoryEntryId::parse(format!("mdl_{digest}")).is_ok());
         assert!(ContentId::parse(format!("content_{digest}")).is_ok());
-        assert!(ModelId::parse(format!("content_{digest}")).is_err());
-        assert!(ModelId::parse(format!("mdl_{}", "A".repeat(64))).is_err());
-        assert!(ModelId::parse("mdl_short").is_err());
+        assert!(InventoryEntryId::parse(format!("content_{digest}")).is_err());
+        assert!(InventoryEntryId::parse(format!("mdl_{}", "A".repeat(64))).is_err());
+        assert!(InventoryEntryId::parse("mdl_short").is_err());
     }
 
     #[test]

@@ -8,7 +8,7 @@
  * - Supports session persistence and hydration
  */
 
-import { Context, Data, Effect, Layer, Option, Stream } from 'effect'
+import { Context, Data, Effect, Layer, Option, Scope, Stream } from 'effect'
 import { Ambient, EventEngine, Introspection, Surface } from '@magnitudedev/event-core'
 import { AmbientServiceTag, HydrationContext, WorkerBusTag, type AmbientService } from '@magnitudedev/event-core'
 import type { FrameworkError } from '@magnitudedev/event-core'
@@ -410,13 +410,18 @@ function makeCodingAgentLive(options: CreateClientOptions) {
         ambientService,
         options.toolAvailability,
       )
+      const serviceScope = yield* Scope.Scope
 
-      yield* Stream.runForEach(options.modelConfigurationChanges, () => modelConfiguration.sync).pipe(
-        Effect.forkScoped,
-      )
-      yield* Stream.runForEach(options.toolAvailabilityChanges, () => toolAvailability.sync).pipe(
-        Effect.forkScoped,
-      )
+      const startLiveConfigurationSynchronization = Effect.gen(function* () {
+        yield* Stream.runForEach(
+          options.modelConfigurationChanges,
+          () => modelConfiguration.sync,
+        ).pipe(Effect.forkIn(serviceScope))
+        yield* Stream.runForEach(
+          options.toolAvailabilityChanges,
+          () => toolAvailability.sync,
+        ).pipe(Effect.forkIn(serviceScope))
+      })
 
       // Root resources are app-owned, not event-core-owned. LifecycleCoordinator
       // persists anything emitted by this cleanup when the engine scope closes.
@@ -524,6 +529,7 @@ function makeCodingAgentLive(options: CreateClientOptions) {
           )
           yield* provideAmbient(publishSkills(skills))
 
+          yield* startLiveConfigurationSynchronization
           return
         }
 
@@ -632,6 +638,8 @@ function makeCodingAgentLive(options: CreateClientOptions) {
             })
           }
         }
+
+        yield* startLiveConfigurationSynchronization
 
       }, Effect.orDie)
 

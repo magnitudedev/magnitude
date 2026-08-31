@@ -1,13 +1,13 @@
-import type { ModelDownloadFailure } from "@magnitudedev/sdk"
 import type {
   OnboardingModelSetupFailure,
   OnboardingModelSetupNotice,
   OnboardingModelSetupExecution,
 } from "./setup-state"
+import type { ModelAcquisitionFailure } from "@magnitudedev/sdk"
 import { formatLocalModelDisplayName } from "../utils/model-presentation"
 import { formatStorageSize } from "../utils/format-bytes"
 
-export const modelDownloadFailureMessage = (failure: ModelDownloadFailure): string => {
+export const modelDownloadFailureMessage = (failure: ModelAcquisitionFailure): string => {
   switch (failure._tag) {
     case "Interrupted": return "The download was interrupted. Try again to continue."
     case "InsufficientDiskSpace":
@@ -17,11 +17,10 @@ export const modelDownloadFailureMessage = (failure: ModelDownloadFailure): stri
     case "SourceUnavailable": return "This model is not available from its source."
     case "NetworkUnavailable":
       return "Couldn’t reach the model source. Check your connection and try again."
-    case "CorruptDownload":
-      return "The downloaded file couldn’t be verified. Try the download again."
+    case "CorruptDownload": return "The downloaded file couldn’t be verified. Try the download again."
     case "LocalStorageFailure":
       return "Magnitude couldn’t write the model to disk. Check disk access and try again."
-    case "Internal": return "Magnitude couldn’t complete the download. Try again."
+    case "Internal": return failure.message
   }
 }
 
@@ -46,7 +45,8 @@ const onboardingModelSetupFailureDetail = (
     case "NetworkUnavailable":
     case "CorruptDownload":
     case "LocalStorageFailure":
-    case "Internal": return modelDownloadFailureMessage(failure as ModelDownloadFailure)
+      return modelDownloadFailureMessage(failure)
+    case "Internal": return failure.message
     default: {
       const message = "message" in failure ? failure.message : undefined
       return typeof message === "string" && message.length > 0

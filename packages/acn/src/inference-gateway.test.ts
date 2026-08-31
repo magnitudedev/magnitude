@@ -13,6 +13,31 @@ const icn = {
 }
 
 describe("Anthropic inference gateway", () => {
+  test("removes only the anthropic-local prefix from canonical hf identities", async () => {
+    const model = "hf:unsloth/Qwen-GGUF/quants/Qwen-Q4.gguf"
+    let forwarded: Request | undefined
+    await proxyAnthropicInferenceRequest(
+      new Request("http://127.0.0.1:10100/inference/anthropic/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: `${LOCAL_ANTHROPIC_MODEL_PREFIX}${model}`,
+          messages: [],
+        }),
+      }),
+      icn,
+      async (input, init) => {
+        forwarded = new Request(input, init)
+        return Response.json({ ok: true })
+      },
+    )
+
+    expect(forwarded?.headers.get("magnitude-gateway-model")).toBe(
+      `anthropic-local/${model}`,
+    )
+    expect(await forwarded?.json()).toMatchObject({ model })
+  })
+
   test("rewrites reserved local aliases and replaces caller credentials", async () => {
     let forwarded: Request | undefined
     const result = await proxyAnthropicInferenceRequest(

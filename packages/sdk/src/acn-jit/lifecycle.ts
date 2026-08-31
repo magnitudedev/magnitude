@@ -16,7 +16,8 @@ export const AcnStartingPhaseSchema = Schema.Union(
     "PreparingAcn",
     "WaitingForOwner",
     "ResolvingLocalInference",
-    "LaunchingLocalInference"
+    "LaunchingLocalInference",
+    "DiscoveringLocalModels"
   ),
   Schema.TaggedStruct("PreparingBackend", {
     backend: Schema.Union(
@@ -119,6 +120,7 @@ export const acnLifecycleObservationFromHealthState = (
     WaitingForOwnership: "WaitingForOwner",
     Resolving: "ResolvingLocalInference",
     Starting: "LaunchingLocalInference",
+    DiscoveringModels: "DiscoveringLocalModels",
   } as const;
   return Option.some({ _tag: "Starting", phase: phase[state.activity] });
 };

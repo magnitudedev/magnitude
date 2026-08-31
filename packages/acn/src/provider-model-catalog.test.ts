@@ -95,10 +95,6 @@ describe("provider model catalog", () => {
           ready: Effect.succeed(true),
           list: Effect.succeed([]),
           catalog: Effect.succeed([]),
-          state: Effect.succeed({
-            entries: [],
-            failure: Option.none(),
-          }),
           changes: Stream.never,
           catalogChanges: Stream.never,
           resolve: () => Effect.die("unused"),

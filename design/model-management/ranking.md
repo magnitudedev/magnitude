@@ -11,11 +11,11 @@ applies_to:
 
 # Local model ranking
 
-Local model ranking separates stable server facts from connection-scoped user preference. ACN's
-`LocalModelRanker` derives `LocalModelRankingScores` for active catalog configurations with a
-completed `Fits` assessment. Client-common applies the user's Fast-to-Smart preference and memory
-budget to those scores. ACN does not publish server-selected preference tiers, explanations, or a
-selected portfolio.
+Local model ranking separates stable server facts from connection-scoped user preference. While
+projecting catalog state, ACN derives `LocalModelRankingScores` from each completed `Fits`
+assessment with the pure ranking policy. Client-common applies the user's Fast-to-Smart preference
+and memory budget to those scores. ACN does not maintain a separate ranking projection or publish
+server-selected preference tiers, explanations, or a selected portfolio.
 
 ## Ranking scores
 

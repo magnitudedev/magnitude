@@ -1,6 +1,7 @@
-import { Schema } from "effect"
+import { Option, Schema } from "effect"
 import {
   LocalModelsStateSchema,
+  localModelServingState,
   type LocalModel,
   type LocalModelsState,
 } from "@magnitudedev/sdk"
@@ -14,12 +15,15 @@ const alignUndisplayedHeadroom = (
   previousModel: LocalModel | undefined,
   nextModel: LocalModel,
 ): LocalModel => {
-  if (previousModel?.servingState._tag !== "Assessed"
-    || previousModel.servingState.assessment._tag !== "Fits"
-    || nextModel.servingState._tag !== "Assessed"
-    || nextModel.servingState.assessment._tag !== "Fits") return nextModel
-  const previousHeadroomState = previousModel.servingState.assessment.memory.currentHeadroomState
-  const nextHeadroomState = nextModel.servingState.assessment.memory.currentHeadroomState
+  if (previousModel === undefined) return nextModel
+  const previousServing = Option.getOrUndefined(localModelServingState(previousModel))
+  const nextServing = Option.getOrUndefined(localModelServingState(nextModel))
+  if (previousServing?._tag !== "Assessed"
+    || previousServing.assessment._tag !== "Fits"
+    || nextServing?._tag !== "Assessed"
+    || nextServing.assessment._tag !== "Fits") return nextModel
+  const previousHeadroomState = previousServing.assessment.memory.currentHeadroomState
+  const nextHeadroomState = nextServing.assessment.memory.currentHeadroomState
   if (previousHeadroomState._tag !== nextHeadroomState._tag
     || previousHeadroomState._tag === "NotObserved"
     || nextHeadroomState._tag === "NotObserved") return nextModel
@@ -47,18 +51,52 @@ const alignUndisplayedHeadroom = (
         previousHeadroomState.minimumAdditionalAvailableBytes,
     }
   }
-  return {
-    ...nextModel,
-    servingState: {
-      ...nextModel.servingState,
-      assessment: {
-        ...nextModel.servingState.assessment,
-        memory: {
-          ...nextModel.servingState.assessment.memory,
-          currentHeadroomState: alignedCurrentHeadroomState,
+  if (nextModel._tag === "Catalog") {
+    const servingState = nextModel.servingState
+    if (servingState._tag !== "Assessed"
+      || servingState.assessment._tag !== "Fits"
+      || !("rankingScores" in servingState)) {
+      return nextModel
+    }
+    const assessment = servingState.assessment
+    return {
+      ...nextModel,
+      servingState: {
+        ...servingState,
+        assessment: {
+          ...assessment,
+          memory: {
+            ...assessment.memory,
+            currentHeadroomState: alignedCurrentHeadroomState,
+          },
         },
       },
-    },
+    }
+  }
+  switch (nextModel.state._tag) {
+    case "Ready": {
+      const discoveredServing = nextModel.state.servingState
+      if (discoveredServing._tag !== "Assessed"
+        || discoveredServing.assessment._tag !== "Fits") return nextModel
+      return {
+        ...nextModel,
+        state: {
+          ...nextModel.state,
+          servingState: {
+            ...discoveredServing,
+            assessment: {
+              ...discoveredServing.assessment,
+              memory: {
+                ...discoveredServing.assessment.memory,
+                currentHeadroomState: alignedCurrentHeadroomState,
+              },
+            },
+          },
+        },
+      }
+    }
+    case "Unavailable":
+    case "Ambiguous": return nextModel
   }
 }
 

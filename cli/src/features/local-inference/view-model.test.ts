@@ -1,10 +1,10 @@
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
+import { HuggingFaceFormModelIdSchema, type LocalModel } from "@magnitudedev/sdk"
 import {
   buildLocalInferenceSelections,
   installedLocalModels,
   modelDownloadFailureMessage,
-  localModelBundleKey,
   localModelMaximumContextLength,
   performanceRange,
   selectionModelId,
@@ -16,7 +16,6 @@ import {
   makeAcquiringModel,
   makeCatalogModel,
   makeModel,
-  makeStandaloneBundle,
   makeView,
   withDoesNotFitAssessment,
 } from "./test-fixtures"
@@ -69,6 +68,27 @@ describe("unified local inference projection", () => {
       .toEqual([installed])
   })
 
+  it("treats only Hugging Face discoveries with a resolved installation as installed", () => {
+    const base = makeModel()
+    const failure = { code: "invalid_artifact", message: "Invalid artifact", retryable: false }
+    const unavailable: LocalModel = {
+      ...base,
+      modelId: base.modelId,
+      state: {
+        _tag: "Unavailable",
+        installation: base.state.installation,
+        failure,
+      },
+    }
+    const ambiguous: LocalModel = {
+      ...base,
+      modelId: HuggingFaceFormModelIdSchema.make("hf:test/model/ambiguous.gguf"),
+      state: { _tag: "Ambiguous", failure },
+    }
+    expect(installedLocalModels(makeView({ models: [unavailable, ambiguous] }).models))
+      .toEqual([unavailable])
+  })
+
   it("excludes non-fitting models from onboarding selections", () => {
     const doesNotFit = withDoesNotFitAssessment(makeCatalogModel())
     const view = makeView({ models: [doesNotFit], ready: false })
@@ -83,73 +103,34 @@ describe("unified local inference projection", () => {
     })
   })
 
-  it("handles embedded and separate speculative bundle packages", () => {
-    const target = makeStandaloneBundle("package_target")
-    const draft = makeStandaloneBundle("package_draft")
-    if (target._tag !== "Standalone" || draft._tag !== "Standalone") {
-      throw new Error("test bundles must contain standalone packages")
-    }
-    const embedded = makeModel({
-      bundle: {
-        _tag: "SpeculativeDecoding",
-        target: target.package,
-        draftSource: { _tag: "Embedded" },
-        method: { _tag: "Mtp" },
-      },
-    })
-    const separate = makeModel({
-      bundle: {
-        _tag: "SpeculativeDecoding",
-        target: target.package,
-        draftSource: {
-          _tag: "Separate",
-          draft: {
-            ...draft.package,
-            properties: {
-              ...draft.package.properties,
-              maximumContextLength: Option.some(16_384),
-            },
-          },
-        },
-        method: { _tag: "DSpark" },
-      },
-    })
-
-    expect(localModelBundleKey(embedded)).toContain("speculative:Mtp:Embedded:package_target")
-    expect(localModelMaximumContextLength(embedded)).toEqual(Option.some(32_768))
-    expect(localModelBundleKey(separate)).toContain(
-      "speculative:DSpark:Separate:package_target:package_draft",
-    )
-    expect(localModelMaximumContextLength(separate)).toEqual(Option.some(16_384))
+  it("uses canonical model identity and serving metadata without exposing bundles", () => {
+    const model = makeModel()
+    expect(model.modelId).toBe("hf:test/model/model-q4.gguf")
+    expect(localModelMaximumContextLength(model)).toEqual(Option.some(32_768))
   })
 
   it("shows the configured speculative method in selection metadata", () => {
-    const target = makeStandaloneBundle("package_target")
-    const draft = makeStandaloneBundle("package_draft")
-    if (target._tag !== "Standalone" || draft._tag !== "Standalone") {
-      throw new Error("test bundles must contain standalone packages")
-    }
-    const model = makeModel({
-      bundle: {
-        _tag: "SpeculativeDecoding",
-        target: target.package,
-        draftSource: { _tag: "Separate", draft: draft.package },
-        method: { _tag: "DFlash" },
+    const base = makeModel()
+    if (base.state.servingState._tag !== "Assessed") throw new Error("fixture must be assessed")
+    const model = makeModel({ state: {
+      ...base.state,
+      servingState: {
+        ...base.state.servingState,
+        speculativeMethod: Option.some({ _tag: "DFlash" }),
       },
-    })
+    } })
     const view = makeView({ models: [model] })
     const [selection] = buildLocalInferenceSelections(view.models, view.slots)
 
     expect(selectionMetadata(selection!)).toMatch(/ · DFlash$/)
 
-    const embedded = makeModel({
-      bundle: {
-        _tag: "SpeculativeDecoding",
-        target: target.package,
-        draftSource: { _tag: "Embedded" },
-        method: { _tag: "Mtp" },
+    const embedded = makeModel({ state: {
+      ...base.state,
+      servingState: {
+        ...base.state.servingState,
+        speculativeMethod: Option.some({ _tag: "Mtp" }),
       },
-    })
+    } })
     const [embeddedSelection] = buildLocalInferenceSelections(
       makeView({ models: [embedded] }).models,
       makeView().slots,

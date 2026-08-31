@@ -7,6 +7,7 @@ import {
   ReasoningEffortSchema,
   installedAcquisition,
   type LocalModelsState,
+  type ModelId,
   type ModelInstanceFailure,
   type ModelSlotsState,
   type ProviderModelId,
@@ -16,6 +17,7 @@ import {
 import { OnboardingPersistence } from "../onboarding/persistence"
 import { ModelSlots, sameSlotSelection } from "../model-slots/service"
 import { localModelOptions, type LocalModelOption } from "./options"
+import { localModelProviderModelId, localModelServingState } from "./projection"
 import { LocalModels } from "./service"
 import {
   HarnessConnection,
@@ -45,7 +47,7 @@ import {
 export * from "./setup-state"
 
 interface PreparedModel {
-  readonly modelId: ProviderModelId
+  readonly modelId: ModelId
   readonly reasoningEffort: ReasoningEffort
   readonly option: LocalModelOption
 }
@@ -132,7 +134,7 @@ export const OnboardingModelSetupConfig = Context.GenericTag<OnboardingModelSetu
 )
 
 const resolveChoice = (
-  modelId: ProviderModelId,
+  modelId: ModelId,
   models: LocalModelsState,
   slots: ModelSlotsState,
 ): Effect.Effect<ResolvedChoice, OnboardingModelChoiceRejected> => {
@@ -140,17 +142,15 @@ const resolveChoice = (
   if (option === undefined) {
     return Effect.fail(new OnboardingModelChoiceRejected({ modelId, reason: "missing" }))
   }
-  const serving = option.model.servingState
-  if (serving._tag !== "Assessed") {
+  const serving = Option.getOrUndefined(localModelServingState(option.model))
+  if (serving === undefined) {
     return Effect.fail(new OnboardingModelChoiceRejected({ modelId, reason: "unresolved" }))
   }
-  if (serving.assessment._tag !== "Fits") {
+  if (serving._tag !== "Assessed" || serving.assessment._tag !== "Fits") {
     return Effect.fail(new OnboardingModelChoiceRejected({ modelId, reason: "ineligible" }))
   }
   const primary = slots.slots.primary
-  const providerModelId = serving.availabilityState._tag === "Selectable"
-    ? Option.some(serving.availabilityState.providerModelId)
-    : Option.none()
+  const providerModelId = localModelProviderModelId(option.model)
   const reasoningEffort = primary._tag !== "Unassigned"
       && Option.contains(providerModelId, primary.selection.providerModelId)
     ? primary.selection.reasoningEffort
@@ -159,7 +159,10 @@ const resolveChoice = (
         () => ReasoningEffortSchema.make("none"),
       )
   const prepared = { modelId, reasoningEffort, option }
-  const installed = option.model.acquisitionState._tag === "Installed"
+  const installedOnDisk = option.model._tag === "Catalog"
+    ? option.model.acquisitionState._tag === "Installed"
+    : option.model.state._tag === "Ready"
+  const installed = installedOnDisk
       && Option.isSome(providerModelId)
     ? Option.some({ ...prepared, providerModelId: providerModelId.value })
     : Option.none()
@@ -345,17 +348,20 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
           resource: "installation",
         }) }
       }
-      const acquisition = model.acquisitionState
-      if (installedAcquisition(acquisition) !== undefined) {
-        const serving = model.servingState
-        if (serving._tag !== "Assessed") return { _tag: "Waiting" }
-        const availability = serving.availabilityState
-        if (availability._tag === "Installable" || availability._tag === "Preparing") {
+      const installed = model._tag === "Catalog"
+        ? installedAcquisition(model.acquisitionState) !== undefined
+        : model.state._tag === "Ready"
+      if (installed) {
+        const serving = Option.getOrUndefined(localModelServingState(model))
+        if (serving === undefined || serving._tag === "Assessing" || serving._tag === "Failed") {
           return { _tag: "Waiting" }
         }
-        const providerModelId = availability._tag === "Unavailable"
-          ? Option.getOrUndefined(availability.providerModelId)
-          : availability.providerModelId
+        if (serving.assessment._tag !== "Fits") {
+          return { _tag: "Failed", failure: serving.assessment._tag === "Incompatible"
+            ? serving.assessment.failure
+            : { code: "insufficient_resources", message: "This model does not fit available hardware.", retryable: false } }
+        }
+        const providerModelId = Option.getOrUndefined(localModelProviderModelId(model))
         if (providerModelId !== prepared.modelId) {
           return providerModelId === undefined
             ? { _tag: "Waiting" }
@@ -364,14 +370,18 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
                 resource: "installation",
               }) }
         }
-        if (availability._tag === "Unavailable") {
-          return { _tag: "Failed", failure: availability.failure }
-        }
         return {
           _tag: "Ready",
           value: { ...prepared, providerModelId: prepared.modelId },
         }
       }
+      if (model._tag === "Discovered") {
+        return { _tag: "Failed", failure: new OnboardingModelResourceChanged({
+          modelId: prepared.modelId,
+          resource: "installation",
+        }) }
+      }
+      const acquisition = model.acquisitionState
       if (acquisition._tag === "Installing" || acquisition._tag === "Updating") {
         return { _tag: "Waiting" }
       }
@@ -400,33 +410,40 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
           ? Effect.fail(new OnboardingModelSelectionCancelled())
           : Effect.succeed(installed)),
       ),
-      onNone: () => localModels.install(resolved.prepared.modelId).pipe(
-        Effect.flatMap(() => {
-          const publish = setExecution(invocation, {
-            _tag: "Installing",
-            option: resolved.prepared.option,
-            modelId: resolved.prepared.modelId,
-            cancelling: false,
-          })
-          const cancel = localModels.cancelDownload(resolved.prepared.modelId)
-          const wait = Effect.raceFirst(
-            awaitInstalled(resolved.prepared).pipe(
-              Effect.map((installed) => ({ _tag: "Installed" as const, installed })),
-            ),
-            Deferred.await(invocation.cancellation).pipe(
-              Effect.as({ _tag: "Cancelled" as const }),
-            ),
-          ).pipe(Effect.flatMap((outcome) => outcome._tag === "Installed"
-            ? Effect.succeed(outcome.installed)
-            : cancel.pipe(Effect.zipRight(Effect.fail(new OnboardingModelSelectionCancelled())))))
-          return publish.pipe(
-            Effect.zipRight(cancelled(invocation)),
-            Effect.flatMap((isCancelled) => isCancelled
-              ? cancel.pipe(Effect.zipRight(Effect.fail(new OnboardingModelSelectionCancelled())))
-              : wait),
-          )
-        }),
-      ),
+      onNone: () => {
+        const model = resolved.prepared.option.model
+        if (model._tag !== "Catalog") return Effect.fail(new OnboardingModelResourceChanged({
+          modelId: resolved.prepared.modelId,
+          resource: "installation",
+        }))
+        return localModels.install(model.modelId).pipe(
+          Effect.flatMap(() => {
+            const publish = setExecution(invocation, {
+              _tag: "Installing",
+              option: resolved.prepared.option,
+              modelId: resolved.prepared.modelId,
+              cancelling: false,
+            })
+            const cancel = localModels.cancelDownload(model.modelId)
+            const wait = Effect.raceFirst(
+              awaitInstalled(resolved.prepared).pipe(
+                Effect.map((installed) => ({ _tag: "Installed" as const, installed })),
+              ),
+              Deferred.await(invocation.cancellation).pipe(
+                Effect.as({ _tag: "Cancelled" as const }),
+              ),
+            ).pipe(Effect.flatMap((outcome) => outcome._tag === "Installed"
+              ? Effect.succeed(outcome.installed)
+              : cancel.pipe(Effect.zipRight(Effect.fail(new OnboardingModelSelectionCancelled())))))
+            return publish.pipe(
+              Effect.zipRight(cancelled(invocation)),
+              Effect.flatMap((isCancelled) => isCancelled
+                ? cancel.pipe(Effect.zipRight(Effect.fail(new OnboardingModelSelectionCancelled())))
+                : wait),
+            )
+          }),
+        )
+      },
     })
 
   const assign = (
@@ -606,7 +623,7 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
     registry.set(lifecycle, { ...current, retainedOpen: true })
   }))
 
-  const select = (modelId: ProviderModelId) =>
+  const select = (modelId: ModelId) =>
     admissionLock.withPermits(1)(Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
       const current = registry.get(lifecycle)
       if (current._tag !== "Resting"

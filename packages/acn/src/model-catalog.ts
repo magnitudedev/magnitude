@@ -56,21 +56,14 @@ export const projectModelCatalog = (
     })),
   ]
   const failures = [...contents.failures]
-  if (local.inventoryState._tag === "Degraded") {
-    failures.push({ _tag: "CatalogFailure", message: local.inventoryState.failure.message })
-  }
-  if (local.discoveryState._tag === "Failed") {
-    failures.push({ _tag: "CatalogFailure", message: local.discoveryState.failure.message })
-  }
   const fields = {
     providers: contents.providers,
     models,
     failures,
-    localInventoryState: local.inventoryState,
-    localDiscoveryState: local.discoveryState,
+    localModelsReconciliationComplete: local.reconciliationComplete,
   }
   if (failures.length > 0) return { _tag: "Degraded", ...fields }
-  if (providers._tag === "Loading" || providers._tag === "Refreshing" || local.discoveryState._tag === "Loading") {
+  if (providers._tag === "Loading" || providers._tag === "Refreshing" || !local.reconciliationComplete) {
     return { _tag: "Refreshing", ...fields }
   }
   return { _tag: "Ready", ...fields }

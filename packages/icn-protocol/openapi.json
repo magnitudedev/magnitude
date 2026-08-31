@@ -140,6 +140,446 @@
         }
       }
     },
+    "/api/v1/catalog/assessments": {
+      "post": {
+        "tags": [
+          "catalog"
+        ],
+        "operationId": "assessCatalogModels",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CatalogAssessmentsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Exact target and profile assessment events",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid assessment request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Assessment target not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Model assessment could not be completed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Assessment target failed integrity validation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Assessment operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "x-magnitude-stream": {
+          "data": {
+            "encoding": "json",
+            "schema": {
+              "$ref": "#/components/schemas/AssessModelsEvent"
+            }
+          },
+          "framing": "ndjson",
+          "reconnect": {
+            "type": "none"
+          },
+          "responseStatus": 200,
+          "termination": {
+            "type": "eof"
+          },
+          "version": 1
+        }
+      }
+    },
+    "/api/v1/catalog/installations": {
+      "get": {
+        "tags": [
+          "catalog"
+        ],
+        "operationId": "listCatalogInstallations",
+        "responses": {
+          "200": {
+            "description": "Managed catalog installation occurrences",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogInstallationsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalog/installations/{operation_id}": {
+      "get": {
+        "tags": [
+          "catalog"
+        ],
+        "operationId": "getCatalogInstallation",
+        "parameters": [
+          {
+            "name": "operation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogInstallationOperation"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalog/installations/{operation_id}/acknowledge-failure": {
+      "post": {
+        "tags": [
+          "catalog"
+        ],
+        "operationId": "acknowledgeCatalogInstallationFailure",
+        "parameters": [
+          {
+            "name": "operation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogInstallationOperation"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalog/installations/{operation_id}/cancel": {
+      "post": {
+        "tags": [
+          "catalog"
+        ],
+        "operationId": "cancelCatalogInstallation",
+        "parameters": [
+          {
+            "name": "operation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogInstallationOperation"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalog/models": {
+      "get": {
+        "tags": [
+          "catalog"
+        ],
+        "operationId": "listCatalogModels",
+        "responses": {
+          "200": {
+            "description": "Catalog declarations and current managed local state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogModelsResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Catalog state unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalog/models/{model_id}": {
+      "get": {
+        "tags": [
+          "catalog"
+        ],
+        "operationId": "getCatalogModel",
+        "parameters": [
+          {
+            "name": "model_id",
+            "in": "path",
+            "description": "Canonical catalog model ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Exact catalog model",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogModel"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Catalog model not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Catalog state unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalog/models/{model_id}/install": {
+      "post": {
+        "tags": [
+          "catalog"
+        ],
+        "operationId": "installCatalogModel",
+        "parameters": [
+          {
+            "name": "model_id",
+            "in": "path",
+            "description": "Canonical catalog model ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Catalog installation admission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogInstallationAdmission"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Catalog model not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Installation cannot be admitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Installation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalog/models/{model_id}/installation": {
+      "delete": {
+        "tags": [
+          "catalog"
+        ],
+        "operationId": "removeCatalogModelInstallation",
+        "parameters": [
+          {
+            "name": "model_id",
+            "in": "path",
+            "description": "Canonical catalog model ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Managed catalog installation removal result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogInstallationRemoval"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Catalog model not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Model is live",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Removal failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/chat/templates/apply": {
       "post": {
         "tags": [
@@ -220,117 +660,35 @@
         }
       }
     },
-    "/api/v1/downloads": {
-      "get": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "listModelDownloads",
-        "responses": {
-          "200": {
-            "description": "Retained model downloads and internal package attempts",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ModelDownloadsResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Model downloads unavailable",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/downloads/{download_id}": {
-      "get": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "getModelDownload",
-        "parameters": [
-          {
-            "name": "download_id",
-            "in": "path",
-            "description": "Model download ID",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Exact model download",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ModelDownload"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Model download not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Model downloads unavailable",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/downloads/{download_id}/acknowledge-failure": {
+    "/api/v1/discovery/assessments": {
       "post": {
         "tags": [
-          "models"
+          "discovery"
         ],
-        "operationId": "acknowledgeModelDownloadFailure",
-        "parameters": [
-          {
-            "name": "download_id",
-            "in": "path",
-            "description": "Failed model download ID",
-            "required": true,
-            "schema": {
-              "type": "string"
+        "operationId": "assessDiscoveredModels",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DiscoveryAssessmentsRequest"
+              }
             }
-          }
-        ],
+          },
+          "required": true
+        },
         "responses": {
           "200": {
-            "description": "Acknowledged failed model download",
+            "description": "Exact discovered-model profile assessment events",
             "content": {
-              "application/json": {
+              "application/x-ndjson": {
                 "schema": {
-                  "$ref": "#/components/schemas/ModelDownload"
+                  "type": "string"
                 }
               }
             }
           },
           "400": {
-            "description": "Model download has not failed",
+            "description": "Invalid assessment request",
             "content": {
               "application/json": {
                 "schema": {
@@ -340,7 +698,27 @@
             }
           },
           "404": {
-            "description": "Model download not found",
+            "description": "Discovered model not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Discovery snapshot is stale",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Discovered model failed integrity validation",
             "content": {
               "application/json": {
                 "schema": {
@@ -350,11 +728,48 @@
             }
           },
           "500": {
-            "description": "Model download acknowledgement failed",
+            "description": "Assessment operation failed",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "x-magnitude-stream": {
+          "data": {
+            "encoding": "json",
+            "schema": {
+              "$ref": "#/components/schemas/AssessModelsEvent"
+            }
+          },
+          "framing": "ndjson",
+          "reconnect": {
+            "type": "none"
+          },
+          "responseStatus": 200,
+          "termination": {
+            "type": "eof"
+          },
+          "version": 1
+        }
+      }
+    },
+    "/api/v1/discovery/models": {
+      "get": {
+        "tags": [
+          "discovery"
+        ],
+        "operationId": "listDiscoveredModels",
+        "responses": {
+          "200": {
+            "description": "Current non-catalog discoveries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiscoveredModelsResponse"
                 }
               }
             }
@@ -362,60 +777,19 @@
         }
       }
     },
-    "/api/v1/downloads/{download_id}/cancel": {
+    "/api/v1/discovery/refresh": {
       "post": {
         "tags": [
-          "models"
+          "discovery"
         ],
-        "operationId": "cancelModelDownload",
-        "parameters": [
-          {
-            "name": "download_id",
-            "in": "path",
-            "description": "Model download ID",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
+        "operationId": "refreshDiscoveredModels",
         "responses": {
           "200": {
-            "description": "Cancelled or terminal model download",
+            "description": "Refreshed discovery snapshot",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ModelDownload"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Model download cannot be cancelled",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Model download not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Model download cancellation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
+                  "$ref": "#/components/schemas/DiscoveredModelsResponse"
                 }
               }
             }
@@ -744,344 +1118,6 @@
         }
       }
     },
-    "/api/v1/models": {
-      "get": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "listModels",
-        "responses": {
-          "200": {
-            "description": "Catalog models joined with current local artifact state",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ModelsResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Model discovery failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/models/assess": {
-      "post": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "assessModels",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AssessModelsRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Exact target and profile assessment events",
-            "content": {
-              "application/x-ndjson": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid assessment request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Assessment target not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Model assessment could not be completed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Assessment target failed integrity validation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Assessment operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        },
-        "x-magnitude-stream": {
-          "data": {
-            "encoding": "json",
-            "schema": {
-              "$ref": "#/components/schemas/AssessModelsEvent"
-            }
-          },
-          "framing": "ndjson",
-          "reconnect": {
-            "type": "none"
-          },
-          "responseStatus": 200,
-          "termination": {
-            "type": "eof"
-          },
-          "version": 1
-        }
-      }
-    },
-    "/api/v1/models/install": {
-      "post": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "installModel",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ModelIdentityRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Model installation admission",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/InstallModelResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid canonical model identity",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Catalog model not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Model installation cannot currently be admitted",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Downloaded model failed integrity validation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Catalog model reconciliation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/models/uninstall": {
-      "post": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "uninstallModel",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ModelIdentityRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Model packages safely removed or retained because they are shared",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/UninstallModelResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid model identity or request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Model not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Model is active or package deletion is unsafe",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Installed model failed integrity validation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Model reconciliation or package removal failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/models/{model_id}": {
-      "get": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "getModel",
-        "parameters": [
-          {
-            "name": "model_id",
-            "in": "path",
-            "description": "Canonical model ID",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Exact Model projection",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/InferenceModel"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Model not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Model discovery failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/v1/models/{model_id}/load-plan": {
       "post": {
         "tags": [
@@ -1233,166 +1269,6 @@
           },
           "500": {
             "description": "Properties unavailable",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/packages": {
-      "get": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "listInstalledModels",
-        "responses": {
-          "200": {
-            "description": "Verified model packages installed on this machine",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/InstalledModelPackagesResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Installed package discovery failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/packages/{package_id}": {
-      "get": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "getInstalledModelPackage",
-        "parameters": [
-          {
-            "name": "package_id",
-            "in": "path",
-            "description": "Model package ID",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Exact installed model package",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/InstalledModelPackage"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Installed model package not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Installed package discovery failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      },
-      "delete": {
-        "tags": [
-          "models"
-        ],
-        "operationId": "removeInstalledModel",
-        "parameters": [
-          {
-            "name": "package_id",
-            "in": "path",
-            "description": "Canonical model package identity",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Installed package removal result",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RemoveInstalledModelPackageResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid package identity or request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Installed package not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Package deletion is currently unsafe",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Installed package failed integrity validation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Installed package removal failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -1975,41 +1851,22 @@
         },
         "additionalProperties": false
       },
-      "AssessModelRequest": {
-        "type": "object",
-        "required": [
-          "requestId",
-          "bundle",
-          "profiles"
-        ],
-        "properties": {
-          "requestId": {
-            "$ref": "#/components/schemas/ModelAssessmentRequestId"
-          },
-          "bundle": {
-            "$ref": "#/components/schemas/ModelBundleInput"
-          },
-          "profiles": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ModelAssessmentProfile"
-            }
-          }
-        },
-        "additionalProperties": false
-      },
       "AssessModelResult": {
         "oneOf": [
           {
             "type": "object",
             "required": [
               "requestId",
+              "subject",
               "profiles",
               "_tag"
             ],
             "properties": {
               "requestId": {
                 "$ref": "#/components/schemas/ModelAssessmentRequestId"
+              },
+              "subject": {
+                "$ref": "#/components/schemas/ModelAssessmentSubject"
               },
               "profiles": {
                 "type": "array",
@@ -2029,6 +1886,7 @@
             "type": "object",
             "required": [
               "requestId",
+              "subject",
               "failure",
               "_tag"
             ],
@@ -2036,13 +1894,16 @@
               "requestId": {
                 "$ref": "#/components/schemas/ModelAssessmentRequestId"
               },
+              "subject": {
+                "$ref": "#/components/schemas/ModelAssessmentSubject"
+              },
               "failure": {
                 "$ref": "#/components/schemas/ModelFailure"
               },
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "InvalidBundle"
+                  "Unavailable"
                 ]
               }
             }
@@ -2051,12 +1912,16 @@
             "type": "object",
             "required": [
               "requestId",
+              "subject",
               "failure",
               "_tag"
             ],
             "properties": {
               "requestId": {
                 "$ref": "#/components/schemas/ModelAssessmentRequestId"
+              },
+              "subject": {
+                "$ref": "#/components/schemas/ModelAssessmentSubject"
               },
               "failure": {
                 "$ref": "#/components/schemas/ModelFailure"
@@ -2076,11 +1941,17 @@
           {
             "type": "object",
             "required": [
+              "revision",
               "environmentId",
               "totalTargets",
               "_tag"
             ],
             "properties": {
+              "revision": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
               "environmentId": {
                 "$ref": "#/components/schemas/AssessmentEnvironmentId"
               },
@@ -2118,11 +1989,17 @@
           {
             "type": "object",
             "required": [
+              "revision",
               "environmentId",
               "totalTargets",
               "_tag"
             ],
             "properties": {
+              "revision": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
               "environmentId": {
                 "$ref": "#/components/schemas/AssessmentEnvironmentId"
               },
@@ -2140,21 +2017,6 @@
             }
           }
         ]
-      },
-      "AssessModelsRequest": {
-        "type": "object",
-        "required": [
-          "requests"
-        ],
-        "properties": {
-          "requests": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/AssessModelRequest"
-            }
-          }
-        },
-        "additionalProperties": false
       },
       "AssessmentEnvironmentId": {
         "type": "string"
@@ -2200,146 +2062,55 @@
           "q5_1"
         ]
       },
-      "CatalogDiagnostic": {
+      "CatalogAssessmentTarget": {
         "type": "object",
         "required": [
+          "requestId",
           "modelId",
-          "variantId",
-          "failure"
+          "selection",
+          "profiles"
         ],
         "properties": {
+          "requestId": {
+            "$ref": "#/components/schemas/ModelAssessmentRequestId"
+          },
           "modelId": {
-            "$ref": "#/components/schemas/CatalogModelId"
+            "$ref": "#/components/schemas/ModelId"
           },
-          "variantId": {
-            "$ref": "#/components/schemas/CatalogVariantId"
+          "selection": {
+            "$ref": "#/components/schemas/CatalogModelSelection"
           },
-          "failure": {
-            "$ref": "#/components/schemas/ModelFailure"
-          }
-        },
-        "additionalProperties": false
-      },
-      "CatalogIntelligence": {
-        "type": "object",
-        "required": [
-          "score",
-          "provenance"
-        ],
-        "properties": {
-          "score": {
-            "type": "number",
-            "format": "double"
-          },
-          "provenance": {
-            "$ref": "#/components/schemas/IntelligenceProvenance"
-          }
-        },
-        "additionalProperties": false
-      },
-      "CatalogModelEffectiveConfiguration": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "configuration",
-              "_tag"
-            ],
-            "properties": {
-              "configuration": {
-                "$ref": "#/components/schemas/ModelServingConfiguration"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Runnable"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "failure",
-              "_tag"
-            ],
-            "properties": {
-              "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Unavailable"
-                ]
-              }
-            }
-          }
-        ]
-      },
-      "CatalogModelId": {
-        "type": "string"
-      },
-      "CatalogModelInstallation": {
-        "type": "object",
-        "required": [
-          "effectiveConfiguration",
-          "packages"
-        ],
-        "properties": {
-          "effectiveConfiguration": {
-            "$ref": "#/components/schemas/CatalogModelEffectiveConfiguration"
-          },
-          "packages": {
+          "profiles": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/InstalledModelPackage"
+              "$ref": "#/components/schemas/ModelAssessmentProfile"
             }
           }
         },
         "additionalProperties": false
       },
-      "CatalogModelLocalState": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "_tag"
-            ],
-            "properties": {
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "NotInstalled"
-                ]
-              }
-            }
+      "CatalogAssessmentsRequest": {
+        "type": "object",
+        "required": [
+          "revision",
+          "targets"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           },
-          {
-            "type": "object",
-            "required": [
-              "installation",
-              "updateState",
-              "_tag"
-            ],
-            "properties": {
-              "installation": {
-                "$ref": "#/components/schemas/CatalogModelInstallation"
-              },
-              "updateState": {
-                "$ref": "#/components/schemas/CatalogModelUpdateState"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Installed"
-                ]
-              }
+          "targets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogAssessmentTarget"
             }
           }
-        ]
+        },
+        "additionalProperties": false
       },
-      "CatalogModelUpdateState": {
+      "CatalogInstallationAdmission": {
         "oneOf": [
           {
             "type": "object",
@@ -2358,22 +2129,396 @@
           {
             "type": "object",
             "required": [
-              "missingPackageIds",
-              "supersededPackageIds",
+              "operationId",
               "_tag"
             ],
             "properties": {
-              "missingPackageIds": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/ModelPackageId"
-                }
+              "operationId": {
+                "$ref": "#/components/schemas/CatalogInstallationOperationId"
               },
-              "supersededPackageIds": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/ModelPackageId"
-                }
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Admitted"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "CatalogInstallationOperation": {
+        "type": "object",
+        "required": [
+          "operationId",
+          "modelId",
+          "state"
+        ],
+        "properties": {
+          "operationId": {
+            "$ref": "#/components/schemas/CatalogInstallationOperationId"
+          },
+          "modelId": {
+            "$ref": "#/components/schemas/ModelId"
+          },
+          "state": {
+            "$ref": "#/components/schemas/CatalogInstallationOperationState"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CatalogInstallationOperationId": {
+        "type": "string"
+      },
+      "CatalogInstallationOperationState": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "progress",
+              "_tag"
+            ],
+            "properties": {
+              "progress": {
+                "$ref": "#/components/schemas/CatalogInstallationProgress"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Pending"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "progress",
+              "_tag"
+            ],
+            "properties": {
+              "progress": {
+                "$ref": "#/components/schemas/CatalogInstallationProgress"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Running"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Completed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "progress",
+              "failure",
+              "acknowledged",
+              "_tag"
+            ],
+            "properties": {
+              "progress": {
+                "$ref": "#/components/schemas/CatalogInstallationProgress"
+              },
+              "failure": {
+                "$ref": "#/components/schemas/DownloadFailure"
+              },
+              "acknowledged": {
+                "type": "boolean"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Failed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "progress",
+              "_tag"
+            ],
+            "properties": {
+              "progress": {
+                "$ref": "#/components/schemas/CatalogInstallationProgress"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Cancelled"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "CatalogInstallationProgress": {
+        "type": "object",
+        "required": [
+          "stage",
+          "completedBytes",
+          "totalBytes"
+        ],
+        "properties": {
+          "stage": {
+            "$ref": "#/components/schemas/DownloadStage"
+          },
+          "completedBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "totalBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "bytesPerSecond": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "CatalogInstallationRemoval": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "reclaimedBytes",
+              "_tag"
+            ],
+            "properties": {
+              "reclaimedBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Removed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "_tag"
+            ],
+            "properties": {
+              "reason": {
+                "$ref": "#/components/schemas/CatalogInstallationRetentionReason"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Retained"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "CatalogInstallationRetentionReason": {
+        "type": "string",
+        "enum": [
+          "SharedMaterial",
+          "ExternalOwnership"
+        ]
+      },
+      "CatalogInstallationsResponse": {
+        "type": "object",
+        "required": [
+          "operations"
+        ],
+        "properties": {
+          "operations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogInstallationOperation"
+            }
+          }
+        }
+      },
+      "CatalogIntelligence": {
+        "type": "object",
+        "required": [
+          "score",
+          "provenance"
+        ],
+        "properties": {
+          "score": {
+            "type": "number",
+            "format": "double"
+          },
+          "provenance": {
+            "$ref": "#/components/schemas/IntelligenceProvenance"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CatalogModel": {
+        "type": "object",
+        "required": [
+          "id",
+          "desired",
+          "displayName",
+          "variantLabel",
+          "description",
+          "releaseDate",
+          "license",
+          "sourceUrls",
+          "parameterization",
+          "intelligence",
+          "fidelityRank",
+          "quantizationAware",
+          "localState"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/ModelId"
+          },
+          "desired": {
+            "$ref": "#/components/schemas/ReadyModel"
+          },
+          "displayName": {
+            "type": "string"
+          },
+          "variantLabel": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "releaseDate": {
+            "$ref": "#/components/schemas/ModelReleaseDate"
+          },
+          "license": {
+            "type": "string"
+          },
+          "sourceUrls": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "parameterization": {
+            "$ref": "#/components/schemas/ModelParameterization"
+          },
+          "intelligence": {
+            "$ref": "#/components/schemas/CatalogIntelligence"
+          },
+          "fidelityRank": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "quantizationAware": {
+            "type": "boolean"
+          },
+          "localState": {
+            "$ref": "#/components/schemas/CatalogModelState"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CatalogModelSelection": {
+        "type": "string",
+        "enum": [
+          "Desired",
+          "Effective"
+        ]
+      },
+      "CatalogModelState": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "NotInstalled"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "effective",
+              "installation",
+              "updateState",
+              "_tag"
+            ],
+            "properties": {
+              "effective": {
+                "$ref": "#/components/schemas/EffectiveModel"
+              },
+              "installation": {
+                "$ref": "#/components/schemas/ModelInstallation"
+              },
+              "updateState": {
+                "$ref": "#/components/schemas/CatalogModelUpdate"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Installed"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "CatalogModelUpdate": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Current"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "requiredDownloadBytes",
+              "_tag"
+            ],
+            "properties": {
+              "requiredDownloadBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
               },
               "_tag": {
                 "type": "string",
@@ -2385,8 +2530,30 @@
           }
         ]
       },
-      "CatalogVariantId": {
-        "type": "string"
+      "CatalogModelsResponse": {
+        "type": "object",
+        "required": [
+          "revision",
+          "reconciliationComplete",
+          "models"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reconciliationComplete": {
+            "type": "boolean"
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogModel"
+            }
+          }
+        },
+        "additionalProperties": false
       },
       "ChatCompletionChoice": {
         "type": "object",
@@ -3367,6 +3534,205 @@
         },
         "additionalProperties": false
       },
+      "DiscoveredModel": {
+        "type": "object",
+        "required": [
+          "id",
+          "state"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/ModelId"
+          },
+          "state": {
+            "$ref": "#/components/schemas/DiscoveredModelState"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DiscoveredModelCatalogAttribution": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "NotInCatalog"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "failure",
+              "_tag"
+            ],
+            "properties": {
+              "failure": {
+                "$ref": "#/components/schemas/ModelFailure"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Failed"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "DiscoveredModelState": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "selectedRevision",
+              "installation",
+              "model",
+              "catalogAttribution",
+              "_tag"
+            ],
+            "properties": {
+              "selectedRevision": {
+                "type": "string"
+              },
+              "installation": {
+                "$ref": "#/components/schemas/ResolvedModelInstallation"
+              },
+              "model": {
+                "$ref": "#/components/schemas/ReadyModel"
+              },
+              "catalogAttribution": {
+                "$ref": "#/components/schemas/DiscoveredModelCatalogAttribution"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Ready"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "selectedRevision",
+              "installation",
+              "failure",
+              "_tag"
+            ],
+            "properties": {
+              "selectedRevision": {
+                "type": "string"
+              },
+              "installation": {
+                "$ref": "#/components/schemas/ResolvedModelInstallation"
+              },
+              "failure": {
+                "$ref": "#/components/schemas/ModelFailure"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Unavailable"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "failure",
+              "_tag"
+            ],
+            "properties": {
+              "failure": {
+                "$ref": "#/components/schemas/ModelFailure"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Ambiguous"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "DiscoveredModelsResponse": {
+        "type": "object",
+        "required": [
+          "revision",
+          "reconciliationComplete",
+          "models"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reconciliationComplete": {
+            "type": "boolean"
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DiscoveredModel"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "DiscoveryAssessmentTarget": {
+        "type": "object",
+        "required": [
+          "requestId",
+          "modelId",
+          "profiles"
+        ],
+        "properties": {
+          "requestId": {
+            "$ref": "#/components/schemas/ModelAssessmentRequestId"
+          },
+          "modelId": {
+            "$ref": "#/components/schemas/ModelId"
+          },
+          "profiles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelAssessmentProfile"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "DiscoveryAssessmentsRequest": {
+        "type": "object",
+        "required": [
+          "revision",
+          "targets"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "targets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DiscoveryAssessmentTarget"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
       "DownloadFailure": {
         "oneOf": [
           {
@@ -3496,6 +3862,46 @@
           "publishing"
         ]
       },
+      "EffectiveModel": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "model",
+              "_tag"
+            ],
+            "properties": {
+              "model": {
+                "$ref": "#/components/schemas/ReadyModel"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Ready"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "failure",
+              "_tag"
+            ],
+            "properties": {
+              "failure": {
+                "$ref": "#/components/schemas/ModelFailure"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Unavailable"
+                ]
+              }
+            }
+          }
+        ]
+      },
       "EnsureModelInstanceRequest": {
         "type": "object",
         "required": [
@@ -3503,7 +3909,7 @@
         ],
         "properties": {
           "modelId": {
-            "type": "string"
+            "$ref": "#/components/schemas/ModelId"
           }
         },
         "additionalProperties": false
@@ -4716,77 +5122,6 @@
           }
         }
       },
-      "InferenceModel": {
-        "type": "object",
-        "required": [
-          "id",
-          "modelId",
-          "variantId",
-          "desiredConfiguration",
-          "displayName",
-          "variantLabel",
-          "description",
-          "releaseDate",
-          "license",
-          "capabilities",
-          "parameterization",
-          "intelligence",
-          "fidelityRank",
-          "quantizationAware",
-          "localState"
-        ],
-        "properties": {
-          "id": {
-            "type": "string",
-            "description": "Canonical callable identity used unchanged by native and standard inference APIs."
-          },
-          "modelId": {
-            "$ref": "#/components/schemas/CatalogModelId"
-          },
-          "variantId": {
-            "$ref": "#/components/schemas/CatalogVariantId"
-          },
-          "desiredConfiguration": {
-            "$ref": "#/components/schemas/ModelServingConfiguration"
-          },
-          "displayName": {
-            "type": "string"
-          },
-          "variantLabel": {
-            "type": "string"
-          },
-          "description": {
-            "type": "string"
-          },
-          "releaseDate": {
-            "$ref": "#/components/schemas/ModelReleaseDate"
-          },
-          "license": {
-            "type": "string"
-          },
-          "capabilities": {
-            "$ref": "#/components/schemas/ModelCapabilities"
-          },
-          "parameterization": {
-            "$ref": "#/components/schemas/ModelParameterization"
-          },
-          "intelligence": {
-            "$ref": "#/components/schemas/CatalogIntelligence"
-          },
-          "fidelityRank": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "quantizationAware": {
-            "type": "boolean"
-          },
-          "localState": {
-            "$ref": "#/components/schemas/CatalogModelLocalState"
-          }
-        },
-        "additionalProperties": false
-      },
       "InferenceResourceInvalidation": {
         "type": "object",
         "required": [
@@ -4808,158 +5143,11 @@
         "type": "string",
         "enum": [
           "hardware",
-          "models",
-          "packages",
-          "downloads",
+          "catalog",
+          "discovery",
+          "catalog-installations",
           "instances"
         ]
-      },
-      "InstallModelResponse": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "_tag"
-            ],
-            "properties": {
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Current"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "downloadId",
-              "_tag"
-            ],
-            "properties": {
-              "downloadId": {
-                "$ref": "#/components/schemas/ModelDownloadId"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "DownloadAdmitted"
-                ]
-              }
-            }
-          }
-        ]
-      },
-      "InstalledCatalogAttribution": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "_tag"
-            ],
-            "properties": {
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "NotCatalogTarget"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "modelId",
-              "variantId",
-              "_tag"
-            ],
-            "properties": {
-              "modelId": {
-                "$ref": "#/components/schemas/CatalogModelId"
-              },
-              "variantId": {
-                "$ref": "#/components/schemas/CatalogVariantId"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Attributed"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "failure",
-              "_tag"
-            ],
-            "properties": {
-              "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Failed"
-                ]
-              }
-            }
-          }
-        ]
-      },
-      "InstalledModelPackage": {
-        "type": "object",
-        "required": [
-          "package",
-          "path",
-          "origin",
-          "inspection",
-          "catalogAttribution"
-        ],
-        "properties": {
-          "package": {
-            "$ref": "#/components/schemas/ModelPackage"
-          },
-          "path": {
-            "type": "string"
-          },
-          "origin": {
-            "$ref": "#/components/schemas/ModelPackageInstallationOrigin"
-          },
-          "inspection": {
-            "$ref": "#/components/schemas/ModelPackageInspection"
-          },
-          "catalogAttribution": {
-            "$ref": "#/components/schemas/InstalledCatalogAttribution"
-          }
-        },
-        "additionalProperties": false
-      },
-      "InstalledModelPackagesResponse": {
-        "type": "object",
-        "required": [
-          "revision",
-          "reconciliationComplete",
-          "packages"
-        ],
-        "properties": {
-          "revision": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "reconciliationComplete": {
-            "type": "boolean"
-          },
-          "packages": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/InstalledModelPackage"
-            }
-          }
-        },
-        "additionalProperties": false
       },
       "IntelligenceEstimateConfidence": {
         "type": "string",
@@ -5322,15 +5510,15 @@
           {
             "type": "object",
             "required": [
-              "configuration",
+              "profile",
               "assessmentId",
               "memory",
               "performance",
               "_tag"
             ],
             "properties": {
-              "configuration": {
-                "$ref": "#/components/schemas/ModelServingConfiguration"
+              "profile": {
+                "$ref": "#/components/schemas/ServingProfile"
               },
               "assessmentId": {
                 "$ref": "#/components/schemas/ModelAssessmentId"
@@ -5358,7 +5546,7 @@
           {
             "type": "object",
             "required": [
-              "configuration",
+              "profile",
               "assessmentId",
               "memory",
               "limitingResource",
@@ -5366,8 +5554,8 @@
               "_tag"
             ],
             "properties": {
-              "configuration": {
-                "$ref": "#/components/schemas/ModelServingConfiguration"
+              "profile": {
+                "$ref": "#/components/schemas/ServingProfile"
               },
               "assessmentId": {
                 "$ref": "#/components/schemas/ModelAssessmentId"
@@ -5397,13 +5585,13 @@
           {
             "type": "object",
             "required": [
-              "configuration",
+              "profile",
               "failure",
               "_tag"
             ],
             "properties": {
-              "configuration": {
-                "$ref": "#/components/schemas/ModelServingConfiguration"
+              "profile": {
+                "$ref": "#/components/schemas/ServingProfile"
               },
               "failure": {
                 "$ref": "#/components/schemas/ModelFailure"
@@ -5445,22 +5633,26 @@
       "ModelAssessmentRequestId": {
         "type": "string"
       },
-      "ModelBundleInput": {
+      "ModelAssessmentSubject": {
         "oneOf": [
           {
             "type": "object",
             "required": [
-              "package",
+              "modelId",
+              "selection",
               "_tag"
             ],
             "properties": {
-              "package": {
-                "$ref": "#/components/schemas/ModelPackageOperand"
+              "modelId": {
+                "$ref": "#/components/schemas/ModelId"
+              },
+              "selection": {
+                "$ref": "#/components/schemas/CatalogModelSelection"
               },
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "Standalone"
+                  "Catalog"
                 ]
               }
             }
@@ -5468,25 +5660,17 @@
           {
             "type": "object",
             "required": [
-              "target",
-              "draftSource",
-              "method",
+              "modelId",
               "_tag"
             ],
             "properties": {
-              "target": {
-                "$ref": "#/components/schemas/ModelPackageOperand"
-              },
-              "draftSource": {
-                "$ref": "#/components/schemas/SpeculativeDraftSourceInput"
-              },
-              "method": {
-                "$ref": "#/components/schemas/SpeculativeMethod"
+              "modelId": {
+                "$ref": "#/components/schemas/ModelId"
               },
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "SpeculativeDecoding"
+                  "Discovery"
                 ]
               }
             }
@@ -5517,185 +5701,6 @@
         },
         "additionalProperties": false
       },
-      "ModelDownload": {
-        "type": "object",
-        "required": [
-          "id",
-          "bundle",
-          "state"
-        ],
-        "properties": {
-          "id": {
-            "$ref": "#/components/schemas/ModelDownloadId"
-          },
-          "bundle": {
-            "$ref": "#/components/schemas/ServableModelBundle"
-          },
-          "state": {
-            "$ref": "#/components/schemas/ModelDownloadState"
-          }
-        },
-        "additionalProperties": false
-      },
-      "ModelDownloadId": {
-        "type": "string"
-      },
-      "ModelDownloadState": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "completedBytes",
-              "totalBytes",
-              "_tag"
-            ],
-            "properties": {
-              "completedBytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "totalBytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Pending"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "stage",
-              "completedBytes",
-              "totalBytes",
-              "_tag"
-            ],
-            "properties": {
-              "stage": {
-                "$ref": "#/components/schemas/DownloadStage"
-              },
-              "completedBytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "totalBytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "bytesPerSecond": {
-                "type": [
-                  "integer",
-                  "null"
-                ],
-                "format": "int64",
-                "minimum": 0
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Downloading"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "_tag"
-            ],
-            "properties": {
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Completed"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "completedBytes",
-              "totalBytes",
-              "failure",
-              "acknowledged",
-              "_tag"
-            ],
-            "properties": {
-              "completedBytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "totalBytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "failure": {
-                "$ref": "#/components/schemas/DownloadFailure"
-              },
-              "acknowledged": {
-                "type": "boolean"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Failed"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "completedBytes",
-              "totalBytes",
-              "_tag"
-            ],
-            "properties": {
-              "completedBytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "totalBytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Cancelled"
-                ]
-              }
-            }
-          }
-        ]
-      },
-      "ModelDownloadsResponse": {
-        "type": "object",
-        "required": [
-          "downloads"
-        ],
-        "properties": {
-          "downloads": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ModelDownload"
-            }
-          }
-        }
-      },
       "ModelFailure": {
         "type": "object",
         "required": [
@@ -5716,180 +5721,78 @@
         },
         "additionalProperties": false
       },
-      "ModelFile": {
-        "type": "object",
-        "required": [
-          "id",
-          "path",
-          "role",
-          "sizeBytes",
-          "sha256"
-        ],
-        "properties": {
-          "id": {
-            "$ref": "#/components/schemas/ModelFileId"
-          },
-          "path": {
-            "type": "string"
-          },
-          "role": {
-            "$ref": "#/components/schemas/ModelFileRole"
-          },
-          "sizeBytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "tensorStorageBytes": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Exact encoded tensor storage, when bounded GGUF inspection succeeded.",
-            "minimum": 0
-          },
-          "sha256": {
-            "type": "string"
-          }
-        },
-        "additionalProperties": false
-      },
-      "ModelFileId": {
+      "ModelId": {
         "type": "string"
       },
-      "ModelFileRelationship": {
+      "ModelInstallation": {
         "oneOf": [
           {
             "type": "object",
             "required": [
-              "fileId",
-              "index",
-              "count",
+              "installedBytes",
+              "primaryPath",
+              "ownership",
               "_tag"
             ],
             "properties": {
-              "fileId": {
-                "$ref": "#/components/schemas/ModelFileId"
-              },
-              "index": {
+              "installedBytes": {
                 "type": "integer",
-                "format": "int32",
+                "format": "int64",
                 "minimum": 0
               },
-              "count": {
+              "primaryPath": {
+                "type": "string"
+              },
+              "ownership": {
+                "$ref": "#/components/schemas/ModelInstallationOwnership"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Resolved"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "installedBytes",
+              "ownership",
+              "_tag"
+            ],
+            "properties": {
+              "installedBytes": {
                 "type": "integer",
-                "format": "int32",
+                "format": "int64",
                 "minimum": 0
               },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Shard"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "projectorFileId",
-              "weightsFileId",
-              "_tag"
-            ],
-            "properties": {
-              "projectorFileId": {
-                "$ref": "#/components/schemas/ModelFileId"
-              },
-              "weightsFileId": {
-                "$ref": "#/components/schemas/ModelFileId"
+              "ownership": {
+                "$ref": "#/components/schemas/ModelInstallationOwnership"
               },
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "ProjectorFor"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "mtpFileId",
-              "weightsFileId",
-              "_tag"
-            ],
-            "properties": {
-              "mtpFileId": {
-                "$ref": "#/components/schemas/ModelFileId"
-              },
-              "weightsFileId": {
-                "$ref": "#/components/schemas/ModelFileId"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "MtpFor"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "draftFileId",
-              "weightsFileId",
-              "method",
-              "_tag"
-            ],
-            "properties": {
-              "draftFileId": {
-                "$ref": "#/components/schemas/ModelFileId"
-              },
-              "weightsFileId": {
-                "$ref": "#/components/schemas/ModelFileId"
-              },
-              "method": {
-                "$ref": "#/components/schemas/SpeculativeMethod"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "DraftFor"
+                  "Unresolved"
                 ]
               }
             }
           }
         ]
       },
-      "ModelFileRole": {
+      "ModelInstallationOwnership": {
         "type": "string",
         "enum": [
-          "weights",
-          "projector",
-          "draft",
-          "mtp",
-          "auxiliary"
+          "Magnitude",
+          "ExternalHuggingFace",
+          "Mixed"
         ]
-      },
-      "ModelIdentityRequest": {
-        "type": "object",
-        "required": [
-          "modelId"
-        ],
-        "properties": {
-          "modelId": {
-            "type": "string"
-          }
-        },
-        "additionalProperties": false
       },
       "ModelInstance": {
         "type": "object",
         "required": [
           "id",
           "modelId",
-          "configuration",
           "lifecycle"
         ],
         "properties": {
@@ -5897,12 +5800,7 @@
             "$ref": "#/components/schemas/ModelInstanceId"
           },
           "modelId": {
-            "type": "string",
-            "description": "Canonical callable model identity (for example `model:format:variant`)."
-          },
-          "configuration": {
-            "$ref": "#/components/schemas/ModelServingConfiguration",
-            "description": "Exact serving configuration admitted for this physical occurrence."
+            "$ref": "#/components/schemas/ModelId"
           },
           "lifecycle": {
             "$ref": "#/components/schemas/ModelInstanceLifecycle"
@@ -6257,172 +6155,20 @@
           "verifying"
         ]
       },
-      "ModelPackage": {
-        "type": "object",
-        "required": [
-          "id",
-          "source",
-          "files",
-          "relationships",
-          "properties"
-        ],
-        "properties": {
-          "id": {
-            "$ref": "#/components/schemas/ModelPackageId"
-          },
-          "source": {
-            "$ref": "#/components/schemas/ModelPackageSource"
-          },
-          "files": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ModelFile"
-            }
-          },
-          "relationships": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ModelFileRelationship"
-            }
-          },
-          "properties": {
-            "$ref": "#/components/schemas/ModelPackageProperties"
-          }
-        },
-        "additionalProperties": false
-      },
-      "ModelPackageId": {
-        "type": "string"
-      },
-      "ModelPackageInspection": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "_tag"
-            ],
-            "properties": {
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Pending"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "capabilities",
-              "_tag"
-            ],
-            "properties": {
-              "capabilities": {
-                "$ref": "#/components/schemas/ModelCapabilities"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Inspected"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "failure",
-              "_tag"
-            ],
-            "properties": {
-              "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Invalid"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "failure",
-              "_tag"
-            ],
-            "properties": {
-              "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Incompatible"
-                ]
-              }
-            }
-          }
-        ]
-      },
-      "ModelPackageInstallationOrigin": {
-        "type": "string",
-        "enum": [
-          "Magnitude",
-          "HuggingFaceCache"
-        ]
-      },
-      "ModelPackageOperand": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "packageId",
-              "_tag"
-            ],
-            "properties": {
-              "packageId": {
-                "$ref": "#/components/schemas/ModelPackageId"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Installed"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "package",
-              "_tag"
-            ],
-            "properties": {
-              "package": {
-                "$ref": "#/components/schemas/ModelPackage"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "SourceBacked"
-                ]
-              }
-            }
-          }
-        ]
-      },
-      "ModelPackageProperties": {
+      "ModelMetadata": {
         "type": "object",
         "required": [
           "format",
+          "architecture",
           "quantization",
           "quantizationName",
-          "architecture"
+          "storageBytes"
         ],
         "properties": {
           "format": {
+            "type": "string"
+          },
+          "architecture": {
             "type": "string"
           },
           "quantization": {
@@ -6431,75 +6177,18 @@
           "quantizationName": {
             "type": "string"
           },
-          "architecture": {
-            "type": "string"
-          },
-          "maximumContextLength": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
+          "storageBytes": {
+            "type": "integer",
+            "format": "int64",
             "minimum": 0
           },
-          "intrinsicModelId": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "intrinsicQualityId": {
-            "type": [
-              "string",
-              "null"
-            ]
+          "maximumContextLength": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           }
         },
         "additionalProperties": false
-      },
-      "ModelPackageSource": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "repository",
-              "revision",
-              "_tag"
-            ],
-            "properties": {
-              "repository": {
-                "type": "string"
-              },
-              "revision": {
-                "type": "string"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "HuggingFace"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "path",
-              "_tag"
-            ],
-            "properties": {
-              "path": {
-                "type": "string"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Local"
-                ]
-              }
-            }
-          }
-        ]
       },
       "ModelParameterization": {
         "oneOf": [
@@ -6589,22 +6278,6 @@
           "memory_pressure"
         ]
       },
-      "ModelServingConfiguration": {
-        "type": "object",
-        "required": [
-          "bundle",
-          "profile"
-        ],
-        "properties": {
-          "bundle": {
-            "$ref": "#/components/schemas/ServableModelBundle"
-          },
-          "profile": {
-            "$ref": "#/components/schemas/ServingProfile"
-          }
-        },
-        "additionalProperties": false
-      },
       "ModelStoppingAllocation": {
         "oneOf": [
           {
@@ -6643,38 +6316,6 @@
             }
           }
         ]
-      },
-      "ModelsResponse": {
-        "type": "object",
-        "required": [
-          "revision",
-          "reconciliationComplete",
-          "models",
-          "diagnostics"
-        ],
-        "properties": {
-          "revision": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "reconciliationComplete": {
-            "type": "boolean"
-          },
-          "models": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/InferenceModel"
-            }
-          },
-          "diagnostics": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/CatalogDiagnostic"
-            }
-          }
-        },
-        "additionalProperties": false
       },
       "NamedFunctionCallRequest": {
         "type": "object",
@@ -6864,6 +6505,29 @@
         },
         "additionalProperties": false
       },
+      "ReadyModel": {
+        "type": "object",
+        "required": [
+          "metadata",
+          "profile",
+          "capabilities"
+        ],
+        "properties": {
+          "metadata": {
+            "$ref": "#/components/schemas/ModelMetadata"
+          },
+          "profile": {
+            "$ref": "#/components/schemas/ServingProfile"
+          },
+          "capabilities": {
+            "$ref": "#/components/schemas/ModelCapabilities"
+          },
+          "speculativeMethod": {
+            "$ref": "#/components/schemas/SpeculativeMethod"
+          }
+        },
+        "additionalProperties": false
+      },
       "ReasoningEffortRequest": {
         "type": "string"
       },
@@ -6885,20 +6549,37 @@
         },
         "additionalProperties": false
       },
-      "RemoveInstalledModelPackageResponse": {
-        "type": "object",
-        "required": [
-          "packageId",
-          "removed"
-        ],
-        "properties": {
-          "packageId": {
-            "$ref": "#/components/schemas/ModelPackageId"
-          },
-          "removed": {
-            "type": "boolean"
+      "ResolvedModelInstallation": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "installedBytes",
+              "primaryPath",
+              "ownership",
+              "_tag"
+            ],
+            "properties": {
+              "installedBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "primaryPath": {
+                "type": "string"
+              },
+              "ownership": {
+                "$ref": "#/components/schemas/ModelInstallationOwnership"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Resolved"
+                ]
+              }
+            }
           }
-        }
+        ]
       },
       "ResponseContentBlock": {
         "oneOf": [
@@ -8110,54 +7791,6 @@
           "assistant"
         ]
       },
-      "ServableModelBundle": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "package",
-              "_tag"
-            ],
-            "properties": {
-              "package": {
-                "$ref": "#/components/schemas/ModelPackage"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Standalone"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "target",
-              "draftSource",
-              "method",
-              "_tag"
-            ],
-            "properties": {
-              "target": {
-                "$ref": "#/components/schemas/ModelPackage"
-              },
-              "draftSource": {
-                "$ref": "#/components/schemas/SpeculativeDraftSource"
-              },
-              "method": {
-                "$ref": "#/components/schemas/SpeculativeMethod"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "SpeculativeDecoding"
-                ]
-              }
-            }
-          }
-        ]
-      },
       "ServingProfile": {
         "type": "object",
         "required": [
@@ -8171,78 +7804,6 @@
           }
         },
         "additionalProperties": false
-      },
-      "SpeculativeDraftSource": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "_tag"
-            ],
-            "properties": {
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Embedded"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "draft",
-              "_tag"
-            ],
-            "properties": {
-              "draft": {
-                "$ref": "#/components/schemas/ModelPackage"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Separate"
-                ]
-              }
-            }
-          }
-        ]
-      },
-      "SpeculativeDraftSourceInput": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "_tag"
-            ],
-            "properties": {
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Embedded"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "draft",
-              "_tag"
-            ],
-            "properties": {
-              "draft": {
-                "$ref": "#/components/schemas/ModelPackageOperand"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Separate"
-                ]
-              }
-            }
-          }
-        ]
       },
       "SpeculativeMethod": {
         "oneOf": [
@@ -8712,32 +8273,6 @@
             }
           }
         ]
-      },
-      "UninstallModelResponse": {
-        "type": "object",
-        "required": [
-          "modelId",
-          "removedPackageIds",
-          "retainedPackageIds"
-        ],
-        "properties": {
-          "modelId": {
-            "type": "string"
-          },
-          "removedPackageIds": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ModelPackageId"
-            }
-          },
-          "retainedPackageIds": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ModelPackageId"
-            }
-          }
-        },
-        "additionalProperties": false
       },
       "Usage": {
         "type": "object",

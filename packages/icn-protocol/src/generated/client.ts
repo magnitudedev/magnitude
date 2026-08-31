@@ -16,10 +16,34 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         countAnthropicMessageTokens: makeHttpOperation(http, options, Operations.countAnthropicMessageTokensOperation),
         createAnthropicMessage: makeHttpOperation(http, options, Operations.createAnthropicMessageOperation),
       },
+      catalog: {
+        acknowledgeCatalogInstallationFailure: makeHttpOperation(
+          http,
+          options,
+          Operations.acknowledgeCatalogInstallationFailureOperation,
+        ),
+        cancelCatalogInstallation: makeHttpOperation(http, options, Operations.cancelCatalogInstallationOperation),
+        getCatalogInstallation: makeHttpOperation(http, options, Operations.getCatalogInstallationOperation),
+        getCatalogModel: makeHttpOperation(http, options, Operations.getCatalogModelOperation),
+        installCatalogModel: makeHttpOperation(http, options, Operations.installCatalogModelOperation),
+        listCatalogInstallations: makeHttpOperation(http, options, Operations.listCatalogInstallationsOperation),
+        listCatalogModels: makeHttpOperation(http, options, Operations.listCatalogModelsOperation),
+        removeCatalogModelInstallation: makeHttpOperation(
+          http,
+          options,
+          Operations.removeCatalogModelInstallationOperation,
+        ),
+        assessCatalogModels: makeStreamOperation(http, options, Operations.assessCatalogModelsOperation),
+      },
       chat: {
         applyChatTemplate: makeHttpOperation(http, options, Operations.applyChatTemplateOperation),
         createChatCompletion: makeStreamOperation(http, options, Operations.createChatCompletionOperation),
         createChatCompletionHttp: makeHttpOperation(http, options, Operations.createChatCompletionHttpOperation),
+      },
+      discovery: {
+        listDiscoveredModels: makeHttpOperation(http, options, Operations.listDiscoveredModelsOperation),
+        refreshDiscoveredModels: makeHttpOperation(http, options, Operations.refreshDiscoveredModelsOperation),
+        assessDiscoveredModels: makeStreamOperation(http, options, Operations.assessDiscoveredModelsOperation),
       },
       huggingFace: {
         resolveHuggingFaceRepository: makeHttpOperation(
@@ -35,28 +59,12 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         createResponseHttp: makeHttpOperation(http, options, Operations.createResponseHttpOperation),
       },
       models: {
-        acknowledgeModelDownloadFailure: makeHttpOperation(
-          http,
-          options,
-          Operations.acknowledgeModelDownloadFailureOperation,
-        ),
-        cancelModelDownload: makeHttpOperation(http, options, Operations.cancelModelDownloadOperation),
         ensureModelInstance: makeHttpOperation(http, options, Operations.ensureModelInstanceOperation),
-        getInstalledModelPackage: makeHttpOperation(http, options, Operations.getInstalledModelPackageOperation),
-        getModel: makeHttpOperation(http, options, Operations.getModelOperation),
-        getModelDownload: makeHttpOperation(http, options, Operations.getModelDownloadOperation),
         getModelInstance: makeHttpOperation(http, options, Operations.getModelInstanceOperation),
         getModelInstances: makeHttpOperation(http, options, Operations.getModelInstancesOperation),
         getModelProperties: makeHttpOperation(http, options, Operations.getModelPropertiesOperation),
-        installModel: makeHttpOperation(http, options, Operations.installModelOperation),
-        listInstalledModels: makeHttpOperation(http, options, Operations.listInstalledModelsOperation),
-        listModelDownloads: makeHttpOperation(http, options, Operations.listModelDownloadsOperation),
-        listModels: makeHttpOperation(http, options, Operations.listModelsOperation),
         previewModelLoad: makeHttpOperation(http, options, Operations.previewModelLoadOperation),
-        removeInstalledModel: makeHttpOperation(http, options, Operations.removeInstalledModelOperation),
         stopModelInstance: makeHttpOperation(http, options, Operations.stopModelInstanceOperation),
-        uninstallModel: makeHttpOperation(http, options, Operations.uninstallModelOperation),
-        assessModels: makeStreamOperation(http, options, Operations.assessModelsOperation),
       },
       system: {
         getHardware: makeHttpOperation(http, options, Operations.getHardwareOperation),

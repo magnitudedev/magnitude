@@ -2,8 +2,8 @@ import { useCallback, useMemo } from "react"
 import { Option, type Equivalence } from "effect"
 import { Atom, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import {
+  type CatalogFormModelId,
   type LocalModelsState,
-  type ProviderModelId,
   type SlotId,
   type SlotSelection,
 } from "@magnitudedev/sdk"
@@ -105,7 +105,7 @@ export function useLocalModelActions() {
   return {
     ...mutations,
     installAndAssign: useCallback((
-      modelId: ProviderModelId,
+      modelId: CatalogFormModelId,
       slotId: SlotId,
       reasoningEffort: SlotSelection["reasoningEffort"],
     ) => {
