@@ -17,7 +17,7 @@ import { ModelSlotController, ModelSlotControllerLive } from "./model-slot-contr
 import { ProviderModelCatalog } from "./provider-model-catalog"
 
 describe("model slot reconciliation", () => {
-  it("preserves a local selection while its discovered model has no provider offering", async () => {
+  it("preserves a local selection while its discovered model is unavailable", async () => {
     const localModels = Schema.validateSync(LocalModelsStateSchema)({
       reconciliationComplete: true,
       models: [{
@@ -31,10 +31,16 @@ describe("model slot reconciliation", () => {
           sourceUrls: ["https://huggingface.co/owner/repository"],
         },
         state: {
-          _tag: "Ambiguous",
+          _tag: "Unavailable",
+          installation: {
+            _tag: "Resolved",
+            installedBytes: 1,
+            primaryPath: "/model.gguf",
+            ownership: "ExternalHuggingFace",
+          },
           failure: {
-            code: "ambiguous_hugging_face_artifact",
-            message: "Multiple installed revisions provide this Hugging Face artifact",
+            code: "invalid_gguf",
+            message: "The selected artifact is invalid",
             retryable: false,
           },
         },

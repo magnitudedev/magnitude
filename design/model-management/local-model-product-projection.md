@@ -28,8 +28,8 @@ not management state.
 
 Each row already carries a valid canonical `ModelId`. Catalog rows exist without local material and
 have `NotInstalled` or `Installed` local state. Discovered rows exist because material was observed
-and have exactly one truthful state: `Ready`, `Unavailable`, or `Ambiguous`. Only states with an
-installation contain installation data; ambiguity never fabricates one.
+and have exactly one truthful state: `Ready` or `Unavailable`; both contain the selected resolved
+installation.
 
 ## ACN projection
 
@@ -42,12 +42,11 @@ separately, then publishes one `LocalModel` union:
 Shared fields contain presentation and canonical `modelId`. Catalog rows directly contain their
 catalog data, acquisition state, and serving state. A discovered row contains one structural state:
 `Ready` owns its resolved installation, residency, catalog attribution, and serving state;
-`Unavailable` owns its resolved installation and native failure; and `Ambiguous` owns only its
-native failure. Unavailable and ambiguous discoveries have no catalog-attribution fact because
-there is no selected ready artifact to attribute.
+`Unavailable` owns its resolved installation and native failure. An unavailable discovery has no
+catalog-attribution fact because its selected artifact is not ready.
 Presentation may include deduplicated HTTPS source links, but never package or bundle structure.
-Where present, serving state is `Assessing`, `Failed`, or `Assessed`. Native catalog/discovery rows already carry
-a complete desired, effective, unavailable, or ambiguous resolution, so ACN never fabricates an
+Where present, serving state is `Assessing`, `Failed`, or `Assessed`. Native catalog/discovery rows
+already carry a complete desired, effective, or unavailable resolution, so ACN never fabricates an
 intermediate resolving row. A failed ready discovery retains the selected serving profile. A
 catalog failure retains a profile only when one was resolved. An assessed state contains metadata,
 capabilities, and one assessment that owns its exact profile. A fitting catalog assessment alone
@@ -74,8 +73,8 @@ remain authoritative.
 ## Conformance
 
 - Catalog and discovered models share `ModelId` without sharing lifecycle semantics.
-- Every unambiguous callable external Hugging Face artifact appears once under its `hf:` identity.
-- Invalid, incompatible, and ambiguous discovery outcomes remain visible but never become offerings.
+- Every callable external Hugging Face artifact appears once under its `hf:` identity.
+- Invalid and incompatible discovery outcomes remain visible but never become offerings.
 - An externally owned discovery can be selected and loaded but cannot be installed, updated, or
   removed through catalog commands.
 - Provider offerings contain no fallback profile, capability, ranking, package, or bundle data.

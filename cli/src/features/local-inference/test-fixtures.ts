@@ -242,8 +242,7 @@ export const withDoesNotFitAssessment = (model: LocalModel): LocalModel => {
       }
       return { ...model, state: { ...model.state, servingState } }
     }
-    case "Unavailable":
-    case "Ambiguous": throw new Error("DoesNotFit fixture requires a ready discovered model")
+    case "Unavailable": throw new Error("DoesNotFit fixture requires a ready discovered model")
   }
 }
 

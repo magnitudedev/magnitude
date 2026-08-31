@@ -870,7 +870,6 @@ export const DiscoveredModelState = S.Union(
         (): S.Schema<ResolvedModelInstallation, ResolvedModelInstallationEncoded> => ResolvedModelInstallation,
       ),
       model: S.suspend((): S.Schema<ReadyModel, ReadyModelEncoded> => ReadyModel),
-      selectedRevision: S.String,
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
@@ -880,13 +879,6 @@ export const DiscoveredModelState = S.Union(
       installation: S.suspend(
         (): S.Schema<ResolvedModelInstallation, ResolvedModelInstallationEncoded> => ResolvedModelInstallation,
       ),
-      selectedRevision: S.String,
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("Ambiguous", {
-      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),

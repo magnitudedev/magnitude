@@ -2,10 +2,7 @@ import { homedir } from "node:os"
 import type { LocalModel } from "@magnitudedev/sdk"
 
 type DiscoveredLocalModel = Extract<LocalModel, { readonly _tag: "Discovered" }>
-type LocatedDiscoveryState = Exclude<
-  DiscoveredLocalModel["state"],
-  { readonly _tag: "Ambiguous" }
->
+type LocatedDiscoveryState = DiscoveredLocalModel["state"]
 
 export const discoveredModelLocation = (state: LocatedDiscoveryState): string => {
   const path = state.installation.primaryPath

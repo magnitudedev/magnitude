@@ -7,8 +7,8 @@ use icn_contracts::InventoryError;
 use icn_contracts::models::{
     DiscoveredModel, DiscoveredModelCatalogAttribution, DiscoveredModelState, DiscoveredModels,
     DiscoveredModelsResponse, EffectiveModel, HuggingFaceArtifactSelector, HuggingFaceRepositoryId,
-    InstalledCatalogAttribution, InstalledModelPackage, ModelDomainInvalidation, ModelFailure,
-    ModelFileRole, ModelId, ModelPackageId, ModelPackageInstallationOrigin, ServingProfile,
+    InstalledCatalogAttribution, InstalledModelPackage, ModelDomainInvalidation, ModelFileRole,
+    ModelId, ModelPackageInstallationOrigin, ServingProfile,
 };
 
 use crate::inventory::InstalledPackageSnapshot;
@@ -17,31 +17,21 @@ use crate::model_projection::effective_model;
 
 const DEFAULT_EXTERNAL_CONTEXT: u32 = 100_000;
 
-#[derive(Clone)]
-pub(crate) struct DiscoveryCandidate {
+struct DiscoveryCandidate {
     package: InstalledModelPackage,
     commit: String,
     current: bool,
+    modified_at: u64,
 }
 
-pub(crate) enum SelectedDiscovery {
-    Ready(DiscoveryCandidate),
-    Ambiguous(ModelFailure),
-}
-
-impl SelectedDiscovery {
-    pub(crate) fn ready(self) -> Option<InstalledModelPackage> {
-        match self {
-            Self::Ready(candidate) => Some(candidate.package),
-            Self::Ambiguous(_) => None,
-        }
-    }
+fn candidate_preference(candidate: &DiscoveryCandidate) -> (bool, u64, &str) {
+    (candidate.current, candidate.modified_at, &candidate.commit)
 }
 
 pub(crate) fn selected_discovered_packages(
     installed: &InstalledPackageSnapshot,
-) -> BTreeMap<ModelId, SelectedDiscovery> {
-    let mut candidates = BTreeMap::<ModelId, Vec<DiscoveryCandidate>>::new();
+) -> BTreeMap<ModelId, InstalledModelPackage> {
+    let mut selected = BTreeMap::<ModelId, DiscoveryCandidate>::new();
     for record in installed.records.values() {
         if record.installed.origin != ModelPackageInstallationOrigin::HuggingFaceCache {
             continue;
@@ -70,52 +60,29 @@ pub(crate) fn selected_discovered_packages(
         let Ok(repository) = HuggingFaceRepositoryId::new(repository.clone()) else {
             continue;
         };
-        candidates
-            .entry(ModelId::hugging_face(&repository, &selector))
-            .or_default()
-            .push(DiscoveryCandidate {
-                package: record.installed.clone(),
-                commit: commit.clone(),
-                current: requested_revision == "main",
-            });
+        let id = ModelId::hugging_face(&repository, &selector);
+        let candidate = DiscoveryCandidate {
+            package: record.installed.clone(),
+            commit: commit.clone(),
+            current: requested_revision == "main",
+            modified_at: record.model.updated_at,
+        };
+        match selected.entry(id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry)
+                if candidate_preference(&candidate) > candidate_preference(entry.get()) =>
+            {
+                entry.insert(candidate);
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
     }
 
-    candidates
+    selected
         .into_iter()
-        .map(|(id, grouped)| {
-            let mut distinct = BTreeMap::<ModelPackageId, DiscoveryCandidate>::new();
-            for candidate in grouped {
-                distinct
-                    .entry(candidate.package.package.id.clone())
-                    .and_modify(|existing| {
-                        if candidate.current && !existing.current
-                            || candidate.current == existing.current
-                                && candidate.commit < existing.commit
-                        {
-                            *existing = candidate.clone();
-                        }
-                    })
-                    .or_insert(candidate);
-            }
-            let current = distinct
-                .values()
-                .filter(|candidate| candidate.current)
-                .cloned()
-                .collect::<Vec<_>>();
-            let selected = if current.len() == 1 {
-                SelectedDiscovery::Ready(current.into_iter().next().expect("one current candidate"))
-            } else if current.is_empty() && distinct.len() == 1 {
-                SelectedDiscovery::Ready(distinct.into_values().next().expect("one candidate"))
-            } else {
-                SelectedDiscovery::Ambiguous(ModelFailure {
-                    code: "ambiguous_hugging_face_artifact".to_owned(),
-                    message: "Multiple installed revisions provide this Hugging Face artifact"
-                        .to_owned(),
-                    retryable: false,
-                })
-            };
-            (id, selected)
-        })
+        .map(|(id, candidate)| (id, candidate.package))
         .collect()
 }
 
@@ -123,16 +90,7 @@ fn discovered_models(installed: &InstalledPackageSnapshot) -> Vec<DiscoveredMode
     selected_discovered_packages(installed)
         .into_iter()
         .filter_map(|(id, selected)| {
-            let selected = match selected {
-                SelectedDiscovery::Ready(selected) => selected,
-                SelectedDiscovery::Ambiguous(failure) => {
-                    return Some(DiscoveredModel {
-                        id,
-                        state: DiscoveredModelState::Ambiguous { failure },
-                    });
-                }
-            };
-            let catalog_attribution = match &selected.package.catalog_attribution {
+            let catalog_attribution = match &selected.catalog_attribution {
                 InstalledCatalogAttribution::NotCatalogTarget => {
                     DiscoveredModelCatalogAttribution::NotInCatalog
                 }
@@ -143,17 +101,15 @@ fn discovered_models(installed: &InstalledPackageSnapshot) -> Vec<DiscoveredMode
                 }
                 InstalledCatalogAttribution::Attributed { .. } => return None,
             };
-            let profile = discovered_profile(&selected.package);
-            let (effective, installation) = effective_model(&selected.package, profile);
+            let profile = discovered_profile(&selected);
+            let (effective, installation) = effective_model(&selected, profile);
             let state = match effective {
                 EffectiveModel::Ready { model } => DiscoveredModelState::Ready {
-                    selected_revision: selected.commit,
                     installation,
                     model,
                     catalog_attribution,
                 },
                 EffectiveModel::Unavailable { failure } => DiscoveredModelState::Unavailable {
-                    selected_revision: selected.commit,
                     installation,
                     failure,
                 },
@@ -230,9 +186,9 @@ mod tests {
     use std::path::PathBuf;
 
     use icn_contracts::models::{
-        CatalogBaseId, CatalogVariantId, ModelCapabilities, ModelFile, ModelFileId, ModelPackage,
-        ModelPackageInspection, ModelPackageProperties, ModelPackageSource,
-        ModelReasoningCapabilities,
+        CatalogBaseId, CatalogVariantId, ModelCapabilities, ModelFailure, ModelFile, ModelFileId,
+        ModelPackage, ModelPackageId, ModelPackageInspection, ModelPackageProperties,
+        ModelPackageSource, ModelReasoningCapabilities,
     };
     use icn_contracts::{
         ComponentRole, ContentId, ContentIdentity, Integrity, InventoryEntryId, InventoryModel,
@@ -392,22 +348,47 @@ mod tests {
             "same-package",
             InstalledCatalogAttribution::NotCatalogTarget,
         );
-        let models = discovered_models(&InstalledPackageSnapshot {
+        let selected = selected_discovered_packages(&InstalledPackageSnapshot {
             records: BTreeMap::from([stale, current]),
         });
-        let [
-            DiscoveredModel {
-                state:
-                    DiscoveredModelState::Ready {
-                        selected_revision, ..
-                    },
-                ..
-            },
-        ] = models.as_slice()
-        else {
-            panic!("identical occurrences must collapse to one ready discovery")
-        };
-        assert_eq!(selected_revision, "commit-b");
+        assert_eq!(selected.len(), 1);
+        let candidate = selected.values().next().expect("one selected discovery");
+        assert!(matches!(
+            &candidate.package.source,
+            ModelPackageSource::HuggingFace { revision, .. } if revision == "commit-b"
+        ));
+    }
+
+    #[test]
+    fn prefers_the_most_recent_distinct_revision_without_a_current_ref() {
+        let older = discovery_record(
+            "older",
+            "owner/repo",
+            "model.gguf",
+            "commit-a",
+            "commit-a",
+            "package-a",
+            InstalledCatalogAttribution::NotCatalogTarget,
+        );
+        let mut newer = discovery_record(
+            "newer",
+            "owner/repo",
+            "model.gguf",
+            "commit-b",
+            "commit-b",
+            "package-b",
+            InstalledCatalogAttribution::NotCatalogTarget,
+        );
+        newer.1.model.updated_at = 2;
+        let selected = selected_discovered_packages(&InstalledPackageSnapshot {
+            records: BTreeMap::from([older, newer]),
+        });
+        assert_eq!(selected.len(), 1);
+        let candidate = selected.values().next().expect("one selected discovery");
+        assert!(matches!(
+            &candidate.package.source,
+            ModelPackageSource::HuggingFace { revision, .. } if revision == "commit-b"
+        ));
     }
 
     #[test]

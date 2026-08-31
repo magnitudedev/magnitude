@@ -122,18 +122,19 @@ describe("LocalModelSchema invariants", () => {
         catalogAttribution: { _tag: "NotInCatalog" },
       },
     })).toThrow()
-    const ambiguous = Schema.decodeUnknownSync(LocalModelSchema)({
+    const unavailable = Schema.decodeUnknownSync(LocalModelSchema)({
       _tag: "Discovered",
       modelId: "hf:owner/repository/model.gguf",
       presentation: catalogModel.presentation,
       state: {
-        _tag: "Ambiguous",
-        failure: { code: "ambiguous", message: "Ambiguous", retryable: false },
+        _tag: "Unavailable",
+        installation: { _tag: "Resolved", installedBytes: 1, primaryPath: "/model.gguf", ownership: "ExternalHuggingFace" },
+        failure: { code: "invalid", message: "Invalid", retryable: false },
       },
     })
-    expect(ambiguous._tag).toBe("Discovered")
+    expect(unavailable._tag).toBe("Discovered")
     expect(() => Schema.decodeUnknownSync(LocalModelSchema)({
-      ...ambiguous,
+      ...unavailable,
       modelId: "model:gguf:q4",
     })).toThrow()
   })
@@ -164,16 +165,18 @@ describe("LocalModelSchema invariants", () => {
         servingState: { _tag: "Failed", profile: { contextLength: 4096 }, failure },
       },
     })).not.toThrow()
-    const ambiguous = Schema.decodeUnknownSync(LocalModelSchema)({
+    const unavailable = Schema.decodeUnknownSync(LocalModelSchema)({
       ...discovered,
       state: {
-        _tag: "Ambiguous",
+        _tag: "Unavailable",
+        installation: ready.installation,
         failure,
         servingState: { _tag: "Failed", profile: { contextLength: 4096 }, failure },
       },
     })
-    expect(ambiguous._tag === "Discovered" && ambiguous.state).toEqual({
-      _tag: "Ambiguous",
+    expect(unavailable._tag === "Discovered" && unavailable.state).toEqual({
+      _tag: "Unavailable",
+      installation: ready.installation,
       failure,
     })
   })

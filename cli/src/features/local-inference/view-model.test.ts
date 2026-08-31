@@ -1,6 +1,6 @@
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
-import { HuggingFaceFormModelIdSchema, type LocalModel } from "@magnitudedev/sdk"
+import type { LocalModel } from "@magnitudedev/sdk"
 import {
   buildLocalInferenceSelections,
   installedLocalModels,
@@ -68,7 +68,7 @@ describe("unified local inference projection", () => {
       .toEqual([installed])
   })
 
-  it("treats only Hugging Face discoveries with a resolved installation as installed", () => {
+  it("retains an unavailable Hugging Face discovery as installed material", () => {
     const base = makeModel()
     const failure = { code: "invalid_artifact", message: "Invalid artifact", retryable: false }
     const unavailable: LocalModel = {
@@ -80,12 +80,7 @@ describe("unified local inference projection", () => {
         failure,
       },
     }
-    const ambiguous: LocalModel = {
-      ...base,
-      modelId: HuggingFaceFormModelIdSchema.make("hf:test/model/ambiguous.gguf"),
-      state: { _tag: "Ambiguous", failure },
-    }
-    expect(installedLocalModels(makeView({ models: [unavailable, ambiguous] }).models))
+    expect(installedLocalModels(makeView({ models: [unavailable] }).models))
       .toEqual([unavailable])
   })
 

@@ -66,9 +66,7 @@ export const findLocalModelById = (
 
 export const localModelInstalledBytes = (model: LocalModel): Option.Option<number> => {
   if (model._tag === "Discovered") {
-    return model.state._tag === "Ambiguous"
-      ? Option.none()
-      : Option.some(model.state.installation.installedBytes)
+    return Option.some(model.state.installation.installedBytes)
   }
   return Option.fromNullable(installedAcquisition(model.acquisitionState)?.installation.installedBytes)
 }
@@ -80,7 +78,7 @@ export const localModelStorageBytes = (model: LocalModel): Option.Option<number>
 
 export const localModelIsInstalled = (model: LocalModel): boolean =>
   model._tag === "Discovered"
-    ? model.state._tag !== "Ambiguous"
+    ? true
     : installedAcquisition(model.acquisitionState) !== undefined
 
 export const installedLocalModels = (

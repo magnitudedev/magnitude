@@ -213,7 +213,7 @@ export const localModelInstalledStatus = (
   model: LocalModel,
 ): string => {
   const installation = model._tag === "Discovered"
-    ? model.state._tag === "Ambiguous" ? undefined : model.state.installation
+    ? model.state.installation
     : installedAcquisition(model.acquisitionState)?.installation
   return installation?.ownership === "ExternalHuggingFace" ? "Installed (HF)" : "Installed"
 }
@@ -241,8 +241,7 @@ export const localModelReadinessStatus = (
 export const localModelReadinessFailureMessage = (
   model: LocalModel,
 ): string | null => {
-  if (model._tag === "Discovered"
-    && (model.state._tag === "Unavailable" || model.state._tag === "Ambiguous")) {
+  if (model._tag === "Discovered" && model.state._tag === "Unavailable") {
     return model.state.failure.message
   }
   if (model._tag === "Catalog") {

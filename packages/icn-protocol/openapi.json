@@ -3591,16 +3591,12 @@
           {
             "type": "object",
             "required": [
-              "selectedRevision",
               "installation",
               "model",
               "catalogAttribution",
               "_tag"
             ],
             "properties": {
-              "selectedRevision": {
-                "type": "string"
-              },
               "installation": {
                 "$ref": "#/components/schemas/ResolvedModelInstallation"
               },
@@ -3621,15 +3617,11 @@
           {
             "type": "object",
             "required": [
-              "selectedRevision",
               "installation",
               "failure",
               "_tag"
             ],
             "properties": {
-              "selectedRevision": {
-                "type": "string"
-              },
               "installation": {
                 "$ref": "#/components/schemas/ResolvedModelInstallation"
               },
@@ -3640,24 +3632,6 @@
                 "type": "string",
                 "enum": [
                   "Unavailable"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "failure",
-              "_tag"
-            ],
-            "properties": {
-              "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Ambiguous"
                 ]
               }
             }
