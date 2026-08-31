@@ -1,7 +1,7 @@
 {
   "generator": "@magnitudedev/openapi-effect",
   "generatorVersion": "0.0.1",
-  "protocolHash": "4097b1ed9b41795aa68635af02f8a82d3d55b08bb923960d355f80000ca502e0",
+  "protocolHash": "ede9cb9391603e18b6575e28e006f85e0e5c732d1ef16eab7fb9e42c9e96249f",
   "configHash": "35eaa09ad05c284228c67845b4e6f4db4aa545ca4a74ee0d812d04c6af53ee75",
   "files": [
     "api.ts",
@@ -14,8 +14,6 @@
   "operations": [
     "acknowledgeCatalogInstallationFailure",
     "applyChatTemplate",
-    "assessCatalogModels",
-    "assessDiscoveredModels",
     "cancelCatalogInstallation",
     "countAnthropicMessageTokens",
     "createAnthropicMessage",
@@ -25,6 +23,7 @@
     "getCatalogInstallation",
     "getCatalogModel",
     "getHardware",
+    "getModelAssessments",
     "getModelInstance",
     "getModelInstances",
     "getModelProperties",

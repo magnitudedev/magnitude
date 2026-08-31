@@ -33,7 +33,6 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
           options,
           Operations.removeCatalogModelInstallationOperation,
         ),
-        assessCatalogModels: makeStreamOperation(http, options, Operations.assessCatalogModelsOperation),
       },
       chat: {
         applyChatTemplate: makeHttpOperation(http, options, Operations.applyChatTemplateOperation),
@@ -43,7 +42,6 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
       discovery: {
         listDiscoveredModels: makeHttpOperation(http, options, Operations.listDiscoveredModelsOperation),
         refreshDiscoveredModels: makeHttpOperation(http, options, Operations.refreshDiscoveredModelsOperation),
-        assessDiscoveredModels: makeStreamOperation(http, options, Operations.assessDiscoveredModelsOperation),
       },
       huggingFace: {
         resolveHuggingFaceRepository: makeHttpOperation(
@@ -60,6 +58,7 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
       },
       models: {
         ensureModelInstance: makeHttpOperation(http, options, Operations.ensureModelInstanceOperation),
+        getModelAssessments: makeHttpOperation(http, options, Operations.getModelAssessmentsOperation),
         getModelInstance: makeHttpOperation(http, options, Operations.getModelInstanceOperation),
         getModelInstances: makeHttpOperation(http, options, Operations.getModelInstancesOperation),
         getModelProperties: makeHttpOperation(http, options, Operations.getModelPropertiesOperation),

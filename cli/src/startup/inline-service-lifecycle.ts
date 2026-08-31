@@ -103,13 +103,6 @@ export const serviceStartupChildPhase = (state: AcnLifecycleState): ChildPhase |
         completed: "Inference engine started",
         progress: null,
       }
-    case "DiscoveringLocalModels":
-      return {
-        key: "models",
-        active: "Discovering local models",
-        completed: "Local models discovered",
-        progress: null,
-      }
   }
 }
 

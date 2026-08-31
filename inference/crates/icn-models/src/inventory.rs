@@ -30,6 +30,8 @@ use crate::store_fs::ensure_store_layout;
 const MAX_SCAN_ENTRIES: usize = 100_000;
 const MAX_SCAN_DEPTH: usize = 8;
 const MODEL_INSPECTION_SCHEMA_VERSION: u32 = 3;
+const BACKGROUND_RECONCILIATION_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct CacheEvidence {
@@ -333,9 +335,21 @@ impl ManagedModelStore {
         let reconciliation = self.clone();
         tokio::spawn(async move {
             let _lease = ReconciliationLease(Arc::clone(&reconciliation.reconciliation_running));
-            let result = reconciliation.ensure_installed_model_inventory().await;
-            if let Err(error) = result {
-                tracing::warn!(%error, "installed-model reconciliation failed");
+            while !reconciliation
+                .reconciliation_complete
+                .load(Ordering::Acquire)
+            {
+                match reconciliation.ensure_installed_model_inventory().await {
+                    Ok(()) => break,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            retry_delay_ms = BACKGROUND_RECONCILIATION_RETRY_DELAY.as_millis(),
+                            "installed-model reconciliation failed; retrying"
+                        );
+                        tokio::time::sleep(BACKGROUND_RECONCILIATION_RETRY_DELAY).await;
+                    }
+                }
             }
         });
     }
@@ -2694,6 +2708,55 @@ mod tests {
         let changed = reopened.list().await.unwrap();
         assert_eq!(changed.len(), 1);
         assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_reconciliation_retries_after_a_scan_failure() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let hf_cache = temporary.path().join("hf-cache");
+        let snapshots = hf_cache.join("models--owner--model").join("snapshots");
+        fs::create_dir_all(&snapshots).unwrap();
+        fs::set_permissions(&snapshots, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut config = InventoryConfig::with_roots(
+            temporary.path().join("store"),
+            temporary.path().join("cache"),
+        )
+        .unwrap();
+        config.hf_cache_dirs.push(hf_cache);
+        let manager = ManagedModelStore::open(config).await.unwrap();
+
+        // Leave the invalid tree in place beyond the first retry boundary. A one-shot startup
+        // reconciliation would have exited permanently before the tree is repaired.
+        tokio::time::sleep(BACKGROUND_RECONCILIATION_RETRY_DELAY.saturating_mul(2)).await;
+        assert!(
+            !manager
+                .installed_packages_response()
+                .unwrap()
+                .reconciliation_complete
+        );
+        fs::set_permissions(&snapshots, fs::Permissions::from_mode(0o755)).unwrap();
+
+        tokio::time::timeout(
+            BACKGROUND_RECONCILIATION_RETRY_DELAY.saturating_mul(3),
+            async {
+                loop {
+                    if manager
+                        .installed_packages_response()
+                        .unwrap()
+                        .reconciliation_complete
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await
+        .expect("background reconciliation should recover");
     }
 
     #[tokio::test]

@@ -1,5 +1,10 @@
 import { Cause, Context, Duration, Effect, Layer, Schema } from "effect"
-import { CatalogInstallationsResponse, CatalogModelsResponse, DiscoveredModelsResponse } from "@magnitudedev/icn-protocol/schemas"
+import {
+  CatalogInstallationsResponse,
+  CatalogModelsResponse,
+  DiscoveredModelsResponse,
+  ModelAssessmentsSnapshot,
+} from "@magnitudedev/icn-protocol/schemas"
 import { IcnClient, type IcnClientService } from "../client.js"
 import { makeIcnObservedState, type IcnObservedState } from "../observed-state.js"
 import { IcnEvents, refreshOnIcnEvents } from "../events/index.js"
@@ -8,6 +13,7 @@ type CatalogReadError = Effect.Effect.Error<ReturnType<IcnClientService["catalog
 type DiscoveryReadError = Effect.Effect.Error<ReturnType<IcnClientService["discovery"]["listDiscoveredModels"]>>
 type DiscoveryRefreshError = Effect.Effect.Error<ReturnType<IcnClientService["discovery"]["refreshDiscoveredModels"]>>
 type CatalogInstallationsReadError = Effect.Effect.Error<ReturnType<IcnClientService["catalog"]["listCatalogInstallations"]>>
+type AssessmentsReadError = Effect.Effect.Error<ReturnType<IcnClientService["models"]["getModelAssessments"]>>
 
 export interface IcnCatalogService
   extends IcnObservedState<typeof CatalogModelsResponse.Type, CatalogReadError> {}
@@ -24,6 +30,13 @@ export interface IcnCatalogInstallationsService
 export class IcnCatalogInstallations extends Context.Tag("@magnitudedev/icn/IcnCatalogInstallations")<
   IcnCatalogInstallations,
   IcnCatalogInstallationsService
+>() {}
+
+export interface IcnModelAssessmentsService
+  extends IcnObservedState<typeof ModelAssessmentsSnapshot.Type, AssessmentsReadError> {}
+export class IcnModelAssessments extends Context.Tag("@magnitudedev/icn/IcnModelAssessments")<
+  IcnModelAssessments,
+  IcnModelAssessmentsService
 >() {}
 
 export interface IcnModelDomainOptions { readonly retryInterval?: Duration.DurationInput }
@@ -54,12 +67,7 @@ export const makeIcnDiscovery = (
   const invalidations = yield* (yield* IcnEvents).subscribe
   const read = client.discovery.listDiscoveredModels({})
   const retryInterval = options.retryInterval ?? "1 second"
-  const snapshot = yield* read
-  const initial = snapshot.reconciliationComplete
-    ? snapshot
-    : yield* client.discovery.refreshDiscoveredModels({}).pipe(
-        Effect.timeout(options.reconciliationTimeout ?? "2 minutes"),
-      )
+  const initial = yield* read
   const observed = yield* makeIcnObservedState(initial, read, Schema.equivalence(DiscoveredModelsResponse), {
     initiallyInitialized: true,
   })
@@ -74,6 +82,31 @@ export const makeIcnDiscovery = (
     ),
   })
 }))
+
+export const makeIcnModelAssessments = (
+  options: IcnModelDomainOptions = {},
+): Layer.Layer<IcnModelAssessments, AssessmentsReadError, IcnClient | IcnEvents> =>
+  Layer.scoped(IcnModelAssessments, Effect.gen(function* () {
+    const client = yield* IcnClient
+    const invalidations = yield* (yield* IcnEvents).subscribe
+    const read = client.models.getModelAssessments({})
+    const retryInterval = options.retryInterval ?? "1 second"
+    const initial = yield* read
+    const observed = yield* makeIcnObservedState(
+      initial,
+      read,
+      Schema.equivalence(ModelAssessmentsSnapshot),
+      { initiallyInitialized: true },
+    )
+    yield* refreshOnIcnEvents(
+      invalidations,
+      new Set(["model-assessments"]),
+      observed.refresh,
+      "ICN model assessments",
+      retryInterval,
+    ).pipe(Effect.forkScoped)
+    return IcnModelAssessments.of(observed)
+  }))
 
 export const makeIcnCatalogInstallations = (
   options: IcnModelDomainOptions = {},

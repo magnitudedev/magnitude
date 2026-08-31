@@ -97,72 +97,6 @@ export const AssessmentEnvironmentId = S.String
 export type AssessmentEnvironmentId = S.Schema.Type<typeof AssessmentEnvironmentId>
 export type AssessmentEnvironmentIdEncoded = S.Schema.Encoded<typeof AssessmentEnvironmentId>
 
-export const AssessModelResult = S.Union(
-  S.extend(
-    S.TaggedStruct("Assessed", {
-      profiles: S.Array(S.suspend((): S.Schema<ModelAssessment, ModelAssessmentEncoded> => ModelAssessment)),
-      requestId: S.suspend(
-        (): S.Schema<ModelAssessmentRequestId, ModelAssessmentRequestIdEncoded> => ModelAssessmentRequestId,
-      ),
-      subject: S.suspend((): S.Schema<ModelAssessmentSubject, ModelAssessmentSubjectEncoded> => ModelAssessmentSubject),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("Unavailable", {
-      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
-      requestId: S.suspend(
-        (): S.Schema<ModelAssessmentRequestId, ModelAssessmentRequestIdEncoded> => ModelAssessmentRequestId,
-      ),
-      subject: S.suspend((): S.Schema<ModelAssessmentSubject, ModelAssessmentSubjectEncoded> => ModelAssessmentSubject),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("Failed", {
-      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
-      requestId: S.suspend(
-        (): S.Schema<ModelAssessmentRequestId, ModelAssessmentRequestIdEncoded> => ModelAssessmentRequestId,
-      ),
-      subject: S.suspend((): S.Schema<ModelAssessmentSubject, ModelAssessmentSubjectEncoded> => ModelAssessmentSubject),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-)
-export type AssessModelResult = S.Schema.Type<typeof AssessModelResult>
-export type AssessModelResultEncoded = S.Schema.Encoded<typeof AssessModelResult>
-
-export const AssessModelsEvent = S.Union(
-  S.extend(
-    S.TaggedStruct("Started", {
-      environmentId: S.suspend(
-        (): S.Schema<AssessmentEnvironmentId, AssessmentEnvironmentIdEncoded> => AssessmentEnvironmentId,
-      ),
-      revision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-      totalTargets: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("Result", {
-      result: S.suspend((): S.Schema<AssessModelResult, AssessModelResultEncoded> => AssessModelResult),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("Completed", {
-      environmentId: S.suspend(
-        (): S.Schema<AssessmentEnvironmentId, AssessmentEnvironmentIdEncoded> => AssessmentEnvironmentId,
-      ),
-      revision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-      totalTargets: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-)
-export type AssessModelsEvent = S.Schema.Type<typeof AssessModelsEvent>
-export type AssessModelsEventEncoded = S.Schema.Encoded<typeof AssessModelsEvent>
-
 export const BackendEligibilityReport = S.Struct({
   cuda: S.suspend((): S.Schema<CudaEligibility, CudaEligibilityEncoded> => CudaEligibility),
   metal: S.suspend((): S.Schema<MetalEligibility, MetalEligibilityEncoded> => MetalEligibility),
@@ -185,28 +119,6 @@ export const CacheTypeResponse = S.Union(
 )
 export type CacheTypeResponse = S.Schema.Type<typeof CacheTypeResponse>
 export type CacheTypeResponseEncoded = S.Schema.Encoded<typeof CacheTypeResponse>
-
-export const CatalogAssessmentsRequest = S.Struct({
-  revision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  targets: S.Array(
-    S.suspend((): S.Schema<CatalogAssessmentTarget, CatalogAssessmentTargetEncoded> => CatalogAssessmentTarget),
-  ),
-})
-export type CatalogAssessmentsRequest = S.Schema.Type<typeof CatalogAssessmentsRequest>
-export type CatalogAssessmentsRequestEncoded = S.Schema.Encoded<typeof CatalogAssessmentsRequest>
-
-export const CatalogAssessmentTarget = S.Struct({
-  modelId: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
-  profiles: S.Array(
-    S.suspend((): S.Schema<ModelAssessmentProfile, ModelAssessmentProfileEncoded> => ModelAssessmentProfile),
-  ),
-  requestId: S.suspend(
-    (): S.Schema<ModelAssessmentRequestId, ModelAssessmentRequestIdEncoded> => ModelAssessmentRequestId,
-  ),
-  selection: S.suspend((): S.Schema<CatalogModelSelection, CatalogModelSelectionEncoded> => CatalogModelSelection),
-})
-export type CatalogAssessmentTarget = S.Schema.Type<typeof CatalogAssessmentTarget>
-export type CatalogAssessmentTargetEncoded = S.Schema.Encoded<typeof CatalogAssessmentTarget>
 
 export const CatalogInstallationAdmission = S.Union(
   S.extend(S.TaggedStruct("Current", {}), S.Record({ key: S.String, value: JsonValue })),
@@ -886,27 +798,6 @@ export const DiscoveredModelState = S.Union(
 export type DiscoveredModelState = S.Schema.Type<typeof DiscoveredModelState>
 export type DiscoveredModelStateEncoded = S.Schema.Encoded<typeof DiscoveredModelState>
 
-export const DiscoveryAssessmentsRequest = S.Struct({
-  revision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  targets: S.Array(
-    S.suspend((): S.Schema<DiscoveryAssessmentTarget, DiscoveryAssessmentTargetEncoded> => DiscoveryAssessmentTarget),
-  ),
-})
-export type DiscoveryAssessmentsRequest = S.Schema.Type<typeof DiscoveryAssessmentsRequest>
-export type DiscoveryAssessmentsRequestEncoded = S.Schema.Encoded<typeof DiscoveryAssessmentsRequest>
-
-export const DiscoveryAssessmentTarget = S.Struct({
-  modelId: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
-  profiles: S.Array(
-    S.suspend((): S.Schema<ModelAssessmentProfile, ModelAssessmentProfileEncoded> => ModelAssessmentProfile),
-  ),
-  requestId: S.suspend(
-    (): S.Schema<ModelAssessmentRequestId, ModelAssessmentRequestIdEncoded> => ModelAssessmentRequestId,
-  ),
-})
-export type DiscoveryAssessmentTarget = S.Schema.Type<typeof DiscoveryAssessmentTarget>
-export type DiscoveryAssessmentTargetEncoded = S.Schema.Encoded<typeof DiscoveryAssessmentTarget>
-
 export const DownloadFailure = S.Union(
   S.extend(S.TaggedStruct("Interrupted", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(
@@ -1476,6 +1367,7 @@ export const InferenceResourceTopic = S.Union(
   S.Literal("hardware"),
   S.Literal("catalog"),
   S.Literal("discovery"),
+  S.Literal("model-assessments"),
   S.Literal("catalog-installations"),
   S.Literal("instances"),
 )
@@ -1665,20 +1557,112 @@ export const ModelAssessment = S.Union(
 export type ModelAssessment = S.Schema.Type<typeof ModelAssessment>
 export type ModelAssessmentEncoded = S.Schema.Encoded<typeof ModelAssessment>
 
+export const ModelAssessmentDomainSnapshot = S.Union(
+  S.extend(
+    S.TaggedStruct("Pending", {
+      sourceRevision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Assessing", {
+      entries: S.Array(
+        S.suspend((): S.Schema<ModelAssessmentEntry, ModelAssessmentEntryEncoded> => ModelAssessmentEntry),
+      ),
+      failedTargets: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      settledTargets: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      sourceRevision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      totalTargets: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Complete", {
+      entries: S.Array(
+        S.suspend((): S.Schema<ModelAssessmentEntry, ModelAssessmentEntryEncoded> => ModelAssessmentEntry),
+      ),
+      failedTargets: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      sourceRevision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      totalTargets: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Failed", {
+      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
+      sourceRevision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ModelAssessmentDomainSnapshot = S.Schema.Type<typeof ModelAssessmentDomainSnapshot>
+export type ModelAssessmentDomainSnapshotEncoded = S.Schema.Encoded<typeof ModelAssessmentDomainSnapshot>
+
+export const ModelAssessmentEntry = S.Struct({
+  state: S.suspend(
+    (): S.Schema<ModelAssessmentEntryState, ModelAssessmentEntryStateEncoded> => ModelAssessmentEntryState,
+  ),
+  subject: S.suspend((): S.Schema<ModelAssessmentSubject, ModelAssessmentSubjectEncoded> => ModelAssessmentSubject),
+})
+export type ModelAssessmentEntry = S.Schema.Type<typeof ModelAssessmentEntry>
+export type ModelAssessmentEntryEncoded = S.Schema.Encoded<typeof ModelAssessmentEntry>
+
+export const ModelAssessmentEntryState = S.Union(
+  S.extend(S.TaggedStruct("Assessing", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Assessed", {
+      profiles: S.Array(S.suspend((): S.Schema<ModelAssessment, ModelAssessmentEncoded> => ModelAssessment)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Failed", {
+      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ModelAssessmentEntryState = S.Schema.Type<typeof ModelAssessmentEntryState>
+export type ModelAssessmentEntryStateEncoded = S.Schema.Encoded<typeof ModelAssessmentEntryState>
+
 export const ModelAssessmentId = S.String
 export type ModelAssessmentId = S.Schema.Type<typeof ModelAssessmentId>
 export type ModelAssessmentIdEncoded = S.Schema.Encoded<typeof ModelAssessmentId>
 
-export const ModelAssessmentProfile = S.Struct({
-  performanceContextTokens: S.Array(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0))),
-  profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
-})
-export type ModelAssessmentProfile = S.Schema.Type<typeof ModelAssessmentProfile>
-export type ModelAssessmentProfileEncoded = S.Schema.Encoded<typeof ModelAssessmentProfile>
+export const ModelAssessmentPoolState = S.Union(
+  S.extend(S.TaggedStruct("Preparing", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Ready", {
+      catalog: S.suspend(
+        (): S.Schema<ModelAssessmentDomainSnapshot, ModelAssessmentDomainSnapshotEncoded> =>
+          ModelAssessmentDomainSnapshot,
+      ),
+      discovered: S.suspend(
+        (): S.Schema<ModelAssessmentDomainSnapshot, ModelAssessmentDomainSnapshotEncoded> =>
+          ModelAssessmentDomainSnapshot,
+      ),
+      environmentId: S.suspend(
+        (): S.Schema<AssessmentEnvironmentId, AssessmentEnvironmentIdEncoded> => AssessmentEnvironmentId,
+      ),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Failed", {
+      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ModelAssessmentPoolState = S.Schema.Type<typeof ModelAssessmentPoolState>
+export type ModelAssessmentPoolStateEncoded = S.Schema.Encoded<typeof ModelAssessmentPoolState>
 
-export const ModelAssessmentRequestId = S.String
-export type ModelAssessmentRequestId = S.Schema.Type<typeof ModelAssessmentRequestId>
-export type ModelAssessmentRequestIdEncoded = S.Schema.Encoded<typeof ModelAssessmentRequestId>
+export const ModelAssessmentsSnapshot = S.Struct({
+  revision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  state: S.suspend((): S.Schema<ModelAssessmentPoolState, ModelAssessmentPoolStateEncoded> => ModelAssessmentPoolState),
+})
+export type ModelAssessmentsSnapshot = S.Schema.Type<typeof ModelAssessmentsSnapshot>
+export type ModelAssessmentsSnapshotEncoded = S.Schema.Encoded<typeof ModelAssessmentsSnapshot>
 
 export const ModelAssessmentSubject = S.Union(
   S.extend(

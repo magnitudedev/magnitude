@@ -13,6 +13,7 @@ import {
   makeIcnCatalog,
   makeIcnCatalogInstallations,
   makeIcnDiscovery,
+  makeIcnModelAssessments,
   makeIcnClient,
   makeIcnProcess,
   makeIcnHardware,
@@ -215,12 +216,8 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
   const withEvents = Layer.provideMerge(makeIcnEvents(), withClient);
   const withHardware = Layer.provideMerge(makeIcnHardware(), withEvents);
   const withCatalog = Layer.provideMerge(makeIcnCatalog(), withHardware);
-  const discovery = Layer.unwrapEffect(Effect.gen(function* () {
-    const lifecycle = yield* AcnServiceLifecycle;
-    yield* lifecycle.reportStarting("DiscoveringModels", Option.none());
-    return makeIcnDiscovery();
-  }));
-  const withModels = Layer.provideMerge(discovery, withCatalog);
-  const withInstallations = Layer.provideMerge(makeIcnCatalogInstallations(), withModels);
+  const withModels = Layer.provideMerge(makeIcnDiscovery(), withCatalog);
+  const withAssessments = Layer.provideMerge(makeIcnModelAssessments(), withModels);
+  const withInstallations = Layer.provideMerge(makeIcnCatalogInstallations(), withAssessments);
   return Layer.provideMerge(IcnInstancesLive, withInstallations).pipe(Layer.orDie);
 };

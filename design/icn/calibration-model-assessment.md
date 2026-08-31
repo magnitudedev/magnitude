@@ -22,7 +22,8 @@ applies_to:
 | --------------------------------------------------------------------------------- | ------- |
 | Hardware discovery, calibration, native planning, memory and performance evidence | ICN     |
 | Serving-configuration construction, canonical identity, validation                | ICN     |
-| Profile policy, assessment demand reconciliation, ranking scores                  | ACN     |
+| Profile policy and assessment demand reconciliation                              | ICN     |
+| Ranking scores                                                                    | ACN     |
 | Target filtering, cache reuse, scheduling, concurrency, native work               | ICN     |
 | Presentation                                                                      | Clients |
 
@@ -77,12 +78,10 @@ metric digest.
 
 ## Model assessment
 
-`POST /api/v1/catalog/assessments` and `POST /api/v1/discovery/assessments` accept targets addressed
-by the current revision of that domain and canonical `ModelId`. A catalog target also selects
-`Desired` or `Effective` material. ICN validates the revision and resolves each target to its exact
-private servable material before admitting work; packages and bundles do not cross the boundary.
-Each requested profile specifies maximum context for one sequence and the context depths at which
-performance must be estimated.
+ICN derives targets from its current catalog and discovery authorities. A catalog target selects
+`Desired` or `Effective` material; a discovery target uses the current ready material. ICN resolves
+each target to exact private servable material before admitting work. Each profile specifies
+maximum context for one sequence and the standard context depths at which performance is estimated.
 
 An uncached assessment performs native work:
 
@@ -109,7 +108,7 @@ object.
 
 ### Results
 
-Every requested profile produces one result:
+Every assessed profile produces one result:
 
 | Result         | Meaning                                                                       |
 | -------------- | ----------------------------------------------------------------------------- |
@@ -117,34 +116,24 @@ Every requested profile produces one result:
 | `DoesNotFit`   | Exact configuration value, memory accounting, limiting resource, and deficit  |
 | `Incompatible` | The artifact/runtime combination cannot execute                               |
 
-The response is a finite generated NDJSON event stream:
+Results are published through the revisioned automatic assessment snapshot. Each source slice
+reports its total, settled, and failed target counts plus the state of each exact subject. A target
+is `Assessing`, `Assessed`, or `Failed`; one target failure does not invalidate sibling results.
 
-```text
-Started(environmentId, totalTargets)
-Result(result) × exactly totalTargets
-Completed(environmentId, totalTargets)
-EOF
-```
-
-Results are emitted as individual targets finish and may arrive out of request order. Request IDs
-provide correlation. `Completed` is the only successful terminal marker; EOF before `Completed` is
-an incomplete operation. The stream has no reconnect behavior.
-
-Malformed or unresolved input produces target-level `InvalidTarget`. An operational failure while
-assessing one requested target produces `Failed` for that request ID; sibling results remain valid.
-`Failed` is not a compatibility or capacity result and creates no cache entry. A failure of shared
-admission fails the endpoint before streaming. A later shared failure truncates the stream; results
-already emitted remain valid and only unresolved request IDs fail in ACN.
+Malformed or permanently unresolved material produces a non-retryable target failure. Operational
+failure produces a retryable target failure, creates no cache entry, and is retried with bounded
+backoff while the exact work remains referenced. Retry admission returns that target to
+`Assessing`. Observation is read-only and has no request, correlation, or stream lifecycle.
 
 ## Profiles
 
-ACN submits the exact profile contained in each issued catalog configuration. Catalog generation rejects a reviewed profile above its artifact
-maximum; a pair is bounded by the lower component maximum. Profiles below 4,096 tokens are not
-submitted. ICN does not search a context range or choose a profile.
+ICN assesses the exact profile contained in each current catalog or discovered configuration.
+Catalog generation rejects a reviewed profile above its artifact maximum; a pair is bounded by the
+lower component maximum. ICN does not search a context range or choose a replacement profile.
 
-For that one profile, ACN requests performance samples at 25K, 50K, 75K, and full configured
-context. Sample depths above the configured context are omitted and duplicates are removed. The
-ordered sample list is nonempty and always ends at the full configured context.
+For that profile, ICN derives performance samples at 25K, 50K, 75K, and full configured context.
+Sample depths above the configured context are omitted and duplicates are removed. The ordered
+sample list is nonempty and always ends at the full configured context.
 
 ## Broad rejection proof
 
@@ -209,19 +198,18 @@ assessment admitted -> Assessing -> terminal result
                                       +-- Failed
 ```
 
-`Assessing` is an internal marker, not a durable record or public operation identity. ACN owns it
-inside the scoped assessment Effect:
+`Assessing` is an internal marker, not a durable record or public operation identity. ICN owns it
+inside its process-lifetime assessment pool:
 
-- enter only after operation admission;
-- complete only from that scope's successful result;
+- enter only while exact work is referenced and admitted;
+- complete only from that exact work's result;
 - publish a typed terminal result on every exit path;
 - never persist it;
-- guard publication by inventory revision and local hardware-cycle generation so overlapping work
-  cannot publish stale completion.
+- guard publication by exact work identity so overlapping reconciliation cannot publish stale
+  completion.
 
-ICN independently bounds the complete stream and every worker job. Target work ends before the
-stream deadline, reserving time to emit terminal events. A caller finishes at its deadline even if
-child termination or reaping stalls.
+ICN independently bounds every worker job. Observation is snapshot-based and does not own or wait
+for assessment work.
 
 ## Assessment cache and single-flight
 
@@ -241,32 +229,27 @@ serialized.
 Stable-topology-checked `Fits`, `DoesNotFit`, and artifact/runtime `Incompatible` results are
 persisted. Operational failures are never persisted.
 
-## ACN demand boundary
+## Automatic assessment pool
 
-`LocalModelAssessor` is ACN's sole native-assessment demand owner. It requests the desired catalog
-material when a catalog model is not installed, effective material when installed, and only ready
-discovered models. It supplies each model's issued profile; ICN resolves and canonically identifies
-the exact private configuration it assesses. Provider, ranking, and product projections consume
-the resulting state and do not invoke assessment directly.
+ICN maintains one assessment pool over the current catalog and discovered-model sources. Catalog
+desired material is admitted immediately when not installed; effective material is used when
+installed. Discovery remains pending until its atomic inventory snapshot is authoritative, then
+ready discoveries are added to the same pool without restarting catalog work.
 
-One source cycle submits at most one request per nonempty domain. ACN does not batch,
-throttle, or capacity-filter the target set; ICN owns target scheduling and native concurrency.
-ACN validates `Started`, revision, exact request-ID cardinality, echoed subject and selection,
-profiles, environment stability, uniqueness, and `Completed`, and publishes each result immediately
-while both source revisions and the hardware-cycle generation remain current.
-
-Source invalidations only request rebuilding and reassessment. Download progress, attempt state,
-semantically equivalent inventory observations, catalog presentation, live memory, and client
-activity cannot admit assessment. A hardware assessment change admits a new cycle without changing
-either source revision.
+Work identity includes the exact resolved bundle, profile, performance depths, and assessment
+environment. Reconciliation retains terminal evidence, joins equivalent in-flight work, queues
+missing work, and cancels work no longer referenced by either current source slice. Publication is
+guarded by that exact identity, so an obsolete completion cannot update a superseding target.
+Catalog and discovery expose independent source revisions and progress views over the unified pool.
+Retryable target and source-reconciliation failures are retried with bounded background backoff.
+Foreground planning takes precedence over queued background assessment.
 
 ## Product behavior
 
 - Reading catalog, inventory, or TUI state does not itself invoke native assessment.
-- One assessor evaluates issued catalog configurations plus canonical standard profiles through
-  the shared assessment service; ICN constructs every resulting exact
-  configuration, and ranking policy consumes only private eligible catalog inputs.
-- Inventory reconciliation is coalesced background work; reads return the last complete snapshot.
+- One ICN-owned pool evaluates current catalog and authoritative discovered configurations; ranking
+  policy consumes only private eligible catalog inputs.
+- Inventory reconciliation is coalesced, retrying background work; reads remain non-blocking.
 - Resolved configurations remain visible while assessment is pending or fails.
 - Only completed `Fits` configurations can become enabled provider offerings; assessment itself
   creates no durable configuration or installation authority.
@@ -276,20 +259,19 @@ either source revision.
 
 - ICN cannot become ready without hardware calibration and an operational worker pool.
 - One same-bundle job returns one result per requested profile.
-- One reconciliation uses at most one HTTP assessment request per nonempty model domain regardless
-  of target count.
-- Progress begins at zero, counts exact submitted targets, and advances once per streamed result.
-- Stream truncation preserves emitted results and fails only unresolved targets.
-- Every profile result carries the exact ICN-constructed serving configuration it assessed.
-- Serving configurations cross the boundary as exact values without a separate configuration ID.
+- Starting discovery or assessment never delays ICN or ACN health.
+- Discovery adds work to the live pool without restarting unchanged catalog work.
+- Progress counts current exact targets and advances once per terminal target result.
+- Every profile result matches the current subject's exact ICN-resolved serving configuration;
+  private material remains inside ICN.
 - Every `Fits` result contains ordered performance samples ending at the profile context.
 - Multiple performance depths for one profile require only one native context graph.
 - Warm exact-cache reads invoke no native planner.
 - Warm `DoesNotFit` cache reads invoke no native planner.
 - Download progress and semantically equivalent source revisions invoke no native assessment.
 - A stale assessment completion cannot overwrite state for a newer semantic key.
-- No domain result represents an operational defect.
-- `Assessing` cannot survive its owning Effect scope.
-- ACN contains no broad capacity filter or fixed assessment batch size.
-- Queueing, native work, caller completion, and child cleanup are all bounded.
+- `Fits`, `DoesNotFit`, and `Incompatible` never represent an operational defect; `Failed` does.
+- `Assessing` cannot exist without pool-owned queued or running work.
+- ACN contains no assessment scheduler, request correlation, or assessment mutation endpoint.
+- Queueing, native work, and child cleanup are bounded.
 - Nested llama.cpp core files remain unmodified.

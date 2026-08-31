@@ -12,30 +12,16 @@ applies_to:
 
 # Model assessment and ranking
 
-ICN owns material resolution, compatibility, memory, placement, performance, filtering, scheduling,
-cache reuse, native concurrency, and deadlines. ACN owns assessment demand, request correlation,
-coherent-inventory publication, and catalog ranking. Clients only render the result.
+ICN owns material resolution, assessment demand, compatibility, memory, placement, performance,
+filtering, scheduling, cache reuse, native concurrency, deadlines, and assessment publication. ACN
+owns catalog ranking and projects native assessment state. Clients only render the result.
 
-Assessment is addressed without exposing material:
-
-- catalog requests send catalog revision, complete `ModelId`, explicit `Desired` or `Effective`
-  selection, and requested profiles;
-- discovery requests send discovery revision, complete `ModelId`, and requested profiles.
-
-ICN validates the domain revision, resolves the selected model to exact private material, and emits
-request-correlated streamed results. Packages, bundles, target IDs, and serving configurations do
-not cross the boundary.
-
-ACN assesses catalog desired material when not installed and effective material when installed. It
-assesses only `Ready` discoveries. Each source cycle starts with exactly its current demands, and a
-result is published only if both source revisions and the hardware cycle still match. Removed or
-superseded models therefore cannot retain stale results.
-
-A hardware assessment change starts a new cycle even when the catalog and discovery revisions are unchanged. ACN
-also guards publication by its local cycle generation, so a slower result from the
-prior hardware environment cannot overwrite the newer cycle. It accepts a stream only when start,
-revision, target count, echoed subject and selection, profiles, uniqueness, environment, and
-completion all correlate with the admitted request.
+The automatic ICN pool assesses catalog desired material when not installed, effective material
+when installed, and only `Ready` discoveries. It publishes a read-only revisioned snapshot with
+independent catalog and discovery source slices. Exact work identity guards publication, so removed
+or superseded models cannot retain stale results. Packages, bundles, and serving configurations do
+not cross the boundary. Retryable target and source failures are observed as failures and retried
+with bounded background backoff while their exact demand remains current.
 
 `Fits`, `DoesNotFit`, and `Incompatible` are genuine terminal evidence. Transport or operation
 failure is `Failed`, not a compatibility result. Hardware observations that were not performed are

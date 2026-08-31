@@ -111,7 +111,6 @@ Client bootstrap
 |       +-- CUDA
 |       `-- Vulkan                                 all daemon startup work <= 5m total
 |   |
-|   `-- DiscoveringLocalModels                   "Discovering local models"
 |       `-- explicit ICN discovery reconciliation  all daemon startup work <= 5m total
 |
 +-- Installing                                    "Installing Magnitude"

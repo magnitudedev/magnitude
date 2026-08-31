@@ -74,7 +74,6 @@ import { SessionLifecycleLive } from "./session-lifecycle"
 import { SessionRuntimeOptionsStoreLive } from "./session-runtime-options"
 import { ModelSelectionLive } from "./model-selection"
 import { makeAcnIcn } from "./icn"
-import { LocalModelAssessorLive } from "./local-model-assessor"
 import { LocalModelSourcesLive } from "./local-model-sources"
 import { LocalModelsLive } from "./local-models"
 import { LocalModelRemovalsLive } from "./local-model-removals"
@@ -428,11 +427,7 @@ const addLocalInferenceServices = <A, E, R>(
     withCustomEndpoints
   )
   const withCatalogAdapter = Layer.provideMerge(LocalModelSourcesLive, withHardware)
-  const withAssessor = Layer.provideMerge(
-    LocalModelAssessorLive,
-    withCatalogAdapter,
-  )
-  const withLocalModels = Layer.provideMerge(LocalModelsLive, withAssessor)
+  const withLocalModels = Layer.provideMerge(LocalModelsLive, withCatalogAdapter)
   const withOfferings = Layer.provideMerge(LocalProviderOfferingsLive, withLocalModels)
   const withOnboarding = Layer.provideMerge(OnboardingLive, withOfferings)
   const withResolver = Layer.provideMerge(

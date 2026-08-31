@@ -79,98 +79,6 @@ export const applyChatTemplateOperation = {
   payloadRequired: true,
 } as const
 
-export const assessCatalogModelsOperation = {
-  operationId: "assessCatalogModels",
-  transport: "ndjson",
-  method: "POST",
-  path: "/api/v1/catalog/assessments",
-  group: "catalog",
-  mediaType: "application/x-ndjson",
-  responseStatus: 200,
-  eventSchema: Schemas.AssessModelsEvent,
-  termination: { type: "eof" },
-  reconnect: { type: "none" },
-  payload: S.suspend(
-    (): S.Schema<Schemas.CatalogAssessmentsRequest, Schemas.CatalogAssessmentsRequestEncoded> =>
-      Schemas.CatalogAssessmentsRequest,
-  ),
-  payloadMediaType: "application/json",
-  payloadRequired: true,
-  errors: [
-    {
-      status: 400,
-      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-      mediaType: "application/json",
-    },
-    {
-      status: 404,
-      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-      mediaType: "application/json",
-    },
-    {
-      status: 409,
-      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-      mediaType: "application/json",
-    },
-    {
-      status: 422,
-      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-      mediaType: "application/json",
-    },
-    {
-      status: 500,
-      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-      mediaType: "application/json",
-    },
-  ],
-} as const
-
-export const assessDiscoveredModelsOperation = {
-  operationId: "assessDiscoveredModels",
-  transport: "ndjson",
-  method: "POST",
-  path: "/api/v1/discovery/assessments",
-  group: "discovery",
-  mediaType: "application/x-ndjson",
-  responseStatus: 200,
-  eventSchema: Schemas.AssessModelsEvent,
-  termination: { type: "eof" },
-  reconnect: { type: "none" },
-  payload: S.suspend(
-    (): S.Schema<Schemas.DiscoveryAssessmentsRequest, Schemas.DiscoveryAssessmentsRequestEncoded> =>
-      Schemas.DiscoveryAssessmentsRequest,
-  ),
-  payloadMediaType: "application/json",
-  payloadRequired: true,
-  errors: [
-    {
-      status: 400,
-      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-      mediaType: "application/json",
-    },
-    {
-      status: 404,
-      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-      mediaType: "application/json",
-    },
-    {
-      status: 409,
-      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-      mediaType: "application/json",
-    },
-    {
-      status: 422,
-      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-      mediaType: "application/json",
-    },
-    {
-      status: 500,
-      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-      mediaType: "application/json",
-    },
-  ],
-} as const
-
 export const cancelCatalogInstallationOperation = {
   operationId: "cancelCatalogInstallation",
   transport: "http",
@@ -599,6 +507,25 @@ export const getHardwareOperation = {
       mediaType: "application/json",
     },
   ],
+} as const
+
+export const getModelAssessmentsOperation = {
+  operationId: "getModelAssessments",
+  transport: "http",
+  method: "GET",
+  path: "/api/v1/model-assessments",
+  group: "models",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.ModelAssessmentsSnapshot, Schemas.ModelAssessmentsSnapshotEncoded> =>
+          Schemas.ModelAssessmentsSnapshot,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [],
 } as const
 
 export const getModelInstanceOperation = {
