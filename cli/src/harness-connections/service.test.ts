@@ -20,6 +20,7 @@ import {
   codexModelCatalog,
   harnessExecutableSearchPath,
   hermesProviderConfig,
+  hermesReasoningOverrides,
   makeHarnessConnectionService,
   makeHarnessConnectorRegistry,
   ohMyPiProviderConfig,
@@ -34,6 +35,11 @@ import {
 const model = ProviderModelIdSchema.make("local/model")
 const secondModel = ProviderModelIdSchema.make("local/second-model")
 const high = ReasoningEffortSchema.make("high")
+const none = ReasoningEffortSchema.make("none")
+const low = ReasoningEffortSchema.make("low")
+const xhigh = ReasoningEffortSchema.make("xhigh")
+const adaptive = ReasoningEffortSchema.make("adaptive")
+const deliberate = ReasoningEffortSchema.make("deliberate")
 const models = [
   {
     id: model,
@@ -178,13 +184,13 @@ describe("HarnessConnector contract and registry", () => {
   })
 
   it("uses all models in model-enumerating provider formats", () => {
-    expect(piProviderConfig(models).models).toEqual(models)
-    expect(openCodeProviderConfig(models).models).toEqual({
-      [model]: { name: "Local Model (Q4)" },
-      [secondModel]: { name: "Second Model (Q6)" },
+    expect(piProviderConfig(models).models.map(({ id }) => id)).toEqual([model, secondModel])
+    expect(openCodeProviderConfig(models).models).toMatchObject({
+      [model]: { name: "Local Model (Q4)", variants: { high: { reasoningEffort: "high" } } },
+      [secondModel]: { name: "Second Model (Q6)", variants: {} },
     })
-    expect(openClawProviderConfig(models).models).toEqual(models)
-    expect(ohMyPiProviderConfig(models).models).toEqual(models)
+    expect(openClawProviderConfig(models).models.map(({ id }) => id)).toEqual([model, secondModel])
+    expect(ohMyPiProviderConfig(models).models.map(({ id }) => id)).toEqual([model, secondModel])
     expect(clineModelCatalog(models)).toEqual({
       [model]: expect.objectContaining({ id: model, name: "Local Model (Q4)", contextWindow: 50_000 }),
       [secondModel]: expect.objectContaining({ id: secondModel, name: "Second Model (Q6)", contextWindow: 32_768 }),
@@ -208,6 +214,122 @@ describe("HarnessConnector contract and registry", () => {
     const result = updateJsonc(source, [[["provider", "magnitude"], { api: "openai-completions" }]])
     expect(result).toContain("// user comment")
     expect(readJson(result)).toMatchObject({ theme: "dark", provider: { magnitude: { api: "openai-completions" } } })
+  })
+
+  it("projects exact model-relative reasoning domains without changing harness globals", () => {
+    const piModels = piProviderConfig(models).models
+    expect(piModels[0]).toMatchObject({
+      reasoning: true,
+      thinkingLevelMap: { off: null, medium: null, high: "high" },
+      compat: { supportsReasoningEffort: true },
+    })
+    expect(piModels[1]).toMatchObject({ reasoning: false })
+
+    expect(ohMyPiProviderConfig(models).models[0]).toMatchObject({
+      reasoning: true,
+      thinking: {
+        efforts: ["high"],
+        defaultLevel: "high",
+        effortMap: { high: "high" },
+        requiresEffort: true,
+      },
+    })
+    expect(openClawProviderConfig(models).models[0]).toMatchObject({
+      reasoning: true,
+      thinkingLevelMap: { medium: null, high: "high" },
+      compat: { supportedReasoningEfforts: ["high"] },
+    })
+    expect(clineModelCatalog(models)[model]).toMatchObject({
+      reasoningOptions: [{ type: "effort", values: ["default", "high"] }],
+    })
+  })
+
+  it("keeps harness controls distinct from named model efforts", () => {
+    const adaptiveModel = {
+      ...models[0],
+      capabilities: {
+        ...models[0].capabilities,
+        reasoning: { supported: true, efforts: [adaptive, high], defaultEffort: adaptive },
+      },
+    } as const
+    const namedOnlyModel = {
+      ...models[0],
+      capabilities: {
+        ...models[0].capabilities,
+        reasoning: { supported: true, efforts: [deliberate], defaultEffort: deliberate },
+      },
+    } as const
+
+    expect(piProviderConfig([adaptiveModel]).models[0]?.thinkingLevelMap).toMatchObject({
+      medium: "adaptive",
+      high: "high",
+    })
+    expect(openClawProviderConfig([adaptiveModel]).models[0]?.thinkingLevelMap).toMatchObject({
+      medium: "adaptive",
+      high: "high",
+    })
+    expect(openClawAgentConfig(adaptiveModel)).toEqual({
+      id: "magnitude",
+      model: `magnitude/${model}`,
+      thinkingDefault: "medium",
+    })
+    expect(ohMyPiProviderConfig([adaptiveModel]).models[0]?.thinking).toMatchObject({
+      efforts: ["medium", "high"],
+      defaultLevel: "medium",
+      effortMap: { medium: "adaptive", high: "high" },
+    })
+    expect(clineModelCatalog([adaptiveModel])[model]).toMatchObject({
+      reasoningOptions: [{ type: "effort", values: ["default", "high"] }],
+    })
+
+    expect(piProviderConfig([namedOnlyModel]).models[0]?.thinkingLevelMap).toMatchObject({ high: "deliberate" })
+    expect(openClawAgentConfig(namedOnlyModel).thinkingDefault).toBe("high")
+    expect(ohMyPiProviderConfig([namedOnlyModel]).models[0]?.thinking).toMatchObject({
+      efforts: ["high"],
+      defaultLevel: "high",
+      effortMap: { high: "deliberate" },
+    })
+  })
+
+  it("projects disabled defaults and sparse effort domains without filling holes", () => {
+    const toggleModel = {
+      ...models[0],
+      capabilities: {
+        ...models[0].capabilities,
+        reasoning: { supported: true, efforts: [none, high], defaultEffort: none },
+      },
+    } as const
+    const sparseModel = {
+      ...models[0],
+      capabilities: {
+        ...models[0].capabilities,
+        reasoning: { supported: true, efforts: [none, low, xhigh], defaultEffort: xhigh },
+      },
+    } as const
+
+    expect(piProviderConfig([sparseModel]).models[0]?.thinkingLevelMap).toEqual({
+      off: "none",
+      minimal: null,
+      low: "low",
+      medium: null,
+      high: null,
+      xhigh: "xhigh",
+      max: null,
+    })
+    expect(openClawAgentConfig(toggleModel).thinkingDefault).toBe("off")
+    expect(openClawAgentConfig(sparseModel).thinkingDefault).toBe("xhigh")
+    expect(ohMyPiProviderConfig([toggleModel]).models[0]?.thinking).toEqual({
+      mode: "effort",
+      efforts: ["high"],
+      effortMap: { high: "high" },
+      requiresEffort: false,
+    })
+    expect(clineModelCatalog([sparseModel])[model]).toMatchObject({
+      reasoningOptions: [
+        { type: "toggle" },
+        { type: "effort", values: ["default", "low", "xhigh"] },
+      ],
+    })
   })
 })
 
@@ -252,6 +374,30 @@ describe("Magnitude skill installation", () => {
 })
 
 describe("HarnessConnection model-set behavior", () => {
+  it("preserves Hermes global and explicit per-model overrides", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-hermes-reasoning-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures({
+        ...initialFiles(paths),
+        [paths.hermes]: `agent:\n  reasoning_effort: medium\n  reasoning_overrides:\n    "local/model": low\n`,
+      })
+      const service = yield* installedService(paths)
+      yield* service.connect(HarnessIdSchema.make("hermes"), { setCurrent: Option.some(model) })
+
+      expect(readYaml(yield* fs.readFileString(paths.hermes))).toMatchObject({
+        agent: {
+          reasoning_effort: "medium",
+          reasoning_overrides: {
+            [model]: "low",
+            [secondModel]: "none",
+          },
+        },
+      })
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
   it("ensures startup before Claude connect and sync only", async () => {
     let startupCalls = 0
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
@@ -369,7 +515,9 @@ describe("HarnessConnection model-set behavior", () => {
         model: "user/model", provider: { magnitude: openCodeProviderConfig(models) },
       })
       expect(readYaml(yield* fs.readFileString(paths.hermes))).toEqual({
-        theme: "dark", providers: { magnitude: hermesProviderConfig() },
+        theme: "dark",
+        providers: { magnitude: hermesProviderConfig() },
+        agent: { reasoning_overrides: hermesReasoningOverrides(models) },
       })
       expect(readJson(yield* fs.readFileString(paths.openclaw))).toMatchObject({
         models: { providers: { magnitude: openClawProviderConfig(models) } },
@@ -464,10 +612,13 @@ describe("HarnessConnection model-set behavior", () => {
       expect(readJson(yield* fs.readFileString(paths.opencode))).toMatchObject({ model: "user/model" })
       expect(readYaml(yield* fs.readFileString(paths.hermes))).not.toHaveProperty("model")
       expect(readJson(yield* fs.readFileString(paths.openclaw))).toMatchObject({
-        agents: { list: [{ id: "main", model: "user/model" }, openClawAgentConfig(model)] },
+        agents: { list: [
+          { id: "main", model: "user/model" },
+          { id: "magnitude", model: `magnitude/${model}`, thinkingDefault: "high" },
+        ] },
       })
       expect(yield* fs.readFileString(paths.codex)).toContain(`model = "${model}"`)
-      expect(yield* fs.readFileString(paths.codex)).toContain('model_reasoning_effort = "high"')
+      expect(yield* fs.readFileString(paths.codex)).not.toContain("model_reasoning_effort")
       expect(yield* fs.readFileString(paths.codex)).toContain('service_tier = "default"')
       const codexModels = readJson(yield* fs.readFileString(paths.codexModels)) as {
         models: ReadonlyArray<Record<string, unknown>>

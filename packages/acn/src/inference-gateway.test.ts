@@ -215,7 +215,22 @@ describe("Anthropic inference gateway", () => {
       icn,
       async () => Response.json({
         object: "list",
-        models: [],
+        models: [{
+          id: "local:model",
+          name: "Local Model",
+          description: "A local fixture.",
+          contextWindow: 32_768,
+          capabilities: {
+            vision: false,
+            tools: true,
+            structuredOutput: true,
+            reasoning: {
+              supported: true,
+              efforts: ["none", "high"],
+              defaultEffort: "high",
+            },
+          },
+        }],
         data: [{
           id: "local:model",
           object: "model",
@@ -225,7 +240,12 @@ describe("Anthropic inference gateway", () => {
       }),
     )
     expect(await response.json()).toMatchObject({
-      data: [{ id: "anthropic-local/local:model", type: "model" }],
+      data: [{
+        id: "anthropic-local/local:model",
+        type: "model",
+        display_name: "Local Model",
+        description: "A local fixture.",
+      }],
       has_more: false,
     })
   })

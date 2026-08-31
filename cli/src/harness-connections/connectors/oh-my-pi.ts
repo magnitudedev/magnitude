@@ -5,18 +5,51 @@ import {
   OPENAI_BASE_URL,
   defineConnector,
   launchPlan,
-  modelEntries,
   readOr,
   removeYamlPaths,
   updateYaml,
   writeIfChanged,
 } from "../shared"
+import type { HarnessConnectionSpec } from "../contract"
+import { modelInput, modelMaxTokens, zeroCost } from "../model-fields"
+import { hasReasoning, projectReasoningControls, supportsReasoningEffort } from "../reasoning"
 
-export const ohMyPiProviderConfig = (models: Parameters<typeof modelEntries>[0]) => ({
+const OMP_EFFORT_SURFACE = {
+  controls: ["minimal", "low", "medium", "high", "xhigh", "max"],
+  soleEnabled: "high",
+  aliases: { medium: "adaptive" },
+} as const
+
+export const ohMyPiModels = (models: HarnessConnectionSpec["models"]) => models.map((model) => {
+  const projection = projectReasoningControls(model, OMP_EFFORT_SURFACE)
+  const effortMap = Object.fromEntries(Object.entries(projection.map).filter((entry): entry is [string, string] =>
+    entry[1] !== null))
+  const efforts = Object.keys(effortMap)
+  return {
+    id: model.id,
+    name: model.name,
+    reasoning: hasReasoning(model),
+    ...(efforts.length === 0 ? {} : {
+      thinking: {
+        mode: "effort",
+        efforts,
+        ...(projection.defaultControl === undefined ? {} : { defaultLevel: projection.defaultControl }),
+        effortMap,
+        requiresEffort: !supportsReasoningEffort(model, "none"),
+      },
+    }),
+    input: modelInput(model),
+    cost: zeroCost(),
+    contextWindow: model.contextWindow,
+    maxTokens: modelMaxTokens(model),
+  }
+})
+
+export const ohMyPiProviderConfig = (models: HarnessConnectionSpec["models"]) => ({
   baseUrl: OPENAI_BASE_URL,
   auth: "none",
   api: CHAT_COMPLETIONS_API,
-  models: modelEntries(models),
+  models: ohMyPiModels(models),
 })
 
 export const makeOhMyPiConnector = (paths: HarnessConnectionPaths) => defineConnector({

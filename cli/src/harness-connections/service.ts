@@ -39,7 +39,7 @@ export {
 export { clineModelCatalog, clineModelRegistryEntry, clineProviderSettings } from "./connectors/cline"
 export { CLAUDE_GATEWAY_DISCOVERY } from "./connectors/claude-code"
 export { codexConfig, codexModelCatalog } from "./connectors/codex"
-export { hermesProviderConfig } from "./connectors/hermes"
+export { hermesProviderConfig, hermesReasoningOverrides } from "./connectors/hermes"
 export { ohMyPiProviderConfig } from "./connectors/oh-my-pi"
 export { openClawAgentConfig, openClawProviderConfig } from "./connectors/openclaw"
 export { openCodeProviderConfig } from "./connectors/opencode"
@@ -224,7 +224,13 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     if (Option.isSome(connectOptions.setCurrent) && !containsModel(models, connectOptions.setCurrent.value)) {
       return yield* failure("connect", `Magnitude model is not installed: ${connectOptions.setCurrent.value}`, harness)
     }
-    const spec: HarnessConnectionSpec = { models, setCurrent: connectOptions.setCurrent }
+    const manifest = yield* readManifest
+    const previousModels = manifest.connections.find((entry) => entry.harness === harness)?.models
+    const spec: HarnessConnectionSpec = {
+      models,
+      setCurrent: connectOptions.setCurrent,
+      ...(previousModels === undefined ? {} : { previousModels }),
+    }
     if (connector.recommended) {
       return { launchPlan: Option.map(spec.setCurrent, (modelId) => connector.launch(modelId, installation.value)) }
     }
@@ -254,7 +260,11 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
       if (Option.isSome(entry.setCurrent) && !containsModel(models, entry.setCurrent.value)) {
         return yield* failure("sync", `Magnitude model is not installed: ${entry.setCurrent.value}`, entry.harness)
       }
-      const spec: HarnessConnectionSpec = { models, setCurrent: entry.setCurrent }
+      const spec: HarnessConnectionSpec = {
+        models,
+        setCurrent: entry.setCurrent,
+        previousModels: entry.models,
+      }
       if (connector.requiresStartup) yield* installStartup
       const snapshots = yield* snapshotFiles(connector.configurationFiles)
       yield* connectorOperation("sync", connector, connector.connect(spec)).pipe(

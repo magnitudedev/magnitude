@@ -236,6 +236,7 @@ type GatewayModel = {
   readonly type: "model"
   readonly id: string
   readonly display_name: string
+  readonly description: string
   readonly created_at: string
 }
 
@@ -299,12 +300,17 @@ const localModels = async (
   const value = await Schema.decodeUnknownPromise(IcnSchemas.OpenAiModelsResponse)(
     await response.json(),
   )
-  const models = value.data.map((entry): GatewayModel => ({
-        type: "model",
-        id: `${LOCAL_ANTHROPIC_MODEL_PREFIX}${entry.id}`,
-        display_name: entry.id,
-        created_at: new Date(entry.created * 1000).toISOString(),
-      }))
+  const descriptors = new Map(value.models.map((model) => [model.id, model]))
+  const models = value.data.map((entry): GatewayModel => {
+    const descriptor = descriptors.get(entry.id)
+    return {
+      type: "model",
+      id: `${LOCAL_ANTHROPIC_MODEL_PREFIX}${entry.id}`,
+      display_name: descriptor?.name ?? entry.id,
+      description: descriptor?.description ?? "Local Magnitude model.",
+      created_at: new Date(entry.created * 1000).toISOString(),
+    }
+  })
     .sort((left, right) => left.id.localeCompare(right.id))
   return paginatedLocalModels(models, incoming)
 }

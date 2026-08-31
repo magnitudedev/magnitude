@@ -7,25 +7,60 @@ import {
   defineConnector,
   jsonObject,
   launchPlan,
-  modelEntries,
   readOr,
   removeJsoncPaths,
   updateJsonc,
   valueAt,
   writeIfChanged,
 } from "../shared"
+import type { HarnessConnectionSpec } from "../contract"
+import { modelInput, modelMaxTokens, zeroCost } from "../model-fields"
+import { hasReasoning, projectReasoningControls } from "../reasoning"
 
-export const openClawProviderConfig = (models: Parameters<typeof modelEntries>[0]) => ({
+const OPENCLAW_THINKING_SURFACE = {
+  controls: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+  off: "off",
+  soleEnabled: "high",
+  aliases: { medium: "adaptive" },
+} as const
+
+const openClawReasoning = (model: HarnessConnectionSpec["models"][number]) =>
+  projectReasoningControls(model, OPENCLAW_THINKING_SURFACE)
+
+export const openClawModels = (models: HarnessConnectionSpec["models"]) => models.map((model) => {
+  const reasoning = hasReasoning(model)
+  return {
+    id: model.id,
+    name: model.name,
+    reasoning,
+    input: modelInput(model),
+    cost: zeroCost(),
+    contextWindow: model.contextWindow,
+    maxTokens: modelMaxTokens(model),
+    thinkingLevelMap: openClawReasoning(model).map,
+    compat: {
+      supportsReasoningEffort: reasoning,
+      supportsTools: model.capabilities.tools,
+      supportedReasoningEfforts: model.capabilities.reasoning.efforts,
+    },
+  }
+})
+
+export const openClawProviderConfig = (models: HarnessConnectionSpec["models"]) => ({
   baseUrl: OPENAI_BASE_URL,
   apiKey: LOCAL_TOKEN,
   api: CHAT_COMPLETIONS_API,
-  models: modelEntries(models),
+  models: openClawModels(models),
 })
 
-export const openClawAgentConfig = (modelId: string) => ({
-  id: "magnitude",
-  model: `magnitude/${modelId}`,
-})
+export const openClawAgentConfig = (model: HarnessConnectionSpec["models"][number]) => {
+  const { defaultControl } = openClawReasoning(model)
+  return {
+    id: "magnitude",
+    model: `magnitude/${model.id}`,
+    ...(defaultControl === undefined ? {} : { thinkingDefault: defaultControl }),
+  }
+}
 
 export const makeOpenClawConnector = (paths: HarnessConnectionPaths) => defineConnector({
   id: "openclaw",
@@ -41,13 +76,17 @@ export const makeOpenClawConnector = (paths: HarnessConnectionPaths) => defineCo
     const changes: Array<readonly [ReadonlyArray<string>, unknown]> = [[
       ["models", "providers", "magnitude"], openClawProviderConfig(spec.models),
     ]]
-    if (Option.isSome(spec.setCurrent)) changes.push([
-      ["agents", "list"],
-      [
-        ...agents.filter((entry) => valueAt(entry, ["id"]) !== "magnitude"),
-        openClawAgentConfig(spec.setCurrent.value),
-      ],
-    ])
+    if (Option.isSome(spec.setCurrent)) {
+      const selectedModelId = spec.setCurrent.value
+      const selected = spec.models.find((model) => model.id === selectedModelId)
+      if (selected !== undefined) changes.push([
+        ["agents", "list"],
+        [
+          ...agents.filter((entry) => valueAt(entry, ["id"]) !== "magnitude"),
+          openClawAgentConfig(selected),
+        ],
+      ])
+    }
     yield* writeIfChanged(paths.openclaw, source, updateJsonc(source, changes))
   }),
   disconnect: () => Effect.gen(function* () {

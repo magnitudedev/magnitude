@@ -1472,7 +1472,13 @@ export const MessagesRequest = S.Struct({
   messages: S.Array(S.suspend((): S.Schema<Message, MessageEncoded> => Message)),
   metadata: S.optionalWith(JsonValue, { exact: true, as: "Option" }),
   model: S.String,
-  output_config: S.optionalWith(JsonValue, { exact: true, as: "Option" }),
+  output_config: S.optionalWith(
+    S.Union(
+      S.Null,
+      S.suspend((): S.Schema<OutputConfig, OutputConfigEncoded> => OutputConfig),
+    ),
+    { exact: true, as: "Option" },
+  ),
   stop_sequences: S.optionalWith(S.Array(S.String), { exact: true, as: "Option" }),
   stream: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
   system: S.optionalWith(
@@ -1982,6 +1988,18 @@ export const OpenAiModelsResponse = S.extend(
 )
 export type OpenAiModelsResponse = S.Schema.Type<typeof OpenAiModelsResponse>
 export type OpenAiModelsResponseEncoded = S.Schema.Encoded<typeof OpenAiModelsResponse>
+
+export const OutputConfig = S.extend(
+  S.Struct({
+    effort: S.optionalWith(
+      S.suspend((): S.Schema<ReasoningEffortRequest, ReasoningEffortRequestEncoded> => ReasoningEffortRequest),
+      { exact: true, as: "Option" },
+    ),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type OutputConfig = S.Schema.Type<typeof OutputConfig>
+export type OutputConfigEncoded = S.Schema.Encoded<typeof OutputConfig>
 
 export const PerformanceConfidence = S.Union(S.Literal("high"), S.Literal("moderate"), S.Literal("low"))
 export type PerformanceConfidence = S.Schema.Type<typeof PerformanceConfidence>

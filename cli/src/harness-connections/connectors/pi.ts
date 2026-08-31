@@ -6,18 +6,42 @@ import {
   OPENAI_BASE_URL,
   defineConnector,
   launchPlan,
-  modelEntries,
   readOr,
   removeJsoncPaths,
   updateJsonc,
   writeIfChanged,
 } from "../shared"
+import type { HarnessConnectionSpec } from "../contract"
+import { modelInput, modelMaxTokens, zeroCost } from "../model-fields"
+import { hasReasoning, projectReasoningControls } from "../reasoning"
 
-export const piProviderConfig = (models: Parameters<typeof modelEntries>[0]) => ({
+const PI_THINKING_SURFACE = {
+  controls: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+  off: "off",
+  soleEnabled: "high",
+  aliases: { medium: "adaptive" },
+} as const
+
+export const piModels = (models: HarnessConnectionSpec["models"]) => models.map((model) => {
+  const reasoning = hasReasoning(model)
+  return {
+    id: model.id,
+    name: model.name,
+    reasoning,
+    thinkingLevelMap: projectReasoningControls(model, PI_THINKING_SURFACE).map,
+    input: modelInput(model),
+    cost: zeroCost(),
+    contextWindow: model.contextWindow,
+    maxTokens: modelMaxTokens(model),
+    compat: { supportsReasoningEffort: reasoning },
+  }
+})
+
+export const piProviderConfig = (models: HarnessConnectionSpec["models"]) => ({
   baseUrl: OPENAI_BASE_URL,
   api: CHAT_COMPLETIONS_API,
   apiKey: LOCAL_TOKEN,
-  models: modelEntries(models),
+  models: piModels(models),
 })
 
 export const makePiConnector = (paths: HarnessConnectionPaths) => defineConnector({

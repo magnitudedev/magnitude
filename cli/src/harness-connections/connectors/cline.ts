@@ -13,6 +13,19 @@ import {
   valueAt,
   writeIfChanged,
 } from "../shared"
+import { modelMaxTokens } from "../model-fields"
+import { enabledReasoningEfforts, supportsReasoningEffort } from "../reasoning"
+
+const CLINE_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh", "max"])
+
+const clineReasoningOptions = (model: HarnessConnectionSpec["models"][number]): ReadonlyArray<Record<string, unknown>> => {
+  if (!model.capabilities.reasoning.supported) return []
+  const efforts = enabledReasoningEfforts(model).filter((effort) => CLINE_EFFORTS.has(effort))
+  return [
+    ...(supportsReasoningEffort(model, "none") ? [{ type: "toggle" }] : []),
+    ...(efforts.length === 0 ? [] : [{ type: "effort", values: ["default", ...efforts] }]),
+  ]
+}
 
 export const clineProviderSettings = (current: Option.Option<string>) => ({
   provider: "openai-compatible",
@@ -28,13 +41,20 @@ export const clineModelCatalog = (models: HarnessConnectionSpec["models"]) => Ob
     id: model.id,
     name: model.name,
     contextWindow: model.contextWindow,
+    maxTokens: modelMaxTokens(model),
     supportsVision: model.capabilities.vision,
     supportsReasoning: model.capabilities.reasoning.supported,
     capabilities: [
       ...(model.capabilities.tools ? ["tools"] : []),
       ...(model.capabilities.vision ? ["images"] : []),
       ...(model.capabilities.reasoning.supported ? ["reasoning"] : []),
+      ...(enabledReasoningEfforts(model).some((effort) => CLINE_EFFORTS.has(effort))
+        ? ["reasoning-effort"]
+        : []),
     ],
+    ...(model.capabilities.reasoning.supported
+      ? { reasoningOptions: clineReasoningOptions(model) }
+      : {}),
   }]),
 )
 

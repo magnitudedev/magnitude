@@ -50,6 +50,8 @@ export type HarnessModel = typeof HarnessModelSchema.Type
 export interface HarnessConnectionSpec {
   readonly models: ReadonlyArray<HarnessModel>
   readonly setCurrent: Option.Option<ProviderModelId>
+  /** Last connector-owned projection, used to distinguish safe sync updates from user overrides. */
+  readonly previousModels?: ReadonlyArray<HarnessModel>
 }
 
 export interface HarnessInstallation {
