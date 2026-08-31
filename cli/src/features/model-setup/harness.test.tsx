@@ -29,9 +29,9 @@ const keyEvent = (name: string) => new KeyEvent({
 })
 
 const destinations = [
-  { id: HarnessIdSchema.make("magnitude"), name: "Magnitude Harness", availability: "Installed" as const, selectable: true, note: "Optimized for local models" },
-  { id: HarnessIdSchema.make("codex"), name: "Codex", availability: "Installed" as const, selectable: true },
-  { id: HarnessIdSchema.make("cline"), name: "Cline", availability: "Not installed" as const, selectable: false },
+  { id: HarnessIdSchema.make("magnitude"), name: "Magnitude Harness", availability: "Installed" as const, selectable: true, connected: false, note: "Optimized for local models" },
+  { id: HarnessIdSchema.make("codex"), name: "Codex", availability: "Installed" as const, selectable: true, connected: false },
+  { id: HarnessIdSchema.make("cline"), name: "Cline", availability: "Not installed" as const, selectable: false, connected: false },
 ]
 
 describe("harness chooser layout", () => {

@@ -32,7 +32,8 @@ describe("Magnitude documentation", () => {
     expect(result._tag).toBe("Success")
     if (result._tag === "Failure") return
     expect(result.output).toContain("# Agent-guided Magnitude onboarding")
-    expect(result.output).toContain("magnitude catalog list --json")
+    expect(result.output).toContain("magnitude catalog recommendations")
+    expect(result.output).not.toContain("--json")
     expect(result.output).toContain("--install-skill")
   })
 

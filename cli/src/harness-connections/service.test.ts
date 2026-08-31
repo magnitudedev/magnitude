@@ -425,6 +425,23 @@ describe("HarnessConnection model-set behavior", () => {
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
   })
 
+  it("observes durable connection intent independently of harness installation", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-observation-" })
+      const paths = fixturePaths(root)
+      const service = yield* installedService(paths)
+      const harness = HarnessIdSchema.make("pi")
+
+      expect((yield* service.list).find(({ id }) => id === harness)?.connected).toBe(false)
+      yield* service.connect(harness, { setCurrent: Option.none() })
+      expect((yield* service.list).find(({ id }) => id === harness)?.connected).toBe(true)
+      yield* service.disconnect(harness)
+      yield* service.disconnect(harness)
+      expect((yield* service.list).find(({ id }) => id === harness)?.connected).toBe(false)
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
   it("applies setCurrent, returns exact launch plans, and disconnects every harness cleanly", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem

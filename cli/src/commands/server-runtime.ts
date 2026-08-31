@@ -11,10 +11,9 @@ import { Client } from "@magnitudedev/effect-query"
 import {
   MAGNITUDE_SERVICE_ORIGIN,
   MagnitudeBoundary,
-  ProviderModelIdSchema,
   magnitudeImplementationsLayer,
 } from "@magnitudedev/sdk"
-import { Effect, Layer, Option, Schema } from "effect"
+import { Effect, Layer, Option } from "effect"
 import {
   confirmServicePublicReady,
   installService,
@@ -35,23 +34,18 @@ import { existingAcnConnection, startingAcnConnection } from "../server/acn-conn
 import { explainServiceStartupFailure } from "../startup/service-startup-error"
 import { runCommand } from "./output"
 
-const ServiceActionSchema = Schema.Struct({
-  action: Schema.Literal("install", "uninstall", "stop"),
-})
-const ActiveModelSchema = Schema.Struct({
-  modelId: ProviderModelIdSchema,
-  displayName: Schema.String,
-  status: Schema.Literal("Loading", "Ready", "Stopping"),
-})
-type ActiveModel = typeof ActiveModelSchema.Type
+interface ActiveModel {
+  readonly displayName: string
+  readonly status: "Loading" | "Ready" | "Stopping"
+}
 
-const ServiceStatusSchema = Schema.Struct({
-  status: Schema.Literal("Stopped", "Starting", "Ready", "Stopping"),
-  address: Schema.String,
-  version: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
-  startsAutomaticallyOnLogin: Schema.Boolean,
-  activeModel: Schema.optionalWith(ActiveModelSchema, { as: "Option", exact: true }),
-})
+interface ServiceStatusPresentation {
+  readonly status: "Stopped" | "Starting" | "Ready" | "Stopping"
+  readonly address: string
+  readonly version: Option.Option<string>
+  readonly startsAutomaticallyOnLogin: boolean
+  readonly activeModel: Option.Option<ActiveModel>
+}
 
 const serviceAddress = new URL(MAGNITUDE_SERVICE_ORIGIN).host
 
@@ -118,23 +112,19 @@ const live = <A, E>(effect: Effect.Effect<A, E, ServiceActionRequirements>) => e
   Effect.provide([BunContext.layer, FetchHttpClient.layer]),
 )
 
-const action = (
-  name: "install" | "uninstall" | "stop",
-  effect: Effect.Effect<unknown, unknown, ServiceActionRequirements>,
-) => runCommand({
-  effect: live(effect).pipe(Effect.as({ action: name })),
-  schema: ServiceActionSchema,
-  render: () => `Magnitude service ${{
-    install: "installed",
-    uninstall: "uninstalled",
-    stop: "stopped",
-  }[name]}.\n`,
+export const runServiceInstall = () => runCommand({
+  effect: live(installService),
+  render: () => "Magnitude will start automatically when you log in.\n",
 })
-
-export const runServiceInstall = () => action("install", installService)
-export const runServiceUninstall = () => action("uninstall", uninstallService)
+export const runServiceUninstall = () => runCommand({
+  effect: live(uninstallService),
+  render: () => "Magnitude service stopped and was removed from login startup.\nModels, settings, and sessions were kept.\n",
+})
 export const runServiceStart = () => run(runServiceStartEffect, explainServiceStartupFailure)
-export const runServiceStop = () => action("stop", stopService)
+export const runServiceStop = () => runCommand({
+  effect: live(stopService),
+  render: () => "Magnitude service stopped.\n",
+})
 
 const readActiveModel = Effect.scoped(Effect.gen(function* () {
   const connection = yield* existingAcnConnection
@@ -165,7 +155,6 @@ const readActiveModel = Effect.scoped(Effect.gen(function* () {
       && residency._tag !== "Ready"
       && residency._tag !== "Stopping") continue
     return Option.some({
-      modelId: model.modelId,
       displayName: formatLocalModelDisplayName(model),
       status: residency._tag === "Requested" ? "Loading" as const : residency._tag,
     })
@@ -192,22 +181,24 @@ const publicServiceStatus = live(serviceStatus).pipe(
   }),
 )
 
-export const renderServiceStatus = (status: typeof ServiceStatusSchema.Type): string => [
-  `Status: ${status.status}`,
-  `Address: ${status.address}`,
-  `Version: ${Option.getOrElse(status.version, () => "Unknown")}`,
-  `Starts automatically on login: ${status.startsAutomaticallyOnLogin ? "Yes" : "No"}`,
-  `Active model: ${Option.match(status.activeModel, {
+export const renderServiceStatus = (status: ServiceStatusPresentation): string => [
+  "Magnitude service",
+  `  Runtime         ${status.status}`,
+  `  Starts at login ${status.startsAutomaticallyOnLogin ? "Yes" : "No"}`,
+  ...(Option.isSome(status.version) ? [
+    `  Version         ${status.version.value}`,
+    `  Address         ${status.address}`,
+  ] : []),
+  ...(status.status === "Ready" ? [`  Active model    ${Option.match(status.activeModel, {
     onNone: () => "None",
     onSome: (model) => model.status === "Ready"
       ? model.displayName
-      : `${model.displayName} (${model.status})`,
-  })}`,
+      : `${model.displayName} - ${model.status}`,
+  })}`] : []),
   "",
 ].join("\n")
 
 export const runServiceStatus = () => runCommand({
   effect: publicServiceStatus,
-  schema: ServiceStatusSchema,
   render: renderServiceStatus,
 })

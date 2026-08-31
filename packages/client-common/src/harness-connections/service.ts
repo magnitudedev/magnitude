@@ -37,6 +37,7 @@ export interface HarnessDestination {
   readonly name: string
   readonly availability: HarnessAvailability
   readonly selectable: boolean
+  readonly connected: boolean
   readonly note?: string
 }
 
@@ -85,6 +86,7 @@ const magnitudeDestination: HarnessDestination = {
   name: "Magnitude Harness",
   availability: "Installed",
   selectable: true,
+  connected: false,
   note: "Optimized for local models",
 }
 

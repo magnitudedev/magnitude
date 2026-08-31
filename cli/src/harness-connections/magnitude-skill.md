@@ -12,5 +12,5 @@ For agent-guided setup, read `magnitude docs onboarding` completely and follow i
 current CLI-only workflow, model-selection evidence, progress semantics, and harness connection
 rules.
 
-For the general non-interactive command contract, read `magnitude docs cli`. Prefer `--json` when
-observing state or making decisions from CLI output.
+For the general non-interactive command contract, read `magnitude docs cli`. Command output is
+designed to be read directly by both agents and people.

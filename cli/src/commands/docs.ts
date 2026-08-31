@@ -1,33 +1,28 @@
 import type { Command } from "@commander-js/extra-typings"
-import { Data, Effect, Schema } from "effect"
+import { Data, Effect } from "effect"
 import {
   documentationTopics,
   findDocumentationTopic,
 } from "../agent-docs/topics"
-import { runCommand } from "./output"
+import { renderTable, runCommand } from "./output"
 
 type DocumentationCommandResult =
   | { readonly _tag: "Success"; readonly output: string }
   | { readonly _tag: "Failure"; readonly error: string }
 
 class DocumentationTopicNotFound extends Data.TaggedError("DocumentationTopicNotFound")<{
-  readonly code: string
   readonly message: string
-  readonly retryable: boolean
 }> {}
-
-const topicLines = (): string =>
-  documentationTopics
-    .map(({ id, description }) => `  ${id.padEnd(20)} ${description}`)
-    .join("\n")
 
 export const renderDocumentationDirectory = (): string => [
   "Magnitude documentation",
   "",
   "Usage: magnitude docs <topic-id>",
   "",
-  "Topics:",
-  topicLines(),
+  renderTable(documentationTopics, [
+    { heading: "TOPIC", value: ({ id }) => id },
+    { heading: "DESCRIPTION", value: ({ description }) => description },
+  ]).trimEnd(),
   "",
 ].join("\n")
 
@@ -61,8 +56,8 @@ export const resolveDocumentationCommand = (
 export const registerDocsCommand = (program: Command): void => {
   program
     .command("docs")
-    .description("Read documentation for Magnitude agents")
-    .argument("[topic-id]", "Exact documentation topic ID")
+    .description("Read bundled documentation for Magnitude agents")
+    .argument("[topic-id]", "Documentation topic ID from `magnitude docs`")
     .allowExcessArguments(false)
     .action((topicId?: string) => {
       const result = resolveDocumentationCommand(topicId)
@@ -71,19 +66,10 @@ export const registerDocsCommand = (program: Command): void => {
             ? { _tag: "Directory" as const, markdown: result.output }
             : { _tag: "Topic" as const, topicId, markdown: result.output })
         : Effect.fail(new DocumentationTopicNotFound({
-            code: "documentation_topic_not_found",
             message: result.error.trimEnd(),
-            retryable: false,
           }))
       return runCommand({
         effect,
-        schema: Schema.Union(
-          Schema.TaggedStruct("Directory", { markdown: Schema.String }),
-          Schema.TaggedStruct("Topic", {
-            topicId: Schema.String,
-            markdown: Schema.String,
-          }),
-        ),
         render: ({ markdown }) => markdown,
       })
     })

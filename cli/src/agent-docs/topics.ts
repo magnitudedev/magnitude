@@ -11,7 +11,7 @@ export interface DocumentationTopic {
 export const documentationTopics: readonly DocumentationTopic[] = [
   {
     id: "cli",
-    description: "Use the non-interactive CLI and JSON output",
+    description: "Use the non-interactive Magnitude CLI",
     markdown: cliMarkdown,
   },
   {

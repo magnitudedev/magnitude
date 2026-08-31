@@ -4,24 +4,24 @@ const loadRuntime = () => import("./server-runtime")
 
 export const registerServiceCommand = (program: Command): void => {
   const service = program.command("service")
-    .description("Manage the Magnitude local inference service")
+    .description("Manage the Magnitude background service")
 
   service.command("install")
-    .description("Install and enable the per-user Magnitude service")
+    .description("Start Magnitude automatically at login without starting it now")
     .action(() => loadRuntime().then(({ runServiceInstall }) => runServiceInstall()))
 
   service.command("uninstall")
-    .description("Stop and remove the per-user Magnitude service")
+    .description("Stop Magnitude and remove it from login startup")
     .action(() => loadRuntime().then(({ runServiceUninstall }) => runServiceUninstall()))
 
   service.command("start")
-    .description("Install and start the per-user Magnitude service")
+    .description("Install and start the Magnitude service")
     .action(() => loadRuntime().then(({ runServiceStart }) => runServiceStart()))
 
   service.command("stop")
-    .description("Stop the Magnitude service without uninstalling it")
+    .description("Stop Magnitude without removing it from login startup")
     .action(() => loadRuntime().then(({ runServiceStop }) => runServiceStop()))
   service.command("status")
-    .description("Show installation and runtime status")
+    .description("Show Magnitude service and active-model status")
     .action(() => loadRuntime().then(({ runServiceStatus }) => runServiceStatus()))
 }

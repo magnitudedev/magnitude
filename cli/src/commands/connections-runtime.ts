@@ -1,105 +1,85 @@
 import { FetchHttpClient } from "@effect/platform"
-import type * as FileSystem from "@effect/platform/FileSystem"
-import type * as Path from "@effect/platform/Path"
 import type * as CommandExecutor from "@effect/platform/CommandExecutor"
+import type * as FileSystem from "@effect/platform/FileSystem"
 import type * as HttpClient from "@effect/platform/HttpClient"
+import type * as Path from "@effect/platform/Path"
 import { BunContext } from "@effect/platform-bun"
 import {
-  HarnessAvailabilitySchema,
   HarnessIdSchema,
   type HarnessConnection,
   type HarnessDestination,
   type HarnessId,
+  type HarnessLaunchPlan,
 } from "@magnitudedev/client-common"
 import { ProviderModelIdSchema } from "@magnitudedev/sdk"
 import { Data, Effect, Option, Schema } from "effect"
 import { makeHarnessConnection } from "../harness-connections/service"
 import { existingAcnConnection } from "../server/acn-connection"
-import { ensureTrailingNewline, runCommand } from "./output"
-
-const HarnessDestinationSchema = Schema.Struct({
-  id: HarnessIdSchema,
-  name: Schema.String,
-  availability: HarnessAvailabilitySchema,
-  selectable: Schema.Boolean,
-  note: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
-})
-const ConnectionsResultSchema = Schema.Struct({
-  connections: Schema.Array(HarnessDestinationSchema),
-})
-const HarnessLaunchPlanSchema = Schema.Struct({
-  harness: HarnessIdSchema,
-  executable: Schema.String,
-  args: Schema.Array(Schema.String),
-  environment: Schema.Record({ key: Schema.String, value: Schema.String }),
-  modelId: ProviderModelIdSchema,
-})
-const AddConnectionResultSchema = Schema.Struct({
-  action: Schema.Literal("add"),
-  harness: HarnessIdSchema,
-  skillInstalled: Schema.Boolean,
-  launchPlan: Schema.optionalWith(HarnessLaunchPlanSchema, { as: "Option", exact: true }),
-})
-const RemoveConnectionResultSchema = Schema.Struct({
-  action: Schema.Literal("remove"),
-  harness: HarnessIdSchema,
-})
+import { renderFields, renderTable, runCommand } from "./output"
 
 class ConnectionsCommandError extends Data.TaggedError("ConnectionsCommandError")<{
-  readonly code: string
   readonly message: string
-  readonly retryable: boolean
 }> {}
 
 const parseHarness = (input: string) => Schema.decodeUnknown(HarnessIdSchema)(input).pipe(
-  Effect.mapError(() => new ConnectionsCommandError({
-    code: "unsupported_harness",
-    message: `Unsupported harness: ${input}`,
-    retryable: false,
-  })),
+  Effect.mapError(() => new ConnectionsCommandError({ message: `Unsupported harness: ${input}` })),
 )
+
 const parseCurrentModel = (input: string | undefined) => input === undefined
   ? Effect.succeed(Option.none())
   : Schema.decodeUnknown(ProviderModelIdSchema)(input).pipe(
       Effect.map(Option.some),
-      Effect.mapError(() => new ConnectionsCommandError({
-        code: "invalid_model_id",
-        message: `Invalid model ID: ${input}`,
-        retryable: false,
-      })),
+      Effect.mapError(() => new ConnectionsCommandError({ message: `Invalid model ID: ${input}` })),
     )
+
 const requireRunningService = Effect.gen(function* () {
   const connection = yield* existingAcnConnection
   yield* connection.startup.awaitReady
 })
+
 type CommandRequirements = FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor | HttpClient.HttpClient
+
 const withService = <A>(use: (service: HarnessConnection) => Effect.Effect<A, unknown, CommandRequirements>) =>
   Effect.scoped(Effect.gen(function* () {
     const service = yield* makeHarnessConnection
     return yield* use(service)
   })).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))
 
-const projectDestination = (row: HarnessDestination) => ({
-  ...row,
-  note: Option.fromNullable(row.note),
-})
-type CommandDestination = ReturnType<typeof projectDestination>
+const connectionStatus = (row: HarnessDestination): string => {
+  if (row.id === "magnitude") return "Built in"
+  if (row.connected) return "Connected"
+  return row.availability === "Installed" ? "Available" : "Not installed"
+}
 
-const renderRows = (rows: ReadonlyArray<CommandDestination>): string => {
-  if (rows.length === 0) return "No harness connections.\n"
-  const width = Math.max(...rows.map(({ name }) => name.length))
-  return ensureTrailingNewline(rows.map((row) =>
-    `${row.name.padEnd(width)}  ${row.availability}`
-  ).join("\n"))
+export const renderConnections = (rows: readonly HarnessDestination[]): string => {
+  if (rows.length === 0) return "No supported harnesses are available.\n"
+  return renderTable(rows, [
+    { heading: "HARNESS", value: ({ name }) => name },
+    { heading: "ID", value: ({ id }) => id },
+    { heading: "STATUS", value: connectionStatus },
+  ])
 }
 
 export const listConnections = () => runCommand({
-  effect: withService((service) => service.list.pipe(Effect.map((connections) => ({
-    connections: connections.map(projectDestination),
-  })))),
-  schema: ConnectionsResultSchema,
-  render: ({ connections }) => renderRows(connections),
+  effect: withService((service) => service.list),
+  render: renderConnections,
 })
+
+const posixQuote = (value: string): string => /^[A-Za-z0-9_./:@%+=,-]+$/.test(value)
+  ? value
+  : `'${value.replaceAll("'", `'"'"'`)}'`
+
+const renderLaunchPlan = (plan: HarnessLaunchPlan): string => {
+  if (process.platform === "win32") {
+    const quote = (value: string) => `"${value.replaceAll('"', '`"')}"`
+    const environment = Object.entries(plan.environment)
+      .map(([key, value]) => `$env:${key} = ${quote(value)}`)
+    return [...environment, `& ${[plan.executable, ...plan.args].map(quote).join(" ")}`].join("\n  ")
+  }
+  const environment = Object.entries(plan.environment)
+    .map(([key, value]) => `${key}=${posixQuote(value)}`)
+  return [...environment, posixQuote(plan.executable), ...plan.args.map(posixQuote)].join(" ")
+}
 
 export const addConnection = (
   harnessInput: string,
@@ -112,19 +92,26 @@ export const addConnection = (
     const setCurrent = yield* parseCurrentModel(setCurrentInput)
     if (installSkill) yield* service.installSkill(harness)
     const result = yield* service.connect(harness, { setCurrent })
-    return { action: "add" as const, harness, skillInstalled: installSkill, launchPlan: result.launchPlan }
+    return { harness, setCurrent, skillInstalled: installSkill, ...result }
   })),
-  schema: AddConnectionResultSchema,
-  render: ({ harness, launchPlan, skillInstalled }) => Option.match(launchPlan, {
-    onNone: () => `Connected all Magnitude models to ${harness}.${skillInstalled ? " Installed the Magnitude skill." : ""}\n`,
-    onSome: (plan) => [
-      `Connected all Magnitude models to ${harness}.`,
-      ...(skillInstalled ? ["Installed the Magnitude skill."] : []),
-      `Current model: ${plan.modelId}`,
-      `Launch: ${[plan.executable, ...plan.args].join(" ")}`,
+  render: ({ harness, setCurrent, skillInstalled, launchPlan }) => {
+    const heading = harness === "magnitude"
+      ? "Magnitude Harness is built in."
+      : `Connected ${harness} to Magnitude.`
+    const fields: (readonly [string, string])[] = [
+      ...(Option.isSome(setCurrent) ? [["Current model", setCurrent.value]] as const : []),
+      ...(skillInstalled ? [["Skill", "Installed"]] as const : []),
+    ]
+    return [
+      heading,
+      ...(fields.length > 0 ? [renderFields(fields)] : []),
+      ...Option.match(launchPlan, {
+        onNone: () => [],
+        onSome: (plan) => ["", `Open ${harness} with this model:`, `  ${renderLaunchPlan(plan)}`],
+      }),
       "",
-    ].join("\n"),
-  }),
+    ].join("\n")
+  },
 })
 
 export const syncConnections = (harnessInput: string | undefined) => runCommand({
@@ -133,19 +120,16 @@ export const syncConnections = (harnessInput: string | undefined) => runCommand(
     const harness: HarnessId | undefined = harnessInput === undefined
       ? undefined
       : yield* parseHarness(harnessInput)
-    const connections = yield* service.sync(harness)
-    return { connections: connections.map(projectDestination) }
+    return yield* service.sync(harness)
   })),
-  schema: ConnectionsResultSchema,
-  render: ({ connections }) => renderRows(connections),
+  render: renderConnections,
 })
 
 export const removeConnection = (harnessInput: string) => runCommand({
   effect: withService((service) => Effect.gen(function* () {
     const harness = yield* parseHarness(harnessInput)
     yield* service.disconnect(harness)
-    return { action: "remove" as const, harness }
+    return harness
   })),
-  schema: RemoveConnectionResultSchema,
-  render: ({ harness }) => `Removed ${harness}.\n`,
+  render: (harness) => `Disconnected ${harness} from Magnitude.\n`,
 })

@@ -1,105 +1,71 @@
-import { Data, Effect, Option, Schema } from "effect"
+import { Data, Effect } from "effect"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { errorDocument, runCommand, setOutputMode } from "./output"
-
-const ResultSchema = Schema.Struct({
-  value: Schema.String,
-  detail: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
-})
+import { renderFields, renderTable, runCommand } from "./output"
 
 class ExpectedFailure extends Data.TaggedError("ExpectedFailure")<{
-  readonly code: string
   readonly message: string
-  readonly retryable: boolean
 }> {}
 
-class ReasonFailure extends Schema.TaggedError<ReasonFailure>()(
-  "ReasonFailure",
-  { reason: Schema.String },
-) {}
-
 afterEach(() => {
-  setOutputMode(false)
   process.exitCode = undefined
   vi.restoreAllMocks()
 })
 
-describe("unified command output", () => {
-  it("schema-encodes exactly one JSON success document", async () => {
+describe("command output", () => {
+  it("renders a successful result to stdout", async () => {
     const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true)
     const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
-    setOutputMode(true)
-
     await runCommand({
-      effect: Effect.succeed({ value: "ok", detail: Option.none<string>() }),
-      schema: ResultSchema,
-      render: () => "human\n",
+      effect: Effect.succeed({ value: "ok" }),
+      render: ({ value }) => `${value}\n`,
     })
-
     expect(stdout).toHaveBeenCalledOnce()
-    expect(stdout).toHaveBeenCalledWith('{"value":"ok"}\n')
+    expect(stdout).toHaveBeenCalledWith("ok\n")
     expect(stderr).not.toHaveBeenCalled()
   })
 
-  it("writes one structured JSON failure only to stderr", async () => {
+  it("writes an actionable failure only to stderr", async () => {
     const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true)
     const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
-    setOutputMode(true)
-
     await runCommand({
-      effect: Effect.fail(new ExpectedFailure({
-        code: "wrong_state",
-        message: "The command is not valid now",
-        retryable: false,
-      })),
-      schema: ResultSchema,
-      render: () => "human\n",
+      effect: Effect.fail(new ExpectedFailure({ message: "The command is not valid now" })),
+      render: () => "unused\n",
     })
-
     expect(stdout).not.toHaveBeenCalled()
     expect(stderr).toHaveBeenCalledOnce()
-    expect(JSON.parse(String(stderr.mock.calls[0]![0]))).toEqual({
-      error: {
-        code: "wrong_state",
-        message: "The command is not valid now",
-        retryable: false,
-      },
-    })
+    expect(stderr).toHaveBeenCalledWith("The command is not valid now\n")
     expect(process.exitCode).toBe(1)
   })
 
-  it("renders human output from the same decoded result", async () => {
-    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true)
-
+  it("prefers an actionable reason to an inherited generic message", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
+    const failure = Object.assign(Object.create({ message: "Generic failure" }) as object, {
+      reason: "Magnitude service is not responding",
+    })
     await runCommand({
-      effect: Effect.succeed({ value: "ok", detail: Option.some("present") }),
-      schema: ResultSchema,
-      render: ({ value, detail }) => `${value}:${Option.getOrElse(detail, () => "none")}\n`,
+      effect: Effect.fail(failure),
+      render: () => "unused\n",
     })
-
-    expect(stdout).toHaveBeenCalledWith("ok:present\n")
+    expect(stderr).toHaveBeenCalledWith("Magnitude service is not responding\n")
   })
 
-  it("uses the actionable message instead of a transport reason category", () => {
-    expect(errorDocument({
-      reason: "Unknown",
-      message: "Magnitude service failed to start in time",
-    })).toEqual({
-      error: {
-        code: "command_failed",
-        message: "Magnitude service failed to start in time",
-        retryable: false,
-      },
-    })
+  it("renders comparable rows as a borderless table", () => {
+    expect(renderTable([{ name: "Codex", status: "Connected" }], [
+      { heading: "NAME", value: ({ name }) => name },
+      { heading: "STATUS", value: ({ status }) => status },
+    ], 80)).toBe("NAME   STATUS\nCodex  Connected\n")
   })
 
-  it("uses an Effect tagged error's reason instead of its inherited message", () => {
-    expect(errorDocument(new ReasonFailure({ reason: "Magnitude service is not responding" }))).toEqual({
-      error: {
-        code: "command_failed",
-        message: "Magnitude service is not responding",
-        retryable: false,
-      },
-    })
+  it("falls back to labeled blocks instead of truncating narrow output", () => {
+    expect(renderTable([{ name: "Long model", id: "exact:model:id" }], [
+      { heading: "MODEL", value: ({ name }) => name },
+      { heading: "MODEL ID", value: ({ id }) => id },
+    ], 10)).toContain("MODEL ID  exact:model:id")
+  })
+
+  it("aligns labeled detail fields", () => {
+    expect(renderFields([["ID", "model"], ["Runtime", "Ready"]])).toBe(
+      "  ID       model\n  Runtime  Ready",
+    )
   })
 })

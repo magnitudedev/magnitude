@@ -1,24 +1,5 @@
-import { Effect, Schema } from "effect"
-
-export type OutputMode = "human" | "json"
-
-let outputMode: OutputMode = "human"
-
-export const setOutputMode = (json: boolean): void => {
-  outputMode = json ? "json" : "human"
-}
-
-export const currentOutputMode = (): OutputMode => outputMode
-
-export const CliErrorSchema = Schema.Struct({
-  error: Schema.Struct({
-    code: Schema.String,
-    message: Schema.String,
-    retryable: Schema.Boolean,
-  }),
-})
-
-export type CliErrorDocument = typeof CliErrorSchema.Type
+import { Data, Effect } from "effect"
+import stringWidth from "string-width"
 
 const messageOf = (error: unknown): string => {
   if (typeof error === "object" && error !== null) {
@@ -30,46 +11,61 @@ const messageOf = (error: unknown): string => {
   return String(error)
 }
 
-export const errorDocument = (error: unknown): CliErrorDocument => ({
-  error: {
-    code: typeof error === "object" && error !== null && "code" in error
-      && typeof error.code === "string" ? error.code : "command_failed",
-    message: messageOf(error),
-    retryable: typeof error === "object" && error !== null && "retryable" in error
-      && typeof error.retryable === "boolean" ? error.retryable : false,
-  },
-})
+class CommandOutputFailed extends Data.TaggedError("CommandOutputFailed")<{
+  readonly message: string
+  readonly cause: unknown
+}> {}
 
-export const encodeErrorDocument = (error: unknown): typeof CliErrorSchema.Encoded =>
-  Schema.encodeSync(CliErrorSchema)(errorDocument(error))
-
-const writeJson = (stream: NodeJS.WriteStream, value: unknown): void => {
-  stream.write(`${JSON.stringify(value)}\n`)
-}
-
-export const runCommand = <S, I, A extends S>(options: {
+export const runCommand = <A>(options: {
   readonly effect: Effect.Effect<A, unknown, never>
-  readonly schema: Schema.Schema<S, I, never>
   readonly render: (result: A) => string
-}): Promise<void> => {
-  const encoded = options.effect.pipe(
-    Effect.flatMap((result) => Schema.encode(options.schema)(result).pipe(
-      Effect.map((document) => ({ result, document })),
-    ),
-  ))
-  return Effect.runPromise(encoded.pipe(
-    Effect.tap(({ result, document }) => Effect.sync(() => {
-      if (outputMode === "json") writeJson(process.stdout, document)
-      else process.stdout.write(options.render(result))
-    })),
-    Effect.catchAll((error) => Effect.sync(() => {
-      if (outputMode === "json") writeJson(process.stderr, encodeErrorDocument(error))
-      else process.stderr.write(`${messageOf(error)}\n`)
-      process.exitCode = 1
-    })),
-    Effect.asVoid,
-  ))
-}
+}): Promise<void> => Effect.runPromise(options.effect.pipe(
+  Effect.tap((result) => Effect.try({
+    try: () => process.stdout.write(options.render(result)),
+    catch: (error) => new CommandOutputFailed({ message: messageOf(error), cause: error }),
+  })),
+  Effect.catchAll((error) => Effect.sync(() => {
+    process.stderr.write(`${messageOf(error)}\n`)
+    process.exitCode = 1
+  })),
+  Effect.asVoid,
+))
 
 export const ensureTrailingNewline = (value: string): string =>
   `${value.replace(/\n+$/, "")}\n`
+
+export interface TableColumn<Row> {
+  readonly heading: string
+  readonly value: (row: Row) => string
+}
+
+export const renderTable = <Row>(
+  rows: readonly Row[],
+  columns: readonly TableColumn<Row>[],
+  terminalWidth = process.stdout.isTTY ? process.stdout.columns ?? 120 : Number.POSITIVE_INFINITY,
+): string => {
+  const values = rows.map((row) => columns.map(({ value }) => value(row)))
+  const widths = columns.map(({ heading }, index) => Math.max(
+    stringWidth(heading),
+    ...values.map((row) => stringWidth(row[index]!)),
+  ))
+  const tableWidth = widths.reduce((total, width) => total + width, 0) + (columns.length - 1) * 2
+  if (tableWidth > terminalWidth) {
+    const labelWidth = Math.max(...columns.map(({ heading }) => heading.length))
+    return ensureTrailingNewline(rows.map((row) => columns.map(({ heading, value }) =>
+      `  ${heading.padEnd(labelWidth)}  ${value(row)}`
+    ).join("\n")).join("\n\n"))
+  }
+  const line = (cells: readonly string[]) => cells.map((cell, index) =>
+    index === cells.length - 1 ? cell : `${cell}${" ".repeat(widths[index]! - stringWidth(cell))}`
+  ).join("  ")
+  return ensureTrailingNewline([
+    line(columns.map(({ heading }) => heading)),
+    ...values.map(line),
+  ].join("\n"))
+}
+
+export const renderFields = (fields: readonly (readonly [string, string])[]): string => {
+  const width = Math.max(...fields.map(([label]) => label.length), 0)
+  return fields.map(([label, value]) => `  ${label.padEnd(width)}  ${value}`).join("\n")
+}

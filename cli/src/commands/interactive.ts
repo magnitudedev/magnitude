@@ -16,7 +16,7 @@ export const registerInteractiveCommand = (program: Command): void => {
     )
 
   interactiveCommand.action((opts) => {
-    const globals = interactiveCommand.optsWithGlobals() as { json?: boolean; version?: boolean }
+    const globals = interactiveCommand.optsWithGlobals() as { version?: boolean }
     return loadRuntime().then(({ runInteractiveCommand }) =>
       runInteractiveCommand(opts, globals))
   })

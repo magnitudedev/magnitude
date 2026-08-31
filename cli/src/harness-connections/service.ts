@@ -190,18 +190,23 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
 
   const installed = (connector: HarnessConnector) => provide(detect(connector))
 
-  const list: HarnessConnection["list"] = provide(Effect.forEach(registry.ordered, (connector) => installed(connector).pipe(
-    Effect.map((installation): HarnessDestination => ({
-      id: connector.id,
-      name: connector.name,
-      availability: Option.isSome(installation) ? "Installed" : "Not installed",
-      selectable: connector.recommended || Option.isSome(installation),
-      ...(connector.note === undefined ? {} : { note: connector.note }),
-    })),
-  )).pipe(
+  const list: HarnessConnection["list"] = provide(Effect.gen(function* () {
+    const manifest = yield* readManifest
+    const connected = new Set(manifest.connections.map(({ harness }) => harness))
+    return yield* Effect.forEach(registry.ordered, (connector) => installed(connector).pipe(
+      Effect.map((installation): HarnessDestination => ({
+        id: connector.id,
+        name: connector.name,
+        availability: Option.isSome(installation) ? "Installed" : "Not installed",
+        selectable: connector.recommended || Option.isSome(installation),
+        connected: connected.has(connector.id),
+        ...(connector.note === undefined ? {} : { note: connector.note }),
+      })),
+    ))
+  })).pipe(
     Effect.map((rows) => [...rows.filter((row) => row.selectable), ...rows.filter((row) => !row.selectable)]),
     Effect.mapError((error) => failure("list", String(error))),
-  ))
+  )
 
   const installStartup = provide(options.installStartup ?? installServiceOnStartup).pipe(
     Effect.mapError((error) => failure("startup", String(error))),
