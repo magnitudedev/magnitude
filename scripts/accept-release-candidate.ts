@@ -6,7 +6,7 @@ import {
   BunDetachedChildProcessSpawner,
   ChildProcessSpawner,
   AcnInstanceManager,
-  makeAcnJitRuntime,
+  makeAcnConnection,
   makeLocalAcnInstanceManager,
 } from "@magnitudedev/sdk"
 import { BunSqliteDriverLayer } from "@magnitudedev/sdk/bun"
@@ -202,12 +202,12 @@ const terminateBootstrap = async (pid?: number): Promise<void> => {
 }
 
 const probeBootstrap = Effect.gen(function* () {
-  const runtime = yield* makeAcnJitRuntime().pipe(
+  const connection = yield* makeAcnConnection().pipe(
     Effect.provideService(AcnInstanceManager, manager),
   )
 
-  yield* runtime.startup.prepare
-  const protocolLayer = runtime.protocolLayer.pipe(
+  yield* connection.startup.prepare
+  const protocolLayer = connection.protocolLayer.pipe(
     Layer.provide(FetchHttpClient.layer),
   )
   return yield* Effect.gen(function* () {
