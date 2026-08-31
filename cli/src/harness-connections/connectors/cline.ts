@@ -8,7 +8,9 @@ import {
   jsonObject,
   launchPlan,
   readOr,
+  qualifiedModelSelection,
   removeJsoncPaths,
+  splitQualifiedModelSelection,
   updateJsonc,
   valueAt,
   writeIfChanged,
@@ -73,32 +75,56 @@ export const makeClineConnector = (paths: HarnessConnectionPaths) => defineConne
     const value = jsonObject(source)
     const existing = valueAt(value, ["providers", "openai-compatible"])
     const updatedAt = valueAt(existing, ["updatedAt"])
-    yield* writeIfChanged(paths.clineProviders, source, updateJsonc(source, [
+    const existingModel = valueAt(existing, ["settings", "model"])
+    const configuredModel = Option.isSome(spec.model)
+      ? spec.model
+      : typeof existingModel === "string"
+        ? Option.some(existingModel)
+        : Option.none()
+    const previousProvider = valueAt(value, ["lastUsedProvider"])
+    const previousModel = typeof previousProvider === "string"
+      ? valueAt(value, ["providers", previousProvider, "settings", "model"])
+      : undefined
+    const changes: Array<readonly [ReadonlyArray<string>, unknown]> = [
       [["version"], 1],
       [["modes"], valueAt(value, ["modes"]) ?? {}],
       [["providers", "openai-compatible"], {
-        settings: clineProviderSettings(spec.setCurrent),
+        settings: clineProviderSettings(configuredModel),
         updatedAt: typeof updatedAt === "string" ? updatedAt : new Date().toISOString(),
         tokenSource: "manual",
       }],
-    ]))
+    ]
+    if (Option.isSome(spec.model)) changes.push([["lastUsedProvider"], "openai-compatible"])
+    yield* writeIfChanged(paths.clineProviders, source, updateJsonc(source, changes))
     const modelsSource = yield* readOr(paths.clineModels, "{}\n")
     yield* writeIfChanged(paths.clineModels, modelsSource, updateJsonc(modelsSource, [
       [["version"], 1],
       [["providers", "openai-compatible"], clineModelRegistryEntry(spec.models)],
     ]))
+    return Option.map(spec.model, () => ({
+      model: qualifiedModelSelection(previousProvider, previousModel),
+    }))
   }),
-  disconnect: () => Effect.gen(function* () {
+  disconnect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.clineProviders, "{}\n")
-    yield* writeIfChanged(paths.clineProviders, source, removeJsoncPaths(source, [["providers", "openai-compatible"]]))
+    const value = jsonObject(source)
+    const currentProvider = valueAt(value, ["lastUsedProvider"])
+    const currentBaseUrl = valueAt(value, ["providers", "openai-compatible", "settings", "baseUrl"])
+    const withoutProvider = removeJsoncPaths(source, [["providers", "openai-compatible"]])
+    const restore = Option.flatMap(spec.restore, ({ model }) =>
+      Option.flatMap(model, (selection) => Option.fromNullable(splitQualifiedModelSelection(selection))))
+    const next = currentProvider === "openai-compatible" && currentBaseUrl === OPENAI_BASE_URL && Option.isSome(spec.restore)
+      ? updateJsonc(withoutProvider, [[
+          ["lastUsedProvider"], Option.match(restore, { onNone: () => undefined, onSome: ({ provider }) => provider }),
+        ]])
+      : withoutProvider
+    yield* writeIfChanged(paths.clineProviders, source, next)
     const modelsSource = yield* readOr(paths.clineModels, "{}\n")
     yield* writeIfChanged(paths.clineModels, modelsSource, removeJsoncPaths(modelsSource, [["providers", "openai-compatible"]]))
   }),
   launch(modelId, installation) {
     return launchPlan(this, installation, modelId, [
       "--tui",
-      "--data-dir",
-      paths.clineDataDir,
       "--provider",
       "openai-compatible",
       "--model",

@@ -1,4 +1,5 @@
 import { Effect, Option } from "effect"
+import { randomUUID } from "node:crypto"
 import type { HarnessConnectionPaths } from "../paths"
 import {
   CHAT_COMPLETIONS_API,
@@ -76,32 +77,47 @@ export const makeOpenClawConnector = (paths: HarnessConnectionPaths) => defineCo
     const changes: Array<readonly [ReadonlyArray<string>, unknown]> = [[
       ["models", "providers", "magnitude"], openClawProviderConfig(spec.models),
     ]]
-    if (Option.isSome(spec.setCurrent)) {
-      const selectedModelId = spec.setCurrent.value
+    const previous = valueAt(value, ["agents", "defaults", "model", "primary"])
+    if (Option.isSome(spec.model)) {
+      const selectedModelId = spec.model.value
       const selected = spec.models.find((model) => model.id === selectedModelId)
-      if (selected !== undefined) changes.push([
-        ["agents", "list"],
-        [
+      if (selected !== undefined) changes.push(
+        [["agents", "defaults", "model", "primary"], `magnitude/${selectedModelId}`],
+        [["agents", "list"], [
           ...agents.filter((entry) => valueAt(entry, ["id"]) !== "magnitude"),
           openClawAgentConfig(selected),
-        ],
-      ])
+        ]],
+      )
     }
     yield* writeIfChanged(paths.openclaw, source, updateJsonc(source, changes))
+    return Option.map(spec.model, () => ({
+      model: typeof previous === "string" ? Option.some(previous) : Option.none(),
+    }))
   }),
-  disconnect: () => Effect.gen(function* () {
+  disconnect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.openclaw, "{}\n")
     const value = jsonObject(source)
     const agents = valueAt(value, ["agents", "list"])
+    const current = valueAt(value, ["agents", "defaults", "model", "primary"])
     const withoutProvider = removeJsoncPaths(source, [["models", "providers", "magnitude"]])
-    const next = !Array.isArray(agents)
+    const withoutAgent = !Array.isArray(agents)
       ? withoutProvider
       : updateJsonc(withoutProvider, [[
           ["agents", "list"], agents.filter((entry) => valueAt(entry, ["id"]) !== "magnitude"),
         ]])
+    const next = typeof current === "string" && current.startsWith("magnitude/") && Option.isSome(spec.restore)
+      ? updateJsonc(withoutAgent, [[
+          ["agents", "defaults", "model", "primary"], Option.getOrUndefined(spec.restore.value.model),
+        ]])
+      : withoutAgent
     yield* writeIfChanged(paths.openclaw, source, next)
   }),
   launch(modelId, installation) {
-    return launchPlan(this, installation, modelId, ["tui", "--local", "--session", "agent:magnitude:main"])
+    return launchPlan(this, installation, modelId, [
+      "tui",
+      "--local",
+      "--session",
+      `agent:magnitude:${randomUUID()}`,
+    ])
   },
 })

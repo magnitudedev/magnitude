@@ -1,4 +1,4 @@
-import { Effect } from "effect"
+import { Effect, Option } from "effect"
 import type { HarnessConnectionSpec } from "../contract"
 import type { HarnessConnectionPaths } from "../paths"
 import { modelInput, modelMaxTokens } from "../model-fields"
@@ -7,10 +7,12 @@ import {
   OPENAI_BASE_URL,
   OPENAI_COMPATIBLE_PACKAGE,
   defineConnector,
+  jsonObject,
   launchPlan,
   readOr,
   removeJsoncPaths,
   updateJsonc,
+  valueAt,
   writeIfChanged,
 } from "../shared"
 
@@ -44,12 +46,27 @@ export const makeOpenCodeConnector = (paths: HarnessConnectionPaths) => defineCo
   configurationFiles: [paths.opencode],
   connect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.opencode, "{}\n")
-    yield* writeIfChanged(paths.opencode, source, updateJsonc(source, [[
+    const previous = valueAt(jsonObject(source), ["model"])
+    const changes: Array<readonly [ReadonlyArray<string>, unknown]> = [[
       ["provider", "magnitude"], openCodeProviderConfig(spec.models),
-    ]]))
+    ]]
+    if (Option.isSome(spec.model)) changes.push([["model"], `magnitude/${spec.model.value}`])
+    yield* writeIfChanged(paths.opencode, source, updateJsonc(source, changes))
+    return Option.map(spec.model, () => ({
+      model: typeof previous === "string" ? Option.some(previous) : Option.none(),
+    }))
   }),
-  disconnect: () => readOr(paths.opencode, "{}\n").pipe(Effect.flatMap((source) =>
-    writeIfChanged(paths.opencode, source, removeJsoncPaths(source, [["provider", "magnitude"]])))),
+  disconnect: (spec) => Effect.gen(function* () {
+    const source = yield* readOr(paths.opencode, "{}\n")
+    const current = valueAt(jsonObject(source), ["model"])
+    const withoutProvider = removeJsoncPaths(source, [["provider", "magnitude"]])
+    const next = typeof current === "string" && current.startsWith("magnitude/") && Option.isSome(spec.restore)
+      ? updateJsonc(withoutProvider, [[
+          ["model"], Option.getOrUndefined(spec.restore.value.model),
+        ]])
+      : withoutProvider
+    yield* writeIfChanged(paths.opencode, source, next)
+  }),
   launch(modelId, installation) {
     return launchPlan(this, installation, modelId, ["--model", `magnitude/${modelId}`])
   },

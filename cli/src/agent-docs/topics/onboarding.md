@@ -51,7 +51,7 @@ requested setup scope.
 
 ```bash
 magnitude connections list
-magnitude connections add <harness> --set-current <model-id> --install-skill
+magnitude connections add <harness> --set-model <model-id> --install-skill
 ```
 
 Identify the harness in which you are currently running and use its canonical ID. Ask only when the

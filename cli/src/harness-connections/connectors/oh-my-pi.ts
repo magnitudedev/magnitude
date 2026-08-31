@@ -1,4 +1,5 @@
-import { Effect } from "effect"
+import { Effect, Option } from "effect"
+import { parseDocument } from "yaml"
 import type { HarnessConnectionPaths } from "../paths"
 import {
   CHAT_COMPLETIONS_API,
@@ -8,6 +9,7 @@ import {
   readOr,
   removeYamlPaths,
   updateYaml,
+  valueAt,
   writeIfChanged,
 } from "../shared"
 import type { HarnessConnectionSpec } from "../contract"
@@ -57,14 +59,36 @@ export const makeOhMyPiConnector = (paths: HarnessConnectionPaths) => defineConn
   name: "Oh My Pi",
   executable: "omp",
   skillInstallationTarget: "shared-agents",
-  configurationFiles: [paths.ompModels],
+  configurationFiles: [paths.ompModels, paths.ompSettings],
   connect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.ompModels, "{}\n")
     yield* writeIfChanged(paths.ompModels, source, updateYaml(source, [[
       ["providers", "magnitude"], ohMyPiProviderConfig(spec.models),
     ]]))
+    if (Option.isNone(spec.model)) return Option.none()
+    const settingsSource = yield* readOr(paths.ompSettings, "{}\n")
+    const document = parseDocument(settingsSource.trim() === "" ? "{}\n" : settingsSource)
+    if (document.errors.length > 0) throw new Error("configuration is not valid YAML")
+    const previous = valueAt(document.toJS(), ["modelRoles", "default"])
+    yield* writeIfChanged(paths.ompSettings, settingsSource, updateYaml(settingsSource, [[
+      ["modelRoles", "default"], `magnitude/${spec.model.value}`,
+    ]]))
+    return Option.some({
+      model: typeof previous === "string" ? Option.some(previous) : Option.none(),
+    })
   }),
-  disconnect: () => Effect.gen(function* () {
+  disconnect: (spec) => Effect.gen(function* () {
+    const settingsSource = yield* readOr(paths.ompSettings, "{}\n")
+    const document = parseDocument(settingsSource.trim() === "" ? "{}\n" : settingsSource)
+    if (document.errors.length > 0) throw new Error("configuration is not valid YAML")
+    const current = valueAt(document.toJS(), ["modelRoles", "default"])
+    if (typeof current === "string" && current.startsWith("magnitude/") && Option.isSome(spec.restore)) {
+      const next = Option.match(spec.restore.value.model, {
+        onNone: () => removeYamlPaths(settingsSource, [["modelRoles", "default"]]),
+        onSome: (model) => updateYaml(settingsSource, [[["modelRoles", "default"], model]]),
+      })
+      yield* writeIfChanged(paths.ompSettings, settingsSource, next)
+    }
     const source = yield* readOr(paths.ompModels, "{}\n")
     yield* writeIfChanged(paths.ompModels, source, removeYamlPaths(source, [["providers", "magnitude"]]))
   }),

@@ -38,21 +38,30 @@ alone never implies a connection.
 
 ## Durable connection and connector ownership
 
-The user manifest records desired harness connections. It contains no gateway credential or
-historical harness settings. Each entry contains the harness, complete installed Magnitude model
-set as harness-facing descriptors, optional handoff-model selection, and update time. The CLI derives
+The user manifest records desired harness connections. It contains no gateway credential. Each
+entry contains the harness, complete installed Magnitude model set as harness-facing descriptors,
+optional model restoration data, and update time. The CLI derives
 each descriptor through the SDK from the enriched OpenAI model-list `data` entry; no second
 Magnitude-only model-list array exists. A descriptor contains identity, display name, description,
 context window, advertised output ceiling, modalities and tool capabilities, and the model's
 reasoning domain and default. Existing persisted descriptors without an output ceiling migrate to
-the lesser of their context window and 32,768 tokens. `add` connects every installed Magnitude model and may
-select one for the immediate handoff; `sync` refreshes the complete model set without launching
-anything; and `remove` deletes the connector's Magnitude-owned provider, agent, profile, or catalog.
+the lesser of their context window and 32,768 tokens. `add` connects every installed Magnitude model
+and may persist one as the harness's model for ordinary new sessions; `sync` refreshes only the
+complete model set without launching or changing model selection; and `remove` deletes the
+connector's Magnitude-owned provider, agent, profile, or catalog.
 Applying a connection is an unconditional idempotent upsert of Magnitude-owned state. Existing,
 older, partial, or differently shaped Magnitude state is replaced rather than classified as a
-conflict. Harness defaults and global model selections are never changed. Generic settings that are
-not uniquely Magnitude-owned remain untouched, except for Claude Code's two documented gateway
-settings.
+conflict. Without an explicit model, harness defaults and global model selections are never changed.
+With an explicit model, the connector captures the prior persisted model selection and writes the
+Magnitude selection to the native configuration used by an ordinary new harness session. Generic
+configuration that is not uniquely Magnitude-owned remains untouched, except for fields required to
+install the Magnitude provider and Claude Code's documented gateway settings.
+
+Model restoration has one uniform shape: an optional `restore` object containing an optional
+`model` string. Absence of `restore` means Magnitude did not change persistent model selection;
+`restore: {}` means no explicit model existed; and `restore: { model }` records the normalized prior
+selection. Repeated connect and sync operations preserve the original restoration value rather than
+replacing it with a Magnitude value.
 
 The manifest is durable user state with no global format version. Missing state defaults to no
 connections. Recovery applies recursively at the nearest valid boundary: an invalid root resets to
@@ -68,23 +77,30 @@ installation observation, transactional file snapshots, registry dispatch, centr
 installation, and startup orchestration. Onboarding and the public `magnitude connections`
 commands call this same service; neither contains connector-specific transforms.
 
-The unified connector contract is `detect`, `connect(HarnessConnectionSpec)`,
-`disconnect(HarnessConnectionSpec)`, and `launch(modelId, installation)`, plus one declarative skill
-installation target. The spec contains the complete harness-facing Magnitude model descriptors plus
-an optional `setCurrent` model ID. During sync it also contains the prior manifest descriptors so a
-connector can replace only its previous model-relative projection. Each harness implements this
-contract in its own module. The
+The unified connector contract separates configuration from process launch. `connect` receives the
+complete harness-facing Magnitude model descriptors and an optional model to persist, and returns
+the prior normalized model selection when it changes one. `disconnect` receives the descriptors and
+optional restoration data. `launch(modelId, installation)` receives its model directly and has no
+dependency on manifest selection state. During sync, configuration also receives the prior manifest
+descriptors so a connector can replace only its previous model-relative projection. Each harness
+implements this contract in its own module. The
 registry only composes those modules in canonical priority order; it contains no harness
 configuration logic.
+
+Disconnect restoration is conditional cleanup, not a precondition. A connector restores the saved
+model only while the current persisted selection still resolves through a Magnitude-owned provider
+identity, model namespace, or unambiguous provider-and-endpoint pair. Ownership is structural and
+never determined by enumerating Magnitude's models. A missing or non-Magnitude selection is a
+successful restoration no-op; provider, catalog, profile, agent, and manifest cleanup continues.
 
 Reasoning validity is model-relative. Magnitude owns the exact normalized model domain; every
 connector separately owns its harness's control vocabulary and the projection from those controls
 to normalized efforts. Shared projection logic may operate on a connector-supplied control surface,
 but no common list is treated as universally native. A projected default is always a harness
 control whose mapping resolves to the model default, never an effort name copied into a control
-field. Connect and sync preserve user-owned global and session preferences. Launch selects only the
-provider/profile/agent and exact model, so the same persisted projection applies when a connected
-harness is opened independently. A fixed-scale harness may give a differently named control to a
+field. Connect without a model and every sync preserve user-owned global and session preferences.
+Connect with a model changes only the native persisted new-session selection. Launch independently
+selects the provider/profile/agent and exact model for its child process. A fixed-scale harness may give a differently named control to a
 normalized named mode, or map its sole enabled control to a model's sole enabled behavior. ICN never
 rounds an ordinary explicit unsupported OpenAI effort. If a user bypasses native validation, ICN
 returns the supported-domain error.
@@ -100,25 +116,27 @@ Completions uses `http://127.0.0.1:10100/inference/v1/chat/completions`. Pi and 
 `openai-completions`; OpenCode uses `@ai-sdk/openai-compatible`; OpenClaw declares
 `openai-completions`; Hermes uses a named `custom:magnitude` provider with its
 `chat_completions` transport; and Cline uses its OpenAI-compatible client and Chat Completions
-protocol inside a Magnitude-owned isolated data directory.
+protocol in Cline's ordinary persistent data directory.
 
-Codex is the sole Responses consumer. Its separately owned profile uses the base
+Codex is the sole Responses consumer. Its Magnitude configuration uses the base
 `http://127.0.0.1:10100/inference/v1`, producing `/inference/v1/responses`, with
 `wire_api = "responses"`. The connector also owns a Codex-native model catalog derived from the
-shared descriptors and points the profile's `model_catalog_json` at it. This prevents fallback
+shared descriptors and points the profile's `model_catalog_json` at it. When a model is persisted,
+ordinary Codex configuration also points at that catalog so a direct `codex` invocation resolves
+the selected model's exact metadata rather than generic fallback metadata. This prevents fallback
 metadata and supplies Codex with exact display names, context windows, input modalities, and
-reasoning domains. When `setCurrent` is present, the profile selects that model; Codex obtains its
+reasoning domains. When a persistent model is requested, ordinary Codex configuration selects the
+Magnitude provider and model; Codex obtains its
 advertised default from the catalog instead of a profile-level `model_reasoning_effort` that could
 become stale after model switching. The profile explicitly selects the default service tier so unrelated
 global priority-tier configuration cannot leak into local requests. Claude Code is the
 sole Anthropic Messages consumer. It uses
 `http://127.0.0.1:10100/inference/anthropic`, producing `/inference/anthropic/v1/messages`, and
-receives `anthropic-local/<model-id>` through `--model`. The reserved prefix selects the local
-Anthropic route instead of the byte-preserving upstream route. Onboarding always supplies
-`setCurrent` for its selected model, so every external handoff starts on that exact model through
-the connector's launch plan. The optional `--set-current <model-id>` CLI input supplies
-`setCurrent`, selects that model, and returns the connector's launch plan; omitting it leaves the
-current-model selection unchanged.
+uses `anthropic-local/<model-id>` for persistent and launch-scoped selection. The reserved prefix
+selects the local Anthropic route instead of the byte-preserving upstream route. Onboarding both
+persists its selected model during connection and independently passes it to launch, so handoff does
+not depend on manifest selection state. The optional `--set-model <model-id>` CLI input persists
+that model during connection; omitting it leaves current-model selection unchanged.
 Provider-local registrations expose the complete Magnitude model set.
 That set includes callable external Hugging Face models using their exact canonical `hf:` identity.
 Connectors preserve the identity as an opaque model key; Claude-facing discovery adds only the
@@ -130,15 +148,17 @@ have no separate display-name field in the configuration path used by their conn
 harnesses receive the provider-facing model ID only.
 For Cline, arbitrary provider IDs can appear in its local catalog but are not executable by its
 agent runtime. The connector therefore writes Cline's supported `openai-compatible` provider and
-named model catalog inside the dedicated `~/.magnitude/harnesses/cline` data directory. The launch
-plan passes that directory through `--data-dir` together with `--provider openai-compatible --model
-<id>` and `--tui`. The user's normal Cline data directory and provider settings remain untouched.
-OpenClaw launches `openclaw tui --local --session agent:magnitude:main`, using its embedded runtime so handoff neither requires
+named model catalog in Cline's ordinary `~/.cline/data` state. Persistent selection updates
+`lastUsedProvider` and that provider's model so an ordinary later `cline` invocation uses Magnitude.
+The launch plan independently passes `--provider openai-compatible --model <id>` and `--tui`.
+OpenClaw launches `openclaw tui --local --session agent:magnitude:<session-id>`, using its embedded runtime so handoff neither requires
 nor starts an OpenClaw Gateway daemon. Its connector owns a dedicated `magnitude` agent whose model
 is the selected Magnitude model and whose native `thinkingDefault` is the OpenClaw control that maps
 to that model's advertised default. Per-model thinking maps clamp that agent preference after later model switches. The
-connector launches the `agent:magnitude:main` session and does not change the user's global primary
-model or other agents.
+connector creates a fresh agent-scoped session for each handoff so an older session-level model
+override cannot supersede the selected handoff model. When connection explicitly selects a model,
+the connector also changes the global primary used by ordinary unpinned sessions and records its
+prior value for conditional restoration; other agents remain unchanged.
 
 ## Skill and startup options
 
@@ -164,11 +184,11 @@ installation complete before harness configuration and handoff.
 Claude Code is the sole connector that must persist generic harness settings. Connecting it merges
 `ANTHROPIC_BASE_URL=http://127.0.0.1:10100/inference/anthropic` and
 `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` into the user-wide `settings.json` `env` object and
-ensures Magnitude's per-user service is registered for login. It writes no credential, model,
-model-alias, or attribution default. An ordinary later `claude` launch therefore discovers local
-`anthropic-local/` aliases through Magnitude while retaining the user's normal Claude authentication
-and model selection. Disconnect removes either setting only while it still equals Magnitude's
-installed value, preserving subsequent user edits.
+ensures Magnitude's per-user service is registered for login. It writes no credential, model alias,
+or attribution default. When connection explicitly selects a model it writes the corresponding
+`anthropic-local/` model as the initial selection for ordinary new sessions. Disconnect removes
+either gateway setting only while it still equals Magnitude's installed value, preserving subsequent
+user edits, and restores the prior model only while the current selection is still Magnitude-owned.
 
 Claude Code 2.1.175 gateway discovery retains only model ID, display name, and description; it has
 no discovery field through which Magnitude can install a per-model effort domain. Magnitude therefore

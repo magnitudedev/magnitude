@@ -30,6 +30,7 @@ import {
   openCodeProviderConfig,
   piProviderConfig,
   updateJsonc,
+  updateYaml,
   type HarnessConnectionPaths,
 } from "./service"
 
@@ -78,11 +79,11 @@ const fixturePaths = (root: string): HarnessConnectionPaths => ({
   hermes: `${root}/hermes/config.yaml`,
   openclaw: `${root}/openclaw/openclaw.json`,
   codex: `${root}/codex/magnitude.config.toml`,
+  codexUser: `${root}/codex/config.toml`,
   codexModels: `${root}/codex/magnitude.models.json`,
   claude: `${root}/claude/settings.json`,
   ompModels: `${root}/omp/models.yml`,
-  ompSettings: `${root}/omp/settings.json`,
-  clineDataDir: `${root}/cline`,
+  ompSettings: `${root}/omp/config.yml`,
   clineProviders: `${root}/cline/providers.json`,
   clineModels: `${root}/cline/models.json`,
   skillInstallations: {
@@ -118,7 +119,7 @@ const initialFiles = (paths: HarnessConnectionPaths): Readonly<Record<string, st
   [paths.piModels]: stringifyJson({ theme: "dark", providers: {} }),
   [paths.piSettings]: stringifyJson({ theme: "dark", defaultProvider: "user", defaultModel: "user/model" }),
   [paths.opencode]: stringifyJson({ theme: "dark", provider: {}, model: "user/model" }),
-  [paths.hermes]: "theme: dark\n",
+  [paths.hermes]: "theme: dark\nmodel:\n  provider: user\n  default: model\n",
   [paths.openclaw]: stringifyJson({
     theme: "dark",
     models: { providers: {} },
@@ -127,13 +128,14 @@ const initialFiles = (paths: HarnessConnectionPaths): Readonly<Record<string, st
       list: [{ id: "main", model: "user/model" }],
     },
   }),
-  [paths.claude]: stringifyJson({ theme: "dark", env: { USER_KEY: "preserve" } }),
+  [paths.codexUser]: 'model_provider = "openai"\nmodel = "user/model"\n',
+  [paths.claude]: stringifyJson({ theme: "dark", model: "user/model", env: { USER_KEY: "preserve" } }),
   [paths.ompModels]: "theme: dark\n",
-  [paths.ompSettings]: stringifyJson({ theme: "dark", model: "user/model" }),
+  [paths.ompSettings]: "theme: dark\nmodelRoles:\n  default: user/model\n",
   [paths.clineProviders]: stringifyJson({
     version: 1,
     modes: { keep: true },
-    providers: {},
+    providers: { "user-provider": { settings: { provider: "user-provider", model: "user/model" } } },
     lastUsedProvider: "user-provider",
   }),
   [paths.clineModels]: stringifyJson({ version: 1, providers: {} }),
@@ -397,7 +399,7 @@ describe("HarnessConnection model-set behavior", () => {
         [paths.hermes]: `agent:\n  reasoning_effort: medium\n  reasoning_overrides:\n    "local/model": low\n`,
       })
       const service = yield* installedService(paths)
-      yield* service.connect(HarnessIdSchema.make("hermes"), { setCurrent: Option.some(model) })
+      yield* service.connect(HarnessIdSchema.make("hermes"), { model: Option.some(model) })
 
       expect(readYaml(yield* fs.readFileString(paths.hermes))).toMatchObject({
         agent: {
@@ -424,9 +426,9 @@ describe("HarnessConnection model-set behavior", () => {
         installStartup: Effect.sync(() => { startupCalls += 1 }),
       })
 
-      yield* service.connect(HarnessIdSchema.make("pi"), { setCurrent: Option.some(model) })
+      yield* service.connect(HarnessIdSchema.make("pi"), { model: Option.some(model) })
       expect(startupCalls).toBe(0)
-      yield* service.connect(HarnessIdSchema.make("claude-code"), { setCurrent: Option.some(model) })
+      yield* service.connect(HarnessIdSchema.make("claude-code"), { model: Option.some(model) })
       expect(startupCalls).toBe(1)
       yield* service.sync(HarnessIdSchema.make("claude-code"))
       expect(startupCalls).toBe(2)
@@ -438,30 +440,43 @@ describe("HarnessConnection model-set behavior", () => {
       const fs = yield* FileSystem.FileSystem
       const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-idempotent-" })
       const paths = fixturePaths(root)
-      yield* writeFixtures(initialFiles(paths))
+      const initial = initialFiles(paths)
+      yield* writeFixtures(initial)
       const service = yield* installedService(paths)
       const connectors = makeHarnessConnectorRegistry(paths).ordered.filter(({ id }) => id !== "magnitude")
 
       for (const connector of connectors) {
-        yield* service.connect(connector.id, { setCurrent: Option.some(model) })
+        yield* service.connect(connector.id, { model: Option.some(model) })
         const first = yield* Effect.forEach(connector.configurationFiles, (file) => fs.readFileString(file))
-        yield* service.connect(connector.id, { setCurrent: Option.some(model) })
+        yield* service.connect(connector.id, { model: Option.some(model) })
         const repeated = yield* Effect.forEach(connector.configurationFiles, (file) => fs.readFileString(file))
-        expect(repeated).toEqual(first)
-        yield* service.connect(connector.id, { setCurrent: Option.some(secondModel) })
+        expect(repeated, connector.id).toEqual(first)
+        yield* service.connect(connector.id, { model: Option.some(secondModel) })
       }
 
       expect(readJson(yield* fs.readFileString(paths.piSettings))).toMatchObject({
-        defaultProvider: "user", defaultModel: "user/model",
+        defaultProvider: "magnitude", defaultModel: secondModel,
       })
-      expect(readJson(yield* fs.readFileString(paths.opencode))).toMatchObject({ model: "user/model" })
-      expect(readYaml(yield* fs.readFileString(paths.hermes))).not.toHaveProperty("model")
-      expect(readJson(yield* fs.readFileString(paths.ompSettings))).toMatchObject({ model: "user/model" })
+      expect(readJson(yield* fs.readFileString(paths.opencode))).toMatchObject({ model: `magnitude/${secondModel}` })
+      expect(readYaml(yield* fs.readFileString(paths.hermes))).toMatchObject({
+        model: { provider: "custom:magnitude", default: secondModel },
+      })
+      expect(readYaml(yield* fs.readFileString(paths.ompSettings))).toMatchObject({
+        modelRoles: { default: `magnitude/${secondModel}` },
+      })
 
       for (const connector of connectors) {
         yield* service.disconnect(connector.id)
         yield* service.disconnect(connector.id)
       }
+      expect(readJson(yield* fs.readFileString(paths.piSettings))).toEqual(readJson(initial[paths.piSettings]!))
+      expect(readJson(yield* fs.readFileString(paths.opencode))).toEqual(readJson(initial[paths.opencode]!))
+      expect(readYaml(yield* fs.readFileString(paths.hermes))).toEqual(readYaml(initial[paths.hermes]!))
+      expect(readJson(yield* fs.readFileString(paths.openclaw))).toEqual(readJson(initial[paths.openclaw]!))
+      expect(Bun.TOML.parse(yield* fs.readFileString(paths.codexUser))).toEqual(Bun.TOML.parse(initial[paths.codexUser]!))
+      expect(readJson(yield* fs.readFileString(paths.claude))).toEqual(readJson(initial[paths.claude]!))
+      expect(readYaml(yield* fs.readFileString(paths.ompSettings))).toEqual(readYaml(initial[paths.ompSettings]!))
+      expect(readJson(yield* fs.readFileString(paths.clineProviders))).toEqual(readJson(initial[paths.clineProviders]!))
       expect((readJson(yield* fs.readFileString(paths.manifest)) as { connections: unknown[] }).connections).toEqual([])
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
   })
@@ -494,7 +509,7 @@ describe("HarnessConnection model-set behavior", () => {
       const service = yield* installedService(paths)
 
       for (const connector of makeHarnessConnectorRegistry(paths).ordered.filter(({ id }) => id !== "magnitude")) {
-        yield* service.connect(connector.id, { setCurrent: Option.some(model) })
+        yield* service.connect(connector.id, { model: Option.some(model) })
       }
 
       expect(readJson(yield* fs.readFileString(paths.piModels))).toMatchObject({
@@ -506,7 +521,7 @@ describe("HarnessConnection model-set behavior", () => {
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
   })
 
-  it("connects every model without changing current selections when setCurrent is absent", async () => {
+  it("connects every model without changing current selections when a model is absent", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
       const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-all-models-" })
@@ -516,8 +531,7 @@ describe("HarnessConnection model-set behavior", () => {
       const service = yield* installedService(paths)
 
       for (const connector of makeHarnessConnectorRegistry(paths).ordered.filter(({ id }) => id !== "magnitude")) {
-        const result = yield* service.connect(connector.id, { setCurrent: Option.none() })
-        expect(Option.isNone(result.launchPlan)).toBe(true)
+        yield* service.connect(connector.id, { model: Option.none() })
       }
 
       expect(readJson(yield* fs.readFileString(paths.piModels))).toMatchObject({
@@ -529,6 +543,7 @@ describe("HarnessConnection model-set behavior", () => {
       })
       expect(readYaml(yield* fs.readFileString(paths.hermes))).toEqual({
         theme: "dark",
+        model: { provider: "user", default: "model" },
         providers: { magnitude: hermesProviderConfig() },
         agent: { reasoning_overrides: hermesReasoningOverrides(models) },
       })
@@ -536,11 +551,15 @@ describe("HarnessConnection model-set behavior", () => {
         models: { providers: { magnitude: openClawProviderConfig(models) } },
         agents: { defaults: { model: { primary: "user/model" } }, list: [{ id: "main", model: "user/model" }] },
       })
-      const codexSpec = { models, setCurrent: Option.none<typeof model>() }
+      const codexSpec = { models, model: Option.none<typeof model>() }
       expect(yield* fs.readFileString(paths.codex)).toBe(codexConfig(codexSpec, paths.codexModels))
       expect(yield* fs.readFileString(paths.codexModels)).toBe(codexModelCatalog(codexSpec))
+      expect(Bun.TOML.parse(yield* fs.readFileString(paths.codexUser))).toMatchObject({
+        model_provider: "openai", model: "user/model",
+      })
       expect(readJson(yield* fs.readFileString(paths.claude))).toEqual({
         theme: "dark",
+        model: "user/model",
         env: {
           USER_KEY: "preserve",
           ANTHROPIC_BASE_URL,
@@ -550,7 +569,7 @@ describe("HarnessConnection model-set behavior", () => {
       expect(readYaml(yield* fs.readFileString(paths.ompModels))).toMatchObject({
         providers: { magnitude: ohMyPiProviderConfig(models) },
       })
-      expect(readJson(yield* fs.readFileString(paths.ompSettings))).toEqual(readJson(initial[paths.ompSettings]!))
+      expect(readYaml(yield* fs.readFileString(paths.ompSettings))).toEqual(readYaml(initial[paths.ompSettings]!))
       expect(readJson(yield* fs.readFileString(paths.clineProviders))).toMatchObject({
         lastUsedProvider: "user-provider",
         providers: { "openai-compatible": { settings: clineProviderSettings(Option.none()) } },
@@ -565,7 +584,7 @@ describe("HarnessConnection model-set behavior", () => {
       expect(manifest.connections).toHaveLength(8)
       for (const entry of manifest.connections) {
         expect(entry.models).toEqual(models)
-        expect(entry).not.toHaveProperty("setCurrent")
+        expect(entry).not.toHaveProperty("restore")
       }
 
       for (const connector of makeHarnessConnectorRegistry(paths).ordered.filter(({ id }) => id !== "magnitude")) {
@@ -578,9 +597,10 @@ describe("HarnessConnection model-set behavior", () => {
       expect(readJson(yield* fs.readFileString(paths.openclaw))).toEqual(readJson(initial[paths.openclaw]!))
       expect(yield* fs.exists(paths.codex)).toBe(false)
       expect(yield* fs.exists(paths.codexModels)).toBe(false)
+      expect(Bun.TOML.parse(yield* fs.readFileString(paths.codexUser))).toEqual(Bun.TOML.parse(initial[paths.codexUser]!))
       expect(readJson(yield* fs.readFileString(paths.claude))).toEqual(readJson(initial[paths.claude]!))
       expect(readYaml(yield* fs.readFileString(paths.ompModels))).toEqual(readYaml(initial[paths.ompModels]!))
-      expect(readJson(yield* fs.readFileString(paths.ompSettings))).toEqual(readJson(initial[paths.ompSettings]!))
+      expect(readYaml(yield* fs.readFileString(paths.ompSettings))).toEqual(readYaml(initial[paths.ompSettings]!))
       expect(readJson(yield* fs.readFileString(paths.clineProviders))).toEqual(readJson(initial[paths.clineProviders]!))
       expect(readJson(yield* fs.readFileString(paths.clineModels))).toEqual(readJson(initial[paths.clineModels]!))
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
@@ -595,7 +615,7 @@ describe("HarnessConnection model-set behavior", () => {
       const harness = HarnessIdSchema.make("pi")
 
       expect((yield* service.list).find(({ id }) => id === harness)?.connected).toBe(false)
-      yield* service.connect(harness, { setCurrent: Option.none() })
+      yield* service.connect(harness, { model: Option.none() })
       expect((yield* service.list).find(({ id }) => id === harness)?.connected).toBe(true)
       yield* service.disconnect(harness)
       yield* service.disconnect(harness)
@@ -603,7 +623,7 @@ describe("HarnessConnection model-set behavior", () => {
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
   })
 
-  it("applies setCurrent, returns exact launch plans, and disconnects every harness cleanly", async () => {
+  it("persists model selection, launches independently, and restores on disconnect", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
       const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-current-" })
@@ -613,24 +633,31 @@ describe("HarnessConnection model-set behavior", () => {
       const service = yield* installedService(paths)
 
       for (const connector of makeHarnessConnectorRegistry(paths).ordered.filter(({ id }) => id !== "magnitude")) {
-        const result = yield* service.connect(connector.id, { setCurrent: Option.some(model) })
-        expect(Option.isSome(result.launchPlan)).toBe(true)
-        if (Option.isSome(result.launchPlan)) {
-          expect(result.launchPlan.value.harness).toBe(connector.id)
-          expect(result.launchPlan.value.modelId).toBe(model)
-        }
+        yield* service.connect(connector.id, { model: Option.some(model) })
+        const plan = yield* service.launch(connector.id, model)
+        expect(plan.harness).toBe(connector.id)
+        expect(plan.modelId).toBe(model)
       }
 
-      expect(readJson(yield* fs.readFileString(paths.piSettings))).toEqual(readJson(initial[paths.piSettings]!))
-      expect(readJson(yield* fs.readFileString(paths.opencode))).toMatchObject({ model: "user/model" })
-      expect(readYaml(yield* fs.readFileString(paths.hermes))).not.toHaveProperty("model")
+      expect(readJson(yield* fs.readFileString(paths.piSettings))).toMatchObject({
+        defaultProvider: "magnitude", defaultModel: model,
+      })
+      expect(readJson(yield* fs.readFileString(paths.opencode))).toMatchObject({ model: `magnitude/${model}` })
+      expect(readYaml(yield* fs.readFileString(paths.hermes))).toMatchObject({
+        model: { provider: "custom:magnitude", default: model },
+      })
+      expect(readJson(yield* fs.readFileString(paths.openclaw))).toMatchObject({
+        agents: { defaults: { model: { primary: `magnitude/${model}` } } },
+      })
       expect(readJson(yield* fs.readFileString(paths.openclaw))).toMatchObject({
         agents: { list: [
           { id: "main", model: "user/model" },
           { id: "magnitude", model: `magnitude/${model}`, thinkingDefault: "high" },
         ] },
       })
-      expect(yield* fs.readFileString(paths.codex)).toContain(`model = "${model}"`)
+      expect(Bun.TOML.parse(yield* fs.readFileString(paths.codexUser))).toMatchObject({
+        model_provider: "magnitude", model, model_catalog_json: paths.codexModels,
+      })
       expect(yield* fs.readFileString(paths.codex)).not.toContain("model_reasoning_effort")
       expect(yield* fs.readFileString(paths.codex)).toContain('service_tier = "default"')
       const codexModels = readJson(yield* fs.readFileString(paths.codexModels)) as {
@@ -644,10 +671,25 @@ describe("HarnessConnection model-set behavior", () => {
         supported_reasoning_levels: [{ effort: "high" }],
         service_tiers: [],
       })
-      expect(readJson(yield* fs.readFileString(paths.ompSettings))).toEqual(readJson(initial[paths.ompSettings]!))
+      expect(readJson(yield* fs.readFileString(paths.claude))).toMatchObject({
+        model: anthropicLocalModelId(model),
+      })
+      expect(readYaml(yield* fs.readFileString(paths.ompSettings))).toMatchObject({
+        modelRoles: { default: `magnitude/${model}` },
+      })
       expect(readJson(yield* fs.readFileString(paths.clineProviders))).toMatchObject({
+        lastUsedProvider: "openai-compatible",
         providers: { "openai-compatible": { settings: clineProviderSettings(Option.some(model)) } },
       })
+
+      const manifest = readJson(yield* fs.readFileString(paths.manifest)) as {
+        connections: ReadonlyArray<Record<string, unknown>>
+      }
+      expect(manifest.connections.every((entry) => Object.hasOwn(entry, "restore"))).toBe(true)
+
+      const openClawPlan = yield* service.launch(HarnessIdSchema.make("openclaw"), model)
+      expect(openClawPlan.args.slice(0, 3)).toEqual(["tui", "--local", "--session"])
+      expect(openClawPlan.args[3]).toMatch(/^agent:magnitude:[0-9a-f-]{36}$/)
 
       for (const connector of makeHarnessConnectorRegistry(paths).ordered.filter(({ id }) => id !== "magnitude")) {
         yield* service.disconnect(connector.id)
@@ -660,9 +702,10 @@ describe("HarnessConnection model-set behavior", () => {
       expect(readJson(yield* fs.readFileString(paths.openclaw))).toEqual(readJson(initial[paths.openclaw]!))
       expect(yield* fs.exists(paths.codex)).toBe(false)
       expect(yield* fs.exists(paths.codexModels)).toBe(false)
+      expect(Bun.TOML.parse(yield* fs.readFileString(paths.codexUser))).toEqual(Bun.TOML.parse(initial[paths.codexUser]!))
       expect(readJson(yield* fs.readFileString(paths.claude))).toEqual(readJson(initial[paths.claude]!))
       expect(readYaml(yield* fs.readFileString(paths.ompModels))).toEqual(readYaml(initial[paths.ompModels]!))
-      expect(readJson(yield* fs.readFileString(paths.ompSettings))).toEqual(readJson(initial[paths.ompSettings]!))
+      expect(readYaml(yield* fs.readFileString(paths.ompSettings))).toEqual(readYaml(initial[paths.ompSettings]!))
       expect(readJson(yield* fs.readFileString(paths.clineProviders))).toEqual(readJson(initial[paths.clineProviders]!))
       expect(readJson(yield* fs.readFileString(paths.clineModels))).toEqual(readJson(initial[paths.clineModels]!))
       expect((readJson(yield* fs.readFileString(paths.manifest)) as { connections: unknown[] }).connections).toEqual([])
@@ -675,12 +718,78 @@ describe("HarnessConnection model-set behavior", () => {
       const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-divergent-" })
       const paths = fixturePaths(root)
       const service = yield* installedService(paths)
-      yield* service.connect(HarnessIdSchema.make("pi"), { setCurrent: Option.none() })
+      yield* service.connect(HarnessIdSchema.make("pi"), { model: Option.none() })
       const connected = readJson(yield* fs.readFileString(paths.piModels)) as Record<string, unknown>
       ;(connected.providers as Record<string, unknown>).magnitude = { userEdited: true }
       yield* fs.writeFileString(paths.piModels, stringifyJson(connected))
       yield* service.disconnect(HarnessIdSchema.make("pi"))
       expect(readJson(yield* fs.readFileString(paths.piModels))).toEqual({ providers: {} })
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
+  it("skips model restoration after a user selects a non-Magnitude model and still disconnects", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-user-selection-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const service = yield* installedService(paths)
+      const connectors = makeHarnessConnectorRegistry(paths).ordered.filter(({ id }) => id !== "magnitude")
+      for (const connector of connectors) yield* service.connect(connector.id, { model: Option.some(model) })
+
+      const pi = yield* fs.readFileString(paths.piSettings)
+      yield* fs.writeFileString(paths.piSettings, updateJsonc(pi, [
+        [["defaultProvider"], "user"], [["defaultModel"], "new/model"],
+      ]))
+      const opencode = yield* fs.readFileString(paths.opencode)
+      yield* fs.writeFileString(paths.opencode, updateJsonc(opencode, [[["model"], "user/new-model"]]))
+      const hermes = yield* fs.readFileString(paths.hermes)
+      yield* fs.writeFileString(paths.hermes, updateYaml(hermes, [
+        [["model", "provider"], "user"], [["model", "default"], "new-model"],
+      ]))
+      const openclaw = yield* fs.readFileString(paths.openclaw)
+      yield* fs.writeFileString(paths.openclaw, updateJsonc(openclaw, [[
+        ["agents", "defaults", "model", "primary"], "user/new-model",
+      ]]))
+      const codex = (yield* fs.readFileString(paths.codexUser))
+        .replace('model_provider = "magnitude"', 'model_provider = "openai"')
+        .replace(`model = "${model}"`, 'model = "user/new-model"')
+      yield* fs.writeFileString(paths.codexUser, codex)
+      const claude = yield* fs.readFileString(paths.claude)
+      yield* fs.writeFileString(paths.claude, updateJsonc(claude, [[["model"], "user/new-model"]]))
+      const omp = yield* fs.readFileString(paths.ompSettings)
+      yield* fs.writeFileString(paths.ompSettings, updateYaml(omp, [[
+        ["modelRoles", "default"], "user/new-model",
+      ]]))
+      const cline = yield* fs.readFileString(paths.clineProviders)
+      yield* fs.writeFileString(paths.clineProviders, updateJsonc(cline, [[
+        ["lastUsedProvider"], "user-provider",
+      ]]))
+
+      yield* service.sync()
+      for (const connector of connectors) yield* service.disconnect(connector.id)
+
+      expect(readJson(yield* fs.readFileString(paths.piSettings))).toMatchObject({
+        defaultProvider: "user", defaultModel: "new/model",
+      })
+      expect(readJson(yield* fs.readFileString(paths.opencode))).toMatchObject({ model: "user/new-model" })
+      expect(readYaml(yield* fs.readFileString(paths.hermes))).toMatchObject({
+        model: { provider: "user", default: "new-model" },
+      })
+      expect(readJson(yield* fs.readFileString(paths.openclaw))).toMatchObject({
+        agents: { defaults: { model: { primary: "user/new-model" } } },
+      })
+      expect(Bun.TOML.parse(yield* fs.readFileString(paths.codexUser))).toMatchObject({
+        model_provider: "openai", model: "user/new-model",
+      })
+      expect(readJson(yield* fs.readFileString(paths.claude))).toMatchObject({ model: "user/new-model" })
+      expect(readYaml(yield* fs.readFileString(paths.ompSettings))).toMatchObject({
+        modelRoles: { default: "user/new-model" },
+      })
+      expect(readJson(yield* fs.readFileString(paths.clineProviders))).toMatchObject({
+        lastUsedProvider: "user-provider",
+      })
+      expect((readJson(yield* fs.readFileString(paths.manifest)) as { connections: unknown[] }).connections).toEqual([])
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
   })
 
@@ -696,7 +805,7 @@ describe("HarnessConnection model-set behavior", () => {
             {
               harness: "pi",
               models: [model],
-              setCurrent: model,
+              setModel: model,
               updatedAt: "2026-08-25T00:00:00.000Z",
             },
           ],
@@ -709,14 +818,13 @@ describe("HarnessConnection model-set behavior", () => {
         connections: [{
           harness: "pi",
           models: [],
-          setCurrent: model,
           updatedAt: "2026-08-25T00:00:00.000Z",
         }],
       })
 
-      yield* service.connect(HarnessIdSchema.make("pi"), { setCurrent: Option.some(model) })
+      yield* service.connect(HarnessIdSchema.make("pi"), { model: Option.some(model) })
       expect(readJson(yield* fs.readFileString(paths.manifest))).toMatchObject({
-        connections: [{ harness: "pi", models, setCurrent: model }],
+        connections: [{ harness: "pi", models, restore: { } }],
       })
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
   })
@@ -732,7 +840,7 @@ describe("HarnessConnection model-set behavior", () => {
             {
               harness: "pi",
               models: [models[0], { ...models[1], name: 42 }],
-              setCurrent: 42,
+              restore: { model: 42 },
               updatedAt: 42,
             },
             { harness: "unknown", models, updatedAt: "2026-08-25T00:00:00.000Z" },
@@ -752,6 +860,7 @@ describe("HarnessConnection model-set behavior", () => {
           {
             harness: "pi",
             models: [models[0]],
+            restore: {},
             updatedAt: "1970-01-01T00:00:00.000Z",
           },
           {
@@ -800,7 +909,7 @@ describe("HarnessConnection model-set behavior", () => {
       const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-cline-divergent-" })
       const paths = fixturePaths(root)
       const service = yield* installedService(paths)
-      yield* service.connect(HarnessIdSchema.make("cline"), { setCurrent: Option.none() })
+      yield* service.connect(HarnessIdSchema.make("cline"), { model: Option.none() })
 
       const providers = readJson(yield* fs.readFileString(paths.clineProviders)) as {
         providers: Record<string, unknown>
@@ -824,7 +933,7 @@ describe("HarnessConnection model-set behavior", () => {
       const paths = fixturePaths(root)
       yield* writeFixtures(initialFiles(paths))
       const service = yield* installedService(paths)
-      yield* service.connect(HarnessIdSchema.make("claude-code"), { setCurrent: Option.some(model) })
+      yield* service.connect(HarnessIdSchema.make("claude-code"), { model: Option.some(model) })
       const settings = readJson(yield* fs.readFileString(paths.claude)) as { env: Record<string, string> }
       settings.env.ANTHROPIC_BASE_URL = "https://user-gateway.example"
       yield* fs.writeFileString(paths.claude, stringifyJson(settings))
@@ -833,6 +942,7 @@ describe("HarnessConnection model-set behavior", () => {
 
       expect(readJson(yield* fs.readFileString(paths.claude))).toEqual({
         theme: "dark",
+        model: anthropicLocalModelId(model),
         env: { USER_KEY: "preserve", ANTHROPIC_BASE_URL: "https://user-gateway.example" },
       })
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
@@ -844,7 +954,7 @@ describe("HarnessConnection model-set behavior", () => {
       const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-cline-sync-" })
       const paths = fixturePaths(root)
       const first = yield* installedService(paths, [models[0]])
-      yield* first.connect(HarnessIdSchema.make("cline"), { setCurrent: Option.some(model) })
+      yield* first.connect(HarnessIdSchema.make("cline"), { model: Option.some(model) })
       const second = yield* installedService(paths, models)
       yield* second.sync(HarnessIdSchema.make("cline"))
 
@@ -854,23 +964,25 @@ describe("HarnessConnection model-set behavior", () => {
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
   })
 
-  it("sync refreshes the complete model set without changing setCurrent", async () => {
+  it("sync refreshes the complete model set without changing model selection", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
       const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-sync-" })
       const paths = fixturePaths(root)
       const first = yield* installedService(paths, [models[0]])
-      yield* first.connect(HarnessIdSchema.make("pi"), { setCurrent: Option.some(model) })
+      yield* first.connect(HarnessIdSchema.make("pi"), { model: Option.some(model) })
       const second = yield* installedService(paths, models)
       yield* second.sync(HarnessIdSchema.make("pi"))
       expect(readJson(yield* fs.readFileString(paths.piModels))).toMatchObject({
         providers: { magnitude: piProviderConfig(models) },
       })
-      expect(yield* fs.exists(paths.piSettings)).toBe(false)
+      expect(readJson(yield* fs.readFileString(paths.piSettings))).toMatchObject({
+        defaultProvider: "magnitude", defaultModel: model,
+      })
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
   })
 
-  it("rejects setCurrent when it is not in the installed Magnitude model set", async () => {
+  it("rejects a model when it is not in the installed Magnitude model set", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
       const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-invalid-current-" })
@@ -878,7 +990,7 @@ describe("HarnessConnection model-set behavior", () => {
       const service = yield* installedService(paths, [models[1]])
       const exit = yield* Effect.exit(service.connect(
         HarnessIdSchema.make("pi"),
-        { setCurrent: Option.some(model) },
+        { model: Option.some(model) },
       ))
       expect(exit._tag).toBe("Failure")
       expect(readJson(yield* fs.readFileString(paths.manifest))).toEqual({ connections: [] })
@@ -893,14 +1005,12 @@ describe("HarnessConnection model-set behavior", () => {
     expect(plan.environment).toEqual({})
   })
 
-  it("launches Cline with its isolated Magnitude data directory", () => {
+  it("launches Cline with an explicit model independently of persistent configuration", () => {
     const paths = fixturePaths("/tmp/cline")
     const connector = makeHarnessConnectorRegistry(paths).get(HarnessIdSchema.make("cline"))
     const plan = connector.launch(model, { executable: "cline" })
     expect(plan.args).toEqual([
       "--tui",
-      "--data-dir",
-      paths.clineDataDir,
       "--provider",
       "openai-compatible",
       "--model",

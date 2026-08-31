@@ -1,4 +1,4 @@
-import { Effect } from "effect"
+import { Effect, Option } from "effect"
 import { defineConnector, launchPlan } from "../shared"
 
 export const makeMagnitudeConnector = () => defineConnector({
@@ -9,7 +9,7 @@ export const makeMagnitudeConnector = () => defineConnector({
   note: "Optimized for local models",
   skillInstallationTarget: "shared-agents",
   configurationFiles: [],
-  connect: () => Effect.void,
+  connect: () => Effect.succeed(Option.none()),
   disconnect: () => Effect.void,
   launch(modelId, installation) { return launchPlan(this, installation, modelId, []) },
 })

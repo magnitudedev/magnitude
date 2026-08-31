@@ -11,7 +11,7 @@ import { applyEdits, modify, parse, type ParseError } from "jsonc-parser"
 import { isDeepStrictEqual } from "node:util"
 import { parseDocument } from "yaml"
 import { writeFileAtomic } from "../utils/atomic-file"
-import type { HarnessConnectionSpec, HarnessConnector, HarnessInstallation } from "./contract"
+import type { HarnessConnector, HarnessInstallation } from "./contract"
 
 export const OPENAI_BASE_URL = new URL("v1", MAGNITUDE_INFERENCE_BASE_URL).href.replace(/\/$/, "")
 export const ANTHROPIC_BASE_URL = MAGNITUDE_ANTHROPIC_BASE_URL.replace(/\/$/, "")
@@ -22,6 +22,68 @@ const LOCAL_ANTHROPIC_MODEL_PREFIX = "anthropic-local/"
 
 export const anthropicLocalModelId = (modelId: string): string =>
   `${LOCAL_ANTHROPIC_MODEL_PREFIX}${modelId}`
+
+export const isAnthropicLocalModelId = (modelId: unknown): modelId is string =>
+  typeof modelId === "string" && modelId.startsWith(LOCAL_ANTHROPIC_MODEL_PREFIX)
+
+/** Normalize a harness selection whose provider and model are stored separately. */
+export const qualifiedModelSelection = (provider: unknown, model: unknown): Option.Option<string> =>
+  typeof provider === "string" && provider.length > 0 && typeof model === "string" && model.length > 0
+    ? Option.some(`${provider}/${model}`)
+    : Option.none()
+
+export const splitQualifiedModelSelection = (
+  selection: string,
+): { readonly provider: string; readonly model: string } | undefined => {
+  const separator = selection.indexOf("/")
+  return separator <= 0 || separator === selection.length - 1
+    ? undefined
+    : { provider: selection.slice(0, separator), model: selection.slice(separator + 1) }
+}
+
+export const tomlTopLevelValue = (source: string, key: string): unknown => {
+  const value = Bun.TOML.parse(source.trim() === "" ? "" : source)
+  return value !== null && typeof value === "object" ? (value as Record<string, unknown>)[key] : undefined
+}
+
+const tomlScalar = (value: string): string => JSON.stringify(value)
+
+/** Update string-valued top-level TOML keys while preserving unrelated text and tables. */
+export const updateTomlTopLevel = (
+  source: string,
+  changes: ReadonlyArray<readonly [string, string | undefined]>,
+): string => {
+  const lines = source.split("\n")
+  const additions: string[] = []
+  for (const [key, value] of changes) {
+    const matcher = new RegExp(`^\\s*${key}\\s*=`)
+    const firstTable = lines.findIndex((line) => /^\s*\[/.test(line))
+    const boundary = firstTable === -1 ? lines.length : firstTable
+    const index = lines.slice(0, boundary).findIndex((line) => matcher.test(line))
+    if (index >= 0) {
+      if (value === undefined) lines.splice(index, 1)
+      else lines[index] = `${key} = ${tomlScalar(value)}`
+    } else if (value !== undefined) {
+      additions.push(`${key} = ${tomlScalar(value)}`)
+    }
+  }
+  if (additions.length > 0) {
+    const insertion = lines.findIndex((line) => /^\s*\[/.test(line))
+    lines.splice(insertion === -1 ? Math.max(0, lines.length - 1) : insertion, 0, ...additions)
+  }
+  return lines.join("\n")
+}
+
+export const removeTomlTable = (source: string, table: string): string => {
+  const lines = source.split("\n")
+  const header = `[${table}]`
+  const start = lines.findIndex((line) => line.trim() === header)
+  if (start < 0) return source
+  let end = start + 1
+  while (end < lines.length && !/^\s*\[/.test(lines[end]!)) end += 1
+  lines.splice(start, end - start)
+  return lines.join("\n")
+}
 
 export const readOr = (file: string, fallback: string) => FileSystem.FileSystem.pipe(
   Effect.flatMap((fs) => fs.readFileString(file)),
@@ -172,5 +234,3 @@ export const defineConnector = (definition: ConnectorDefinition): HarnessConnect
         )),
   }
 }
-
-export const currentModel = (spec: HarnessConnectionSpec): Option.Option<ProviderModelId> => spec.setCurrent

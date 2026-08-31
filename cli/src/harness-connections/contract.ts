@@ -68,11 +68,22 @@ export const HarnessModelSchema = Schema.transform(
 )
 export type HarnessModel = typeof HarnessModelSchema.Type
 
+export const HarnessRestoreSchema = Schema.Struct({
+  model: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+})
+export type HarnessRestore = typeof HarnessRestoreSchema.Type
+
 export interface HarnessConnectionSpec {
   readonly models: ReadonlyArray<HarnessModel>
-  readonly setCurrent: Option.Option<ProviderModelId>
+  /** Model to persist for ordinary new harness sessions. */
+  readonly model: Option.Option<ProviderModelId>
   /** Last connector-owned projection, used to distinguish safe sync updates from user overrides. */
   readonly previousModels?: ReadonlyArray<HarnessModel>
+}
+
+export interface HarnessDisconnectionSpec {
+  readonly models: ReadonlyArray<HarnessModel>
+  readonly restore: Option.Option<HarnessRestore>
 }
 
 export interface HarnessInstallation {
@@ -90,9 +101,9 @@ export interface HarnessConnector {
   readonly detect: (searchPath: string) => Effect.Effect<Option.Option<HarnessInstallation>>
   readonly connect: (
     spec: HarnessConnectionSpec,
-  ) => Effect.Effect<void, unknown, FileSystem.FileSystem | Path.Path>
+  ) => Effect.Effect<Option.Option<HarnessRestore>, unknown, FileSystem.FileSystem | Path.Path>
   readonly disconnect: (
-    spec: HarnessConnectionSpec,
+    spec: HarnessDisconnectionSpec,
   ) => Effect.Effect<void, unknown, FileSystem.FileSystem | Path.Path>
   readonly launch: (
     modelId: ProviderModelId,

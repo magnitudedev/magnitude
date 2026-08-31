@@ -13,10 +13,10 @@ export const registerConnectionsCommand = (program: Command): void => {
   connections.command("add")
     .description("Connect installed Magnitude models to a harness")
     .argument("<harness>", "Harness ID")
-    .option("--set-current <model-id>", "Also select this Magnitude model in the harness")
+    .option("--set-model <model-id>", "Also select this Magnitude model in the harness")
     .option("--install-skill", "Install or refresh the Magnitude skill for this harness")
     .action((harness, options) => loadRuntime().then(({ addConnection }) =>
-      addConnection(harness, options.setCurrent, options.installSkill === true)))
+      addConnection(harness, options.setModel, options.installSkill === true)))
 
   connections.command("sync")
     .description("Refresh configured harnesses with installed Magnitude models")

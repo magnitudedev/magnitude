@@ -2,7 +2,18 @@ import * as FileSystem from "@effect/platform/FileSystem"
 import { Effect, Option } from "effect"
 import type { HarnessConnectionSpec } from "../contract"
 import type { HarnessConnectionPaths } from "../paths"
-import { OPENAI_BASE_URL, defineConnector, launchPlan } from "../shared"
+import {
+  OPENAI_BASE_URL,
+  defineConnector,
+  launchPlan,
+  qualifiedModelSelection,
+  readOr,
+  removeTomlTable,
+  splitQualifiedModelSelection,
+  tomlTopLevelValue,
+  updateTomlTopLevel,
+  writeIfChanged,
+} from "../shared"
 import { writeFileAtomic } from "../../utils/atomic-file"
 
 const CODEX_BASE_INSTRUCTIONS = "You are a coding agent running in Codex CLI. Work with the user in the current workspace until their request is resolved. Inspect relevant files before changing them, follow repository instructions, make focused edits, verify consequential changes, and communicate progress and results concisely. Use the available tools when they are needed and preserve user work unrelated to the request."
@@ -56,10 +67,6 @@ export const codexConfig = (spec: HarnessConnectionSpec, modelCatalogPath: strin
   return `model_provider = "magnitude"
 model_catalog_json = ${JSON.stringify(modelCatalogPath)}
 service_tier = "default"
-${Option.match(spec.setCurrent, {
-  onNone: () => "",
-  onSome: (modelId) => `model = ${JSON.stringify(modelId)}\n`,
-})}
 [model_providers.magnitude]
 name = "Magnitude"
 base_url = ${JSON.stringify(OPENAI_BASE_URL)}
@@ -68,23 +75,72 @@ requires_openai_auth = false
 `
 }
 
+const CODEX_PROVIDER_TABLE = `[model_providers.magnitude]
+name = "Magnitude"
+base_url = ${JSON.stringify(OPENAI_BASE_URL)}
+wire_api = "responses"
+requires_openai_auth = false
+`
+
+const installCodexProvider = (source: string): string => {
+  const withoutProvider = removeTomlTable(source, "model_providers.magnitude").trimEnd()
+  return `${withoutProvider}${withoutProvider.length === 0 ? "" : "\n\n"}${CODEX_PROVIDER_TABLE}`
+}
+
 export const makeCodexConnector = (paths: HarnessConnectionPaths) => defineConnector({
   id: "codex",
   name: "Codex",
   executable: "codex",
   skillInstallationTarget: "shared-agents",
-  configurationFiles: [paths.codex, paths.codexModels],
+  configurationFiles: [paths.codex, paths.codexUser, paths.codexModels],
   connect: (spec) => Effect.gen(function* () {
     yield* writeFileAtomic(paths.codexModels, codexModelCatalog(spec))
     yield* writeFileAtomic(paths.codex, codexConfig(spec, paths.codexModels))
+    const userSource = yield* readOr(paths.codexUser, "")
+    const previousModel = tomlTopLevelValue(userSource, "model")
+    const previousProvider = tomlTopLevelValue(userSource, "model_provider")
+    let next = userSource
+    if (Option.isSome(spec.model)) {
+      next = updateTomlTopLevel(next, [
+        ["model_provider", "magnitude"],
+        ["model", spec.model.value],
+        ["model_catalog_json", paths.codexModels],
+      ])
+    }
+    next = installCodexProvider(next)
+    yield* writeIfChanged(paths.codexUser, userSource, next)
+    return Option.map(spec.model, () => ({
+      model: typeof previousModel === "string"
+        ? qualifiedModelSelection(
+            typeof previousProvider === "string" ? previousProvider : "openai",
+            previousModel,
+          )
+        : Option.none(),
+    }))
   }),
-  disconnect: () => Effect.gen(function* () {
+  disconnect: (spec) => Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
+    const userSource = yield* readOr(paths.codexUser, "")
+    const currentProvider = tomlTopLevelValue(userSource, "model_provider")
+    const currentCatalog = tomlTopLevelValue(userSource, "model_catalog_json")
+    let next = removeTomlTable(userSource, "model_providers.magnitude")
+    if (currentCatalog === paths.codexModels) {
+      next = updateTomlTopLevel(next, [["model_catalog_json", undefined]])
+    }
+    if (currentProvider === "magnitude" && Option.isSome(spec.restore)) {
+      const previous = Option.flatMap(spec.restore.value.model, (selection) =>
+        Option.fromNullable(splitQualifiedModelSelection(selection)))
+      next = updateTomlTopLevel(next, [
+        ["model_provider", Option.match(previous, { onNone: () => undefined, onSome: ({ provider }) => provider })],
+        ["model", Option.match(previous, { onNone: () => undefined, onSome: ({ model }) => model })],
+      ])
+    }
+    yield* writeIfChanged(paths.codexUser, userSource, next)
     yield* Effect.forEach([paths.codex, paths.codexModels], (path) => fs.remove(path).pipe(
       Effect.catchTag("SystemError", (error) => error.reason === "NotFound" ? Effect.void : Effect.fail(error)),
     ), { discard: true })
   }),
   launch(modelId, installation) {
-    return launchPlan(this, installation, modelId, ["--profile", "magnitude"])
+    return launchPlan(this, installation, modelId, ["--profile", "magnitude", "--model", modelId])
   },
 })
