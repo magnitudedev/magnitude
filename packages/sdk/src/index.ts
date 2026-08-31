@@ -11,8 +11,12 @@ export {
 } from "./inference-endpoint"
 export {
   makeInferenceClient,
+  InferenceModelSchema,
+  InferenceModelsResponseSchema,
   ResponseObjectSchema,
   type InferenceClient,
+  type InferenceModel,
+  type InferenceModelsResponse,
   type ResponseObject,
 } from "./inference-client"
 

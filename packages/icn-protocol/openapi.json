@@ -4790,35 +4790,6 @@
         },
         "additionalProperties": false
       },
-      "MagnitudeModelDescriptor": {
-        "type": "object",
-        "required": [
-          "id",
-          "name",
-          "description",
-          "contextWindow",
-          "capabilities"
-        ],
-        "properties": {
-          "id": {
-            "type": "string"
-          },
-          "name": {
-            "type": "string"
-          },
-          "description": {
-            "type": "string"
-          },
-          "contextWindow": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "capabilities": {
-            "$ref": "#/components/schemas/ModelCapabilities"
-          }
-        }
-      },
       "MemoryAssessment": {
         "type": "object",
         "required": [
@@ -6151,7 +6122,13 @@
           "id",
           "object",
           "created",
-          "owned_by"
+          "owned_by",
+          "name",
+          "description",
+          "context_length",
+          "architecture",
+          "supported_parameters",
+          "top_provider"
         ],
         "properties": {
           "id": {
@@ -6167,6 +6144,86 @@
           },
           "owned_by": {
             "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "context_length": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "architecture": {
+            "$ref": "#/components/schemas/OpenAiModelArchitecture"
+          },
+          "supported_parameters": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "reasoning": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OpenAiModelReasoning"
+              }
+            ]
+          },
+          "top_provider": {
+            "$ref": "#/components/schemas/OpenAiTopProvider"
+          }
+        }
+      },
+      "OpenAiModelArchitecture": {
+        "type": "object",
+        "required": [
+          "input_modalities",
+          "output_modalities"
+        ],
+        "properties": {
+          "input_modalities": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "output_modalities": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "OpenAiModelReasoning": {
+        "type": "object",
+        "required": [
+          "supported_efforts",
+          "default_effort",
+          "default_enabled",
+          "mandatory"
+        ],
+        "properties": {
+          "supported_efforts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "default_effort": {
+            "type": "string"
+          },
+          "default_enabled": {
+            "type": "boolean"
+          },
+          "mandatory": {
+            "type": "boolean"
           }
         }
       },
@@ -6174,8 +6231,7 @@
         "type": "object",
         "required": [
           "object",
-          "data",
-          "models"
+          "data"
         ],
         "properties": {
           "object": {
@@ -6186,12 +6242,25 @@
             "items": {
               "$ref": "#/components/schemas/OpenAiModel"
             }
+          }
+        }
+      },
+      "OpenAiTopProvider": {
+        "type": "object",
+        "required": [
+          "context_length",
+          "max_completion_tokens"
+        ],
+        "properties": {
+          "context_length": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           },
-          "models": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/MagnitudeModelDescriptor"
-            }
+          "max_completion_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           }
         }
       },

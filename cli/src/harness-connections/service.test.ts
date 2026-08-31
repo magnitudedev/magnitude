@@ -8,6 +8,7 @@ import { parse } from "jsonc-parser"
 import { delimiter } from "node:path"
 import { parseDocument } from "yaml"
 import { describe, expect, it } from "vitest"
+import { HarnessModelSchema } from "./contract"
 import {
   ANTHROPIC_BASE_URL,
   CLAUDE_GATEWAY_DISCOVERY,
@@ -46,6 +47,7 @@ const models = [
     name: "Local Model (Q4)",
     description: "A local test model.",
     contextWindow: 50_000,
+    maxOutputTokens: 32_768,
     capabilities: {
       vision: false,
       tools: true,
@@ -58,6 +60,7 @@ const models = [
     name: "Second Model (Q6)",
     description: "Another local test model.",
     contextWindow: 32_768,
+    maxOutputTokens: 32_768,
     capabilities: {
       vision: true,
       tools: true,
@@ -142,6 +145,16 @@ const writeFixtures = (files: Readonly<Record<string, string>>) => Effect.gen(fu
     yield* fs.makeDirectory(file.slice(0, file.lastIndexOf("/")), { recursive: true })
     yield* fs.writeFileString(file, contents.endsWith("\n") ? contents : `${contents}\n`)
   }
+})
+
+describe("HarnessModel persistence", () => {
+  it("derives the 32K-bounded output ceiling for existing descriptors", () => {
+    const { maxOutputTokens: _, ...persisted } = models[0]
+
+    const decoded = Schema.decodeUnknownSync(HarnessModelSchema)(persisted)
+
+    expect(decoded.maxOutputTokens).toBe(32_768)
+  })
 })
 
 describe("HarnessConnector contract and registry", () => {

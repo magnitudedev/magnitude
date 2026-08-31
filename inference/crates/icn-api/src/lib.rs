@@ -88,23 +88,40 @@ pub struct OpenAiModel {
     pub object: &'static str,
     pub created: u64,
     pub owned_by: &'static str,
+    pub name: String,
+    pub description: String,
+    pub context_length: u32,
+    pub architecture: OpenAiModelArchitecture,
+    pub supported_parameters: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<OpenAiModelReasoning>,
+    pub top_provider: OpenAiTopProvider,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OpenAiModelArchitecture {
+    pub input_modalities: Vec<&'static str>,
+    pub output_modalities: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OpenAiModelReasoning {
+    pub supported_efforts: Vec<String>,
+    pub default_effort: String,
+    pub default_enabled: bool,
+    pub mandatory: bool,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OpenAiTopProvider {
+    pub context_length: u32,
+    pub max_completion_tokens: u32,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct OpenAiModelsResponse {
     pub object: &'static str,
     pub data: Vec<OpenAiModel>,
-    pub models: Vec<MagnitudeModelDescriptor>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct MagnitudeModelDescriptor {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-    pub context_window: u32,
-    pub capabilities: icn_contracts::models::ModelCapabilities,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -1512,20 +1529,13 @@ async fn standard_models(
         };
         let name = format!("{} ({})", model.display_name, model.variant_label);
         let id = model.id.to_string();
-        Some((
-            OpenAiModel {
-                id: id.clone(),
-                object: "model",
-                created: 0,
-                owned_by: "magnitude",
-            },
-            MagnitudeModelDescriptor {
-                id,
-                name,
-                description: model.description,
-                context_window: target.profile.context_length,
-                capabilities: target.capabilities,
-            },
+        Some(open_ai_model(
+            id,
+            "magnitude",
+            name,
+            model.description,
+            target.profile.context_length,
+            target.capabilities,
         ))
     });
     let discovered_models = discovered.models.into_iter().filter_map(|model| {
@@ -1547,28 +1557,78 @@ async fn standard_models(
             .to_owned();
         let repository = repository_id.as_str().to_owned();
         let id = id.to_string();
-        Some((
-            OpenAiModel {
-                id: id.clone(),
-                object: "model",
-                created: 0,
-                owned_by: "huggingface-cache",
-            },
-            MagnitudeModelDescriptor {
-                id,
-                name: display_name,
-                description: format!("Discovered in Hugging Face cache from {repository}"),
-                context_window: target.profile.context_length,
-                capabilities: target.capabilities,
-            },
+        Some(open_ai_model(
+            id,
+            "huggingface-cache",
+            display_name,
+            format!("Discovered in Hugging Face cache from {repository}"),
+            target.profile.context_length,
+            target.capabilities,
         ))
     });
-    let (data, model_names) = catalog_models.chain(discovered_models).unzip();
+    let data = catalog_models.chain(discovered_models).collect();
     Ok(Json(OpenAiModelsResponse {
         object: "list",
         data,
-        models: model_names,
     }))
+}
+
+fn open_ai_model(
+    id: String,
+    owned_by: &'static str,
+    name: String,
+    description: String,
+    context_length: u32,
+    capabilities: icn_contracts::models::ModelCapabilities,
+) -> OpenAiModel {
+    let mut supported_parameters = vec!["max_tokens"];
+    if capabilities.tools {
+        supported_parameters.extend(["tools", "tool_choice"]);
+    }
+    if capabilities.structured_output {
+        supported_parameters.extend(["structured_outputs", "response_format"]);
+    }
+    let reasoning = capabilities.reasoning.supported.then(|| {
+        supported_parameters.push("reasoning");
+        let default_effort = capabilities
+            .reasoning
+            .default_effort
+            .clone()
+            .expect("assessed reasoning capabilities must include a default effort");
+        OpenAiModelReasoning {
+            default_enabled: default_effort != "none",
+            mandatory: !capabilities
+                .reasoning
+                .efforts
+                .iter()
+                .any(|effort| effort == "none"),
+            supported_efforts: capabilities.reasoning.efforts,
+            default_effort,
+        }
+    });
+    let mut input_modalities = vec!["text"];
+    if capabilities.vision {
+        input_modalities.push("image");
+    }
+    OpenAiModel {
+        id,
+        object: "model",
+        created: 0,
+        owned_by,
+        name,
+        description,
+        context_length,
+        architecture: OpenAiModelArchitecture {
+            input_modalities,
+            output_modalities: vec!["text"],
+        },
+        supported_parameters,
+        reasoning,
+        top_provider: OpenAiTopProvider {
+            context_length,
+            max_completion_tokens: context_length.min(32_768),
+        },
+    }
 }
 
 #[utoipa::path(post, path = "/api/v1/models/{model_id}/properties", operation_id = "getModelProperties", tag = "models",
@@ -2128,6 +2188,9 @@ fn domain_error(error: domain::InferenceRequestError) -> ApiError {
         CatalogInstallationRemoval,
         EnsureModelInstanceRequest,
         OpenAiModel,
+        OpenAiModelArchitecture,
+        OpenAiModelReasoning,
+        OpenAiTopProvider,
         OpenAiModelsResponse,
         HuggingFaceModelSearchRequest,
         HuggingFaceModelSearchResults,
@@ -2663,6 +2726,47 @@ mod tests {
     use serde_json::{Value, json};
     use std::sync::atomic::AtomicBool;
     use tower::ServiceExt;
+
+    #[test]
+    fn openai_model_discovery_projects_harness_metadata_into_data() {
+        let model = open_ai_model(
+            "local/model".to_owned(),
+            "magnitude",
+            "Local Model".to_owned(),
+            "Local fixture.".to_owned(),
+            65_536,
+            icn_contracts::models::ModelCapabilities {
+                vision: true,
+                tools: true,
+                structured_output: true,
+                reasoning: icn_contracts::models::ModelReasoningCapabilities {
+                    supported: true,
+                    efforts: vec!["none".to_owned(), "high".to_owned()],
+                    default_effort: Some("high".to_owned()),
+                },
+            },
+        );
+
+        let value = serde_json::to_value(model).expect("serializable model");
+        assert_eq!(value["context_length"], 65_536);
+        assert_eq!(value["top_provider"]["max_completion_tokens"], 32_768);
+        assert_eq!(
+            value["architecture"]["input_modalities"],
+            json!(["text", "image"])
+        );
+        assert_eq!(
+            value["reasoning"]["supported_efforts"],
+            json!(["none", "high"])
+        );
+        assert_eq!(value["reasoning"]["default_effort"], "high");
+        assert_eq!(value["reasoning"]["mandatory"], false);
+        assert!(
+            value["supported_parameters"]
+                .as_array()
+                .expect("parameters")
+                .contains(&json!("reasoning"))
+        );
+    }
 
     #[tokio::test]
     async fn direct_resource_invalidations_are_published_with_monotonic_revisions() {

@@ -300,14 +300,12 @@ const localModels = async (
   const value = await Schema.decodeUnknownPromise(IcnSchemas.OpenAiModelsResponse)(
     await response.json(),
   )
-  const descriptors = new Map(value.models.map((model) => [model.id, model]))
   const models = value.data.map((entry): GatewayModel => {
-    const descriptor = descriptors.get(entry.id)
     return {
       type: "model",
       id: `${LOCAL_ANTHROPIC_MODEL_PREFIX}${entry.id}`,
-      display_name: descriptor?.name ?? entry.id,
-      description: descriptor?.description ?? "Local Magnitude model.",
+      display_name: entry.name,
+      description: entry.description,
       created_at: new Date(entry.created * 1000).toISOString(),
     }
   })
