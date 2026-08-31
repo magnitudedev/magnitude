@@ -31,7 +31,7 @@ applies_to:
 | Term                     | Meaning                                                                     |
 | ------------------------ | --------------------------------------------------------------------------- |
 | **Hardware calibration** | Model-free, serializable backend-performance evidence                       |
-| **Model assessment**     | Native evaluation of one exact servable bundle at one exact serving profile |
+| **Model assessment**     | Native evaluation of one exact resolved model at one exact serving profile  |
 | **Assessing**            | Ephemeral observable state while an admitted assessment scope is alive      |
 
 ## Hardware calibration
@@ -77,10 +77,12 @@ metric digest.
 
 ## Model assessment
 
-`POST /api/v1/models/assess` accepts one complete set of exact bundles and explicit assessment profiles. A bundle
-is one standalone package or one method-identified speculative-decoding bundle with embedded or
-separate draft capability. Each assessment profile specifies maximum context for one sequence and
-the context depths at which performance must be estimated.
+`POST /api/v1/catalog/assessments` and `POST /api/v1/discovery/assessments` accept targets addressed
+by the current revision of that domain and canonical `ModelId`. A catalog target also selects
+`Desired` or `Effective` material. ICN validates the revision and resolves each target to its exact
+private servable material before admitting work; packages and bundles do not cross the boundary.
+Each requested profile specifies maximum context for one sequence and the context depths at which
+performance must be estimated.
 
 An uncached assessment performs native work:
 
@@ -214,7 +216,8 @@ inside the scoped assessment Effect:
 - complete only from that scope's successful result;
 - publish a typed terminal result on every exit path;
 - never persist it;
-- serialize overlapping owners so stale completion is structurally impossible.
+- guard publication by inventory revision and local hardware-cycle generation so overlapping work
+  cannot publish stale completion.
 
 ICN independently bounds the complete stream and every worker job. Target work ends before the
 stream deadline, reserving time to emit terminal events. A caller finishes at its deadline even if
@@ -240,23 +243,22 @@ persisted. Operational failures are never persisted.
 
 ## ACN demand boundary
 
-`LocalModelAssessor` is ACN's sole native-assessment demand owner for issued catalog
-configurations plus canonical standard profiles for installed standalone bundles. ACN supplies the
-bundle and chosen profile for standard demand; ICN constructs and canonically identifies the exact
-configuration it assesses. The semantic assessment key covers every native cache-identity input
-plus that exact configuration and requested performance-depth policy. Provider, ranking,
-and product projections consume the resulting per-configuration state and do not invoke this
-endpoint directly.
+`LocalModelAssessor` is ACN's sole native-assessment demand owner. It requests the desired catalog
+material when a catalog model is not installed, effective material when installed, and only ready
+discovered models. It supplies each model's issued profile; ICN resolves and canonically identifies
+the exact private configuration it assesses. Provider, ranking, and product projections consume
+the resulting state and do not invoke assessment directly.
 
-One reconciliation submits every distinct pending bundle target in one ICN request. Profiles for
-the same bundle are combined into that target. ACN does not batch, throttle, or pre-filter the set;
-ICN owns target scheduling and native concurrency. ACN validates `Started`, exact request-ID
-cardinality, environment stability, and `Completed`, then publishes each result immediately.
+One source cycle submits at most one request per nonempty domain. ACN does not batch,
+throttle, or capacity-filter the target set; ICN owns target scheduling and native concurrency.
+ACN validates `Started`, revision, exact request-ID cardinality, echoed subject and selection,
+profiles, environment stability, uniqueness, and `Completed`, and publishes each result immediately
+while both source revisions and the hardware-cycle generation remain current.
 
-Source revisions and notifications only request reconciliation. Download progress, attempt state,
+Source invalidations only request rebuilding and reassessment. Download progress, attempt state,
 semantically equivalent inventory observations, catalog presentation, live memory, and client
-activity cannot admit assessment. A genuine semantic-key change admits work only for affected
-configurations, and completion publishes only if that key remains current.
+activity cannot admit assessment. A hardware assessment change admits a new cycle without changing
+either source revision.
 
 ## Product behavior
 
@@ -266,15 +268,16 @@ configurations, and completion publishes only if that key remains current.
   configuration, and ranking policy consumes only private eligible catalog inputs.
 - Inventory reconciliation is coalesced background work; reads return the last complete snapshot.
 - Resolved configurations remain visible while assessment is pending or fails.
-- Only completed `Fits` configurations can become installable catalog rows or enabled provider
-  offerings; assessment itself creates no durable configuration.
+- Only completed `Fits` configurations can become enabled provider offerings; assessment itself
+  creates no durable configuration or installation authority.
 - Downloading never performs hardware calibration.
 
 ## Conformance
 
 - ICN cannot become ready without hardware calibration and an operational worker pool.
 - One same-bundle job returns one result per requested profile.
-- One reconciliation uses one HTTP assessment request regardless of target count.
+- One reconciliation uses at most one HTTP assessment request per nonempty model domain regardless
+  of target count.
 - Progress begins at zero, counts exact submitted targets, and advances once per streamed result.
 - Stream truncation preserves emitted results and fails only unresolved targets.
 - Every profile result carries the exact ICN-constructed serving configuration it assessed.

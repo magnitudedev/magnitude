@@ -154,9 +154,12 @@ const readActiveModel = Effect.scoped(Effect.gen(function* () {
   for (const entry of catalog.models) {
     if (entry._tag !== "Local") continue
     const model = entry.product
-    const acquisition = model.acquisitionState
-    if (!("residencyState" in acquisition)) continue
-    const residency = acquisition.residencyState
+    const residency = model._tag === "Discovered"
+      ? model.state._tag === "Ready" ? model.state.residencyState : undefined
+      : "residencyState" in model.acquisitionState
+        ? model.acquisitionState.residencyState
+        : undefined
+    if (residency === undefined) continue
     if (residency._tag !== "Requested"
       && residency._tag !== "Loading"
       && residency._tag !== "Ready"

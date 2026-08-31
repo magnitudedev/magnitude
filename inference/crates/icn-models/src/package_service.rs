@@ -12,7 +12,7 @@ use icn_contracts::models::{
     ModelPackage, ModelPackageId, ModelPackageInspection, ModelPackageInstallationOrigin,
     ModelPackageOperand, ModelPackageProperties, ModelPackageSource,
     RemoveInstalledModelPackageResponse, ResolvedServableModelBundle, ServableModelBundle,
-    ServableModelBundleKey, ServingProfile,
+    ServingProfile,
 };
 use icn_contracts::{
     ComponentRelationship, ComponentRole, ContentIdentity, InventoryError, InventoryModel,
@@ -34,6 +34,13 @@ struct ResolvedPackageOperand {
     model: ResolvedModel,
     resolution_guard: Option<PreparedPreview>,
 }
+
+/// Private structural fingerprint used only by ICN's material caches and work coordination.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct ServableModelBundleKey(pub String);
 
 #[derive(Debug)]
 pub(crate) struct InspectedModelPackage {
@@ -557,10 +564,6 @@ impl ManagedModelStore {
         model: &InventoryModel,
         package: &ModelPackage,
     ) -> InstalledCatalogAttribution {
-        if !matches!(model.location, ModelLocation::MagnitudeCache { .. }) {
-            return InstalledCatalogAttribution::NotCatalogTarget;
-        }
-
         let attributed = |model: &icn_contracts::models::RecommendableModel| {
             InstalledCatalogAttribution::Attributed {
                 model_id: model.model_id.clone(),
@@ -594,19 +597,6 @@ impl ManagedModelStore {
             );
         }
 
-        let ModelPackageSource::HuggingFace { repository, .. } = &package.source else {
-            return failure(
-                "catalog_target_source_missing",
-                "managed catalog model has no Hugging Face target repository".to_owned(),
-            );
-        };
-        let Some(quality) = package.properties.intrinsic_quality_id.as_deref() else {
-            return failure(
-                "catalog_target_identity_missing",
-                "managed catalog model has no intrinsic GGUF quality identity".to_owned(),
-            );
-        };
-
         let affiliated_keys = self
             .catalog_affiliations
             .read()
@@ -616,7 +606,7 @@ impl ManagedModelStore {
                     .entries()
                     .filter(|affiliation| {
                         affiliation.role == CatalogPackageRole::Target
-                            && affiliation.repository == *repository
+                            && affiliation.package_id == package.id
                     })
                     .map(|affiliation| {
                         (affiliation.model_id.clone(), affiliation.variant_id.clone())
@@ -632,11 +622,7 @@ impl ManagedModelStore {
                 affiliated_keys.contains(&(
                     catalog_model.model_id.clone(),
                     catalog_model.variant_id.clone(),
-                )) && catalog_target(catalog_model)
-                    .properties
-                    .intrinsic_quality_id
-                    .as_deref()
-                    == Some(quality)
+                ))
             })
             .collect::<Vec<_>>();
         if affiliated.len() == 1 {
@@ -644,12 +630,33 @@ impl ManagedModelStore {
         }
         if affiliated.len() > 1 {
             return failure(
-                "catalog_repository_affiliation_ambiguous",
+                "catalog_package_affiliation_ambiguous",
                 format!(
-                    "repository {repository} and GGUF quality {quality} identify multiple catalog variants"
+                    "package {} is affiliated with multiple catalog variants",
+                    package.id.0
                 ),
             );
         }
+
+        // Intrinsic upgrade attribution is reserved for Magnitude-managed
+        // installations. External material requires an exact current or
+        // persisted package identity match.
+        if !matches!(model.location, ModelLocation::MagnitudeCache { .. }) {
+            return InstalledCatalogAttribution::NotCatalogTarget;
+        }
+
+        let ModelPackageSource::HuggingFace { .. } = &package.source else {
+            return failure(
+                "catalog_target_source_missing",
+                "managed catalog model has no Hugging Face target repository".to_owned(),
+            );
+        };
+        let Some(quality) = package.properties.intrinsic_quality_id.as_deref() else {
+            return failure(
+                "catalog_target_identity_missing",
+                "managed catalog model has no intrinsic GGUF quality identity".to_owned(),
+            );
+        };
 
         let Some(intrinsic_model_id) = package.properties.intrinsic_model_id.as_deref() else {
             return failure(
@@ -879,7 +886,7 @@ impl ManagedModelStore {
 
     pub(crate) fn build_installed_package_snapshot(
         &self,
-        models: &BTreeMap<icn_contracts::ModelId, InventoryModel>,
+        models: &BTreeMap<icn_contracts::InventoryEntryId, InventoryModel>,
     ) -> Result<InstalledPackageSnapshot, InventoryError> {
         self.retry_catalog_affiliation_persistence();
         let mut records = BTreeMap::new();
@@ -926,7 +933,7 @@ impl ManagedModelStore {
                 package,
             };
             records.insert(
-                installed.package.id.clone(),
+                model.id.clone(),
                 InstalledPackageRecord {
                     installed,
                     model: model.clone(),
@@ -997,7 +1004,14 @@ impl ManagedModelStore {
                 InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
             })?
             .records
-            .get(package_id)
+            .values()
+            .filter(|record| record.installed.package.id == *package_id)
+            .min_by_key(|record| {
+                (
+                    record.installed.origin == ModelPackageInstallationOrigin::HuggingFaceCache,
+                    &record.model.id,
+                )
+            })
             .cloned()
             .ok_or_else(|| InventoryError::NotFound(package_id.0.clone()))?;
         let resolved = ResolvedModel {
@@ -1161,12 +1175,10 @@ impl InstalledModelPackages for ManagedModelStore {
             match bundle {
                 ModelBundleInput::Standalone { package } => {
                     let resolved = self.resolve_package_operand(package).await?;
-                    let bundle_key = servable_model_bundle_key(&[&resolved.package.id]);
                     let bundle = ServableModelBundle::Standalone {
                         package: resolved.package,
                     };
-                    let mut result =
-                        ResolvedServableModelBundle::new(bundle_key, bundle, resolved.model, None);
+                    let mut result = ResolvedServableModelBundle::new(bundle, resolved.model, None);
                     if let Some(guard) = resolved.resolution_guard {
                         result = result.retain_resolution_guard(guard);
                     }
@@ -1206,13 +1218,8 @@ impl InstalledModelPackages for ManagedModelStore {
                         draft_source,
                         method,
                     };
-                    let bundle_key = servable_model_bundle_key_for_bundle(&bundle);
-                    let mut result = ResolvedServableModelBundle::new(
-                        bundle_key,
-                        bundle,
-                        target.model,
-                        draft_model,
-                    );
+                    let mut result =
+                        ResolvedServableModelBundle::new(bundle, target.model, draft_model);
                     if let Some(guard) = target.resolution_guard {
                         result = result.retain_resolution_guard(guard);
                     }
@@ -1231,11 +1238,34 @@ impl InstalledModelPackages for ManagedModelStore {
     ) -> BoxFuture<'_, Result<RemoveInstalledModelPackageResponse, InventoryError>> {
         let package_id = package_id.clone();
         Box::pin(async move {
-            let (_, resolved) = self.installed_package(&package_id).await?;
-            let deleted = <Self as ModelInventory>::delete(self, &resolved.model.id).await?;
+            let managed_occurrences = self
+                .installed_packages
+                .read()
+                .map_err(|_| {
+                    InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
+                })?
+                .records
+                .values()
+                .filter(|record| {
+                    record.installed.package.id == package_id
+                        && record.installed.origin == ModelPackageInstallationOrigin::Magnitude
+                })
+                .map(|record| record.model.id.clone())
+                .collect::<Vec<_>>();
+            if managed_occurrences.is_empty() {
+                return Err(InventoryError::NotFound(package_id.0));
+            }
+            let mut removed = false;
+            let mut freed_bytes = 0_u64;
+            for inventory_entry_id in managed_occurrences {
+                let deleted = <Self as ModelInventory>::delete(self, &inventory_entry_id).await?;
+                removed |= deleted.deleted;
+                freed_bytes = freed_bytes.saturating_add(deleted.freed_bytes);
+            }
             Ok(RemoveInstalledModelPackageResponse {
                 package_id,
-                removed: deleted.deleted,
+                removed,
+                freed_bytes,
             })
         })
     }
@@ -1252,8 +1282,8 @@ mod tests {
     };
     use icn_contracts::{
         CapabilityEvidence, CapabilitySupport, ComponentRelationship, ComponentRole, ContentId,
-        ContentIdentity, Integrity, InventoryModel, InventoryProperties, LocalDeclaration,
-        ModelAvailability, ModelComponent, ModelId, ModelLocation, ModelSource,
+        ContentIdentity, Integrity, InventoryEntryId, InventoryModel, InventoryProperties,
+        LocalDeclaration, ModelAvailability, ModelComponent, ModelLocation, ModelSource,
         ReasoningCapability, ResolvedComponent, ResolvedModel,
     };
 
@@ -1274,7 +1304,7 @@ mod tests {
             .collect();
         ResolvedModel {
             model: InventoryModel {
-                id: ModelId("model".to_owned()),
+                id: InventoryEntryId("model".to_owned()),
                 content_id: ContentId("content".to_owned()),
                 created: 0,
                 name: "model".to_owned(),

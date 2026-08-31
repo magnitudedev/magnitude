@@ -44,6 +44,18 @@ describe("inline service lifecycle copy", () => {
     })
   })
 
+  it("shows model discovery as its own startup phase", () => {
+    expect(serviceStartupChildPhase(state({
+      _tag: "Starting",
+      phase: "DiscoveringLocalModels",
+    }))).toEqual({
+      key: "models",
+      active: "Discovering local models",
+      completed: "Local models discovered",
+      progress: null,
+    })
+  })
+
   it("keeps download measurement on one line and completes total over total", () => {
     const downloading = state({
       _tag: "Installing",

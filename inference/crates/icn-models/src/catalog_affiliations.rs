@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use icn_contracts::models::{
-    CatalogModelId, CatalogPackageAffiliation, CatalogPackageRole, CatalogVariantId, ModelPackageId,
+    CatalogBaseId, CatalogPackageAffiliation, CatalogPackageRole, CatalogVariantId, ModelPackageId,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -91,8 +91,8 @@ impl CatalogAffiliations {
 fn decode_entry(value: &Value) -> Option<CatalogPackageAffiliation> {
     let entry = value.as_object()?;
     let affiliation = CatalogPackageAffiliation {
-        model_id: CatalogModelId(entry.get("modelId")?.as_str()?.to_owned()),
-        variant_id: CatalogVariantId(entry.get("variantId")?.as_str()?.to_owned()),
+        model_id: CatalogBaseId::new(entry.get("modelId")?.as_str()?.to_owned()).ok()?,
+        variant_id: CatalogVariantId::new(entry.get("variantId")?.as_str()?.to_owned()).ok()?,
         package_id: ModelPackageId(entry.get("packageId")?.as_str()?.to_owned()),
         repository: entry.get("repository")?.as_str()?.to_owned(),
         role: match entry.get("role")?.as_str()? {
@@ -105,8 +105,8 @@ fn decode_entry(value: &Value) -> Option<CatalogPackageAffiliation> {
 }
 
 fn valid_affiliation(affiliation: &CatalogPackageAffiliation) -> bool {
-    valid_identity_component(&affiliation.model_id.0)
-        && valid_variant_id(&affiliation.variant_id.0)
+    valid_identity_component(affiliation.model_id.as_str())
+        && valid_variant_id(affiliation.variant_id.as_str())
         && !affiliation.package_id.0.is_empty()
         && affiliation.package_id.0.trim() == affiliation.package_id.0
         && valid_repository(&affiliation.repository)

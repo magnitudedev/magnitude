@@ -105,11 +105,14 @@ Client bootstrap
 |   |   +-- validate loopback health identity
 |   |   `-- commit readiness                       all daemon startup work <= 5m total
 |   |
-|   `-- PreparingBackend                         "Preparing <backend> backend for <hardware>"
+|   +-- PreparingBackend                         "Preparing <backend> backend for <hardware>"
 |       +-- CPU
 |       +-- Metal
 |       +-- CUDA
 |       `-- Vulkan                                 all daemon startup work <= 5m total
+|   |
+|   `-- DiscoveringLocalModels                   "Discovering local models"
+|       `-- explicit ICN discovery reconciliation  all daemon startup work <= 5m total
 |
 +-- Installing                                    "Installing Magnitude"
 |   |

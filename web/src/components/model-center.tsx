@@ -47,6 +47,9 @@ import {
   deriveHardwareMemoryView,
   formatLocalModelDisplayName,
   localModelRadarAxes,
+  localModelIsInstalled,
+  localModelServingState,
+  localModelStorageBytes,
   modelDownloadFailureMessage,
   modelSlotResidentAllocation,
   useCatalogModels,
@@ -62,8 +65,6 @@ import {
   acquisitionFailure,
   acquisitionProgress,
   installedAcquisition,
-  servableModelBundlePackages,
-  servableModelBundleTargetPackageId,
   type LocalModel,
 } from "@magnitudedev/sdk"
 import type { SettingsTab } from "../state/web-atoms"
@@ -78,6 +79,9 @@ import { ModelRadarChart } from "./model-radar-chart"
 const valueOf = <A, E>(result: Result.Result<A, E>): A | null =>
   Option.getOrNull(Result.value(result))
 const modelKey = (model: LocalModel): string => model.modelId
+type CatalogLocalModel = Extract<LocalModel, { readonly _tag: "Catalog" }>
+const servingState = (model: LocalModel) => Option.getOrUndefined(localModelServingState(model))
+
 function QueryNotice({
   result,
   label,
@@ -126,98 +130,95 @@ function LoadingNotice({
   )
 }
 const modelFailure = (model: LocalModel): string | null => {
-  if (model.acquisitionState._tag === "RemoveFailed")
+  if (model._tag === "Catalog" && model.acquisitionState._tag === "RemoveFailed")
     return model.acquisitionState.failure.message
-  const transferFailure = acquisitionFailure(model.acquisitionState)
+  const transferFailure = model._tag === "Catalog"
+    ? acquisitionFailure(model.acquisitionState)
+    : undefined
   if (transferFailure !== undefined)
     return modelDownloadFailureMessage(transferFailure)
-  if (model.servingState._tag === "Failed")
-    return model.servingState.failure.message
-  if (model.servingState._tag === "Assessed") {
-    if (model.servingState.assessment._tag === "DoesNotFit") {
+  if (model._tag === "Discovered" && model.state._tag !== "Ready") return model.state.failure.message
+  const serving = servingState(model)
+  if (serving?._tag === "Failed") return serving.failure.message
+  if (serving?._tag === "Assessed") {
+    if (serving.assessment._tag === "DoesNotFit") {
       return `Needs ${formatBytes(
-        model.servingState.assessment.deficitBytes
-      )} more ${model.servingState.assessment.limitingResource}.`
+        serving.assessment.deficitBytes
+      )} more ${serving.assessment.limitingResource}.`
     }
-    if (model.servingState.assessment._tag === "Incompatible")
-      return model.servingState.assessment.failure.message
-    if (model.servingState.availabilityState._tag === "Unavailable")
-      return model.servingState.availabilityState.failure.message
+    if (serving.assessment._tag === "Incompatible")
+      return serving.assessment.failure.message
   }
   return null
 }
 const modelTransfer = (model: LocalModel) =>
-  acquisitionProgress(model.acquisitionState) ?? null
+  model._tag === "Catalog" ? acquisitionProgress(model.acquisitionState) ?? null : null
 type StatusTone = "neutral" | "success" | "progress" | "warning" | "danger"
 const modelStatus = (model: LocalModel): { readonly label: string; readonly tone: StatusTone } => {
-  if (model.acquisitionState._tag === "Removing")
+  if (model._tag === "Discovered" && model.state._tag === "Ambiguous")
+    return { label: "Ambiguous", tone: "danger" }
+  if (model._tag === "Discovered" && model.state._tag === "Unavailable")
+    return { label: "Unavailable", tone: "danger" }
+  const acquisition = model._tag === "Catalog" ? model.acquisitionState : undefined
+  if (acquisition?._tag === "Removing")
     return {
       label: "Removing",
       tone: "progress",
     }
-  if (model.acquisitionState._tag === "RemoveFailed")
+  if (acquisition?._tag === "RemoveFailed")
     return {
       label: "Remove failed",
       tone: "danger",
     }
-  if (model.servingState._tag === "Resolving")
-    return {
-      label: "Resolving",
-      tone: "progress",
-    }
-  if (model.servingState._tag === "Assessing")
+  const serving = servingState(model)
+  if (serving?._tag === "Assessing")
     return {
       label: "Assessing",
       tone: "progress",
     }
-  if (model.servingState._tag === "Failed")
+  if (serving?._tag === "Failed")
     return {
       label: "Assessment failed",
       tone: "danger",
     }
-  if (model.servingState.assessment._tag === "DoesNotFit")
+  if (serving?._tag === "Assessed" && serving.assessment._tag === "DoesNotFit")
     return {
       label: "Doesn’t fit",
       tone: "danger",
     }
-  if (model.servingState.assessment._tag === "Incompatible")
+  if (serving?._tag === "Assessed" && serving.assessment._tag === "Incompatible")
     return {
       label: "Incompatible",
       tone: "danger",
     }
-  if (model.servingState.availabilityState._tag === "Unavailable")
-    return {
-      label: "Unavailable",
-      tone: "danger",
-    }
-  if (model.acquisitionState._tag === "UpdateAvailable")
+  if (acquisition?._tag === "UpdateAvailable")
     return {
       label: "Update available",
       tone: "warning",
     }
-  if (installedAcquisition(model.acquisitionState) !== undefined
-    && model.acquisitionState._tag !== "Updating"
-    && model.acquisitionState._tag !== "UpdateFailed")
+  if ((model._tag === "Discovered" && model.state._tag === "Ready") ||
+    (acquisition !== undefined && installedAcquisition(acquisition) !== undefined
+      && acquisition._tag !== "Updating" && acquisition._tag !== "UpdateFailed"))
     return {
       label: "Installed",
       tone: "success",
     }
-  if (model.acquisitionState._tag === "Installing")
+  if (acquisition?._tag === "Installing")
     return {
-      label: `Downloading ${transferProgress(model.acquisitionState.progress)}%`,
+      label: `Downloading ${transferProgress(acquisition.progress)}%`,
       tone: "progress",
     }
-  if (model.acquisitionState._tag === "Updating")
+  if (acquisition?._tag === "Updating")
     return {
-      label: `Updating ${transferProgress(model.acquisitionState.progress)}%`,
+      label: `Updating ${transferProgress(acquisition.progress)}%`,
       tone: "progress",
     }
-  if (model.acquisitionState._tag === "InstallFailed")
+  if (acquisition?._tag === "InstallFailed")
     return {
       label: "Download failed",
       tone: "danger",
     }
-  if (model.acquisitionState._tag === "UpdateFailed")
+  if (acquisition?._tag === "UpdateFailed")
     return {
       label: "Update failed",
       tone: "danger",
@@ -289,14 +290,11 @@ function ModelTransferProgress({
   )
 }
 const installedModelTargetPath = (model: LocalModel): string | null => {
-  const acquisition = installedAcquisition(model.acquisitionState)
-  if (acquisition === undefined) return null
-  const targetPackageId = servableModelBundleTargetPackageId(model.bundle)
-  return (
-    acquisition.packages.find(
-      ({ packageId }) => packageId === targetPackageId
-    )?.path ?? null
-  )
+  if (model._tag === "Discovered") return model.state._tag !== "Ambiguous"
+    ? model.state.installation.primaryPath
+    : null
+  const installation = installedAcquisition(model.acquisitionState)?.installation
+  return installation?._tag === "Resolved" ? installation.primaryPath : null
 }
 
 function InstalledModelMenu({
@@ -310,6 +308,11 @@ function InstalledModelMenu({
   const configurationId = model.modelId
   const displayName = formatLocalModelDisplayName(model)
   const installedPath = installedModelTargetPath(model)
+  const ownership = model._tag === "Catalog"
+    ? installedAcquisition(model.acquisitionState)?.installation.ownership
+    : undefined
+  const externallyManaged = model._tag === "Discovered" || ownership === "ExternalHuggingFace"
+    || ownership === "Mixed"
 
   return (
     <>
@@ -335,19 +338,23 @@ function InstalledModelMenu({
             <FolderOpen aria-hidden="true" />
             Reveal in Finder
           </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem
-            variant="destructive"
-            disabled={configurationId === null}
-            onClick={() => setConfirmingRemoval(true)}
-          >
-            <Trash2 aria-hidden="true" />
-            Remove Model
-          </DropdownMenuItem>
+          {!externallyManaged ? (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                variant="destructive"
+                disabled={configurationId === null}
+                onClick={() => setConfirmingRemoval(true)}
+              >
+                <Trash2 aria-hidden="true" />
+                Remove Model
+              </DropdownMenuItem>
+            </>
+          ) : null}
         </DropdownMenuContent>
       </DropdownMenu>
 
-      <AlertDialog open={confirmingRemoval} onOpenChange={setConfirmingRemoval}>
+      {!externallyManaged ? <AlertDialog open={confirmingRemoval} onOpenChange={setConfirmingRemoval}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Remove {displayName}?</AlertDialogTitle>
@@ -361,8 +368,8 @@ function InstalledModelMenu({
               type="button"
               variant="destructive"
               onClick={() => {
-                if (configurationId === null) return
-                actions.remove(configurationId)
+                if (model._tag !== "Catalog") return
+                actions.remove(model.modelId)
                 setConfirmingRemoval(false)
               }}
             >
@@ -370,7 +377,7 @@ function InstalledModelMenu({
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
-      </AlertDialog>
+      </AlertDialog> : null}
     </>
   )
 }
@@ -440,10 +447,7 @@ function InstalledLibrary({
           {filteredModels.map((model) => {
             const displayName = formatLocalModelDisplayName(model)
             const context = modelContextLength(model)
-            const installedBytes =
-              model.acquisitionState._tag === "Installed"
-                ? model.acquisitionState.installedBytes
-                : model.downloadBytes
+            const installedBytes = Option.getOrNull(localModelStorageBytes(model))
             return (
               <article
                 className="grid min-h-[82px] grid-cols-[auto_minmax(240px,1fr)_minmax(190px,.45fr)_auto] items-center gap-4 border-b border-slate-200 px-4 py-3.5 text-slate-500 last:border-b-0 dark:border-slate-800 max-[820px]:grid-cols-[auto_minmax(0,1fr)_auto]"
@@ -473,7 +477,7 @@ function InstalledLibrary({
                       Storage
                     </dt>
                     <dd className="whitespace-nowrap text-[11px] tabular-nums text-slate-600 dark:text-slate-400">
-                      {formatBytes(installedBytes)}
+                      {installedBytes === null ? "Unknown" : formatBytes(installedBytes)}
                     </dd>
                   </div>
                 </dl>
@@ -489,10 +493,10 @@ function InstalledLibrary({
 function ModelsView(): ReactNode {
   const modelsResult = useLocalModels()
   const models = valueOf(modelsResult)
-  const inventoryLoading = models?.inventoryState._tag === "Initializing"
+  const inventoryLoading = models !== null && !models.reconciliationComplete
   const installed =
     models?.models.filter(
-      (model) => installedAcquisition(model.acquisitionState) !== undefined
+      localModelIsInstalled
     ) ?? []
   return (
     <div className="box-border mx-auto flex w-full max-w-[1240px] flex-col gap-[34px] px-[clamp(18px,4vw,48px)] pt-[34px] pb-[72px] max-[640px]:pt-16 max-[620px]:px-3.5">
@@ -510,26 +514,14 @@ function ModelsView(): ReactNode {
           description="Reading the models installed on this computer."
         />
       ) : null}
-      {models?.inventoryState._tag === "Degraded" ? (
-        <div className="danger flex items-center gap-2 rounded-[7px] border border-red-300 bg-white px-3 py-2.5 text-xs text-red-600 dark:border-red-700 dark:bg-slate-850 dark:text-red-400">
-          <AlertTriangle size={15} />
-          {models.inventoryState.failure.message}
-        </div>
-      ) : null}
       {models && !inventoryLoading ? (
         <InstalledLibrary models={installed} />
       ) : null}
     </div>
   )
 }
-const repositoryUrl = (model: LocalModel): string | null => {
-  const repository = servableModelBundlePackages(model.bundle).find(
-    ({ source }) => source._tag === "HuggingFace"
-  )?.source
-  return repository?._tag === "HuggingFace"
-    ? `https://huggingface.co/${repository.repository}`
-    : null
-}
+const repositoryUrl = (model: LocalModel): string | null =>
+  model.presentation.sourceUrls.find((url) => url.startsWith("https://huggingface.co/")) ?? null
 type CatalogFilter = "all" | "installed"
 type CatalogSort =
   | "recent"
@@ -547,16 +539,16 @@ const catalogSortLabels: Readonly<Record<CatalogSort, string>> = {
 }
 
 const catalogData = (model: LocalModel) =>
-  model.catalogMembershipState._tag === "InCatalog"
-    ? model.catalogMembershipState.catalogData
-    : null
+  model._tag === "Catalog" ? model.catalogData : null
 
 const isCatalogVisible = (model: LocalModel): boolean =>
-  model.servingState._tag !== "Assessed" ||
-  model.servingState.assessment._tag === "Fits"
+  Option.match(localModelServingState(model), {
+    onNone: () => true,
+    onSome: (serving) => serving._tag !== "Assessed" || serving.assessment._tag === "Fits",
+  })
 
 const matchesCatalogFilter = (
-  model: LocalModel,
+  model: CatalogLocalModel,
   filter: CatalogFilter
 ): boolean => {
   if (filter === "all") return true
@@ -564,8 +556,8 @@ const matchesCatalogFilter = (
 }
 
 const compareCatalogModels = (
-  left: LocalModel,
-  right: LocalModel,
+  left: CatalogLocalModel,
+  right: CatalogLocalModel,
   sort: CatalogSort
 ): number => {
   const leftName = formatLocalModelDisplayName(left)
@@ -588,10 +580,10 @@ const compareCatalogModels = (
     )
   }
   if (sort === "largest") {
-    return right.downloadBytes - left.downloadBytes || byName
+    return right.storageBytes - left.storageBytes || byName
   }
   if (sort === "smallest") {
-    return left.downloadBytes - right.downloadBytes || byName
+    return left.storageBytes - right.storageBytes || byName
   }
   return byName
 }
@@ -601,7 +593,7 @@ function CatalogCandidate({
   selected,
   onSelect,
 }: {
-  readonly model: LocalModel
+  readonly model: CatalogLocalModel
   readonly selected: boolean
   readonly onSelect: () => void
 }): ReactNode {
@@ -639,7 +631,7 @@ function CatalogCandidate({
 function CatalogInspector({
   model,
 }: {
-  readonly model: LocalModel
+  readonly model: CatalogLocalModel
 }): ReactNode {
   const modelActions = useLocalModelActions()
   const configurationId = model.modelId
@@ -789,7 +781,9 @@ function CatalogView(): ReactNode {
   const [filter, setFilter] = useState<CatalogFilter>("all")
   const [sort, setSort] = useState<CatalogSort>("intelligence")
   const normalizedQuery = query.trim().toLowerCase()
-  const allCandidates = catalog?.models ?? []
+  const allCandidates = catalog?.models.filter(
+    (model): model is CatalogLocalModel => model._tag === "Catalog"
+  ) ?? []
   const visibleCandidates = useMemo(
     () => allCandidates.filter(isCatalogVisible),
     [allCandidates]
@@ -812,7 +806,7 @@ function CatalogView(): ReactNode {
     candidates.find((model) => modelKey(model) === selectedKey) ??
     candidates[0] ??
     null
-  const discovery = catalog?.discoveryState ?? null
+  const reconciliationComplete = catalog?.reconciliationComplete ?? false
   const filterCounts = useMemo(
     () => ({
       all: visibleCandidates.length,
@@ -832,18 +826,13 @@ function CatalogView(): ReactNode {
       ) : (
         <QueryNotice result={catalogResult} label="catalog" />
       )}
-      {discovery?._tag === "Loading" ? (
+      {catalog !== null && !reconciliationComplete ? (
         <LoadingNotice
           title="Loading catalog"
           description="Assessing local models for this computer."
         />
       ) : null}
-      {discovery?._tag === "Failed" && (
-        <div className="flex items-center gap-2 rounded-[7px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-850 px-3 py-2.5 text-slate-600 dark:text-slate-400 text-xs [&.danger]:border-red-300 [&.danger]:text-red-600 dark:[&.danger]:border-red-700 dark:[&.danger]:text-red-400 danger">
-          <AlertTriangle size={15} /> {discovery.failure.message}
-        </div>
-      )}
-      {catalog && discovery?._tag !== "Loading" ? (
+      {catalog && reconciliationComplete ? (
         <>
           <header className="shrink-0">
             <div>
@@ -917,7 +906,7 @@ function CatalogView(): ReactNode {
               </div>
             </div>
           </header>
-          {visibleCandidates.length === 0 && discovery?._tag === "Ready" ? (
+          {visibleCandidates.length === 0 ? (
             <div className="rounded-[10px] border border-dashed border-slate-300 dark:border-slate-750 bg-white dark:bg-slate-850 p-[26px] text-center text-[13px] text-slate-500">
               No local catalog models are currently available.
             </div>

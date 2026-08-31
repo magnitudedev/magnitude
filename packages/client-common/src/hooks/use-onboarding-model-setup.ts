@@ -6,7 +6,7 @@ import {
   useAtomValue,
 } from "@effect-atom/atom-react"
 import { Effect } from "effect"
-import { type ProviderModelId } from "@magnitudedev/sdk"
+import { type ModelId } from "@magnitudedev/sdk"
 import type { HarnessId } from "../harness-connections/service"
 import { OnboardingModelSetup } from "../local-models/setup"
 import type { OnboardingModelRankingControls } from "../local-models/setup-state"
@@ -26,7 +26,7 @@ export const useOnboardingModelSetup = () => {
     () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.open),
     { concurrent: true },
   ), [client])
-  const selectAction = useMemo(() => client.runtime.fn<ProviderModelId>()(
+  const selectAction = useMemo(() => client.runtime.fn<ModelId>()(
     (modelId) => Effect.flatMap(
       OnboardingModelSetup,
       (setup) => setup.select(modelId),
@@ -82,7 +82,7 @@ export const useOnboardingModelSetup = () => {
     view: useAtomValue(view),
     retry: useCallback(() => retry(), [retry]),
     open: useCallback(() => open(), [open]),
-    select: useCallback((modelId: ProviderModelId) => {
+    select: useCallback((modelId: ModelId) => {
       select(modelId)
     }, [select]),
     setRankingControls: useCallback((controls: OnboardingModelRankingControls) => {

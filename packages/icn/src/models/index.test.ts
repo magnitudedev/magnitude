@@ -1,56 +1,101 @@
-import { Effect, Layer, Ref, Stream, TestClock, TestContext } from "effect"
+import { Effect, Exit, Layer, Ref, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import { IcnClient, type IcnClientService } from "../client.js"
 import { IcnEvents } from "../events/index.js"
-import { IcnModels, makeIcnModels } from "./index.js"
+import { IcnCatalog, IcnDiscovery, makeIcnCatalog, makeIcnDiscovery } from "./index.js"
 
-describe("ICN models", () => {
-  it("refreshes an incomplete startup snapshot until reconciliation completes", async () => {
-    const incomplete = {
-      revision: 0,
-      reconciliationComplete: false,
-      models: [],
-      diagnostics: [],
-    }
-    const complete = {
-      ...incomplete,
-      revision: 1,
-      reconciliationComplete: true,
-    }
+const eventsLayer = Layer.succeed(
+  IcnEvents,
+  IcnEvents.of({ subscribe: Effect.succeed(Stream.never) }),
+)
+
+describe("ICN catalog", () => {
+  it("exposes an incomplete snapshot without opening an immortal polling loop", async () => {
+    const incomplete = { revision: 0, reconciliationComplete: false, models: [] }
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const reads = yield* Ref.make(0)
-      const client = {
-        models: {
-          listModels: () => Ref.getAndUpdate(reads, (count) => count + 1).pipe(
-            Effect.flatMap((count) => count === 0
-              ? Effect.succeed(incomplete)
-              : count === 1
-                ? Effect.fail("transient startup read failure")
-                : Effect.succeed(complete)),
-          ),
-        },
-      } as unknown as IcnClientService
+      const client = { catalog: { listCatalogModels: () => Ref.update(reads, (count) => count + 1).pipe(
+        Effect.as(incomplete),
+      ) } } as unknown as IcnClientService
       return yield* Effect.gen(function* () {
-        const models = yield* IcnModels
-        yield* Effect.yieldNow()
-        yield* TestClock.adjust("3 seconds")
-        yield* Effect.yieldNow()
-        return yield* models.get
-      }).pipe(Effect.provide(
-        makeIcnModels({ retryInterval: "1 second" }).pipe(Layer.provide(
-          Layer.merge(
-            Layer.succeed(IcnClient, client),
-            Layer.succeed(IcnEvents, IcnEvents.of({
-              subscribe: Effect.succeed(Stream.never),
-            })),
-          ),
-        )),
-      ))
-    })).pipe(Effect.provide(TestContext.TestContext)))
+        const catalog = yield* IcnCatalog
+        return { state: yield* catalog.get, reads: yield* Ref.get(reads) }
+      }).pipe(Effect.provide(makeIcnCatalog({ retryInterval: "1 second" }).pipe(Layer.provide(
+        Layer.merge(
+          Layer.succeed(IcnClient, client),
+          eventsLayer,
+        ),
+      ))))
+    })))
+    expect(result).toEqual({ state: { revision: 1, state: incomplete }, reads: 1 })
+  })
+})
 
-    expect(result).toEqual({
-      revision: 2,
-      state: complete,
-    })
+describe("ICN discovery", () => {
+  it("completes initial reconciliation before exposing discovery state", async () => {
+    const incomplete = { revision: 0, reconciliationComplete: false, models: [] }
+    const complete = { revision: 1, reconciliationComplete: true, models: [] }
+    const reconciliations = { count: 0 }
+    const client = { discovery: {
+      listDiscoveredModels: () => Effect.succeed(incomplete),
+      refreshDiscoveredModels: () => Effect.sync(() => {
+        reconciliations.count += 1
+        return complete
+      }),
+    } } as unknown as IcnClientService
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const discovery = yield* IcnDiscovery
+      return yield* discovery.get
+    }).pipe(Effect.provide(makeIcnDiscovery().pipe(Layer.provide(
+      Layer.merge(Layer.succeed(IcnClient, client), eventsLayer),
+    ))))))
+    expect(result).toEqual({ revision: 1, state: complete })
+    expect(reconciliations.count).toBe(1)
+  })
+
+  it("fails startup when initial reconciliation fails", async () => {
+    const incomplete = { revision: 0, reconciliationComplete: false, models: [] }
+    const client = { discovery: {
+      listDiscoveredModels: () => Effect.succeed(incomplete),
+      refreshDiscoveredModels: () => Effect.fail("inventory scan failed"),
+    } } as unknown as IcnClientService
+    const exit = await Effect.runPromise(Effect.scoped(IcnDiscovery.pipe(
+      Effect.provide(makeIcnDiscovery().pipe(Layer.provide(
+        Layer.merge(Layer.succeed(IcnClient, client), eventsLayer),
+      ))),
+      Effect.exit,
+    )))
+    expect(Exit.isFailure(exit)).toBe(true)
+  })
+
+  it("fails startup instead of waiting forever for initial reconciliation", async () => {
+    const incomplete = { revision: 0, reconciliationComplete: false, models: [] }
+    const client = { discovery: {
+      listDiscoveredModels: () => Effect.succeed(incomplete),
+      refreshDiscoveredModels: () => Effect.never,
+    } } as unknown as IcnClientService
+    const exit = await Effect.runPromise(Effect.scoped(IcnDiscovery.pipe(
+      Effect.provide(makeIcnDiscovery({ reconciliationTimeout: "10 millis" }).pipe(Layer.provide(
+        Layer.merge(Layer.succeed(IcnClient, client), eventsLayer),
+      ))),
+      Effect.exit,
+    )))
+    expect(Exit.isFailure(exit)).toBe(true)
+  })
+
+  it("fails an explicit reconciliation instead of waiting forever", async () => {
+    const complete = { revision: 1, reconciliationComplete: true, models: [] }
+    const client = { discovery: {
+      listDiscoveredModels: () => Effect.succeed(complete),
+      refreshDiscoveredModels: () => Effect.never,
+    } } as unknown as IcnClientService
+    const program = Effect.gen(function* () {
+      const discovery = yield* IcnDiscovery
+      return yield* discovery.reconcile.pipe(Effect.exit)
+    }).pipe(Effect.provide(makeIcnDiscovery({ reconciliationTimeout: "10 millis" }).pipe(Layer.provide(
+      Layer.merge(Layer.succeed(IcnClient, client), eventsLayer),
+    ))))
+    const exit = await Effect.runPromise(Effect.scoped(program))
+    expect(Exit.isFailure(exit)).toBe(true)
   })
 })

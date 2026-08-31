@@ -8,25 +8,25 @@ use std::sync::Arc;
 use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, stream};
 use icn_contracts::models::{
-    CatalogDiagnostic, CatalogIntelligence, CatalogModelId, CatalogVariantId,
+    CatalogBaseId, CatalogDiagnostic, CatalogIntelligence, CatalogVariantId,
     IntelligenceProvenance, ModelFailure, ModelFileRole, ModelPackage, ModelPackageInspection,
     ModelPackageSource, ModelParameterization, ModelReleaseDate, ModelServingConfiguration,
     RecommendableModel, RecommendableModelCatalog, RecommendableModelCatalogProvider,
-    ResolvedServableModelBundle, ServableModelBundle, ServableModelBundleKey, ServingProfile,
-    SpeculativeDraftSource, SpeculativeMethod,
+    ResolvedServableModelBundle, ServableModelBundle, ServingProfile, SpeculativeDraftSource,
+    SpeculativeMethod,
 };
 use icn_contracts::{
     ComponentRole, ContentId, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
-    Integrity, InventoryError, InventoryModel, InventoryProperties, ModelAvailability,
-    ModelComponent, ModelId, ModelLocation, ModelPreviewComponentRole, ModelPreviewComponentSource,
-    ModelPreviewSource, ModelSource, ResolvedComponent, ResolvedModel,
+    Integrity, InventoryEntryId, InventoryError, InventoryModel, InventoryProperties,
+    ModelAvailability, ModelComponent, ModelLocation, ModelPreviewComponentRole,
+    ModelPreviewComponentSource, ModelPreviewSource, ModelSource, ResolvedComponent, ResolvedModel,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::cache::ModelBlobKind;
 use crate::inventory::ManagedModelStore;
 use crate::package_service::{
-    inspected_package_from_resolved, servable_model_bundle_key_for_bundle,
+    ServableModelBundleKey, inspected_package_from_resolved, servable_model_bundle_key_for_bundle,
 };
 use crate::planner_stub::{PlannerStubComponent, compact_planner_stub, planner_stub_context};
 use crate::preview::PreparedPreview;
@@ -141,7 +141,7 @@ struct ReleasePlannerManifest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReleasePlannerInput {
-    model_id: CatalogModelId,
+    model_id: CatalogBaseId,
     variant_id: CatalogVariantId,
     target: ReleasePlannerPackage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -950,7 +950,7 @@ fn planner_input_and_bundle<'a>(
 }
 
 fn materialize_planner_bundle<'a>(
-    bundle_key: &ServableModelBundleKey,
+    _bundle_key: &ServableModelBundleKey,
     artifact: &ReleasePlannerInput,
     bundle: ServableModelBundle,
     mut input_for: impl FnMut(&ReleasePlannerComponent) -> Result<(Cow<'a, [u8]>, u64), InventoryError>,
@@ -986,9 +986,8 @@ fn materialize_planner_bundle<'a>(
         (None, None) => (None, None),
         _ => unreachable!("draft presence was validated"),
     };
-    let mut resolved =
-        ResolvedServableModelBundle::new(bundle_key.clone(), bundle, target_model, draft_model)
-            .retain_resolution_guard(target_workspace);
+    let mut resolved = ResolvedServableModelBundle::new(bundle, target_model, draft_model)
+        .retain_resolution_guard(target_workspace);
     if let Some(workspace) = draft_workspace {
         resolved = resolved.retain_resolution_guard(workspace);
     }
@@ -1050,7 +1049,7 @@ fn materialize_planner_package<'a>(
         .map(|component| component.component.clone())
         .collect::<Vec<_>>();
     let model = InventoryModel {
-        id: ModelId(package_identity.clone()),
+        id: InventoryEntryId(package_identity.clone()),
         content_id: ContentId(package_identity.clone()),
         created: 0,
         name: package_identity,
@@ -1102,7 +1101,7 @@ fn validate_resolved_catalog(
     let actual = catalog
         .models
         .iter()
-        .map(|model| (model.model_id.0.as_str(), model.variant_id.0.as_str()))
+        .map(|model| (model.model_id.as_str(), model.variant_id.as_str()))
         .collect::<BTreeSet<_>>();
     let expected = source
         .models
@@ -1127,18 +1126,15 @@ fn validate_resolved_catalog(
         let declaration = source
             .models
             .iter()
-            .find(|declaration| declaration.id == model.model_id.0)
+            .find(|declaration| declaration.id == model.model_id.as_str())
             .ok_or_else(|| {
                 InventoryError::Integrity(format!(
                     "release catalog model {} variant {} has no source declaration",
-                    model.model_id.0, model.variant_id.0
+                    model.model_id, model.variant_id
                 ))
             })?;
-        let expected_lock = lock.get(&model.model_id.0).ok_or_else(|| {
-            InventoryError::Integrity(format!(
-                "model catalog lock is missing {}",
-                model.model_id.0
-            ))
+        let expected_lock = lock.get(model.model_id.as_str()).ok_or_else(|| {
+            InventoryError::Integrity(format!("model catalog lock is missing {}", model.model_id))
         })?;
         let (target, draft_source, method) = match &model.configuration.bundle {
             ServableModelBundle::Standalone { package } => (package, None, None),
@@ -1169,7 +1165,7 @@ fn validate_resolved_catalog(
                 let Some(expected_draft_commit) = expected_lock.speculative_draft.as_deref() else {
                     return Err(InventoryError::Integrity(format!(
                         "model catalog lock is missing {} speculative draft",
-                        model.model_id.0
+                        model.model_id
                     )));
                 };
                 let Some((expected_repository, expected_path)) = declaration
@@ -1213,7 +1209,7 @@ fn validate_resolved_catalog(
         {
             return Err(InventoryError::Integrity(format!(
                 "release catalog model {} variant {} does not match models.json and models.lock.json",
-                model.model_id.0, model.variant_id.0
+                model.model_id, model.variant_id
             )));
         }
     }
@@ -1292,8 +1288,10 @@ fn recommendable_model(
         context_length: declaration.context_length,
     };
     Ok(RecommendableModel {
-        model_id: CatalogModelId(declaration.id.clone()),
-        variant_id: CatalogVariantId(variant.variant_id.clone()),
+        model_id: CatalogBaseId::new(declaration.id.clone())
+            .map_err(|error| InventoryError::Integrity(error.to_string()))?,
+        variant_id: CatalogVariantId::new(variant.variant_id.clone())
+            .map_err(|error| InventoryError::Integrity(error.to_string()))?,
         configuration: ModelServingConfiguration { bundle, profile },
         display_name: declaration.display_name.clone(),
         variant_label: variant.variant_label.clone(),
@@ -1340,8 +1338,10 @@ fn catalog_from_planner_inputs(
     for declaration in &source.models {
         for variant in &declaration.variants {
             let identity = (
-                CatalogModelId(declaration.id.clone()),
-                CatalogVariantId(variant.variant_id.clone()),
+                CatalogBaseId::new(declaration.id.clone())
+                    .map_err(|error| InventoryError::Integrity(error.to_string()))?,
+                CatalogVariantId::new(variant.variant_id.clone())
+                    .map_err(|error| InventoryError::Integrity(error.to_string()))?,
             );
             let input = by_identity.get(&identity).ok_or_else(|| {
                 InventoryError::Integrity(format!(
@@ -1890,8 +1890,10 @@ impl ResolvingRecommendableCatalog {
                     }
                 }
                 Err(error) => diagnostics.push(CatalogDiagnostic {
-                    model_id: CatalogModelId(declaration.id.clone()),
-                    variant_id: CatalogVariantId(variant.variant_id.clone()),
+                    model_id: CatalogBaseId::new(declaration.id.clone())
+                        .map_err(|error| InventoryError::Integrity(error.to_string()))?,
+                    variant_id: CatalogVariantId::new(variant.variant_id.clone())
+                        .map_err(|error| InventoryError::Integrity(error.to_string()))?,
                     failure: ModelFailure {
                         code: "catalog_resolution_failed".to_owned(),
                         message: error.to_string(),

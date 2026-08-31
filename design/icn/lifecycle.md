@@ -79,7 +79,7 @@ The ICN package owns:
 - exposing one scoped generated client whose admitted streams preserve their response lifetime; and
 - supplying the generated client with the connection established by the managed child lifecycle.
 
-The package owns exact hardware, recommendable-catalog, installed-package, and download observation
+The package owns exact hardware, catalog, discovery, catalog-installation, and instance observation
 plus the local provider adaptation because those capabilities compose the one generated ICN client.
 It does not own ranking policy, user selection, ACN RPC state, cloud
 provider routing, or client presentation. It does not independently inspect hardware or GGUF files
@@ -99,9 +99,11 @@ ordinary TypeScript and Cargo builds perform no catalog network access.
 
 ACN owns the parent scope, application policy, and complete first-party client control plane. It
 supplies ICN's storage roots and supported binary identity and translates native observations into
-Magnitude-owned catalog, Slot, Instance, environment, ranking, and provider resources.
-Hardware, Models, Packages, Downloads, and Instances remain native ICN authorities, but their
-generated management contract and event stream are private to ACN. Only the OpenAI-compatible
+Magnitude-owned catalog, Slot, Instance, environment, ranking, and provider resources. Hardware,
+catalog, discovery, catalog-installation, assessment, and instance operations remain native ICN
+authorities. Packages and download occurrences are internal implementation details of those direct
+operations, not management resources exposed to ACN. The generated contract and event stream are
+private to ACN. Only the OpenAI-compatible
 `/inference/v1/**` and `/inference/anthropic/**` serving data planes are public; private
 `/inference/api/**` management remains inaccessible.
 
@@ -141,8 +143,8 @@ response metadata.
 
 Every operation in the normalized IR is emitted into the callable client automatically. There is
 no allowlist or hand-maintained facade coverage table. At minimum the ICN contract comprises health
-and identity, Hardware, Models, Packages, Downloads, Instances, assessment and load planning,
-Hugging Face discovery, template application, model properties, resource-event
+and identity, hardware, catalog, discovery, catalog installation, instances, assessment and load
+planning, Hugging Face repository preview, template application, model properties, resource-event
 observation, mixed JSON/SSE Chat Completions and Responses, local Anthropic Messages, and
 Anthropic token counting. Generator tests
 prove that the manifest, descriptors, and callable client contain the same operation set.
@@ -185,7 +187,13 @@ lives under `.magnitude/cache`; cache implementations must not create private ca
 the model store. ICN's managed Hugging Face hub lives beneath the model store, and ICN does not
 implicitly discover or adopt a host user's global Hugging Face cache.
 External caches or directories participate only when they are supplied explicitly as read-only
-import/source roots. ACN supplies no such roots for the product-managed ICN.
+import/source roots. ACN resolves the active Hugging Face hub cache from `HF_HUB_CACHE`,
+`HUGGINGFACE_HUB_CACHE`, `HF_HOME`, `XDG_CACHE_HOME`, or the platform home default and supplies
+that one root explicitly; ICN never discovers another host cache implicitly.
+
+After native backend preparation, ACN reports `DiscoveringModels` while it requests the initial
+explicit discovery reconciliation. A scan failure fails application startup and enters
+`startup-failed`; it cannot leave health indefinitely reporting backend preparation.
 
 Per-request context length belongs to an explicit model serving configuration supplied to
 assessment and load. ACN resolves that configuration from catalog authority and projects its
@@ -343,8 +351,8 @@ or sharing.
 
 ## Model instance lifecycle
 
-The singleton starts with no model instances. Catalog, installed-package, assessment,
-download, and deletion remain available in that state. ICN's `ModelInstanceController` owns
+The singleton starts with no model instances. Catalog, discovery, assessment, catalog installation,
+and deletion remain available in that state. ICN's `ModelInstanceController` owns
 physical instance admission, native workers, backends, exact-instance leases, lifecycle
 publication, and terminal cleanup. ACN owns product slots as durable selection only. A slot is not
 an ICN resource and carries no physical lifecycle.
@@ -444,10 +452,11 @@ Human messages are derived from those facts. There is no generic phase/reason/me
 envelope and no wrapper whose primary payload is another error. Bounded native output is owned only
 by variants for which process output is relevant, including startup timeout and process exit.
 
-ACN observes ordinary startup failure with the typed Effect error channel, logs that error value
-directly, commits `Stopping(startup-failed)`, and lets the same error continue unchanged. It does not
-convert typed errors to `Cause` or render them through `Cause.pretty`. Defects remain defects and
-propagate to the process runtime; scoped finalizers, rather than error taps, guarantee cleanup.
+Every failed startup cause commits `Stopping(startup-failed)` before it propagates. Typed failures
+remain their original typed errors, and defects remain defects; neither can leave readiness waiters
+blocked behind a lifecycle state that still claims startup is in progress. The complete cause is
+logged once at the startup boundary, and the ACN process exits unsuccessfully. Scoped finalizers
+independently guarantee cleanup.
 
 Generated client failures distinguish invalid local input, transport failure, a declared remote
 failure, undeclared or invalid response, incomplete stream, and cancellation. Declared ICN error

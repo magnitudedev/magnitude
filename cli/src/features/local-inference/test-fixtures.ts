@@ -2,11 +2,11 @@ import { Option, Schema } from "effect"
 import {
   AssessmentEnvironmentIdSchema,
   CatalogIntelligenceSchema,
-  CatalogModelIdSchema,
-  CatalogVariantIdSchema,
+  CatalogFormModelIdSchema,
+  HuggingFaceFormModelIdSchema,
+  HttpsUrlSchema,
   LocalInferenceAcceleratorIdSchema,
   LocalInferenceMemoryDomainIdSchema,
-  ModelPackageIdSchema,
   ModelAssessmentIdSchema,
   ModelSlotConfiguredLocal,
   ModelSlotUnassigned,
@@ -14,46 +14,28 @@ import {
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
   ProviderModelCatalogReady,
-  ProviderModelIdSchema,
   ReasoningEffortSchema,
   SECONDARY_SLOT_ID,
-  servableModelBundlePackages,
   type LocalInferenceHardware,
   type LocalModel,
   type LocalModelAcquisitionState,
+  type CatalogLocalModelServingState,
+  type DiscoveredLocalModelServingState,
   type LocalModelsState,
   type ModelInstanceAllocation,
   type ModelReleaseDate,
   type ModelSlotsState,
   type ProviderModelCatalogState,
-  type ServableModelBundle,
 } from "@magnitudedev/sdk"
 
 export const GIB = 1024 ** 3
 export const LOCAL_PROVIDER_ID = ProviderIdSchema.make("local")
-export const TEST_MODEL_ID = ProviderModelIdSchema.make("configuration_test")
-export const TEST_PACKAGE_ID = ModelPackageIdSchema.make("package_test")
+export const TEST_MODEL_ID = HuggingFaceFormModelIdSchema.make("hf:test/model/model-q4.gguf")
+export const TEST_CATALOG_MODEL_ID = CatalogFormModelIdSchema.make("qwen-test:gguf:q4")
 export const TEST_MEMORY_DOMAIN_ID = LocalInferenceMemoryDomainIdSchema.make("memory")
 export const TEST_REASONING_EFFORT = ReasoningEffortSchema.make("none")
-
-export const makeStandaloneBundle = (id: string = TEST_PACKAGE_ID): ServableModelBundle => ({
-  _tag: "Standalone",
-  package: {
-    id: ModelPackageIdSchema.make(id),
-    source: { _tag: "Local", path: `/models/${id}` },
-    files: [],
-    relationships: [],
-    properties: {
-      format: "gguf",
-      quantization: "Q4_K_M",
-      quantizationName: "4-bit",
-      architecture: "test",
-      maximumContextLength: Option.some(32_768),
-      intrinsicModelId: Option.none(),
-      intrinsicQualityId: Option.none(),
-    },
-  },
-})
+type DiscoveredLocalModel = Extract<LocalModel, { readonly _tag: "Discovered" }>
+type CatalogLocalModel = Extract<LocalModel, { readonly _tag: "Catalog" }>
 
 export const makeHardware = (
   overrides: Partial<LocalInferenceHardware> = {},
@@ -106,81 +88,84 @@ const performance = (contextLength: number) => [...new Set([
   }
 })
 
-export const makeModel = (overrides: Partial<LocalModel> = {}): LocalModel => {
-  const bundle = overrides.bundle ?? makeStandaloneBundle()
+export type ReadyDiscoveredLocalModel = Omit<DiscoveredLocalModel, "state"> & {
+  readonly state: Extract<DiscoveredLocalModel["state"], { readonly _tag: "Ready" }>
+}
+
+export const makeModel = (overrides: Partial<ReadyDiscoveredLocalModel> = {}): ReadyDiscoveredLocalModel => {
   const contextLength = 32_768
-  const [firstInstalledPackage, ...remainingInstalledPackages] = servableModelBundlePackages(bundle)
-    .map((modelPackage) => ({
-      packageId: modelPackage.id,
-      path: modelPackage.source._tag === "Local"
-        ? modelPackage.source.path
-        : `/models/${modelPackage.id}`,
-      origin: "Magnitude" as const,
-    }))
-  if (firstInstalledPackage === undefined) throw new Error("Test model bundle must contain a package")
   return {
+    _tag: "Discovered",
     modelId: overrides.modelId ?? TEST_MODEL_ID,
-    bundle,
     presentation: {
       displayName: "Qwen Test",
       variantLabel: ModelVariantLabelSchema.make("Q4"),
       description: "Test model",
       license: Option.none(),
+      sourceUrls: [HttpsUrlSchema.make("https://huggingface.co/test/model")],
     },
-    downloadBytes: 16 * GIB,
-    catalogMembershipState: { _tag: "NotInCatalog" },
-    acquisitionState: {
-      _tag: "Installed",
-      installedBytes: 16 * GIB,
-      packages: [firstInstalledPackage, ...remainingInstalledPackages],
+    state: {
+      _tag: "Ready",
+      installation: {
+        _tag: "Resolved",
+        installedBytes: 16 * GIB,
+        primaryPath: "/models/model-q4.gguf",
+        ownership: "ExternalHuggingFace",
+      },
       residencyState: { _tag: "Unloaded" },
-    },
-    servingState: {
-      _tag: "Assessed",
-      capabilities,
-      configuration: {
-        bundle,
-        profile: { contextLength },
-      },
-      assessment: {
-        _tag: "Fits",
-        profile: { contextLength },
-        assessmentId: ModelAssessmentIdSchema.make("assessment_test"),
-        environmentId: AssessmentEnvironmentIdSchema.make("environment_test"),
-        memory: {
-          domains: [],
-          totalRequiredBytes: 0,
-          requiredSystemMemoryBytes: 0,
-          systemUseState: {
-            _tag: "WithinRecommendedHeadroom",
-            recommendedHeadroomBytes: 4 * GIB,
-            predictedHeadroomBytes: 48 * GIB,
-          },
-          currentHeadroomState: { _tag: "NotObserved" },
+      catalogAttribution: { _tag: "NotInCatalog" },
+      servingState: {
+        _tag: "Assessed",
+        metadata: {
+          format: "gguf",
+          quantization: "Q4_K_M",
+          quantizationName: "4-bit",
+          architecture: "test",
+          storageBytes: 16 * GIB,
+          maximumContextLength: Option.some(contextLength),
         },
-        performance: performance(contextLength),
+        capabilities,
+        speculativeMethod: Option.none(),
+        assessment: {
+          _tag: "Fits",
+          profile: { contextLength },
+          assessmentId: ModelAssessmentIdSchema.make("assessment_test"),
+          environmentId: AssessmentEnvironmentIdSchema.make("environment_test"),
+          memory: {
+            domains: [],
+            totalRequiredBytes: 0,
+            requiredSystemMemoryBytes: 0,
+            systemUseState: {
+              _tag: "WithinRecommendedHeadroom",
+              recommendedHeadroomBytes: 4 * GIB,
+              predictedHeadroomBytes: 48 * GIB,
+            },
+            currentHeadroomState: { _tag: "NotObserved" },
+          },
+          performance: performance(contextLength),
+        },
       },
-      availabilityState: { _tag: "Selectable", providerModelId: TEST_MODEL_ID },
-      rankingScores: Option.none(),
     },
     ...overrides,
   }
 }
 
 export const makeCatalogOnlyModel = (
-  overrides: Partial<LocalModel> = {},
-  modelId = TEST_MODEL_ID,
-): LocalModel => {
+  overrides: Partial<CatalogLocalModel> = {},
+  modelId = TEST_CATALOG_MODEL_ID,
+): CatalogLocalModel => {
   const model = makeModel()
-  if (model.servingState._tag !== "Assessed") return { ...model, ...overrides }
+  const { state: _state, ...shared } = model
+  const servingState = model.state.servingState
+  if (servingState._tag !== "Assessed" || servingState.assessment._tag !== "Fits") {
+    throw new Error("Base fixture must have a fitting assessment")
+  }
   return {
-    ...model,
+    ...shared,
+    _tag: "Catalog",
     modelId,
-    catalogMembershipState: {
-      _tag: "InCatalog",
-      catalogData: {
-        modelId: CatalogModelIdSchema.make("qwen-test"),
-        variantId: CatalogVariantIdSchema.make("gguf:q4"),
+    storageBytes: servingState.metadata.storageBytes,
+    catalogData: {
         releaseDate: "2026-01-01" as ModelReleaseDate,
         parameterization: { architecture: "dense", totalParameters: 8_000_000_000 },
         intelligence: Schema.decodeUnknownSync(CatalogIntelligenceSchema)({
@@ -194,12 +179,14 @@ export const makeCatalogOnlyModel = (
         }),
         fidelityRank: 75,
         quantizationAware: false,
-      },
     },
     acquisitionState: { _tag: "NotInstalled" },
     servingState: {
-      ...model.servingState,
-      availabilityState: { _tag: "Installable" },
+      _tag: "Assessed",
+      metadata: servingState.metadata,
+      capabilities: servingState.capabilities,
+      speculativeMethod: servingState.speculativeMethod,
+      assessment: servingState.assessment,
       rankingScores: Option.some({ intelligence: 0.75, speed: 0.65, fidelity: 0.75 }),
     },
     presentation: { ...model.presentation, license: Option.some("Apache-2.0") },
@@ -208,89 +195,128 @@ export const makeCatalogOnlyModel = (
 }
 
 export const withDoesNotFitAssessment = (model: LocalModel): LocalModel => {
-  if (model.servingState._tag !== "Assessed"
-    || model.servingState.assessment._tag !== "Fits") {
-    throw new Error("DoesNotFit fixture requires a fitting assessed model")
-  }
-  return {
-    ...model,
-    servingState: {
-      ...model.servingState,
+  if (model._tag === "Catalog") {
+    const serving = model.servingState
+    if (serving._tag !== "Assessed" || serving.assessment._tag !== "Fits") {
+      throw new Error("DoesNotFit fixture requires a fitting assessed model")
+    }
+    const servingState: CatalogLocalModelServingState = {
+      _tag: "Assessed",
+      metadata: serving.metadata,
+      capabilities: serving.capabilities,
+      speculativeMethod: serving.speculativeMethod,
       assessment: {
         _tag: "DoesNotFit",
-        assessmentId: model.servingState.assessment.assessmentId,
-        environmentId: model.servingState.assessment.environmentId,
+        assessmentId: serving.assessment.assessmentId,
+        environmentId: serving.assessment.environmentId,
+        profile: serving.assessment.profile,
         memoryDomains: [],
         totalRequiredBytes: 10,
         deficitBytes: 2,
         limitingResource: "system memory",
       },
-      availabilityState: {
-        _tag: "Unavailable",
-        providerModelId: Option.none(),
-        failure: {
-          code: "insufficient_resources",
-          message: "Does not fit",
-          retryable: false,
+    }
+    return { ...model, servingState }
+  }
+  switch (model.state._tag) {
+    case "Ready": {
+      const serving = model.state.servingState
+      if (serving._tag !== "Assessed" || serving.assessment._tag !== "Fits") {
+        throw new Error("DoesNotFit fixture requires a fitting assessed model")
+      }
+      const servingState: DiscoveredLocalModelServingState = {
+        _tag: "Assessed",
+        metadata: serving.metadata,
+        capabilities: serving.capabilities,
+        speculativeMethod: serving.speculativeMethod,
+        assessment: {
+          _tag: "DoesNotFit",
+          assessmentId: serving.assessment.assessmentId,
+          environmentId: serving.assessment.environmentId,
+          profile: serving.assessment.profile,
+          memoryDomains: [],
+          totalRequiredBytes: 10,
+          deficitBytes: 2,
+          limitingResource: "system memory",
         },
-      },
-    },
+      }
+      return { ...model, state: { ...model.state, servingState } }
+    }
+    case "Unavailable":
+    case "Ambiguous": throw new Error("DoesNotFit fixture requires a ready discovered model")
   }
 }
 
 export const makeConfiguredModel = (
-  modelId: ReturnType<typeof ProviderModelIdSchema.make>,
-  overrides: Partial<LocalModel> = {},
-): LocalModel => {
+  modelId: typeof HuggingFaceFormModelIdSchema.Type,
+  overrides: Partial<ReadyDiscoveredLocalModel> = {},
+): ReadyDiscoveredLocalModel => {
   const model = makeModel()
-  if (model.servingState._tag !== "Assessed") return { ...model, ...overrides }
   return {
     ...model,
     modelId,
-    servingState: {
-      ...model.servingState,
-      availabilityState: {
-        _tag: "Selectable",
-        providerModelId: modelId,
-      },
-    },
     ...overrides,
   }
 }
 
 export const makeModelWithContext = (
   contextLength: number,
-  overrides: Partial<LocalModel> = {},
-): LocalModel => {
+  overrides: Partial<ReadyDiscoveredLocalModel> = {},
+): ReadyDiscoveredLocalModel => {
   const model = makeModel()
-  if (model.servingState._tag !== "Assessed") return { ...model, ...overrides }
+  const serving = model.state.servingState
+  if (serving._tag !== "Assessed" || serving.assessment._tag !== "Fits") {
+    return { ...model, ...overrides }
+  }
   return {
     ...model,
-    servingState: {
-      ...model.servingState,
-      configuration: {
-        ...model.servingState.configuration,
-        profile: { contextLength },
+    state: {
+      ...model.state,
+      servingState: {
+        ...serving,
+        metadata: {
+          ...serving.metadata,
+          maximumContextLength: Option.some(contextLength),
+        },
+        assessment: {
+          ...serving.assessment,
+          profile: { contextLength },
+          performance: performance(contextLength),
+        },
       },
-      assessment: model.servingState.assessment._tag === "Fits"
-        ? {
-            ...model.servingState.assessment,
-            profile: { contextLength },
-            performance: performance(contextLength),
-          }
-        : model.servingState.assessment,
     },
     ...overrides,
   }
 }
 
-export const makeCatalogModel = (overrides: Partial<LocalModel> = {}): LocalModel =>
+export const makeCatalogModel = (overrides: Partial<CatalogLocalModel> = {}): CatalogLocalModel =>
   makeCatalogOnlyModel(overrides)
+
+export const makeInstalledCatalogModel = (
+  overrides: Partial<CatalogLocalModel> = {},
+): CatalogLocalModel => {
+  const model = makeCatalogOnlyModel()
+  if (model.servingState._tag !== "Assessed") throw new Error("Base fixture must be assessed")
+  return {
+    ...model,
+    acquisitionState: {
+      _tag: "Installed",
+      installation: {
+        _tag: "Resolved",
+        installedBytes: model.servingState.metadata.storageBytes,
+        primaryPath: "/models/catalog-model.gguf",
+        ownership: "Magnitude",
+      },
+      residencyState: { _tag: "Unloaded" },
+    },
+    ...overrides,
+  }
+}
 
 export const makeAcquiringModel = (
   acquisitionState: LocalModelAcquisitionState,
-  overrides: Partial<LocalModel> = {},
-): LocalModel => makeCatalogOnlyModel({ acquisitionState, ...overrides })
+  overrides: Partial<CatalogLocalModel> = {},
+): CatalogLocalModel => makeCatalogOnlyModel({ acquisitionState, ...overrides })
 
 export const makeView = (options: {
   readonly hardware?: LocalInferenceHardware
@@ -314,9 +340,8 @@ export const makeView = (options: {
   return {
     hardware: options.hardware ?? makeHardware(),
     models: {
-      inventoryState: { _tag: "Ready" },
+      reconciliationComplete: true,
       models,
-      discoveryState: { _tag: "Ready", progress: [] },
     },
     catalog: new ProviderModelCatalogReady({
       providers: [{

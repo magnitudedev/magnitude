@@ -1,6 +1,6 @@
 import { Data, Effect, Option, Schema } from "effect"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { runCommand, setOutputMode } from "./output"
+import { errorDocument, runCommand, setOutputMode } from "./output"
 
 const ResultSchema = Schema.Struct({
   value: Schema.String,
@@ -12,6 +12,11 @@ class ExpectedFailure extends Data.TaggedError("ExpectedFailure")<{
   readonly message: string
   readonly retryable: boolean
 }> {}
+
+class ReasonFailure extends Schema.TaggedError<ReasonFailure>()(
+  "ReasonFailure",
+  { reason: Schema.String },
+) {}
 
 afterEach(() => {
   setOutputMode(false)
@@ -73,5 +78,28 @@ describe("unified command output", () => {
     })
 
     expect(stdout).toHaveBeenCalledWith("ok:present\n")
+  })
+
+  it("uses the actionable message instead of a transport reason category", () => {
+    expect(errorDocument({
+      reason: "Unknown",
+      message: "Magnitude service failed to start in time",
+    })).toEqual({
+      error: {
+        code: "command_failed",
+        message: "Magnitude service failed to start in time",
+        retryable: false,
+      },
+    })
+  })
+
+  it("uses an Effect tagged error's reason instead of its inherited message", () => {
+    expect(errorDocument(new ReasonFailure({ reason: "Magnitude service is not responding" }))).toEqual({
+      error: {
+        code: "command_failed",
+        message: "Magnitude service is not responding",
+        retryable: false,
+      },
+    })
   })
 })

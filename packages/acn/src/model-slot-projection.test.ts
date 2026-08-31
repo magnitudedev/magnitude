@@ -42,37 +42,28 @@ describe("model slot projection", () => {
     })).toEqual(["RetryLoad"])
   })
 
-  it("keeps a durable local offering selected while its packages download", () => {
+  it("reports a missing local offering as unavailable", () => {
     expect(localModelSlotAvailability({
       catalogIdentityPending: false,
       offeringsReady: true,
-      inventory: { _tag: "Ready" },
-      offeringExists: true,
-      installed: false,
+      offeringExists: false,
     })).toEqual({
       _tag: "Unavailable",
       failure: {
-        code: "local_model_not_installed",
-        message: "The selected local model is not downloaded",
+        code: "local_offering_unavailable",
+        message: "The selected local configuration is unavailable",
         retryable: true,
       },
     })
   })
 
-  it("keeps incomplete local authority pending", () => {
+  it("keeps incomplete catalog authority pending", () => {
     const input = {
-      catalogIdentityPending: false,
+      catalogIdentityPending: true,
       offeringsReady: true,
-      inventory: { _tag: "Initializing" },
       offeringExists: true,
-      installed: false,
     } as const
     expect(localModelSlotAvailability(input)).toEqual({ _tag: "Pending" })
-    expect(localModelSlotAvailability({
-      ...input,
-      catalogIdentityPending: true,
-      inventory: { _tag: "Ready" },
-    })).toEqual({ _tag: "Pending" })
   })
 
   it("admits a durable offering before catalog publication", () => {

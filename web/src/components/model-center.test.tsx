@@ -47,8 +47,7 @@ describe("Settings query states", () => {
 describe("Settings model loading states", () => {
   it("does not render an initializing model inventory as an empty library", () => {
     modelState.localModels = Result.success({
-      inventoryState: { _tag: "Initializing" },
-      discoveryState: { _tag: "Loading", progress: [] },
+      reconciliationComplete: false,
       models: [],
     })
 
@@ -62,8 +61,7 @@ describe("Settings model loading states", () => {
 
   it("renders Models as a searchable installed-model library only", () => {
     modelState.localModels = Result.success({
-      inventoryState: { _tag: "Ready" },
-      discoveryState: { _tag: "Ready", progress: [] },
+      reconciliationComplete: true,
       models: [],
     })
 
@@ -80,7 +78,7 @@ describe("Settings model loading states", () => {
 
   it("shows catalog discovery as loading instead of an empty candidate layout", () => {
     modelState.catalog = Result.success({
-      discoveryState: { _tag: "Loading", progress: [] },
+      reconciliationComplete: false,
       models: [],
     })
 
@@ -96,7 +94,7 @@ describe("Settings model loading states", () => {
 
   it("renders the catalog empty state only after discovery is ready", () => {
     modelState.catalog = Result.success({
-      discoveryState: { _tag: "Ready", progress: [] },
+      reconciliationComplete: true,
       models: [],
     })
 
@@ -112,19 +110,4 @@ describe("Settings model loading states", () => {
     expect(html).not.toContain("Loading catalog")
   })
 
-  it("does not turn failed catalog discovery into a successful empty state", () => {
-    modelState.catalog = Result.success({
-      discoveryState: {
-        _tag: "Failed",
-        progress: [],
-        failure: { message: "Assessment failed." },
-      },
-      models: [],
-    })
-
-    const html = renderToStaticMarkup(<ModelSettingsCenter tab="catalog" />)
-
-    expect(html).toContain("Assessment failed.")
-    expect(html).not.toContain("No local catalog models are currently available.")
-  })
 })

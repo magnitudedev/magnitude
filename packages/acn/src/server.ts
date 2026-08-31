@@ -11,6 +11,7 @@ import * as HttpServerRequest from "@effect/platform/HttpServerRequest"
 import { RpcSerialization, RpcServer } from "@effect/rpc"
 import {
   Context,
+  Cause,
   Data,
   Deferred,
   Duration,
@@ -72,16 +73,11 @@ import { SessionDraftsLive } from "./session-drafts"
 import { SessionLifecycleLive } from "./session-lifecycle"
 import { SessionRuntimeOptionsStoreLive } from "./session-runtime-options"
 import { ModelSelectionLive } from "./model-selection"
-import { LocalModelConfigurationCoordinatorLive } from "./local-model-configuration-coordinator"
 import { makeAcnIcn } from "./icn"
-import { LocalModelAssessmentsLive } from "./local-model-assessments"
 import { LocalModelAssessorLive } from "./local-model-assessor"
-import { LocalModelConfigurationResolverLive } from "./local-model-configuration-resolver"
-import { LocalModelCatalogAdapterLive } from "./local-model-catalog-adapter"
-import { LocalModelPackagesLive } from "./local-model-packages"
-import { LocalModelAcquisitionCoordinatorLive } from "./local-model-acquisition-coordinator"
-import { makeLocalModelRankerLive } from "./local-model-ranker"
+import { LocalModelSourcesLive } from "./local-model-sources"
 import { LocalModelsLive } from "./local-models"
+import { LocalModelRemovalsLive } from "./local-model-removals"
 import { ModelCatalogLive } from "./model-catalog"
 import { ModelCommandsLive } from "./model-commands"
 import { LocalProviderOfferingsLive } from "./local-provider-offerings"
@@ -137,7 +133,8 @@ class InferenceProxyFailed extends Data.TaggedError("InferenceProxyFailed")<{
 }> {}
 
 class AcnRestartRequired extends Data.TaggedError("AcnRestartRequired")<{
-  readonly reason: string
+  readonly reason: "fatal" | "icn-exited" | "startup-failed"
+  readonly message: string
 }> {}
 
 type ParentBindingState = "Pending" | "Admitted" | "Lost"
@@ -417,50 +414,27 @@ const addLocalInferenceServices = <A, E, R>(
   dataDir: string
 ) => {
   const withIcn = Layer.provideMerge(makeAcnIcn(dataDir), base)
+  const withModelRemovals = Layer.provideMerge(LocalModelRemovalsLive, withIcn)
   const withSelection = Layer.provideMerge(
     ModelSelectionLive,
-    withIcn
-  )
-  const withConfigurationCoordinator = Layer.provideMerge(
-    LocalModelConfigurationCoordinatorLive,
-    withSelection,
+    withModelRemovals
   )
   const withCustomEndpoints = Layer.provideMerge(
     CustomEndpointsLive,
-    withConfigurationCoordinator,
+    withSelection,
   )
   const withHardware = Layer.provideMerge(
     LocalInferenceHardwareLive,
     withCustomEndpoints
   )
-  const withCatalogAdapter = Layer.provideMerge(LocalModelCatalogAdapterLive, withHardware)
-  const withPackages = Layer.provideMerge(LocalModelPackagesLive, withCatalogAdapter)
-  const withAcquisition = Layer.provideMerge(
-    LocalModelAcquisitionCoordinatorLive,
-    withPackages,
-  )
-  const withAssessments = Layer.provideMerge(
-    LocalModelAssessmentsLive,
-    withAcquisition,
-  )
+  const withCatalogAdapter = Layer.provideMerge(LocalModelSourcesLive, withHardware)
   const withAssessor = Layer.provideMerge(
     LocalModelAssessorLive,
-    withAssessments,
+    withCatalogAdapter,
   )
-  const withConfigurationResolver = Layer.provideMerge(
-    LocalModelConfigurationResolverLive,
-    withAssessor,
-  )
-  const withOfferings = Layer.provideMerge(
-    LocalProviderOfferingsLive,
-    withConfigurationResolver
-  )
-  const withRanker = Layer.provideMerge(
-    makeLocalModelRankerLive(),
-    withOfferings
-  )
-  const withLocalModels = Layer.provideMerge(LocalModelsLive, withRanker)
-  const withOnboarding = Layer.provideMerge(OnboardingLive, withLocalModels)
+  const withLocalModels = Layer.provideMerge(LocalModelsLive, withAssessor)
+  const withOfferings = Layer.provideMerge(LocalProviderOfferingsLive, withLocalModels)
+  const withOnboarding = Layer.provideMerge(OnboardingLive, withOfferings)
   const withResolver = Layer.provideMerge(
     LocalProviderResolverLive,
     withOnboarding
@@ -795,32 +769,35 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
 
     const startup = application.pipe(
       Effect.timeout(Duration.minutes(5)),
-      Effect.tapError((error) => lifecycle.beginStopping({
+      Effect.tapErrorCause((cause) => lifecycle.beginStopping({
         reason: "startup-failed",
-        detail: "Magnitude could not prepare local inference",
-      }).pipe(Effect.zipRight(Effect.logError("ACN application startup failed", error)))),
+        detail: Cause.pretty(cause),
+      }).pipe(Effect.zipRight(Effect.logError("ACN application startup failed", cause)))),
     )
     const started = yield* Effect.raceFirst(
       startup.pipe(Effect.disconnect, Effect.map(Option.some)),
       lifecycle.awaitStopping.pipe(Effect.map(() => Option.none())),
     )
+    const request = yield* lifecycle.awaitStopping
     if (Option.isNone(started)) {
       yield* closeApplicationScope
-      return
+    } else {
+      const { subscriptions, icn } = started.value
+      yield* Effect.logInfo("ACN shutdown requested").pipe(Effect.annotateLogs({
+        reason: request.reason,
+        detail: Option.getOrNull(request.safeDetail),
+      }))
+      yield* boundedShutdownStep(subscriptions.terminate)
+      yield* closeApplicationScope
+      yield* boundedShutdownStep(icn.shutdown, Duration.seconds(2))
     }
-    const { subscriptions, icn } = started.value
-    const request = yield* lifecycle.awaitStopping
-    yield* Effect.logInfo("ACN shutdown requested").pipe(Effect.annotateLogs({
-      reason: request.reason,
-      detail: Option.getOrNull(request.safeDetail),
-    }))
-    yield* boundedShutdownStep(subscriptions.terminate)
-    yield* closeApplicationScope
-    yield* boundedShutdownStep(icn.shutdown, Duration.seconds(2))
     if (request.reason === "fatal"
       || request.reason === "icn-exited"
       || request.reason === "startup-failed") {
-      return yield* new AcnRestartRequired({ reason: request.reason })
+      return yield* new AcnRestartRequired({
+        reason: request.reason,
+        message: Option.getOrElse(request.safeDetail, () => `ACN stopped because ${request.reason}`),
+      })
     }
   })).pipe(
     Effect.provideService(ProcessGroupController, ProcessGroupControllerLive),

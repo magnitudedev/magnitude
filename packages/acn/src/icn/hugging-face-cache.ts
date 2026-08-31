@@ -1,19 +1,9 @@
-import { statSync } from "node:fs"
 import { homedir } from "node:os"
 import { isAbsolute, join, resolve } from "node:path"
 
 export interface HuggingFaceCacheResolutionOptions {
   readonly env?: Readonly<Record<string, string | undefined>>
   readonly homeDirectory?: string
-  readonly isDirectory?: (path: string) => boolean
-}
-
-const existingDirectory = (path: string): boolean => {
-  try {
-    return statSync(path).isDirectory()
-  } catch {
-    return false
-  }
 }
 
 const expandPath = (path: string, homeDirectory: string): string => {
@@ -41,5 +31,5 @@ export const resolveHuggingFaceCacheRoots = (
         ? join(configuredXdgHome, "huggingface", "hub")
         : join(homeDirectory, ".cache", "huggingface", "hub"))
   const root = expandPath(candidate, homeDirectory)
-  return (options.isDirectory ?? existingDirectory)(root) ? [root] : []
+  return [root]
 }

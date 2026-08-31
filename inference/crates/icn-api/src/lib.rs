@@ -25,12 +25,13 @@ use icn_contracts::bootstrap_protocol::{
 };
 use icn_contracts::inference as domain;
 use icn_contracts::models::{
-    AssessModelsEvent, AssessModelsRequest, CatalogModelLocalState, CatalogModels, InferenceModel,
-    InstallCatalogModelRequest, InstallModelResponse, InstalledModelPackage,
-    InstalledModelPackages, InstalledModelPackagesResponse, ModelAssessor, ModelDownload,
-    ModelDownloadId, ModelDownloads, ModelDownloadsResponse, ModelInstance, ModelInstanceId,
-    ModelInstanceLifecycle, ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadPlan,
-    ModelPackageId, ModelsResponse, RemoveInstalledModelPackageResponse,
+    AssessModelRequest, AssessModelsEvent, AssessModelsRequest, CatalogAssessmentsRequest,
+    CatalogInstallationAdmission, CatalogInstallationOperation, CatalogInstallationOperationId,
+    CatalogInstallationRemoval, CatalogInstallations, CatalogInstallationsResponse, CatalogModel,
+    CatalogModelState, CatalogModels, CatalogModelsResponse, DiscoveredModel, DiscoveredModelState,
+    DiscoveredModels, DiscoveredModelsResponse, DiscoveryAssessmentsRequest, EffectiveModel,
+    ModelAssessmentSubject, ModelAssessor, ModelDownloads, ModelId, ModelInstance, ModelInstanceId,
+    ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadPlan, ParsedModelId,
 };
 use icn_contracts::{
     CacheType, CompletionBackend, ExecutionConfig, ExecutionConfigReport, FlashAttention,
@@ -71,7 +72,8 @@ static NEXT_HTTP_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone)]
 pub struct AppState {
     catalog_models: Option<Arc<dyn CatalogModels>>,
-    installed_packages: Option<Arc<dyn InstalledModelPackages>>,
+    discovered_models: Option<Arc<dyn DiscoveredModels>>,
+    catalog_installations: Option<Arc<dyn CatalogInstallations>>,
     model_assessor: Option<Arc<dyn ModelAssessor>>,
     model_downloads: Option<Arc<dyn ModelDownloads>>,
     hardware: Option<Arc<dyn HardwareProvider>>,
@@ -111,31 +113,17 @@ pub struct MagnitudeModelDescriptor {
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelIdentityRequest {
-    pub model_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct UninstallModelResponse {
-    pub model_id: String,
-    pub removed_package_ids: Vec<ModelPackageId>,
-    pub retained_package_ids: Vec<ModelPackageId>,
-}
-
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EnsureModelInstanceRequest {
-    pub model_id: String,
+    pub model_id: ModelId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum InferenceResourceTopic {
     Hardware,
-    Models,
-    Packages,
-    Downloads,
+    Catalog,
+    Discovery,
+    CatalogInstallations,
     Instances,
 }
 
@@ -143,9 +131,9 @@ impl InferenceResourceTopic {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Hardware => "hardware",
-            Self::Models => "models",
-            Self::Packages => "packages",
-            Self::Downloads => "downloads",
+            Self::Catalog => "catalog",
+            Self::Discovery => "discovery",
+            Self::CatalogInstallations => "catalog-installations",
             Self::Instances => "instances",
         }
     }
@@ -153,9 +141,9 @@ impl InferenceResourceTopic {
     fn parse(value: &str) -> Option<Self> {
         match value {
             "hardware" => Some(Self::Hardware),
-            "models" => Some(Self::Models),
-            "packages" => Some(Self::Packages),
-            "downloads" => Some(Self::Downloads),
+            "catalog" => Some(Self::Catalog),
+            "discovery" => Some(Self::Discovery),
+            "catalog-installations" => Some(Self::CatalogInstallations),
             "instances" => Some(Self::Instances),
             _ => None,
         }
@@ -255,7 +243,8 @@ impl AppState {
         let (resource_changes, _) = tokio::sync::broadcast::channel(64);
         Self {
             catalog_models: None,
-            installed_packages: None,
+            discovered_models: None,
+            catalog_installations: None,
             model_assessor: None,
             model_downloads: None,
             hardware: None,
@@ -273,7 +262,8 @@ impl AppState {
         let (resource_changes, _) = tokio::sync::broadcast::channel(64);
         Self {
             catalog_models: None,
-            installed_packages: None,
+            discovered_models: None,
+            catalog_installations: None,
             model_assessor: None,
             model_downloads: None,
             hardware: None,
@@ -297,16 +287,15 @@ impl AppState {
         self
     }
 
-    pub fn with_installed_packages(
+    pub fn with_model_domains(
         mut self,
-        installed_packages: Arc<dyn InstalledModelPackages>,
+        catalog_models: Arc<dyn CatalogModels>,
+        discovered_models: Arc<dyn DiscoveredModels>,
+        catalog_installations: Arc<dyn CatalogInstallations>,
     ) -> Self {
-        self.installed_packages = Some(installed_packages);
-        self
-    }
-
-    pub fn with_catalog_models(mut self, catalog_models: Arc<dyn CatalogModels>) -> Self {
         self.catalog_models = Some(catalog_models);
+        self.discovered_models = Some(discovered_models);
+        self.catalog_installations = Some(catalog_installations);
         self
     }
 
@@ -361,18 +350,36 @@ impl AppState {
 pub fn app(state: AppState) -> Router {
     let mut protected = Router::new()
         .route("/api/v1/hardware", get(hardware))
-        .route("/api/v1/models", get(models))
-        .route("/api/v1/models/{model_id}", get(model))
-        .route("/api/v1/models/install", post(install_model))
-        .route("/api/v1/models/uninstall", post(uninstall_model))
-        .route("/api/v1/packages", get(installed_models))
+        .route("/api/v1/catalog/models", get(catalog_models))
+        .route("/api/v1/catalog/models/{model_id}", get(catalog_model))
         .route(
-            "/api/v1/packages/{package_id}",
-            get(installed_model).delete(remove_installed_model),
+            "/api/v1/catalog/models/{model_id}/install",
+            post(install_catalog_model),
         )
-        .route("/api/v1/models/assess", post(assess_models))
-        .route("/api/v1/downloads", get(model_downloads))
-        .route("/api/v1/downloads/{download_id}", get(model_download))
+        .route(
+            "/api/v1/catalog/models/{model_id}/installation",
+            axum::routing::delete(remove_catalog_model_installation),
+        )
+        .route("/api/v1/catalog/installations", get(catalog_installations))
+        .route(
+            "/api/v1/catalog/installations/{operation_id}",
+            get(catalog_installation),
+        )
+        .route(
+            "/api/v1/catalog/installations/{operation_id}/cancel",
+            post(cancel_catalog_installation),
+        )
+        .route(
+            "/api/v1/catalog/installations/{operation_id}/acknowledge-failure",
+            post(acknowledge_catalog_installation_failure),
+        )
+        .route("/api/v1/discovery/models", get(discovered_models))
+        .route("/api/v1/discovery/refresh", post(refresh_discovery))
+        .route("/api/v1/catalog/assessments", post(assess_catalog_models))
+        .route(
+            "/api/v1/discovery/assessments",
+            post(assess_discovered_models),
+        )
         .route(
             "/api/v1/models/{model_id}/load-plan",
             post(preview_model_load),
@@ -386,14 +393,6 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/api/v1/instances/{instance_id}/stop",
             post(stop_model_instance),
-        )
-        .route(
-            "/api/v1/downloads/{download_id}/cancel",
-            post(cancel_model_download),
-        )
-        .route(
-            "/api/v1/downloads/{download_id}/acknowledge-failure",
-            post(acknowledge_model_download_failure),
         )
         .route(
             "/api/v1/sources/hugging-face/search",
@@ -484,10 +483,6 @@ pub trait ModelInstanceController: Send + Sync + 'static {
     ) -> BoxFuture<'_, Result<(), InventoryError>>;
     fn instances(&self) -> BoxFuture<'_, ModelInstancesSnapshot>;
     fn watch_instances(&self) -> BoxStream<'static, ModelInstancesInvalidation>;
-    fn remove_installed(
-        &self,
-        package_id: ModelPackageId,
-    ) -> BoxFuture<'_, Result<RemoveInstalledModelPackageResponse, InventoryError>>;
     fn lease(
         &self,
         instance_id: ModelInstanceId,
@@ -561,18 +556,6 @@ impl ModelInstanceController for StaticModelInstanceController {
 
     fn watch_instances(&self) -> BoxStream<'static, ModelInstancesInvalidation> {
         Box::pin(futures_util::stream::empty())
-    }
-
-    fn remove_installed(
-        &self,
-        package_id: ModelPackageId,
-    ) -> BoxFuture<'_, Result<RemoveInstalledModelPackageResponse, InventoryError>> {
-        Box::pin(async move {
-            Err(InventoryError::Unsupported(format!(
-                "cannot remove package {} from a static model controller",
-                package_id.0
-            )))
-        })
     }
 
     fn lease(
@@ -966,7 +949,7 @@ async fn ensure_model_instance(
         .as_ref()
         .ok_or_else(|| ApiError::server("model control is not configured"))?;
     controller
-        .ensure_resident(request.model_id)
+        .ensure_resident(request.model_id.to_string())
         .await
         .map(Json)
         .map_err(ApiError::from_inventory)
@@ -988,12 +971,15 @@ async fn preview_model_load(
     State(state): State<AppState>,
     Path(model_id): Path<String>,
 ) -> Result<Json<ModelLoadPlan>, ApiError> {
+    let model_id = model_id
+        .parse::<ModelId>()
+        .map_err(|error| ApiError::invalid(error.to_string()))?;
     let controller = state
         .model_controller
         .as_ref()
         .ok_or_else(|| ApiError::server("model control is not configured"))?;
     controller
-        .preview_load(model_id)
+        .preview_load(model_id.to_string())
         .await
         .map(Json)
         .map_err(ApiError::from_inventory)
@@ -1109,6 +1095,14 @@ async fn watch_inference_events(
         .model_downloads
         .as_ref()
         .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
+    let catalog = state
+        .catalog_models
+        .as_ref()
+        .ok_or_else(|| ApiError::server("catalog models are not configured"))?;
+    let discovery = state
+        .discovered_models
+        .as_ref()
+        .ok_or_else(|| ApiError::server("discovered models are not configured"))?;
     let instance_events =
         futures_util::StreamExt::flat_map(controller.watch_instances(), |event| {
             futures_util::stream::iter(
@@ -1123,17 +1117,24 @@ async fn watch_inference_events(
             )
         });
     let download_events = futures_util::StreamExt::flat_map(downloads.watch(), |event| {
-        futures_util::stream::iter(
-            [
-                InferenceResourceTopic::Downloads,
-                InferenceResourceTopic::Models,
-                InferenceResourceTopic::Packages,
-            ]
-            .map(|topic| InferenceResourceInvalidation {
-                topic,
+        futures_util::stream::once(async move {
+            InferenceResourceInvalidation {
+                topic: InferenceResourceTopic::CatalogInstallations,
                 revision: event.revision,
-            }),
-        )
+            }
+        })
+    });
+    let catalog_events = futures_util::StreamExt::map(catalog.watch_catalog(), |event| {
+        InferenceResourceInvalidation {
+            topic: InferenceResourceTopic::Catalog,
+            revision: event.revision,
+        }
+    });
+    let discovery_events = futures_util::StreamExt::map(discovery.watch_discovery(), |event| {
+        InferenceResourceInvalidation {
+            topic: InferenceResourceTopic::Discovery,
+            revision: event.revision,
+        }
     });
     let direct_events = futures_util::stream::unfold(
         state.resource_changes.subscribe(),
@@ -1148,7 +1149,13 @@ async fn watch_inference_events(
         },
     );
     let events = futures_util::stream::select(
-        futures_util::stream::select(instance_events, download_events),
+        futures_util::stream::select(
+            futures_util::stream::select(
+                futures_util::stream::select(instance_events, download_events),
+                catalog_events,
+            ),
+            discovery_events,
+        ),
         direct_events,
     );
     let events = futures_util::StreamExt::filter(events, move |event| {
@@ -1231,98 +1238,225 @@ async fn resolve_hugging_face_repository(
         .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(get, path = "/api/v1/packages", operation_id = "listInstalledModels", tag = "models",
+#[utoipa::path(get, path = "/api/v1/catalog/models", operation_id = "listCatalogModels", tag = "catalog",
     responses(
-        (status = 200, description = "Verified model packages installed on this machine", body = InstalledModelPackagesResponse),
-        (status = 500, description = "Installed package discovery failed", body = ErrorResponse)
+        (status = 200, description = "Catalog declarations and current managed local state", body = CatalogModelsResponse),
+        (status = 500, description = "Catalog state unavailable", body = ErrorResponse)
     )
 )]
-#[tracing::instrument(name = "icn.models.installed", skip_all, err(Debug))]
-async fn installed_models(
+async fn catalog_models(
     State(state): State<AppState>,
-) -> Result<Json<InstalledModelPackagesResponse>, ApiError> {
-    let installed = state
-        .installed_packages
-        .as_ref()
-        .ok_or_else(|| ApiError::server("installed model packages are not configured"))?;
-    installed
-        .list_installed()
-        .await
-        .map(Json)
-        .map_err(ApiError::from_inventory)
-}
-
-#[utoipa::path(get, path = "/api/v1/packages/{package_id}", operation_id = "getInstalledModelPackage", tag = "models",
-    params(("package_id" = String, Path, description = "Model package ID")),
-    responses(
-        (status = 200, description = "Exact installed model package", body = InstalledModelPackage),
-        (status = 404, description = "Installed model package not found", body = ErrorResponse),
-        (status = 500, description = "Installed package discovery failed", body = ErrorResponse)
-    )
-)]
-async fn installed_model(
-    State(state): State<AppState>,
-    Path(package_id): Path<String>,
-) -> Result<Json<InstalledModelPackage>, ApiError> {
-    let installed = state
-        .installed_packages
-        .as_ref()
-        .ok_or_else(|| ApiError::server("installed model packages are not configured"))?;
-    installed
-        .list_installed()
-        .await
-        .map_err(ApiError::from_inventory)?
-        .packages
-        .into_iter()
-        .find(|package| package.package.id.0 == package_id)
-        .map(Json)
-        .ok_or_else(|| ApiError::from_inventory(InventoryError::NotFound(package_id)))
-}
-
-#[utoipa::path(get, path = "/api/v1/models", operation_id = "listModels", tag = "models",
-    responses(
-        (status = 200, description = "Catalog models joined with current local artifact state", body = ModelsResponse),
-        (status = 500, description = "Model discovery failed", body = ErrorResponse)
-    )
-)]
-#[tracing::instrument(name = "icn.models.list", skip_all, err(Debug))]
-async fn models(State(state): State<AppState>) -> Result<Json<ModelsResponse>, ApiError> {
-    let models = state
+) -> Result<Json<CatalogModelsResponse>, ApiError> {
+    state
         .catalog_models
         .as_ref()
-        .ok_or_else(|| ApiError::server("catalog models are not configured"))?;
-    models
-        .list()
+        .ok_or_else(|| ApiError::server("catalog models are not configured"))?
+        .list_catalog()
         .await
         .map(Json)
         .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(get, path = "/api/v1/models/{model_id}", operation_id = "getModel", tag = "models",
-    params(("model_id" = String, Path, description = "Canonical model ID")),
+#[utoipa::path(get, path = "/api/v1/catalog/models/{model_id}", operation_id = "getCatalogModel", tag = "catalog",
+    params(("model_id" = String, Path, description = "Canonical catalog model ID")),
     responses(
-        (status = 200, description = "Exact Model projection", body = InferenceModel),
-        (status = 404, description = "Model not found", body = ErrorResponse),
-        (status = 500, description = "Model discovery failed", body = ErrorResponse)
+        (status = 200, description = "Exact catalog model", body = CatalogModel),
+        (status = 404, description = "Catalog model not found", body = ErrorResponse),
+        (status = 500, description = "Catalog state unavailable", body = ErrorResponse)
     )
 )]
-async fn model(
+async fn catalog_model(
     State(state): State<AppState>,
     Path(model_id): Path<String>,
-) -> Result<Json<InferenceModel>, ApiError> {
-    let models = state
+) -> Result<Json<CatalogModel>, ApiError> {
+    let parsed_id = model_id
+        .parse::<ModelId>()
+        .map_err(|error| ApiError::invalid(error.to_string()))?;
+    state
         .catalog_models
         .as_ref()
-        .ok_or_else(|| ApiError::server("catalog models are not configured"))?;
-    models
-        .list()
+        .ok_or_else(|| ApiError::server("catalog models are not configured"))?
+        .list_catalog()
         .await
         .map_err(ApiError::from_inventory)?
         .models
         .into_iter()
-        .find(|model| model.id == model_id)
+        .find(|model| model.id == parsed_id)
         .map(Json)
         .ok_or_else(|| ApiError::from_inventory(InventoryError::NotFound(model_id)))
+}
+
+#[utoipa::path(post, path = "/api/v1/catalog/models/{model_id}/install", operation_id = "installCatalogModel", tag = "catalog",
+    params(("model_id" = String, Path, description = "Canonical catalog model ID")),
+    responses(
+        (status = 200, description = "Catalog installation admission", body = CatalogInstallationAdmission),
+        (status = 404, description = "Catalog model not found", body = ErrorResponse),
+        (status = 409, description = "Installation cannot be admitted", body = ErrorResponse),
+        (status = 500, description = "Installation failed", body = ErrorResponse)
+    )
+)]
+async fn install_catalog_model(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+) -> Result<Json<CatalogInstallationAdmission>, ApiError> {
+    let parsed_id = model_id
+        .parse::<ModelId>()
+        .map_err(|error| ApiError::invalid(error.to_string()))?;
+    if !matches!(parsed_id.parsed(), ParsedModelId::Catalog { .. }) {
+        return Err(ApiError::invalid(
+            "catalog installation requires a catalog model ID",
+        ));
+    }
+    let result = state
+        .catalog_models
+        .as_ref()
+        .ok_or_else(|| ApiError::server("catalog models are not configured"))?
+        .install_catalog_model(&parsed_id)
+        .await
+        .map_err(ApiError::from_inventory)?;
+    state.invalidate_resources([
+        InferenceResourceTopic::Catalog,
+        InferenceResourceTopic::CatalogInstallations,
+    ]);
+    Ok(Json(result))
+}
+
+#[utoipa::path(delete, path = "/api/v1/catalog/models/{model_id}/installation", operation_id = "removeCatalogModelInstallation", tag = "catalog",
+    params(("model_id" = String, Path, description = "Canonical catalog model ID")),
+    responses(
+        (status = 200, description = "Managed catalog installation removal result", body = CatalogInstallationRemoval),
+        (status = 404, description = "Catalog model not found", body = ErrorResponse),
+        (status = 409, description = "Model is live", body = ErrorResponse),
+        (status = 500, description = "Removal failed", body = ErrorResponse)
+    )
+)]
+async fn remove_catalog_model_installation(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+) -> Result<Json<CatalogInstallationRemoval>, ApiError> {
+    let parsed_id = model_id
+        .parse::<ModelId>()
+        .map_err(|error| ApiError::invalid(error.to_string()))?;
+    if !matches!(parsed_id.parsed(), ParsedModelId::Catalog { .. }) {
+        return Err(ApiError::invalid(
+            "catalog removal requires a catalog model ID",
+        ));
+    }
+    let result = state
+        .catalog_models
+        .as_ref()
+        .ok_or_else(|| ApiError::server("catalog models are not configured"))?
+        .remove_catalog_model_installation(&parsed_id)
+        .await
+        .map_err(ApiError::from_inventory)?;
+    state.invalidate_resources([InferenceResourceTopic::Catalog]);
+    Ok(Json(result))
+}
+
+#[utoipa::path(get, path = "/api/v1/catalog/installations", operation_id = "listCatalogInstallations", tag = "catalog",
+    responses((status = 200, description = "Managed catalog installation occurrences", body = CatalogInstallationsResponse))
+)]
+async fn catalog_installations(
+    State(state): State<AppState>,
+) -> Result<Json<CatalogInstallationsResponse>, ApiError> {
+    state
+        .catalog_installations
+        .as_ref()
+        .ok_or_else(|| ApiError::server("catalog installations are not configured"))?
+        .list_catalog_installations()
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(get, path = "/api/v1/catalog/installations/{operation_id}", operation_id = "getCatalogInstallation", tag = "catalog",
+    params(("operation_id" = String, Path)), responses((status = 200, body = CatalogInstallationOperation), (status = 404, body = ErrorResponse))
+)]
+async fn catalog_installation(
+    State(state): State<AppState>,
+    Path(operation_id): Path<String>,
+) -> Result<Json<CatalogInstallationOperation>, ApiError> {
+    state
+        .catalog_installations
+        .as_ref()
+        .ok_or_else(|| ApiError::server("catalog installations are not configured"))?
+        .list_catalog_installations()
+        .await
+        .map_err(ApiError::from_inventory)?
+        .operations
+        .into_iter()
+        .find(|operation| operation.operation_id.0 == operation_id)
+        .map(Json)
+        .ok_or_else(|| ApiError::from_inventory(InventoryError::NotFound(operation_id)))
+}
+
+#[utoipa::path(post, path = "/api/v1/catalog/installations/{operation_id}/cancel", operation_id = "cancelCatalogInstallation", tag = "catalog",
+    params(("operation_id" = String, Path)), responses((status = 200, body = CatalogInstallationOperation), (status = 404, body = ErrorResponse))
+)]
+async fn cancel_catalog_installation(
+    State(state): State<AppState>,
+    Path(operation_id): Path<String>,
+) -> Result<Json<CatalogInstallationOperation>, ApiError> {
+    let result = state
+        .catalog_installations
+        .as_ref()
+        .ok_or_else(|| ApiError::server("catalog installations are not configured"))?
+        .cancel_catalog_installation(&CatalogInstallationOperationId(operation_id))
+        .await
+        .map_err(ApiError::from_inventory)?;
+    state.invalidate_resources([InferenceResourceTopic::CatalogInstallations]);
+    Ok(Json(result))
+}
+
+#[utoipa::path(post, path = "/api/v1/catalog/installations/{operation_id}/acknowledge-failure", operation_id = "acknowledgeCatalogInstallationFailure", tag = "catalog",
+    params(("operation_id" = String, Path)), responses((status = 200, body = CatalogInstallationOperation), (status = 404, body = ErrorResponse))
+)]
+async fn acknowledge_catalog_installation_failure(
+    State(state): State<AppState>,
+    Path(operation_id): Path<String>,
+) -> Result<Json<CatalogInstallationOperation>, ApiError> {
+    let result = state
+        .catalog_installations
+        .as_ref()
+        .ok_or_else(|| ApiError::server("catalog installations are not configured"))?
+        .acknowledge_catalog_installation_failure(&CatalogInstallationOperationId(operation_id))
+        .await
+        .map_err(ApiError::from_inventory)?;
+    state.invalidate_resources([InferenceResourceTopic::CatalogInstallations]);
+    Ok(Json(result))
+}
+
+#[utoipa::path(get, path = "/api/v1/discovery/models", operation_id = "listDiscoveredModels", tag = "discovery",
+    responses((status = 200, description = "Current non-catalog discoveries", body = DiscoveredModelsResponse))
+)]
+async fn discovered_models(
+    State(state): State<AppState>,
+) -> Result<Json<DiscoveredModelsResponse>, ApiError> {
+    state
+        .discovered_models
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model discovery is not configured"))?
+        .list_discovered()
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(post, path = "/api/v1/discovery/refresh", operation_id = "refreshDiscoveredModels", tag = "discovery",
+    responses((status = 200, description = "Refreshed discovery snapshot", body = DiscoveredModelsResponse))
+)]
+async fn refresh_discovery(
+    State(state): State<AppState>,
+) -> Result<Json<DiscoveredModelsResponse>, ApiError> {
+    let result = state
+        .discovered_models
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model discovery is not configured"))?
+        .refresh_discovery()
+        .await
+        .map_err(ApiError::from_inventory)?;
+    state.invalidate_resources([InferenceResourceTopic::Discovery]);
+    Ok(Json(result))
 }
 
 #[utoipa::path(get, path = "/v1/models", operation_id = "listServableModels", tag = "inference",
@@ -1335,40 +1469,81 @@ async fn model(
 async fn standard_models(
     State(state): State<AppState>,
 ) -> Result<Json<OpenAiModelsResponse>, ApiError> {
-    let models = state
+    let catalog = state
         .catalog_models
         .as_ref()
         .ok_or_else(|| ApiError::server("catalog models are not configured"))?
-        .list()
+        .list_catalog()
         .await
         .map_err(ApiError::from_inventory)?;
-    let (data, model_names) = models
-        .models
-        .into_iter()
-        .filter(|model| matches!(model.local_state, CatalogModelLocalState::Installed { .. }))
-        .map(|model| {
-            let name = format!("{} ({})", model.display_name, model.variant_label);
-            let id = model.id;
-            let description = model.description;
-            let context_window = model.desired_configuration.profile.context_length;
-            let capabilities = model.capabilities;
-            (
-                OpenAiModel {
-                    id: id.clone(),
-                    object: "model",
-                    created: 0,
-                    owned_by: "magnitude",
-                },
-                MagnitudeModelDescriptor {
-                    id,
-                    name,
-                    description,
-                    context_window,
-                    capabilities,
-                },
-            )
-        })
-        .unzip();
+    let discovered = state
+        .discovered_models
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model discovery is not configured"))?
+        .list_discovered()
+        .await
+        .map_err(ApiError::from_inventory)?;
+    let catalog_models = catalog.models.into_iter().filter_map(|model| {
+        let CatalogModelState::Installed { effective, .. } = model.local_state else {
+            return None;
+        };
+        let EffectiveModel::Ready { model: target } = effective else {
+            return None;
+        };
+        let name = format!("{} ({})", model.display_name, model.variant_label);
+        let id = model.id.to_string();
+        Some((
+            OpenAiModel {
+                id: id.clone(),
+                object: "model",
+                created: 0,
+                owned_by: "magnitude",
+            },
+            MagnitudeModelDescriptor {
+                id,
+                name,
+                description: model.description,
+                context_window: target.profile.context_length,
+                capabilities: target.capabilities,
+            },
+        ))
+    });
+    let discovered_models = discovered.models.into_iter().filter_map(|model| {
+        let DiscoveredModel { id, state } = model;
+        let DiscoveredModelState::Ready { model: target, .. } = state else {
+            return None;
+        };
+        let ParsedModelId::HuggingFace {
+            repository_id,
+            artifact_selector,
+        } = id.parsed()
+        else {
+            return None;
+        };
+        let display_name = std::path::Path::new(artifact_selector.as_str())
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or(artifact_selector.as_str())
+            .to_owned();
+        let repository = repository_id.as_str().to_owned();
+        let id = id.to_string();
+        Some((
+            OpenAiModel {
+                id: id.clone(),
+                object: "model",
+                created: 0,
+                owned_by: "huggingface-cache",
+            },
+            MagnitudeModelDescriptor {
+                id,
+                name: display_name,
+                description: format!("Discovered in Hugging Face cache from {repository}"),
+                context_window: target.profile.context_length,
+                capabilities: target.capabilities,
+            },
+        ))
+    });
+    let (data, model_names) = catalog_models.chain(discovered_models).unzip();
     Ok(Json(OpenAiModelsResponse {
         object: "list",
         data,
@@ -1376,181 +1551,8 @@ async fn standard_models(
     }))
 }
 
-#[utoipa::path(post, path = "/api/v1/models/install", operation_id = "installModel", tag = "models",
-    request_body(content = ModelIdentityRequest, content_type = "application/json"),
-    responses(
-        (status = 200, description = "Model installation admission", body = InstallModelResponse),
-        (status = 400, description = "Invalid canonical model identity", body = ErrorResponse),
-        (status = 404, description = "Catalog model not found", body = ErrorResponse),
-        (status = 409, description = "Model installation cannot currently be admitted", body = ErrorResponse),
-        (status = 422, description = "Downloaded model failed integrity validation", body = ErrorResponse),
-        (status = 500, description = "Catalog model reconciliation failed", body = ErrorResponse)
-    )
-)]
-#[tracing::instrument(name = "icn.models.install", skip_all, err(Debug))]
-async fn install_model(
-    State(state): State<AppState>,
-    Json(request): Json<ModelIdentityRequest>,
-) -> Result<Json<InstallModelResponse>, ApiError> {
-    let Some((model_id, variant_id)) = request.model_id.split_once(':') else {
-        return Err(ApiError::invalid(
-            "modelId must be a canonical model and variant ID",
-        ));
-    };
-    let models = state
-        .catalog_models
-        .as_ref()
-        .ok_or_else(|| ApiError::server("catalog models are not configured"))?;
-    let response = models
-        .install(InstallCatalogModelRequest {
-            model_id: icn_contracts::models::CatalogModelId(model_id.to_owned()),
-            variant_id: icn_contracts::models::CatalogVariantId(variant_id.to_owned()),
-        })
-        .await
-        .map_err(ApiError::from_inventory)?;
-    if matches!(response, InstallModelResponse::Current) {
-        state.invalidate_resources([
-            InferenceResourceTopic::Models,
-            InferenceResourceTopic::Packages,
-        ]);
-    }
-    Ok(Json(response))
-}
-
-#[utoipa::path(post, path = "/api/v1/models/uninstall", operation_id = "uninstallModel", tag = "models",
-    request_body(content = ModelIdentityRequest, content_type = "application/json"),
-    responses(
-        (status = 200, description = "Model packages safely removed or retained because they are shared", body = UninstallModelResponse),
-        (status = 400, description = "Invalid model identity or request", body = ErrorResponse),
-        (status = 404, description = "Model not found", body = ErrorResponse),
-        (status = 409, description = "Model is active or package deletion is unsafe", body = ErrorResponse),
-        (status = 422, description = "Installed model failed integrity validation", body = ErrorResponse),
-        (status = 500, description = "Model reconciliation or package removal failed", body = ErrorResponse)
-    )
-)]
-async fn uninstall_model(
-    State(state): State<AppState>,
-    Json(request): Json<ModelIdentityRequest>,
-) -> Result<Json<UninstallModelResponse>, ApiError> {
-    let models = state
-        .catalog_models
-        .as_ref()
-        .ok_or_else(|| ApiError::server("catalog models are not configured"))?
-        .list()
-        .await
-        .map_err(ApiError::from_inventory)?;
-    let target = models
-        .models
-        .iter()
-        .find(|model| model.id == request.model_id)
-        .ok_or_else(|| {
-            ApiError::from_inventory(InventoryError::NotFound(request.model_id.clone()))
-        })?;
-    let target_packages = match &target.local_state {
-        CatalogModelLocalState::NotInstalled => Vec::new(),
-        CatalogModelLocalState::Installed { installation, .. } => installation
-            .packages
-            .iter()
-            .map(|package| package.package.id.clone())
-            .collect::<Vec<_>>(),
-    };
-    let controller = state
-        .model_controller
-        .as_ref()
-        .ok_or_else(|| ApiError::server("model control is not configured"))?;
-    if controller
-        .instances()
-        .await
-        .instances
-        .iter()
-        .any(|instance| {
-            instance.model_id == request.model_id
-                && !matches!(
-                    instance.lifecycle,
-                    ModelInstanceLifecycle::Stopped { .. } | ModelInstanceLifecycle::Failed { .. }
-                )
-        })
-    {
-        return Err(ApiError::from_inventory(InventoryError::Loaded(
-            request.model_id,
-        )));
-    }
-    let shared = models
-        .models
-        .iter()
-        .filter(|model| model.id != request.model_id)
-        .filter_map(|model| match &model.local_state {
-            CatalogModelLocalState::NotInstalled => None,
-            CatalogModelLocalState::Installed { installation, .. } => Some(installation),
-        })
-        .flat_map(|installation| {
-            installation
-                .packages
-                .iter()
-                .map(|package| package.package.id.clone())
-        })
-        .collect::<BTreeSet<_>>();
-    let mut removed_package_ids = Vec::new();
-    let mut retained_package_ids = Vec::new();
-    for package_id in target_packages {
-        if shared.contains(&package_id) {
-            retained_package_ids.push(package_id);
-        } else {
-            controller
-                .remove_installed(package_id.clone())
-                .await
-                .map_err(ApiError::from_inventory)?;
-            removed_package_ids.push(package_id);
-        }
-    }
-    if !removed_package_ids.is_empty() {
-        state.invalidate_resources([
-            InferenceResourceTopic::Models,
-            InferenceResourceTopic::Packages,
-        ]);
-    }
-    Ok(Json(UninstallModelResponse {
-        model_id: request.model_id,
-        removed_package_ids,
-        retained_package_ids,
-    }))
-}
-
-#[utoipa::path(delete, path = "/api/v1/packages/{package_id}", operation_id = "removeInstalledModel", tag = "models",
-    params(("package_id" = String, Path, description = "Canonical model package identity")),
-    responses(
-        (status = 200, description = "Installed package removal result", body = RemoveInstalledModelPackageResponse),
-        (status = 400, description = "Invalid package identity or request", body = ErrorResponse),
-        (status = 404, description = "Installed package not found", body = ErrorResponse),
-        (status = 409, description = "Package deletion is currently unsafe", body = ErrorResponse),
-        (status = 422, description = "Installed package failed integrity validation", body = ErrorResponse),
-        (status = 500, description = "Installed package removal failed", body = ErrorResponse)
-    )
-)]
-#[tracing::instrument(name = "icn.models.installed.remove", skip_all, fields(model.package.id = %package_id), err(Debug))]
-async fn remove_installed_model(
-    State(state): State<AppState>,
-    Path(package_id): Path<String>,
-) -> Result<Json<RemoveInstalledModelPackageResponse>, ApiError> {
-    let controller = state
-        .model_controller
-        .as_ref()
-        .ok_or_else(|| ApiError::server("model control is not configured"))?;
-    let response = controller
-        .remove_installed(ModelPackageId(package_id))
-        .await
-        .map_err(ApiError::from_inventory)?;
-    if response.removed {
-        state.invalidate_resources([
-            InferenceResourceTopic::Models,
-            InferenceResourceTopic::Packages,
-        ]);
-    }
-    Ok(Json(response))
-}
-
-#[utoipa::path(post, path = "/api/v1/models/assess", operation_id = "assessModels", tag = "models",
-    request_body(content = AssessModelsRequest, content_type = "application/json"),
+#[utoipa::path(post, path = "/api/v1/catalog/assessments", operation_id = "assessCatalogModels", tag = "catalog",
+    request_body(content = CatalogAssessmentsRequest, content_type = "application/json"),
     responses(
         (status = 200, description = "Exact target and profile assessment events", body = String, content_type = "application/x-ndjson"),
         (status = 400, description = "Invalid assessment request", body = ErrorResponse),
@@ -1560,10 +1562,71 @@ async fn remove_installed_model(
         (status = 500, description = "Assessment operation failed", body = ErrorResponse)
     )
 )]
-#[tracing::instrument(name = "icn.models.assess", skip_all, err(Debug))]
-async fn assess_models(
+#[tracing::instrument(name = "icn.catalog.assess", skip_all, err(Debug))]
+async fn assess_catalog_models(
     State(state): State<AppState>,
-    Json(request): Json<AssessModelsRequest>,
+    Json(request): Json<CatalogAssessmentsRequest>,
+) -> Result<Response, ApiError> {
+    assessment_response(
+        state,
+        AssessModelsRequest {
+            revision: request.revision,
+            requests: request
+                .targets
+                .into_iter()
+                .map(|target| AssessModelRequest {
+                    request_id: target.request_id,
+                    subject: ModelAssessmentSubject::Catalog {
+                        model_id: target.model_id,
+                        selection: target.selection,
+                    },
+                    profiles: target.profiles,
+                })
+                .collect(),
+        },
+    )
+    .await
+}
+
+#[utoipa::path(post, path = "/api/v1/discovery/assessments", operation_id = "assessDiscoveredModels", tag = "discovery",
+    request_body(content = DiscoveryAssessmentsRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Exact discovered-model profile assessment events", body = String, content_type = "application/x-ndjson"),
+        (status = 400, description = "Invalid assessment request", body = ErrorResponse),
+        (status = 404, description = "Discovered model not found", body = ErrorResponse),
+        (status = 409, description = "Discovery snapshot is stale", body = ErrorResponse),
+        (status = 422, description = "Discovered model failed integrity validation", body = ErrorResponse),
+        (status = 500, description = "Assessment operation failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.discovery.assess", skip_all, err(Debug))]
+async fn assess_discovered_models(
+    State(state): State<AppState>,
+    Json(request): Json<DiscoveryAssessmentsRequest>,
+) -> Result<Response, ApiError> {
+    assessment_response(
+        state,
+        AssessModelsRequest {
+            revision: request.revision,
+            requests: request
+                .targets
+                .into_iter()
+                .map(|target| AssessModelRequest {
+                    request_id: target.request_id,
+                    subject: ModelAssessmentSubject::Discovery {
+                        model_id: target.model_id,
+                    },
+                    profiles: target.profiles,
+                })
+                .collect(),
+        },
+    )
+    .await
+}
+
+async fn assessment_response(
+    state: AppState,
+    request: AssessModelsRequest,
 ) -> Result<Response, ApiError> {
     let assessor = state
         .model_assessor
@@ -1587,108 +1650,6 @@ async fn assess_models(
         HeaderValue::from_static("application/x-ndjson"),
     );
     Ok(response)
-}
-
-#[utoipa::path(get, path = "/api/v1/downloads", operation_id = "listModelDownloads", tag = "models",
-    responses(
-        (status = 200, description = "Retained model downloads and internal package attempts", body = ModelDownloadsResponse),
-        (status = 500, description = "Model downloads unavailable", body = ErrorResponse)
-    )
-)]
-#[tracing::instrument(name = "icn.models.downloads.list", skip_all, err(Debug))]
-async fn model_downloads(
-    State(state): State<AppState>,
-) -> Result<Json<ModelDownloadsResponse>, ApiError> {
-    let downloads = state
-        .model_downloads
-        .as_ref()
-        .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
-    downloads
-        .list()
-        .await
-        .map(Json)
-        .map_err(ApiError::from_inventory)
-}
-
-#[utoipa::path(get, path = "/api/v1/downloads/{download_id}", operation_id = "getModelDownload", tag = "models",
-    params(("download_id" = String, Path, description = "Model download ID")),
-    responses(
-        (status = 200, description = "Exact model download", body = ModelDownload),
-        (status = 404, description = "Model download not found", body = ErrorResponse),
-        (status = 500, description = "Model downloads unavailable", body = ErrorResponse)
-    )
-)]
-async fn model_download(
-    State(state): State<AppState>,
-    Path(download_id): Path<String>,
-) -> Result<Json<ModelDownload>, ApiError> {
-    let downloads = state
-        .model_downloads
-        .as_ref()
-        .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
-    downloads
-        .list()
-        .await
-        .map_err(ApiError::from_inventory)?
-        .downloads
-        .into_iter()
-        .find(|download| download.id.0 == download_id)
-        .map(Json)
-        .ok_or_else(|| ApiError::from_inventory(InventoryError::NotFound(download_id)))
-}
-
-#[utoipa::path(post, path = "/api/v1/downloads/{download_id}/cancel", operation_id = "cancelModelDownload", tag = "models",
-    params(("download_id" = String, Path, description = "Model download ID")),
-    responses(
-        (status = 200, description = "Cancelled or terminal model download", body = ModelDownload),
-        (status = 400, description = "Model download cannot be cancelled", body = ErrorResponse),
-        (status = 404, description = "Model download not found", body = ErrorResponse),
-        (status = 500, description = "Model download cancellation failed", body = ErrorResponse)
-    )
-)]
-#[tracing::instrument(name = "icn.models.downloads.cancel", skip_all, err(Debug))]
-async fn cancel_model_download(
-    State(state): State<AppState>,
-    Path(download_id): Path<String>,
-) -> Result<Json<ModelDownload>, ApiError> {
-    let downloads = state
-        .model_downloads
-        .as_ref()
-        .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
-    downloads
-        .cancel(&ModelDownloadId(download_id))
-        .await
-        .map(Json)
-        .map_err(ApiError::from_inventory)
-}
-
-#[utoipa::path(post, path = "/api/v1/downloads/{download_id}/acknowledge-failure", operation_id = "acknowledgeModelDownloadFailure", tag = "models",
-    params(("download_id" = String, Path, description = "Failed model download ID")),
-    responses(
-        (status = 200, description = "Acknowledged failed model download", body = ModelDownload),
-        (status = 400, description = "Model download has not failed", body = ErrorResponse),
-        (status = 404, description = "Model download not found", body = ErrorResponse),
-        (status = 500, description = "Model download acknowledgement failed", body = ErrorResponse)
-    )
-)]
-#[tracing::instrument(
-    name = "icn.models.downloads.acknowledge_failure",
-    skip_all,
-    err(Debug)
-)]
-async fn acknowledge_model_download_failure(
-    State(state): State<AppState>,
-    Path(download_id): Path<String>,
-) -> Result<Json<ModelDownload>, ApiError> {
-    let downloads = state
-        .model_downloads
-        .as_ref()
-        .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
-    downloads
-        .acknowledge_failure(&ModelDownloadId(download_id))
-        .await
-        .map(Json)
-        .map_err(ApiError::from_inventory)
 }
 
 #[utoipa::path(post, path = "/api/v1/models/{model_id}/properties", operation_id = "getModelProperties", tag = "models",
@@ -2102,21 +2063,21 @@ fn domain_error(error: domain::InferenceRequestError) -> ApiError {
     paths(
         health,
         hardware,
-        models,
-        model,
+        catalog_models,
+        catalog_model,
+        install_catalog_model,
+        remove_catalog_model_installation,
+        catalog_installations,
+        catalog_installation,
+        cancel_catalog_installation,
+        acknowledge_catalog_installation_failure,
+        discovered_models,
+        refresh_discovery,
         standard_models,
-        install_model,
-        uninstall_model,
         search_hugging_face_models,
         resolve_hugging_face_repository,
-        installed_models,
-        installed_model,
-        remove_installed_model,
-        assess_models,
-        model_downloads,
-        model_download,
-        cancel_model_download,
-        acknowledge_model_download_failure,
+        assess_catalog_models,
+        assess_discovered_models,
         preview_model_load,
         ensure_model_instance,
         model_instances,
@@ -2133,23 +2094,21 @@ fn domain_error(error: domain::InferenceRequestError) -> ApiError {
     components(schemas(
         HealthResponse,
         HardwareSnapshot,
-        ModelsResponse,
-        ModelIdentityRequest,
-        UninstallModelResponse,
+        CatalogModelsResponse,
+        DiscoveredModelsResponse,
+        CatalogInstallationsResponse,
+        CatalogInstallationAdmission,
+        CatalogInstallationRemoval,
         EnsureModelInstanceRequest,
         OpenAiModel,
         OpenAiModelsResponse,
-        InstallModelResponse,
         HuggingFaceModelSearchRequest,
         HuggingFaceModelSearchResults,
         HuggingFaceRepositoryRequest,
         HuggingFaceRepositorySnapshot,
-        InstalledModelPackagesResponse,
-        RemoveInstalledModelPackageResponse,
-        AssessModelsRequest,
+        CatalogAssessmentsRequest,
+        DiscoveryAssessmentsRequest,
         AssessModelsEvent,
-        ModelDownloadsResponse,
-        ModelDownload,
         ModelLoadPlan,
         ModelInstancesSnapshot,
         ModelInstancesInvalidation,
@@ -2407,7 +2366,12 @@ pub fn openapi() -> Result<OpenApiDocument, OpenApiExportError> {
     )?;
     attach_stream_contract::<ModelAssessmentStream>(
         &mut document,
-        "assessModels",
+        "assessCatalogModels",
+        "application/x-ndjson",
+    )?;
+    attach_stream_contract::<ModelAssessmentStream>(
+        &mut document,
+        "assessDiscoveredModels",
         "application/x-ndjson",
     )?;
     Ok(document)
@@ -2701,38 +2665,11 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use icn_contracts::InferenceProgress;
-    use icn_contracts::models::ModelInstanceAllocation;
+    use icn_contracts::models::{ModelInstanceAllocation, ModelInstanceLifecycle};
     use serde_json::Value as JsonValue;
     use serde_json::{Value, json};
     use std::sync::atomic::AtomicBool;
     use tower::ServiceExt;
-
-    fn test_model_serving_configuration() -> icn_contracts::models::ModelServingConfiguration {
-        icn_contracts::models::ModelServingConfiguration {
-            bundle: icn_contracts::models::ServableModelBundle::Standalone {
-                package: icn_contracts::models::ModelPackage {
-                    id: ModelPackageId("test-package".to_owned()),
-                    source: icn_contracts::models::ModelPackageSource::Local {
-                        path: std::path::PathBuf::from("/test/model.gguf"),
-                    },
-                    files: Vec::new(),
-                    relationships: Vec::new(),
-                    properties: icn_contracts::models::ModelPackageProperties {
-                        format: "gguf".to_owned(),
-                        quantization: "f16".to_owned(),
-                        quantization_name: "F16".to_owned(),
-                        architecture: "test".to_owned(),
-                        maximum_context_length: Some(8_192),
-                        intrinsic_model_id: Some("test-model".to_owned()),
-                        intrinsic_quality_id: None,
-                    },
-                },
-            },
-            profile: icn_contracts::models::ServingProfile {
-                context_length: 8_192,
-            },
-        }
-    }
 
     #[tokio::test]
     async fn direct_resource_invalidations_are_published_with_monotonic_revisions() {
@@ -2740,14 +2677,14 @@ mod tests {
         let mut changes = state.resource_changes.subscribe();
 
         state.invalidate_resources([
-            InferenceResourceTopic::Models,
-            InferenceResourceTopic::Packages,
+            InferenceResourceTopic::Catalog,
+            InferenceResourceTopic::Catalog,
         ]);
 
         let models = changes.recv().await.expect("models invalidation");
         let packages = changes.recv().await.expect("packages invalidation");
-        assert_eq!(models.topic, InferenceResourceTopic::Models);
-        assert_eq!(packages.topic, InferenceResourceTopic::Packages);
+        assert_eq!(models.topic, InferenceResourceTopic::Catalog);
+        assert_eq!(packages.topic, InferenceResourceTopic::Catalog);
         assert!(packages.revision > models.revision);
     }
 
@@ -2882,10 +2819,12 @@ mod tests {
                     icn_contracts::models::AssessmentEnvironmentId("test-environment".to_owned());
                 Ok(futures_util::stream::iter([
                     AssessModelsEvent::Started {
+                        revision: request.revision,
                         environment_id: environment_id.clone(),
                         total_targets,
                     },
                     AssessModelsEvent::Completed {
+                        revision: request.revision,
                         environment_id,
                         total_targets,
                     },
@@ -2899,9 +2838,9 @@ mod tests {
     async fn assessment_endpoint_streams_finite_ndjson_lifecycle() {
         let response = app(AppState::model_free().with_model_assessor(Arc::new(StubModelAssessor)))
             .oneshot(
-                Request::post("/api/v1/models/assess")
+                Request::post("/api/v1/catalog/assessments")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"requests":[]}"#))
+                    .body(Body::from(r#"{"revision":0,"targets":[]}"#))
                     .unwrap(),
             )
             .await
@@ -4234,8 +4173,7 @@ mod tests {
                     revision: 0,
                     instances: vec![ModelInstance {
                         id: ModelInstanceId("test-instance".to_owned()),
-                        model_id: "test-model".to_owned(),
-                        configuration: test_model_serving_configuration(),
+                        model_id: "test-model:gguf:f16".parse().unwrap(),
                         lifecycle: ModelInstanceLifecycle::Ready {
                             allocation: ModelInstanceAllocation {
                                 context_window_tokens: 1,
@@ -4251,18 +4189,6 @@ mod tests {
 
         fn watch_instances(&self) -> BoxStream<'static, ModelInstancesInvalidation> {
             Box::pin(futures_util::stream::empty())
-        }
-
-        fn remove_installed(
-            &self,
-            package_id: ModelPackageId,
-        ) -> BoxFuture<'_, Result<RemoveInstalledModelPackageResponse, InventoryError>> {
-            Box::pin(async move {
-                Err(InventoryError::Unsupported(format!(
-                    "cannot remove package {} in the stub model controller",
-                    package_id.0
-                )))
-            })
         }
 
         fn lease(
@@ -4637,19 +4563,24 @@ mod tests {
     #[test]
     fn exported_assessment_operation_declares_conflict_response() {
         let value = serde_json::to_value(openapi().unwrap()).unwrap();
-        let operation = &value["paths"]["/api/v1/models/assess"]["post"];
-        let contract = &operation[STREAM_EXTENSION];
-        assert_eq!(contract["framing"], "ndjson");
-        assert_eq!(contract["termination"]["type"], "eof");
-        assert_eq!(contract["reconnect"]["type"], "none");
-        assert_eq!(
-            contract["data"]["schema"]["$ref"],
-            "#/components/schemas/AssessModelsEvent"
-        );
-        assert_eq!(
-            operation["responses"]["409"]["content"]["application/json"]["schema"]["$ref"],
-            "#/components/schemas/ErrorResponse"
-        );
+        for path in [
+            "/api/v1/catalog/assessments",
+            "/api/v1/discovery/assessments",
+        ] {
+            let operation = &value["paths"][path]["post"];
+            let contract = &operation[STREAM_EXTENSION];
+            assert_eq!(contract["framing"], "ndjson");
+            assert_eq!(contract["termination"]["type"], "eof");
+            assert_eq!(contract["reconnect"]["type"], "none");
+            assert_eq!(
+                contract["data"]["schema"]["$ref"],
+                "#/components/schemas/AssessModelsEvent"
+            );
+            assert_eq!(
+                operation["responses"]["409"]["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/ErrorResponse"
+            );
+        }
     }
 
     #[test]

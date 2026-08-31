@@ -119,7 +119,7 @@ fn ensure_catalog_resolved(generated: &icn_models::GeneratedReleaseCatalog) -> a
     for diagnostic in &generated.catalog.diagnostics {
         eprintln!(
             "Catalog resolution failed for {} variant {}: {}",
-            diagnostic.model_id.0, diagnostic.variant_id.0, diagnostic.failure.message
+            diagnostic.model_id, diagnostic.variant_id, diagnostic.failure.message
         );
     }
     anyhow::ensure!(

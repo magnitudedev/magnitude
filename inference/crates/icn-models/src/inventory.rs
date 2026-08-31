@@ -13,9 +13,9 @@ use icn_contracts::models::{
 };
 use icn_contracts::{
     CapabilitySupport, ComponentRole, ContentIdentity, EffectiveTemplateInputs, Integrity,
-    InventoryError, InventoryModel, InventoryProperties, LocalDeclaration, ModelAvailability,
-    ModelComponent, ModelId, ModelLocation, ModelOperation, ModelSource, ReasoningCapability,
-    TemplateAssessor,
+    InventoryEntryId, InventoryError, InventoryModel, InventoryProperties, LocalDeclaration,
+    ModelAvailability, ModelComponent, ModelLocation, ModelOperation, ModelSource,
+    ReasoningCapability, TemplateAssessor,
 };
 use icn_utils::file_cache::recover_map;
 use sha2::{Digest, Sha256};
@@ -24,7 +24,7 @@ use crate::cache::{ModelCache, ModelIndexKind};
 use crate::catalog_affiliations::CatalogAffiliations;
 use crate::download::blob_key;
 use crate::gguf;
-use crate::identity::{content_id, fingerprint, model_id};
+use crate::identity::{content_id, fingerprint, inventory_entry_id};
 use crate::store_fs::ensure_store_layout;
 
 const MAX_SCAN_ENTRIES: usize = 100_000;
@@ -47,14 +47,14 @@ pub(crate) struct CachedModelInspection {
 
 #[derive(Debug, serde::Serialize)]
 struct InventoryCache {
-    models: BTreeMap<ModelId, InventoryModel>,
-    evidence: BTreeMap<ModelId, CacheEvidence>,
+    models: BTreeMap<InventoryEntryId, InventoryModel>,
+    evidence: BTreeMap<InventoryEntryId, CacheEvidence>,
     installed: InstalledPackageSnapshot,
 }
 
 type HydratedInventory = (
-    BTreeMap<ModelId, InventoryModel>,
-    BTreeMap<ModelId, CacheEvidence>,
+    BTreeMap<InventoryEntryId, InventoryModel>,
+    BTreeMap<InventoryEntryId, CacheEvidence>,
     InstalledPackageSnapshot,
 );
 
@@ -66,7 +66,7 @@ pub(crate) struct InstalledPackageRecord {
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct InstalledPackageSnapshot {
-    pub(crate) records: BTreeMap<ModelPackageId, InstalledPackageRecord>,
+    pub(crate) records: BTreeMap<InventoryEntryId, InstalledPackageRecord>,
 }
 
 impl InstalledPackageSnapshot {
@@ -75,14 +75,26 @@ impl InstalledPackageSnapshot {
         revision: u64,
         reconciliation_complete: bool,
     ) -> InstalledModelPackagesResponse {
+        let packages = self.records.values().fold(
+            BTreeMap::<ModelPackageId, InstalledModelPackage>::new(),
+            |mut packages, record| {
+                packages
+                    .entry(record.installed.package.id.clone())
+                    .and_modify(|selected| {
+                        if selected.origin == icn_contracts::models::ModelPackageInstallationOrigin::HuggingFaceCache
+                            && record.installed.origin == icn_contracts::models::ModelPackageInstallationOrigin::Magnitude
+                        {
+                            *selected = record.installed.clone();
+                        }
+                    })
+                    .or_insert_with(|| record.installed.clone());
+                packages
+            },
+        );
         InstalledModelPackagesResponse {
             revision,
             reconciliation_complete,
-            packages: self
-                .records
-                .values()
-                .map(|record| record.installed.clone())
-                .collect(),
+            packages: packages.into_values().collect(),
         }
     }
 }
@@ -161,7 +173,7 @@ pub struct ManagedModelStore {
     pub(crate) config: InventoryConfig,
     pub(crate) client: HFClient,
     pub(crate) http: reqwest::Client,
-    pub(crate) models: Arc<RwLock<BTreeMap<ModelId, InventoryModel>>>,
+    pub(crate) models: Arc<RwLock<BTreeMap<InventoryEntryId, InventoryModel>>>,
     pub(crate) operations:
         Arc<tokio::sync::Mutex<BTreeMap<String, Arc<crate::download::DownloadOperation>>>>,
     pub(crate) download_slots: Arc<tokio::sync::Semaphore>,
@@ -172,7 +184,7 @@ pub struct ManagedModelStore {
     pub(crate) model_assessments: Arc<RwLock<BTreeMap<String, ModelAssessment>>>,
     pub(crate) catalog_affiliations: Arc<RwLock<CatalogAffiliations>>,
     pub(crate) catalog_affiliations_dirty: Arc<AtomicBool>,
-    cache_evidence: Arc<RwLock<BTreeMap<ModelId, CacheEvidence>>>,
+    cache_evidence: Arc<RwLock<BTreeMap<InventoryEntryId, CacheEvidence>>>,
     ensure_gate: Arc<tokio::sync::Mutex<()>>,
     ensure_generation: Arc<AtomicU64>,
     reconciliation_running: Arc<AtomicBool>,
@@ -181,7 +193,7 @@ pub struct ManagedModelStore {
 }
 
 pub(crate) trait InstalledPackagesObserver: Send + Sync {
-    fn installed_packages_changed(&self);
+    fn installed_packages_changed(&self, revision: u64);
 }
 
 struct ReconciliationLease(Arc<AtomicBool>);
@@ -237,7 +249,7 @@ impl ManagedModelStore {
             .ok()
             .and_then(|observer| observer.as_ref().and_then(Weak::upgrade));
         if let Some(observer) = observer {
-            observer.installed_packages_changed();
+            observer.installed_packages_changed(self.ensure_generation.load(Ordering::Acquire));
         }
     }
 
@@ -458,10 +470,16 @@ impl ManagedModelStore {
             *current = installed_packages;
             changed
         };
-        self.ensure_generation.fetch_add(1, Ordering::Release);
+        let revision = self.ensure_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let became_authoritative = !self.reconciliation_complete.swap(true, Ordering::AcqRel);
-        if installed_packages_changed || became_authoritative {
-            self.notify_installed_packages_changed();
+        if (installed_packages_changed || became_authoritative)
+            && let Some(observer) = self
+                .installed_packages_observer
+                .read()
+                .ok()
+                .and_then(|observer| observer.as_ref().and_then(Weak::upgrade))
+        {
+            observer.installed_packages_changed(revision);
         }
         Ok(())
     }
@@ -476,7 +494,7 @@ impl ManagedModelStore {
         &self,
         path: &Path,
         display_name: Option<&str>,
-    ) -> Result<ModelId, InventoryError> {
+    ) -> Result<InventoryEntryId, InventoryError> {
         let canonical = path.canonicalize().map_err(io_error)?;
         if !canonical.is_file() {
             return Err(InventoryError::InvalidRequest(format!(
@@ -509,7 +527,7 @@ impl ManagedModelStore {
             relationship: None,
         };
         let content = content_id(std::slice::from_ref(&component));
-        let id = model_id("active-file", &canonical, &content);
+        let id = inventory_entry_id("active-file", &canonical, &content);
         let timestamp = now();
         let mut model = build_model(
             id.clone(),
@@ -597,7 +615,10 @@ impl ManagedModelStore {
         Ok(model)
     }
 
-    pub(crate) async fn remove_published_model(&self, id: &ModelId) -> Result<(), InventoryError> {
+    pub(crate) async fn remove_published_model(
+        &self,
+        id: &InventoryEntryId,
+    ) -> Result<(), InventoryError> {
         let _guard = self.ensure_gate.lock().await;
         let mut models = self
             .models
@@ -618,7 +639,7 @@ impl ManagedModelStore {
                 InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
             })?
             .clone();
-        installed.records.retain(|_, record| record.model.id != *id);
+        installed.records.remove(id);
         persist_inventory_index(&self.cache, &models, &cache, &installed);
         *self
             .models
@@ -666,8 +687,8 @@ fn is_cacheable_model(model: &InventoryModel) -> Result<bool, InventoryError> {
 
 fn inventory_snapshot_is_current(
     root: &Path,
-    models: &BTreeMap<ModelId, InventoryModel>,
-    observations: &BTreeMap<ModelId, String>,
+    models: &BTreeMap<InventoryEntryId, InventoryModel>,
+    observations: &BTreeMap<InventoryEntryId, String>,
 ) -> bool {
     models
         .values()
@@ -702,7 +723,7 @@ fn load_inventory_index(cache: &ModelCache) -> HydratedInventory {
         .unwrap_or_default();
     let mut models = BTreeMap::new();
     for (raw_id, model) in raw_models {
-        let Ok(id) = ModelId::parse(raw_id) else {
+        let Ok(id) = InventoryEntryId::parse(raw_id) else {
             continue;
         };
         if model.id != id {
@@ -712,7 +733,7 @@ fn load_inventory_index(cache: &ModelCache) -> HydratedInventory {
     }
     let mut evidence = BTreeMap::new();
     for (raw_id, entry) in raw_evidence {
-        let Ok(id) = ModelId::parse(raw_id) else {
+        let Ok(id) = InventoryEntryId::parse(raw_id) else {
             continue;
         };
         if !models.contains_key(&id) {
@@ -725,8 +746,8 @@ fn load_inventory_index(cache: &ModelCache) -> HydratedInventory {
 
 fn persist_inventory_index(
     cache: &ModelCache,
-    models: &BTreeMap<ModelId, InventoryModel>,
-    evidence: &BTreeMap<ModelId, CacheEvidence>,
+    models: &BTreeMap<InventoryEntryId, InventoryModel>,
+    evidence: &BTreeMap<InventoryEntryId, CacheEvidence>,
     installed: &InstalledPackageSnapshot,
 ) {
     cache.write_inventory(&InventoryCache {
@@ -791,16 +812,16 @@ fn validate_config(config: &InventoryConfig) -> Result<(), InventoryError> {
 }
 
 struct InventoryScan {
-    models: BTreeMap<ModelId, InventoryModel>,
-    observations: BTreeMap<ModelId, String>,
-    inspection_keys: BTreeMap<ModelId, String>,
+    models: BTreeMap<InventoryEntryId, InventoryModel>,
+    observations: BTreeMap<InventoryEntryId, String>,
+    inspection_keys: BTreeMap<InventoryEntryId, String>,
 }
 
 fn scan(
     config: &InventoryConfig,
     cache: &ModelCache,
     assessor: Option<&dyn TemplateAssessor>,
-    live_models: &BTreeMap<ModelId, InventoryModel>,
+    live_models: &BTreeMap<InventoryEntryId, InventoryModel>,
 ) -> Result<InventoryScan, InventoryError> {
     let mut discovered = Vec::new();
     scan_managed(config, &mut discovered)?;
@@ -999,7 +1020,7 @@ fn scan_managed(
                     None => continue,
                 };
                 let content = content_id(&components);
-                let id = model_id("magnitude-cache", &snapshot, &content);
+                let id = inventory_entry_id("magnitude-cache", &snapshot, &content);
                 let timestamp = modified_seconds(&snapshot).unwrap_or_else(now);
                 output.push(DiscoveryCandidate::Artifact(Box::new(ArtifactCandidate {
                     id,
@@ -1151,7 +1172,7 @@ fn append_discovered_groups(
             continue;
         };
         let content = content_id(&components);
-        let id = model_id("magnitude-cache", snapshot, &content);
+        let id = inventory_entry_id("magnitude-cache", snapshot, &content);
         let timestamp = modified_seconds(snapshot).unwrap_or_else(now);
         output.push(DiscoveryCandidate::Artifact(Box::new(ArtifactCandidate {
             id,
@@ -1189,6 +1210,10 @@ fn scan_hf_cache(cache: &Path, output: &mut Vec<DiscoveryCandidate>) -> Result<(
             continue;
         };
         let repo_root = repo_entry.path();
+        let current_commit = std::fs::read_to_string(repo_root.join("refs/main"))
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
         let snapshots = repo_root.join("snapshots");
         for snapshot_entry in read_dir_sorted(&snapshots)? {
             count += 1;
@@ -1207,7 +1232,7 @@ fn scan_hf_cache(cache: &Path, output: &mut Vec<DiscoveryCandidate>) -> Result<(
                     None => continue,
                 };
                 let content = content_id(&components);
-                let id = model_id("hugging-face-cache", &snapshot, &content);
+                let id = inventory_entry_id("hugging-face-cache", &snapshot, &content);
                 let created = modified_seconds(&snapshot).unwrap_or_else(now);
                 output.push(DiscoveryCandidate::Artifact(Box::new(ArtifactCandidate {
                     id,
@@ -1216,7 +1241,11 @@ fn scan_hf_cache(cache: &Path, output: &mut Vec<DiscoveryCandidate>) -> Result<(
                     ready_at: created,
                     source: ModelSource::HuggingFace {
                         repository: repository.clone(),
-                        requested_revision: commit.clone(),
+                        requested_revision: if current_commit.as_deref() == Some(commit.as_str()) {
+                            "main".to_owned()
+                        } else {
+                            commit.clone()
+                        },
                         commit: commit.clone(),
                         metadata: None,
                     },
@@ -1241,7 +1270,7 @@ fn scan_hf_cache(cache: &Path, output: &mut Vec<DiscoveryCandidate>) -> Result<(
 
 #[derive(Debug)]
 struct ArtifactCandidate {
-    id: ModelId,
+    id: InventoryEntryId,
     content_id: icn_contracts::ContentId,
     created: u64,
     ready_at: u64,
@@ -1270,8 +1299,8 @@ fn reuse_inspection(
     candidate: &ArtifactCandidate,
     observation_key: &str,
     inspection_key: &str,
-    cached_models: &BTreeMap<ModelId, InventoryModel>,
-    cached_evidence: &BTreeMap<ModelId, CacheEvidence>,
+    cached_models: &BTreeMap<InventoryEntryId, InventoryModel>,
+    cached_evidence: &BTreeMap<InventoryEntryId, CacheEvidence>,
 ) -> Option<InventoryModel> {
     let reusable = cached_evidence
         .get(&candidate.id)
@@ -1341,7 +1370,7 @@ fn enrich_candidate(
 // grouping them would introduce an otherwise meaningless intermediate domain type.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_model(
-    id: ModelId,
+    id: InventoryEntryId,
     content_id: icn_contracts::ContentId,
     created: u64,
     ready_at: u64,
@@ -1532,7 +1561,7 @@ fn model_inspection_evidence_for_model(
 
 #[allow(clippy::too_many_arguments)]
 fn unavailable_model(
-    id: ModelId,
+    id: InventoryEntryId,
     content_id: icn_contracts::ContentId,
     created: u64,
     detected_at: u64,
@@ -1716,7 +1745,10 @@ fn collect_gguf(
                 _ => continue,
             };
             if canonical.is_file()
-                && path.extension().and_then(|value| value.to_str()) == Some("gguf")
+                && path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
             {
                 output.push(path);
             }
@@ -1738,8 +1770,10 @@ fn collect_gguf(
 }
 
 fn split_shard_name(path: &Path) -> Option<(PathBuf, u32, u32)> {
-    let name = path.file_name()?.to_str()?;
-    let stem = name.strip_suffix(".gguf")?;
+    if !path.extension()?.to_str()?.eq_ignore_ascii_case("gguf") {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
     let (left, total) = stem.rsplit_once("-of-")?;
     let (prefix, index) = left.rsplit_once('-')?;
     if index.len() != 5 || total.len() != 5 {
@@ -1945,17 +1979,17 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use icn_contracts::models::{
-        CatalogIntelligence, CatalogModelId, CatalogVariantId, InstalledModelPackages,
-        IntelligenceProvenance, ModelCapabilities, ModelFile, ModelFileId, ModelFileRole,
-        ModelPackageInspection, ModelPackageProperties, ModelReasoningCapabilities,
-        ModelReleaseDate, ModelServingConfiguration, RecommendableModel, ServableModelBundle,
-        ServingProfile,
+        CatalogBaseId, CatalogIntelligence, CatalogVariantId, InstalledCatalogAttribution,
+        InstalledModelPackages, IntelligenceProvenance, ModelCapabilities, ModelFile, ModelFileId,
+        ModelFileRole, ModelPackageInspection, ModelPackageInstallationOrigin,
+        ModelPackageProperties, ModelReasoningCapabilities, ModelReleaseDate,
+        ModelServingConfiguration, RecommendableModel, ServableModelBundle, ServingProfile,
     };
 
     fn catalog_model(package: ModelPackage) -> RecommendableModel {
         RecommendableModel {
-            model_id: CatalogModelId("catalog".to_owned()),
-            variant_id: CatalogVariantId("gguf:q4".to_owned()),
+            model_id: CatalogBaseId::new("catalog").expect("catalog base ID"),
+            variant_id: CatalogVariantId::new("gguf:q4").expect("catalog variant ID"),
             configuration: ModelServingConfiguration {
                 bundle: ServableModelBundle::Standalone { package },
                 profile: ServingProfile {
@@ -2334,6 +2368,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn external_exact_catalog_package_is_attributed_without_changing_ownership() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("store");
+        let cache = temporary.path().join("cache");
+        let (hf_cache, source) = create_hf_snapshot(temporary.path());
+        write_minimal_gguf(&source.join("model.gguf"));
+
+        let mut initial = InventoryConfig::with_roots(store.clone(), cache.clone()).unwrap();
+        initial.hf_cache_dirs.push(hf_cache.clone());
+        let manager = ManagedModelStore::open_with_template_assessor(
+            initial,
+            Some(Arc::new(CompleteTemplateAssessor::default())),
+        )
+        .await
+        .unwrap();
+        manager.ensure_installed_model_inventory().await.unwrap();
+        let package = manager.list_installed().await.unwrap().packages[0]
+            .package
+            .clone();
+        drop(manager);
+
+        let mut configured = InventoryConfig::with_roots(store.clone(), cache.clone()).unwrap();
+        configured.hf_cache_dirs.push(hf_cache.clone());
+        configured.catalog_models = vec![catalog_model(package.clone())];
+        let manager = ManagedModelStore::open_with_template_assessor(
+            configured,
+            Some(Arc::new(CompleteTemplateAssessor::default())),
+        )
+        .await
+        .unwrap();
+        manager.ensure_installed_model_inventory().await.unwrap();
+        let installed = manager.list_installed().await.unwrap();
+        assert_eq!(
+            installed.packages[0].origin,
+            ModelPackageInstallationOrigin::HuggingFaceCache
+        );
+        assert!(matches!(
+            installed.packages[0].catalog_attribution,
+            InstalledCatalogAttribution::Attributed { .. }
+        ));
+        drop(manager);
+
+        let mut future_package = package;
+        future_package.id = ModelPackageId("future-package".to_owned());
+        let mut updated = InventoryConfig::with_roots(store, cache).unwrap();
+        updated.hf_cache_dirs.push(hf_cache);
+        updated.catalog_models = vec![catalog_model(future_package)];
+        let manager = ManagedModelStore::open_with_template_assessor(
+            updated,
+            Some(Arc::new(CompleteTemplateAssessor::default())),
+        )
+        .await
+        .unwrap();
+        manager.ensure_installed_model_inventory().await.unwrap();
+        let installed = manager.list_installed().await.unwrap();
+        assert!(matches!(
+            installed.packages[0].catalog_attribution,
+            InstalledCatalogAttribution::Attributed { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn completed_publication_updates_installed_snapshot_before_returning() {
         let temporary = tempfile::tempdir().unwrap();
         let model_path = temporary.path().join("active.gguf");
@@ -2471,7 +2567,35 @@ mod tests {
             split_shard_name(first).map(|(_, index, total)| (index, total)),
             Some((1, 2))
         );
+        assert_eq!(
+            split_shard_name(Path::new("model-00002-of-00002.GGUF"))
+                .map(|(_, index, total)| (index, total)),
+            Some((2, 2))
+        );
         assert!(split_shard_name(Path::new("model-1-of-2.gguf")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovers_case_insensitive_gguf_snapshot_links() {
+        let temporary = tempfile::tempdir().unwrap();
+        let blob = temporary.path().join("blob");
+        write_minimal_gguf(&blob);
+        let snapshot = temporary.path().join("snapshot");
+        fs::create_dir(&snapshot).unwrap();
+        std::os::unix::fs::symlink(&blob, snapshot.join("MODEL.GGUF")).unwrap();
+
+        let groups = discover_groups(
+            &snapshot,
+            &temporary
+                .path()
+                .canonicalize()
+                .expect("canonical temporary root"),
+        )
+        .unwrap();
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].paths[0], snapshot.join("MODEL.GGUF"));
     }
 
     #[test]

@@ -6,21 +6,19 @@ import {
   MagnitudeBoundary,
   AssessmentEnvironmentIdSchema,
   CatalogIntelligenceSchema,
-  CatalogModelIdSchema,
-  CatalogVariantIdSchema,
+  CatalogFormModelIdSchema,
   ModelAssessmentIdSchema,
-  ModelPackageIdSchema,
   ModelReleaseDateSchema,
   ModelSlotConfiguredLocal,
   ModelSlotUnassigned,
   ModelVariantLabelSchema,
   PRIMARY_SLOT_ID,
   ProviderIdSchema,
-  ProviderModelIdSchema,
   ReasoningEffortSchema,
   SECONDARY_SLOT_ID,
   type LocalModel,
-  type ModelDownloadFailure,
+  type ModelAcquisitionFailure,
+  type ModelFailure,
   type ModelInstanceFailure,
   type LocalModelsState,
   type ModelSlotsState,
@@ -41,7 +39,7 @@ import {
   type OnboardingModelSetupState,
 } from "./setup-state"
 
-const providerModelId = ProviderModelIdSchema.make("setup-model:gguf:q4")
+const providerModelId = CatalogFormModelIdSchema.make("setup-model:gguf:q4")
 const instanceId = "setup-instance"
 const reasoningEffort = ReasoningEffortSchema.make("none")
 const localProviderId = ProviderIdSchema.make("local")
@@ -52,40 +50,19 @@ const allocation = {
   memoryDomains: [],
 }
 
-const makeModel = (installed: boolean): LocalModel => {
-  const bundle = {
-    _tag: "Standalone" as const,
-    package: {
-      id: ModelPackageIdSchema.make("setup-package"),
-      source: { _tag: "Local" as const, path: "/models/setup.gguf" },
-      files: [],
-      relationships: [],
-      properties: {
-        format: "gguf",
-        quantization: "Q4_K_M",
-        quantizationName: "4-bit",
-        architecture: "test",
-        maximumContextLength: Option.some(32_768),
-        intrinsicModelId: Option.none(),
-        intrinsicQualityId: Option.none(),
-      },
-    },
-  }
+const makeModel = (installed: boolean): Extract<LocalModel, { readonly _tag: "Catalog" }> => {
   return {
+    _tag: "Catalog",
     modelId: providerModelId,
-    bundle,
+    storageBytes: 1,
     presentation: {
       displayName: "Setup Model",
       variantLabel: ModelVariantLabelSchema.make("Q4"),
       description: "",
       license: Option.none(),
+      sourceUrls: [],
     },
-    downloadBytes: 1,
-    catalogMembershipState: {
-      _tag: "InCatalog",
-      catalogData: {
-        modelId: CatalogModelIdSchema.make("setup-model"),
-        variantId: CatalogVariantIdSchema.make("gguf:q4"),
+    catalogData: {
         releaseDate: ModelReleaseDateSchema.make("2026-01-01"),
         parameterization: { architecture: "dense", totalParameters: 1 },
         intelligence: Schema.decodeUnknownSync(CatalogIntelligenceSchema)({
@@ -99,13 +76,16 @@ const makeModel = (installed: boolean): LocalModel => {
         }),
         fidelityRank: 1,
         quantizationAware: false,
-      },
     },
     acquisitionState: installed
       ? {
           _tag: "Installed",
-          installedBytes: 1,
-          packages: [{ packageId: bundle.package.id, path: "/models/setup.gguf", origin: "Magnitude" }],
+          installation: {
+            _tag: "Resolved",
+            installedBytes: 1,
+            primaryPath: "/models/setup.gguf",
+            ownership: "Magnitude",
+          },
           residencyState: { _tag: "Unloaded" },
         }
       : { _tag: "NotInstalled" },
@@ -117,7 +97,15 @@ const makeModel = (installed: boolean): LocalModel => {
         structuredOutput: true,
         reasoning: { supported: false, efforts: [], defaultEffort: Option.none() },
       },
-      configuration: { bundle, profile: { contextLength: 32_768 } },
+      speculativeMethod: Option.none(),
+      metadata: {
+        format: "gguf",
+        quantization: "Q4_K_M",
+        quantizationName: "4-bit",
+        architecture: "test",
+        maximumContextLength: Option.some(32_768),
+        storageBytes: 1,
+      },
       assessment: {
         _tag: "Fits",
         profile: { contextLength: 32_768 },
@@ -136,9 +124,6 @@ const makeModel = (installed: boolean): LocalModel => {
         },
         performance: [],
       },
-      availabilityState: installed
-        ? { _tag: "Selectable", providerModelId }
-        : { _tag: "Installable" },
       rankingScores: installed
         ? Option.none()
         : Option.some({ intelligence: 0.7, speed: 0.8, fidelity: 0.9 }),
@@ -211,9 +196,8 @@ describe("projectOnboardingModelSetupContent", () => {
   it("reports the selected model's ready instance", () => {
     const model = makeModel(true)
     const option = localModelOptions({
-      inventoryState: { _tag: "Ready" },
+      reconciliationComplete: true,
       models: [model],
-      discoveryState: { _tag: "Ready", progress: [] },
     }, unassignedSlots())[0]!
     const state = projectOnboardingModelSetupContent(
       Option.some({
@@ -225,9 +209,8 @@ describe("projectOnboardingModelSetupContent", () => {
         cancelling: false,
       }),
       {
-        inventoryState: { _tag: "Ready" },
+        reconciliationComplete: true,
         models: [model],
-        discoveryState: { _tag: "Ready", progress: [] },
       },
       configuredSlots("Ready", instanceId),
       defaultOnboardingModelRankingControls,
@@ -241,9 +224,8 @@ describe("projectOnboardingModelSetupContent", () => {
     const model = makeModel(true)
     const slots = configuredSlots("Loading", instanceId, Option.some(0.42))
     const option = localModelOptions({
-      inventoryState: { _tag: "Ready" },
+      reconciliationComplete: true,
       models: [model],
-      discoveryState: { _tag: "Ready", progress: [] },
     }, slots)[0]!
     const state = projectOnboardingModelSetupContent(
       Option.some({
@@ -255,9 +237,8 @@ describe("projectOnboardingModelSetupContent", () => {
         cancelling: false,
       }),
       {
-        inventoryState: { _tag: "Ready" },
+        reconciliationComplete: true,
         models: [model],
-        discoveryState: { _tag: "Ready", progress: [] },
       },
       slots,
       defaultOnboardingModelRankingControls,
@@ -274,9 +255,8 @@ describe("projectOnboardingModelSetupContent", () => {
     const model = makeModel(true)
     const slots = configuredSlots("Loading", instanceId, Option.some(0.42))
     const option = localModelOptions({
-      inventoryState: { _tag: "Ready" },
+      reconciliationComplete: true,
       models: [model],
-      discoveryState: { _tag: "Ready", progress: [] },
     }, slots)[0]!
     const state = projectOnboardingModelSetupContent(
       Option.some({
@@ -288,9 +268,8 @@ describe("projectOnboardingModelSetupContent", () => {
         cancelling: true,
       }),
       {
-        inventoryState: { _tag: "Ready" },
+        reconciliationComplete: true,
         models: [model],
-        discoveryState: { _tag: "Ready", progress: [] },
       },
       slots,
       defaultOnboardingModelRankingControls,
@@ -303,9 +282,8 @@ describe("projectOnboardingModelSetupContent", () => {
   it("does not let discovery refresh mask an active invocation", () => {
     const model = makeModel(true)
     const option = localModelOptions({
-      inventoryState: { _tag: "Ready" },
+      reconciliationComplete: true,
       models: [model],
-      discoveryState: { _tag: "Ready", progress: [] },
     }, configuredSlots("Loading"))[0]!
     const state = projectOnboardingModelSetupContent(
       Option.some({
@@ -317,9 +295,8 @@ describe("projectOnboardingModelSetupContent", () => {
         cancelling: false,
       }),
       {
-        inventoryState: { _tag: "Ready" },
         models: [model],
-        discoveryState: { _tag: "Loading", progress: [] },
+        reconciliationComplete: false,
       },
       configuredSlots("Loading"),
       defaultOnboardingModelRankingControls,
@@ -332,9 +309,8 @@ describe("projectOnboardingModelSetupContent", () => {
   it("retains the submitted model when discovery temporarily removes it", () => {
     const model = makeModel(true)
     const option = localModelOptions({
-      inventoryState: { _tag: "Ready" },
+      reconciliationComplete: true,
       models: [model],
-      discoveryState: { _tag: "Ready", progress: [] },
     }, configuredSlots("Loading"))[0]!
     const state = projectOnboardingModelSetupContent(
       Option.some({
@@ -346,9 +322,8 @@ describe("projectOnboardingModelSetupContent", () => {
         cancelling: false,
       }),
       {
-        inventoryState: { _tag: "Ready" },
         models: [],
-        discoveryState: { _tag: "Loading", progress: [] },
+        reconciliationComplete: false,
       },
       configuredSlots("Loading"),
       defaultOnboardingModelRankingControls,
@@ -375,7 +350,7 @@ interface HarnessOptions {
   readonly failInitialModelSlotsRead?: boolean
   readonly replaceSelectionBeforeLoad?: boolean
   readonly postSyncCatalogRead?: Deferred.Deferred<void>
-  readonly downloadFailure?: ModelDownloadFailure
+  readonly downloadFailure?: ModelAcquisitionFailure
   readonly loadFailure?: ModelInstanceFailure
 }
 
@@ -393,16 +368,11 @@ const makeHarness = (options: HarnessOptions) => {
           bytesPerSecond: Option.none(),
         },
       },
-      servingState: {
-        ...model.servingState,
-        availabilityState: { _tag: "Installable" },
-      },
     }
   }
   let models: LocalModelsState = {
-    inventoryState: { _tag: "Ready" },
+    reconciliationComplete: true,
     models: [model],
-    discoveryState: { _tag: "Ready", progress: [] },
   }
   let slots = options.ready ? configuredSlots("Ready") : unassignedSlots()
   let onboardingCompleted = options.onboardingCompleted ?? false
@@ -454,8 +424,7 @@ const makeHarness = (options: HarnessOptions) => {
         offering: Option.fromNullable(providers.models[0]),
       }],
       failures: [],
-      localInventoryState: models.inventoryState,
-      localDiscoveryState: models.discoveryState,
+      localModelsReconciliationComplete: models.reconciliationComplete,
     }
   }
   const rpc = ((name: string, payload: any) => Effect.suspend<unknown, unknown, never>(() => {
@@ -513,10 +482,6 @@ const makeHarness = (options: HarnessOptions) => {
                     totalBytes: 1,
                     bytesPerSecond: Option.none(),
                   },
-                },
-                servingState: {
-                  ...uninstalled.servingState,
-                  availabilityState: { _tag: "Installable" as const },
                 },
               } : uninstalled
             })()
@@ -1118,7 +1083,7 @@ describe("OnboardingModelSetup", () => {
   })
 
   it("preserves a structured download failure as the terminal setup failure", async () => {
-    const failure: ModelDownloadFailure = {
+    const failure: ModelAcquisitionFailure = {
       _tag: "InsufficientDiskSpace",
       requiredBytes: 40,
       availableBytes: 30,

@@ -15,6 +15,7 @@ import {
   LOCAL_MODEL_RANKING_SCALE_LABELS,
   LOCAL_MODEL_RANKING_SCALE_VALUES,
   localModelRankingScaleIndex,
+  localModelServingState,
   rankedLocalModelOptions,
   targetPhysicalMemoryBytes,
   wrapTextToWordLines,
@@ -22,7 +23,7 @@ import {
 import type {
   LocalModel,
   LocalModelMemory,
-  LocalModelDiscoveryProgressStep,
+  ModelId,
   ProviderModelId,
 } from "@magnitudedev/sdk"
 import { Button } from "../../components/button"
@@ -37,7 +38,6 @@ import { BOX_CHARS } from "../../utils/ui-constants"
 import { subscribeScrollboxActivity } from "../../utils/scroll-helpers"
 import {
   describeLocalHardwareSummary,
-  localInferenceProgressLines,
   selectedInferenceIndex,
   selectionContextLabel,
   selectionModelId,
@@ -116,12 +116,14 @@ const scrollOnboardingModelPastOverflowIndicators = (
 }
 
 export const onboardingModelActionLabel = (selection: LocalInferenceSelection): string | null => {
-  switch (selection.model.acquisitionState._tag) {
-    case "UpdateAvailable": return "Update"
-    case "UpdateFailed": return "Retry update"
-    case "Updating": return "Updating"
-    case "Removing": return "Removing"
-    case "RemoveFailed": return "Remove failed"
+  if (selection.model._tag === "Catalog") {
+    switch (selection.model.acquisitionState._tag) {
+      case "UpdateAvailable": return "Update"
+      case "UpdateFailed": return "Retry update"
+      case "Updating": return "Updating"
+      case "Removing": return "Removing"
+      case "RemoveFailed": return "Remove failed"
+    }
   }
   if (selection.kind === "running") return "Loaded"
   if (selection.kind === "downloadable") return null
@@ -547,7 +549,7 @@ export function OnboardingModelChooser({
   readonly width: number
   readonly error: string | null
   readonly operation: OnboardingModelChooserOperation | null
-  readonly onSelect: (modelId: ProviderModelId) => void
+  readonly onSelect: (modelId: ModelId) => void
 }): ReactNode {
   const theme = useTheme()
   const maximumMemoryBytes = Result.isSuccess(hardware)
@@ -588,9 +590,12 @@ export function OnboardingModelChooser({
       : selectedInferenceIndex(selections, activeSelectionId)
   const selected = selections[selectedIndex]
   const detailModel = operation?.model ?? selected?.model
-  const selectedMemory = detailModel?.servingState._tag === "Assessed"
-    && detailModel.servingState.assessment._tag === "Fits"
-    ? Option.some(detailModel.servingState.assessment.memory)
+  const detailServing = detailModel === undefined
+    ? undefined
+    : Option.getOrUndefined(localModelServingState(detailModel))
+  const selectedMemory = detailServing?._tag === "Assessed"
+    && detailServing.assessment._tag === "Fits"
+    ? Option.some(detailServing.assessment.memory)
     : Option.none<LocalModelMemory>()
   const selectedRadarAxes = detailModel === undefined
     ? Option.none()
@@ -775,24 +780,24 @@ export function OnboardingModelChooser({
           ? "! Heavy memory use: Limited memory remains for other apps"
           : null,
   })
-  const discoveredLocation = detailModel !== undefined
-      && detailModel.catalogMembershipState._tag !== "InCatalog"
-    ? discoveredModelLocation(detailModel)
+  const discoveredLocation = detailModel?._tag === "Discovered"
+      && detailModel.state._tag === "Ready"
+    ? discoveredModelLocation(detailModel.state)
     : null
   const modelSummary = detailModel === undefined
     ? ""
-    : detailModel.catalogMembershipState._tag === "InCatalog"
-        && detailModel.servingState._tag === "Assessed"
+    : detailModel._tag === "Catalog"
+        && detailServing?._tag === "Assessed"
       ? formatModelClassification(
-          detailModel.catalogMembershipState.catalogData.parameterization,
-          detailModel.servingState.capabilities.vision,
+          detailModel.catalogData.parameterization,
+          detailServing.capabilities.vision,
         )
       : discoveredLocation === null
         ? ""
         : `DISCOVERED MODEL · ${discoveredLocation}`
-  const modelReleaseRecency = detailModel?.catalogMembershipState._tag === "InCatalog"
-    && detailModel.servingState._tag === "Assessed"
-    ? formatModelReleaseRecency(detailModel.catalogMembershipState.catalogData.releaseDate)
+  const modelReleaseRecency = detailModel?._tag === "Catalog"
+    && detailServing?._tag === "Assessed"
+    ? formatModelReleaseRecency(detailModel.catalogData.releaseDate)
     : null
   const emptySelectionMessage = "No compatible models found."
   const regularDetails = detailModel ? (
@@ -959,22 +964,15 @@ export function OnboardingModelChooser({
 
 export function OnboardingModelPreparation({
   hardware,
-  progress,
   error,
   width,
 }: {
   readonly hardware: LocalInferenceHardwareResult
-  readonly progress: readonly LocalModelDiscoveryProgressStep[]
   readonly error: string | null
   readonly width: number
 }): ReactNode {
   const theme = useTheme()
-  const lines = localInferenceProgressLines(progress)
-    .filter(({ id }) => id !== "hardware")
-  const spinner = useSpinnerFrame(
-    Result.isInitial(hardware)
-      || lines.some(({ state }) => state === "running"),
-  )
+  const spinner = useSpinnerFrame(error === null)
   return (
     <OnboardingSetupCard
       width={width}
@@ -984,15 +982,10 @@ export function OnboardingModelPreparation({
       spinnerFrame={spinner}
       footer={<text style={{ fg: theme.text.supporting }}>Ctrl+C to exit</text>}
     >
-      {lines.map((line) => (
-        <text key={line.id} style={{ fg: line.state === "pending" ? theme.text.supporting : theme.text.body }}>
-          <span fg={line.state === "completed" ? theme.status.success : line.state === "failed" ? theme.status.failure : line.state === "running" ? theme.accent : theme.text.supporting}>
-            {line.state === "completed" ? "✓ " : line.state === "failed" ? "! " : line.state === "running" ? `${spinner} ` : "○ "}
-          </span>
-          {line.label}<span fg={line.state === "failed" ? theme.status.failure : theme.text.supporting}>{line.metadata}</span>
-        </text>
-      ))}
-      {error && <text style={{ fg: theme.status.failure }}>{error}</text>}
+      <text style={{ fg: error === null ? theme.text.body : theme.status.failure }}>
+        {error === null && <span fg={theme.accent}>{spinner} </span>}
+        {error ?? "Reconciling local models"}
+      </text>
     </OnboardingSetupCard>
   )
 }

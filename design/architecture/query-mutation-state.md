@@ -419,17 +419,15 @@ definition. Components consume those atoms; they do not pass definitions to a ma
 construct runtimes, or wrap them in parallel request atoms or writable status state.
 
 Mutation states are retained per invocation and keyed by the mutation definition and, when
-concurrency is resource-specific, a semantic scope. A configuration-scoped installation therefore supports
-concurrent installations of different configurations while serializing duplicate commands for the
-same configuration. Pending and failure presentation is selected from those exact mutation states.
+concurrency is resource-specific, a semantic scope. A model-scoped installation therefore supports
+concurrent installations of different models while serializing duplicate commands for the same
+canonical `ModelId`. Pending and failure presentation is selected from those exact mutation states.
 It is never represented by a singleton `installingId`, `busy`, or error side channel.
 
 Mutation success includes invalidation of every canonical query whose visibility may have changed.
 The command owner, not a client reread, defines acknowledgement: a committed command returns after
-its owner commit. An instance command may return its exact admitted identity. Model sync is instead
-model-addressed at the client boundary: ACN retains the exact native occurrence returned by ICN,
-publishes the post-admission `LocalModel.acquisitionState`, and exposes neither that occurrence nor
-its identity to the client.
+its owner commit. Model sync is model-addressed at the client boundary; ICN returns a private
+`CatalogInstallationOperationId` that ACN observes but does not expose to the client.
 Progress, physical completion, and serving readiness remain authoritative query state. Mutation
 synchronization never polls a query until it appears to prove the command response.
 

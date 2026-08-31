@@ -3,11 +3,13 @@ import { FetchHttpClient } from "@effect/platform"
 import { Client, Mutation } from "@magnitudedev/effect-query"
 import {
   LocalModelSchema,
-  LocalModelDiscoveryStateSchema,
-  LocalModelInventoryStateSchema,
+  CatalogFormModelIdSchema,
+  localModelIsInstalled,
+  localModelStorageBytes,
   MagnitudeBoundary,
-  ProviderModelIdSchema,
+  ModelIdSchema,
   ProviderCatalogFailureSchema,
+  type CatalogFormModelId,
   type MagnitudeImplementationError,
   magnitudeImplementationsLayer,
 } from "@magnitudedev/sdk"
@@ -15,8 +17,9 @@ import { Effect, Layer, Option, Schema } from "effect"
 import { existingAcnConnection } from "../server/acn-connection"
 import { ensureTrailingNewline, runCommand } from "./output"
 
-const decodeModelId = Schema.decodeUnknown(ProviderModelIdSchema)
-type ModelId = typeof ProviderModelIdSchema.Type
+const decodeModelId = Schema.decodeUnknown(ModelIdSchema)
+const decodeCatalogFormModelId = Schema.decodeUnknown(CatalogFormModelIdSchema)
+type ModelId = typeof ModelIdSchema.Type
 type CliModelsClient = Pick<
   Client.Materialized<typeof MagnitudeBoundary, unknown, MagnitudeImplementationError>,
   "Models"
@@ -24,12 +27,12 @@ type CliModelsClient = Pick<
 
 const PullResultSchema = Schema.Struct({
   operation: Schema.Literal("pull"),
-  modelId: ProviderModelIdSchema,
+  modelId: ModelIdSchema,
   outcome: Schema.Literal("Started", "AlreadyCurrent"),
 })
 const AddressedMutationResultSchema = Schema.Struct({
   operation: Schema.Literal("remove", "cancel", "load"),
-  modelId: ProviderModelIdSchema,
+  modelId: ModelIdSchema,
 })
 const StopResultSchema = Schema.Struct({ operation: Schema.Literal("stop") })
 const ModelsStatusSchema = Schema.Struct({ models: Schema.Array(LocalModelSchema) })
@@ -39,8 +42,7 @@ const CatalogResultSchema = Schema.Union(
     _tag: Schema.Literal("Ready", "Refreshing", "Degraded"),
     models: Schema.Array(LocalModelSchema),
     failures: Schema.Array(ProviderCatalogFailureSchema),
-    localInventoryState: LocalModelInventoryStateSchema,
-    localDiscoveryState: LocalModelDiscoveryStateSchema,
+    localModelsReconciliationComplete: Schema.Boolean,
   }),
 )
 
@@ -58,45 +60,49 @@ const formatBytes = (bytes: number): string => {
 const percent = (completed: number, total: number): string =>
   `${total === 0 ? 0 : Math.round((completed / total) * 100)}%`
 
+const modelResidency = (model: typeof LocalModelSchema.Type) => {
+  if (model._tag === "Discovered") {
+    return model.state._tag === "Ready" ? model.state.residencyState : undefined
+  }
+  return "residencyState" in model.acquisitionState
+    ? model.acquisitionState.residencyState
+    : undefined
+}
+
 const catalogPresentation = (state: typeof CatalogResultSchema.Type): string => {
   if (state._tag === "Initializing") return "Model catalog is initializing.\n"
-  const rows = state.models.map((model) => {
-    const target = model.bundle._tag === "Standalone" ? model.bundle.package : model.bundle.target
-    const catalog = model.catalogMembershipState._tag === "InCatalog"
-      ? model.catalogMembershipState.catalogData : undefined
+  const rows = state.models.filter((model) => model._tag === "Catalog").map((model) => {
+    const catalog = model.catalogData
     const assessment = model.servingState._tag === "Assessed"
       ? model.servingState.assessment : undefined
+    const speculativeMethod = model.servingState._tag === "Assessed"
+      ? Option.getOrUndefined(model.servingState.speculativeMethod)
+      : undefined
     const requiredBytes = assessment?._tag === "Fits"
       ? assessment.memory.totalRequiredBytes
       : assessment?._tag === "DoesNotFit" ? assessment.totalRequiredBytes : undefined
-    const source = target.source._tag === "HuggingFace"
-      ? `https://huggingface.co/${target.source.repository}` : target.source._tag
     return [
       model.modelId,
       `${model.presentation.displayName} (${model.presentation.variantLabel})`,
-      target.properties.quantizationName,
-      `QAT: ${catalog?.quantizationAware === true ? "yes" : "no"}`,
-      requiredBytes === undefined ? `download: ${formatBytes(model.downloadBytes)}` : `memory: ${formatBytes(requiredBytes)}`,
+      model.servingState._tag === "Assessed"
+        ? model.servingState.metadata.quantizationName
+        : model.presentation.variantLabel,
+      `QAT: ${catalog.quantizationAware ? "yes" : "no"}`,
+      requiredBytes === undefined
+        ? `storage: ${Option.match(localModelStorageBytes(model), { onNone: () => "unknown", onSome: formatBytes })}`
+        : `memory: ${formatBytes(requiredBytes)}`,
       assessment?._tag ?? model.servingState._tag,
-      catalog === undefined ? "AA: pending" : `AA: ${catalog.intelligence.score}`,
-      model.bundle._tag === "SpeculativeDecoding" ? model.bundle.method._tag : "standard",
+      `AA: ${catalog.intelligence.score}`,
+      speculativeMethod?._tag ?? "standard",
       model.acquisitionState._tag,
-      source,
+      model.presentation.sourceUrls[0] ?? "catalog",
     ].join("  ")
   })
-  const assessment = state.localDiscoveryState.progress.find(({ id }) => id === "assessment")
-  const pending = assessment !== undefined
-    && Option.isSome(assessment.totalItems)
-    && Option.isSome(assessment.completedItems)
-    ? assessment.totalItems.value - assessment.completedItems.value
-    : 0
-  return ensureTrailingNewline([
-    ...rows,
-    ...(pending > 0 ? [`${pending} model${pending === 1 ? " is" : "s are"} still being assessed.`] : []),
-  ].join("\n"))
+  return ensureTrailingNewline(rows.join("\n"))
 }
 
 const modelStatus = (model: typeof LocalModelSchema.Type): string => {
+  if (model._tag === "Discovered") return modelResidency(model)?._tag ?? model.state._tag
   const acquisition = model.acquisitionState
   if (acquisition._tag === "Installing" || acquisition._tag === "Updating") {
     return `${acquisition._tag} ${percent(acquisition.progress.completedBytes, acquisition.progress.totalBytes)}`
@@ -141,7 +147,7 @@ export const showModelCatalog = () => runCommand({
 })
 
 export const pullModel = (modelInput: string) => runCommand({
-  effect: withClient((client, registry) => decodeModelId(modelInput).pipe(
+  effect: withClient((client, registry) => decodeCatalogFormModelId(modelInput).pipe(
     Effect.flatMap((modelId) => Mutation.execute(client.Models.SyncLocalModel, {
       modelId,
     }).pipe(Effect.map(({ outcome }) => ({
@@ -157,12 +163,13 @@ export const pullModel = (modelInput: string) => runCommand({
     : `Pulling ${modelId} in the background.\n`,
 })
 
-const modelMutation = (
+const modelMutation = <Id extends ModelId>(
   modelInput: string,
   operation: "remove" | "cancel" | "load",
-  execute: (client: CliModelsClient, registry: Registry.Registry, modelId: ModelId) => Effect.Effect<unknown, unknown>,
+  decode: (input: string) => Effect.Effect<Id, unknown>,
+  execute: (client: CliModelsClient, registry: Registry.Registry, modelId: Id) => Effect.Effect<unknown, unknown>,
 ) => runCommand({
-  effect: withClient((client, registry) => decodeModelId(modelInput).pipe(
+  effect: withClient((client, registry) => decode(modelInput).pipe(
     Effect.flatMap((modelId) => execute(client, registry, modelId).pipe(
       Effect.as({ operation, modelId }),
     )),
@@ -171,12 +178,12 @@ const modelMutation = (
   render: ({ modelId }) => `${operation === "remove" ? "Removed" : operation === "cancel" ? "Cancelled work for" : "Loading"} ${modelId}.\n`,
 })
 
-export const removeModel = (modelId: string) => modelMutation(modelId, "remove",
+export const removeModel = (modelId: string) => modelMutation<CatalogFormModelId>(modelId, "remove", decodeCatalogFormModelId,
   (client, registry, decoded) => Mutation.execute(client.Models.RemoveLocalModel, {
     modelId: decoded,
   }).pipe(Effect.provideService(Registry.AtomRegistry, registry)))
 
-export const cancelDownload = (modelId: string) => modelMutation(modelId, "cancel",
+export const cancelDownload = (modelId: string) => modelMutation<CatalogFormModelId>(modelId, "cancel", decodeCatalogFormModelId,
   (client, registry, decoded) => Mutation.execute(client.Models.CancelLocalModelSync, {
     modelId: decoded,
   }).pipe(Effect.provideService(Registry.AtomRegistry, registry)))
@@ -187,18 +194,17 @@ export const listInstances = () => runCommand({
     Atom.make((get) => get(client.Models.GetCatalog({})).result),
   ).pipe(Effect.map((state) => ({
     models: state._tag === "Initializing" ? [] : state.models.flatMap((entry) =>
-      entry._tag === "Local" && entry.product.acquisitionState._tag !== "NotInstalled"
-        && entry.product.acquisitionState._tag !== "InstallFailed" ? [entry.product] : []),
+      entry._tag === "Local" && localModelIsInstalled(entry.product) ? [entry.product] : []),
   })))),
   schema: ModelsStatusSchema,
   render: ({ models }) => models.length === 0
     ? "No installed models.\n"
     : ensureTrailingNewline(models.map((model) =>
-        `${model.modelId}  ${model.presentation.variantLabel}  ${formatBytes(model.downloadBytes)}  ${modelStatus(model)}`
+        `${model.modelId}  ${model.presentation.variantLabel}  ${Option.match(localModelStorageBytes(model), { onNone: () => "unknown", onSome: formatBytes })}  ${modelStatus(model)}`
       ).join("\n")),
 })
 
-export const loadInstance = (modelId: string) => modelMutation(modelId, "load",
+export const loadInstance = (modelId: string) => modelMutation(modelId, "load", decodeModelId,
   (client, registry, decoded) => Mutation.execute(client.Models.LoadLocalModel, {
     modelId: decoded,
   }).pipe(Effect.provideService(Registry.AtomRegistry, registry)))

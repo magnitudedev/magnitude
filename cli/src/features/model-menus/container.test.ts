@@ -2,6 +2,7 @@ import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   PRIMARY_SLOT_ID,
+  HttpsUrlSchema,
   ProviderIdSchema,
   ProviderModelIdSchema,
   type LocalModel,
@@ -16,6 +17,7 @@ import {
   catalogLocalModels,
   huggingFaceRepositoryUrls,
   localModelInstalledStatus,
+  localModelReadinessFailureMessage,
   localModelReadinessStatus,
   modelsMenuEntryIsSelected,
   modelsMenuEntryIsEligible,
@@ -29,7 +31,7 @@ import {
   LOCAL_PROVIDER_ID,
   makeModel,
   makeCatalogOnlyModel,
-  makeStandaloneBundle,
+  makeInstalledCatalogModel,
   makeView,
   TEST_MODEL_ID,
   withDoesNotFitAssessment,
@@ -42,19 +44,21 @@ const testProgress: ModelTransferProgress = {
   bytesPerSecond: Option.none(),
 }
 
-const installedFieldsOf = (model: LocalModel) => {
+type CatalogLocalModel = Extract<LocalModel, { readonly _tag: "Catalog" }>
+
+const installedFieldsOf = (model: CatalogLocalModel) => {
   if (model.acquisitionState._tag !== "Installed") {
     throw new Error("expected an installed fixture")
   }
   return model.acquisitionState
 }
 
-const withUpdateAvailable = (model: LocalModel): LocalModel => ({
+const withUpdateAvailable = (model: CatalogLocalModel): CatalogLocalModel => ({
   ...model,
   acquisitionState: { ...installedFieldsOf(model), _tag: "UpdateAvailable" },
 })
 
-const withUpdating = (model: LocalModel): LocalModel => ({
+const withUpdating = (model: CatalogLocalModel): CatalogLocalModel => ({
   ...model,
   acquisitionState: { ...installedFieldsOf(model), _tag: "Updating", progress: testProgress },
 })
@@ -107,9 +111,7 @@ describe("unified models menu projection", () => {
 
   it("includes only fitting catalog rows in Catalog", () => {
     const catalogFit = makeCatalogOnlyModel()
-    const nonCatalogFit = makeModel({
-      acquisitionState: { _tag: "NotInstalled" },
-    })
+    const nonCatalogFit = makeModel()
     const models = [
       catalogFit,
       nonCatalogFit,
@@ -127,13 +129,13 @@ describe("unified models menu projection", () => {
   })
 
   it("shows exact catalog drift as an available update without hiding the installed model", () => {
-    expect(catalogStatus(withUpdateAvailable(makeModel()))).toBe("Update available")
+    expect(catalogStatus(withUpdateAvailable(makeInstalledCatalogModel()))).toBe("Update available")
   })
 
   it("preserves the established detail actions and labels", () => {
     const available = makeCatalogOnlyModel()
-    const installed = makeModel()
-    const update = withUpdateAvailable(makeModel())
+    const installed = makeInstalledCatalogModel()
+    const update = withUpdateAvailable(makeInstalledCatalogModel())
     const selectedSlot = makeView().slots.slots.primary
     const downloading = makeCatalogOnlyModel({
       acquisitionState: { _tag: "Installing", progress: testProgress },
@@ -152,27 +154,14 @@ describe("unified models menu projection", () => {
     expect(catalogInspectorActionLabel("stop", installed, selectedSlot)).toBe("Stop model")
   })
 
-  it("lists target and separate-draft repositories without treating the draft source as a package", () => {
-    const target = makeStandaloneBundle("package_target")
-    const draft = makeStandaloneBundle("package_draft")
-    if (target._tag !== "Standalone" || draft._tag !== "Standalone") {
-      throw new Error("test bundles must contain standalone packages")
-    }
+  it("lists catalog source repositories without exposing their packages", () => {
     const model = makeCatalogOnlyModel({
-      bundle: {
-        _tag: "SpeculativeDecoding",
-        target: {
-          ...target.package,
-          source: { _tag: "HuggingFace", repository: "publisher/target", revision: "a".repeat(40) },
-        },
-        draftSource: {
-          _tag: "Separate",
-          draft: {
-            ...draft.package,
-            source: { _tag: "HuggingFace", repository: "publisher/draft", revision: "b".repeat(40) },
-          },
-        },
-        method: { _tag: "DSpark" },
+      presentation: {
+        ...makeCatalogOnlyModel().presentation,
+        sourceUrls: [
+          HttpsUrlSchema.make("https://huggingface.co/publisher/target"),
+          HttpsUrlSchema.make("https://huggingface.co/publisher/draft"),
+        ],
       },
     })
 
@@ -182,18 +171,11 @@ describe("unified models menu projection", () => {
     ])
   })
 
-  it("lists only the target repository for embedded speculative decoding", () => {
-    const target = makeStandaloneBundle("package_target")
-    if (target._tag !== "Standalone") throw new Error("test bundle must contain a package")
+  it("lists a discovered Hugging Face repository", () => {
     const model = makeCatalogOnlyModel({
-      bundle: {
-        _tag: "SpeculativeDecoding",
-        target: {
-          ...target.package,
-          source: { _tag: "HuggingFace", repository: "publisher/target", revision: "a".repeat(40) },
-        },
-        draftSource: { _tag: "Embedded" },
-        method: { _tag: "Mtp" },
+      presentation: {
+        ...makeCatalogOnlyModel().presentation,
+        sourceUrls: [HttpsUrlSchema.make("https://huggingface.co/publisher/target")],
       },
     })
 
@@ -222,7 +204,7 @@ describe("unified models menu projection", () => {
 
   it("keeps eligibility tied to the selection captured when the menu opened", () => {
     const local = makeModel()
-    if (local.servingState._tag !== "Assessed") throw new Error("fixture must be assessed")
+    if (local.state.servingState._tag !== "Assessed") throw new Error("fixture must be assessed")
     const provider = {
       providerId: ProviderIdSchema.make("test"),
       displayName: "Test",
@@ -240,7 +222,7 @@ describe("unified models menu projection", () => {
       contextWindow: 1,
       maxOutputTokens: 1,
       memory: Option.none(),
-      capabilities: local.servingState.capabilities,
+      capabilities: local.state.servingState.capabilities,
       availability: { _tag: "Disabled" as const, reason: "model_unavailable" as const },
       pricing: Option.none(),
     } satisfies ProviderModelCatalogEntry
@@ -289,9 +271,34 @@ describe("unified models menu projection", () => {
     expect(localModelReadinessStatus(model)).toBe("Doesn’t fit")
   })
 
+  it("preserves the exact discovered-model failure for the details view", () => {
+    const model = makeModel()
+    const failed: LocalModel = {
+      ...model,
+      state: {
+        ...model.state,
+        servingState: {
+          _tag: "Failed",
+          profile: model.state.servingState._tag === "Assessed"
+            ? model.state.servingState.assessment.profile
+            : { contextLength: 32_768 },
+          failure: {
+            code: "invalid_artifact",
+            message: "The GGUF artifact does not contain a complete model.",
+            retryable: false,
+          },
+        },
+      },
+    }
+
+    expect(localModelReadinessFailureMessage(failed)).toBe(
+      "The GGUF artifact does not contain a complete model.",
+    )
+  })
+
   it("renders catalog upgrade state without inferring artifact differences", () => {
-    expect(localModelReadinessStatus(withUpdateAvailable(makeModel()))).toBe("Update available")
-    const model = withUpdating(makeModel())
+    expect(localModelReadinessStatus(withUpdateAvailable(makeInstalledCatalogModel()))).toBe("Update available")
+    const model = withUpdating(makeInstalledCatalogModel())
     expect(localModelReadinessStatus(model)).toBe("Updating")
     expect(catalogStatus(model)).toBe("Updating 25%")
   })

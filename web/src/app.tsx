@@ -46,6 +46,7 @@ import {
   deriveCurrentLocalModel,
   deriveLocalModelLoadActivity,
   installedLocalModels,
+  localModelProviderModelId,
   formatLocalModelDisplayName,
   selectedSlotModel,
   reasoningEffortControl,
@@ -497,13 +498,8 @@ function FooterBarContainer({
     onSome: (state) =>
       installedLocalModels(state)
         .flatMap((model) => {
-          if (
-            model.servingState._tag !== "Assessed" ||
-            model.servingState.availabilityState._tag !== "Selectable"
-          ) {
-            return []
-          }
-          const providerModelId = model.servingState.availabilityState.providerModelId
+          const providerModelId = Option.getOrUndefined(localModelProviderModelId(model))
+          if (providerModelId === undefined) return []
           const providerModel = providerCatalog.models.find((candidate) =>
             candidate.providerId === "local"
             && candidate.providerModelId === providerModelId)
@@ -529,15 +525,12 @@ function FooterBarContainer({
   const modelOptionsState: FooterModelOptionsState =
     Result.isFailure(localModelsResult) ||
     Result.isFailure(catalogResult) ||
-    localModels?.discoveryState._tag === "Failed" ||
     providerCatalog._tag === "Failed"
       ? { _tag: "Failed", options: modelOptions }
-      : localModels?.inventoryState._tag === "Degraded" ||
-        providerCatalog._tag === "Degraded"
+      : providerCatalog._tag === "Degraded"
       ? { _tag: "Degraded", options: modelOptions }
       : localModels === null ||
-        localModels.inventoryState._tag === "Initializing" ||
-        localModels.discoveryState._tag === "Loading" ||
+        !localModels.reconciliationComplete ||
         providerCatalog._tag === "Loading"
       ? { _tag: "Loading", options: modelOptions }
       : { _tag: "Ready", options: modelOptions }

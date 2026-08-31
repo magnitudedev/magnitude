@@ -108,6 +108,7 @@ Only the current child uses the animated Braille spinner.
 | `Starting / ResolvingLocalInference` | No child; absorbed into the parent operation |
 | `Starting / LaunchingLocalInference` | Child `Starting inference engine` |
 | `Starting / PreparingBackend` | Child `Preparing <backend> backend for <hardware>` |
+| `Starting / DiscoveringLocalModels` | Child `Discovering local models` |
 | `Ready` | Complete the active child and change the parent `○` to `●` |
 | `Failed` | Preserve the current progress; outer boundary prints the actual error and exits nonzero |
 

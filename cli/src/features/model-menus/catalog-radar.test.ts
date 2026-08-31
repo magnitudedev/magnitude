@@ -41,16 +41,19 @@ describe("catalog radar", () => {
     const model = makeCatalogOnlyModel()
     if (
       model.servingState._tag !== "Assessed" ||
-      model.servingState.assessment._tag !== "Fits"
+      model.servingState.assessment._tag !== "Fits" ||
+      !("rankingScores" in model.servingState)
     ) {
       throw new Error("Expected an assessed catalog fixture")
     }
+    const servingState = model.servingState
+    const assessment = servingState.assessment
     const withoutPerformance = {
       ...model,
       servingState: {
-        ...model.servingState,
+        ...servingState,
         assessment: {
-          ...model.servingState.assessment,
+          ...assessment,
           performance: [],
         },
       },
@@ -61,14 +64,16 @@ describe("catalog radar", () => {
   test("displays memory using the hardware convention", () => {
     const model = makeCatalogOnlyModel()
     if (model.servingState._tag !== "Assessed"
-      || model.servingState.assessment._tag !== "Fits") {
+      || model.servingState.assessment._tag !== "Fits"
+      || !("rankingScores" in model.servingState)) {
       throw new Error("Catalog radar fixture must have a fitting assessment")
     }
-    const assessed = model.servingState.assessment
+    const servingState = model.servingState
+    const assessed = servingState.assessment
     const axes = Option.getOrThrow(localModelRadarAxes({
       ...model,
       servingState: {
-        ...model.servingState,
+        ...servingState,
         assessment: {
           ...assessed,
           memory: { ...assessed.memory, totalRequiredBytes: 3.4 * 1024 ** 3 },
@@ -82,11 +87,13 @@ describe("catalog radar", () => {
   test("plots larger memory footprints farther from the center", () => {
     const model = makeCatalogOnlyModel()
     if (model.servingState._tag !== "Assessed"
-      || model.servingState.assessment._tag !== "Fits") {
+      || model.servingState.assessment._tag !== "Fits"
+      || !("rankingScores" in model.servingState)) {
       throw new Error("Catalog radar fixture must have a fitting assessment")
     }
-    const assessed = model.servingState.assessment
-    const servingState = { ...model.servingState, assessment: assessed }
+    const modelServingState = model.servingState
+    const assessed = modelServingState.assessment
+    const servingState = { ...modelServingState, assessment: assessed }
     const memoryValue = (requiredBytes: number) => {
       const axes = Option.getOrThrow(localModelRadarAxes({
         ...model,

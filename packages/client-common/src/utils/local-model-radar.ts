@@ -1,5 +1,5 @@
 import { Option } from "effect"
-import type { LocalModel } from "@magnitudedev/sdk"
+import { localModelServingState, type LocalModel, type LocalModelServingState } from "@magnitudedev/sdk"
 import { formatMemorySize } from "./format-bytes"
 import { localModelSpeculativeMethodLabel } from "./model-presentation"
 
@@ -26,7 +26,9 @@ export const normalizeLocalModelRadarSpeed = (tokensPerSecond: number): number =
   return 0.9 + (0.1 * Math.log(tokensPerSecond / 100)) / Math.log(10)
 }
 
-type AssessedModel = Extract<LocalModel["servingState"], { readonly _tag: "Assessed" }>
+type AssessedModel = Extract<LocalModelServingState, {
+  readonly _tag: "Assessed"
+}>
 type ModelAssessment = AssessedModel["assessment"]
 
 const memoryUseRatio = (assessment: ModelAssessment): number => {
@@ -45,15 +47,18 @@ const memoryUseRatio = (assessment: ModelAssessment): number => {
 }
 
 const speculationValue = (model: LocalModel): number => {
-  if (model.bundle._tag !== "SpeculativeDecoding") return 0
-  switch (model.bundle.method._tag) {
-    case "Mtp":
-      return 1 / 3
-    case "DFlash":
-      return 2 / 3
-    case "DSpark":
-      return 1
-  }
+  const serving = Option.getOrUndefined(localModelServingState(model))
+  if (serving?._tag !== "Assessed") return 0
+  return Option.match(serving.speculativeMethod, {
+    onNone: () => 0,
+    onSome: (method) => {
+      switch (method._tag) {
+        case "Mtp": return 1 / 3
+        case "DFlash": return 2 / 3
+        case "DSpark": return 1
+      }
+    },
+  })
 }
 
 const accuracyLabel = (rank: number): string =>
@@ -64,14 +69,12 @@ const shortVariantLabel = (model: LocalModel): string =>
   String(model.presentation.variantLabel).split(/[ _-]/, 1)[0] ??
   String(model.presentation.variantLabel)
 
-const targetPackage = (model: LocalModel) =>
-  model.bundle._tag === "Standalone" ? model.bundle.package : model.bundle.target
-
 const quantizationBits = (model: LocalModel): Option.Option<number> => {
-  const target = targetPackage(model)
+  const serving = Option.getOrUndefined(localModelServingState(model))
+  if (serving?._tag !== "Assessed") return Option.none()
   for (const candidate of [
-    target.properties.quantization,
-    target.properties.quantizationName,
+    serving.metadata.quantization,
+    serving.metadata.quantizationName,
   ]) {
     const bits = candidate.match(/(?:IQ|Q)?(\d+(?:\.\d+)?)\s*(?:[- ]?bit)?/i)?.[1]
     if (bits !== undefined) return Option.some(Number(bits))
@@ -96,13 +99,11 @@ const memoryFootprintLabel = (assessment: ModelAssessment): string => {
 }
 
 const performanceRangeSpeedLabel = (model: LocalModel): string => {
-  if (
-    model.servingState._tag !== "Assessed" ||
-    model.servingState.assessment._tag !== "Fits"
-  ) {
+  const serving = Option.getOrUndefined(localModelServingState(model))
+  if (serving?._tag !== "Assessed" || serving.assessment._tag !== "Fits") {
     return "Not assessed"
   }
-  const assessment = model.servingState.assessment
+  const assessment = serving.assessment
   const lowerContext = Math.min(25_000, assessment.profile.contextLength)
   const upperContext = Math.min(75_000, assessment.profile.contextLength)
   const lowerSample = assessment.performance.find(
@@ -128,14 +129,12 @@ const performanceRangeSpeedLabel = (model: LocalModel): string => {
 export const localModelRadarAxes = (
   model: LocalModel
 ): Option.Option<LocalModelRadarAxes> => {
-  if (
-    model.servingState._tag !== "Assessed" ||
-    model.servingState.assessment._tag !== "Fits"
-  ) {
+  const serving = Option.getOrUndefined(localModelServingState(model))
+  if (serving?._tag !== "Assessed" || serving.assessment._tag !== "Fits") {
     return Option.none()
   }
 
-  const assessment = model.servingState.assessment
+  const assessment = serving.assessment
   if (assessment.performance.length === 0) return Option.none()
   const comparisonContext = Math.min(50_000, assessment.profile.contextLength)
   const performance = assessment.performance.reduce((closest, candidate) =>
@@ -144,16 +143,10 @@ export const localModelRadarAxes = (
       ? candidate
       : closest
   )
-  const speculation = Option.getOrElse(
-    localModelSpeculativeMethodLabel(model),
-    () => "None"
-  )
-  const catalog =
-    model.catalogMembershipState._tag === "InCatalog"
-      ? Option.some(model.catalogMembershipState.catalogData)
-      : Option.none()
+  const catalog = model._tag === "Catalog" ? Option.some(model.catalogData) : Option.none()
+  const speculation = Option.getOrElse(localModelSpeculativeMethodLabel(model), () => "None")
   const bits = quantizationBits(model)
-  const quantization = targetPackage(model).properties.quantization
+  const quantization = serving.metadata.quantization
   const axes: LocalModelRadarAxes = [
     {
       value: Option.map(catalog, ({ intelligence }) =>

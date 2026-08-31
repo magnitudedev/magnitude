@@ -1,7 +1,6 @@
-import { Effect } from "effect"
+import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 import {
-  LocalModelRankingSampleMissing,
   modelRankingScores,
   normalizedModelSpeedScore,
   type LocalModelRankingCandidate,
@@ -17,19 +16,17 @@ const candidate = (input: {
   const contextLength = input.context ?? 100_000
   const comparisonContext = Math.min(50_000, contextLength)
   return {
-    model: {
-      modelId: "model",
-      intelligence: { score: input.intelligence ?? 80 },
-      fidelityRank: input.fidelity ?? 60,
-    },
+    intelligenceScore: input.intelligence ?? 80,
+    fidelityRank: input.fidelity ?? 60,
     profile: { contextLength },
-    assessment: {
-      performance: input.includeComparisonSample === false ? [] : [{
+    performance: input.includeComparisonSample === false ? [] : [{
         contextTokens: comparisonContext,
+        lowerTokensPerSecond: input.speed ?? 40,
         estimatedTokensPerSecond: input.speed ?? 40,
+        upperTokensPerSecond: input.speed ?? 40,
+        confidence: "high",
       }],
-    },
-  } as unknown as LocalModelRankingCandidate
+  }
 }
 
 describe("normalizedModelSpeedScore", () => {
@@ -43,8 +40,8 @@ describe("normalizedModelSpeedScore", () => {
 })
 
 describe("modelRankingScores", () => {
-  it("normalizes intelligence, target speed, and quantization fidelity independently", async () => {
-    const scores = await Effect.runPromise(modelRankingScores(candidate({
+  it("normalizes intelligence, target speed, and quantization fidelity independently", () => {
+    const scores = Option.getOrThrow(modelRankingScores(candidate({
       intelligence: 75,
       fidelity: 50,
       speed: 40,
@@ -56,8 +53,8 @@ describe("modelRankingScores", () => {
     })
   })
 
-  it("clamps catalog scores to the normalized range", async () => {
-    const scores = await Effect.runPromise(modelRankingScores(candidate({
+  it("clamps catalog scores to the normalized range", () => {
+    const scores = Option.getOrThrow(modelRankingScores(candidate({
       intelligence: 150,
       fidelity: -10,
     })))
@@ -65,16 +62,15 @@ describe("modelRankingScores", () => {
     expect(scores.fidelity).toBe(0)
   })
 
-  it("fails explicitly when the bounded comparison sample is absent", async () => {
-    const failure = await Effect.runPromise(Effect.flip(modelRankingScores(candidate({
+  it("omits ranking when the bounded comparison sample is absent", () => {
+    const scores = modelRankingScores(candidate({
       includeComparisonSample: false,
-    }))))
-    expect(failure).toBeInstanceOf(LocalModelRankingSampleMissing)
-    expect(failure.contextTokens).toBe(50_000)
+    }))
+    expect(Option.isNone(scores)).toBe(true)
   })
 
-  it("uses the configured context as the comparison point below 50K", async () => {
-    const scores = await Effect.runPromise(modelRankingScores(candidate({
+  it("uses the configured context as the comparison point below 50K", () => {
+    const scores = Option.getOrThrow(modelRankingScores(candidate({
       context: 32_768,
       speed: 24,
     })))

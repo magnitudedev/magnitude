@@ -10,68 +10,41 @@ applies_to:
   - packages/icn-protocol/src/generated/**
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/storage/src/types/model-state.ts
-  - packages/client-common/src/hooks/use-onboarding-model-setup.ts
-  - packages/client-common/src/hooks/use-local-inference-state.ts
   - packages/client-common/src/**/local-model*
-  - cli/src/features/model-menus/**
   - web/src/components/local-model-onboarding.tsx
   - web/src/components/model-center.tsx
 ---
 
 # Model offerings and selection
 
-## Provider boundary
+Generic provider code sees `(ProviderId, ProviderModelId)` and a bound model. For the local provider,
+`ProviderModelId` is the canonical `ModelId` unchanged for both catalog and `hf:` discovery rows.
+ACN creates no alias, configuration identity, package identity, or bundle identity.
 
-Generic provider and agent code sees `(ProviderId, ProviderModelId)` and a bound model. It does not
-see catalog packages, downloads, assessments, or reconciliation state.
+ACN publishes an offering only when the exact effective model is assessed `Fits` and its availability
+is `Selectable`. The offering carries the assessed profile and capabilities. Models without that
+evidence may remain visible in the model center but are absent from selectable provider offerings;
+ACN never fills required provider fields with zero or false placeholders.
 
-The local provider projects each callable ICN Model as one offering. Its provider-model ID is the
-Model's existing canonical model ID (for example `gemma-4-26b-a4b-it-qat:gguf:q4`) everywhere:
-native Models, standard inference, slot selection, and provider invocation. ACN creates no alias or
-configuration identity. Provider offerings and configurations are derived and are not persisted.
+The local offering set is authoritative only after inventory and discovery reconciliation complete
+and every current assessment is terminal. Startup and reassessment therefore cannot turn temporary
+offering absence into removal of a persisted Slot selection.
 
-An offering is selectable only when its effective configuration is runnable, installed, currently
-assessed as fitting, and published by the provider. Update availability does not disable the old
-effective offering.
+Catalog installation and removal address `/api/v1/catalog/models/{modelId}/**` with the complete
+catalog-form `ModelId`. Cancellation and failure acknowledgement address the admitted
+`CatalogInstallationOperationId` under `/api/v1/catalog/installations/**`. These actions apply only
+to catalog models. Discovered models are externally owned observations and expose no managed
+lifecycle.
 
-## Model installation
-
-Acquisition and update use one idempotent native inference mutation:
-
-```text
-POST /api/v1/models/install { modelId }
-  -> Current(modelId)
-   | DownloadAdmitted(modelId, downloadId)
-```
-
-ICN compares the current filesystem and package affiliations with the desired Model
-bundle. It acquires missing desired packages, waits until the desired bundle is complete, and then
-removes only affiliated superseded packages. Removal passes through runtime ownership checks; a
-package used by a live instance is retained and installation remains available for retry.
-
-The old effective target remains runnable throughout acquisition. Failed or cancelled acquisition
-does not remove it. Installation writes artifacts and non-derivable package affiliations only; it
-does not persist configurations, manifests, versions, or product state.
-
-## Slot selection
-
-A slot persists only provider, provider-model identity, and normalized reasoning effort. Assignment
-validates a current offering. Slots express durable selection, not physical residency. Explicit
-warm loading and inference both send the selected canonical model ID to ICN; ICN resolves the
-current configuration and owns admission, replacement, and request leases.
-
-Temporary unavailability preserves a selection. Local offerings expose whether ICN's model
-inventory has completed its initial authoritative observation; an empty local list before that
-point cannot invalidate a selection. Once a successful, ready provider projection proves the
-identity absent, ACN clears the selection durably. A slot with an unknown selected model is not a
-representable published state.
+A Slot persists only provider ID, provider-model ID, and normalized reasoning effort. Assignment
+validates a current offering. Slots express selection, while ICN owns load admission, replacement,
+physical `ModelInstanceId`, and request leases. Temporary offering loss preserves a selection until
+authoritative provider state proves it invalid according to Slot policy.
 
 ## Conformance
 
-- Catalog identity is structured and branded outside the provider boundary.
-- Native Model installation is the sole install/update mutation.
-- Model installation is idempotent and exact-package based.
-- A runnable prior target remains available during update.
-- Superseded cleanup never deletes an unaffiliated or live package.
-- Startup ordering cannot clear a local selection before local offerings are authoritative.
-- Slot state never publishes a selection that authoritative provider state proves invalid.
+- Catalog and discovered offerings preserve canonical `ModelId` unchanged.
+- Only evidence-backed assessed models become offerings.
+- Catalog commands never accept discovered identities as managed acquisitions.
+- Slots never persist package, bundle, installation-operation, assessment, or instance identity.
+- Update availability does not disable a still-runnable installed catalog model.

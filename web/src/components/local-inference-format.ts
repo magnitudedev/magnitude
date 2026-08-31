@@ -1,5 +1,5 @@
 import { Option } from "effect"
-import type { LocalModel, ModelSlot } from "@magnitudedev/sdk"
+import { localModelServingProfile, type LocalModel, type ModelSlot } from "@magnitudedev/sdk"
 
 export const formatBytes = (bytes: number): string => {
   if (bytes <= 0) return "0 B"
@@ -44,19 +44,9 @@ export const transferLabel = (transfer: {
     transfer.totalBytes
   )}`
 
-export const modelContextLength = (model: LocalModel): number | null =>
-  model.servingState._tag === "Assessing"
-    ? model.servingState.configuration.profile.contextLength
-    : model.servingState._tag === "Assessed"
-    ? model.servingState.configuration.profile.contextLength
-    : model.servingState._tag === "Failed"
-    ? Option.getOrNull(
-        Option.map(
-          model.servingState.configuration,
-          ({ profile }) => profile.contextLength
-        )
-      )
-    : null
+export const modelContextLength = (model: LocalModel): number | null => Option.getOrNull(
+  Option.map(localModelServingProfile(model), ({ contextLength }) => contextLength),
+)
 
 export const slotStatus = (
   slot: ModelSlot

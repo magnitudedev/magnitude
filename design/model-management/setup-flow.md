@@ -99,7 +99,8 @@ authorities and are joined by canonical model ID for presentation.
 
 Cancellation is cooperative and identity-safe. Before model-sync admission it interrupts the
 request; after sync is admitted it sends a model-addressed cancellation that ACN resolves to the
-exact ICN download occurrence. ICN preserves package work required by other occurrences. After residency admission
+current ICN catalog-installation occurrence. ICN preserves private package work required by other
+occurrences. After residency admission
 it detaches this setup waiter and does not stop the shared
 Instance. Completing onboarding cannot be cancelled.
 

@@ -1,18 +1,19 @@
 import { Fragment, type ReactNode } from "react"
 import { Button } from "@/components/ui/button"
-import { Progress } from "@/components/ui/progress"
 import { Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
 import { AlertTriangle, Cpu, HardDrive, Loader2, X } from "lucide-react"
 import {
   formatLocalModelDisplayName,
-  modelDownloadFailureMessage,
   onboardingModelSetupNoticeMessage,
   rankedLocalModelOptions,
   LOCAL_MODEL_RANKING_SCALE_INTERVALS,
   LOCAL_MODEL_RANKING_SCALE_LABELS,
   LOCAL_MODEL_RANKING_SCALE_VALUES,
+  localModelSpeculativeMethodLabel,
+  localModelStorageBytes,
   localModelRankingScaleIndex,
+  modelDownloadFailureMessage,
   targetPhysicalMemoryBytes,
   type useOnboardingModelSetup,
 } from "@magnitudedev/client-common"
@@ -20,7 +21,6 @@ import {
   acquisitionFailure,
   acquisitionProgress,
   type LocalModel,
-  type LocalModelDiscoveryProgressStep,
 } from "@magnitudedev/sdk"
 import {
   formatBytes,
@@ -31,94 +31,18 @@ import {
 } from "./local-inference-format"
 type Setup = ReturnType<typeof useOnboardingModelSetup>
 
-const formatDurationMs = (durationMs: number): string =>
-  durationMs < 1_000
-    ? `${(durationMs / 1_000).toFixed(1)}s`
-    : durationMs < 60_000
-      ? `${Math.round(durationMs / 1_000)}s`
-      : `${Math.floor(durationMs / 60_000)}m ${Math.round(
-          (durationMs % 60_000) / 1_000
-        )}s`
-
-const preparationLabel = (
-  step: LocalModelDiscoveryProgressStep,
-  completed: boolean
-): string => {
-  if (step.id === "hardware") {
-    return completed ? "Detected hardware" : "Detecting hardware"
-  }
-  if (step.id === "inventory") {
-    if (!completed) return "Checking downloaded models"
-    const count = Option.getOrElse(step.completedItems, () => 0)
-    return `Found ${count} downloaded ${count === 1 ? "model" : "models"}`
-  }
-  if (step.id === "assessment") {
-    if (!completed) return "Assessing models for this machine"
-    const count = Option.getOrElse(step.completedItems, () => 0)
-    return `Assessed ${count} models for this machine`
-  }
-  if (!completed) return "Ranking models"
-  const count = Option.getOrElse(step.completedItems, () => 0)
-  return `Ranked ${count} models`
-}
-
-const preparationMetadata = (
-  step: LocalModelDiscoveryProgressStep
-): string | null => {
-  if (step.status._tag === "Failed") return step.status.failure.message
-  if (step.status._tag === "Completed") {
-    return step.id === "assessment" && !step.status.cached
-      ? `Completed in ${formatDurationMs(step.status.durationMs)}`
-      : null
-  }
-  if (step.status._tag !== "Running") return null
-  const count =
-    step.id === "assessment"
-      ? Option.match(step.totalItems, {
-          onNone: () => null,
-          onSome: (total) =>
-            Option.match(step.completedItems, {
-              onNone: () => `${total} models`,
-              onSome: (completed) => `${completed} of ${total} models`,
-            }),
-        })
-      : null
-  const estimate = Option.match(step.estimatedRemainingMs, {
-    onNone: () => null,
-    onSome: (remainingMs) =>
-      `About ${formatDurationMs(remainingMs)} remaining`,
-  })
-  return [count, estimate].filter((value) => value !== null).join(" · ") || null
-}
-
-const preparationFraction = (
-  step: LocalModelDiscoveryProgressStep
-): number | null => {
-  if (step.status._tag !== "Running") return null
-  return Option.match(
-    Option.all({
-      completed: step.completedItems,
-      total: step.totalItems,
-    }),
-    {
-      onNone: () => null,
-      onSome: ({ completed, total }) =>
-        total <= 0 ? null : Math.max(0, Math.min(1, completed / total)),
-    }
-  )
-}
 const ModelSummary = ({ model }: { model: LocalModel }): ReactNode => {
   const context = modelContextLength(model)
+  const speculativeMethod = Option.getOrNull(localModelSpeculativeMethodLabel(model))
+  const storageBytes = Option.getOrNull(localModelStorageBytes(model))
   return (
     <div className="model-meta-row">
       <span>
         <HardDrive size={13} />
-        {formatBytes(model.downloadBytes)}
+        {storageBytes === null ? "Size pending" : formatBytes(storageBytes)}
       </span>
       {context !== null && <span>{formatContext(context)} context</span>}
-      {model.bundle._tag === "SpeculativeDecoding" && (
-        <span>{model.bundle.method._tag} speculative decoding</span>
-      )}
+      {speculativeMethod !== null && <span>{speculativeMethod} speculative decoding</span>}
     </div>
   )
 }
@@ -140,10 +64,14 @@ export function LocalModelOnboarding({
   const operationModel = operation?.model ?? null
   const transfer = operationModel === null
     ? null
-    : acquisitionProgress(operationModel.acquisitionState) ?? null
+    : operationModel._tag === "Catalog"
+      ? acquisitionProgress(operationModel.acquisitionState) ?? null
+      : null
   const transferFailure = operationModel === null
     ? undefined
-    : acquisitionFailure(operationModel.acquisitionState)
+    : operationModel._tag === "Catalog"
+      ? acquisitionFailure(operationModel.acquisitionState)
+      : undefined
   const operationFailure =
     (operation?._tag === "Loading" && operation.status._tag === "Failed"
       ? operation.status.failure.message
@@ -151,21 +79,6 @@ export function LocalModelOnboarding({
     (transferFailure !== undefined
       ? modelDownloadFailureMessage(transferFailure)
       : null)
-  const preparationStep =
-    content._tag === "Preparation"
-      ? content.progress.find((step) => step.status._tag === "Failed") ??
-        content.progress.find((step) => step.status._tag === "Running") ??
-        [...content.progress]
-          .reverse()
-          .find((step) => step.status._tag === "Completed") ??
-        null
-      : null
-  const preparationProgress =
-    preparationStep === null ? null : preparationFraction(preparationStep)
-  const completedPreparation =
-    content._tag === "Preparation"
-      ? content.progress.filter((step) => step.status._tag === "Completed")
-      : []
   const rankedOptions = content._tag === "Chooser" && hardware !== null
       ? rankedLocalModelOptions(content.options, {
         fastToSmart: content.rankingControls.fastToSmart,
@@ -232,58 +145,20 @@ export function LocalModelOnboarding({
             className="mt-7 max-w-[720px] border-t border-slate-200 pt-6 dark:border-slate-800"
           >
             <div className="flex items-start gap-3.5">
-              {content.discoveryFailure || preparationStep?.status._tag === "Failed" ? (
-                <AlertTriangle
-                  className="mt-0.5 shrink-0 text-red-600 dark:text-red-400"
-                  size={20}
-                />
-              ) : (
-                <Loader2
-                  className="mt-0.5 shrink-0 animate-spin text-blue-700 motion-reduce:animate-none dark:text-blue-500"
-                  size={20}
-                />
-              )}
+              <Loader2
+                className="mt-0.5 shrink-0 animate-spin text-blue-700 motion-reduce:animate-none dark:text-blue-500"
+                size={20}
+              />
               <div className="min-w-0 flex-1">
                 <span className="block text-[10px] font-semibold uppercase tracking-[0.09em] text-slate-500">
                   Preparing local models
                 </span>
                 <h2 className="mt-1 text-[17px] font-semibold leading-6 text-slate-900 dark:text-slate-200">
-                  {preparationStep === null
-                    ? "Reading local inference state"
-                    : preparationLabel(
-                        preparationStep,
-                        preparationStep.status._tag === "Completed"
-                      )}
+                  Reconciling local models
                 </h2>
                 <p className="mt-1 text-[12px] leading-5 text-slate-600 dark:text-slate-400">
-                  {content.discoveryFailure?.message ??
-                    (preparationStep === null
-                      ? "Waiting for hardware and model inventory."
-                      : preparationMetadata(preparationStep) ??
-                        "Hardware detection and model assessment run locally.")}
+                  Checking the model catalog and installed Hugging Face cache entries.
                 </p>
-                {preparationStep !== null && preparationProgress !== null && (
-                  <div className="mt-3 flex max-w-[480px] items-center gap-3">
-                    <Progress
-                      aria-label={preparationLabel(preparationStep, false)}
-                      value={Math.round(preparationProgress * 100)}
-                      className="min-w-0 flex-1"
-                      trackClassName="h-1.5 rounded-full bg-slate-200 dark:bg-slate-800"
-                      indicatorClassName="rounded-full bg-blue-700 duration-150 motion-reduce:transition-none dark:bg-blue-500"
-                    />
-                    <span className="w-9 text-right font-mono text-[11px] tabular-nums text-slate-500">
-                      {Math.round(preparationProgress * 100)}%
-                    </span>
-                  </div>
-                )}
-                {completedPreparation.length > 0 &&
-                  preparationStep?.status._tag !== "Completed" && (
-                    <p className="mt-3 text-[11px] leading-5 text-slate-500">
-                      {completedPreparation
-                        .map((step) => preparationLabel(step, true))
-                        .join(" · ")}
-                    </p>
-                  )}
               </div>
             </div>
           </section>

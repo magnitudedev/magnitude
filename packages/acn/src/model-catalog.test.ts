@@ -36,8 +36,7 @@ const offering = (
 })
 
 const local = (overrides: Partial<LocalModelsState> = {}): LocalModelsState => ({
-  inventoryState: { _tag: "Ready" },
-  discoveryState: { _tag: "Ready", progress: [] },
+  reconciliationComplete: true,
   models: [],
   ...overrides,
 })
@@ -48,7 +47,7 @@ describe("ACN model catalog projection", () => {
       _tag: "Refreshing",
       providers: [],
       models: [],
-      localInventoryState: { _tag: "Ready" },
+      localModelsReconciliationComplete: true,
     })
   })
 
@@ -87,7 +86,7 @@ describe("ACN model catalog projection", () => {
     }])
   })
 
-  it("retains valid rows and exposes local projection degradation", () => {
+  it("retains valid rows while local reconciliation is incomplete", () => {
     const providers: ProviderModelCatalogState = {
       _tag: "Ready",
       providers: [{
@@ -99,15 +98,13 @@ describe("ACN model catalog projection", () => {
       }],
       models: [offering(remoteProviderId, "remote-model")],
     }
-    const failure = { code: "inventory_unavailable", message: "inventory unavailable", retryable: true }
-
     const result = projectModelCatalog(providers, local({
-      inventoryState: { _tag: "Degraded", failure },
+      reconciliationComplete: false,
     }))
 
-    expect(result._tag).toBe("Degraded")
-    if (result._tag !== "Degraded") return
+    expect(result._tag).toBe("Refreshing")
+    if (result._tag !== "Refreshing") return
     expect(result.models).toHaveLength(1)
-    expect(result.failures).toContainEqual({ _tag: "CatalogFailure", message: failure.message })
+    expect(result.failures).toEqual([])
   })
 })

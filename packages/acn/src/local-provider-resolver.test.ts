@@ -15,10 +15,6 @@ describe("local provider model resolution", () => {
       list: Effect.succeed([offering]),
       changes: Stream.never,
       catalog: Effect.succeed([]),
-      state: Effect.succeed({
-        entries: [],
-        failure: Option.none(),
-      }),
       catalogChanges: Stream.never,
       resolve: (requested) => requested === providerModelId
         ? Effect.succeed(offering)

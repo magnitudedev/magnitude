@@ -2,7 +2,7 @@ import { Effect } from "effect"
 import { Group, Mutation } from "@magnitudedev/effect-query"
 import {
   ProviderIdSchema,
-  type ProviderModelId,
+  type CatalogFormModelId,
   type SlotId,
   type SlotSelection,
 } from "@magnitudedev/sdk"
@@ -10,7 +10,7 @@ import { ModelSlots } from "../model-slots/service"
 import { LocalModels } from "./service"
 
 export interface SelectLocalModelInput {
-  readonly modelId: ProviderModelId
+  readonly modelId: CatalogFormModelId
   readonly slotId: SlotId
   readonly reasoningEffort: SlotSelection["reasoningEffort"]
 }

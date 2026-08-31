@@ -1,8 +1,7 @@
-import { Data, Effect } from "effect"
+import { Option } from "effect"
 import type {
-  FitsModelAssessment,
+  GenerationPerformanceSamples,
   LocalModelRankingScores,
-  RecommendableModel,
   ServingProfile,
 } from "@magnitudedev/acn-protocol"
 
@@ -11,17 +10,11 @@ const LINEAR_SPEED_SCORE_LIMIT = 40
 const SPEED_SCORE_CEILING = 100
 
 export interface LocalModelRankingCandidate {
-  readonly model: RecommendableModel
+  readonly intelligenceScore: number
+  readonly fidelityRank: number
   readonly profile: ServingProfile
-  readonly assessment: FitsModelAssessment
+  readonly performance: GenerationPerformanceSamples
 }
-
-export class LocalModelRankingSampleMissing extends Data.TaggedError(
-  "LocalModelRankingSampleMissing",
-)<{
-  readonly modelId: string
-  readonly contextTokens: number
-}> {}
 
 const clamp01 = (value: number): number => Math.max(0, Math.min(1, value))
 
@@ -36,22 +29,17 @@ export const normalizedModelSpeedScore = (tokensPerSecond: number): number => {
 
 export const modelRankingScores = (
   candidate: LocalModelRankingCandidate,
-): Effect.Effect<LocalModelRankingScores, LocalModelRankingSampleMissing> => {
+): Option.Option<LocalModelRankingScores> => {
   const comparisonContext = Math.min(
     COMPARISON_CONTEXT_LENGTH,
     candidate.profile.contextLength,
   )
-  const generation = candidate.assessment.performance.find(({ contextTokens }) =>
+  const generation = candidate.performance.find(({ contextTokens }) =>
     contextTokens === comparisonContext)
-  if (generation === undefined) {
-    return Effect.fail(new LocalModelRankingSampleMissing({
-      modelId: candidate.model.modelId,
-      contextTokens: comparisonContext,
-    }))
-  }
-  return Effect.succeed({
-    intelligence: clamp01(candidate.model.intelligence.score / 100),
+  if (generation === undefined) return Option.none()
+  return Option.some({
+    intelligence: clamp01(candidate.intelligenceScore / 100),
     speed: normalizedModelSpeedScore(generation.estimatedTokensPerSecond),
-    fidelity: clamp01(candidate.model.fidelityRank / 100),
+    fidelity: clamp01(candidate.fidelityRank / 100),
   })
 }

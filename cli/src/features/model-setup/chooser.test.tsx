@@ -3,11 +3,16 @@ import { testRender } from "@opentui/react/test-utils"
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
-import { ProviderModelIdSchema, type ProviderModelId } from "@magnitudedev/sdk"
+import {
+  CatalogFormModelIdSchema,
+  HuggingFaceFormModelIdSchema,
+  type ProviderModelId,
+} from "@magnitudedev/sdk"
 import {
   makeAcquiringModel,
   makeCatalogModel,
   makeHardware,
+  makeInstalledCatalogModel,
   makeModel,
   makeView,
 } from "../local-inference/test-fixtures"
@@ -38,7 +43,7 @@ const makeRankedCatalogModel = (
   if (model.servingState._tag !== "Assessed") throw new Error("catalog fixture must be assessed")
   return {
     ...model,
-    modelId: ProviderModelIdSchema.make(id),
+    modelId: CatalogFormModelIdSchema.make(`${id}:gguf:q4`),
     presentation: { ...model.presentation, displayName },
     servingState: { ...model.servingState, rankingScores: Option.some(rankingScores) },
   }
@@ -684,7 +689,9 @@ describe("onboarding model chooser identity", () => {
 
   it("shows exact hidden-model counts above and below an overflowing local list", async () => {
     const options = Array.from({ length: 20 }, (_, index) => {
-      const base = makeModel({ modelId: ProviderModelIdSchema.make(`local-${index + 1}`) })
+      const base = makeModel({
+        modelId: HuggingFaceFormModelIdSchema.make(`hf:test/local-${index + 1}/model.gguf`),
+      })
       return {
         id: `installed:${index + 1}`,
         kind: "stored" as const,
@@ -807,7 +814,7 @@ describe("onboarding model chooser identity", () => {
   })
 
   it("shows update as the model-level action when an installed model is stale", () => {
-    const installed = makeModel()
+    const installed = makeInstalledCatalogModel()
     if (installed.acquisitionState._tag !== "Installed") {
       throw new Error("installed fixture must be installed")
     }

@@ -2,12 +2,13 @@ import { Cause, Data, Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
 import type {
   LocalModel,
-  LocalModelDiscoveryProgressStep,
+  ModelAcquisitionFailure,
   LocalModelsState,
-  ModelDownloadFailure,
+  ModelFailure,
   ModelInstanceFailure,
   ModelResidency,
   ModelSlotsState,
+  ModelId,
   ProviderModelId,
   SlotSelection,
 } from "@magnitudedev/sdk"
@@ -46,14 +47,14 @@ export class OnboardingModelSetupCancellationUnavailable extends Data.TaggedErro
 export class OnboardingModelChoiceRejected extends Data.TaggedError(
   "OnboardingModelChoiceRejected",
 )<{
-  readonly modelId: ProviderModelId
+  readonly modelId: ModelId
   readonly reason: "missing" | "unresolved" | "ineligible"
 }> {}
 
 export class OnboardingModelResourceChanged extends Data.TaggedError(
   "OnboardingModelResourceChanged",
 )<{
-  readonly modelId: ProviderModelId
+  readonly modelId: ModelId
   readonly resource: "installation" | "instance"
 }> {}
 
@@ -64,7 +65,8 @@ export class OnboardingModelSetupObservationFailed extends Data.TaggedError(
 export type OnboardingModelSetupFailure =
   | OnboardingModelChoiceRejected
   | OnboardingModelResourceChanged
-  | ModelDownloadFailure
+  | ModelFailure
+  | ModelAcquisitionFailure
   | ModelInstanceFailure
   | LocalModelsInstallError
   | LocalModelsCancelError
@@ -126,25 +128,20 @@ export type OnboardingModelSetupOperation =
   | {
       readonly _tag: "Loading"
       readonly model: LocalModel
-      readonly modelId: ProviderModelId
+      readonly modelId: ModelId
       readonly providerModelId: ProviderModelId
       readonly status: OnboardingModelLoadStatus
     }
   | {
       readonly _tag: "Completing"
       readonly model: LocalModel
-      readonly modelId: ProviderModelId
+      readonly modelId: ModelId
       readonly providerModelId: ProviderModelId
     }
 
 export type OnboardingModelSetupContent =
   | {
       readonly _tag: "Preparation"
-      readonly progress: readonly LocalModelDiscoveryProgressStep[]
-      readonly discoveryFailure: Extract<
-        LocalModelsState["discoveryState"],
-        { readonly _tag: "Failed" }
-      >["failure"] | null
     }
   | {
       readonly _tag: "Chooser"
@@ -155,14 +152,14 @@ export type OnboardingModelSetupContent =
   | {
       readonly _tag: "Harness"
       readonly model: LocalModel
-      readonly modelId: ProviderModelId
+      readonly modelId: ModelId
       readonly providerModelId: ProviderModelId
       readonly destinations: ReadonlyArray<HarnessDestination>
     }
   | {
       readonly _tag: "ApplyingHarness"
       readonly model: LocalModel
-      readonly modelId: ProviderModelId
+      readonly modelId: ModelId
       readonly harness: HarnessId
     }
   | {
@@ -184,13 +181,13 @@ export type OnboardingModelSetupExecution =
   | {
       readonly _tag: "Preparing" | "Installing" | "Configuring"
       readonly option: LocalModelOption
-      readonly modelId: ProviderModelId
+      readonly modelId: ModelId
       readonly cancelling: boolean
     }
   | {
       readonly _tag: "Loading"
       readonly option: LocalModelOption
-      readonly modelId: ProviderModelId
+      readonly modelId: ModelId
       readonly providerModelId: ProviderModelId
       readonly selection: SlotSelection
       readonly cancelling: boolean
@@ -198,7 +195,7 @@ export type OnboardingModelSetupExecution =
   | {
       readonly _tag: "Completing"
       readonly option: LocalModelOption
-      readonly modelId: ProviderModelId
+      readonly modelId: ModelId
       readonly providerModelId: ProviderModelId
     }
 
@@ -244,20 +241,7 @@ export const projectOnboardingModelSetupContent = (
   rankingControls: OnboardingModelRankingControls,
 ): OnboardingModelSetupContent => {
   if (Option.isNone(attempt)) {
-    if (models.discoveryState._tag === "Loading") {
-      return {
-        _tag: "Preparation",
-        progress: models.discoveryState.progress,
-        discoveryFailure: null,
-      }
-    }
-    if (models.discoveryState._tag === "Failed") {
-      return {
-        _tag: "Preparation",
-        progress: models.discoveryState.progress,
-        discoveryFailure: models.discoveryState.failure,
-      }
-    }
+    if (!models.reconciliationComplete) return { _tag: "Preparation" }
     return {
       _tag: "Chooser",
       options: localModelOptions(models, slots),

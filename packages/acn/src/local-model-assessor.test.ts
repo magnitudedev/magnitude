@@ -1,244 +1,144 @@
-import { Deferred, Effect, Layer, Option, Stream, SubscriptionRef } from "effect"
 import { describe, expect, it } from "vitest"
+import { Effect, Stream } from "effect"
+import { ModelIdSchema } from "@magnitudedev/acn-protocol"
+import type { AssessModelsEvent, CatalogModel } from "@magnitudedev/icn-protocol/schemas"
 import {
-  AssessmentEnvironmentIdSchema,
-  LocalModelMutationFailed,
-  ModelFileIdSchema,
-  ModelPackageIdSchema,
-  ModelReleaseDateSchema,
-  type ModelPackageEntry,
-} from "@magnitudedev/acn-protocol"
-import { IcnHardware, IcnModels } from "@magnitudedev/icn"
-import { LocalModelAssessments } from "./local-model-assessments"
-import { LocalModelAssessor, LocalModelAssessorLive } from "./local-model-assessor"
-import { LocalModelCatalogAdapterLive } from "./local-model-catalog-adapter"
-import { LocalModelPackages } from "./local-model-packages"
+  catalogAssessmentDemands,
+  consumeAssessmentEvents,
+  type AssessmentExpectation,
+  type CoordinatedLocalModelAssessment,
+} from "./local-model-assessor"
+import type { LocalModelSourcesState } from "./local-model-sources"
 
-describe("LocalModelAssessor", () => {
-  it("correlates native evidence to authored configuration without reassessing unchanged evidence", async () => {
-    let assessmentCalls = 0
-    const assessmentRequestCounts: number[] = []
+const ready = {
+  profile: { contextLength: 32_768 },
+  metadata: {},
+  capabilities: {},
+} as never
 
-    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const firstAssessmentStarted = yield* Deferred.make<void>()
-      const releaseFirstAssessment = yield* Deferred.make<void>()
-      const packageId = ModelPackageIdSchema.make("package-test")
-      const modelPackage = {
-        id: packageId,
-        source: { _tag: "Local" as const, path: "/models/test.gguf" },
-        files: [{
-          id: ModelFileIdSchema.make("file-test"),
-          path: "test.gguf",
-          role: "weights" as const,
-          sizeBytes: 1,
-          tensorStorageBytes: Option.none(),
-          sha256: "a".repeat(64),
-        }],
-        relationships: [],
-        properties: {
-          format: "gguf",
-          quantization: "Q4_K_M",
-          quantizationName: "4-bit",
-          architecture: "test",
-          maximumContextLength: Option.some(32_768),
-          intrinsicModelId: Option.none(),
-          intrinsicQualityId: Option.none(),
-        },
-      }
-      const packageEntry: ModelPackageEntry = {
-        package: modelPackage,
-        localState: { _tag: "Installed", path: "/models/test.gguf", origin: "Magnitude" },
-        inspection: {
-          _tag: "Inspected",
-          capabilities: {
-            vision: false,
-            tools: true,
-            structuredOutput: true,
-            reasoning: { supported: false, efforts: [], defaultEffort: Option.none() },
-          },
-        },
-        catalogAttribution: { _tag: "NotCatalogTarget" },
-      }
-      let packageState = { inventory: { _tag: "Ready" as const }, entries: [packageEntry], downloads: [] }
-      const packageStateRef = yield* SubscriptionRef.make(packageState)
-      const configuration = {
-        bundle: { _tag: "Standalone" as const, package: modelPackage },
-        profile: { contextLength: 32_768 },
-      }
-      const configurationWithSameMaterialIdentity = {
-        ...configuration,
-        bundle: {
-          _tag: "Standalone" as const,
-          package: {
-            ...modelPackage,
-            properties: {
-              ...modelPackage.properties,
-              quantizationName: "alternate authored configuration",
-            },
-          },
-        },
-      }
-      const catalogModel = (id: string, desiredConfiguration: typeof configuration) => ({
-        id: `${id}:gguf:q4`,
-        modelId: id,
-        variantId: "gguf:q4",
-        desiredConfiguration,
-        localState: { _tag: "NotInstalled" as const },
-        displayName: "Test",
-        variantLabel: "Q4",
-        description: "Test",
-        releaseDate: ModelReleaseDateSchema.make("2026-01-01"),
-        license: "test",
-        capabilities: packageEntry.inspection._tag === "Inspected"
-          ? packageEntry.inspection.capabilities
-          : undefined,
-        parameterization: { architecture: "dense" as const, totalParameters: 8_000_000_000 },
-        intelligence: {
-          score: 1,
-          provenance: {
-            kind: "artificialAnalysisIntelligenceIndex",
-            methodologyVersion: "test",
-            asOfDate: "2026-01-01",
-            url: "https://example.com/model",
-          },
-        },
-        fidelityRank: 1,
-        quantizationAware: false,
-      })
-      const modelState = {
-        revision: 1,
-        reconciliationComplete: true,
-        models: [
-          catalogModel("recommendable-test", configuration),
-          catalogModel("same-material-test", configurationWithSameMaterialIdentity),
-        ] as never,
-        diagnostics: [],
-      }
-      const modelStateRef = yield* SubscriptionRef.make(modelState)
-      const dependencies = Layer.mergeAll(
-        Layer.succeed(IcnModels, IcnModels.of({
-          get: SubscriptionRef.get(modelStateRef).pipe(
-            Effect.map((state) => ({ revision: state.revision, state })),
-          ),
-          changes: modelStateRef.changes.pipe(
-            Stream.map((state) => ({ revision: state.revision, state })),
-          ),
-          initialized: Effect.succeed(true),
-          refresh: Effect.void,
-        })),
-        Layer.succeed(IcnHardware, IcnHardware.of({
-          get: Effect.succeed({
-            revision: 1,
-            state: {
-              native_build: "native-build-test",
-              topology_fingerprint: "topology-test",
-              system_memory: { physical_capacity_bytes: 64, assess_reserve_bytes: 8 },
-              enabled_backends: ["cpu"],
-            },
-          } as never),
-          changes: Stream.never,
-          initialized: Effect.succeed(true),
-          refresh: Effect.void,
-          assessmentChanges: Stream.never,
-        })),
-        Layer.succeed(LocalModelPackages, LocalModelPackages.of({
-          initialized: Effect.succeed(true),
-          state: SubscriptionRef.get(packageStateRef),
-          changes: packageStateRef.changes,
-          installedPackageIds: Effect.succeed(new Set([packageId])),
-          refresh: Effect.void,
-        })),
-        Layer.succeed(LocalModelAssessments, LocalModelAssessments.of({
-          assess: (requests, onResult) => Effect.gen(function* () {
-            assessmentCalls += 1
-            assessmentRequestCounts.push(requests.length)
-            if (assessmentCalls === 1) {
-              yield* Deferred.succeed(firstAssessmentStarted, undefined)
-              yield* Deferred.await(releaseFirstAssessment)
-            }
-            if (assessmentCalls === 3) {
-              return yield* new LocalModelMutationFailed({
-                code: "planner_unavailable",
-                message: "Planning worker stopped",
-                retryable: true,
-              })
-            }
-            yield* Effect.forEach(requests, (_, index) => onResult(index, {
-              _tag: "Assessed",
-              environmentId: AssessmentEnvironmentIdSchema.make("environment-test"),
-              assessments: [{
-                _tag: "Incompatible",
-                configuration,
-                failure: {
-                  code: "unsupported_architecture",
-                  message: "Unsupported architecture",
-                  retryable: false,
-                },
-              }],
-            }), { discard: true })
-          }),
-        })),
-      )
-      const testLayer = LocalModelAssessorLive.pipe(
-        Layer.provide(LocalModelCatalogAdapterLive.pipe(Layer.provideMerge(dependencies))),
-        Layer.provide(dependencies),
-      )
+const state = (localState: CatalogModel["localState"]): LocalModelSourcesState => ({
+  catalogRevision: 7,
+  discoveryRevision: 3,
+  reconciliationComplete: true,
+  catalogModels: [{
+    id: ModelIdSchema.make("model:gguf:q4") as never,
+    source: { desired: ready, localState } as unknown as Omit<CatalogModel, "id">,
+  }],
+  discoveredModels: [],
+})
 
-      yield* Effect.gen(function* () {
-        const assessor = yield* LocalModelAssessor
-        yield* Deferred.await(firstAssessmentStarted)
-        expect((yield* assessor.snapshot).lifecycle).toMatchObject({
-          _tag: "Assessing",
-          cycle: { completedTargets: 0, totalTargets: 2 },
-        })
-        packageState = {
-          ...packageState,
-          entries: [{ ...packageEntry, inspection: { _tag: "Pending" as const } }],
-        }
-        yield* SubscriptionRef.set(packageStateRef, packageState)
-        yield* Deferred.succeed(releaseFirstAssessment, undefined)
-        yield* Effect.sleep("150 millis")
-        expect(assessmentCalls).toBe(2)
-        expect(assessmentRequestCounts).toEqual([1, 1])
-        expect((yield* assessor.snapshot).lifecycle).toMatchObject({
-          _tag: "Ready",
-          cycle: { completedTargets: 2, totalTargets: 2 },
-        })
-        const initialState = (yield* assessor.snapshot).assessments
-        expect(initialState).toHaveLength(2)
-        expect(initialState[0]?.configuration).toEqual(configuration)
-        expect(initialState[0]?.assessment).toEqual({
-          _tag: "Incompatible",
-          environmentId: AssessmentEnvironmentIdSchema.make("environment-test"),
-          failure: {
-            code: "unsupported_architecture",
-            message: "Unsupported architecture",
-            retryable: false,
-          },
-        })
-        yield* SubscriptionRef.set(packageStateRef, packageState)
-        yield* SubscriptionRef.set(packageStateRef, packageState)
-        yield* Effect.sleep("100 millis")
+describe("catalog assessment demand", () => {
+  it("assesses desired material for an uninstalled catalog model", () => {
+    expect(catalogAssessmentDemands(state({ _tag: "NotInstalled" }))).toMatchObject([
+      { selection: "Desired", requestId: "catalog-7-0" },
+    ])
+  })
 
-        expect(assessmentCalls).toBe(2)
-        expect((yield* assessor.snapshot).assessments[0]?.assessment._tag)
-          .toBe("Incompatible")
+  it("assesses the effective installed material rather than desired update material", () => {
+    expect(catalogAssessmentDemands(state({
+      _tag: "Installed",
+      effective: { _tag: "Ready", model: ready },
+      installation: {} as never,
+      updateState: { _tag: "Available", requiredDownloadBytes: 1 },
+    }))).toMatchObject([{ selection: "Effective" }])
+  })
 
-        packageState = { ...packageState, entries: [packageEntry] }
-        yield* SubscriptionRef.set(packageStateRef, packageState)
-        yield* Effect.sleep("100 millis")
-        expect((yield* assessor.snapshot).lifecycle._tag).toBe("Failed")
+  it("does not assess an installed model that ICN says is unavailable", () => {
+    expect(catalogAssessmentDemands(state({
+      _tag: "Installed",
+      effective: { _tag: "Unavailable", failure: {
+        code: "invalid_artifact", message: "Invalid model", retryable: false,
+      } },
+      installation: {} as never,
+      updateState: { _tag: "Current" },
+    }))).toEqual([])
+  })
+})
 
-        yield* SubscriptionRef.set(modelStateRef, {
-          ...modelState,
-          revision: 2,
-          models: [] as never,
-        })
-        yield* Effect.sleep("100 millis")
-        const afterRemoval = yield* assessor.snapshot
-        expect(afterRemoval.lifecycle._tag).toBe("Ready")
-        expect(afterRemoval.assessments).toEqual([])
-      }).pipe(Effect.provide(testLayer))
-    })))
+const assessmentExpectation = (): AssessmentExpectation => ({
+  modelId: ModelIdSchema.make("model:gguf:q4"),
+  subject: { _tag: "Catalog", modelId: "model:gguf:q4", selection: "Desired" },
+  profiles: [{
+    profile: { contextLength: 32_768 },
+    performanceContextTokens: [25_000, 32_768],
+  }],
+})
+
+const failedResult = (): AssessModelsEvent => ({
+  _tag: "Result",
+  result: {
+    _tag: "Failed",
+    requestId: "request-1",
+    subject: { _tag: "Catalog", modelId: "model:gguf:q4", selection: "Desired" },
+    failure: { code: "native_failure", message: "native failure", retryable: false },
+  },
+})
+
+const assessmentEvents = (middle: readonly AssessModelsEvent[], completed = true): readonly AssessModelsEvent[] => [
+  { _tag: "Started", revision: 7, environmentId: "environment-1", totalTargets: 1 },
+  ...middle,
+  ...(completed
+    ? [{ _tag: "Completed", revision: 7, environmentId: "environment-1", totalTargets: 1 } as const]
+    : []),
+]
+
+describe("assessment stream correlation", () => {
+  const run = async (events: readonly AssessModelsEvent[]) => {
+    const published = new Map<string, CoordinatedLocalModelAssessment>()
+    await Effect.runPromise(consumeAssessmentEvents(
+      { events: Stream.fromIterable(events) },
+      7,
+      new Map([["request-1", assessmentExpectation()]]),
+      (modelId, value) => Effect.sync(() => { published.set(modelId, value) }),
+    ))
+    return published.get("model:gguf:q4")
+  }
+
+  it("accepts exactly correlated, explicitly completed results", async () => {
+    expect(await run(assessmentEvents([failedResult()]))).toEqual({
+      _tag: "Failed",
+      failure: { code: "native_failure", message: "native failure", retryable: false },
+    })
+  })
+
+  it("rejects duplicate results instead of trusting the first one", async () => {
+    expect(await run(assessmentEvents([failedResult(), failedResult()]))).toMatchObject({
+      _tag: "Failed",
+      failure: { code: "invalid_assessment_response" },
+    })
+  })
+
+  it("keeps a correlated result when the stream omits its completion event", async () => {
+    expect(await run(assessmentEvents([failedResult()], false))).toMatchObject({
+      _tag: "Failed",
+      failure: { code: "native_failure" },
+    })
+  })
+
+  it("rejects an echoed subject that does not match the request", async () => {
+    const event = failedResult()
+    if (event._tag !== "Result") throw new Error("test fixture must be a result")
+    expect(await run(assessmentEvents([{ ...event, result: {
+      ...event.result,
+      subject: { _tag: "Catalog", modelId: "other:gguf:q4", selection: "Desired" },
+    } }]))).toMatchObject({
+      _tag: "Failed",
+      failure: { code: "invalid_assessment_response" },
+    })
+  })
+
+  it("fails pending assessments when the ICN result stream stops making progress", async () => {
+    const published = new Map<string, CoordinatedLocalModelAssessment>()
+    await Effect.runPromise(consumeAssessmentEvents(
+      { events: Stream.never },
+      7,
+      new Map([["request-1", assessmentExpectation()]]),
+      (modelId, value) => Effect.sync(() => { published.set(modelId, value) }),
+      "10 millis",
+    ))
+    expect(published.get("model:gguf:q4")).toMatchObject({
+      _tag: "Failed",
+      failure: { code: "assessment_stream_failed", retryable: true },
+    })
   })
 })

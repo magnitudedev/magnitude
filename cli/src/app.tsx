@@ -312,14 +312,10 @@ function CliAppContent(
     setupActive: props.onboardingSetupOpen,
   });
 
-  const setupPreparation = (
-    progress: LocalModelsState["discoveryState"]["progress"],
-    error: string | null,
-  ) => ({
+  const setupPreparation = (error: string | null = null) => ({
     surface: (
       <OnboardingModelPreparation
         hardware={onboardingSetup.hardware}
-        progress={progress}
         error={error}
         width={chatColumnWidth}
       />
@@ -342,18 +338,7 @@ function CliAppContent(
       };
     }
     if (state.content._tag === "Preparation") {
-      const content = state.content;
-      const notice = Option.map(
-        state.notice,
-        onboardingModelSetupNoticeMessage,
-      );
-      return setupPreparation(
-        content.progress,
-        Option.getOrElse(
-          notice,
-          () => content.discoveryFailure?.message ?? null,
-        ),
-      );
+      return setupPreparation();
     }
     if (state.content._tag === "Harness") {
       return {
@@ -419,8 +404,10 @@ function CliAppContent(
       onSome: (operation) => {
         switch (operation._tag) {
           case "Preparing": {
-            const acquisition = operation.model.acquisitionState;
-            if (acquisition._tag !== "Installed") {
+            const acquisition = operation.model._tag === "Catalog"
+              ? operation.model.acquisitionState
+              : undefined;
+            if (acquisition !== undefined && acquisition._tag !== "Installed") {
               const starting = acquisition._tag !== "Installing";
               return chooser({
                 _tag: "Downloading",
@@ -442,7 +429,8 @@ function CliAppContent(
           case "Installing": return chooser({
             _tag: "Downloading",
             model: operation.model,
-            starting: operation.model.acquisitionState._tag === "NotInstalled",
+            starting: operation.model._tag === "Catalog"
+              && operation.model.acquisitionState._tag === "NotInstalled",
             cancelling: operation.cancelling,
             onCancel: cancelOnboardingModelSetup,
           }, `Downloading ${formatLocalModelDisplayName(operation.model)}…`);
@@ -479,8 +467,8 @@ function CliAppContent(
   const setupPresentation = !props.onboardingSetupOpen
     ? { surface: undefined, placeholder: null }
     : Result.match(onboardingSetup.view, {
-        onInitial: () => setupPreparation([], null),
-        onFailure: () => setupPreparation([], "Local model setup is unavailable."),
+        onInitial: () => setupPreparation(),
+        onFailure: () => setupPreparation("Local model setup is unavailable."),
         onSuccess: ({ value }) => setupWithState(value),
       });
   const setupSurface = setupPresentation.surface;

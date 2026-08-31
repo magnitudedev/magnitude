@@ -22,7 +22,7 @@ const exactProgressCopy = (progress: AcnStartupProgress): string => {
 }
 
 type ChildKey = "service-download" | "inference-download" | "previous-service"
-  | "local-inference" | "backend"
+  | "local-inference" | "backend" | "models"
 
 interface ChildPhase {
   readonly key: ChildKey
@@ -101,6 +101,13 @@ export const serviceStartupChildPhase = (state: AcnLifecycleState): ChildPhase |
         key: "local-inference",
         active: "Starting inference engine",
         completed: "Inference engine started",
+        progress: null,
+      }
+    case "DiscoveringLocalModels":
+      return {
+        key: "models",
+        active: "Discovering local models",
+        completed: "Local models discovered",
         progress: null,
       }
   }

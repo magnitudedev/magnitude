@@ -1,9 +1,13 @@
 use std::path::Path;
 
-use icn_contracts::{ContentId, ContentIdentity, ModelComponent, ModelId};
+use icn_contracts::{ContentId, ContentIdentity, InventoryEntryId, ModelComponent};
 use sha2::{Digest, Sha256};
 
-pub fn model_id(source_kind: &str, source_location: &Path, content_id: &ContentId) -> ModelId {
+pub fn inventory_entry_id(
+    source_kind: &str,
+    source_location: &Path,
+    content_id: &ContentId,
+) -> InventoryEntryId {
     let canonical = source_location
         .canonicalize()
         .unwrap_or_else(|_| source_location.to_path_buf());
@@ -14,7 +18,7 @@ pub fn model_id(source_kind: &str, source_location: &Path, content_id: &ContentI
     digest.update(canonical.to_string_lossy().as_bytes());
     digest.update(b"\0");
     digest.update(content_id.0.as_bytes());
-    ModelId(format!("mdl_{:x}", digest.finalize()))
+    InventoryEntryId(format!("mdl_{:x}", digest.finalize()))
 }
 
 pub fn content_id(components: &[ModelComponent]) -> ContentId {

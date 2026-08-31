@@ -145,6 +145,10 @@ The OpenAI model-list response retains the standard `data` array and also includ
 canonical model ID, the same `Model Name (Variant Label)` text shown by Magnitude, description,
 configured context window, input and tool capabilities, and reasoning effort domain and default.
 This extension is discovery metadata only and does not change model selection semantics.
+Runnable external Hugging Face models appear in both arrays under the exact canonical
+`hf:<owner>/<repository>/<artifact-selector>` identity. Path transport percent-encodes that whole
+identity where it occupies one URL segment; JSON bodies and model-list values do not encode or
+rewrite it.
 
 For a reserved alias, ACN removes any caller-supplied alias-echo header, rewrites only the request
 model to its canonical ID, removes caller credentials, installs private ICN authorization, and

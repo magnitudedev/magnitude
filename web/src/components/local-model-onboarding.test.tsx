@@ -3,18 +3,11 @@ import { Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
 import { describe, expect, it } from "vitest"
 import type { useOnboardingModelSetup } from "@magnitudedev/client-common"
-import type {
-  LocalModelDiscoveryProgressStep,
-  ModelFailure,
-} from "@magnitudedev/sdk"
 import { LocalModelOnboarding } from "./local-model-onboarding"
 
 type Setup = ReturnType<typeof useOnboardingModelSetup>
 
-const setupWithProgress = (
-  progress: readonly LocalModelDiscoveryProgressStep[],
-  discoveryFailure: ModelFailure | null = null
-): Setup => ({
+const preparingSetup = (): Setup => ({
   hardware: Result.initial(false),
   view: Result.success({
     _tag: "Open",
@@ -22,8 +15,6 @@ const setupWithProgress = (
     notice: Option.none(),
     content: {
       _tag: "Preparation",
-      progress,
-      discoveryFailure,
     },
   }),
   retry: () => {},
@@ -79,68 +70,13 @@ describe("LocalModelOnboarding preparation", () => {
     expect(html).not.toContain('aria-label="Memory budget"')
   })
 
-  it("shows the active authoritative step with count, ETA, and progress", () => {
+  it("shows the explicit reconciliation activity", () => {
     const html = renderToStaticMarkup(
-      <LocalModelOnboarding
-        setup={setupWithProgress([
-          {
-            id: "hardware",
-            status: {
-              _tag: "Completed",
-              startedAtMs: 0,
-              durationMs: 120,
-              cached: false,
-            },
-            completedItems: Option.none(),
-            totalItems: Option.none(),
-            estimatedRemainingMs: Option.none(),
-          },
-          {
-            id: "assessment",
-            status: { _tag: "Running", startedAtMs: 120 },
-            completedItems: Option.some(3),
-            totalItems: Option.some(12),
-            estimatedRemainingMs: Option.some(5_000),
-          },
-        ])}
-      />
+      <LocalModelOnboarding setup={preparingSetup()} />
     )
 
-    expect(html).toContain("Assessing models for this machine")
-    expect(html).toContain("3 of 12 models · About 5s remaining")
-    expect(html).toContain('aria-valuenow="25"')
-    expect(html).toContain("Detected hardware")
-    expect(html).not.toContain(">Hardware<")
-    expect(html).not.toContain(">Assessment<")
-  })
-
-  it("shows the exact discovery failure instead of indefinite activity", () => {
-    const failure: ModelFailure = {
-      code: "inventory_unavailable",
-      message: "Inventory database is unavailable",
-      retryable: true,
-    }
-    const setup = setupWithProgress(
-      [
-        {
-          id: "inventory",
-          status: {
-            _tag: "Failed",
-            startedAtMs: 0,
-            durationMs: 200,
-            failure,
-          },
-          completedItems: Option.none(),
-          totalItems: Option.none(),
-          estimatedRemainingMs: Option.none(),
-        },
-      ],
-      failure
-    )
-
-    const html = renderToStaticMarkup(<LocalModelOnboarding setup={setup} />)
-
-    expect(html).toContain("Inventory database is unavailable")
-    expect(html).toContain("Checking downloaded models")
+    expect(html).toContain("Reconciling local models")
+    expect(html).toContain("Checking the model catalog and installed Hugging Face cache entries.")
+    expect(html).toContain("animate-spin")
   })
 })

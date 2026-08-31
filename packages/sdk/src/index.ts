@@ -21,10 +21,7 @@ export {
   projectInferenceLoadPlan,
   projectInferenceResidency,
 } from "./inference-projection"
-export type {
-  ModelsResponse as InferenceModelsResponse,
-  ModelInstancesSnapshot as InferenceInstancesSnapshot,
-} from "@magnitudedev/icn-protocol/schemas"
+export type { ModelInstancesSnapshot as InferenceInstancesSnapshot } from "@magnitudedev/icn-protocol/schemas"
 
 export {
   AcnInstanceManager,

@@ -17,6 +17,7 @@ const option = (
   id: `${kind}:${modelId}`,
   kind,
   model: {
+    _tag: "Catalog",
     modelId: modelId as ProviderModelId,
     servingState: {
       _tag: "Assessed",

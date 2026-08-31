@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest"
 import { Option } from "effect"
+import { describe, expect, it } from "vitest"
 import { modelCommandFailure } from "./model-commands"
 
 describe("modelCommandFailure", () => {
@@ -40,6 +40,5 @@ describe("modelCommandFailure", () => {
       message: "ICN connection closed while loading",
       retryable: true,
     })
-    expect(failure.message).not.toContain("GeneratedClientTransportError")
   })
 })

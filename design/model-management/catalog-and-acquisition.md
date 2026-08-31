@@ -5,8 +5,8 @@ applies_to:
   - inference/crates/icn-models/**
   - inference/crates/icn-contracts/src/inventory.rs
   - inference/crates/icn-contracts/src/models.rs
-  - packages/icn/src/installed/**
-  - packages/icn/src/downloads/**
+  - packages/icn/src/models/**
+  - packages/icn/src/events/**
   - packages/acn/src/local-model-**
   - packages/acn-protocol/src/schemas/model-state.ts
 ---
@@ -38,6 +38,8 @@ represented upstream model or material named revision was first publicly release
 conversions, quantizations, quantization-aware packaging, and provider publication do not change
 that date; every artifact variant inherits the model declaration's date. Each entry publishes one exact default
 `ModelServingConfiguration`, required package components, presentation, and ranking evidence.
+Published catalog rows reduce package sources to deduplicated HTTPS repository links for product
+presentation; package coordinates and bundle structure remain private.
 Every active model carries one model-level intelligence assessment on a single declared Artificial
 Analysis Intelligence Index methodology version. A direct assessment records the observation date
 and canonical Artificial Analysis model URL. When no direct result exists, an estimate is a
@@ -96,7 +98,9 @@ historical success can make files present or absent.
 
 Magnitude-owned artifacts live in the configured `ManagedModelStore`. Explicit Hugging Face roots are
 read-only external sources with origin `HuggingFaceCache`; they are never moved, deleted, or adopted.
-Origin affects ownership-sensitive operations, not package identity or runtime eligibility.
+The standard environment-derived Hugging Face hub root remains configured even when absent at ICN
+startup, so an explicit later discovery refresh can observe a cache created during the same daemon
+lifetime. Origin affects ownership-sensitive operations, not package identity or runtime eligibility.
 
 Each repository in the Magnitude-owned store may contain any number of complete revision snapshots.
 Each snapshot directory names its immutable revision and contains links to installed
@@ -111,6 +115,32 @@ make only the affected package unavailable. Store mutations reconcile owned path
 quarantining conflicting nodes before writing; they never follow a conflicting link or overwrite an
 unclassified node. Explicit external Hugging Face roots retain their ordinary
 multi-revision layout and remain read-only.
+
+Each complete independently callable GGUF group in an external Hugging Face root is a discovered
+model candidate. A standalone file uses its repository-relative path as its artifact selector; a
+complete shard set uses its lexical first shard. Projectors and execution companions belong to the
+selected package and do not receive independent model identities. Metadata-only repositories,
+Safetensors-only repositories, and incomplete shard sets produce no discovered model.
+
+The canonical discovered identity is
+`hf:<owner>/<repository>/<artifact-selector>`. Its three semantic parts are parsed and validated;
+the identity never contains an inventory hash, absolute cache path, package ID, revision, or
+projector. Multiple quantizations therefore remain distinct when they occupy distinct repository
+paths. Quantization presentation comes from GGUF inspection rather than filename parsing.
+
+When several cached revisions or configured roots provide the same repository and selector, exact
+identical packages collapse. The candidate selected by the repository's cached `main` ref wins;
+without one, exactly one distinct candidate wins. Every other case is an explicit ambiguity and is
+not callable. Selection precedes inspection, so an invalid selected revision never falls back to a
+stale revision. An exact catalog target that is successfully attributed publishes only under its
+catalog identity; failed attribution remains visible through discovery so the installed artifact
+does not disappear from inventory.
+
+Inventory retains source occurrences by `InventoryEntryId` until this selection is complete.
+Package-content deduplication therefore never erases the repository, selector, root, revision, or
+current-ref evidence needed to form and select distinct `hf:` identities. Catalog package presence
+may collapse identical package content afterward, while ownership still reflects every retained
+physical occurrence.
 
 Temporary and `.incomplete` files never contribute presence. A partial multi-file package is not
 installed. A complete independently servable weights package may remain installed while an
@@ -135,33 +165,27 @@ servable artifacts.
 
 ## Downloads
 
-A client model-sync command — the CLI's `catalog pull` — carries only canonical model identity
-and converges that model to present-and-current: it is admitted from `NotInstalled`,
-`InstallFailed`, `UpdateAvailable`, or `UpdateFailed`, succeeds immediately as `AlreadyCurrent`
-for an installed, current model, and is rejected from removal states. ACN invokes ICN's existing
-catalog-install operation, which resolves the exact desired bundle. If every required package is installed, ICN
-returns `AlreadyInstalled`. Otherwise ICN creates one process-local `ModelDownload` with a stable
-`ModelDownloadId` and admits missing package work or joins equivalent work already owned by the
-same ICN process.
+A catalog installation command carries the complete catalog-form `ModelId` and converges that
+model to present-and-current. ICN admits one `CatalogInstallationOperation` or reports that the
+model is already current. The admitted occurrence retains the exact resolved private bundle and
+uses process-local download/package work internally; none of those internal identities crosses the
+ICN–ACN boundary.
 
 Admission validates each package in the requested bundle against the current materialized package
 record and that package's current exact file evidence. It does not await inventory-wide filesystem
 reconciliation. Global reconciliation remains the discovery path for external filesystem changes;
 it is never a prerequisite for acknowledging a known catalog download.
 
-The raw download occurrence retains its bundle and aggregates bounded progress and one terminal
-outcome. It does not retain ACN model identity. ACN records the exact `ModelDownloadId` returned
-for each admitted model sync and uses that causal correlation for projection and later commands.
-The admission receipt reports only whether work started or the model was already current; it
-never exposes the native download ID. A repeated sync while the model has active acquisition
-work is rejected as busy at the ACN command boundary; package attempts remain process-local ICN
-details. Equivalent model downloads may share active package work.
+The catalog installation occurrence retains `ModelId`, aggregates bounded progress, and has one
+terminal outcome. ACN observes and addresses that occurrence by `CatalogInstallationOperationId`.
+Equivalent operations may share private package work, but sharing never changes their public
+model identity or operation state.
 Caller interruption detaches that waiter without abandoning admitted work. Cancellation stops
 shared package work only when no other live occurrence depends on it. A retry creates a new
 occurrence. Restart ends all occurrences, attempt history, cancellation state, and failure
 dismissal.
 
-Progress is relative to the work admitted by that download occurrence. Its total is the byte size
+Progress is relative to the work admitted by that catalog installation occurrence. Its total is the byte size
 of missing packages whose attempts it owns or joins, and completed bytes come only from those
 attempts. Packages already installed at admission contribute neither baseline progress nor total.
 Consequently a first installation measures the whole missing bundle, while an update measures only
@@ -172,9 +196,9 @@ unavailable network, local storage failure, and corrupt content. Cancellation is
 terminal result. Structured facts, including required and available byte counts, cross boundaries
 without parsing diagnostic prose.
 
-Failure dismissal is process-local presentation state addressed by canonical model identity at the
-ACN boundary. ACN resolves it to the exact correlated download ID; ICN acknowledges only that raw
-occurrence.
+Failure acknowledgement is process-local presentation state on the exact catalog installation
+occurrence. ACN resolves a model-addressed user command to the current occurrence; raw download
+identity remains private.
 It does not alter the terminal result and does not survive restart.
 
 Downloads write only to temporary `.incomplete` paths until a component matches its expected size
@@ -198,20 +222,17 @@ Catalog and acquisition contribute catalog configurations, current package obser
 process-local download state to the [local-model product projection](./local-model-product-projection.md).
 They do not persist provider offerings or serving configurations.
 
-Every independently servable installed non-catalog package contributes a standalone row. Installed
-catalog targets are attributed to `CatalogIdentity` by the exact mapping defined in
+Every independently servable, unambiguous external Hugging Face artifact contributes a discovery
+row under its canonical `hf:` `ModelId`. Installed catalog targets are attributed to their complete
+catalog `ModelId` by the exact mapping defined in
 [Intrinsic catalog target mapping](./intrinsic-target-mapping.md). One catalog product row retains
-curated presentation, including its reviewed variant label, across target, repository, and drafter
-changes. A non-catalog row derives its variant label from inspected target-package quantization.
-Artifact format and inspection evidence are not copied into parallel product-presentation fields.
+curated presentation across target, repository, and drafter changes.
 
-Model installation addresses the existing canonical model ID; ICN resolves its internal
-`CatalogIdentity`, compares desired package IDs with current
-filesystem presence and exact package affiliations, acquires missing desired packages, and removes
-affiliated superseded packages after the desired bundle is complete. It does not materialize or
-persist configuration state. The response carries the deterministic local provider-model identity
-and, when work was admitted, the process-local download identity used for observation and
-cancellation.
+Model installation addresses the canonical catalog `ModelId`; ICN parses its base and variant
+components, compares desired package IDs with current filesystem presence and exact package
+affiliations, acquires missing desired packages, and removes affiliated superseded packages after
+the desired bundle is complete. The response exposes only the catalog installation occurrence and
+model-level progress/state.
 
 Superseded cleanup is an invariant of the authoritative installed set, not a task owned by the
 request that admitted a download. After an installed-set change is committed, one coalesced catalog
@@ -236,6 +257,13 @@ guessing. Interrupted deletion is represented by the files that remain and may b
 idempotently. Conservative garbage collection may remove blobs proven unreferenced. Runtime
 ownership rejects or waits for removal of files used by a live model instance.
 
+Catalog removal is serialized with installation admission. An active installation is rejected.
+Externally owned or shared dependencies are retained while a removable target and other exclusively
+owned material are removed; removal is retained as a whole only when a target itself is external or
+shared, because deleting it would either violate ownership or break another catalog model. Removing
+an eligible package removes every Magnitude-owned inventory occurrence of that package and preserves
+every external Hugging Face cache occurrence.
+
 Deleting artifacts does not delete slot selection, favorites, or recency. Those are user intent and
 may remain unresolved until the exact catalog configuration and required files are available again.
 
@@ -245,7 +273,8 @@ Operations that publish, replace, or remove files in the same managed repository
 may share in-flight hashing and inspection. Package download sharing and cancellation exist only
 within the owning ICN process.
 
-Startup derives inventory from current files and callable models from catalog.
+Startup derives inventory from current files and callable models from the catalog plus unambiguous,
+successfully inspected external Hugging Face artifacts.
 There is no model-state recovery epoch. Later explicit filesystem observations and product-owned
 artifact mutations update the same materialized derivation.
 
@@ -259,7 +288,8 @@ artifact mutations update the same materialized derivation.
 - Every active catalog model publishes exactly one finite, non-negative intelligence assessment
   with valid direct or estimated provenance on the catalog's declared Intelligence Index version.
 - Model intelligence and artifact-variant fidelity remain separate catalog authorities.
-- Installed packages without catalog attribution remain inventory and do not become callable models.
+- Independently callable external Hugging Face packages without catalog attribution publish under
+  their canonical `hf:` identity; other unattributed packages remain inventory only.
 - Installed inventory is derived without network access or hardware assessment.
 - Partial, unsafe, invalid, or digest-mismatched content is not installed.
 - Complete packages from multiple repository revisions may coexist until exact catalog affiliation
@@ -271,3 +301,5 @@ artifact mutations update the same materialized derivation.
 - Historical download completion never proves current presence.
 - Shared blobs are deleted only after current filesystem references prove them unreferenced.
 - Catalog failure cannot hide independently servable installed packages.
+- External Hugging Face artifacts cannot be installed, updated, or removed through Magnitude-owned
+  acquisition operations.

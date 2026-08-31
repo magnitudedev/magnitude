@@ -22,7 +22,7 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
 
 use crate::hugging_face::{require_requested_revision, revision_metadata_url};
-use crate::identity::{content_id, model_id};
+use crate::identity::{content_id, inventory_entry_id};
 use crate::inventory::{ManagedModelStore, build_model, hf_repo_dir, now, repository_lock_path};
 use crate::store_fs::{
     acquire_exclusive_lock, ensure_owned_directory as ensure_store_directory,
@@ -490,7 +490,7 @@ impl ManagedModelStore {
         let content_id = content_id(&components);
         let repo_root = self.config.root.join("hub").join(hf_repo_dir(&repository));
         let snapshot = repo_root.join("snapshots").join(&commit);
-        let model_id = model_id("magnitude-cache", &snapshot, &content_id);
+        let model_id = inventory_entry_id("magnitude-cache", &snapshot, &content_id);
         let total_bytes: u64 = components
             .iter()
             .map(|component| component.size_bytes)
@@ -1703,7 +1703,7 @@ fn watch_stream(receiver: watch::Receiver<ModelDownloadEvent>) -> DownloadEventS
     .boxed()
 }
 
-fn current_model_id(event: &ModelDownloadEvent) -> Option<icn_contracts::ModelId> {
+fn current_model_id(event: &ModelDownloadEvent) -> Option<icn_contracts::InventoryEntryId> {
     match event {
         ModelDownloadEvent::CheckingSpace { model_id, .. }
         | ModelDownloadEvent::Progress { model_id, .. } => Some(model_id.clone()),

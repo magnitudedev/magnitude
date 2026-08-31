@@ -341,20 +341,18 @@ export const ProviderModelCatalogLive: Layer.Layer<
 
   const state = Effect.zipWith(
     SubscriptionRef.get(current),
-    Effect.either(localOfferings.catalog),
+    localOfferings.catalog,
     (remote, local): ProviderModelCatalogState => {
       if (remote._tag === "Loading") return remote
       const remoteContents = contents(remote)
       const remoteModels = remoteContents.models.filter(({ providerId }) => providerId !== LOCAL_PROVIDER_ID)
-      const localModels = Either.isRight(local) ? local.right : []
       const failures = [
         ...remoteContents.failures.filter((failure) =>
           failure._tag !== "ProviderFailure" || failure.providerId !== LOCAL_PROVIDER_ID),
-        ...(Either.isLeft(local) ? [providerFailure(LOCAL_PROVIDER_ID, local.left.message)] : []),
       ]
       const fields = {
         providers: remoteContents.providers,
-        models: [...remoteModels, ...localModels],
+        models: [...remoteModels, ...local],
         failures,
       }
       if (remote._tag === "Refreshing") return { _tag: "Refreshing", ...fields }

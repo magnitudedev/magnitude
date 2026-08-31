@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest"
 import { Option } from "effect"
-import { makeModel, makeView } from "../local-inference/test-fixtures"
+import { makeInstalledCatalogModel, makeModel, makeView } from "../local-inference/test-fixtures"
 import { modelMenusLocalModelsStateEquivalent } from "./state"
 
 const withHeadroom = (
@@ -8,17 +8,19 @@ const withHeadroom = (
   insufficient: boolean,
 ) => {
   const model = makeModel()
-  if (model.servingState._tag !== "Assessed"
-    || model.servingState.assessment._tag !== "Fits") {
+  if (model.state.servingState._tag !== "Assessed"
+    || model.state.servingState.assessment._tag !== "Fits") {
     throw new Error("fixture must be an assessed fitting model")
   }
   return makeModel({
-    servingState: {
-      ...model.servingState,
-      assessment: {
-        ...model.servingState.assessment,
-        memory: {
-          ...model.servingState.assessment.memory,
+    state: {
+      ...model.state,
+      servingState: {
+        ...model.state.servingState,
+        assessment: {
+          ...model.state.servingState.assessment,
+          memory: {
+            ...model.state.servingState.assessment.memory,
           currentHeadroomState: insufficient
             ? {
                 _tag: "Insufficient",
@@ -39,6 +41,7 @@ const withHeadroom = (
                   loadBoundaryBytes: 22,
                 },
               },
+          },
         },
       },
     },
@@ -61,10 +64,10 @@ describe("model-menu state equality", () => {
   })
 
   test("observes acquisition progress", () => {
-    const left = makeView().models
+    const left = makeView({ models: [makeInstalledCatalogModel()] }).models
     const right = {
       ...left,
-      models: left.models.map((model) => ({
+      models: left.models.map((model) => model._tag === "Catalog" ? ({
         ...model,
         acquisitionState: {
           _tag: "Installing" as const,
@@ -75,7 +78,7 @@ describe("model-menu state equality", () => {
             bytesPerSecond: Option.none(),
           },
         },
-      })),
+      }) : model),
     }
 
     expect(modelMenusLocalModelsStateEquivalent(left, right)).toBe(false)
