@@ -71,17 +71,22 @@ required tool-call ID. Anthropic Messages accepts cache-control annotations and 
 output configuration. Unknown output-configuration members remain compatibility hints, while
 `output_config.effort` is a semantic input owned by the Anthropic adapter.
 
-An Anthropic output effort that exactly names a model behavior selects that behavior. Current
-Claude gateway discovery cannot advertise a local model's effort domain: it retains only ID,
-display name, and description. The Anthropic adapter therefore owns a `RoundUpOrClamp` admission
-policy over the ordinal scale `minimal < low < medium < high < xhigh < max`. An unsupported ordinal
-selects the least supported enabled ordinal at or above it; if none exists, it clamps to the
-greatest supported enabled ordinal below it. A model with only named enabled behavior uses its
-enabled default. This is Anthropic-protocol compatibility, not generic gateway rounding.
-Omitted/adaptive effort selects the model default, and disabled thinking is accepted only when the
-model supports `none`. The adapter represents this interpretation as a transient admission policy
-beside the canonical invocation. Admission applies it after leasing exposes the model profile; it
-is not a canonical reasoning intent or a serializable domain value.
+Reasoning-effort compatibility is one unconditional local-admission invariant. Every Chat
+Completions, Responses, and Anthropic request applies `RoundUpOrClamp` after model resolution.
+Requests carry no trusted harness identity, so there is no adapter field or selectable resolution
+mode. This is scoped reasoning-effort compatibility, not generic request rewriting.
+
+An effort that exactly names a supported model behavior remains unchanged. For the ordinal scale
+`minimal < low < medium < high < xhigh < max`, an unsupported value selects the least supported
+enabled ordinal at or above it, or the greatest supported enabled ordinal below it when no higher
+value exists. An unsupported named behavior selects the enabled model default. Omitted or
+`adaptive` effort selects the model default. Disabled reasoning remains valid only when the model
+supports `none`.
+
+Admission applies reconciliation only after leasing exposes the model profile. The behavior is
+neither a canonical reasoning intent nor a serializable provider-model value. Connectors must still
+project the most precise native effort domain and default each harness can express; global safety is
+not a substitute for accurate harness controls.
 
 Reasoning-history controls are independent from current-turn reasoning effort. Chat Completions
 passes explicitly supplied history controls through to the effective template unchanged.
@@ -196,12 +201,11 @@ ACN continues to rewrite only the routing alias.
 ## Ownership
 
 - ICN contracts own input, execution, output, usage, termination, and failure facts.
-- ICN API adapters own DTO validation, request conversion, protocol IDs, wire event ordering,
-  protocol-specific errors, and any transient admission policy required to interpret their wire
-  controls against a resolved model.
-- The shared runner owns exact model leasing, strict reasoning resolution, application of the
-  adapter-supplied admission policy, execution, cancellation, and bounded output delivery. Admission
-  policies are API-local and never extend the canonical inference contract.
+- ICN API adapters own DTO validation, request conversion, protocol IDs, wire event ordering, and
+  protocol-specific errors.
+- The shared runner owns exact model leasing, global reasoning-effort reconciliation against the
+  resolved model, reasoning resolution, execution, cancellation, and bounded output delivery. Wire
+  compatibility never extends the canonical inference contract.
 - ACN owns public Anthropic model routing, local aliases, discovery projection, credential
   isolation, and byte-preserving upstream proxying. Its only local request mutation is replacing
   the routing alias with the canonical model ID.

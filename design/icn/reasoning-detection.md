@@ -291,21 +291,18 @@ Normalized strings are never blindly forwarded as Jinja values. A recipe is vali
 same effective-template fingerprint used during detection. A template change requires resolution
 against the new profile.
 
-An explicit unsupported option fails with the model's supported option list. ICN does not silently
-fall back to the default or nearest ordinal level. Harness-native maps resolve before the ordinary
-canonical OpenAI request reaches ICN. Raw template arguments remain an advanced escape hatch when normalized
-reasoning is absent. A request that supplies both normalized reasoning and conflicting raw
-reasoning controls is rejected.
+After model resolution, local admission preserves an exact supported option. An unsupported ordinal
+selects the least supported enabled ordinal at or above it; when none exists, it selects the
+greatest supported enabled ordinal below it. An unsupported named option selects the enabled model
+default. This reconciliation applies to Chat Completions, Responses, and Anthropic because requests
+carry no trusted harness identity. It is not represented in the serializable inference contract.
+Disabled reasoning remains the explicit `none` behavior and fails for a fixed-reasoning model.
 
-The Anthropic Messages boundary has one deliberately scoped compatibility policy. Claude Code's
-gateway discovery cannot publish a machine-readable effort domain, so its adapter carries a
-transient admission policy beside the canonical invocation. After model resolution, an Anthropic
-`output_config.effort` selects its exact match. An unsupported ordinal effort selects the least
-supported enabled ordinal at or above it; when none exists, it clamps to the greatest supported
-enabled ordinal below it. For a named-only model, the enabled default behavior is used. The policy
-never enters the serializable inference contract. OpenAI Chat Completions and Responses retain
-ordinary exact validation. Disabled Anthropic thinking is still the explicit `none` behavior and
-fails for a fixed-reasoning model.
+Harness connectors must still project the exact domain and default as faithfully as their native
+configuration permits. Admission reconciliation is a safety invariant, not a replacement for
+precise harness controls. Raw template arguments remain an advanced escape hatch when normalized
+reasoning is absent. A request that supplies both normalized reasoning and conflicting raw reasoning
+controls is rejected.
 
 ## Token budgeting
 
@@ -349,9 +346,10 @@ advertise a disabling option.
 - Equivalent ordinal inputs use rendered affiliated-name evidence first and normalized rank second.
 - One meaningful alternate effort is not discarded.
 - No fixed-thinking template is advertised as disableable.
-- Explicit unsupported requests fail rather than falling back.
-- Anthropic effort translation preserves an exact match, otherwise rounds an ordinal effort upward
-  within the model domain or clamps it to the model's greatest enabled ordinal.
+- Exact supported efforts remain unchanged at admission.
+- Unsupported ordinal efforts round upward within the model domain or clamp to its greatest enabled
+  ordinal; unsupported named efforts select the enabled default.
+- Disabling reasoning fails when the model does not support `none`.
 - Every private recipe is bound to the effective-template fingerprint.
 - Every normalized option has automatic token budgeting disabled initially.
 - Selecting a symbolic effort never implicitly sets a hard reasoning-token budget.
