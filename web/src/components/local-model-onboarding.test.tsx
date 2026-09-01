@@ -15,6 +15,10 @@ const preparingSetup = (): Setup => ({
     notice: Option.none(),
     content: {
       _tag: "Preparation",
+      preparation: {
+        discovery: { complete: false, modelsFound: 5 },
+        assessment: { complete: false, settledModels: 12, totalModels: 18 },
+      },
     },
   }),
   retry: () => {},
@@ -70,13 +74,42 @@ describe("LocalModelOnboarding preparation", () => {
     expect(html).not.toContain('aria-label="Memory budget"')
   })
 
-  it("shows the explicit reconciliation activity", () => {
+  it("shows the fixed live discovery and assessment rows", () => {
     const html = renderToStaticMarkup(
       <LocalModelOnboarding setup={preparingSetup()} />
     )
 
-    expect(html).toContain("Reconciling local models")
-    expect(html).toContain("Checking the model catalog and installed Hugging Face cache entries.")
-    expect(html).toContain("animate-spin")
+    expect(html).toContain("Discovering existing models")
+    expect(html).toContain("· 5 found")
+    expect(html).toContain("Assessing models · 12 of 18")
+    expect(html.match(/animate-spin/g)).toHaveLength(2)
+    expect(html).not.toContain("Discovery complete")
+    expect(html).not.toContain("currently known")
+  })
+
+  it("omits the found count while discovery has found nothing", () => {
+    const setup = preparingSetup()
+    const html = renderToStaticMarkup(
+      <LocalModelOnboarding
+        setup={{
+          ...setup,
+          view: Result.success({
+            notice: Option.none(),
+            content: {
+              _tag: "Preparation",
+              preparation: {
+                discovery: { complete: false, modelsFound: 0 },
+                assessment: { complete: false, settledModels: 0, totalModels: 0 },
+              },
+            },
+          }),
+        }}
+      />
+    )
+
+    expect(html).toContain("Discovering existing models")
+    expect(html).toContain("Assessing models")
+    expect(html).not.toContain("found")
+    expect(html).not.toContain("Assessing models ·")
   })
 })

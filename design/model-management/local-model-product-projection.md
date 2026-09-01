@@ -39,6 +39,14 @@ separately, then publishes one `LocalModel` union:
 - `Catalog` contains catalog membership and managed acquisition state.
 - `Discovered` contains discovery state and never exposes managed acquisition actions.
 
+The same projection publishes a small preparation summary derived directly from the current ICN
+source and assessment snapshots: discovery completion and the discovered-model count (catalog
+models are excluded from it), plus assessment completion,
+settled count, and total count. Assessment totals describe the current target set and may grow when
+authoritative discovery contributes additional targets. This summary is the readiness authority for
+onboarding and local provider offerings; clients do not recover global readiness by scanning
+individual product rows.
+
 Shared fields contain presentation and canonical `modelId`. Catalog rows directly contain their
 catalog data, acquisition state, and serving state. A discovered row contains one structural state:
 `Ready` owns its resolved installation, residency, catalog attribution, and serving state;
@@ -47,8 +55,9 @@ catalog-attribution fact because its selected artifact is not ready.
 Presentation may include deduplicated HTTPS source links, but never package or bundle structure.
 Where present, serving state is `Assessing`, `Failed`, or `Assessed`. Native catalog/discovery rows
 already carry a complete desired, effective, or unavailable resolution, so ACN never fabricates an
-intermediate resolving row. A failed ready discovery retains the selected serving profile. A
-catalog failure retains a profile only when one was resolved. An assessed state contains metadata,
+intermediate resolving row. `Failed` represents source or serving unavailability, not a failed
+assessment: ICN marks a failed assessment target `Dropped`, and ACN omits that target's row. An
+assessed state contains metadata,
 capabilities, and one assessment that owns its exact profile. A fitting catalog assessment alone
 contains ranking scores; discovered and non-fitting states cannot contain them. Provider
 selectability is derived from these structural facts and is never stored as a second state machine.
@@ -74,7 +83,8 @@ remain authoritative.
 
 - Catalog and discovered models share `ModelId` without sharing lifecycle semantics.
 - Every callable external Hugging Face artifact appears once under its `hf:` identity.
-- Invalid and incompatible discovery outcomes remain visible but never become offerings.
+- Native `Incompatible` assessment outcomes remain visible but never become offerings; targets
+  whose assessment attempt fails are omitted.
 - An externally owned discovery can be selected and loaded but cannot be installed, updated, or
   removed through catalog commands.
 - Provider offerings contain no fallback profile, capability, ranking, package, or bundle data.

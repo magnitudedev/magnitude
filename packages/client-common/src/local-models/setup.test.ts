@@ -49,6 +49,14 @@ const allocation = {
   physicalContextTokens: 32_768,
   memoryDomains: [],
 }
+const completePreparation = {
+  discovery: { complete: true, modelsFound: 1 },
+  assessment: { complete: true, settledModels: 1, totalModels: 1 },
+} as const
+const activePreparation = {
+  discovery: { complete: false, modelsFound: 3 },
+  assessment: { complete: false, settledModels: 2, totalModels: 4 },
+} as const
 
 const makeModel = (installed: boolean): Extract<LocalModel, { readonly _tag: "Catalog" }> => {
   return {
@@ -193,10 +201,49 @@ describe("projectOnboardingModelSetupContent", () => {
     })).toEqual({ fastToSmart: 1 })
   })
 
+  it("keeps the exact live discovery and assessment counts in preparation", () => {
+    const content = projectOnboardingModelSetupContent(
+      Option.none(),
+      {
+        preparation: activePreparation,
+        models: [makeModel(true)],
+      },
+      unassignedSlots(),
+      defaultOnboardingModelRankingControls,
+    )
+
+    expect(content).toEqual({ _tag: "Preparation", preparation: activePreparation })
+  })
+
+  it("waits for assessment after discovery completes and reveals the chooser only when both complete", () => {
+    const model = makeModel(true)
+    const assessing = projectOnboardingModelSetupContent(
+      Option.none(),
+      {
+        preparation: {
+          discovery: { complete: true, modelsFound: 4 },
+          assessment: { complete: false, settledModels: 3, totalModels: 4 },
+        },
+        models: [model],
+      },
+      unassignedSlots(),
+      defaultOnboardingModelRankingControls,
+    )
+    const ready = projectOnboardingModelSetupContent(
+      Option.none(),
+      { preparation: completePreparation, models: [model] },
+      unassignedSlots(),
+      defaultOnboardingModelRankingControls,
+    )
+
+    expect(assessing._tag).toBe("Preparation")
+    expect(ready._tag).toBe("Chooser")
+  })
+
   it("reports the selected model's ready instance", () => {
     const model = makeModel(true)
     const option = localModelOptions({
-      reconciliationComplete: true,
+      preparation: completePreparation,
       models: [model],
     }, unassignedSlots())[0]!
     const state = projectOnboardingModelSetupContent(
@@ -209,7 +256,7 @@ describe("projectOnboardingModelSetupContent", () => {
         cancelling: false,
       }),
       {
-        reconciliationComplete: true,
+        preparation: completePreparation,
         models: [model],
       },
       configuredSlots("Ready", instanceId),
@@ -224,7 +271,7 @@ describe("projectOnboardingModelSetupContent", () => {
     const model = makeModel(true)
     const slots = configuredSlots("Loading", instanceId, Option.some(0.42))
     const option = localModelOptions({
-      reconciliationComplete: true,
+      preparation: completePreparation,
       models: [model],
     }, slots)[0]!
     const state = projectOnboardingModelSetupContent(
@@ -237,7 +284,7 @@ describe("projectOnboardingModelSetupContent", () => {
         cancelling: false,
       }),
       {
-        reconciliationComplete: true,
+        preparation: completePreparation,
         models: [model],
       },
       slots,
@@ -255,7 +302,7 @@ describe("projectOnboardingModelSetupContent", () => {
     const model = makeModel(true)
     const slots = configuredSlots("Loading", instanceId, Option.some(0.42))
     const option = localModelOptions({
-      reconciliationComplete: true,
+      preparation: completePreparation,
       models: [model],
     }, slots)[0]!
     const state = projectOnboardingModelSetupContent(
@@ -268,7 +315,7 @@ describe("projectOnboardingModelSetupContent", () => {
         cancelling: true,
       }),
       {
-        reconciliationComplete: true,
+        preparation: completePreparation,
         models: [model],
       },
       slots,
@@ -282,7 +329,7 @@ describe("projectOnboardingModelSetupContent", () => {
   it("does not let discovery refresh mask an active invocation", () => {
     const model = makeModel(true)
     const option = localModelOptions({
-      reconciliationComplete: true,
+      preparation: completePreparation,
       models: [model],
     }, configuredSlots("Loading"))[0]!
     const state = projectOnboardingModelSetupContent(
@@ -296,7 +343,7 @@ describe("projectOnboardingModelSetupContent", () => {
       }),
       {
         models: [model],
-        reconciliationComplete: false,
+        preparation: activePreparation,
       },
       configuredSlots("Loading"),
       defaultOnboardingModelRankingControls,
@@ -309,7 +356,7 @@ describe("projectOnboardingModelSetupContent", () => {
   it("retains the submitted model when discovery temporarily removes it", () => {
     const model = makeModel(true)
     const option = localModelOptions({
-      reconciliationComplete: true,
+      preparation: completePreparation,
       models: [model],
     }, configuredSlots("Loading"))[0]!
     const state = projectOnboardingModelSetupContent(
@@ -323,7 +370,7 @@ describe("projectOnboardingModelSetupContent", () => {
       }),
       {
         models: [],
-        reconciliationComplete: false,
+        preparation: activePreparation,
       },
       configuredSlots("Loading"),
       defaultOnboardingModelRankingControls,
@@ -371,7 +418,7 @@ const makeHarness = (options: HarnessOptions) => {
     }
   }
   let models: LocalModelsState = {
-    reconciliationComplete: true,
+    preparation: completePreparation,
     models: [model],
   }
   let slots = options.ready ? configuredSlots("Ready") : unassignedSlots()
@@ -424,7 +471,7 @@ const makeHarness = (options: HarnessOptions) => {
         offering: Option.fromNullable(providers.models[0]),
       }],
       failures: [],
-      localModelsReconciliationComplete: models.reconciliationComplete,
+      localModelPreparation: models.preparation,
     }
   }
   const rpc = ((name: string, payload: any) => Effect.suspend<unknown, unknown, never>(() => {

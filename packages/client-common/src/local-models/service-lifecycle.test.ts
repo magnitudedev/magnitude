@@ -19,7 +19,10 @@ import { fakeAcnImplementationsLayer } from "../state/fake-acn-implementations"
 import { MagnitudeOperations } from "../state/application-operations"
 
 const localModelsState: LocalModelsState = {
-  reconciliationComplete: true,
+  preparation: {
+    discovery: { complete: true, modelsFound: 0 },
+    assessment: { complete: true, settledModels: 0, totalModels: 0 },
+  },
   models: [],
 }
 
@@ -44,7 +47,7 @@ const makeFakeAgentClient = (
           offering: { _tag: "None" },
         })),
         failures: [],
-        localModelsReconciliationComplete: localModelsState.reconciliationComplete,
+        localModelPreparation: localModelsState.preparation,
       })
     }
     return Effect.dieMessage(`Unexpected RPC in local-model lifecycle test: ${tag}`)

@@ -804,8 +804,26 @@ export type DiscoveredLocalModel = typeof DiscoveredLocalModelSchema.Type
 export const LocalModelSchema = Schema.Union(CatalogLocalModelSchema, DiscoveredLocalModelSchema)
 export type LocalModel = typeof LocalModelSchema.Type
 
+export const LocalModelPreparationSchema = Schema.Struct({
+  discovery: Schema.Struct({
+    complete: Schema.Boolean,
+    modelsFound: NonNegativeSafeInteger,
+  }),
+  assessment: Schema.Struct({
+    complete: Schema.Boolean,
+    settledModels: NonNegativeSafeInteger,
+    totalModels: NonNegativeSafeInteger,
+  }).pipe(Schema.filter(({ settledModels, totalModels }) => settledModels <= totalModels, {
+    message: () => "settled model assessments cannot exceed total model assessments",
+  })),
+}).pipe(Schema.filter(({ assessment }) => !assessment.complete
+  || assessment.settledModels === assessment.totalModels, {
+  message: () => "complete model assessment progress must have every target settled",
+}))
+export type LocalModelPreparation = typeof LocalModelPreparationSchema.Type
+
 export const LocalModelsStateSchema = Schema.Struct({
-  reconciliationComplete: Schema.Boolean,
+  preparation: LocalModelPreparationSchema,
   models: Schema.Array(LocalModelSchema),
 }).pipe(Schema.filter(({ models }) => {
   const identities = models.map(({ modelId }) => modelId)
@@ -938,7 +956,7 @@ const ModelCatalogSnapshotFields = {
   providers: Schema.Array(ProviderCatalogEntrySchema),
   models: Schema.Array(ModelCatalogEntrySchema),
   failures: Schema.Array(ProviderCatalogFailureSchema),
-  localModelsReconciliationComplete: Schema.Boolean,
+  localModelPreparation: LocalModelPreparationSchema,
 } as const
 
 export const ModelCatalogStateSchema = Schema.Union(

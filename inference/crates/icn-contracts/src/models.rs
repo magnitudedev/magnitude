@@ -1446,10 +1446,7 @@ pub enum ModelAssessmentEntryState {
     Assessed {
         profiles: Vec<ModelAssessment>,
     },
-    #[serde(rename_all = "camelCase")]
-    Failed {
-        failure: ModelFailure,
-    },
+    Dropped,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -1467,18 +1464,8 @@ pub enum ModelAssessmentDomainSnapshot {
     #[serde(rename_all = "camelCase")]
     Pending { source_revision: u64 },
     #[serde(rename_all = "camelCase")]
-    Assessing {
+    Available {
         source_revision: u64,
-        total_targets: u32,
-        settled_targets: u32,
-        failed_targets: u32,
-        entries: Vec<ModelAssessmentEntry>,
-    },
-    #[serde(rename_all = "camelCase")]
-    Complete {
-        source_revision: u64,
-        total_targets: u32,
-        failed_targets: u32,
         entries: Vec<ModelAssessmentEntry>,
     },
     #[serde(rename_all = "camelCase")]

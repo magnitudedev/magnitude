@@ -47,7 +47,10 @@ describe("Settings query states", () => {
 describe("Settings model loading states", () => {
   it("does not render an initializing model inventory as an empty library", () => {
     modelState.localModels = Result.success({
-      reconciliationComplete: false,
+      preparation: {
+        discovery: { complete: false, modelsFound: 0 },
+        assessment: { complete: false, settledModels: 0, totalModels: 0 },
+      },
       models: [],
     })
 
@@ -61,7 +64,10 @@ describe("Settings model loading states", () => {
 
   it("renders Models as a searchable installed-model library only", () => {
     modelState.localModels = Result.success({
-      reconciliationComplete: true,
+      preparation: {
+        discovery: { complete: true, modelsFound: 0 },
+        assessment: { complete: true, settledModels: 0, totalModels: 0 },
+      },
       models: [],
     })
 
@@ -78,7 +84,10 @@ describe("Settings model loading states", () => {
 
   it("shows catalog discovery as loading instead of an empty candidate layout", () => {
     modelState.catalog = Result.success({
-      reconciliationComplete: false,
+      preparation: {
+        discovery: { complete: false, modelsFound: 0 },
+        assessment: { complete: false, settledModels: 0, totalModels: 0 },
+      },
       models: [],
     })
 
@@ -94,7 +103,10 @@ describe("Settings model loading states", () => {
 
   it("renders the catalog empty state only after discovery is ready", () => {
     modelState.catalog = Result.success({
-      reconciliationComplete: true,
+      preparation: {
+        discovery: { complete: true, modelsFound: 0 },
+        assessment: { complete: true, settledModels: 0, totalModels: 0 },
+      },
       models: [],
     })
 

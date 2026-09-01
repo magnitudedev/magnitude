@@ -22,6 +22,7 @@ import {
 } from "@magnitudedev/client-common"
 import type {
   LocalModel,
+  LocalModelPreparation,
   LocalModelMemory,
   ModelId,
   ProviderModelId,
@@ -964,10 +965,12 @@ export function OnboardingModelChooser({
 
 export function OnboardingModelPreparation({
   hardware,
+  preparation,
   error,
   width,
 }: {
   readonly hardware: LocalInferenceHardwareResult
+  readonly preparation: LocalModelPreparation
   readonly error: string | null
   readonly width: number
 }): ReactNode {
@@ -982,10 +985,26 @@ export function OnboardingModelPreparation({
       spinnerFrame={spinner}
       footer={<text style={{ fg: theme.text.supporting }}>Ctrl+C to exit</text>}
     >
-      <text style={{ fg: error === null ? theme.text.body : theme.status.failure }}>
-        {error === null && <span fg={theme.accent}>{spinner} </span>}
-        {error ?? "Reconciling local models"}
-      </text>
+      {error === null ? (
+        <>
+          <text style={{ fg: theme.text.body }}>
+            <span fg={theme.accent}>{spinner} </span>
+            Discovering existing models
+            {preparation.discovery.modelsFound > 0
+              ? ` · ${preparation.discovery.modelsFound} found`
+              : ""}
+          </text>
+          <text style={{ fg: theme.text.body }}>
+            <span fg={theme.accent}>{spinner} </span>
+            Assessing models
+            {preparation.assessment.totalModels > 0
+              ? ` · ${preparation.assessment.settledModels} of ${preparation.assessment.totalModels}`
+              : ""}
+          </text>
+        </>
+      ) : (
+        <text style={{ fg: theme.status.failure }}>{error}</text>
+      )}
     </OnboardingSetupCard>
   )
 }

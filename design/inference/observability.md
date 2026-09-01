@@ -66,6 +66,10 @@ Native worker stdout and stderr are concurrently drained into bounded retention 
 cannot become hidden planner latency. Public assessment failures contain only stable codes and safe
 messages; native diagnostics remain private and bounded.
 
+A failed one-shot assessment for reviewed catalog material emits one error record with the canonical
+model ID and stable failure code/message before that target is dropped. Failed discovered targets
+are dropped without an error record because they are unreviewed external cache observations.
+
 Instrumentation must never record prompts, generated or reasoning text, image contents,
 authorization values, request headers, token arrays, tool arguments, full request structures, or
 query strings. Function instrumentation therefore skips arguments by default and opts safe fields
@@ -90,3 +94,4 @@ operation boundaries instead.
 - Collector failure never changes an HTTP or inference domain result.
 - Native planner diagnostics distinguish queue time from worker time and identify bounded terminal
   outcomes without recording model paths or assessment payloads.
+- Catalog assessment drops emit a structured error; discovered assessment drops do not.

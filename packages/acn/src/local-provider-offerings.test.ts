@@ -160,14 +160,26 @@ describe("local provider offerings", () => {
   it("does not make temporary startup or assessment emptiness authoritative", () => {
     const model = catalogAssessed("qwen3.5-4b:gguf:q4")
     const state = (overrides: Partial<LocalModelsState> = {}): LocalModelsState => ({
-      reconciliationComplete: true,
+      preparation: {
+        discovery: { complete: true, modelsFound: 1 },
+        assessment: { complete: true, settledModels: 1, totalModels: 1 },
+      },
       models: [model],
       ...overrides,
     })
     expect(localProviderOfferingsReady(state())).toBe(true)
     expect(localProviderOfferingsReady(state({
       models: [{ ...model, servingState: { _tag: "Assessing", profile: { contextLength: 32_768 } } }],
+      preparation: {
+        discovery: { complete: true, modelsFound: 1 },
+        assessment: { complete: false, settledModels: 0, totalModels: 1 },
+      },
     }))).toBe(false)
-    expect(localProviderOfferingsReady(state({ reconciliationComplete: false }))).toBe(false)
+    expect(localProviderOfferingsReady(state({
+      preparation: {
+        discovery: { complete: true, modelsFound: 1 },
+        assessment: { complete: false, settledModels: 0, totalModels: 1 },
+      },
+    }))).toBe(false)
   })
 })

@@ -5,6 +5,7 @@ import {
   CatalogBaseIdSchema,
   CatalogVariantIdSchema,
   LocalModelMemorySchema,
+  LocalModelPreparationSchema,
   LocalModelSchema,
   LocalModelServingStateSchema,
   ModelIdSchema,
@@ -223,6 +224,26 @@ describe("LocalModelSchema invariants", () => {
       requiredSystemMemoryBytes: 4,
       systemUseState: { _tag: "NotObserved" },
       currentHeadroomState: { _tag: "NotObserved" },
+    })).toThrow()
+  })
+})
+
+describe("LocalModelPreparationSchema", () => {
+  it("accepts growing live counts and rejects settled counts above the current total", () => {
+    expect(Schema.decodeUnknownSync(LocalModelPreparationSchema)({
+      discovery: { complete: false, modelsFound: 5 },
+      assessment: { complete: false, settledModels: 12, totalModels: 18 },
+    })).toEqual({
+      discovery: { complete: false, modelsFound: 5 },
+      assessment: { complete: false, settledModels: 12, totalModels: 18 },
+    })
+    expect(() => Schema.decodeUnknownSync(LocalModelPreparationSchema)({
+      discovery: { complete: false, modelsFound: 5 },
+      assessment: { complete: false, settledModels: 19, totalModels: 18 },
+    })).toThrow()
+    expect(() => Schema.decodeUnknownSync(LocalModelPreparationSchema)({
+      discovery: { complete: true, modelsFound: 18 },
+      assessment: { complete: true, settledModels: 17, totalModels: 18 },
     })).toThrow()
   })
 })

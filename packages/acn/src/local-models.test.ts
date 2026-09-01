@@ -8,11 +8,14 @@ import type {
   ReadyModel,
 } from "@magnitudedev/icn-protocol/schemas"
 import {
+  assessmentTargetVisible,
   catalogAcquisition,
   catalogModelServingState,
   catalogRemovalAcquisition,
   coordinatedAssessment,
+  projectLocalModelPreparation,
 } from "./local-models"
+import type { LocalModelSourcesState } from "./local-model-sources"
 
 describe("local model serving projection", () => {
   it("accepts capabilities already decoded by the ICN client", () => {
@@ -93,15 +96,12 @@ describe("automatic assessment projection", () => {
     expect(coordinatedAssessment(pending, 2, "catalog", modelId)).toBeUndefined()
   })
 
-  it("projects pool, source, and exact-target failures", () => {
+  it("keeps pool and source failures pending while dropping exact targets", () => {
     const poolFailure = {
       revision: 1,
       state: { _tag: "Failed", failure },
     } as ModelAssessmentsSnapshot
-    expect(coordinatedAssessment(poolFailure, 1, "catalog", modelId)).toEqual({
-      _tag: "Failed",
-      failure,
-    })
+    expect(coordinatedAssessment(poolFailure, 1, "catalog", modelId)).toBeUndefined()
 
     const sourceFailure = {
       revision: 2,
@@ -112,10 +112,7 @@ describe("automatic assessment projection", () => {
         discovered: { _tag: "Pending", sourceRevision: 1 },
       },
     } as ModelAssessmentsSnapshot
-    expect(coordinatedAssessment(sourceFailure, 1, "catalog", modelId)).toEqual({
-      _tag: "Failed",
-      failure,
-    })
+    expect(coordinatedAssessment(sourceFailure, 1, "catalog", modelId)).toBeUndefined()
 
     const targetFailure = {
       revision: 3,
@@ -123,21 +120,141 @@ describe("automatic assessment projection", () => {
         _tag: "Ready",
         environmentId: "environment",
         catalog: {
-          _tag: "Complete",
+          _tag: "Available",
           sourceRevision: 1,
-          totalTargets: 1,
-          failedTargets: 1,
           entries: [{
             subject: { _tag: "Catalog", modelId, selection: "Desired" },
-            state: { _tag: "Failed", failure },
+            state: { _tag: "Dropped" },
           }],
         },
         discovered: { _tag: "Pending", sourceRevision: 1 },
       },
     } as ModelAssessmentsSnapshot
-    expect(coordinatedAssessment(targetFailure, 1, "catalog", modelId)).toEqual({
-      _tag: "Failed",
-      failure,
+    expect(coordinatedAssessment(targetFailure, 1, "catalog", modelId)).toEqual({ _tag: "Dropped" })
+    expect(assessmentTargetVisible({ _tag: "Dropped" })).toBe(false)
+  })
+})
+
+describe("local model preparation projection", () => {
+  const sources = (
+    reconciliationComplete: boolean,
+    catalogModels: number,
+    discoveredModels: number,
+  ): LocalModelSourcesState => ({
+    catalogRevision: 1,
+    discoveryRevision: 1,
+    reconciliationComplete,
+    catalogModels: Array.from({ length: catalogModels }) as unknown as LocalModelSourcesState["catalogModels"],
+    discoveredModels: Array.from({ length: discoveredModels }) as unknown as LocalModelSourcesState["discoveredModels"],
+  })
+  const entries = (settled: number, total: number, prefix: string) => Array.from({ length: total }, (_, index) => ({
+    subject: {
+      _tag: "Catalog" as const,
+      modelId: ModelIdSchema.make(`${prefix}:gguf:variant-${index}`),
+      selection: "Desired" as const,
+    },
+    state: index < settled
+      ? { _tag: "Dropped" as const }
+      : { _tag: "Assessing" as const },
+  }))
+
+  it("projects live counts and allows the assessment total to grow", () => {
+    const discovering = projectLocalModelPreparation(
+      sources(false, 4, 1),
+      {
+        revision: 1,
+        state: {
+          _tag: "Ready",
+          environmentId: "environment",
+          catalog: {
+            _tag: "Available",
+            sourceRevision: 1,
+            entries: entries(2, 4, "discovering-catalog"),
+          },
+          discovered: { _tag: "Pending", sourceRevision: 1 },
+        },
+      } as ModelAssessmentsSnapshot,
+    )
+    const discovered = projectLocalModelPreparation(
+      sources(true, 4, 3),
+      {
+        revision: 2,
+        state: {
+          _tag: "Ready",
+          environmentId: "environment",
+          catalog: {
+            _tag: "Available",
+            sourceRevision: 1,
+            entries: entries(4, 4, "discovered-catalog"),
+          },
+          discovered: {
+            _tag: "Available",
+            sourceRevision: 1,
+            entries: entries(1, 3, "discovered-local"),
+          },
+        },
+      } as ModelAssessmentsSnapshot,
+    )
+
+    expect(discovering).toEqual({
+      discovery: { complete: false, modelsFound: 1 },
+      assessment: { complete: false, settledModels: 2, totalModels: 4 },
+    })
+    expect(discovered).toEqual({
+      discovery: { complete: true, modelsFound: 3 },
+      assessment: { complete: false, settledModels: 5, totalModels: 7 },
+    })
+  })
+
+  it("is complete only when both assessment domains are complete", () => {
+    expect(projectLocalModelPreparation(
+      sources(true, 2, 1),
+      {
+        revision: 1,
+        state: {
+          _tag: "Ready",
+          environmentId: "environment",
+          catalog: {
+            _tag: "Available",
+            sourceRevision: 1,
+            entries: entries(2, 2, "complete-catalog"),
+          },
+          discovered: {
+            _tag: "Available",
+            sourceRevision: 1,
+            entries: entries(1, 1, "complete-local"),
+          },
+        },
+      } as ModelAssessmentsSnapshot,
+    )).toEqual({
+      discovery: { complete: true, modelsFound: 1 },
+      assessment: { complete: true, settledModels: 3, totalModels: 3 },
+    })
+  })
+
+  it("does not unlock on completed assessment state for an older source snapshot", () => {
+    expect(projectLocalModelPreparation(
+      { ...sources(true, 2, 1), discoveryRevision: 2 },
+      {
+        revision: 2,
+        state: {
+          _tag: "Ready",
+          environmentId: "environment",
+          catalog: {
+            _tag: "Available",
+            sourceRevision: 1,
+            entries: entries(2, 2, "stale-catalog"),
+          },
+          discovered: {
+            _tag: "Available",
+            sourceRevision: 1,
+            entries: entries(1, 1, "stale-local"),
+          },
+        },
+      } as ModelAssessmentsSnapshot,
+    )).toEqual({
+      discovery: { complete: true, modelsFound: 1 },
+      assessment: { complete: false, settledModels: 3, totalModels: 3 },
     })
   })
 })

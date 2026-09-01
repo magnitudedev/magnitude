@@ -489,7 +489,7 @@ function InstalledLibrary({
 function ModelsView(): ReactNode {
   const modelsResult = useLocalModels()
   const models = valueOf(modelsResult)
-  const inventoryLoading = models !== null && !models.reconciliationComplete
+  const inventoryLoading = models !== null && !models.preparation.discovery.complete
   const installed =
     models?.models.filter(
       localModelIsInstalled
@@ -802,7 +802,7 @@ function CatalogView(): ReactNode {
     candidates.find((model) => modelKey(model) === selectedKey) ??
     candidates[0] ??
     null
-  const reconciliationComplete = catalog?.reconciliationComplete ?? false
+  const discoveryComplete = catalog?.preparation.discovery.complete ?? false
   const filterCounts = useMemo(
     () => ({
       all: visibleCandidates.length,
@@ -822,13 +822,13 @@ function CatalogView(): ReactNode {
       ) : (
         <QueryNotice result={catalogResult} label="catalog" />
       )}
-      {catalog !== null && !reconciliationComplete ? (
+      {catalog !== null && !discoveryComplete ? (
         <LoadingNotice
           title="Loading catalog"
           description="Assessing local models for this computer."
         />
       ) : null}
-      {catalog && reconciliationComplete ? (
+      {catalog && discoveryComplete ? (
         <>
           <header className="shrink-0">
             <div>

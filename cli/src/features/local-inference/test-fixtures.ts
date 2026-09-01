@@ -339,7 +339,10 @@ export const makeView = (options: {
   return {
     hardware: options.hardware ?? makeHardware(),
     models: {
-      reconciliationComplete: true,
+      preparation: {
+        discovery: { complete: true, modelsFound: models.length },
+        assessment: { complete: true, settledModels: models.length, totalModels: models.length },
+      },
       models,
     },
     catalog: new ProviderModelCatalogReady({
