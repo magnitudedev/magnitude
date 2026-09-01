@@ -22,122 +22,87 @@
     }
 
     body {
-      --card: #121d2c;
-      --card-border: #273448;
-      --heading: #f8fafc;
+      --text: #f8fafc;
       --muted: #93a1b6;
       --tile: #152234;
       --tile-border: #2c3b50;
-      --runtime-start: #16253a;
-      --runtime-end: #111c2c;
-      --runtime-border: #435875;
-      --runtime-rule: #304058;
-      --model-tile: #101a29;
-      --model-border: #2d3c51;
-      --arrow: #6680a5;
-      color: var(--heading);
+      --container: #121d2c;
+      --container-border: #435875;
+      --connector: #6680a5;
+      color: var(--text);
     }
 
     body.light {
-      --card: #f8fafc;
-      --card-border: #cbd5e1;
-      --heading: #0f172a;
+      --text: #0f172a;
       --muted: #64748b;
       --tile: #ffffff;
       --tile-border: #d8dee8;
-      --runtime-start: #ffffff;
-      --runtime-end: #f1f5f9;
-      --runtime-border: #94a3b8;
-      --runtime-rule: #d8dee8;
-      --model-tile: #ffffff;
-      --model-border: #d8dee8;
-      --arrow: #64748b;
-    }
-
-    body.landing {
-      --tile: #121e2e;
-      --tile-border: #233247;
-      --runtime-start: #142238;
-      --runtime-end: #101b2a;
-      --runtime-border: #334863;
-      --runtime-rule: #293950;
-      --model-tile: #101b2a;
-      --model-border: #26364a;
+      --container: #f1f5f9;
+      --container-border: #94a3b8;
+      --connector: #64748b;
     }
 
     .stage {
       position: absolute;
-      inset: 16px;
+      inset: 0;
       display: grid;
       place-items: center;
       overflow: hidden;
-      padding: 16px;
-      border: 2px solid var(--card-border);
-      border-radius: 28px;
-      background: var(--card);
     }
 
     .composition {
-      display: grid;
-      grid-template-columns: 598px 68px 700px;
-      gap: 22px;
-      align-items: center;
-      transform: scale(1.065);
-      transform-origin: center;
+      position: relative;
+      width: 1350px;
+      height: 450px;
     }
 
-    body.landing .stage {
-      border: 0;
-      background: transparent;
-    }
-
-    body.landing .runtime {
-      border-width: 1px;
-    }
-
-    .clients {
+    .tile {
       display: flex;
-      flex-direction: column;
-      gap: 19px;
+      min-width: 0;
+      align-items: center;
+      justify-content: center;
+      padding: 14px;
+      border: 1px solid var(--tile-border);
+      border-radius: 18px;
+      background: var(--tile);
     }
 
-    .clients h1 {
-      margin: 0;
+    .harnesses {
+      position: absolute;
+      top: 36px;
+      left: 0;
+      width: 344px;
+    }
+
+    .group-label {
+      margin: 0 0 16px;
       color: var(--muted);
       font-size: 18px;
-      font-weight: 780;
-      line-height: 1.2;
-      letter-spacing: .06em;
-      text-transform: uppercase;
+      font-weight: 800;
+      line-height: 24px;
+      letter-spacing: .12em;
     }
 
     .harness-grid {
       display: grid;
-      grid-template-columns: repeat(4, 139px);
-      grid-template-rows: repeat(2, 134px);
-      gap: 14px;
+      grid-template-columns: repeat(2, 164px);
+      grid-template-rows: repeat(3, 104px);
+      column-gap: 16px;
+      row-gap: 14px;
     }
 
-    .harness-item {
-      display: flex;
-      height: 134px;
-      min-width: 0;
+    .harness-tile {
       flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 11px;
-      border: 1px solid var(--tile-border);
-      border-radius: 20px;
-      background: var(--tile);
+      gap: 8px;
     }
 
-    .h-icon {
-      width: 62px;
-      height: 62px;
+    .harness-logo {
+      width: 48px;
+      height: 48px;
       object-fit: contain;
     }
 
-    .h-name {
+    .harness-name {
       color: var(--muted);
       font-size: 16px;
       font-weight: 680;
@@ -145,200 +110,140 @@
       white-space: nowrap;
     }
 
-    .intake {
-      position: relative;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      height: 2px;
-      transform: translateY(19px);
-    }
-
-    .arrow {
-      position: relative;
-      width: 58px;
-      height: 2px;
-      background: var(--arrow);
-    }
-
-    .arrow::before,
-    .arrow::after {
+    .connector {
       position: absolute;
-      top: -5px;
-      width: 10px;
-      height: 10px;
-      content: "";
-      border-top: 2px solid var(--arrow);
+      top: 224px;
+      left: 344px;
+      width: 186px;
+      height: 2px;
+      background: var(--connector);
     }
 
-    .arrow::before {
-      left: 0;
-      border-left: 2px solid var(--arrow);
-      transform: rotate(-45deg);
-    }
-
-    .arrow::after {
-      right: 0;
-      border-right: 2px solid var(--arrow);
-      transform: rotate(45deg);
-    }
-
-    .intake span {
+    .magnitude-box {
       position: absolute;
-      top: 17px;
-      left: 50%;
-      transform: translateX(-50%);
-      color: var(--muted);
-      font-size: 16px;
-      font-weight: 800;
-      letter-spacing: .12em;
+      top: 45px;
+      left: 530px;
+      width: 820px;
+      height: 360px;
+      padding: 22px 24px 24px;
+      border: 1px solid var(--container-border);
+      border-radius: 26px;
+      background: var(--container);
     }
 
-    .runtime {
-      width: 700px;
-      padding: 25px;
-      border: 1px solid var(--runtime-border);
-      border-radius: 32px;
-      background: var(--runtime-start);
-    }
-
-    .runtime-header {
+    .magnitude-header {
       display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      padding: 0 9px;
-    }
-
-    .runtime-header img {
-      order: 2;
-      width: 60px;
-      height: 58px;
-      object-fit: contain;
-    }
-
-    .runtime-header span {
-      display: block;
-      color: var(--muted);
-      font-size: 18px;
-      font-weight: 780;
-      line-height: 1.3;
-      letter-spacing: .06em;
-      text-transform: uppercase;
-      white-space: nowrap;
-    }
-
-    .model-grid {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      grid-template-rows: repeat(3, 97px);
-      gap: 13px;
-      padding-top: 20px;
-    }
-
-    .model-item {
-      display: flex;
-      height: 97px;
-      min-width: 0;
+      height: 74px;
+      flex-direction: column;
       align-items: center;
-      justify-content: center;
-      padding: 12px;
-      border: 1px solid var(--model-border);
-      border-radius: 19px;
-      background: var(--model-tile);
+      justify-content: flex-start;
+      gap: 9px;
     }
 
-    .model-logo {
-      max-width: 156px;
+    .magnitude-wordmark {
+      width: 226px;
       max-height: 48px;
       object-fit: contain;
     }
 
-    .qwen-lockup,
-    .gemma-lockup { gap: 8px; }
+    .magnitude-label {
+      color: var(--muted);
+      font-size: 18px;
+      font-weight: 800;
+      line-height: 1;
+      letter-spacing: .12em;
+    }
 
-    .qwen-lockup .model-icon,
-    .gemma-lockup .model-icon {
-      width: 44px;
-      height: 44px;
+    .models { margin-top: 14px; }
+
+    .model-row {
+      display: grid;
+      gap: 14px;
+    }
+
+    .model-row + .model-row { margin-top: 14px; }
+    .model-row-top { grid-template-columns: 360px 192px 192px; }
+    .model-row-bottom { grid-template-columns: repeat(2, 379px); }
+    .model-tile { height: 106px; }
+
+    .model-logo {
+      max-width: 100%;
+      max-height: 54px;
       object-fit: contain;
     }
 
-    .qwen-lockup .model-logo { width: 106px; }
-    .gemma-lockup .model-logo { width: 111px; }
-
-    .deepseek-lockup .model-logo,
-    .poolside-lockup .model-logo { transform: scale(1.18); }
-
-    .gemma-lockup-inner {
+    .qwen-lockup,
+    .gemma-lockup {
       display: flex;
       align-items: center;
-      gap: 8px;
-      transform: scale(1.15);
+      justify-content: center;
+      gap: 12px;
     }
-    .prism-lockup .model-logo { transform: scale(1.15); }
-    .nvidia-lockup .model-logo { transform: scale(1.1); }
+
+    .qwen-lockup .model-icon,
+    .gemma-lockup .model-icon {
+      width: 46px;
+      height: 46px;
+      object-fit: contain;
+    }
+
+    .qwen-lockup .model-logo { width: 142px; }
+    .gemma-lockup .model-logo { width: 142px; }
+    .nvidia-logo { width: 92px; }
+    .zai-logo { width: 72px; }
+    .deepseek-logo { width: 220px; }
 
     .only-light { display: none; }
     body.light .only-dark { display: none; }
     body.light .only-light { display: block; }
-
     body.dark .dark-invert { filter: brightness(0) invert(1); }
     body.light .light-darken { filter: brightness(0) saturate(100%); }
   </style>
   <script>
-    const params = new URLSearchParams(location.search)
-    const requestedTheme = params.get('theme')
-    const surface = params.get('surface')
+    const requestedTheme = new URLSearchParams(location.search).get('theme')
     const theme = requestedTheme === 'light' || requestedTheme === 'dark'
       ? requestedTheme
       : matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
     document.documentElement.style.colorScheme = theme
-    addEventListener('DOMContentLoaded', () => {
-      document.body.classList.add(theme)
-      if (surface === 'landing') document.body.classList.add('landing')
-    })
+    addEventListener('DOMContentLoaded', () => document.body.classList.add(theme))
   </script>
 </head>
 <body>
   <main class="stage">
     <div class="composition">
-    <section class="clients">
-      <h1>Works with your existing harness</h1>
-      <div class="harness-grid">
-        <div class="harness-item"><img class="h-icon light-darken" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/pi.svg" alt=""><span class="h-name">Pi</span></div>
-        <div class="harness-item"><img class="h-icon light-darken" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/opencode.svg" alt=""><span class="h-name">OpenCode</span></div>
-        <div class="harness-item"><img class="h-icon" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/hermes.svg" alt=""><span class="h-name">Hermes</span></div>
-        <div class="harness-item"><img class="h-icon" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/openclaw.svg" alt=""><span class="h-name">OpenClaw</span></div>
-        <div class="harness-item"><img class="h-icon light-darken" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/codex.svg" alt=""><span class="h-name">Codex</span></div>
-        <div class="harness-item"><img class="h-icon" src="../../../magnitude-dev-landing/src/assets/logos/claude.svg" alt=""><span class="h-name">Claude Code</span></div>
-        <div class="harness-item"><img class="h-icon" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/omp.svg" alt=""><span class="h-name">Oh My Pi</span></div>
-        <div class="harness-item"><img class="h-icon dark-invert" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/cline.svg" alt=""><span class="h-name">Cline</span></div>
-      </div>
-    </section>
-
-    <div class="intake" aria-hidden="true"><div class="arrow"></div><span>CLI</span></div>
-
-    <section class="runtime">
-      <header class="runtime-header">
-        <img class="only-dark" src="../brand/icon-dark.svg" alt="">
-        <img class="only-light" src="../brand/icon-light.svg" alt="">
-        <div>
-          <span>Finds, downloads, and runs the best</span>
-          <span>local models for your machine</span>
+      <section class="harnesses">
+        <h1 class="group-label">YOUR EXISTING AGENT</h1>
+        <div class="harness-grid">
+          <div class="tile harness-tile"><img class="harness-logo light-darken" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/pi.svg" alt=""><span class="harness-name">Pi</span></div>
+          <div class="tile harness-tile"><img class="harness-logo light-darken" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/opencode.svg" alt=""><span class="harness-name">OpenCode</span></div>
+          <div class="tile harness-tile"><img class="harness-logo" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/hermes.svg" alt=""><span class="harness-name">Hermes</span></div>
+          <div class="tile harness-tile"><img class="harness-logo light-darken" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/codex.svg" alt=""><span class="harness-name">Codex</span></div>
+          <div class="tile harness-tile"><img class="harness-logo" src="../../../magnitude-dev-landing/src/assets/logos/claude.svg" alt=""><span class="harness-name">Claude Code</span></div>
+          <div class="tile harness-tile"><img class="harness-logo" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/openclaw.svg" alt=""><span class="harness-name">OpenClaw</span></div>
         </div>
-      </header>
-      <div class="model-grid">
-        <div class="model-item qwen-lockup"><img class="model-icon" src="../../../magnitude-dev-landing/src/assets/logos/qwen.svg" alt=""><img class="model-logo dark-invert" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/qwen-wordmark.svg" alt="Qwen"></div>
-        <div class="model-item deepseek-lockup"><img class="model-logo" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/deepseek.svg" alt="DeepSeek"></div>
-        <div class="model-item gemma-lockup"><div class="gemma-lockup-inner"><img class="model-icon" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/gemma-icon-trimmed.png" alt=""><img class="model-logo dark-invert" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/gemma-wordmark.svg" alt="Gemma"></div></div>
-        <div class="model-item"><img class="model-logo light-darken" src="../../../magnitude-dev-landing/src/assets/logos/zai.svg" alt="Z.ai"></div>
-        <div class="model-item nvidia-lockup"><img class="model-logo light-darken" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/nvidia.svg" alt="NVIDIA"></div>
-        <div class="model-item"><img class="model-logo light-darken" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/meta.svg" alt="Meta"></div>
-        <div class="model-item"><img class="model-logo light-darken" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/liquid-ai.svg" alt="Liquid AI"></div>
-        <div class="model-item poolside-lockup"><img class="model-logo" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/poolside.svg" alt="Poolside"></div>
-        <div class="model-item prism-lockup"><img class="model-logo light-darken" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/prismml.svg" alt="PrismML"></div>
-      </div>
-    </section>
+      </section>
+
+      <div class="connector" aria-hidden="true"></div>
+
+      <section class="magnitude-box">
+        <header class="magnitude-header">
+          <img class="magnitude-wordmark only-dark" src="../../../magnitude-dev-landing/src/assets/wordmark-white.svg" alt="Magnitude">
+          <img class="magnitude-wordmark only-light" src="../../../magnitude-dev-landing/src/assets/wordmark-black.svg" alt="Magnitude">
+          <span class="magnitude-label">LOCAL MODELS FOR YOUR HARDWARE</span>
+        </header>
+
+        <div class="models">
+          <div class="model-row model-row-top">
+            <div class="tile model-tile qwen-lockup"><img class="model-icon" src="../../../magnitude-dev-landing/src/assets/logos/qwen.svg" alt=""><img class="model-logo dark-invert" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/qwen-wordmark.svg" alt="Qwen"></div>
+            <div class="tile model-tile"><img class="model-logo nvidia-logo light-darken" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/nvidia.svg" alt="NVIDIA"></div>
+            <div class="tile model-tile"><img class="model-logo zai-logo light-darken" src="../../../magnitude-dev-landing/src/assets/logos/zai.svg" alt="Z.ai"></div>
+          </div>
+          <div class="model-row model-row-bottom">
+            <div class="tile model-tile"><img class="model-logo deepseek-logo" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/deepseek.svg" alt="DeepSeek"></div>
+            <div class="tile model-tile gemma-lockup"><img class="model-icon" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/gemma-icon-trimmed.png" alt=""><img class="model-logo dark-invert" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/gemma-wordmark.svg" alt="Gemma"></div>
+          </div>
+        </div>
+      </section>
     </div>
   </main>
 </body>

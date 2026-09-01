@@ -6,7 +6,7 @@ icon: message-circle-question-mark
 
 ## What is Magnitude?
 
-An open source inference server your agent sets up and operates through the Magnitude CLI. It profiles your hardware, recommends the best models for it, and runs them tuned to your machine.
+An open source inference server that runs the best local models for your hardware, plugged into the agent you already use. It profiles your machine, recommends the models that fit, then downloads, tunes, and runs them.
 
 ## What hardware do I need?
 
@@ -14,7 +14,7 @@ There's no fixed minimum. Magnitude profiles your hardware and recommends the be
 
 ## Why not just have my agent set up Ollama?
 
-Your agent can install Ollama and pull a model, but it's guessing. It doesn't know your hardware, which quant fits, or how fast it'll run. Magnitude gives it a curated catalog with recommendations computed for your machine. Setup is agent-first, through a headless CLI that connects the model to your harness. Inference is built for agents. Models load just in time, unload when idle or memory gets tight, and concurrency is handled for you.
+Your agent would be guessing. It doesn't know your hardware, which quant fits, or how fast it'll run. Magnitude gives it a catalog with recommendations computed for your machine, an onboarding flow that writes your harness config, and inference built for agent workloads. Models load just in time and unload when idle or memory gets tight.
 
 ## Which harnesses work with it?
 
