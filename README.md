@@ -18,7 +18,7 @@
   <a href="https://www.npmjs.com/package/@magnitudedev/cli"><img src="https://img.shields.io/npm/v/%40magnitudedev%2Fcli" alt="npm version"></a>
 </p>
 
-An open source inference server that your agent sets up for you. Magnitude profiles your hardware, helps you choose the best local models for it, then downloads, tunes, and runs them.
+An open source inference server your agent sets up for you. It profiles your hardware, helps you choose the best local models for it, then downloads, tunes, and runs them.
 
 ⭐ Help us reach more developers and grow the Magnitude community. Star this repo!
 
