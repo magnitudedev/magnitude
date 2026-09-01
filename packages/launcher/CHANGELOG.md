@@ -1,5 +1,13 @@
 # @magnitudedev/cli
 
+## 0.0.10
+
+### Patch Changes
+
+- [`88a9987`](https://github.com/magnitudedev/magnitude/commit/88a9987267c58ed1633ffa58a896dd3c55dfb6e0) Thanks [@anerli](https://github.com/anerli)! - fix: template inspections failing after model download through CLI
+
+- [`88a9987`](https://github.com/magnitudedev/magnitude/commit/88a9987267c58ed1633ffa58a896dd3c55dfb6e0) Thanks [@anerli](https://github.com/anerli)! - fix: CLI commands hanging after completion
+
 ## 0.0.9
 
 ### Patch Changes
