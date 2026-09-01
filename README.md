@@ -8,7 +8,7 @@
 
 <h1 align="center">Magnitude</h1>
 
-<p align="center"><strong>Easy local inference for agents</strong></p>
+<p align="center"><strong>Run your agent on local models. Free, private, and offline.</strong></p>
 
 <p align="center">
   <a href="https://docs.magnitude.dev"><img src="https://img.shields.io/badge/%F0%9F%93%95-Docs-0369a1?style=flat-square&labelColor=0369a1&color=gray" alt="Documentation"></a>
@@ -18,42 +18,56 @@
   <a href="https://www.npmjs.com/package/@magnitudedev/cli"><img src="https://img.shields.io/npm/v/%40magnitudedev%2Fcli" alt="npm version"></a>
 </p>
 
-An open source inference server that profiles your hardware, recommends the best local models for it, then downloads, tunes, and runs them. Use the built-in harness or connect OpenCode, Pi, Hermes, or whatever you already use.
+Magnitude is an open source inference server that runs the best local models for your hardware, plugged into the agent you already use. It profiles your machine, recommends the models that fit, then downloads, tunes, and runs them. Works with Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline, or use the built-in harness.
 
 ⭐ Help us reach more developers and grow the Magnitude community. Star this repo!
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/readme/ecosystem-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="assets/readme/ecosystem-light.png">
-  <img alt="Magnitude works with Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline, and leading local models" src="assets/readme/ecosystem-light.png">
+  <img alt="Pi, OpenCode, Hermes, Codex, Claude Code, and OpenClaw connected to Magnitude, which runs local models for your hardware." src="assets/readme/ecosystem-light.png">
 </picture>
 
 ## Get started
 
-```sh
-npm i -g @magnitudedev/cli && magnitude setup
+**Send this to your agent to walk through models and setup:**
+
+```text
+Set up local models for me with the Magnitude CLI. Install it with `npm i -g @magnitudedev/cli` (or my package manager), then run `magnitude docs onboarding` and follow the instructions.
 ```
 
-Magnitude profiles your machine and shows you the best local models for it. Choose one and Magnitude downloads it, then connects it to your harness of choice.
+Your agent will profile your hardware, walk you through the best local models for it, download the ones you pick, and switch itself over to them.
 
 Magnitude supports macOS and Linux. Windows is supported through WSL.
 
+<details>
+<summary>Want to browse the models directly?</summary>
+
+```sh
+npm i -g @magnitudedev/cli
+magnitude setup
+```
+
+The interactive setup lets you browse the recommended models and choose one yourself.
+
+</details>
+
 ## Why Magnitude?
 
-- **Set up in one command:** pick a recommended model and it launches your harness
+- **Free to run:** no token costs, API keys, or rate limits
+- **Fully private and offline:** models, prompts, and files stay on your machine
+- **Agent-first setup:** one prompt and your agent walks you through the rest
 - **Knows your hardware:** profiles your chip, memory, and bandwidth
 - **Recommends what fits:** the best models for your machine, with estimated tok/s
 - **Tuned end to end:** speculative decoding, concurrency, all set for your machine
 - **Models on demand:** loaded on request, unloaded when idle or memory fills
-- **Fully private and offline:** models, prompts, and files stay on your machine
-- **Free to run:** no token costs, API keys, or rate limits
 - **Open source:** Apache 2.0, yours to modify
 
 ## FAQ
 
 ### What is Magnitude?
 
-An open source inference server your agent sets up and operates through the Magnitude CLI. It profiles your hardware, recommends the best models for it, and runs them tuned to your machine.
+An open source inference server that runs the best local models for your hardware, plugged into the agent you already use. It profiles your machine, recommends the models that fit, then downloads, tunes, and runs them.
 
 ### What hardware do I need?
 
@@ -61,7 +75,7 @@ There's no fixed minimum. Magnitude profiles your hardware and recommends the be
 
 ### Why not just have my agent set up Ollama?
 
-Your agent can install Ollama and pull a model, but it's guessing. It doesn't know your hardware, which quant fits, or how fast it'll run. Magnitude gives it a curated catalog with recommendations computed for your machine. Setup is agent-first, through a headless CLI that connects the model to your harness. Inference is built for agents. Models load just in time, unload when idle or memory gets tight, and concurrency is handled for you.
+Your agent would be guessing. It doesn't know your hardware, which quant fits, or how fast it'll run. Magnitude gives it a catalog with recommendations computed for your machine, an onboarding flow that writes your harness config, and inference built for agent workloads. Models load just in time and unload when idle or memory gets tight.
 
 ### Which harnesses work with it?
 

@@ -2,7 +2,7 @@
     "$schema": "https://mintlify.com/docs.json",
     "name": "Magnitude",
     "theme": "linden",
-    "description": "Easy local inference for agents",
+    "description": "Run your agent on local models. Free, private, and offline.",
     "logo": {
         "light": "/wordmark-black.svg",
         "dark": "/wordmark-white.svg"
