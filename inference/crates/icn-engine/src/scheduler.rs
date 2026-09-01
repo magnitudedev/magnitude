@@ -445,6 +445,8 @@ pub(crate) struct SequencePool {
     available: VecDeque<AvailableSequence>,
 }
 
+const SLOT_PROMPT_SIMILARITY_THRESHOLD: f32 = 0.1;
+
 impl SequencePool {
     pub(crate) fn new(count: u32) -> Self {
         Self {
@@ -466,17 +468,26 @@ impl SequencePool {
     }
 
     pub(crate) fn acquire_matching(&mut self, prompt: &PromptLayout) -> Option<AvailableSequence> {
+        let prompt_tokens = prompt.logical_tokens();
+        if prompt_tokens == 0 {
+            return self.available.pop_back();
+        }
         let best = self
             .available
             .iter()
             .enumerate()
-            .max_by_key(|(_, sequence)| {
-                sequence.reusable_prefix.as_ref().map_or(0, |prefix| {
-                    prefix.layout.common_prefix(prompt).logical_tokens
-                })
+            .filter_map(|(index, sequence)| {
+                let prefix = sequence.reusable_prefix.as_ref()?;
+                let common_prefix = prefix.layout.common_prefix(prompt).logical_tokens;
+                let similarity = common_prefix as f32 / prompt_tokens as f32;
+                (similarity > SLOT_PROMPT_SIMILARITY_THRESHOLD).then_some((index, common_prefix))
             })
-            .map(|(index, _)| index)?;
-        self.available.remove(best)
+            .max_by_key(|(_, common_prefix)| *common_prefix)
+            .map(|(index, _)| index);
+        match best {
+            Some(index) => self.available.remove(index),
+            None => self.available.pop_back(),
+        }
     }
 
     pub(crate) fn release(&mut self, sequence: AvailableSequence) {
@@ -685,6 +696,81 @@ mod tests {
             ]))
             .unwrap();
         assert_eq!(acquired.id(), first_id);
+    }
+
+    #[test]
+    fn weak_cache_match_uses_an_empty_lru_sequence() {
+        let mut pool = SequencePool::new(2);
+        let cached = pool.acquire().unwrap();
+        let cached_id = cached.id();
+        pool.release(cached.activate().into_available(Some(ReusablePrefix {
+            layout: PromptLayout::text(vec![LlamaToken::new(1)]),
+            checkpoints: Vec::new(),
+        })));
+
+        let acquired = pool
+            .acquire_matching(&PromptLayout::text((1..=11).map(LlamaToken::new).collect()))
+            .unwrap();
+
+        assert_ne!(acquired.id(), cached_id);
+        assert!(acquired.reusable_prefix.is_none());
+    }
+
+    #[test]
+    fn cache_match_must_strictly_exceed_similarity_threshold() {
+        let mut pool = SequencePool::new(2);
+        let cached = pool.acquire().unwrap();
+        let cached_id = cached.id();
+        pool.release(cached.activate().into_available(Some(ReusablePrefix {
+            layout: PromptLayout::text(vec![LlamaToken::new(1)]),
+            checkpoints: Vec::new(),
+        })));
+
+        let acquired = pool
+            .acquire_matching(&PromptLayout::text((1..=10).map(LlamaToken::new).collect()))
+            .unwrap();
+
+        assert_ne!(acquired.id(), cached_id);
+        assert!(acquired.reusable_prefix.is_none());
+    }
+
+    #[test]
+    fn qualifying_cache_match_wins_over_an_empty_lru_sequence() {
+        let mut pool = SequencePool::new(2);
+        let cached = pool.acquire().unwrap();
+        let cached_id = cached.id();
+        pool.release(cached.activate().into_available(Some(ReusablePrefix {
+            layout: PromptLayout::text(vec![LlamaToken::new(1)]),
+            checkpoints: Vec::new(),
+        })));
+
+        let acquired = pool
+            .acquire_matching(&PromptLayout::text((1..=9).map(LlamaToken::new).collect()))
+            .unwrap();
+
+        assert_eq!(acquired.id(), cached_id);
+    }
+
+    #[test]
+    fn missing_qualifying_match_uses_least_recently_used_cached_sequence() {
+        let mut pool = SequencePool::new(2);
+        let oldest = pool.acquire().unwrap();
+        let oldest_id = oldest.id();
+        let newest = pool.acquire().unwrap();
+        pool.release(oldest.activate().into_available(Some(ReusablePrefix {
+            layout: PromptLayout::text(vec![LlamaToken::new(1)]),
+            checkpoints: Vec::new(),
+        })));
+        pool.release(newest.activate().into_available(Some(ReusablePrefix {
+            layout: PromptLayout::text(vec![LlamaToken::new(2)]),
+            checkpoints: Vec::new(),
+        })));
+
+        let acquired = pool
+            .acquire_matching(&PromptLayout::text(vec![LlamaToken::new(3); 11]))
+            .unwrap();
+
+        assert_eq!(acquired.id(), oldest_id);
     }
 
     #[test]

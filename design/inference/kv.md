@@ -31,8 +31,10 @@ Prefix metadata cannot exist apart from its available sequence. Native KV stays 
 
 ## Reuse
 
-Admission selects the available sequence with the longest exact committed semantic prefix. A
-semantic prompt is an ordered sequence of text and media spans:
+Admission selects the available sequence with the longest exact committed semantic prefix when the
+match exceeds ten percent of the incoming prompt. Otherwise it selects the least recently used
+sequence, allowing unused empty capacity to absorb weakly related requests without displacing a
+recent retained prefix. A semantic prompt is an ordered sequence of text and media spans:
 
 ```text
 Text(tokens) -> Media(identity, logical tokens, native positions) -> Text(tokens)
