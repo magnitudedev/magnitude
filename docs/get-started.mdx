@@ -1,10 +1,24 @@
 ---
 title: Get Started
-description: "Install Magnitude and set up local inference"
+description: "Set up local inference through your agent or browse models directly"
 icon: rocket
 ---
 
-## Install and set up
+## Set up with your agent
+
+**Send this to your agent:**
+
+```text
+Set up local models for me with the Magnitude CLI. Install it with `npm i -g @magnitudedev/cli` (or my package manager), then run `magnitude docs onboarding` and follow the instructions.
+```
+
+Your agent will profile your hardware, walk you through the best local models for it, download the ones you pick, and switch itself over to them.
+
+Magnitude supports macOS and Linux. Windows is supported through WSL.
+
+## Browse the models directly
+
+If you prefer to browse the recommended models and choose one yourself, use the interactive setup:
 
 <Tabs>
   <Tab title="npm">
@@ -33,7 +47,7 @@ icon: rocket
   </Tab>
 </Tabs>
 
-Setup:
+Interactive setup:
 
 1. Profiles your processor, memory, and memory bandwidth.
 2. Ranks model, quantization, and context combinations for your hardware.
@@ -46,13 +60,13 @@ Magnitude supports the Magnitude Harness, Pi, OpenCode, Hermes, OpenClaw, Codex,
 
 ## Start working
 
-Continue in the harness that setup launches. Magnitude runs headlessly in the background, loads the model when your agent requests it, and manages memory and concurrency automatically.
+Follow any handoff instructions your agent gives you, then continue in your harness. Magnitude runs headlessly in the background, loads the model when your agent requests it, and manages memory and concurrency automatically.
 
-You do not need to learn the Magnitude CLI. Setup can install a Magnitude skill that lets your agent inspect Magnitude and find or install other local models later. Choose between installed models from your harness model dropdown.
+You do not need to learn the Magnitude CLI. Your agent can inspect Magnitude and find, install, or switch local models later. You can also choose between installed models from your harness model dropdown.
 
 ## Windows
 
-Magnitude supports macOS and Linux. On Windows, use WSL:
+On Windows, install WSL first:
 
 ```powershell
 wsl --install

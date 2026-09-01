@@ -4,7 +4,7 @@ description: "Resolve setup, connection, model, memory, and performance problems
 icon: wrench
 ---
 
-If your harness is available, ask the agent to inspect Magnitude and fix the problem. Setup can install the Magnitude skill so the agent knows how to use the CLI.
+If your harness is available, ask the agent to inspect Magnitude and fix the problem. It can run `magnitude docs onboarding` for the current agent-guided workflow and use the headless CLI to inspect the service, models, and connections.
 
 <Warning>
   Do not delete `~/.magnitude`. It contains downloaded models, settings, harness connections, and Magnitude Harness sessions.
@@ -12,9 +12,9 @@ If your harness is available, ask the agent to inspect Magnitude and fix the pro
 
 ## Setup did not finish
 
-Run `magnitude setup` again. Completed hardware profiling and model downloads are reused when possible.
+Ask your agent to resume setup and follow `magnitude docs onboarding` again. Completed hardware profiling and model downloads are reused when possible.
 
-If the command does not start, check `magnitude --version`, then update or reinstall the CLI. On Windows, run Magnitude inside WSL.
+If the CLI does not start, check `magnitude --version`, then update or reinstall it. On Windows, run Magnitude inside WSL. If you were using interactive setup, you can run `magnitude setup` again.
 
 ## Harness cannot use Magnitude
 
@@ -25,7 +25,7 @@ magnitude service start
 magnitude connections sync
 ```
 
-If the harness is not connected, rerun `magnitude setup` or add the connection from the CLI reference.
+If the harness is not connected, ask your agent to resume onboarding. For manual recovery, rerun `magnitude setup` or add the connection from the CLI reference.
 
 ## Model download failed
 
@@ -62,7 +62,7 @@ Use the least disruptive recovery:
 1. Retry the request.
 2. Restart the harness.
 3. Start or restart the Magnitude service.
-4. Run `magnitude setup` again.
+4. Ask your agent to resume onboarding, or run `magnitude setup` again for interactive setup.
 5. Clear only `~/.magnitude/cache` when derived hardware or catalog data is the problem.
 6. Reinstall the CLI if bundled inference files are missing.
 

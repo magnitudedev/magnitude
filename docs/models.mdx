@@ -14,7 +14,7 @@ Magnitude caches this profile and recalibrates when needed.
 
 ## Recommendations
 
-Setup ranks up to ten configurations using:
+During agent-first setup, Magnitude ranks up to ten configurations using:
 
 - Model intelligence
 - Estimated generation speed
@@ -22,19 +22,19 @@ Setup ranks up to ten configurations using:
 - Configured context size
 - Physical memory
 
-Move **Fast to Smart** toward Fast to favor generation speed or toward Smart to favor intelligence.
+Your agent asks whether you prefer faster, balanced, or smarter output, then walks you through the strongest options. In interactive setup, move **Fast to Smart** toward Fast to favor generation speed or toward Smart to favor intelligence.
 
 Speed is shown as a range such as `~36–48 tok/s`. Actual performance varies with prompt length, concurrent work, available memory, and model revision.
 
 ## Model catalog
 
-The catalog contains all curated configurations that fit the current hardware, not only the recommendations produced by the setup preferences. It includes memory, intelligence, quantization, speed, context, and license information.
+The catalog contains all curated configurations that fit the current hardware, not only the top recommendations. It includes memory, intelligence, quantization, speed, context, and license information.
 
 Magnitude-managed models are stored in `~/.magnitude/models`. Downloading a model stores it on disk. It does not keep the model permanently loaded in memory.
 
 ## Change models later
 
-Setup should provide the best starting configuration. Revisit the model choice when new models are released or when you want a different speed, intelligence, context, or memory trade-off.
+Initial setup should provide the best starting configuration. Revisit the model choice when new models are released or when you want a different speed, intelligence, context, or memory trade-off.
 
 Choose another installed model from your harness model dropdown. You can also ask your agent to research and install a new model. For example:
 

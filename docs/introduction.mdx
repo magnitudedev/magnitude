@@ -4,17 +4,19 @@ description: "Easy local inference for agents"
 icon: compass
 ---
 
-Magnitude is an open source inference server that profiles your hardware, recommends the best models for it, then downloads, tunes, and runs them. Use the Magnitude Harness or connect Pi, OpenCode, Hermes, or another supported harness.
+Magnitude is an open source inference server your agent sets up for you. It profiles your hardware, helps you choose the best local models for it, then downloads, tunes, and runs them.
 
 ## Why Magnitude?
 
-- **Knows your hardware:** Profiles your chip, memory, and bandwidth.
-- **Recommends what fits:** Ranks exact model, quantization, and context combinations for your machine, with estimated tok/s.
-- **Models on demand:** loaded on request, unloaded when idle or memory fills.
-- **Tuned end to end:** Configures acceleration, speculative decoding, context, and concurrency for your machine.
-- **Set up in one command:** Pick a recommended model and Magnitude connects and launches your harness.
-- **Fully private and offline:** Models, prompts, and files stay on your machine.
-- **Free to run:** No token costs, API keys, or rate limits.
-- **Open source:** Apache 2.0 licensed and yours to modify.
+- **Agent-first setup:** one prompt and your agent walks you through the rest
+- **Knows your hardware:** profiles your chip, memory, and bandwidth
+- **Recommends what fits:** the best models for your machine, with estimated tok/s
+- **Tuned end to end:** speculative decoding, concurrency, all set for your machine
+- **Models on demand:** loaded on request, unloaded when idle or memory fills
+- **Fully private and offline:** models, prompts, and files stay on your machine
+- **Free to run:** no token costs, API keys, or rate limits
+- **Open source:** Apache 2.0, yours to modify
 
-After setup, Magnitude runs in the background. Open your harness and work normally. Magnitude loads and serves the selected model as it is needed.
+Magnitude works with Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline, or you can use Magnitude's built-in harness.
+
+[Get started by sending one prompt to your agent](/get-started). After setup, Magnitude runs in the background and loads the selected model when your agent needs it.
