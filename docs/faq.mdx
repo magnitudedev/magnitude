@@ -6,36 +6,32 @@ icon: message-circle-question-mark
 
 ## What is Magnitude?
 
-Magnitude is an open source local inference server for agents. It profiles your hardware, recommends model configurations, then downloads, tunes, and runs them. Use Magnitude Harness or connect another supported harness.
+An open source inference server your agent sets up and operates through the Magnitude CLI. It profiles your hardware, recommends the best models for it, and runs them tuned to your machine.
 
 ## What hardware do I need?
 
-There is no fixed minimum. Magnitude profiles the available hardware and recommends configurations that fit. More memory supports larger models and contexts.
+There's no fixed minimum. Magnitude profiles your hardware and recommends the best models for your machine. More memory lets you run larger models.
 
-## How is it different from Ollama or LM Studio?
+## Why not just have my agent set up Ollama?
 
-Ollama and LM Studio run the model configuration you choose. Magnitude profiles the machine, recommends exact model, quantization, and context combinations, estimates their performance, and tunes the runtime. It also manages model residency, memory, and concurrency for agent workloads.
+Your agent can install Ollama and pull a model, but it's guessing. It doesn't know your hardware, which quant fits, or how fast it'll run. Magnitude gives it a curated catalog with recommendations computed for your machine. Setup is agent-first, through a headless CLI that connects the model to your harness. Inference is built for agents. Models load just in time, unload when idle or memory gets tight, and concurrency is handled for you.
 
 ## Which harnesses work with it?
 
-Magnitude supports Magnitude Harness, Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline. Setup connects and launches the harness you choose.
+Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline. During setup, your agent connects your harness to the model you pick. Or use Magnitude's built-in harness.
 
 ## Do I need to manage Magnitude after setup?
 
-No. Magnitude runs in the background and manages the selected model automatically. Revisit it when you want to try a new or different model or need to diagnose a problem. Your agent can use the Magnitude CLI for you.
-
-## Does the model stay in memory all the time?
-
-No. Magnitude loads the model when an agent requests it, keeps it available while active, and unloads it after inactivity or when memory is needed. The model remains downloaded and selected.
+No. It runs in the background, loads models when your agent needs them, and unloads them when idle or memory gets tight. Your agent can install or switch models through the Magnitude CLI anytime.
 
 ## Does my data go to the cloud?
 
-Not when using local models. Models, prompts, and files stay on your machine. Requests only leave the machine when you explicitly configure an external endpoint in Magnitude Harness.
+No. Prompts, files, and models stay on your machine.
 
 ## Can it run completely offline?
 
-Yes. After Magnitude and a model are downloaded, local inference works without an internet connection.
+Yes. Once Magnitude and a model are downloaded, no internet connection needed.
 
 ## Can I use models outside the catalog?
 
-Yes. Magnitude discovers compatible GGUF models in recognized Hugging Face Hub cache locations, including models outside its catalog.
+Yes. You can [download compatible GGUF models from Hugging Face](/models#download-a-model-outside-the-catalog) and use them in Magnitude.
