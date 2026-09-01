@@ -54,49 +54,72 @@
       --arrow: #64748b;
     }
 
+    body.landing {
+      --tile: #121e2e;
+      --tile-border: #233247;
+      --runtime-start: #142238;
+      --runtime-end: #101b2a;
+      --runtime-border: #334863;
+      --runtime-rule: #293950;
+      --model-tile: #101b2a;
+      --model-border: #26364a;
+    }
+
     .stage {
       position: absolute;
       inset: 24px;
       display: grid;
-      grid-template-columns: 540px 130px 1fr;
+      grid-template-columns: 598px 68px 700px;
+      gap: 22px;
       align-items: center;
+      justify-content: center;
       overflow: hidden;
-      padding: 42px 50px;
+      padding: 36px;
       border: 2px solid var(--card-border);
       border-radius: 28px;
       background: var(--card);
     }
 
+    body.landing .stage {
+      border: 0;
+      background: transparent;
+    }
+
+    body.landing .runtime {
+      border-width: 1px;
+    }
+
     .clients {
       display: flex;
       flex-direction: column;
-      gap: 28px;
+      gap: 19px;
     }
 
     .clients h1 {
       margin: 0;
-      font-size: 32px;
+      color: var(--muted);
+      font-size: 18px;
+      font-weight: 780;
       line-height: 1.2;
-      letter-spacing: -.02em;
+      letter-spacing: .06em;
+      text-transform: uppercase;
     }
-
-    .clients h1 span { color: var(--muted); }
 
     .harness-grid {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 18px;
+      grid-template-columns: repeat(4, 139px);
+      grid-template-rows: repeat(2, 134px);
+      gap: 14px;
     }
 
     .harness-item {
       display: flex;
-      height: 132px;
+      height: 134px;
       min-width: 0;
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      gap: 13px;
-      padding-top: 10px;
+      gap: 11px;
       border: 1px solid var(--tile-border);
       border-radius: 20px;
       background: var(--tile);
@@ -110,104 +133,117 @@
 
     .h-name {
       color: var(--muted);
-      font-size: 18px;
-      font-weight: 600;
+      font-size: 16px;
+      font-weight: 680;
       line-height: 1;
       white-space: nowrap;
     }
 
     .intake {
+      position: relative;
       display: flex;
       align-items: center;
       justify-content: center;
+      height: 2px;
+      transform: translateY(19px);
     }
 
     .arrow {
       position: relative;
-      width: 76px;
-      height: 4px;
+      width: 58px;
+      height: 2px;
       background: var(--arrow);
     }
 
     .arrow::before,
     .arrow::after {
       position: absolute;
-      top: 50%;
+      top: -5px;
+      width: 10px;
+      height: 10px;
       content: "";
-      transform: translateY(-50%);
-      border-block: 10px solid transparent;
+      border-top: 2px solid var(--arrow);
     }
 
     .arrow::before {
-      left: -1px;
-      border-right: 16px solid var(--arrow);
+      left: 0;
+      border-left: 2px solid var(--arrow);
+      transform: rotate(-45deg);
     }
 
     .arrow::after {
-      right: -1px;
-      border-left: 16px solid var(--arrow);
+      right: 0;
+      border-right: 2px solid var(--arrow);
+      transform: rotate(45deg);
+    }
+
+    .intake span {
+      position: absolute;
+      top: 17px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: var(--muted);
+      font-size: 16px;
+      font-weight: 800;
+      letter-spacing: .12em;
     }
 
     .runtime {
-      height: 100%;
-      padding: 24px;
-      border: 2px solid var(--runtime-border);
+      width: 700px;
+      padding: 25px;
+      border: 1px solid var(--runtime-border);
       border-radius: 32px;
-      background: linear-gradient(145deg, var(--runtime-start), var(--runtime-end));
+      background: var(--runtime-start);
     }
 
     .runtime-header {
       display: flex;
-      height: 92px;
-      align-items: center;
-      gap: 16px;
-      padding: 0 14px 20px;
-      border-bottom: 1px solid var(--runtime-rule);
+      align-items: flex-start;
+      justify-content: space-between;
+      padding: 0 9px;
     }
 
     .runtime-header img {
-      width: 78px;
-      height: 78px;
-    }
-
-    .runtime-header strong {
-      display: block;
-      font-size: 35px;
-      line-height: 1.05;
-      letter-spacing: -.02em;
+      order: 2;
+      width: 60px;
+      height: 58px;
+      object-fit: contain;
     }
 
     .runtime-header span {
       display: block;
-      margin-top: 7px;
       color: var(--muted);
-      font-size: 23px;
-      line-height: 1.2;
+      font-size: 18px;
+      font-weight: 780;
+      line-height: 1.3;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      white-space: nowrap;
     }
 
     .model-grid {
       display: grid;
       grid-template-columns: repeat(3, 1fr);
-      grid-template-rows: repeat(3, 92px);
+      grid-template-rows: repeat(3, 97px);
       gap: 13px;
       padding-top: 20px;
     }
 
     .model-item {
       display: flex;
-      height: 92px;
+      height: 97px;
       min-width: 0;
       align-items: center;
       justify-content: center;
       padding: 12px;
       border: 1px solid var(--model-border);
-      border-radius: 18px;
+      border-radius: 19px;
       background: var(--model-tile);
     }
 
     .model-logo {
-      max-width: 148px;
-      max-height: 46px;
+      max-width: 156px;
+      max-height: 48px;
       object-fit: contain;
     }
 
@@ -216,13 +252,13 @@
 
     .qwen-lockup .model-icon,
     .gemma-lockup .model-icon {
-      width: 42px;
-      height: 42px;
+      width: 44px;
+      height: 44px;
       object-fit: contain;
     }
 
-    .qwen-lockup .model-logo { width: 100px; }
-    .gemma-lockup .model-logo { width: 105px; }
+    .qwen-lockup .model-logo { width: 106px; }
+    .gemma-lockup .model-logo { width: 111px; }
 
     .deepseek-lockup .model-logo,
     .poolside-lockup .model-logo { transform: scale(1.18); }
@@ -244,18 +280,23 @@
     body.light .light-darken { filter: brightness(0) saturate(100%); }
   </style>
   <script>
-    const requestedTheme = new URLSearchParams(location.search).get('theme')
+    const params = new URLSearchParams(location.search)
+    const requestedTheme = params.get('theme')
+    const surface = params.get('surface')
     const theme = requestedTheme === 'light' || requestedTheme === 'dark'
       ? requestedTheme
       : matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
     document.documentElement.style.colorScheme = theme
-    addEventListener('DOMContentLoaded', () => document.body.classList.add(theme))
+    addEventListener('DOMContentLoaded', () => {
+      document.body.classList.add(theme)
+      if (surface === 'landing') document.body.classList.add('landing')
+    })
   </script>
 </head>
 <body>
   <main class="stage">
     <section class="clients">
-      <h1>Works with your<br><span>existing harness</span></h1>
+      <h1>Works with your existing harness</h1>
       <div class="harness-grid">
         <div class="harness-item"><img class="h-icon light-darken" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/pi.svg" alt=""><span class="h-name">Pi</span></div>
         <div class="harness-item"><img class="h-icon light-darken" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/opencode.svg" alt=""><span class="h-name">OpenCode</span></div>
@@ -268,13 +309,16 @@
       </div>
     </section>
 
-    <div class="intake" aria-hidden="true"><div class="arrow"></div></div>
+    <div class="intake" aria-hidden="true"><div class="arrow"></div><span>CLI</span></div>
 
     <section class="runtime">
       <header class="runtime-header">
         <img class="only-dark" src="../brand/icon-dark.svg" alt="">
         <img class="only-light" src="../brand/icon-light.svg" alt="">
-        <div><strong>Magnitude</strong><span>Runs the best local models for your machine</span></div>
+        <div>
+          <span>Finds, downloads, and runs the best</span>
+          <span>local models for your machine</span>
+        </div>
       </header>
       <div class="model-grid">
         <div class="model-item qwen-lockup"><img class="model-icon" src="../../../magnitude-dev-landing/src/assets/logos/qwen.svg" alt=""><img class="model-logo dark-invert" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/qwen-wordmark.svg" alt="Qwen"></div>
