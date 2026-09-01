@@ -144,21 +144,33 @@ export function LocalModelOnboarding({
             aria-live="polite"
             className="mt-7 max-w-[720px] border-t border-slate-200 pt-6 dark:border-slate-800"
           >
-            <div className="flex items-start gap-3.5">
-              <Loader2
-                className="mt-0.5 shrink-0 animate-spin text-blue-700 motion-reduce:animate-none dark:text-blue-500"
-                size={20}
-              />
-              <div className="min-w-0 flex-1">
-                <span className="block text-[10px] font-semibold uppercase tracking-[0.09em] text-slate-500">
-                  Preparing local models
+            <span className="block text-[10px] font-semibold uppercase tracking-[0.09em] text-slate-500">
+              Preparing local models
+            </span>
+            <div className="mt-3 grid gap-2 text-[13px] leading-5 text-slate-700 dark:text-slate-300">
+              <div className="flex items-center gap-2.5">
+                <Loader2
+                  className="shrink-0 animate-spin text-blue-700 motion-reduce:animate-none dark:text-blue-500"
+                  size={17}
+                />
+                <span>
+                  Discovering existing models
+                  {content.preparation.discovery.modelsFound > 0
+                    ? ` · ${content.preparation.discovery.modelsFound} found`
+                    : ""}
                 </span>
-                <h2 className="mt-1 text-[17px] font-semibold leading-6 text-slate-900 dark:text-slate-200">
-                  Reconciling local models
-                </h2>
-                <p className="mt-1 text-[12px] leading-5 text-slate-600 dark:text-slate-400">
-                  Checking the model catalog and installed Hugging Face cache entries.
-                </p>
+              </div>
+              <div className="flex items-center gap-2.5">
+                <Loader2
+                  className="shrink-0 animate-spin text-blue-700 motion-reduce:animate-none dark:text-blue-500"
+                  size={17}
+                />
+                <span>
+                  Assessing models
+                  {content.preparation.assessment.totalModels > 0
+                    ? ` · ${content.preparation.assessment.settledModels} of ${content.preparation.assessment.totalModels}`
+                    : ""}
+                </span>
               </div>
             </div>
           </section>

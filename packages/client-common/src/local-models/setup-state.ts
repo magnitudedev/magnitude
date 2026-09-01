@@ -2,6 +2,7 @@ import { Cause, Data, Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
 import type {
   LocalModel,
+  LocalModelPreparation,
   ModelAcquisitionFailure,
   LocalModelsState,
   ModelFailure,
@@ -142,6 +143,7 @@ export type OnboardingModelSetupOperation =
 export type OnboardingModelSetupContent =
   | {
       readonly _tag: "Preparation"
+      readonly preparation: LocalModelPreparation
     }
   | {
       readonly _tag: "Chooser"
@@ -241,7 +243,9 @@ export const projectOnboardingModelSetupContent = (
   rankingControls: OnboardingModelRankingControls,
 ): OnboardingModelSetupContent => {
   if (Option.isNone(attempt)) {
-    if (!models.reconciliationComplete) return { _tag: "Preparation" }
+    if (!models.preparation.discovery.complete || !models.preparation.assessment.complete) {
+      return { _tag: "Preparation", preparation: models.preparation }
+    }
     return {
       _tag: "Chooser",
       options: localModelOptions(models, slots),

@@ -151,6 +151,33 @@ Open {
 }
 ```
 
+`Preparation` carries ACN's direct projection of ICN discovery and automatic-assessment progress.
+Onboarding remains in preparation until discovery and both assessment domains are complete; source
+reconciliation alone is not readiness. The discovery row reports the number of discovered models
+found on this machine — catalog models are not part of that count — and
+the assessment row reports settled targets over total targets. Both numbers are live snapshot facts,
+so the assessment total may increase when discovery adds targets. Clients do not scan model rows,
+capture a denominator, or introduce a revision or cycle to decide readiness.
+
+An assessment target settles exactly once as assessed or dropped. Dropped targets count as settled
+and are omitted from the chooser, so one unusable discovered artifact cannot block onboarding or
+make it return to preparation later.
+
+The preparation body has one fixed presentation inside the existing Choose model stage:
+
+```text
+Preparing local models
+
+spinner Discovering existing models · N found
+spinner Assessing models · X of Y
+```
+
+Only the numbers update in place. Each row shows its count suffix only once it has something to
+count: the discovery row omits `· N found` until at least one model has been discovered, and the
+assessment row omits `· X of Y` while it has no targets. There is no completed-row variant or
+intermediate layout. Once
+both native activities are complete, the whole preparation body is replaced by the existing chooser.
+
 Repeated metadata lives on its parent. Choice options and the connection-scoped Fast-to-Smart
 preference exist only on chooser content. Its normalized value is clamped to `[0, 1]`, survives
 renderer remounts for the connection, and are not durable onboarding state. The active

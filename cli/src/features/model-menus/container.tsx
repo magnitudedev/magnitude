@@ -1618,7 +1618,7 @@ const CatalogMenu = memo(function CatalogMenu({
   })
   const rankingReady = Option.exists(
     catalogView,
-    (models) => models.reconciliationComplete,
+    (models) => models.preparation.discovery.complete,
   )
   const memoryBytesFor = (model: CatalogLocalModel): number | undefined =>
     model.servingState._tag === "Assessed"

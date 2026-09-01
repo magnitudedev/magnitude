@@ -34,6 +34,7 @@ applies_to:
 | **Hardware calibration** | Model-free, serializable backend-performance evidence                       |
 | **Model assessment**     | Native evaluation of one exact resolved model at one exact serving profile  |
 | **Assessing**            | Ephemeral observable state while an admitted assessment scope is alive      |
+| **Dropped**              | Terminal disposition for a target whose one assessment attempt failed       |
 
 ## Hardware calibration
 
@@ -116,14 +117,17 @@ Every assessed profile produces one result:
 | `DoesNotFit`   | Exact configuration value, memory accounting, limiting resource, and deficit  |
 | `Incompatible` | The artifact/runtime combination cannot execute                               |
 
-Results are published through the revisioned automatic assessment snapshot. Each source slice
-reports its total, settled, and failed target counts plus the state of each exact subject. A target
-is `Assessing`, `Assessed`, or `Failed`; one target failure does not invalidate sibling results.
+Results are published through the revisioned automatic assessment snapshot. Each available source
+slice contains its current exact subjects. A target is `Assessing`, `Assessed`, or `Dropped`; total
+and settled counts are derived from that list rather than stored as parallel state. One target
+failure does not invalidate sibling results.
 
-Malformed or permanently unresolved material produces a non-retryable target failure. Operational
-failure produces a retryable target failure, creates no cache entry, and is retried with bounded
-backoff while the exact work remains referenced. Retry admission returns that target to
-`Assessing`. Observation is read-only and has no request, correlation, or stream lifecycle.
+Every exact target receives one assessment attempt. Any operational, malformed-material, timeout,
+or resolution failure creates no cache entry and settles that target as `Dropped`; it is not
+re-admitted by a timer. A dropped discovery target is silent. A dropped reviewed-catalog target
+emits an OpenTelemetry error before ACN omits it from the product projection. A changed artifact,
+profile, bundle, hardware environment, or other exact work identity is new work, not a retry.
+Observation is read-only and has no request, correlation, or stream lifecycle.
 
 ## Profiles
 
@@ -195,7 +199,7 @@ assessment admitted -> Assessing -> terminal result
                                       |-- Fits
                                       |-- DoesNotFit
                                       |-- Incompatible
-                                      +-- Failed
+                                      +-- Dropped
 ```
 
 `Assessing` is an internal marker, not a durable record or public operation identity. ICN owns it
@@ -203,7 +207,7 @@ inside its process-lifetime assessment pool:
 
 - enter only while exact work is referenced and admitted;
 - complete only from that exact work's result;
-- publish a typed terminal result on every exit path;
+- publish an assessed result or dropped disposition on every exit path;
 - never persist it;
 - guard publication by exact work identity so overlapping reconciliation cannot publish stale
   completion.
@@ -241,8 +245,9 @@ environment. Reconciliation retains terminal evidence, joins equivalent in-fligh
 missing work, and cancels work no longer referenced by either current source slice. Publication is
 guarded by that exact identity, so an obsolete completion cannot update a superseding target.
 Catalog and discovery expose independent source revisions and progress views over the unified pool.
-Retryable target and source-reconciliation failures are retried with bounded background backoff.
-Foreground planning takes precedence over queued background assessment.
+Whole-source reconciliation failures are retried with bounded background backoff. Individual
+target failures are terminal and never retried. Foreground planning takes precedence over queued
+background assessment.
 
 ## Product behavior
 
@@ -250,7 +255,7 @@ Foreground planning takes precedence over queued background assessment.
 - One ICN-owned pool evaluates current catalog and authoritative discovered configurations; ranking
   policy consumes only private eligible catalog inputs.
 - Inventory reconciliation is coalesced, retrying background work; reads remain non-blocking.
-- Resolved configurations remain visible while assessment is pending or fails.
+- Resolved configurations remain visible while assessment is pending; dropped targets are omitted.
 - Only completed `Fits` configurations can become enabled provider offerings; assessment itself
   creates no durable configuration or installation authority.
 - Downloading never performs hardware calibration.
@@ -261,7 +266,7 @@ Foreground planning takes precedence over queued background assessment.
 - One same-bundle job returns one result per requested profile.
 - Starting discovery or assessment never delays ICN or ACN health.
 - Discovery adds work to the live pool without restarting unchanged catalog work.
-- Progress counts current exact targets and advances once per terminal target result.
+- Progress counts current exact targets and advances once per assessed or dropped target.
 - Every profile result matches the current subject's exact ICN-resolved serving configuration;
   private material remains inside ICN.
 - Every `Fits` result contains ordered performance samples ending at the profile context.
@@ -270,8 +275,10 @@ Foreground planning takes precedence over queued background assessment.
 - Warm `DoesNotFit` cache reads invoke no native planner.
 - Download progress and semantically equivalent source revisions invoke no native assessment.
 - A stale assessment completion cannot overwrite state for a newer semantic key.
-- `Fits`, `DoesNotFit`, and `Incompatible` never represent an operational defect; `Failed` does.
+- `Fits`, `DoesNotFit`, and `Incompatible` never represent an operational defect; operational
+  defects drop the target.
 - `Assessing` cannot exist without pool-owned queued or running work.
+- A settled target cannot return to `Assessing` unless its exact work identity changes.
 - ACN contains no assessment scheduler, request correlation, or assessment mutation endpoint.
 - Queueing, native work, and child cleanup are bounded.
 - Nested llama.cpp core files remain unmodified.

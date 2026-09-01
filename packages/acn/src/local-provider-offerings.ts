@@ -50,11 +50,7 @@ const providerAvailability = (
 }
 
 export const localProviderOfferingsReady = (state: LocalModelsState): boolean =>
-  state.reconciliationComplete
-  && state.models.every((model) => Option.match(localModelServingState(model), {
-    onNone: () => true,
-    onSome: (serving) => serving._tag !== "Assessing",
-  }))
+  state.preparation.discovery.complete && state.preparation.assessment.complete
 
 export const projectLocalProviderOfferings = (models: readonly LocalModel[]) => {
   const assessedModels = models.flatMap((model) => Option.match(localModelServingState(model), {

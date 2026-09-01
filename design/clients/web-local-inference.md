@@ -48,6 +48,14 @@ The shared setup service sequences install, assignment, load, cancellation, and 
 completion and publishes one server-derived presentation state. Web renders that state directly and
 does not maintain a second workflow or correlate operations itself.
 
+Before the model chooser is ready, the existing onboarding screen renders one fixed preparation
+body with `Discovering existing models · N found` and `Assessing models · X of Y`. Both rows remain visually
+active and only their numbers update; the discovery row omits its `· N found` suffix while nothing
+has been discovered, and the assessment row omits its `· X of Y` suffix while it has no targets. The slider and model choices remain absent until the projected
+ICN discovery and assessment states are both complete, at which point the same screen replaces the
+preparation body with the chooser. There is no completed-row presentation, client-owned denominator,
+or client-visible discovery revision.
+
 Browser and Electron bootstrap presentation observes the SDK's client ACN lifecycle before treating
 the application connection as ready. Starting phases display their latest authoritative activity;
 installation displays the lifecycle's monotonic overall progress and exact transfer size only when

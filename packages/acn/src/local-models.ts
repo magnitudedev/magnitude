@@ -16,6 +16,7 @@ import {
   type LocalModelAssessment,
   type LocalModel,
   type LocalModelsState,
+  type LocalModelPreparation,
   type ModelId,
   type ModelFailure,
   type ModelResidency,
@@ -35,6 +36,7 @@ import {
   LocalModelSources,
   type CatalogModelSource,
   type DiscoveredModelSource,
+  type LocalModelSourcesState,
 } from "./local-model-sources"
 import { materializeProjection } from "./materialized-projection"
 import { modelRankingScores } from "./local-model-ranking-policy"
@@ -42,10 +44,61 @@ import { LocalModelRemovals, type LocalModelRemovalState } from "./local-model-r
 
 const failure = (code: string, message: string, retryable = false): ModelFailure => ({ code, message, retryable })
 
+const assessmentDomainProgress = (
+  domain: ModelAssessmentDomainSnapshot,
+  sourceRevision: number,
+): { readonly complete: boolean; readonly settledModels: number; readonly totalModels: number } => {
+  switch (domain._tag) {
+    case "Available": {
+      const totalModels = domain.entries.length
+      const settledModels = domain.entries.filter(({ state }) => state._tag !== "Assessing").length
+      return {
+        complete: domain.sourceRevision === sourceRevision && settledModels === totalModels,
+        settledModels,
+        totalModels,
+      }
+    }
+    case "Pending":
+    case "Failed": return { complete: false, settledModels: 0, totalModels: 0 }
+  }
+}
+
+export const projectLocalModelPreparation = (
+  source: LocalModelSourcesState,
+  assessments: ModelAssessmentsSnapshot,
+): LocalModelPreparation => {
+  const discovery = {
+    complete: source.reconciliationComplete,
+    modelsFound: source.discoveredModels.length,
+  }
+  if (assessments.state._tag !== "Ready") {
+    return {
+      discovery,
+      assessment: { complete: false, settledModels: 0, totalModels: 0 },
+    }
+  }
+  const catalog = assessmentDomainProgress(assessments.state.catalog, source.catalogRevision)
+  const discovered = assessmentDomainProgress(assessments.state.discovered, source.discoveryRevision)
+  return {
+    discovery,
+    assessment: {
+      complete: catalog.complete && discovered.complete,
+      settledModels: catalog.settledModels + discovered.settledModels,
+      totalModels: catalog.totalModels + discovered.totalModels,
+    },
+  }
+}
+
 type CoordinatedLocalModelAssessment =
   | { readonly _tag: "Assessing" }
   | { readonly _tag: "Assessed"; readonly assessment: LocalModelAssessment }
-  | { readonly _tag: "Failed"; readonly failure: ModelFailure }
+  | { readonly _tag: "Dropped" }
+
+type VisibleCoordinatedLocalModelAssessment = Exclude<CoordinatedLocalModelAssessment, { readonly _tag: "Dropped" }>
+
+export const assessmentTargetVisible = (
+  assessment: CoordinatedLocalModelAssessment | undefined,
+): assessment is VisibleCoordinatedLocalModelAssessment | undefined => assessment?._tag !== "Dropped"
 
 const projectAssessment = (environmentId: string, assessment: ModelAssessment): LocalModelAssessment => {
   if (assessment._tag === "Fits") {
@@ -83,17 +136,16 @@ export const coordinatedAssessment = (
   source: "catalog" | "discovered",
   modelId: ModelId,
 ): CoordinatedLocalModelAssessment | undefined => {
-  if (snapshot.state._tag === "Failed") return { _tag: "Failed", failure: snapshot.state.failure }
   if (snapshot.state._tag !== "Ready") return undefined
   const domain: ModelAssessmentDomainSnapshot = snapshot.state[source]
   if (domain.sourceRevision !== sourceRevision || domain._tag === "Pending") return undefined
-  if (domain._tag === "Failed") return { _tag: "Failed", failure: domain.failure }
+  if (domain._tag === "Failed") return undefined
   const entry = domain.entries.find(({ subject }) => subject.modelId === modelId)
   if (entry === undefined || entry.state._tag === "Assessing") return undefined
-  if (entry.state._tag === "Failed") return { _tag: "Failed", failure: entry.state.failure }
+  if (entry.state._tag === "Dropped") return { _tag: "Dropped" }
   const assessment = entry.state.profiles[0]
   return assessment === undefined
-    ? { _tag: "Failed", failure: failure("missing_assessment", "ICN returned no model assessment", true) }
+    ? { _tag: "Dropped" }
     : { _tag: "Assessed", assessment: projectAssessment(snapshot.state.environmentId, assessment) }
 }
 
@@ -141,7 +193,7 @@ export const catalogAcquisition = (
 
 export const catalogModelServingState = (
   ready: ReadyModel | undefined,
-  assessment: CoordinatedLocalModelAssessment | undefined,
+  assessment: VisibleCoordinatedLocalModelAssessment | undefined,
   rankingScores: Option.Option<LocalModelRankingScores>,
   unavailableFailure?: ModelFailure,
 ): CatalogLocalModelServingState => {
@@ -150,9 +202,6 @@ export const catalogModelServingState = (
   ) }
   if (assessment === undefined || assessment._tag === "Assessing") return {
     _tag: "Assessing", profile: ready.profile,
-  }
-  if (assessment._tag === "Failed") return {
-    _tag: "Failed", profile: Option.some(ready.profile), failure: assessment.failure,
   }
   const fits = assessment.assessment._tag === "Fits"
   const assessed = {
@@ -167,13 +216,10 @@ export const catalogModelServingState = (
 
 export const discoveredModelServingState = (
   ready: ReadyModel,
-  assessment: CoordinatedLocalModelAssessment | undefined,
+  assessment: VisibleCoordinatedLocalModelAssessment | undefined,
 ): DiscoveredLocalModelServingState => {
   if (assessment === undefined || assessment._tag === "Assessing") {
     return { _tag: "Assessing", profile: ready.profile }
-  }
-  if (assessment._tag === "Failed") {
-    return { _tag: "Failed", profile: ready.profile, failure: assessment.failure }
   }
   const assessed = {
     metadata: ready.metadata,
@@ -201,7 +247,7 @@ const catalogModel = (
   entry: CatalogModelSource,
   operation: CatalogInstallationOperation | undefined,
   removal: LocalModelRemovalState | undefined,
-  assessment: CoordinatedLocalModelAssessment | undefined,
+  assessment: VisibleCoordinatedLocalModelAssessment | undefined,
   instances: readonly import("@magnitudedev/icn-protocol/schemas").ModelInstance[],
 ): Extract<LocalModel, { readonly _tag: "Catalog" }> => {
   const source = entry.source
@@ -264,7 +310,7 @@ const discoveredPresentation = (id: ModelId, model: ReadyModel | undefined) => {
 
 const discoveredModel = (
   entry: DiscoveredModelSource,
-  assessment: CoordinatedLocalModelAssessment | undefined,
+  assessment: VisibleCoordinatedLocalModelAssessment | undefined,
   instances: readonly import("@magnitudedev/icn-protocol/schemas").ModelInstance[],
 ): Extract<LocalModel, { readonly _tag: "Discovered" }> => {
   const state = entry.source.state
@@ -309,13 +355,18 @@ export const LocalModelsLive: Layer.Layer<
     const removals = yield* removalService.state
     const latestOperation = new Map(operations.map((operation) => [operation.modelId, operation]))
     return {
-      reconciliationComplete: source.reconciliationComplete,
+      preparation: projectLocalModelPreparation(source, assessment),
       models: [
-        ...source.catalogModels.map((entry) => catalogModel(entry, latestOperation.get(entry.id),
-          removals.get(entry.id),
-          coordinatedAssessment(assessment, source.catalogRevision, "catalog", entry.id), runtime)),
-        ...source.discoveredModels.map((entry) => discoveredModel(entry,
-          coordinatedAssessment(assessment, source.discoveryRevision, "discovered", entry.id), runtime)),
+        ...source.catalogModels.flatMap((entry) => {
+          const coordinated = coordinatedAssessment(assessment, source.catalogRevision, "catalog", entry.id)
+          return assessmentTargetVisible(coordinated)
+            ? [catalogModel(entry, latestOperation.get(entry.id), removals.get(entry.id), coordinated, runtime)]
+            : []
+        }),
+        ...source.discoveredModels.flatMap((entry) => {
+          const coordinated = coordinatedAssessment(assessment, source.discoveryRevision, "discovered", entry.id)
+          return assessmentTargetVisible(coordinated) ? [discoveredModel(entry, coordinated, runtime)] : []
+        }),
       ],
     } satisfies LocalModelsState
   })

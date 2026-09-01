@@ -43,6 +43,7 @@ import {
   type OnboardingModelSetupState,
 } from "@magnitudedev/client-common";
 import {
+  type LocalModelPreparation,
   type LocalModelsState,
   type SessionOptions,
 } from "@magnitudedev/sdk";
@@ -95,6 +96,11 @@ import {
 import { registerCliCommands } from "./commands/register";
 
 registerCliCommands();
+
+const unresolvedLocalModelPreparation: LocalModelPreparation = {
+  discovery: { complete: false, modelsFound: 0 },
+  assessment: { complete: false, settledModels: 0, totalModels: 0 },
+};
 
 export type { SessionStart };
 
@@ -312,10 +318,14 @@ function CliAppContent(
     setupActive: props.onboardingSetupOpen,
   });
 
-  const setupPreparation = (error: string | null = null) => ({
+  const setupPreparation = (
+    preparation: LocalModelPreparation = unresolvedLocalModelPreparation,
+    error: string | null = null,
+  ) => ({
     surface: (
       <OnboardingModelPreparation
         hardware={onboardingSetup.hardware}
+        preparation={preparation}
         error={error}
         width={chatColumnWidth}
       />
@@ -338,7 +348,7 @@ function CliAppContent(
       };
     }
     if (state.content._tag === "Preparation") {
-      return setupPreparation();
+      return setupPreparation(state.content.preparation);
     }
     if (state.content._tag === "Harness") {
       return {
@@ -468,7 +478,10 @@ function CliAppContent(
     ? { surface: undefined, placeholder: null }
     : Result.match(onboardingSetup.view, {
         onInitial: () => setupPreparation(),
-        onFailure: () => setupPreparation("Local model setup is unavailable."),
+        onFailure: () => setupPreparation(
+          unresolvedLocalModelPreparation,
+          "Local model setup is unavailable.",
+        ),
         onSuccess: ({ value }) => setupWithState(value),
       });
   const setupSurface = setupPresentation.surface;

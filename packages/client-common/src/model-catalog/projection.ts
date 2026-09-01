@@ -11,11 +11,14 @@ import {
 export const localModelsFromCatalog = (catalog: ModelCatalogState): LocalModelsState =>
   catalog._tag === "Initializing"
     ? {
-        reconciliationComplete: false,
+        preparation: {
+          discovery: { complete: false, modelsFound: 0 },
+          assessment: { complete: false, settledModels: 0, totalModels: 0 },
+        },
         models: [],
       }
     : {
-        reconciliationComplete: catalog.localModelsReconciliationComplete,
+        preparation: catalog.localModelPreparation,
         models: catalog.models.flatMap((entry) => entry._tag === "Local" ? [entry.product] : []),
       }
 

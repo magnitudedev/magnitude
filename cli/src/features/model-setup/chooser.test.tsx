@@ -26,6 +26,7 @@ import {
   onboardingModelRowEmphasis,
   onboardingSelectionEnterAction,
   onboardingModelRowName,
+  OnboardingModelPreparation,
   scrollOnboardingModelIntoView,
   type OnboardingModelChooserOperation,
 } from "./chooser"
@@ -33,6 +34,61 @@ import { buildLocalInferenceSelections } from "../local-inference/view-model"
 
 const rankingControls = { fastToSmart: 0.5 }
 const onRankingControlsChange = () => undefined
+
+describe("onboarding model preparation", () => {
+  it("renders one fixed pair of live discovery and assessment rows", async () => {
+    const view = await testRender(
+      <OnboardingModelPreparation
+        hardware={Result.success(makeHardware())}
+        preparation={{
+          discovery: { complete: false, modelsFound: 5 },
+          assessment: { complete: false, settledModels: 12, totalModels: 18 },
+        }}
+        error={null}
+        width={120}
+      />,
+      { width: 120, height: 44 },
+    )
+
+    try {
+      await act(view.renderOnce)
+      const frame = view.captureCharFrame()
+      expect(frame).toContain("Discovering existing models · 5 found")
+      expect(frame).toContain("Assessing models · 12 of 18")
+      expect(frame).not.toContain("Discovery complete")
+      expect(frame).not.toContain("currently known")
+    } finally {
+      await act(async () => view.renderer.destroy())
+    }
+  })
+
+  it("omits the found count while discovery has found nothing", async () => {
+    const view = await testRender(
+      <OnboardingModelPreparation
+        hardware={Result.success(makeHardware())}
+        preparation={{
+          discovery: { complete: false, modelsFound: 0 },
+          assessment: { complete: false, settledModels: 0, totalModels: 0 },
+        }}
+        error={null}
+        width={120}
+      />,
+      { width: 120, height: 44 },
+    )
+
+    try {
+      await act(view.renderOnce)
+      const frame = view.captureCharFrame()
+      expect(frame).toContain("Discovering existing models")
+      expect(frame).toContain("Assessing models")
+      expect(frame).not.toContain("Discovering existing models ·")
+      expect(frame).not.toContain("Assessing models ·")
+      expect(frame).not.toContain("found")
+    } finally {
+      await act(async () => view.renderer.destroy())
+    }
+  })
+})
 
 const makeRankedCatalogModel = (
   id: string,

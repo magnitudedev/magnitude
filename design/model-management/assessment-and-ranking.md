@@ -20,12 +20,14 @@ The automatic ICN pool assesses catalog desired material when not installed, eff
 when installed, and only `Ready` discoveries. It publishes a read-only revisioned snapshot with
 independent catalog and discovery source slices. Exact work identity guards publication, so removed
 or superseded models cannot retain stale results. Packages, bundles, and serving configurations do
-not cross the boundary. Retryable target and source failures are observed as failures and retried
-with bounded background backoff while their exact demand remains current.
+not cross the boundary. Whole-source failures are observed and retried with bounded background
+backoff. Each exact target is attempted once; any target failure settles as `Dropped`, is never
+retried, and is omitted by ACN. Catalog drops emit an OpenTelemetry error; discovered drops are
+silent.
 
 `Fits`, `DoesNotFit`, and `Incompatible` are genuine terminal evidence. Transport or operation
-failure is `Failed`, not a compatibility result. Hardware observations that were not performed are
-represented as `NotObserved`; zero-valued headroom is never fabricated.
+failure drops the target rather than fabricating compatibility evidence. Hardware observations
+that were not performed are represented as `NotObserved`; zero-valued headroom is never fabricated.
 
 Ranking exists only for reviewed catalog models with `Fits` evidence and the required bounded
 performance sample. Intelligence and fidelity come from authored catalog evidence; speed comes

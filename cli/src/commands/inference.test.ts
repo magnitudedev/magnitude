@@ -15,7 +15,10 @@ const catalogState = (...models: ReturnType<typeof makeCatalogModel>[]): ModelCa
   providers: [],
   models: models.map((product) => ({ _tag: "Local", product, offering: Option.none() })),
   failures: [],
-  localModelsReconciliationComplete: true,
+  localModelPreparation: {
+    discovery: { complete: true, modelsFound: models.length },
+    assessment: { complete: true, settledModels: models.length, totalModels: models.length },
+  },
 })
 
 describe("inference command surface", () => {

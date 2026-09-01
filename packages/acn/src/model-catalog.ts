@@ -60,10 +60,10 @@ export const projectModelCatalog = (
     providers: contents.providers,
     models,
     failures,
-    localModelsReconciliationComplete: local.reconciliationComplete,
+    localModelPreparation: local.preparation,
   }
   if (failures.length > 0) return { _tag: "Degraded", ...fields }
-  if (providers._tag === "Loading" || providers._tag === "Refreshing" || !local.reconciliationComplete) {
+  if (providers._tag === "Loading" || providers._tag === "Refreshing" || !local.preparation.discovery.complete) {
     return { _tag: "Refreshing", ...fields }
   }
   return { _tag: "Ready", ...fields }

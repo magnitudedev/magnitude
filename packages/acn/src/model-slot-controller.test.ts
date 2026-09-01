@@ -19,7 +19,10 @@ import { ProviderModelCatalog } from "./provider-model-catalog"
 describe("model slot reconciliation", () => {
   it("preserves a local selection while its discovered model is unavailable", async () => {
     const localModels = Schema.validateSync(LocalModelsStateSchema)({
-      reconciliationComplete: true,
+      preparation: {
+        discovery: { complete: true, modelsFound: 1 },
+        assessment: { complete: true, settledModels: 1, totalModels: 1 },
+      },
       models: [{
         _tag: "Discovered",
         modelId: "hf:owner/repository/model.gguf",

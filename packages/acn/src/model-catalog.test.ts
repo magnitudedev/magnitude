@@ -36,7 +36,10 @@ const offering = (
 })
 
 const local = (overrides: Partial<LocalModelsState> = {}): LocalModelsState => ({
-  reconciliationComplete: true,
+  preparation: {
+    discovery: { complete: true, modelsFound: 0 },
+    assessment: { complete: true, settledModels: 0, totalModels: 0 },
+  },
   models: [],
   ...overrides,
 })
@@ -47,7 +50,10 @@ describe("ACN model catalog projection", () => {
       _tag: "Refreshing",
       providers: [],
       models: [],
-      localModelsReconciliationComplete: true,
+      localModelPreparation: {
+        discovery: { complete: true, modelsFound: 0 },
+        assessment: { complete: true, settledModels: 0, totalModels: 0 },
+      },
     })
   })
 
@@ -99,7 +105,10 @@ describe("ACN model catalog projection", () => {
       models: [offering(remoteProviderId, "remote-model")],
     }
     const result = projectModelCatalog(providers, local({
-      reconciliationComplete: false,
+      preparation: {
+        discovery: { complete: false, modelsFound: 0 },
+        assessment: { complete: false, settledModels: 0, totalModels: 0 },
+      },
     }))
 
     expect(result._tag).toBe("Refreshing")

@@ -5154,9 +5154,6 @@
             "type": "object",
             "required": [
               "sourceRevision",
-              "totalTargets",
-              "settledTargets",
-              "failedTargets",
               "entries",
               "_tag"
             ],
@@ -5164,21 +5161,6 @@
               "sourceRevision": {
                 "type": "integer",
                 "format": "int64",
-                "minimum": 0
-              },
-              "totalTargets": {
-                "type": "integer",
-                "format": "int32",
-                "minimum": 0
-              },
-              "settledTargets": {
-                "type": "integer",
-                "format": "int32",
-                "minimum": 0
-              },
-              "failedTargets": {
-                "type": "integer",
-                "format": "int32",
                 "minimum": 0
               },
               "entries": {
@@ -5190,46 +5172,7 @@
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "Assessing"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "sourceRevision",
-              "totalTargets",
-              "failedTargets",
-              "entries",
-              "_tag"
-            ],
-            "properties": {
-              "sourceRevision": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "totalTargets": {
-                "type": "integer",
-                "format": "int32",
-                "minimum": 0
-              },
-              "failedTargets": {
-                "type": "integer",
-                "format": "int32",
-                "minimum": 0
-              },
-              "entries": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/ModelAssessmentEntry"
-                }
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Complete"
+                  "Available"
                 ]
               }
             }
@@ -5316,17 +5259,13 @@
           {
             "type": "object",
             "required": [
-              "failure",
               "_tag"
             ],
             "properties": {
-              "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
-              },
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "Failed"
+                  "Dropped"
                 ]
               }
             }
@@ -7216,7 +7155,6 @@
               "id",
               "status",
               "summary",
-              "content",
               "type"
             ],
             "properties": {
@@ -7230,12 +7168,6 @@
                 "type": "array",
                 "items": {
                   "$ref": "#/components/schemas/ResponseSummaryPart"
-                }
-              },
-              "content": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/ResponseReasoningContent"
                 }
               },
               "type": {
@@ -7349,21 +7281,6 @@
           }
         },
         "additionalProperties": false
-      },
-      "ResponseReasoningContent": {
-        "type": "object",
-        "required": [
-          "type",
-          "text"
-        ],
-        "properties": {
-          "type": {
-            "type": "string"
-          },
-          "text": {
-            "type": "string"
-          }
-        }
       },
       "ResponseReasoningInput": {
         "type": "object",

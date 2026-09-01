@@ -1558,25 +1558,11 @@ export const ModelAssessmentDomainSnapshot = S.Union(
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.TaggedStruct("Assessing", {
+    S.TaggedStruct("Available", {
       entries: S.Array(
         S.suspend((): S.Schema<ModelAssessmentEntry, ModelAssessmentEntryEncoded> => ModelAssessmentEntry),
       ),
-      failedTargets: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-      settledTargets: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       sourceRevision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-      totalTargets: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("Complete", {
-      entries: S.Array(
-        S.suspend((): S.Schema<ModelAssessmentEntry, ModelAssessmentEntryEncoded> => ModelAssessmentEntry),
-      ),
-      failedTargets: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-      sourceRevision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-      totalTargets: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
@@ -1608,12 +1594,7 @@ export const ModelAssessmentEntryState = S.Union(
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
-  S.extend(
-    S.TaggedStruct("Failed", {
-      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
+  S.extend(S.TaggedStruct("Dropped", {}), S.Record({ key: S.String, value: JsonValue })),
 )
 export type ModelAssessmentEntryState = S.Schema.Type<typeof ModelAssessmentEntryState>
 export type ModelAssessmentEntryStateEncoded = S.Schema.Encoded<typeof ModelAssessmentEntryState>
@@ -2421,9 +2402,6 @@ export type ResponseOutputContentEncoded = S.Schema.Encoded<typeof ResponseOutpu
 export const ResponseOutputItem = S.Union(
   S.extend(
     S.Struct({
-      content: S.Array(
-        S.suspend((): S.Schema<ResponseReasoningContent, ResponseReasoningContentEncoded> => ResponseReasoningContent),
-      ),
       id: S.String,
       status: S.String,
       summary: S.Array(S.suspend((): S.Schema<ResponseSummaryPart, ResponseSummaryPartEncoded> => ResponseSummaryPart)),
@@ -2479,16 +2457,6 @@ export const ResponseReasoning = S.Struct({
 })
 export type ResponseReasoning = S.Schema.Type<typeof ResponseReasoning>
 export type ResponseReasoningEncoded = S.Schema.Encoded<typeof ResponseReasoning>
-
-export const ResponseReasoningContent = S.extend(
-  S.Struct({
-    text: S.String,
-    type: S.String,
-  }),
-  S.Record({ key: S.String, value: JsonValue }),
-)
-export type ResponseReasoningContent = S.Schema.Type<typeof ResponseReasoningContent>
-export type ResponseReasoningContentEncoded = S.Schema.Encoded<typeof ResponseReasoningContent>
 
 export const ResponseReasoningInput = S.Struct({
   content: S.optionalWith(

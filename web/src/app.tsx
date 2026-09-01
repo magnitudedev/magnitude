@@ -530,7 +530,7 @@ function FooterBarContainer({
       : providerCatalog._tag === "Degraded"
       ? { _tag: "Degraded", options: modelOptions }
       : localModels === null ||
-        !localModels.reconciliationComplete ||
+        !localModels.preparation.discovery.complete ||
         providerCatalog._tag === "Loading"
       ? { _tag: "Loading", options: modelOptions }
       : { _tag: "Ready", options: modelOptions }
