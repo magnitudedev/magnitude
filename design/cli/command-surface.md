@@ -22,7 +22,7 @@ The public command vocabulary is:
 update
 service install | uninstall | start | stop | status
 hardware
-catalog list | show <model-id> | recommendations [--preference <value>] [--limit <count>]
+catalog status | list | show <model-id> | recommendations [--preference <value>] [--limit <count>]
 catalog pull <model-id> | cancel <model-id> | remove <model-id>
 models status [model-id] | load <model-id> | stop
 connections list | add <harness> [--set-model <model-id>] [--install-skill]
@@ -37,8 +37,8 @@ and there is no global JSON mode.
 
 - `service` reports runtime readiness and login-startup intent.
 - `hardware` reports the local inference topology, current memory use, and current allocation.
-- `catalog` reports reviewed model choices, machine-specific assessment evidence, recommendations,
-  and download operations.
+- `catalog` reports model discovery and assessment progress, reviewed model choices,
+  machine-specific assessment evidence, recommendations, and download operations.
 - `models` reports models present or undergoing local operations and controls runtime residency.
 - `connections` reports harness installation and durable Magnitude connection intent.
 
@@ -66,6 +66,10 @@ Memory uses hardware-conventional units; storage and transfer use decimal units;
 compact token counts; generation speed uses `tok/s`. Rounded values are presentation only.
 
 ## Catalog and recommendation behavior
+
+`catalog status` reports the authoritative discovery and assessment completion flags and their
+progress counts independently. It does not infer completion from catalog rows or recommendation
+availability and does not wait for either phase to finish.
 
 `catalog list` displays only assessed catalog configurations that fit the current machine. It shows
 friendly identity, predicted memory, baseline speed, configured context, speculative acceleration,
@@ -111,6 +115,7 @@ non-interactive command.
 - Every public command and option has useful help.
 - Collection ordering is deterministic and every collection has an explicit empty state.
 - Addressable rows preserve exact canonical IDs at every terminal width.
+- Catalog status preserves the authoritative discovery and assessment completion states.
 - Recommendations match shared onboarding ranking and memory eligibility.
 - No observation command waits for assessment or residency completion.
 - Mutation commands acknowledge authoritative completion without adding preflight state
