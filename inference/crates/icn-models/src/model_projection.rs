@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
 use icn_contracts::models::{
-    EffectiveModel, InstalledModelPackage, ModelCapabilities, ModelFailure, ModelFileRole,
-    ModelInstallationOwnership, ModelMetadata, ModelPackage, ModelPackageId,
-    ModelPackageInspection, ModelPackageInstallationOrigin, ModelServingConfiguration, ReadyModel,
-    ResolvedModelInstallation, ServableModelBundle, ServingProfile,
+    EffectiveModel, InstalledModelPackage, ModelFailure, ModelFileRole, ModelInstallationOwnership,
+    ModelMetadata, ModelPackage, ModelPackageId, ModelPackageInstallationOrigin,
+    ModelServingConfiguration, PackageValidation, ReadyModel, ResolvedModelInstallation,
+    ServableModelBundle, ServingProfile,
 };
 
 const MINIMUM_EXTERNAL_CONTEXT: u32 = 4_096;
@@ -92,7 +92,7 @@ pub(crate) fn effective_configuration_model(
                 },
             };
         };
-        if let Some(failure) = inspection_failure(installed) {
+        if let Some(failure) = validation_failure(installed) {
             return EffectiveModel::Unavailable { failure };
         }
     }
@@ -105,24 +105,21 @@ pub(crate) fn effective_configuration_model(
             },
         };
     }
-    let ModelPackageInspection::Inspected { capabilities } = &installed_target.inspection else {
+    let PackageValidation::Valid = &installed_target.validation else {
         unreachable!("inspection failures returned before effective model construction")
     };
     EffectiveModel::Ready {
-        model: ready_model(
-            &configuration.bundle,
-            configuration.profile.clone(),
-            capabilities.clone(),
-        ),
+        model: ready_model(&configuration.bundle, configuration.profile.clone()),
     }
 }
 
-fn inspection_failure(installed: &InstalledModelPackage) -> Option<ModelFailure> {
-    match &installed.inspection {
-        ModelPackageInspection::Inspected { .. } => None,
-        ModelPackageInspection::Invalid { failure }
-        | ModelPackageInspection::Incompatible { failure } => Some(failure.clone()),
-        ModelPackageInspection::Pending => Some(ModelFailure {
+fn validation_failure(installed: &InstalledModelPackage) -> Option<ModelFailure> {
+    match &installed.validation {
+        PackageValidation::Valid => None,
+        PackageValidation::Invalid { failure } | PackageValidation::Unsupported { failure } => {
+            Some(failure.clone())
+        }
+        PackageValidation::Pending => Some(ModelFailure {
             code: "model_inspection_pending".to_owned(),
             message: "The selected target has not been inspected yet".to_owned(),
             retryable: true,
@@ -130,11 +127,7 @@ fn inspection_failure(installed: &InstalledModelPackage) -> Option<ModelFailure>
     }
 }
 
-pub(crate) fn ready_model(
-    bundle: &ServableModelBundle,
-    profile: ServingProfile,
-    capabilities: ModelCapabilities,
-) -> ReadyModel {
+pub(crate) fn ready_model(bundle: &ServableModelBundle, profile: ServingProfile) -> ReadyModel {
     let package = match bundle {
         ServableModelBundle::Standalone { package }
         | ServableModelBundle::SpeculativeDecoding {
@@ -154,7 +147,6 @@ pub(crate) fn ready_model(
             maximum_context_length: package.properties.maximum_context_length,
         },
         profile,
-        capabilities,
         speculative_method: match bundle {
             ServableModelBundle::Standalone { .. } => None,
             ServableModelBundle::SpeculativeDecoding { method, .. } => Some(method.clone()),

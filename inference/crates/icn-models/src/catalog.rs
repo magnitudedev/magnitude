@@ -9,8 +9,8 @@ use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, stream};
 use icn_contracts::models::{
     CatalogBaseId, CatalogDiagnostic, CatalogIntelligence, CatalogVariantId,
-    IntelligenceProvenance, ModelFailure, ModelFileRole, ModelPackage, ModelPackageInspection,
-    ModelPackageSource, ModelParameterization, ModelReleaseDate, ModelServingConfiguration,
+    IntelligenceProvenance, ModelFailure, ModelFileRole, ModelPackage, ModelPackageSource,
+    ModelParameterization, ModelReleaseDate, ModelServingConfiguration, PackageValidation,
     RecommendableModel, RecommendableModelCatalog, RecommendableModelCatalogProvider,
     ResolvedServableModelBundle, ServableModelBundle, ServingProfile, SpeculativeDraftSource,
     SpeculativeMethod,
@@ -26,9 +26,11 @@ use serde::{Deserialize, Serialize};
 use crate::cache::ModelBlobKind;
 use crate::inventory::ManagedModelStore;
 use crate::package_service::{
-    ServableModelBundleKey, inspected_package_from_resolved, servable_model_bundle_key_for_bundle,
+    ServableModelBundleKey, servable_model_bundle_key_for_bundle, validated_package_from_resolved,
 };
-use crate::planner_stub::{PlannerStubComponent, compact_planner_stub, planner_stub_context};
+use crate::planner_stub::{
+    AssessmentMaterialComponent, assessment_material_context, compact_assessment_material,
+};
 use crate::preview::PreparedPreview;
 use crate::refresh_hugging_face_repository;
 
@@ -152,7 +154,7 @@ struct ReleasePlannerInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReleasePlannerPackage {
     package: ModelPackage,
-    inspection: ModelPackageInspection,
+    validation: PackageValidation,
     properties: InventoryProperties,
     primary_gguf: PathBuf,
     components: Vec<ReleasePlannerComponent>,
@@ -673,8 +675,7 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
                 .count();
             model.configuration.profile.context_length < MIN_CATALOG_CONTEXT_LENGTH
                 || projector_count > 1
-                || model.capabilities.vision != (projector_count == 1)
-                || (model.capabilities.vision && method == Some(&SpeculativeMethod::Mtp))
+                || (projector_count == 1 && method == Some(&SpeculativeMethod::Mtp))
                 || servable_bundle_packages(&model.configuration.bundle).any(|package| {
                     package
                         .properties
@@ -875,7 +876,7 @@ impl GeneratedReleaseCatalog {
                 Ok((Cow::Borrowed(input.as_slice()), expected_size))
             },
             if compact {
-                "generated_compact_planner_stub"
+                "generated_compact_assessment_material"
             } else {
                 "generated_source_planner_header"
             },
@@ -1196,7 +1197,7 @@ fn validate_resolved_catalog(
             Some(projector) => {
                 projector_files.len() == 1 && projector_files[0].path == projector.path
             }
-            None => projector_files.len() == usize::from(model.capabilities.vision),
+            None => projector_files.is_empty(),
         };
         if model.configuration.profile.context_length != declaration.context_length
             || !package_source_matches(
@@ -1236,7 +1237,6 @@ fn recommendable_model(
     target: ModelPackage,
     draft: Option<ModelPackage>,
     properties: &InventoryProperties,
-    capabilities: icn_contracts::models::ModelCapabilities,
 ) -> Result<RecommendableModel, InventoryError> {
     let has_draft = draft.is_some();
     let bundle = match &declaration.speculative_decoding {
@@ -1298,27 +1298,11 @@ fn recommendable_model(
         description: declaration.description.clone(),
         release_date: declaration.release_date.clone(),
         license: declaration.license.clone(),
-        capabilities,
         parameterization: declaration.parameterization.clone(),
         intelligence: declaration.intelligence.clone(),
         fidelity_rank: variant.fidelity_rank,
         quantization_aware: variant.quantization_aware,
     })
-}
-
-fn catalog_package_capabilities(
-    inspection: ModelPackageInspection,
-) -> Result<icn_contracts::models::ModelCapabilities, InventoryError> {
-    match inspection {
-        ModelPackageInspection::Inspected { capabilities } => Ok(capabilities),
-        ModelPackageInspection::Pending => Err(InventoryError::Integrity(
-            "catalog package inspection remained pending".to_owned(),
-        )),
-        ModelPackageInspection::Invalid { failure }
-        | ModelPackageInspection::Incompatible { failure } => Err(InventoryError::Integrity(
-            format!("catalog package inspection failed: {}", failure.message),
-        )),
-    }
 }
 
 fn catalog_from_planner_inputs(
@@ -1355,7 +1339,6 @@ fn catalog_from_planner_inputs(
                 input.target.package.clone(),
                 input.draft.as_ref().map(|draft| draft.package.clone()),
                 &input.target.properties,
-                catalog_package_capabilities(input.target.inspection.clone())?,
             )?;
             if !inputs.contains_key(&recommendable_model_bundle_key(&model)) {
                 return Err(InventoryError::Integrity(format!(
@@ -1517,7 +1500,6 @@ impl ResolvingRecommendableCatalog {
             target.package.clone(),
             draft.as_ref().map(|draft| draft.package.clone()),
             &target.properties,
-            catalog_package_capabilities(target.inspection.clone())?,
         )?;
         let planner = ReleasePlannerInput {
             model_id: model.model_id.clone(),
@@ -1540,7 +1522,7 @@ impl ResolvingRecommendableCatalog {
         ),
         InventoryError,
     > {
-        let inspected = inspected_package_from_resolved(&prepared.model)?;
+        let inspected = validated_package_from_resolved(&prepared.model)?;
         let headers = prepared
             .headers
             .iter()
@@ -1564,7 +1546,7 @@ impl ResolvingRecommendableCatalog {
             .ok_or_else(|| {
                 InventoryError::Integrity("catalog primary has no planner header".to_owned())
             })?;
-        let context = planner_stub_context(
+        let context = assessment_material_context(
             headers
                 .get(&primary_header.digest)
                 .ok_or_else(|| {
@@ -1604,13 +1586,13 @@ impl ResolvingRecommendableCatalog {
                     )));
                 }
                 let kind = if component.path == primary {
-                    PlannerStubComponent::Primary
+                    AssessmentMaterialComponent::Primary
                 } else if component.role == ComponentRole::Shard {
-                    PlannerStubComponent::Shard
+                    AssessmentMaterialComponent::Shard
                 } else {
-                    PlannerStubComponent::Companion
+                    AssessmentMaterialComponent::Companion
                 };
-                let stub = compact_planner_stub(source, &context, kind)
+                let stub = compact_assessment_material(source, &context, kind)
                     .map_err(|error| InventoryError::Integrity(error.to_string()))?;
                 let planner_stub_digest = planner_bundle::sha256(&stub);
                 let planner_stub_size_bytes = u64::try_from(stub.len()).map_err(|_| {
@@ -1637,7 +1619,7 @@ impl ResolvingRecommendableCatalog {
             .collect::<Result<Vec<_>, InventoryError>>()?;
         let planner = ReleasePlannerPackage {
             package: inspected.package,
-            inspection: inspected.inspection,
+            validation: inspected.validation,
             properties: prepared.model.model.properties.clone(),
             primary_gguf: primary.to_path_buf(),
             components,

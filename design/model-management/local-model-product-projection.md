@@ -57,8 +57,9 @@ Where present, serving state is `Assessing`, `Failed`, or `Assessed`. Native cat
 already carry a complete desired, effective, or unavailable resolution, so ACN never fabricates an
 intermediate resolving row. `Failed` represents source or serving unavailability, not a failed
 assessment: ICN marks a failed assessment target `Dropped`, and ACN omits that target's row. An
-assessed state contains metadata,
-capabilities, and one assessment that owns its exact profile. A fitting catalog assessment alone
+assessed state contains serving metadata plus capabilities and profile evidence from one atomic ICN
+assessment result. Native catalog, discovery, package-validation, and ready-model state do not
+carry a parallel capability copy. A fitting catalog assessment alone
 contains ranking scores; discovered and non-fitting states cannot contain them. Provider
 selectability is derived from these structural facts and is never stored as a second state machine.
 An assessed state also carries the optional speculative method as a direct serving fact; ACN does

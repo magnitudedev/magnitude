@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use getrandom::fill;
 use icn_contracts::{
-    AutomaticReasoningBudget, CapabilityEvidence, EffectiveTemplateInputs, NativeReasoningControls,
+    AutomaticReasoningBudget, CapabilityEvidence, NativeReasoningControls,
     NormalizedReasoningEffort, ReasoningCapability, ReasoningControlDomain, ReasoningDelimiters,
     ReasoningEffortMapping, ReasoningProfile, ReasoningVisibility, TemplateCapabilities,
 };
@@ -12,8 +12,10 @@ use llama_cpp_2::common_chat::{
     ChatContent, ChatMessage, ChatPrepareOptions, ChatTemplateKwarg, ChatTool, ChatToolCall,
     ChatToolChoice, CommonChatTemplates,
 };
+#[cfg(test)]
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::LlamaModel;
+#[cfg(test)]
 use llama_cpp_2::model::params::LlamaModelParams;
 use sha2::{Digest, Sha256};
 
@@ -39,14 +41,83 @@ pub struct TemplateInspection {
     pub profile: ReasoningProfile,
 }
 
-pub fn inspect_template_inputs_with_backend(
+impl TemplateInspection {
+    /// Project detailed native template evidence into the public model capability contract.
+    #[must_use]
+    pub fn model_capabilities(&self, vision: bool) -> icn_contracts::models::ModelCapabilities {
+        let reasoning = match &self.reasoning {
+            ReasoningCapability::Unsupported { .. } => {
+                icn_contracts::models::ModelReasoningCapabilities {
+                    supported: false,
+                    efforts: Vec::new(),
+                    default_effort: None,
+                }
+            }
+            ReasoningCapability::Supported { control, .. } => {
+                let (efforts, requested_default) = match control {
+                    ReasoningControlDomain::Toggle { default } => (
+                        vec!["none".to_owned(), "high".to_owned()],
+                        Some(if *default { "high" } else { "none" }.to_owned()),
+                    ),
+                    ReasoningControlDomain::Effort { levels, default } => {
+                        (levels.clone(), default.clone())
+                    }
+                    ReasoningControlDomain::Budget { .. } => {
+                        (vec!["high".to_owned()], Some("high".to_owned()))
+                    }
+                    ReasoningControlDomain::EffortAndBudget {
+                        levels,
+                        default_effort,
+                        ..
+                    } => (levels.clone(), default_effort.clone()),
+                };
+                let efforts = efforts.into_iter().fold(Vec::new(), |mut unique, effort| {
+                    if !unique.contains(&effort) {
+                        unique.push(effort);
+                    }
+                    unique
+                });
+                match requested_default.filter(|effort| efforts.contains(effort)) {
+                    Some(default_effort) if !efforts.is_empty() => {
+                        icn_contracts::models::ModelReasoningCapabilities {
+                            supported: true,
+                            efforts,
+                            default_effort: Some(default_effort),
+                        }
+                    }
+                    _ => icn_contracts::models::ModelReasoningCapabilities {
+                        supported: false,
+                        efforts: Vec::new(),
+                        default_effort: None,
+                    },
+                }
+            }
+        };
+        icn_contracts::models::ModelCapabilities {
+            vision,
+            tools: self.capabilities.tools || self.capabilities.tool_calls,
+            structured_output: self.capabilities.typed_content
+                || self.capabilities.object_arguments,
+            reasoning,
+        }
+    }
+}
+
+#[cfg(test)]
+fn inspect_template_inputs_with_backend(
     backend: &LlamaBackend,
-    inputs: &EffectiveTemplateInputs,
+    model_path: &std::path::Path,
 ) -> Result<TemplateInspection, InspectionError> {
     let params = LlamaModelParams::default().with_no_alloc(true);
-    let model =
-        LlamaModel::load_from_file(backend, &inputs.model_path, &params).map_err(native_error)?;
-    let templates = CommonChatTemplates::from_model(&model).map_err(native_error)?;
+    let model = LlamaModel::load_from_file(backend, model_path, &params).map_err(native_error)?;
+    inspect_template_inputs_from_model(&model)
+}
+
+/// Inspect template inputs from a model already prepared by the enclosing assessment job.
+pub fn inspect_template_inputs_from_model(
+    model: &LlamaModel,
+) -> Result<TemplateInspection, InspectionError> {
+    let templates = CommonChatTemplates::from_model(model).map_err(native_error)?;
     inspect_templates(&templates)
 }
 
@@ -73,14 +144,7 @@ pub fn inspect_template(
 pub fn inspect_templates(
     templates: &CommonChatTemplates,
 ) -> Result<TemplateInspection, InspectionError> {
-    let source = templates.source(None).map_err(native_error)?;
-    let tool_use_source = templates.source(Some("tool_use")).map_err(native_error)?;
-    let mut fingerprint_material = source.as_bytes().to_vec();
-    if !tool_use_source.is_empty() {
-        fingerprint_material.push(0);
-        fingerprint_material.extend_from_slice(tool_use_source.as_bytes());
-    }
-    let fingerprint = format!("sha256:{:x}", Sha256::digest(&fingerprint_material));
+    let fingerprint = template_fingerprint(templates)?;
     let native = templates.capabilities().map_err(native_error)?;
     let capabilities = TemplateCapabilities {
         string_content: native.supports_string_content,
@@ -156,6 +220,21 @@ pub fn inspect_templates(
         reasoning,
         profile,
     })
+}
+
+/// Fingerprint the authored template variants used by both assessment and load verification.
+pub fn template_fingerprint(templates: &CommonChatTemplates) -> Result<String, InspectionError> {
+    let source = templates.source(None).map_err(native_error)?;
+    let tool_use_source = templates.source(Some("tool_use")).map_err(native_error)?;
+    let mut fingerprint_material = source.as_bytes().to_vec();
+    if !tool_use_source.is_empty() {
+        fingerprint_material.push(0);
+        fingerprint_material.extend_from_slice(tool_use_source.as_bytes());
+    }
+    Ok(format!(
+        "sha256:{:x}",
+        Sha256::digest(&fingerprint_material)
+    ))
 }
 
 fn inspect_profile(
@@ -970,5 +1049,26 @@ mod tests {
                 AutomaticReasoningBudget::Disabled
             ))
         );
+    }
+
+    #[test]
+    #[ignore = "requires ICN_REASONING_PARITY_MODEL to name a complete GGUF"]
+    fn already_open_model_matches_path_based_template_inspection() {
+        let model_path = std::path::PathBuf::from(
+            std::env::var_os("ICN_REASONING_PARITY_MODEL")
+                .expect("ICN_REASONING_PARITY_MODEL must name a complete GGUF"),
+        );
+        let backend = llama_cpp_2::llama_backend::LlamaBackend::init()
+            .expect("initialize native backend for template parity");
+        let params = LlamaModelParams::default().with_no_alloc(true);
+        let model = LlamaModel::load_from_file(&backend, &model_path, &params)
+            .expect("open no-allocation parity model");
+
+        let loaded = inspect_template_inputs_from_model(&model)
+            .expect("inspect templates from already-open model");
+        let path = inspect_template_inputs_with_backend(&backend, &model_path)
+            .expect("inspect templates through path-opening API");
+
+        assert_eq!(loaded, path);
     }
 }

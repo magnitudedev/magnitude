@@ -3,8 +3,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use icn_contracts::{EffectiveTemplateInputs, TemplateAssessment, TemplateAssessor};
-use icn_engine::NativeBackend;
 use icn_models::{
     InventoryConfig, ManagedModelStore, ResolvingRecommendableCatalog, advance_model_catalog_lock,
     load_release_catalog,
@@ -46,35 +44,6 @@ enum Command {
     },
 }
 
-struct NativeTemplateAssessor {
-    backend: NativeBackend,
-}
-
-impl NativeTemplateAssessor {
-    fn new(backend: NativeBackend) -> Self {
-        Self { backend }
-    }
-}
-
-impl TemplateAssessor for NativeTemplateAssessor {
-    fn cache_identity(&self) -> &str {
-        icn_reasoning::TEMPLATE_INSPECTION_CACHE_IDENTITY
-    }
-
-    fn assess(&self, inputs: &EffectiveTemplateInputs) -> Result<TemplateAssessment, String> {
-        let inspection = icn_reasoning::inspect_template_inputs_with_backend(
-            self.backend.as_llama_backend(),
-            inputs,
-        )
-        .map_err(|error| error.to_string())?;
-        Ok(TemplateAssessment {
-            capabilities: inspection.capabilities,
-            reasoning: inspection.reasoning,
-            fingerprint: inspection.template_fingerprint,
-        })
-    }
-}
-
 async fn update_lock(
     output: PathBuf,
     model_store: PathBuf,
@@ -101,18 +70,10 @@ async fn open_catalog_models(
     cache_root: PathBuf,
     hf_caches: Vec<PathBuf>,
 ) -> anyhow::Result<Arc<ManagedModelStore>> {
-    icn_engine::disable_native_diagnostics();
-    let backend = NativeBackend::initialize().context("failed to initialize native backend")?;
     let mut config = InventoryConfig::with_roots(model_store, cache_root)
         .context("invalid catalog-build inventory configuration")?;
     config.hf_cache_dirs.extend(hf_caches);
-    Ok(Arc::new(
-        ManagedModelStore::open_with_template_assessor(
-            config,
-            Some(Arc::new(NativeTemplateAssessor::new(backend))),
-        )
-        .await?,
-    ))
+    Ok(Arc::new(ManagedModelStore::open(config).await?))
 }
 
 fn ensure_catalog_resolved(generated: &icn_models::GeneratedReleaseCatalog) -> anyhow::Result<()> {

@@ -53,7 +53,6 @@ impl NativeWorkerArgs {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum NativeWorkerRole {
     Planning,
-    Template,
     Inference,
 }
 
@@ -61,7 +60,6 @@ impl NativeWorkerRole {
     fn subcommand(self) -> &'static str {
         match self {
             Self::Planning => "planning-worker",
-            Self::Template => "template-worker",
             Self::Inference => "inference-worker",
         }
     }
@@ -149,7 +147,6 @@ mod tests {
         let launcher = NativeWorkerLauncher::development();
         for (role, expected_subcommand) in [
             (NativeWorkerRole::Planning, "planning-worker"),
-            (NativeWorkerRole::Template, "template-worker"),
             (NativeWorkerRole::Inference, "inference-worker"),
         ] {
             let command = launcher.command(role).expect("worker command");

@@ -120,10 +120,7 @@ impl ModelPreviewService {
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("remote model");
-        let Some(inspection) = self
-            .models
-            .cached_model_inspection(&content_id, primary_name)
-        else {
+        let Some(inspection) = self.models.cached_model_metadata(&content_id, primary_name) else {
             return Ok(None);
         };
         let source_fingerprint = format!(
@@ -1167,7 +1164,6 @@ impl ManagedModelStore {
             &primary,
             false,
             &self.cache,
-            self.template_assessor.as_deref(),
         )?;
         let resolved = ResolvedModel {
             model,
@@ -1749,13 +1745,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::test_support::system_memory_topology;
-    use icn_contracts::{
-        CapabilityEvidence, EffectiveTemplateInputs, HardwareAssessment, LocalDeclaration,
-        ReasoningCapability, ReasoningControlDomain, ReasoningDelimiters, ReasoningVisibility,
-        TemplateAssessment, TemplateAssessor, TemplateCapabilities,
-    };
-
-    struct TestTemplateAssessor;
+    use icn_contracts::{HardwareAssessment, LocalDeclaration};
 
     #[test]
     fn hub_search_results_require_immutable_commits() {
@@ -1890,40 +1880,6 @@ mod tests {
         assert_eq!(selected[0].shard_index, Some(1));
         assert_eq!(selected[1].shard_index, Some(2));
         assert_eq!(selected[1].size_bytes, 20);
-    }
-
-    impl TemplateAssessor for TestTemplateAssessor {
-        fn cache_identity(&self) -> &str {
-            "preview-template-assessor:test"
-        }
-
-        fn assess(&self, _inputs: &EffectiveTemplateInputs) -> Result<TemplateAssessment, String> {
-            Ok(TemplateAssessment {
-                capabilities: TemplateCapabilities {
-                    string_content: true,
-                    typed_content: false,
-                    tools: false,
-                    tool_calls: false,
-                    parallel_tool_calls: false,
-                    system_role: true,
-                    preserve_reasoning: false,
-                    object_arguments: false,
-                    enable_thinking: false,
-                },
-                reasoning: ReasoningCapability::Supported {
-                    control: ReasoningControlDomain::Effort {
-                        levels: vec!["none".to_owned()],
-                        default: Some("none".to_owned()),
-                    },
-                    visibility: ReasoningVisibility::Hidden,
-                    delimiters: ReasoningDelimiters::Unavailable,
-                    evidence: CapabilityEvidence::BoundedTemplateProbe {
-                        fingerprint: "preview-test-template".to_owned(),
-                    },
-                },
-                fingerprint: "preview-test-template".to_owned(),
-            })
-        }
     }
 
     struct CountingProfileAssessor(AtomicUsize);
@@ -2165,12 +2121,7 @@ mod tests {
             crate::inventory::InventoryConfig::with_roots(store.clone(), cache_root.clone())
                 .unwrap();
         config.hf_cache_dirs.clear();
-        let manager = ManagedModelStore::open_with_template_assessor(
-            config,
-            Some(Arc::new(TestTemplateAssessor)),
-        )
-        .await
-        .unwrap();
+        let manager = ManagedModelStore::open(config).await.unwrap();
         let _ = fs::remove_dir_all(&cache_root);
         fs::write(&cache_root, b"not a directory").unwrap();
 
@@ -2329,7 +2280,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preview_assessments_cache_only_terminal_results_by_complete_evidence() {
+    async fn execution_assessments_cache_only_terminal_results_by_complete_evidence() {
         let temporary = tempfile::tempdir().unwrap();
         let mut config = crate::inventory::InventoryConfig::with_roots(
             temporary.path().join("model-store"),
@@ -2364,36 +2315,6 @@ mod tests {
         };
         let topology = system_memory_topology(20);
         let content_id = icn_contracts::ContentId("artifact".to_owned());
-        manager
-            .cache
-            .write_hardware_assessment(&content_id, "profile:hardware", &assessment);
-        assert_eq!(
-            manager
-                .cache
-                .read_hardware_assessment(&content_id, "profile:hardware", &topology),
-            Some(assessment.clone())
-        );
-        assert!(
-            manager
-                .cache
-                .read_hardware_assessment(&content_id, "other-profile:hardware", &topology,)
-                .is_none()
-        );
-
-        manager.cache.write_hardware_assessment(
-            &content_id,
-            "operational-failure",
-            &HardwareAssessment::NotAssessed {
-                reason: "temporary".to_owned(),
-            },
-        );
-        assert!(
-            manager
-                .cache
-                .read_hardware_assessment(&content_id, "operational-failure", &topology)
-                .is_none()
-        );
-
         let execution = icn_contracts::ModelExecutionAssessment::Executable {
             hardware: assessment.clone(),
             performance: vec![icn_contracts::GenerationPerformanceAssessment {
@@ -2431,14 +2352,7 @@ mod tests {
             crate::inventory::InventoryConfig::with_roots(store.clone(), cache_root.clone())
                 .unwrap();
         config.hf_cache_dirs.clear();
-        let manager = Arc::new(
-            ManagedModelStore::open_with_template_assessor(
-                config,
-                Some(Arc::new(TestTemplateAssessor)),
-            )
-            .await
-            .unwrap(),
-        );
+        let manager = Arc::new(ManagedModelStore::open(config).await.unwrap());
         let source = ModelPreviewSource {
             repository: "owner/repository".to_owned(),
             revision: "a".repeat(40),
@@ -2533,12 +2447,7 @@ mod tests {
         )
         .unwrap();
         config.hf_cache_dirs.clear();
-        let manager = ManagedModelStore::open_with_template_assessor(
-            config,
-            Some(Arc::new(TestTemplateAssessor)),
-        )
-        .await
-        .unwrap();
+        let manager = ManagedModelStore::open(config).await.unwrap();
 
         for (index, fixture) in fixtures.into_iter().enumerate() {
             let inspection = crate::gguf::inspect(&fixture).unwrap();
@@ -2598,7 +2507,6 @@ mod tests {
                 &fixture,
                 false,
                 &manager.cache,
-                manager.template_assessor.as_deref(),
             )
             .unwrap();
             assert_eq!(

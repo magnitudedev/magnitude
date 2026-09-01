@@ -182,10 +182,12 @@ change the normalized effort list in this implementation.
 
 ## Detection architecture
 
-Detection loads the actual model through llama.cpp in no-allocation mode and constructs common-chat
-templates from that model. This makes llama.cpp authoritative for metadata, vocabulary, template
-selection, BOS/EOS behavior, and rendering without loading tensor weights or creating an inference
-context. ICN does not copy those inputs into a parallel metadata representation.
+As the template phase of model assessment, detection consumes Assessment Material. The planning
+worker opens its compact primary GGUF once through llama.cpp in no-allocation mode and constructs
+common-chat templates from that model. The same native model handle is then used to construct every
+requested no-allocation context graph. This makes llama.cpp authoritative for metadata, vocabulary,
+template selection, BOS/EOS behavior, rendering, and planning without loading tensor weights or
+creating an inference context. ICN does not copy those inputs into a parallel metadata schema.
 
 The process has two distinct responsibilities:
 
@@ -258,15 +260,13 @@ thinking. Runtime behavior is never selected from filename substrings.
 Changing the effective template, template-selection inputs, inspector version, semantic-policy
 version, or pinned llama.cpp behavior invalidates the cached result.
 
-Reasoning persistence is part of the artifact-inspection index in the
-[model-management cache](../model-management/catalog-and-acquisition.md#concurrency-and-recovery). The reasoning detector defines
-the typed result and a stable semantic-policy identity included in the inspection evidence; it does
-not own a reasoning-specific cache or filesystem layout. Local inventory inspection and remote
-preview reuse the same index whenever the artifact, effective template, and policy evidence match.
-Release-catalog generation records the resulting capabilities in the release-bound catalog and binds
-that artifact to the native template-assessor identity. A changed inspector, semantic policy, or
-pinned native implementation therefore requires catalog regeneration before release validation
-can pass.
+Reasoning evidence is published and cached only inside the flat model-assessment result alongside
+the template fingerprint and profile evidence. The detector owns no worker, deadline, cache,
+inventory field, or filesystem layout. Local inventory and download never invoke it. Release-catalog
+generation binds Assessment Material to the same inspector, semantic-policy, and pinned-native
+identities used at runtime and proves full-artifact/material parity. Changing any of those identities
+invalidates the combined assessment cache and requires catalog regeneration before release
+validation can pass.
 
 ## Request behavior
 
@@ -353,4 +353,5 @@ advertise a disabling option.
 - Every private recipe is bound to the effective-template fingerprint.
 - Every normalized option has automatic token budgeting disabled initially.
 - Selecting a symbolic effort never implicitly sets a hard reasoning-token budget.
-- Detection is model-free, bounded, deterministic apart from nonces, and cacheable.
+- Detection performs no tensor allocation or inference, is bounded and deterministic apart from
+  nonces, and is cacheable only as part of the complete model assessment.

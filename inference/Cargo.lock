@@ -1422,9 +1422,7 @@ dependencies = [
  "anyhow",
  "clap",
  "icn-contracts",
- "icn-engine",
  "icn-models",
- "icn-reasoning",
  "serde_json",
  "tokio",
 ]

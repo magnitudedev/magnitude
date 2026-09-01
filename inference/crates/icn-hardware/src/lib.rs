@@ -13,6 +13,7 @@ use llama_cpp_2::context::params::{
     FlashAttentionPolicy, KvCacheType, LlamaContextParams, LlamaContextType,
 };
 use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::params::fit::{
     FitCalibration as HardwareCalibration, FitCalibrationMetric as HardwareCalibrationMetric,
@@ -819,6 +820,8 @@ pub enum AssessmentError {
     Projector(#[from] llama_cpp_2::mtmd::MtmdPreflightError),
     #[error("the native planner omitted required memory measurements")]
     MissingMeasurements,
+    #[error("failed to open the model without tensor allocation: {0}")]
+    ModelLoad(String),
     #[error(
         "{owner:?} native device is absent from the supplied memory topology: backend={backend:?}, physical_id={physical_id:?}, native_index={native_index}"
     )]
@@ -834,6 +837,56 @@ pub enum AssessmentError {
     InvalidArtifact { code: String, message: String },
     #[error("generation performance assessment failed: {code}: {message}")]
     PerformanceEstimate { code: &'static str, message: String },
+}
+
+/// Open the target once without allocating tensor data so one worker request can reuse it for
+/// template inspection and profile measurement.
+pub fn open_no_alloc_model(
+    backend: &LlamaBackend,
+    requested: &[ExecutionIntent],
+) -> Result<LlamaModel, AssessmentError> {
+    let (model_path, model_params, _, _) = profile_measurement_inputs(requested)?;
+    LlamaModel::load_from_file(backend, model_path, model_params.as_ref().get_ref())
+        .map_err(|error| AssessmentError::ModelLoad(error.to_string()))
+}
+
+fn profile_measurement_inputs(
+    requested: &[ExecutionIntent],
+) -> Result<
+    (
+        PathBuf,
+        std::pin::Pin<Box<LlamaModelParams>>,
+        Vec<LlamaContextParams>,
+        Vec<usize>,
+    ),
+    AssessmentError,
+> {
+    let requests = requested
+        .iter()
+        .map(|intent| planning_request(intent, false))
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(first) = requests.first() else {
+        return Err(AssessmentError::MissingMeasurements);
+    };
+    if requests.iter().any(|request| request.model != first.model) {
+        return Err(AssessmentError::MissingMeasurements);
+    }
+    let native = requests
+        .iter()
+        .map(native_parameter_plan)
+        .collect::<Result<Vec<_>, _>>()?;
+    let model_params = Box::pin(
+        native_model_params(&first.options)?
+            .with_use_mlock(false)
+            .with_no_alloc(true),
+    );
+    let margins = expand_margins(&first.options.margins_bytes, llama_cpp_2::max_devices())?;
+    Ok((
+        first.model.clone(),
+        model_params,
+        native.into_iter().map(|plan| plan.context_params).collect(),
+        margins,
+    ))
 }
 
 /// Assess execution intent using the same native planning implementation used by loading.
@@ -1912,8 +1965,22 @@ pub fn assess_profiles_with_backend(
     topology: &MemoryTopology,
     requested: &[ExecutionIntent],
 ) -> Result<Vec<HardwareAssessment>, AssessmentError> {
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
+    let model = open_no_alloc_model(backend, requested)?;
+    assess_profiles_with_model(backend, topology, requested, &model)
+}
+
+/// Assess capacity profiles using an already-open no-allocation model.
+pub fn assess_profiles_with_model(
+    backend: &LlamaBackend,
+    topology: &MemoryTopology,
+    requested: &[ExecutionIntent],
+    model: &LlamaModel,
+) -> Result<Vec<HardwareAssessment>, AssessmentError> {
     Ok(
-        assess_profiles_impl(backend, topology, requested, None, &[])?
+        assess_profiles_impl(backend, topology, requested, model, None, &[])?
             .into_iter()
             .map(|assessment| assessment.hardware)
             .collect(),
@@ -1928,10 +1995,34 @@ pub fn assess_execution_profiles_with_backend(
     calibration: &HardwareCalibration,
     performance_context_tokens: &[Vec<u32>],
 ) -> Result<Vec<ModelExecutionAssessment>, AssessmentError> {
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
+    let model = open_no_alloc_model(backend, requested)?;
+    assess_execution_profiles_with_model(
+        backend,
+        topology,
+        requested,
+        &model,
+        calibration,
+        performance_context_tokens,
+    )
+}
+
+/// Assess execution profiles using an already-open no-allocation model.
+pub fn assess_execution_profiles_with_model(
+    backend: &LlamaBackend,
+    topology: &MemoryTopology,
+    requested: &[ExecutionIntent],
+    model: &LlamaModel,
+    calibration: &HardwareCalibration,
+    performance_context_tokens: &[Vec<u32>],
+) -> Result<Vec<ModelExecutionAssessment>, AssessmentError> {
     assess_profiles_impl(
         backend,
         topology,
         requested,
+        model,
         Some(calibration),
         performance_context_tokens,
     )?
@@ -1957,53 +2048,26 @@ fn assess_profiles_impl(
     backend: &LlamaBackend,
     topology: &MemoryTopology,
     requested: &[ExecutionIntent],
+    model: &LlamaModel,
     calibration: Option<&HardwareCalibration>,
     performance_context_tokens: &[Vec<u32>],
 ) -> Result<Vec<ProfileAssessment>, AssessmentError> {
-    if requested.is_empty() {
-        return Ok(Vec::new());
-    }
     if calibration.is_some() && performance_context_tokens.len() != requested.len() {
         return Err(AssessmentError::PerformanceEstimate {
             code: "invalid_performance_contexts",
             message: "performance sample contexts did not match assessed profiles".to_owned(),
         });
     }
-    let requests = requested
-        .iter()
-        .map(|intent| planning_request(intent, false))
-        .collect::<Result<Vec<_>, _>>()?;
-    if requests
-        .iter()
-        .any(|request| request.model != requests[0].model)
-    {
-        return Err(AssessmentError::MissingMeasurements);
-    }
-
-    let native = requests
-        .iter()
-        .map(native_parameter_plan)
-        .collect::<Result<Vec<_>, _>>()?;
-    let model_path = path_c_string(&requests[0].model)?;
-    let margins = expand_margins(
-        &requests[0].options.margins_bytes,
-        llama_cpp_2::max_devices(),
-    )?;
-    let contexts = native
-        .iter()
-        .map(|plan| plan.context_params.clone())
-        .collect::<Vec<_>>();
+    let (_, model_params, contexts, margins) = profile_measurement_inputs(requested)?;
     let reports = match calibration {
-        Some(_) => native[0]
-            .model_params
+        Some(_) => model_params
             .as_ref()
             .get_ref()
-            .measure_contexts_with_decode_workload(&model_path, &contexts, &margins),
-        None => native[0].model_params.as_ref().get_ref().measure_contexts(
-            &model_path,
-            &contexts,
-            &margins,
-        ),
+            .measure_loaded_contexts_with_decode_workload(model, &contexts, &margins),
+        None => model_params
+            .as_ref()
+            .get_ref()
+            .measure_loaded_contexts(model, &contexts, &margins),
     }
     .map_err(NativePlanningError::NativeBridge)?;
     let aggregate_stable_capacity = topology.aggregate_stable_capacity();

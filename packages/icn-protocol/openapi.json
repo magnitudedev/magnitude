@@ -5238,10 +5238,18 @@
           {
             "type": "object",
             "required": [
+              "capabilities",
+              "templateFingerprint",
               "profiles",
               "_tag"
             ],
             "properties": {
+              "capabilities": {
+                "$ref": "#/components/schemas/ModelCapabilities"
+              },
+              "templateFingerprint": {
+                "type": "string"
+              },
               "profiles": {
                 "type": "array",
                 "items": {
@@ -6337,8 +6345,7 @@
         "type": "object",
         "required": [
           "metadata",
-          "profile",
-          "capabilities"
+          "profile"
         ],
         "properties": {
           "metadata": {
@@ -6346,9 +6353,6 @@
           },
           "profile": {
             "$ref": "#/components/schemas/ServingProfile"
-          },
-          "capabilities": {
-            "$ref": "#/components/schemas/ModelCapabilities"
           },
           "speculativeMethod": {
             "$ref": "#/components/schemas/SpeculativeMethod"

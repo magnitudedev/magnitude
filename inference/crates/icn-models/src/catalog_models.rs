@@ -453,7 +453,6 @@ fn catalog_model(
         desired: ready_model(
             &definition.configuration.bundle,
             definition.configuration.profile.clone(),
-            definition.capabilities.clone(),
         ),
         display_name: definition.display_name.clone(),
         variant_label: definition.variant_label.clone(),
@@ -710,27 +709,14 @@ mod tests {
 
     use icn_contracts::models::{
         CatalogBaseId, CatalogIntelligence, CatalogPackageAffiliation, CatalogVariantId,
-        IntelligenceProvenance, ModelCapabilities, ModelFile, ModelFileId, ModelFileRole,
-        ModelPackage, ModelPackageInspection, ModelPackageProperties, ModelPackageSource,
-        ModelParameterization, ModelReasoningCapabilities, ModelReleaseDate,
-        ResolvedModelInstallation, ServingProfile, SpeculativeDraftSource, SpeculativeMethod,
+        IntelligenceProvenance, ModelFile, ModelFileId, ModelFileRole, ModelPackage,
+        ModelPackageProperties, ModelPackageSource, ModelParameterization, ModelReleaseDate,
+        PackageValidation, ResolvedModelInstallation, ServingProfile, SpeculativeDraftSource,
+        SpeculativeMethod,
     };
 
     use super::*;
     use crate::model_projection::resolved_installation;
-
-    fn capabilities() -> ModelCapabilities {
-        ModelCapabilities {
-            vision: false,
-            tools: true,
-            structured_output: true,
-            reasoning: ModelReasoningCapabilities {
-                supported: false,
-                efforts: Vec::new(),
-                default_effort: None,
-            },
-        }
-    }
 
     fn package(id: &str, bytes: u64) -> ModelPackage {
         ModelPackage {
@@ -767,9 +753,7 @@ mod tests {
             path: PathBuf::from(format!("/installed/{}", package.id.0)),
             package,
             origin,
-            inspection: ModelPackageInspection::Inspected {
-                capabilities: capabilities(),
-            },
+            validation: PackageValidation::Valid,
             catalog_attribution: InstalledCatalogAttribution::NotCatalogTarget,
         }
     }
@@ -789,7 +773,6 @@ mod tests {
             description: "Catalog model".to_owned(),
             release_date: ModelReleaseDate::new("2026-01-01").expect("release date"),
             license: "test".to_owned(),
-            capabilities: capabilities(),
             parameterization: ModelParameterization::Dense {
                 total_parameters: 1_000_000,
             },
@@ -882,7 +865,6 @@ mod tests {
             ServingProfile {
                 context_length: 32_768,
             },
-            capabilities(),
         );
         assert_eq!(ready.metadata.storage_bytes, 25);
         assert_eq!(ready.speculative_method, Some(SpeculativeMethod::DFlash));
@@ -989,7 +971,7 @@ mod tests {
             draft_package.clone(),
             ModelPackageInstallationOrigin::HuggingFaceCache,
         );
-        draft.inspection = ModelPackageInspection::Invalid {
+        draft.validation = PackageValidation::Invalid {
             failure: ModelFailure {
                 code: "invalid_draft".to_owned(),
                 message: "draft is invalid".to_owned(),

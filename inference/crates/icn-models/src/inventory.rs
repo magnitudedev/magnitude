@@ -7,15 +7,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hf_hub::HFClient;
 use icn_contracts::models::{
-    CatalogPackageRole, InstalledModelPackage, InstalledModelPackagesResponse, ModelAssessment,
+    CatalogPackageRole, InstalledModelPackage, InstalledModelPackagesResponse,
     ModelFileRelationship, ModelFileRole, ModelPackage, ModelPackageId, ModelPackageSource,
     RecommendableModel, ServableModelBundle, SpeculativeDraftSource,
 };
 use icn_contracts::{
-    CapabilitySupport, ComponentRole, ContentIdentity, EffectiveTemplateInputs, Integrity,
-    InventoryEntryId, InventoryError, InventoryModel, InventoryProperties, LocalDeclaration,
-    ModelAvailability, ModelComponent, ModelLocation, ModelOperation, ModelSource,
-    ReasoningCapability, TemplateAssessor,
+    ComponentRole, ContentIdentity, Integrity, InventoryEntryId, InventoryError, InventoryModel,
+    InventoryProperties, LocalDeclaration, ModelAvailability, ModelComponent, ModelLocation,
+    ModelOperation, ModelSource,
 };
 use icn_utils::file_cache::recover_map;
 use sha2::{Digest, Sha256};
@@ -29,7 +28,6 @@ use crate::store_fs::ensure_store_layout;
 
 const MAX_SCAN_ENTRIES: usize = 100_000;
 const MAX_SCAN_DEPTH: usize = 8;
-const MODEL_INSPECTION_SCHEMA_VERSION: u32 = 3;
 const BACKGROUND_RECONCILIATION_RETRY_DELAY: std::time::Duration =
     std::time::Duration::from_secs(1);
 
@@ -37,11 +35,11 @@ const BACKGROUND_RECONCILIATION_RETRY_DELAY: std::time::Duration =
 struct CacheEvidence {
     content_id: String,
     observation_key: String,
-    inspection_key: String,
+    metadata_key: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct CachedModelInspection {
+pub(crate) struct CachedModelMetadata {
     pub(crate) name: String,
     pub(crate) properties: InventoryProperties,
     pub(crate) supported_parameters: Vec<String>,
@@ -179,11 +177,11 @@ pub struct ManagedModelStore {
     pub(crate) operations:
         Arc<tokio::sync::Mutex<BTreeMap<String, Arc<crate::download::DownloadOperation>>>>,
     pub(crate) download_slots: Arc<tokio::sync::Semaphore>,
-    pub(crate) template_assessor: Option<Arc<dyn TemplateAssessor>>,
     pub(crate) cache: ModelCache,
     pub(crate) package_digests: Arc<RwLock<BTreeMap<PathBuf, (u64, SystemTime, String)>>>,
     pub(crate) installed_packages: Arc<RwLock<InstalledPackageSnapshot>>,
-    pub(crate) model_assessments: Arc<RwLock<BTreeMap<String, ModelAssessment>>>,
+    pub(crate) model_assessments:
+        Arc<RwLock<BTreeMap<String, crate::cache::CachedModelAssessment>>>,
     pub(crate) catalog_affiliations: Arc<RwLock<CatalogAffiliations>>,
     pub(crate) catalog_affiliations_dirty: Arc<AtomicBool>,
     cache_evidence: Arc<RwLock<BTreeMap<InventoryEntryId, CacheEvidence>>>,
@@ -215,7 +213,6 @@ impl Clone for ManagedModelStore {
             models: Arc::clone(&self.models),
             operations: Arc::clone(&self.operations),
             download_slots: Arc::clone(&self.download_slots),
-            template_assessor: self.template_assessor.clone(),
             cache: self.cache.clone(),
             package_digests: Arc::clone(&self.package_digests),
             installed_packages: Arc::clone(&self.installed_packages),
@@ -277,13 +274,6 @@ impl ManagedModelStore {
     }
 
     pub async fn open(config: InventoryConfig) -> Result<Self, InventoryError> {
-        Self::open_with_template_assessor(config, None).await
-    }
-
-    pub async fn open_with_template_assessor(
-        config: InventoryConfig,
-        template_assessor: Option<Arc<dyn TemplateAssessor>>,
-    ) -> Result<Self, InventoryError> {
         validate_config(&config)?;
         ensure_store_layout(&config.root).await?;
         let client_builder = HFClient::builder().cache_dir(config.root.join("hub"));
@@ -306,7 +296,6 @@ impl ManagedModelStore {
             http: reqwest::Client::new(),
             models: Arc::new(RwLock::new(BTreeMap::new())),
             operations: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
-            template_assessor,
             cache,
             package_digests: Arc::new(RwLock::new(BTreeMap::new())),
             installed_packages: Arc::new(RwLock::new(InstalledPackageSnapshot::default())),
@@ -354,16 +343,14 @@ impl ManagedModelStore {
         });
     }
 
-    pub(crate) fn cached_model_inspection(
+    pub(crate) fn cached_model_metadata(
         &self,
         content_id: &icn_contracts::ContentId,
         primary_name: &str,
-    ) -> Option<CachedModelInspection> {
-        let assessor = self.template_assessor.as_deref()?;
-        let evidence =
-            model_inspection_evidence(content_id, assessor.cache_identity(), primary_name).ok()?;
+    ) -> Option<CachedModelMetadata> {
+        let evidence = model_metadata_evidence(content_id, primary_name).ok()?;
         self.cache
-            .read_index(ModelIndexKind::ArtifactInspection, &evidence)
+            .read_index(ModelIndexKind::InventoryMetadata, &evidence)
     }
 
     pub async fn ensure_model_inventory(&self) -> Result<(), InventoryError> {
@@ -390,18 +377,11 @@ impl ManagedModelStore {
         let (discovered, next_evidence, installed_packages) = loop {
             let config = self.config.clone();
             let cache = self.cache.clone();
-            let template_assessor = self.template_assessor.clone();
             let scan_live_models = live_models.clone();
-            let scan_result = tokio::task::spawn_blocking(move || {
-                scan(
-                    &config,
-                    &cache,
-                    template_assessor.as_deref(),
-                    &scan_live_models,
-                )
-            })
-            .await
-            .map_err(|error| InventoryError::Internal(error.to_string()))??;
+            let scan_result =
+                tokio::task::spawn_blocking(move || scan(&config, &cache, &scan_live_models))
+                    .await
+                    .map_err(|error| InventoryError::Internal(error.to_string()))??;
             let discovered = scan_result.models;
 
             let mut next_evidence = BTreeMap::new();
@@ -422,13 +402,13 @@ impl ManagedModelStore {
                                 model.id.0
                             ))
                         })?,
-                    inspection_key: scan_result
-                        .inspection_keys
+                    metadata_key: scan_result
+                        .metadata_keys
                         .get(&model.id)
                         .cloned()
                         .ok_or_else(|| {
                             InventoryError::Internal(format!(
-                                "ready model {} has no inspection evidence",
+                                "ready model {} has no metadata evidence",
                                 model.id.0
                             ))
                         })?,
@@ -561,7 +541,6 @@ impl ManagedModelStore {
             &canonical,
             false,
             &self.cache,
-            self.template_assessor.as_deref(),
         )?;
         if let Some(name) = display_name {
             model.name = name.to_owned();
@@ -580,17 +559,7 @@ impl ManagedModelStore {
                 Ok::<_, InventoryError>(CacheEvidence {
                     content_id: model.content_id.0.clone(),
                     observation_key: model_observation_key(&self.config.root, &model)?,
-                    inspection_key: model_inspection_evidence_for_model(
-                        &model,
-                        self.template_assessor
-                            .as_deref()
-                            .ok_or_else(|| {
-                                InventoryError::Internal(
-                                    "ready model has no template assessor".to_owned(),
-                                )
-                            })?
-                            .cache_identity(),
-                    )?,
+                    metadata_key: model_metadata_evidence_for_model(&model)?,
                 })
             })
             .transpose()?;
@@ -828,13 +797,12 @@ fn validate_config(config: &InventoryConfig) -> Result<(), InventoryError> {
 struct InventoryScan {
     models: BTreeMap<InventoryEntryId, InventoryModel>,
     observations: BTreeMap<InventoryEntryId, String>,
-    inspection_keys: BTreeMap<InventoryEntryId, String>,
+    metadata_keys: BTreeMap<InventoryEntryId, String>,
 }
 
 fn scan(
     config: &InventoryConfig,
     cache: &ModelCache,
-    assessor: Option<&dyn TemplateAssessor>,
     live_models: &BTreeMap<InventoryEntryId, InventoryModel>,
 ) -> Result<InventoryScan, InventoryError> {
     let mut discovered = Vec::new();
@@ -894,7 +862,7 @@ fn scan(
     let mut seen_paths = BTreeSet::new();
     let mut models = BTreeMap::new();
     let mut observations = BTreeMap::new();
-    let mut inspection_keys = BTreeMap::new();
+    let mut metadata_keys = BTreeMap::new();
     let mut stale = Vec::new();
     for candidate in discovered {
         let path = candidate.primary_path().to_path_buf();
@@ -920,15 +888,8 @@ fn scan(
                         &candidate.source,
                         &candidate.location,
                     )?;
-                    let inspection_key = model_inspection_evidence(
+                    let metadata_key = model_metadata_evidence(
                         &candidate.content_id,
-                        assessor
-                            .ok_or_else(|| {
-                                InventoryError::Internal(
-                                    "model inventory has no template assessor".to_owned(),
-                                )
-                            })?
-                            .cache_identity(),
                         candidate
                             .primary
                             .file_name()
@@ -936,11 +897,11 @@ fn scan(
                             .unwrap_or("local model"),
                     )?;
                     observations.insert(candidate.id.clone(), observation_key.clone());
-                    inspection_keys.insert(candidate.id.clone(), inspection_key.clone());
-                    if let Some(model) = reuse_inspection(
+                    metadata_keys.insert(candidate.id.clone(), metadata_key.clone());
+                    if let Some(model) = reuse_metadata(
                         &candidate,
                         &observation_key,
-                        &inspection_key,
+                        &metadata_key,
                         &cached_models,
                         &cached_evidence,
                     ) {
@@ -958,7 +919,7 @@ fn scan(
         let enriched = std::thread::scope(|scope| {
             candidates
                 .iter()
-                .map(|candidate| scope.spawn(move || enrich_candidate(candidate, cache, assessor)))
+                .map(|candidate| scope.spawn(move || enrich_candidate(candidate, cache)))
                 .collect::<Vec<_>>()
                 .into_iter()
                 .map(|handle| {
@@ -975,7 +936,7 @@ fn scan(
     Ok(InventoryScan {
         models,
         observations,
-        inspection_keys,
+        metadata_keys,
     })
 }
 
@@ -1309,10 +1270,10 @@ impl DiscoveryCandidate {
 
 // Discovery resolves stable identity and location before enrichment. An unchanged artifact can
 // therefore reuse its persisted terminal inspection without reopening or reprobeing the GGUF.
-fn reuse_inspection(
+fn reuse_metadata(
     candidate: &ArtifactCandidate,
     observation_key: &str,
-    inspection_key: &str,
+    metadata_key: &str,
     cached_models: &BTreeMap<InventoryEntryId, InventoryModel>,
     cached_evidence: &BTreeMap<InventoryEntryId, CacheEvidence>,
 ) -> Option<InventoryModel> {
@@ -1320,7 +1281,7 @@ fn reuse_inspection(
         .get(&candidate.id)
         .filter(|evidence| evidence.content_id == candidate.content_id.0)
         .filter(|evidence| evidence.observation_key == observation_key)
-        .filter(|evidence| evidence.inspection_key == inspection_key)
+        .filter(|evidence| evidence.metadata_key == metadata_key)
         .and_then(|_| cached_models.get(&candidate.id))
         .filter(|model| {
             matches!(
@@ -1363,7 +1324,6 @@ fn reuse_inspection(
 fn enrich_candidate(
     candidate: &ArtifactCandidate,
     cache: &ModelCache,
-    assessor: Option<&dyn TemplateAssessor>,
 ) -> Result<InventoryModel, InventoryError> {
     let model = build_model(
         candidate.id.clone(),
@@ -1375,7 +1335,6 @@ fn enrich_candidate(
         &candidate.primary,
         candidate.deletable,
         cache,
-        assessor,
     )?;
     Ok(model)
 }
@@ -1393,60 +1352,19 @@ pub(crate) fn build_model(
     primary: &Path,
     deletable: bool,
     cache: &ModelCache,
-    assessor: Option<&dyn TemplateAssessor>,
 ) -> Result<InventoryModel, InventoryError> {
-    let assessor = assessor.ok_or_else(|| {
-        InventoryError::Internal("the model inventory has no template assessor".to_owned())
-    })?;
     let primary_name = primary
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("local model");
-    let inspection_evidence =
-        model_inspection_evidence(&content_id, assessor.cache_identity(), primary_name)?;
-    let cached_inspection = cache.read_index::<CachedModelInspection>(
-        ModelIndexKind::ArtifactInspection,
-        &inspection_evidence,
-    );
-    let inspected = match cached_inspection {
+    let metadata_evidence = model_metadata_evidence(&content_id, primary_name)?;
+    let cached_metadata = cache
+        .read_index::<CachedModelMetadata>(ModelIndexKind::InventoryMetadata, &metadata_evidence);
+    let inspected = match cached_metadata {
         Some(inspection) => inspection,
         None => match gguf::inspect(primary) {
             Ok(inspection) => {
                 let evidence = fingerprint(&inspection.fingerprint_material);
-                let template = assessor.assess(&EffectiveTemplateInputs {
-                    model_path: primary.to_path_buf(),
-                });
-                let (tools, reasoning, template_evidence) = match template {
-                    Ok(assessment) => (
-                        if assessment.capabilities.tools || assessment.capabilities.tool_calls {
-                            CapabilitySupport::Supported {
-                                parallel: Some(assessment.capabilities.parallel_tool_calls),
-                            }
-                        } else {
-                            CapabilitySupport::Unsupported
-                        },
-                        assessment.reasoning,
-                        Some(assessment.fingerprint),
-                    ),
-                    Err(error) => {
-                        return Ok(unavailable_model(
-                            id,
-                            content_id,
-                            created,
-                            ready_at,
-                            source,
-                            location,
-                            primary,
-                            deletable,
-                            "template_inspection_failed",
-                            format!(
-                                "template inspection failed for {}: {error}",
-                                primary.display()
-                            ),
-                            false,
-                        ));
-                    }
-                };
                 let name = inspection.name.clone().unwrap_or_else(|| {
                     primary
                         .file_stem()
@@ -1454,21 +1372,7 @@ pub(crate) fn build_model(
                         .unwrap_or("local model")
                         .to_owned()
                 });
-                let mut supported_parameters = Vec::new();
-                if matches!(tools, CapabilitySupport::Supported { .. }) {
-                    supported_parameters.push("tools".to_owned());
-                }
-                if matches!(
-                    reasoning,
-                    ReasoningCapability::Supported {
-                        control: icn_contracts::ReasoningControlDomain::Effort { .. }
-                            | icn_contracts::ReasoningControlDomain::EffortAndBudget { .. },
-                        ..
-                    }
-                ) {
-                    supported_parameters.push("reasoning_effort".to_owned());
-                }
-                let inspected = CachedModelInspection {
+                let inspected = CachedModelMetadata {
                     name,
                     properties: InventoryProperties::Inspected {
                         architecture: inspection.architecture,
@@ -1481,19 +1385,13 @@ pub(crate) fn build_model(
                         tokenizer: inspection.tokenizer,
                         modalities: inspection.modalities,
                         base_models: inspection.base_models,
-                        tools,
-                        structured_output: CapabilitySupport::Supported { parallel: None },
-                        reasoning,
-                        evidence_fingerprint: template_evidence
-                            .map_or(evidence.clone(), |template| {
-                                format!("{evidence}+{template}")
-                            }),
+                        evidence_fingerprint: evidence,
                     },
-                    supported_parameters,
+                    supported_parameters: Vec::new(),
                 };
                 cache.write_index(
-                    ModelIndexKind::ArtifactInspection,
-                    &inspection_evidence,
+                    ModelIndexKind::InventoryMetadata,
+                    &metadata_evidence,
                     &inspected,
                 );
                 inspected
@@ -1539,24 +1437,15 @@ pub(crate) fn build_model(
     })
 }
 
-fn model_inspection_evidence(
+fn model_metadata_evidence(
     content_id: &icn_contracts::ContentId,
-    assessor_identity: &str,
     primary_name: &str,
 ) -> Result<String, InventoryError> {
-    serde_json::to_string(&(
-        MODEL_INSPECTION_SCHEMA_VERSION,
-        &content_id.0,
-        assessor_identity,
-        primary_name,
-    ))
-    .map_err(|error| InventoryError::Internal(error.to_string()))
+    serde_json::to_string(&(&content_id.0, primary_name))
+        .map_err(|error| InventoryError::Internal(error.to_string()))
 }
 
-fn model_inspection_evidence_for_model(
-    model: &InventoryModel,
-    assessor_identity: &str,
-) -> Result<String, InventoryError> {
+fn model_metadata_evidence_for_model(model: &InventoryModel) -> Result<String, InventoryError> {
     let primary_name = model
         .location
         .components()
@@ -1570,7 +1459,7 @@ fn model_inspection_evidence_for_model(
         .and_then(|component| Path::new(&component.path).file_name())
         .and_then(|value| value.to_str())
         .unwrap_or("local model");
-    model_inspection_evidence(&model.content_id, assessor_identity, primary_name)
+    model_metadata_evidence(&model.content_id, primary_name)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1990,14 +1879,13 @@ fn io_error(error: impl std::fmt::Display) -> InventoryError {
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use icn_contracts::models::{
         CatalogBaseId, CatalogIntelligence, CatalogVariantId, InstalledCatalogAttribution,
-        InstalledModelPackages, IntelligenceProvenance, ModelCapabilities, ModelFile, ModelFileId,
-        ModelFileRole, ModelPackageInspection, ModelPackageInstallationOrigin,
-        ModelPackageProperties, ModelReasoningCapabilities, ModelReleaseDate,
-        ModelServingConfiguration, RecommendableModel, ServableModelBundle, ServingProfile,
+        InstalledModelPackages, IntelligenceProvenance, ModelFile, ModelFileId, ModelFileRole,
+        ModelPackageInstallationOrigin, ModelPackageProperties, ModelReleaseDate,
+        ModelServingConfiguration, PackageValidation, RecommendableModel, ServableModelBundle,
+        ServingProfile,
     };
 
     fn catalog_model(package: ModelPackage) -> RecommendableModel {
@@ -2015,16 +1903,6 @@ mod tests {
             description: String::new(),
             release_date: ModelReleaseDate::new("2026-01-01").expect("valid test date"),
             license: "test".to_owned(),
-            capabilities: ModelCapabilities {
-                vision: false,
-                tools: false,
-                structured_output: false,
-                reasoning: ModelReasoningCapabilities {
-                    supported: false,
-                    efforts: Vec::new(),
-                    default_effort: None,
-                },
-            },
             parameterization: icn_contracts::models::ModelParameterization::Dense {
                 total_parameters: 8_000_000_000,
             },
@@ -2040,10 +1918,7 @@ mod tests {
             quantization_aware: false,
         }
     }
-    use icn_contracts::{
-        CapabilityEvidence, ModelInventory, ReasoningControlDomain, ReasoningDelimiters,
-        ReasoningVisibility, TemplateAssessment, TemplateCapabilities,
-    };
+    use icn_contracts::ModelInventory;
 
     #[test]
     fn configured_store_does_not_adopt_host_hugging_face_caches() {
@@ -2119,13 +1994,7 @@ mod tests {
             },
         })];
 
-        let result = scan(
-            &config,
-            &cache,
-            Some(&CompleteTemplateAssessor::default()),
-            &BTreeMap::new(),
-        )
-        .expect("filesystem-derived inventory");
+        let result = scan(&config, &cache, &BTreeMap::new()).expect("filesystem-derived inventory");
 
         assert_eq!(result.models.len(), 1);
         let discovered = result.models.values().next().expect("catalog model");
@@ -2149,13 +2018,8 @@ mod tests {
         );
 
         fs::remove_file(snapshot.join(&artifact_name)).expect("remove installed link");
-        let after_delete = scan(
-            &config,
-            &cache,
-            Some(&CompleteTemplateAssessor::default()),
-            &BTreeMap::new(),
-        )
-        .expect("read-only filesystem-derived inventory");
+        let after_delete = scan(&config, &cache, &BTreeMap::new())
+            .expect("read-only filesystem-derived inventory");
         assert!(after_delete.models.is_empty());
         assert!(!snapshot.join(&artifact_name).exists());
     }
@@ -2234,85 +2098,14 @@ mod tests {
             },
         })];
 
-        let discovered = scan(
-            &config,
-            &cache,
-            Some(&CompleteTemplateAssessor::default()),
-            &BTreeMap::new(),
-        )
-        .expect("single managed revision");
+        let discovered = scan(&config, &cache, &BTreeMap::new()).expect("single managed revision");
         assert_eq!(discovered.models.len(), 2);
 
         fs::create_dir_all(repository_root.join("snapshots/other-commit"))
             .expect("second snapshot");
-        let with_incomplete_second_snapshot = scan(
-            &config,
-            &cache,
-            Some(&CompleteTemplateAssessor::default()),
-            &BTreeMap::new(),
-        )
-        .expect("managed snapshots");
+        let with_incomplete_second_snapshot =
+            scan(&config, &cache, &BTreeMap::new()).expect("managed snapshots");
         assert_eq!(with_incomplete_second_snapshot.models.len(), 2);
-    }
-
-    #[derive(Default)]
-    struct CompleteTemplateAssessor {
-        calls: AtomicUsize,
-        active: AtomicUsize,
-        max_active: AtomicUsize,
-        delay: bool,
-        reject_name: Option<&'static str>,
-        identity: Option<&'static str>,
-    }
-
-    impl TemplateAssessor for CompleteTemplateAssessor {
-        fn cache_identity(&self) -> &str {
-            self.identity.unwrap_or("complete-template-assessor:test")
-        }
-
-        fn assess(&self, inputs: &EffectiveTemplateInputs) -> Result<TemplateAssessment, String> {
-            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
-            if self.reject_name.is_some_and(|name| {
-                inputs
-                    .model_path
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(|file_name| file_name.contains(name))
-            }) {
-                return Err("unsupported template".to_owned());
-            }
-            let active = self.active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
-            self.max_active.fetch_max(active, AtomicOrdering::SeqCst);
-            if self.delay {
-                std::thread::sleep(std::time::Duration::from_millis(30));
-            }
-            self.active.fetch_sub(1, AtomicOrdering::SeqCst);
-            Ok(TemplateAssessment {
-                capabilities: TemplateCapabilities {
-                    string_content: true,
-                    typed_content: false,
-                    tools: false,
-                    tool_calls: false,
-                    parallel_tool_calls: false,
-                    system_role: true,
-                    preserve_reasoning: false,
-                    object_arguments: false,
-                    enable_thinking: false,
-                },
-                reasoning: ReasoningCapability::Supported {
-                    control: ReasoningControlDomain::Effort {
-                        levels: vec!["none".to_owned()],
-                        default: Some("none".to_owned()),
-                    },
-                    visibility: ReasoningVisibility::Hidden,
-                    delimiters: ReasoningDelimiters::Unavailable,
-                    evidence: CapabilityEvidence::BoundedTemplateProbe {
-                        fingerprint: "template-v1".to_owned(),
-                    },
-                },
-                fingerprint: "template-v1".to_owned(),
-            })
-        }
     }
 
     fn write_minimal_gguf(path: &Path) {
@@ -2363,12 +2156,7 @@ mod tests {
         let mut config =
             InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
         config.hf_cache_dirs.push(hf_cache);
-        let manager = ManagedModelStore::open_with_template_assessor(
-            config,
-            Some(Arc::new(CompleteTemplateAssessor::default())),
-        )
-        .await
-        .unwrap();
+        let manager = ManagedModelStore::open(config).await.unwrap();
         manager.ensure_installed_model_inventory().await.unwrap();
         let installed = manager.list_installed().await.unwrap();
 
@@ -2391,12 +2179,7 @@ mod tests {
 
         let mut initial = InventoryConfig::with_roots(store.clone(), cache.clone()).unwrap();
         initial.hf_cache_dirs.push(hf_cache.clone());
-        let manager = ManagedModelStore::open_with_template_assessor(
-            initial,
-            Some(Arc::new(CompleteTemplateAssessor::default())),
-        )
-        .await
-        .unwrap();
+        let manager = ManagedModelStore::open(initial).await.unwrap();
         manager.ensure_installed_model_inventory().await.unwrap();
         let package = manager.list_installed().await.unwrap().packages[0]
             .package
@@ -2406,12 +2189,7 @@ mod tests {
         let mut configured = InventoryConfig::with_roots(store.clone(), cache.clone()).unwrap();
         configured.hf_cache_dirs.push(hf_cache.clone());
         configured.catalog_models = vec![catalog_model(package.clone())];
-        let manager = ManagedModelStore::open_with_template_assessor(
-            configured,
-            Some(Arc::new(CompleteTemplateAssessor::default())),
-        )
-        .await
-        .unwrap();
+        let manager = ManagedModelStore::open(configured).await.unwrap();
         manager.ensure_installed_model_inventory().await.unwrap();
         let installed = manager.list_installed().await.unwrap();
         assert_eq!(
@@ -2429,12 +2207,7 @@ mod tests {
         let mut updated = InventoryConfig::with_roots(store, cache).unwrap();
         updated.hf_cache_dirs.push(hf_cache);
         updated.catalog_models = vec![catalog_model(future_package)];
-        let manager = ManagedModelStore::open_with_template_assessor(
-            updated,
-            Some(Arc::new(CompleteTemplateAssessor::default())),
-        )
-        .await
-        .unwrap();
+        let manager = ManagedModelStore::open(updated).await.unwrap();
         manager.ensure_installed_model_inventory().await.unwrap();
         let installed = manager.list_installed().await.unwrap();
         assert!(matches!(
@@ -2448,13 +2221,12 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let model_path = temporary.path().join("active.gguf");
         write_minimal_gguf(&model_path);
-        let manager = ManagedModelStore::open_with_template_assessor(
+        let manager = ManagedModelStore::open(
             InventoryConfig::with_roots(
                 temporary.path().join("store"),
                 temporary.path().join("cache"),
             )
             .unwrap(),
-            Some(Arc::new(CompleteTemplateAssessor::default())),
         )
         .await
         .unwrap();
@@ -2477,12 +2249,7 @@ mod tests {
         let mut config =
             InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
         config.hf_cache_dirs.push(hf_cache);
-        let manager = ManagedModelStore::open_with_template_assessor(
-            config,
-            Some(Arc::new(CompleteTemplateAssessor::default())),
-        )
-        .await
-        .unwrap();
+        let manager = ManagedModelStore::open(config).await.unwrap();
         manager.ensure_installed_model_inventory().await.unwrap();
         assert_eq!(manager.list_installed().await.unwrap().packages.len(), 1);
 
@@ -2522,31 +2289,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn template_failure_isolated_to_the_affected_installed_model() {
+    async fn structural_failure_isolated_to_the_affected_installed_model() {
         let temporary = tempfile::tempdir().unwrap();
         let store = temporary.path().join("store");
         let (hf_cache, source) = create_hf_snapshot(temporary.path());
         write_minimal_gguf(&source.join("working.gguf"));
-        write_minimal_gguf(&source.join("broken.gguf"));
-        fs::OpenOptions::new()
-            .append(true)
-            .open(source.join("broken.gguf"))
-            .unwrap()
-            .write_all(&[0])
-            .unwrap();
+        fs::write(source.join("broken.gguf"), b"not a gguf").unwrap();
 
         let mut config =
             InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
         config.hf_cache_dirs.push(hf_cache);
-        let manager = ManagedModelStore::open_with_template_assessor(
-            config,
-            Some(Arc::new(CompleteTemplateAssessor {
-                reject_name: Some("broken"),
-                ..CompleteTemplateAssessor::default()
-            })),
-        )
-        .await
-        .unwrap();
+        let manager = ManagedModelStore::open(config).await.unwrap();
 
         manager.ensure_installed_model_inventory().await.unwrap();
         let installed = manager.list_installed().await.unwrap();
@@ -2556,9 +2309,7 @@ mod tests {
             installed
                 .packages
                 .iter()
-                .filter(|package| {
-                    matches!(package.inspection, ModelPackageInspection::Inspected { .. })
-                })
+                .filter(|package| matches!(package.validation, PackageValidation::Valid))
                 .count(),
             1,
         );
@@ -2567,11 +2318,94 @@ mod tests {
                 .packages
                 .iter()
                 .filter(|package| {
-                    matches!(package.inspection, ModelPackageInspection::Invalid { .. })
+                    matches!(package.validation, PackageValidation::Invalid { .. })
                 })
                 .count(),
             1,
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_download_publication_only_requires_structural_inspection() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("store");
+        let manager = ManagedModelStore::open(
+            InventoryConfig::with_roots(store.clone(), temporary.path().join("cache")).unwrap(),
+        )
+        .await
+        .unwrap();
+        manager.ensure_installed_model_inventory().await.unwrap();
+
+        let repository = "owner/repository";
+        let commit = "a".repeat(40);
+        let repository_root = store.join("hub").join(hf_repo_dir(repository));
+        let snapshot = repository_root.join("snapshots").join(&commit);
+        let blobs = repository_root.join("blobs");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(&blobs).unwrap();
+        let fixture = temporary.path().join("fixture.gguf");
+        write_minimal_gguf(&fixture);
+        let bytes = fs::read(&fixture).unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let content_identity = ContentIdentity::Sha256 {
+            value: sha256.clone(),
+        };
+        let blob = blobs.join(blob_key(&content_identity));
+        fs::write(&blob, &bytes).unwrap();
+        let primary = snapshot.join("model.gguf");
+        std::os::unix::fs::symlink(
+            PathBuf::from("../../blobs").join(blob.file_name().unwrap()),
+            &primary,
+        )
+        .unwrap();
+        let components = vec![ModelComponent {
+            path: PathBuf::from("model.gguf"),
+            role: ComponentRole::Weights,
+            size_bytes: u64::try_from(bytes.len()).unwrap(),
+            content: ContentIdentity::Sha256 { value: sha256 },
+            shard_index: None,
+            relationship: None,
+        }];
+        let content = content_id(&components);
+        let model_id = inventory_entry_id("magnitude-cache", &snapshot, &content);
+        let ready_at = now();
+        let model = build_model(
+            model_id,
+            content,
+            ready_at,
+            ready_at,
+            ModelSource::HuggingFace {
+                repository: repository.to_owned(),
+                requested_revision: commit.clone(),
+                commit,
+                metadata: None,
+            },
+            ModelLocation::MagnitudeCache {
+                total_bytes: components
+                    .iter()
+                    .map(|component| component.size_bytes)
+                    .sum(),
+                components,
+                integrity: Integrity::Verified {
+                    method: "content_identity".to_owned(),
+                },
+            },
+            &primary,
+            true,
+            &manager.cache,
+        )
+        .unwrap();
+        let published = manager.complete_and_publish_model(model).await.unwrap();
+
+        assert!(matches!(
+            published.availability,
+            ModelAvailability::Available { .. }
+        ));
+        assert!(matches!(
+            published.properties,
+            InventoryProperties::Inspected { .. }
+        ));
     }
 
     #[test]
@@ -2661,11 +2495,7 @@ mod tests {
 
         let mut config = InventoryConfig::with_roots(store.clone(), cache_root.clone()).unwrap();
         config.hf_cache_dirs.push(hf_cache);
-        let template = Arc::new(CompleteTemplateAssessor::default());
-        let manager =
-            ManagedModelStore::open_with_template_assessor(config.clone(), Some(template.clone()))
-                .await
-                .unwrap();
+        let manager = ManagedModelStore::open(config.clone()).await.unwrap();
         assert!(manager.models.read().unwrap().is_empty());
         manager.ensure_model_inventory().await.unwrap();
         let (first, second) = tokio::join!(manager.list(), manager.list());
@@ -2680,21 +2510,16 @@ mod tests {
             first[0].properties,
             InventoryProperties::Inspected { .. }
         ));
-        assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 1);
         let persisted_bytes = fs::read(cache_root.join("indexes/inventory.json")).unwrap();
         let persisted: serde_json::Value = serde_json::from_slice(&persisted_bytes).unwrap();
         assert!(persisted.get("version").is_none());
 
         fs::remove_file(source.join("model.gguf")).unwrap();
-        let reopened =
-            ManagedModelStore::open_with_template_assessor(config.clone(), Some(template.clone()))
-                .await
-                .unwrap();
+        let reopened = ManagedModelStore::open(config.clone()).await.unwrap();
         let warm = reopened.list().await.unwrap();
         assert!(warm.is_empty());
         reopened.ensure_model_inventory().await.unwrap();
         assert!(reopened.list().await.unwrap().is_empty());
-        assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 1);
 
         // A changed identity is the only candidate enriched on the next reconciliation.
         write_minimal_gguf(&source.join("model.gguf"));
@@ -2707,7 +2532,6 @@ mod tests {
         reopened.ensure_model_inventory().await.unwrap();
         let changed = reopened.list().await.unwrap();
         assert_eq!(changed.len(), 1);
-        assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 2);
     }
 
     #[cfg(unix)]
@@ -2760,41 +2584,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changed_template_assessor_identity_invalidates_inventory_reuse() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = temporary.path().join("store");
-        let cache_root = temporary.path().join("cache");
-        let (hf_cache, source) = create_hf_snapshot(temporary.path());
-        write_minimal_gguf(&source.join("model.gguf"));
-
-        let mut config = InventoryConfig::with_roots(store, cache_root).unwrap();
-        config.hf_cache_dirs.push(hf_cache);
-        let original = Arc::new(CompleteTemplateAssessor {
-            identity: Some("template-inspection-v1"),
-            ..CompleteTemplateAssessor::default()
-        });
-        let manager =
-            ManagedModelStore::open_with_template_assessor(config.clone(), Some(original.clone()))
-                .await
-                .unwrap();
-        manager.ensure_model_inventory().await.unwrap();
-        assert_eq!(original.calls.load(AtomicOrdering::SeqCst), 1);
-
-        let updated = Arc::new(CompleteTemplateAssessor {
-            identity: Some("template-inspection-v2"),
-            ..CompleteTemplateAssessor::default()
-        });
-        let restarted =
-            ManagedModelStore::open_with_template_assessor(config, Some(updated.clone()))
-                .await
-                .unwrap();
-        restarted.ensure_model_inventory().await.unwrap();
-
-        assert_eq!(updated.calls.load(AtomicOrdering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn malformed_index_entry_is_isolated_and_stale_candidates_enrich_in_parallel() {
+    async fn malformed_index_entry_is_isolated_from_other_candidates() {
         let temporary = tempfile::tempdir().unwrap();
         let store = temporary.path().join("store");
         let cache_root = temporary.path().join("cache");
@@ -2804,17 +2594,9 @@ mod tests {
 
         let mut config = InventoryConfig::with_roots(store.clone(), cache_root.clone()).unwrap();
         config.hf_cache_dirs.push(hf_cache);
-        let template = Arc::new(CompleteTemplateAssessor {
-            delay: true,
-            ..CompleteTemplateAssessor::default()
-        });
-        let manager =
-            ManagedModelStore::open_with_template_assessor(config.clone(), Some(template.clone()))
-                .await
-                .unwrap();
+        let manager = ManagedModelStore::open(config.clone()).await.unwrap();
         manager.ensure_installed_model_inventory().await.unwrap();
         assert_eq!(manager.list().await.unwrap().len(), 2);
-        assert!(template.max_active.load(AtomicOrdering::SeqCst) > 1);
 
         let index_path = cache_root.join("indexes/inventory.json");
         let mut index: serde_json::Value =
@@ -2827,39 +2609,27 @@ mod tests {
         models.insert(malformed_id, serde_json::json!({ "invalid": true }));
         fs::write(&index_path, serde_json::to_vec_pretty(&index).unwrap()).unwrap();
 
-        let reopened =
-            ManagedModelStore::open_with_template_assessor(config.clone(), Some(template.clone()))
-                .await
-                .unwrap();
+        let reopened = ManagedModelStore::open(config.clone()).await.unwrap();
         reopened.ensure_installed_model_inventory().await.unwrap();
         assert_eq!(reopened.list().await.unwrap().len(), 2);
-        assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 2);
 
-        let inspection_dir = cache_root.join("indexes/inspections/artifacts");
-        let one_inspection = fs::read_dir(&inspection_dir)
+        let metadata_dir = cache_root.join("indexes/inventory/model-metadata");
+        let one_metadata = fs::read_dir(&metadata_dir)
             .unwrap()
             .next()
             .unwrap()
             .unwrap()
             .path();
-        fs::write(one_inspection, b"not json").unwrap();
+        fs::write(one_metadata, b"not json").unwrap();
         fs::write(&index_path, b"not json").unwrap();
-        let corrupted =
-            ManagedModelStore::open_with_template_assessor(config.clone(), Some(template.clone()))
-                .await
-                .unwrap();
+        let corrupted = ManagedModelStore::open(config.clone()).await.unwrap();
         corrupted.ensure_installed_model_inventory().await.unwrap();
         assert_eq!(corrupted.list().await.unwrap().len(), 2);
-        assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 3);
 
         fs::remove_file(&index_path).unwrap();
         fs::create_dir(&index_path).unwrap();
-        let uncached =
-            ManagedModelStore::open_with_template_assessor(config, Some(template.clone()))
-                .await
-                .unwrap();
+        let uncached = ManagedModelStore::open(config).await.unwrap();
         uncached.ensure_installed_model_inventory().await.unwrap();
         assert_eq!(uncached.list().await.unwrap().len(), 2);
-        assert_eq!(template.calls.load(AtomicOrdering::SeqCst), 3);
     }
 }

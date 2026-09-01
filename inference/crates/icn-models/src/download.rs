@@ -747,7 +747,6 @@ impl ManagedModelStore {
             &primary,
             true,
             &self.cache,
-            self.template_assessor.as_deref(),
         )
         .map_err(|error| DownloadError {
             kind: DownloadErrorKind::Internal,
@@ -1758,52 +1757,12 @@ fn progress_totals(event: &ModelDownloadEvent) -> (u64, u64) {
 mod tests {
     use super::*;
     use crate::inventory::InventoryConfig;
-    use crate::package_service::inspected_package_from_resolved;
+    use crate::package_service::validated_package_from_resolved;
     use icn_contracts::models::{
         ModelFile, ModelFileId, ModelFileRelationship, ModelFileRole, ModelPackageId,
         ModelPackageProperties, ModelPackageSource,
     };
-    use icn_contracts::{
-        CapabilityEvidence, ComponentRelationship, ComponentRole, EffectiveTemplateInputs,
-        ReasoningCapability, ReasoningControlDomain, ReasoningDelimiters, ReasoningVisibility,
-        ResolvedModel, TemplateAssessment, TemplateAssessor, TemplateCapabilities,
-    };
-
-    struct DownloadTestTemplateAssessor;
-
-    impl TemplateAssessor for DownloadTestTemplateAssessor {
-        fn cache_identity(&self) -> &str {
-            "download-test-template-assessor"
-        }
-
-        fn assess(&self, _: &EffectiveTemplateInputs) -> Result<TemplateAssessment, String> {
-            Ok(TemplateAssessment {
-                capabilities: TemplateCapabilities {
-                    string_content: true,
-                    typed_content: false,
-                    tools: false,
-                    tool_calls: false,
-                    parallel_tool_calls: false,
-                    system_role: true,
-                    preserve_reasoning: false,
-                    object_arguments: false,
-                    enable_thinking: false,
-                },
-                reasoning: ReasoningCapability::Supported {
-                    control: ReasoningControlDomain::Effort {
-                        levels: vec!["none".to_owned()],
-                        default: Some("none".to_owned()),
-                    },
-                    visibility: ReasoningVisibility::Hidden,
-                    delimiters: ReasoningDelimiters::Unavailable,
-                    evidence: CapabilityEvidence::BoundedTemplateProbe {
-                        fingerprint: "download-test".to_owned(),
-                    },
-                },
-                fingerprint: "download-test".to_owned(),
-            })
-        }
-    }
+    use icn_contracts::{ComponentRelationship, ComponentRole, ResolvedModel};
 
     fn model_component(contents: &[u8]) -> ModelComponent {
         let digest = format!("{:x}", Sha256::digest(contents));
@@ -1986,12 +1945,9 @@ mod tests {
             .expect("installed model");
         let mut config = InventoryConfig::with_roots(root, cache_root).expect("inventory config");
         config.hf_cache_dirs.push(hf_cache);
-        let manager = ManagedModelStore::open_with_template_assessor(
-            config,
-            Some(Arc::new(DownloadTestTemplateAssessor)),
-        )
-        .await
-        .expect("model manager");
+        let manager = ManagedModelStore::open(config)
+            .await
+            .expect("model manager");
         manager
             .ensure_installed_model_inventory()
             .await
@@ -2009,7 +1965,7 @@ mod tests {
                 .expect("resolved components"),
             model: model.clone(),
         };
-        let package = inspected_package_from_resolved(&resolved)
+        let package = validated_package_from_resolved(&resolved)
             .expect("installed package")
             .package;
 

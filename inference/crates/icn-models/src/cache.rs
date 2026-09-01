@@ -3,7 +3,10 @@ use std::{fs, io};
 
 use getrandom::fill;
 use icn_contracts::models::ModelAssessment;
-use icn_contracts::{ContentId, HardwareAssessment, MemoryTopology, ModelExecutionAssessment};
+use icn_contracts::{
+    ContentId, HardwareAssessment, MemoryTopology, ModelExecutionAssessment, ReasoningProfile,
+    SpeculativeDecodingSelection, TemplateCapabilities,
+};
 use icn_utils::file_cache::{
     read_bytes, read_json, read_object, write_bytes_atomic, write_json_atomic,
 };
@@ -12,17 +15,26 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct CachedModelAssessment {
+    pub capabilities: icn_contracts::models::ModelCapabilities,
+    pub template_capabilities: TemplateCapabilities,
+    pub reasoning: ReasoningProfile,
+    pub template_fingerprint: String,
+    pub speculative: SpeculativeDecodingSelection,
+    pub profile: ModelAssessment,
+}
+
 const MAX_INDEX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BLOB_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub enum ModelIndexKind {
     Artifact,
-    ArtifactInspection,
+    InventoryMetadata,
     GgufInspection,
     HuggingFaceRepositorySnapshot,
     RecommendableModelCatalog,
-    HardwareAssessment,
     ExecutionAssessment,
     ModelAssessment,
     HardwareCalibration,
@@ -32,11 +44,10 @@ impl ModelIndexKind {
     fn relative(self) -> &'static str {
         match self {
             Self::Artifact => "artifacts",
-            Self::ArtifactInspection => "inspections/artifacts",
+            Self::InventoryMetadata => "inventory/model-metadata",
             Self::GgufInspection => "inspections/gguf",
             Self::HuggingFaceRepositorySnapshot => "sources/hugging-face/repositories",
             Self::RecommendableModelCatalog => "catalogs/recommendable-models",
-            Self::HardwareAssessment => "assessments/hardware",
             Self::ExecutionAssessment => "assessments/execution",
             Self::ModelAssessment => "assessments/model-configurations",
             Self::HardwareCalibration => "hardware-calibrations",
@@ -135,34 +146,6 @@ impl ModelCache {
         );
     }
 
-    pub fn read_hardware_assessment(
-        &self,
-        content_id: &ContentId,
-        hardware_evidence: &str,
-        topology: &MemoryTopology,
-    ) -> Option<HardwareAssessment> {
-        self.read_index::<HardwareAssessment>(
-            ModelIndexKind::HardwareAssessment,
-            &hardware_assessment_evidence(content_id, hardware_evidence),
-        )
-        .filter(|assessment| topology.validates_hardware_assessment(assessment))
-    }
-
-    pub fn write_hardware_assessment(
-        &self,
-        content_id: &ContentId,
-        hardware_evidence: &str,
-        assessment: &HardwareAssessment,
-    ) {
-        if is_terminal_assessment(assessment) {
-            self.write_index(
-                ModelIndexKind::HardwareAssessment,
-                &hardware_assessment_evidence(content_id, hardware_evidence),
-                assessment,
-            );
-        }
-    }
-
     pub fn read_execution_assessment(
         &self,
         content_id: &ContentId,
@@ -195,12 +178,12 @@ impl ModelCache {
         &self,
         evidence: &str,
         topology: &MemoryTopology,
-    ) -> Option<ModelAssessment> {
+    ) -> Option<CachedModelAssessment> {
         self.read_index(ModelIndexKind::ModelAssessment, evidence)
-            .filter(|assessment: &ModelAssessment| assessment.is_valid_for(topology))
+            .filter(|assessment: &CachedModelAssessment| assessment.profile.is_valid_for(topology))
     }
 
-    pub fn write_model_assessment(&self, evidence: &str, assessment: &ModelAssessment) {
+    pub fn write_model_assessment(&self, evidence: &str, assessment: &CachedModelAssessment) {
         self.write_index(ModelIndexKind::ModelAssessment, evidence, assessment);
     }
 
@@ -322,8 +305,8 @@ mod tests {
     use crate::test_support::system_memory_topology;
     use icn_contracts::MemoryDomainId;
     use icn_contracts::models::{
-        MemoryAssessment, ModelAssessmentId, PerformanceConfidence, PerformanceEvidence,
-        ServingProfile,
+        MemoryAssessment, ModelAssessmentId, ModelCapabilities, ModelReasoningCapabilities,
+        PerformanceConfidence, PerformanceEvidence, ServingProfile,
     };
 
     fn profile(context_length: u32) -> ServingProfile {
@@ -335,80 +318,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let cache = ModelCache::new(directory.path());
 
-        cache.write_index(
-            ModelIndexKind::ArtifactInspection,
-            "template evidence",
-            &42_u64,
-        );
+        cache.write_index(ModelIndexKind::InventoryMetadata, "model evidence", &42_u64);
         assert_eq!(
-            cache.read_index::<u64>(ModelIndexKind::ArtifactInspection, "template evidence"),
+            cache.read_index::<u64>(ModelIndexKind::InventoryMetadata, "model evidence"),
             Some(42)
         );
-        assert_eq!(
-            cache.read_index::<u64>(ModelIndexKind::HardwareAssessment, "template evidence"),
-            None
-        );
-
-        let content_id = ContentId("artifact".to_owned());
-        let assessment = serde_json::from_value::<HardwareAssessment>(serde_json::json!({
-            "type": "fits",
-            "profile": {
-                "context_length": 4096,
-                "acceleration": "cpu",
-                "device": "system"
-            },
-            "memory": {
-                "required_bytes": 1,
-                "usable_capacity_bytes": 2,
-                "headroom_bytes": 1,
-                "domains": [{
-                    "memory_domain": "system",
-                    "model_bytes": 1,
-                    "context_bytes": 0,
-                    "compute_bytes": 0,
-                    "auxiliary_bytes": 0,
-                    "required_bytes": 1,
-                    "usable_capacity_bytes": 2,
-                    "margin_bytes": 1
-                }]
-            },
-            "recommendation": "recommended"
-        }))
-        .unwrap();
-        let topology = system_memory_topology(2);
-        cache.write_hardware_assessment(&content_id, "hardware", &assessment);
-        assert_eq!(
-            cache.read_hardware_assessment(&content_id, "hardware", &topology),
-            Some(assessment.clone())
-        );
-        let mut capacity_corruption = assessment;
-        let HardwareAssessment::Fits { memory, .. } = &mut capacity_corruption else {
-            unreachable!();
-        };
-        memory.domains[0].usable_capacity_bytes = 1;
-        memory.domains[0].margin_bytes = 0;
-        memory.usable_capacity_bytes = 1;
-        memory.headroom_bytes = 0;
-        cache.write_hardware_assessment(
-            &content_id,
-            "internally-consistent-capacity-corruption",
-            &capacity_corruption,
-        );
-        assert!(
-            cache
-                .read_hardware_assessment(
-                    &content_id,
-                    "internally-consistent-capacity-corruption",
-                    &topology,
-                )
-                .is_none()
-        );
-        assert!(
-            cache
-                .read_hardware_assessment(&content_id, "different-hardware", &topology)
-                .is_none()
-        );
-
         let bytes = b"header";
         let digest = hex_sha256(bytes);
         cache.write_blob(ModelBlobKind::GgufHeader, &digest, bytes);
@@ -425,19 +339,15 @@ mod tests {
                 .is_none()
         );
 
-        let index_path = cache.index_path(ModelIndexKind::ArtifactInspection, "template evidence");
+        let index_path = cache.index_path(ModelIndexKind::InventoryMetadata, "model evidence");
         fs::write(&index_path, b"corrupt").unwrap();
         assert_eq!(
-            cache.read_index::<u64>(ModelIndexKind::ArtifactInspection, "template evidence"),
+            cache.read_index::<u64>(ModelIndexKind::InventoryMetadata, "model evidence"),
             None
         );
-        cache.write_index(
-            ModelIndexKind::ArtifactInspection,
-            "template evidence",
-            &7_u64,
-        );
+        cache.write_index(ModelIndexKind::InventoryMetadata, "model evidence", &7_u64);
         assert_eq!(
-            cache.read_index::<u64>(ModelIndexKind::ArtifactInspection, "template evidence"),
+            cache.read_index::<u64>(ModelIndexKind::InventoryMetadata, "model evidence"),
             Some(7)
         );
 
@@ -500,6 +410,48 @@ mod tests {
         };
 
         let initial = ModelCache::new(directory.path());
+        let capabilities = ModelCapabilities {
+            vision: false,
+            tools: true,
+            structured_output: true,
+            reasoning: ModelReasoningCapabilities {
+                supported: false,
+                efforts: Vec::new(),
+                default_effort: None,
+            },
+        };
+        let fits = CachedModelAssessment {
+            capabilities: capabilities.clone(),
+            template_capabilities: TemplateCapabilities {
+                string_content: true,
+                typed_content: false,
+                tools: true,
+                tool_calls: true,
+                parallel_tool_calls: false,
+                system_role: true,
+                preserve_reasoning: false,
+                object_arguments: true,
+                enable_thinking: false,
+            },
+            reasoning: ReasoningProfile {
+                default_effort: None,
+                mappings: Vec::new(),
+                template_fingerprint: "template".to_owned(),
+            },
+            template_fingerprint: "template".to_owned(),
+            speculative: SpeculativeDecodingSelection::Disabled {
+                reason: "standalone_bundle".to_owned(),
+            },
+            profile: fits,
+        };
+        let does_not_fit = CachedModelAssessment {
+            capabilities,
+            template_capabilities: fits.template_capabilities.clone(),
+            reasoning: fits.reasoning.clone(),
+            template_fingerprint: fits.template_fingerprint.clone(),
+            speculative: fits.speculative.clone(),
+            profile: does_not_fit,
+        };
         initial.write_model_assessment("fits evidence", &fits);
         initial.write_model_assessment("non-fit evidence", &does_not_fit);
 

@@ -42,9 +42,11 @@ alias, or bundle key at the ICN–ACN boundary.
 | Catalog model | Reviewed callable variant that exists whether installed or not; ICN catalog domain |
 | Discovered model | Non-catalog callable candidate observed in an external source; ICN discovery domain |
 | Package / bundle | Exact files and private servable structure; ICN implementation only |
+| Assessment Material | Compact immutable GGUF and bundle evidence sufficient for native assessment, including effective template inputs but no tensor payloads; ICN implementation only |
 | Inventory entry | One source-location/content observation; ICN implementation only |
+| Package validation | Structural statement that exact package files are valid and supported; never capability or hardware evidence |
 | Catalog installation operation | One model-addressed install/update synchronization occurrence; ICN |
-| Assessment | Recomputable compatibility, memory, and performance evidence for exact model work; ICN owns computation and coordination |
+| Assessment | One recomputable result containing template-derived capabilities, template fingerprint, compatibility, memory, and performance evidence for exact model work; ICN owns computation and coordination |
 | Instance | One physical loaded occurrence identified by `ModelInstanceId`; ICN |
 | Local model product | ACN application projection combining catalog or discovery facts with assessment, acquisition, ranking, and residency |
 | Provider offering | Selectable ACN projection keyed by the same canonical `ModelId` |

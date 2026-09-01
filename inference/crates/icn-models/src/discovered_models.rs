@@ -186,9 +186,8 @@ mod tests {
     use std::path::PathBuf;
 
     use icn_contracts::models::{
-        CatalogBaseId, CatalogVariantId, ModelCapabilities, ModelFailure, ModelFile, ModelFileId,
-        ModelPackage, ModelPackageId, ModelPackageInspection, ModelPackageProperties,
-        ModelPackageSource, ModelReasoningCapabilities,
+        CatalogBaseId, CatalogVariantId, ModelFailure, ModelFile, ModelFileId, ModelPackage,
+        ModelPackageId, ModelPackageProperties, ModelPackageSource, PackageValidation,
     };
     use icn_contracts::{
         ComponentRole, ContentId, ContentIdentity, Integrity, InventoryEntryId, InventoryModel,
@@ -237,18 +236,7 @@ mod tests {
             path: PathBuf::from(format!("/cache/{occurrence}/{selector}")),
             package,
             origin: ModelPackageInstallationOrigin::HuggingFaceCache,
-            inspection: ModelPackageInspection::Inspected {
-                capabilities: ModelCapabilities {
-                    vision: false,
-                    tools: true,
-                    structured_output: true,
-                    reasoning: ModelReasoningCapabilities {
-                        supported: false,
-                        efforts: Vec::new(),
-                        default_effort: None,
-                    },
-                },
-            },
+            validation: PackageValidation::Valid,
             catalog_attribution,
         };
         let id = InventoryEntryId(occurrence.to_owned());

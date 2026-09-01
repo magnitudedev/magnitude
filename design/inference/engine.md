@@ -68,8 +68,12 @@ native planner -----> normalized assessment evidence
 Rules:
 
 - Native plans are pointer-safe, process-local values and are never reconstructed from summaries.
-- Assessment discards its plan; resident loading replans under current conditions.
-- Assessment and loading use the same speculative-decoding selector and policy fingerprint.
+- Assessment discards its process-local plan but retains its capability evidence and resolved
+  speculative configuration; resident loading replans memory under current conditions.
+- Load planning consumes those assessed facts and cannot rerun template inspection, projector
+  capability inspection, or speculative preflight.
+- After tensor load, the runtime verifies template fingerprint and modalities against assessment
+  evidence, then uses the assessed template and reasoning configuration.
 - Execution identity includes the selected components and serving-configuration revision.
 - A serving worker initializes one installation-authorized native backend for its lifetime.
 - Load success requires exhaustive resident-allocation evidence with every location resolved to one

@@ -1590,7 +1590,9 @@ export const ModelAssessmentEntryState = S.Union(
   S.extend(S.TaggedStruct("Assessing", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(
     S.TaggedStruct("Assessed", {
+      capabilities: S.suspend((): S.Schema<ModelCapabilities, ModelCapabilitiesEncoded> => ModelCapabilities),
       profiles: S.Array(S.suspend((): S.Schema<ModelAssessment, ModelAssessmentEncoded> => ModelAssessment)),
+      templateFingerprint: S.String,
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
@@ -2061,7 +2063,6 @@ export type PropsResponse = S.Schema.Type<typeof PropsResponse>
 export type PropsResponseEncoded = S.Schema.Encoded<typeof PropsResponse>
 
 export const ReadyModel = S.Struct({
-  capabilities: S.suspend((): S.Schema<ModelCapabilities, ModelCapabilitiesEncoded> => ModelCapabilities),
   metadata: S.suspend((): S.Schema<ModelMetadata, ModelMetadataEncoded> => ModelMetadata),
   profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
   speculativeMethod: S.optionalWith(
