@@ -42,6 +42,7 @@
         "@magnitudedev/release": "workspace:*",
         "@magnitudedev/sdk": "workspace:*",
         "@magnitudedev/storage": "workspace:*",
+        "@magnitudedev/utils": "workspace:*",
         "@magnitudedev/version": "workspace:*",
         "@opentui/core": "0.5.1",
         "@opentui/react": "0.5.1",
@@ -369,7 +370,7 @@
     },
     "packages/launcher": {
       "name": "@magnitudedev/cli",
-      "version": "0.0.7",
+      "version": "0.0.9",
       "bin": {
         "magnitude": "bin/magnitude.js",
       },
@@ -377,6 +378,7 @@
         "@effect/platform": "^0.96.0",
         "@effect/platform-node": "0.107.0",
         "@magnitudedev/release": "workspace:*",
+        "@magnitudedev/utils": "workspace:*",
         "@types/bun": "1.3.14",
         "@types/tar-stream": "^3.1.4",
         "effect": "^3.21.2",
@@ -639,6 +641,7 @@
     "sqlite3",
   ],
   "patchedDependencies": {
+    "@effect-atom/atom@0.5.3": "patches/@effect-atom%2Fatom@0.5.3.patch",
     "@changesets/assemble-release-plan@6.0.10": "patches/@changesets%2Fassemble-release-plan@6.0.10.patch",
   },
   "overrides": {
