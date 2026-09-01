@@ -10,7 +10,7 @@ path = "src/bin/export-openapi.rs"
 
 [dependencies]
 anyhow.workspace = true
-axum.workspace = true
+axum = { workspace = true, features = ["ws"] }
 base64.workspace = true
 futures-util.workspace = true
 icn-contracts = { workspace = true, features = ["openapi"] }

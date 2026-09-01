@@ -18,13 +18,15 @@ applies_to:
 
 ```text
 first-party clients -> one Effect Query client -> ACN RPC -> private ICN management
-external inference clients --------------------> ACN /inference/{v1,anthropic}/** -> serving
+external inference clients --------------------> ACN /inference/** -> serving or fixed upstream
 ```
 
 ACN is the complete first-party application boundary. Clients do not call ICN management routes,
 consume ICN resource events, or reconstruct ACN product state from native resources. The only
-public inference boundary exposes the OpenAI-compatible data plane under `/inference/v1/**` and
-the Anthropic gateway under `/inference/anthropic/**`.
+public inference boundary exposes the generic local OpenAI-compatible data plane under
+`/inference/v1/**`, the generic local Anthropic data plane under `/inference/anthropic/**`, and
+harness-specific multiplexing proxies under `/inference/v1/proxies/codex/**` and
+`/inference/anthropic/proxies/claude-code/**`.
 `/inference/api/**` is not public.
 
 ## ICN responsibility
@@ -168,8 +170,11 @@ generation and cannot restart ACN or interrupt ICN-owned transfers.
   events.
 - Every ICN stream is generated from OpenAPI metadata; ACN contains no handwritten streaming
   transport. Automatic model assessment is observed as a snapshot, not a finite stream.
-- `/inference/v1/**` remains a transparent proxy; `/inference/anthropic/**` routes reserved local
-  aliases to ICN and preserves non-reserved upstream Anthropic request bytes.
+- Generic `/inference/v1/**` and `/inference/anthropic/**` traffic remains a transparent local ICN
+  proxy. Harness-only alias discovery and upstream multiplexing exist only below the explicit
+  Codex and Claude Code proxy subroutes.
+- Codex WebSocket model routing and socket replacement belong to ACN; native local Responses
+  WebSocket events and connection-scoped replay belong to ICN.
 - Every client-visible model query and mutation belongs to the ACN `Models` group.
 - Query successes are direct domain values with no generic revision envelope.
 - No generic mirrored-resource service or wire schema exists. Private derived projections may

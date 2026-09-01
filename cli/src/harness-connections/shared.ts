@@ -2,7 +2,8 @@ import * as FileSystem from "@effect/platform/FileSystem"
 import * as Path from "@effect/platform/Path"
 import { HarnessIdSchema, type HarnessId, type HarnessLaunchPlan } from "@magnitudedev/client-common"
 import {
-  MAGNITUDE_ANTHROPIC_BASE_URL,
+  MAGNITUDE_CLAUDE_CODE_PROXY_BASE_URL,
+  MAGNITUDE_CODEX_PROXY_BASE_URL,
   MAGNITUDE_INFERENCE_BASE_URL,
   type ProviderModelId,
 } from "@magnitudedev/sdk"
@@ -14,17 +15,25 @@ import { writeFileAtomic } from "../utils/atomic-file"
 import type { HarnessConnector, HarnessInstallation } from "./contract"
 
 export const OPENAI_BASE_URL = new URL("v1", MAGNITUDE_INFERENCE_BASE_URL).href.replace(/\/$/, "")
-export const ANTHROPIC_BASE_URL = MAGNITUDE_ANTHROPIC_BASE_URL.replace(/\/$/, "")
+export const CODEX_PROXY_BASE_URL = MAGNITUDE_CODEX_PROXY_BASE_URL.replace(/\/$/, "")
+export const ANTHROPIC_BASE_URL = MAGNITUDE_CLAUDE_CODE_PROXY_BASE_URL.replace(/\/$/, "")
 export const LOCAL_TOKEN = "magnitude-local"
 export const CHAT_COMPLETIONS_API = "openai-completions" as const
 export const OPENAI_COMPATIBLE_PACKAGE = "@ai-sdk/openai-compatible" as const
 const LOCAL_ANTHROPIC_MODEL_PREFIX = "anthropic-local/"
+const LOCAL_CODEX_MODEL_PREFIX = "magnitude-local/"
 
 export const anthropicLocalModelId = (modelId: string): string =>
   `${LOCAL_ANTHROPIC_MODEL_PREFIX}${modelId}`
 
 export const isAnthropicLocalModelId = (modelId: unknown): modelId is string =>
   typeof modelId === "string" && modelId.startsWith(LOCAL_ANTHROPIC_MODEL_PREFIX)
+
+export const codexLocalModelId = (modelId: string): string =>
+  `${LOCAL_CODEX_MODEL_PREFIX}${modelId}`
+
+export const isCodexLocalModelId = (modelId: unknown): modelId is string =>
+  typeof modelId === "string" && modelId.startsWith(LOCAL_CODEX_MODEL_PREFIX)
 
 /** Normalize a harness selection whose provider and model are stored separately. */
 export const qualifiedModelSelection = (provider: unknown, model: unknown): Option.Option<string> =>
@@ -219,6 +228,7 @@ export const defineConnector = (definition: ConnectorDefinition): HarnessConnect
   return {
     id,
     name: definition.name,
+    executable: definition.executable,
     ...(definition.recommended === undefined ? {} : { recommended: definition.recommended }),
     ...(definition.note === undefined ? {} : { note: definition.note }),
     ...(definition.requiresStartup === undefined ? {} : { requiresStartup: definition.requiresStartup }),
