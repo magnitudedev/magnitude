@@ -154,9 +154,12 @@ Streaming Messages reports that count in `message_start` before output blocks.
 
 ## Public routing
 
-ACN exposes OpenAI traffic under `/inference/v1/**` and Anthropic traffic under
-`/inference/anthropic/**`. The reserved local namespace is
-`anthropic-local/<canonical-model-id>`.
+ACN exposes generic local OpenAI traffic under `/inference/v1/**` and generic local Anthropic
+traffic under `/inference/anthropic/**`. These generic surfaces do not expose harness-specific
+aliases or discovery. Codex multiplexing is isolated under `/inference/v1/proxies/codex/**` with
+the reserved `magnitude-local/<canonical-model-id>` namespace. Claude Code multiplexing is isolated
+under `/inference/anthropic/proxies/claude-code/**` with the reserved
+`anthropic-local/<canonical-model-id>` namespace.
 
 The OpenAI model-list response is one standard `object: "list"` envelope with an enriched `data`
 array. Each model entry retains the standard identity fields and follows the OpenRouter discovery
@@ -172,27 +175,42 @@ Runnable external Hugging Face models appear in the array under the exact canoni
 identity where it occupies one URL segment; JSON bodies and model-list values do not encode or
 rewrite it.
 
-For a reserved alias, ACN removes any caller-supplied alias-echo header, rewrites only the request
+For a reserved harness-proxy alias, ACN removes any caller-supplied alias-echo header, rewrites only the request
 model to its canonical ID, removes caller credentials, installs private ICN authorization, and
 sets the validated alias for response model echoing. The alias never enters the canonical
 invocation, model controller, worker transport, or engine.
 
-For non-reserved Anthropic models, ACN forwards the original request bytes and Anthropic headers
-upstream. Upstream traffic never enters ICN, and local aliases never reach upstream.
+For non-reserved Claude Code models, ACN forwards the original request bytes and Anthropic headers
+upstream. For non-reserved Codex models, ACN selects the fixed OpenAI API or ChatGPT Codex origin
+from Codex's request headers and forwards the request and credentials. Codex response items minted
+by ICN are the sole request-body exception: local reasoning items are omitted because they have no
+portable encrypted payload, local message IDs are removed so their content remains inline, and a
+local previous-response ID is removed. OpenAI must never receive an ICN ID as a reference to
+OpenAI-hosted state. Upstream traffic never enters ICN, and local aliases never reach upstream.
 
-The Anthropic gateway is deliberately a routing shim rather than a protocol adapter. It recognizes
-only gateway-owned paths and the one top-level model discriminator needed to choose a target. It
-does not define Anthropic request DTOs, validate message or tool content, parse response bodies or
+The harness gateways are deliberately routing shims rather than protocol adapters. They recognize
+only gateway-owned paths and the one top-level model discriminator needed to choose a target. They
+do not define provider request DTOs, validate message or tool content, parse response bodies or
 SSE events, or normalize evolving vendor fields. Classification is size-bounded. A local request is
 changed mechanically only at the model string; every other JSON field remains opaque. An upstream
 request retains its original bytes, query, public headers, response status, headers, and body
-stream.
+stream. Except when removing ICN-owned history references, Codex zstd request compression is
+decoded only into a bounded routing copy and the original compressed bytes go upstream unchanged.
+Proxy fetches disable automatic response decompression so
+an upstream `Content-Encoding` header always describes the bytes returned to the harness.
+Codex's proxy provider retains the semantic provider name `OpenAI` and native OpenAI authentication
+and declares native Responses WebSocket support. ACN classifies every `response.create` frame and
+maintains one active outbound socket for that frame's destination, replacing it when the selected
+model crosses the local/upstream boundary. Server frames are relayed opaquely. ICN implements the
+local Responses WebSocket state machine, including connection-scoped previous-response history;
+ACN does not translate WebSocket events into SSE.
 
 Claude Code receives the local base URL and gateway discovery switch through its user-wide settings.
-Magnitude writes no persistent Claude credential or model default: ordinary Claude models retain
-the user's authentication and pass through the gateway to Anthropic, while discovered
-`anthropic-local/<canonical-model-id>` aliases route to ICN. The handoff launch plan passes the
-selected local alias explicitly without changing Claude Code's persisted model selection.
+Magnitude writes no persistent Claude credential. Ordinary Claude models retain the user's
+authentication and pass through the gateway to Anthropic, while discovered
+`anthropic-local/<canonical-model-id>` aliases route to ICN. When connection receives an explicit
+model, it persists that alias as Claude Code's ordinary startup model; a launch plan independently
+passes the same explicit alias.
 The discovery response uses the model's ordinary description and does not encode capability
 metadata as prose. Claude Code's current gateway schema cannot consume a machine-readable effort
 domain, so effort interpretation remains in the local Anthropic adapter after model resolution;
@@ -206,9 +224,9 @@ ACN continues to rewrite only the routing alias.
 - The shared runner owns exact model leasing, global reasoning-effort reconciliation against the
   resolved model, reasoning resolution, execution, cancellation, and bounded output delivery. Wire
   compatibility never extends the canonical inference contract.
-- ACN owns public Anthropic model routing, local aliases, discovery projection, credential
-  isolation, and byte-preserving upstream proxying. Its only local request mutation is replacing
-  the routing alias with the canonical model ID.
+- ACN owns harness-proxy model routing, local aliases, Claude Code discovery projection, credential
+  isolation, and byte-preserving upstream proxying. Request mutation is limited to replacing a
+  local routing alias and removing ICN-owned response references before an upstream Codex request.
 
 No adapter converts through another adapter's DTO. No generic adapter abstraction may erase the
 distinct protocol state machines.

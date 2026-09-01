@@ -1,5 +1,6 @@
 import type * as FileSystem from "@effect/platform/FileSystem"
 import type * as Path from "@effect/platform/Path"
+import type * as CommandExecutor from "@effect/platform/CommandExecutor"
 import type {
   HarnessId,
   HarnessLaunchPlan,
@@ -75,6 +76,7 @@ export type HarnessRestore = typeof HarnessRestoreSchema.Type
 
 export interface HarnessConnectionSpec {
   readonly models: ReadonlyArray<HarnessModel>
+  readonly installation: HarnessInstallation
   /** Model to persist for ordinary new harness sessions. */
   readonly model: Option.Option<ProviderModelId>
   /** Last connector-owned projection, used to distinguish safe sync updates from user overrides. */
@@ -93,6 +95,8 @@ export interface HarnessInstallation {
 export interface HarnessConnector {
   readonly id: HarnessId
   readonly name: string
+  /** Ambient command name; detection resolves it to an exact installed executable. */
+  readonly executable: string
   readonly recommended?: boolean
   readonly note?: string
   readonly requiresStartup?: boolean
@@ -101,7 +105,11 @@ export interface HarnessConnector {
   readonly detect: (searchPath: string) => Effect.Effect<Option.Option<HarnessInstallation>>
   readonly connect: (
     spec: HarnessConnectionSpec,
-  ) => Effect.Effect<Option.Option<HarnessRestore>, unknown, FileSystem.FileSystem | Path.Path>
+  ) => Effect.Effect<
+    Option.Option<HarnessRestore>,
+    unknown,
+    FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor
+  >
   readonly disconnect: (
     spec: HarnessDisconnectionSpec,
   ) => Effect.Effect<void, unknown, FileSystem.FileSystem | Path.Path>

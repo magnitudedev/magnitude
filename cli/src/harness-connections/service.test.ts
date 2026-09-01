@@ -12,12 +12,13 @@ import { HarnessModelSchema } from "./contract"
 import {
   ANTHROPIC_BASE_URL,
   CLAUDE_GATEWAY_DISCOVERY,
+  CODEX_PROXY_BASE_URL,
   OPENAI_BASE_URL,
   anthropicLocalModelId,
   clineModelCatalog,
   clineModelRegistryEntry,
   clineProviderSettings,
-  codexConfig,
+  codexLocalModelId,
   codexModelCatalog,
   harnessExecutableSearchPath,
   hermesProviderConfig,
@@ -71,6 +72,16 @@ const models = [
   },
 ] as const
 
+const bundledCodexCatalog = {
+  future_root_field: { preserved: true },
+  models: [{
+    slug: "gpt-openai-fixture",
+    display_name: "OpenAI Fixture",
+    visibility: "list",
+    unknown_future_field: { preserved: true },
+  }],
+}
+
 const fixturePaths = (root: string): HarnessConnectionPaths => ({
   manifest: `${root}/magnitude/harness-connections.json`,
   piModels: `${root}/pi/models.json`,
@@ -109,6 +120,9 @@ const readYaml = (source: string): unknown => parseDocument(source).toJS()
 const installedService = (paths: HarnessConnectionPaths, resolvedModels = models as ReadonlyArray<(typeof models)[number]>) =>
   makeHarnessConnectionService({
     paths,
+    registry: makeHarnessConnectorRegistry(paths, {
+      readCodexBundledCatalog: () => Effect.succeed(bundledCodexCatalog),
+    }),
     detect: (connector) => Effect.succeed(Option.some({ executable: `/installed/${connector.id}` })),
     resolveModels: Effect.succeed(resolvedModels),
     now: () => new Date("2026-08-26T00:00:00.000Z"),
@@ -217,7 +231,10 @@ describe("HarnessConnector contract and registry", () => {
 
   it("keeps protocol assignments explicit", () => {
     expect(OPENAI_BASE_URL).toBe("http://127.0.0.1:10100/inference/v1")
-    expect(ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:10100/inference/anthropic")
+    expect(CODEX_PROXY_BASE_URL).toBe("http://127.0.0.1:10100/inference/v1/proxies/codex")
+    expect(ANTHROPIC_BASE_URL).toBe(
+      "http://127.0.0.1:10100/inference/anthropic/proxies/claude-code",
+    )
     expect(piProviderConfig(models).api).toBe("openai-completions")
     expect(openCodeProviderConfig(models).npm).toBe("@ai-sdk/openai-compatible")
     expect(openClawProviderConfig(models).api).toBe("openai-completions")
@@ -444,12 +461,18 @@ describe("HarnessConnection model-set behavior", () => {
       yield* writeFixtures(initial)
       const service = yield* installedService(paths)
       const connectors = makeHarnessConnectorRegistry(paths).ordered.filter(({ id }) => id !== "magnitude")
+      const readConfiguration = (file: string) => fs.readFileString(file).pipe(
+        Effect.map(Option.some),
+        Effect.catchTag("SystemError", (error) => error.reason === "NotFound"
+          ? Effect.succeed(Option.none<string>())
+          : Effect.fail(error)),
+      )
 
       for (const connector of connectors) {
         yield* service.connect(connector.id, { model: Option.some(model) })
-        const first = yield* Effect.forEach(connector.configurationFiles, (file) => fs.readFileString(file))
+        const first = yield* Effect.forEach(connector.configurationFiles, readConfiguration)
         yield* service.connect(connector.id, { model: Option.some(model) })
-        const repeated = yield* Effect.forEach(connector.configurationFiles, (file) => fs.readFileString(file))
+        const repeated = yield* Effect.forEach(connector.configurationFiles, readConfiguration)
         expect(repeated, connector.id).toEqual(first)
         yield* service.connect(connector.id, { model: Option.some(secondModel) })
       }
@@ -551,11 +574,27 @@ describe("HarnessConnection model-set behavior", () => {
         models: { providers: { magnitude: openClawProviderConfig(models) } },
         agents: { defaults: { model: { primary: "user/model" } }, list: [{ id: "main", model: "user/model" }] },
       })
-      const codexSpec = { models, model: Option.none<typeof model>() }
-      expect(yield* fs.readFileString(paths.codex)).toBe(codexConfig(codexSpec, paths.codexModels))
-      expect(yield* fs.readFileString(paths.codexModels)).toBe(codexModelCatalog(codexSpec))
+      const codexSpec = {
+        models,
+        model: Option.none<typeof model>(),
+        installation: { executable: "/installed/codex" },
+      }
+      expect(yield* fs.exists(paths.codex)).toBe(false)
+      expect(yield* fs.readFileString(paths.codexModels)).toBe(
+        codexModelCatalog(codexSpec, bundledCodexCatalog),
+      )
       expect(Bun.TOML.parse(yield* fs.readFileString(paths.codexUser))).toMatchObject({
-        model_provider: "openai", model: "user/model",
+        model_provider: "magnitude", model: "user/model",
+        model_catalog_json: paths.codexModels,
+        model_providers: {
+          magnitude: {
+            name: "OpenAI",
+            base_url: CODEX_PROXY_BASE_URL,
+            wire_api: "responses",
+            requires_openai_auth: true,
+            supports_websockets: true,
+          },
+        },
       })
       expect(readJson(yield* fs.readFileString(paths.claude))).toEqual({
         theme: "dark",
@@ -584,7 +623,8 @@ describe("HarnessConnection model-set behavior", () => {
       expect(manifest.connections).toHaveLength(8)
       for (const entry of manifest.connections) {
         expect(entry.models).toEqual(models)
-        expect(entry).not.toHaveProperty("restore")
+        if (entry.harness === "codex") expect(entry).toHaveProperty("restore")
+        else expect(entry).not.toHaveProperty("restore")
       }
 
       for (const connector of makeHarnessConnectorRegistry(paths).ordered.filter(({ id }) => id !== "magnitude")) {
@@ -656,15 +696,26 @@ describe("HarnessConnection model-set behavior", () => {
         ] },
       })
       expect(Bun.TOML.parse(yield* fs.readFileString(paths.codexUser))).toMatchObject({
-        model_provider: "magnitude", model, model_catalog_json: paths.codexModels,
+        model_provider: "magnitude",
+        model: codexLocalModelId(model),
+        model_catalog_json: paths.codexModels,
+        model_providers: {
+          magnitude: {
+            name: "OpenAI",
+            base_url: CODEX_PROXY_BASE_URL,
+            supports_websockets: true,
+          },
+        },
       })
-      expect(yield* fs.readFileString(paths.codex)).not.toContain("model_reasoning_effort")
-      expect(yield* fs.readFileString(paths.codex)).toContain('service_tier = "default"')
+      expect(yield* fs.exists(paths.codex)).toBe(false)
       const codexModels = readJson(yield* fs.readFileString(paths.codexModels)) as {
+        future_root_field: unknown
         models: ReadonlyArray<Record<string, unknown>>
       }
-      expect(codexModels.models[0]).toMatchObject({
-        slug: model,
+      expect(codexModels.future_root_field).toEqual({ preserved: true })
+      expect(codexModels.models[0]).toEqual(bundledCodexCatalog.models[0])
+      expect(codexModels.models[1]).toMatchObject({
+        slug: codexLocalModelId(model),
         display_name: "Local Model (Q4)",
         context_window: 50_000,
         default_reasoning_level: "high",
@@ -686,10 +737,18 @@ describe("HarnessConnection model-set behavior", () => {
         connections: ReadonlyArray<Record<string, unknown>>
       }
       expect(manifest.connections.every((entry) => Object.hasOwn(entry, "restore"))).toBe(true)
+      expect(manifest.connections.every((entry) => {
+        const restore = entry.restore
+        return typeof restore === "object"
+          && restore !== null
+          && Object.keys(restore).every((key) => key === "model")
+      })).toBe(true)
 
       const openClawPlan = yield* service.launch(HarnessIdSchema.make("openclaw"), model)
       expect(openClawPlan.args.slice(0, 3)).toEqual(["tui", "--local", "--session"])
       expect(openClawPlan.args[3]).toMatch(/^agent:magnitude:[0-9a-f-]{36}$/)
+      const codexPlan = yield* service.launch(HarnessIdSchema.make("codex"), model)
+      expect(codexPlan.args).toEqual(["--model", codexLocalModelId(model)])
 
       for (const connector of makeHarnessConnectorRegistry(paths).ordered.filter(({ id }) => id !== "magnitude")) {
         yield* service.disconnect(connector.id)
@@ -709,6 +768,152 @@ describe("HarnessConnection model-set behavior", () => {
       expect(readJson(yield* fs.readFileString(paths.clineProviders))).toEqual(readJson(initial[paths.clineProviders]!))
       expect(readJson(yield* fs.readFileString(paths.clineModels))).toEqual(readJson(initial[paths.clineModels]!))
       expect((readJson(yield* fs.readFileString(paths.manifest)) as { connections: unknown[] }).connections).toEqual([])
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
+  it("restores only the prior Codex model selection and clears the owned catalog", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-codex-restore-" })
+      const paths = fixturePaths(root)
+      const original = [
+        'model_provider = "custom"',
+        'model = "user/model"',
+        'openai_base_url = "https://user.example/v1"',
+        'model_catalog_json = "/user/catalog.json"',
+        "",
+      ].join("\n")
+      yield* writeFixtures({ [paths.codexUser]: original })
+      const service = yield* installedService(paths)
+
+      yield* service.connect(HarnessIdSchema.make("codex"), { model: Option.some(model) })
+      yield* service.disconnect(HarnessIdSchema.make("codex"))
+
+      expect(Bun.TOML.parse(yield* fs.readFileString(paths.codexUser))).toEqual({
+        model_provider: "custom",
+        model: "user/model",
+        openai_base_url: "https://user.example/v1",
+      })
+      expect(yield* fs.exists(paths.codexModels)).toBe(false)
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
+  it("preserves user-edited Codex endpoint and catalog while still disconnecting", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-codex-diverged-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures({
+        ...initialFiles(paths),
+        [paths.codexUser]: [
+          'model_provider = "openai"',
+          'model = "user/model"',
+          `openai_base_url = "${CODEX_PROXY_BASE_URL}"`,
+          "",
+        ].join("\n"),
+      })
+      const service = yield* installedService(paths)
+
+      yield* service.connect(HarnessIdSchema.make("codex"), { model: Option.some(model) })
+      const connected = yield* fs.readFileString(paths.codexUser)
+      yield* fs.writeFileString(paths.codexUser, connected
+        .replace(`openai_base_url = "${CODEX_PROXY_BASE_URL}"`, 'openai_base_url = "https://new.example/v1"')
+        .replace(`model_catalog_json = "${paths.codexModels}"`, 'model_catalog_json = "/new/catalog.json"'))
+      yield* service.disconnect(HarnessIdSchema.make("codex"))
+
+      expect(Bun.TOML.parse(yield* fs.readFileString(paths.codexUser))).toMatchObject({
+        model_provider: "openai",
+        model: "user/model",
+        openai_base_url: "https://new.example/v1",
+        model_catalog_json: "/new/catalog.json",
+      })
+      expect(yield* fs.exists(paths.codexModels)).toBe(false)
+      expect((readJson(yield* fs.readFileString(paths.manifest)) as { connections: unknown[] }).connections)
+        .toEqual([])
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
+  it("refreshes the installed Codex catalog on sync without changing selection or restoration", async () => {
+    let bundled: Readonly<Record<string, unknown>> & { readonly models: ReadonlyArray<unknown> } =
+      bundledCodexCatalog
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-codex-sync-" })
+      const paths = fixturePaths(root)
+      const initial = initialFiles(paths)
+      yield* writeFixtures(initial)
+      const registry = makeHarnessConnectorRegistry(paths, {
+        readCodexBundledCatalog: () => Effect.sync(() => bundled),
+      })
+      const service = yield* makeHarnessConnectionService({
+        paths,
+        registry,
+        detect: (connector) => Effect.succeed(Option.some({ executable: `/installed/${connector.id}` })),
+        resolveModels: Effect.succeed(models),
+        installStartup: Effect.void,
+      })
+
+      yield* service.connect(HarnessIdSchema.make("codex"), { model: Option.some(model) })
+      const restoreBefore = (readJson(yield* fs.readFileString(paths.manifest)) as {
+        connections: ReadonlyArray<{ restore?: unknown }>
+      }).connections[0]?.restore
+      bundled = {
+        future_root_field: { refreshed: true },
+        models: [{ slug: "new-openai-fixture", unknown: "preserved" }],
+      }
+      yield* service.sync(HarnessIdSchema.make("codex"))
+
+      const config = Bun.TOML.parse(yield* fs.readFileString(paths.codexUser)) as Record<string, unknown>
+      expect(config.model).toBe(codexLocalModelId(model))
+      expect(config.model_provider).toBe("magnitude")
+      const catalog = readJson(yield* fs.readFileString(paths.codexModels)) as {
+        future_root_field: unknown
+        models: ReadonlyArray<Record<string, unknown>>
+      }
+      expect(catalog.future_root_field).toEqual({ refreshed: true })
+      expect(catalog.models[0]).toEqual({ slug: "new-openai-fixture", unknown: "preserved" })
+      const restoreAfter = (readJson(yield* fs.readFileString(paths.manifest)) as {
+        connections: ReadonlyArray<{ restore?: unknown }>
+      }).connections[0]?.restore
+      expect(restoreAfter).toEqual(restoreBefore)
+
+      yield* service.disconnect(HarnessIdSchema.make("codex"))
+      expect(Bun.TOML.parse(yield* fs.readFileString(paths.codexUser)))
+        .toEqual(Bun.TOML.parse(initial[paths.codexUser]!))
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
+  it("leaves Codex files unchanged when bundled catalog export fails", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-codex-export-failure-" })
+      const paths = fixturePaths(root)
+      const initial = initialFiles(paths)
+      yield* writeFixtures({
+        ...initial,
+        [paths.codex]: "legacy config\n",
+        [paths.codexModels]: "legacy catalog\n",
+      })
+      const registry = makeHarnessConnectorRegistry(paths, {
+        readCodexBundledCatalog: () => Effect.fail("export failed"),
+      })
+      const service = yield* makeHarnessConnectionService({
+        paths,
+        registry,
+        detect: (connector) => Effect.succeed(Option.some({ executable: `/installed/${connector.id}` })),
+        resolveModels: Effect.succeed(models),
+        installStartup: Effect.void,
+      })
+
+      const result = yield* Effect.either(
+        service.connect(HarnessIdSchema.make("codex"), { model: Option.some(model) }),
+      )
+      expect(result._tag).toBe("Left")
+      expect(yield* fs.readFileString(paths.codexUser)).toBe(initial[paths.codexUser])
+      expect(yield* fs.readFileString(paths.codex)).toBe("legacy config\n")
+      expect(yield* fs.readFileString(paths.codexModels)).toBe("legacy catalog\n")
+      expect((readJson(yield* fs.readFileString(paths.manifest)) as { connections: unknown[] }).connections)
+        .toEqual([])
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
   })
 
@@ -752,8 +957,7 @@ describe("HarnessConnection model-set behavior", () => {
         ["agents", "defaults", "model", "primary"], "user/new-model",
       ]]))
       const codex = (yield* fs.readFileString(paths.codexUser))
-        .replace('model_provider = "magnitude"', 'model_provider = "openai"')
-        .replace(`model = "${model}"`, 'model = "user/new-model"')
+        .replace(`model = "${codexLocalModelId(model)}"`, 'model = "user/new-model"')
       yield* fs.writeFileString(paths.codexUser, codex)
       const claude = yield* fs.readFileString(paths.claude)
       yield* fs.writeFileString(paths.claude, updateJsonc(claude, [[["model"], "user/new-model"]]))

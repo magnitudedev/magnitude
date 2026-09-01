@@ -35,6 +35,10 @@ come from the enriched OpenAI model list and include model identity, presentatio
 capabilities, and the exact normalized reasoning domain and default. There is no second
 Magnitude-specific model inventory.
 
+Restoration has exactly one uniform field across connectors: `model`, the prior persistent model
+selection. Connector-owned provider, endpoint, and catalog projections are removed rather than
+stored as restoration state.
+
 Each harness has one connector. A connector owns that harness's:
 
 - Magnitude-specific provider, profile, agent, or catalog projection;
@@ -126,9 +130,15 @@ not own this wire-compatibility behavior.
 
 ## Harness-specific requirements
 
-- **Codex:** publish a native model catalog containing exact domains/defaults and persist the
-  selected Magnitude provider and model. Catalog correctness does not remove the Responses boundary
-  requirement for startup or raw overrides.
+- **Codex:** install one HTTP and native Responses WebSocket proxy provider named `OpenAI`, using
+  Codex's native OpenAI auth, for both bundled and local entries. Its base URL is
+  `/inference/v1/proxies/codex`; the gateway routes each request frame by its selected model and
+  never translates WebSocket events into SSE. Publish one catalog composed from the installed Codex binary's opaque
+  bundled entries plus `magnitude-local/` entries. An explicit selection persists that local alias
+  as Codex's ordinary startup model. Sync re-exports the installed binary's catalog without
+  changing selection or restoration state. Disconnect removes the proxy provider, preserves a
+  newly selected bundled OpenAI model on the built-in provider, clears the owned catalog reference,
+  and restores the prior model selection only while the current selection remains Magnitude-owned.
 - **Hermes:** publish per-model defaults without changing unrelated global preferences. Session
   precedence still requires the Chat Completions boundary.
 - **Cline:** publish its supported OpenAI-compatible provider, exact model metadata, and persistent
@@ -148,8 +158,8 @@ selected target's Magnitude skill with the bundled version; shared targets recei
 copy.
 
 Startup means idempotently registering Magnitude's per-user operating-system service. Startup and
-skill installation finish before connector configuration and handoff. Claude Code's persistent
-gateway configuration also requires this service; disconnect removes those settings only while
+skill installation finish before connector configuration and handoff. Codex and Claude Code's
+persistent proxy configuration require this service; disconnect removes those settings only while
 they retain Magnitude's installed values.
 
 ## Conformance

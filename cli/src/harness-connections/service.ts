@@ -31,21 +31,23 @@ import {
   HarnessRestoreSchema,
 } from "./contract"
 import { harnessConnectionPaths, type HarnessConnectionPaths } from "./paths"
-import { makeHarnessConnectorRegistry } from "./registry"
+import { makeHarnessConnectorRegistry, type HarnessConnectorRegistry } from "./registry"
 import { OPENAI_BASE_URL, readOr } from "./shared"
 import skillContents from "./magnitude-skill.md" with { type: "text" }
 
 export {
   ANTHROPIC_BASE_URL,
+  CODEX_PROXY_BASE_URL,
   OPENAI_BASE_URL,
   anthropicLocalModelId,
+  codexLocalModelId,
   removeOwnedJsonc,
   updateJsonc,
   updateYaml,
 } from "./shared"
 export { clineModelCatalog, clineModelRegistryEntry, clineProviderSettings } from "./connectors/cline"
 export { CLAUDE_GATEWAY_DISCOVERY } from "./connectors/claude-code"
-export { codexConfig, codexModelCatalog } from "./connectors/codex"
+export { codexModelCatalog } from "./connectors/codex"
 export { hermesProviderConfig, hermesReasoningOverrides } from "./connectors/hermes"
 export { ohMyPiProviderConfig } from "./connectors/oh-my-pi"
 export { openClawAgentConfig, openClawProviderConfig } from "./connectors/openclaw"
@@ -85,6 +87,7 @@ export interface HarnessConnectionOptions {
   readonly detect?: (connector: HarnessConnector) => Effect.Effect<Option.Option<HarnessInstallation>>
   readonly resolveModels?: Effect.Effect<ReadonlyArray<HarnessModel>, unknown, HttpClient.HttpClient>
   readonly now?: () => Date
+  readonly registry?: HarnessConnectorRegistry
   readonly installStartup?: Effect.Effect<
     void,
     unknown,
@@ -153,7 +156,7 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor | HttpClient.HttpClient
   >()
   const paths = options.paths ?? harnessConnectionPaths()
-  const registry = makeHarnessConnectorRegistry(paths)
+  const registry = options.registry ?? makeHarnessConnectorRegistry(paths)
   const now = options.now ?? (() => new Date())
   const manifestState = yield* makeStateDocument({
     path: paths.manifest,
@@ -194,7 +197,11 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
   const connectorOperation = <A>(
     operation: HarnessConnectionError["operation"],
     connector: HarnessConnector,
-    effect: Effect.Effect<A, unknown, FileSystem.FileSystem | Path.Path>,
+    effect: Effect.Effect<
+      A,
+      unknown,
+      FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor
+    >,
   ) => effect.pipe(
     Effect.mapError((error) => error instanceof HarnessConnectionError
       ? error
@@ -248,6 +255,7 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     const spec: HarnessConnectionSpec = {
       models,
       model: connectOptions.model,
+      installation: installation.value,
       ...(previousModels === undefined ? {} : { previousModels }),
     }
     if (connector.recommended) return
@@ -287,9 +295,18 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     if (models.length === 0) return yield* failure("sync", "No installed Magnitude models are available", harness)
     for (const entry of entries) {
       const connector = registry.get(entry.harness)
+      const installation = connector.id === "codex"
+        ? yield* installed(connector)
+        : Option.some({ executable: connector.executable })
+      if (Option.isNone(installation)) return yield* failure(
+        "sync",
+        `${connector.name} is not installed`,
+        connector.id,
+      )
       const spec: HarnessConnectionSpec = {
         models,
         model: Option.none(),
+        installation: installation.value,
         previousModels: entry.models,
       }
       if (connector.requiresStartup) yield* installStartup

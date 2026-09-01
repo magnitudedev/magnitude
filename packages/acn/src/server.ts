@@ -4,7 +4,7 @@ import {
   BunPath,
   BunCommandExecutor,
 } from "@effect/platform-bun"
-import { FetchHttpClient, HttpServerResponse } from "@effect/platform"
+import { FetchHttpClient, HttpServerResponse, Socket as PlatformSocket } from "@effect/platform"
 import * as HttpLayerRouter from "@effect/platform/HttpLayerRouter"
 import * as HttpServer from "@effect/platform/HttpServer"
 import * as HttpServerRequest from "@effect/platform/HttpServerRequest"
@@ -17,8 +17,10 @@ import {
   Duration,
   Effect,
   Exit,
+  Fiber,
   Layer,
   Option,
+  Queue,
   Ref,
   Runtime,
   Schema,
@@ -111,6 +113,9 @@ import {
 import {
   type InferenceProxyTarget,
   makeAnthropicGateway,
+  makeCodexGateway,
+  codexWebSocketTarget,
+  proxyLocalAnthropicInferenceRequest,
   proxyOpenAiInferenceRequest,
 } from "./inference-gateway"
 
@@ -540,13 +545,88 @@ export const proxyInferenceWebRequest = async (
   return proxyOpenAiInferenceRequest(source, icn, fetchTarget, signal)
 }
 
+const makeCodexWebSocketProxy = (
+  request: HttpServerRequest.HttpServerRequest,
+  source: Request,
+  icn: InferenceProxyTarget,
+) => Effect.scoped(Effect.gen(function* () {
+  const incoming = yield* request.upgrade
+  type ClientEvent =
+    | { readonly _tag: "Message"; readonly message: string | Uint8Array }
+    | { readonly _tag: "Closed" }
+  const messages = yield* Queue.unbounded<ClientEvent>()
+  yield* incoming.runRaw((message) => Queue.offer(messages, { _tag: "Message", message })).pipe(
+    Effect.onExit(() => Queue.offer(messages, { _tag: "Closed" })),
+    Effect.forkScoped,
+  )
+  const incomingWriter = yield* incoming.writer
+  const BunWebSocket = WebSocket as unknown as new (
+    url: string | URL,
+    options: { readonly headers: Readonly<Record<string, string>> },
+  ) => WebSocket
+  let active: {
+    readonly key: string
+    readonly scope: Scope.CloseableScope
+    readonly writer: (
+      chunk: Uint8Array | string | PlatformSocket.CloseEvent,
+    ) => Effect.Effect<void, PlatformSocket.SocketError>
+  } | undefined
+  while (true) {
+    const event = yield* Queue.take(messages)
+    if (event._tag === "Closed") break
+    const target = codexWebSocketTarget(event.message, source.headers, icn)
+    if (target._tag === "Invalid") {
+      yield* incomingWriter(new PlatformSocket.CloseEvent(1008, target.message))
+      break
+    }
+    const key = `${target.route}:${target.url.href}`
+    if (active?.key !== key) {
+      if (active !== undefined) yield* Scope.close(active.scope, Exit.void)
+      const outgoingScope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(outgoingScope, Exit.void))
+      const outgoing = yield* PlatformSocket.fromWebSocket(Effect.acquireRelease(
+        Effect.sync(() => new BunWebSocket(target.url, {
+          headers: Object.fromEntries(target.headers.entries()),
+        })),
+        (socket) => Effect.sync(() => socket.close(1000)),
+      )).pipe(Scope.extend(outgoingScope))
+      const writer = yield* outgoing.writer
+      yield* outgoing.runRaw((message) => incomingWriter(message)).pipe(
+        Effect.onExit((exit) => Exit.isInterrupted(exit)
+          ? Effect.void
+          : incomingWriter(new PlatformSocket.CloseEvent(
+            1011,
+            "Upstream WebSocket closed",
+          )).pipe(Effect.ignore)),
+        Effect.forkIn(outgoingScope),
+      )
+      active = { key, scope: outgoingScope, writer }
+    }
+    const sent = yield* active.writer(target.firstMessage).pipe(Effect.either)
+    if (sent._tag === "Left") {
+      yield* incomingWriter(new PlatformSocket.CloseEvent(
+        1011,
+        "Unable to write to upstream WebSocket",
+      )).pipe(Effect.ignore)
+      break
+    }
+  }
+  return HttpServerResponse.empty()
+})).pipe(
+  Effect.catchAllCause((cause) => Effect.logDebug(
+    "Codex WebSocket proxy closed",
+    Cause.pretty(cause),
+  ).pipe(Effect.as(HttpServerResponse.empty()))),
+)
+
 const makeInferenceProxy = (
   icn: Context.Tag.Service<typeof IcnProcess>,
-  protocol: "openai" | "anthropic",
+  protocol: "openai" | "anthropic" | "codex" | "claude-code",
 ) => {
-  const anthropicGateway = protocol === "anthropic"
+  const anthropicGateway = protocol === "claude-code"
     ? makeAnthropicGateway(icn)
     : undefined
+  const codexGateway = protocol === "codex" ? makeCodexGateway(icn) : undefined
   return (request: HttpServerRequest.HttpServerRequest) => Effect.gen(function* () {
     // The wildcard proxy route is also the most specific OPTIONS route. Handle
     // browser preflight locally instead of forwarding it to an ICN operation.
@@ -555,18 +635,25 @@ const makeInferenceProxy = (
     if (!(source instanceof Request)) {
       return HttpServerResponse.text("Unsupported request transport", { status: 500 })
     }
-    const response = anthropicGateway === undefined
-      ? yield* Effect.tryPromise({
-          try: (signal) => proxyInferenceWebRequest(source, icn, fetch, signal),
+    if (protocol === "codex" && source.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      return yield* makeCodexWebSocketProxy(request, source, icn)
+    }
+    const response = anthropicGateway !== undefined
+      ? yield* anthropicGateway.route(source).pipe(Effect.either)
+      : codexGateway !== undefined
+        ? yield* codexGateway.route(source).pipe(Effect.either)
+        : yield* Effect.tryPromise({
+          try: (signal) => protocol === "openai"
+            ? proxyInferenceWebRequest(source, icn, fetch, signal)
+            : proxyLocalAnthropicInferenceRequest(source, icn, fetch, signal),
           catch: (cause) => new InferenceProxyFailed({ cause }),
         }).pipe(Effect.either)
-      : yield* anthropicGateway.route(source).pipe(Effect.either)
     if (response._tag === "Right") {
       return HttpServerResponse.fromWeb(response.right)
     }
     yield* Effect.logError("Inference gateway failed", response.left)
     const requestId = `req_acn_gateway_${Date.now()}`
-    const body = protocol === "anthropic"
+    const body = protocol === "anthropic" || protocol === "claude-code"
       ? {
           type: "error",
           error: {
@@ -744,10 +831,20 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
         )),
         Effect.orDie,
       ))
+      yield* publicRouter.prefixed("/inference/v1/proxies/codex").add(
+        "*",
+        "/*",
+        makeInferenceProxy(icn, "codex"),
+      )
       yield* publicRouter.prefixed("/inference/v1").add(
         "*",
         "/*",
         makeInferenceProxy(icn, "openai"),
+      )
+      yield* publicRouter.prefixed("/inference/anthropic/proxies/claude-code").add(
+        "*",
+        "/*",
+        makeInferenceProxy(icn, "claude-code"),
       )
       yield* publicRouter.prefixed("/inference/anthropic").add(
         "*",

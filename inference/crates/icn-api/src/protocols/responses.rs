@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -7,9 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use axum::Json;
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
@@ -102,7 +104,6 @@ pub enum ResponseOutputItem {
         id: String,
         status: &'static str,
         summary: Vec<ResponseSummaryPart>,
-        content: Vec<ResponseReasoningContent>,
     },
     Message {
         id: String,
@@ -121,12 +122,6 @@ pub enum ResponseOutputItem {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ResponseSummaryPart {
-    pub r#type: &'static str,
-    pub text: String,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ResponseReasoningContent {
     pub r#type: &'static str,
     pub text: String,
 }
@@ -191,11 +186,10 @@ pub(crate) fn reasoning_item(
     ResponseOutputItem::Reasoning {
         id,
         status,
-        summary: Vec::new(),
-        content: text
+        summary: text
             .map(|text| {
-                vec![ResponseReasoningContent {
-                    r#type: "reasoning_text",
+                vec![ResponseSummaryPart {
+                    r#type: "summary_text",
                     text,
                 }]
             })
@@ -345,7 +339,7 @@ pub(crate) struct StreamProjector {
     message_id: String,
     created_at: u64,
     model: String,
-    sender: mpsc::Sender<Result<Event, Infallible>>,
+    sender: mpsc::Sender<Value>,
     sequence: Arc<AtomicU64>,
     next_output_index: usize,
     message_output_index: Option<usize>,
@@ -361,7 +355,7 @@ impl StreamProjector {
         id: String,
         created_at: u64,
         model: String,
-        sender: mpsc::Sender<Result<Event, Infallible>>,
+        sender: mpsc::Sender<Value>,
         sequence: Arc<AtomicU64>,
         projection: ResponseProjection,
     ) -> Self {
@@ -400,14 +394,7 @@ impl StreamProjector {
             "sequence_number".into(),
             Value::from(self.sequence.fetch_add(1, Ordering::Relaxed)),
         );
-        serde_json::to_string(&data)
-            .ok()
-            .and_then(|data| {
-                self.sender
-                    .blocking_send(Ok(Event::default().event(event_type).data(data)))
-                    .ok()
-            })
-            .is_some()
+        self.sender.blocking_send(Value::Object(data)).is_ok()
     }
 
     async fn send_async(&self, event_type: &'static str, mut data: Map<String, Value>) -> bool {
@@ -416,13 +403,7 @@ impl StreamProjector {
             "sequence_number".into(),
             Value::from(self.sequence.fetch_add(1, Ordering::Relaxed)),
         );
-        let Ok(data) = serde_json::to_string(&data) else {
-            return false;
-        };
-        self.sender
-            .send(Ok(Event::default().event(event_type).data(data)))
-            .await
-            .is_ok()
+        self.sender.send(Value::Object(data)).await.is_ok()
     }
 
     pub(crate) async fn created(&self) -> bool {
@@ -512,10 +493,10 @@ impl StreamProjector {
                 };
                 self.reasoning.push_str(text.as_str());
                 self.require(self.send(
-                    "response.reasoning_text.delta",
+                    "response.reasoning_summary_text.delta",
                     object(serde_json::json!({
                         "item_id": self.reasoning_id(), "output_index": index,
-                        "content_index": 0, "delta": text,
+                        "summary_index": 0, "delta": text,
                     })),
                 ))
             }
@@ -615,9 +596,9 @@ impl StreamProjector {
             .expect("output item is serializable");
             for (kind, data) in [
                 (
-                    "response.reasoning_text.done",
+                    "response.reasoning_summary_text.done",
                     serde_json::json!({
-                        "item_id": item_id, "output_index": index, "content_index": 0, "text": self.reasoning,
+                        "item_id": item_id, "output_index": index, "summary_index": 0, "text": self.reasoning,
                     }),
                 ),
                 (
@@ -745,7 +726,7 @@ impl StreamProjector {
 }
 
 pub(crate) fn send_loading_progress(
-    sender: &mpsc::Sender<Result<Event, Infallible>>,
+    sender: &mpsc::Sender<Value>,
     sequence: &AtomicU64,
     response_id: &str,
     fraction: f32,
@@ -756,11 +737,7 @@ pub(crate) fn send_loading_progress(
         "response_id": response_id,
         "progress": { "phase": "model_loading", "fraction": fraction },
     });
-    if let Ok(data) = serde_json::to_string(&value) {
-        let _ = sender.try_send(Ok(Event::default()
-            .event("response.magnitude_progress")
-            .data(data)));
-    }
+    let _ = sender.try_send(value);
 }
 
 fn object(value: Value) -> Map<String, Value> {
@@ -1086,7 +1063,6 @@ pub enum ResponseTextFormat {
 
 pub(crate) struct AdaptedResponseRequest {
     pub(crate) invocation: domain::InferenceInvocation,
-    pub(crate) stream: bool,
     pub(crate) projection: ResponseProjection,
 }
 
@@ -1217,7 +1193,6 @@ pub(crate) fn adapt(request: ResponseCreateRequest) -> Result<AdaptedResponseReq
                 domain::PromptReusePolicy::Allowed,
             ),
         ),
-        stream: request.stream,
         projection,
     })
 }
@@ -1612,6 +1587,21 @@ pub(crate) async fn responses(
     payload: Result<Json<ResponseCreateRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(request) = payload.map_err(|error| ApiError::invalid(error.body_text()))?;
+    if request.stream {
+        let (request_id, receiver) = start_response_stream(state, headers, request).await?;
+        let receiver = ReceiverStream::new(receiver).map(|value| {
+            let event_type = value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("message")
+                .to_owned();
+            Ok::<_, Infallible>(Event::default().event(event_type).data(value.to_string()))
+        });
+        let response = Sse::new(receiver)
+            .keep_alive(KeepAlive::default())
+            .into_response();
+        return Ok(with_openai_request_id(response, &request_id));
+    }
     let adapted = adapt(request)?;
     let model = adapted.invocation.model().as_str().to_owned();
     let controller = state
@@ -1620,33 +1610,45 @@ pub(crate) async fn responses(
         .ok_or_else(|| ApiError::server("model control is not configured"))?;
     let id = format!("resp_icn_{}", state.next_id.fetch_add(1, Ordering::Relaxed));
     let created_at = unix_timestamp();
-    if !adapted.stream {
-        let admitted = admit_invocation(controller, adapted.invocation, None).await?;
-        let lease = admitted.lease;
-        let request = admitted.request;
-        let span = tracing::Span::current();
-        let result = tokio::task::spawn_blocking(move || {
-            span.in_scope(|| execute_with_journal(lease.backend().as_ref(), request, |_| Ok(())))
-        })
-        .await
-        .map_err(|error| ApiError::server(format!("inference task failed: {error}")))?
-        .map_err(ApiError::from_inference)?;
-        let response = Json(from_result(
-            &id,
-            created_at,
-            &model,
-            &adapted.projection,
-            &result,
-        ))
-        .into_response();
-        return Ok(with_openai_request_id(response, &id));
-    }
+    let admitted = admit_invocation(controller, adapted.invocation, None).await?;
+    let lease = admitted.lease;
+    let request = admitted.request;
+    let span = tracing::Span::current();
+    let result = tokio::task::spawn_blocking(move || {
+        span.in_scope(|| execute_with_journal(lease.backend().as_ref(), request, |_| Ok(())))
+    })
+    .await
+    .map_err(|error| ApiError::server(format!("inference task failed: {error}")))?
+    .map_err(ApiError::from_inference)?;
+    let response = Json(from_result(
+        &id,
+        created_at,
+        &model,
+        &adapted.projection,
+        &result,
+    ))
+    .into_response();
+    Ok(with_openai_request_id(response, &id))
+}
 
+async fn start_response_stream(
+    state: AppState,
+    headers: HeaderMap,
+    request: ResponseCreateRequest,
+) -> Result<(String, mpsc::Receiver<Value>), ApiError> {
+    let adapted = adapt(request)?;
+    let model = adapted.invocation.model().as_str().to_owned();
+    let controller = state
+        .model_controller
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model control is not configured"))?;
+    let id = format!("resp_icn_{}", state.next_id.fetch_add(1, Ordering::Relaxed));
+    let created_at = unix_timestamp();
     let include_progress = headers
         .get("Magnitude-Include-Progress")
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-    let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(32);
+    let (sender, receiver) = mpsc::channel::<Value>(32);
     let sequence = Arc::new(AtomicU64::new(0));
     let mut invocation = Some(adapted.invocation);
     let admitted = if include_progress {
@@ -1712,8 +1714,220 @@ pub(crate) async fn responses(
         .await
         .ok();
     });
-    let response = Sse::new(ReceiverStream::new(receiver))
-        .keep_alive(KeepAlive::default())
-        .into_response();
-    Ok(with_openai_request_id(response, &request_id))
+    Ok((request_id, receiver))
+}
+
+pub(crate) async fn responses_websocket(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    upgrade.on_upgrade(move |socket| serve_responses_websocket(socket, state, headers))
+}
+
+async fn send_websocket_value(socket: &mut WebSocket, value: Value) -> bool {
+    socket
+        .send(Message::Text(value.to_string().into()))
+        .await
+        .is_ok()
+}
+
+async fn send_websocket_error(socket: &mut WebSocket, message: impl Into<String>) -> bool {
+    send_websocket_value(
+        socket,
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_request",
+                "message": message.into(),
+            }
+        }),
+    )
+    .await
+}
+
+fn websocket_logical_request(
+    mut request: Value,
+    history: &HashMap<String, Value>,
+) -> Result<(Value, bool), String> {
+    let object = request
+        .as_object_mut()
+        .ok_or_else(|| "WebSocket message must be a JSON object".to_owned())?;
+    if object.get("type").and_then(Value::as_str) != Some("response.create") {
+        return Err("WebSocket message type must be response.create".to_owned());
+    }
+    let generate = object.remove("generate").and_then(|value| value.as_bool()) != Some(false);
+    object.remove("type");
+    if let Some(previous_id) = object
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+    {
+        let previous = history
+            .get(&previous_id)
+            .ok_or_else(|| format!("Unknown previous_response_id: {previous_id}"))?;
+        let previous_input = previous
+            .get("input")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Previous WebSocket request input was not an array".to_owned())?;
+        let incremental_input = object
+            .get("input")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Incremental WebSocket request input must be an array".to_owned())?;
+        let mut input = previous_input.clone();
+        input.extend(incremental_input.iter().cloned());
+        object.insert("input".to_owned(), Value::Array(input));
+        object.remove("previous_response_id");
+    }
+    object.insert("stream".to_owned(), Value::Bool(true));
+    Ok((request, generate))
+}
+
+fn warmup_events(id: &str) -> [Value; 2] {
+    [
+        serde_json::json!({
+            "type": "response.created",
+            "sequence_number": 0,
+            "response": { "id": id, "status": "in_progress" },
+        }),
+        serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {
+                "id": id,
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 0,
+                    "input_tokens_details": null,
+                    "output_tokens": 0,
+                    "output_tokens_details": null,
+                    "total_tokens": 0,
+                }
+            },
+        }),
+    ]
+}
+
+async fn serve_responses_websocket(mut socket: WebSocket, state: AppState, headers: HeaderMap) {
+    let mut history = HashMap::<String, Value>::new();
+    while let Some(message) = socket.next().await {
+        let request = match message {
+            Ok(Message::Text(text)) => serde_json::from_str::<Value>(&text),
+            Ok(Message::Binary(bytes)) => serde_json::from_slice::<Value>(&bytes),
+            Ok(Message::Ping(bytes)) => {
+                if socket.send(Message::Pong(bytes)).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            Ok(Message::Pong(_)) => continue,
+            Ok(Message::Close(_)) | Err(_) => return,
+        };
+        let request = match request {
+            Ok(request) => request,
+            Err(error) => {
+                if !send_websocket_error(&mut socket, format!("Invalid JSON: {error}")).await {
+                    return;
+                }
+                continue;
+            }
+        };
+        let (logical, generate) = match websocket_logical_request(request, &history) {
+            Ok(request) => request,
+            Err(error) => {
+                if !send_websocket_error(&mut socket, error).await {
+                    return;
+                }
+                continue;
+            }
+        };
+        if !generate {
+            let id = format!("resp_icn_{}", state.next_id.fetch_add(1, Ordering::Relaxed));
+            for event in warmup_events(&id) {
+                if !send_websocket_value(&mut socket, event).await {
+                    return;
+                }
+            }
+            history.insert(id, logical);
+            continue;
+        }
+        let request = match serde_json::from_value::<ResponseCreateRequest>(logical.clone()) {
+            Ok(request) => request,
+            Err(error) => {
+                if !send_websocket_error(&mut socket, error.to_string()).await {
+                    return;
+                }
+                continue;
+            }
+        };
+        let (id, mut receiver) =
+            match start_response_stream(state.clone(), headers.clone(), request).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    if !send_websocket_error(&mut socket, error.body.error.message).await {
+                        return;
+                    }
+                    continue;
+                }
+            };
+        while let Some(event) = receiver.recv().await {
+            if !send_websocket_value(&mut socket, event).await {
+                return;
+            }
+        }
+        history.insert(id, logical);
+    }
+}
+
+#[cfg(test)]
+mod websocket_tests {
+    use super::*;
+
+    #[test]
+    fn warmup_is_retained_for_incremental_generation() {
+        let warmup = serde_json::json!({
+            "type": "response.create",
+            "model": "local-model",
+            "input": [{"role": "user", "content": "hello"}],
+            "generate": false,
+        });
+        let (warmup, generate) = websocket_logical_request(warmup, &HashMap::new()).unwrap();
+        assert!(!generate);
+        let history = HashMap::from([("warm-1".to_owned(), warmup)]);
+        let request = serde_json::json!({
+            "type": "response.create",
+            "model": "local-model",
+            "input": [],
+            "previous_response_id": "warm-1",
+        });
+        let (logical, generate) = websocket_logical_request(request, &history).unwrap();
+        assert!(generate);
+        assert!(logical.get("previous_response_id").is_none());
+        assert_eq!(logical["input"].as_array().unwrap().len(), 1);
+        assert_eq!(logical["stream"], Value::Bool(true));
+    }
+
+    #[test]
+    fn incremental_items_append_to_the_previous_logical_request() {
+        let history = HashMap::from([(
+            "resp-1".to_owned(),
+            serde_json::json!({
+                "model": "local-model",
+                "input": [{"role": "user", "content": "hello"}],
+                "stream": true,
+            }),
+        )]);
+        let request = serde_json::json!({
+            "type": "response.create",
+            "model": "local-model",
+            "input": [
+                {"type": "message", "role": "assistant", "content": []},
+                {"type": "function_call_output", "call_id": "call-1", "output": "ok"}
+            ],
+            "previous_response_id": "resp-1",
+        });
+        let (logical, _) = websocket_logical_request(request, &history).unwrap();
+        assert_eq!(logical["input"].as_array().unwrap().len(), 3);
+    }
 }

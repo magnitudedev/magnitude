@@ -2,7 +2,10 @@ import type { HarnessId } from "@magnitudedev/client-common"
 import type { HarnessConnector } from "./contract"
 import { makeClaudeCodeConnector } from "./connectors/claude-code"
 import { makeClineConnector } from "./connectors/cline"
-import { makeCodexConnector } from "./connectors/codex"
+import {
+  makeCodexConnector,
+  type CodexBundledCatalogReader,
+} from "./connectors/codex"
 import { makeHermesConnector } from "./connectors/hermes"
 import { makeMagnitudeConnector } from "./connectors/magnitude"
 import { makeOhMyPiConnector } from "./connectors/oh-my-pi"
@@ -16,14 +19,21 @@ export interface HarnessConnectorRegistry {
   readonly get: (harness: HarnessId) => HarnessConnector
 }
 
-export const makeHarnessConnectorRegistry = (paths: HarnessConnectionPaths): HarnessConnectorRegistry => {
+export interface HarnessConnectorRegistryOptions {
+  readonly readCodexBundledCatalog?: CodexBundledCatalogReader
+}
+
+export const makeHarnessConnectorRegistry = (
+  paths: HarnessConnectionPaths,
+  options: HarnessConnectorRegistryOptions = {},
+): HarnessConnectorRegistry => {
   const ordered = [
     makeMagnitudeConnector(),
     makePiConnector(paths),
     makeOpenCodeConnector(paths),
     makeHermesConnector(paths),
     makeOpenClawConnector(paths),
-    makeCodexConnector(paths),
+    makeCodexConnector(paths, options.readCodexBundledCatalog),
     makeClaudeCodeConnector(paths),
     makeOhMyPiConnector(paths),
     makeClineConnector(paths),

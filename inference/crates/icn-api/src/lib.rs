@@ -421,7 +421,10 @@ pub fn app(state: AppState) -> Router {
             "/v1/chat/completions",
             post(protocols::chat::chat_completions),
         )
-        .route("/v1/responses", post(protocols::responses::responses))
+        .route(
+            "/v1/responses",
+            get(protocols::responses::responses_websocket).post(protocols::responses::responses),
+        )
         .route(
             "/anthropic/v1/messages",
             post(protocols::anthropic::anthropic_messages),
