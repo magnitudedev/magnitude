@@ -143,9 +143,10 @@ planning work is idle-only.
 ## Prompt state
 
 An available native sequence carries its optional reusable prefix as one owned value. Admission
-chooses the longest exact semantic match and transfers the sequence into active ownership. Native
-KV never leaves llama.cpp. Logical token counts drive capacity and progress; native positions drive
-KV trimming and continuation, including M-RoPE prompts where those values differ.
+chooses the longest exact semantic match above the configured similarity threshold, otherwise the
+least recently used sequence, and transfers it into active ownership. Native KV never leaves
+llama.cpp. Logical token counts drive capacity and progress; native positions drive KV trimming
+and continuation, including M-RoPE prompts where those values differ.
 When speculation is active, a reusable checkpoint is one value containing the linked boundary and
 a binding-owned prompt state with target state, draft state, and any method-owned state. A
 target-only or partially restored speculative checkpoint is not representable.

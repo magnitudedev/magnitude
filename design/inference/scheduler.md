@@ -46,7 +46,9 @@ The FIFO waiting queue admits a request only when:
 
 Oversized requests fail before allocation. Every request is prepared once into an ordered semantic
 prompt before sequence selection. Cache-enabled requests take the available sequence with the
-longest exact reusable text/media prefix. Before native mutation, cancellation or validation
+longest exact reusable text/media prefix only when that prefix exceeds ten percent of the incoming
+prompt. Without a qualifying match, admission takes the least recently used sequence; unused empty
+sequences therefore precede retained sequences. Before native mutation, cancellation or validation
 failure returns that sequence unchanged. Native setup transfers it to active ownership, trims any
 unmatched suffix at its native-position boundary, and prefills the remainder.
 
