@@ -17,8 +17,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use utoipa::ToSchema;
 
 use super::super::{
-    ApiError, AppState, ImageInput, ReasoningEffortResolution,
-    admit_invocation_with_effort_resolution, domain, domain_error, execute_with_journal,
+    ApiError, AppState, ImageInput, admit_invocation, domain, domain_error, execute_with_journal,
     non_empty_text, non_empty_vec,
 };
 use super::chat::ReasoningEffortRequest;
@@ -213,7 +212,6 @@ pub(crate) enum Thinking {
 pub(crate) struct AdaptedRequest {
     pub(crate) invocation: domain::InferenceInvocation,
     pub(crate) stream: bool,
-    pub(crate) reasoning_effort_resolution: ReasoningEffortResolution,
 }
 
 pub(crate) fn adapt(request: MessagesRequest) -> Result<AdaptedRequest, ApiError> {
@@ -356,7 +354,6 @@ pub(crate) fn adapt(request: MessagesRequest) -> Result<AdaptedRequest, ApiError
             ),
         ),
         stream: request.stream,
-        reasoning_effort_resolution: ReasoningEffortResolution::RoundUpOrClamp,
     })
 }
 
@@ -1159,13 +1156,7 @@ pub(crate) async fn anthropic_count_tokens(
             .model_controller
             .as_ref()
             .ok_or_else(|| ApiError::server("model control is not configured"))?;
-        let admitted = admit_invocation_with_effort_resolution(
-            controller,
-            adapted.invocation,
-            None,
-            adapted.reasoning_effort_resolution,
-        )
-        .await?;
+        let admitted = admit_invocation(controller, adapted.invocation, None).await?;
         let count = tokio::task::spawn_blocking(move || {
             admitted.lease.backend().count_tokens(admitted.request)
         })
@@ -1261,13 +1252,7 @@ async fn anthropic_messages_inner(
         .as_ref()
         .ok_or_else(|| ApiError::server("model control is not configured"))?;
     let stream = adapted.stream;
-    let admitted = admit_invocation_with_effort_resolution(
-        controller,
-        adapted.invocation,
-        None,
-        adapted.reasoning_effort_resolution,
-    )
-    .await?;
+    let admitted = admit_invocation(controller, adapted.invocation, None).await?;
     let lease = admitted.lease;
     let request = admitted.request;
     let id = format!("msg_icn_{}", state.next_id.fetch_add(1, Ordering::Relaxed));

@@ -1725,32 +1725,10 @@ struct AdmittedInvocation {
     request: domain::ResolvedInferenceRequest,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) enum ReasoningEffortResolution {
-    #[default]
-    Exact,
-    RoundUpOrClamp,
-}
-
 async fn admit_invocation(
     controller: &Arc<dyn ModelInstanceController>,
     invocation: domain::InferenceInvocation,
     progress: Option<ModelLoadingObserver>,
-) -> Result<AdmittedInvocation, ApiError> {
-    admit_invocation_with_effort_resolution(
-        controller,
-        invocation,
-        progress,
-        ReasoningEffortResolution::Exact,
-    )
-    .await
-}
-
-async fn admit_invocation_with_effort_resolution(
-    controller: &Arc<dyn ModelInstanceController>,
-    invocation: domain::InferenceInvocation,
-    progress: Option<ModelLoadingObserver>,
-    effort_resolution: ReasoningEffortResolution,
 ) -> Result<AdmittedInvocation, ApiError> {
     let (model, request) = invocation.into_parts();
     let model = model.into_inner();
@@ -1763,8 +1741,7 @@ async fn admit_invocation_with_effort_resolution(
         .backend()
         .properties()
         .map_err(ApiError::from_inference)?;
-    let request =
-        apply_reasoning_effort_resolution(request, &properties.reasoning, effort_resolution);
+    let request = apply_reasoning_effort_compatibility(request, &properties.reasoning);
     let request = resolve_request(request, &properties.reasoning)?;
     Ok(AdmittedInvocation {
         lease,
@@ -1935,25 +1912,20 @@ fn resolve_request(
     Ok(request.map_reasoning(|_| reasoning))
 }
 
-fn apply_reasoning_effort_resolution(
+fn apply_reasoning_effort_compatibility(
     request: domain::InferenceRequest<domain::ReasoningIntent>,
     profile: &icn_contracts::ReasoningProfile,
-    resolution: ReasoningEffortResolution,
 ) -> domain::InferenceRequest<domain::ReasoningIntent> {
     request.map_reasoning(|intent| match intent {
         domain::ReasoningIntent::Effort {
             effort,
             template_args,
             budget,
-        } if profile.mapping(&effort).is_none()
-            && matches!(resolution, ReasoningEffortResolution::RoundUpOrClamp) =>
-        {
-            domain::ReasoningIntent::Effort {
-                effort: round_up_or_clamp_reasoning_effort(&effort, profile).unwrap_or(effort),
-                template_args,
-                budget,
-            }
-        }
+        } if profile.mapping(&effort).is_none() => domain::ReasoningIntent::Effort {
+            effort: round_up_or_clamp_reasoning_effort(&effort, profile).unwrap_or(effort),
+            template_args,
+            budget,
+        },
         other => other,
     })
 }
@@ -3669,7 +3641,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_effort_rounds_up_or_clamps_to_the_model_domain() {
+    fn admission_rounds_up_or_clamps_effort_to_the_model_domain() {
         let base_profile = FakeBackend::new("test-model", "")
             .properties()
             .expect("fake properties")
@@ -3711,18 +3683,14 @@ mod tests {
             let adapted =
                 protocols::anthropic::adapt(request).expect("Anthropic effort must adapt");
             let (_, request) = adapted.invocation.into_parts();
-            let request = apply_reasoning_effort_resolution(
-                request,
-                &profile,
-                adapted.reasoning_effort_resolution,
-            );
+            let request = apply_reasoning_effort_compatibility(request, &profile);
             let resolved = resolve_request(request, &profile).expect("effort must resolve");
             assert_eq!(resolved.reasoning().effort().as_str(), expected);
         }
     }
 
     #[test]
-    fn strict_efforts_and_thinking_disable_do_not_use_anthropic_rounding() {
+    fn final_reasoning_resolution_rejects_unsupported_effort_and_disable() {
         let mut profile = FakeBackend::new("test-model", "")
             .properties()
             .expect("fake properties")
@@ -4038,6 +4006,58 @@ mod tests {
         let status = response.status();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn every_local_protocol_reconciles_unsupported_reasoning_effort() {
+        let (chat_status, _) = post_chat(
+            FakeBackend::new("test-model", "hello"),
+            json!({
+                "model": "test-model",
+                "reasoning_effort": "medium",
+                "messages": [{ "role": "user", "content": "hi" }]
+            }),
+        )
+        .await;
+        assert_eq!(chat_status, StatusCode::OK);
+
+        let responses = app(AppState::new(FakeBackend::new("test-model", "hello")))
+            .oneshot(
+                Request::post("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "test-model",
+                            "reasoning": { "effort": "medium" },
+                            "input": "hi"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(responses.status(), StatusCode::OK);
+
+        let anthropic = app(AppState::new(FakeBackend::new("test-model", "hello")))
+            .oneshot(
+                Request::post("/anthropic/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("anthropic-version", "2023-06-01")
+                    .body(Body::from(
+                        json!({
+                            "model": "test-model",
+                            "max_tokens": 32,
+                            "output_config": { "effort": "medium" },
+                            "messages": [{ "role": "user", "content": "hi" }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anthropic.status(), StatusCode::OK);
     }
 
     #[tokio::test]
