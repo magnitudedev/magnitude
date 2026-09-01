@@ -75,6 +75,26 @@ const localModels = (catalog: ModelCatalogState): readonly LocalModel[] =>
   catalog._tag === "Initializing" ? [] : catalog.models.flatMap((entry) =>
     entry._tag === "Local" ? [entry.product] : [])
 
+export const renderCatalogStatus = (catalog: ModelCatalogState): string => {
+  if (catalog._tag === "Initializing") return ensureTrailingNewline([
+    "Model catalog preparation",
+    "Discovery: In progress",
+    "Assessment: In progress",
+  ].join("\n"))
+
+  const { discovery, assessment } = catalog.localModelPreparation
+  return ensureTrailingNewline([
+    "Model catalog preparation",
+    `Discovery: ${discovery.complete ? "Complete" : "In progress"} - ${discovery.modelsFound} model${discovery.modelsFound === 1 ? "" : "s"} found`,
+    `Assessment: ${assessment.complete ? "Complete" : "In progress"} - ${assessment.settledModels} of ${assessment.totalModels} model${assessment.totalModels === 1 ? "" : "s"} assessed`,
+  ].join("\n"))
+}
+
+export const showCatalogStatus = () => runCommand({
+  effect: withClient(readCatalog),
+  render: renderCatalogStatus,
+})
+
 const requireLocalModels = (catalog: ModelCatalogState): Effect.Effect<readonly LocalModel[], ModelCommandError> =>
   catalog._tag === "Initializing"
     ? Effect.fail(new ModelCommandError({ message: "Local models are initializing. Try again shortly." }))

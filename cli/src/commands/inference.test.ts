@@ -8,9 +8,11 @@ import {
   makeInstalledCatalogModel,
 } from "../features/local-inference/test-fixtures"
 import { registerInferenceCommands } from "./inference"
-import { renderCatalog, renderModelsStatus } from "./inference-runtime"
+import { renderCatalog, renderCatalogStatus, renderModelsStatus } from "./inference-runtime"
 
-const catalogState = (...models: ReturnType<typeof makeCatalogModel>[]): ModelCatalogState => ({
+type CatalogSnapshotState = Exclude<ModelCatalogState, { readonly _tag: "Initializing" }>
+
+const catalogState = (...models: ReturnType<typeof makeCatalogModel>[]): CatalogSnapshotState => ({
   _tag: "Ready",
   providers: [],
   models: models.map((product) => ({ _tag: "Local", product, offering: Option.none() })),
@@ -32,6 +34,7 @@ describe("inference command surface", () => {
       "models",
     ])
     expect(program.commands[1]!.commands.map((command) => command.name())).toEqual([
+      "status",
       "list",
       "show",
       "recommendations",
@@ -45,6 +48,39 @@ describe("inference command surface", () => {
       "stop",
     ])
     expect(program.commands[2]!.commands[2]!.registeredArguments).toHaveLength(0)
+  })
+
+  it("renders authoritative discovery and assessment completion independently", () => {
+    const active: ModelCatalogState = {
+      ...catalogState(),
+      localModelPreparation: {
+        discovery: { complete: true, modelsFound: 4 },
+        assessment: { complete: false, settledModels: 3, totalModels: 4 },
+      },
+    }
+    expect(renderCatalogStatus(active)).toBe([
+      "Model catalog preparation",
+      "Discovery: Complete - 4 models found",
+      "Assessment: In progress - 3 of 4 models assessed",
+      "",
+    ].join("\n"))
+
+    expect(renderCatalogStatus({
+      ...active,
+      localModelPreparation: {
+        discovery: { complete: true, modelsFound: 4 },
+        assessment: { complete: true, settledModels: 4, totalModels: 4 },
+      },
+    })).toContain("Assessment: Complete - 4 of 4 models assessed")
+  })
+
+  it("reports both preparation phases as active while the catalog initializes", () => {
+    expect(renderCatalogStatus({ _tag: "Initializing" })).toBe([
+      "Model catalog preparation",
+      "Discovery: In progress",
+      "Assessment: In progress",
+      "",
+    ].join("\n"))
   })
 
   it("renders only fitting catalog evidence and exact model IDs", () => {

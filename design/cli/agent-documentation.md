@@ -26,6 +26,13 @@ machine-specific catalog evidence, user model-selection conversation, progress o
 harness connection behavior. Keeping the procedure in the CLI documentation corpus lets a refreshed
 CLI provide current guidance without requiring an already-installed skill copy to duplicate it.
 
+The onboarding topic distinguishes service registration from first startup, model acquisition from
+model loading, and persistent harness selection from the already-running session. It gives agents
+explicit polling cadences for background work, waits for the catalog's authoritative discovery and
+assessment completion states, starts model selection with balanced recommendations, and names every
+supported harness ID and its current-session model control. The procedure must not claim completion
+signals or side effects that the non-interactive CLI does not expose.
+
 ## Conformance
 
 - Topic lookup is exact and case-sensitive over one flat namespace.
