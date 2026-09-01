@@ -20,7 +20,7 @@ use icn_contracts::{
     HardwareAssessment, HardwareSnapshot, ImageInput, InferenceError, InferenceProgress,
     MemoryAccountant, MemoryBreakdown, MemoryCharge, MemoryChargeOwner, MemoryLocation,
     MemoryTopology, ModelModalities, ModelProperties, NativeDeviceLocator, PreparedChatInfo,
-    ProjectorConfig, SplitMode, TemplateCapabilities,
+    ProjectorConfig, ReasoningProfile, SplitMode, TemplateCapabilities,
 };
 use llama_cpp_2::LlamaStateSeqFlags;
 use llama_cpp_2::TokenToStringError;
@@ -172,6 +172,10 @@ impl NativeBackend {
         config: ExecutionIntent,
         speculative: icn_contracts::SpeculativeDecodingConfig,
         hardware: HardwareSnapshot,
+        template_capabilities: TemplateCapabilities,
+        reasoning: ReasoningProfile,
+        template_fingerprint: String,
+        expected_vision: bool,
     ) -> Result<PreparedModelLoad, ModelLoadError> {
         let topology = MemoryTopology::from_snapshot(&hardware).ok_or_else(|| {
             ModelLoadError::Planning("load request contains an invalid memory topology".to_owned())
@@ -182,6 +186,10 @@ impl NativeBackend {
             config,
             speculative,
             topology,
+            template_capabilities,
+            reasoning,
+            template_fingerprint,
+            expected_vision,
         )
     }
 }
@@ -528,6 +536,10 @@ impl PreparedModelLoad {
         config: ExecutionIntent,
         speculative: icn_contracts::SpeculativeDecodingConfig,
         topology: MemoryTopology,
+        template_capabilities: TemplateCapabilities,
+        reasoning: ReasoningProfile,
+        template_fingerprint: String,
+        expected_vision: bool,
     ) -> Result<Self, ModelLoadError> {
         validate_model_config(&config).map_err(ModelLoadError::from)?;
         tracing::Span::current().record("model.id", model_id.as_str());
@@ -559,6 +571,10 @@ impl PreparedModelLoad {
                             command_receiver,
                             ready_sender,
                             observer,
+                            template_capabilities,
+                            reasoning,
+                            template_fingerprint,
+                            expected_vision,
                         );
                     }
                     Err(error) => {
@@ -859,8 +875,6 @@ fn prepare_native_plan(
     speculative: icn_contracts::SpeculativeDecodingConfig,
 ) -> Result<(icn_hardware::BackendLoadPlan, String, Vec<ModelLoadPhase>), ModelLoadError> {
     requested.speculative = speculative;
-    requested.speculative = icn_speculative::preflight_with_backend(backend, &requested)
-        .map_err(|error| ModelLoadError::SpeculativePreflight(error.to_string()))?;
     let planned = match icn_hardware::plan_load_with_backend(backend, topology, &requested)
         .map_err(|error| ModelLoadError::Planning(error.to_string()))?
     {
@@ -961,6 +975,10 @@ fn executor_main(
     commands: Receiver<ExecutorCommand>,
     ready: SyncSender<Result<(ModelProperties, String), ModelLoadError>>,
     observer: Arc<dyn ModelLoadObserver>,
+    template_capabilities: TemplateCapabilities,
+    reasoning: ReasoningProfile,
+    template_fingerprint: String,
+    expected_vision: bool,
 ) {
     #[cfg(feature = "mtmd")]
     let auxiliary_allocations = planned
@@ -1194,6 +1212,10 @@ fn executor_main(
                 &ready,
                 acceleration.clone(),
                 observer.as_ref(),
+                &template_capabilities,
+                &reasoning,
+                &template_fingerprint,
+                expected_vision,
             );
         } else {
             let mut batch_pool =
@@ -1232,6 +1254,10 @@ fn executor_main(
                 &ready,
                 acceleration.clone(),
                 observer.as_ref(),
+                &template_capabilities,
+                &reasoning,
+                &template_fingerprint,
+                expected_vision,
             );
         }
     } else if threads == threads_batch {
@@ -1256,6 +1282,10 @@ fn executor_main(
             &ready,
             acceleration.clone(),
             observer.as_ref(),
+            &template_capabilities,
+            &reasoning,
+            &template_fingerprint,
+            expected_vision,
         );
     } else {
         let mut context = context
@@ -1287,6 +1317,10 @@ fn executor_main(
             &ready,
             acceleration,
             observer.as_ref(),
+            &template_capabilities,
+            &reasoning,
+            &template_fingerprint,
+            expected_vision,
         );
     }
 }
@@ -1337,6 +1371,10 @@ fn run_initialized_executor<'model>(
     ready: &SyncSender<Result<(ModelProperties, String), ModelLoadError>>,
     acceleration: String,
     observer: &dyn ModelLoadObserver,
+    template_capabilities: &TemplateCapabilities,
+    reasoning: &ReasoningProfile,
+    template_fingerprint: &str,
+    expected_vision: bool,
 ) {
     observer.phase_started(ModelLoadPhase::Warmup);
     if let Err(error) = warm_up(model, context, speculative.as_deref_mut()) {
@@ -1367,6 +1405,10 @@ fn run_initialized_executor<'model>(
         context,
         chat_templates,
         modalities,
+        template_capabilities,
+        reasoning,
+        template_fingerprint,
+        expected_vision,
     ) {
         Ok(properties) => properties,
         Err(error) => {
@@ -3030,10 +3072,26 @@ fn model_properties(
     _context: &LlamaContext<'_>,
     templates: &CommonChatTemplates,
     modalities: ModelModalities,
+    assessed_capabilities: &TemplateCapabilities,
+    assessed_reasoning: &ReasoningProfile,
+    assessed_template_fingerprint: &str,
+    expected_vision: bool,
 ) -> Result<ModelProperties, InferenceError> {
     let chat_template = templates.source(None).map_err(backend_error)?;
-    let capabilities = templates.capabilities().map_err(backend_error)?;
-    let reasoning = icn_reasoning::inspect_templates(templates).map_err(backend_error)?;
+    let actual_template_fingerprint =
+        icn_reasoning::template_fingerprint(templates).map_err(backend_error)?;
+    if actual_template_fingerprint != assessed_template_fingerprint
+        || assessed_reasoning.template_fingerprint != assessed_template_fingerprint
+    {
+        return Err(InferenceError::Backend(
+            "loaded model template differs from its assessment".to_owned(),
+        ));
+    }
+    if modalities.vision != expected_vision {
+        return Err(InferenceError::Backend(
+            "loaded projector modalities differ from the model assessment".to_owned(),
+        ));
+    }
     Ok(ModelProperties {
         model_path: config.model_path.clone(),
         model_size_bytes: model.size(),
@@ -3042,20 +3100,10 @@ fn model_properties(
         context_tokens: config.context_size,
         training_context_tokens: model.n_ctx_train(),
         sliding_window_tokens: model.n_swa(),
-        template_fingerprint: fingerprint(&chat_template),
+        template_fingerprint: actual_template_fingerprint,
         chat_template,
-        capabilities: TemplateCapabilities {
-            string_content: capabilities.supports_string_content,
-            typed_content: capabilities.supports_typed_content,
-            tools: capabilities.supports_tools,
-            tool_calls: capabilities.supports_tool_calls,
-            parallel_tool_calls: capabilities.supports_parallel_tool_calls,
-            system_role: capabilities.supports_system_role,
-            preserve_reasoning: capabilities.supports_preserve_reasoning,
-            object_arguments: capabilities.supports_object_arguments,
-            enable_thinking: capabilities.supports_enable_thinking,
-        },
-        reasoning: reasoning.profile,
+        capabilities: assessed_capabilities.clone(),
+        reasoning: assessed_reasoning.clone(),
         modalities,
         speculative: match &config.speculative {
             icn_contracts::SpeculativeDecodingConfig::Disabled { reason } => {

@@ -1,7 +1,6 @@
 //! Durable local model inventory, storage, and Hugging Face acquisition.
 
 mod cache;
-mod capabilities;
 mod catalog;
 mod catalog_affiliations;
 mod catalog_installations;
@@ -24,7 +23,9 @@ mod store_fs;
 mod test_support;
 mod validation;
 
-pub use cache::{ModelBlobKind, ModelCache, ModelCacheWorkspace, ModelIndexKind};
+pub use cache::{
+    CachedModelAssessment, ModelBlobKind, ModelCache, ModelCacheWorkspace, ModelIndexKind,
+};
 pub use catalog::{
     GeneratedReleaseCatalog, ReleaseCatalog, ReleaseRecommendableCatalog,
     ResolvingRecommendableCatalog, advance_model_catalog_lock, load_release_catalog,
@@ -42,7 +43,7 @@ pub use package_service::{
     speculative_servable_model_bundle_key,
 };
 pub use planner_stub::{
-    PlannerStubComponent, PlannerStubContext, PlannerStubError, compact_planner_stub,
-    planner_stub_context,
+    AssessmentMaterialComponent, AssessmentMaterialContext, AssessmentMaterialError,
+    assessment_material_context, compact_assessment_material,
 };
 pub use preview::{ModelPreviewService, PreparedPreview, refresh_hugging_face_repository};

@@ -84,13 +84,14 @@ ICN derives targets from its current catalog and discovery authorities. A catalo
 each target to exact private servable material before admitting work. Each profile specifies
 maximum context for one sequence and the standard context depths at which performance is estimated.
 
-An uncached assessment performs native work:
+An uncached assessment performs one worker job:
 
-1. open GGUF metadata and tensor directories;
-2. construct a no-allocation native model;
-3. construct a no-allocation context graph for each missing profile;
-4. run native placement selection when the requested placement does not fit;
-5. combine the profile's exact workload facts with hardware calibration at every requested
+1. open the target Assessment Material once as a no-allocation native model;
+2. derive the effective-template fingerprint and tool/reasoning capabilities from that model;
+3. derive projector modalities and resolve speculative-decoding compatibility;
+4. reuse that same model handle to construct a no-allocation context graph for each missing profile;
+5. run native placement selection when the requested placement does not fit;
+6. combine the profile's exact workload facts with hardware calibration at every requested
    performance depth.
 
 It reads no tensor payload, allocates no model weights or KV cache, and runs no inference benchmark.
@@ -102,10 +103,10 @@ cost = one initial model open per target batch
      + native placement-search work where required
 ```
 
-The initial model open is shared by all profiles for one target. Performance depths within one
-profile reuse its single context graph and differ only in estimation arithmetic. Some native
-fallback-placement paths may reopen the model per profile. Different targets cannot share a model
-object.
+The model open is shared by template analysis and all profiles for one target. Performance depths
+within one profile reuse its single context graph and differ only in estimation arithmetic. Some
+native fallback-placement paths may reopen the model per profile. Different targets cannot share a
+model object.
 
 ### Results
 
@@ -117,7 +118,10 @@ Every assessed profile produces one result:
 | `DoesNotFit`   | Exact configuration value, memory accounting, limiting resource, and deficit  |
 | `Incompatible` | The artifact/runtime combination cannot execute                               |
 
-Results are published through the revisioned automatic assessment snapshot. Each available source
+The terminal assessed state is flat: it contains capabilities, the template fingerprint, and the
+ordered profile results. Its cache entry also retains the native template/reasoning configuration
+and resolved speculative configuration required by residency. Results are published atomically
+through the revisioned automatic assessment snapshot. Each available source
 slice contains its current exact subjects. A target is `Assessing`, `Assessed`, or `Dropped`; total
 and settled counts are derived from that list rather than stored as parallel state. One target
 failure does not invalidate sibling results.
@@ -165,9 +169,12 @@ Assessment results are validated against the captured topology and capacity poli
 `Fits`, `DoesNotFit`, and `Incompatible` are completed results and are reusable for the exact
 assessment identity. Live availability never participates in assessment cache validity.
 
-Load admission always performs fresh planning against current availability. Cached assessment never
-authorizes residency. Explicit stable-capacity native planning may be added only through a proven
-binding-level facility; it must not require changes to the nested llama.cpp core.
+Load admission always performs fresh memory planning against current availability, using the
+completed assessment's capability and speculative evidence. It does not repeat template,
+projector, or speculative capability work. The loaded runtime verifies fingerprint and modalities
+against that evidence. Cached assessment never authorizes residency by itself. Explicit
+stable-capacity native planning may be added only through a proven binding-level facility; it must
+not require changes to the nested llama.cpp core.
 
 ## Planning-worker pool
 
@@ -217,7 +224,9 @@ for assessment work.
 
 ## Assessment cache and single-flight
 
-The cache unit is one exact bundle/profile result. Identity covers:
+The cache unit is one exact Assessment Material/profile result containing public capabilities,
+native template/reasoning configuration, template fingerprint, resolved speculative configuration,
+and profile evidence. Identity covers:
 
 - immutable package content, ordered bundle structure, roles, and relationships;
 - exact serving profile, requested performance depths, and capacity policy;
@@ -227,8 +236,8 @@ The cache unit is one exact bundle/profile result. Identity covers:
 
 ICN checks memory and disk before planner preparation. Missing profiles for one bundle are batched.
 Equivalent bundle/environment misses share one gate and recheck the cache after admission. Cache
-corruption is a miss. Process-local parsed model state is reused only within its batch and is not
-serialized.
+corruption is a miss. The no-allocation native model handle is reused only within its worker job and
+is not serialized.
 
 Stable-topology-checked `Fits`, `DoesNotFit`, and artifact/runtime `Incompatible` results are
 persisted. Operational failures are never persisted.

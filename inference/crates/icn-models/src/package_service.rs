@@ -7,10 +7,10 @@ use std::sync::atomic::Ordering;
 use futures_util::future::BoxFuture;
 use icn_contracts::models::{
     CatalogPackageAffiliation, CatalogPackageRole, InstalledCatalogAttribution,
-    InstalledModelPackage, InstalledModelPackages, InstalledModelPackagesResponse, ModelAssessment,
+    InstalledModelPackage, InstalledModelPackages, InstalledModelPackagesResponse,
     ModelBundleInput, ModelFailure, ModelFile, ModelFileId, ModelFileRelationship, ModelFileRole,
-    ModelPackage, ModelPackageId, ModelPackageInspection, ModelPackageInstallationOrigin,
-    ModelPackageOperand, ModelPackageProperties, ModelPackageSource,
+    ModelPackage, ModelPackageId, ModelPackageInstallationOrigin, ModelPackageOperand,
+    ModelPackageProperties, ModelPackageSource, PackageValidation,
     RemoveInstalledModelPackageResponse, ResolvedServableModelBundle, ServableModelBundle,
     ServingProfile,
 };
@@ -22,8 +22,7 @@ use icn_contracts::{
 use sha2::{Digest, Sha256};
 
 use crate::PreparedPreview;
-use crate::cache::ModelIndexKind;
-use crate::capabilities::model_capabilities;
+use crate::cache::{CachedModelAssessment, ModelIndexKind};
 use crate::inventory::{
     InstalledPackageRecord, InstalledPackageSnapshot, ManagedModelStore, catalog_packages,
     catalog_target,
@@ -43,14 +42,9 @@ struct ResolvedPackageOperand {
 pub struct ServableModelBundleKey(pub String);
 
 #[derive(Debug)]
-pub(crate) struct InspectedModelPackage {
+pub(crate) struct ValidatedModelPackage {
     pub(crate) package: ModelPackage,
-    pub(crate) inspection: ModelPackageInspection,
-}
-
-#[derive(Clone, Copy)]
-struct ProjectorCapabilities {
-    vision: bool,
+    pub(crate) validation: PackageValidation,
 }
 
 fn digest_file(path: &Path) -> Result<String, InventoryError> {
@@ -326,8 +320,8 @@ fn shard_count(indices: impl IntoIterator<Item = Option<u32>>) -> u32 {
     indices.into_iter().flatten().max().unwrap_or(0)
 }
 
-fn invalid_package_inspection(code: &str, message: impl Into<String>) -> ModelPackageInspection {
-    ModelPackageInspection::Invalid {
+fn invalid_package_validation(code: &str, message: impl Into<String>) -> PackageValidation {
+    PackageValidation::Invalid {
         failure: ModelFailure {
             code: code.to_owned(),
             message: message.into(),
@@ -336,15 +330,10 @@ fn invalid_package_inspection(code: &str, message: impl Into<String>) -> ModelPa
     }
 }
 
-fn package_inspection_for(
-    model: &InventoryModel,
-    resolved: &ResolvedModel,
-    package: &ModelPackage,
-    inspect_projector: impl Fn(&Path) -> Result<ProjectorCapabilities, String>,
-) -> ModelPackageInspection {
+fn package_validation_for(model: &InventoryModel, package: &ModelPackage) -> PackageValidation {
     match &model.availability {
         ModelAvailability::InvalidArtifact { code, message, .. } => {
-            return ModelPackageInspection::Invalid {
+            return PackageValidation::Invalid {
                 failure: ModelFailure {
                     code: code.clone(),
                     message: message.clone(),
@@ -353,7 +342,7 @@ fn package_inspection_for(
             };
         }
         ModelAvailability::IncompatibleArtifact { code, message, .. } => {
-            return ModelPackageInspection::Incompatible {
+            return PackageValidation::Unsupported {
                 failure: ModelFailure {
                     code: code.clone(),
                     message: message.clone(),
@@ -367,8 +356,8 @@ fn package_inspection_for(
     }
 
     match &model.properties {
-        InventoryProperties::Pending => ModelPackageInspection::Pending,
-        InventoryProperties::Unavailable { reason } => ModelPackageInspection::Invalid {
+        InventoryProperties::Pending => PackageValidation::Pending,
+        InventoryProperties::Unavailable { reason } => PackageValidation::Invalid {
             failure: ModelFailure {
                 code: "inspection_unavailable".to_owned(),
                 message: reason.clone(),
@@ -381,8 +370,8 @@ fn package_inspection_for(
                 .iter()
                 .filter(|file| file.role == ModelFileRole::Projector)
                 .collect::<Vec<_>>();
-            let vision = match projectors.as_slice() {
-                [] => false,
+            match projectors.as_slice() {
+                [] => {}
                 [projector] => {
                     let related_to_weights = package.relationships.iter().any(|relationship| {
                         matches!(
@@ -397,97 +386,43 @@ fn package_inspection_for(
                         )
                     });
                     if !related_to_weights {
-                        return invalid_package_inspection(
+                        return invalid_package_validation(
                             "invalid_projector_relationship",
                             "the multimodal projector is not related to package weights",
                         );
                     }
-                    let Some(path) = model
-                        .location
-                        .components()
-                        .iter()
-                        .zip(&resolved.components)
-                        .find_map(|(declared, resolved)| {
-                            (declared.role == ComponentRole::Projector)
-                                .then_some(resolved.path.as_path())
-                        })
-                    else {
-                        return invalid_package_inspection(
-                            "missing_projector_component",
-                            "the package projector has no resolved component",
-                        );
-                    };
-                    match inspect_projector(path) {
-                        Ok(capabilities) if capabilities.vision => true,
-                        Ok(_) => {
-                            return ModelPackageInspection::Incompatible {
-                                failure: ModelFailure {
-                                    code: "projector_without_vision".to_owned(),
-                                    message: "the configured multimodal projector does not support image input"
-                                        .to_owned(),
-                                    retryable: false,
-                                },
-                            };
-                        }
-                        Err(message) => {
-                            return ModelPackageInspection::Incompatible {
-                                failure: ModelFailure {
-                                    code: "projector_inspection_failed".to_owned(),
-                                    message,
-                                    retryable: false,
-                                },
-                            };
-                        }
-                    }
                 }
                 _ => {
-                    return invalid_package_inspection(
+                    return invalid_package_validation(
                         "ambiguous_projector_components",
                         "a model package may contain at most one multimodal projector",
                     );
                 }
-            };
-            ModelPackageInspection::Inspected {
-                capabilities: model_capabilities(&model.properties, vision),
             }
+            PackageValidation::Valid
         }
     }
 }
 
-fn inspected_package_from_resolved_with(
+fn validated_package_from_resolved_with(
     resolved: &ResolvedModel,
     digest: impl Fn(&Path) -> Result<String, InventoryError>,
     inspect_gguf: impl Fn(&Path, &ContentIdentity) -> Option<crate::gguf::GgufInspection>,
-    inspect_projector: impl Fn(&Path) -> Result<ProjectorCapabilities, String>,
-) -> Result<InspectedModelPackage, InventoryError> {
+) -> Result<ValidatedModelPackage, InventoryError> {
     let package = package_from_resolved_with(resolved, digest, inspect_gguf)?;
-    let inspection = package_inspection_for(&resolved.model, resolved, &package, inspect_projector);
-    Ok(InspectedModelPackage {
+    let validation = package_validation_for(&resolved.model, &package);
+    Ok(ValidatedModelPackage {
         package,
-        inspection,
+        validation,
     })
 }
 
-pub(crate) fn inspected_package_from_resolved(
+pub(crate) fn validated_package_from_resolved(
     resolved: &ResolvedModel,
-) -> Result<InspectedModelPackage, InventoryError> {
-    inspected_package_from_resolved_with(
-        resolved,
-        digest_file,
-        |path, _| crate::gguf::inspect(path).ok(),
-        |path| {
-            llama_cpp_2::mtmd::mtmd_capabilities_from_file(path)
-                .map(|capabilities| ProjectorCapabilities {
-                    vision: capabilities.vision,
-                })
-                .map_err(|error| {
-                    format!(
-                        "failed to inspect multimodal projector {}: {error}",
-                        path.display()
-                    )
-                })
-        },
-    )
+) -> Result<ValidatedModelPackage, InventoryError> {
+    validated_package_from_resolved_with(resolved, digest_file, |path, _| {
+        crate::gguf::inspect(path).ok()
+    })
 }
 
 fn installed_path(model: &InventoryModel, resolved: &ResolvedModel) -> PathBuf {
@@ -808,8 +743,8 @@ impl ManagedModelStore {
     fn inspect_package_from_resolved(
         &self,
         resolved: &ResolvedModel,
-    ) -> Result<InspectedModelPackage, InventoryError> {
-        inspected_package_from_resolved_with(
+    ) -> Result<ValidatedModelPackage, InventoryError> {
+        validated_package_from_resolved_with(
             resolved,
             |path| {
                 let metadata = fs::metadata(path).map_err(|error| {
@@ -847,18 +782,6 @@ impl ManagedModelStore {
                 Ok(digest)
             },
             |path, content| self.inspect_gguf(path, content),
-            |path| {
-                llama_cpp_2::mtmd::mtmd_capabilities_from_file(path)
-                    .map(|capabilities| ProjectorCapabilities {
-                        vision: capabilities.vision,
-                    })
-                    .map_err(|error| {
-                        format!(
-                            "failed to inspect multimodal projector {}: {error}",
-                            path.display()
-                        )
-                    })
-            },
         )
     }
 
@@ -904,9 +827,9 @@ impl ManagedModelStore {
                 model: model.clone(),
             };
             self.seed_package_digests_from_snapshot(&resolved)?;
-            let InspectedModelPackage {
+            let ValidatedModelPackage {
                 package,
-                inspection,
+                validation,
             } = self.inspect_package_from_resolved(&resolved)?;
             for catalog_model in &self.config.catalog_models {
                 for (catalog_package, role) in catalog_packages(catalog_model) {
@@ -928,7 +851,7 @@ impl ManagedModelStore {
                         ModelPackageInstallationOrigin::Magnitude
                     }
                 },
-                inspection,
+                validation,
                 catalog_attribution: self.installed_catalog_attribution(model, &package),
                 package,
             };
@@ -967,13 +890,13 @@ impl ManagedModelStore {
         &self,
         evidence: &str,
         topology: &icn_contracts::MemoryTopology,
-    ) -> Option<ModelAssessment> {
+    ) -> Option<CachedModelAssessment> {
         if let Some(assessment) = self
             .model_assessments
             .read()
             .ok()?
             .get(evidence)
-            .filter(|assessment| assessment.is_valid_for(topology))
+            .filter(|assessment| assessment.profile.is_valid_for(topology))
             .cloned()
         {
             return Some(assessment);
@@ -986,7 +909,7 @@ impl ManagedModelStore {
         Some(assessment)
     }
 
-    pub fn write_model_assessment(&self, evidence: &str, assessment: &ModelAssessment) {
+    pub fn write_model_assessment(&self, evidence: &str, assessment: &CachedModelAssessment) {
         if let Ok(mut memory) = self.model_assessments.write() {
             memory.insert(evidence.to_owned(), assessment.clone());
         }
@@ -1278,17 +1201,16 @@ mod tests {
 
     use icn_contracts::models::{
         ModelFile, ModelFileId, ModelFileRelationship, ModelFileRole, ModelPackage, ModelPackageId,
-        ModelPackageInspection, ModelPackageProperties, ModelPackageSource, SpeculativeMethod,
+        ModelPackageProperties, ModelPackageSource, PackageValidation, SpeculativeMethod,
     };
     use icn_contracts::{
-        CapabilityEvidence, CapabilitySupport, ComponentRelationship, ComponentRole, ContentId,
-        ContentIdentity, Integrity, InventoryEntryId, InventoryModel, InventoryProperties,
-        LocalDeclaration, ModelAvailability, ModelComponent, ModelLocation, ModelSource,
-        ReasoningCapability, ResolvedComponent, ResolvedModel,
+        ComponentRelationship, ComponentRole, ContentId, ContentIdentity, Integrity,
+        InventoryEntryId, InventoryModel, InventoryProperties, LocalDeclaration, ModelAvailability,
+        ModelComponent, ModelLocation, ModelSource, ResolvedComponent, ResolvedModel,
     };
 
     use super::{
-        ProjectorCapabilities, package_inspection_for, package_relationship, shard_count,
+        package_relationship, package_validation_for, shard_count,
         speculative_servable_model_bundle_key,
     };
 
@@ -1333,13 +1255,6 @@ mod tests {
                     tokenizer: None,
                     modalities: vec!["text".to_owned(), "image".to_owned()],
                     base_models: Vec::new(),
-                    tools: CapabilitySupport::Unsupported,
-                    structured_output: CapabilitySupport::Unsupported,
-                    reasoning: ReasoningCapability::Unsupported {
-                        evidence: CapabilityEvidence::DeclaredMetadata {
-                            source: "test".to_owned(),
-                        },
-                    },
                     evidence_fingerprint: "test".to_owned(),
                 },
                 operations: Vec::new(),
@@ -1475,44 +1390,19 @@ mod tests {
     }
 
     #[test]
-    fn target_metadata_does_not_advertise_vision_without_a_projector() {
+    fn package_without_projector_is_structurally_valid() {
         let resolved = inspected_resolved_model(components(false));
-        let inspection =
-            package_inspection_for(&resolved.model, &resolved, &package(false), |_| {
-                panic!("a package without a projector must not inspect one")
-            });
+        let validation = package_validation_for(&resolved.model, &package(false));
 
-        assert!(matches!(
-            inspection,
-            ModelPackageInspection::Inspected { capabilities } if !capabilities.vision
-        ));
+        assert_eq!(validation, PackageValidation::Valid);
     }
 
     #[test]
-    fn exact_related_native_projector_establishes_vision() {
+    fn related_projector_is_structurally_valid_without_native_inspection() {
         let resolved = inspected_resolved_model(components(true));
-        let inspection = package_inspection_for(&resolved.model, &resolved, &package(true), |_| {
-            Ok(ProjectorCapabilities { vision: true })
-        });
+        let validation = package_validation_for(&resolved.model, &package(true));
 
-        assert!(matches!(
-            inspection,
-            ModelPackageInspection::Inspected { capabilities } if capabilities.vision
-        ));
-    }
-
-    #[test]
-    fn non_vision_projector_makes_the_package_incompatible() {
-        let resolved = inspected_resolved_model(components(true));
-        let inspection = package_inspection_for(&resolved.model, &resolved, &package(true), |_| {
-            Ok(ProjectorCapabilities { vision: false })
-        });
-
-        assert!(matches!(
-            inspection,
-            ModelPackageInspection::Incompatible { failure }
-                if failure.code == "projector_without_vision"
-        ));
+        assert_eq!(validation, PackageValidation::Valid);
     }
 
     #[test]
@@ -1520,29 +1410,12 @@ mod tests {
         let resolved = inspected_resolved_model(components(true));
         let mut model_package = package(true);
         model_package.relationships.clear();
-        let inspection = package_inspection_for(&resolved.model, &resolved, &model_package, |_| {
-            panic!("an unbound projector must not reach native inspection")
-        });
+        let inspection = package_validation_for(&resolved.model, &model_package);
 
         assert!(matches!(
             inspection,
-            ModelPackageInspection::Invalid { failure }
+            PackageValidation::Invalid { failure }
                 if failure.code == "invalid_projector_relationship"
-        ));
-    }
-
-    #[test]
-    fn unreadable_projector_makes_the_package_incompatible() {
-        let resolved = inspected_resolved_model(components(true));
-        let inspection = package_inspection_for(&resolved.model, &resolved, &package(true), |_| {
-            Err("native parse failed".to_owned())
-        });
-
-        assert!(matches!(
-            inspection,
-            ModelPackageInspection::Incompatible { failure }
-                if failure.code == "projector_inspection_failed"
-                    && failure.message == "native parse failed"
         ));
     }
 }

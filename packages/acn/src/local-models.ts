@@ -30,6 +30,8 @@ import type {
   ModelAssessment,
   ModelAssessmentDomainSnapshot,
   ModelAssessmentsSnapshot,
+  ModelCapabilities,
+  ModelInstance,
   ReadyModel,
 } from "@magnitudedev/icn-protocol/schemas"
 import {
@@ -91,7 +93,11 @@ export const projectLocalModelPreparation = (
 
 type CoordinatedLocalModelAssessment =
   | { readonly _tag: "Assessing" }
-  | { readonly _tag: "Assessed"; readonly assessment: LocalModelAssessment }
+  | {
+      readonly _tag: "Assessed"
+      readonly assessment: LocalModelAssessment
+      readonly capabilities: ModelCapabilities
+    }
   | { readonly _tag: "Dropped" }
 
 type VisibleCoordinatedLocalModelAssessment = Exclude<CoordinatedLocalModelAssessment, { readonly _tag: "Dropped" }>
@@ -146,10 +152,14 @@ export const coordinatedAssessment = (
   const assessment = entry.state.profiles[0]
   return assessment === undefined
     ? { _tag: "Dropped" }
-    : { _tag: "Assessed", assessment: projectAssessment(snapshot.state.environmentId, assessment) }
+    : {
+        _tag: "Assessed",
+        assessment: projectAssessment(snapshot.state.environmentId, assessment),
+        capabilities: entry.state.capabilities,
+      }
 }
 
-const residencyFor = (modelId: string, instances: readonly import("@magnitudedev/icn-protocol/schemas").ModelInstance[]): ModelResidency => {
+const residencyFor = (modelId: string, instances: readonly ModelInstance[]): ModelResidency => {
   const instance = instances.findLast((candidate) => candidate.modelId === modelId)
   return instance === undefined ? { _tag: "Unloaded" } : projectInferenceResidency(instance)
 }
@@ -206,7 +216,7 @@ export const catalogModelServingState = (
   const fits = assessment.assessment._tag === "Fits"
   const assessed = {
     metadata: ready.metadata,
-    capabilities: Schema.validateSync(ModelCapabilitiesSchema)(ready.capabilities),
+    capabilities: Schema.validateSync(ModelCapabilitiesSchema)(assessment.capabilities),
     speculativeMethod: ready.speculativeMethod,
   }
   return fits
@@ -223,7 +233,7 @@ export const discoveredModelServingState = (
   }
   const assessed = {
     metadata: ready.metadata,
-    capabilities: Schema.validateSync(ModelCapabilitiesSchema)(ready.capabilities),
+    capabilities: Schema.validateSync(ModelCapabilitiesSchema)(assessment.capabilities),
     speculativeMethod: ready.speculativeMethod,
   }
   return { _tag: "Assessed", ...assessed, assessment: assessment.assessment }
@@ -248,7 +258,7 @@ const catalogModel = (
   operation: CatalogInstallationOperation | undefined,
   removal: LocalModelRemovalState | undefined,
   assessment: VisibleCoordinatedLocalModelAssessment | undefined,
-  instances: readonly import("@magnitudedev/icn-protocol/schemas").ModelInstance[],
+  instances: readonly ModelInstance[],
 ): Extract<LocalModel, { readonly _tag: "Catalog" }> => {
   const source = entry.source
   const residency = residencyFor(entry.id, instances)
@@ -311,7 +321,7 @@ const discoveredPresentation = (id: ModelId, model: ReadyModel | undefined) => {
 const discoveredModel = (
   entry: DiscoveredModelSource,
   assessment: VisibleCoordinatedLocalModelAssessment | undefined,
-  instances: readonly import("@magnitudedev/icn-protocol/schemas").ModelInstance[],
+  instances: readonly ModelInstance[],
 ): Extract<LocalModel, { readonly _tag: "Discovered" }> => {
   const state = entry.source.state
   const ready = state._tag === "Ready" ? state.model : undefined

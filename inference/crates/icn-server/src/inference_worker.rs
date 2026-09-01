@@ -9,7 +9,8 @@ use icn_contracts::inference::{
     InferenceCompletion, InferenceObservation, ResolvedInferenceRequest,
 };
 use icn_contracts::{
-    CompletionBackend, InferenceError, ModelProperties, PreparedChatInfo, SpeculativeDecodingConfig,
+    CompletionBackend, InferenceError, ModelProperties, PreparedChatInfo, ReasoningProfile,
+    SpeculativeDecodingConfig, TemplateCapabilities,
 };
 use icn_engine::{ModelLoadObserver, ModelLoadPhase, NativeBackend};
 use icn_hardware::CapacityPolicy;
@@ -17,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::worker_process::{NativeWorkerLauncher, NativeWorkerRole};
 
-const PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = 3;
 const MAX_FRAME_BYTES: usize = 48 * 1024 * 1024;
 // At most one maximum-sized request may wait behind the frame currently being written.
 const COMMAND_QUEUE_CAPACITY: usize = 1;
@@ -43,6 +44,10 @@ enum HostMessage {
         plan: icn_contracts::ExecutionIntent,
         speculative: SpeculativeDecodingConfig,
         hardware: icn_contracts::HardwareSnapshot,
+        template_capabilities: TemplateCapabilities,
+        reasoning: ReasoningProfile,
+        template_fingerprint: String,
+        expected_vision: bool,
         trace: crate::telemetry::TraceCarrier,
     },
     Infer {
@@ -644,12 +649,20 @@ impl InferenceWorker {
         plan: icn_contracts::ExecutionIntent,
         speculative: SpeculativeDecodingConfig,
         hardware: icn_contracts::HardwareSnapshot,
+        template_capabilities: TemplateCapabilities,
+        reasoning: ReasoningProfile,
+        template_fingerprint: String,
+        expected_vision: bool,
     ) -> Result<(), InferenceError> {
         self.client.inner.send(HostMessage::Load {
             model_id,
             plan,
             speculative,
             hardware,
+            template_capabilities,
+            reasoning,
+            template_fingerprint,
+            expected_vision,
             trace: crate::telemetry::inject_current_trace(),
         })
     }
@@ -934,6 +947,10 @@ pub(crate) fn run_worker(build: String, native: NativeBackend) -> anyhow::Result
         plan,
         speculative,
         hardware,
+        template_capabilities,
+        reasoning,
+        template_fingerprint,
+        expected_vision,
         trace,
     } = load.message
     else {
@@ -943,7 +960,16 @@ pub(crate) fn run_worker(build: String, native: NativeBackend) -> anyhow::Result
     let load_span = tracing::info_span!("icn.worker.load", model.id = %model_id);
     crate::telemetry::set_parent_from_carrier(&load_span, &trace);
     let _load_entered = load_span.enter();
-    let prepared = match native.prepare_load(model_id.clone(), plan, speculative, hardware) {
+    let prepared = match native.prepare_load(
+        model_id.clone(),
+        plan,
+        speculative,
+        hardware,
+        template_capabilities,
+        reasoning,
+        template_fingerprint,
+        expected_vision,
+    ) {
         Ok(prepared) => prepared,
         Err(error) => {
             let _ = responses.send(WorkerMessage::LoadFailed {

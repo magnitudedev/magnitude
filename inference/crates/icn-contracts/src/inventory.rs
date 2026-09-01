@@ -415,25 +415,6 @@ pub enum CapabilityEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TemplateAssessment {
-    pub capabilities: crate::TemplateCapabilities,
-    pub reasoning: ReasoningCapability,
-    pub fingerprint: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EffectiveTemplateInputs {
-    pub model_path: std::path::PathBuf,
-}
-
-/// Native chat-template assessment injected into model discovery.
-pub trait TemplateAssessor: Send + Sync + 'static {
-    fn cache_identity(&self) -> &str;
-
-    fn assess(&self, inputs: &EffectiveTemplateInputs) -> Result<TemplateAssessment, String>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 // This is a wire contract: introducing a nested payload solely to equalize in-memory variant
 // sizes would make the serialized shape less direct for every API consumer.
@@ -454,9 +435,6 @@ pub enum InventoryProperties {
         tokenizer: Option<String>,
         modalities: Vec<String>,
         base_models: Vec<String>,
-        tools: CapabilitySupport,
-        structured_output: CapabilitySupport,
-        reasoning: ReasoningCapability,
         evidence_fingerprint: String,
     },
 }

@@ -801,11 +801,11 @@ pub struct ModelFailure {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase")]
-pub enum ModelPackageInspection {
+pub enum PackageValidation {
     Pending,
-    Inspected { capabilities: ModelCapabilities },
+    Valid,
     Invalid { failure: ModelFailure },
-    Incompatible { failure: ModelFailure },
+    Unsupported { failure: ModelFailure },
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -843,7 +843,7 @@ pub struct InstalledModelPackage {
     #[cfg_attr(feature = "openapi", schema(value_type = String))]
     pub path: PathBuf,
     pub origin: ModelPackageInstallationOrigin,
-    pub inspection: ModelPackageInspection,
+    pub validation: PackageValidation,
     pub catalog_attribution: InstalledCatalogAttribution,
 }
 
@@ -958,7 +958,6 @@ pub struct ModelMetadata {
 pub struct ReadyModel {
     pub metadata: ModelMetadata,
     pub profile: ServingProfile,
-    pub capabilities: ModelCapabilities,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub speculative_method: Option<SpeculativeMethod>,
@@ -1090,7 +1089,6 @@ pub struct RecommendableModel {
     pub description: String,
     pub release_date: ModelReleaseDate,
     pub license: String,
-    pub capabilities: ModelCapabilities,
     pub parameterization: ModelParameterization,
     pub intelligence: CatalogIntelligence,
     pub fidelity_rank: u32,
@@ -1444,6 +1442,8 @@ pub enum ModelAssessmentEntryState {
     Assessing,
     #[serde(rename_all = "camelCase")]
     Assessed {
+        capabilities: ModelCapabilities,
+        template_fingerprint: String,
         profiles: Vec<ModelAssessment>,
     },
     Dropped,

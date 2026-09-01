@@ -23,7 +23,7 @@ inventory, and process-local download coordination. ACN observes those authoriti
 product projections. Clients initiate native mutations through ACN's transparent inference proxy
 and do not infer command authorization or completion from cached projections.
 
-Catalog membership, artifact presence, download activity, inspection, assessment, provider
+Catalog membership, artifact presence, download activity, package validation, assessment, provider
 offering, slot selection, and runtime residency remain separate facts.
 
 Catalog attribution across exact artifact or drafter changes follows
@@ -51,21 +51,22 @@ reviewed immutable release data and is never refreshed from the network at runti
 Reviewed model parameterization states whether the architecture is dense or
 mixture-of-experts, its positive total parameter count, and, only for mixture-of-experts, a
 positive active parameter count smaller than the total. Parameter counts are factual catalog data;
-clients own their human-readable rounding and formatting. Input modality remains an inspected
-capability and is not duplicated in catalog declarations. An image-capable target requires one
+clients own their human-readable rounding and formatting. Input modality is assessment evidence
+and is not duplicated in catalog declarations. An image-capable target requires one
 projector component in its exact target package. Catalog generation selects the projector
 automatically only when the locked target repository contains one candidate; otherwise the reviewed
 declaration names the exact projector path in that repository. Package construction and package
-inspection are one operation: image capability requires an exact projector component, a typed
-relationship to the package weights, and native MTMD inspection that recognizes image input.
-Primary-weight metadata and projector presence alone never establish runnable image capability. A
-missing, ambiguous, incompatible, or MTP-combined projector fails generation.
+validation are one operation: an image target requires an exact projector component and a typed
+relationship to the package weights. Native assessment establishes whether MTMD recognizes image
+input. Primary-weight metadata and projector presence alone never establish runnable image
+capability. A missing, ambiguous, incompatible, or MTP-combined projector fails generation.
 Speculative decoding is explicit as either capability embedded in the target GGUF or an exact draft
 file in the target or another repository. Every package source is locked.
 
 Catalog generation resolves only locked revisions through production package construction,
-inspection, template analysis, and native planning. It emits a self-contained planner-input bundle
-and proves that compact planner inputs yield the same native assessments as their source metadata.
+validation, and unified native assessment. It emits self-contained Assessment Material and proves
+that compact material yields the same template-derived capabilities and hardware profiles as the
+source artifact.
 Repeated references to one immutable package reuse one package identity and content payload.
 Incomplete coverage, integrity mismatch, invalid relationships, or assessment mismatch fails
 generation or ICN readiness.
@@ -110,7 +111,7 @@ to its revision snapshot and does not infer that other components or revisions a
 ICN derives managed inventory by bounded, containment-safe enumeration of every complete snapshot.
 The observation path never creates, repairs, or removes artifact links. Component paths, sizes, content
 identities, roles, shards, and relationships come from existing validated files, exact catalog
-matches, and artifact inspection. Unsafe links, special files, escaping paths, and invalid entries
+matches, and package validation. Unsafe links, special files, escaping paths, and invalid entries
 make only the affected package unavailable. Store mutations reconcile owned path topology by
 quarantining conflicting nodes before writing; they never follow a conflicting link or overwrite an
 unclassified node. Explicit external Hugging Face roots retain their ordinary
@@ -126,13 +127,13 @@ The canonical discovered identity is
 `hf:<owner>/<repository>/<artifact-selector>`. Its three semantic parts are parsed and validated;
 the identity never contains an inventory hash, absolute cache path, package ID, revision, or
 projector. Multiple quantizations therefore remain distinct when they occupy distinct repository
-paths. Quantization presentation comes from GGUF inspection rather than filename parsing.
+paths. Quantization presentation comes from bounded GGUF parsing rather than filename parsing.
 
 When several cached revisions or configured roots provide the same repository and selector, exact
 identical packages collapse. Candidates referenced by a cached `main` ref outrank other candidates.
 Within the same ref priority, the most recently modified cached revision wins; its immutable commit
 provides the deterministic final tie-break. This is local cache recency, not a claim about upstream
-commit chronology. Selection precedes inspection, so an invalid selected revision never falls back
+commit chronology. Selection precedes validation, so an invalid selected revision never falls back
 to a stale revision. An exact catalog target that is successfully attributed publishes only under
 its catalog identity; failed attribution remains visible through discovery so the installed
 artifact does not disappear from inventory.
@@ -147,11 +148,12 @@ Temporary and `.incomplete` files never contribute presence. A partial multi-fil
 installed. A complete independently servable weights package may remain installed while an
 optional companion or a larger bundle is incomplete.
 
-Inventory reconciliation owns filesystem discovery, hashing, GGUF inspection, tensor-storage
-derivation, and package construction. Package construction produces the exact package and its one
-authoritative inspection atomically; catalog generation and installed inventory use that same
-operation. One cached GGUF inspection supplies every derived property
-for an immutable component. Reconciliation publishes complete inventory snapshots and retains the
+Inventory reconciliation owns filesystem discovery, hashing, bounded GGUF parsing, tensor-storage
+derivation, package construction, package validation, and local Assessment Material derivation.
+Package construction produces the exact package and its one authoritative structural validation
+atomically; catalog generation and installed inventory use that same operation. One cached GGUF
+parse supplies every structural property for an immutable component. Template-derived capabilities
+are produced only by assessment. Reconciliation publishes complete inventory snapshots and retains the
 previous complete inventory snapshot while a refresh is in flight. Queries return the current materialized snapshot
 and perform no filesystem work. Discovery is hardware-independent and performs no network access,
 assessment, calibration, profile choice, or ranking. ICN reconciles once at startup. Product-owned
@@ -159,7 +161,7 @@ artifact mutations publish their exact inventory change before completing and do
 global scan. A later global reconciliation is performed only when an operation explicitly requires
 fresh discovery or validation; it is never driven by an unconditional timer.
 
-All inventory indexes, content hashes, inspections, and derived package evidence are optimistic
+All inventory indexes, content hashes, GGUF parses, validations, and derived package evidence are optimistic
 caches. Missing, stale, malformed, unreadable, or unwritable cache state causes scoped recomputation
 and cannot remove a valid artifact from inventory. Catalog failure cannot hide independently
 servable artifacts.

@@ -25,9 +25,11 @@ use icn_contracts::models::{
     CatalogInstallationAdmission, CatalogInstallationOperation, CatalogInstallationOperationId,
     CatalogInstallationRemoval, CatalogInstallations, CatalogInstallationsResponse, CatalogModel,
     CatalogModelState, CatalogModels, CatalogModelsResponse, DiscoveredModel, DiscoveredModelState,
-    DiscoveredModels, DiscoveredModelsResponse, EffectiveModel, ModelAssessments,
-    ModelAssessmentsSnapshot, ModelDownloads, ModelId, ModelInstance, ModelInstanceId,
-    ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadPlan, ParsedModelId,
+    DiscoveredModels, DiscoveredModelsResponse, EffectiveModel, ModelAssessmentDomainSnapshot,
+    ModelAssessmentEntryState, ModelAssessmentPoolState, ModelAssessmentSubject, ModelAssessments,
+    ModelAssessmentsSnapshot, ModelCapabilities, ModelDownloads, ModelId, ModelInstance,
+    ModelInstanceId, ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadPlan,
+    ParsedModelId,
 };
 use icn_contracts::{
     CacheType, CompletionBackend, ExecutionConfig, ExecutionConfigReport, FlashAttention,
@@ -1523,6 +1525,14 @@ async fn standard_models(
         .list_discovered()
         .await
         .map_err(ApiError::from_inventory)?;
+    let assessment_snapshot = state
+        .model_assessments
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model assessments are not configured"))?
+        .snapshot()
+        .await
+        .map_err(ApiError::from_inventory)?;
+    let assessed_capabilities = assessed_capabilities(&assessment_snapshot);
     let catalog_models = catalog.models.into_iter().filter_map(|model| {
         let CatalogModelState::Installed { effective, .. } = model.local_state else {
             return None;
@@ -1530,6 +1540,10 @@ async fn standard_models(
         let EffectiveModel::Ready { model: target } = effective else {
             return None;
         };
+        let capabilities = assessed_capabilities.get(&ModelAssessmentSubject::Catalog {
+            model_id: model.id.clone(),
+            selection: icn_contracts::models::CatalogModelSelection::Effective,
+        })?;
         let name = format!("{} ({})", model.display_name, model.variant_label);
         let id = model.id.to_string();
         Some(open_ai_model(
@@ -1538,7 +1552,7 @@ async fn standard_models(
             name,
             model.description,
             target.profile.context_length,
-            target.capabilities,
+            capabilities.clone(),
         ))
     });
     let discovered_models = discovered.models.into_iter().filter_map(|model| {
@@ -1546,6 +1560,9 @@ async fn standard_models(
         let DiscoveredModelState::Ready { model: target, .. } = state else {
             return None;
         };
+        let capabilities = assessed_capabilities.get(&ModelAssessmentSubject::Discovery {
+            model_id: id.clone(),
+        })?;
         let ParsedModelId::HuggingFace {
             repository_id,
             artifact_selector,
@@ -1566,7 +1583,7 @@ async fn standard_models(
             display_name,
             format!("Discovered in Hugging Face cache from {repository}"),
             target.profile.context_length,
-            target.capabilities,
+            capabilities.clone(),
         ))
     });
     let data = catalog_models.chain(discovered_models).collect();
@@ -1574,6 +1591,34 @@ async fn standard_models(
         object: "list",
         data,
     }))
+}
+
+fn assessed_capabilities(
+    snapshot: &ModelAssessmentsSnapshot,
+) -> BTreeMap<ModelAssessmentSubject, ModelCapabilities> {
+    let ModelAssessmentPoolState::Ready {
+        catalog,
+        discovered,
+        ..
+    } = &snapshot.state
+    else {
+        return BTreeMap::new();
+    };
+    [catalog, discovered]
+        .into_iter()
+        .filter_map(|domain| match domain {
+            ModelAssessmentDomainSnapshot::Available { entries, .. } => Some(entries),
+            ModelAssessmentDomainSnapshot::Pending { .. }
+            | ModelAssessmentDomainSnapshot::Failed { .. } => None,
+        })
+        .flatten()
+        .filter_map(|entry| match &entry.state {
+            ModelAssessmentEntryState::Assessed { capabilities, .. } => {
+                Some((entry.subject.clone(), capabilities.clone()))
+            }
+            ModelAssessmentEntryState::Assessing | ModelAssessmentEntryState::Dropped => None,
+        })
+        .collect()
 }
 
 fn open_ai_model(

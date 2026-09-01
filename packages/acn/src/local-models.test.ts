@@ -18,7 +18,7 @@ import {
 import type { LocalModelSourcesState } from "./local-model-sources"
 
 describe("local model serving projection", () => {
-  it("accepts capabilities already decoded by the ICN client", () => {
+  it("uses capabilities from the unified assessment result", () => {
     const ready = {
       profile: { contextLength: 32_768 },
       metadata: {
@@ -29,6 +29,11 @@ describe("local model serving projection", () => {
         storageBytes: 1,
         maximumContextLength: Option.some(32_768),
       },
+      speculativeMethod: Option.none(),
+    } as unknown as ReadyModel
+    const assessment = {
+      _tag: "Assessed",
+      assessment: { _tag: "Fits" },
       capabilities: {
         vision: false,
         tools: true,
@@ -39,11 +44,6 @@ describe("local model serving projection", () => {
           defaultEffort: Option.some("high"),
         },
       },
-      speculativeMethod: Option.none(),
-    } as unknown as ReadyModel
-    const assessment = {
-      _tag: "Assessed",
-      assessment: { _tag: "Fits" },
     } as unknown as Parameters<typeof catalogModelServingState>[1]
 
     const state = catalogModelServingState(ready, assessment, Option.none())

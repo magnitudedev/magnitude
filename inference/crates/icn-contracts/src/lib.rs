@@ -62,6 +62,48 @@ impl Default for SpeculativeDecodingConfig {
     }
 }
 
+/// Durable speculative-decoding selection resolved by assessment. It names the selected method
+/// and tuning parameters but never a draft file location; execution binds the draft path from
+/// the currently resolved bundle.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SpeculativeDecodingSelection {
+    Disabled {
+        reason: String,
+    },
+    Enabled {
+        method: SpeculativeMethodConfig,
+        n_max: u32,
+        n_min: u32,
+        cache_type_k: CacheType,
+        cache_type_v: CacheType,
+    },
+}
+
+impl From<&SpeculativeDecodingConfig> for SpeculativeDecodingSelection {
+    fn from(config: &SpeculativeDecodingConfig) -> Self {
+        match config {
+            SpeculativeDecodingConfig::Disabled { reason } => Self::Disabled {
+                reason: reason.clone(),
+            },
+            SpeculativeDecodingConfig::Enabled {
+                source: _,
+                method,
+                n_max,
+                n_min,
+                cache_type_k,
+                cache_type_v,
+            } => Self::Enabled {
+                method: method.clone(),
+                n_max: *n_max,
+                n_min: *n_min,
+                cache_type_k: *cache_type_k,
+                cache_type_v: *cache_type_v,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SpeculativeDraftSource {

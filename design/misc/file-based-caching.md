@@ -173,10 +173,10 @@ all recomputable caches. Completed artifact files and immutable release catalog 
 authorities. Removing or corrupting any such cache cannot change which artifacts are present,
 create or remove a serving configuration, or change durable user intent.
 
-An inventory entry may reuse an enriched model only when both its filesystem observation and the
-exact artifact-inspection evidence still match. That inspection evidence includes the template
-assessor's semantic-policy identity. Changing template-inspection behavior therefore invalidates
-the affected durable inventory entries even when the underlying GGUF files are unchanged.
+An inventory entry may reuse structural model facts only when its filesystem observation and exact
+GGUF/package-validation evidence still match. Template semantics are not inventory evidence. The
+template inspector and semantic-policy identities belong to the combined assessment key, so changing
+either invalidates affected assessment entries without invalidating physical artifact presence.
 
 ## Durable user-state behavior
 
