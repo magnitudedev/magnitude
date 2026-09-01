@@ -146,6 +146,49 @@ describe("effect-query/rpc", () => {
     registry.dispose()
   })
 
+  it("registry dispose after a synchronized mutation leaves no pending timers", async () => {
+    // Requires a fixed @effect-atom/atom registry: pristine npm 0.5.3-0.7.0
+    // clears the idle-TTL timeout buckets before removing
+    // nodes, so dispose's removal cascade re-parks the synchronize-mounted query
+    // retention atom (idleTTL = gcTime, default 5 minutes) into a fresh
+    // setTimeout that nothing ever clears. That zombie timer holds the process's
+    // event loop, so every headless CLI mutation command hangs ~5 minutes after
+    // printing its output.
+    const registry = Registry.make()
+    const client = Client.make(implementationLayer)
+    const renamed = await Effect.runPromise(
+      Mutation.execute(client.mutation(Rename), { id: "1", name: "Grace" }).pipe(
+        Effect.provideService(Registry.AtomRegistry, registry),
+      ),
+    )
+    expect(renamed).toEqual({ id: "1", name: "Grace" })
+
+    const realSetTimeout = globalThis.setTimeout
+    const realClearTimeout = globalThis.clearTimeout
+    const pending = new Map<unknown, number>()
+    globalThis.setTimeout = ((handler: () => void, delay?: number, ...args: unknown[]) => {
+      const id = realSetTimeout(handler, delay, ...args)
+      pending.set(id, delay ?? 0)
+      return id
+    }) as typeof setTimeout
+    globalThis.clearTimeout = ((id: unknown) => {
+      pending.delete(id)
+      return realClearTimeout(id as Parameters<typeof realClearTimeout>[0])
+    }) as typeof clearTimeout
+    let leakedDelays: number[]
+    try {
+      registry.dispose()
+    } finally {
+      globalThis.setTimeout = realSetTimeout
+      globalThis.clearTimeout = realClearTimeout
+      leakedDelays = [...pending.values()]
+      for (const id of pending.keys()) {
+        realClearTimeout(id as Parameters<typeof realClearTimeout>[0])
+      }
+    }
+    expect(leakedDelays).toEqual([])
+  })
+
   it("materializes base Subscriptions over derived stream Rpcs", async () => {
     const registry = Registry.make()
     const client = Client.make(implementationLayer)

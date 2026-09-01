@@ -1,0 +1,36 @@
+diff --git a/dist/cjs/internal/registry.js b/dist/cjs/internal/registry.js
+index 8150c0cb2814a157df42b02249a38999a94f5fc8..a70ba0bff98314a6d65db686ed4a2fb29c6028e9 100644
+--- a/dist/cjs/internal/registry.js
++++ b/dist/cjs/internal/registry.js
+@@ -224,11 +224,11 @@ class RegistryImpl {
+     });
+   }
+   reset() {
++    this.nodes.forEach(node => node.remove());
++    this.nodes.clear();
+     this.timeoutBuckets.forEach(([, handle]) => clearTimeout(handle));
+     this.timeoutBuckets.clear();
+     this.nodeTimeoutBucket.clear();
+-    this.nodes.forEach(node => node.remove());
+-    this.nodes.clear();
+   }
+   dispose() {
+     this.disposed = true;
+diff --git a/dist/esm/internal/registry.js b/dist/esm/internal/registry.js
+index 03b681075ef27a0a039d56f774e8589ede0540bf..3902bbacf14a6a721b27a85b1a1d35b6932dd413 100644
+--- a/dist/esm/internal/registry.js
++++ b/dist/esm/internal/registry.js
+@@ -195,11 +195,11 @@ class RegistryImpl {
+     });
+   }
+   reset() {
++    this.nodes.forEach(node => node.remove());
++    this.nodes.clear();
+     this.timeoutBuckets.forEach(([, handle]) => clearTimeout(handle));
+     this.timeoutBuckets.clear();
+     this.nodeTimeoutBucket.clear();
+-    this.nodes.forEach(node => node.remove());
+-    this.nodes.clear();
+   }
+   dispose() {
+     this.disposed = true;
