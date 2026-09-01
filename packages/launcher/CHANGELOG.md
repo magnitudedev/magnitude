@@ -1,5 +1,13 @@
 # @magnitudedev/cli
 
+## 0.0.9
+
+### Patch Changes
+
+- [`7f0ef1b`](https://github.com/magnitudedev/magnitude/commit/7f0ef1bcc83fc80e2b606b7f48aee85ed7316457) Thanks [@anerli](https://github.com/anerli)! - Load heavy CLI command runtimes only when their command is selected, reducing version and help startup overhead.
+
+- [`7759adf`](https://github.com/magnitudedev/magnitude/commit/7759adf540c22141597bd4b7743db6fe310533c8) Thanks [@anerli](https://github.com/anerli)! - Better headless CLI interface
+
 ## 0.0.9-alpha.0
 
 ### Patch Changes
