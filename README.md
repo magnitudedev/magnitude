@@ -30,13 +30,13 @@ An open source inference server your agent sets up for you. It profiles your har
 
 ## Get started
 
-### Send this to your agent
+**Send this to your agent:**
 
 ```text
 Set up local models for me with the Magnitude CLI. Install it with `npm i -g @magnitudedev/cli` (or my package manager), then run `magnitude docs onboarding` and follow the instructions.
 ```
 
-Your agent will inspect your hardware, compare compatible models with you, download and load your choice, and connect Magnitude to the agent you already use.
+Your agent will profile your hardware, walk you through the best local models for it, download the ones you pick, and switch itself over to them.
 
 Magnitude supports macOS and Linux. Windows is supported through WSL.
 
