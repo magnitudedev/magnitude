@@ -67,17 +67,23 @@
 
     .stage {
       position: absolute;
-      inset: 24px;
+      inset: 16px;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+      padding: 16px;
+      border: 2px solid var(--card-border);
+      border-radius: 28px;
+      background: var(--card);
+    }
+
+    .composition {
       display: grid;
       grid-template-columns: 598px 68px 700px;
       gap: 22px;
       align-items: center;
-      justify-content: center;
-      overflow: hidden;
-      padding: 36px;
-      border: 2px solid var(--card-border);
-      border-radius: 28px;
-      background: var(--card);
+      transform: scale(1.065);
+      transform-origin: center;
     }
 
     body.landing .stage {
@@ -295,6 +301,7 @@
 </head>
 <body>
   <main class="stage">
+    <div class="composition">
     <section class="clients">
       <h1>Works with your existing harness</h1>
       <div class="harness-grid">
@@ -332,6 +339,7 @@
         <div class="model-item prism-lockup"><img class="model-logo light-darken" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/prismml.svg" alt="PrismML"></div>
       </div>
     </section>
+    </div>
   </main>
 </body>
 </html>

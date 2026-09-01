@@ -18,7 +18,7 @@
   <a href="https://www.npmjs.com/package/@magnitudedev/cli"><img src="https://img.shields.io/npm/v/%40magnitudedev%2Fcli" alt="npm version"></a>
 </p>
 
-An open source inference server your agent sets up for you. It profiles your hardware, helps you choose the best local models for it, then downloads, tunes, and runs them.
+An open source inference server that profiles your hardware, recommends the best local models for it, then downloads, tunes, and runs them. Use the built-in harness or connect OpenCode, Pi, Hermes, or whatever you already use.
 
 ⭐ Help us reach more developers and grow the Magnitude community. Star this repo!
 
@@ -30,31 +30,17 @@ An open source inference server your agent sets up for you. It profiles your har
 
 ## Get started
 
-**Send this to your agent:**
-
-```text
-Set up local models for me with the Magnitude CLI. Install it with `npm i -g @magnitudedev/cli` (or my package manager), then run `magnitude docs onboarding` and follow the instructions.
+```sh
+npm i -g @magnitudedev/cli && magnitude setup
 ```
 
-Your agent will profile your hardware, walk you through the best local models for it, download the ones you pick, and switch itself over to them.
+Magnitude profiles your machine and shows you the best local models for it. Choose one and Magnitude downloads it, then connects it to your harness of choice.
 
 Magnitude supports macOS and Linux. Windows is supported through WSL.
 
-<details>
-<summary>Want to browse the models directly?</summary>
-
-```sh
-npm i -g @magnitudedev/cli
-magnitude setup
-```
-
-The interactive setup lets you browse the recommended models and choose one yourself.
-
-</details>
-
 ## Why Magnitude?
 
-- **Agent-first setup:** one prompt and your agent walks you through the rest
+- **Set up in one command:** pick a recommended model and it launches your harness
 - **Knows your hardware:** profiles your chip, memory, and bandwidth
 - **Recommends what fits:** the best models for your machine, with estimated tok/s
 - **Tuned end to end:** speculative decoding, concurrency, all set for your machine
