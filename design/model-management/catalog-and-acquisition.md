@@ -40,6 +40,10 @@ that date; every artifact variant inherits the model declaration's date. Each en
 `ModelServingConfiguration`, required package components, presentation, and ranking evidence.
 Published catalog rows reduce package sources to deduplicated HTTPS repository links for product
 presentation; package coordinates and bundle structure remain private.
+The reviewed context length is a local serving configuration, not a claim about the architecture's
+absolute maximum. Compact tiers may deliberately use a shorter context, such as 64K instead of
+100K, because longer context increases KV memory and decode cost and would undermine their role on
+resource-constrained machines.
 Every active model carries one model-level intelligence assessment on a single declared Artificial
 Analysis Intelligence Index methodology version. A direct assessment records the observation date
 and canonical Artificial Analysis model URL. When no direct result exists, an estimate is a

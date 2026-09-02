@@ -27,6 +27,21 @@ magnitude connections sync
 
 If the harness is not connected, ask your agent to resume onboarding. For manual recovery, rerun `magnitude setup` or add the connection from the CLI reference.
 
+Codex and Claude Code keep using Magnitude's local gateway while their connection is installed. If
+the service was stopped, start it again:
+
+```sh
+magnitude service start
+```
+
+To stop using the Magnitude connection instead, remove it and restart the harness:
+
+```sh
+magnitude connections remove codex
+# or
+magnitude connections remove claude-code
+```
+
 ## Model download failed
 
 Magnitude retries temporary network and server failures. If retries are exhausted, retry after checking network access and disk space. Partial downloads can resume instead of starting again.

@@ -70,7 +70,8 @@ diagnosis before resetting to no connections. Valid siblings survive.
 
 Configuration and launch are independent. Configuration publishes the complete model projection
 and optional persisted selection. Launch receives an exact model ID directly and must not depend on
-manifest selection state. A launch plan contains an executable, arguments, environment additions,
+manifest selection state. A launch plan contains the exact detected executable for programmatic
+launch, the stable ambient command name for user-facing handoff, arguments, environment additions,
 and model identity; it never invokes a shell.
 
 The interactive runtime releases its inference client and terminal renderer before running the

@@ -676,6 +676,8 @@ describe("HarnessConnection model-set behavior", () => {
         yield* service.connect(connector.id, { model: Option.some(model) })
         const plan = yield* service.launch(connector.id, model)
         expect(plan.harness).toBe(connector.id)
+        expect(plan.command).toBe(connector.executable)
+        expect(plan.executable).toBe(`/installed/${connector.id}`)
         expect(plan.modelId).toBe(model)
       }
 
