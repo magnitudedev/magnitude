@@ -43,6 +43,9 @@ export interface HarnessDestination {
 
 export interface HarnessLaunchPlan {
   readonly harness: HarnessId
+  /** Ambient command name for user-facing handoff instructions. */
+  readonly command: string
+  /** Exact detected executable used when Magnitude launches the harness itself. */
   readonly executable: string
   readonly args: ReadonlyArray<string>
   readonly environment: Readonly<Record<string, string>>
@@ -97,7 +100,7 @@ export const UnavailableHarnessConnection: HarnessConnection = {
     ? Effect.void
     : Effect.fail(new HarnessConnectionError({ operation: "connect", harness, message: "External harness connections are unavailable in this client" })),
   launch: (harness, modelId) => harness === "magnitude"
-    ? Effect.succeed({ harness, executable: "magnitude", args: [], environment: {}, modelId })
+    ? Effect.succeed({ harness, command: "magnitude", executable: "magnitude", args: [], environment: {}, modelId })
     : Effect.fail(new HarnessConnectionError({ operation: "launch", harness, message: "External harness connections are unavailable in this client" })),
   sync: () => Effect.succeed([magnitudeDestination]),
   disconnect: (harness) => Effect.fail(new HarnessConnectionError({ operation: "disconnect", harness, message: "Harness connections are unavailable in this client" })),

@@ -80,7 +80,8 @@ is one of Fastest, Faster, Balanced, Smarter, or Smartest and defaults to Balanc
 to ten. Recommendation evidence includes speed, memory, context, intelligence, artifact accuracy,
 acceleration, capabilities, and canonical ID. Raw ranking scores and aggregate utility remain
 private. The command is a client projection over existing catalog and hardware authorities, not a
-second server recommendation authority.
+second server recommendation authority. Successful nonempty output ends with the exact local
+documentation command for interpreting the evidence and ranking methodology.
 
 `catalog show` supplies one model's useful curated and machine-specific evidence.
 
@@ -107,7 +108,8 @@ residency slot, so stop remains unaddressed.
 Connection observation distinguishes `Built in`, `Connected`, `Available`, and `Not installed`.
 `Connected` comes from the durable connection manifest, not from executable detection. Connection
 mutations delegate directly to the existing service operations. Handoff output is copyable shell
-text rather than raw argv or environment structures, and Magnitude does not launch it from a
+text rather than raw argv or environment structures. It uses the harness's ordinary ambient command
+name rather than the exact detected executable path, and Magnitude does not launch it from a
 non-interactive command.
 
 ## Conformance

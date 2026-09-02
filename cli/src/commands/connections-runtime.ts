@@ -69,16 +69,16 @@ const posixQuote = (value: string): string => /^[A-Za-z0-9_./:@%+=,-]+$/.test(va
   ? value
   : `'${value.replaceAll("'", `'"'"'`)}'`
 
-const renderLaunchPlan = (plan: HarnessLaunchPlan): string => {
+export const renderLaunchPlan = (plan: HarnessLaunchPlan): string => {
   if (process.platform === "win32") {
     const quote = (value: string) => `"${value.replaceAll('"', '`"')}"`
     const environment = Object.entries(plan.environment)
       .map(([key, value]) => `$env:${key} = ${quote(value)}`)
-    return [...environment, `& ${[plan.executable, ...plan.args].map(quote).join(" ")}`].join("\n  ")
+    return [...environment, `& ${[plan.command, ...plan.args].map(quote).join(" ")}`].join("\n  ")
   }
   const environment = Object.entries(plan.environment)
     .map(([key, value]) => `${key}=${posixQuote(value)}`)
-  return [...environment, posixQuote(plan.executable), ...plan.args.map(posixQuote)].join(" ")
+  return [...environment, posixQuote(plan.command), ...plan.args.map(posixQuote)].join(" ")
 }
 
 export const addConnection = (

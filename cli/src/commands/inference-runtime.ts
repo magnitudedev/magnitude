@@ -281,23 +281,39 @@ export const showRecommendations = (preferenceInput: string, limitInput: string)
     }, limit).flatMap(({ model }) => model._tag === "Catalog" ? [model] : [])
     return { catalog, models, hardware, preference, ranked }
   })),
-  render: ({ catalog, models, hardware, preference, ranked }) => {
-    if (catalog._tag === "Initializing") return "The local model catalog is initializing.\n"
-    const system = describeLocalHardware(hardware).system.name
-    const notice = [...assessmentNotice(models, "recommendations"), ...catalogWarnings(catalog)]
-    if (ranked.length === 0) return ensureTrailingNewline([
-      `No compatible recommendations are available for ${preference.label}.`,
-      ...notice,
-    ].join("\n"))
-    return ensureTrailingNewline([
-      `Local model recommendations - ${preference.label}`,
-      `${system} - ${formatMemorySize(hardware.totalSystemMemoryBytes)}`,
-      "",
-      ranked.map(renderRecommendation).join("\n\n"),
-      ...(notice.length > 0 ? ["", ...notice] : []),
-    ].join("\n"))
-  },
+  render: renderRecommendations,
 })
+
+export function renderRecommendations({
+  catalog,
+  models,
+  hardware,
+  preference,
+  ranked,
+}: {
+  readonly catalog: ModelCatalogState
+  readonly models: readonly LocalModel[]
+  readonly hardware: LocalInferenceHardware
+  readonly preference: { readonly label: string }
+  readonly ranked: readonly CatalogLocalModel[]
+}): string {
+  if (catalog._tag === "Initializing") return "The local model catalog is initializing.\n"
+  const system = describeLocalHardware(hardware).system.name
+  const notice = [...assessmentNotice(models, "recommendations"), ...catalogWarnings(catalog)]
+  if (ranked.length === 0) return ensureTrailingNewline([
+    `No compatible recommendations are available for ${preference.label}.`,
+    ...notice,
+  ].join("\n"))
+  return ensureTrailingNewline([
+    `Local model recommendations - ${preference.label}`,
+    `${system} - ${formatMemorySize(hardware.totalSystemMemoryBytes)}`,
+    "",
+    ranked.map(renderRecommendation).join("\n\n"),
+    ...(notice.length > 0 ? ["", ...notice] : []),
+    "",
+    "Learn more: magnitude docs recommendations",
+  ].join("\n"))
+}
 
 const formatParameters = (model: CatalogLocalModel): string => {
   const format = (value: number) => value >= 1_000_000_000

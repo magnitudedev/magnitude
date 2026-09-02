@@ -484,7 +484,7 @@ export const runInteractiveCommand = (
     }).pipe(
       Effect.map(interactiveProcessExitCode),
       Effect.catchAll((error) => Effect.sync(() => {
-        const manual = [result.plan.executable, ...result.plan.args]
+        const manual = [result.plan.command, ...result.plan.args]
           .map((part) => /[\s'"\\]/.test(part) ? JSON.stringify(part) : part)
           .join(" ")
         process.stderr.write([

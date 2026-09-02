@@ -205,13 +205,17 @@ export const writeIfChanged = (file: string, source: string, next: string) => ne
   : writeFileAtomic(file, next)
 
 export const launchPlan = (
-  connector: { readonly id: Parameters<typeof HarnessIdSchema.make>[0] },
+  connector: {
+    readonly id: Parameters<typeof HarnessIdSchema.make>[0]
+    readonly executable: string
+  },
   installation: HarnessInstallation,
   modelId: ProviderModelId,
   args: ReadonlyArray<string>,
   environment: Readonly<Record<string, string>> = {},
 ): HarnessLaunchPlan => ({
   harness: HarnessIdSchema.make(connector.id),
+  command: connector.executable,
   executable: installation.executable,
   args,
   environment,

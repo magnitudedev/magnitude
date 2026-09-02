@@ -5,10 +5,16 @@ import { describe, expect, it } from "vitest"
 import {
   makeAcquiringModel,
   makeCatalogModel,
+  makeHardware,
   makeInstalledCatalogModel,
 } from "../features/local-inference/test-fixtures"
 import { registerInferenceCommands } from "./inference"
-import { renderCatalog, renderCatalogStatus, renderModelsStatus } from "./inference-runtime"
+import {
+  renderCatalog,
+  renderCatalogStatus,
+  renderModelsStatus,
+  renderRecommendations,
+} from "./inference-runtime"
 
 type CatalogSnapshotState = Exclude<ModelCatalogState, { readonly _tag: "Initializing" }>
 
@@ -91,6 +97,21 @@ describe("inference command surface", () => {
     expect(output).toContain("tok/s")
     expect(output).not.toContain("NotInstalled")
     expect(output).not.toContain("assessmentId")
+  })
+
+  it("links recommendation evidence to the bundled methodology topic", () => {
+    const model = makeCatalogModel()
+    const catalog = catalogState(model)
+    const output = renderRecommendations({
+      catalog,
+      models: [model],
+      hardware: makeHardware(),
+      preference: { label: "Balanced" },
+      ranked: [model],
+    })
+
+    expect(output).toContain("Local model recommendations - Balanced")
+    expect(output).toContain("Learn more: magnitude docs recommendations")
   })
 
   it("summarizes outstanding assessment without emitting placeholder rows", () => {

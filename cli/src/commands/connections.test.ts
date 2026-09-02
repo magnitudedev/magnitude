@@ -1,8 +1,9 @@
 import { Command } from "@commander-js/extra-typings"
 import { HarnessIdSchema } from "@magnitudedev/client-common"
+import { ProviderModelIdSchema } from "@magnitudedev/sdk"
 import { describe, expect, it } from "vitest"
 import { registerConnectionsCommand } from "./connections"
-import { renderConnections } from "./connections-runtime"
+import { renderConnections, renderLaunchPlan } from "./connections-runtime"
 
 describe("connections command contract", () => {
   it("connects all models and optionally selects a harness model", () => {
@@ -28,5 +29,20 @@ describe("connections command contract", () => {
     expect(output).toContain("Connected")
     expect(output).toContain("Available")
     expect(output).toContain("Not installed")
+  })
+
+  it("renders handoff with the ambient command instead of the detected executable path", () => {
+    const detectedExecutable = "/Applications/Codex.app/Contents/MacOS/codex"
+    const output = renderLaunchPlan({
+      harness: HarnessIdSchema.make("codex"),
+      command: "codex",
+      executable: detectedExecutable,
+      args: ["--model", "magnitude-local/example"],
+      environment: {},
+      modelId: ProviderModelIdSchema.make("example"),
+    })
+
+    expect(output).toContain("codex")
+    expect(output).not.toContain(detectedExecutable)
   })
 })
