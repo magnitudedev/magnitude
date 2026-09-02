@@ -36,8 +36,8 @@ user updates, waits for the catalog's authoritative discovery and assessment com
 starts model selection with balanced recommendations, uses Faster and Smarter for ordinary
 directional requests, and reserves Fastest and Smartest for clearly requested extremes after
 explaining what the opposing signal gives up. It names every supported harness ID and its
-harness-specific handoff. Magnitude selection is automatic, Pi and OpenCode expose the supported
-current-process switching paths, and every other external harness requires exiting the running
+harness-specific handoff. Magnitude selection is automatic, Pi exposes the supported
+current-process switching path, and every other external harness requires exiting the running
 process with Ctrl+C and relaunching from the printed command. Persistent harness model choice is
 communicated as selecting a model, not setting a default. Guidance defines outcomes and decision
 boundaries without scripting exact user-facing sentences. The procedure must not claim completion
