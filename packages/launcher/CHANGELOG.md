@@ -1,5 +1,15 @@
 # @magnitudedev/cli
 
+## 0.0.11
+
+### Patch Changes
+
+- [`a18e40a`](https://github.com/magnitudedev/magnitude/commit/a18e40a26c75ae30e005ea6b2a87d70208bfcebf) Thanks [@anerli](https://github.com/anerli)! - More robust service health checks
+
+- [`a18e40a`](https://github.com/magnitudedev/magnitude/commit/a18e40a26c75ae30e005ea6b2a87d70208bfcebf) Thanks [@anerli](https://github.com/anerli)! - Better inference errors for context length exceeded
+
+- [`a18e40a`](https://github.com/magnitudedev/magnitude/commit/a18e40a26c75ae30e005ea6b2a87d70208bfcebf) Thanks [@anerli](https://github.com/anerli)! - Improve agent onboarding doc
+
 ## 0.0.10
 
 ### Patch Changes
