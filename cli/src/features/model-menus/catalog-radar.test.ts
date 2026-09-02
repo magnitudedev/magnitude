@@ -14,6 +14,7 @@ import { localModelRadarAxes } from "@magnitudedev/client-common"
 import {
   GIB,
   makeCatalogOnlyModel,
+  makeModel,
   TEST_MEMORY_DOMAIN_ID,
 } from "../local-inference/test-fixtures"
 
@@ -35,6 +36,56 @@ describe("catalog radar", () => {
       "MEMORY",
       "ACCURACY",
     ])
+  })
+
+  test("labels catalog fidelity using the quantization-scale buckets", () => {
+    const base = makeCatalogOnlyModel()
+    for (const [fidelityRank, expected] of [
+      [20, "Reduced"],
+      [40, "Medium"],
+      [50, "High"],
+      [58, "High"],
+      [60, "High"],
+      [80, "Very high"],
+    ] as const) {
+      const axes = Option.getOrThrow(localModelRadarAxes({
+        ...base,
+        catalogData: { ...base.catalogData, fidelityRank },
+      }))
+      expect(axes[4].detail).toBe(`${expected} (Q4)`)
+    }
+  })
+
+  test("uses the same quantization-scale labels for discovered models", () => {
+    const base = makeModel()
+    const serving = base.state.servingState
+    if (serving._tag !== "Assessed" || serving.assessment._tag !== "Fits") {
+      throw new Error("Discovered radar fixture must have a fitting assessment")
+    }
+    for (const [bits, expected] of [
+      [3, "Reduced"],
+      [4, "Medium"],
+      [5, "High"],
+      [6, "High"],
+      [8, "Very high"],
+    ] as const) {
+      const quantization = `Q${bits}`
+      const axes = Option.getOrThrow(localModelRadarAxes({
+        ...base,
+        state: {
+          ...base.state,
+          servingState: {
+            ...serving,
+            metadata: {
+              ...serving.metadata,
+              quantization,
+              quantizationName: `${bits}-bit`,
+            },
+          },
+        },
+      }))
+      expect(axes[4].detail).toBe(`${expected} (${quantization})`)
+    }
   })
 
   test("omits the profile when assessment has no performance samples", () => {
