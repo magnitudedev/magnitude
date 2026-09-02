@@ -62,7 +62,7 @@ const speculationValue = (model: LocalModel): number => {
 }
 
 const accuracyLabel = (rank: number): string =>
-  rank >= 75 ? "Native" : rank >= 55 ? "Very high" : rank >= 45 ? "High" : "Reduced"
+  rank >= 70 ? "Very high" : rank >= 45 ? "High" : rank >= 30 ? "Medium" : "Reduced"
 
 const shortVariantLabel = (model: LocalModel): string =>
   String(model.presentation.variantLabel).match(/\b(?:IQ|Q)\d+(?:\.\d+)?\b/i)?.[0] ??
@@ -86,7 +86,7 @@ const discoveredAccuracyLabel = (bits: Option.Option<number>): string =>
   Option.match(bits, {
     onNone: () => "Not assessed",
     onSome: (value) =>
-      value >= 8 ? "Native" : value >= 6 ? "Very high" : value >= 5 ? "High" : "Reduced",
+      value >= 8 ? "Very high" : value >= 5 ? "High" : value >= 4 ? "Medium" : "Reduced",
   })
 
 const memoryFootprintLabel = (assessment: ModelAssessment): string => {
