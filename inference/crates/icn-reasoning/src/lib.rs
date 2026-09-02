@@ -7,6 +7,7 @@ use icn_contracts::{
     AutomaticReasoningBudget, CapabilityEvidence, NativeReasoningControls,
     NormalizedReasoningEffort, ReasoningCapability, ReasoningControlDomain, ReasoningDelimiters,
     ReasoningEffortMapping, ReasoningProfile, ReasoningVisibility, TemplateCapabilities,
+    inference as domain,
 };
 use llama_cpp_2::common_chat::{
     ChatContent, ChatMessage, ChatPrepareOptions, ChatTemplateKwarg, ChatTool, ChatToolCall,
@@ -32,6 +33,219 @@ const EFFORT_DEFINITIONS: &[(&str, &[&str])] = &[
 
 /// Version of the complete template-inspection semantics stored in model inspection caches.
 pub const TEMPLATE_INSPECTION_CACHE_IDENTITY: &str = "template-inspection-v2";
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReasoningResolutionError {
+    #[error("{0}")]
+    InvalidRequest(String),
+    #[error("{0}")]
+    InvalidProfile(String),
+}
+
+pub fn resolve_inference_request(
+    request: domain::InferenceRequest<domain::ReasoningIntent>,
+    profile: &ReasoningProfile,
+) -> Result<domain::ResolvedInferenceRequest, ReasoningResolutionError> {
+    let request = reconcile_reasoning_effort(request, profile);
+    let intent = request.reasoning().clone();
+    let reasoning = resolve_reasoning_intent(intent, profile)?;
+    Ok(request.map_reasoning(|_| reasoning))
+}
+
+fn reconcile_reasoning_effort(
+    request: domain::InferenceRequest<domain::ReasoningIntent>,
+    profile: &ReasoningProfile,
+) -> domain::InferenceRequest<domain::ReasoningIntent> {
+    request.map_reasoning(|intent| match intent {
+        domain::ReasoningIntent::Effort {
+            effort,
+            template_args,
+            budget,
+        } if profile.mapping(&effort).is_none() => domain::ReasoningIntent::Effort {
+            effort: round_up_or_clamp_reasoning_effort(&effort, profile).unwrap_or(effort),
+            template_args,
+            budget,
+        },
+        other => other,
+    })
+}
+
+fn reasoning_effort_rank(effort: &NormalizedReasoningEffort) -> Option<usize> {
+    match effort.as_str() {
+        "minimal" => Some(0),
+        "low" => Some(1),
+        "medium" => Some(2),
+        "high" => Some(3),
+        "xhigh" => Some(4),
+        "max" => Some(5),
+        "none" | "adaptive" => None,
+        _ => None,
+    }
+}
+
+fn round_up_or_clamp_reasoning_effort(
+    requested: &NormalizedReasoningEffort,
+    profile: &ReasoningProfile,
+) -> Option<NormalizedReasoningEffort> {
+    let enabled = profile
+        .mappings
+        .iter()
+        .filter(|mapping| mapping.effort.as_str() != "none")
+        .collect::<Vec<_>>();
+    let rounded = reasoning_effort_rank(requested).and_then(|requested_rank| {
+        let ranked = || {
+            enabled.iter().filter_map(|mapping| {
+                reasoning_effort_rank(&mapping.effort).map(|rank| (rank, mapping))
+            })
+        };
+        ranked()
+            .filter(|(rank, _)| *rank >= requested_rank)
+            .min_by_key(|(rank, _)| *rank)
+            .or_else(|| ranked().max_by_key(|(rank, _)| *rank))
+            .map(|(_, mapping)| mapping.effort.clone())
+    });
+    rounded.or_else(|| {
+        profile
+            .default_effort
+            .as_ref()
+            .filter(|effort| effort.as_str() != "none" && profile.mapping(effort).is_some())
+            .cloned()
+            .or_else(|| enabled.first().map(|mapping| mapping.effort.clone()))
+    })
+}
+
+pub fn resolve_reasoning_intent(
+    intent: domain::ReasoningIntent,
+    profile: &ReasoningProfile,
+) -> Result<domain::ResolvedReasoning, ReasoningResolutionError> {
+    let invalid = ReasoningResolutionError::InvalidRequest;
+    let unsupported_effort = |effort: &NormalizedReasoningEffort| {
+        let supported = profile
+            .mappings
+            .iter()
+            .map(|mapping| mapping.effort.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        invalid(format!(
+            "reasoning effort {} is unsupported for this model; supported values: {supported}",
+            effort.as_str()
+        ))
+    };
+    let (effort, mut controls, automatic_budget, explicit_budget, template_args) = match intent {
+        domain::ReasoningIntent::Disabled { template_args } => {
+            let effort = NormalizedReasoningEffort("none".into());
+            if !profile.mappings.is_empty() && profile.mapping(&effort).is_none() {
+                let supported = profile
+                    .mappings
+                    .iter()
+                    .map(|mapping| mapping.effort.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(invalid(format!(
+                    "reasoning cannot be disabled for this model; supported values: {supported}"
+                )));
+            }
+            (
+                effort,
+                NativeReasoningControls {
+                    enable_thinking: Some(false),
+                    template_args: BTreeMap::new(),
+                },
+                AutomaticReasoningBudget::Disabled,
+                None,
+                template_args,
+            )
+        }
+        domain::ReasoningIntent::ModelDefault {
+            template_args,
+            budget,
+        } => {
+            let Some(effort) = profile.default_effort.clone() else {
+                if budget.is_some() {
+                    return Err(invalid(
+                        "reasoning budget requires a model with a classified reasoning default"
+                            .to_owned(),
+                    ));
+                }
+                return Ok(domain::ResolvedReasoning::new(
+                    NormalizedReasoningEffort("none".into()),
+                    NativeReasoningControls {
+                        enable_thinking: None,
+                        template_args,
+                    },
+                    AutomaticReasoningBudget::Disabled,
+                    None,
+                    profile.template_fingerprint.clone(),
+                ));
+            };
+            let mapping = profile.mapping(&effort).ok_or_else(|| {
+                ReasoningResolutionError::InvalidProfile(
+                    "reasoning profile default has no compiled mapping".to_owned(),
+                )
+            })?;
+            (
+                effort,
+                mapping.controls.clone(),
+                mapping.automatic_budget.clone(),
+                budget,
+                template_args,
+            )
+        }
+        domain::ReasoningIntent::Enabled {
+            template_args,
+            budget,
+        } => {
+            let effort = profile
+                .default_effort
+                .clone()
+                .ok_or_else(|| invalid("model has no resolved reasoning default".to_owned()))?;
+            let mapping = profile.mapping(&effort).ok_or_else(|| {
+                ReasoningResolutionError::InvalidProfile(
+                    "reasoning profile default has no compiled mapping".to_owned(),
+                )
+            })?;
+            let mut controls = mapping.controls.clone();
+            controls.enable_thinking = Some(true);
+            (
+                effort,
+                controls,
+                mapping.automatic_budget.clone(),
+                budget,
+                template_args,
+            )
+        }
+        domain::ReasoningIntent::Effort {
+            effort,
+            template_args,
+            budget,
+        } => {
+            let mapping = profile
+                .mapping(&effort)
+                .ok_or_else(|| unsupported_effort(&effort))?;
+            (
+                effort,
+                mapping.controls.clone(),
+                mapping.automatic_budget.clone(),
+                budget,
+                template_args,
+            )
+        }
+    };
+    for (key, value) in template_args {
+        if controls.template_args.insert(key.clone(), value).is_some() {
+            return Err(invalid(format!(
+                "chat_template_kwargs conflicts with resolved reasoning control: {key}"
+            )));
+        }
+    }
+    Ok(domain::ResolvedReasoning::new(
+        effort,
+        controls,
+        automatic_budget,
+        explicit_budget,
+        profile.template_fingerprint.clone(),
+    ))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateInspection {

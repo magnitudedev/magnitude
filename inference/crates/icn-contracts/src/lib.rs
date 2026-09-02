@@ -529,10 +529,17 @@ pub enum InferenceProgress {
     Generating,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum InferenceError {
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
+    #[error(
+        "prompt is too long: {prompt_tokens} tokens leave no generation capacity in a {context_capacity}-token context"
+    )]
+    ContextLengthExceeded {
+        prompt_tokens: u64,
+        context_capacity: u64,
+    },
     #[error("model backend failed: {0}")]
     Backend(String),
     #[error("inference request was cancelled")]
@@ -545,6 +552,44 @@ pub enum InferenceError {
     ExecutorStopped,
     #[error("token callback failed: {0}")]
     Callback(String),
+}
+
+/// Validates that a prepared prompt leaves at least one context position for generation.
+pub fn validate_inference_capacity(
+    prompt_tokens: u64,
+    context_capacity: u64,
+) -> Result<(), InferenceError> {
+    if prompt_tokens >= context_capacity {
+        return Err(InferenceError::ContextLengthExceeded {
+            prompt_tokens,
+            context_capacity,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod inference_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn prompt_must_leave_at_least_one_generation_position() {
+        assert!(validate_inference_capacity(31, 32).is_ok());
+        assert!(matches!(
+            validate_inference_capacity(32, 32),
+            Err(InferenceError::ContextLengthExceeded {
+                prompt_tokens: 32,
+                context_capacity: 32,
+            })
+        ));
+        assert!(matches!(
+            validate_inference_capacity(33, 32),
+            Err(InferenceError::ContextLengthExceeded {
+                prompt_tokens: 33,
+                context_capacity: 32,
+            })
+        ));
+    }
 }
 
 pub trait CompletionBackend: Send + Sync + 'static {
@@ -575,6 +620,7 @@ pub trait CompletionBackend: Send + Sync + 'static {
     fn complete(
         &self,
         request: inference::ResolvedInferenceRequest,
+        on_admitted: &mut dyn FnMut(u64) -> Result<(), InferenceError>,
         on_event: &mut dyn FnMut(inference::InferenceObservation) -> Result<(), InferenceError>,
     ) -> Result<inference::InferenceCompletion, InferenceError>;
 }

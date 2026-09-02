@@ -13,6 +13,8 @@ import {
 import { Option, Schema, type Effect } from "effect"
 import type { SkillInstallationTarget } from "./paths"
 
+const CONNECTOR_MAX_OUTPUT_TOKENS = 32_768
+
 const HarnessReasoningCapabilitiesSchema = Schema.Union(
   Schema.Struct({
     supported: Schema.Literal(true),
@@ -61,7 +63,7 @@ export const HarnessModelSchema = Schema.transform(
       ...model,
       maxOutputTokens: Option.getOrElse(
         model.maxOutputTokens,
-        () => Math.min(model.contextWindow, 32_768),
+        () => Math.min(model.contextWindow, CONNECTOR_MAX_OUTPUT_TOKENS),
       ),
     }),
     encode: (model) => ({ ...model, maxOutputTokens: Option.some(model.maxOutputTokens) }),

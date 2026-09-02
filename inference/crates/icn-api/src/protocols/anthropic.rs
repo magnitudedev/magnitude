@@ -1,7 +1,7 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::num::NonZeroU32;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use axum::Json;
@@ -17,8 +17,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use utoipa::ToSchema;
 
 use super::super::{
-    ApiError, AppState, ImageInput, admit_invocation, domain, domain_error, execute_with_journal,
-    non_empty_text, non_empty_vec,
+    ApiError, AppState, ImageInput, InferenceAdmission, ResidentInvocation, acquire_invocation,
+    await_inference_admission, domain, domain_error, execute_with_journal, non_empty_text,
+    non_empty_vec,
 };
 use super::chat::ReasoningEffortRequest;
 
@@ -1156,13 +1157,12 @@ pub(crate) async fn anthropic_count_tokens(
             .model_controller
             .as_ref()
             .ok_or_else(|| ApiError::server("model control is not configured"))?;
-        let admitted = admit_invocation(controller, adapted.invocation, None).await?;
-        let count = tokio::task::spawn_blocking(move || {
-            admitted.lease.backend().count_tokens(admitted.request)
-        })
-        .await
-        .map_err(|error| ApiError::server(format!("token-count task failed: {error}")))?
-        .map_err(ApiError::from_inference)?;
+        let ResidentInvocation { lease, request, .. } =
+            acquire_invocation(controller, adapted.invocation, None).await?;
+        let count = tokio::task::spawn_blocking(move || lease.backend().count_tokens(request))
+            .await
+            .map_err(|error| ApiError::server(format!("token-count task failed: {error}")))?
+            .map_err(ApiError::from_inference)?;
         Ok::<_, ApiError>(
             Json(CountTokensResponse {
                 input_tokens: count,
@@ -1252,14 +1252,15 @@ async fn anthropic_messages_inner(
         .as_ref()
         .ok_or_else(|| ApiError::server("model control is not configured"))?;
     let stream = adapted.stream;
-    let admitted = admit_invocation(controller, adapted.invocation, None).await?;
-    let lease = admitted.lease;
-    let request = admitted.request;
+    let resident = acquire_invocation(controller, adapted.invocation, None).await?;
     let id = format!("msg_icn_{}", state.next_id.fetch_add(1, Ordering::Relaxed));
     if !stream {
+        let ResidentInvocation { lease, request, .. } = resident;
         let span = tracing::Span::current();
         let result = tokio::task::spawn_blocking(move || {
-            span.in_scope(|| execute_with_journal(lease.backend().as_ref(), request, |_| Ok(())))
+            span.in_scope(|| {
+                execute_with_journal(lease.backend().as_ref(), request, |_| Ok(()), |_| Ok(()))
+            })
         })
         .await
         .map_err(|error| ApiError::server(format!("inference task failed: {error}")))?
@@ -1267,31 +1268,54 @@ async fn anthropic_messages_inner(
         return Ok(Json(message(&id, &response_model, &result)).into_response());
     }
 
+    let ResidentInvocation { lease, request, .. } = resident;
     let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(32);
-    let count_backend = Arc::clone(lease.backend());
-    let count_request = request.clone();
-    let input_tokens =
-        tokio::task::spawn_blocking(move || count_backend.count_tokens(count_request))
-            .await
-            .map_err(|error| ApiError::server(format!("token-count task failed: {error}")))?
-            .map_err(ApiError::from_inference)?;
+    let (mut admission, admitted) = InferenceAdmission::channel();
     let span = tracing::Span::current();
     tokio::task::spawn_blocking(move || {
         span.in_scope(|| {
-            let mut projector =
-                StreamProjector::new(id, response_model, request_id, sender, input_tokens);
-            if !projector.start() {
-                return;
-            }
-            let result = execute_with_journal(lease.backend().as_ref(), request, |observation| {
-                projector.observe(observation)
-            });
-            match result {
-                Ok(result) => projector.finish(&result),
-                Err(error) => projector.fail(error),
+            let projector = RefCell::new(None::<StreamProjector>);
+            let result = execute_with_journal(
+                lease.backend().as_ref(),
+                request,
+                |input_tokens| {
+                    let value = StreamProjector::new(
+                        id.clone(),
+                        response_model.clone(),
+                        request_id.clone(),
+                        sender.clone(),
+                        input_tokens,
+                    );
+                    if !value.start() {
+                        return Err(icn_contracts::InferenceError::Callback(
+                            "stream consumer disconnected".into(),
+                        ));
+                    }
+                    *projector.borrow_mut() = Some(value);
+                    admission.admitted(input_tokens)
+                },
+                |observation| {
+                    projector
+                        .borrow_mut()
+                        .as_mut()
+                        .ok_or_else(|| {
+                            icn_contracts::InferenceError::Backend(
+                                "inference output preceded admission".into(),
+                            )
+                        })?
+                        .observe(observation)
+                },
+            );
+            admission.finish(&result);
+            if let Some(projector) = projector.into_inner() {
+                match result {
+                    Ok(result) => projector.finish(&result),
+                    Err(error) => projector.fail(error),
+                }
             }
         });
     });
+    await_inference_admission(admitted).await?;
     Ok(Sse::new(ReceiverStream::new(receiver))
         .keep_alive(KeepAlive::default())
         .into_response())

@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::worker_process::{NativeWorkerLauncher, NativeWorkerRole};
 
-const PROTOCOL_VERSION: u32 = 3;
+const PROTOCOL_VERSION: u32 = 4;
 const MAX_FRAME_BYTES: usize = 48 * 1024 * 1024;
 // At most one maximum-sized request may wait behind the frame currently being written.
 const COMMAND_QUEUE_CAPACITY: usize = 1;
@@ -102,6 +102,10 @@ enum WorkerMessage {
         request_id: u64,
         event: InferenceObservation,
     },
+    InferenceAdmitted {
+        request_id: u64,
+        prompt_tokens: u64,
+    },
     RequestCompleted {
         request_id: u64,
         completion: InferenceCompletion,
@@ -127,6 +131,10 @@ enum WorkerMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum WireInferenceError {
     InvalidConfig(String),
+    ContextLengthExceeded {
+        prompt_tokens: u64,
+        context_capacity: u64,
+    },
     Backend(String),
     Cancelled,
     ModelInstanceStopped,
@@ -139,6 +147,13 @@ impl From<InferenceError> for WireInferenceError {
     fn from(error: InferenceError) -> Self {
         match error {
             InferenceError::InvalidConfig(message) => Self::InvalidConfig(message),
+            InferenceError::ContextLengthExceeded {
+                prompt_tokens,
+                context_capacity,
+            } => Self::ContextLengthExceeded {
+                prompt_tokens,
+                context_capacity,
+            },
             InferenceError::Backend(message) => Self::Backend(message),
             InferenceError::Cancelled => Self::Cancelled,
             InferenceError::ModelInstanceStopped => Self::ModelInstanceStopped,
@@ -153,6 +168,13 @@ impl From<WireInferenceError> for InferenceError {
     fn from(error: WireInferenceError) -> Self {
         match error {
             WireInferenceError::InvalidConfig(message) => Self::InvalidConfig(message),
+            WireInferenceError::ContextLengthExceeded {
+                prompt_tokens,
+                context_capacity,
+            } => Self::ContextLengthExceeded {
+                prompt_tokens,
+                context_capacity,
+            },
             WireInferenceError::Backend(message) => Self::Backend(message),
             WireInferenceError::Cancelled => Self::Cancelled,
             WireInferenceError::ModelInstanceStopped => Self::ModelInstanceStopped,
@@ -224,6 +246,7 @@ pub(crate) enum LoadEvent {
 }
 
 enum RequestReply {
+    Admitted(u64),
     Event(InferenceObservation),
     Completed(InferenceCompletion),
     Failed(WireInferenceError),
@@ -320,6 +343,10 @@ impl ClientHandle {
             receiver,
             client: self.clone(),
         })
+    }
+
+    fn cancel(&self, request_id: u64) {
+        let _ = self.inner.send(HostMessage::Cancel { request_id });
     }
 }
 
@@ -419,6 +446,7 @@ impl CompletionBackend for RemoteBackend {
     fn complete(
         &self,
         request: ResolvedInferenceRequest,
+        on_admitted: &mut dyn FnMut(u64) -> Result<(), InferenceError>,
         on_event: &mut dyn FnMut(InferenceObservation) -> Result<(), InferenceError>,
     ) -> Result<InferenceCompletion, InferenceError> {
         let waiter = self.client.request(|request_id| HostMessage::Infer {
@@ -426,17 +454,40 @@ impl CompletionBackend for RemoteBackend {
             request,
             trace: crate::telemetry::inject_current_trace(),
         })?;
+        let mut admitted = false;
         loop {
             match waiter.receiver.recv() {
+                Ok(RequestReply::Admitted(prompt_tokens)) => {
+                    if admitted {
+                        self.client.cancel(waiter.request_id);
+                        return Err(InferenceError::Backend(
+                            "worker reported inference admission more than once".to_owned(),
+                        ));
+                    }
+                    if let Err(error) = on_admitted(prompt_tokens) {
+                        self.client.cancel(waiter.request_id);
+                        return Err(error);
+                    }
+                    admitted = true;
+                }
                 Ok(RequestReply::Event(event)) => {
+                    if !admitted {
+                        self.client.cancel(waiter.request_id);
+                        return Err(InferenceError::Backend(
+                            "worker emitted inference output before admission".to_owned(),
+                        ));
+                    }
                     if let Err(error) = on_event(event) {
-                        let _ = self.client.inner.send(HostMessage::Cancel {
-                            request_id: waiter.request_id,
-                        });
+                        self.client.cancel(waiter.request_id);
                         return Err(error);
                     }
                 }
-                Ok(RequestReply::Completed(completion)) => return Ok(completion),
+                Ok(RequestReply::Completed(completion)) if admitted => return Ok(completion),
+                Ok(RequestReply::Completed(_)) => {
+                    return Err(InferenceError::Backend(
+                        "worker completed inference before admission".to_owned(),
+                    ));
+                }
                 Ok(RequestReply::Failed(error)) => return Err(error.into()),
                 Ok(_) => {
                     return Err(InferenceError::Backend(
@@ -822,6 +873,17 @@ fn dispatch_worker_message(inner: &Arc<ClientInner>, message: WorkerMessage) {
         WorkerMessage::InferenceObservation { request_id, event } => {
             send_request_reply(inner, request_id, RequestReply::Event(event), false);
         }
+        WorkerMessage::InferenceAdmitted {
+            request_id,
+            prompt_tokens,
+        } => {
+            send_request_reply(
+                inner,
+                request_id,
+                RequestReply::Admitted(prompt_tokens),
+                false,
+            );
+        }
         WorkerMessage::RequestCompleted {
             request_id,
             completion,
@@ -1039,14 +1101,28 @@ pub(crate) fn run_worker(build: String, native: NativeBackend) -> anyhow::Result
                         tracing::info_span!("icn.worker.inference", worker.request.id = request_id);
                     crate::telemetry::set_parent_from_carrier(&span, &trace);
                     let _entered = span.enter();
-                    let result = backend.complete(request, &mut |event| {
-                        if cancelled.load(Ordering::Acquire) {
-                            return Err(InferenceError::Cancelled);
-                        }
-                        responses
-                            .send(WorkerMessage::InferenceObservation { request_id, event })
-                            .map_err(|_| InferenceError::ExecutorStopped)
-                    });
+                    let result = backend.complete(
+                        request,
+                        &mut |prompt_tokens| {
+                            if cancelled.load(Ordering::Acquire) {
+                                return Err(InferenceError::Cancelled);
+                            }
+                            responses
+                                .send(WorkerMessage::InferenceAdmitted {
+                                    request_id,
+                                    prompt_tokens,
+                                })
+                                .map_err(|_| InferenceError::ExecutorStopped)
+                        },
+                        &mut |event| {
+                            if cancelled.load(Ordering::Acquire) {
+                                return Err(InferenceError::Cancelled);
+                            }
+                            responses
+                                .send(WorkerMessage::InferenceObservation { request_id, event })
+                                .map_err(|_| InferenceError::ExecutorStopped)
+                        },
+                    );
                     if let Ok(mut active) = cancellations.lock() {
                         active.remove(&request_id);
                     }
@@ -1164,6 +1240,19 @@ fn start_parent_watchdog() {
 mod tests {
     use super::*;
 
+    fn test_client() -> (ClientHandle, mpsc::Receiver<HostMessage>) {
+        let (commands, command_receiver) = mpsc::sync_channel(COMMAND_QUEUE_CAPACITY);
+        let (load_events, _load_receiver) = tokio::sync::mpsc::channel(LOAD_EVENT_CAPACITY);
+        let inner = Arc::new(ClientInner {
+            commands,
+            next_request_id: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+            load_events,
+            failed: AtomicBool::new(false),
+        });
+        (ClientHandle { inner }, command_receiver)
+    }
+
     #[test]
     fn frame_round_trip_and_length_limit() {
         let mut bytes = Vec::new();
@@ -1195,18 +1284,8 @@ mod tests {
 
     #[test]
     fn explicit_worker_stop_terminalizes_active_requests_as_model_instance_stopped() {
-        let (commands, _command_receiver) = mpsc::sync_channel(COMMAND_QUEUE_CAPACITY);
-        let (load_events, _load_receiver) = tokio::sync::mpsc::channel(LOAD_EVENT_CAPACITY);
-        let inner = Arc::new(ClientInner {
-            commands,
-            next_request_id: AtomicU64::new(1),
-            pending: Mutex::new(HashMap::new()),
-            load_events,
-            failed: AtomicBool::new(false),
-        });
-        let client = ClientHandle {
-            inner: Arc::clone(&inner),
-        };
+        let (client, _command_receiver) = test_client();
+        let inner = Arc::clone(&client.inner);
         let waiter = client
             .request(|request_id| HostMessage::Cancel { request_id })
             .expect("request must be admitted");
@@ -1220,5 +1299,27 @@ mod tests {
             ))
         ));
         assert!(inner.failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn worker_admission_is_forwarded_to_the_matching_request() {
+        let (client, _command_receiver) = test_client();
+        let inner = Arc::clone(&client.inner);
+        let waiter = client
+            .request(|request_id| HostMessage::Cancel { request_id })
+            .expect("request must be registered");
+
+        dispatch_worker_message(
+            &inner,
+            WorkerMessage::InferenceAdmitted {
+                request_id: waiter.request_id,
+                prompt_tokens: 37,
+            },
+        );
+
+        assert!(matches!(
+            waiter.receiver.recv(),
+            Ok(RequestReply::Admitted(37))
+        ));
     }
 }

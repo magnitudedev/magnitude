@@ -35,7 +35,7 @@ disposable inference worker (one resident model)
   | bounded commands
   v
 single executor thread
-  +-- request preparation
+  +-- request preparation + admission
   +-- scheduler + sequence pool
   +-- llama.cpp target context
   +-- optional projector
@@ -88,11 +88,18 @@ to preserve that per-request limit.
 Prepared execution reports completed semantic phases—target model, context, optional components,
 setup, warm-up, and finalization. These phases are not byte-level native progress.
 
+After the model is resident, its executor prepares each request exactly once using the model's
+native tokenizer, chat templates, and multimodal runtime. It reports an admission result after
+preparation and capacity validation, before semantic inference output. Prepared prompt state never
+crosses the worker boundary.
+
 ## Request flow
 
 ```text
 submit
-  -> prepare + tokenize
+  -> prepare + tokenize once
+  -> reject if logical prompt tokens >= configured per-request context
+  -> report admission
   -> wait for sequence capacity
   -> restore exact reusable prefix or cold-prefill
   -> prefill / decode / sample
@@ -107,6 +114,11 @@ Batch effects are staged separately from requests until that boundary. A sampled
 committed only when a later decode or speculative-verification step accepts it.
 Generation is always bounded by the request's remaining configured context capacity. A caller may
 add a smaller output-token limit; when it does not, remaining context capacity is the sole limit.
+A prepared prompt at or above the configured context capacity is a typed request-local context
+failure carrying both token counts; it is not an output-limit failure.
+Requested output limits do not participate in that predicate. An accepted request's effective
+generation limit is the lesser of its requested limit, when present, and the context positions
+remaining after the prompt.
 Multimodal projector execution supports only speculative methods that can advance from embedding
 sub-batches; MTP is rejected during configuration validation.
 

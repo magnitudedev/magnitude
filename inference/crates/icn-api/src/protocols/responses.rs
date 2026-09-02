@@ -21,9 +21,10 @@ use utoipa::openapi::schema::AnyOfBuilder;
 use utoipa::{PartialSchema, ToSchema};
 
 use super::super::{
-    ApiError, ApiErrorBody, AppState, ErrorResponse, ModelLoadingObserver, ReasoningEffortRequest,
-    admit_invocation, domain, domain_error, execute_with_journal, inference_error_body,
-    non_empty_text, non_empty_vec, unix_timestamp, with_openai_request_id,
+    ApiError, ApiErrorBody, AppState, ErrorResponse, InferenceAdmission, ModelLoadingObserver,
+    ReasoningEffortRequest, ResidentInvocation, acquire_invocation, await_inference_admission,
+    domain, domain_error, execute_with_journal, inference_error_body, non_empty_text,
+    non_empty_vec, unix_timestamp, with_openai_request_id,
 };
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -414,10 +415,6 @@ impl StreamProjector {
             })),
         )
         .await
-    }
-
-    pub(crate) async fn sender_closed(&self) {
-        self.sender.closed().await;
     }
 
     pub(crate) fn in_progress(&self) -> bool {
@@ -1610,16 +1607,19 @@ pub(crate) async fn responses(
         .ok_or_else(|| ApiError::server("model control is not configured"))?;
     let id = format!("resp_icn_{}", state.next_id.fetch_add(1, Ordering::Relaxed));
     let created_at = unix_timestamp();
-    let admitted = admit_invocation(controller, adapted.invocation, None).await?;
-    let lease = admitted.lease;
-    let request = admitted.request;
+    let resident = acquire_invocation(controller, adapted.invocation, None)
+        .await
+        .map_err(|error| error.with_param("input"))?;
+    let ResidentInvocation { lease, request, .. } = resident;
     let span = tracing::Span::current();
     let result = tokio::task::spawn_blocking(move || {
-        span.in_scope(|| execute_with_journal(lease.backend().as_ref(), request, |_| Ok(())))
+        span.in_scope(|| {
+            execute_with_journal(lease.backend().as_ref(), request, |_| Ok(()), |_| Ok(()))
+        })
     })
     .await
     .map_err(|error| ApiError::server(format!("inference task failed: {error}")))?
-    .map_err(ApiError::from_inference)?;
+    .map_err(|error| ApiError::from_inference(error).with_param("input"))?;
     let response = Json(from_result(
         &id,
         created_at,
@@ -1629,6 +1629,11 @@ pub(crate) async fn responses(
     ))
     .into_response();
     Ok(with_openai_request_id(response, &id))
+}
+
+enum ResponseStreamResidency {
+    Resident(ResidentInvocation),
+    Pending(domain::InferenceInvocation),
 }
 
 async fn start_response_stream(
@@ -1650,27 +1655,27 @@ async fn start_response_stream(
         .is_some_and(|value| value.eq_ignore_ascii_case("true"));
     let (sender, receiver) = mpsc::channel::<Value>(32);
     let sequence = Arc::new(AtomicU64::new(0));
-    let mut invocation = Some(adapted.invocation);
-    let admitted = if include_progress {
-        None
+    let residency = if include_progress {
+        ResponseStreamResidency::Pending(adapted.invocation)
     } else {
-        Some(
-            admit_invocation(
-                controller,
-                invocation.take().expect("pending invocation"),
-                None,
-            )
-            .await?,
+        ResponseStreamResidency::Resident(
+            acquire_invocation(controller, adapted.invocation, None).await?,
         )
     };
     let progress = include_progress.then(|| {
-        let sender = sender.clone();
-        let sequence = Arc::clone(&sequence);
-        let response_id = id.clone();
+        let progress_sender = sender.clone();
+        let progress_sequence = Arc::clone(&sequence);
+        let progress_id = id.clone();
         Arc::new(move |fraction| {
-            send_loading_progress(&sender, &sequence, &response_id, fraction);
+            send_loading_progress(&progress_sender, &progress_sequence, &progress_id, fraction);
         }) as ModelLoadingObserver
     });
+    let (admission, admitted) = if include_progress {
+        (InferenceAdmission::detached(), None)
+    } else {
+        let (admission, admitted) = InferenceAdmission::channel();
+        (admission, Some(admitted))
+    };
     let controller = Arc::clone(controller);
     let request_id = id.clone();
     tokio::spawn(async move {
@@ -1679,19 +1684,19 @@ async fn start_response_stream(
         if !projector.created().await {
             return;
         }
-        let admitted = match admitted {
-            Some(admitted) => Ok(admitted),
-            None => tokio::select! {
-                result = admit_invocation(
+        let resident = match residency {
+            ResponseStreamResidency::Resident(resident) => Ok(resident),
+            ResponseStreamResidency::Pending(invocation) => tokio::select! {
+                result = acquire_invocation(
                     &controller,
-                    invocation.expect("deferred invocation"),
+                    invocation,
                     progress,
                 ) => result,
-                _ = projector.sender_closed() => return,
+                _ = projector.sender.closed() => return,
             },
         };
-        let admitted = match admitted {
-            Ok(admitted) => admitted,
+        let ResidentInvocation { lease, request, .. } = match resident {
+            Ok(resident) => resident,
             Err(error) => {
                 projector.fail(&error.body.error);
                 return;
@@ -1701,11 +1706,14 @@ async fn start_response_stream(
             if !projector.in_progress() {
                 return;
             }
+            let mut admission = admission;
             let result = execute_with_journal(
-                admitted.lease.backend().as_ref(),
-                admitted.request,
+                lease.backend().as_ref(),
+                request,
+                |prompt_tokens| admission.admitted(prompt_tokens),
                 |observation| projector.observe(observation, include_progress),
             );
+            admission.finish(&result);
             match result {
                 Ok(result) => projector.finish(&result),
                 Err(error) => projector.fail(&inference_error_body(&error)),
@@ -1714,6 +1722,11 @@ async fn start_response_stream(
         .await
         .ok();
     });
+    if let Some(admitted) = admitted {
+        await_inference_admission(admitted)
+            .await
+            .map_err(|error| error.with_param("input"))?;
+    }
     Ok((request_id, receiver))
 }
 
@@ -1732,19 +1745,23 @@ async fn send_websocket_value(socket: &mut WebSocket, value: Value) -> bool {
         .is_ok()
 }
 
-async fn send_websocket_error(socket: &mut WebSocket, message: impl Into<String>) -> bool {
-    send_websocket_value(
-        socket,
-        serde_json::json!({
-            "type": "error",
-            "error": {
-                "type": "invalid_request_error",
-                "code": "invalid_request",
-                "message": message.into(),
-            }
-        }),
-    )
-    .await
+fn websocket_error_event(error: &ApiErrorBody, sequence_number: u64) -> Value {
+    serde_json::json!({
+        "type": "error",
+        "code": error.code,
+        "message": error.message,
+        "param": error.param,
+        "sequence_number": sequence_number,
+    })
+}
+
+async fn send_websocket_error(
+    socket: &mut WebSocket,
+    error: &ApiErrorBody,
+    sequence: &AtomicU64,
+) -> bool {
+    let sequence_number = sequence.fetch_add(1, Ordering::Relaxed);
+    send_websocket_value(socket, websocket_error_event(error, sequence_number)).await
 }
 
 fn websocket_logical_request(
@@ -1812,6 +1829,7 @@ fn warmup_events(id: &str) -> [Value; 2] {
 async fn serve_responses_websocket(mut socket: WebSocket, state: AppState, headers: HeaderMap) {
     let mut history = HashMap::<String, Value>::new();
     while let Some(message) = socket.next().await {
+        let sequence = AtomicU64::new(0);
         let request = match message {
             Ok(Message::Text(text)) => serde_json::from_str::<Value>(&text),
             Ok(Message::Binary(bytes)) => serde_json::from_slice::<Value>(&bytes),
@@ -1827,7 +1845,8 @@ async fn serve_responses_websocket(mut socket: WebSocket, state: AppState, heade
         let request = match request {
             Ok(request) => request,
             Err(error) => {
-                if !send_websocket_error(&mut socket, format!("Invalid JSON: {error}")).await {
+                let error = ApiError::invalid(format!("Invalid JSON: {error}"));
+                if !send_websocket_error(&mut socket, &error.body.error, &sequence).await {
                     return;
                 }
                 continue;
@@ -1836,7 +1855,8 @@ async fn serve_responses_websocket(mut socket: WebSocket, state: AppState, heade
         let (logical, generate) = match websocket_logical_request(request, &history) {
             Ok(request) => request,
             Err(error) => {
-                if !send_websocket_error(&mut socket, error).await {
+                let error = ApiError::invalid(error);
+                if !send_websocket_error(&mut socket, &error.body.error, &sequence).await {
                     return;
                 }
                 continue;
@@ -1855,7 +1875,8 @@ async fn serve_responses_websocket(mut socket: WebSocket, state: AppState, heade
         let request = match serde_json::from_value::<ResponseCreateRequest>(logical.clone()) {
             Ok(request) => request,
             Err(error) => {
-                if !send_websocket_error(&mut socket, error.to_string()).await {
+                let error = ApiError::invalid(error.to_string());
+                if !send_websocket_error(&mut socket, &error.body.error, &sequence).await {
                     return;
                 }
                 continue;
@@ -1865,7 +1886,7 @@ async fn serve_responses_websocket(mut socket: WebSocket, state: AppState, heade
             match start_response_stream(state.clone(), headers.clone(), request).await {
                 Ok(stream) => stream,
                 Err(error) => {
-                    if !send_websocket_error(&mut socket, error.body.error.message).await {
+                    if !send_websocket_error(&mut socket, &error.body.error, &sequence).await {
                         return;
                     }
                     continue;
@@ -1883,6 +1904,26 @@ async fn serve_responses_websocket(mut socket: WebSocket, state: AppState, heade
 #[cfg(test)]
 mod websocket_tests {
     use super::*;
+
+    #[test]
+    fn errors_use_the_standard_top_level_event_shape() {
+        let error =
+            ApiError::from_inference(icn_contracts::InferenceError::ContextLengthExceeded {
+                prompt_tokens: 33,
+                context_capacity: 32,
+            })
+            .with_param("input");
+        assert_eq!(
+            websocket_error_event(&error.body.error, 7),
+            serde_json::json!({
+                "type": "error",
+                "code": "context_length_exceeded",
+                "message": "prompt is too long: 33 tokens leave no generation capacity in a 32-token context",
+                "param": "input",
+                "sequence_number": 7,
+            })
+        );
+    }
 
     #[test]
     fn warmup_is_retained_for_incremental_generation() {

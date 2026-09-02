@@ -1405,6 +1405,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "icn-contracts",
+ "icn-reasoning",
  "serde",
  "serde_json",
  "thiserror",
