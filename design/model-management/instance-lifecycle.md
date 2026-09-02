@@ -76,7 +76,8 @@ slot load request, or caller-supplied instance identity.
 
 When `Magnitude-Include-Progress: true` is present, streaming endpoints begin their SSE response
 before acquisition and publish meaningful model-loading progress on the same response stream.
-Ordinary consumers receive only the standard inference stream.
+Ordinary consumers wait through acquisition and inference admission before opening a successful
+stream. They receive only the standard inference stream.
 
 Loading inference waiters belong to the Loading state. Loading success moves the worker to Ready
 and grants live waiters actor-issued leases in the same mailbox transition, so no pending-demand

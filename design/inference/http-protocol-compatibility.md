@@ -137,6 +137,23 @@ through the model's remaining context capacity. Anthropic Messages is unchanged:
 requires `max_tokens`, so the adapter always supplies that explicit limit. No adapter invents a
 finite limit for a request that omitted one.
 
+Prompt capacity is independent of that output policy. After model acquisition, the resident worker
+prepares the native prompt exactly once and reports admission before semantic output. A prompt at
+or above the configured per-request context capacity cannot leave room for generation. Ordinary
+Chat Completions, Responses, and Anthropic Messages requests await this admission before opening a
+successful response or event stream, so the failure is a protocol-native HTTP error. Chat
+Completions and Responses use an OpenAI `invalid_request_error` with code
+`context_length_exceeded` and request-field `param`; Anthropic Messages uses its
+`invalid_request_error` and `prompt is too long` message. Responses WebSocket necessarily reports
+the error through its upgraded protocol. Byte-preserved upstream requests remain excluded.
+
+`Magnitude-Include-Progress: true` deliberately changes the HTTP commitment point for streaming
+Chat Completions and Responses. The endpoint opens SSE before model acquisition and forwards
+loading fractions live as they occur. A later load, admission, or execution failure therefore uses
+the protocol's native in-stream failure. Progress is never buffered for replay. Text and multimodal
+inputs use the same authoritative resident preparation path; no estimate may produce a
+context-length rejection.
+
 The engine emits fixed reasoning, text, and tool-call output phases plus terminal usage,
 termination, and metrics facts. It does not construct an aggregate output. Lifecycle progress is
 observation, not semantic output. One bounded output journal validates the event lifecycle,
@@ -149,7 +166,8 @@ and the generated client derives both calls from that one operation. SDK code mu
 untyped HTTP path beside the generated transport.
 
 Anthropic token counting runs the same canonical request conversion and model-native prompt
-preparation as Messages generation, then returns the exact prepared logical input-token count.
+preparation as Messages generation on a resident model, then returns the exact logical input-token
+count.
 Streaming Messages reports that count in `message_start` before output blocks.
 
 ## Public routing
@@ -241,6 +259,9 @@ distinct protocol state machines.
   strings; protocol-forbidden empty forms remain request errors.
 - Every historical tool call in input context has exactly one result in the same assistant entry.
 - OpenAI and Anthropic errors retain their native HTTP and in-stream envelopes.
+- For ordinary HTTP requests, a local prompt that leaves no generation capacity fails with a
+  protocol-native HTTP error before an HTTP streaming success response is opened. Explicit
+  Magnitude progress streams report failures discovered after opening in-stream.
 - Generated mixed-operation clients validate JSON success bodies and promote declared HTTP or SSE
   errors through one typed runtime path.
 - Client cancellation releases the exact inference lease and emits no further client output.

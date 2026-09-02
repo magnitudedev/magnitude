@@ -46,6 +46,8 @@ use utoipa::openapi::schema::{AdditionalProperties, Schema};
 use utoipa::openapi::{Components, OpenApi as OpenApiDocument, RefOr};
 use utoipa::{OpenApi, PartialSchema, ToSchema};
 
+const CONNECTOR_MAX_OUTPUT_TOKENS: u32 = 32_768;
+
 mod media;
 mod protocols;
 
@@ -814,9 +816,20 @@ impl ApiError {
         }
     }
 
+    fn with_param(mut self, param: &'static str) -> Self {
+        self.body.error.param = Some(param.to_owned());
+        self
+    }
+
     fn from_inference(error: InferenceError) -> Self {
         match error {
             InferenceError::InvalidConfig(message) => Self::invalid(message),
+            error @ InferenceError::ContextLengthExceeded { .. } => Self {
+                status: StatusCode::BAD_REQUEST,
+                body: ErrorResponse {
+                    error: inference_error_body(&error),
+                },
+            },
             InferenceError::ModelInstanceStopped => Self {
                 status: StatusCode::CONFLICT,
                 body: ErrorResponse {
@@ -1674,7 +1687,7 @@ fn open_ai_model(
         reasoning,
         top_provider: OpenAiTopProvider {
             context_length,
-            max_completion_tokens: context_length.min(32_768),
+            max_completion_tokens: context_length.min(CONNECTOR_MAX_OUTPUT_TOKENS),
         },
     }
 }
@@ -1767,17 +1780,17 @@ async fn apply_template(
     Ok(Json(apply_template_response(prepared)))
 }
 
-struct AdmittedInvocation {
+pub(crate) struct ResidentInvocation {
     lease: ModelInstanceLease,
     model: String,
     request: domain::ResolvedInferenceRequest,
 }
 
-async fn admit_invocation(
+async fn acquire_invocation(
     controller: &Arc<dyn ModelInstanceController>,
     invocation: domain::InferenceInvocation,
     progress: Option<ModelLoadingObserver>,
-) -> Result<AdmittedInvocation, ApiError> {
+) -> Result<ResidentInvocation, ApiError> {
     let (model, request) = invocation.into_parts();
     let model = model.into_inner();
     let lease = controller
@@ -1789,22 +1802,76 @@ async fn admit_invocation(
         .backend()
         .properties()
         .map_err(ApiError::from_inference)?;
-    let request = apply_reasoning_effort_compatibility(request, &properties.reasoning);
     let request = resolve_request(request, &properties.reasoning)?;
-    Ok(AdmittedInvocation {
+    Ok(ResidentInvocation {
         lease,
         model,
         request,
     })
 }
 
+pub(crate) struct InferenceAdmission {
+    sender: Option<tokio::sync::oneshot::Sender<Result<u64, InferenceError>>>,
+}
+
+impl InferenceAdmission {
+    pub(crate) fn detached() -> Self {
+        Self { sender: None }
+    }
+
+    pub(crate) fn channel() -> (
+        Self,
+        tokio::sync::oneshot::Receiver<Result<u64, InferenceError>>,
+    ) {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                sender: Some(sender),
+            },
+            receiver,
+        )
+    }
+
+    pub(crate) fn admitted(&mut self, prompt_tokens: u64) -> Result<(), InferenceError> {
+        let Some(sender) = self.sender.take() else {
+            return Ok(());
+        };
+        sender
+            .send(Ok(prompt_tokens))
+            .map_err(|_| InferenceError::Callback("inference admission waiter disconnected".into()))
+    }
+
+    pub(crate) fn finish<T>(&mut self, result: &Result<T, InferenceError>) {
+        let Some(sender) = self.sender.take() else {
+            return;
+        };
+        let error = match result {
+            Err(error) => error.clone(),
+            Ok(_) => InferenceError::Backend(
+                "inference completed without reporting admission".to_owned(),
+            ),
+        };
+        let _ = sender.send(Err(error));
+    }
+}
+
+pub(crate) async fn await_inference_admission(
+    receiver: tokio::sync::oneshot::Receiver<Result<u64, InferenceError>>,
+) -> Result<u64, ApiError> {
+    receiver
+        .await
+        .map_err(|_| ApiError::server("inference task stopped before admission"))?
+        .map_err(ApiError::from_inference)
+}
+
 fn execute_with_journal(
     backend: &dyn CompletionBackend,
     request: domain::ResolvedInferenceRequest,
+    mut admit: impl FnMut(u64) -> Result<(), InferenceError>,
     mut observe: impl FnMut(&domain::InferenceObservation) -> Result<(), InferenceError>,
 ) -> Result<domain::InferenceResult, InferenceError> {
     let mut journal = domain::OutputJournal::default();
-    let completion = backend.complete(request, &mut |observation| {
+    let completion = backend.complete(request, &mut admit, &mut |observation| {
         if let domain::InferenceObservationEvent::Output { event } = observation.event() {
             journal
                 .push(event)
@@ -1821,6 +1888,9 @@ fn execute_with_journal(
 fn inference_error_body(error: &InferenceError) -> ApiErrorBody {
     let (error_type, code, retryable) = match error {
         InferenceError::InvalidConfig(_) => ("invalid_request_error", "invalid_request", false),
+        InferenceError::ContextLengthExceeded { .. } => {
+            ("invalid_request_error", "context_length_exceeded", false)
+        }
         InferenceError::Backend(_) => ("server_error", "backend_error", true),
         InferenceError::Cancelled => ("cancelled", "request_cancelled", true),
         InferenceError::ModelInstanceStopped => ("model_error", "model_instance_stopped", false),
@@ -1955,198 +2025,14 @@ fn resolve_request(
     request: domain::InferenceRequest<domain::ReasoningIntent>,
     profile: &icn_contracts::ReasoningProfile,
 ) -> Result<domain::ResolvedInferenceRequest, ApiError> {
-    let intent = request.reasoning().clone();
-    let reasoning = resolve_reasoning(intent, profile)?;
-    Ok(request.map_reasoning(|_| reasoning))
-}
-
-fn apply_reasoning_effort_compatibility(
-    request: domain::InferenceRequest<domain::ReasoningIntent>,
-    profile: &icn_contracts::ReasoningProfile,
-) -> domain::InferenceRequest<domain::ReasoningIntent> {
-    request.map_reasoning(|intent| match intent {
-        domain::ReasoningIntent::Effort {
-            effort,
-            template_args,
-            budget,
-        } if profile.mapping(&effort).is_none() => domain::ReasoningIntent::Effort {
-            effort: round_up_or_clamp_reasoning_effort(&effort, profile).unwrap_or(effort),
-            template_args,
-            budget,
-        },
-        other => other,
+    icn_reasoning::resolve_inference_request(request, profile).map_err(|error| match error {
+        icn_reasoning::ReasoningResolutionError::InvalidRequest(message) => {
+            ApiError::invalid(message)
+        }
+        icn_reasoning::ReasoningResolutionError::InvalidProfile(message) => {
+            ApiError::server(message)
+        }
     })
-}
-
-fn reasoning_effort_rank(effort: &icn_contracts::NormalizedReasoningEffort) -> Option<usize> {
-    match effort.as_str() {
-        "minimal" => Some(0),
-        "low" => Some(1),
-        "medium" => Some(2),
-        "high" => Some(3),
-        "xhigh" => Some(4),
-        "max" => Some(5),
-        "none" | "adaptive" => None,
-        _ => None,
-    }
-}
-
-fn round_up_or_clamp_reasoning_effort(
-    requested: &icn_contracts::NormalizedReasoningEffort,
-    profile: &icn_contracts::ReasoningProfile,
-) -> Option<icn_contracts::NormalizedReasoningEffort> {
-    let enabled = profile
-        .mappings
-        .iter()
-        .filter(|mapping| mapping.effort.as_str() != "none")
-        .collect::<Vec<_>>();
-    let rounded = reasoning_effort_rank(requested).and_then(|requested_rank| {
-        let ranked = || {
-            enabled.iter().filter_map(|mapping| {
-                reasoning_effort_rank(&mapping.effort).map(|rank| (rank, mapping))
-            })
-        };
-        ranked()
-            .filter(|(rank, _)| *rank >= requested_rank)
-            .min_by_key(|(rank, _)| *rank)
-            .or_else(|| ranked().max_by_key(|(rank, _)| *rank))
-            .map(|(_, mapping)| mapping.effort.clone())
-    });
-    rounded.or_else(|| {
-        profile
-            .default_effort
-            .as_ref()
-            .filter(|effort| effort.as_str() != "none" && profile.mapping(effort).is_some())
-            .cloned()
-            .or_else(|| enabled.first().map(|mapping| mapping.effort.clone()))
-    })
-}
-
-fn resolve_reasoning(
-    intent: domain::ReasoningIntent,
-    profile: &icn_contracts::ReasoningProfile,
-) -> Result<domain::ResolvedReasoning, ApiError> {
-    let unsupported_effort = |effort: &icn_contracts::NormalizedReasoningEffort| {
-        let supported = profile
-            .mappings
-            .iter()
-            .map(|mapping| mapping.effort.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        ApiError::invalid(format!(
-            "reasoning effort {} is unsupported for this model; supported values: {supported}",
-            effort.as_str()
-        ))
-    };
-    let (effort, mut controls, automatic_budget, explicit_budget, template_args) = match intent {
-        domain::ReasoningIntent::Disabled { template_args } => {
-            let effort = icn_contracts::NormalizedReasoningEffort("none".into());
-            if !profile.mappings.is_empty() && profile.mapping(&effort).is_none() {
-                let supported = profile
-                    .mappings
-                    .iter()
-                    .map(|mapping| mapping.effort.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(ApiError::invalid(format!(
-                    "reasoning cannot be disabled for this model; supported values: {supported}"
-                )));
-            }
-            (
-                effort,
-                icn_contracts::NativeReasoningControls {
-                    enable_thinking: Some(false),
-                    template_args: BTreeMap::new(),
-                },
-                icn_contracts::AutomaticReasoningBudget::Disabled,
-                None,
-                template_args,
-            )
-        }
-        domain::ReasoningIntent::ModelDefault {
-            template_args,
-            budget,
-        } => {
-            let Some(effort) = profile.default_effort.clone() else {
-                if budget.is_some() {
-                    return Err(ApiError::invalid(
-                        "reasoning budget requires a model with a classified reasoning default",
-                    ));
-                }
-                return Ok(domain::ResolvedReasoning::new(
-                    icn_contracts::NormalizedReasoningEffort("none".into()),
-                    icn_contracts::NativeReasoningControls {
-                        enable_thinking: None,
-                        template_args,
-                    },
-                    icn_contracts::AutomaticReasoningBudget::Disabled,
-                    None,
-                    profile.template_fingerprint.clone(),
-                ));
-            };
-            let mapping = profile.mapping(&effort).ok_or_else(|| {
-                ApiError::server("reasoning profile default has no compiled mapping")
-            })?;
-            (
-                effort,
-                mapping.controls.clone(),
-                mapping.automatic_budget.clone(),
-                budget,
-                template_args,
-            )
-        }
-        domain::ReasoningIntent::Enabled {
-            template_args,
-            budget,
-        } => {
-            let effort = profile
-                .default_effort
-                .clone()
-                .ok_or_else(|| ApiError::invalid("model has no resolved reasoning default"))?;
-            let mapping = profile.mapping(&effort).ok_or_else(|| {
-                ApiError::server("reasoning profile default has no compiled mapping")
-            })?;
-            let mut controls = mapping.controls.clone();
-            controls.enable_thinking = Some(true);
-            (
-                effort,
-                controls,
-                mapping.automatic_budget.clone(),
-                budget,
-                template_args,
-            )
-        }
-        domain::ReasoningIntent::Effort {
-            effort,
-            template_args,
-            budget,
-        } => {
-            let mapping = profile
-                .mapping(&effort)
-                .ok_or_else(|| unsupported_effort(&effort))?;
-            (
-                effort,
-                mapping.controls.clone(),
-                mapping.automatic_budget.clone(),
-                budget,
-                template_args,
-            )
-        }
-    };
-    for (key, value) in template_args {
-        if controls.template_args.insert(key.clone(), value).is_some() {
-            return Err(ApiError::invalid(format!(
-                "chat_template_kwargs conflicts with resolved reasoning control: {key}"
-            )));
-        }
-    }
-    Ok(domain::ResolvedReasoning::new(
-        effort,
-        controls,
-        automatic_budget,
-        explicit_budget,
-        profile.template_fingerprint.clone(),
-    ))
 }
 
 fn non_empty_text(value: String, field: &'static str) -> Result<domain::NonEmptyText, ApiError> {
@@ -2570,13 +2456,21 @@ fn unix_timestamp() -> u64 {
 pub struct FakeBackend {
     model_id: String,
     response: String,
+    context_tokens: u32,
 }
 impl FakeBackend {
     pub fn new(model_id: impl Into<String>, response: impl Into<String>) -> Self {
         Self {
             model_id: model_id.into(),
             response: response.into(),
+            context_tokens: 4096,
         }
+    }
+
+    #[cfg(test)]
+    fn with_context_tokens(mut self, context_tokens: u32) -> Self {
+        self.context_tokens = context_tokens;
+        self
     }
 }
 
@@ -2591,7 +2485,7 @@ impl CompletionBackend for FakeBackend {
             model_size_bytes: 1,
             architecture: Some("fake".into()),
             name: Some(self.model_id.clone()),
-            context_tokens: 4096,
+            context_tokens: self.context_tokens,
             training_context_tokens: 4096,
             sliding_window_tokens: 0,
             chat_template: "fake-template".into(),
@@ -2691,9 +2585,17 @@ impl CompletionBackend for FakeBackend {
     fn complete(
         &self,
         request: domain::ResolvedInferenceRequest,
+        on_admitted: &mut dyn FnMut(u64) -> Result<(), InferenceError>,
         on_event: &mut dyn FnMut(domain::InferenceObservation) -> Result<(), InferenceError>,
     ) -> Result<domain::InferenceCompletion, InferenceError> {
         let prompt_tokens = request.context().entries().len();
+        let logical_prompt_tokens =
+            u64::try_from(prompt_tokens).expect("fake prompt token count fits u64");
+        icn_contracts::validate_inference_capacity(
+            logical_prompt_tokens,
+            u64::from(self.context_tokens),
+        )?;
+        on_admitted(logical_prompt_tokens)?;
         on_event(domain::InferenceObservation::new(
             domain::InferenceObservationEvent::Output {
                 event: domain::InferenceOutputEvent::Started,
@@ -3731,7 +3633,6 @@ mod tests {
             let adapted =
                 protocols::anthropic::adapt(request).expect("Anthropic effort must adapt");
             let (_, request) = adapted.invocation.into_parts();
-            let request = apply_reasoning_effort_compatibility(request, &profile);
             let resolved = resolve_request(request, &profile).expect("effort must resolve");
             assert_eq!(resolved.reasoning().effort().as_str(), expected);
         }
@@ -3752,9 +3653,9 @@ mod tests {
             template_args: BTreeMap::new(),
             budget: None,
         };
-        assert!(resolve_reasoning(explicit, &profile).is_err());
+        assert!(icn_reasoning::resolve_reasoning_intent(explicit, &profile).is_err());
         assert!(
-            resolve_reasoning(
+            icn_reasoning::resolve_reasoning_intent(
                 domain::ReasoningIntent::Disabled {
                     template_args: BTreeMap::new(),
                 },
@@ -4057,6 +3958,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_context_overflow_uses_protocol_native_http_errors() {
+        let (chat_status, chat_body) = post_chat(
+            FakeBackend::new("test-model", "hello").with_context_tokens(1),
+            json!({
+                "model": "test-model",
+                "stream": true,
+                "messages": [{ "role": "user", "content": "hi" }]
+            }),
+        )
+        .await;
+        assert_eq!(chat_status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_str::<Value>(&chat_body).unwrap(),
+            json!({
+                "error": {
+                    "message": "prompt is too long: 1 tokens leave no generation capacity in a 1-token context",
+                    "type": "invalid_request_error",
+                    "param": "messages",
+                    "code": "context_length_exceeded"
+                }
+            })
+        );
+
+        let responses = app(AppState::new(
+            FakeBackend::new("test-model", "hello").with_context_tokens(1),
+        ))
+        .oneshot(
+            Request::post("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "test-model",
+                        "input": "hi",
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(responses.status(), StatusCode::BAD_REQUEST);
+        let responses_body: Value =
+            serde_json::from_slice(&responses.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(responses_body["error"]["code"], "context_length_exceeded");
+        assert_eq!(responses_body["error"]["param"], "input");
+
+        let anthropic = app(AppState::new(
+            FakeBackend::new("test-model", "hello").with_context_tokens(1),
+        ))
+        .oneshot(
+            Request::post("/anthropic/v1/messages")
+                .header("content-type", "application/json")
+                .header("anthropic-version", "2023-06-01")
+                .body(Body::from(
+                    json!({
+                        "model": "test-model",
+                        "max_tokens": 32,
+                        "stream": true,
+                        "messages": [{ "role": "user", "content": "hi" }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(anthropic.status(), StatusCode::BAD_REQUEST);
+        let anthropic_body: Value =
+            serde_json::from_slice(&anthropic.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(anthropic_body["type"], "error");
+        assert_eq!(anthropic_body["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            anthropic_body["error"]["message"],
+            "prompt is too long: 1 tokens leave no generation capacity in a 1-token context"
+        );
+        assert!(anthropic_body["request_id"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn explicit_progress_streams_report_context_overflow_in_stream() {
+        let chat = app(AppState::new(
+            FakeBackend::new("test-model", "hello").with_context_tokens(1),
+        ))
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("Magnitude-Include-Progress", "true")
+                .body(Body::from(
+                    json!({
+                        "model": "test-model",
+                        "stream": true,
+                        "messages": [{ "role": "user", "content": "hi" }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(chat.status(), StatusCode::OK);
+        let chat_body = String::from_utf8(
+            chat.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(chat_body.contains("event: error"));
+        assert!(chat_body.contains("context_length_exceeded"));
+        assert!(!chat_body.contains("data: [DONE]"));
+
+        let responses = app(AppState::new(
+            FakeBackend::new("test-model", "hello").with_context_tokens(1),
+        ))
+        .oneshot(
+            Request::post("/v1/responses")
+                .header("content-type", "application/json")
+                .header("Magnitude-Include-Progress", "true")
+                .body(Body::from(
+                    json!({
+                        "model": "test-model",
+                        "input": "hi",
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(responses.status(), StatusCode::OK);
+        let responses_body = String::from_utf8(
+            responses
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(responses_body.contains("response.failed"));
+        assert!(responses_body.contains("context_length_exceeded"));
+    }
+
+    #[tokio::test]
+    async fn requested_output_limit_does_not_change_prompt_admission() {
+        let (status, body) = post_chat(
+            FakeBackend::new("test-model", "hello").with_context_tokens(2),
+            json!({
+                "model": "test-model",
+                "stream": true,
+                "max_tokens": 32_768,
+                "messages": [{ "role": "user", "content": "hi" }]
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("data: [DONE]"));
+    }
+
+    #[tokio::test]
     async fn every_local_protocol_reconciles_unsupported_reasoning_effort() {
         let (chat_status, _) = post_chat(
             FakeBackend::new("test-model", "hello"),
@@ -4344,12 +4413,12 @@ mod tests {
         backend: Arc<dyn CompletionBackend>,
         leases: Arc<AtomicU64>,
         pending_acquisition_dropped: Option<Arc<AtomicBool>>,
-        stop_preparation: bool,
+        acquisition_fails: bool,
     }
 
-    struct PendingAcquisitionDrop(Arc<AtomicBool>);
+    struct DropFlag(Arc<AtomicBool>);
 
-    impl Drop for PendingAcquisitionDrop {
+    impl Drop for DropFlag {
         fn drop(&mut self) {
             self.0.store(true, Ordering::Release);
         }
@@ -4441,7 +4510,7 @@ mod tests {
             model_id: String,
             _progress: Option<ModelLoadingObserver>,
         ) -> BoxFuture<'_, Result<ModelInstanceLease, InventoryError>> {
-            if self.stop_preparation {
+            if self.acquisition_fails {
                 return Box::pin(async {
                     Err(InventoryError::ModelOperation {
                         code: "model_instance_stopped".to_owned(),
@@ -4452,7 +4521,7 @@ mod tests {
             }
             if let Some(dropped) = self.pending_acquisition_dropped.clone() {
                 return Box::pin(async move {
-                    let _drop = PendingAcquisitionDrop(dropped);
+                    let _drop = DropFlag(dropped);
                     std::future::pending().await
                 });
             }
@@ -4470,7 +4539,7 @@ mod tests {
             backend: Arc::new(FakeBackend::new("test-model", "ready")),
             leases: Arc::new(AtomicU64::new(0)),
             pending_acquisition_dropped: None,
-            stop_preparation: false,
+            acquisition_fails: false,
         });
         let response = app(AppState::model_free().with_model_controller(controller))
             .oneshot(
@@ -4520,7 +4589,7 @@ mod tests {
             backend: Arc::new(FakeBackend::new("test-model", "ready")),
             leases: Arc::clone(&leases),
             pending_acquisition_dropped: None,
-            stop_preparation: false,
+            acquisition_fails: false,
         });
         let response = app(AppState::model_free().with_model_controller(controller))
             .oneshot(
@@ -4546,12 +4615,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn progress_chat_reports_stopped_model_instance_as_a_terminal_sse_error() {
+    async fn progress_chat_reports_acquisition_failure_in_stream() {
         let controller = Arc::new(StubModelInstanceController {
             backend: Arc::new(FakeBackend::new("test-model", "unused")),
             leases: Arc::new(AtomicU64::new(0)),
             pending_acquisition_dropped: None,
-            stop_preparation: true,
+            acquisition_fails: true,
         });
         let response = app(AppState::model_free().with_model_controller(controller))
             .oneshot(
@@ -4575,12 +4644,9 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        let chunks = stream_json(&body);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0]["error"]["type"], "model_error");
-        assert_eq!(chunks[0]["error"]["code"], "model_instance_stopped");
-        assert!(chunks[0]["error"].get("retryable").is_none());
-        assert!(!body.contains("data: [DONE]"));
+        let error = stream_json(&body).pop().unwrap();
+        assert_eq!(error["error"]["type"], "model_error");
+        assert_eq!(error["error"]["code"], "model_instance_stopped");
     }
 
     #[tokio::test]
@@ -4590,7 +4656,7 @@ mod tests {
             backend: Arc::new(FakeBackend::new("test-model", "ready")),
             leases: Arc::clone(&leases),
             pending_acquisition_dropped: None,
-            stop_preparation: false,
+            acquisition_fails: false,
         });
         let response = app(AppState::model_free().with_model_controller(controller))
             .oneshot(
@@ -4613,30 +4679,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn progress_stream_disconnect_detaches_pending_inference_acquisition() {
+    async fn ordinary_stream_waits_for_acquisition_before_opening() {
         let dropped = Arc::new(AtomicBool::new(false));
         let controller = Arc::new(StubModelInstanceController {
             backend: Arc::new(FakeBackend::new("test-model", "ready")),
             leases: Arc::new(AtomicU64::new(0)),
             pending_acquisition_dropped: Some(Arc::clone(&dropped)),
-            stop_preparation: false,
+            acquisition_fails: false,
         });
-        let response = app(AppState::model_free().with_model_controller(controller))
-            .oneshot(
+        let mut response = Box::pin(
+            app(AppState::model_free().with_model_controller(controller)).oneshot(
                 Request::post("/v1/chat/completions")
                     .header("content-type", "application/json")
-                    .header("Magnitude-Include-Progress", "true")
                     .body(Body::from(minimal_request().to_string()))
                     .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        // Poll the response body once, as a real HTTP connection does before
-        // disconnecting, so the streaming body owns the receiver it will drop.
-        let mut body = response.into_body();
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(10), body.frame()).await;
-        drop(body);
+            ),
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut response)
+                .await
+                .is_err()
+        );
+        drop(response);
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while !dropped.load(Ordering::Acquire) {
@@ -4644,7 +4708,42 @@ mod tests {
             }
         })
         .await
-        .expect("dropping the SSE body must cancel only its pending waiter");
+        .expect("dropping the pending HTTP request must cancel model acquisition");
+    }
+
+    #[tokio::test]
+    async fn progress_stream_opens_before_pending_model_acquisition_finishes() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let controller = Arc::new(StubModelInstanceController {
+            backend: Arc::new(FakeBackend::new("test-model", "ready")),
+            leases: Arc::new(AtomicU64::new(0)),
+            pending_acquisition_dropped: Some(Arc::clone(&dropped)),
+            acquisition_fails: false,
+        });
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app(AppState::model_free().with_model_controller(controller)).oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("Magnitude-Include-Progress", "true")
+                    .body(Body::from(minimal_request().to_string()))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("progress response opens before model acquisition")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        tokio::task::yield_now().await;
+        drop(response);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the open stream cancels its pending acquisition");
     }
 
     struct ScriptedBackend {
@@ -4698,9 +4797,11 @@ mod tests {
 
         fn complete(
             &self,
-            _request: domain::ResolvedInferenceRequest,
+            request: domain::ResolvedInferenceRequest,
+            on_admitted: &mut dyn FnMut(u64) -> Result<(), InferenceError>,
             on_event: &mut dyn FnMut(domain::InferenceObservation) -> Result<(), InferenceError>,
         ) -> Result<domain::InferenceCompletion, InferenceError> {
+            on_admitted(request.context().entries().len() as u64)?;
             if !matches!(
                 self.events.first().map(domain::InferenceObservation::event),
                 Some(domain::InferenceObservationEvent::Output {
@@ -4743,7 +4844,6 @@ mod tests {
                     accepted_draft_tokens: 0,
                     draft_ms: 0.0,
                     verification_ms: 0.0,
-                    ..GenerationMetrics::default()
                 },
             ))
         }
@@ -5275,14 +5375,8 @@ mod tests {
 
         let mut request = minimal_request();
         request["reasoning_effort"] = json!("medium");
-        let error = validate_test_request(request_from_json(request)).unwrap_err();
-        assert!(
-            error
-                .body
-                .error
-                .message
-                .contains("supported values: none, high")
-        );
+        let (request, _) = validate_test_request(request_from_json(request)).unwrap();
+        assert_eq!(request.reasoning().effort().as_str(), "high");
 
         let mut request = minimal_request();
         request["tools"] = json!([{"type": "function", "function": {

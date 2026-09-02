@@ -285,6 +285,7 @@ impl From<LlamaMemoryBreakdown> for ResidentAllocation {
 enum ExecutorCommand {
     Complete {
         request: domain::ResolvedInferenceRequest,
+        admission: SyncSender<Result<u64, InferenceError>>,
         events: SyncSender<ExecutorItem>,
         cancelled: Arc<AtomicBool>,
         queued_at: Instant,
@@ -315,7 +316,7 @@ enum ExecutorItem {
 
 struct QueuedCompletion {
     request: domain::ResolvedInferenceRequest,
-    prepared: Option<PreparedInput>,
+    prepared: PreparedInput,
     events: SyncSender<ExecutorItem>,
     cancelled: Arc<AtomicBool>,
     queued_at: Instant,
@@ -761,12 +762,15 @@ impl LlamaCompletionBackend {
     fn complete_inference(
         &self,
         request: domain::ResolvedInferenceRequest,
+        on_admitted: &mut dyn FnMut(u64) -> Result<(), InferenceError>,
         on_event: &mut dyn FnMut(domain::InferenceObservation) -> Result<(), InferenceError>,
     ) -> Result<domain::InferenceCompletion, InferenceError> {
+        let (admission, admission_receiver) = sync_channel(1);
         let (events, event_receiver) = sync_channel(EVENT_QUEUE_CAPACITY);
         let cancelled = Arc::new(AtomicBool::new(false));
         match self.commands.try_send(ExecutorCommand::Complete {
             request,
+            admission,
             events,
             cancelled: Arc::clone(&cancelled),
             queued_at: Instant::now(),
@@ -775,6 +779,14 @@ impl LlamaCompletionBackend {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => return Err(InferenceError::Overloaded),
             Err(TrySendError::Disconnected(_)) => return Err(InferenceError::ExecutorStopped),
+        }
+
+        let prompt_tokens = admission_receiver
+            .recv()
+            .map_err(|_| InferenceError::ExecutorStopped)??;
+        if let Err(error) = on_admitted(prompt_tokens) {
+            cancelled.store(true, Ordering::Release);
+            return Err(error);
         }
 
         loop {
@@ -851,9 +863,10 @@ impl CompletionBackend for LlamaCompletionBackend {
     fn complete(
         &self,
         request: domain::ResolvedInferenceRequest,
+        on_admitted: &mut dyn FnMut(u64) -> Result<(), InferenceError>,
         on_event: &mut dyn FnMut(domain::InferenceObservation) -> Result<(), InferenceError>,
     ) -> Result<domain::InferenceCompletion, InferenceError> {
-        self.complete_inference(request, on_event)
+        self.complete_inference(request, on_admitted, on_event)
     }
 }
 
@@ -1547,6 +1560,7 @@ fn run_scheduler<'model>(
             model,
             chat_templates,
             multimodal.as_ref(),
+            config.context_size as usize,
             &mut queued,
             &mut exclusive_native,
             &mut model_instance_observations,
@@ -1593,6 +1607,7 @@ fn run_scheduler<'model>(
                         model,
                         chat_templates,
                         multimodal.as_ref(),
+                        config.context_size as usize,
                         &mut queued,
                         &mut exclusive_native,
                         &mut model_instance_observations,
@@ -1637,8 +1652,6 @@ fn run_scheduler<'model>(
         } else {
             admit_requests(
                 model,
-                chat_templates,
-                multimodal.as_ref(),
                 context,
                 draft_context.as_deref_mut(),
                 speculative.as_deref_mut(),
@@ -1715,6 +1728,7 @@ fn run_scheduler<'model>(
                     model,
                     chat_templates,
                     multimodal.as_ref(),
+                    config.context_size as usize,
                     &mut queued,
                     &mut exclusive_native,
                     &mut model_instance_observations,
@@ -1737,6 +1751,7 @@ fn drain_commands(
     model: &LlamaModel,
     chat_templates: &CommonChatTemplates,
     multimodal: Option<&MultimodalRuntime<'_>>,
+    context_capacity: usize,
     queued: &mut VecDeque<QueuedCompletion>,
     exclusive_native: &mut VecDeque<ExclusiveNativeTask>,
     model_instance_observations: &mut VecDeque<ModelInstanceObservationRequest>,
@@ -1751,6 +1766,7 @@ fn drain_commands(
                 model,
                 chat_templates,
                 multimodal,
+                context_capacity,
                 queued,
                 exclusive_native,
                 model_instance_observations,
@@ -1773,6 +1789,7 @@ fn handle_command(
     model: &LlamaModel,
     chat_templates: &CommonChatTemplates,
     multimodal: Option<&MultimodalRuntime<'_>>,
+    context_capacity: usize,
     queued: &mut VecDeque<QueuedCompletion>,
     exclusive_native: &mut VecDeque<ExclusiveNativeTask>,
     model_instance_observations: &mut VecDeque<ModelInstanceObservationRequest>,
@@ -1783,6 +1800,7 @@ fn handle_command(
     match command {
         ExecutorCommand::Complete {
             request,
+            admission,
             events,
             cancelled,
             queued_at,
@@ -1790,10 +1808,10 @@ fn handle_command(
         } => {
             let entered_span = span.clone();
             let _entered = entered_span.enter();
-            if *shutting_down {
-                let _ = events.try_send(ExecutorItem::Failed(InferenceError::ExecutorStopped));
+            let prepared = if *shutting_down {
+                Err(InferenceError::ExecutorStopped)
             } else if queued.len() + active_count >= max_tracked {
-                let _ = events.try_send(ExecutorItem::Failed(InferenceError::Overloaded));
+                Err(InferenceError::Overloaded)
             } else {
                 let _ = events.try_send(ExecutorItem::Event(domain::InferenceObservation::new(
                     domain::InferenceObservationEvent::Progress {
@@ -1801,14 +1819,39 @@ fn handle_command(
                     },
                     None,
                 )));
-                queued.push_back(QueuedCompletion {
-                    request,
-                    prepared: None,
-                    events,
-                    cancelled,
-                    queued_at,
-                    span,
-                });
+                let _ = events.try_send(ExecutorItem::Event(domain::InferenceObservation::new(
+                    domain::InferenceObservationEvent::Progress {
+                        progress: InferenceProgress::Preparing,
+                    },
+                    None,
+                )));
+                prepare_input(model, chat_templates, multimodal, &request).and_then(|prepared| {
+                    let prompt_tokens = u64::try_from(prepared.prompt.layout.logical_tokens())
+                        .expect("prompt token count fits u64");
+                    icn_contracts::validate_inference_capacity(
+                        prompt_tokens,
+                        u64::try_from(context_capacity).expect("context token capacity fits u64"),
+                    )?;
+                    Ok((prepared, prompt_tokens))
+                })
+            };
+            match prepared {
+                Ok((prepared, prompt_tokens)) => {
+                    if admission.send(Ok(prompt_tokens)).is_err() {
+                        return;
+                    }
+                    queued.push_back(QueuedCompletion {
+                        request,
+                        prepared,
+                        events,
+                        cancelled,
+                        queued_at,
+                        span,
+                    });
+                }
+                Err(error) => {
+                    let _ = admission.send(Err(error));
+                }
             }
         }
         ExecutorCommand::ApplyTemplate {
@@ -1860,8 +1903,6 @@ fn handle_command(
 #[allow(clippy::too_many_arguments)]
 fn admit_requests<'model>(
     model: &'model LlamaModel,
-    chat_templates: &CommonChatTemplates,
-    multimodal: Option<&MultimodalRuntime<'model>>,
     context: &mut LlamaContext<'model>,
     mut draft_context: Option<&mut LlamaContext<'model>>,
     mut speculative: Option<&mut SpeculativeOperations<'_>>,
@@ -1884,42 +1925,12 @@ fn admit_requests<'model>(
         if sequence_pool.is_empty() {
             break;
         }
-        if queued
-            .front()
-            .is_some_and(|queued| queued.prepared.is_none())
-        {
-            let pending = queued.front_mut().expect("queue front exists");
-            let _ =
-                pending
-                    .events
-                    .try_send(ExecutorItem::Event(domain::InferenceObservation::new(
-                        domain::InferenceObservationEvent::Progress {
-                            progress: InferenceProgress::Preparing,
-                        },
-                        None,
-                    )));
-            match prepare_input(model, chat_templates, multimodal, &pending.request) {
-                Ok(prepared) => pending.prepared = Some(prepared),
-                Err(error) => {
-                    let failed = queued.pop_front().expect("queue front exists");
-                    let _ = failed.events.try_send(ExecutorItem::Failed(error));
-                    continue;
-                }
-            }
-        }
         let queued_front = queued.front().expect("queue front exists");
         let acquired = if matches!(
             queued_front.request.prompt_reuse(),
             domain::PromptReusePolicy::Allowed
         ) {
-            sequence_pool.acquire_matching(
-                &queued_front
-                    .prepared
-                    .as_ref()
-                    .expect("request was prepared")
-                    .prompt
-                    .layout,
-            )
+            sequence_pool.acquire_matching(&queued_front.prepared.prompt.layout)
         } else {
             sequence_pool.acquire()
         };
@@ -2830,7 +2841,7 @@ fn fail_queued(queued: &mut VecDeque<QueuedCompletion>, reason: InferenceError) 
     while let Some(request) = queued.pop_front() {
         let _ = request
             .events
-            .try_send(ExecutorItem::Failed(clone_inference_error(&reason)));
+            .try_send(ExecutorItem::Failed(reason.clone()));
     }
 }
 
@@ -2843,7 +2854,7 @@ fn fail_active(
 ) {
     for request in active {
         if !matches!(request.phase, RequestPhase::Terminal) {
-            fail_request(request, clone_inference_error(&reason));
+            fail_request(request, reason.clone());
         }
         release_sequence(context, speculative.as_deref_mut(), sequence_pool, request);
     }
@@ -2856,23 +2867,11 @@ fn fail_active_after_context_reset(
 ) {
     for request in active {
         if !matches!(request.phase, RequestPhase::Terminal) {
-            fail_request(request, clone_inference_error(&reason));
+            fail_request(request, reason.clone());
         }
         if let Some(sequence) = request.sequence.take() {
             sequence_pool.release(sequence.into_available(None));
         }
-    }
-}
-
-fn clone_inference_error(error: &InferenceError) -> InferenceError {
-    match error {
-        InferenceError::InvalidConfig(message) => InferenceError::InvalidConfig(message.clone()),
-        InferenceError::Backend(message) => InferenceError::Backend(message.clone()),
-        InferenceError::Cancelled => InferenceError::Cancelled,
-        InferenceError::ModelInstanceStopped => InferenceError::ModelInstanceStopped,
-        InferenceError::Overloaded => InferenceError::Overloaded,
-        InferenceError::ExecutorStopped => InferenceError::ExecutorStopped,
-        InferenceError::Callback(message) => InferenceError::Callback(message.clone()),
     }
 }
 
@@ -3288,18 +3287,6 @@ fn multimodal_modalities(_runtime: &MultimodalRuntime<'_>) -> ModelModalities {
     ModelModalities::default()
 }
 
-fn validate_prompt_capacity(
-    prompt_tokens: usize,
-    context_capacity: usize,
-) -> Result<(), InferenceError> {
-    if prompt_tokens >= context_capacity {
-        return Err(InferenceError::InvalidConfig(format!(
-            "prompt ({prompt_tokens} tokens) leaves no generation capacity in the effective per-sequence context ({context_capacity})"
-        )));
-    }
-    Ok(())
-}
-
 impl<'model> ActiveRequest<'model> {
     fn sequence_id(&self) -> Option<i32> {
         self.sequence.as_ref().map(ActiveSequence::id)
@@ -3328,9 +3315,7 @@ impl<'model> ActiveRequest<'model> {
             let PreparedInput {
                 chat: prepared,
                 prompt: tokenized,
-            } = prepared.ok_or_else(|| {
-                InferenceError::Backend("request reached admission without preparation".into())
-            })?;
+            } = prepared;
             let admitted_at = Instant::now();
             let tools_enabled = !request.tools().definitions().is_empty()
                 && !matches!(request.tools().choice(), domain::ToolChoice::Disabled);
@@ -3346,7 +3331,6 @@ impl<'model> ActiveRequest<'model> {
                 ));
             }
             let prompt_tokens = tokenized.layout.logical_tokens();
-            validate_prompt_capacity(prompt_tokens, context_capacity)?;
 
             let mut sampler = make_sampler(model, &request, &prepared)?;
             sampler

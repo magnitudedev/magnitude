@@ -24,9 +24,10 @@ use utoipa::openapi::schema::AnyOfBuilder;
 use utoipa::{PartialSchema, ToSchema};
 
 use super::super::{
-    AdmittedInvocation, ApiError, ApiErrorBody, AppState, ErrorResponse, ModelLoadingObserver,
-    admit_invocation, domain_error, execute_with_journal, inference_error_body, media,
-    non_empty_text, non_empty_vec, unix_timestamp, with_openai_request_id,
+    ApiError, ApiErrorBody, AppState, ErrorResponse, InferenceAdmission, ModelLoadingObserver,
+    ResidentInvocation, acquire_invocation, await_inference_admission, domain_error,
+    execute_with_journal, inference_error_body, media, non_empty_text, non_empty_vec,
+    unix_timestamp, with_openai_request_id,
 };
 
 const DEFAULT_TEMPERATURE: f32 = 0.8;
@@ -1597,30 +1598,32 @@ pub(crate) async fn chat_completions(
         let span = tracing::Span::current();
         let request_id = id.clone();
         tokio::spawn(async move {
-            let acquisition = tokio::select! {
-                result = admit_invocation(&controller, request.invocation, Some(progress)) => result,
+            let resident = tokio::select! {
+                result = acquire_invocation(&controller, request.invocation, Some(progress)) => result,
                 _ = sender.closed() => return,
             };
-            let result = match acquisition {
-                Ok(admitted) => start_chat_completion(
-                    admitted,
-                    id.clone(),
+            match resident {
+                Ok(resident) => start_chat_completion(
+                    resident,
+                    InferenceAdmission::detached(),
+                    id,
                     created,
-                    sender.clone(),
+                    sender,
                     span,
-                    true,
-                    request.timings_per_token,
-                    request.include_usage,
+                    ChatStreamOptions {
+                        include_progress: true,
+                        timings_per_token: request.timings_per_token,
+                        include_usage: request.include_usage,
+                    },
                 ),
-                Err(error) => Err(error),
-            };
-            if let Err(error) = result {
-                if let Ok(data) = serde_json::to_string(&ErrorResponse {
-                    error: error.body.error,
-                }) {
-                    let _ = sender
-                        .send(Ok(Event::default().event("error").data(data)))
-                        .await;
+                Err(error) => {
+                    if let Ok(data) = serde_json::to_string(&ErrorResponse {
+                        error: error.body.error,
+                    }) {
+                        let _ = sender
+                            .send(Ok(Event::default().event("error").data(data)))
+                            .await;
+                    }
                 }
             }
         });
@@ -1632,37 +1635,40 @@ pub(crate) async fn chat_completions(
     let stream = request.stream;
     let timings_per_token = request.timings_per_token;
     let include_usage = request.include_usage;
-    let admitted = admit_invocation(controller, request.invocation, None).await?;
-    chat_completion_with_admitted(state, stream, timings_per_token, include_usage, admitted).await
+    let resident = acquire_invocation(controller, request.invocation, None)
+        .await
+        .map_err(|error| error.with_param("messages"))?;
+    chat_completion_with_resident(state, stream, timings_per_token, include_usage, resident).await
 }
 
-async fn chat_completion_with_admitted(
+async fn chat_completion_with_resident(
     state: AppState,
     stream: bool,
     timings_per_token: bool,
     include_usage: bool,
-    admitted: AdmittedInvocation,
+    resident: ResidentInvocation,
 ) -> Result<Response, ApiError> {
-    let lease = admitted.lease;
-    let resolved_request = admitted.request;
     let id = format!(
         "chatcmpl-icn-{}",
         state.next_id.fetch_add(1, Ordering::Relaxed)
     );
     let created = unix_timestamp();
-    let model = admitted.model;
     if !stream {
+        let ResidentInvocation {
+            lease,
+            model: response_model,
+            request,
+        } = resident;
         let response_id = id.clone();
-        let response_model = model.clone();
         let span = tracing::Span::current();
         let result = tokio::task::spawn_blocking(move || {
             span.in_scope(|| {
-                execute_with_journal(lease.backend().as_ref(), resolved_request, |_| Ok(()))
+                execute_with_journal(lease.backend().as_ref(), request, |_| Ok(()), |_| Ok(()))
             })
         })
         .await
         .map_err(|error| ApiError::server(format!("inference task failed: {error}")))?
-        .map_err(ApiError::from_inference)?;
+        .map_err(|error| ApiError::from_inference(error).with_param("messages"))?;
         let response = Json(chat_completion_response(
             response_id,
             created,
@@ -1673,40 +1679,50 @@ async fn chat_completion_with_admitted(
         return Ok(with_openai_request_id(response, &id));
     }
     let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(16);
+    let (admission, admitted) = InferenceAdmission::channel();
     let request_id = id.clone();
     start_chat_completion(
-        AdmittedInvocation {
-            lease,
-            model,
-            request: resolved_request,
-        },
+        resident,
+        admission,
         id,
         created,
         sender,
         tracing::Span::current(),
-        false,
-        timings_per_token,
-        include_usage,
-    )?;
+        ChatStreamOptions {
+            include_progress: false,
+            timings_per_token,
+            include_usage,
+        },
+    );
+    await_inference_admission(admitted)
+        .await
+        .map_err(|error| error.with_param("messages"))?;
     let response = Sse::new(ReceiverStream::new(receiver))
         .keep_alive(KeepAlive::default())
         .into_response();
     Ok(with_openai_request_id(response, &request_id))
 }
 
+struct ChatStreamOptions {
+    include_progress: bool,
+    timings_per_token: bool,
+    include_usage: bool,
+}
+
 fn start_chat_completion(
-    admitted: AdmittedInvocation,
+    resident: ResidentInvocation,
+    mut admission: InferenceAdmission,
     id: String,
     created: u64,
     sender: mpsc::Sender<Result<Event, Infallible>>,
     current_span: tracing::Span,
-    include_progress: bool,
-    timings_per_token: bool,
-    include_usage: bool,
-) -> Result<(), ApiError> {
-    let lease = admitted.lease;
-    let model = admitted.model;
-    let request = admitted.request;
+    options: ChatStreamOptions,
+) {
+    let ResidentInvocation {
+        lease,
+        model,
+        request,
+    } = resident;
     current_span.record("completion.id", id.as_str());
     current_span.record("model.id", model.as_str());
 
@@ -1715,7 +1731,7 @@ fn start_chat_completion(
         span.in_scope(|| {
             let mut callback = |observation: &domain::InferenceObservation| {
                 let (event, timings) = observation.clone().into_parts();
-                let keep_timings = timings_per_token
+                let keep_timings = options.timings_per_token
                     || matches!(
                         &event,
                         domain::InferenceObservationEvent::Output {
@@ -1727,7 +1743,9 @@ fn start_chat_completion(
                     .flatten()
                     .map(|snapshot| snapshot_timings(&snapshot));
                 let chunk = match event {
-                    domain::InferenceObservationEvent::Progress { .. } if !include_progress => {
+                    domain::InferenceObservationEvent::Progress { .. }
+                        if !options.include_progress =>
+                    {
                         return Ok(());
                     }
                     domain::InferenceObservationEvent::Progress { progress } => {
@@ -1749,15 +1767,21 @@ fn start_chat_completion(
                     ))
                 }
             };
-            let generation =
-                match execute_with_journal(lease.backend().as_ref(), request, &mut callback) {
-                    Ok(generation) => generation,
-                    Err(error) => {
-                        tracing::error!(error = %error, "chat completion failed");
-                        emit_stream_error(&sender, inference_error_body(&error));
-                        return;
-                    }
-                };
+            let generation = execute_with_journal(
+                lease.backend().as_ref(),
+                request,
+                |prompt_tokens| admission.admitted(prompt_tokens),
+                &mut callback,
+            );
+            admission.finish(&generation);
+            let generation = match generation {
+                Ok(generation) => generation,
+                Err(error) => {
+                    tracing::error!(error = %error, "chat completion failed");
+                    emit_stream_error(&sender, inference_error_body(&error));
+                    return;
+                }
+            };
             let reason = chat_finish_reason(generation.termination());
             let usage = generation.usage();
             let metrics = generation.metrics();
@@ -1772,7 +1796,8 @@ fn start_chat_completion(
                 decode.ms = metrics.decode_ms,
                 "chat completion finished"
             );
-            let terminal_timings = (!include_usage).then(|| generation_timings(&generation));
+            let terminal_timings =
+                (!options.include_usage).then(|| generation_timings(&generation));
             if !emit_chunk(
                 &sender,
                 &choice_chunk(
@@ -1786,7 +1811,7 @@ fn start_chat_completion(
             ) {
                 return;
             }
-            if include_usage
+            if options.include_usage
                 && !emit_chunk(&sender, &usage_chunk(&id, created, &model, &generation))
             {
                 return;
@@ -1794,5 +1819,4 @@ fn start_chat_completion(
             emit_done(&sender);
         });
     });
-    Ok(())
 }
