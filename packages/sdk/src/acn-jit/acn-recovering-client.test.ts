@@ -14,10 +14,12 @@ import {
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientError from "@effect/platform/HttpClientError"
 import * as HttpClientResponse from "@effect/platform/HttpClientResponse"
+import { AcnOwnerRecordSchema } from "@magnitudedev/acn-protocol/coordination"
 import {
   Deferred,
   Duration,
   Effect,
+  Either,
   Exit,
   Fiber,
   Layer,
@@ -27,7 +29,12 @@ import {
   TestClock,
   TestContext,
 } from "effect"
-import { AcnEnsuranceFailed } from "./errors"
+import {
+  AcnEnsuranceFailed,
+  AcnHealthRequestFailed,
+  AcnHealthResponseInvalid,
+  AcnHealthUnavailable,
+} from "./errors"
 import { AcnInstanceManager } from "./acn-instance-manager"
 import { makeAcnConnection } from "./acn-recovering-client"
 import { SDK_VERSION } from "../version"
@@ -107,6 +114,45 @@ const rpcClient = (
 }))
 
 describe("AcnConnection", () => {
+  it("presents health selection failure details without internal error tags", async () => {
+    const owner = Schema.decodeUnknownSync(AcnOwnerRecordSchema)({
+      pid: 42,
+      processStartIdentity: "start-1",
+      port: 14_000,
+    })
+    const failure = new AcnHealthUnavailable({
+      owner,
+      attempts: [
+        new AcnHealthRequestFailed({ message: "connection refused" }),
+        new AcnHealthResponseInvalid({ message: "expected magnitude-acn health" }),
+      ],
+    })
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const http = rpcClient([])
+      const connection = yield* makeAcnConnection().pipe(
+        Effect.provideService(AcnInstanceManager, AcnInstanceManager.of({
+          ensure: () => Stream.fail(failure),
+          stop: Effect.void,
+        })),
+        Effect.provideService(HttpClient.HttpClient, http),
+      )
+      const client = yield* AcnRpc.makeRpcClient(AcnBoundary).pipe(
+        Effect.provide(connection.protocolLayer.pipe(
+          Layer.provide(Layer.succeed(HttpClient.HttpClient, http)),
+        )),
+      )
+      return yield* Effect.either(client.Health({}))
+    })))
+
+    expect(Either.isLeft(result)).toBe(true)
+    if (Either.isRight(result)) return
+    expect(result.left.message).toContain("Magnitude service unavailable:\n")
+    expect(result.left.message).toContain("Health check 1: request failed: connection refused")
+    expect(result.left.message).toContain("Health check 2: response was invalid: expected magnitude-acn health")
+    expect(result.left.message).not.toContain("AcnHealthUnavailable")
+    expect(result.left.message).not.toContain("AcnEnsuranceFailed")
+  })
+
   it("publishes no visible startup observation before an already-ready selection", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const connection = yield* makeAcnConnection().pipe(

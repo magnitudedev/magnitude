@@ -18,6 +18,36 @@ export class AcnEnsuranceFailed extends Schema.TaggedError<AcnEnsuranceFailed>()
   { reason: Schema.String.pipe(Schema.minLength(1)) },
 ) {}
 
+export class AcnHealthRequestFailed extends Schema.TaggedClass<AcnHealthRequestFailed>()(
+  "AcnHealthRequestFailed",
+  { message: Schema.String.pipe(Schema.minLength(1)) },
+) {}
+
+export class AcnHealthAttemptTimedOut extends Schema.TaggedClass<AcnHealthAttemptTimedOut>()(
+  "AcnHealthAttemptTimedOut",
+  {},
+) {}
+
+export class AcnHealthResponseInvalid extends Schema.TaggedClass<AcnHealthResponseInvalid>()(
+  "AcnHealthResponseInvalid",
+  { message: Schema.String.pipe(Schema.minLength(1)) },
+) {}
+
+export const AcnHealthAttemptFailureSchema = Schema.Union(
+  AcnHealthRequestFailed,
+  AcnHealthAttemptTimedOut,
+  AcnHealthResponseInvalid,
+)
+export type AcnHealthAttemptFailure = typeof AcnHealthAttemptFailureSchema.Type
+
+export class AcnHealthUnavailable extends Schema.TaggedError<AcnHealthUnavailable>()(
+  "AcnHealthUnavailable",
+  {
+    owner: AcnOwnerRecordSchema,
+    attempts: Schema.Tuple(AcnHealthAttemptFailureSchema, AcnHealthAttemptFailureSchema),
+  },
+) {}
+
 export class AcnOwnerRecordReadUnavailable extends Schema.TaggedError<AcnOwnerRecordReadUnavailable>()(
   "AcnOwnerRecordReadUnavailable",
   { path: Schema.String, message: Schema.String },
@@ -198,6 +228,7 @@ export class ChecksumMismatch extends Schema.TaggedError<ChecksumMismatch>()(
 
 export const AcnEnsuranceError = Schema.Union(
   AcnEnsuranceFailed,
+  AcnHealthUnavailable,
   AcnOwnerRecordReadUnavailable,
   AcnOwnerRecordInvalid,
   ExactProcessIdentityObservationFailed,

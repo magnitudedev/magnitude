@@ -35,6 +35,7 @@ import { acnSubscriptionProtocol } from "./acn-subscription-protocol"
 import { type AcnEnsuranceError, AcnEnsuranceFailed } from "./errors"
 import {
   AcnLifecycleStateSchema,
+  formatAcnEnsuranceError,
   makeAcnLifecycle,
   type AcnLifecycle,
   type AcnLifecycleOwner,
@@ -118,7 +119,7 @@ const unavailableError = (cause: SelectionError): RpcClientError.RpcClientError 
     reason: "Unknown",
     message: cause._tag === "AcnConnectionClosed"
       ? "Magnitude service client is closed"
-      : `Magnitude service unavailable: ${cause._tag}${"reason" in cause ? `: ${String(cause.reason)}` : ""}`,
+      : `Magnitude service unavailable:\n${formatAcnEnsuranceError(cause)}`,
     cause,
   })
 

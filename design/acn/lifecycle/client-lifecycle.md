@@ -163,6 +163,9 @@ client presentation, and atomically publishes only terminal `AcnInstance<AcnRead
 typed manager terminal failure is projected to `Failed`; explicit retry starts one new ensure
 occurrence with a fresh absolute deadline.
 
+Terminal presentation formats the semantic manager failure and its typed diagnostics. Transport
+wrappers and first-party clients do not expose internal SDK error tags.
+
 Runtime construction explicitly starts initial selection. Selected-instance publication and the
 open/closed check occur in one admission critical section.
 

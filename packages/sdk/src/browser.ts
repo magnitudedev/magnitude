@@ -27,6 +27,12 @@ export {
   type MagnitudeImplementationError,
 } from "./inference"
 export {
+  AcnHealthRequestFailed,
+  AcnHealthAttemptTimedOut,
+  AcnHealthResponseInvalid,
+  AcnHealthAttemptFailureSchema,
+  type AcnHealthAttemptFailure,
+  AcnHealthUnavailable,
   AcnEnsuranceFailed,
   AcnAdministrationFailed,
   BinaryNotFound,

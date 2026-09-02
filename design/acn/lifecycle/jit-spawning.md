@@ -157,7 +157,8 @@ Mutation and final ready adoption reread the complete owner required by their ac
 revision has authority only while exact process inspection proves that same owner occurrence live.
 
 Policy uses Effect `Duration`, monotonic `Clock`, bounded `Schedule`, and `TestClock`. Initial bounds
-are one second polling, two seconds per health request, thirty seconds without an observable health
+are one second polling, two seconds per health request, exactly one independent confirmation after
+an inconclusive health request, thirty seconds without an observable health
 response, thirty seconds for candidate admission, five minutes absolute application startup while
 health remains `Starting` (including phases with unchanged optional diagnostics, such as Resolving,
 PreparingBackend and Starting), five seconds for stopping, two seconds after TERM, two

@@ -1,4 +1,5 @@
 import * as HttpClient from "@effect/platform/HttpClient"
+import * as HttpClientError from "@effect/platform/HttpClientError"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import {
   AcnHealthResponseSchema,
@@ -17,8 +18,13 @@ import {
   type ProcessGroup,
   type ProcessGroupController,
 } from "@magnitudedev/acn-protocol/coordination"
-import { Context, Duration, Effect, Option, Schedule, Schema } from "effect"
+import { Context, Duration, Effect, Either, Option, Schedule, Schema } from "effect"
 import {
+  AcnHealthAttemptFailureSchema,
+  type AcnHealthAttemptFailure,
+  AcnHealthAttemptTimedOut,
+  AcnHealthRequestFailed,
+  AcnHealthResponseInvalid,
   AcnOwnerRecordInvalid,
   AcnOwnerRecordReadUnavailable,
   AcnProcessIdentityObservationTimedOut,
@@ -46,7 +52,10 @@ export class AcnRecordedOwnerProcessGroupSurvives extends Schema.TaggedClass<Acn
 
 export class AcnRecordedOwnerLiveWithoutHealth extends Schema.TaggedClass<AcnRecordedOwnerLiveWithoutHealth>()(
   "AcnRecordedOwnerLiveWithoutHealth",
-  { owner: AcnOwnerRecordSchema },
+  {
+    owner: AcnOwnerRecordSchema,
+    attempts: Schema.Tuple(AcnHealthAttemptFailureSchema, AcnHealthAttemptFailureSchema),
+  },
 ) {}
 
 export class AcnRecordedOwnerLiveWithHealth extends Schema.TaggedClass<AcnRecordedOwnerLiveWithHealth>()(
@@ -128,22 +137,53 @@ export const makeAcnOwnerObserver = (
       : new AcnOwnerRecordReadUnavailable({ path: error.path, message: error.message })),
   )
 
-  const probeHealth = (owner: AcnOwnerRecord): Effect.Effect<Option.Option<AcnHealthObservation>> =>
+  const diagnosticMessage = (
+    error: { readonly message: string; readonly cause?: unknown },
+  ): string => {
+    const causeMessage = error.cause instanceof Error ? error.cause.message.trim() : ""
+    return causeMessage.length > 0 && !error.message.includes(causeMessage)
+      ? `${error.message}: ${causeMessage}`
+      : error.message
+  }
+
+  const mapHttpFailure = (
+    error: HttpClientError.HttpClientError,
+  ): AcnHealthAttemptFailure => error._tag === "RequestError"
+    ? new AcnHealthRequestFailed({ message: diagnosticMessage(error) })
+    : new AcnHealthResponseInvalid({ message: diagnosticMessage(error) })
+
+  const healthAttempt = (
+    owner: AcnOwnerRecord,
+  ): Effect.Effect<AcnHealthObservation, AcnHealthAttemptFailure> =>
     http.execute(HttpClientRequest.get(`http://127.0.0.1:${owner.port}/health`)).pipe(
-      Effect.timeoutOption(HEALTH_TIMEOUT),
-      Effect.option,
-      Effect.flatMap(Option.match({
-        onNone: () => Effect.succeed(Option.none()),
-        onSome: Option.match({
-          onNone: () => Effect.succeed(Option.none()),
-          onSome: (response) => response.json.pipe(
-            Effect.flatMap(Schema.decodeUnknown(AcnHealthResponseSchema)),
-            Effect.map((health) => Option.some({ status: response.status, health })),
-            Effect.catchAll(() => Effect.succeed(Option.none())),
-          ),
-        }),
-      })),
+      Effect.mapError(mapHttpFailure),
+      Effect.flatMap((response) => response.json.pipe(
+        Effect.mapError(mapHttpFailure),
+        Effect.flatMap((body) => Schema.decodeUnknown(AcnHealthResponseSchema)(body).pipe(
+          Effect.mapError((error) => new AcnHealthResponseInvalid({ message: diagnosticMessage(error) })),
+        )),
+        Effect.map((health) => ({ status: response.status, health })),
+      )),
+      Effect.timeoutFail({
+        duration: HEALTH_TIMEOUT,
+        onTimeout: () => new AcnHealthAttemptTimedOut({}),
+      }),
     )
+
+  const probeHealth = (
+    owner: AcnOwnerRecord,
+  ): Effect.Effect<Either.Either<
+    AcnHealthObservation,
+    readonly [AcnHealthAttemptFailure, AcnHealthAttemptFailure]
+  >> =>
+    Effect.gen(function* () {
+      const first = yield* Effect.either(healthAttempt(owner))
+      if (Either.isRight(first)) return Either.right(first.right)
+      const second = yield* Effect.either(healthAttempt(owner))
+      return Either.isRight(second)
+        ? Either.right(second.right)
+        : Either.left([first.left, second.left] as const)
+    })
 
   const observe = Effect.gen(function* () {
     const current = yield* readCurrentOwner
@@ -161,9 +201,9 @@ export const makeAcnOwnerObserver = (
       case "ProcessGroupLeaderLive":
         break
     }
-    return Option.match(yield* probeHealth(owner), {
-      onNone: () => new AcnRecordedOwnerLiveWithoutHealth({ owner }),
-      onSome: (health) => new AcnRecordedOwnerLiveWithHealth({ owner, health }),
+    return Either.match(yield* probeHealth(owner), {
+      onLeft: (attempts) => new AcnRecordedOwnerLiveWithoutHealth({ owner, attempts }),
+      onRight: (health) => new AcnRecordedOwnerLiveWithHealth({ owner, health }),
     })
   })
 

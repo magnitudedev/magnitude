@@ -19,6 +19,7 @@ import { makeAcnOwnerObserver, type AcnOwnerObserver } from "./acn-owner-observe
 import {
   AcnAdministrationFailed,
   AcnEnsuranceFailed,
+  AcnHealthUnavailable,
   type AcnEnsuranceError,
 } from "./errors"
 import { acnLifecycleObservationFromHealthState } from "./lifecycle"
@@ -53,7 +54,10 @@ const observeRunning = (
           yield* Effect.sleep(Duration.millis(250))
           continue
         }
-        return yield* unavailable("The running Magnitude service is not responding.")
+        return yield* new AcnHealthUnavailable({
+          owner: observation.owner,
+          attempts: observation.attempts,
+        })
       case "AcnRecordedOwnerLiveWithHealth": {
         const { health } = observation.health
         if (health.revision < target.revision) {
