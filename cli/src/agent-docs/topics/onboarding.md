@@ -113,7 +113,7 @@ Supported harnesses and canonical IDs are:
 | --- | --- | --- |
 | Magnitude | `magnitude` | The loaded model is selected automatically. |
 | Pi | `pi` | Switch this session with `/model` or Ctrl+L, then choose provider `magnitude` and the selected model. |
-| OpenCode | `opencode` | Switch this session with `/models`, then choose `magnitude/<model-id>`. |
+| OpenCode | `opencode` | Exit the running process with Ctrl+C, then run the printed launch command. |
 | Hermes | `hermes` | Exit the running process with Ctrl+C, then run the printed launch command. |
 | OpenClaw | `openclaw` | Exit the running process with Ctrl+C, then run the printed launch command; its dedicated Magnitude-agent session avoids stale model overrides. |
 | Codex | `codex` | Exit the Codex process with Ctrl+C, then run the printed launch command. |
@@ -140,8 +140,6 @@ Give one clear primary action for the current harness:
 
 - **Pi:** switch in place with `/model` or Ctrl+L. The printed `pi` command in another terminal is a
   secondary option.
-- **OpenCode:** switch in place with `/models`. The printed `opencode` command in another terminal
-  is a secondary option.
 - **Every other external harness:** restart the harness process by exiting with Ctrl+C and reopening
   it with the printed launch command.
 
