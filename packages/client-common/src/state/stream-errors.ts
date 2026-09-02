@@ -5,12 +5,11 @@
  * `StreamCallbacks.onError`. The CLI's `FatalErrorScreen` and the web's
  * `DaemonConnectionError` both read `invariantViolation` from the info.
  */
-import { Cause, Chunk } from "effect"
+import { Cause, Chunk, Schema } from "effect"
 import {
-  BinaryNotFound,
-  BinaryVersionMismatch,
-  AcnEnsuranceFailed,
-  DownloadFailed,
+  AcnEnsuranceError,
+  formatAcnEnsuranceError,
+  type AcnEnsuranceError as AcnEnsuranceErrorType,
   type StreamDisplayViewFailure,
 } from "@magnitudedev/sdk"
 
@@ -23,32 +22,14 @@ export interface StreamErrorInfo {
   readonly isAcnAvailabilityError: boolean
 }
 
-type AcnAvailabilityError =
-  | BinaryNotFound
-  | BinaryVersionMismatch
-  | AcnEnsuranceFailed
-  | DownloadFailed
+type AcnAvailabilityError = AcnEnsuranceErrorType
 
 export function isAcnAvailabilityError(error: unknown): error is AcnAvailabilityError {
-  return (
-    error instanceof BinaryNotFound ||
-    error instanceof BinaryVersionMismatch ||
-    error instanceof AcnEnsuranceFailed ||
-    error instanceof DownloadFailed
-  )
+  return Schema.is(AcnEnsuranceError)(error)
 }
 
 export function acnAvailabilityErrorMessage(error: AcnAvailabilityError): string {
-  if (error instanceof BinaryNotFound) {
-    return "Magnitude service is missing. Run `magnitude service start`."
-  }
-  if (error instanceof BinaryVersionMismatch) {
-    return `Magnitude service version does not match this client. Expected ${error.expected}, got ${error.actual}.`
-  }
-  if (error instanceof DownloadFailed) {
-    return `Failed to download the Magnitude service: ${error.reason}`
-  }
-  return `Magnitude service failed to start: ${error.reason}`
+  return `Magnitude service unavailable:\n${formatAcnEnsuranceError(error)}`
 }
 
 function caughtErrorDetails(error: unknown): string {

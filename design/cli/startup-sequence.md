@@ -37,6 +37,10 @@ Every service-backed command explicitly constructs the mechanism appropriate to 
 | `magnitude service start` | Explicit platform-service installation/start followed by an observing `AcnConnection` | Install/register/start and await exact readiness inline |
 | Catalog, model, and connection operations | Existing-service observer followed by an `AcnConnection` | Fail with `Magnitude service is not running. Run \`magnitude service start\`.` |
 
+When an exact live service cannot produce valid health in either bounded attempt, commands report
+the observed private endpoint and process ID plus both ordered attempt diagnostics. They do not
+expose SDK error class names.
+
 The terminal adapter contains only terminal and OS operations. It never selects a service-acquisition
 mechanism and contains no RPC transport, startup lifecycle, recovery lifecycle, or connection close.
 Noninteractive commands do not construct it.

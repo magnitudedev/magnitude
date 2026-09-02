@@ -9,7 +9,7 @@ import {
 } from "@magnitudedev/acn-protocol";
 import { FSM } from "@magnitudedev/utils";
 import { Clock, Duration, Effect, Option, Schema, Stream, SubscriptionRef } from "effect";
-import type { AcnEnsuranceError } from "./errors";
+import type { AcnEnsuranceError, AcnHealthAttemptFailure } from "./errors";
 
 export const AcnStartingPhaseSchema = Schema.Union(
   Schema.Literal(
@@ -300,11 +300,29 @@ const shutdownControlFailureMessage = (
   }
 };
 
+const formatHealthAttemptFailure = (failure: AcnHealthAttemptFailure): string => {
+  switch (failure._tag) {
+    case "AcnHealthRequestFailed":
+      return `request failed: ${failure.message}`;
+    case "AcnHealthAttemptTimedOut":
+      return "timed out after 2 seconds";
+    case "AcnHealthResponseInvalid":
+      return `response was invalid: ${failure.message}`;
+  }
+};
+
 /** Formats an ensurance failure without imposing a client-specific heading. */
 export const formatAcnEnsuranceError = (error: AcnEnsuranceError): string => {
   switch (error._tag) {
     case "AcnEnsuranceFailed":
       return error.reason;
+    case "AcnHealthUnavailable":
+      return [
+        `A live Magnitude service process was observed at http://127.0.0.1:${error.owner.port}/health (PID ${error.owner.pid}), but neither health check produced a valid response.`,
+        `Health check 1: ${formatHealthAttemptFailure(error.attempts[0])}`,
+        `Health check 2: ${formatHealthAttemptFailure(error.attempts[1])}`,
+        "Run `magnitude service start`.",
+      ].join("\n");
     case "AcnOwnerRecordReadUnavailable":
       return `Could not read the Magnitude service owner record at ${error.path}: ${error.message}`;
     case "AcnOwnerRecordInvalid":

@@ -109,6 +109,12 @@ Health contains at least the exact owner PID and the process's revision. HTTP `2
 new clients; HTTP `503` means live but not ready. Additional fields are optional diagnostics and
 cannot establish liveness or extend a deadline.
 
+A valid health response is authoritative for that observation. A request error, bounded timeout,
+undecodable response, or schema-invalid response is an inconclusive observation, not health state.
+After one inconclusive observation, a client makes exactly one independent request to the same
+exact owner endpoint. Either valid response is interpreted normally. Two inconclusive observations
+produce typed observational failure carrying both causes; they never authorize endpoint adoption.
+
 Shutdown atomically closes work admission, enters the monotonic stopping lifecycle, and returns
 without waiting for drain, finalizers, child shutdown, or process exit.
 
@@ -163,4 +169,5 @@ revision wins, older managers adopt it. Process death removes revision authority
 - Store, observation, and signal failures remain distinct typed causes carried inside one typed
   shutdown failure; no string or numeric pseudo-tag is interpreted as error identity.
 - Observation uncertainty authorizes neither endpoint adoption nor overlapping service groups.
+- One inconclusive health request cannot by itself establish endpoint unavailability.
 - SQLite contention and every convergence state are bounded.

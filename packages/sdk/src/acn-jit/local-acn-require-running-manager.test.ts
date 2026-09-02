@@ -13,10 +13,16 @@ import {
   AcnRecordedOwnerLiveWithHealth,
   type AcnOwnerObserver,
 } from "./acn-owner-observer"
+import { AcnHealthAttemptTimedOut } from "./errors"
 import {
   makeRequireRunningAcnInstanceManagerFromObserver,
   makeStartingAcnInstanceManagerFromObserver,
 } from "./local-acn-require-running-manager"
+
+const unavailableHealth = [
+  new AcnHealthAttemptTimedOut({}),
+  new AcnHealthAttemptTimedOut({}),
+] as const
 
 describe("require-running ACN manager", () => {
   it("fails absent service with the actionable command and performs no bootstrap", async () => {
@@ -88,7 +94,10 @@ describe("require-running ACN manager", () => {
       port: 14000,
     })
     const observer: AcnOwnerObserver = {
-      observe: Effect.succeed(new AcnRecordedOwnerLiveWithoutHealth({ owner })),
+      observe: Effect.succeed(new AcnRecordedOwnerLiveWithoutHealth({
+        owner,
+        attempts: unavailableHealth,
+      })),
       confirmReady: () => Effect.succeed(Option.none()),
     }
     const manager = makeRequireRunningAcnInstanceManagerFromObserver(observer)
@@ -100,7 +109,9 @@ describe("require-running ACN manager", () => {
       cause: {
         _tag: "Fail",
         error: {
-          reason: "The running Magnitude service is not responding. Run `magnitude service start`.",
+          _tag: "AcnHealthUnavailable",
+          owner,
+          attempts: unavailableHealth,
         },
       },
     })
@@ -133,7 +144,7 @@ describe("require-running ACN manager", () => {
     const observer: AcnOwnerObserver = {
       observe: Ref.getAndUpdate(observations, (value) => value + 1).pipe(
         Effect.map((value) => value === 0
-          ? new AcnRecordedOwnerLiveWithoutHealth({ owner })
+          ? new AcnRecordedOwnerLiveWithoutHealth({ owner, attempts: unavailableHealth })
           : new AcnRecordedOwnerLiveWithHealth({ owner, health: { status: 200, health } })),
       ),
       confirmReady: () => Effect.succeed(Option.some(ready)),
