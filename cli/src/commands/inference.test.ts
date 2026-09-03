@@ -54,6 +54,13 @@ describe("inference command surface", () => {
       "stop",
     ])
     expect(program.commands[2]!.commands[2]!.registeredArguments).toHaveLength(0)
+    for (const command of program.commands[2]!.commands) {
+      expect(command.options.map(({ long }) => long)).toEqual(["--json"])
+    }
+    expect(program.commands[0]!.options).toHaveLength(0)
+    for (const command of program.commands[1]!.commands) {
+      expect(command.options.map(({ long }) => long)).not.toContain("--json")
+    }
   })
 
   it("renders authoritative discovery and assessment completion independently", () => {
