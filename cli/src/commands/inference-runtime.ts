@@ -35,7 +35,23 @@ import {
   describeLocalHardware,
   formatContext,
 } from "../features/local-inference/view-model"
-import { ensureTrailingNewline, renderFields, renderTable, runCommand } from "./output"
+import {
+  ensureTrailingNewline,
+  renderFields,
+  renderTable,
+  runCommand,
+  type JsonCommandOutput,
+} from "./output"
+import {
+  ModelsLoadJsonDataSchema,
+  ModelsStatusJsonDataSchema,
+  ModelsStopJsonDataSchema,
+  modelsForStatus,
+  modelsLoadJsonData,
+  modelsStatusJsonData,
+  modelsStopJsonData,
+  type ModelsStatusResult,
+} from "./models-json"
 
 type CliModelsClient = Pick<
   Client.Materialized<typeof MagnitudeBoundary, unknown, MagnitudeImplementationError>,
@@ -401,11 +417,12 @@ export const pullModel = (modelInput: string) => runCommand({
     : `Downloading or updating ${modelId}.\nCheck progress: magnitude models status ${modelId}\n`,
 })
 
-const modelMutation = <Id extends ModelId>(
+const modelMutation = <Id extends ModelId, JsonData = never, JsonEncoded = never>(
   modelInput: string,
   decode: (input: string) => Effect.Effect<Id, unknown>,
   execute: (client: CliModelsClient, registry: Registry.Registry, modelId: Id) => Effect.Effect<unknown, unknown>,
   render: (modelId: Id) => string,
+  json?: JsonCommandOutput<Id, JsonData, JsonEncoded>,
 ) => runCommand({
   effect: withClient((client, registry) => decode(modelInput).pipe(
     Effect.flatMap((modelId) => execute(client, registry, modelId).pipe(
@@ -413,6 +430,7 @@ const modelMutation = <Id extends ModelId>(
     )),
   )),
   render,
+  json,
 })
 
 export const cancelDownload = (modelInput: string) => modelMutation(
@@ -471,13 +489,8 @@ const modelStatus = (model: LocalModel): string => {
   }
 }
 
-const statusModels = (models: readonly LocalModel[]): LocalModel[] => models
-  .filter((model) => model._tag === "Discovered" || model.acquisitionState._tag !== "NotInstalled")
-  .sort((left, right) => formatLocalModelDisplayName(left).localeCompare(formatLocalModelDisplayName(right))
-    || left.modelId.localeCompare(right.modelId))
-
 export const renderModelsStatus = (models: readonly LocalModel[]): string => {
-  const visible = statusModels(models)
+  const visible = modelsForStatus(models)
   if (visible.length === 0) return "No local models are on this computer.\n"
   return ensureTrailingNewline([
     "Local models",
@@ -521,10 +534,13 @@ const renderModelDetail = (model: LocalModel): string => ensureTrailingNewline([
   ]),
 ].join("\n"))
 
-export const showModelsStatus = (modelInput?: string) => runCommand({
+export const showModelsStatus = (modelInput?: string, json = false) => runCommand({
   effect: withClient((client, registry) => Effect.gen(function* () {
     const catalog = yield* readCatalog(client, registry)
-    if (catalog._tag === "Initializing") return { _tag: "Initializing" as const }
+    if (catalog._tag === "Initializing") return {
+      _tag: "Initializing" as const,
+      view: modelInput === undefined ? "list" as const : "detail" as const,
+    }
     const models = localModels(catalog)
     if (modelInput === undefined) return { _tag: "List" as const, models }
     const modelId = yield* decodeModelId(modelInput)
@@ -533,22 +549,37 @@ export const showModelsStatus = (modelInput?: string) => runCommand({
   render: (result) => result._tag === "Initializing"
     ? "Local models are initializing.\n"
     : result._tag === "List" ? renderModelsStatus(result.models) : renderModelDetail(result.model),
+  json: json ? {
+    command: "models.status",
+    schema: ModelsStatusJsonDataSchema,
+    data: (result: ModelsStatusResult) => modelsStatusJsonData(result),
+  } : undefined,
 })
 
-export const loadInstance = (modelInput: string) => modelMutation(
+export const loadInstance = (modelInput: string, json = false) => modelMutation(
   modelInput,
   decodeModelId,
   (client, registry, modelId) => Mutation.execute(client.Models.LoadLocalModel, { modelId }).pipe(
     Effect.provideService(Registry.AtomRegistry, registry),
   ),
   (modelId) => `Loading ${modelId}.\nCheck progress: magnitude models status ${modelId}\n`,
+  json ? {
+    command: "models.load",
+    schema: ModelsLoadJsonDataSchema,
+    data: modelsLoadJsonData,
+  } : undefined,
 )
 
-export const stopInstance = () => runCommand({
+export const stopInstance = (json = false) => runCommand({
   effect: withClient((client, registry) => Mutation.execute(client.Models.StopActiveLocalModel, {}).pipe(
     Effect.provideService(Registry.AtomRegistry, registry),
   )),
   render: () => "Stopped the active local model.\n",
+  json: json ? {
+    command: "models.stop",
+    schema: ModelsStopJsonDataSchema,
+    data: modelsStopJsonData,
+  } : undefined,
 })
 
 const residentAllocation = (model: LocalModel) => {

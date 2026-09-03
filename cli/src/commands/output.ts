@@ -1,5 +1,36 @@
-import { Data, Effect } from "effect"
+import { Data, Effect, Schema } from "effect"
 import stringWidth from "string-width"
+
+export const JsonCommandNameSchema = Schema.Literal(
+  "models.status",
+  "models.load",
+  "models.stop",
+)
+export type JsonCommandName = typeof JsonCommandNameSchema.Type
+
+const JsonCommandErrorSchema = Schema.Struct({
+  message: Schema.String,
+})
+
+const jsonSuccessEnvelopeSchema = <Data, Encoded>(data: Schema.Schema<Data, Encoded, never>) => Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  command: JsonCommandNameSchema,
+  ok: Schema.Literal(true),
+  data,
+})
+
+const JsonFailureEnvelopeSchema = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  command: JsonCommandNameSchema,
+  ok: Schema.Literal(false),
+  error: JsonCommandErrorSchema,
+})
+
+export interface JsonCommandOutput<Result, Data, Encoded> {
+  readonly command: JsonCommandName
+  readonly schema: Schema.Schema<Data, Encoded, never>
+  readonly data: (result: Result) => Data
+}
 
 const messageOf = (error: unknown): string => {
   if (typeof error === "object" && error !== null) {
@@ -13,19 +44,43 @@ const messageOf = (error: unknown): string => {
 
 class CommandOutputFailed extends Data.TaggedError("CommandOutputFailed")<{
   readonly message: string
-  readonly cause: unknown
 }> {}
 
-export const runCommand = <A>(options: {
+const jsonLine = (value: unknown): string => `${JSON.stringify(value)}\n`
+
+const renderJsonSuccess = <Result, JsonData, JsonEncoded>(
+  output: JsonCommandOutput<Result, JsonData, JsonEncoded>,
+  result: Result,
+): string => jsonLine(Schema.encodeSync(jsonSuccessEnvelopeSchema(output.schema))({
+  schemaVersion: 1,
+  command: output.command,
+  ok: true,
+  data: output.data(result),
+}))
+
+export const renderJsonCommandFailure = (command: JsonCommandName, error: unknown): string =>
+  jsonLine(Schema.encodeSync(JsonFailureEnvelopeSchema)({
+    schemaVersion: 1,
+    command,
+    ok: false,
+    error: { message: messageOf(error) },
+  }))
+
+export const runCommand = <A, JsonData = never, JsonEncoded = never>(options: {
   readonly effect: Effect.Effect<A, unknown, never>
   readonly render: (result: A) => string
+  readonly json?: JsonCommandOutput<A, JsonData, JsonEncoded>
 }): Promise<void> => Effect.runPromise(options.effect.pipe(
   Effect.tap((result) => Effect.try({
-    try: () => process.stdout.write(options.render(result)),
-    catch: (error) => new CommandOutputFailed({ message: messageOf(error), cause: error }),
+    try: () => process.stdout.write(options.json === undefined
+      ? options.render(result)
+      : renderJsonSuccess(options.json, result)),
+    catch: (error) => new CommandOutputFailed({ message: messageOf(error) }),
   })),
   Effect.catchAll((error) => Effect.sync(() => {
-    process.stderr.write(`${messageOf(error)}\n`)
+    process.stderr.write(options.json === undefined
+      ? `${messageOf(error)}\n`
+      : renderJsonCommandFailure(options.json.command, error))
     process.exitCode = 1
   })),
   Effect.asVoid,

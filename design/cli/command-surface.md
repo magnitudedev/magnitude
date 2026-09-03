@@ -31,7 +31,8 @@ docs [topic-id]
 ```
 
 Removed output flags are not retained as aliases. The acquisition command remains `catalog pull`,
-and there is no global JSON mode.
+and there is no global JSON mode. The plugin-facing `models status`, `models load`, and `models stop`
+commands independently accept `--json`.
 
 ## Domain ownership
 
@@ -64,6 +65,75 @@ retryability flags, and stack traces.
 
 Memory uses hardware-conventional units; storage and transfer use decimal units; context uses
 compact token counts; generation speed uses `tok/s`. Rounded values are presentation only.
+
+## Plugin-facing JSON output
+
+`--json` is a versioned machine contract for model observation and residency control. It is scoped
+to `models status`, `models load`, and `models stop`; it is not inherited globally and does not
+change the default human presentation.
+
+Every JSON invocation writes exactly one compact JSON document followed by one newline. Success
+writes only to stdout and exits successfully. Failure writes only to stderr and exits nonzero.
+Neither stream contains prose, ANSI escapes, progress animation, or additional JSON documents.
+
+Every document has these common fields:
+
+- `schemaVersion`, currently the integer `1`;
+- `command`, exactly `models.status`, `models.load`, or `models.stop`;
+- `ok`, the success discriminator; and
+- either `data` when `ok` is true or `error.message` when `ok` is false.
+
+The envelopes are exactly:
+
+```text
+{ schemaVersion: 1, command, ok: true, data }
+{ schemaVersion: 1, command, ok: false, error: { message } }
+```
+
+The version covers the complete JSON document, including command data. Any structural or semantic
+contract change—including adding, renaming, or removing a field—requires a new version. An
+implementation correction that leaves every documented meaning and shape intact does not.
+
+`models status --json` preserves the human command's observation semantics and deterministic model
+ordering. Its data distinguishes initialization from a ready list or ready addressed detail. A model
+contains its canonical ID, friendly display name, source, optional byte-accurate memory requirement,
+optional exact context length, installation state, and optional residency state. Installation and
+residency are separate discriminated unions. Transfer states contain their native stage, completed
+and total bytes, and optional bytes per second. Loading contains its native stage and optional
+fractional progress. Failure states contain a product message and, for residency failures, whether
+retry is meaningful. Optional fields are absent rather than `null`.
+
+Status data has exactly these top-level variants:
+
+```text
+{ state: "initializing", view: "list" | "detail" }
+{ state: "ready", view: "list", models: Model[] }
+{ state: "ready", view: "detail", model: Model }
+```
+
+Each `Model` has `modelId`, `displayName`, `source` (`catalog` or `discovered`), `installation`, and
+optional `memoryBytes`, `contextLength`, and `residency`. The exact installation discriminators are
+`not_installed`, `installing`, `install_failed`, `installed`, `update_available`, `updating`,
+`update_failed`, `removing`, `remove_failed`, and `unavailable`. The exact residency discriminators
+are `unloaded`, `requested`, `loading`, `ready`, `stopping`, and `failed`.
+
+`installing` and `updating` carry `progress: { stage, completedBytes, totalBytes, bytesPerSecond? }`.
+Installation failures carry `error: { message }`. `loading` carries `{ stage, progress? }`, where
+progress is a number from zero through one. `stopping` carries its release `reason`. Residency
+failure carries `error: { message, retryable }`. No other variant carries those state-specific
+fields.
+
+The unaddressed status form includes the same models as human output: discovered models and catalog
+models that are installed or have relevant acquisition/removal work. The addressed form may return
+a known not-installed catalog model because it observes the exact requested identity. Initialization
+does not wait for readiness. Unknown or malformed IDs are failures once the authoritative catalog is
+available, preserving existing command behavior.
+
+`models load --json` succeeds after the authoritative load mutation is admitted and returns the
+canonical `modelId` with outcome `load_requested`; it does not claim that loading has completed.
+`models stop --json` succeeds after the authoritative stop mutation and returns outcome `stopped`.
+Callers observe continuing work through `models status --json` rather than polling an internal
+operation identity.
 
 ## Catalog and recommendation behavior
 
@@ -124,3 +194,7 @@ non-interactive command.
   interpretations.
 - Agent documentation completes onboarding using only the human command surface.
 - Tests cover collection, detail, narrow-width, empty, partial, failure, and redirected forms.
+- Plugin-facing JSON tests cover every installation and residency variant, list and addressed views,
+  initialization, empty state, deterministic ordering, mutation acknowledgements, structured
+  failures, stream separation, newline framing, and schema validation.
+- Enabling JSON cannot change command effects, validation order, mutation admission, or exit status.
