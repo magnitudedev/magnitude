@@ -7,6 +7,9 @@ applies_to:
   - cli/src/server/service.ts
   - cli/src/runtime/interactive.tsx
   - cli/src/features/model-setup/harness.tsx
+  - integrations/pi/**
+  - scripts/dev-pi.ts
+  - package.json
 ---
 
 # Harness connections
@@ -51,6 +54,21 @@ Each harness has one connector. A connector owns that harness's:
 The shared service owns manifest persistence, installation observation, transactional file
 snapshots, connector dispatch, skill installation, and startup orchestration. It contains no
 harness-specific configuration transforms.
+
+A connector may require one harness-native companion package. That package is part of the
+connection's desired state rather than an optional setup extra. The connector owns its exact
+package identity, source, inspection, installation, activation, and removal operations. The shared
+service owns package reconciliation, mutation ordering, compensation, and persistence of package
+ownership. A connection records whether Magnitude installed the package or found it pre-existing,
+plus any prior enablement state that Magnitude changed. Disconnect removes a package only when
+Magnitude owns its installation; otherwise it restores the user's prior state. Sync reconciles a
+required package as well as connector configuration.
+
+The Pi companion has one desired package source. Production uses its exact versioned npm source;
+the repository development launcher supplies the local integration directory instead. The manifest
+records the source actually installed. Reconciliation addresses that exact source, replaces a
+Magnitude-owned package when the desired source changes, and never replaces a pre-existing
+user-owned package merely because development mode is active.
 
 Applying a connection is an idempotent replacement of Magnitude-owned state. Unrelated user state
 is preserved. Without an explicit model, connection and sync do not change the harness's current
@@ -163,6 +181,41 @@ skill installation finish before connector configuration and handoff. Codex and 
 persistent proxy configuration require this service; disconnect removes those settings only while
 they retain Magnitude's installed values.
 
+The Magnitude skill is independent of a harness companion package. It remains optional for ordinary
+connectors, but is required for Pi because catalog discovery, recommendation, acquisition, and
+removal are agent-guided rather than duplicated as Pi extension commands. Connecting Pi always
+installs or enables the desired Magnitude Pi package through Pi's package command and installs the
+skill into Pi's shared agent-skill target. Both the
+non-interactive `connections add pi` flow and interactive onboarding submit the same connection
+request to the shared service; neither presentation surface owns a second installation path.
+Interactive onboarding discloses the exact package source and that Pi extensions execute with the
+user's authority. A successful connection reports whether an already-running harness must reload
+or restart.
+
+During a Magnitude request, the Pi companion uses Pi's native working row rather than an extension
+footer status. Model loading and prefill temporarily replace the generic working message; generation
+is presented as timed work. The companion treats transport requests and a Pi agent run as separate
+lifecycles: request progress owns the live row, while `agent_start` through `agent_settled` owns the
+retained summary. Completion restores Pi's default working message and presents the model display
+name, total agent-run wall time, the first request's time to first token, and token-weighted generation
+throughput in one widget line immediately above the editor. Throughput is derived from the sum of
+generated tokens divided by the sum of decode time across every completed Magnitude request in the
+run. Starting another run, cancellation, failure, switching providers, or extension disposal clears
+the retained summary and restores Pi's default working message.
+
+The repository exposes one `dev:pi` entrypoint. It selects an installed Magnitude model, connects
+Pi through the ordinary non-interactive connection path using the local package source, and launches
+Pi with a scoped executable for the current source CLI. Temporary executables live outside the
+repository and remain available for the entire child session. This development path exercises the
+same provider configuration, package ownership, skill installation, and Pi extension loading as a
+published connection. It builds and runs the checkout's inference runtime and suppresses successful
+native-build diagnostics while preserving complete failure diagnostics. It inherits the caller's
+environment but does not start a telemetry collector or enable tracing itself.
+It borrows the fixed service endpoint only from a stopped state or the installed service manager:
+after Pi exits, it stops the development daemon and restores whether the installed service was
+running. An already-running unmanaged daemon is rejected because its launch state cannot be safely
+reconstructed.
+
 ## Conformance
 
 A conforming connector must prove that:
@@ -172,5 +225,9 @@ A conforming connector must prove that:
 - ordinary independent launch uses the persisted Magnitude model when one was explicitly selected;
 - sync replaces stale Magnitude model metadata without changing unrelated user state;
 - disconnect removes only Magnitude-owned state and conditionally restores selection; and
+- required companion packages are reconciled transactionally, user-owned packages survive
+  disconnect, and every connection entry accurately records package ownership; and
+- Pi connection, sync, source replacement, and removal address the exact recorded local or npm
+  package source, and the local development entrypoint leaves no repository artifacts; and
 - reasoning behavior matches the projection table across startup, persisted state, session override,
   model switching, and direct TUI launch.

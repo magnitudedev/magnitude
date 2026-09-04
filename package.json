@@ -7,6 +7,7 @@
     "desktop",
     "web",
     "inference",
+    "integrations/*",
     "packages/*"
   ],
   "scripts": {
@@ -16,12 +17,13 @@
     "dev:version": "bun run packages/version/scripts/generate-version.ts --dev",
     "dev:client": "bun run cli/src/index.tsx",
     "dev:client:local": "MAGNITUDE_USE_LOCAL=1 bun run cli/src/index.tsx",
+    "dev:pi": "bun run scripts/dev-pi.ts",
     "acn:dash": "bun run --cwd packages/acn-dashboard dashboard",
     "build": "bun run packages/version/scripts/generate-version.ts && turbo build",
     "build:release": "bun run icn:catalog:build-bundle && bun run packages/release/scripts/build/host.ts",
     "test:release-bootstrap": "bun run packages/release/scripts/test-bootstrap.ts",
     "simulate:distribution": "bun run packages/version/scripts/generate-version.ts && bun run packages/release/scripts/simulate-distribution.ts",
-    "typecheck": "bunx tsc --noEmit -p scripts/tsconfig.release.json && turbo typecheck",
+    "typecheck": "bunx tsc --noEmit -p scripts/tsconfig.release.json && bunx tsc --noEmit -p scripts/tsconfig.dev-pi.json && turbo typecheck",
     "test": "bun run packages/version/scripts/generate-version.ts && bun test",
     "cache:clear": "bun run scripts/clear-derived-cache.ts assessments",
     "cache:clear:all": "bun run scripts/clear-derived-cache.ts all",

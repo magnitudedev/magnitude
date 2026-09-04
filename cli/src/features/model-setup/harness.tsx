@@ -36,18 +36,22 @@ export function HarnessChooser({
   const [selected, setSelected] = useState<HarnessId>(selectable[0]?.id ?? destinations[0].id)
   const [launchOnStartup, setLaunchOnStartup] = useState(true)
   const [installSkill, setInstallSkill] = useState(true)
+  const selectedRow = destinations.find((row) => row.id === selected) ?? destinations[0]
   const items = useMemo<ReadonlyArray<HarnessChooserItem>>(() => [
     ...selectable.map((row) => ({ _tag: "Harness" as const, harness: row.id })),
     { _tag: "LaunchOnStartup" },
-    { _tag: "InstallSkill" },
-  ], [selectable])
+    ...(selectedRow.skillRequired === true ? [] : [{ _tag: "InstallSkill" as const }]),
+  ], [selectable, selectedRow.skillRequired])
   const [focusedIndex, setFocusedIndex] = useState(0)
   const focusedItem = items[focusedIndex] ?? items[0]
-  const selectedRow = destinations.find((row) => row.id === selected) ?? destinations[0]
   const locked = applying !== null
   const submit = useCallback((harness: HarnessId = selectedRow.id) => {
     const row = destinations.find((destination) => destination.id === harness)
-    if (!locked && row?.selectable) onContinue({ harness, launchOnStartup, installSkill })
+    if (!locked && row?.selectable) onContinue({
+      harness,
+      launchOnStartup,
+      installSkill: row.skillRequired === true || installSkill,
+    })
   }, [destinations, installSkill, launchOnStartup, locked, onContinue, selectedRow.id])
 
   useKeyboard(useCallback((key: KeyEvent) => {
@@ -117,13 +121,25 @@ export function HarnessChooser({
           )
         })}
       </box>
+      {selectedRow.companion === undefined ? null : (
+        <box style={{ flexDirection: "column", marginTop: 1 }}>
+          <text style={{ fg: theme.text.body }}>
+            Magnitude will install and enable {selectedRow.companion.name} ({selectedRow.companion.source}).
+          </text>
+          <text style={{ fg: theme.text.supporting }}>{selectedRow.companion.securityNotice}</text>
+        </box>
+      )}
       <box style={{ height: 1 }} />
       <Button onMouseOver={() => focusItem({ _tag: "LaunchOnStartup" })} onClick={() => { focusItem({ _tag: "LaunchOnStartup" }); setLaunchOnStartup((value) => !value) }}>
         <text style={{ fg: focusedItem?._tag === "LaunchOnStartup" ? theme.accent : theme.text.body }}>{focusedItem?._tag === "LaunchOnStartup" ? "› " : "  "}{launchOnStartup ? "[x]" : "[ ]"} Launch Magnitude service on startup</text>
       </Button>
-      <Button onMouseOver={() => focusItem({ _tag: "InstallSkill" })} onClick={() => { focusItem({ _tag: "InstallSkill" }); setInstallSkill((value) => !value) }}>
-        <text style={{ fg: focusedItem?._tag === "InstallSkill" ? theme.accent : theme.text.body }}>{focusedItem?._tag === "InstallSkill" ? "› " : "  "}{installSkill ? "[x]" : "[ ]"} Install Magnitude skill to help agents manage local models</text>
-      </Button>
+      {selectedRow.skillRequired === true
+        ? <text style={{ fg: theme.text.body }}>  [x] Magnitude skill required for agent model management</text>
+        : (
+          <Button onMouseOver={() => focusItem({ _tag: "InstallSkill" })} onClick={() => { focusItem({ _tag: "InstallSkill" }); setInstallSkill((value) => !value) }}>
+            <text style={{ fg: focusedItem?._tag === "InstallSkill" ? theme.accent : theme.text.body }}>{focusedItem?._tag === "InstallSkill" ? "› " : "  "}{installSkill ? "[x]" : "[ ]"} Install Magnitude skill to help agents manage local models</text>
+          </Button>
+        )}
       <box style={{ height: 1, minHeight: 1, flexShrink: 0 }} />
       <text style={{ fg: theme.text.guidance }} wrapMode="none">You can change harness connections later with magnitude connections.</text>
       <text style={{ fg: theme.text.supporting }} wrapMode="none">↑/↓ choose · Space toggle · Enter continue · Ctrl+C to exit</text>

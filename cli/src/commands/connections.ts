@@ -14,7 +14,7 @@ export const registerConnectionsCommand = (program: Command): void => {
     .description("Connect installed Magnitude models to a harness")
     .argument("<harness>", "Harness ID")
     .option("--set-model <model-id>", "Also select this Magnitude model in the harness")
-    .option("--install-skill", "Install or refresh the Magnitude skill for this harness")
+    .option("--install-skill", "Install or refresh the Magnitude skill (automatic for Pi)")
     .action((harness, options) => loadRuntime().then(({ addConnection }) =>
       addConnection(harness, options.setModel, options.installSkill === true)))
 

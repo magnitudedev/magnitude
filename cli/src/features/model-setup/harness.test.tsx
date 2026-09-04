@@ -30,6 +30,19 @@ const keyEvent = (name: string) => new KeyEvent({
 
 const destinations = [
   { id: HarnessIdSchema.make("magnitude"), name: "Magnitude Harness", availability: "Installed" as const, selectable: true, connected: false, note: "Optimized for local models" },
+  {
+    id: HarnessIdSchema.make("pi"),
+    name: "Pi",
+    availability: "Installed" as const,
+    selectable: true,
+    connected: false,
+    skillRequired: true,
+    companion: {
+      name: "Magnitude for Pi",
+      source: "npm:@magnitudedev/pi@0.0.1",
+      securityNotice: "Pi extensions execute with your user permissions.",
+    },
+  },
   { id: HarnessIdSchema.make("codex"), name: "Codex", availability: "Installed" as const, selectable: true, connected: false },
   { id: HarnessIdSchema.make("cline"), name: "Cline", availability: "Not installed" as const, selectable: false, connected: false },
 ]
@@ -90,6 +103,7 @@ describe("harness chooser layout", () => {
       act(() => keyboard.handler?.(keyEvent("enter")))
       expect(onContinue).toHaveBeenCalledWith(expect.objectContaining({ harness: "magnitude" }))
       for (const expected of [
+        "› Pi",
         "› Codex",
         "› [x] Launch Magnitude service on startup",
         "› [x] Install Magnitude skill to help agents manage local models",
@@ -102,6 +116,31 @@ describe("harness chooser layout", () => {
       await act(view.renderOnce)
       expect(onContinue).toHaveBeenCalledTimes(2)
       expect(onContinue).toHaveBeenCalledWith(expect.objectContaining({ harness: "codex" }))
+    } finally {
+      await act(async () => view.renderer.destroy())
+    }
+  })
+
+  it("discloses the exact companion package and execution permissions before connecting Pi", async () => {
+    const view = await testRender(
+      <HarnessChooser
+        width={120}
+        model={makeModel()}
+        destinations={destinations}
+        applying={null}
+        onContinue={vi.fn()}
+      />,
+      { width: 120, height: 40 },
+    )
+
+    try {
+      await act(view.renderOnce)
+      act(() => keyboard.handler?.(keyEvent("down")))
+      await act(view.renderOnce)
+      const frame = view.captureCharFrame()
+      expect(frame).toContain("Magnitude will install and enable Magnitude for Pi (npm:@magnitudedev/pi@0.0.1).")
+      expect(frame).toContain("Pi extensions execute with your user permissions.")
+      expect(frame).toContain("[x] Magnitude skill required for agent model management")
     } finally {
       await act(async () => view.renderer.destroy())
     }

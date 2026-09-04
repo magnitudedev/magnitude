@@ -195,7 +195,16 @@ describe("model command JSON process boundary", () => {
           Schema.encodeSync(ModelCatalogStateSchema)(catalog()),
         )
         case "LoadLocalModel":
-          residency = { _tag: "Requested" }
+          // ICN's ensureModelInstance response is returned only after the model is ready.
+          residency = {
+            _tag: "Ready",
+            allocation: {
+              contextWindowTokens: 32_768,
+              parallelSequences: 1,
+              physicalContextTokens: 32_768,
+              memoryDomains: [],
+            },
+          }
           return success(rpc, {})
         case "StopActiveLocalModel":
           residency = { _tag: "Unloaded" }
@@ -227,30 +236,29 @@ describe("model command JSON process boundary", () => {
         schemaVersion: 1,
         command: "models.load",
         ok: true,
-        data: { modelId: TEST_MODEL_ID, outcome: "load_requested" },
+        data: { modelId: TEST_MODEL_ID },
       })}\n`,
       stderr: "",
     })
 
-    const loadingStatus = await runCli(home, "models", "status", TEST_MODEL_ID, "--json")
-    expect(loadingStatus.exitCode).toBe(0)
-    expect(loadingStatus.stderr).toBe("")
-    expect(JSON.parse(loadingStatus.stdout)).toMatchObject({
+    const loadedStatus = await runCli(home, "models", "status", TEST_MODEL_ID, "--json")
+    expect(loadedStatus.exitCode).toBe(0)
+    expect(loadedStatus.stderr).toBe("")
+    expect(JSON.parse(loadedStatus.stdout)).toMatchObject({
       schemaVersion: 1,
       command: "models.status",
       ok: true,
       data: {
         state: "ready",
-        view: "detail",
-        model: {
+        models: [{
           modelId: TEST_MODEL_ID,
-          installation: { state: "installed" },
-          residency: { state: "requested" },
-        },
+          installation: "installed",
+          residency: "ready",
+        }],
       },
     })
-    expect(loadingStatus.stdout.endsWith("\n")).toBe(true)
-    expect(loadingStatus.stdout.split("\n")).toHaveLength(2)
+    expect(loadedStatus.stdout.endsWith("\n")).toBe(true)
+    expect(loadedStatus.stdout.split("\n")).toHaveLength(2)
 
     const stop = await runCli(home, "models", "stop", "--json")
     expect(stop).toEqual({
@@ -259,7 +267,7 @@ describe("model command JSON process boundary", () => {
         schemaVersion: 1,
         command: "models.stop",
         ok: true,
-        data: { outcome: "stopped" },
+        data: {},
       })}\n`,
       stderr: "",
     })
@@ -268,7 +276,7 @@ describe("model command JSON process boundary", () => {
     expect(stoppedStatus.exitCode).toBe(0)
     expect(stoppedStatus.stderr).toBe("")
     expect(JSON.parse(stoppedStatus.stdout)).toMatchObject({
-      data: { model: { residency: { state: "unloaded" } } },
+      data: { models: [{ residency: "unloaded" }] },
     })
   }, 30_000)
 
@@ -285,7 +293,7 @@ describe("model command JSON process boundary", () => {
     expect(jsonLoad.exitCode).toBe(0)
     expect(humanLoad).toEqual({
       exitCode: 0,
-      stdout: `Loading ${TEST_MODEL_ID}.\nCheck progress: magnitude models status ${TEST_MODEL_ID}\n`,
+      stdout: `Loaded ${TEST_MODEL_ID}.\n`,
       stderr: "",
     })
     expect(jsonLoadRequests).toEqual(humanLoadRequests)
@@ -306,4 +314,23 @@ describe("model command JSON process boundary", () => {
     })
     expect(jsonStopRequests).toEqual(humanStopRequests)
   }, 30_000)
+
+  it("leaves malformed invocations and help on Commander's ordinary text path", async () => {
+    const missingModel = await runCli(home, "models", "load", "--json")
+    expect(missingModel.exitCode).not.toBe(0)
+    expect(missingModel.stdout).toBe("")
+    expect(missingModel.stderr).toContain("missing required argument 'model-id'")
+    expect(() => JSON.parse(missingModel.stderr)).toThrow()
+
+    const unknownOption = await runCli(home, "models", "stop", "--json", "--unknown")
+    expect(unknownOption.exitCode).not.toBe(0)
+    expect(unknownOption.stdout).toBe("")
+    expect(unknownOption.stderr).toContain("unknown option '--unknown'")
+    expect(() => JSON.parse(unknownOption.stderr)).toThrow()
+
+    const help = await runCli(home, "models", "status", "--json", "--help")
+    expect(help.exitCode).toBe(0)
+    expect(help.stdout).toContain("Usage: magnitude models status")
+    expect(help.stderr).toBe("")
+  })
 })

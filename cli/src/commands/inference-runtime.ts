@@ -537,10 +537,7 @@ const renderModelDetail = (model: LocalModel): string => ensureTrailingNewline([
 export const showModelsStatus = (modelInput?: string, json = false) => runCommand({
   effect: withClient((client, registry) => Effect.gen(function* () {
     const catalog = yield* readCatalog(client, registry)
-    if (catalog._tag === "Initializing") return {
-      _tag: "Initializing" as const,
-      view: modelInput === undefined ? "list" as const : "detail" as const,
-    }
+    if (catalog._tag === "Initializing") return { _tag: "Initializing" as const }
     const models = localModels(catalog)
     if (modelInput === undefined) return { _tag: "List" as const, models }
     const modelId = yield* decodeModelId(modelInput)
@@ -562,7 +559,7 @@ export const loadInstance = (modelInput: string, json = false) => modelMutation(
   (client, registry, modelId) => Mutation.execute(client.Models.LoadLocalModel, { modelId }).pipe(
     Effect.provideService(Registry.AtomRegistry, registry),
   ),
-  (modelId) => `Loading ${modelId}.\nCheck progress: magnitude models status ${modelId}\n`,
+  (modelId) => `Loaded ${modelId}.\n`,
   json ? {
     command: "models.load",
     schema: ModelsLoadJsonDataSchema,

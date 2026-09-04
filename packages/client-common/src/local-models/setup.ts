@@ -714,9 +714,11 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
     registry.set(lifecycle, { _tag: "ApplyingHarness", selected: current.selected, harness, completeOnFinish: current.completeOnFinish })
     return { selected: current.selected, completeOnFinish: current.completeOnFinish }
   })).pipe(Effect.flatMap(({ selected, completeOnFinish }) => Effect.gen(function* () {
-    if (options.launchOnStartup) yield* harnessConnection.installStartup
-    if (options.installSkill) yield* harnessConnection.installSkill(harness)
-    yield* harnessConnection.connect(harness, { model: Option.some(selected.modelId) })
+    yield* harnessConnection.connect(harness, {
+      model: Option.some(selected.modelId),
+      installSkill: options.installSkill,
+      launchOnStartup: options.launchOnStartup,
+    })
     const plan = yield* harnessConnection.launch(harness, selected.modelId)
     if (completeOnFinish) yield* onboarding.complete
     yield* admissionLock.withPermits(1)(Effect.sync(() => {

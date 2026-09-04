@@ -103,7 +103,7 @@ export const readOr = (file: string, fallback: string) => FileSystem.FileSystem.
 
 export const updateJsonc = (
   source: string,
-  changes: ReadonlyArray<readonly [ReadonlyArray<string>, unknown]>,
+  changes: ReadonlyArray<readonly [ReadonlyArray<string | number>, unknown]>,
 ): string => {
   const errors: ParseError[] = []
   const value = parse(source, errors, { allowTrailingComma: true, disallowComments: false })
@@ -236,6 +236,8 @@ export const defineConnector = (definition: ConnectorDefinition): HarnessConnect
     ...(definition.recommended === undefined ? {} : { recommended: definition.recommended }),
     ...(definition.note === undefined ? {} : { note: definition.note }),
     ...(definition.requiresStartup === undefined ? {} : { requiresStartup: definition.requiresStartup }),
+    ...(definition.companion === undefined ? {} : { companion: definition.companion }),
+    ...(definition.skillRequired === true ? { skillRequired: true } : {}),
     skillInstallationTarget: definition.skillInstallationTarget,
     configurationFiles: definition.configurationFiles,
     connect: definition.connect,

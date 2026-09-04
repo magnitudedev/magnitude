@@ -1,5 +1,5 @@
 import type { HarnessId } from "@magnitudedev/client-common"
-import type { HarnessConnector } from "./contract"
+import type { HarnessCompanionPackage, HarnessConnector } from "./contract"
 import { makeClaudeCodeConnector } from "./connectors/claude-code"
 import { makeClineConnector } from "./connectors/cline"
 import {
@@ -21,6 +21,10 @@ export interface HarnessConnectorRegistry {
 
 export interface HarnessConnectorRegistryOptions {
   readonly readCodexBundledCatalog?: CodexBundledCatalogReader
+  /** Package lifecycle injection used by deterministic connector tests. */
+  readonly piCompanion?: HarnessCompanionPackage
+  /** Alternate Pi package source used by the repository's local development launcher. */
+  readonly piCompanionSource?: string
 }
 
 export const makeHarnessConnectorRegistry = (
@@ -29,7 +33,10 @@ export const makeHarnessConnectorRegistry = (
 ): HarnessConnectorRegistry => {
   const ordered = [
     makeMagnitudeConnector(),
-    makePiConnector(paths),
+    makePiConnector(paths, {
+      ...(options.piCompanion === undefined ? {} : { companion: options.piCompanion }),
+      ...(options.piCompanionSource === undefined ? {} : { packageSource: options.piCompanionSource }),
+    }),
     makeOpenCodeConnector(paths),
     makeHermesConnector(paths),
     makeOpenClawConnector(paths),
