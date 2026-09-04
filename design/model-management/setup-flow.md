@@ -270,11 +270,15 @@ currently selected harness and the current toggle values; clicking an available 
 continues with that exact harness and the current toggle values. No separate Continue row is rendered.
 Harness guidance follows the toggles after one empty row instead of occupying the frame's fixed
 footer, so short harness content does not create a large empty visual gap.
+When the selected destination requires a harness-native companion package, the stage discloses its
+exact source and execution authority before submission. The package is part of the destination and
+is therefore installed or enabled unconditionally; it is not represented by another toggle.
 
 An external destination produces `HarnessHandoff` only after selected startup and skill work,
-adapter reconciliation, and durable onboarding completion succeed. The CLI runtime observes this
-state outside React, closes client-owned ACN resources, unwinds the root and renderer scope, and
-only then starts the returned executable with inherited terminal I/O and the captured model active.
+companion-package and adapter reconciliation, and durable onboarding completion succeed. The CLI
+runtime observes this state outside React, closes client-owned ACN resources, unwinds the root and
+renderer scope, and only then starts the returned executable with inherited terminal I/O and the
+captured model active.
 
 ## Conformance
 

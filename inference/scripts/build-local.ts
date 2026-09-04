@@ -75,29 +75,45 @@ const selectBackend = async (): Promise<LocalIcnBackend> => {
 
 const run = async (
   command: readonly string[],
-  environment: Readonly<Record<string, string | undefined>> = process.env
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+  diagnostics: "all" | "errors" = "all",
 ): Promise<void> => {
   const child = Bun.spawn([...command], {
     cwd: PROJECT_ROOT,
     env: environment,
     stdin: "ignore",
-    stdout: "inherit",
-    stderr: "inherit",
+    stdout: diagnostics === "all" ? "inherit" : "pipe",
+    stderr: diagnostics === "all" ? "inherit" : "pipe",
   });
-  const code = await child.exited;
+  const [code, stdout, stderr] = await Promise.all([
+    child.exited,
+    diagnostics === "all" ? Promise.resolve("") : new Response(child.stdout).text(),
+    diagnostics === "all" ? Promise.resolve("") : new Response(child.stderr).text(),
+  ]);
   if (code !== 0) {
+    const output = [stderr, stdout]
+      .filter((value) => value.trim().length > 0)
+      .join("\n")
+      .trim();
     throw new Error(
-      `command failed with exit code ${code}: ${command.join(" ")}`
+      `command failed with exit code ${code}: ${command.join(" ")}${output.length > 0 ? `\n${output}` : ""}`
     );
   }
 };
 
-export const buildLocalIcn = async (): Promise<{
+export interface BuildLocalIcnOptions {
+  /** Print successful build diagnostics, or retain them only for a failed build. */
+  readonly diagnostics?: "all" | "errors";
+}
+
+export const buildLocalIcn = async ({
+  diagnostics = "all",
+}: BuildLocalIcnOptions = {}): Promise<{
   readonly backend: LocalIcnBackend;
   readonly installationPath: string;
 }> => {
   const backend = await selectBackend();
-  await run(["bun", "run", "icn:catalog:build-bundle"]);
+  await run(["bun", "run", "icn:catalog:build-bundle"], process.env, diagnostics);
   console.log(
     `[dev] Building ${backend} ICN${backend === "cuda" ? " for attached GPU(s)" : ""}...`
   );
@@ -111,6 +127,7 @@ export const buildLocalIcn = async (): Promise<{
     ],
     release: false,
     clean: false,
+    diagnostics,
     buildEnvironment: developmentBuildEnvironment(backend),
   });
   const target = resolve(PROJECT_ROOT, "inference/target");

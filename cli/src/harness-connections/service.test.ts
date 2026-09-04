@@ -5,15 +5,18 @@ import { HARNESS_PRIORITY, HarnessIdSchema } from "@magnitudedev/client-common"
 import { ProviderModelIdSchema, ReasoningEffortSchema } from "@magnitudedev/sdk"
 import { Effect, Option, Schema } from "effect"
 import { parse } from "jsonc-parser"
-import { delimiter } from "node:path"
+import { delimiter, dirname, resolve } from "node:path"
 import { parseDocument } from "yaml"
 import { describe, expect, it } from "vitest"
-import { HarnessModelSchema } from "./contract"
+import { HarnessModelSchema, type HarnessCompanionPackage } from "./contract"
 import {
   ANTHROPIC_BASE_URL,
   CLAUDE_GATEWAY_DISCOVERY,
   CODEX_PROXY_BASE_URL,
   OPENAI_BASE_URL,
+  PI_COMPANION_EXTENSION_PATH,
+  PI_COMPANION_PACKAGE_IDENTITY,
+  PI_COMPANION_PACKAGE_SOURCE,
   anthropicLocalModelId,
   clineModelCatalog,
   clineModelRegistryEntry,
@@ -29,6 +32,7 @@ import {
   openClawAgentConfig,
   openClawProviderConfig,
   openCodeProviderConfig,
+  piPackageExtensionEnabled,
   piProviderConfig,
   updateJsonc,
   updateYaml,
@@ -117,11 +121,32 @@ const stringifyJson = Schema.encodeSync(Schema.parseJson(Schema.Unknown, { space
 const readJson = (source: string): unknown => parse(source)
 const readYaml = (source: string): unknown => parseDocument(source).toJS()
 
+const testPiCompanion: HarnessCompanionPackage = {
+  description: {
+    name: "Magnitude for Pi",
+    source: "npm:@magnitudedev/pi@0.0.1",
+    securityNotice: "Pi extensions execute with your user permissions.",
+  },
+  activation: "reload-or-restart",
+  reconcile: ({ previous }) => Effect.succeed({
+    state: Option.getOrElse(previous, () => ({
+      identity: "@magnitudedev/pi",
+      source: "npm:@magnitudedev/pi@0.0.1",
+      ownership: "magnitude" as const,
+      previousEntryJson: Option.none<string>(),
+    })),
+    status: Option.isSome(previous) ? "already-installed" as const : "installed" as const,
+    rollback: Effect.void,
+  }),
+  disconnect: () => Effect.succeed({ rollback: Effect.void }),
+}
+
 const installedService = (paths: HarnessConnectionPaths, resolvedModels = models as ReadonlyArray<(typeof models)[number]>) =>
   makeHarnessConnectionService({
     paths,
     registry: makeHarnessConnectorRegistry(paths, {
       readCodexBundledCatalog: () => Effect.succeed(bundledCodexCatalog),
+      piCompanion: testPiCompanion,
     }),
     detect: (connector) => Effect.succeed(Option.some({ executable: `/installed/${connector.id}` })),
     resolveModels: Effect.succeed(resolvedModels),
@@ -161,6 +186,38 @@ const writeFixtures = (files: Readonly<Record<string, string>>) => Effect.gen(fu
     yield* fs.makeDirectory(file.slice(0, file.lastIndexOf("/")), { recursive: true })
     yield* fs.writeFileString(file, contents.endsWith("\n") ? contents : `${contents}\n`)
   }
+})
+
+const writeFakePiExecutable = (
+  paths: HarnessConnectionPaths,
+  failCommand?: "install" | "remove",
+) => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const executable = `${paths.piSettings.slice(0, paths.piSettings.lastIndexOf("/"))}/pi-test`
+  const encodedFailCommand = failCommand === undefined ? "undefined" : stringifyJson(failCommand)
+const source = `#!/usr/bin/env bun
+import { dirname, isAbsolute, relative, resolve } from "node:path"
+const settingsPath = new URL("./settings.json", import.meta.url).pathname
+const logPath = new URL("./package-commands.jsonl", import.meta.url).pathname
+const [command, source] = process.argv.slice(2)
+if (command === ${encodedFailCommand}) process.exit(9)
+const settings = await Bun.file(settingsPath).exists() ? await Bun.file(settingsPath).json() : {}
+const packages = Array.isArray(settings.packages) ? settings.packages : []
+const storedSource = isAbsolute(source) ? relative(dirname(settingsPath), source) : source
+const equalSource = (value) => value === source || (!value.startsWith("npm:") && resolve(dirname(settingsPath), value) === resolve(dirname(settingsPath), source))
+if (command === "install") settings.packages = [...packages, storedSource]
+else if (command === "remove") settings.packages = packages.filter((entry) => {
+  const value = typeof entry === "string" ? entry : entry?.source
+  return typeof value !== "string" || !equalSource(value)
+})
+else process.exit(2)
+await Bun.write(settingsPath, JSON.stringify(settings, null, 2) + "\\n")
+const previous = await Bun.file(logPath).exists() ? await Bun.file(logPath).text() : ""
+await Bun.write(logPath, previous + JSON.stringify({ command, source }) + "\\n")
+`
+  yield* fs.writeFileString(executable, source)
+  yield* fs.chmod(executable, 0o755)
+  return executable
 })
 
 describe("HarnessModel persistence", () => {
@@ -365,6 +422,392 @@ describe("HarnessConnector contract and registry", () => {
   })
 })
 
+describe("Pi companion package lifecycle", () => {
+  it("matches Pi's include, exclude, and exact override precedence", () => {
+    expect(piPackageExtensionEnabled("npm:@magnitudedev/pi@0.0.1")).toBe(true)
+    expect(piPackageExtensionEnabled({ source: PI_COMPANION_PACKAGE_SOURCE })).toBe(true)
+    expect(piPackageExtensionEnabled({ extensions: ["extensions/*.ts"] })).toBe(true)
+    expect(piPackageExtensionEnabled({ extensions: ["extensions/other.ts"] })).toBe(false)
+    expect(piPackageExtensionEnabled({ extensions: ["!extensions/*.ts"] })).toBe(false)
+    expect(piPackageExtensionEnabled({ extensions: ["!extensions/*.ts", "+./extensions/magnitude.ts"] })).toBe(true)
+    expect(piPackageExtensionEnabled({ extensions: ["+extensions/magnitude.ts", "-.\\extensions\\magnitude.ts"] })).toBe(false)
+  })
+
+  it("keeps the exact install source synchronized with the publishable package manifest", async () => {
+    const manifest = await Bun.file(new URL("../../../integrations/pi/package.json", import.meta.url)).json() as {
+      readonly name: string
+      readonly version: string
+    }
+
+    expect(manifest.name).toBe(PI_COMPANION_PACKAGE_IDENTITY)
+    expect(PI_COMPANION_PACKAGE_SOURCE).toBe(`npm:${manifest.name}@${manifest.version}`)
+  })
+
+  it("installs, records ownership, reconciles, and removes an owned package through the shared service", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-package-owned-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const executable = yield* writeFakePiExecutable(paths)
+      const service = yield* makeHarnessConnectionService({
+        paths,
+        detect: () => Effect.succeed(Option.some({ executable })),
+        resolveModels: Effect.succeed(models),
+        installStartup: Effect.void,
+      })
+
+      const result = yield* service.connect(HarnessIdSchema.make("pi"), {
+        model: Option.some(model),
+        installSkill: true,
+      })
+      const companion = Option.getOrThrow(result.companion)
+      expect(companion).toMatchObject({
+        source: PI_COMPANION_PACKAGE_SOURCE,
+        status: "installed",
+        activation: "reload-or-restart",
+      })
+      expect(result.skillInstalled).toBe(true)
+      expect(readJson(yield* fs.readFileString(paths.piSettings))).toMatchObject({
+        packages: [PI_COMPANION_PACKAGE_SOURCE],
+        defaultProvider: "magnitude",
+        defaultModel: model,
+      })
+      expect(readJson(yield* fs.readFileString(paths.manifest))).toMatchObject({
+        connections: [{
+          harness: "pi",
+          companion: {
+            identity: PI_COMPANION_PACKAGE_IDENTITY,
+            source: PI_COMPANION_PACKAGE_SOURCE,
+            ownership: "magnitude",
+          },
+        }],
+      })
+
+      const repeated = yield* service.connect(HarnessIdSchema.make("pi"), { model: Option.some(secondModel) })
+      expect(Option.getOrThrow(repeated.companion).status).toBe("already-installed")
+      yield* service.disconnect(HarnessIdSchema.make("pi"))
+      expect(readJson(yield* fs.readFileString(paths.piSettings))).toMatchObject({
+        packages: [],
+        defaultProvider: "user",
+        defaultModel: "user/model",
+      })
+      expect(readJson(yield* fs.readFileString(paths.piModels))).toEqual({ theme: "dark", providers: {} })
+      expect((yield* fs.readFileString(`${root}/pi/package-commands.jsonl`)).trim().split("\n").map((line) => JSON.parse(line)))
+        .toEqual([
+          { command: "install", source: PI_COMPANION_PACKAGE_SOURCE },
+          { command: "remove", source: PI_COMPANION_PACKAGE_SOURCE },
+        ])
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
+  it("tracks a local development package source and always installs the Pi agent skill", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-package-local-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const executable = yield* writeFakePiExecutable(paths)
+      const localSource = "/workspace/magnitude/integrations/pi"
+      const service = yield* makeHarnessConnectionService({
+        paths,
+        registry: makeHarnessConnectorRegistry(paths, { piCompanionSource: localSource }),
+        detect: () => Effect.succeed(Option.some({ executable })),
+        resolveModels: Effect.succeed(models),
+        installStartup: Effect.void,
+      })
+
+      const result = yield* service.connect(HarnessIdSchema.make("pi"), {
+        model: Option.some(model),
+      })
+
+      expect(result.skillInstalled).toBe(true)
+      expect(Option.getOrThrow(result.companion)).toMatchObject({
+        source: localSource,
+        status: "installed",
+      })
+      const installedPackages = (readJson(yield* fs.readFileString(paths.piSettings)) as { packages: string[] }).packages
+      expect(installedPackages).toHaveLength(1)
+      expect(resolve(dirname(paths.piSettings), installedPackages[0]!)).toBe(localSource)
+      expect(yield* fs.readFileString(paths.skillInstallations["shared-agents"].skillFile))
+        .toContain("name: magnitude")
+      expect(readJson(yield* fs.readFileString(paths.manifest))).toMatchObject({
+        connections: [{
+          harness: "pi",
+          companion: { source: localSource, ownership: "magnitude" },
+        }],
+      })
+
+      yield* fs.remove(paths.skillInstallations["shared-agents"].skillFile)
+      yield* service.sync(HarnessIdSchema.make("pi"))
+      expect(yield* fs.readFileString(paths.skillInstallations["shared-agents"].skillFile))
+        .toContain("name: magnitude")
+      yield* service.disconnect(HarnessIdSchema.make("pi"))
+
+      expect((yield* fs.readFileString(`${root}/pi/package-commands.jsonl`)).trim().split("\n").map((line) => JSON.parse(line)))
+        .toEqual([
+          { command: "install", source: localSource },
+          { command: "remove", source: localSource },
+        ])
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
+  it("replaces a Magnitude-owned companion when the desired package source changes", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-package-source-change-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const executable = yield* writeFakePiExecutable(paths)
+      const makeService = (source: string) => makeHarnessConnectionService({
+        paths,
+        registry: makeHarnessConnectorRegistry(paths, { piCompanionSource: source }),
+        detect: () => Effect.succeed(Option.some({ executable })),
+        resolveModels: Effect.succeed(models),
+        installStartup: Effect.void,
+      })
+      const firstSource = "/workspace/magnitude/integrations/pi-a"
+      const secondSource = "/workspace/magnitude/integrations/pi-b"
+
+      const first = yield* makeService(firstSource)
+      yield* first.connect(HarnessIdSchema.make("pi"), { model: Option.none() })
+      const second = yield* makeService(secondSource)
+      yield* second.sync(HarnessIdSchema.make("pi"))
+
+      const installedPackages = (readJson(yield* fs.readFileString(paths.piSettings)) as { packages: string[] }).packages
+      expect(installedPackages).toHaveLength(1)
+      expect(resolve(dirname(paths.piSettings), installedPackages[0]!)).toBe(secondSource)
+      expect(readJson(yield* fs.readFileString(paths.manifest))).toMatchObject({
+        connections: [{ companion: { source: secondSource, ownership: "magnitude" } }],
+      })
+      expect((yield* fs.readFileString(`${root}/pi/package-commands.jsonl`)).trim().split("\n").map((line) => JSON.parse(line)))
+        .toEqual([
+          { command: "install", source: firstSource },
+          { command: "remove", source: firstSource },
+          { command: "install", source: secondSource },
+        ])
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
+  it("minimally enables and exactly restores a pre-existing package without package-manager calls", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-package-existing-" })
+      const paths = fixturePaths(root)
+      const existing = {
+        source: "npm:@magnitudedev/pi@0.0.0",
+        extensions: ["extensions/other.ts", `-${PI_COMPANION_EXTENSION_PATH}`],
+        custom: { preserve: true },
+      }
+      yield* writeFixtures({
+        ...initialFiles(paths),
+        [paths.piSettings]: stringifyJson({
+          theme: "dark",
+          defaultProvider: "user",
+          defaultModel: "user/model",
+          packages: [existing],
+        }),
+      })
+      const executable = yield* writeFakePiExecutable(paths)
+      const service = yield* makeHarnessConnectionService({
+        paths,
+        detect: () => Effect.succeed(Option.some({ executable })),
+        resolveModels: Effect.succeed(models),
+        installStartup: Effect.void,
+      })
+
+      const result = yield* service.connect(HarnessIdSchema.make("pi"), { model: Option.none() })
+      expect(Option.getOrThrow(result.companion).status).toBe("enabled")
+      expect(readJson(yield* fs.readFileString(paths.piSettings))).toMatchObject({
+        packages: [{
+          source: existing.source,
+          extensions: ["extensions/other.ts", `+${PI_COMPANION_EXTENSION_PATH}`],
+          custom: { preserve: true },
+        }],
+      })
+      expect(yield* fs.exists(`${root}/pi/package-commands.jsonl`)).toBe(false)
+
+      yield* service.disconnect(HarnessIdSchema.make("pi"))
+      expect((readJson(yield* fs.readFileString(paths.piSettings)) as { packages: unknown[] }).packages)
+        .toEqual([existing])
+      expect(yield* fs.exists(`${root}/pi/package-commands.jsonl`)).toBe(false)
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
+  it("reinstalls a missing owned package during sync", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-package-sync-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const executable = yield* writeFakePiExecutable(paths)
+      const service = yield* makeHarnessConnectionService({
+        paths,
+        detect: () => Effect.succeed(Option.some({ executable })),
+        resolveModels: Effect.succeed(models),
+        installStartup: Effect.void,
+      })
+      yield* service.connect(HarnessIdSchema.make("pi"), { model: Option.none() })
+      const settings = readJson(yield* fs.readFileString(paths.piSettings)) as Record<string, unknown>
+      yield* fs.writeFileString(paths.piSettings, stringifyJson({ ...settings, packages: [] }))
+
+      yield* service.sync(HarnessIdSchema.make("pi"))
+
+      expect(readJson(yield* fs.readFileString(paths.piSettings))).toMatchObject({
+        packages: [PI_COMPANION_PACKAGE_SOURCE],
+      })
+      expect((yield* fs.readFileString(`${root}/pi/package-commands.jsonl`)).trim().split("\n").map((line) => JSON.parse(line)))
+        .toEqual([
+          { command: "install", source: PI_COMPANION_PACKAGE_SOURCE },
+          { command: "install", source: PI_COMPANION_PACKAGE_SOURCE },
+        ])
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
+  it("compensates package-manager and file effects when the enclosing connection fails", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-package-rollback-" })
+      const paths = fixturePaths(root)
+      const initial = initialFiles(paths)
+      yield* writeFixtures(initial)
+      const executable = yield* writeFakePiExecutable(paths)
+      const base = makeHarnessConnectorRegistry(paths)
+      const ordered = base.ordered.map((connector) => connector.id === "pi"
+        ? { ...connector, connect: () => Effect.die("fixture connect failure") }
+        : connector)
+      const registry = {
+        ordered,
+        get: (harness: typeof ordered[number]["id"]) => ordered.find(({ id }) => id === harness)!,
+      }
+      const service = yield* makeHarnessConnectionService({
+        paths,
+        registry,
+        detect: () => Effect.succeed(Option.some({ executable })),
+        resolveModels: Effect.succeed(models),
+        installStartup: Effect.void,
+      })
+
+      const exit = yield* Effect.exit(service.connect(HarnessIdSchema.make("pi"), {
+        model: Option.some(model),
+        installSkill: true,
+      }))
+
+      expect(exit._tag).toBe("Failure")
+      expect(yield* fs.readFileString(paths.piSettings)).toBe(`${initial[paths.piSettings]}\n`)
+      expect(yield* fs.readFileString(paths.piModels)).toBe(`${initial[paths.piModels]}\n`)
+      expect(yield* fs.exists(paths.skillInstallations["shared-agents"].skillFile)).toBe(false)
+      expect((yield* fs.readFileString(`${root}/pi/package-commands.jsonl`)).trim().split("\n").map((line) => JSON.parse(line)))
+        .toEqual([
+          { command: "install", source: PI_COMPANION_PACKAGE_SOURCE },
+          { command: "remove", source: PI_COMPANION_PACKAGE_SOURCE },
+        ])
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
+  it("reinstalls an owned package and restores files when disconnect fails", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-package-disconnect-rollback-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const executable = yield* writeFakePiExecutable(paths)
+      const base = makeHarnessConnectorRegistry(paths)
+      const ordered = base.ordered.map((connector) => connector.id === "pi"
+        ? { ...connector, disconnect: () => Effect.die("fixture disconnect failure") }
+        : connector)
+      const registry = {
+        ordered,
+        get: (harness: typeof ordered[number]["id"]) => ordered.find(({ id }) => id === harness)!,
+      }
+      const service = yield* makeHarnessConnectionService({
+        paths,
+        registry,
+        detect: () => Effect.succeed(Option.some({ executable })),
+        resolveModels: Effect.succeed(models),
+        installStartup: Effect.void,
+      })
+      yield* service.connect(HarnessIdSchema.make("pi"), {
+        model: Option.some(model),
+        installSkill: false,
+      })
+      const connectedSettings = yield* fs.readFileString(paths.piSettings)
+      const connectedModels = yield* fs.readFileString(paths.piModels)
+
+      const exit = yield* Effect.exit(service.disconnect(HarnessIdSchema.make("pi")))
+
+      expect(exit._tag).toBe("Failure")
+      expect(yield* fs.readFileString(paths.piSettings)).toBe(connectedSettings)
+      expect(yield* fs.readFileString(paths.piModels)).toBe(connectedModels)
+      expect(readJson(yield* fs.readFileString(paths.manifest))).toMatchObject({
+        connections: [{ harness: "pi", companion: { ownership: "magnitude" } }],
+      })
+      expect((yield* fs.readFileString(`${root}/pi/package-commands.jsonl`)).trim().split("\n").map((line) => JSON.parse(line)))
+        .toEqual([
+          { command: "install", source: PI_COMPANION_PACKAGE_SOURCE },
+          { command: "remove", source: PI_COMPANION_PACKAGE_SOURCE },
+          { command: "install", source: PI_COMPANION_PACKAGE_SOURCE },
+        ])
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
+  it("leaves connection state unchanged when Pi rejects package installation", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-package-install-failure-" })
+      const paths = fixturePaths(root)
+      const initial = initialFiles(paths)
+      yield* writeFixtures(initial)
+      const executable = yield* writeFakePiExecutable(paths, "install")
+      const service = yield* makeHarnessConnectionService({
+        paths,
+        detect: () => Effect.succeed(Option.some({ executable })),
+        resolveModels: Effect.succeed(models),
+        installStartup: Effect.void,
+      })
+
+      const exit = yield* Effect.exit(service.connect(HarnessIdSchema.make("pi"), {
+        model: Option.some(model),
+        installSkill: true,
+      }))
+
+      expect(exit._tag).toBe("Failure")
+      expect(yield* fs.readFileString(paths.piSettings)).toBe(`${initial[paths.piSettings]}\n`)
+      expect(yield* fs.readFileString(paths.piModels)).toBe(`${initial[paths.piModels]}\n`)
+      expect(yield* fs.exists(paths.skillInstallations["shared-agents"].skillFile)).toBe(false)
+      expect(readJson(yield* fs.readFileString(paths.manifest))).toEqual({ connections: [] })
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
+  it("retains a connected package and manifest when Pi rejects package removal", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-package-remove-failure-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const executable = yield* writeFakePiExecutable(paths, "remove")
+      const service = yield* makeHarnessConnectionService({
+        paths,
+        detect: () => Effect.succeed(Option.some({ executable })),
+        resolveModels: Effect.succeed(models),
+        installStartup: Effect.void,
+      })
+      yield* service.connect(HarnessIdSchema.make("pi"), { model: Option.some(model) })
+      const connectedSettings = yield* fs.readFileString(paths.piSettings)
+      const connectedModels = yield* fs.readFileString(paths.piModels)
+
+      const exit = yield* Effect.exit(service.disconnect(HarnessIdSchema.make("pi")))
+
+      expect(exit._tag).toBe("Failure")
+      expect(yield* fs.readFileString(paths.piSettings)).toBe(connectedSettings)
+      expect(yield* fs.readFileString(paths.piModels)).toBe(connectedModels)
+      expect(readJson(yield* fs.readFileString(paths.manifest))).toMatchObject({
+        connections: [{ harness: "pi", companion: { ownership: "magnitude" } }],
+      })
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+})
+
 describe("Magnitude skill installation", () => {
   it("shares one installation and replaces it on every interoperable-harness install", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
@@ -438,6 +881,7 @@ describe("HarnessConnection model-set behavior", () => {
       const paths = fixturePaths(root)
       const service = yield* makeHarnessConnectionService({
         paths,
+        registry: makeHarnessConnectorRegistry(paths, { piCompanion: testPiCompanion }),
         detect: (connector) => Effect.succeed(Option.some({ executable: `/installed/${connector.id}` })),
         resolveModels: Effect.succeed(models),
         installStartup: Effect.sync(() => { startupCalls += 1 }),

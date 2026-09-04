@@ -1,6 +1,6 @@
 import { Atom, Registry, Result } from "@effect-atom/atom-react"
 import { Cause, Deferred, Effect, Layer, Option, Queue, Schema, Stream } from "effect"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { Client as EffectQueryClient } from "@magnitudedev/effect-query"
 import {
   MagnitudeBoundary,
@@ -32,6 +32,10 @@ import { localModelProviderModelId } from "./projection"
 import { OnboardingModelSetup } from "./setup"
 import { localModelOptions } from "./options"
 import { onboardingModelSetupNoticeMessage } from "./failure-messages"
+import {
+  HarnessIdSchema,
+  type HarnessConnection,
+} from "../harness-connections/service"
 import {
   defaultOnboardingModelRankingControls,
   normalizeOnboardingModelRankingControls,
@@ -399,6 +403,7 @@ interface HarnessOptions {
   readonly postSyncCatalogRead?: Deferred.Deferred<void>
   readonly downloadFailure?: ModelAcquisitionFailure
   readonly loadFailure?: ModelInstanceFailure
+  readonly harnessConnection?: HarnessConnection
 }
 
 const makeHarness = (options: HarnessOptions) => {
@@ -611,6 +616,7 @@ const makeHarness = (options: HarnessOptions) => {
     ),
     (client) => clientServicesLayer(client, {
       onboardingSetupInitiallyOpen: options.initiallyOpen,
+      ...(options.harnessConnection === undefined ? {} : { harnessConnection: options.harnessConnection }),
     }),
   )
   const registry = Registry.make()
@@ -644,6 +650,13 @@ const makeHarness = (options: HarnessOptions) => {
       () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.continueWithHarness(
         "magnitude" as never,
         { launchOnStartup: false, installSkill: false },
+      )),
+      { concurrent: true },
+    ),
+    continueWithPi: effectQuery.runtime.fn(
+      () => Effect.flatMap(OnboardingModelSetup, (setup) => setup.continueWithHarness(
+        HarnessIdSchema.make("pi"),
+        { launchOnStartup: true, installSkill: true },
       )),
       { concurrent: true },
     ),
@@ -796,6 +809,75 @@ describe("OnboardingModelSetup", () => {
     expect(harness.calls).not.toContain("SyncLocalModel")
     expect(harness.calls).not.toContain("AssignModelSlot")
     expect(harness.calls).not.toContain("LoadModelSlot")
+    harness.registry.dispose()
+  })
+
+  it("uses the shared connection transaction for Pi companion, skill, and startup setup", async () => {
+    const pi = HarnessIdSchema.make("pi")
+    const connect = vi.fn(() => Effect.succeed({
+      companion: Option.some({
+        name: "Magnitude for Pi",
+        source: "npm:@magnitudedev/pi@0.0.1",
+        securityNotice: "Pi extensions execute with your user permissions.",
+        status: "installed" as const,
+        activation: "reload-or-restart" as const,
+      }),
+      skillInstalled: true,
+      startupInstalled: true,
+    }))
+    const harnessConnection: HarnessConnection = {
+      list: Effect.succeed([{
+        id: pi,
+        name: "Pi",
+        availability: "Installed",
+        selectable: true,
+        connected: false,
+        companion: {
+          name: "Magnitude for Pi",
+          source: "npm:@magnitudedev/pi@0.0.1",
+          securityNotice: "Pi extensions execute with your user permissions.",
+        },
+      }]),
+      connect,
+      launch: (harness, modelId) => Effect.succeed({
+        harness,
+        command: "pi",
+        executable: "/installed/pi",
+        args: ["--model", `magnitude/${modelId}`],
+        environment: {},
+        modelId,
+      }),
+      sync: () => Effect.succeed([]),
+      disconnect: () => Effect.void,
+      installSkill: () => Effect.die("onboarding must not call the legacy standalone skill operation"),
+      installStartup: Effect.die("onboarding must not call the legacy standalone startup operation"),
+    }
+    const harness = makeHarness({ installed: true, ready: true, harnessConnection })
+    await Effect.runPromise(execute(harness.registry, harness.service.select, providerModelId))
+    await Effect.runPromise(waitForView(
+      harness,
+      (state) => state._tag === "Open" && state.content._tag === "Harness",
+    ))
+
+    await Effect.runPromise(execute(harness.registry, harness.service.continueWithPi, undefined))
+    const state = await Effect.runPromise(waitForView(
+      harness,
+      (value) => value._tag === "Open" && value.content._tag === "HarnessHandoff",
+    ))
+
+    expect(connect).toHaveBeenCalledOnce()
+    expect(connect).toHaveBeenCalledWith(pi, {
+      model: Option.some(providerModelId),
+      installSkill: true,
+      launchOnStartup: true,
+    })
+    expect(state).toMatchObject({
+      content: {
+        _tag: "HarnessHandoff",
+        plan: { harness: "pi", command: "pi" },
+      },
+    })
+    expect(harness.onboardingCompleted()).toBe(true)
     harness.registry.dispose()
   })
 

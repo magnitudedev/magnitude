@@ -10,6 +10,8 @@ applies_to:
   - packages/acn/src/server.ts
   - packages/sdk/src/inference-client.ts
   - cli/src/harness-connections/**
+  - integrations/pi/extensions/observing-fetch.ts
+  - integrations/pi/extensions/protocol.ts
 ---
 
 # Inference HTTP protocol compatibility

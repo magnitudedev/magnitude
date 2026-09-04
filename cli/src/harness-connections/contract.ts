@@ -2,6 +2,8 @@ import type * as FileSystem from "@effect/platform/FileSystem"
 import type * as Path from "@effect/platform/Path"
 import type * as CommandExecutor from "@effect/platform/CommandExecutor"
 import type {
+  HarnessCompanionConnectionResult,
+  HarnessCompanionDescription,
   HarnessId,
   HarnessLaunchPlan,
 } from "@magnitudedev/client-common"
@@ -76,6 +78,51 @@ export const HarnessRestoreSchema = Schema.Struct({
 })
 export type HarnessRestore = typeof HarnessRestoreSchema.Type
 
+export const HarnessCompanionStateSchema = Schema.Struct({
+  identity: Schema.NonEmptyString,
+  source: Schema.NonEmptyString,
+  ownership: Schema.Literal("magnitude", "pre-existing"),
+  previousEntryJson: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+})
+export type HarnessCompanionState = typeof HarnessCompanionStateSchema.Type
+
+export interface HarnessCompanionReconcileSpec {
+  readonly installation: HarnessInstallation
+  readonly previous: Option.Option<HarnessCompanionState>
+}
+
+export interface HarnessCompanionDisconnectSpec {
+  readonly installation: HarnessInstallation
+  readonly state: HarnessCompanionState
+}
+
+export interface HarnessCompanionPackage {
+  readonly description: HarnessCompanionDescription
+  readonly activation: HarnessCompanionConnectionResult["activation"]
+  readonly reconcile: (
+    spec: HarnessCompanionReconcileSpec,
+  ) => Effect.Effect<{
+    readonly state: HarnessCompanionState
+    readonly status: HarnessCompanionConnectionResult["status"]
+    /** Reverses non-file package-manager side effects when the enclosing connection transaction fails. */
+    readonly rollback: Effect.Effect<
+      void,
+      unknown,
+      FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor
+    >
+  }, unknown, FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor>
+  readonly disconnect: (
+    spec: HarnessCompanionDisconnectSpec,
+  ) => Effect.Effect<{
+    /** Reverses non-file package-manager effects when the enclosing disconnect transaction fails. */
+    readonly rollback: Effect.Effect<
+      void,
+      unknown,
+      FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor
+    >
+  }, unknown, FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor>
+}
+
 export interface HarnessConnectionSpec {
   readonly models: ReadonlyArray<HarnessModel>
   readonly installation: HarnessInstallation
@@ -102,7 +149,9 @@ export interface HarnessConnector {
   readonly recommended?: boolean
   readonly note?: string
   readonly requiresStartup?: boolean
+  readonly companion?: HarnessCompanionPackage
   readonly skillInstallationTarget: SkillInstallationTarget
+  readonly skillRequired?: boolean
   readonly configurationFiles: ReadonlyArray<string>
   readonly detect: (searchPath: string) => Effect.Effect<Option.Option<HarnessInstallation>>
   readonly connect: (

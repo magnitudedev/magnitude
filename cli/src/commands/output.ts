@@ -1,33 +1,29 @@
 import { Data, Effect, Schema } from "effect"
 import stringWidth from "string-width"
 
-export const JsonCommandNameSchema = Schema.Literal(
-  "models.status",
-  "models.load",
-  "models.stop",
-)
-export type JsonCommandName = typeof JsonCommandNameSchema.Type
-
 const JsonCommandErrorSchema = Schema.Struct({
   message: Schema.String,
 })
 
-const jsonSuccessEnvelopeSchema = <Data, Encoded>(data: Schema.Schema<Data, Encoded, never>) => Schema.Struct({
+const jsonSuccessEnvelopeSchema = <CommandName extends string, Data, Encoded>(
+  command: CommandName,
+  data: Schema.Schema<Data, Encoded, never>,
+) => Schema.Struct({
   schemaVersion: Schema.Literal(1),
-  command: JsonCommandNameSchema,
+  command: Schema.Literal(command),
   ok: Schema.Literal(true),
   data,
 })
 
-const JsonFailureEnvelopeSchema = Schema.Struct({
+const jsonFailureEnvelopeSchema = <CommandName extends string>(command: CommandName) => Schema.Struct({
   schemaVersion: Schema.Literal(1),
-  command: JsonCommandNameSchema,
+  command: Schema.Literal(command),
   ok: Schema.Literal(false),
   error: JsonCommandErrorSchema,
 })
 
-export interface JsonCommandOutput<Result, Data, Encoded> {
-  readonly command: JsonCommandName
+export interface JsonCommandOutput<Result, Data, Encoded, CommandName extends string = string> {
+  readonly command: CommandName
   readonly schema: Schema.Schema<Data, Encoded, never>
   readonly data: (result: Result) => Data
 }
@@ -46,25 +42,31 @@ class CommandOutputFailed extends Data.TaggedError("CommandOutputFailed")<{
   readonly message: string
 }> {}
 
-const jsonLine = (value: unknown): string => `${JSON.stringify(value)}\n`
+const encodeJsonLine = <A, I>(schema: Schema.Schema<A, I, never>) => (value: A): string =>
+  `${Schema.encodeSync(Schema.parseJson(schema))(value)}\n`
 
-const renderJsonSuccess = <Result, JsonData, JsonEncoded>(
-  output: JsonCommandOutput<Result, JsonData, JsonEncoded>,
+const renderJsonSuccess = <Result, JsonData, JsonEncoded, CommandName extends string>(
+  output: JsonCommandOutput<Result, JsonData, JsonEncoded, CommandName>,
   result: Result,
-): string => jsonLine(Schema.encodeSync(jsonSuccessEnvelopeSchema(output.schema))({
-  schemaVersion: 1,
-  command: output.command,
-  ok: true,
-  data: output.data(result),
-}))
+): string => {
+  const schema = jsonSuccessEnvelopeSchema(output.command, output.schema)
+  return encodeJsonLine(schema)({
+    schemaVersion: 1,
+    command: output.command,
+    ok: true,
+    data: output.data(result),
+  })
+}
 
-export const renderJsonCommandFailure = (command: JsonCommandName, error: unknown): string =>
-  jsonLine(Schema.encodeSync(JsonFailureEnvelopeSchema)({
+const renderJsonCommandFailure = <CommandName extends string>(command: CommandName, error: unknown): string => {
+  const schema = jsonFailureEnvelopeSchema(command)
+  return encodeJsonLine(schema)({
     schemaVersion: 1,
     command,
     ok: false,
     error: { message: messageOf(error) },
-  }))
+  })
+}
 
 export const runCommand = <A, JsonData = never, JsonEncoded = never>(options: {
   readonly effect: Effect.Effect<A, unknown, never>

@@ -1,0 +1,4 @@
+{
+  "extends": "../tsconfig.json",
+  "include": ["dev-pi.ts", "dev-pi.test.ts", "vitest.config.ts"]
+}

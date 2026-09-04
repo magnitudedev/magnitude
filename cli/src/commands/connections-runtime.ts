@@ -7,6 +7,7 @@ import { BunContext } from "@effect/platform-bun"
 import {
   HarnessIdSchema,
   type HarnessConnection,
+  type HarnessConnectResult,
   type HarnessDestination,
   type HarnessId,
   type HarnessLaunchPlan,
@@ -81,6 +82,47 @@ export const renderLaunchPlan = (plan: HarnessLaunchPlan): string => {
   return [...environment, posixQuote(plan.command), ...plan.args.map(posixQuote)].join(" ")
 }
 
+export const renderAddedConnection = ({
+  harness,
+  model,
+  connection,
+  launchPlan,
+}: {
+  readonly harness: HarnessId
+  readonly model: Option.Option<typeof ProviderModelIdSchema.Type>
+  readonly connection: HarnessConnectResult
+  readonly launchPlan: Option.Option<HarnessLaunchPlan>
+}): string => {
+  const heading = harness === "magnitude"
+    ? "Magnitude Harness is built in."
+    : `Connected ${harness} to Magnitude.`
+  const fields: (readonly [string, string])[] = [
+    ...(Option.isSome(model) ? [["Selected model", model.value]] as const : []),
+    ...Option.match(connection.companion, {
+      onNone: () => [],
+      onSome: (companion) => [[companion.name, companion.status === "already-installed"
+        ? "Already installed"
+        : companion.status === "enabled" ? "Enabled" : "Installed"]] as const,
+    }),
+    ...(connection.skillInstalled ? [["Skill", "Installed"]] as const : []),
+  ]
+  return [
+    heading,
+    ...(fields.length > 0 ? [renderFields(fields)] : []),
+    ...Option.match(launchPlan, {
+      onNone: () => [],
+      onSome: (plan) => ["", `Open ${harness} with this model:`, `  ${renderLaunchPlan(plan)}`],
+    }),
+    ...Option.match(connection.companion, {
+      onNone: () => [],
+      onSome: ({ activation }) => activation === "reload-or-restart"
+        ? ["", "Restart existing Pi sessions or run /reload to activate the extension."]
+        : [],
+    }),
+    "",
+  ].join("\n")
+}
+
 export const addConnection = (
   harnessInput: string,
   modelInput: string | undefined,
@@ -90,32 +132,18 @@ export const addConnection = (
     yield* Effect.scoped(requireRunningService)
     const harness = yield* parseHarness(harnessInput)
     const model = yield* parseModel(modelInput)
-    if (installSkill) yield* service.installSkill(harness)
-    yield* service.connect(harness, { model })
+    const connection = yield* service.connect(harness, {
+      model,
+      installSkill,
+      launchOnStartup: false,
+    })
     const launchPlan = yield* Option.match(model, {
       onNone: () => Effect.succeed(Option.none()),
       onSome: (modelId) => service.launch(harness, modelId).pipe(Effect.map(Option.some)),
     })
-    return { harness, model, skillInstalled: installSkill, launchPlan }
+    return { harness, model, connection, launchPlan }
   })),
-  render: ({ harness, model, skillInstalled, launchPlan }) => {
-    const heading = harness === "magnitude"
-      ? "Magnitude Harness is built in."
-      : `Connected ${harness} to Magnitude.`
-    const fields: (readonly [string, string])[] = [
-      ...(Option.isSome(model) ? [["Selected model", model.value]] as const : []),
-      ...(skillInstalled ? [["Skill", "Installed"]] as const : []),
-    ]
-    return [
-      heading,
-      ...(fields.length > 0 ? [renderFields(fields)] : []),
-      ...Option.match(launchPlan, {
-        onNone: () => [],
-        onSome: (plan) => ["", `Open ${harness} with this model:`, `  ${renderLaunchPlan(plan)}`],
-      }),
-      "",
-    ].join("\n")
-  },
+  render: renderAddedConnection,
 })
 
 export const syncConnections = (harnessInput: string | undefined) => runCommand({

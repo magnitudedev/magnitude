@@ -2,8 +2,9 @@ import { Command } from "@commander-js/extra-typings"
 import { HarnessIdSchema } from "@magnitudedev/client-common"
 import { ProviderModelIdSchema } from "@magnitudedev/sdk"
 import { describe, expect, it } from "vitest"
+import { Option } from "effect"
 import { registerConnectionsCommand } from "./connections"
-import { renderConnections, renderLaunchPlan } from "./connections-runtime"
+import { renderAddedConnection, renderConnections, renderLaunchPlan } from "./connections-runtime"
 
 describe("connections command contract", () => {
   it("connects all models and optionally selects a harness model", () => {
@@ -44,5 +45,39 @@ describe("connections command contract", () => {
 
     expect(output).toContain("codex")
     expect(output).not.toContain(detectedExecutable)
+  })
+
+  it("reports automatic Pi package and skill installation in the headless flow", () => {
+    const pi = HarnessIdSchema.make("pi")
+    const model = ProviderModelIdSchema.make("local/model")
+    const output = renderAddedConnection({
+      harness: pi,
+      model: Option.some(model),
+      connection: {
+        companion: Option.some({
+          name: "Magnitude for Pi",
+          source: "npm:@magnitudedev/pi@0.0.1",
+          securityNotice: "Pi extensions execute with your user permissions.",
+          status: "installed",
+          activation: "reload-or-restart",
+        }),
+        skillInstalled: true,
+        startupInstalled: false,
+      },
+      launchPlan: Option.some({
+        harness: pi,
+        command: "pi",
+        executable: "/installed/pi",
+        args: ["--model", `magnitude/${model}`],
+        environment: {},
+        modelId: model,
+      }),
+    })
+
+    expect(output).toContain("Connected pi to Magnitude.")
+    expect(output).toContain("Magnitude for Pi  Installed")
+    expect(output).toContain("Skill             Installed")
+    expect(output).toContain("pi --model magnitude/local/model")
+    expect(output).toContain("run /reload to activate the extension")
   })
 })

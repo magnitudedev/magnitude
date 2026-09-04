@@ -39,6 +39,26 @@ export interface HarnessDestination {
   readonly selectable: boolean
   readonly connected: boolean
   readonly note?: string
+  readonly companion?: HarnessCompanionDescription
+  /** The harness connection is not useful without Magnitude's agent instructions. */
+  readonly skillRequired?: boolean
+}
+
+export interface HarnessCompanionDescription {
+  readonly name: string
+  readonly source: string
+  readonly securityNotice: string
+}
+
+export interface HarnessCompanionConnectionResult extends HarnessCompanionDescription {
+  readonly status: "installed" | "enabled" | "already-installed"
+  readonly activation: "immediate" | "reload-or-restart"
+}
+
+export interface HarnessConnectResult {
+  readonly companion: Option.Option<HarnessCompanionConnectionResult>
+  readonly skillInstalled: boolean
+  readonly startupInstalled: boolean
 }
 
 export interface HarnessLaunchPlan {
@@ -55,6 +75,10 @@ export interface HarnessLaunchPlan {
 export interface HarnessConnectOptions {
   /** Persist this model as the harness selection for ordinary new sessions. */
   readonly model: Option.Option<ProviderModelId>
+  /** Install or refresh the Magnitude skill when the connector does not require it. */
+  readonly installSkill?: boolean
+  /** Register Magnitude's per-user service for login startup. */
+  readonly launchOnStartup?: boolean
 }
 
 export class HarnessConnectionError extends Data.TaggedError("HarnessConnectionError")<{
@@ -68,7 +92,7 @@ export interface HarnessConnection {
   readonly connect: (
     harness: HarnessId,
     options: HarnessConnectOptions,
-  ) => Effect.Effect<void, HarnessConnectionError>
+  ) => Effect.Effect<HarnessConnectResult, HarnessConnectionError>
   readonly launch: (
     harness: HarnessId,
     model: ProviderModelId,
@@ -97,7 +121,11 @@ const magnitudeDestination: HarnessDestination = {
 export const UnavailableHarnessConnection: HarnessConnection = {
   list: Effect.succeed([magnitudeDestination]),
   connect: (harness) => harness === "magnitude"
-    ? Effect.void
+    ? Effect.succeed({
+        companion: Option.none(),
+        skillInstalled: false,
+        startupInstalled: false,
+      })
     : Effect.fail(new HarnessConnectionError({ operation: "connect", harness, message: "External harness connections are unavailable in this client" })),
   launch: (harness, modelId) => harness === "magnitude"
     ? Effect.succeed({ harness, command: "magnitude", executable: "magnitude", args: [], environment: {}, modelId })

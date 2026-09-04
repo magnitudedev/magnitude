@@ -112,6 +112,7 @@ const runCargoBuild = async (
   options: {
     readonly cwd: string
     readonly env: Readonly<Record<string, string | undefined>>
+    readonly diagnostics: "all" | "errors"
   },
 ): Promise<readonly CargoMessage[]> => {
   const child = Bun.spawn([...command], {
@@ -119,14 +120,24 @@ const runCargoBuild = async (
     env: options.env,
     stdin: "ignore",
     stdout: "pipe",
-    stderr: "inherit",
+    stderr: options.diagnostics === "all" ? "inherit" : "pipe",
   })
-  const [code, messages] = await Promise.all([
+  const renderedDiagnostics: string[] = []
+  const [code, messages, stderr] = await Promise.all([
     child.exited,
-    readCargoMessages(child.stdout),
+    readCargoMessages(child.stdout, options.diagnostics === "all"
+      ? (rendered) => process.stderr.write(rendered)
+      : (rendered) => renderedDiagnostics.push(rendered)),
+    options.diagnostics === "all"
+      ? Promise.resolve("")
+      : new Response(child.stderr).text(),
   ])
   if (code !== 0) {
-    throw new Error(`${command[0]} failed with exit ${code}`)
+    const diagnostics = [stderr, ...renderedDiagnostics]
+      .filter((value) => value.trim().length > 0)
+      .join("\n")
+      .trim()
+    throw new Error(`${command[0]} failed with exit ${code}${diagnostics.length > 0 ? `: ${diagnostics}` : ""}`)
   }
   return messages
 }
@@ -234,6 +245,8 @@ export interface BuildIcnInput {
   readonly release?: boolean
   readonly clean?: boolean
   readonly buildEnvironment?: Readonly<Record<string, string>>
+  /** Print successful compiler diagnostics, or retain them only for a failed build. */
+  readonly diagnostics?: "all" | "errors"
 }
 
 export const buildIcnBinary = async ({
@@ -243,6 +256,7 @@ export const buildIcnBinary = async ({
   release = true,
   clean = true,
   buildEnvironment = {},
+  diagnostics = "all",
 }: BuildIcnInput): Promise<IcnBuild> => {
   const cargoTarget = rustTarget(target)
   const targetDirectory = resolve(
@@ -284,6 +298,7 @@ export const buildIcnBinary = async ({
     "json-render-diagnostics",
   ], {
     cwd: PROJECT_ROOT,
+    diagnostics,
     env: {
       ...process.env,
       ...buildEnvironment,
