@@ -1,4 +1,4 @@
-import { Either, Schema } from "effect"
+import { Effect, Either, Schema, Scope } from "effect"
 
 import type { ProgressRequest } from "./progress"
 import { decodeMagnitudeObservation } from "./protocol"
@@ -52,67 +52,63 @@ export class SseDataParser {
   }
 }
 
-const observeResponse = async (
+const observeResponse = (
   response: Response,
   request: ProgressRequest,
   signal: AbortSignal,
-): Promise<void> => {
-  if (response.body === null) {
-    request.finish()
-    return
-  }
-  const reader = response.body.getReader()
-  const abort = () => {
-    request.fail()
-    void reader.cancel().catch(() => {})
-  }
-  if (signal.aborted) {
-    abort()
-    reader.releaseLock()
-    return
-  }
-  signal.addEventListener("abort", abort, { once: true })
+): Effect.Effect<void> => Effect.scoped(Effect.gen(function* () {
+  if (!response.ok || response.body === null) { yield* request.fail; return }
+  const reader = yield* Effect.acquireRelease(Effect.sync(() => response.body!.getReader()), (reader) =>
+    Effect.promise(() => reader.cancel()).pipe(Effect.interruptible, Effect.timeout("100 millis"), Effect.ignore,
+      Effect.ensuring(Effect.sync(() => reader.releaseLock()))))
+  if (signal.aborted) { yield* request.fail; return }
   const decoder = new TextDecoder()
   const parser = new SseDataParser()
-  const observe = (value: unknown) => {
-    const observation = decodeMagnitudeObservation(value)
-    if (observation !== undefined) request.observe(observation)
-  }
-  try {
+  const drain = Effect.gen(function* () {
     while (true) {
-      const result = await reader.read()
+      const result = yield* Effect.tryPromise(() => reader.read())
       if (result.done) break
-      parser.push(decoder.decode(result.value, { stream: true }), observe)
+      const values: unknown[] = []
+      parser.push(decoder.decode(result.value, { stream: true }), (value) => values.push(value))
+      for (const value of values) {
+        const observation = decodeMagnitudeObservation(value)
+        if (observation) yield* request.observe(observation)
+      }
     }
-    parser.push(decoder.decode(), observe)
-    parser.finish(observe)
-    request.finish()
-  } catch {
-    request.fail()
-  } finally {
-    signal.removeEventListener("abort", abort)
-    reader.releaseLock()
-  }
-}
+    // An unterminated final frame is not evidence of a completed observation.
+    yield* request.finish
+  })
+  const aborted = Effect.async<void>((resume) => {
+    const abort = () => resume(Effect.interrupt)
+    signal.addEventListener("abort", abort, { once: true })
+    if (signal.aborted) abort()
+    return Effect.sync(() => signal.removeEventListener("abort", abort))
+  })
+  yield* Effect.raceFirst(drain, aborted).pipe(Effect.onError(() => request.fail))
+})).pipe(Effect.catchAllCause(() => Effect.void))
 
 export const makeObservingFetch = (
   fetchImplementation: typeof fetch,
-  begin: () => ProgressRequest,
+  begin: () => Effect.Effect<ProgressRequest>,
+  scope: Scope.Scope,
 ): typeof fetch => {
   const observingFetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const request = new Request(input, init)
     request.headers.set(MAGNITUDE_PROGRESS_HEADER, "true")
-    const progress = begin()
+    const progress = Effect.runSync(Effect.suspend(begin).pipe(Effect.catchAllCause(() => Effect.succeed({
+      observe: () => Effect.void, finish: Effect.void, fail: Effect.void,
+    }))))
     try {
       const response = await fetchImplementation(request)
       try {
-        void observeResponse(response.clone(), progress, request.signal).catch(() => progress.fail())
+        const observation = observeResponse(response.clone(), progress, request.signal)
+        Effect.runFork(Effect.forkIn(observation, scope))
       } catch {
-        progress.fail()
+        Effect.runSync(progress.fail.pipe(Effect.catchAllCause(() => Effect.void)))
       }
       return response
     } catch (error) {
-      progress.fail()
+      Effect.runSync(progress.fail.pipe(Effect.catchAllCause(() => Effect.void)))
       throw error
     }
   }

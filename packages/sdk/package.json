@@ -27,6 +27,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@magnitudedev/integration-protocol": "workspace:*",
     "@effect-atom/atom": "^0.5.3",
     "effect": "^3.21.2",
     "@effect/platform": "^0.96.0",

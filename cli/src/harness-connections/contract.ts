@@ -14,6 +14,8 @@ import {
 } from "@magnitudedev/sdk"
 import { Option, Schema, type Effect } from "effect"
 import type { SkillInstallationTarget } from "./paths"
+import type { ConnectionTransaction } from "./transaction"
+import { PiCompanionStateSchema } from "./connectors/pi-package-state"
 
 const CONNECTOR_MAX_OUTPUT_TOKENS = 32_768
 
@@ -78,12 +80,8 @@ export const HarnessRestoreSchema = Schema.Struct({
 })
 export type HarnessRestore = typeof HarnessRestoreSchema.Type
 
-export const HarnessCompanionStateSchema = Schema.Struct({
-  identity: Schema.NonEmptyString,
-  source: Schema.NonEmptyString,
-  ownership: Schema.Literal("magnitude", "pre-existing"),
-  previousEntryJson: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
-})
+// Extend this union with each adapter's validated receipt, not opaque serialized host settings.
+export const HarnessCompanionStateSchema = PiCompanionStateSchema
 export type HarnessCompanionState = typeof HarnessCompanionStateSchema.Type
 
 export interface HarnessCompanionReconcileSpec {
@@ -98,29 +96,16 @@ export interface HarnessCompanionDisconnectSpec {
 
 export interface HarnessCompanionPackage {
   readonly description: HarnessCompanionDescription
-  readonly activation: HarnessCompanionConnectionResult["activation"]
+  readonly activationInstructions: HarnessCompanionConnectionResult["activationInstructions"]
   readonly reconcile: (
     spec: HarnessCompanionReconcileSpec,
   ) => Effect.Effect<{
     readonly state: HarnessCompanionState
     readonly status: HarnessCompanionConnectionResult["status"]
-    /** Reverses non-file package-manager side effects when the enclosing connection transaction fails. */
-    readonly rollback: Effect.Effect<
-      void,
-      unknown,
-      FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor
-    >
-  }, unknown, FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor>
+  }, unknown, FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor | ConnectionTransaction>
   readonly disconnect: (
     spec: HarnessCompanionDisconnectSpec,
-  ) => Effect.Effect<{
-    /** Reverses non-file package-manager effects when the enclosing disconnect transaction fails. */
-    readonly rollback: Effect.Effect<
-      void,
-      unknown,
-      FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor
-    >
-  }, unknown, FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor>
+  ) => Effect.Effect<void, unknown, FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor | ConnectionTransaction>
 }
 
 export interface HarnessConnectionSpec {

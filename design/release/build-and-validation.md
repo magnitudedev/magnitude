@@ -1,14 +1,15 @@
 ---
 applies_to:
-  - .github/workflows/release-build.yml
-  - .github/workflows/release-checks.yml
-  - .github/workflows/release-candidate-dry-run.yml
-  - packages/release/scripts/assemble.ts
-  - packages/release/scripts/build/**
-  - packages/release/scripts/matrix.ts
-  - packages/release/scripts/validate-host.ts
+  - .github/workflows/release*.yml
+  - packages/release/scripts/**
   - packages/release/src/targets.ts
   - inference/scripts/compile.ts
+  - .github/workflows/integrations.yml
+  - .github/workflows/publish-integrations.yml
+  - scripts/*integrations.ts
+  - integrations/**/package.json
+  - integrations/**/scripts/**
+  - packages/integration-protocol/**
 ---
 
 # Release build and validation
@@ -87,3 +88,15 @@ Linux x64 dry run exercises the CPU-only production path but cannot authorize pu
 Publication requires the complete configured artifact graph. A runner-only build success, a
 host-scoped dry run, static inspection without execution, or execution without final-archive
 inspection is insufficient.
+
+Harness companion packages have independent, exact package versions. Their public contract is
+published before the companion, and both are verified available before a CLI release advertises
+the pinned companion. An explicit integration-only release can publish a main-branch source commit
+without rebuilding the CLI/native artifact graph. It must pass the same package tests and clean
+consumer acceptance, and must verify the published integrity; an existing version is never replaced.
+
+Integration acceptance packs the public contract and companion, installs those tarballs outside the
+workspace, and loads the extension through the supported harness's native package and resource
+loader under Node and Bun. Private workspace dependencies cannot escape into the packed artifact.
+Integration-only changes trigger these checks, including shared wire fixtures and the pinned host's
+filter semantics. Local acceptance never publishes packages.

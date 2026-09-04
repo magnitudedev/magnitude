@@ -6,6 +6,7 @@ applies_to:
   - cli/src/agent-docs/**
   - packages/client-common/src/harness-connections/**
   - cli/src/harness-connections/**
+  - packages/integration-protocol/**
 ---
 
 # Non-interactive CLI contract
@@ -92,9 +93,11 @@ The envelopes are exactly:
 { schemaVersion: 1, command, ok: false, error: { message } }
 ```
 
-The version covers the complete JSON document, including command data. Any structural or semantic
-contract change—including adding, renaming, or removing a field—requires a new version. An
-implementation correction that leaves every documented meaning and shape intact does not.
+The public integration-protocol package owns these schemas; CLI producers consume them through the
+SDK, and standalone integrations consume the public package without private workspace dependencies.
+The version covers required fields and their meanings. Breaking changes require a new version;
+additive optional fields do not. Consumers ignore unknown fields while validating known fields,
+command identity, and version. Shared wire fixtures exercise both sides of this contract.
 
 `models status --json` preserves the human command's model visibility and deterministic ordering,
 but projects only the stable information required by harness integrations. List and addressed forms

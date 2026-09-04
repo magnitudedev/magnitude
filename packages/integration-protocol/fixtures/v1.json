@@ -1,0 +1,9 @@
+{
+  "status": { "schemaVersion": 1, "command": "models.status", "ok": true, "data": { "state": "ready", "models": [{ "modelId": "local/model:q4", "displayName": "Local Model (Q4)", "installation": "installed", "residency": "ready" }] } },
+  "initializing": { "schemaVersion": 1, "command": "models.status", "ok": true, "data": { "state": "initializing", "models": [] } },
+  "load": { "schemaVersion": 1, "command": "models.load", "ok": true, "data": { "modelId": "local/model:q4" } },
+  "stop": { "schemaVersion": 1, "command": "models.stop", "ok": true, "data": {} },
+  "failure": { "schemaVersion": 1, "command": "models.load", "ok": false, "error": { "message": "Model is not installed" } },
+  "progress": { "phase": "prefill", "completed_tokens": 120, "total_tokens": 200, "cached_tokens": 100 },
+  "timings": { "prompt_ms": 500, "time_to_first_token_ms": 600, "predicted_n": 10, "predicted_ms": 200, "predicted_per_second": 50 }
+}

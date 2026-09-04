@@ -6,6 +6,7 @@ import {
   HarnessConnectionError,
   HarnessIdSchema,
   type HarnessConnection,
+  type HarnessConnectOptions,
   type HarnessDestination,
   type HarnessId,
 } from "@magnitudedev/client-common"
@@ -17,10 +18,12 @@ import {
   type ProviderModelId,
 } from "@magnitudedev/sdk"
 import { makeStateDocument } from "@magnitudedev/storage"
-import { Effect, Option, Schema } from "effect"
+import { Cause, Effect, Option, Schema } from "effect"
+import { ConnectionTransaction, connectionTransaction } from "./transaction"
+import { withConnectionLock } from "./lock"
 import { delimiter } from "node:path"
 import { installServiceOnStartup } from "../server/service"
-import { writeFileAtomic } from "../utils/atomic-file"
+import { writeFileAtomic } from "./configuration-file"
 import {
   HarnessModelSchema,
   HarnessCompanionStateSchema,
@@ -162,61 +165,37 @@ const containsModel = (models: ReadonlyArray<HarnessModel>, modelId: ProviderMod
   models.some(({ id }) => id === modelId)
 
 export const makeHarnessConnectionService = (options: HarnessConnectionOptions = {}) => Effect.gen(function* () {
-  const fs = yield* FileSystem.FileSystem
   const runtime = yield* Effect.runtime<
     FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor | HttpClient.HttpClient
   >()
   const paths = options.paths ?? harnessConnectionPaths()
-  const localPiPackageSource = process.env.MAGNITUDE_PI_PACKAGE_SOURCE?.trim()
-  const registry = options.registry ?? makeHarnessConnectorRegistry(paths, {
-    ...(localPiPackageSource === undefined || localPiPackageSource.length === 0
-      ? {}
-      : { piCompanionSource: localPiPackageSource }),
-  })
+  const registry = options.registry ?? makeHarnessConnectorRegistry(paths)
   const now = options.now ?? (() => new Date())
-  const manifestState = yield* makeStateDocument({
+  const manifestState = makeStateDocument({
     path: paths.manifest,
     schema: ManifestSchema,
     initial: emptyManifest,
     equivalence: Schema.equivalence(ManifestSchema),
   })
-  const readManifest = manifestState.get
-  const updateManifest = manifestState.update
+  const readManifest = Effect.flatMap(manifestState, (state) => state.get)
+  yield* withConnectionLock(paths.manifest, manifestState).pipe(Effect.mapError((error) => failure("list", String(error))))
+  const updateManifest = (f: (manifest: Manifest) => Manifest) => Effect.gen(function* () {
+    const state = yield* manifestState
+    const transaction = yield* ConnectionTransaction
+    return yield* transaction.commit(state.update(f))
+  })
   const detect = options.detect ?? ((connector: HarnessConnector) => connector.detect(harnessExecutableSearchPath()))
   const resolveModels = options.resolveModels ?? discoverMagnitudeModels
   const mutationLock = yield* Effect.makeSemaphore(1)
-  const provide = <A, E>(effect: Effect.Effect<
-    A,
-    E,
-    FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor | HttpClient.HttpClient
-  >) => Effect.provide(effect, runtime)
+  const provide = <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.provide(effect, runtime)
 
-  const snapshotFiles = (files: ReadonlyArray<string>) => Effect.forEach(
-    files,
-    (file) => fs.readFileString(file).pipe(
-      Effect.map((contents) => ({ file, contents: Option.some(contents) })),
-      Effect.catchTag("SystemError", (error) => error.reason === "NotFound"
-        ? Effect.succeed({ file, contents: Option.none<string>() })
-        : Effect.fail(error)),
-    ),
-  )
-
-  const restoreFiles = (
-    snapshots: ReadonlyArray<{ readonly file: string; readonly contents: Option.Option<string> }>,
-  ) => Effect.forEach(snapshots, ({ file, contents }) => Option.match(contents, {
-    onSome: (source) => writeFileAtomic(file, source),
-    onNone: () => fs.remove(file).pipe(
-      Effect.catchTag("SystemError", (error) => error.reason === "NotFound" ? Effect.void : Effect.fail(error)),
-    ),
-  }), { discard: true })
-
-  const connectorOperation = <A>(
+  const connectorOperation = <A, R>(
     operation: HarnessConnectionError["operation"],
     connector: HarnessConnector,
     effect: Effect.Effect<
       A,
       unknown,
-      FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor
+      R
     >,
   ) => effect.pipe(
     Effect.mapError((error) => error instanceof HarnessConnectionError
@@ -255,10 +234,14 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     Effect.mapError((error) => failure("startup", String(error))),
   )
 
-  const withMutationLock = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-    mutationLock.withPermits(1)(effect)
+  const withMutationLock = <A, E, R>(operation: HarnessConnectionError["operation"], effect: Effect.Effect<A, E, R>) =>
+    provide(mutationLock.withPermits(1)(withConnectionLock(paths.manifest, effect))).pipe(
+      Effect.catchAllCause((cause) => Cause.isInterruptedOnly(cause)
+        ? Effect.interrupt
+        : Effect.fail(failure(operation, Cause.pretty(cause)))),
+    )
 
-  const connect: HarnessConnection["connect"] = (harness, connectOptions) => provide(Effect.gen(function* () {
+  const connect = (harness: HarnessId, connectOptions: HarnessConnectOptions) => provide(connectionTransaction(Effect.gen(function* () {
     const connector = registry.get(harness)
     const installation = yield* installed(connector)
     if (Option.isNone(installation)) return yield* failure("connect", `${connector.name} is not installed`, harness)
@@ -287,20 +270,10 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
         startupInstalled: shouldInstallStartup,
       }
     }
-    const skillFile = paths.skillInstallations[connector.skillInstallationTarget].skillFile
-    const snapshots = yield* snapshotFiles([
-      ...connector.configurationFiles,
-      ...(shouldInstallSkill ? [skillFile] : []),
-    ])
     const companionResult = connector.companion === undefined
       ? Option.none<{
           readonly state: HarnessCompanionState
           readonly status: "installed" | "enabled" | "already-installed"
-          readonly rollback: Effect.Effect<
-            void,
-            unknown,
-            FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor
-          >
         }>()
       : Option.some(yield* connectorOperation(
           "connect",
@@ -310,44 +283,39 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
             previous: Option.fromNullable(existing).pipe(Option.flatMap(({ companion }) => companion)),
           }),
         ))
-    const rollback = Effect.gen(function* () {
-      if (Option.isSome(companionResult)) yield* companionResult.value.rollback.pipe(Effect.ignore)
-      yield* restoreFiles(snapshots).pipe(Effect.ignore)
+    if (shouldInstallStartup) yield* installStartup
+    if (shouldInstallSkill) yield* installSkill(harness)
+    const captured = yield* connectorOperation("connect", connector, connector.connect(spec))
+    const restore = existing !== undefined && Option.isSome(existing.restore)
+      ? existing.restore
+      : captured
+    const companion = Option.match(companionResult, {
+      onNone: () => Option.none<HarnessCompanionState>(),
+      onSome: ({ state }) => Option.some(state),
     })
-    yield* Effect.gen(function* () {
-      if (shouldInstallStartup) yield* installStartup
-      if (shouldInstallSkill) yield* installSkill(harness)
-      const captured = yield* connectorOperation("connect", connector, connector.connect(spec))
-      const restore = existing !== undefined && Option.isSome(existing.restore)
-        ? existing.restore
-        : captured
-      const companion = Option.match(companionResult, {
-        onNone: () => Option.none<HarnessCompanionState>(),
-        onSome: ({ state }) => Option.some(state),
-      })
-      yield* updateManifest((manifest) => upsertManifest(
-        manifest,
-        harness,
-        models,
-        restore,
-        companion,
-        now,
-      ))
-    }).pipe(Effect.onError(() => rollback))
+    yield* updateManifest((manifest) => upsertManifest(
+      manifest,
+      harness,
+      models,
+      restore,
+      companion,
+      now,
+    ))
     return {
-      companion: Option.flatMap(companionResult, ({ status }) => connector.companion === undefined
+      companion: Option.flatMap(companionResult, ({ status, state }) => connector.companion === undefined
         ? Option.none()
         : Option.some({
             ...connector.companion.description,
+            source: state.source,
             status,
-            activation: connector.companion.activation,
+            activationInstructions: connector.companion.activationInstructions,
           })),
       skillInstalled: shouldInstallSkill,
       startupInstalled: shouldInstallStartup,
     }
   }).pipe(Effect.mapError((error) => error instanceof HarnessConnectionError
     ? error
-    : failure("connect", String(error), harness))))
+    : failure("connect", String(error), harness)))))
 
   const launch: HarnessConnection["launch"] = (harness, modelId) => provide(Effect.gen(function* () {
     const connector = registry.get(harness)
@@ -359,7 +327,7 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     : failure("launch", String(error), harness))))
 
   const sync: HarnessConnection["sync"] = (harness) => provide(Effect.gen(function* () {
-    let manifest = yield* readManifest
+    const manifest = yield* readManifest
     const entries = harness === undefined
       ? manifest.connections
       : manifest.connections.filter((entry) => entry.harness === harness)
@@ -369,44 +337,31 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     const models = uniqueModels(yield* resolveModels)
     if (models.length === 0) return yield* failure("sync", "No installed Magnitude models are available", harness)
     for (const entry of entries) {
-      const connector = registry.get(entry.harness)
-      const installation = connector.id === "codex" || connector.companion !== undefined
-        ? yield* installed(connector)
-        : Option.some({ executable: connector.executable })
-      if (Option.isNone(installation)) return yield* failure(
-        "sync",
-        `${connector.name} is not installed`,
-        connector.id,
-      )
-      const spec: HarnessConnectionSpec = {
-        models,
-        model: Option.none(),
-        installation: installation.value,
-        previousModels: entry.models,
-      }
-      if (connector.requiresStartup) yield* installStartup
-      const requiredSkillFile = connector.skillRequired === true
-        ? [paths.skillInstallations[connector.skillInstallationTarget].skillFile]
-        : []
-      const snapshots = yield* snapshotFiles([...connector.configurationFiles, ...requiredSkillFile])
-      const companionResult = connector.companion === undefined
-        ? Option.none<{
-            readonly state: HarnessCompanionState
-            readonly rollback: Effect.Effect<
-              void,
-              unknown,
-              FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor
-            >
-          }>()
-        : Option.some(yield* connectorOperation("sync", connector, connector.companion.reconcile({
-            installation: installation.value,
-            previous: entry.companion,
-          })))
-      const rollback = Effect.gen(function* () {
-        if (Option.isSome(companionResult)) yield* companionResult.value.rollback.pipe(Effect.ignore)
-        yield* restoreFiles(snapshots).pipe(Effect.ignore)
-      })
-      yield* Effect.gen(function* () {
+      yield* connectionTransaction(Effect.gen(function* () {
+        const connector = registry.get(entry.harness)
+        const installation = connector.id === "codex" || connector.companion !== undefined
+          ? yield* installed(connector)
+          : Option.some({ executable: connector.executable })
+        if (Option.isNone(installation)) return yield* failure(
+          "sync",
+          `${connector.name} is not installed`,
+          connector.id,
+        )
+        const spec: HarnessConnectionSpec = {
+          models,
+          model: Option.none(),
+          installation: installation.value,
+          previousModels: entry.models,
+        }
+        if (connector.requiresStartup) yield* installStartup
+        const companionResult = connector.companion === undefined
+          ? Option.none<{
+              readonly state: HarnessCompanionState
+            }>()
+          : Option.some(yield* connectorOperation("sync", connector, connector.companion.reconcile({
+              installation: installation.value,
+              previous: entry.companion,
+            })))
         if (connector.skillRequired === true) yield* installSkill(entry.harness)
         yield* connectorOperation("sync", connector, connector.connect(spec))
         yield* updateManifest((current) => upsertManifest(
@@ -420,15 +375,14 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
           }),
           now,
         ))
-      }).pipe(Effect.onError(() => rollback))
-      manifest = yield* readManifest
+      }))
     }
     return yield* list
   }).pipe(Effect.mapError((error) => error instanceof HarnessConnectionError
     ? error
     : failure("sync", String(error), harness))))
 
-  const disconnect: HarnessConnection["disconnect"] = (harness) => provide(Effect.gen(function* () {
+  const disconnect = (harness: HarnessId) => provide(connectionTransaction(Effect.gen(function* () {
     const manifest = yield* readManifest
     const entry = manifest.connections.find((candidate) => candidate.harness === harness)
     if (entry === undefined) return
@@ -439,32 +393,22 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     if (connector.companion !== undefined && Option.isNone(installation)) {
       return yield* failure("disconnect", `${connector.name} is not installed`, harness)
     }
-    const snapshots = yield* snapshotFiles(connector.configurationFiles)
-    const companionResult = connector.companion !== undefined
+    if (connector.companion !== undefined
         && Option.isSome(entry.companion)
-        && Option.isSome(installation)
-      ? Option.some(yield* connectorOperation("disconnect", connector, connector.companion.disconnect({
-            installation: installation.value,
-            state: entry.companion.value,
-          })))
-      : Option.none<{ readonly rollback: Effect.Effect<
-          void,
-          unknown,
-          FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor
-        > }>()
-    const rollback = Effect.gen(function* () {
-      if (Option.isSome(companionResult)) yield* companionResult.value.rollback.pipe(Effect.ignore)
-      yield* restoreFiles(snapshots).pipe(Effect.ignore)
-    })
+        && Option.isSome(installation)) {
+      yield* connectorOperation("disconnect", connector, connector.companion.disconnect({
+        installation: installation.value,
+        state: entry.companion.value,
+      }))
+    }
     yield* connectorOperation("disconnect", connector, connector.disconnect(entrySpec(entry))).pipe(
       Effect.zipRight(updateManifest((current) => ({
         connections: current.connections.filter((candidate) => candidate.harness !== harness),
       }))),
-      Effect.onError(() => rollback),
     )
   }).pipe(Effect.mapError((error) => error instanceof HarnessConnectionError
     ? error
-    : failure("disconnect", String(error), harness))))
+    : failure("disconnect", String(error), harness)))))
 
   const installSkill: HarnessConnection["installSkill"] = (harness) => {
     const target = registry.get(harness).skillInstallationTarget
@@ -476,11 +420,11 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
   }
 
   return {
-    list,
-    connect: (harness, options) => withMutationLock(connect(harness, options)),
+    list: withMutationLock("list", list),
+    connect: (harness, options) => withMutationLock("connect", connect(harness, options)),
     launch,
-    sync: (harness?: HarnessId) => withMutationLock(sync(harness)),
-    disconnect: (harness) => withMutationLock(disconnect(harness)),
+    sync: (harness?: HarnessId) => withMutationLock("sync", sync(harness)),
+    disconnect: (harness) => withMutationLock("disconnect", disconnect(harness)),
     installSkill,
     installStartup,
   } satisfies HarnessConnection

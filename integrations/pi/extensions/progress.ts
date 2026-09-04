@@ -1,273 +1,200 @@
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent"
 import { Text } from "@earendil-works/pi-tui"
+import { defineFSM, type StateUnion } from "@magnitudedev/utils/fsm"
+import { Data, Effect, Fiber, Option, Queue, Schema } from "effect"
 import type { MagnitudeObservation, MagnitudeProgress, MagnitudeTimings } from "./protocol"
 
 export const MAGNITUDE_SUMMARY_WIDGET_KEY = "magnitude-inference-summary"
-
-const elapsedSeconds = (milliseconds: number): string => `${(Math.max(0, milliseconds) / 1_000).toFixed(1)}s`
-
-const compactNumber = (value: number): string => {
-  if (value < 1_000) return String(Math.round(value))
-  if (value < 1_000_000) return `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}k`
-  return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`
-}
-
-const rate = (value: number): string => Number.isFinite(value) ? value.toFixed(1) : "0.0"
-
-const workDuration = (milliseconds: number): string => {
-  if (milliseconds < 1_000) return "<1 second"
-  const totalSeconds = Math.floor(milliseconds / 1_000)
-  if (totalSeconds < 60) return `${totalSeconds} second${totalSeconds === 1 ? "" : "s"}`
-  const minutes = Math.floor(totalSeconds / 60)
-  const seconds = totalSeconds % 60
-  return seconds === 0
-    ? `${minutes} minute${minutes === 1 ? "" : "s"}`
-    : `${minutes}:${String(seconds).padStart(2, "0")}`
-}
-
-type ActiveStatus =
-  | {
-      readonly phase: "model_loading"
-      readonly startedAt: number
-      readonly modelName: string
-      readonly fraction: number
-    }
-  | {
-      readonly phase: "prefill"
-      readonly startedAt: number
-      readonly completedTokens: number
-      readonly totalTokens: number
-      readonly cachedTokens: number
-    }
-  | { readonly phase: "generating"; readonly startedAt: number }
-
-interface AgentRun {
+const RequestId = Schema.Number.pipe(Schema.int(), Schema.brand("ProgressRequestId"))
+type RequestId = typeof RequestId.Type
+type LivePhase = { readonly progress: MagnitudeProgress; readonly startedAt: number; readonly modelName: string }
+class Observing extends Data.TaggedClass("Observing")<{
+  readonly timings: Option.Option<MagnitudeTimings>
+}> {}
+class Observed extends Data.TaggedClass("Observed")<{
+  readonly timings: Option.Option<MagnitudeTimings>
+}> {}
+class Closed extends Data.TaggedClass("Closed")<{}> {}
+const requestMachine = defineFSM({ Observing, Observed, Closed }, {
+  Observing: ["Observed", "Closed"], Observed: ["Closed"], Closed: [],
+})
+type RequestState = StateUnion<typeof requestMachine.stateClasses>
+interface Run {
   readonly startedAt: number
-  modelName?: string
-  firstTimeToFirstTokenMs?: number
-  generatedTokens: number
-  decodeMs: number
-  settledAt?: number
-  cancelled: boolean
+  readonly modelName: string
+  readonly requests: Map<RequestId, RequestState>
+  readonly completed: Map<RequestId, MagnitudeTimings>
+  readonly responses: Map<number, Option.Option<boolean>>
+  readonly accepted: Set<RequestId>
 }
-
-export interface ProgressTrackerOptions {
-  readonly now?: () => number
-  readonly setInterval?: (callback: () => void, milliseconds: number) => ReturnType<typeof globalThis.setInterval>
-  readonly clearInterval?: (timer: ReturnType<typeof globalThis.setInterval>) => void
-  readonly tickMilliseconds?: number
-}
+class Idle extends Data.TaggedClass("Idle")<{}> {}
+class Working extends Data.TaggedClass("Working")<{ readonly run: Run }> {}
+class Settled extends Data.TaggedClass("Settled")<{ readonly run: Run; readonly settledAt: number }> {}
+class Disposed extends Data.TaggedClass("Disposed")<{}> {}
+const runMachine = defineFSM({ Idle, Working, Settled, Disposed }, {
+  Idle: ["Working", "Disposed"], Working: ["Settled", "Idle", "Disposed"],
+  Settled: ["Idle", "Disposed"], Disposed: [],
+})
+type RunState = StateUnion<typeof runMachine.stateClasses>
 
 export interface ProgressRequest {
-  readonly observe: (observation: MagnitudeObservation) => void
-  readonly finish: () => void
-  readonly fail: () => void
+  readonly observe: (observation: MagnitudeObservation) => Effect.Effect<void>
+  /** EOF closes observation, never implies successful inference. */
+  readonly finish: Effect.Effect<void>
+  readonly fail: Effect.Effect<void>
+}
+export interface ProgressTracker {
+  readonly startRun: (modelName: string) => Effect.Effect<void>
+  readonly beginResponse: (modelName: string) => Effect.Effect<ProgressResponse>
+  readonly settleRun: Effect.Effect<void>
+  readonly clear: Effect.Effect<void>
+}
+export interface ProgressResponse {
+  readonly begin: Effect.Effect<ProgressRequest>
+  /** The stock Pi parser, not observational EOF, decides the outcome. */
+  readonly end: (successful: boolean) => Effect.Effect<void>
 }
 
-export class MagnitudeProgressTracker {
-  readonly #ui: Pick<ExtensionUIContext, "setWidget" | "setWorkingMessage">
-  readonly #now: () => number
-  readonly #schedule: (callback: () => void, milliseconds: number) => ReturnType<typeof globalThis.setInterval>
-  readonly #clearInterval: (timer: ReturnType<typeof globalThis.setInterval>) => void
-  readonly #tickMilliseconds: number
-  #timer: ReturnType<typeof globalThis.setInterval> | undefined
-  #active: ActiveStatus | undefined
-  #run: AgentRun | undefined
-  #requestInFlight = false
-  #requestId = 0
-  #disposed = false
-
-  constructor(
-    ui: Pick<ExtensionUIContext, "setWidget" | "setWorkingMessage">,
-    options: ProgressTrackerOptions = {},
-  ) {
-    this.#ui = ui
-    this.#now = options.now ?? Date.now
-    this.#schedule = options.setInterval ?? globalThis.setInterval
-    this.#clearInterval = options.clearInterval ?? globalThis.clearInterval
-    this.#tickMilliseconds = options.tickMilliseconds ?? 100
-  }
-
-  startRun(modelName?: string): void {
-    if (this.#disposed || this.#run !== undefined) return
-    this.#run = {
-      startedAt: this.#now(),
-      ...(modelName === undefined ? {} : { modelName }),
-      generatedTokens: 0,
-      decodeMs: 0,
-      cancelled: false,
+const seconds = (ms: number) => `${(Math.max(0, ms) / 1_000).toFixed(1)}s`
+const count = (n: number) => n < 1_000 ? String(Math.round(n))
+  : `${(n / (n < 1_000_000 ? 1_000 : 1_000_000)).toFixed(1).replace(/\.0$/, "")}${n < 1_000_000 ? "k" : "m"}`
+const duration = (ms: number) => {
+  const s = Math.floor(Math.max(0, ms) / 1_000)
+  return s === 0 ? "<1 second" : s < 60 ? `${s} second${s === 1 ? "" : "s"}`
+    : s % 60 === 0 ? `${s / 60} minute${s === 60 ? "" : "s"}` : `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`
+}
+export const formatLiveProgress = ({ progress, modelName, startedAt }: LivePhase, now: number): string | undefined => {
+  switch (progress.phase) {
+    case "queued": case "preparing": return undefined
+    case "model_loading": return `Loading ${modelName} into memory · ${Math.round(Math.max(0, Math.min(1, progress.fraction)) * 100)}% · ${seconds(now - startedAt)}`
+    case "generating": return `Working · ${seconds(now - startedAt)}`
+    case "prefill": {
+      const cached = Math.min(progress.cached_tokens, progress.total_tokens)
+      const completed = Math.min(Math.max(progress.completed_tokens, cached), progress.total_tokens)
+      return `Prefilling prompt · ${count(completed - cached)} / ${count(progress.total_tokens - cached)} tokens · ${count(cached)} cached · ${seconds(now - startedAt)}`
     }
-    this.#clearSummary()
-  }
-
-  settleRun(): void {
-    if (this.#disposed || this.#run === undefined) return
-    this.#run.settledAt = this.#now()
-    if (!this.#requestInFlight) this.#renderSummary()
-  }
-
-  begin(modelName: string): ProgressRequest {
-    this.startRun(modelName)
-    if (this.#run !== undefined && this.#run.modelName === undefined) this.#run.modelName = modelName
-    const requestId = ++this.#requestId
-    this.#requestInFlight = true
-    this.#active = undefined
-    this.#stopTimer()
-    this.#clearSummary()
-    this.#ui.setWorkingMessage()
-    return {
-      observe: (observation) => {
-        if (!this.#isCurrent(requestId)) return
-        if (observation.progress !== undefined) this.#observeProgress(observation.progress, modelName)
-        if (observation.timings !== undefined) this.#recordTimings(observation.timings)
-      },
-      finish: () => {
-        if (!this.#isCurrent(requestId)) return
-        this.#requestInFlight = false
-        this.#active = undefined
-        this.#stopTimer()
-        this.#ui.setWorkingMessage()
-        if (this.#run?.settledAt !== undefined) this.#renderSummary()
-      },
-      fail: () => {
-        if (!this.#isCurrent(requestId)) return
-        this.#requestInFlight = false
-        if (this.#run !== undefined) this.#run.cancelled = true
-        this.#active = undefined
-        this.#stopTimer()
-        this.#ui.setWorkingMessage()
-        this.#clearSummary()
-        if (this.#run?.settledAt !== undefined) this.#renderSummary()
-      },
-    }
-  }
-
-  clear(): void {
-    this.#requestId++
-    this.#requestInFlight = false
-    this.#active = undefined
-    this.#run = undefined
-    this.#stopTimer()
-    this.#ui.setWorkingMessage()
-    this.#clearSummary()
-  }
-
-  dispose(): void {
-    if (this.#disposed) return
-    this.clear()
-    this.#disposed = true
-  }
-
-  #isCurrent(requestId: number): boolean {
-    return !this.#disposed && requestId === this.#requestId
-  }
-
-  #observeProgress(progress: MagnitudeProgress, modelName: string): void {
-    const now = this.#now()
-    switch (progress.phase) {
-      case "model_loading":
-        this.#active = {
-          phase: "model_loading",
-          modelName,
-          fraction: Math.max(0, Math.min(1, progress.fraction)),
-          startedAt: this.#active?.phase === "model_loading" ? this.#active.startedAt : now,
-        }
-        break
-      case "queued":
-      case "preparing":
-        this.#active = undefined
-        this.#stopTimer()
-        this.#ui.setWorkingMessage()
-        return
-      case "prefill":
-        this.#active = {
-          phase: "prefill",
-          completedTokens: progress.completed_tokens,
-          totalTokens: progress.total_tokens,
-          cachedTokens: progress.cached_tokens,
-          startedAt: this.#active?.phase === "prefill" ? this.#active.startedAt : now,
-        }
-        break
-      case "generating":
-        this.#active = {
-          phase: "generating",
-          startedAt: this.#active?.phase === "generating" ? this.#active.startedAt : now,
-        }
-        break
-    }
-    this.#startTimer()
-    this.#render()
-  }
-
-  #recordTimings(timings: MagnitudeTimings): void {
-    this.#active = undefined
-    this.#stopTimer()
-    this.#ui.setWorkingMessage()
-    if (this.#run === undefined) return
-    this.#run.firstTimeToFirstTokenMs ??= timings.time_to_first_token_ms
-    this.#run.generatedTokens += timings.predicted_n
-    this.#run.decodeMs += timings.predicted_ms
-    this.#run.cancelled = false
-  }
-
-  #render(): void {
-    if (this.#disposed || this.#active === undefined) return
-    const elapsed = elapsedSeconds(this.#now() - this.#active.startedAt)
-    switch (this.#active.phase) {
-      case "model_loading":
-        this.#ui.setWorkingMessage(
-          `Loading ${this.#active.modelName} into memory · ${Math.round(this.#active.fraction * 100)}% · ${elapsed}`,
-        )
-        break
-      case "prefill": {
-        const cached = Math.min(this.#active.cachedTokens, this.#active.totalTokens)
-        const completed = Math.min(Math.max(this.#active.completedTokens, cached), this.#active.totalTokens)
-        const effectiveCompleted = completed - cached
-        const effectiveTotal = this.#active.totalTokens - cached
-        this.#ui.setWorkingMessage(
-          `Prefilling prompt · ${compactNumber(effectiveCompleted)} / ${compactNumber(effectiveTotal)} tokens · ${compactNumber(cached)} cached · ${elapsed}`,
-        )
-        break
-      }
-      case "generating":
-        this.#ui.setWorkingMessage(`Working · ${elapsed}`)
-        break
-    }
-  }
-
-  #startTimer(): void {
-    if (this.#timer === undefined) {
-      this.#timer = this.#schedule(() => this.#render(), this.#tickMilliseconds)
-    }
-  }
-
-  #stopTimer(): void {
-    if (this.#timer === undefined) return
-    this.#clearInterval(this.#timer)
-    this.#timer = undefined
-  }
-
-  #clearSummary(): void {
-    this.#ui.setWidget(MAGNITUDE_SUMMARY_WIDGET_KEY, undefined)
-  }
-
-  #renderSummary(): void {
-    const run = this.#run
-    if (run === undefined || run.settledAt === undefined) return
-    this.#run = undefined
-    if (run.cancelled || run.modelName === undefined || run.firstTimeToFirstTokenMs === undefined) {
-      this.#clearSummary()
-      return
-    }
-    const tokensPerSecond = run.generatedTokens > 0 && run.decodeMs > 0
-      ? run.generatedTokens * 1_000 / run.decodeMs
-      : undefined
-    const summary = `● ${run.modelName} worked for ${workDuration(run.settledAt - run.startedAt)}`
-      + ` · ${elapsedSeconds(run.firstTimeToFirstTokenMs)} TTFT`
-      + (tokensPerSecond === undefined ? "" : ` · ${rate(tokensPerSecond)} tok/s`)
-    this.#ui.setWidget(
-      MAGNITUDE_SUMMARY_WIDGET_KEY,
-      (_tui, theme) => new Text(theme.fg("muted", summary), 0, 0),
-    )
   }
 }
+
+/** One session scope owns the timer; only observations for its active run can mutate presentation. */
+export const makeProgressTracker = (
+  ui: Pick<ExtensionUIContext, "setWidget" | "setWorkingMessage">,
+  now: () => number = () => performance.now(),
+) => Effect.gen(function* () {
+  let state: RunState = new Idle()
+  let nextId = 0
+  let active: { readonly id: RequestId; readonly phase: LivePhase } | undefined
+  let latest: RequestId | undefined
+  let nextResponseId = 0
+  const wake = yield* Queue.sliding<void>(1)
+  const present = (f: () => void) => Effect.sync(f).pipe(Effect.catchAllCause(() => Effect.void))
+  const clearSummary = present(() => ui.setWidget(MAGNITUDE_SUMMARY_WIDGET_KEY, undefined))
+  const resetRow = present(() => ui.setWorkingMessage())
+  const render = present(() => { if (active) ui.setWorkingMessage(formatLiveProgress(active.phase, now())) })
+  const finalize = Effect.gen(function* () {
+    if (state._tag !== "Settled") return
+    if ([...state.run.responses.values()].some(Option.isNone)) return
+    if ([...state.run.requests.values()].some((r) => r._tag === "Observing")) return
+    const settled = state
+    state = runMachine.transition(settled, "Idle", {})
+    const timings = [...settled.run.completed.entries()].filter(([id]) => settled.run.accepted.has(id)).sort(([a], [b]) => a - b).map(([, value]) => value)
+    if ([...settled.run.responses.values()].some((outcome) => !Option.getOrElse(outcome, () => false)) || timings.length === 0) { yield* clearSummary; return }
+    const tokens = timings.reduce((sum, t) => sum + t.predicted_n, 0)
+    const decodeMs = timings.reduce((sum, t) => sum + t.predicted_ms, 0)
+    const summary = `● ${settled.run.modelName} worked for ${duration(settled.settledAt - settled.run.startedAt)}`
+      + ` · ${seconds(timings[0]!.time_to_first_token_ms)} TTFT`
+      + (decodeMs > 0 && tokens > 0 ? ` · ${(tokens * 1_000 / decodeMs).toFixed(1)} tok/s` : "")
+    yield* present(() => ui.setWidget(MAGNITUDE_SUMMARY_WIDGET_KEY, (_tui, theme) => new Text(theme.fg("muted", summary), 0, 0)))
+  })
+  const clear = Effect.gen(function* () {
+    if (state._tag === "Disposed") return
+    if (state._tag !== "Idle") state = runMachine.transition(state, "Idle", {})
+    active = undefined
+    latest = undefined
+    yield* resetRow
+    yield* clearSummary
+  })
+  const startRun = (modelName: string) => Effect.gen(function* () {
+    if (state._tag === "Disposed") return
+    if (state._tag === "Settled") yield* clear
+    if (state._tag !== "Idle") return
+    state = runMachine.transition(state, "Working", { run: { startedAt: now(), modelName, requests: new Map(), completed: new Map(), responses: new Map(), accepted: new Set<RequestId>() } })
+    yield* clearSummary
+  })
+  const timer = yield* Effect.forever(Effect.gen(function* () {
+    yield* Queue.take(wake)
+    while (active) { yield* Effect.sleep("100 millis"); yield* render }
+  })).pipe(Effect.forkScoped)
+  yield* Effect.addFinalizer(() => Effect.gen(function* () {
+    yield* clear
+    if (state._tag !== "Disposed") state = runMachine.transition(state, "Disposed", {})
+    yield* Fiber.interrupt(timer)
+  }))
+  return {
+    startRun, clear,
+    settleRun: Effect.gen(function* () {
+      if (state._tag === "Working") state = runMachine.transition(state, "Settled", { settledAt: now() })
+      yield* finalize
+    }),
+    beginResponse: (modelName) => Effect.gen(function* () {
+      yield* startRun(modelName)
+      const run = state._tag === "Working" ? state.run : undefined
+      const responseId = ++nextResponseId
+      const requests: RequestId[] = []
+      run?.responses.set(responseId, Option.none())
+      const belongs = () => run !== undefined && (state._tag === "Working" || state._tag === "Settled") && state.run === run
+      const end = (successful: boolean) => Effect.gen(function* () {
+        if (!belongs() || Option.isSome(run!.responses.get(responseId)!)) return
+        run!.responses.set(responseId, Option.some(successful))
+        const last = requests.at(-1)
+        if (successful && last !== undefined) run!.accepted.add(last)
+        for (const id of requests) {
+          if (successful && id === last) continue
+          const request = run!.requests.get(id)!
+          if (request._tag !== "Closed") run!.requests.set(id, requestMachine.transition(request, "Closed", {}))
+          run!.completed.delete(id)
+        }
+        if (!successful && latest !== undefined && requests.includes(latest)) { active = undefined; yield* resetRow; yield* clearSummary }
+        yield* finalize
+      })
+      const begin: Effect.Effect<ProgressRequest> = Effect.gen(function* () {
+        if (!belongs() || Option.isSome(run!.responses.get(responseId)!)) return { observe: () => Effect.void, finish: Effect.void, fail: Effect.void }
+        const id = RequestId.make(++nextId)
+        requests.push(id)
+        latest = id
+        active = undefined
+        run?.requests.set(id, new Observing({ timings: Option.none() }))
+        yield* resetRow
+        const close = (failed: boolean) => Effect.gen(function* () {
+          if (!belongs()) return
+          const request = run!.requests.get(id)!
+          if (request._tag !== "Observing") return
+          if (failed) run!.requests.set(id, requestMachine.transition(request, "Closed", {}))
+          else {
+            run!.requests.set(id, requestMachine.transition(request, "Observed", {}))
+            if (Option.isSome(request.timings)) run!.completed.set(id, request.timings.value)
+          }
+          if (latest === id) { active = undefined; yield* resetRow }
+          yield* finalize
+        })
+        return {
+          observe: (observation: MagnitudeObservation) => Effect.gen(function* () {
+            if (!belongs()) return
+            const request = run!.requests.get(id)!
+            if (request._tag !== "Observing") return
+            if (observation.timings) run!.requests.set(id, requestMachine.hold(request, { timings: Option.some(observation.timings) }))
+            if (latest !== id || !observation.progress) return
+            const progress = observation.progress
+            active = progress.phase === "queued" || progress.phase === "preparing" ? undefined : {
+              id, phase: { progress, modelName, startedAt: active && active.phase.progress.phase === progress.phase ? active.phase.startedAt : now() },
+            }
+            if (active) { yield* Queue.offer(wake, undefined); yield* render }
+            else yield* resetRow
+          }),
+          finish: close(false), fail: close(true),
+        }
+      })
+      return { begin, end }
+    }),
+  } satisfies ProgressTracker
+})

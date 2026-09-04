@@ -1,4 +1,5 @@
 export { protocolLayer } from "./protocol"
+export * from "@magnitudedev/integration-protocol"
 export {
   MagnitudeBoundary,
   magnitudeImplementationsLayer,

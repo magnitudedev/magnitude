@@ -1,7 +1,11 @@
-import { describe, expect, it, vi } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
+import { Effect, Exit, Scope } from "effect"
 import { MAGNITUDE_PROGRESS_HEADER, makeObservingFetch, SseDataParser } from "../extensions/observing-fetch"
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
+const scopes: Scope.CloseableScope[] = []
+const scope = () => { const value = Effect.runSync(Scope.make()); scopes.push(value); return value }
+afterEach(async () => { for (const value of scopes.splice(0)) await Effect.runPromise(Scope.close(value, Exit.void)) })
 
 describe("SseDataParser", () => {
   it("handles fragmented CRLF, comments, multiline data, malformed JSON, and a final unterminated event", () => {
@@ -19,6 +23,25 @@ describe("SseDataParser", () => {
 })
 
 describe("makeObservingFetch", () => {
+  it("does not prevent inference when progress startup throws", async () => {
+    const upstream = Object.assign(vi.fn(async () => new Response("unmodified")), { preconnect: vi.fn() }) as typeof fetch
+    const response = await makeObservingFetch(upstream, () => { throw new Error("presentation failed") }, scope())("http://localhost")
+    expect(await response.text()).toBe("unmodified")
+    expect(upstream).toHaveBeenCalledOnce()
+  })
+
+  it("cancels its clone when the owning extension scope closes", async () => {
+    const cancelled = vi.fn()
+    const failed = vi.fn()
+    const owned = scope()
+    const upstream = Object.assign(vi.fn(async () => new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('data: {}\n\n')) }, cancel: cancelled }))), { preconnect: vi.fn() }) as typeof fetch
+    const response = await makeObservingFetch(upstream, () => Effect.succeed({ observe: () => Effect.void, finish: Effect.void, fail: Effect.sync(failed) }), owned)("http://localhost")
+    await settle()
+    await Effect.runPromise(Scope.close(owned, Exit.void))
+    await response.body!.cancel()
+    expect(cancelled).toHaveBeenCalledOnce()
+    expect(failed).toHaveBeenCalledOnce()
+  })
   it("opts into progress while returning the original response body untouched", async () => {
     const events = [
       'data: {"progress":{"phase":"model_loading","fraction":0.47}}\n\n',
@@ -33,7 +56,7 @@ describe("makeObservingFetch", () => {
       expect(request.headers.get(MAGNITUDE_PROGRESS_HEADER)).toBe("true")
       return new Response(events, { headers: { "content-type": "text/event-stream" } })
     }), { preconnect: vi.fn() }) as typeof fetch
-    const wrapped = makeObservingFetch(upstream, () => ({ observe, finish, fail }))
+    const wrapped = makeObservingFetch(upstream, () => Effect.succeed({ observe: (value) => Effect.sync(() => observe(value)), finish: Effect.sync(finish), fail: Effect.sync(fail) }), scope())
 
     const response = await wrapped("http://127.0.0.1/v1/chat/completions", {
       headers: { "Magnitude-Include-Progress": "false", "x-user": "preserved" },
@@ -60,7 +83,7 @@ describe("makeObservingFetch", () => {
   it("clears progress when the request or observational clone fails", async () => {
     const fail = vi.fn()
     const upstream = Object.assign(vi.fn(async () => { throw new Error("offline") }), { preconnect: vi.fn() }) as typeof fetch
-    await expect(makeObservingFetch(upstream, () => ({ observe: vi.fn(), finish: vi.fn(), fail }))("http://x"))
+    await expect(makeObservingFetch(upstream, () => Effect.succeed({ observe: () => Effect.void, finish: Effect.void, fail: Effect.sync(fail) }), scope())("http://x"))
       .rejects.toThrow("offline")
     expect(fail).toHaveBeenCalledOnce()
   })
@@ -75,11 +98,11 @@ describe("makeObservingFetch", () => {
       },
       cancel: cancelled,
     }))), { preconnect: vi.fn() }) as typeof fetch
-    const response = await makeObservingFetch(upstream, () => ({
-      observe: vi.fn(),
-      finish: vi.fn(),
-      fail,
-    }))("http://x", { signal: controller.signal })
+    const response = await makeObservingFetch(upstream, () => Effect.succeed({
+      observe: () => Effect.void,
+      finish: Effect.void,
+      fail: Effect.sync(fail),
+    }), scope())("http://x", { signal: controller.signal })
 
     controller.abort()
     // A cloned response tees the source. Both branches must be cancelled before

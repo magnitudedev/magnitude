@@ -1,4 +1,5 @@
 import { homedir } from "node:os"
+import { resolve } from "node:path"
 
 export type SkillInstallationTarget = "shared-agents" | "hermes-user" | "claude-user" | "cline-user"
 
@@ -26,6 +27,7 @@ export interface HarnessConnectionPaths {
 
 export const harnessConnectionPaths = (): HarnessConnectionPaths => {
   const home = homedir()
+  const piRoot = resolve(process.env.PI_CODING_AGENT_DIR ?? `${home}/.pi/agent`)
   const clineRoot = `${home}/.cline/data`
   const hermesRoot = process.env.HERMES_HOME ?? `${home}/.hermes`
   const openClawRoot = process.env.OPENCLAW_STATE_DIR ?? `${home}/.openclaw`
@@ -35,8 +37,8 @@ export const harnessConnectionPaths = (): HarnessConnectionPaths => {
   })
   return {
     manifest: `${home}/.magnitude/harness-connections.json`,
-    piModels: `${home}/.pi/agent/models.json`,
-    piSettings: `${home}/.pi/agent/settings.json`,
+    piModels: `${piRoot}/models.json`,
+    piSettings: `${piRoot}/settings.json`,
     opencode: `${home}/.config/opencode/opencode.json`,
     hermes: `${hermesRoot}/config.yaml`,
     openclaw: `${openClawRoot}/openclaw.json`,

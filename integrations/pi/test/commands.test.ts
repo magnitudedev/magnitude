@@ -3,7 +3,7 @@ import type {
   ExtensionCommandContext,
   RegisteredCommand,
 } from "@earendil-works/pi-coding-agent"
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { registerMagnitudeCommands } from "../extensions/commands"
 
 type Command = Omit<RegisteredCommand, "name" | "sourceInfo">
@@ -22,6 +22,9 @@ const model = {
   residency: "unloaded",
 }
 
+const disposers: (() => Promise<void>)[] = []
+afterEach(async () => { await Promise.all(disposers.splice(0).map((dispose) => dispose())) })
+
 const setup = () => {
   const commands = new Map<string, Command>()
   const exec = vi.fn()
@@ -29,7 +32,7 @@ const setup = () => {
     exec,
     registerCommand: (name: string, command: Command) => commands.set(name, command),
   } as unknown as ExtensionAPI
-  registerMagnitudeCommands(pi)
+  disposers.push(registerMagnitudeCommands(pi))
   const ui = { notify: vi.fn(), select: vi.fn() }
   const ctx = { ui } as unknown as ExtensionCommandContext
   return { commands, exec, ui, ctx }
@@ -40,6 +43,48 @@ beforeEach(() => {
 })
 
 describe("Magnitude slash commands", () => {
+  it("does not cache initializing discovery and deduplicates concurrent completions", async () => {
+    const { commands, exec, ui, ctx } = setup()
+    const load = commands.get("load-model")!
+    exec.mockResolvedValueOnce({ code: 0, stdout: success("models.status", { state: "initializing", models: [] }), stderr: "", killed: false })
+    await load.handler("", ctx)
+    expect(ui.notify).toHaveBeenLastCalledWith("Magnitude is discovering local models. Try again shortly.", "info")
+    let finish!: (result: unknown) => void
+    exec.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    const first = load.getArgumentCompletions!("")
+    const second = load.getArgumentCompletions!("local")
+    await vi.waitFor(() => expect(exec).toHaveBeenCalledTimes(2))
+    finish({ code: 0, stdout: success("models.status", { state: "ready", models: [model] }), stderr: "", killed: false })
+    expect(await first).toHaveLength(1)
+    expect(await second).toHaveLength(1)
+    expect(exec).toHaveBeenCalledTimes(2)
+  })
+
+  it("rejects killed processes even when their output looks successful", async () => {
+    const { commands, exec, ui, ctx } = setup()
+    exec.mockResolvedValue({ code: 0, stdout: success("models.load", { modelId: model.modelId }), stderr: "", killed: true })
+    await commands.get("load-model")!.handler(model.modelId, ctx)
+    expect(ui.notify).toHaveBeenLastCalledWith("Magnitude command timed out or was cancelled.", "error")
+  })
+
+  it("cancels a running subprocess when the extension runtime is disposed", async () => {
+    const commands = new Map<string, Command>()
+    let signal: AbortSignal | undefined
+    const dispose = registerMagnitudeCommands({
+      registerCommand: (name: string, command: Command) => commands.set(name, command),
+      exec: (_command: string, _args: string[], options: { signal: AbortSignal }) => {
+        signal = options.signal
+        return new Promise((_resolve, reject) => signal!.addEventListener("abort", () => reject(new Error("cancelled")), { once: true }))
+      },
+    } as unknown as ExtensionAPI)
+    const ui = { notify: vi.fn(), select: vi.fn() }
+    const pending = commands.get("load-model")!.handler(model.modelId, { ui } as unknown as ExtensionCommandContext).catch(() => undefined)
+    await vi.waitFor(() => expect(signal).toBeDefined())
+    await dispose()
+    await pending
+    expect(signal!.aborted).toBe(true)
+    expect(ui.notify).not.toHaveBeenCalled()
+  })
   it("registers all commands and renders model state from the versioned JSON contract", async () => {
     const { commands, exec } = setup()
     expect([...commands.keys()]).toEqual(["load-model", "stop-model"])
@@ -56,7 +101,7 @@ describe("Magnitude slash commands", () => {
       description: "unloaded",
     }])
 
-    expect(exec).toHaveBeenCalledWith("magnitude", ["models", "status", "--json"], { timeout: 120_000 })
+    expect(exec).toHaveBeenCalledWith("magnitude", ["models", "status", "--json"], expect.objectContaining({ timeout: 10_000, signal: expect.any(AbortSignal) }))
   })
 
   it("loads an explicit model, stops the resident model, and honors MAGNITUDE_CLI", async () => {
@@ -79,8 +124,8 @@ describe("Magnitude slash commands", () => {
     await commands.get("load-model")!.handler(model.modelId, ctx)
     await commands.get("stop-model")!.handler("", ctx)
 
-    expect(exec).toHaveBeenNthCalledWith(1, "/opt/magnitude-dev", ["models", "load", model.modelId, "--json"], { timeout: 120_000 })
-    expect(exec).toHaveBeenNthCalledWith(2, "/opt/magnitude-dev", ["models", "stop", "--json"], { timeout: 120_000 })
+    expect(exec).toHaveBeenNthCalledWith(1, "/opt/magnitude-dev", ["models", "load", model.modelId, "--json"], expect.objectContaining({ timeout: 600_000, signal: expect.any(AbortSignal) }))
+    expect(exec).toHaveBeenNthCalledWith(2, "/opt/magnitude-dev", ["models", "stop", "--json"], expect.objectContaining({ timeout: 120_000, signal: expect.any(AbortSignal) }))
     expect(ui.notify).toHaveBeenNthCalledWith(1, `Loaded ${model.modelId}.`, "info")
     expect(ui.notify).toHaveBeenNthCalledWith(2, "Stopped the active Magnitude model.", "info")
   })
@@ -100,6 +145,10 @@ describe("Magnitude slash commands", () => {
         stderr: "",
         killed: false,
       })
+    exec.mockReset().mockImplementation(async (_command, args) => ({
+      code: 0, stderr: "", killed: false,
+      stdout: args[1] === "status" ? success("models.status", { state: "ready", models: [model] }) : success("models.load", { modelId: model.modelId }),
+    }))
     ui.select.mockResolvedValue("Local Model (Q4) · unloaded · local/model:q4")
 
     const load = commands.get("load-model")!
@@ -109,7 +158,7 @@ describe("Magnitude slash commands", () => {
       description: "unloaded",
     }])
     await load.handler("", ctx)
-    expect(exec).toHaveBeenLastCalledWith("magnitude", ["models", "load", model.modelId, "--json"], { timeout: 120_000 })
+    expect(exec).toHaveBeenLastCalledWith("magnitude", ["models", "load", model.modelId, "--json"], expect.objectContaining({ timeout: 600_000, signal: expect.any(AbortSignal) }))
   })
 
   it("surfaces structured CLI failures and rejects incompatible success JSON", async () => {
@@ -125,7 +174,7 @@ describe("Magnitude slash commands", () => {
 
     exec.mockResolvedValueOnce({ code: 0, stdout: "{}", stderr: "", killed: false })
     await commands.get("stop-model")!.handler("", ctx)
-    expect(ui.notify).toHaveBeenLastCalledWith("This Magnitude extension requires a newer Magnitude CLI.", "error")
+    expect(ui.notify).toHaveBeenLastCalledWith("Magnitude CLI and this extension use incompatible command versions. Update them together.", "error")
 
     exec.mockResolvedValueOnce({
       code: 1,
@@ -134,7 +183,7 @@ describe("Magnitude slash commands", () => {
       killed: false,
     })
     await commands.get("stop-model")!.handler("", ctx)
-    expect(ui.notify).toHaveBeenLastCalledWith("This Magnitude extension requires a newer Magnitude CLI.", "error")
+    expect(ui.notify).toHaveBeenLastCalledWith("Magnitude CLI and this extension use incompatible command versions. Update them together.", "error")
 
     exec.mockResolvedValueOnce({
       code: 0,
@@ -143,7 +192,7 @@ describe("Magnitude slash commands", () => {
       killed: false,
     })
     await commands.get("stop-model")!.handler("", ctx)
-    expect(ui.notify).toHaveBeenLastCalledWith("This Magnitude extension requires a newer Magnitude CLI.", "error")
+    expect(ui.notify).toHaveBeenLastCalledWith("Magnitude CLI and this extension use incompatible command versions. Update them together.", "error")
 
     exec.mockResolvedValueOnce({ code: 0, stdout: "not json", stderr: "", killed: false })
     await commands.get("stop-model")!.handler("", ctx)
@@ -151,7 +200,7 @@ describe("Magnitude slash commands", () => {
 
     exec.mockRejectedValueOnce(new Error("Executable not found: magnitude"))
     await commands.get("stop-model")!.handler("", ctx)
-    expect(ui.notify).toHaveBeenLastCalledWith("Executable not found: magnitude", "error")
+    expect(ui.notify).toHaveBeenLastCalledWith("Could not execute Magnitude: Error: Executable not found: magnitude", "error")
 
     exec.mockResolvedValueOnce({
       code: 1,
@@ -160,7 +209,7 @@ describe("Magnitude slash commands", () => {
       killed: false,
     })
     await commands.get("stop-model")!.handler("", ctx)
-    expect(ui.notify).toHaveBeenLastCalledWith("Magnitude returned an incompatible JSON error response", "error")
+    expect(ui.notify).toHaveBeenLastCalledWith("Magnitude CLI and this extension use incompatible command versions. Update them together.", "error")
   })
 
   it("does not offer models that have no loadable installation", async () => {
@@ -185,6 +234,6 @@ describe("Magnitude slash commands", () => {
 
     expect(ui.select).not.toHaveBeenCalled()
     expect(ui.notify).toHaveBeenLastCalledWith("No installed Magnitude models are available.", "info")
-    expect(exec).toHaveBeenCalledTimes(1)
+    expect(exec).toHaveBeenCalledTimes(2)
   })
 })

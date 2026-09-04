@@ -127,18 +127,16 @@ const testPiCompanion: HarnessCompanionPackage = {
     source: "npm:@magnitudedev/pi@0.0.1",
     securityNotice: "Pi extensions execute with your user permissions.",
   },
-  activation: "reload-or-restart",
+  activationInstructions: Option.some("Restart existing Pi sessions or run /reload to activate the extension."),
   reconcile: ({ previous }) => Effect.succeed({
     state: Option.getOrElse(previous, () => ({
       identity: "@magnitudedev/pi",
       source: "npm:@magnitudedev/pi@0.0.1",
       ownership: "magnitude" as const,
-      previousEntryJson: Option.none<string>(),
     })),
     status: Option.isSome(previous) ? "already-installed" as const : "installed" as const,
-    rollback: Effect.void,
   }),
-  disconnect: () => Effect.succeed({ rollback: Effect.void }),
+  disconnect: () => Effect.void,
 }
 
 const installedService = (paths: HarnessConnectionPaths, resolvedModels = models as ReadonlyArray<(typeof models)[number]>) =>
@@ -190,7 +188,7 @@ const writeFixtures = (files: Readonly<Record<string, string>>) => Effect.gen(fu
 
 const writeFakePiExecutable = (
   paths: HarnessConnectionPaths,
-  failCommand?: "install" | "remove",
+  failCommand?: "install" | "remove" | "install-after" | "remove-after",
 ) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const executable = `${paths.piSettings.slice(0, paths.piSettings.lastIndexOf("/"))}/pi-test`
@@ -200,12 +198,18 @@ import { dirname, isAbsolute, relative, resolve } from "node:path"
 const settingsPath = new URL("./settings.json", import.meta.url).pathname
 const logPath = new URL("./package-commands.jsonl", import.meta.url).pathname
 const [command, source] = process.argv.slice(2)
+if (command === "--version") { console.log("0.84.4"); process.exit(0) }
 if (command === ${encodedFailCommand}) process.exit(9)
 const settings = await Bun.file(settingsPath).exists() ? await Bun.file(settingsPath).json() : {}
 const packages = Array.isArray(settings.packages) ? settings.packages : []
 const storedSource = isAbsolute(source) ? relative(dirname(settingsPath), source) : source
 const equalSource = (value) => value === source || (!value.startsWith("npm:") && resolve(dirname(settingsPath), value) === resolve(dirname(settingsPath), source))
-if (command === "install") settings.packages = [...packages, storedSource]
+if (command === "install") {
+  settings.packages = packages.some((entry) => equalSource(typeof entry === "string" ? entry : entry.source)) ? packages : [...packages, storedSource]
+  const root = source.startsWith("npm:") ? resolve(dirname(settingsPath), "npm/node_modules/@magnitudedev/pi") : source
+  await Bun.write(resolve(root, "package.json"), JSON.stringify({ name: "@magnitudedev/pi", version: "0.0.1", pi: { extensions: ["./dist/magnitude.js"] } }))
+  await Bun.write(resolve(root, "dist/magnitude.js"), "export default () => {}")
+}
 else if (command === "remove") settings.packages = packages.filter((entry) => {
   const value = typeof entry === "string" ? entry : entry?.source
   return typeof value !== "string" || !equalSource(value)
@@ -214,6 +218,7 @@ else process.exit(2)
 await Bun.write(settingsPath, JSON.stringify(settings, null, 2) + "\\n")
 const previous = await Bun.file(logPath).exists() ? await Bun.file(logPath).text() : ""
 await Bun.write(logPath, previous + JSON.stringify({ command, source }) + "\\n")
+if (command + "-after" === ${encodedFailCommand}) { console.error("failed after native mutation"); process.exit(9) }
 `
   yield* fs.writeFileString(executable, source)
   yield* fs.chmod(executable, 0o755)
@@ -423,14 +428,93 @@ describe("HarnessConnector contract and registry", () => {
 })
 
 describe("Pi companion package lifecycle", () => {
+  it.each(["install-after", "remove-after"] as const)("compensates partial native failure: %s", async (failure) => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-partial-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const executable = yield* writeFakePiExecutable(paths, failure)
+      const service = yield* makeHarnessConnectionService({ paths, detect: () => Effect.succeed(Option.some({ executable })), resolveModels: Effect.succeed(models), installStartup: Effect.void })
+      if (failure === "remove-after") yield* service.connect(HarnessIdSchema.make("pi"), { model: Option.none() })
+      const before = yield* fs.readFileString(paths.piSettings)
+      const manifest = yield* fs.readFileString(paths.manifest)
+      const exit = yield* Effect.exit(failure === "install-after" ? service.connect(HarnessIdSchema.make("pi"), { model: Option.none() }) : service.disconnect(HarnessIdSchema.make("pi")))
+      expect(String(exit)).toContain("failed after native mutation")
+      expect(yield* fs.readFileString(paths.piSettings)).toBe(before)
+      expect(yield* fs.readFileString(paths.manifest)).toBe(manifest)
+      const log = (yield* fs.readFileString(`${root}/pi/package-commands.jsonl`)).trim().split("\n").map((line) => JSON.parse(line).command)
+      expect(log).toEqual(failure === "install-after" ? ["install", "remove"] : ["install", "remove", "install"])
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+  it.each(["unrelated", "filters", "removed"])("preserves subsequent borrowed-package edits: %s", async (change) => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-borrowed-edit-" })
+      const paths = fixturePaths(root)
+      const existing = { source: PI_COMPANION_PACKAGE_SOURCE, extensions: [], prompts: ["original"], autoload: false }
+      yield* writeFixtures({
+        ...initialFiles(paths),
+        [paths.piSettings]: stringifyJson({ theme: "original", packages: [existing] }),
+        [`${root}/pi/npm/node_modules/@magnitudedev/pi/package.json`]: stringifyJson({ name: "@magnitudedev/pi", version: "0.0.1", pi: { extensions: ["./dist/magnitude.js"] } }),
+        [`${root}/pi/npm/node_modules/@magnitudedev/pi/dist/magnitude.js`]: "export default () => {}",
+      })
+      const executable = yield* writeFakePiExecutable(paths)
+      const service = yield* makeHarnessConnectionService({ paths, detect: () => Effect.succeed(Option.some({ executable })), resolveModels: Effect.succeed(models), installStartup: Effect.void })
+      const connected = yield* service.connect(HarnessIdSchema.make("pi"), { model: Option.none() })
+      expect(Option.getOrThrow(connected.companion).status).toBe("enabled")
+      const settings = readJson(yield* fs.readFileString(paths.piSettings)) as { packages: Record<string, unknown>[] }
+      const edited = { ...settings.packages[0], prompts: ["user changed"], ...(change === "filters" ? { extensions: ["user/*.js"] } : {}) }
+      yield* fs.writeFileString(paths.piSettings, stringifyJson({ ...settings, theme: "user changed", packages: change === "removed" ? [] : [edited] }))
+      yield* service.disconnect(HarnessIdSchema.make("pi"))
+      expect(readJson(yield* fs.readFileString(paths.piSettings))).toMatchObject({ theme: "user changed", packages: change === "removed" ? [] : [{ ...edited, extensions: change === "filters" ? ["user/*.js"] : [] }] })
+      expect(yield* fs.exists(`${root}/pi/package-commands.jsonl`)).toBe(false)
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
+  it("repairs missing physical files even when a package remains configured", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-missing-files-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const executable = yield* writeFakePiExecutable(paths)
+      const service = yield* makeHarnessConnectionService({ paths, detect: () => Effect.succeed(Option.some({ executable })), resolveModels: Effect.succeed(models), installStartup: Effect.void })
+      yield* service.connect(HarnessIdSchema.make("pi"), { model: Option.none() })
+      const entrypoint = `${root}/pi/npm/node_modules/@magnitudedev/pi/dist/magnitude.js`
+      yield* fs.remove(entrypoint)
+      yield* service.sync(HarnessIdSchema.make("pi"))
+      expect(yield* fs.exists(entrypoint)).toBe(true)
+      expect((yield* fs.readFileString(`${root}/pi/package-commands.jsonl`)).trim().split("\n")).toHaveLength(2)
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
+  it("rejects an incompatible borrowed package without replacing user-owned state", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-incompatible-" })
+      const paths = fixturePaths(root)
+      const settings = stringifyJson({ packages: ["npm:@magnitudedev/pi@9.0.0"] })
+      yield* writeFixtures({ ...initialFiles(paths), [paths.piSettings]: settings,
+        [`${root}/pi/npm/node_modules/@magnitudedev/pi/package.json`]: stringifyJson({ name: "@magnitudedev/pi", version: "9.0.0", pi: { extensions: ["./dist/magnitude.js"] } }),
+      })
+      const executable = yield* writeFakePiExecutable(paths)
+      const service = yield* makeHarnessConnectionService({ paths, detect: () => Effect.succeed(Option.some({ executable })), resolveModels: Effect.succeed(models), installStartup: Effect.void })
+      const exit = yield* Effect.exit(service.connect(HarnessIdSchema.make("pi"), { model: Option.none() }))
+      expect(String(exit)).toContain("Unsupported Magnitude for Pi package")
+      expect(yield* fs.readFileString(paths.piSettings)).toBe(settings + "\n")
+      expect(yield* fs.exists(`${root}/pi/package-commands.jsonl`)).toBe(false)
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
   it("matches Pi's include, exclude, and exact override precedence", () => {
     expect(piPackageExtensionEnabled("npm:@magnitudedev/pi@0.0.1")).toBe(true)
     expect(piPackageExtensionEnabled({ source: PI_COMPANION_PACKAGE_SOURCE })).toBe(true)
-    expect(piPackageExtensionEnabled({ extensions: ["extensions/*.ts"] })).toBe(true)
+    expect(piPackageExtensionEnabled({ extensions: ["dist/*.js"] })).toBe(true)
     expect(piPackageExtensionEnabled({ extensions: ["extensions/other.ts"] })).toBe(false)
-    expect(piPackageExtensionEnabled({ extensions: ["!extensions/*.ts"] })).toBe(false)
-    expect(piPackageExtensionEnabled({ extensions: ["!extensions/*.ts", "+./extensions/magnitude.ts"] })).toBe(true)
-    expect(piPackageExtensionEnabled({ extensions: ["+extensions/magnitude.ts", "-.\\extensions\\magnitude.ts"] })).toBe(false)
+    expect(piPackageExtensionEnabled({ extensions: ["!dist/*.js"] })).toBe(false)
+    expect(piPackageExtensionEnabled({ extensions: ["!dist/*.js", "+./dist/magnitude.js"] })).toBe(true)
+    expect(piPackageExtensionEnabled({ extensions: ["+dist/magnitude.js", "-./dist/magnitude.js"] })).toBe(false)
   })
 
   it("keeps the exact install source synchronized with the publishable package manifest", async () => {
@@ -465,7 +549,7 @@ describe("Pi companion package lifecycle", () => {
       expect(companion).toMatchObject({
         source: PI_COMPANION_PACKAGE_SOURCE,
         status: "installed",
-        activation: "reload-or-restart",
+        activationInstructions: Option.some("Restart existing Pi sessions or run /reload to activate the extension."),
       })
       expect(result.skillInstalled).toBe(true)
       expect(readJson(yield* fs.readFileString(paths.piSettings))).toMatchObject({
@@ -508,7 +592,7 @@ describe("Pi companion package lifecycle", () => {
       const paths = fixturePaths(root)
       yield* writeFixtures(initialFiles(paths))
       const executable = yield* writeFakePiExecutable(paths)
-      const localSource = "/workspace/magnitude/integrations/pi"
+      const localSource = `${root}/checkout/integrations/pi`
       const service = yield* makeHarnessConnectionService({
         paths,
         registry: makeHarnessConnectorRegistry(paths, { piCompanionSource: localSource }),
@@ -566,8 +650,8 @@ describe("Pi companion package lifecycle", () => {
         resolveModels: Effect.succeed(models),
         installStartup: Effect.void,
       })
-      const firstSource = "/workspace/magnitude/integrations/pi-a"
-      const secondSource = "/workspace/magnitude/integrations/pi-b"
+      const firstSource = `${root}/checkout/integrations/pi-a`
+      const secondSource = `${root}/checkout/integrations/pi-b`
 
       const first = yield* makeService(firstSource)
       yield* first.connect(HarnessIdSchema.make("pi"), { model: Option.none() })
@@ -594,8 +678,12 @@ describe("Pi companion package lifecycle", () => {
       const fs = yield* FileSystem.FileSystem
       const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-package-existing-" })
       const paths = fixturePaths(root)
+      yield* writeFixtures({
+        [`${root}/pi/npm/node_modules/@magnitudedev/pi/package.json`]: stringifyJson({ name: "@magnitudedev/pi", version: "0.0.1", pi: { extensions: ["./dist/magnitude.js"] } }),
+        [`${root}/pi/npm/node_modules/@magnitudedev/pi/dist/magnitude.js`]: "export default () => {}",
+      })
       const existing = {
-        source: "npm:@magnitudedev/pi@0.0.0",
+        source: PI_COMPANION_PACKAGE_SOURCE,
         extensions: ["extensions/other.ts", `-${PI_COMPANION_EXTENSION_PATH}`],
         custom: { preserve: true },
       }
@@ -849,6 +937,23 @@ describe("Magnitude skill installation", () => {
 })
 
 describe("HarnessConnection model-set behavior", () => {
+  it("reads fresh manifests across independent service instances", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-manifest-concurrent-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const first = yield* installedService(paths)
+      const second = yield* installedService(paths)
+      yield* Effect.all([
+        first.connect(HarnessIdSchema.make("pi"), { model: Option.none() }),
+        second.connect(HarnessIdSchema.make("opencode"), { model: Option.none() }),
+      ], { concurrency: "unbounded" })
+      expect((yield* first.list).filter((row) => row.connected).map((row) => row.id)).toEqual(["pi", "opencode"])
+      yield* second.disconnect(HarnessIdSchema.make("pi"))
+      expect((yield* first.list).filter((row) => row.connected).map((row) => row.id)).toEqual(["opencode"])
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
   it("preserves Hermes global and explicit per-model overrides", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem

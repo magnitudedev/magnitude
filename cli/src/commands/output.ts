@@ -1,26 +1,6 @@
 import { Data, Effect, Schema } from "effect"
 import stringWidth from "string-width"
-
-const JsonCommandErrorSchema = Schema.Struct({
-  message: Schema.String,
-})
-
-const jsonSuccessEnvelopeSchema = <CommandName extends string, Data, Encoded>(
-  command: CommandName,
-  data: Schema.Schema<Data, Encoded, never>,
-) => Schema.Struct({
-  schemaVersion: Schema.Literal(1),
-  command: Schema.Literal(command),
-  ok: Schema.Literal(true),
-  data,
-})
-
-const jsonFailureEnvelopeSchema = <CommandName extends string>(command: CommandName) => Schema.Struct({
-  schemaVersion: Schema.Literal(1),
-  command: Schema.Literal(command),
-  ok: Schema.Literal(false),
-  error: JsonCommandErrorSchema,
-})
+import { jsonSuccessEnvelopeSchema, jsonFailureEnvelopeSchema } from "@magnitudedev/sdk"
 
 export interface JsonCommandOutput<Result, Data, Encoded, CommandName extends string = string> {
   readonly command: CommandName
