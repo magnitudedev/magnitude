@@ -6,7 +6,7 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -445,6 +445,7 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .merge(protected)
+        .layer(DefaultBodyLimit::max(media::MAX_HTTP_BODY_BYTES))
         .with_state(state)
 }
 
@@ -3955,6 +3956,27 @@ mod tests {
         let status = response.status();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn request_bodies_larger_than_the_axum_default_limit_reach_the_handler() {
+        // A body larger than axum's old 2 MiB default must reach the handler, so
+        // image requests near `media::MAX_HTTP_IMAGE_BYTES` are not rejected by the transport.
+        let oversized = "x".repeat(3 * 1024 * 1024);
+        assert!(oversized.len() > 2 * 1024 * 1024);
+        assert!(oversized.len() < media::MAX_HTTP_BODY_BYTES);
+
+        let (status, _body) = post_chat(
+            FakeBackend::new("test-model", "hello"),
+            json!({
+                "model": "test-model",
+                "messages": [{ "role": "user", "content": oversized }]
+            }),
+        )
+        .await;
+
+        assert_ne!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
