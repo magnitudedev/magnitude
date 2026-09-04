@@ -1,0 +1,48 @@
+name: Publish integrations
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact main commit containing the integration versions to publish
+        required: true
+        type: string
+
+concurrency:
+  group: magnitude-production-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+      - name: Verify explicit source on main
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          [[ "$SOURCE_COMMIT" =~ ^[a-f0-9]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          git merge-base --is-ancestor "$SOURCE_COMMIT" origin/main
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: bun install --frozen-lockfile
+      - run: bun run --cwd packages/integration-protocol typecheck
+      - run: bun run --cwd packages/integration-protocol test
+      - run: bun run --cwd integrations/pi typecheck
+      - run: bun run --cwd integrations/pi test
+      - run: bun scripts/accept-integrations.ts
+      - run: bun scripts/publish-integrations.ts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

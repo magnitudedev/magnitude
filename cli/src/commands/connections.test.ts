@@ -59,7 +59,7 @@ describe("connections command contract", () => {
           source: "npm:@magnitudedev/pi@0.0.1",
           securityNotice: "Pi extensions execute with your user permissions.",
           status: "installed",
-          activation: "reload-or-restart",
+          activationInstructions: Option.some("Restart existing Pi sessions or run /reload to activate the extension."),
         }),
         skillInstalled: true,
         startupInstalled: false,

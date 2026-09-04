@@ -7,11 +7,14 @@ on:
       - ".github/workflows/**"
       - "cli/**"
       - "inference/**"
+      - "integrations/**"
       - "packages/**"
       - "patches/**"
       - "scripts/accept-release-candidate.ts"
       - "scripts/release-target.ts"
       - "scripts/tsconfig.release.json"
+      - "scripts/*integrations*"
+      - "scripts/dev-pi*"
       - "bun.lock"
       - "package.json"
 
@@ -24,6 +27,9 @@ env:
   NPM_VERSION: "11.6.2"
 
 jobs:
+  integrations:
+    uses: ./.github/workflows/integrations.yml
+
   static:
     runs-on: ubuntu-latest
     steps:
@@ -55,7 +61,7 @@ jobs:
       - run: bun run packages/release/scripts/prepare-npm.ts release/npm-candidate
 
   release-build:
-    needs: static
+    needs: [static, integrations]
     uses: ./.github/workflows/release-build.yml
     with:
       source_commit: ${{ github.sha }}

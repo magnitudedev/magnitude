@@ -52,7 +52,7 @@ export interface HarnessCompanionDescription {
 
 export interface HarnessCompanionConnectionResult extends HarnessCompanionDescription {
   readonly status: "installed" | "enabled" | "already-installed"
-  readonly activation: "immediate" | "reload-or-restart"
+  readonly activationInstructions: Option.Option<string>
 }
 
 export interface HarnessConnectResult {

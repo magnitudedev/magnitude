@@ -8,24 +8,27 @@
     "access": "public"
   },
   "files": [
-    "extensions",
+    "dist",
     "README.md"
   ],
   "pi": {
     "extensions": [
-      "./extensions/magnitude.ts"
+      "./dist/magnitude.js"
     ]
   },
   "scripts": {
+    "build": "bun run scripts/build.ts",
+    "prepack": "bun run build",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "bunx --bun vitest run"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.84.4",
-    "@earendil-works/pi-coding-agent": ">=0.84.4",
-    "@earendil-works/pi-tui": ">=0.84.4"
+    "@earendil-works/pi-ai": "~0.84.4",
+    "@earendil-works/pi-coding-agent": "~0.84.4",
+    "@earendil-works/pi-tui": "~0.84.4"
   },
   "devDependencies": {
+    "@magnitudedev/utils": "workspace:*",
     "@earendil-works/pi-ai": "0.84.4",
     "@earendil-works/pi-coding-agent": "0.84.4",
     "@earendil-works/pi-tui": "0.84.4",
@@ -34,6 +37,7 @@
     "vitest": "^3.2.4"
   },
   "dependencies": {
+    "@magnitudedev/integration-protocol": "0.0.1",
     "effect": "3.21.2"
   },
   "keywords": [

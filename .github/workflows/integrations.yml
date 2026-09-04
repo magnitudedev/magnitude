@@ -1,0 +1,42 @@
+name: Integration checks
+
+on:
+  pull_request:
+    paths:
+      - "integrations/**"
+      - "packages/integration-protocol/**"
+      - "packages/utils/src/fsm/**"
+      - "cli/src/harness-connections/**"
+      - "cli/src/commands/**"
+      - "scripts/*integrations*"
+      - "scripts/dev-pi*"
+      - "scripts/tsconfig.dev-pi.json"
+      - ".github/workflows/**"
+      - "bun.lock"
+      - "package.json"
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  integrations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: bun install --frozen-lockfile
+      - run: bun run --cwd packages/integration-protocol typecheck
+      - run: bun run --cwd packages/integration-protocol test
+      - run: bun run --cwd integrations/pi typecheck
+      - run: bun run --cwd integrations/pi test
+      - run: bunx --bun tsc --noEmit -p scripts/tsconfig.dev-pi.json
+      - run: bunx --bun vitest run --config scripts/vitest.config.ts
+      - run: bunx --bun vitest run src/harness-connections src/commands
+        working-directory: cli
+      - run: bun scripts/accept-integrations.ts

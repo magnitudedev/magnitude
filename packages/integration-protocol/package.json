@@ -1,0 +1,11 @@
+{
+  "name": "@magnitudedev/integration-protocol",
+  "version": "0.0.1",
+  "type": "module",
+  "license": "MIT",
+  "exports": { ".": "./src/index.ts" },
+  "files": ["src", "fixtures", "README.md"],
+  "publishConfig": { "access": "public" },
+  "scripts": { "typecheck": "tsc --noEmit", "test": "bunx --bun vitest run" },
+  "dependencies": { "effect": "3.21.2" }
+}

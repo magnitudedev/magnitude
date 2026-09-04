@@ -21,6 +21,7 @@ import {
   pushNotificationAtom,
   stopDisplayViewController,
   type HarnessLaunchPlan,
+  type HarnessConnectionError,
 } from "@magnitudedev/client-common"
 import {
   updateActionFor,
@@ -218,7 +219,7 @@ const runInteractiveSession = (
   options: InteractiveLaunchOptions,
 ): Effect.Effect<
   InteractiveSessionResult,
-  CliRendererAcquisitionFailed | StateDocumentError | AcnEnsuranceError,
+  CliRendererAcquisitionFailed | StateDocumentError | AcnEnsuranceError | HarnessConnectionError,
   CliUpdater | FileSystem.FileSystem | Path.Path | Scope.Scope
     | CommandExecutor.CommandExecutor | HttpClient.HttpClient | Terminal.Terminal
 > => Effect.gen(function* () {
@@ -458,7 +459,7 @@ export const runInteractiveCommand = (
   options: InteractiveLaunchOptions,
 ): Effect.Effect<
   number,
-  CliRendererAcquisitionFailed | StateDocumentError | AcnEnsuranceError,
+  CliRendererAcquisitionFailed | StateDocumentError | AcnEnsuranceError | HarnessConnectionError,
   | CommandExecutor.CommandExecutor
   | FileSystem.FileSystem
   | HttpClient.HttpClient

@@ -1,164 +1,114 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent"
-import { Either, Option, Schema } from "effect"
+import { Context, Effect, Either, Exit, Fiber, Layer, ManagedRuntime, Option, Schema, Scope } from "effect"
+import {
+  ModelsStatusEnvelopeSchema, ModelsLoadEnvelopeSchema, ModelsStopEnvelopeSchema,
+  jsonFailureEnvelopeSchema, type JsonLocalModel, type JsonCommandName,
+} from "@magnitudedev/integration-protocol"
 
-const COMMAND_TIMEOUT_MS = 120_000
-const INCOMPATIBLE_CLI_MESSAGE = "This Magnitude extension requires a newer Magnitude CLI."
-const magnitudeExecutable = (): string => process.env.MAGNITUDE_CLI ?? "magnitude"
+class MagnitudeCommandFailed extends Schema.TaggedError<MagnitudeCommandFailed>()("MagnitudeCommandFailed", {
+  message: Schema.String,
+}) {}
+const JsonDocument = Schema.parseJson(Schema.Unknown)
+const incompatible = "Magnitude CLI and this extension use incompatible command versions. Update them together."
 
-const JsonModelSchema = Schema.Struct({
-  modelId: Schema.NonEmptyString,
-  displayName: Schema.NonEmptyString,
-  installation: Schema.Literal("not_installed", "installing", "installed", "removing", "unavailable"),
-  residency: Schema.optionalWith(
-    Schema.Literal("unloaded", "loading", "ready", "stopping", "failed"),
-    { as: "Option", exact: true },
-  ),
-})
-type JsonModel = typeof JsonModelSchema.Type
-
-const StatusEnvelopeSchema = Schema.Struct({
-  schemaVersion: Schema.Literal(1),
-  command: Schema.Literal("models.status"),
-  ok: Schema.Literal(true),
-  data: Schema.Union(
-    Schema.Struct({ state: Schema.Literal("initializing"), models: Schema.Tuple() }),
-    Schema.Struct({ state: Schema.Literal("ready"), models: Schema.Array(JsonModelSchema) }),
-  ),
-})
-
-const LoadEnvelopeSchema = Schema.Struct({
-  schemaVersion: Schema.Literal(1),
-  command: Schema.Literal("models.load"),
-  ok: Schema.Literal(true),
-  data: Schema.Struct({ modelId: Schema.NonEmptyString }),
-})
-
-const StopEnvelopeSchema = Schema.Struct({
-  schemaVersion: Schema.Literal(1),
-  command: Schema.Literal("models.stop"),
-  ok: Schema.Literal(true),
-  data: Schema.Struct({}),
-})
-
-const FailureEnvelopeSchema = Schema.Struct({
-  schemaVersion: Schema.Literal(1),
-  command: Schema.Literal("models.status", "models.load", "models.stop"),
-  ok: Schema.Literal(false),
-  error: Schema.Struct({ message: Schema.String }),
-})
-const JsonDocumentSchema = Schema.parseJson(Schema.Unknown)
-
-const parseFailureMessage = (source: string, expectedCommand: string): string | undefined => {
-  const json = Schema.decodeUnknownEither(JsonDocumentSchema)(source)
-  if (Either.isLeft(json)) return undefined
-  const decoded = Schema.decodeUnknownEither(FailureEnvelopeSchema)(json.right)
-  return Either.isRight(decoded) && decoded.right.command === expectedCommand
-    ? decoded.right.error.message
-    : undefined
+interface ModelCommands {
+  readonly status: (fresh: boolean) => Effect.Effect<typeof ModelsStatusEnvelopeSchema.Type, MagnitudeCommandFailed>
+  readonly load: (modelId: string) => Effect.Effect<string, MagnitudeCommandFailed>
+  readonly stop: Effect.Effect<void, MagnitudeCommandFailed>
 }
+const ModelCommands = Context.GenericTag<ModelCommands>("pi/ModelCommands")
 
-const executeJson = async <A, I>(
-  pi: ExtensionAPI,
-  arguments_: ReadonlyArray<string>,
-  schema: Schema.Schema<A, I>,
-): Promise<A> => {
-  const result = await pi.exec(magnitudeExecutable(), [...arguments_, "--json"], { timeout: COMMAND_TIMEOUT_MS })
-  if (result.code !== 0) {
-    const expectedCommand = arguments_.slice(0, 2).join(".")
-    const stderr = result.stderr.trim()
-    const stdout = result.stdout.trim()
-    const message = parseFailureMessage(stderr, expectedCommand)
-    if (message !== undefined) throw new Error(message)
-    const fallback = stderr || stdout
-    if (fallback.includes("unknown option '--json'") || fallback.includes('unknown option "--json"')) {
-      throw new Error(INCOMPATIBLE_CLI_MESSAGE)
-    }
-    if (fallback.startsWith("{") || fallback.startsWith("[")) {
-      throw new Error("Magnitude returned an incompatible JSON error response")
-    }
-    throw new Error(fallback || `Magnitude exited with status ${result.code}`)
-  }
-  const json = Schema.decodeUnknownEither(JsonDocumentSchema)(result.stdout)
-  if (Either.isLeft(json)) throw new Error("Magnitude returned invalid JSON")
-  const decoded = Schema.decodeUnknownEither(schema)(json.right)
-  if (Either.isLeft(decoded)) throw new Error(INCOMPATIBLE_CLI_MESSAGE)
-  return decoded.right
-}
+const commandsLayer = (pi: ExtensionAPI) => Layer.effect(ModelCommands, Effect.gen(function* () {
+  const execute = <A, I>(command: JsonCommandName, args: readonly string[], schema: Schema.Schema<A, I>, timeout: number) =>
+    Effect.tryPromise({
+      try: (signal) => pi.exec(process.env.MAGNITUDE_CLI?.trim() || "magnitude", [...args, "--json"], { timeout, signal }),
+      catch: (error) => new MagnitudeCommandFailed({ message: `Could not execute Magnitude: ${String(error)}` }),
+    }).pipe(Effect.flatMap((result) => {
+      if (result.killed) return Effect.fail(new MagnitudeCommandFailed({ message: "Magnitude command timed out or was cancelled." }))
+      if (result.code !== 0) {
+        const failure = Schema.decodeUnknownEither(Schema.parseJson(jsonFailureEnvelopeSchema(command)))(result.stderr)
+        const detail = Either.isRight(failure) ? failure.right.error.message : result.stderr.trim() || result.stdout.trim()
+        return Effect.fail(new MagnitudeCommandFailed({ message: detail.startsWith("{") || detail.startsWith("[") || /unknown option.*--json/.test(detail)
+          ? incompatible : (detail || `Magnitude exited with status ${result.code}`).slice(0, 2_000) }))
+      }
+      return Schema.decodeUnknown(Schema.parseJson(schema))(result.stdout).pipe(
+        Effect.mapError(() => new MagnitudeCommandFailed({ message:
+          Either.isLeft(Schema.decodeUnknownEither(JsonDocument)(result.stdout)) ? "Magnitude returned invalid JSON" : incompatible })),
+      )
+    }))
+  const [cached, invalidate] = yield* Effect.cachedInvalidateWithTTL(
+    execute("models.status", ["models", "status"], ModelsStatusEnvelopeSchema, 10_000), "30 seconds",
+  )
+  return {
+    status: (fresh) => Effect.gen(function* () {
+      if (fresh) yield* invalidate
+      const result = yield* cached.pipe(Effect.tapError(() => invalidate))
+      if (result.data.state === "initializing") yield* invalidate
+      return result
+    }),
+    load: (modelId) => execute("models.load", ["models", "load", modelId], ModelsLoadEnvelopeSchema, 600_000).pipe(
+      Effect.tap(() => invalidate), Effect.map((result) => result.data.modelId),
+    ),
+    stop: execute("models.stop", ["models", "stop"], ModelsStopEnvelopeSchema, 120_000).pipe(
+      Effect.tap(() => invalidate), Effect.asVoid,
+    ),
+  } satisfies ModelCommands
+}))
+const stateLabel = (model: JsonLocalModel) => Option.getOrElse(model.residency, () => model.installation)
+const loadable = (models: readonly JsonLocalModel[]) => models.filter((model) => model.installation === "installed")
 
-const listModels = async (pi: ExtensionAPI): Promise<ReadonlyArray<JsonModel>> => {
-  const envelope = await executeJson(pi, ["models", "status"], StatusEnvelopeSchema)
-  if (envelope.data.state === "initializing") return []
-  return envelope.data.models
-}
-
-const modelState = (model: JsonModel): string => Option.match(model.residency, {
-  onNone: () => model.installation,
-  onSome: (state) => state,
-})
-const modelLabel = (model: JsonModel): string => `${model.displayName} · ${modelState(model)} · ${model.modelId}`
-const loadableModels = (models: ReadonlyArray<JsonModel>): ReadonlyArray<JsonModel> => models.filter(
-  (model) => model.installation === "installed",
-)
-
-const reportError = (ctx: ExtensionCommandContext, error: unknown): void => {
-  ctx.ui.notify(error instanceof Error ? error.message : String(error), "error")
-}
-
-export const registerMagnitudeCommands = (pi: ExtensionAPI): void => {
-  let cachedModels: { readonly expiresAt: number; readonly models: ReadonlyArray<JsonModel> } | undefined
-  const cachedList = async (): Promise<ReadonlyArray<JsonModel>> => {
-    if (cachedModels !== undefined && cachedModels.expiresAt > Date.now()) return cachedModels.models
-    const models = await listModels(pi)
-    cachedModels = { expiresAt: Date.now() + 30_000, models }
-    return models
-  }
-  const completions = async (prefix: string) => {
-    try {
-      return loadableModels(await cachedList())
-        .filter((model) => model.modelId.toLowerCase().includes(prefix.trim().toLowerCase()))
-        .map((model) => ({ value: model.modelId, label: model.displayName, description: modelState(model) }))
-    } catch {
-      return null
-    }
-  }
-
+/** Pi callbacks are the sole Promise boundary; runtime disposal cancels subprocess work. */
+export const registerMagnitudeCommands = (pi: ExtensionAPI): (() => Promise<void>) => {
+  const runtime = ManagedRuntime.make(commandsLayer(pi))
+  const scope = Effect.runSync(Scope.make())
+  const run = <A, E>(effect: Effect.Effect<A, E, ModelCommands>) => runtime.runPromise(
+    Effect.forkIn(effect, scope).pipe(Effect.flatMap(Fiber.join)),
+  )
+  const invoke = (ctx: ExtensionCommandContext, action: Effect.Effect<void, MagnitudeCommandFailed, ModelCommands>) =>
+    run(action.pipe(Effect.catchAll((error) => Effect.sync(() => ctx.ui.notify(error.message, "error")))))
   pi.registerCommand("load-model", {
     description: "Load a Magnitude model",
-    getArgumentCompletions: completions,
-    handler: async (args, ctx) => {
-      try {
-        let modelId = args.trim()
-        if (modelId.length === 0) {
-          const eligible = loadableModels(await cachedList())
-          if (eligible.length === 0) {
-            ctx.ui.notify("No installed Magnitude models are available.", "info")
-            return
-          }
-          const labels = eligible.map(modelLabel)
-          const selected = await ctx.ui.select("Load Magnitude model", labels)
-          if (selected === undefined) return
-          modelId = eligible[labels.indexOf(selected)]?.modelId ?? ""
+    getArgumentCompletions: (prefix) => run(Effect.gen(function* () {
+      const commands = yield* ModelCommands
+      const status = yield* commands.status(false)
+      return loadable(status.data.models)
+        .filter((model) => model.modelId.toLowerCase().includes(prefix.trim().toLowerCase()))
+        .map((model) => ({ value: model.modelId, label: model.displayName, description: stateLabel(model) }))
+    }).pipe(Effect.catchAll(() => Effect.succeed(null)))),
+    handler: (args, ctx) => invoke(ctx, Effect.gen(function* () {
+      const commands = yield* ModelCommands
+      let modelId = args.trim()
+      if (!modelId) {
+        const status = yield* commands.status(true)
+        if (status.data.state === "initializing") {
+          yield* Effect.sync(() => ctx.ui.notify("Magnitude is discovering local models. Try again shortly.", "info"))
+          return
         }
-        if (modelId.length === 0) return
-        const result = await executeJson(pi, ["models", "load", modelId], LoadEnvelopeSchema)
-        cachedModels = undefined
-        ctx.ui.notify(`Loaded ${result.data.modelId}.`, "info")
-      } catch (error) {
-        reportError(ctx, error)
+        const eligible = loadable(status.data.models)
+        if (!eligible.length) {
+          yield* Effect.sync(() => ctx.ui.notify("No installed Magnitude models are available.", "info"))
+          return
+        }
+        const labels = eligible.map((model) => `${model.displayName} · ${stateLabel(model)} · ${model.modelId}`)
+        const selected = yield* Effect.promise(() => ctx.ui.select("Load Magnitude model", labels))
+        if (selected === undefined) return
+        modelId = eligible[labels.indexOf(selected)]?.modelId ?? ""
       }
-    },
+      if (!modelId) return
+      const loaded = yield* commands.load(modelId)
+      yield* Effect.sync(() => ctx.ui.notify(`Loaded ${loaded}.`, "info"))
+    })),
   })
-
   pi.registerCommand("stop-model", {
     description: "Stop the active Magnitude model",
-    handler: async (_args, ctx) => {
-      try {
-        await executeJson(pi, ["models", "stop"], StopEnvelopeSchema)
-        cachedModels = undefined
-        ctx.ui.notify("Stopped the active Magnitude model.", "info")
-      } catch (error) {
-        reportError(ctx, error)
-      }
-    },
+    handler: (_args, ctx) => invoke(ctx, Effect.gen(function* () {
+      const commands = yield* ModelCommands
+      yield* commands.stop
+      yield* Effect.sync(() => ctx.ui.notify("Stopped the active Magnitude model.", "info"))
+    })),
   })
+  return async () => {
+    await Effect.runPromise(Scope.close(scope, Exit.void))
+    await runtime.dispose()
+  }
 }

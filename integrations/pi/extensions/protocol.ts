@@ -1,30 +1,7 @@
 import { Either, Schema } from "effect"
-
-const NonNegativeInteger = Schema.Number.pipe(Schema.int(), Schema.nonNegative())
-const FiniteNonNegative = Schema.Number.pipe(Schema.finite(), Schema.nonNegative())
-
-export const MagnitudeProgressSchema = Schema.Union(
-  Schema.Struct({ phase: Schema.Literal("model_loading"), fraction: Schema.Number.pipe(Schema.finite()) }),
-  Schema.Struct({ phase: Schema.Literal("queued") }),
-  Schema.Struct({ phase: Schema.Literal("preparing") }),
-  Schema.Struct({
-    phase: Schema.Literal("prefill"),
-    completed_tokens: NonNegativeInteger,
-    total_tokens: NonNegativeInteger,
-    cached_tokens: NonNegativeInteger,
-  }),
-  Schema.Struct({ phase: Schema.Literal("generating") }),
-)
-export type MagnitudeProgress = typeof MagnitudeProgressSchema.Type
-
-export const MagnitudeTimingsSchema = Schema.Struct({
-  prompt_ms: FiniteNonNegative,
-  time_to_first_token_ms: FiniteNonNegative,
-  predicted_n: NonNegativeInteger,
-  predicted_ms: FiniteNonNegative,
-  predicted_per_second: FiniteNonNegative,
-})
-export type MagnitudeTimings = typeof MagnitudeTimingsSchema.Type
+import { MagnitudeProgressSchema, MagnitudeTimingsSchema, type MagnitudeProgress, type MagnitudeTimings } from "@magnitudedev/integration-protocol"
+export { MagnitudeProgressSchema, MagnitudeTimingsSchema }
+export type { MagnitudeProgress, MagnitudeTimings }
 
 const ProgressChunkSchema = Schema.Struct({ progress: MagnitudeProgressSchema })
 const TimingsChunkSchema = Schema.Struct({ timings: MagnitudeTimingsSchema })

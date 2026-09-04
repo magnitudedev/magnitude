@@ -14,7 +14,7 @@ applies_to:
 
 # Release publication
 
-Changesets is the sole authority for the CLI version, npm publication, and npm dist-tag.
+Changesets is the sole authority for the CLI version, CLI npm publication, and CLI npm dist-tag.
 
 ## Source identity
 

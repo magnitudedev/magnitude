@@ -178,6 +178,10 @@ jobs:
           MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
           MAGNITUDE_REQUIRE_RELEASE: "true"
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: bun scripts/accept-integrations.ts
+      - run: bun scripts/publish-integrations.ts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - run: bun run packages/release/scripts/publish.ts release-candidate
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

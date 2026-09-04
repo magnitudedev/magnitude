@@ -11,7 +11,7 @@ import { Effect, Option } from "effect"
 import { applyEdits, modify, parse, type ParseError } from "jsonc-parser"
 import { isDeepStrictEqual } from "node:util"
 import { parseDocument } from "yaml"
-import { writeFileAtomic } from "../utils/atomic-file"
+import { writeFileAtomic } from "./configuration-file"
 import type { HarnessConnector, HarnessInstallation } from "./contract"
 
 export const OPENAI_BASE_URL = new URL("v1", MAGNITUDE_INFERENCE_BASE_URL).href.replace(/\/$/, "")

@@ -115,9 +115,9 @@ export const renderAddedConnection = ({
     }),
     ...Option.match(connection.companion, {
       onNone: () => [],
-      onSome: ({ activation }) => activation === "reload-or-restart"
-        ? ["", "Restart existing Pi sessions or run /reload to activate the extension."]
-        : [],
+      onSome: ({ activationInstructions }) => Option.match(activationInstructions, {
+        onNone: () => [], onSome: (instructions) => ["", instructions],
+      }),
     }),
     "",
   ].join("\n")

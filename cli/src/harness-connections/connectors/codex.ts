@@ -18,7 +18,7 @@ import {
   updateTomlTopLevel,
   writeIfChanged,
 } from "../shared"
-import { writeFileAtomic } from "../../utils/atomic-file"
+import { removeConfigurationFile, writeFileAtomic } from "../configuration-file"
 
 const CODEX_BASE_INSTRUCTIONS = "You are a coding agent running in Codex CLI. Work with the user in the current workspace until their request is resolved. Inspect relevant files before changing them, follow repository instructions, make focused edits, verify consequential changes, and communicate progress and results concisely. Use the available tools when they are needed and preserve user work unrelated to the request."
 const CODEX_PROVIDER_ID = "magnitude"
@@ -150,9 +150,7 @@ export const makeCodexConnector = (
     }
     next = installMagnitudeProvider(next)
     yield* writeIfChanged(paths.codexUser, userSource, next)
-    yield* fs.remove(paths.codex).pipe(
-      Effect.catchTag("SystemError", (error) => error.reason === "NotFound" ? Effect.void : Effect.fail(error)),
-    )
+    yield* removeConfigurationFile(paths.codex)
     return Option.some({
       model: typeof previousModel === "string"
         ? qualifiedModelSelection(
@@ -186,9 +184,7 @@ export const makeCodexConnector = (
       next = updateTomlTopLevel(next, [["model_provider", "openai"]])
     }
     yield* writeIfChanged(paths.codexUser, userSource, next)
-    yield* Effect.forEach([paths.codex, paths.codexModels], (path) => fs.remove(path).pipe(
-      Effect.catchTag("SystemError", (error) => error.reason === "NotFound" ? Effect.void : Effect.fail(error)),
-    ), { discard: true })
+    yield* Effect.forEach([paths.codex, paths.codexModels], removeConfigurationFile, { discard: true })
   }),
   launch(modelId, installation) {
     return launchPlan(this, installation, modelId, ["--model", codexLocalModelId(modelId)])

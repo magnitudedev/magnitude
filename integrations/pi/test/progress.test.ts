@@ -1,195 +1,135 @@
+import { Effect, Exit, Scope } from "effect"
 import { describe, expect, it, vi } from "vitest"
-import { MAGNITUDE_SUMMARY_WIDGET_KEY, MagnitudeProgressTracker } from "../extensions/progress"
+import { MAGNITUDE_SUMMARY_WIDGET_KEY, makeProgressTracker, formatLiveProgress } from "../extensions/progress"
 
-const expectLastSummary = (setWidget: ReturnType<typeof vi.fn>, summary: string): void => {
-  const factory = setWidget.mock.calls.at(-1)?.[1] as
-    | ((tui: unknown, theme: { fg: (color: string, text: string) => string }) => { render: (width: number) => string[] })
-    | undefined
-  expect(factory).toBeTypeOf("function")
-  const fg = vi.fn((_color: string, text: string) => text)
-  const component = factory?.({}, { fg })
-  expect(fg).toHaveBeenCalledWith("muted", summary)
-  expect(component?.render(200).map((line) => line.trimEnd())).toEqual([summary])
+const timings = (predicted_n = 10, predicted_ms = 200) => ({
+  prompt_ms: 500, time_to_first_token_ms: 3_400, predicted_n, predicted_ms, predicted_per_second: predicted_n * 1_000 / predicted_ms,
+})
+const testTracker = (test: (fixture: { tracker: Effect.Effect.Success<ReturnType<typeof makeProgressTracker>>; setWidget: ReturnType<typeof vi.fn>; setWorkingMessage: ReturnType<typeof vi.fn>; advance: (ms: number) => void }) => Effect.Effect<void>) =>
+  Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    let now = 0
+    const setWidget = vi.fn()
+    const setWorkingMessage = vi.fn()
+    const tracker = yield* makeProgressTracker({ setWidget, setWorkingMessage }, () => now)
+    yield* test({ tracker, setWidget, setWorkingMessage, advance: (ms) => { now += ms } })
+  })))
+const summary = (widget: ReturnType<typeof vi.fn>) => {
+  const factory = widget.mock.calls.at(-1)?.[1]
+  if (!factory) return undefined
+  return factory({}, { fg: (_color: string, text: string) => text }).render(200).map((line: string) => line.trimEnd()).join("\n")
 }
 
-describe("MagnitudeProgressTracker", () => {
-  it("renders the approved live stages and derives uncached prefill counts", () => {
-    let now = 1_000
-    let tick = () => {}
-    const setWidget = vi.fn()
-    const setWorkingMessage = vi.fn()
-    const tracker = new MagnitudeProgressTracker({ setWidget, setWorkingMessage }, {
-      now: () => now,
-      setInterval: (callback) => {
-        tick = callback
-        return {} as ReturnType<typeof setInterval>
-      },
-      clearInterval: vi.fn(),
-    })
-    const request = tracker.begin("Qwen3.6 35B-A3B (Q6)")
-
-    request.observe({ progress: { phase: "model_loading", fraction: 0.47 } })
-    now = 3_300
-    tick()
-    expect(setWorkingMessage).toHaveBeenLastCalledWith(
-      "Loading Qwen3.6 35B-A3B (Q6) into memory · 47% · 2.3s",
-    )
-
-    request.observe({ progress: { phase: "preparing" } })
-    expect(setWorkingMessage).toHaveBeenLastCalledWith()
-
-    request.observe({
-      progress: {
-        phase: "prefill",
-        completed_tokens: 14_020,
-        total_tokens: 14_300,
-        cached_tokens: 13_200,
-      },
-    })
-    now = 3_700
-    tick()
-    expect(setWorkingMessage).toHaveBeenLastCalledWith(
-      "Prefilling prompt · 820 / 1.1k tokens · 13.2k cached · 0.4s",
-    )
-
-    request.observe({ progress: { phase: "generating" } })
-    now = 5_400
-    tick()
-    expect(setWorkingMessage).toHaveBeenLastCalledWith("Working · 1.7s")
-    expect(setWidget).toHaveBeenLastCalledWith(MAGNITUDE_SUMMARY_WIDGET_KEY, undefined)
+describe("scoped progress lifecycle", () => {
+  it("formats the approved live phases and clamps inconsistent counters", () => {
+    expect(formatLiveProgress({ modelName: "Model", startedAt: 0, progress: { phase: "model_loading", fraction: 0.47 } }, 2300)).toBe("Loading Model into memory · 47% · 2.3s")
+    expect(formatLiveProgress({ modelName: "Model", startedAt: 0, progress: { phase: "preparing" } }, 2300)).toBeUndefined()
+    expect(formatLiveProgress({ modelName: "Model", startedAt: 0, progress: { phase: "prefill", completed_tokens: 14020, total_tokens: 14300, cached_tokens: 13200 } }, 400)).toBe("Prefilling prompt · 820 / 1.1k tokens · 13.2k cached · 0.4s")
+    expect(formatLiveProgress({ modelName: "Model", startedAt: 0, progress: { phase: "prefill", completed_tokens: 9000, total_tokens: 1000, cached_tokens: 2000 } }, 0)).toBe("Prefilling prompt · 0 / 0 tokens · 1k cached · 0.0s")
   })
 
-  it("summarizes a settled multi-request run with first TTFT and weighted throughput", () => {
-    let now = 0
-    const setWidget = vi.fn()
-    const setWorkingMessage = vi.fn()
-    const tracker = new MagnitudeProgressTracker({ setWidget, setWorkingMessage }, {
-      now: () => now,
-      setInterval: () => ({} as ReturnType<typeof setInterval>),
-      clearInterval: vi.fn(),
-    })
-    tracker.startRun("Qwen3.6 35B-A3B (Q6)")
-    const first = tracker.begin("Qwen3.6 35B-A3B (Q6)")
-    first.observe({ timings: {
-      prompt_ms: 500,
-      time_to_first_token_ms: 3_400,
-      predicted_n: 10,
-      predicted_ms: 200,
-      predicted_per_second: 50,
-    } })
-    first.finish()
+  it("waits for semantic success and delayed observers, using cumulative timings once", () => testTracker(({ tracker, setWidget, advance }) => Effect.gen(function* () {
+    const response = yield* tracker.beginResponse("Model")
+    const request = yield* response.begin
+    yield* request.observe({ timings: timings(5, 100) })
+    yield* request.observe({ timings: timings(10, 200) })
+    advance(6000)
+    yield* response.end(true)
+    yield* tracker.settleRun
+    expect(summary(setWidget)).toBeUndefined()
+    yield* request.finish
+    expect(summary(setWidget)).toBe("● Model worked for 6 seconds · 3.4s TTFT · 50.0 tok/s")
+    yield* request.observe({ timings: timings(900, 1) })
+    yield* request.fail
+    expect(summary(setWidget)).toBe("● Model worked for 6 seconds · 3.4s TTFT · 50.0 tok/s")
+  })))
 
-    now = 4_000
-    const second = tracker.begin("Qwen3.6 35B-A3B (Q6)")
-    second.observe({ timings: {
-      prompt_ms: 100,
-      time_to_first_token_ms: 500,
-      predicted_n: 20,
-      predicted_ms: 200,
-      predicted_per_second: 100,
-    } })
-    now = 6_000
-    tracker.settleRun()
-    expect(setWidget).not.toHaveBeenCalledWith(
-      MAGNITUDE_SUMMARY_WIDGET_KEY,
-      expect.arrayContaining([expect.stringContaining("worked for")]),
-    )
-    second.finish()
+  it("never reports success for EOF followed by Pi error", () => testTracker(({ tracker, setWidget }) => Effect.gen(function* () {
+    const response = yield* tracker.beginResponse("Model")
+    const request = yield* response.begin
+    yield* request.observe({ timings: timings() })
+    yield* request.finish
+    yield* tracker.settleRun
+    expect(summary(setWidget)).toBeUndefined()
+    yield* response.end(false)
+    expect(summary(setWidget)).toBeUndefined()
+    yield* request.observe({ progress: { phase: "generating" }, timings: timings() })
+    yield* response.end(true)
+    expect(summary(setWidget)).toBeUndefined()
+  })))
+
+  it("accounts for overlapping responses independent of observer completion order", () => testTracker(({ tracker, setWidget, setWorkingMessage, advance }) => Effect.gen(function* () {
+    const first = yield* tracker.beginResponse("Model")
+    const a = yield* first.begin
+    const second = yield* tracker.beginResponse("Model")
+    const b = yield* second.begin
+    yield* b.observe({ progress: { phase: "generating" }, timings: timings(20, 200) })
+    const latestRow = setWorkingMessage.mock.calls.at(-1)
+    yield* a.observe({ progress: { phase: "prefill", completed_tokens: 0, total_tokens: 20, cached_tokens: 0 }, timings: timings() })
+    yield* a.finish
+    expect(setWorkingMessage.mock.calls.at(-1)).toEqual(latestRow)
+    yield* b.finish
+    yield* second.end(true)
+    yield* first.end(true)
+    advance(6000)
+    yield* tracker.settleRun
+    expect(summary(setWidget)).toBe("● Model worked for 6 seconds · 3.4s TTFT · 75.0 tok/s")
+  })))
+
+  it("does not count failed HTTP attempts in a successful retry", () => testTracker(({ tracker, setWidget }) => Effect.gen(function* () {
+    const response = yield* tracker.beginResponse("Model")
+    const failed = yield* response.begin
+    yield* failed.observe({ timings: timings(900, 1) })
+    yield* failed.finish
+    const retried = yield* response.begin
+    yield* retried.observe({ timings: timings() })
+    yield* response.end(true)
+    yield* retried.finish
+    yield* tracker.settleRun
+    expect(summary(setWidget)).toBe("● Model worked for <1 second · 3.4s TTFT · 50.0 tok/s")
+  })))
+
+  it("ignores observations from cleared runs and terminal requests", () => testTracker(({ tracker, setWidget, setWorkingMessage }) => Effect.gen(function* () {
+    const old = yield* tracker.beginResponse("Old")
+    const request = yield* old.begin
+    yield* request.fail
+    yield* request.observe({ progress: { phase: "generating" } })
     expect(setWorkingMessage).toHaveBeenLastCalledWith()
-    expectLastSummary(
-      setWidget,
-      "● Qwen3.6 35B-A3B (Q6) worked for 6 seconds · 3.4s TTFT · 75.0 tok/s",
-    )
-
-    tracker.startRun("Qwen3.6 35B-A3B (Q6)")
+    yield* tracker.clear
+    const current = yield* tracker.beginResponse("Current")
+    const fresh = yield* current.begin
+    yield* fresh.observe({ progress: { phase: "generating" } })
+    const row = setWorkingMessage.mock.calls.at(-1)
+    yield* old.end(false)
+    yield* request.finish
+    expect(setWorkingMessage.mock.calls.at(-1)).toEqual(row)
     expect(setWidget).toHaveBeenLastCalledWith(MAGNITUDE_SUMMARY_WIDGET_KEY, undefined)
+  })))
+
+  it("cleans presentation and prevents late work after its scope closes", async () => {
+    const scope = Effect.runSync(Scope.make())
+    const ui = { setWidget: vi.fn(), setWorkingMessage: vi.fn() }
+    const tracker = await Effect.runPromise(makeProgressTracker(ui).pipe(Scope.extend(scope)))
+    const response = Effect.runSync(tracker.beginResponse("Model"))
+    const request = Effect.runSync(response.begin)
+    Effect.runSync(request.observe({ progress: { phase: "generating" } }))
+    await Effect.runPromise(Scope.close(scope, Exit.void))
+    const count = ui.setWorkingMessage.mock.calls.length
+    Effect.runSync(request.observe({ progress: { phase: "generating" } }))
+    Effect.runSync(response.end(true))
+    const late = Effect.runSync(tracker.beginResponse("Model"))
+    Effect.runSync(late.begin)
+    expect(ui.setWorkingMessage).toHaveBeenCalledTimes(count)
   })
 
-  it("uses Magnitude's completed-work duration formatting", () => {
-    let now = 0
-    const setWidget = vi.fn()
-    const tracker = new MagnitudeProgressTracker({ setWidget, setWorkingMessage: vi.fn() }, {
-      now: () => now,
-      setInterval: () => ({} as ReturnType<typeof setInterval>),
-      clearInterval: vi.fn(),
-    })
-    const completeRun = (settledAt: number) => {
-      tracker.startRun("Model")
-      const request = tracker.begin("Model")
-      request.observe({ timings: {
-        prompt_ms: 1,
-        time_to_first_token_ms: 100,
-        predicted_n: 1,
-        predicted_ms: 10,
-        predicted_per_second: 100,
-      } })
-      request.finish()
-      now = settledAt
-      tracker.settleRun()
-    }
-
-    completeRun(999)
-    expectLastSummary(
-      setWidget,
-      "● Model worked for <1 second · 0.1s TTFT · 100.0 tok/s",
-    )
-
-    now = 10_000
-    completeRun(75_000)
-    expectLastSummary(
-      setWidget,
-      "● Model worked for 1:05 · 0.1s TTFT · 100.0 tok/s",
-    )
-  })
-
-  it("clamps inconsistent server counters before deriving uncached prefill", () => {
-    const setWidget = vi.fn()
-    const setWorkingMessage = vi.fn()
-    const tracker = new MagnitudeProgressTracker({ setWidget, setWorkingMessage }, {
-      now: () => 0,
-      setInterval: () => ({} as ReturnType<typeof setInterval>),
-      clearInterval: vi.fn(),
-    })
-    const request = tracker.begin("Qwen3.6 35B-A3B (Q6)")
-
-    request.observe({
-      progress: {
-        phase: "prefill",
-        completed_tokens: 9_000,
-        total_tokens: 1_000,
-        cached_tokens: 2_000,
-      },
-    })
-
-    expect(setWorkingMessage).toHaveBeenLastCalledWith(
-      "Prefilling prompt · 0 / 0 tokens · 1k cached · 0.0s",
-    )
-  })
-
-  it("clears incomplete, failed, model-switched, and disposed state", () => {
-    const setWidget = vi.fn()
-    const setWorkingMessage = vi.fn()
-    const clearInterval = vi.fn()
-    const tracker = new MagnitudeProgressTracker({ setWidget, setWorkingMessage }, {
-      setInterval: () => ({ id: 7 } as unknown as ReturnType<typeof setInterval>),
-      clearInterval,
-    })
-    const incomplete = tracker.begin("Qwen3.6 35B-A3B (Q6)")
-    incomplete.observe({ progress: { phase: "generating" } })
-    incomplete.finish()
-    expect(setWorkingMessage).toHaveBeenLastCalledWith()
-    expect(setWidget).toHaveBeenLastCalledWith(MAGNITUDE_SUMMARY_WIDGET_KEY, undefined)
-    const failed = tracker.begin("Qwen3.6 35B-A3B (Q6)")
-    failed.observe({ progress: { phase: "generating" } })
-    failed.fail()
-    tracker.settleRun()
-    expect(setWorkingMessage).toHaveBeenLastCalledWith()
-    expect(setWidget).toHaveBeenLastCalledWith(MAGNITUDE_SUMMARY_WIDGET_KEY, undefined)
-    tracker.clear()
-    tracker.dispose()
-    tracker.dispose()
-    expect(clearInterval).toHaveBeenCalledTimes(2)
-    expect(clearInterval).toHaveBeenNthCalledWith(1, { id: 7 })
-    expect(clearInterval).toHaveBeenNthCalledWith(2, { id: 7 })
+  it("isolates throwing UI callbacks", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const tracker = yield* makeProgressTracker({ setWidget: () => { throw Error("widget") }, setWorkingMessage: () => { throw Error("row") } })
+      const response = yield* tracker.beginResponse("Model")
+      const request = yield* response.begin
+      yield* request.observe({ progress: { phase: "generating" }, timings: timings() })
+      yield* request.finish
+      yield* response.end(true)
+      yield* tracker.settleRun
+    })))
   })
 })

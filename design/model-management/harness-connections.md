@@ -51,8 +51,8 @@ Each harness has one connector. A connector owns that harness's:
 - skill installation target; and
 - launch plan.
 
-The shared service owns manifest persistence, installation observation, transactional file
-snapshots, connector dispatch, skill installation, and startup orchestration. It contains no
+The shared service owns manifest persistence, installation observation, transactional compensation,
+connector dispatch, skill installation, and startup orchestration. It contains no
 harness-specific configuration transforms.
 
 A connector may require one harness-native companion package. That package is part of the
@@ -60,8 +60,9 @@ connection's desired state rather than an optional setup extra. The connector ow
 package identity, source, inspection, installation, activation, and removal operations. The shared
 service owns package reconciliation, mutation ordering, compensation, and persistence of package
 ownership. A connection records whether Magnitude installed the package or found it pre-existing,
-plus any prior enablement state that Magnitude changed. Disconnect removes a package only when
-Magnitude owns its installation; otherwise it restores the user's prior state. Sync reconciles a
+plus a connector-specific validated receipt of any enablement fields Magnitude changed. Disconnect
+removes a package only while Magnitude owns its installation; otherwise it conditionally restores
+only those fields, never recreating a removed user entry or overwriting subsequent edits. Sync reconciles a
 required package as well as connector configuration.
 
 The Pi companion has one desired package source. Production uses its exact versioned npm source;
@@ -69,6 +70,20 @@ the repository development launcher supplies the local integration directory ins
 records the source actually installed. Reconciliation addresses that exact source, replaces a
 Magnitude-owned package when the desired source changes, and never replaces a pre-existing
 user-owned package merely because development mode is active.
+
+Configuration presence is not proof of package availability. Pi reconciliation verifies the supported
+host, installed package version, and extension entrypoint before reporting success. Filters follow
+the supported host's native rules, including empty arrays, basename and absolute exclusions, and
+autoload-disabled ordering. Relative local sources resolve from Pi's settings directory; explicit
+agent-directory overrides govern both configuration and native package commands. An incompatible
+borrowed package is reported, not silently replaced.
+
+Connection mutations hold one cross-process lock through fresh manifest observation, native
+operations, configuration, and manifest commit. Process death releases the lock; elapsed time never
+transfers ownership. Compensations are registered before mutations, run in reverse order, and all
+are attempted even after a recovery failure. Failed operations report incomplete recovery together
+with the original error. File recovery checks the value written by the transaction before restoring
+it, preserving concurrent edits. Manifest commit is the uninterruptible durability point.
 
 Applying a connection is an idempotent replacement of Magnitude-owned state. Unrelated user state
 is preserved. Without an explicit model, connection and sync do not change the harness's current
@@ -198,17 +213,30 @@ is presented as timed work. The companion treats transport requests and a Pi age
 lifecycles: request progress owns the live row, while `agent_start` through `agent_settled` owns the
 retained summary. Completion restores Pi's default working message and presents the model display
 name, total agent-run wall time, the first request's time to first token, and token-weighted generation
-throughput in one widget line immediately above the editor. Throughput is derived from the sum of
-generated tokens divided by the sum of decode time across every completed Magnitude request in the
-run. Starting another run, cancellation, failure, switching providers, or extension disposal clears
+throughput in one widget line immediately above the editor. Pi's stock parser decides semantic
+success; HTTP EOF alone cannot authorize a summary. Responses and their retry attempts are tracked
+independently, including overlapping and delayed observations. Timings are cumulative snapshots;
+throughput sums tokens and decode time once for each successful response's final request. Run duration
+uses monotonic time. Starting another run, cancellation, failure, switching providers, or extension disposal clears
 the retained summary and restores Pi's default working message.
 
+The extension owns a scoped observer, live-row timer, and subprocess lifetime. Disposing it cancels
+pending work; terminal request handles and older runs cannot mutate newer presentation. Presentation
+failures do not prevent inference. Status completion lookups share in-flight work and briefly cache
+ready discovery, but never cache initialization or failure. Explicit model selection refreshes status.
+Loading is acknowledged only after server readiness, with a longer bound than discovery or stop.
+
 The repository exposes one `dev:pi` entrypoint. It selects an installed Magnitude model, connects
-Pi through the ordinary non-interactive connection path using the local package source, and launches
+Pi through the ordinary connection service using the local package source, and launches
 Pi with a scoped executable for the current source CLI. Temporary executables live outside the
 repository and remain available for the entire child session. This development path exercises the
 same provider configuration, package ownership, skill installation, and Pi extension loading as a
-published connection. It builds and runs the checkout's inference runtime and suppresses successful
+published connection. Pi's user configuration, connection receipts, and bundled skill are isolated
+in the development scope. Pi inherits the caller's working directory: project files and context
+remain available, and development setup never substitutes a temporary workspace.
+Automatic skill discovery is disabled for this launcher; only the explicit checkout skill is loaded,
+including after reload. Changing Pi's agent directory alone does not isolate shared agent skills.
+It builds the extension and runs the checkout's inference runtime and suppresses successful
 native-build diagnostics while preserving complete failure diagnostics. It inherits the caller's
 environment but does not start a telemetry collector or enable tracing itself.
 It borrows the fixed service endpoint only from a stopped state or the installed service manager:

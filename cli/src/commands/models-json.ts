@@ -1,50 +1,16 @@
 import { formatLocalModelDisplayName } from "@magnitudedev/client-common"
-import { ModelIdSchema, type LocalModel } from "@magnitudedev/sdk"
+import {
+  ModelIdSchema, IntegrationModelIdSchema, type LocalModel,
+  JsonInstallationStateSchema, JsonResidencyStateSchema, JsonLocalModelSchema,
+  ModelsStatusJsonDataSchema, type JsonLocalModel, type ModelsStatusJsonData,
+} from "@magnitudedev/sdk"
 import { Schema } from "effect"
 
-export const JsonInstallationStateSchema = Schema.Literal(
-  "not_installed",
-  "installing",
-  "installed",
-  "removing",
-  "unavailable",
-)
+export { JsonInstallationStateSchema, JsonResidencyStateSchema, JsonLocalModelSchema, ModelsStatusJsonDataSchema }
+export { ModelsLoadJsonDataSchema, ModelsStopJsonDataSchema } from "@magnitudedev/sdk"
+export type { JsonLocalModel, ModelsStatusJsonData }
 
-export const JsonResidencyStateSchema = Schema.Literal(
-  "unloaded",
-  "loading",
-  "ready",
-  "stopping",
-  "failed",
-)
-
-export const JsonLocalModelSchema = Schema.Struct({
-  modelId: ModelIdSchema,
-  displayName: Schema.NonEmptyString,
-  installation: JsonInstallationStateSchema,
-  residency: Schema.optionalWith(JsonResidencyStateSchema, { as: "Option", exact: true }),
-})
-export type JsonLocalModel = typeof JsonLocalModelSchema.Type
-
-export const ModelsStatusJsonDataSchema = Schema.Union(
-  Schema.Struct({
-    state: Schema.Literal("initializing"),
-    models: Schema.Tuple(),
-  }),
-  Schema.Struct({
-    state: Schema.Literal("ready"),
-    models: Schema.Array(JsonLocalModelSchema),
-  }),
-)
-export type ModelsStatusJsonData = typeof ModelsStatusJsonDataSchema.Type
-
-export const ModelsLoadJsonDataSchema = Schema.Struct({
-  modelId: ModelIdSchema,
-})
-
-export const ModelsStopJsonDataSchema = Schema.Struct({})
-
-export const modelsLoadJsonData = (modelId: typeof ModelIdSchema.Type) => ({ modelId })
+export const modelsLoadJsonData = (modelId: typeof ModelIdSchema.Type) => ({ modelId: IntegrationModelIdSchema.make(modelId) })
 
 export const modelsStopJsonData = () => ({})
 
