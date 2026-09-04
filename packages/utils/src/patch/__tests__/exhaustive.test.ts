@@ -8,9 +8,9 @@ import {
 } from '../index'
 import type { PatchApplyError } from '../index'
 import type { CompiledMap, DecodedPatchOp, DecodedValue, Path } from '../index'
-import { DisplayViewSnapshot } from '../../../../protocol/src/schemas/display'
-import type { DisplayViewSnapshot as DVS } from '../../../../protocol/src/schemas/display'
-import { StreamEvent } from '../../../../protocol/src/schemas/events'
+import { DisplayViewSnapshot } from '../../../../acn-protocol/src/schemas/display'
+import type { DisplayViewSnapshot as DVS } from '../../../../acn-protocol/src/schemas/display'
+import { StreamEvent } from '../../../../acn-protocol/src/schemas/events'
 
 // ---------------------------------------------------------------------------
 // Helpers
