@@ -1,6 +1,10 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import MemoryAtlasCanvas from './MemoryAtlasCanvas.svelte'
+  import {
+    KILL_ALL_ACNS_ACTION,
+    MUTATING_ACTION_HEADER,
+  } from './request-security'
   import type {
     AcnDisplayViewIntrospection,
     AcnInfo,
@@ -382,7 +386,10 @@
     error = null
     notice = null
     try {
-      const response = await fetch('/api/acns/kill-all', { method: 'POST' })
+      const response = await fetch('/api/acns/kill-all', {
+        method: 'POST',
+        headers: { [MUTATING_ACTION_HEADER]: KILL_ALL_ACNS_ACTION },
+      })
       if (!response.ok) throw new Error(`${response.status} ${response.statusText}`)
       const payload = await response.json() as { results: KillAllAcnResult[] }
       notice = killSummary(payload.results)

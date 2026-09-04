@@ -7,6 +7,10 @@ import {
   type AcnRegistration,
 } from '@magnitudedev/acn-protocol'
 import type { AcnInfo, KillAllAcnResult, RpcTraceSummary } from './lib/types'
+import {
+  isAuthorizedDashboardAction,
+  KILL_ALL_ACNS_ACTION,
+} from './request-security'
 
 const PORT = Number(process.env.ACN_DASH_API_PORT ?? 4886)
 const MOTEL_URL = process.env.MAGNITUDE_MOTEL_URL ?? 'http://127.0.0.1:27686'
@@ -15,19 +19,10 @@ const ACN_DIR = join(DATA_DIR, 'acn')
 const DIST_DIR = join(import.meta.dir, '..', 'dist')
 const decodeRegistry = Schema.decodeUnknownSync(AcnVersionRegistryJson)
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
-}
-
 function json(body: unknown, init?: ResponseInit): Response {
   return Response.json(body, {
     ...init,
-    headers: {
-      ...corsHeaders,
-      ...(init?.headers ?? {}),
-    },
+    headers: init?.headers,
   })
 }
 
@@ -264,7 +259,6 @@ async function proxyJson(version: string, suffix: string): Promise<Response> {
     status: response.status,
     statusText: response.statusText,
     headers: {
-      ...corsHeaders,
       'Content-Type': response.headers.get('Content-Type') ?? 'application/json',
     },
   })
@@ -285,7 +279,6 @@ async function proxyStream(version: string, suffix: string): Promise<Response> {
     status: response.status,
     statusText: response.statusText,
     headers: {
-      ...corsHeaders,
       'Content-Type': response.headers.get('Content-Type') ?? 'text/event-stream',
       'Cache-Control': 'no-cache',
     },
@@ -300,7 +293,7 @@ const server = Bun.serve({
     const path = url.pathname
 
     if (req.method === 'OPTIONS') {
-      return new Response(null, { headers: corsHeaders })
+      return new Response(null, { status: 204 })
     }
 
     if (path === '/api/acns') {
@@ -308,6 +301,12 @@ const server = Bun.serve({
     }
 
     if (path === '/api/acns/kill-all' && req.method === 'POST') {
+      if (!isAuthorizedDashboardAction(req, KILL_ALL_ACNS_ACTION)) {
+        return json({
+          error: 'forbidden',
+          message: 'Missing or invalid dashboard action authorization',
+        }, { status: 403 })
+      }
       const results = await killAllAcns()
       return json({ results, timestamp: Date.now() })
     }
