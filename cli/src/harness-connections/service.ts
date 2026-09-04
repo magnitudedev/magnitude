@@ -43,11 +43,16 @@ import skillContents from "./magnitude-skill.md" with { type: "text" }
 export {
   ANTHROPIC_BASE_URL,
   CODEX_PROXY_BASE_URL,
+  LOCAL_TOKEN,
   OPENAI_BASE_URL,
   anthropicLocalModelId,
   codexLocalModelId,
   removeOwnedJsonc,
+  removeTomlArrayBlock,
+  replaceOrAppendTomlArrayBlock,
+  tomlTableScalarValue,
   updateJsonc,
+  updateTomlTableScalar,
   updateYaml,
 } from "./shared"
 export { clineModelCatalog, clineModelRegistryEntry, clineProviderSettings } from "./connectors/cline"
@@ -65,6 +70,7 @@ export {
   piPackageExtensionEnabled,
   piProviderConfig,
 } from "./connectors/pi"
+export { makeGptmeConnector } from "./connectors/gptme"
 export { makeHarnessConnectorRegistry } from "./registry"
 export { harnessConnectionPaths, type HarnessConnectionPaths } from "./paths"
 export type { HarnessConnectionSpec, HarnessConnector, HarnessInstallation, HarnessModel } from "./contract"

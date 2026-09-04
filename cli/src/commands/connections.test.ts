@@ -25,6 +25,7 @@ describe("connections command contract", () => {
       { id: HarnessIdSchema.make("codex"), name: "Codex", availability: "Installed", selectable: true, connected: true },
       { id: HarnessIdSchema.make("claude-code"), name: "Claude Code", availability: "Installed", selectable: true, connected: false },
       { id: HarnessIdSchema.make("cline"), name: "Cline", availability: "Not installed", selectable: false, connected: false },
+      { id: HarnessIdSchema.make("gptme"), name: "gptme", availability: "Installed", selectable: true, connected: false },
     ])
     expect(output).toContain("Built in")
     expect(output).toContain("Connected")

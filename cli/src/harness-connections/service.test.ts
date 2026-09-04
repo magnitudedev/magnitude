@@ -3,7 +3,7 @@ import * as FileSystem from "@effect/platform/FileSystem"
 import { BunContext } from "@effect/platform-bun"
 import { HARNESS_PRIORITY, HarnessIdSchema } from "@magnitudedev/client-common"
 import { ProviderModelIdSchema, ReasoningEffortSchema } from "@magnitudedev/sdk"
-import { Effect, Option, Schema } from "effect"
+import { Effect, Option, Schema, Scope } from "effect"
 import { parse } from "jsonc-parser"
 import { delimiter, dirname, resolve } from "node:path"
 import { parseDocument } from "yaml"
@@ -33,6 +33,8 @@ import {
   harnessExecutableSearchPath,
   hermesProviderConfig,
   hermesReasoningOverrides,
+  LOCAL_TOKEN,
+  makeGptmeConnector,
   makeHarnessConnectionService,
   makeHarnessConnectorRegistry,
   ohMyPiProviderConfig,
@@ -41,7 +43,9 @@ import {
   openCodeProviderConfig,
   piPackageExtensionEnabled,
   piProviderConfig,
+  tomlTableScalarValue,
   updateJsonc,
+  updateTomlTableScalar,
   updateYaml,
   type HarnessConnectionPaths,
 } from "./service"
@@ -108,6 +112,7 @@ const fixturePaths = (root: string): HarnessConnectionPaths => ({
   ompSettings: `${root}/omp/config.yml`,
   clineProviders: `${root}/cline/providers.json`,
   clineModels: `${root}/cline/models.json`,
+  gptme: `${root}/gptme/config.toml`,
   skillInstallations: {
     "shared-agents": {
       skillFile: `${root}/skills/agents/magnitude/SKILL.md`,
@@ -183,6 +188,7 @@ const initialFiles = (paths: HarnessConnectionPaths): Readonly<Record<string, st
     lastUsedProvider: "user-provider",
   }),
   [paths.clineModels]: stringifyJson({ version: 1, providers: {} }),
+  [paths.gptme]: '[models]\ndefault = "user/model"\n',
 })
 
 const writeFixtures = (files: Readonly<Record<string, string>>) => Effect.gen(function* () {
@@ -271,6 +277,7 @@ describe("HarnessConnector contract and registry", () => {
       "claude-code": "claude-user",
       "oh-my-pi": "shared-agents",
       cline: "cline-user",
+      gptme: "shared-agents",
     })
   })
 
@@ -1286,7 +1293,7 @@ describe("HarnessConnection model-set behavior", () => {
       const manifest = readJson(yield* fs.readFileString(paths.manifest)) as {
         connections: ReadonlyArray<Record<string, unknown>>
       }
-      expect(manifest.connections).toHaveLength(8)
+      expect(manifest.connections).toHaveLength(9)
       for (const entry of manifest.connections) {
         expect(entry.models).toEqual(models)
         if (entry.harness === "codex") expect(entry).toHaveProperty("restore")
@@ -1309,6 +1316,7 @@ describe("HarnessConnection model-set behavior", () => {
       expect(readYaml(yield* fs.readFileString(paths.ompSettings))).toEqual(readYaml(initial[paths.ompSettings]!))
       expect(readJson(yield* fs.readFileString(paths.clineProviders))).toEqual(readJson(initial[paths.clineProviders]!))
       expect(readJson(yield* fs.readFileString(paths.clineModels))).toEqual(readJson(initial[paths.clineModels]!))
+      expect(Bun.TOML.parse(yield* fs.readFileString(paths.gptme))).toEqual(Bun.TOML.parse(initial[paths.gptme]!))
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
   })
 
@@ -1888,5 +1896,164 @@ describe("HarnessConnection model-set behavior", () => {
       "--model",
       model,
     ])
+  })
+
+  it("launches gptme with magnitude/<model>", () => {
+    const paths = fixturePaths("/tmp/gptme-launch")
+    const connector = makeHarnessConnectorRegistry(paths).get(HarnessIdSchema.make("gptme"))
+    const plan = connector.launch(model, { executable: "gptme" })
+    expect(plan.args).toEqual(["--model", `magnitude/${model}`])
+    expect(plan.command).toBe("gptme")
+  })
+})
+
+describe("gptme connector", () => {
+  const runEffect = <A>(eff: Effect.Effect<A, unknown, BunContext.BunContext | Scope.Scope>) =>
+    Effect.runPromise(Effect.scoped(eff.pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+
+  it("writes the [[providers]] block and sets [models].default on connect with model", async () => {
+    await runEffect(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "gptme-connect-model-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const connector = makeGptmeConnector(paths)
+      yield* connector.connect({ models, installation: { executable: "gptme" }, model: Option.some(model) })
+      const source = yield* fs.readFileString(paths.gptme)
+      const parsed = Bun.TOML.parse(source) as Record<string, unknown>
+      const providers = parsed["providers"] as Array<Record<string, unknown>>
+      expect(providers).toHaveLength(1)
+      expect(providers[0]).toMatchObject({
+        name: "magnitude",
+        base_url: OPENAI_BASE_URL,
+        api_key: LOCAL_TOKEN,
+        default_model: model,
+      })
+      expect(tomlTableScalarValue(source, "models", "default")).toBe(`magnitude/${model}`)
+    }))
+  })
+
+  it("writes only the [[providers]] block without touching [models].default when model is absent", async () => {
+    await runEffect(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "gptme-connect-nomodel-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const connector = makeGptmeConnector(paths)
+      yield* connector.connect({ models, installation: { executable: "gptme" }, model: Option.none() })
+      const source = yield* fs.readFileString(paths.gptme)
+      const parsed = Bun.TOML.parse(source) as Record<string, unknown>
+      const providers = parsed["providers"] as Array<Record<string, unknown>>
+      expect(providers).toHaveLength(1)
+      expect(providers[0]).toMatchObject({ name: "magnitude", base_url: OPENAI_BASE_URL })
+      expect((providers[0] as Record<string, unknown>)["default_model"]).toBeUndefined()
+      // [models].default is preserved from the initial config
+      expect(tomlTableScalarValue(source, "models", "default")).toBe("user/model")
+    }))
+  })
+
+  it("restores [models].default on disconnect when model was set", async () => {
+    await runEffect(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "gptme-disconnect-restore-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const connector = makeGptmeConnector(paths)
+      const restore = yield* connector.connect({ models, installation: { executable: "gptme" }, model: Option.some(model) })
+      yield* connector.disconnect({ models, restore })
+      const source = yield* fs.readFileString(paths.gptme)
+      const parsed = Bun.TOML.parse(source) as Record<string, unknown>
+      // [[providers]] block removed
+      expect(parsed["providers"]).toBeUndefined()
+      // [models].default restored to original
+      expect(tomlTableScalarValue(source, "models", "default")).toBe("user/model")
+    }))
+  })
+
+  it("removes connector-owned [models].default on disconnect when no previous default existed", async () => {
+    await runEffect(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "gptme-disconnect-no-restore-" })
+      const paths = fixturePaths(root)
+      // No initial [models] table
+      yield* writeFixtures({ ...initialFiles(paths), [paths.gptme]: "" })
+      const connector = makeGptmeConnector(paths)
+      const restore = yield* connector.connect({ models, installation: { executable: "gptme" }, model: Option.some(model) })
+      yield* connector.disconnect({ models, restore })
+      const source = yield* fs.readFileString(paths.gptme)
+      const parsed = Bun.TOML.parse(source) as Record<string, unknown>
+      expect(parsed["providers"]).toBeUndefined()
+      expect(tomlTableScalarValue(source, "models", "default")).toBeUndefined()
+    }))
+  })
+
+  it("preserves a user-selected non-Magnitude model after connect+disconnect", async () => {
+    await runEffect(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "gptme-disconnect-user-default-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const connector = makeGptmeConnector(paths)
+      const restore = yield* connector.connect({ models, installation: { executable: "gptme" }, model: Option.some(model) })
+      // User changes the model after connect
+      const current = yield* fs.readFileString(paths.gptme)
+      yield* fs.writeFileString(paths.gptme, updateTomlTableScalar(current, "models", [["default", "openai/gpt-4o"]]))
+      yield* connector.disconnect({ models, restore })
+      const source = yield* fs.readFileString(paths.gptme)
+      // User's selection must be preserved; the connector does not restore over it
+      expect(tomlTableScalarValue(source, "models", "default")).toBe("openai/gpt-4o")
+    }))
+  })
+
+  it("fails cleanly when a user-owned magnitude provider exists with a different base_url", async () => {
+    await runEffect(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "gptme-user-owned-provider-" })
+      const paths = fixturePaths(root)
+      const userConfig = `[[providers]]\nname = "magnitude"\nbase_url = "https://custom.example.com"\napi_key = "user-key"\n`
+      yield* writeFixtures({ ...initialFiles(paths), [paths.gptme]: userConfig })
+      const connector = makeGptmeConnector(paths)
+      const exit = yield* Effect.exit(
+        connector.connect({ models, installation: { executable: "gptme" }, model: Option.some(model) }),
+      )
+      expect(exit._tag).toBe("Failure")
+      // Config must remain untouched
+      expect(yield* fs.readFileString(paths.gptme)).toBe(userConfig)
+    }))
+  })
+
+  it("replaces an existing connector-owned [[providers]] block on re-connect", async () => {
+    await runEffect(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "gptme-reconnect-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const connector = makeGptmeConnector(paths)
+      yield* connector.connect({ models, installation: { executable: "gptme" }, model: Option.some(model) })
+      yield* connector.connect({ models, installation: { executable: "gptme" }, model: Option.some(secondModel) })
+      const source = yield* fs.readFileString(paths.gptme)
+      const parsed = Bun.TOML.parse(source) as Record<string, unknown>
+      const providers = parsed["providers"] as Array<Record<string, unknown>>
+      expect(providers).toHaveLength(1)
+      expect(providers[0]).toMatchObject({ name: "magnitude", default_model: secondModel })
+      expect(tomlTableScalarValue(source, "models", "default")).toBe(`magnitude/${secondModel}`)
+    }))
+  })
+
+  it("preserves user comments and unrelated config sections through connect/disconnect", async () => {
+    await runEffect(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "gptme-preserve-comments-" })
+      const paths = fixturePaths(root)
+      const userConfig = '# User comment\n[chat]\ndefault_prompt = "Hello"\n\n[models]\ndefault = "user/model"\n'
+      yield* writeFixtures({ ...initialFiles(paths), [paths.gptme]: userConfig })
+      const connector = makeGptmeConnector(paths)
+      const restore = yield* connector.connect({ models, installation: { executable: "gptme" }, model: Option.some(model) })
+      yield* connector.disconnect({ models, restore })
+      const result = yield* fs.readFileString(paths.gptme)
+      expect(result).toContain("# User comment")
+      expect(result).toContain('default_prompt = "Hello"')
+      expect(tomlTableScalarValue(result, "models", "default")).toBe("user/model")
+    }))
   })
 })

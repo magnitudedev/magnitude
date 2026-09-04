@@ -94,6 +94,113 @@ export const removeTomlTable = (source: string, table: string): string => {
   return lines.join("\n")
 }
 
+/** Find a [[table]] array-of-tables block where `name = "X"` matches, returning line boundaries. */
+const findTomlArrayBlock = (
+  lines: string[],
+  table: string,
+  name: string,
+): { start: number; end: number } | undefined => {
+  const arrayHeader = new RegExp(`^\\s*\\[\\[${table}\\]\\]\\s*$`)
+  for (let i = 0; i < lines.length; i++) {
+    if (!arrayHeader.test(lines[i]!)) continue
+    // Scan forward until the next section header to check for name match
+    let j = i + 1
+    let nameMatch = false
+    while (j < lines.length && !/^\s*\[/.test(lines[j]!)) {
+      const m = lines[j]!.match(/^\s*name\s*=\s*"([^"]*)"/)
+      if (m?.[1] === name) nameMatch = true
+      j++
+    }
+    if (nameMatch) return { start: i, end: j }
+  }
+  return undefined
+}
+
+/**
+ * Replace an existing [[table]] block where name matches with `block`,
+ * or append `block` if no matching block exists.
+ */
+export const replaceOrAppendTomlArrayBlock = (
+  source: string,
+  table: string,
+  name: string,
+  block: string,
+): string => {
+  const lines = source.split("\n")
+  const existing = findTomlArrayBlock(lines, table, name)
+  const blockLines = block.trimEnd().split("\n")
+  if (existing !== undefined) {
+    lines.splice(existing.start, existing.end - existing.start, ...blockLines)
+    const result = lines.join("\n")
+    // Preserve trailing newline from source so idempotent calls don't flip it
+    return source.endsWith("\n") && !result.endsWith("\n") ? `${result}\n` : result
+  }
+  const trimmed = source.trimEnd()
+  return `${trimmed}${trimmed.length > 0 ? "\n\n" : ""}${block.trimEnd()}\n`
+}
+
+/**
+ * Remove the [[table]] block where name matches, trimming any preceding blank line.
+ */
+export const removeTomlArrayBlock = (source: string, table: string, name: string): string => {
+  const lines = source.split("\n")
+  const existing = findTomlArrayBlock(lines, table, name)
+  if (existing === undefined) return source
+  let { start } = existing
+  const { end } = existing
+  // Absorb a preceding blank separator line so the result stays clean
+  if (start > 0 && lines[start - 1]!.trim() === "") start--
+  lines.splice(start, end - start)
+  return lines.join("\n")
+}
+
+/** Read a scalar value from a named TOML table, e.g. `[models].default`. */
+export const tomlTableScalarValue = (source: string, table: string, key: string): unknown => {
+  const parsed = Bun.TOML.parse(source.trim() === "" ? "" : source)
+  if (parsed === null || typeof parsed !== "object") return undefined
+  const section = (parsed as Record<string, unknown>)[table]
+  return section !== null && typeof section === "object"
+    ? (section as Record<string, unknown>)[key]
+    : undefined
+}
+
+/**
+ * Set or remove string scalars within a named TOML table section, e.g. `[models]`.
+ * If the table does not exist and values are being set, it is appended.
+ */
+export const updateTomlTableScalar = (
+  source: string,
+  table: string,
+  changes: ReadonlyArray<readonly [string, string | undefined]>,
+): string => {
+  const tableHeader = `[${table}]`
+  const lines = source.split("\n")
+  const tableStart = lines.findIndex((line) => line.trim() === tableHeader)
+  if (tableStart < 0) {
+    const additions = changes.filter(([, v]) => v !== undefined)
+    if (additions.length === 0) return source
+    const block = `\n${tableHeader}\n${additions.map(([k, v]) => `${k} = ${JSON.stringify(v)}`).join("\n")}\n`
+    return source.trimEnd() + block
+  }
+  let tableEnd = tableStart + 1
+  while (tableEnd < lines.length && !/^\s*\[/.test(lines[tableEnd]!)) tableEnd++
+  const sectionLines = lines.slice(tableStart + 1, tableEnd)
+  const additions: string[] = []
+  for (const [key, value] of changes) {
+    const matcher = new RegExp(`^\\s*${key}\\s*=`)
+    const idx = sectionLines.findIndex((line) => matcher.test(line))
+    if (idx >= 0) {
+      if (value === undefined) sectionLines.splice(idx, 1)
+      else sectionLines[idx] = `${key} = ${JSON.stringify(value)}`
+    } else if (value !== undefined) {
+      additions.push(`${key} = ${JSON.stringify(value)}`)
+    }
+  }
+  if (additions.length > 0) sectionLines.push(...additions)
+  lines.splice(tableStart + 1, tableEnd - tableStart - 1, ...sectionLines)
+  return lines.join("\n")
+}
+
 export const readOr = (file: string, fallback: string) => FileSystem.FileSystem.pipe(
   Effect.flatMap((fs) => fs.readFileString(file)),
   Effect.catchTag("SystemError", (error) => error.reason === "NotFound"
