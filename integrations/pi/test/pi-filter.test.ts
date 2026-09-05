@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { resolve } from "node:path"
-import { DefaultPackageManager } from "../../../node_modules/@earendil-works/pi-coding-agent/dist/core/package-manager.js"
-import { PI_COMPANION_EXTENSION_PATH, piPackageExtensionEnabled } from "./connectors/pi-package"
+import { DefaultPackageManager } from "@earendil-works/pi-coding-agent"
+import { PI_COMPANION_EXTENSION_PATH, piPackageExtensionEnabled } from "../../../cli/src/harness-connections/connectors/pi-package"
 
 // Differential check against the pinned host, without its filesystem discovery.
 // Only discovery and collection are substituted; Pi executes its actual filters.
