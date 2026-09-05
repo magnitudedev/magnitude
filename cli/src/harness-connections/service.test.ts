@@ -9,6 +9,7 @@ import { delimiter, dirname, resolve } from "node:path"
 import { parseDocument } from "yaml"
 import { describe, expect, it } from "vitest"
 import { HarnessModelSchema, type HarnessCompanionPackage } from "./contract"
+import { PiPackageEntrySchema } from "./connectors/pi-settings"
 import {
   ANTHROPIC_BASE_URL,
   CLAUDE_GATEWAY_DISCOVERY,
@@ -131,7 +132,7 @@ const testPiCompanion: HarnessCompanionPackage = {
   reconcile: ({ previous }) => Effect.succeed({
     state: Option.getOrElse(previous, () => ({
       identity: "@magnitudedev/pi",
-      source: "npm:@magnitudedev/pi@0.0.1",
+      source: PI_COMPANION_PACKAGE_SOURCE,
       ownership: "magnitude" as const,
     })),
     status: Option.isSome(previous) ? "already-installed" as const : "installed" as const,
@@ -430,6 +431,68 @@ describe("HarnessConnector contract and registry", () => {
 
 describe("Pi companion package lifecycle", () => {
   it.each([
+    '{"packages":{}}',
+    '{"packages":[{"source":"npm:@magnitudedev/pi@0.0.1","extensions":[42]}]}',
+    '{"packages":[{"source":"npm:@magnitudedev/pi@0.0.1","autoload":"false"}]}',
+    '{"packages":[{"extensions":[]}]}',
+  ])("rejects invalid settings before native package operations: %s", async (settings) => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-invalid-settings-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures({ ...initialFiles(paths), [paths.piSettings]: settings })
+      const beforeSettings = yield* fs.readFileString(paths.piSettings)
+      const beforeModels = yield* fs.readFileString(paths.piModels)
+      const executable = yield* writeFakePiExecutable(paths)
+      const service = yield* makeHarnessConnectionService({ paths, detect: () => Effect.succeed(Option.some({ executable })), resolveModels: Effect.succeed(models), installStartup: Effect.void })
+      const exit = yield* Effect.exit(service.connect(HarnessIdSchema.make("pi"), { model: Option.none() }))
+      expect(String(exit)).toContain("Invalid Pi settings")
+      expect(String(exit)).toContain(paths.piSettings)
+      expect(yield* fs.readFileString(paths.piSettings)).toBe(beforeSettings)
+      expect(yield* fs.readFileString(paths.piModels)).toBe(beforeModels)
+      expect(yield* fs.exists(`${root}/pi/package-commands.jsonl`)).toBe(false)
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
+  it("preserves JSONC comments and unrelated fields while enabling and restoring a borrowed package", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-jsonc-" })
+      const paths = fixturePaths(root)
+      const settings = `{
+  // Preserve the user's theme.
+  "theme": "dark",
+  "packages": [{
+    "source": "${PI_COMPANION_PACKAGE_SOURCE}",
+    // This package also supplies prompts.
+    "prompts": ["./prompts"],
+    "future": {"preserve": true},
+    "autoload": false,
+  }],
+}`
+      yield* writeFixtures({
+        ...initialFiles(paths),
+        [paths.piSettings]: settings,
+        [`${root}/pi/npm/node_modules/@magnitudedev/pi/package.json`]: stringifyJson({ name: "@magnitudedev/pi", version: "0.0.1", pi: { extensions: ["./dist/magnitude.js"] } }),
+        [`${root}/pi/npm/node_modules/@magnitudedev/pi/dist/magnitude.js`]: "export default () => {}",
+      })
+      const executable = yield* writeFakePiExecutable(paths)
+      const service = yield* makeHarnessConnectionService({ paths, detect: () => Effect.succeed(Option.some({ executable })), resolveModels: Effect.succeed(models), installStartup: Effect.void })
+      yield* service.connect(HarnessIdSchema.make("pi"), { model: Option.none() })
+      const connected = yield* fs.readFileString(paths.piSettings)
+      expect(connected).toContain("// Preserve the user's theme.")
+      expect(connected).toContain("// This package also supplies prompts.")
+      expect(readJson(connected)).toMatchObject({ packages: [{ extensions: [`+${PI_COMPANION_EXTENSION_PATH}`], future: { preserve: true } }] })
+      yield* service.disconnect(HarnessIdSchema.make("pi"))
+      const restored = yield* fs.readFileString(paths.piSettings)
+      expect(restored).toContain("// Preserve the user's theme.")
+      expect(restored).toContain("// This package also supplies prompts.")
+      expect(readJson(restored)).toEqual(readJson(settings))
+      expect(yield* fs.exists(`${root}/pi/package-commands.jsonl`)).toBe(false)
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
+  it.each([
     ["0.82.1", false],
     ["0.83.0", true],
     ["0.84.4", true],
@@ -533,13 +596,17 @@ describe("Pi companion package lifecycle", () => {
   })
 
   it("matches Pi's include, exclude, and exact override precedence", () => {
-    expect(piPackageExtensionEnabled("npm:@magnitudedev/pi@0.0.1")).toBe(true)
-    expect(piPackageExtensionEnabled({ source: PI_COMPANION_PACKAGE_SOURCE })).toBe(true)
-    expect(piPackageExtensionEnabled({ extensions: ["dist/*.js"] })).toBe(true)
-    expect(piPackageExtensionEnabled({ extensions: ["extensions/other.ts"] })).toBe(false)
-    expect(piPackageExtensionEnabled({ extensions: ["!dist/*.js"] })).toBe(false)
-    expect(piPackageExtensionEnabled({ extensions: ["!dist/*.js", "+./dist/magnitude.js"] })).toBe(true)
-    expect(piPackageExtensionEnabled({ extensions: ["+dist/magnitude.js", "-./dist/magnitude.js"] })).toBe(false)
+    const enabled = (extensions?: readonly string[]) => piPackageExtensionEnabled(Schema.decodeUnknownSync(PiPackageEntrySchema)({
+      source: PI_COMPANION_PACKAGE_SOURCE,
+      ...(extensions === undefined ? {} : { extensions }),
+    }))
+    expect(piPackageExtensionEnabled(PI_COMPANION_PACKAGE_SOURCE)).toBe(true)
+    expect(enabled()).toBe(true)
+    expect(enabled(["dist/*.js"])).toBe(true)
+    expect(enabled(["extensions/other.ts"])).toBe(false)
+    expect(enabled(["!dist/*.js"])).toBe(false)
+    expect(enabled(["!dist/*.js", "+./dist/magnitude.js"])).toBe(true)
+    expect(enabled(["+dist/magnitude.js", "-./dist/magnitude.js"])).toBe(false)
   })
 
   it("keeps the exact install source synchronized with the publishable package manifest", async () => {

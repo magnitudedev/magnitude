@@ -77,7 +77,10 @@ version 0.83.0 or newer for the per-request fetch hook used to observe inference
 the supported host's native rules, including empty arrays, basename and absolute exclusions, and
 autoload-disabled ordering. Relative local sources resolve from Pi's settings directory; explicit
 agent-directory overrides govern both configuration and native package commands. An incompatible
-borrowed package is reported, not silently replaced.
+borrowed package is reported, not silently replaced. Pi settings fields used by the connector are
+schema-validated before mutation; malformed package entries or filters are errors, not absent or
+disabled packages. Settings edits preserve unrelated JSONC content, and native-operation recovery
+preserves unknown package fields as well as the original string or object entry representation.
 
 Connection mutations hold one cross-process lock through fresh manifest observation, native
 operations, configuration, and manifest commit. Process death releases the lock; elapsed time never

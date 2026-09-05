@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest"
 import { resolve } from "node:path"
 import { DefaultPackageManager } from "@earendil-works/pi-coding-agent"
+import { Schema } from "effect"
 import { PI_COMPANION_EXTENSION_PATH, piPackageExtensionEnabled } from "../../../cli/src/harness-connections/connectors/pi-package"
+import { PiPackageEntrySchema } from "../../../cli/src/harness-connections/connectors/pi-settings"
 
 // Differential check against the pinned host, without its filesystem discovery.
 // Only discovery and collection are substituted; Pi executes its actual filters.
@@ -16,6 +18,6 @@ describe("supported Pi package filter conformance", () => {
     const native = DefaultPackageManager.prototype as unknown as Record<string, (...args: any[]) => void>
     if (extensions === undefined) enabled = autoload
     else native[autoload ? "applyPackageFilter" : "applyPackageDeltaFilter"]!.call(receiver, root, extensions, "extensions", new Map(), {})
-    expect(piPackageExtensionEnabled(entry, root)).toBe(enabled)
+    expect(piPackageExtensionEnabled(Schema.decodeUnknownSync(PiPackageEntrySchema)(entry), root)).toBe(enabled)
   })
 })

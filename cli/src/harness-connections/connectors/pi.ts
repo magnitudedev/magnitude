@@ -1,10 +1,11 @@
 import { Effect, Option } from "effect"
 import type { HarnessConnectionPaths } from "../paths"
-import { CHAT_COMPLETIONS_API, LOCAL_TOKEN, OPENAI_BASE_URL, defineConnector, jsonObject, launchPlan, readOr, qualifiedModelSelection, removeJsoncPaths, splitQualifiedModelSelection, updateJsonc, valueAt, writeIfChanged } from "../shared"
+import { CHAT_COMPLETIONS_API, LOCAL_TOKEN, OPENAI_BASE_URL, defineConnector, launchPlan, readOr, qualifiedModelSelection, removeJsoncPaths, splitQualifiedModelSelection, updateJsonc, writeIfChanged } from "../shared"
 import type { HarnessCompanionPackage, HarnessConnectionSpec } from "../contract"
 import { modelInput, modelMaxTokens, zeroCost } from "../model-fields"
 import { hasReasoning, projectReasoningControls } from "../reasoning"
 import { makePiCompanion } from "./pi-package"
+import { readPiSettings } from "./pi-settings"
 export { PI_COMPANION_EXTENSION_PATH, PI_COMPANION_PACKAGE_IDENTITY, PI_COMPANION_PACKAGE_SOURCE, makePiCompanion, piPackageExtensionEnabled } from "./pi-package"
 
 const PI_THINKING_SURFACE = {
@@ -58,12 +59,11 @@ export const makePiConnector = (
       ["providers", "magnitude"], piProviderConfig(spec.models),
     ]]))
     if (Option.isNone(spec.model)) return Option.none()
-    const settingsSource = yield* readOr(paths.piSettings, "{}\n")
-    const settings = jsonObject(settingsSource)
+    const { text: settingsSource, settings } = yield* readPiSettings(paths.piSettings)
     const restore = {
       model: qualifiedModelSelection(
-        valueAt(settings, ["defaultProvider"]),
-        valueAt(settings, ["defaultModel"]),
+        Option.getOrUndefined(settings.defaultProvider),
+        Option.getOrUndefined(settings.defaultModel),
       ),
     }
     yield* writeIfChanged(paths.piSettings, settingsSource, updateJsonc(settingsSource, [
@@ -73,9 +73,8 @@ export const makePiConnector = (
     return Option.some(restore)
   }),
   disconnect: (spec) => Effect.gen(function* () {
-    const settingsSource = yield* readOr(paths.piSettings, "{}\n")
-    const settings = jsonObject(settingsSource)
-    if (valueAt(settings, ["defaultProvider"]) === "magnitude" && Option.isSome(spec.restore)) {
+    const { text: settingsSource, settings } = yield* readPiSettings(paths.piSettings)
+    if (Option.contains(settings.defaultProvider, "magnitude") && Option.isSome(spec.restore)) {
       const previous = Option.flatMap(spec.restore.value.model, (selection) =>
         Option.fromNullable(splitQualifiedModelSelection(selection)))
       yield* writeIfChanged(paths.piSettings, settingsSource, updateJsonc(settingsSource, [
