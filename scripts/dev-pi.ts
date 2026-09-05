@@ -3,7 +3,7 @@ import { FetchHttpClient } from "@effect/platform"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as BunContext from "@effect/platform-bun/BunContext"
 import * as BunRuntime from "@effect/platform-bun/BunRuntime"
-import { ModelsStatusEnvelopeSchema, jsonFailureEnvelopeSchema, ProviderModelIdSchema } from "@magnitudedev/sdk"
+import { ModelsStatusEnvelopeSchema, jsonFailureEnvelopeSchema, ProviderModelIdSchema, type JsonLocalModel } from "@magnitudedev/sdk"
 import { HarnessIdSchema } from "@magnitudedev/client-common"
 import { harnessConnectionPaths, makeHarnessConnectionService, makeHarnessConnectorRegistry } from "../cli/src/harness-connections/service"
 import {
@@ -78,17 +78,21 @@ const buildDevelopmentIcn = Effect.tryPromise({
   }),
 })
 
-export const awaitPiDevelopmentReady = <E, R>(
+export const awaitPiDevelopmentModel = <E, R>(
   read: Effect.Effect<typeof StatusSuccessEnvelopeSchema.Type, E, R>,
 ) => {
-  const poll: typeof read = Effect.suspend(() => read.pipe(
-    Effect.flatMap((status) => status.data.state === "ready"
-      ? Effect.succeed(status)
-      : Effect.sleep("500 millis").pipe(Effect.zipRight(poll))),
+  const poll: Effect.Effect<JsonLocalModel, E, R> = Effect.suspend(() => read.pipe(
+    Effect.flatMap((status) => {
+      // A ready snapshot can still be empty while startup discovery runs.
+      const model = status.data.models.find(({ installation }) => installation === "installed")
+      return model === undefined
+        ? Effect.sleep("500 millis").pipe(Effect.zipRight(poll))
+        : Effect.succeed(model)
+    }),
   ))
   return poll.pipe(Effect.timeoutFail({
     duration: "30 seconds",
-    onTimeout: () => new PiDevelopmentFailed({ message: "Magnitude model discovery did not become ready within 30 seconds" }),
+    onTimeout: () => new PiDevelopmentFailed({ message: "No installed Magnitude model became available within 30 seconds. Check `magnitude models status` or install a model before starting Pi development." }),
   }))
 }
 
@@ -154,18 +158,12 @@ const program = Effect.scoped(Effect.gen(function* () {
   )
 
   const readOutput = <E, R>(stream: Stream.Stream<Uint8Array, E, R>) => stream.pipe(Stream.decodeText(), Stream.runFold("", (text, part) => text + part))
-  const status = yield* awaitPiDevelopmentReady(Effect.scoped(Effect.gen(function* () {
+  yield* Console.log("Waiting for an installed Magnitude model...")
+  const model = yield* awaitPiDevelopmentModel(Effect.scoped(Effect.gen(function* () {
     const child = yield* Command.make(magnitudeExecutable, "models", "status", "--json").pipe(Command.start)
     const [code, stdout, stderr] = yield* Effect.all([child.exitCode, readOutput(child.stdout), readOutput(child.stderr)], { concurrency: "unbounded" })
     return yield* decodePiDevelopmentStatus(code === 0 ? stdout : stderr)
   })))
-  const model = status.data.models.find(({ installation }) => installation === "installed")
-  if (model === undefined) {
-    return yield* new PiDevelopmentFailed({
-      message: "Install a Magnitude model before starting Pi development",
-    })
-  }
-
   yield* Console.log(`Connecting the local Pi package with ${model.modelId}...`)
   const connection = yield* makeHarnessConnectionService({
     paths,

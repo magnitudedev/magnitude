@@ -1,6 +1,6 @@
-import { Effect } from "effect"
+import { Effect, Fiber, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
-import { awaitPiDevelopmentReady, decodePiDevelopmentStatus, piDevelopmentArgs } from "./dev-pi"
+import { awaitPiDevelopmentModel, decodePiDevelopmentStatus, piDevelopmentArgs } from "./dev-pi"
 import { FileSystem } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import { DefaultResourceLoader } from "@earendil-works/pi-coding-agent"
@@ -44,16 +44,47 @@ describe("Pi development resource isolation", () => {
 })
 
 describe("Pi development status decoding", () => {
-  it("polls initialization and returns the ready envelope, not the schedule counter", async () => {
+  it("waits through initialization, empty ready snapshots, and uninstalled models", async () => {
     let reads = 0
-    const result = await Effect.runPromise(awaitPiDevelopmentReady(Effect.suspend(() =>
+    const model = { modelId: "gemma:gguf:q4", displayName: "Gemma", installation: "installed" }
+    const snapshots = [
+      { state: "initializing", models: [] },
+      { state: "ready", models: [] },
+      { state: "ready", models: [{ ...model, installation: "installing" }] },
+      { state: "ready", models: [model] },
+    ]
+    const result = await Effect.runPromise(awaitPiDevelopmentModel(Effect.suspend(() =>
       decodePiDevelopmentStatus(JSON.stringify({
         schemaVersion: 1, command: "models.status", ok: true,
-        data: { state: ++reads === 1 ? "initializing" : "ready", models: [] },
+        data: snapshots[reads++],
       })),
     )))
-    expect(result.data.state).toBe("ready")
-    expect(reads).toBe(2)
+    expect(result.modelId).toBe(model.modelId)
+    expect(reads).toBe(4)
+  })
+
+  it("times out if no installed model appears", async () => {
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const fiber = yield* awaitPiDevelopmentModel(decodePiDevelopmentStatus(JSON.stringify({
+        schemaVersion: 1, command: "models.status", ok: true,
+        data: { state: "ready", models: [] },
+      }))).pipe(Effect.fork)
+      yield* TestClock.adjust("30 seconds")
+      return yield* Fiber.await(fiber)
+    }).pipe(Effect.provide(TestContext.TestContext)))
+    expect(result._tag).toBe("Failure")
+    expect(String(result)).toContain("No installed Magnitude model became available within 30 seconds")
+  })
+
+  it("reports command failures without retrying until timeout", async () => {
+    let reads = 0
+    const result = await Effect.runPromiseExit(awaitPiDevelopmentModel(Effect.suspend(() => {
+      reads++
+      return Effect.fail("service unavailable")
+    })))
+    expect(result._tag).toBe("Failure")
+    expect(String(result)).toContain("service unavailable")
+    expect(reads).toBe(1)
   })
 
   it("accepts initializing and ready model status envelopes", async () => {
