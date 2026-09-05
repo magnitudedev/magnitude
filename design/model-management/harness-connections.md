@@ -72,7 +72,8 @@ Magnitude-owned package when the desired source changes, and never replaces a pr
 user-owned package merely because development mode is active.
 
 Configuration presence is not proof of package availability. Pi reconciliation verifies the supported
-host, installed package version, and extension entrypoint before reporting success. Filters follow
+host, installed package version, and extension entrypoint before reporting success. Pi requires
+version 0.83.0 or newer for the per-request fetch hook used to observe inference progress. Filters follow
 the supported host's native rules, including empty arrays, basename and absolute exclusions, and
 autoload-disabled ordering. Relative local sources resolve from Pi's settings directory; explicit
 agent-directory overrides govern both configuration and native package commands. An incompatible

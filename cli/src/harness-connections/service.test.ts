@@ -189,6 +189,7 @@ const writeFixtures = (files: Readonly<Record<string, string>>) => Effect.gen(fu
 const writeFakePiExecutable = (
   paths: HarnessConnectionPaths,
   failCommand?: "install" | "remove" | "install-after" | "remove-after",
+  version = "0.83.0",
 ) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const executable = `${paths.piSettings.slice(0, paths.piSettings.lastIndexOf("/"))}/pi-test`
@@ -198,7 +199,7 @@ import { dirname, isAbsolute, relative, resolve } from "node:path"
 const settingsPath = new URL("./settings.json", import.meta.url).pathname
 const logPath = new URL("./package-commands.jsonl", import.meta.url).pathname
 const [command, source] = process.argv.slice(2)
-if (command === "--version") { console.log("0.84.4"); process.exit(0) }
+if (command === "--version") { console.log(${JSON.stringify(version)}); process.exit(0) }
 if (command === ${encodedFailCommand}) process.exit(9)
 const settings = await Bun.file(settingsPath).exists() ? await Bun.file(settingsPath).json() : {}
 const packages = Array.isArray(settings.packages) ? settings.packages : []
@@ -428,6 +429,30 @@ describe("HarnessConnector contract and registry", () => {
 })
 
 describe("Pi companion package lifecycle", () => {
+  it.each([
+    ["0.82.1", false],
+    ["0.83.0", true],
+    ["0.84.4", true],
+    ["0.85.0", true],
+    ["0.83.0-beta.1", false],
+    ["invalid", false],
+  ] as const)("checks the minimum Pi version: %s", async (version, supported) => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-version-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const executable = yield* writeFakePiExecutable(paths, undefined, version)
+      const service = yield* makeHarnessConnectionService({ paths, detect: () => Effect.succeed(Option.some({ executable })), resolveModels: Effect.succeed(models), installStartup: Effect.void })
+      const exit = yield* Effect.exit(service.connect(HarnessIdSchema.make("pi"), { model: Option.none() }))
+      expect(exit._tag).toBe(supported ? "Success" : "Failure")
+      if (!supported) {
+        expect(String(exit)).toContain("requires Pi 0.83.0 or newer")
+        expect(yield* fs.exists(`${root}/pi/package-commands.jsonl`)).toBe(false)
+      }
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
+  })
+
   it.each(["install-after", "remove-after"] as const)("compensates partial native failure: %s", async (failure) => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem

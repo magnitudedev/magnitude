@@ -106,8 +106,8 @@ export const makePiCompanion = (paths: HarnessConnectionPaths, desiredSource = P
     return yield* fs.exists(resolve(root, PI_COMPANION_EXTENSION_PATH))
   })
   const verifyHost = (executable: string) => Command.make(executable, "--version").pipe(Command.string, Effect.timeout("10 seconds"), Effect.flatMap((version) =>
-    /^0\.84\.(?:[4-9]|[1-9]\d+)\s*$/.test(version.trim()) ? Effect.void
-      : Effect.fail(new PiPackageError({ message: `Magnitude for Pi requires Pi 0.84.4–0.84.x; found ${version.trim()}.` }))))
+    satisfies(version.trim(), ">=0.83.0") ? Effect.void
+      : Effect.fail(new PiPackageError({ message: `Magnitude for Pi requires Pi 0.83.0 or newer; found ${version.trim()}.` }))))
 
   // Native package operations can fail after mutating settings or disk. Register the
   // inverse first, and never overwrite a changed package entry during recovery.
