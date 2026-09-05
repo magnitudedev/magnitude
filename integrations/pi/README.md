@@ -3,15 +3,36 @@
 This Pi package adds Magnitude model management commands and live local-inference progress to Pi's
 built-in working row above the editor.
 
-Requires Pi 0.83.0 or newer and a matching Magnitude CLI. Install a local model, then run:
+Requires Pi 0.83.0 or newer. Install from your terminal:
+
+```sh
+pi install npm:@magnitudedev/pi-extension
+```
+
+On the next fresh interactive Pi launch, Magnitude asks **“Set up local models with Magnitude now?”**
+Yes sends this prompt to your current Pi agent and starts onboarding:
+
+> Set up local models for me with the Magnitude CLI. Install it with `npm i -g @magnitudedev/cli` (or my package manager), then run `magnitude docs onboarding` and follow the instructions.
+
+No or Escape leaves “You can set up local models anytime with `/magnitude-setup`.” in the conversation.
+The offer is remembered per Pi profile across restarts, reloads, and package updates. Existing
+Magnitude model configurations, non-interactive modes, conversations, and startup prompts are left
+alone. Run `/magnitude-setup` whenever you want to start onboarding yourself.
+
+The package includes the Magnitude usage skill; an already-loaded skill of that name takes
+precedence without a collision warning. `--no-skills` disables this fallback too. The CLI is not
+an npm dependency and is not required to load the extension. Your Pi agent needs a working model
+and credentials to carry out onboarding.
+
+If you already have Magnitude and a local model, connect directly:
 
 ```sh
 magnitude connections add pi
 ```
 
 Restart Pi or run `/reload` after connecting. `PI_CODING_AGENT_DIR`, if set, is honored.
-Installing the package directly with `pi install` does not configure provider models,
-install the Magnitude CLI, start its service, or install its agent skill; the connection command
+Installing the package directly does not configure provider models,
+install the Magnitude CLI, or start its service; the connection command
 does all connection configuration and can be run safely after a standalone package install.
 
 The extension bundles Magnitude's private SDK. Model status, loading, and stopping use the existing
@@ -28,6 +49,7 @@ latency, and token-weighted generation throughput. Pi extensions execute with yo
 
 Commands:
 
+- `/magnitude-setup` — ask your current agent to set up Magnitude local models
 - `/load-model [model-id]` — load an installed model
 - `/stop-model` — stop the active model
 

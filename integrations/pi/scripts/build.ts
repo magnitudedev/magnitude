@@ -18,7 +18,9 @@ await Effect.runPromise(Effect.tryPromise(() => Bun.build({
 
 await Effect.runPromise(Effect.gen(function* () {
   const directory = new URL("..", import.meta.url).pathname.replace(/\/$/, "")
-  const { metadata } = yield* inspectPluginContent(directory, MAGNITUDE_RPC_VERSION)
   const fs = yield* FileSystem.FileSystem
+  yield* fs.makeDirectory(`${directory}/dist/skills/magnitude`, { recursive: true })
+  yield* fs.copyFile(new URL("../../../cli/src/harness-connections/magnitude-skill.md", import.meta.url).pathname, `${directory}/dist/skills/magnitude/SKILL.md`)
+  const { metadata } = yield* inspectPluginContent(directory, MAGNITUDE_RPC_VERSION)
   yield* fs.writeFileString(`${directory}/${PLUGIN_METADATA_PATH}`, `${yield* Schema.encode(Schema.parseJson(PluginContentManifestSchema, { space: 2 }))(metadata)}\n`)
 }).pipe(Effect.provide(BunContext.layer)))

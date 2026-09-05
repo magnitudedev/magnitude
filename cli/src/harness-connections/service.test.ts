@@ -580,16 +580,21 @@ describe("Pi companion package lifecycle", () => {
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))))
   })
 
-  it("accepts a borrowed package at another version when its RPC version matches", async () => {
+  it.each([
+    ["9.0.0", "@9.0.0"],
+    ["9.0.0", ""],
+    ["9.0.0-alpha.0", "@9.0.0-alpha.0"],
+    ["9.0.0-alpha.0", ""],
+  ])("accepts a borrowed package with matching RPC at %s (source suffix %s)", async (version, suffix) => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
       const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-borrowed-" })
       const paths = fixturePaths(root)
       const packageRoot = `${root}/pi/npm/node_modules/@magnitudedev/pi-extension`
-      const source = "npm:@magnitudedev/pi-extension@9.0.0"
+      const source = `npm:@magnitudedev/pi-extension${suffix}`
       yield* writeFixtures({ ...initialFiles(paths), ...piPackageFiles(packageRoot), [paths.piSettings]: stringifyJson({ packages: [source] }) })
       const manifest = parse(yield* fs.readFileString(`${packageRoot}/package.json`)) as Record<string, unknown>
-      yield* fs.writeFileString(`${packageRoot}/package.json`, stringifyJson({ ...manifest, version: "9.0.0" }))
+      yield* fs.writeFileString(`${packageRoot}/package.json`, stringifyJson({ ...manifest, version }))
       const { metadata } = yield* inspectPluginContent(packageRoot, MAGNITUDE_RPC_VERSION)
       yield* fs.writeFileString(`${packageRoot}/dist/magnitude-plugin.json`, JSON.stringify(metadata))
       const executable = yield* writeFakePiExecutable(paths)
