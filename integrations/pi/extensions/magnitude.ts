@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import type { Model } from "@earendil-works/pi-ai"
 import { openAICompletionsApi } from "@earendil-works/pi-ai/compat"
 import { registerMagnitudeCommands } from "./commands"
+import { registerMagnitudeOnboarding } from "./onboarding"
 import { makeObservingFetch } from "./observing-fetch"
 import { makeProgressTracker, type ProgressTracker } from "./progress"
 import { Effect, Exit, Scope } from "effect"
@@ -12,6 +13,7 @@ export default function magnitudeExtension(pi: ExtensionAPI): void {
   let tracker: ProgressTracker | undefined
   let scope: Scope.CloseableScope | undefined
   const disposeCommands = registerMagnitudeCommands(pi)
+  const disposeOnboarding = registerMagnitudeOnboarding(pi)
   const perform = (effect: Effect.Effect<void> | undefined) => Effect.runSync((effect ?? Effect.void).pipe(Effect.catchAllCause(() => Effect.void)))
 
   pi.registerProvider("magnitude", {
@@ -52,6 +54,7 @@ export default function magnitudeExtension(pi: ExtensionAPI): void {
   })
   pi.on("agent_settled", () => perform(tracker?.settleRun))
   pi.on("session_shutdown", async () => {
+    await disposeOnboarding()
     if (scope) await Effect.runPromise(Scope.close(scope, Exit.void))
     tracker = undefined
     scope = undefined

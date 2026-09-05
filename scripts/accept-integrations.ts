@@ -75,28 +75,50 @@ const program = Effect.scoped(
       `
 import assert from 'node:assert/strict'
 import { resolve } from 'node:path'
-import { DefaultResourceLoader } from '@earendil-works/pi-coding-agent'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { DefaultResourceLoader, createAgentSession, SessionManager } from '@earendil-works/pi-coding-agent'
+const sharedSkills = resolve(${encodeString(workspace)}, process.versions.bun ? 'bun-shared-skills' : 'node-shared-skills')
+await mkdir(sharedSkills, { recursive: true })
 const loader = new DefaultResourceLoader({ cwd: ${encodeString(workspace)}, agentDir: ${encodeString(
         agentDir
-      )}, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true })
+      )}, noSkills: true, additionalSkillPaths: [sharedSkills], noPromptTemplates: true, noThemes: true, noContextFiles: true })
 await loader.reload()
 const result = loader.getExtensions()
 assert.deepEqual(result.errors, [])
 assert.equal(result.extensions.length, 1)
-assert.deepEqual([...result.extensions[0].commands.keys()].sort(), ['load-model', 'stop-model'])
+assert.deepEqual([...result.extensions[0].commands.keys()].sort(), ['load-model', 'magnitude-setup', 'stop-model'])
 assert.equal(result.runtime.pendingProviderRegistrations[0].name, 'magnitude')
+const { session } = await createAgentSession({ cwd: ${encodeString(workspace)}, agentDir: ${encodeString(agentDir)}, resourceLoader: loader, sessionManager: SessionManager.inMemory(${encodeString(workspace)}), tools: [] })
+await session.bindExtensions({ mode: 'print' })
+const skills = loader.getSkills()
+assert.equal(skills.skills.filter(skill => skill.name === 'magnitude').length, 1, 'Packed usage skill must be discovered without the CLI')
+assert.equal(skills.diagnostics.filter(diagnostic => diagnostic.type === 'collision').length, 0)
+const sharedSkill = resolve(sharedSkills, 'magnitude/SKILL.md')
+await mkdir(resolve(sharedSkills, 'magnitude'), { recursive: true })
+await writeFile(sharedSkill, await readFile(skills.skills.find(skill => skill.name === 'magnitude').filePath))
+// The interactive connector installs the shared skill after package-first onboarding.
+// Reload must replace the fallback, not retain both copies or report a collision.
+for (let reload = 0; reload < 2; reload++) {
+  await session.reload()
+  const current = loader.getSkills()
+  assert.deepEqual(current.skills.filter(skill => skill.name === 'magnitude').map(skill => skill.filePath), [sharedSkill])
+  assert.equal(current.diagnostics.filter(diagnostic => diagnostic.type === 'collision').length, 0)
+}
 if (${process.argv.includes("--daemon")}) {
   const notifications = []
   const ctx = { ui: { notify: (message, level) => notifications.push({ message, level }) } }
-  const commands = result.extensions[0].commands
+  const commands = loader.getExtensions().extensions[0].commands
   const completions = await commands.get('load-model').getArgumentCompletions('')
   assert.ok(Array.isArray(completions), 'Catalog RPC must succeed through the bundled SDK')
   await commands.get('stop-model').handler('', ctx)
   assert.equal(notifications.filter(event => event.level === 'error').length, 0, JSON.stringify(notifications))
   assert.ok(notifications.some(event => event.message === 'Stopped the active Magnitude model.'))
 }
-for (const handler of result.extensions[0].handlers.get('session_shutdown') ?? []) await handler({}, {})
-console.log('Packed Magnitude extension loaded through Pi with both commands and provider', process.versions.bun ? 'Bun ' + process.versions.bun : 'Node ' + process.version)
+// SDK disposal does not emit the host's shutdown event. Exercise that lifecycle
+// explicitly so command RPC runtimes release their resources before process exit.
+await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'exit' })
+session.dispose()
+console.log('Packed Magnitude extension loaded through Pi with all commands and provider', process.versions.bun ? 'Bun ' + process.versions.bun : 'Node ' + process.version)
 `
     )
     yield* checked(

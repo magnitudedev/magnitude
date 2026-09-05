@@ -43,8 +43,9 @@ describe("Magnitude Pi extension", () => {
       api: "openai-completions",
       streamSimple: expect.any(Function),
     }))
-    expect(commands).toEqual(["load-model", "stop-model"])
+    expect(commands).toEqual(["load-model", "stop-model", "magnitude-setup"])
     expect([...events.keys()]).toEqual([
+      "resources_discover",
       "session_start",
       "model_select",
       "agent_start",

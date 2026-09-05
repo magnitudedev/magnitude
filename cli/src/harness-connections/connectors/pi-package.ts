@@ -104,7 +104,7 @@ export const makePiCompanion = (paths: HarnessConnectionPaths, desiredSource: st
     const manifest = yield* fs.readFileString(resolve(root, "package.json")).pipe(Effect.flatMap(decodeManifest))
     const configuredVersion = source.startsWith(`npm:${PI_COMPANION_PACKAGE_IDENTITY}@`) ? source.slice(`npm:${PI_COMPANION_PACKAGE_IDENTITY}@`.length) : "*"
     if (manifest.name !== PI_COMPANION_PACKAGE_IDENTITY
-      || source.startsWith("npm:") && !satisfies(manifest.version, configuredVersion)
+      || source.startsWith("npm:") && !satisfies(manifest.version, configuredVersion, { includePrerelease: true })
       || !manifest.pi.extensions.includes(`./${PI_COMPANION_EXTENSION_PATH}`)) {
       return yield* new PiPackageError({ message: `Unsupported Magnitude for Pi package at ${root}; update this package explicitly before connecting.` })
     }

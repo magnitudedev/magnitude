@@ -200,7 +200,7 @@ skill installation finish before connector configuration and handoff. Codex and 
 persistent proxy configuration require this service; disconnect removes those settings only while
 they retain Magnitude's installed values.
 
-The Magnitude skill is independent of a harness companion package. It remains optional for ordinary
+The Magnitude skill remains independently installable from a harness companion package. It remains optional for ordinary
 connectors, but is required for Pi because catalog discovery, recommendation, acquisition, and
 removal are agent-guided rather than duplicated as Pi extension commands. Connecting Pi always
 installs or enables the desired Magnitude Pi package through Pi's package command and installs the
@@ -210,6 +210,17 @@ request to the shared service; neither presentation surface owns a second instal
 Interactive onboarding discloses the exact package source and that Pi extensions execute with the
 user's authority. A successful connection reports whether an already-running harness must reload
 or restart.
+
+Native Pi package installation also bundles the canonical Magnitude usage skill, using it only when
+no skill of that name is already loaded and automatic skills have not been disabled. Loading the
+extension does not require the CLI or contact the service. The first eligible fresh interactive
+startup offers local-model setup with a Yes/No dialog. Acceptance sends the canonical onboarding
+prompt to the existing agent; rejection or cancellation retains a conversation-area reminder for
+`/magnitude-setup`. An exclusive profile-local receipt prevents repeat offers across processes,
+reloads, and package updates. Existing Magnitude configurations, conversations, pending work, editor
+input, and command-line prompts suppress the offer without consuming it; headless modes do likewise.
+Manual setup remains available independently of the receipt. The agent owns CLI installation and
+guided setup; the package does not install a private CLI dependency or alter executable lookup.
 
 During a Magnitude request, the Pi companion uses Pi's native working row rather than an extension
 footer status. Model loading and prefill temporarily replace the generic working message; generation
@@ -230,6 +241,8 @@ The SDK checks the exact RPC version and instance identity. CLI connection manag
 exact generated plugin version when nothing usable is present. An installed package of any version
 is compatible when its recorded file hashes verify and its declared RPC version equals the CLI's;
 no other check applies. Unrelated user-owned packages are not replaced.
+An unversioned npm installation accepts stable and prerelease package versions alike; absence of
+a version constraint cannot implicitly exclude a compatible prerelease.
 
 On a protocol mismatch from an explicit model command, the Pi extension runs
 `magnitude connections sync pi` once per loaded extension, through the same CLI executable used
