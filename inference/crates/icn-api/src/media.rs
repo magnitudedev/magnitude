@@ -3,6 +3,11 @@ use base64::engine::general_purpose::STANDARD;
 
 pub(crate) const MAX_HTTP_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Request-body ceiling for the HTTP surface. Sized above a base64-encoded
+/// [`MAX_HTTP_IMAGE_BYTES`] image so image requests are not rejected before
+/// reaching the handler; axum's 2 MiB default was too small.
+pub(crate) const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct DecodedImage {
     pub(crate) media_type: String,
