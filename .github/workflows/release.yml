@@ -201,10 +201,7 @@ jobs:
         env:
           MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
       - name: Publish accepted CLI tarball
-        shell: bash
-        run: |
-          bun run publish "${{ steps.npm-candidate.outputs.tarball }}"
-          bun run packages/release/scripts/verify-npm.ts
+        run: bun run publish "${{ steps.npm-candidate.outputs.tarball }}"
         env:
           MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
           MAGNITUDE_EXPECTED_NPM_INTEGRITY: ${{ steps.npm-candidate.outputs.integrity }}

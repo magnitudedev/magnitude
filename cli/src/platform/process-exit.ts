@@ -15,6 +15,24 @@ export interface ProcessExitSource {
   readonly await: Effect.Effect<ProcessExitRequest>
 }
 
+export type UntilProcessExit<A> =
+  | { readonly _tag: "Completed"; readonly value: A }
+  | { readonly _tag: "Exit"; readonly request: ProcessExitRequest }
+
+/**
+ * The one place work yields to a user exit request. Whichever side completes first
+ * wins, failure included: a failing effect propagates immediately instead of waiting
+ * for a signal that may never come, and an exit request interrupts the effect so its
+ * finalizers run.
+ */
+export const untilProcessExit = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+  source: ProcessExitSource,
+): Effect.Effect<UntilProcessExit<A>, E, R> => Effect.raceFirst(
+  effect.pipe(Effect.map((value): UntilProcessExit<A> => ({ _tag: "Completed", value }))),
+  source.await.pipe(Effect.map((request): UntilProcessExit<A> => ({ _tag: "Exit", request }))),
+)
+
 export const restoreTerminalState = (): void => {
   process.stdout.write([
     "\x1b[?1000l",

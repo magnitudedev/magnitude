@@ -29,9 +29,16 @@ const health = (id = "first", rpcVersion = MAGNITUDE_RPC_VERSION) => ({
   state: { _tag: "Ready" },
 });
 
-const fixture = () => {
+/** A daemon from before the RPC version existed: the same health, minus the field. */
+const legacyHealth = (id: string) => {
+  const { rpcVersion: _, ...rest } = health(id);
+  return rest;
+};
+
+const fixture = (options: { readonly starterUpgrades?: boolean } = {}) => {
   let running = true;
   let version = MAGNITUDE_RPC_VERSION;
+  let legacy = false;
   let id = "first";
   const requests: string[] = [];
   let starts = 0;
@@ -46,7 +53,7 @@ const fixture = () => {
         return Effect.succeed(
           HttpClientResponse.fromWeb(
             request,
-            Response.json(health(id, version))
+            Response.json(legacy ? legacyHealth(id) : health(id, version))
           )
         );
       if (request.headers["x-magnitude-acn-id"] !== id)
@@ -79,6 +86,11 @@ const fixture = () => {
     Effect.sync(() => {
       starts++;
       running = true;
+      // A privileged starter replaces an older or mismatched daemon with the current one.
+      if (options.starterUpgrades) {
+        legacy = false;
+        version = MAGNITUDE_RPC_VERSION;
+      }
     })
   );
   const live = MagnitudeClient.layer().pipe(
@@ -101,6 +113,9 @@ const fixture = () => {
     },
     mismatch: () => {
       version++;
+    },
+    legacy: () => {
+      legacy = true;
     },
   };
 };
@@ -247,7 +262,7 @@ describe("MagnitudeClient", () => {
     expect(f.starts()).toBe(1);
   });
 
-  it("returns protocol mismatch directly and does not invoke startup or RPC", async () => {
+  it("gives the starter one chance at a mismatched daemon, then reports the mismatch", async () => {
     const f = fixture();
     f.mismatch();
     await Effect.runPromise(
@@ -257,9 +272,43 @@ describe("MagnitudeClient", () => {
         expect(result._tag).toBe("Left");
         if (result._tag === "Left")
           expect(result.left._tag).toBe("ProtocolMismatch");
-        expect(f.starts()).toBe(0);
+        expect(f.starts()).toBe(1);
         expect(f.requests.every((url) => url.endsWith("/health"))).toBe(true);
       }).pipe(Effect.provide(f.live))
+    );
+  });
+
+  it("replaces a daemon that predates the RPC version through the starter", async () => {
+    const f = fixture({ starterUpgrades: true });
+    f.legacy();
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* MagnitudeClient;
+        yield* client.models.stop({});
+        expect(f.starts()).toBe(1);
+        const state = yield* client.connection.state;
+        expect(state._tag).toBe("Ready");
+      }).pipe(Effect.provide(f.live))
+    );
+  });
+
+  it("reports a pre-RPC daemon as version 0 when no starter can replace it", async () => {
+    const f = fixture();
+    f.legacy();
+    const live = MagnitudeClient.layer({ autoStart: false }).pipe(
+      Layer.provide(Layer.succeed(HttpClient.HttpClient, f.http))
+    );
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* MagnitudeClient;
+        const result = yield* Effect.either(client.connection.connect);
+        expect(result._tag).toBe("Left");
+        if (result._tag === "Left" && result.left._tag === "ProtocolMismatch") {
+          expect(result.left.expected).toBe(MAGNITUDE_RPC_VERSION);
+          expect(result.left.actual).toBe(0);
+        } else expect.unreachable("expected a protocol mismatch");
+        expect(f.starts()).toBe(0);
+      }).pipe(Effect.provide(live))
     );
   });
 
@@ -287,7 +336,7 @@ describe("MagnitudeClient", () => {
       const result = yield* Effect.either(client.changes.streamChanges({}).pipe(Stream.runHead));
       expect(result._tag).toBe("Left");
       if (result._tag === "Left") expect(result.left._tag).toBe("ProtocolMismatch");
-      expect(f.starts()).toBe(0);
+      expect(f.starts()).toBe(1);
       expect(f.requests.every(url => url.endsWith("/health"))).toBe(true);
     }).pipe(Effect.provide(f.live)));
   });

@@ -53,6 +53,7 @@ import {
 import {
   makeProcessExitSource,
   restoreTerminalState,
+  untilProcessExit,
   type ProcessExitRequest,
 } from "../platform/process-exit"
 import { terminalAppearanceAtom } from "../hooks/use-theme"
@@ -101,9 +102,14 @@ type InteractiveSessionResult =
       readonly plan: HarnessLaunchPlan
     }
 
-type ExitRace<A> =
-  | { readonly _tag: "Value"; readonly value: A }
-  | { readonly _tag: "Exit"; readonly request: ProcessExitRequest }
+/** Everything before the application is on screen, or an update the user chose instead. */
+type PreparedApplication =
+  | { readonly _tag: "UpdateRequested"; readonly action: UpdateAction }
+  | {
+      readonly _tag: "Prepared"
+      readonly connection: FirstPartyConnection
+      readonly handoff: Effect.Effect<HarnessLaunchPlan>
+    }
 
 const acquireRegistry = Effect.acquireRelease(
   Effect.sync(() => Registry.make({
@@ -159,14 +165,6 @@ const renderRoot = (
   )
 })
 
-const raceExit = <A, E, R>(
-  effect: Effect.Effect<A, E, R>,
-  exit: Effect.Effect<ProcessExitRequest>,
-): Effect.Effect<ExitRace<A>, E, R> => Effect.race(
-  effect.pipe(Effect.map((value): ExitRace<A> => ({ _tag: "Value", value }))),
-  exit.pipe(Effect.map((request): ExitRace<A> => ({ _tag: "Exit", request }))),
-)
-
 const fatalResult = (
   request: Extract<ProcessExitRequest, { readonly _tag: "Fatal" }>,
 ): InteractiveSessionResult => {
@@ -211,11 +209,15 @@ const closeApplication = (
       }),
     )
 
-
-const runInteractiveSession = (
+/**
+ * Startup, from update discovery to the application on screen. It contains no
+ * exit handling: a failure anywhere propagates, and `runInteractiveSession` is
+ * the one place that races the whole of it against a user exit request.
+ */
+const prepareApplication = (
   options: InteractiveLaunchOptions,
 ): Effect.Effect<
-  InteractiveSessionResult,
+  PreparedApplication,
   CliRendererAcquisitionFailed | StateDocumentError | import("@magnitudedev/sdk").ConnectionError | HarnessConnectionError,
   CliUpdater | FileSystem.FileSystem | Path.Path | Scope.Scope
     | CommandExecutor.CommandExecutor | HttpClient.HttpClient | Terminal.Terminal
@@ -228,7 +230,6 @@ const runInteractiveSession = (
       registry.set(pushNotificationAtom, notification)
     },
   })
-  const processExit = yield* makeProcessExitSource
 
   // The appearance probe starts with the session — concurrent with discovery
   // and service work — and self-terminates within one terminal roundtrip
@@ -251,22 +252,21 @@ const runInteractiveSession = (
   const offerable = (latest: Option.Option<string>): Option.Option<string> =>
     Option.filter(latest, (version) => !declinedVersions.has(version))
 
+  // Ctrl-C inside the prompt raises SIGINT, which the session-level exit race
+  // turns into an interruption of this whole effect.
   const presentUpdatePrompt = (latestVersion: string, action: UpdateAction) =>
     Effect.gen(function* () {
       const appearance = yield* Fiber.join(appearanceProbe)
-      const selected = yield* raceExit(runInlineUpdatePrompt({
+      const selected = yield* runInlineUpdatePrompt({
         currentVersion: CLI_VERSION,
         latestVersion,
         action,
         theme: resolveCliTheme(appearance),
-      }), processExit.await)
-      if (selected._tag === "Exit") {
-        return { _tag: "Exit", request: selected.request } as const
-      }
-      if (selected.value._tag === "Dismiss") {
+      })
+      if (selected._tag === "Dismiss") {
         yield* updater.dismissVersion(latestVersion)
       }
-      if (selected.value._tag === "Update") return { _tag: "Update" } as const
+      if (selected._tag === "Update") return { _tag: "Update" } as const
       declinedVersions.add(latestVersion)
       return { _tag: "Declined" } as const
     })
@@ -274,7 +274,6 @@ const runInteractiveSession = (
   if (Option.isSome(updateMethod) && Option.isSome(discovery.known)) {
     const action = updateActionFor(updateMethod.value, discovery.known.value)
     const resolution = yield* presentUpdatePrompt(discovery.known.value, action)
-    if (resolution._tag === "Exit") return preApplicationExit(resolution.request)
     if (resolution._tag === "Update") {
       return { _tag: "UpdateRequested", action }
     }
@@ -286,32 +285,25 @@ const runInteractiveSession = (
   // needs the network regardless, so the wait costs nothing real.
   if (Option.isSome(updateMethod)
     && !(yield* acnInstallationPresent(DAEMON_TARGET.identity))) {
-    const answer = yield* raceExit(discovery.fresh, processExit.await)
-    if (answer._tag === "Exit") return preApplicationExit(answer.request)
+    const answer = yield* discovery.fresh
     freshPending = false
-    const offer = offerable(answer.value)
+    const offer = offerable(answer)
     if (Option.isSome(offer)) {
       const action = updateActionFor(updateMethod.value, offer.value)
       const resolution = yield* presentUpdatePrompt(offer.value, action)
-      if (resolution._tag === "Exit") return preApplicationExit(resolution.request)
       if (resolution._tag === "Update") {
         return { _tag: "UpdateRequested", action }
       }
     }
   }
 
-  const connectionResult = yield* raceExit(
-    Effect.gen(function* () {
-      const manager = yield* makeBootstrappingAcnInstanceManager({
-        launchCommand: developmentLaunchCommand(options),
-        debug: options.debug,
-      })
-      return yield* makeAcnConnectionWithInstanceManager(manager)
-    }).pipe(Effect.provide(effectLoggingLayer)),
-    processExit.await,
-  )
-  if (connectionResult._tag === "Exit") return preApplicationExit(connectionResult.request)
-  const connection = connectionResult.value
+  const connection = yield* Effect.gen(function* () {
+    const manager = yield* makeBootstrappingAcnInstanceManager({
+      launchCommand: developmentLaunchCommand(options),
+      debug: options.debug,
+    })
+    return yield* makeAcnConnectionWithInstanceManager(manager)
+  }).pipe(Effect.provide(effectLoggingLayer))
   const appearance = yield* Fiber.join(appearanceProbe)
   const startupTheme = resolveCliTheme(appearance)
   const serviceStartup = yield* makeInlineServiceStartupPresenter(startupTheme)
@@ -319,23 +311,18 @@ const runInteractiveSession = (
   type ServiceWaitOutcome =
     | { readonly _tag: "Ready" }
     | { readonly _tag: "FreshOffer"; readonly version: string }
-    | { readonly _tag: "Exit"; readonly request: ProcessExitRequest }
 
   // A fresh update offer may interrupt terminal presentation, but it does not
   // interrupt the shared SDK ensurance occurrence. Declining resumes from the
-  // current authoritative lifecycle state.
+  // current authoritative lifecycle state. A readiness failure wins the race
+  // outright and propagates.
   let starting = true
   while (starting) {
-    const readiness = Effect.race(
-      serviceStartup.run(connection.startup).pipe(
-        Effect.map((): ServiceWaitOutcome => ({ _tag: "Ready" })),
-      ),
-      processExit.await.pipe(Effect.map(
-        (request): ServiceWaitOutcome => ({ _tag: "Exit", request }),
-      )),
+    const readiness = serviceStartup.run(connection.startup).pipe(
+      Effect.map((): ServiceWaitOutcome => ({ _tag: "Ready" })),
     )
     const outcome = Option.isSome(updateMethod) && freshPending
-      ? yield* Effect.race(readiness, discovery.fresh.pipe(
+      ? yield* Effect.raceFirst(readiness, discovery.fresh.pipe(
         Effect.flatMap((latest) => Option.match(offerable(latest), {
           onNone: () => Effect.never,
           onSome: (offer): Effect.Effect<ServiceWaitOutcome> => Effect.succeed({
@@ -345,7 +332,6 @@ const runInteractiveSession = (
         })),
       ))
       : yield* readiness
-    if (outcome._tag === "Exit") return preApplicationExit(outcome.request)
     if (outcome._tag === "Ready") {
       starting = false
       continue
@@ -354,25 +340,23 @@ const runInteractiveSession = (
     if (Option.isNone(updateMethod)) continue
     const action = updateActionFor(updateMethod.value, outcome.version)
     const resolution = yield* presentUpdatePrompt(outcome.version, action)
-    if (resolution._tag === "Exit") return preApplicationExit(resolution.request)
     if (resolution._tag === "Update") {
       return { _tag: "UpdateRequested", action }
     }
   }
 
-  const connected = yield* raceExit(Effect.gen(function* () {
-    const harnessConnection = yield* makeHarnessConnection
-    const agentClient = createAgentClient(connection.client, {
-      onboardingSetupInitiallyOpen: options.setup,
-      harnessConnection,
-    })
-    yield* Effect.exit(Registry.getResult(
-      registry,
-      onboardingModelSetupViewAtom(agentClient),
-    ))
-    return agentClient
-  }), processExit.await)
-  if (connected._tag === "Exit") return preApplicationExit(connected.request)
+  const harnessConnection = yield* makeHarnessConnection
+  const agentClient = createAgentClient(connection.client, {
+    onboardingSetupInitiallyOpen: options.setup,
+    harnessConnection,
+  })
+  // Warm the onboarding view so the first frame is not empty. Best-effort and
+  // bounded: the app reads the same atom reactively, so painting never waits on
+  // a daemon that is ready but slow to answer.
+  yield* Effect.exit(Registry.getResult(
+    registry,
+    onboardingModelSetupViewAtom(agentClient),
+  ).pipe(Effect.timeout("5 seconds")))
 
   const app: CliAppProps = {
     sessionStart: options.sessionStart,
@@ -388,7 +372,7 @@ const runInteractiveSession = (
     root,
     registry,
     makeTerminalAdapter(),
-    connected.value,
+    agentClient,
     connection.startup,
     app,
   )
@@ -413,7 +397,7 @@ const runInteractiveSession = (
 
   const handoff = Registry.toStream(
     registry,
-    onboardingModelSetupViewAtom(connected.value),
+    onboardingModelSetupViewAtom(agentClient),
   ).pipe(
     Stream.filterMap((result) => Option.flatMap(Result.value(result), (state) =>
       state._tag === "Open" && state.content._tag === "HarnessHandoff"
@@ -422,7 +406,26 @@ const runInteractiveSession = (
     Stream.runHead,
     Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed })),
   )
-  const outcome = yield* Effect.race(
+  return { _tag: "Prepared", connection, handoff }
+})
+
+const runInteractiveSession = (
+  options: InteractiveLaunchOptions,
+): Effect.Effect<
+  InteractiveSessionResult,
+  CliRendererAcquisitionFailed | StateDocumentError | import("@magnitudedev/sdk").ConnectionError | HarnessConnectionError,
+  CliUpdater | FileSystem.FileSystem | Path.Path | Scope.Scope
+    | CommandExecutor.CommandExecutor | HttpClient.HttpClient | Terminal.Terminal
+> => Effect.gen(function* () {
+  const processExit = yield* makeProcessExitSource
+  const prepared = yield* untilProcessExit(prepareApplication(options), processExit)
+  if (prepared._tag === "Exit") return preApplicationExit(prepared.request)
+  if (prepared.value._tag === "UpdateRequested") return prepared.value
+  const { connection, handoff } = prepared.value
+
+  // The application's own wait: neither side can fail, and it ends only when
+  // the user exits or a harness handoff is chosen.
+  const outcome = yield* Effect.raceFirst(
     processExit.await.pipe(Effect.map((request) => ({ _tag: "Exit" as const, request }))),
     handoff.pipe(Effect.map((plan) => ({ _tag: "Launch" as const, plan }))),
   )

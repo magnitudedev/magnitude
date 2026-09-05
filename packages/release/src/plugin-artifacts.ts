@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGunzip } from "node:zlib";
-import { Effect, Option, Schema, Stream } from "effect";
+import { Duration, Effect, Either, Option, Schema, Stream } from "effect";
 import { extract } from "tar-stream";
 import { PLUGIN_METADATA_PATH, verifyPluginContent } from "./plugin-content";
 import {
@@ -282,6 +282,51 @@ export const publishedPlugin = (
       integrity,
     });
   });
+
+export interface RegistryReadBack {
+  readonly attempts: number;
+  readonly interval: Duration.DurationInput;
+}
+/** npm's registry lags a fresh publish; sixty seconds of polling covers it. */
+export const REGISTRY_READ_BACK: RegistryReadBack = {
+  attempts: 20,
+  interval: "3 seconds",
+};
+
+/**
+ * Wait for the registry to expose exactly the bytes that were published. A missing
+ * version or a read failure is retried; a different integrity is final, because a
+ * registry version is immutable. Failures name what was observed.
+ */
+export const awaitIntegrity = <E, R>(
+  read: Effect.Effect<string | null, E, R>,
+  expected: string,
+  policy: RegistryReadBack = REGISTRY_READ_BACK
+) =>
+  Effect.gen(function* () {
+    let last = "the registry did not expose the version";
+    for (let attempt = 1; attempt <= policy.attempts; attempt++) {
+      const observed = yield* Effect.either(read);
+      if (Either.isRight(observed)) {
+        if (observed.right === expected) return;
+        if (observed.right !== null)
+          return yield* new PluginArtifactError({
+            message: `Registry integrity ${observed.right} differs from the accepted ${expected}; never overwrite a version`,
+          });
+      } else last = String(observed.left);
+      if (attempt < policy.attempts) yield* Effect.sleep(policy.interval);
+    }
+    return yield* new PluginArtifactError({
+      message: `Registry did not expose the accepted integrity ${expected} after ${policy.attempts} attempts: ${last}`,
+    });
+  });
+
+export const awaitPublishedIntegrity = (
+  name: string,
+  version: string,
+  expected: string,
+  cwd: string
+) => awaitIntegrity(publishedPluginIntegrity(name, version, cwd), expected);
 
 export const verifyPublishedPlugins = (
   artifacts: readonly PluginArtifact[],
