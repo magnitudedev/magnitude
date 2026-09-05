@@ -18,7 +18,7 @@ import {
   type ProviderModel,
   type ProviderRegistryInfo,
   type ReasoningEffort,
-} from "@magnitudedev/sdk"
+} from "@magnitudedev/providers/client"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
 import { LocalProviderOfferings } from "./local-provider-offerings"
 import { makeServiceOperationCoordinator } from "./service-operation-coordinator"

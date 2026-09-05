@@ -1,7 +1,7 @@
 import { FetchHttpClient } from "@effect/platform"
 import { Context, Effect, Layer, Option } from "effect"
 import { SessionOperationFailed, type ProviderAuth, type SessionError } from "@magnitudedev/acn-protocol"
-import { ProviderIdSchema, type ProviderId } from "@magnitudedev/sdk"
+import { ProviderIdSchema, type ProviderId } from "@magnitudedev/providers/client"
 import { MagnitudeStorage } from "@magnitudedev/storage"
 import { ProviderModelCatalog } from "./provider-model-catalog"
 import { ProviderClientRegistry } from "./shared-client"

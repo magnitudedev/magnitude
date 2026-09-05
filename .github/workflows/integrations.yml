@@ -4,8 +4,15 @@ on:
   pull_request:
     paths:
       - "integrations/**"
-      - "packages/integration-protocol/**"
-      - "packages/utils/src/fsm/**"
+      - "packages/sdk/**"
+      - "packages/acn-protocol/**"
+      - "packages/version/**"
+      - "packages/release/**"
+      - "packages/utils/**"
+      - "packages/ai/**"
+      - "packages/icn-protocol/**"
+      - "packages/openapi-effect/**"
+      - "packages/roles/**"
       - "cli/src/harness-connections/**"
       - "cli/src/commands/**"
       - "scripts/*integrations*"
@@ -31,12 +38,23 @@ jobs:
         with:
           node-version: 24
       - run: bun install --frozen-lockfile
-      - run: bun run --cwd packages/integration-protocol typecheck
-      - run: bun run --cwd packages/integration-protocol test
+      - run: npm install --global npm@11.6.2
+      - run: bun run --cwd packages/version typecheck
+      - run: bun run --cwd packages/version test
+      - run: bun run --cwd packages/release typecheck
+      - run: bun scripts/check-sdk-boundary.ts
+      - run: bunx --bun vitest run packages/sdk packages/daemon-management packages/release packages/acn-protocol
+      # Allocate against the real public baselines (GitHub releases, npm); nothing is committed.
+      - run: bun packages/release/scripts/prepare-release.ts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - run: bun run --cwd integrations/pi typecheck
       - run: bun run --cwd integrations/pi test
       - run: bunx --bun tsc --noEmit -p scripts/tsconfig.dev-pi.json
       - run: bunx --bun vitest run --config scripts/vitest.config.ts
       - run: bunx --bun vitest run src/harness-connections src/commands
         working-directory: cli
-      - run: bun scripts/accept-integrations.ts
+      - run: bun scripts/prepare-integrations.ts release/integration-candidate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - run: bun scripts/accept-integrations.ts release/integration-candidate

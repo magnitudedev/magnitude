@@ -1,10 +1,10 @@
 /**
  * Desktop renderer entry — spec §5.2
  *
- * Reads `window.__magnitudeDesktop`, creates the AcnConnection and the
+ * Reads `window.__magnitudeDesktop`, creates the FirstPartyConnection and the
  * DesktopPlatform, creates the AgentClient (the connection's Effect Query client)
  * over the connection's transport, and mounts App inside PlatformProvider +
- * AcnStartupProvider + RegistryProvider + AgentClientProvider.
+ * ServiceStartupProvider + RegistryProvider + AgentClientProvider.
  *
  * The connection selects the exact ACN before application queries are exposed.
  *
@@ -14,13 +14,13 @@ import { createRoot } from "react-dom/client"
 import { RegistryProvider } from "@effect-atom/atom-react"
 import { Effect, Layer } from "effect"
 import { FetchHttpClient } from "@effect/platform"
-import type { AcnConnection } from "@magnitudedev/sdk"
+import type { FirstPartyConnection } from "@magnitudedev/client-common"
 import {
   App,
   PlatformProvider,
   createAgentClient,
   AgentClientProvider,
-  AcnStartupProvider,
+  ServiceStartupProvider,
   initializeAppearance,
   MagnitudeMark,
   stopDisplayViewController,
@@ -36,7 +36,7 @@ initializeAppearance()
 
 const desktopApi = window.__magnitudeDesktop
 const root = createRoot(document.getElementById("root")!)
-let activeConnection: AcnConnection | undefined
+let activeConnection: FirstPartyConnection | undefined
 
 document.documentElement.dataset.desktopPlatform = desktopApi.platform
 
@@ -78,18 +78,16 @@ async function renderApp() {
   const initialAcnLifecycle = await Effect.runPromise(
     connection.startup.prepare
   )
-  const agentClientTag = createAgentClient(connection.protocolLayer.pipe(
-    Layer.provide(FetchHttpClient.layer),
-  ))
+  const agentClientTag = createAgentClient(connection.client)
   root.render(
     <PlatformProvider platform={platform}>
-      <AcnStartupProvider startup={connection.startup}>
+      <ServiceStartupProvider startup={connection.startup}>
         <RegistryProvider defaultIdleTTL={5000}>
           <AgentClientProvider tag={agentClientTag}>
             <App initialAcnLifecycle={initialAcnLifecycle} />
           </AgentClientProvider>
         </RegistryProvider>
-      </AcnStartupProvider>
+      </ServiceStartupProvider>
     </PlatformProvider>
   )
 }

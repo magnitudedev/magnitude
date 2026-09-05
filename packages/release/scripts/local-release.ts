@@ -1,4 +1,5 @@
 import { resolve } from "node:path"
+import releasePlan from "../release-plan.json"
 import * as FileSystem from "@effect/platform/FileSystem"
 import { Console, Data, Effect, Option, Schema } from "effect"
 import {
@@ -310,6 +311,8 @@ export const buildLocalRelease: Effect.Effect<
     schemaVersion: 2,
     version,
     acnRevision: ACN_COORDINATION_REVISION,
+    rpc: releasePlan.rpc,
+    plugins: yield* Schema.decodeUnknown(ReleaseManifestSchema.fields.plugins)(releasePlan.plugins.map(plugin => plugin.artifact)).pipe(Effect.mapError(error => localReleaseFailure(`Invalid plugin inventory: ${String(error)}`))),
     tag: releaseTag(version),
     sourceCommit,
     artifacts: [firstArtifact, ...remainingArtifacts],

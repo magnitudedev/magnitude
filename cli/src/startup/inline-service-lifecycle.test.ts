@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import * as Terminal from "@effect/platform/Terminal"
 import { Effect, Schema } from "effect"
-import { AcnLifecycleStateSchema } from "@magnitudedev/sdk"
+import { ServiceLifecycleStateSchema } from "@magnitudedev/client-common"
 import {
   inlineServiceCompletionColor,
   makeInlineServiceStartupPresenter,
@@ -9,7 +9,7 @@ import {
 } from "./inline-service-lifecycle"
 import { defaultCliThemes } from "../utils/theme"
 
-const state = (input: unknown) => Schema.decodeUnknownSync(AcnLifecycleStateSchema)(input)
+const state = (input: unknown) => Schema.decodeUnknownSync(ServiceLifecycleStateSchema)(input)
 
 describe("inline service lifecycle copy", () => {
   it("uses the Markdown sea-foam token for completed checks", () => {

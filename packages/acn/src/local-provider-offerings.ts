@@ -12,7 +12,7 @@ import {
   type LocalProviderOffering,
   type ProviderModelCatalogEntry,
 } from "@magnitudedev/acn-protocol"
-import type { ProviderModelId } from "@magnitudedev/sdk"
+import type { ProviderModelId } from "@magnitudedev/providers/client"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
 import { LocalModels } from "./local-models"
 

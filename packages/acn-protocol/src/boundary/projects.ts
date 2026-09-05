@@ -1,5 +1,6 @@
+import { Rpc } from "@effect/rpc"
+import { replaySafe, atMostOnce } from "../transport/recovery"
 import { Schema } from "effect"
-import { Group, Mutation, Query } from "@magnitudedev/effect-query"
 import {
   InvalidProjectName,
   InvalidDirectoryPath,
@@ -22,23 +23,19 @@ import {
   ProjectSchema,
 } from "../schemas/project"
 
-/** Project pages are fresh until the ACN publishes a project change on `StreamChanges`. */
-const ListProjects = Query.make("ListProjects", {
+const ListProjects = Rpc.make("ListProjects", {
   payload: ProjectPageRequestSchema,
   success: ProjectPageSchema,
   error: Schema.Union(InvalidProjectPageCursor, ProjectStoreUnavailable),
-  staleTime: Infinity,
-})
+}).pipe(replaySafe)
 
-const CreateProject = Mutation.make("CreateProject", {
-  policy: { recovery: "ReplaySafe" },
+const CreateProject = Rpc.make("CreateProject", {
   payload: Schema.Struct({ cwd: Schema.String, name: Schema.String }),
   success: ProjectSchema,
   error: Schema.Union(InvalidProjectName, InvalidDirectoryPath, DirectoryNotFound, DirectoryAccessDenied, PathNotDirectory, FileSystemUnavailable, ProjectCwdAlreadyRegistered, ProjectStoreUnavailable),
-})
+}).pipe(replaySafe)
 
-const EditProject = Mutation.make("EditProject", {
-  policy: { recovery: "ReplaySafe" },
+const EditProject = Rpc.make("EditProject", {
   payload: Schema.Struct({
     projectId: ProjectIdSchema,
     name: Schema.String,
@@ -46,42 +43,38 @@ const EditProject = Mutation.make("EditProject", {
   }),
   success: ProjectSchema,
   error: Schema.Union(ProjectNotFound, InvalidProjectName, InvalidDirectoryPath, DirectoryNotFound, DirectoryAccessDenied, PathNotDirectory, FileSystemUnavailable, ProjectCwdAlreadyRegistered, ProjectStoreUnavailable),
-})
+}).pipe(replaySafe)
 
-const RemoveProject = Mutation.make("RemoveProject", {
-  policy: { recovery: "ReplaySafe" },
+const RemoveProject = Rpc.make("RemoveProject", {
   payload: Schema.Struct({ projectId: ProjectIdSchema }),
   success: ProjectSchema,
   error: Schema.Union(ProjectNotFound, ProjectStoreUnavailable),
-})
+}).pipe(replaySafe)
 
-const RestoreProject = Mutation.make("RestoreProject", {
-  policy: { recovery: "ReplaySafe" },
+const RestoreProject = Rpc.make("RestoreProject", {
   payload: Schema.Struct({ projectId: ProjectIdSchema }),
   success: ProjectSchema,
   error: Schema.Union(ProjectNotFound, ProjectCwdAlreadyRegistered, ProjectStoreUnavailable),
-})
+}).pipe(replaySafe)
 
-const RevealProjectSource = Mutation.make("RevealProjectSource", {
-  policy: { recovery: "AtMostOnce" },
+const RevealProjectSource = Rpc.make("RevealProjectSource", {
   payload: Schema.Struct({ projectId: ProjectIdSchema }),
   success: Schema.Struct({}),
   error: Schema.Union(ProjectNotFound, ProjectStoreUnavailable, RevealUnsupported, RevealFailed),
-})
+}).pipe(atMostOnce)
 
-const InspectProject = Query.make("InspectProject", {
+const InspectProject = Rpc.make("InspectProject", {
   payload: Schema.Struct({ projectId: ProjectIdSchema }),
   success: ProjectInspectionSchema,
   error: Schema.Union(ProjectNotFound, ProjectStoreUnavailable),
-  staleTime: Infinity,
-})
+}).pipe(replaySafe)
 
-export const Projects = Group.make({
-  ListProjects,
-  CreateProject,
-  EditProject,
-  RemoveProject,
-  RestoreProject,
-  RevealProjectSource,
-  InspectProject,
-})
+export const Projects = {
+  listProjects: ListProjects,
+  createProject: CreateProject,
+  editProject: EditProject,
+  removeProject: RemoveProject,
+  restoreProject: RestoreProject,
+  revealProjectSource: RevealProjectSource,
+  inspectProject: InspectProject,
+}

@@ -77,7 +77,7 @@ export default defineConfig({
         },
         {
           find: /^@magnitudedev\/sdk$/,
-          replacement: resolve(__dirname, "../packages/sdk/src/browser.ts"),
+          replacement: resolve(__dirname, "../packages/sdk/src/index.ts"),
         },
         {
           find: "@web-styles",

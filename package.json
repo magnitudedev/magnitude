@@ -42,8 +42,8 @@
     "logs:copy": "bun session logs --copy",
     "cs": "changeset",
     "changeset": "changeset",
-    "version": "bun run packages/version/scripts/apply-changesets-version.ts",
-    "publish": "changeset publish",
+    "version": "bun run packages/release/scripts/apply-changesets-version.ts",
+    "publish": "bun run packages/release/scripts/publish-npm.ts",
     "pre:alpha": "changeset pre enter alpha",
     "pre:beta": "changeset pre enter beta",
     "pre:exit": "changeset pre exit",
@@ -101,7 +101,8 @@
     "remark-wiki-link": "^2.0.1"
   },
   "resolutions": {
-    "effect": "3.21.2"
+    "effect": "3.21.2",
+    "@effect/platform": "0.96.1"
   },
   "trustedDependencies": [
     "electron",

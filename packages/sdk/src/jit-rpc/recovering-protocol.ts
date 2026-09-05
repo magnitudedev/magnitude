@@ -18,6 +18,7 @@ import {
   StreamLivenessTimeout,
   StreamEndedWithoutExit,
   RpcOutcomeUnknown,
+  RecoveryExhausted,
 } from "./errors"
 import { isChunkMessage, isFromServerEncoded, isTerminalMessage } from "./transport"
 
@@ -45,6 +46,8 @@ export interface RecoveringProtocolOptions<InfraError, Endpoint extends RpcEndpo
   readonly rpcPath: string
   readonly streamProtocol: RecoveringStreamProtocol
   readonly isEndpointRetirementExit?: (exit: ResponseExitEncoded["exit"]) => boolean
+  // Effect RPC's Protocol.send fixes its failure type to RpcClientError. Keep the
+  // adapter here until that upstream boundary supports generic transport errors.
   readonly classifyInfraError: (error: InfraError) => RpcClientError.RpcClientError
   readonly recoveryPolicy: (tag: string) => AcnRpcRecoveryPolicy
 }
@@ -70,6 +73,7 @@ export const makeRecoveringProtocol = <InfraError, Endpoint extends RpcEndpoint 
           return Effect.suspend(() => {
             let done = false
             let progressed = false
+            let consecutiveFailures = 0
 
             const attempt = (
               endpoint: Endpoint,
@@ -248,6 +252,10 @@ export const makeRecoveringProtocol = <InfraError, Endpoint extends RpcEndpoint 
                   }),
                 )
                 const outcome = yield* Effect.either(attempt(endpoint))
+                consecutiveFailures = progressed ? 0 : consecutiveFailures + 1
+                if (!done && consecutiveFailures >= 3) {
+                  return yield* toRpcClientError(new RecoveryExhausted({ attempts: consecutiveFailures }))
+                }
                 if (Either.isRight(outcome)) {
                   if (outcome.right._tag === "SubscriptionTerminated") {
                     yield* options.recover(endpoint).pipe(

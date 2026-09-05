@@ -41,17 +41,14 @@ export const registerInferenceCommands = (program: Command): void => {
   models.command("status")
     .description("Show local model installation and runtime status")
     .argument("[model-id]", "Canonical model ID from `magnitude models status`")
-    .option("--json", "Write one versioned JSON result for programmatic use")
-    .action((modelId, options) => loadRuntime().then(({ showModelsStatus }) =>
-      showModelsStatus(modelId, options.json)))
+    .action((modelId) => loadRuntime().then(({ showModelsStatus }) =>
+      showModelsStatus(modelId)))
   models.command("load")
     .description("Load a local model for inference")
     .argument("<model-id>", "Canonical model ID from `magnitude models status`")
-    .option("--json", "Write one versioned JSON result for programmatic use")
-    .action((modelId, options) => loadRuntime().then(({ loadInstance }) =>
-      loadInstance(modelId, options.json)))
+    .action((modelId) => loadRuntime().then(({ loadInstance }) =>
+      loadInstance(modelId)))
   models.command("stop")
     .description("Stop the active local model")
-    .option("--json", "Write one versioned JSON result for programmatic use")
-    .action((options) => loadRuntime().then(({ stopInstance }) => stopInstance(options.json)))
+    .action(() => loadRuntime().then(({ stopInstance }) => stopInstance()))
 }

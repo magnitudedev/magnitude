@@ -1,11 +1,10 @@
+import { Rpc } from "@effect/rpc"
+import { atMostOnce } from "../transport/recovery"
 import { Schema } from "effect"
-import { Group, Mutation } from "@magnitudedev/effect-query"
 import { SessionError } from "../errors"
 import { RawMessageUploads, RawMentionOccurrence } from "../schemas/attachments"
-import { turnAdmissionScope } from "./configuration"
 
-const SendMessage = Mutation.make("SendMessage", {
-  policy: { recovery: "AtMostOnce" },
+const SendMessage = Rpc.make("SendMessage", {
   payload: Schema.Struct({
     sessionId: Schema.String,
     messageId: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
@@ -17,19 +16,16 @@ const SendMessage = Mutation.make("SendMessage", {
   }),
   success: Schema.Struct({}),
   error: SessionError,
-  scope: () => turnAdmissionScope,
-})
+}).pipe(atMostOnce)
 
-const StartGoal = Mutation.make("StartGoal", {
-  policy: { recovery: "AtMostOnce" },
+const StartGoal = Rpc.make("StartGoal", {
   payload: Schema.Struct({
     sessionId: Schema.String,
     objective: Schema.String,
   }),
   success: Schema.Struct({}),
   error: SessionError,
-  scope: () => turnAdmissionScope,
-})
+}).pipe(atMostOnce)
 
 export const InterruptTarget = Schema.Union(
   Schema.TaggedStruct("all", {}),
@@ -37,14 +33,17 @@ export const InterruptTarget = Schema.Union(
 )
 export type InterruptTarget = Schema.Schema.Type<typeof InterruptTarget>
 
-const Interrupt = Mutation.make("Interrupt", {
-  policy: { recovery: "AtMostOnce" },
+const Interrupt = Rpc.make("Interrupt", {
   payload: Schema.Struct({
     sessionId: Schema.String,
     target: InterruptTarget,
   }),
   success: Schema.Struct({}),
   error: SessionError,
-})
+}).pipe(atMostOnce)
 
-export const Agent = Group.make({ SendMessage, StartGoal, Interrupt })
+export const Agent = {
+  sendMessage: SendMessage,
+  startGoal: StartGoal,
+  interrupt: Interrupt,
+}

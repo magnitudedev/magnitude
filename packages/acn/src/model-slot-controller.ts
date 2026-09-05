@@ -29,12 +29,8 @@ import {
   type SlotSelection,
 } from "@magnitudedev/acn-protocol"
 import { MagnitudeStorage } from "@magnitudedev/storage"
-import {
-  ReasoningEffortSchema,
-  projectInferenceResidency,
-  type ProviderId,
-  type ProviderModelId,
-} from "@magnitudedev/sdk"
+import { ReasoningEffortSchema, type ProviderId, type ProviderModelId } from "@magnitudedev/providers/client"
+import { projectInferenceResidency } from "@magnitudedev/acn-protocol"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
 import { IcnInstances } from "@magnitudedev/icn"
 import { ModelSelection } from "./model-selection"
@@ -118,6 +114,7 @@ const modelFailure = (
   retryable: boolean,
 ): ModelFailure => ({ code, message, retryable })
 
+
 export const ModelSlotControllerLive: Layer.Layer<
   ModelSlotController,
   never,
@@ -182,7 +179,7 @@ export const ModelSlotControllerLive: Layer.Layer<
     }
     yield* SubscriptionRef.set(aggregate, next)
     if (stateChanged) {
-      yield* changes.publish({ query: Models.GetSlots.name })
+      yield* changes.publish({ operation: Models.getSlots._tag })
     }
     return next
   })

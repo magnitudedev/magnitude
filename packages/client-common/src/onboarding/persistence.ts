@@ -1,7 +1,7 @@
 import { Atom, Registry, Result } from "@effect-atom/atom-react"
 import { Context, Effect, Layer } from "effect"
 import { Mutation, QueryClient } from "@magnitudedev/effect-query"
-import { Onboarding } from "@magnitudedev/sdk"
+import { Onboarding } from "../operations"
 import { ClientEffectQuery } from "../state/client-effect-query"
 
 

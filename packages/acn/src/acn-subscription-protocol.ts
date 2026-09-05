@@ -1,9 +1,9 @@
-import { RpcServer } from "@effect/rpc"
+import { RpcSchema, RpcServer } from "@effect/rpc"
 import type {
   FromClientEncoded,
   FromServerEncoded,
 } from "@effect/rpc/RpcMessage"
-import { AcnBoundary, AcnRpc } from "@magnitudedev/acn-protocol/boundary"
+import { AcnRpcGroup } from "@magnitudedev/acn-protocol/boundary"
 import { Array as Arr, Context, Effect, Layer, Ref } from "effect"
 import { AcnSubscriptions } from "./acn-subscriptions"
 
@@ -80,7 +80,7 @@ export const makeAcnSubscriptionProtocol = (
       request: Extract<FromClientEncoded, { readonly _tag: "Request" }>
     ) =>
       Effect.gen(function* () {
-        if (AcnRpc.operation(AcnBoundary, request.tag)?.stream !== true) return
+        if (!(AcnRpcGroup.requests.get(request.tag) && RpcSchema.isStreamSchema(AcnRpcGroup.requests.get(request.tag)!.successSchema))) return
         yield* track(clientId, request.id, true)
         const handle = yield* subscriptions.register({
           clientId,

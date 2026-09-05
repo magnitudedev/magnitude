@@ -240,18 +240,16 @@ Primary sources:
 
 Keep the three integrations independent, but give them the same four conceptual layers.
 
-### 1. Stable machine-control contract
+### 1. Existing RPC and a private bundled SDK
 
-Add command-scoped JSON modes rather than a global output switch:
+Model controls use the existing daemon RPC through the Effect-native Magnitude SDK. The SDK is a
+private workspace dependency bundled into the TypeScript plugin, not a separately published
+package. It handles fixed-endpoint admission, exact RPC-version checks, and recovery.
 
-- `magnitude models status --json`
-- `magnitude models status <model-id> --json`
-- `magnitude models load <model-id> --json`
-- `magnitude models stop --json`
-
-Define each output with Effect Schema. Include a contract version and command discriminator. In JSON mode, stdout should contain exactly one JSON document; diagnostics belong on stderr; failures use a nonzero exit status and a schema-defined error object.
-
-Do not make plugins scrape human-oriented tables or progress spinners.
+An injected starter may invoke `magnitude service start`; model operations never scrape CLI output
+or use a second CLI JSON contract. Pi implements this path. OpenCode can consume the same TypeScript
+SDK; a Python Hermes adapter would require contract-derived bindings, not handwritten duplicate
+schemas. Those integrations remain future work.
 
 ### 2. Shared inference-observation semantics
 

@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest"
 import { Effect, Layer } from "effect"
 import * as Registry from "@effect-atom/atom/Registry"
 import { Client } from "@magnitudedev/effect-query"
-import { AcnBoundary, type DisplayTimeline } from "@magnitudedev/sdk"
+import { AcnQueries } from "../operations"
+import { type DisplayTimeline } from "@magnitudedev/sdk"
 import {
   createDisplayViewStore,
   displayShapeFor,
@@ -19,7 +20,7 @@ import {
 } from "./controller"
 
 const client = Client.make(
-  AcnBoundary,
+  AcnQueries,
   fakeAcnImplementationsLayer((tag) => Effect.dieMessage(`Unexpected RPC ${tag}`)),
 )
 

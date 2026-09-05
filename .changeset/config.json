@@ -5,6 +5,6 @@
   "access": "public",
   "baseBranch": "main",
   "updateInternalDependencies": "patch",
-  "ignore": ["@magnitudedev/!(cli)"],
+  "ignore": ["@magnitudedev/!(cli|pi-extension)"],
   "privatePackages": { "version": false, "tag": false }
 }

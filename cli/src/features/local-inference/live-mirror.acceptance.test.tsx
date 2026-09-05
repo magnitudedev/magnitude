@@ -1,7 +1,8 @@
 import { act } from "react"
 import { testRender } from "@opentui/react/test-utils"
 import { RegistryProvider, Result } from "@effect-atom/atom-react"
-import { Option } from "effect"
+import { Effect, Layer, ManagedRuntime, Option } from "effect"
+import { FetchHttpClient } from "@effect/platform"
 import { expect, test, vi } from "vitest"
 import {
   AgentClientProvider,
@@ -9,7 +10,7 @@ import {
   useLocalModels,
   useModelSlots,
 } from "@magnitudedev/client-common"
-import { PRIMARY_SLOT_ID, ProviderIdSchema, protocolLayer } from "@magnitudedev/sdk"
+import { PRIMARY_SLOT_ID, ProviderIdSchema, MagnitudeClient } from "@magnitudedev/sdk"
 import { deriveLocalInferenceFooterView } from "./footer-status"
 import { defaultCliThemes } from "../../utils/theme"
 
@@ -49,7 +50,8 @@ test.skipIf(Option.isNone(acnUrl))("live independent mirrors remain independentl
 
   const url = Option.getOrUndefined(acnUrl)
   if (url === undefined) return
-  const agentClient = createAgentClient(protocolLayer(url))
+  const runtime = ManagedRuntime.make(MagnitudeClient.layer({ origin: url, autoStart: false }).pipe(Layer.provide(FetchHttpClient.layer)))
+  const agentClient = createAgentClient(await runtime.runPromise(MagnitudeClient))
   const view = await testRender(
     <RegistryProvider defaultIdleTTL={5_000}>
       <AgentClientProvider tag={agentClient}>
@@ -68,5 +70,6 @@ test.skipIf(Option.isNone(acnUrl))("live independent mirrors remain independentl
     expect(view.captureCharFrame()).toContain("mirror:success")
   } finally {
     await act(async () => view.renderer.destroy())
+    await runtime.dispose()
   }
 })

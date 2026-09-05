@@ -10,14 +10,14 @@ describe("ACN changes", () => {
       const changes = yield* AcnChanges
       const collected = yield* changes.stream.pipe(Stream.take(2), Stream.runCollect, Effect.fork)
       yield* Effect.sleep("5 millis")
-      yield* changes.publish({ query: "GetModelSlots" })
-      yield* changes.publish({ query: "GetSession", key: { sessionId: "s1" } })
+      yield* changes.publish({ operation: "GetModelSlots" })
+      yield* changes.publish({ operation: "GetSession", key: { sessionId: "s1" } })
       return Chunk.toReadonlyArray(yield* Fiber.join(collected))
     }).pipe(Effect.provide(AcnChangesLive))))
 
     expect(values).toEqual([
-      { query: "GetModelSlots" },
-      { query: "GetSession", key: { sessionId: "s1" } },
+      { operation: "GetModelSlots" },
+      { operation: "GetSession", key: { sessionId: "s1" } },
     ])
   })
 
@@ -37,11 +37,11 @@ describe("ACN changes", () => {
         Effect.fork,
       )
       yield* Effect.sleep("5 millis")
-      yield* changes.publish({ query: "GetSession", key: { sessionId: "first" } })
+      yield* changes.publish({ operation: "GetSession", key: { sessionId: "first" } })
       yield* Deferred.await(firstObserved)
       yield* Effect.forEach(
         Array.from({ length: 100 }, (_, index) => index),
-        (index) => changes.publish({ query: "GetSession", key: { sessionId: `pending-${index}` } }),
+        (index) => changes.publish({ operation: "GetSession", key: { sessionId: `pending-${index}` } }),
         { discard: true },
       )
       yield* Deferred.succeed(releaseFirst, undefined)
@@ -49,8 +49,8 @@ describe("ACN changes", () => {
     }).pipe(Effect.provide(AcnChangesLive))))
 
     expect(values).toEqual([
-      { query: "GetSession", key: { sessionId: "first" } },
-      { query: "GetSession" },
+      { operation: "GetSession", key: { sessionId: "first" } },
+      { operation: "GetSession" },
     ])
   })
 
@@ -79,11 +79,11 @@ describe("ACN changes", () => {
     })))
 
     expect(values).toEqual(expect.arrayContaining([
-      { query: "ListProjects" },
-      { query: "InspectProject" },
-      { query: "ListSessions" },
-      { query: "ListRecentSessionDirectories" },
-      { query: "GetSession" },
+      { operation: "ListProjects" },
+      { operation: "InspectProject" },
+      { operation: "ListSessions" },
+      { operation: "ListRecentSessionDirectories" },
+      { operation: "GetSession" },
     ]))
   })
 })

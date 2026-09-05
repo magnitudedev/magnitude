@@ -3,7 +3,7 @@ import { FetchHttpClient } from "@effect/platform"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as BunContext from "@effect/platform-bun/BunContext"
 import * as BunRuntime from "@effect/platform-bun/BunRuntime"
-import { ModelsStatusEnvelopeSchema, jsonFailureEnvelopeSchema, ProviderModelIdSchema, type JsonLocalModel } from "@magnitudedev/sdk"
+import { ProviderModelIdSchema, localModelIsInstalled, type ModelCatalogState, type LocalModel, formatConnectionError } from "@magnitudedev/sdk"
 import { HarnessIdSchema } from "@magnitudedev/client-common"
 import { harnessConnectionPaths, makeHarnessConnectionService, makeHarnessConnectorRegistry } from "../cli/src/harness-connections/service"
 import {
@@ -39,14 +39,6 @@ export const piDevelopmentArgs = (modelId: string, skillFile: string): string[] 
   "--no-skills", "--skill", skillFile,
 ]
 
-const StatusSuccessEnvelopeSchema = ModelsStatusEnvelopeSchema
-const StatusFailureEnvelopeSchema = jsonFailureEnvelopeSchema("models.status")
-
-const StatusEnvelopeSchema = Schema.parseJson(Schema.Union(
-  StatusSuccessEnvelopeSchema,
-  StatusFailureEnvelopeSchema,
-))
-
 class PiDevelopmentFailed extends Schema.TaggedError<PiDevelopmentFailed>()(
   "PiDevelopmentFailed",
   { message: Schema.String },
@@ -59,18 +51,6 @@ const requireSuccess = (operation: string, termination: InteractiveProcessTermin
     : Effect.fail(new PiDevelopmentFailed({ message: `${operation} exited with status ${exitCode}` }))
 }
 
-export const decodePiDevelopmentStatus = (
-  source: string,
-): Effect.Effect<typeof StatusSuccessEnvelopeSchema.Type, PiDevelopmentFailed> => Schema.decodeUnknown(StatusEnvelopeSchema)(source).pipe(
-  Effect.mapError(() => new PiDevelopmentFailed({
-    message: "The development CLI returned an incompatible model status response",
-  })),
-  Effect.flatMap((status) => {
-    if (!status.ok) return Effect.fail(new PiDevelopmentFailed({ message: status.error.message }))
-    return Effect.succeed(status)
-  }),
-)
-
 const buildDevelopmentIcn = Effect.tryPromise({
   try: () => buildLocalIcn({ diagnostics: "errors" }),
   catch: (error) => new PiDevelopmentFailed({
@@ -79,12 +59,12 @@ const buildDevelopmentIcn = Effect.tryPromise({
 })
 
 export const awaitPiDevelopmentModel = <E, R>(
-  read: Effect.Effect<typeof StatusSuccessEnvelopeSchema.Type, E, R>,
+  read: Effect.Effect<ModelCatalogState, E, R>,
 ) => {
-  const poll: Effect.Effect<JsonLocalModel, E, R> = Effect.suspend(() => read.pipe(
+  const poll: Effect.Effect<LocalModel, E, R> = Effect.suspend(() => read.pipe(
     Effect.flatMap((status) => {
       // A ready snapshot can still be empty while startup discovery runs.
-      const model = status.data.models.find(({ installation }) => installation === "installed")
+      const model = status._tag === "Initializing" ? undefined : status.models.flatMap(entry => entry._tag === "Local" ? [entry.product] : []).find(localModelIsInstalled)
       return model === undefined
         ? Effect.sleep("500 millis").pipe(Effect.zipRight(poll))
         : Effect.succeed(model)
@@ -153,17 +133,12 @@ const program = Effect.scoped(Effect.gen(function* () {
   const acnConnection = yield* makeAcnConnectionWithInstanceManager(manager)
   yield* acnConnection.startup.awaitReady.pipe(
     Effect.mapError((error) => new PiDevelopmentFailed({
-      message: `Could not start the development Magnitude service: ${error.message}`,
+      message: `Could not start the development Magnitude service: ${formatConnectionError(error)}`,
     })),
   )
 
-  const readOutput = <E, R>(stream: Stream.Stream<Uint8Array, E, R>) => stream.pipe(Stream.decodeText(), Stream.runFold("", (text, part) => text + part))
   yield* Console.log("Waiting for an installed Magnitude model...")
-  const model = yield* awaitPiDevelopmentModel(Effect.scoped(Effect.gen(function* () {
-    const child = yield* Command.make(magnitudeExecutable, "models", "status", "--json").pipe(Command.start)
-    const [code, stdout, stderr] = yield* Effect.all([child.exitCode, readOutput(child.stdout), readOutput(child.stderr)], { concurrency: "unbounded" })
-    return yield* decodePiDevelopmentStatus(code === 0 ? stdout : stderr)
-  })))
+  const model = yield* awaitPiDevelopmentModel(acnConnection.client.models.getCatalog({}))
   yield* Console.log(`Connecting the local Pi package with ${model.modelId}...`)
   const connection = yield* makeHarnessConnectionService({
     paths,

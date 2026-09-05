@@ -1,5 +1,3 @@
-import { Atom, Registry } from "@effect-atom/atom"
-import { FetchHttpClient } from "@effect/platform"
 import {
   deriveHardwareMemoryView,
   formatLocalModelDisplayName,
@@ -16,20 +14,17 @@ import {
   rankedLocalModelOptions,
   targetPhysicalMemoryBytes,
 } from "@magnitudedev/client-common"
-import { Client, Mutation } from "@magnitudedev/effect-query"
 import {
   CatalogFormModelIdSchema,
-  MagnitudeBoundary,
+  type MagnitudeClient,
   ModelIdSchema,
   type CatalogLocalModel,
   type LocalInferenceHardware,
   type LocalModel,
-  type MagnitudeImplementationError,
   type ModelCatalogState,
   type ModelId,
-  magnitudeImplementationsLayer,
 } from "@magnitudedev/sdk"
-import { Data, Effect, Layer, Option, Schema } from "effect"
+import { Data, Effect, Option, Schema } from "effect"
 import { existingAcnConnection } from "../server/acn-connection"
 import {
   describeLocalHardware,
@@ -40,52 +35,26 @@ import {
   renderFields,
   renderTable,
   runCommand,
-  type JsonCommandOutput,
 } from "./output"
-import {
-  ModelsLoadJsonDataSchema,
-  ModelsStatusJsonDataSchema,
-  ModelsStopJsonDataSchema,
-  modelsForStatus,
-  modelsLoadJsonData,
-  modelsStatusJsonData,
-  modelsStopJsonData,
-  type ModelsStatusResult,
-} from "./models-json"
 
-type CliModelsClient = Pick<
-  Client.Materialized<typeof MagnitudeBoundary, unknown, MagnitudeImplementationError>,
-  "Models"
->
+type CliModelsClient = Pick<MagnitudeClient, "models">
 
 class ModelCommandError extends Data.TaggedError("ModelCommandError")<{
   readonly message: string
 }> {}
 
-const withClient = <A>(
-  use: (client: CliModelsClient, registry: Registry.Registry) => Effect.Effect<A, unknown>,
-) => Effect.scoped(Effect.gen(function* () {
-  const connection = yield* existingAcnConnection
-  const registry = Registry.make()
-  yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
-  const client = Client.make(
-    MagnitudeBoundary,
-    magnitudeImplementationsLayer(connection.protocolLayer.pipe(
-      Layer.provide(FetchHttpClient.layer),
-    )),
-  )
-  return yield* use(client, registry)
-}))
+const withClient = <A>(use: (client: CliModelsClient) => Effect.Effect<A, unknown>) =>
+  Effect.scoped(Effect.gen(function* () {
+    const connection = yield* existingAcnConnection
+    return yield* use(connection.client)
+  }))
 
-const readCatalog = (client: CliModelsClient, registry: Registry.Registry) => Registry.getResult(
-  registry,
-  Atom.make((get) => get(client.Models.GetCatalog({})).result),
-)
+const readCatalog = (client: CliModelsClient) => client.models.getCatalog({})
+const readHardware = (client: CliModelsClient) => client.models.getLocalEnvironment({})
 
-const readHardware = (client: CliModelsClient, registry: Registry.Registry) => Registry.getResult(
-  registry,
-  Atom.make((get) => get(client.Models.GetLocalEnvironment({})).result),
-)
+const modelsForStatus = (models: readonly LocalModel[]): LocalModel[] => models
+  .filter(model => model._tag === "Discovered" || model.acquisitionState._tag !== "NotInstalled")
+  .sort((a,b) => formatLocalModelDisplayName(a).localeCompare(formatLocalModelDisplayName(b)) || a.modelId.localeCompare(b.modelId))
 
 const localModels = (catalog: ModelCatalogState): readonly LocalModel[] =>
   catalog._tag === "Initializing" ? [] : catalog.models.flatMap((entry) =>
@@ -279,10 +248,10 @@ const renderRecommendation = (model: CatalogLocalModel, index: number): string =
 }
 
 export const showRecommendations = (preferenceInput: string, limitInput: string) => runCommand({
-  effect: withClient((client, registry) => Effect.gen(function* () {
+  effect: withClient((client) => Effect.gen(function* () {
     const [catalog, hardware, preference, limit] = yield* Effect.all([
-      readCatalog(client, registry),
-      readHardware(client, registry),
+      readCatalog(client),
+      readHardware(client),
       parsePreference(preferenceInput),
       parseLimit(limitInput),
     ])
@@ -396,9 +365,9 @@ const renderCatalogDetail = (model: CatalogLocalModel): string => {
 }
 
 export const showCatalogModel = (modelInput: string) => runCommand({
-  effect: withClient((client, registry) => Effect.gen(function* () {
+  effect: withClient((client) => Effect.gen(function* () {
     const modelId = yield* decodeCatalogId(modelInput)
-    const models = (yield* requireLocalModels(yield* readCatalog(client, registry)))
+    const models = (yield* requireLocalModels(yield* readCatalog(client)))
       .filter((model): model is CatalogLocalModel => model._tag === "Catalog")
     return yield* findModel(models, modelId, "catalog model")
   })),
@@ -406,48 +375,41 @@ export const showCatalogModel = (modelInput: string) => runCommand({
 })
 
 export const pullModel = (modelInput: string) => runCommand({
-  effect: withClient((client, registry) => decodeCatalogId(modelInput).pipe(
-    Effect.flatMap((modelId) => Mutation.execute(client.Models.SyncLocalModel, { modelId }).pipe(
+  effect: withClient((client) => decodeCatalogId(modelInput).pipe(
+    Effect.flatMap((modelId) => client.models.syncLocalModel({ modelId }).pipe(
       Effect.map(({ outcome }) => ({ modelId, outcome })),
     )),
-    Effect.provideService(Registry.AtomRegistry, registry),
   )),
   render: ({ modelId, outcome }) => outcome === "AlreadyCurrent"
     ? `${modelId} is already installed and up to date.\n`
     : `Downloading or updating ${modelId}.\nCheck progress: magnitude models status ${modelId}\n`,
 })
 
-const modelMutation = <Id extends ModelId, JsonData = never, JsonEncoded = never>(
+const modelMutation = <Id extends ModelId>(
   modelInput: string,
   decode: (input: string) => Effect.Effect<Id, unknown>,
-  execute: (client: CliModelsClient, registry: Registry.Registry, modelId: Id) => Effect.Effect<unknown, unknown>,
+  execute: (client: CliModelsClient, modelId: Id) => Effect.Effect<unknown, unknown>,
   render: (modelId: Id) => string,
-  json?: JsonCommandOutput<Id, JsonData, JsonEncoded>,
 ) => runCommand({
-  effect: withClient((client, registry) => decode(modelInput).pipe(
-    Effect.flatMap((modelId) => execute(client, registry, modelId).pipe(
+  effect: withClient((client) => decode(modelInput).pipe(
+    Effect.flatMap((modelId) => execute(client, modelId).pipe(
       Effect.as(modelId),
     )),
   )),
   render,
-  json,
 })
 
 export const cancelDownload = (modelInput: string) => modelMutation(
   modelInput,
   decodeCatalogId,
-  (client, registry, modelId) => Mutation.execute(client.Models.CancelLocalModelSync, { modelId }).pipe(
-    Effect.provideService(Registry.AtomRegistry, registry),
-  ),
+  (client, modelId) => client.models.cancelLocalModelSync({ modelId }),
   (modelId) => `Cancelled work for ${modelId}.\n`,
 )
 
 export const removeModel = (modelInput: string) => modelMutation(
   modelInput,
   decodeCatalogId,
-  (client, registry, modelId) => Mutation.execute(client.Models.RemoveLocalModel, { modelId }).pipe(
-    Effect.provideService(Registry.AtomRegistry, registry),
-  ),
+  (client, modelId) => client.models.removeLocalModel({ modelId }),
   (modelId) => `Removed ${modelId} from this computer.\nThe model remains available in the catalog.\n`,
 )
 
@@ -534,9 +496,9 @@ const renderModelDetail = (model: LocalModel): string => ensureTrailingNewline([
   ]),
 ].join("\n"))
 
-export const showModelsStatus = (modelInput?: string, json = false) => runCommand({
-  effect: withClient((client, registry) => Effect.gen(function* () {
-    const catalog = yield* readCatalog(client, registry)
+export const showModelsStatus = (modelInput?: string) => runCommand({
+  effect: withClient((client) => Effect.gen(function* () {
+    const catalog = yield* readCatalog(client)
     if (catalog._tag === "Initializing") return { _tag: "Initializing" as const }
     const models = localModels(catalog)
     if (modelInput === undefined) return { _tag: "List" as const, models }
@@ -546,37 +508,18 @@ export const showModelsStatus = (modelInput?: string, json = false) => runComman
   render: (result) => result._tag === "Initializing"
     ? "Local models are initializing.\n"
     : result._tag === "List" ? renderModelsStatus(result.models) : renderModelDetail(result.model),
-  json: json ? {
-    command: "models.status",
-    schema: ModelsStatusJsonDataSchema,
-    data: (result: ModelsStatusResult) => modelsStatusJsonData(result),
-  } : undefined,
 })
 
-export const loadInstance = (modelInput: string, json = false) => modelMutation(
+export const loadInstance = (modelInput: string) => modelMutation(
   modelInput,
   decodeModelId,
-  (client, registry, modelId) => Mutation.execute(client.Models.LoadLocalModel, { modelId }).pipe(
-    Effect.provideService(Registry.AtomRegistry, registry),
-  ),
+  (client, modelId) => client.models.load({ modelId }),
   (modelId) => `Loaded ${modelId}.\n`,
-  json ? {
-    command: "models.load",
-    schema: ModelsLoadJsonDataSchema,
-    data: modelsLoadJsonData,
-  } : undefined,
 )
 
-export const stopInstance = (json = false) => runCommand({
-  effect: withClient((client, registry) => Mutation.execute(client.Models.StopActiveLocalModel, {}).pipe(
-    Effect.provideService(Registry.AtomRegistry, registry),
-  )),
+export const stopInstance = () => runCommand({
+  effect: withClient((client) => client.models.stop({})),
   render: () => "Stopped the active local model.\n",
-  json: json ? {
-    command: "models.stop",
-    schema: ModelsStopJsonDataSchema,
-    data: modelsStopJsonData,
-  } : undefined,
 })
 
 const residentAllocation = (model: LocalModel) => {
@@ -641,9 +584,9 @@ const renderHardware = (hardware: LocalInferenceHardware, models: readonly Local
 }
 
 export const showHardware = () => runCommand({
-  effect: withClient((client, registry) => Effect.all({
-    hardware: readHardware(client, registry),
-    catalog: readCatalog(client, registry),
+  effect: withClient((client) => Effect.all({
+    hardware: readHardware(client),
+    catalog: readCatalog(client),
   })),
   render: ({ hardware, catalog }) => renderHardware(hardware, localModels(catalog)),
 })

@@ -2,7 +2,10 @@ import { createHash } from "node:crypto"
 import { readdir, readFile, stat } from "node:fs/promises"
 import { resolve } from "node:path"
 import { fromMarkdown } from "mdast-util-from-markdown"
-import { Schema } from "effect"
+import { Effect, Schema } from "effect"
+import { BunContext } from "@effect/platform-bun"
+import { prerelease as semverPrerelease } from "semver"
+import { verifyPublishedPlugins } from "../src/plugin-artifacts"
 import { ReleaseManifestSchema } from "../src/contracts"
 import { fileSha256 } from "./build/common"
 import {
@@ -91,8 +94,8 @@ const sourceCommit = required("MAGNITUDE_SOURCE_COMMIT")
 if (manifest.sourceCommit !== sourceCommit) {
   throw new Error("candidate source commit differs from the workflow commit")
 }
-const prerelease = manifest.version.includes("-alpha.") ||
-  manifest.version.includes("-beta.")
+const prerelease = semverPrerelease(manifest.version) !== null
+if (!prerelease) await Effect.runPromise(verifyPublishedPlugins(manifest.plugins, resolve(import.meta.dir, "../../..")).pipe(Effect.provide(BunContext.layer)))
 const expectedNames = new Set([
   "magnitude-release.json",
   ...manifest.artifacts.map((artifact) => artifact.filename),

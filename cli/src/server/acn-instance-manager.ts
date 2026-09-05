@@ -1,12 +1,7 @@
 import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
-import {
-  BunDetachedChildProcessSpawner,
-  ChildProcessSpawner,
-  makeLocalAcnInstanceManager,
-  SDK_ACN_TARGET,
-} from "@magnitudedev/sdk"
-import { BunSqliteDriverLayer } from "@magnitudedev/sdk/bun"
+import { BunDetachedChildProcessSpawner, ChildProcessSpawner, makeLocalAcnInstanceManager, DAEMON_TARGET } from "@magnitudedev/daemon-management"
+import { BunSqliteDriverLayer } from "@magnitudedev/daemon-management/bun"
 import { Array as Arr, Effect, Option } from "effect"
 
 export interface BootstrappingAcnInstanceManagerOptions {
@@ -19,6 +14,7 @@ const provideLocalAcnDependencies = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]),
 )
 
+
 export const makeBootstrappingAcnInstanceManager = (
   options: BootstrappingAcnInstanceManagerOptions,
 ) => makeLocalAcnInstanceManager({
@@ -27,7 +23,7 @@ export const makeBootstrappingAcnInstanceManager = (
     onNone: () => ({}),
     onSome: (command) => ({
       launchOverride: {
-        target: SDK_ACN_TARGET,
+        target: DAEMON_TARGET,
         command,
       },
     }),

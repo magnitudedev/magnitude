@@ -1,5 +1,5 @@
 import { Effect, Option, Schema } from 'effect'
-import { ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema } from '@magnitudedev/sdk'
+import { ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema } from '@magnitudedev/providers/client'
 import { describe, expect, it } from 'vitest'
 import {
   PRIMARY_SLOT_ID,

@@ -111,3 +111,10 @@ export const AcnHealthResponseSchema = Schema.Struct({
   state: AcnHealthStateSchema,
 });
 export type AcnHealthResponse = typeof AcnHealthResponseSchema.Type;
+
+/** Application admission metadata; not a new private coordination prerequisite. */
+export const MagnitudeHealthResponseSchema = Schema.Struct({
+  ...AcnHealthResponseSchema.fields,
+  rpcVersion: PositiveSafeInteger,
+});
+export type MagnitudeHealthResponse = typeof MagnitudeHealthResponseSchema.Type;

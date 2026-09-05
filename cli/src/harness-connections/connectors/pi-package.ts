@@ -6,11 +6,14 @@ import { basename, dirname, resolve, sep } from "node:path"
 import { homedir } from "node:os"
 import { isDeepStrictEqual } from "node:util"
 import { satisfies } from "semver"
+import { MAGNITUDE_RPC_VERSION } from "@magnitudedev/sdk"
+import releasePlan from "@magnitudedev/release/plan"
+import { verifyPluginContent } from "@magnitudedev/release/plugin-content"
 import type { HarnessCompanionPackage, HarnessCompanionState } from "../contract"
 import type { HarnessConnectionPaths } from "../paths"
 import { updateJsonc, writeIfChanged } from "../shared"
 import { ConnectionTransaction } from "../transaction"
-import { writeFileAtomic } from "../../utils/atomic-file"
+import { writeFileAtomic } from "@magnitudedev/utils/atomic-file"
 import { PiPackageSourceSchema, type PiPackageSource } from "./pi-package-state"
 import {
   decodePiSettings, piPackageFilters, piPackageSource, readPiSettings, replacePiPackages,
@@ -19,9 +22,12 @@ import {
 
 export const PI_COMPANION_PACKAGE_NAME = "Magnitude for Pi"
 export const PI_COMPANION_PACKAGE_IDENTITY = "@magnitudedev/pi-extension"
-export const PI_COMPANION_PACKAGE_SOURCE = PiPackageSourceSchema.make("npm:@magnitudedev/pi-extension@0.0.1")
+const selectedPackage = Option.getOrThrowWith(
+  Array.findFirst(releasePlan.plugins, ({ artifact }) => artifact.host === "pi"),
+  () => new TypeError("Release preparation omitted the Pi plugin selection"),
+).artifact
+export const PI_COMPANION_PACKAGE_SOURCE = PiPackageSourceSchema.make(`npm:${selectedPackage.name}@${selectedPackage.version}`)
 export const PI_COMPANION_EXTENSION_PATH = "dist/magnitude.js"
-const SUPPORTED_PACKAGE_VERSION = "0.0.1"
 
 export class PiPackageError extends Schema.TaggedError<PiPackageError>()("PiPackageError", {
   message: Schema.String,
@@ -97,10 +103,15 @@ export const makePiCompanion = (paths: HarnessConnectionPaths, desiredSource: st
     if (!(yield* fs.exists(resolve(root, "package.json")))) return false
     const manifest = yield* fs.readFileString(resolve(root, "package.json")).pipe(Effect.flatMap(decodeManifest))
     const configuredVersion = source.startsWith(`npm:${PI_COMPANION_PACKAGE_IDENTITY}@`) ? source.slice(`npm:${PI_COMPANION_PACKAGE_IDENTITY}@`.length) : "*"
-    if (manifest.name !== PI_COMPANION_PACKAGE_IDENTITY || manifest.version !== SUPPORTED_PACKAGE_VERSION
+    if (manifest.name !== PI_COMPANION_PACKAGE_IDENTITY
       || source.startsWith("npm:") && !satisfies(manifest.version, configuredVersion)
       || !manifest.pi.extensions.includes(`./${PI_COMPANION_EXTENSION_PATH}`)) {
-      return yield* new PiPackageError({ message: `Unsupported Magnitude for Pi package at ${root}. Expected version ${SUPPORTED_PACKAGE_VERSION}; update this package explicitly before connecting.` })
+      return yield* new PiPackageError({ message: `Unsupported Magnitude for Pi package at ${root}; update this package explicitly before connecting.` })
+    }
+    if (!(yield* fs.exists(resolve(root, PI_COMPANION_EXTENSION_PATH)))) return false
+    const { metadata } = yield* verifyPluginContent(root).pipe(Effect.mapError(() => new PiPackageError({ message: `Magnitude for Pi contents at ${root} do not match its build metadata; reinstall the package.` })))
+    if (metadata.rpcVersion !== MAGNITUDE_RPC_VERSION) {
+      return yield* new PiPackageError({ message: `Magnitude for Pi at ${root} targets RPC ${metadata.rpcVersion}; this CLI requires RPC ${MAGNITUDE_RPC_VERSION}. Update it explicitly before connecting.` })
     }
     return yield* fs.exists(resolve(root, PI_COMPANION_EXTENSION_PATH))
   })

@@ -1,5 +1,5 @@
 import { Either, Schema } from "effect"
-import { MagnitudeProgressSchema, MagnitudeTimingsSchema, type MagnitudeProgress, type MagnitudeTimings } from "@magnitudedev/integration-protocol"
+import { MagnitudeProgressSchema, MagnitudeTimingsSchema, type MagnitudeProgress, type MagnitudeTimings } from "@magnitudedev/sdk"
 export { MagnitudeProgressSchema, MagnitudeTimingsSchema }
 export type { MagnitudeProgress, MagnitudeTimings }
 

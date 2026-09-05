@@ -1,15 +1,13 @@
 import { describe, expect, test } from "vitest"
 import { Option } from "effect"
 import {
-  decodeDesktopAcnEnsureEvent,
-  encodeDesktopAcnEnsureEvent,
+  decodeDesktopServiceStartProgress,
+  encodeDesktopServiceStartProgress,
 } from "./desktop-rpc"
 
 describe("desktop ACN ensure bridge", () => {
   test("restores Effect options after Electron structured cloning", () => {
-    const encoded = encodeDesktopAcnEnsureEvent({
-      _tag: "Observation",
-      observation: {
+    const encoded = encodeDesktopServiceStartProgress({
         _tag: "Installing",
         phase: "DownloadingInferenceEngine",
         plan: {
@@ -23,18 +21,14 @@ describe("desktop ACN ensure bridge", () => {
           unit: "Bytes",
           attempt: Option.some(1),
         }),
-      },
     })
 
-    const decoded = decodeDesktopAcnEnsureEvent(structuredClone(encoded))
-    expect(decoded._tag).toBe("Observation")
-    if (
-      decoded._tag !== "Observation" ||
-      decoded.observation._tag !== "Installing"
-    ) {
+    const decoded = decodeDesktopServiceStartProgress(structuredClone(encoded))
+    expect(decoded._tag).toBe("Installing")
+    if (decoded._tag !== "Installing") {
       throw new Error("expected an installing observation")
     }
-    expect(Option.getOrThrow(decoded.observation.progress)).toEqual({
+    expect(Option.getOrThrow(decoded.progress)).toEqual({
       completed: 50,
       totalBytes: 100,
       unit: "Bytes",

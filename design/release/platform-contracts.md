@@ -3,7 +3,7 @@ applies_to:
   - packages/release/**
   - packages/icn/src/lifecycle/release-installation.ts
   - packages/icn/src/lifecycle/installation-environment.ts
-  - packages/sdk/src/binary.ts
+  - packages/daemon-management/src/binary.ts
   - inference/**
   - .github/workflows/release-build.yml
 ---

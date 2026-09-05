@@ -2,11 +2,11 @@
 applies_to:
   - packages/acn-protocol/src/coordination/**
   - packages/acn-protocol/src/schemas/acn-health.ts
-  - packages/sdk/src/acn-jit/acn-owner-observer.ts
-  - packages/sdk/src/acn-jit/acn-daemon-shutdown-supervisor.ts
-  - packages/sdk/src/acn-jit/acn-candidate-launch-supervisor.ts
-  - packages/sdk/src/acn-jit/acn-ensurance-coordinator.ts
-  - packages/sdk/src/acn-jit/local-acn-instance-manager.ts
+  - packages/daemon-management/src/acn-jit/acn-owner-observer.ts
+  - packages/daemon-management/src/acn-jit/acn-daemon-shutdown-supervisor.ts
+  - packages/daemon-management/src/acn-jit/acn-candidate-launch-supervisor.ts
+  - packages/daemon-management/src/acn-jit/acn-ensurance-coordinator.ts
+  - packages/daemon-management/src/acn-jit/local-acn-instance-manager.ts
   - packages/acn/src/server.ts
   - packages/acn/src/ownership-monitor.ts
   - packages/acn/src/binary.ts

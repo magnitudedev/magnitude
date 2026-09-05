@@ -1,12 +1,5 @@
-import { Data, Effect, Schema } from "effect"
+import { Data, Effect } from "effect"
 import stringWidth from "string-width"
-import { jsonSuccessEnvelopeSchema, jsonFailureEnvelopeSchema } from "@magnitudedev/sdk"
-
-export interface JsonCommandOutput<Result, Data, Encoded, CommandName extends string = string> {
-  readonly command: CommandName
-  readonly schema: Schema.Schema<Data, Encoded, never>
-  readonly data: (result: Result) => Data
-}
 
 const messageOf = (error: unknown): string => {
   if (typeof error === "object" && error !== null) {
@@ -22,47 +15,16 @@ class CommandOutputFailed extends Data.TaggedError("CommandOutputFailed")<{
   readonly message: string
 }> {}
 
-const encodeJsonLine = <A, I>(schema: Schema.Schema<A, I, never>) => (value: A): string =>
-  `${Schema.encodeSync(Schema.parseJson(schema))(value)}\n`
-
-const renderJsonSuccess = <Result, JsonData, JsonEncoded, CommandName extends string>(
-  output: JsonCommandOutput<Result, JsonData, JsonEncoded, CommandName>,
-  result: Result,
-): string => {
-  const schema = jsonSuccessEnvelopeSchema(output.command, output.schema)
-  return encodeJsonLine(schema)({
-    schemaVersion: 1,
-    command: output.command,
-    ok: true,
-    data: output.data(result),
-  })
-}
-
-const renderJsonCommandFailure = <CommandName extends string>(command: CommandName, error: unknown): string => {
-  const schema = jsonFailureEnvelopeSchema(command)
-  return encodeJsonLine(schema)({
-    schemaVersion: 1,
-    command,
-    ok: false,
-    error: { message: messageOf(error) },
-  })
-}
-
-export const runCommand = <A, JsonData = never, JsonEncoded = never>(options: {
+export const runCommand = <A>(options: {
   readonly effect: Effect.Effect<A, unknown, never>
   readonly render: (result: A) => string
-  readonly json?: JsonCommandOutput<A, JsonData, JsonEncoded>
 }): Promise<void> => Effect.runPromise(options.effect.pipe(
   Effect.tap((result) => Effect.try({
-    try: () => process.stdout.write(options.json === undefined
-      ? options.render(result)
-      : renderJsonSuccess(options.json, result)),
+    try: () => process.stdout.write(options.render(result)),
     catch: (error) => new CommandOutputFailed({ message: messageOf(error) }),
   })),
   Effect.catchAll((error) => Effect.sync(() => {
-    process.stderr.write(options.json === undefined
-      ? `${messageOf(error)}\n`
-      : renderJsonCommandFailure(options.json.command, error))
+    process.stderr.write(`${messageOf(error)}\n`)
     process.exitCode = 1
   })),
   Effect.asVoid,

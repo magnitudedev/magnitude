@@ -8,7 +8,7 @@ import {
   type StreamStartFailure,
   type ModelStreamEvent,
 } from '@magnitudedev/ai'
-import type { IcnModelPreparation } from '@magnitudedev/sdk'
+import type { IcnModelPreparation } from '@magnitudedev/providers/client'
 import type { ModelRequestActivity } from './model-request-activity'
 import type { SlotId } from '@magnitudedev/roles'
 import { buildMaxToolCallsGrammar } from './tool-call-grammar'

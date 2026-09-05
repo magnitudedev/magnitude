@@ -55,12 +55,22 @@ describe("inference command surface", () => {
     ])
     expect(program.commands[2]!.commands[2]!.registeredArguments).toHaveLength(0)
     for (const command of program.commands[2]!.commands) {
-      expect(command.options.map(({ long }) => long)).toEqual(["--json"])
+      expect(command.options).toHaveLength(0)
     }
     expect(program.commands[0]!.options).toHaveLength(0)
     for (const command of program.commands[1]!.commands) {
       expect(command.options.map(({ long }) => long)).not.toContain("--json")
     }
+  })
+
+  it.each([
+    ["models", "status", "--json"],
+    ["models", "load", "test-model", "--json"],
+    ["models", "stop", "--json"],
+  ])("rejects the removed JSON mode: %s %s", async (...args) => {
+    const program = new Command().name("magnitude").exitOverride().configureOutput({ writeErr: () => {} })
+    registerInferenceCommands(program)
+    await expect(program.parseAsync(args, { from: "user" })).rejects.toMatchObject({ code: "commander.unknownOption" })
   })
 
   it("renders authoritative discovery and assessment completion independently", () => {

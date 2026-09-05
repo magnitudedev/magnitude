@@ -7,7 +7,7 @@ import {
   type CloudUsageResponse,
   type ProviderClientShape,
   type UsageQuery,
-} from "@magnitudedev/sdk"
+} from "@magnitudedev/providers/client"
 import { MagnitudeStorage } from "@magnitudedev/storage"
 
 const MAGNITUDE_PROVIDER_ID = ProviderIdSchema.make("magnitude")

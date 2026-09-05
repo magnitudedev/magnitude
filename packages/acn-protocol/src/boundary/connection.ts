@@ -1,11 +1,13 @@
+import { Rpc } from "@effect/rpc"
+import { replaySafe } from "../transport/recovery"
 import { Schema } from "effect"
-import { Group, Query } from "@magnitudedev/effect-query"
-import { AcnHealthResponseSchema } from "../schemas/acn-health"
+import { MagnitudeHealthResponseSchema } from "../schemas/acn-health"
 
-/** Health observation executed by the transport during selection. */
-const Health = Query.make("Health", {
+const Health = Rpc.make("Health", {
   payload: Schema.Struct({}),
-  success: AcnHealthResponseSchema,
-})
+  success: MagnitudeHealthResponseSchema,
+}).pipe(replaySafe)
 
-export const Connection = Group.make({ Health })
+export const Connection = {
+  health: Health,
+}

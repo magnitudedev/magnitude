@@ -65,19 +65,23 @@ root-mount an atom to simulate durability—declare it with `Atom.keepAlive`.
 
 ## Client ↔ ACN: queries, mutations, subscriptions
 
-Every client↔ACN interaction is a core Effect Query `Query`, `Mutation`, `Subscription`, or
-stream-folded `Query`, composed into `AcnBoundary` in `packages/acn-protocol`. Client-common may
-recursively extend that boundary with Effect-backed semantic commands under the existing domain
-groups. `createAgentClient(protocolLayer)` makes one client for this application operation graph;
-only `AcnBoundary` is projected to RPC, and client construction must close every RPC implementation
-and embedded Effect requirement. `useAgentClient()` returns it. Every operation is a member of that client at its group name, already
+First-party reactive interactions use Effect Query `Query`, `Mutation`, `Subscription`, or
+stream-folded `Query` definitions in client-common's `AcnQueries`. Each definition calls the shared
+`MagnitudeClient` through Effect DI and derives payload identity from the authoritative RPC schema.
+Client-common may extend that graph with local semantic commands.
+Local operation bindings centralize SDK service lookup and schema-derived keys; they never generate
+RPCs or choose domain cache policy. Freshness, mutation scope/synchronization, and stream folding
+remain explicit at each domain definition.
+`createAgentClient(sdk)` makes
+one application operation client; Effect Query never generates the RPC contract. Construction must
+close every embedded Effect requirement. `useAgentClient()` returns it. Every operation is a member of that client at its group name, already
 materialized: a query member is `(input) => QueryAtom` (`client.Sessions.GetSession({ sessionId })`),
 a mutation member is its `MutationAtom` (`client.Agent.SendMessage`), a subscription member is
 `(input) => SubscriptionAtom` (`client.Changes.StreamChanges({})`). Members are the canonical atoms —
 equal inputs return the same atom — so they are never wrapped in `useMemo`. Domain services see the
 same members through `ClientEffectQuery`. Client code never passes a definition to
 `client.query`/`client.mutation`/`client.subscription`, and never declares or inspects RPCs,
-transports, or framing: there is no raw RPC client, parallel request cache, reactivity-key
+transports, or framing: UI/domain services do not construct another SDK client or parallel request cache, reactivity-key
 registry, or per-domain invalidation wiring.
 
 - A definition carries its cache identity (the payload), freshness, and — for mutations — its

@@ -1,5 +1,6 @@
+import { Rpc } from "@effect/rpc"
+import { replaySafe, atMostOnce } from "../transport/recovery"
 import { Option, Schema } from "effect"
-import { Group, Mutation, Query, QueryClient } from "@magnitudedev/effect-query"
 import { ProviderIdSchema } from "@magnitudedev/ai/provider/model"
 import {
   LocalInferenceError,
@@ -16,159 +17,121 @@ import {
   ProviderModelIdentitySchema,
   SlotIdSchema,
   SlotSelectionSchema,
-  type SlotId,
 } from "../schemas/model-state"
-import { turnAdmissionScope } from "./configuration"
 
-const stateQuery = <const Name extends string, A, I>(name: Name, schema: Schema.Schema<A, I>) => Query.make(name, {
+const GetCatalog = Rpc.make("GetModelCatalog", {
   payload: Schema.Struct({}),
-  success: schema,
-  error: Schema.Never,
-  staleTime: Infinity,
-  gcTime: Infinity,
-})
+  success: ModelCatalogStateSchema,
+}).pipe(replaySafe)
 
-const GetCatalog = stateQuery("GetModelCatalog", ModelCatalogStateSchema)
-const GetSlots = stateQuery("GetModelSlots", ModelSlotsStateSchema)
-const GetLocalEnvironment = stateQuery("GetLocalInferenceEnvironment", LocalInferenceHardwareSchema)
+const GetSlots = Rpc.make("GetModelSlots", {
+  payload: Schema.Struct({}),
+  success: ModelSlotsStateSchema,
+}).pipe(replaySafe)
 
-const RefreshCatalog = Mutation.make("RefreshModelCatalog", {
-  policy: { recovery: "AtMostOnce" },
+const GetLocalEnvironment = Rpc.make("GetLocalInferenceEnvironment", {
+  payload: Schema.Struct({}),
+  success: LocalInferenceHardwareSchema,
+}).pipe(replaySafe)
+
+const RefreshCatalog = Rpc.make("RefreshModelCatalog", {
   payload: Schema.Struct({
     providerId: Schema.optionalWith(ProviderIdSchema, { as: "Option", exact: true }),
   }),
   success: Schema.Struct({}),
   error: Schema.Never,
-  synchronize: () => QueryClient.refetch(GetCatalog.match()),
-})
+}).pipe(atMostOnce)
 
-const slotScope = (slotId: SlotId) => Mutation.MutationScope(`model-slot:${slotId}`)
-const slotMutationScope = (slotId: SlotId) => slotId === "primary"
-  ? turnAdmissionScope
-  : slotScope(slotId)
-const synchronizeCatalog = QueryClient.refetch(GetCatalog.match())
-const synchronizeSlots = QueryClient.refetch(GetSlots.match())
-
-const AssignSlot = Mutation.make("AssignModelSlot", {
-  policy: { recovery: "ReplaySafe" },
+const AssignSlot = Rpc.make("AssignModelSlot", {
   payload: Schema.Struct({ slotId: SlotIdSchema, selection: SlotSelectionSchema }),
   success: Schema.Struct({}),
   error: ModelSlotUpdateError,
-  scope: ({ slotId }) => slotMutationScope(slotId),
-  synchronize: () => synchronizeSlots,
-})
+}).pipe(replaySafe)
 
-const ClearSlot = Mutation.make("ClearModelSlot", {
-  policy: { recovery: "ReplaySafe" },
+const ClearSlot = Rpc.make("ClearModelSlot", {
   payload: Schema.Struct({ slotId: SlotIdSchema }),
   success: Schema.Struct({}),
   error: ModelSlotUpdateError,
-  scope: ({ slotId }) => slotMutationScope(slotId),
-  synchronize: () => synchronizeSlots,
-})
+}).pipe(replaySafe)
 
-const SetFavorite = Mutation.make("SetModelFavorite", {
-  policy: { recovery: "ReplaySafe" },
+const SetFavorite = Rpc.make("SetModelFavorite", {
   payload: Schema.Struct({ model: ProviderModelIdentitySchema, favorite: Schema.Boolean }),
   success: Schema.Struct({}),
   error: ModelPreferenceMutationFailed,
-  scope: ({ model }) => Mutation.MutationScope(`model-favorite:${model.providerId}:${model.providerModelId}`),
-  synchronize: () => synchronizeSlots,
-})
+}).pipe(replaySafe)
 
-const SyncLocalModel = Mutation.make("SyncLocalModel", {
-  policy: { recovery: "AtMostOnce" },
+const SyncLocalModel = Rpc.make("SyncLocalModel", {
   payload: Schema.Struct({ modelId: CatalogFormModelIdSchema }),
   success: Schema.Struct({ outcome: Schema.Literal("Started", "AlreadyCurrent") }),
   error: LocalInferenceError,
-  scope: ({ modelId }) => Mutation.MutationScope(`local-model:${modelId}`),
-  synchronize: () => synchronizeCatalog,
-})
+}).pipe(atMostOnce)
 
-const CancelLocalModelSync = Mutation.make("CancelLocalModelSync", {
-  policy: { recovery: "AtMostOnce" },
+const CancelLocalModelSync = Rpc.make("CancelLocalModelSync", {
   payload: Schema.Struct({ modelId: CatalogFormModelIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
-  scope: ({ modelId }) => Mutation.MutationScope(`local-model:${modelId}`),
-  synchronize: () => synchronizeCatalog,
-})
+}).pipe(atMostOnce)
 
-const AcknowledgeLocalModelSyncFailure = Mutation.make("AcknowledgeLocalModelSyncFailure", {
-  policy: { recovery: "AtMostOnce" },
+const AcknowledgeLocalModelSyncFailure = Rpc.make(
+  "AcknowledgeLocalModelSyncFailure",
+  {
+    payload: Schema.Struct({ modelId: CatalogFormModelIdSchema }),
+    success: Schema.Struct({}),
+    error: LocalInferenceError,
+  }
+).pipe(atMostOnce)
+
+const RemoveLocalModel = Rpc.make("RemoveLocalModel", {
   payload: Schema.Struct({ modelId: CatalogFormModelIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
-  scope: ({ modelId }) => Mutation.MutationScope(`local-model:${modelId}`),
-  synchronize: () => synchronizeCatalog,
-})
+}).pipe(atMostOnce)
 
-const RemoveLocalModel = Mutation.make("RemoveLocalModel", {
-  policy: { recovery: "AtMostOnce" },
-  payload: Schema.Struct({ modelId: CatalogFormModelIdSchema }),
-  success: Schema.Struct({}),
-  error: LocalInferenceError,
-  scope: ({ modelId }) => Mutation.MutationScope(`local-model:${modelId}`),
-  synchronize: () => synchronizeCatalog,
-})
-
-const LoadLocalModel = Mutation.make("LoadLocalModel", {
-  policy: { recovery: "AtMostOnce" },
+const LoadLocalModel = Rpc.make("LoadLocalModel", {
   payload: Schema.Struct({ modelId: ModelIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
-  scope: ({ modelId }) => Mutation.MutationScope(`local-model-residency:${modelId}`),
-  synchronize: () => synchronizeCatalog,
-})
+}).pipe(atMostOnce)
 
-const StopActiveLocalModel = Mutation.make("StopActiveLocalModel", {
-  policy: { recovery: "AtMostOnce" },
+const StopActiveLocalModel = Rpc.make("StopActiveLocalModel", {
   payload: Schema.Struct({}),
   success: Schema.Struct({}),
   error: LocalInferenceError,
-  scope: () => Mutation.MutationScope("active-local-model-residency"),
-  synchronize: () => synchronizeCatalog,
-})
+}).pipe(atMostOnce)
 
-const LoadSlot = Mutation.make("LoadModelSlot", {
-  policy: { recovery: "AtMostOnce" },
+const LoadSlot = Rpc.make("LoadModelSlot", {
   payload: Schema.Struct({ slotId: SlotIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
-  scope: ({ slotId }) => Mutation.MutationScope(`model-slot-instance:${slotId}`),
-  synchronize: () => synchronizeSlots,
-})
+}).pipe(atMostOnce)
 
-const StopSlot = Mutation.make("StopModelSlot", {
-  policy: { recovery: "AtMostOnce" },
+const StopSlot = Rpc.make("StopModelSlot", {
   payload: Schema.Struct({ slotId: SlotIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
-  scope: ({ slotId }) => Mutation.MutationScope(`model-slot-instance:${slotId}`),
-  synchronize: () => synchronizeSlots,
-})
+}).pipe(atMostOnce)
 
-const PreviewSlotLoad = Query.make("PreviewModelSlotLoad", {
+const PreviewSlotLoad = Rpc.make("PreviewModelSlotLoad", {
   payload: Schema.Struct({ slotId: SlotIdSchema }),
   success: ModelLoadPlanSchema,
   error: LocalInferenceError,
-})
+}).pipe(replaySafe)
 
-export const Models = Group.make({
-  GetCatalog,
-  GetSlots,
-  GetLocalEnvironment,
-  PreviewSlotLoad,
-  RefreshCatalog,
-  AssignSlot,
-  ClearSlot,
-  SetFavorite,
-  SyncLocalModel,
-  CancelLocalModelSync,
-  AcknowledgeLocalModelSyncFailure,
-  RemoveLocalModel,
-  LoadLocalModel,
-  StopActiveLocalModel,
-  LoadSlot,
-  StopSlot,
-})
+export const Models = {
+  getCatalog: GetCatalog,
+  getSlots: GetSlots,
+  getLocalEnvironment: GetLocalEnvironment,
+  refreshCatalog: RefreshCatalog,
+  assignSlot: AssignSlot,
+  clearSlot: ClearSlot,
+  setFavorite: SetFavorite,
+  syncLocalModel: SyncLocalModel,
+  cancelLocalModelSync: CancelLocalModelSync,
+  acknowledgeLocalModelSyncFailure: AcknowledgeLocalModelSyncFailure,
+  removeLocalModel: RemoveLocalModel,
+  load: LoadLocalModel,
+  stop: StopActiveLocalModel,
+  loadSlot: LoadSlot,
+  stopSlot: StopSlot,
+  previewSlotLoad: PreviewSlotLoad,
+}

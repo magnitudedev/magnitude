@@ -5,3 +5,8 @@ export * from "./errors"
 export * from "./acn-identity"
 export * from "./acn-revision"
 export * from "./acn-instance"
+export * from "./service-start"
+export * from "./rpc-version"
+
+export * from "./service-endpoint"
+export { projectInferenceAllocation, projectInferenceLoadPlan, projectInferenceResidency } from "./inference-projection"

@@ -11,11 +11,11 @@ import {
   type ProviderCatalogOutcome,
   type ProviderClientShape,
   type ProviderModel,
-} from "@magnitudedev/sdk"
+} from "@magnitudedev/providers/client"
 import { LocalProviderOfferings } from "./local-provider-offerings"
 import { AcnChangesLive } from "./changes"
 import { ProviderModelCatalog, ProviderModelCatalogLive } from "./provider-model-catalog"
-import { ProviderClient } from "@magnitudedev/sdk"
+import { ProviderClient } from "@magnitudedev/providers/client"
 
 const providerA = ProviderIdSchema.make("provider-a")
 const providerB = ProviderIdSchema.make("provider-b")

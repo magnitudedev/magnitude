@@ -11,7 +11,7 @@ import {
   ReasoningProperty,
   VisionProperty,
   type ProviderClientShape,
-} from "@magnitudedev/sdk"
+} from "@magnitudedev/providers/client"
 import {
   nextToolAvailability,
   makeDelegatingProviderClient,

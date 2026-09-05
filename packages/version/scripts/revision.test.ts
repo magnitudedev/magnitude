@@ -2,7 +2,6 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { resolve } from "node:path"
 import { afterEach, describe, expect, test, vi } from "vitest"
-import { advanceAcnRevision } from "./advance-acn-revision"
 import {
   DEVELOPMENT_COUNTER_ENVIRONMENT_VARIABLE,
   nextDevelopmentCounter,
@@ -25,16 +24,6 @@ afterEach(async () => {
 })
 
 describe("ACN revision allocation", () => {
-  test("advances the checked-in allocation by exactly one", async () => {
-    const root = await temporaryRoot()
-    const path = resolve(root, "acn-revision.json")
-    await writeFile(path, '{"revision":1}\n')
-
-    await advanceAcnRevision(path)
-
-    expect(JSON.parse(await readFile(path, "utf8"))).toEqual({ revision: 2 })
-  })
-
   test("increments the machine-local development counter", async () => {
     const root = await temporaryRoot()
     const path = resolve(root, "development-revision-counter")

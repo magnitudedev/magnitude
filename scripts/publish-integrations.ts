@@ -1,49 +1,64 @@
-import * as Command from "@effect/platform/Command"
-import * as FileSystem from "@effect/platform/FileSystem"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
-import { Console, Effect, Schema, Stream } from "effect"
+import { Console, Effect } from "effect"
 import { resolve } from "node:path"
+import { canonical } from "@magnitudedev/utils/canonical-key"
+import {
+  publishedPluginIntegrity,
+  requireNpm,
+  PluginArtifactError,
+} from "../packages/release/src/plugin-artifacts"
+import { readAcceptedPluginCandidate } from "../packages/release/src/plugin-candidate"
+import {
+  readPreparedRelease,
+  verifyPublicBaseline,
+} from "../packages/release/scripts/prepare-release"
+import { rpcFingerprint } from "../packages/release/scripts/rpc-fingerprint"
+import { publishTag } from "../packages/release/scripts/release-channel"
 
-class IntegrationPublicationFailed extends Schema.TaggedError<IntegrationPublicationFailed>()(
-  "IntegrationPublicationFailed", { message: Schema.String },
-) {}
-
-const project = resolve(import.meta.dir, "..")
-const Manifest = Schema.Struct({ name: Schema.String, version: Schema.String })
-const Pack = Schema.Array(Schema.Struct({ filename: Schema.String, integrity: Schema.String }))
-const text = <E, R>(stream: Stream.Stream<Uint8Array, E, R>) => stream.pipe(Stream.decodeText(), Stream.runFold("", (text, part) => text + part))
-const run = (args: string[], cwd: string) => Effect.scoped(Effect.gen(function* () {
-  const child = yield* Command.make("npm", ...args).pipe(Command.workingDirectory(cwd), Command.start)
-  const [code, stdout, stderr] = yield* Effect.all([child.exitCode, text(child.stdout), text(child.stderr)], { concurrency: "unbounded" })
-  return { code, stdout, stderr }
-}))
-
-// Called only by publication workflows, after tarball acceptance. Publishing the
-// public contract first makes the pinned companion installable before CLI release.
-const program = Effect.scoped(Effect.gen(function* () {
-  const fs = yield* FileSystem.FileSystem
-  const temporary = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-integration-publish-" })
-  for (const directory of ["packages/integration-protocol", "integrations/pi"]) {
-    const cwd = resolve(project, directory)
-    const manifest = yield* fs.readFileString(resolve(cwd, "package.json")).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(Manifest))))
-    const packed = yield* run(["pack", "--ignore-scripts", "--json", "--pack-destination", temporary], cwd)
-    if (packed.code !== 0) return yield* new IntegrationPublicationFailed({ message: packed.stderr })
-    const packages = yield* Schema.decodeUnknown(Schema.parseJson(Pack))(packed.stdout)
-    if (packages.length !== 1) return yield* new IntegrationPublicationFailed({ message: "Expected one tarball" })
-    const artifact = packages[0]!
-    const specifier = `${manifest.name}@${manifest.version}`
-    const existing = yield* run(["view", specifier, "dist.integrity", "--json"], cwd)
-    if (existing.code !== 0) {
-      if (!existing.stderr.includes("E404")) return yield* new IntegrationPublicationFailed({ message: existing.stderr })
-      const published = yield* run(["publish", resolve(temporary, artifact.filename), "--access", "public"], cwd)
-      if (published.code !== 0) return yield* new IntegrationPublicationFailed({ message: published.stderr })
-    }
-    const verified = yield* run(["view", specifier, "dist.integrity", "--json"], cwd)
-    if (verified.code !== 0 || (yield* Schema.decodeUnknown(Schema.parseJson(Schema.String))(verified.stdout)) !== artifact.integrity) {
-      return yield* new IntegrationPublicationFailed({ message: `Published integrity differs for ${specifier}. Bump its version; never overwrite an existing release.` })
-    }
-    yield* Console.log(`Verified ${specifier}`)
+// Never builds or packs. Only the exact tarballs covered by acceptance can be published.
+const program = Effect.gen(function* () {
+  const directory = resolve(process.argv[2] ?? "release/integration-candidate")
+  const candidate = yield* readAcceptedPluginCandidate(directory)
+  const source = yield* readPreparedRelease
+  if (
+    canonical(source) !== canonical(candidate.plan) ||
+    (yield* rpcFingerprint()) !== source.rpc.fingerprint
+  ) {
+    return yield* new PluginArtifactError({
+      message: "Accepted candidate does not match the release source",
+    })
   }
-}))
-
+  yield* verifyPublicBaseline(source)
+  for (const { artifact, publish } of candidate.plan.plugins) {
+    const existing = yield* publishedPluginIntegrity(
+      artifact.name,
+      artifact.version,
+      directory
+    )
+    // A prerelease version publishes under its own dist-tag; `latest` stays stable.
+    if (existing === null && publish)
+      yield* requireNpm(
+        [
+          "publish",
+          `${directory}/${artifact.filename}`,
+          "--access",
+          "public",
+          "--ignore-scripts",
+          "--tag",
+          publishTag(artifact.version),
+        ],
+        directory
+      )
+    const actual = yield* publishedPluginIntegrity(
+      artifact.name,
+      artifact.version,
+      directory
+    )
+    if (actual !== artifact.integrity)
+      return yield* new PluginArtifactError({
+        message: `Published integrity differs for ${artifact.name}@${artifact.version}. Refresh preparation; never overwrite a version.`,
+      })
+    yield* Console.log(`Verified public ${artifact.name}@${artifact.version}`)
+  }
+})
 if (import.meta.main) BunRuntime.runMain(program.pipe(Effect.provide(BunContext.layer)))

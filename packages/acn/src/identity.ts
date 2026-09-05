@@ -3,7 +3,8 @@ import {
   AcnInstanceIdSchema,
   AcnIdentitySchema,
   AcnRevisionSchema,
-  type AcnHealthResponse,
+  type MagnitudeHealthResponse,
+  MAGNITUDE_RPC_VERSION,
   type AcnHealthState,
 } from "@magnitudedev/acn-protocol";
 import { ACN_REVISION } from "./version";
@@ -17,10 +18,11 @@ export const makeHealthResponse = (
   id: string = ACN_INSTANCE_ID,
   pid: number = process.pid,
   revision: number = ACN_REVISION,
-): AcnHealthResponse => ({
+): MagnitudeHealthResponse => ({
   service: "magnitude-acn",
   version: AcnIdentitySchema.make(version),
   revision: AcnRevisionSchema.make(revision),
+  rpcVersion: MAGNITUDE_RPC_VERSION,
   id: AcnInstanceIdSchema.make(id),
   pid,
   state,

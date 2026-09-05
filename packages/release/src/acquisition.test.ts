@@ -2,6 +2,7 @@ import * as FetchHttpClient from "@effect/platform/FetchHttpClient"
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem"
 import * as NodePath from "@effect/platform-node/NodePath"
 import { createHash } from "node:crypto"
+import releasePlan from "../release-plan.json"
 import {
   chmod,
   mkdir,
@@ -53,6 +54,8 @@ const manifestBytes = (
     schemaVersion: 2,
     version,
     acnRevision: 1_000_000,
+    rpc: releasePlan.rpc,
+    plugins: releasePlan.plugins.map(plugin => plugin.artifact),
     tag,
     sourceCommit,
     artifacts: [Schema.encodeSync(ReleaseArtifactSchema)(artifact)],

@@ -39,7 +39,7 @@ import { SkillsAmbient } from '../ambient/skills-ambient'
 import { buildInterruptedTurnOutcome } from '../util/interrupt-utils'
 import type { ContextPart } from '../content'
 import type { ObservablePart } from '../observables/types'
-import type { BaseCallOptions } from '@magnitudedev/sdk'
+import type { BaseCallOptions } from '@magnitudedev/providers/client'
 import { normalizeVision } from '@magnitudedev/ai'
 import { captureContextImageInline, type ContextImageCaptureError } from '../util/capture-context-image'
 

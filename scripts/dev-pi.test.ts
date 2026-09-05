@@ -1,6 +1,8 @@
-import { Effect, Fiber, TestClock, TestContext } from "effect"
+import type { ModelCatalogState } from "@magnitudedev/sdk"
+import { makeInstalledCatalogModel, makeCatalogOnlyModel } from "../cli/src/features/local-inference/test-fixtures"
+import { Effect, Fiber, Option, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
-import { awaitPiDevelopmentModel, decodePiDevelopmentStatus, piDevelopmentArgs } from "./dev-pi"
+import { awaitPiDevelopmentModel, piDevelopmentArgs } from "./dev-pi"
 import { FileSystem } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import { DefaultResourceLoader } from "@earendil-works/pi-coding-agent"
@@ -43,32 +45,27 @@ describe("Pi development resource isolation", () => {
   })
 })
 
-describe("Pi development status decoding", () => {
-  it("waits through initialization, empty ready snapshots, and uninstalled models", async () => {
+const readyCatalog = (models = [makeInstalledCatalogModel()]): ModelCatalogState => ({
+  _tag: "Ready", providers: [], failures: [],
+  models: models.map(product => ({ _tag: "Local", product, offering: Option.none() })),
+  localModelPreparation: { discovery: { complete: true, modelsFound: models.length }, assessment: { complete: true, settledModels: models.length, totalModels: models.length } },
+})
+
+describe("Pi development SDK model readiness", () => {
+  it("waits through initialization, empty snapshots, and uninstalled models", async () => {
     let reads = 0
-    const model = { modelId: "gemma:gguf:q4", displayName: "Gemma", installation: "installed" }
-    const snapshots = [
-      { state: "initializing", models: [] },
-      { state: "ready", models: [] },
-      { state: "ready", models: [{ ...model, installation: "installing" }] },
-      { state: "ready", models: [model] },
+    const installed = makeInstalledCatalogModel()
+    const snapshots: ModelCatalogState[] = [
+      { _tag: "Initializing" }, readyCatalog([]), readyCatalog([makeCatalogOnlyModel()]), readyCatalog([installed]),
     ]
-    const result = await Effect.runPromise(awaitPiDevelopmentModel(Effect.suspend(() =>
-      decodePiDevelopmentStatus(JSON.stringify({
-        schemaVersion: 1, command: "models.status", ok: true,
-        data: snapshots[reads++],
-      })),
-    )))
-    expect(result.modelId).toBe(model.modelId)
+    const result = await Effect.runPromise(awaitPiDevelopmentModel(Effect.suspend(() => Effect.succeed(snapshots[reads++]!))))
+    expect(result.modelId).toBe(installed.modelId)
     expect(reads).toBe(4)
   })
 
   it("times out if no installed model appears", async () => {
     const result = await Effect.runPromise(Effect.gen(function* () {
-      const fiber = yield* awaitPiDevelopmentModel(decodePiDevelopmentStatus(JSON.stringify({
-        schemaVersion: 1, command: "models.status", ok: true,
-        data: { state: "ready", models: [] },
-      }))).pipe(Effect.fork)
+      const fiber = yield* awaitPiDevelopmentModel(Effect.succeed(readyCatalog([]))).pipe(Effect.fork)
       yield* TestClock.adjust("30 seconds")
       return yield* Fiber.await(fiber)
     }).pipe(Effect.provide(TestContext.TestContext)))
@@ -76,7 +73,7 @@ describe("Pi development status decoding", () => {
     expect(String(result)).toContain("No installed Magnitude model became available within 30 seconds")
   })
 
-  it("reports command failures without retrying until timeout", async () => {
+  it("reports SDK failure without retrying until timeout", async () => {
     let reads = 0
     const result = await Effect.runPromiseExit(awaitPiDevelopmentModel(Effect.suspend(() => {
       reads++
@@ -85,45 +82,5 @@ describe("Pi development status decoding", () => {
     expect(result._tag).toBe("Failure")
     expect(String(result)).toContain("service unavailable")
     expect(reads).toBe(1)
-  })
-
-  it("accepts initializing and ready model status envelopes", async () => {
-    const initializing = await Effect.runPromise(decodePiDevelopmentStatus(JSON.stringify({
-      schemaVersion: 1,
-      command: "models.status",
-      ok: true,
-      data: { state: "initializing", models: [] },
-    })))
-    expect(initializing.ok).toBe(true)
-    if (initializing.ok) expect(initializing.data.state).toBe("initializing")
-
-    const ready = await Effect.runPromise(decodePiDevelopmentStatus(JSON.stringify({
-      schemaVersion: 1,
-      command: "models.status",
-      ok: true,
-      data: {
-        state: "ready",
-        models: [{ modelId: "qwen3.6-35b-a3b:gguf:q6", displayName: "Qwen", installation: "installed" }],
-      },
-    })))
-    expect(ready.ok).toBe(true)
-    if (ready.ok) expect(ready.data.models).toHaveLength(1)
-  })
-
-  it("preserves the CLI failure message", async () => {
-    const error = await Effect.runPromiseExit(decodePiDevelopmentStatus(JSON.stringify({
-      schemaVersion: 1,
-      command: "models.status",
-      ok: false,
-      error: { message: "Magnitude service is not running" },
-    })))
-    expect(error._tag).toBe("Failure")
-    expect(String(error)).toContain("Magnitude service is not running")
-  })
-
-  it("rejects malformed or incompatible responses", async () => {
-    const error = await Effect.runPromiseExit(decodePiDevelopmentStatus("not json"))
-    expect(error._tag).toBe("Failure")
-    expect(String(error)).toContain("incompatible model status response")
   })
 })

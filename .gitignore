@@ -35,5 +35,7 @@ desktop/out
 desktop/node_modules
 
 packages/launcher/bin/magnitude.js
+# Generated from packages/release/release-plan.json by packages/version/scripts/generate-version.ts
+packages/acn-protocol/src/rpc-version.ts
 
 .humanlayer/tasks/

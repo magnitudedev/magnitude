@@ -1,15 +1,23 @@
 // Barrel export for @magnitudedev/client-common
 
 // State
+export * from './connection/connection'
+export {
+  ServiceLifecycleStateSchema,
+  type ServiceLifecycleState,
+  type ServiceLifecycle,
+  type ServiceStartingPhase,
+} from './connection/lifecycle'
+export * from './connection/remote-starter'
 export * from './state/stream-errors'
 export * from './state/agent-client'
 export * from './state/agent-client-context'
 export * from './state/session-atoms'
 export * from './state/display-state-store'
 export * from './state/notification-area-state'
-export * from './state/acn-startup'
-export * from './state/acn-lifecycle'
-export * from './state/acn-recovery'
+export * from './state/service-startup'
+export * from './state/service-lifecycle'
+export * from './state/service-recovery'
 export * from './display-view-controller/hooks'
 export * from './hooks/use-stabilized-root-detail'
 
@@ -112,3 +120,5 @@ export * from './hooks/use-menu-actions-core'
 export * from './hooks/use-local-inference-state'
 export * from './hooks/use-onboarding-model-setup'
 export * from './display-view-controller/timeline-scroll-controller'
+
+export * from './tracing'

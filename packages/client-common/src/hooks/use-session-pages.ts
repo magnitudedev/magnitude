@@ -12,14 +12,8 @@ import { useCallback, useMemo } from "react"
 import { Effect, Option } from "effect"
 import { Atom, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { Key, QueryClient } from "@magnitudedev/effect-query"
-import {
-  Sessions,
-  type DirectoryPath,
-  type SessionArchiveFilter,
-  type SessionMetadata,
-  type SessionPageCursor,
-  type SessionPinFilter,
-} from "@magnitudedev/sdk"
+import { Sessions } from "../operations"
+import { type DirectoryPath, type SessionArchiveFilter, type SessionMetadata, type SessionPageCursor, type SessionPinFilter } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 import { appendRequestedPage, makePageSet, type RequestedPage } from "../data/paginated-query"
 import { sessionsToRecentChats, type RecentChat } from "../data/recent-chats"

@@ -162,13 +162,16 @@ jobs:
           pattern: backend-*
           path: release-artifacts
       - run: npm install --global "npm@${NPM_VERSION}"
+      - run: bun scripts/prepare-integrations.ts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - id: npm-candidate
         run: bun run packages/release/scripts/prepare-npm.ts release/npm-candidate
       - run: bun run packages/release/scripts/assemble.ts release-artifacts release-candidate
         env:
           MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
           MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
-      - run: bun run scripts/accept-release-candidate.ts release-candidate "${{ steps.npm-candidate.outputs.tarball }}"
+      - run: bun run scripts/accept-release-candidate.ts release-candidate "${{ steps.npm-candidate.outputs.tarball }}" release/integration-candidate
       - name: Commit-point recheck
         run: bun run packages/release/scripts/preflight.ts
         env:
@@ -179,9 +182,16 @@ jobs:
           MAGNITUDE_REQUIRE_RELEASE: "true"
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - run: bun scripts/accept-integrations.ts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: accepted-integrations
+          path: release/integration-candidate
+          if-no-files-found: ignore
+          overwrite: true
       - run: bun scripts/publish-integrations.ts
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - run: bun run packages/release/scripts/publish.ts release-candidate
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -190,10 +200,10 @@ jobs:
         run: bun run packages/release/scripts/accept-public-cli.ts "${{ steps.npm-candidate.outputs.tarball }}"
         env:
           MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
-      - name: Publish npm through Changesets
+      - name: Publish accepted CLI tarball
         shell: bash
         run: |
-          bun run publish -- --no-git-tag || true
+          bun run publish "${{ steps.npm-candidate.outputs.tarball }}"
           bun run packages/release/scripts/verify-npm.ts
         env:
           MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
@@ -216,12 +226,42 @@ jobs:
           npm install --global "@magnitudedev/cli@${{ needs.preflight.outputs.version }}"
           magnitude --version
 
-  complete:
+  # The CLI is already public: this Version PR changed only plugins, or is a retry after
+  # a complete CLI release. Plugins publish on their own; unchanged ones verify as no-ops.
+  publish-integrations:
     needs: preflight
     if: needs.preflight.outputs.action == 'complete'
     runs-on: ubuntu-latest
     steps:
-      - run: echo "${{ needs.preflight.outputs.version }} is already published"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.source_commit }}
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: bun install --frozen-lockfile
+      - run: npm install --global "npm@${NPM_VERSION}"
+      - run: bun run --cwd integrations/pi typecheck
+      - run: bun run --cwd integrations/pi test
+      - run: bun scripts/prepare-integrations.ts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - run: bun scripts/accept-integrations.ts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: accepted-integrations
+          path: release/integration-candidate
+          if-no-files-found: ignore
+          overwrite: true
+      - run: bun scripts/publish-integrations.ts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish-npm:
     needs: preflight

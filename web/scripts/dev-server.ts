@@ -5,7 +5,7 @@
  * 1. Exposes ACN ensurance
  * 2. Serves the web app via Vite's middleware
  * 3. Exposes one cancellable ensure stream
- * 4. Proxies RPC, health, and logs only to the selected exact ACN
+ * 4. Proxies RPC, health, and logs to the fixed daemon endpoint; RPC retains the SDK instance fence
  *
  * The browser talks only to this same-origin server.
  */
@@ -14,20 +14,10 @@ import { createServer as createViteServer } from "vite"
 import { Effect, Exit, Fiber, Layer, Runtime, Option, Schema, Scope, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
-import {
-  makeLocalAcnInstanceManager,
-  BunDetachedChildProcessSpawner,
-  ChildProcessSpawner,
-  AcnEnsureRequestSchema,
-  AcnInstanceIdSchema,
-  RemoteAcnErrorResponseSchema,
-  RemoteAcnEnsureMessageSchema,
-  AcnEnsuranceError,
-  AcnEnsuranceFailed,
-  SDK_ACN_TARGET,
-  type RemoteAcnEnsureMessage,
-} from "@magnitudedev/sdk"
-import { BunSqliteDriverLayer } from "@magnitudedev/sdk/bun"
+import { makeLocalAcnInstanceManager, BunDetachedChildProcessSpawner, ChildProcessSpawner, DAEMON_TARGET, makeServiceStarter } from "@magnitudedev/daemon-management"
+import { MAGNITUDE_SERVICE_ORIGIN, ServiceStartFailed } from "@magnitudedev/sdk"
+import { RemoteServiceStartMessageSchema, type RemoteServiceStartMessage } from "@magnitudedev/client-common"
+import { BunSqliteDriverLayer } from "@magnitudedev/daemon-management/bun"
 import { resolve } from "node:path"
 
 // ─── Daemon host boundaries ─────────────────────────────────────────────────
@@ -37,11 +27,12 @@ const ensurerScope = await Runtime.runPromise(rt)(Scope.make())
 const acnSourcePath = resolve(import.meta.dir, "..", "..", "packages", "acn", "src", "binary.ts")
 const developmentDataDir = process.env.MAGNITUDE_DEV_DATA_DIR
 
+
 async function createEnsurer() {
   return Runtime.runPromise(rt)(makeLocalAcnInstanceManager({
     dataDir: developmentDataDir,
     launchOverride: {
-      target: SDK_ACN_TARGET,
+      target: DAEMON_TARGET,
       command: ["bun", acnSourcePath, "serve"],
     },
   }).pipe(
@@ -52,19 +43,11 @@ async function createEnsurer() {
 }
 
 const managerPromise = createEnsurer()
-const proxyTargets = new Map<string, string>()
+
 
 // ─── Dev-mode launch command ────────────────────────────────────────────────
 
-const decodeEnsureRequest = Schema.decode(
-  Schema.parseJson(AcnEnsureRequestSchema),
-)
-const encodeEnsureMessage = Schema.encode(
-  Schema.parseJson(RemoteAcnEnsureMessageSchema),
-)
-const encodeErrorResponse = Schema.encode(
-  Schema.parseJson(RemoteAcnErrorResponseSchema),
-)
+const encodeStartMessage = Schema.encode(Schema.parseJson(RemoteServiceStartMessageSchema))
 
 const respondError = async (
   res: ServerResponse,
@@ -75,20 +58,6 @@ const respondError = async (
   res.end(JSON.stringify({ error: String(error) }))
 }
 
-const asEnsuranceError = (cause: unknown) => Schema.is(AcnEnsuranceError)(cause)
-  ? cause
-  : new AcnEnsuranceFailed({ reason: String(cause) })
-
-const respondEnsuranceError = async (
-  res: ServerResponse,
-  status: number,
-  cause: unknown,
-): Promise<void> => {
-  res.writeHead(status, { "Content-Type": "application/json" })
-  res.end(await Runtime.runPromise(rt)(
-    encodeErrorResponse({ error: asEnsuranceError(cause) }),
-  ))
-}
 // ─── HTTP server with Vite middleware ─────────────────────────────────
 
 const PORT = Number(process.env.PORT) || 5173
@@ -103,24 +72,16 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url!, `http://localhost:${PORT}`)
 
   // ── ACN process operations ──────────────────────────────────────
-  if (url.pathname === "/acn/ensure" && req.method === "POST") {
+  if (url.pathname === "/service/start" && req.method === "POST") {
     try {
-      const chunks: Buffer[] = []
-      for await (const chunk of req) chunks.push(chunk as Buffer)
-      const raw = Buffer.concat(chunks).toString()
-      const body = await Runtime.runPromise(rt)(decodeEnsureRequest(
-        raw.length === 0 ? "{}" : raw,
-      ))
       const manager = await managerPromise
       res.writeHead(200, {
         "Content-Type": "application/x-ndjson",
         "Cache-Control": "no-store",
       })
-      const write = (message: RemoteAcnEnsureMessage) => {
-        if (message._tag === "Ready") {
-          proxyTargets.set(message.instance.id, message.instance.url)
-        }
-        return encodeEnsureMessage(message).pipe(
+      const write = (message: RemoteServiceStartMessage) => {
+
+        return encodeStartMessage(message).pipe(
           Effect.flatMap((encoded) =>
             Effect.sync(() => {
               if (!res.destroyed) res.write(`${encoded}\n`)
@@ -132,7 +93,7 @@ const server = createServer(async (req, res) => {
           Effect.orDie,
         )
       }
-      const observer = Runtime.runFork(rt)(manager.ensure(body).pipe(
+      const observer = Runtime.runFork(rt)(makeServiceStarter(manager).start.pipe(
         Stream.runForEach(write),
         Effect.catchAll((error) => write({ _tag: "Failed", error })),
       ))
@@ -142,27 +103,17 @@ const server = createServer(async (req, res) => {
       res.off("close", interrupt)
       if (!res.destroyed) res.end()
     } catch (err) {
-      await respondEnsuranceError(res, 500, err)
+      if (res.headersSent) res.destroy(err instanceof Error ? err : new Error(String(err)))
+      else await respondError(res, 500, err)
     }
     return
   }
 
   // ── Same-origin ACN proxy (streaming) ───────────────────────────
-  const proxyMatch = url.pathname.match(/^\/acn\/([^/]+)(\/rpc|\/health|\/logs)$/)
+  const proxyMatch = url.pathname.match(/^\/acn(\/rpc|\/health|\/logs)$/)
   if (proxyMatch) {
-    const expectedId = Schema.decodeUnknownOption(AcnInstanceIdSchema)(decodeURIComponent(proxyMatch[1]!))
-    const targetPath = proxyMatch[2]!
-    if (Option.isNone(expectedId)) {
-      await respondError(res, 400, "Invalid ACN instance ID")
-      return
-    }
-    const targetUrl = proxyTargets.get(expectedId.value)
-    if (targetUrl === undefined) {
-      await respondError(res, 409, "Selected ACN instance is no longer current")
-      return
-    }
-
-    const target = new URL(targetUrl)
+    const targetPath = proxyMatch[1]!
+    const target = new URL(MAGNITUDE_SERVICE_ORIGIN)
     const proxyReq = http.request({
       hostname: target.hostname,
       port: target.port,
@@ -179,7 +130,8 @@ const server = createServer(async (req, res) => {
         res.destroy(error)
         return
       }
-      void respondError(res, 502, error)
+      if (targetPath === "/health") res.destroy(error)
+      else void respondError(res, 502, error)
     })
 
     req.pipe(proxyReq)

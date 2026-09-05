@@ -1,12 +1,14 @@
-import { Group, Mutation } from "@magnitudedev/effect-query"
+import { Rpc } from "@effect/rpc"
+import { atMostOnce } from "../transport/recovery"
 import { RunBashPayload, RunBashResult } from "../schemas/shell"
 import { SessionError } from "../errors"
 
-const RunBash = Mutation.make("RunBash", {
-  policy: { recovery: "AtMostOnce" },
+const RunBash = Rpc.make("RunBash", {
   payload: RunBashPayload,
   success: RunBashResult,
   error: SessionError,
-})
+}).pipe(atMostOnce)
 
-export const Shell = Group.make({ RunBash })
+export const Shell = {
+  runBash: RunBash,
+}

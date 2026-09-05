@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest"
 import { Effect, Exit } from "effect"
-import { ACN_SUBSCRIPTION_LIVENESS_TIMEOUT_MS, AcnRpc, AcnBoundary } from "@magnitudedev/acn-protocol"
+import { ACN_SUBSCRIPTION_LIVENESS_TIMEOUT_MS, AcnRpcGroup } from "@magnitudedev/acn-protocol"
 import { acnSubscriptionProtocol } from "./acn-subscription-protocol"
 
 describe("ACN subscription protocol", () => {
   it("treats exactly the group's stream Rpcs as subscriptions", () => {
-    const subscriptions = AcnRpc.operations(AcnBoundary)
-      .map((operation) => operation.name)
+    const subscriptions = [...AcnRpcGroup.requests.values()]
+      .map((operation) => operation._tag)
       .filter(acnSubscriptionProtocol.isStream)
       .sort()
     expect(subscriptions).toEqual([

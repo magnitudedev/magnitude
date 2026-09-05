@@ -2,7 +2,7 @@ import * as FileSystem from "@effect/platform/FileSystem"
 import { BunContext } from "@effect/platform-bun"
 import { Effect } from "effect"
 import { describe, expect, it } from "vitest"
-import { writeFileAtomic } from "./atomic-file"
+import { writeFileAtomic } from "@magnitudedev/utils/atomic-file"
 
 describe("writeFileAtomic", () => {
   it("creates and replaces a configuration without leaving work files", async () => {

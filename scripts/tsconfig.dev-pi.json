@@ -1,4 +1,4 @@
 {
   "extends": "../tsconfig.json",
-  "include": ["dev-pi.ts", "dev-pi.test.ts", "accept-integrations.ts", "publish-integrations.ts", "vitest.config.ts", "../cli/src/types/text-imports.d.ts"]
+  "include": ["dev-pi.ts", "dev-pi.test.ts", "check-sdk-boundary.ts", "prepare-integrations.ts", "accept-integrations.ts", "publish-integrations.ts", "vitest.config.ts", "../cli/src/types/text-imports.d.ts"]
 }

@@ -11,15 +11,16 @@ applies_to:
   - packages/sdk/src/acn-jit/acn-subscription-protocol.ts
   - packages/sdk/src/jit-rpc/recovering-stream-protocol.ts
   - packages/client-common/src/state/changes.ts
-  - packages/sdk/src/inference.ts
+  - packages/sdk/src/client.ts
+  - packages/client-common/src/operations/**
 ---
 
 # ACN subscriptions
 
-An ACN subscription is a core `Subscription` or stream-folded `Query` in an ACN boundary group
-whose derived RPC streams domain values. Stream status comes from stable
-`AcnRpc.operations(AcnBoundary)`
-metadata rather than a separate registry. Opening one is caller-owned observation: it never retains ACN or a session
+An ACN subscription is an ordinary streaming RPC in the authoritative declaration tree.
+Its stream schema supplies transport metadata; there is no separate operation registry or
+Effect Query RPC projection. Client-common chooses whether to materialize it as a Subscription
+or a stream-folded Query. Opening one is caller-owned observation: it never retains ACN or a session
 runtime. Domain handlers produce domain values and consumers receive domain values.
 
 ## Wire protocol
@@ -51,7 +52,7 @@ transport.
 ## Change notifications
 
 Connection-global change notifications share one subscription, `StreamChanges`. Each event is a
-poke in the clients' query-identity space — `{ query, key? }` naming the query whose authoritative
+poke naming the authoritative read-operation identity — `{ operation, key? }` naming the query whose authoritative
 data may have changed. The ACN change registry multiplexes every source: an owner commit names its
 query; a storage commit names every query it backs. Multiplexing neither combines state nor creates
 a cross-domain authority. Pokes carry no snapshot, revision, acknowledgement, or ordering claim.

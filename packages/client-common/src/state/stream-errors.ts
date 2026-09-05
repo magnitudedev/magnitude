@@ -5,13 +5,10 @@
  * `StreamCallbacks.onError`. The CLI's `FatalErrorScreen` and the web's
  * `DaemonConnectionError` both read `invariantViolation` from the info.
  */
-import { Cause, Chunk, Schema } from "effect"
-import {
-  AcnEnsuranceError,
-  formatAcnEnsuranceError,
-  type AcnEnsuranceError as AcnEnsuranceErrorType,
-  type StreamDisplayViewFailure,
-} from "@magnitudedev/sdk"
+import { Cause, Chunk, Schema, type Stream } from "effect"
+import { ConnectionErrorSchema, formatConnectionError, type ConnectionError, type MagnitudeClient } from "@magnitudedev/sdk"
+
+export type StreamDisplayViewFailure = Stream.Stream.Error<ReturnType<MagnitudeClient["display"]["streamDisplayView"]>>
 
 /**
  * Structured stream error info consumed by both apps.
@@ -22,14 +19,14 @@ export interface StreamErrorInfo {
   readonly isAcnAvailabilityError: boolean
 }
 
-type AcnAvailabilityError = AcnEnsuranceErrorType
+type AcnAvailabilityError = ConnectionError
 
 export function isAcnAvailabilityError(error: unknown): error is AcnAvailabilityError {
-  return Schema.is(AcnEnsuranceError)(error)
+  return Schema.is(ConnectionErrorSchema)(error)
 }
 
 export function acnAvailabilityErrorMessage(error: AcnAvailabilityError): string {
-  return `Magnitude service unavailable:\n${formatAcnEnsuranceError(error)}`
+  return `Magnitude service unavailable:\n${formatConnectionError(error)}`
 }
 
 function caughtErrorDetails(error: unknown): string {

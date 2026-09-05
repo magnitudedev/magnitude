@@ -1,17 +1,9 @@
 import { describe, expect, test } from "vitest"
 import { Option, Schema } from "effect"
 import { Registry } from "@effect-atom/atom-react"
-import {
-  AcnRecovering,
-  AcnLifecycleStateSchema,
-  ModelSlotConfiguredLocal,
-  ModelSlotUnassigned,
-  PRIMARY_SLOT_ID,
-  ProviderIdSchema,
-  ProviderModelIdSchema,
-  ReasoningEffortSchema,
-  SECONDARY_SLOT_ID,
-} from "@magnitudedev/sdk"
+import { ServiceRecovering } from "../connection/connection"
+import { ModelSlotConfiguredLocal, ModelSlotUnassigned, PRIMARY_SLOT_ID, ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema, SECONDARY_SLOT_ID } from "@magnitudedev/sdk"
+import { ServiceLifecycleStateSchema } from "../connection/lifecycle"
 import {
   deriveAcnRecoveryNotificationState,
   deriveSelectedModelResidencyNotificationState,
@@ -37,9 +29,9 @@ const notification = (
 
 describe("notification area state", () => {
   test("projects active service recovery without blocking the application", () => {
-    const state = new AcnRecovering({
+    const state = new ServiceRecovering({
       occurrence: 1,
-      lifecycle: Schema.decodeUnknownSync(AcnLifecycleStateSchema)({
+      lifecycle: Schema.decodeUnknownSync(ServiceLifecycleStateSchema)({
         _tag: "Starting",
         phase: "LaunchingLocalInference",
       }),

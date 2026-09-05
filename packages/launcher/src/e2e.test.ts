@@ -143,6 +143,8 @@ const writeReleaseFiles = async (version: string, artifact: Buffer): Promise<voi
     schemaVersion: 2,
     version,
     acnRevision: 1,
+    rpc: { version: 1, fingerprint: "a".repeat(64) },
+    plugins: [{ host: "pi", name: "@magnitudedev/pi-extension", version: "0.0.1", rpcVersion: 1, contentFingerprint: "a".repeat(64), filename: "pi.tgz", integrity: "sha512-dGVzdA==" }],
     tag: releaseTag(version),
     sourceCommit: "a".repeat(40),
     artifacts: [{

@@ -9,42 +9,21 @@
     ".": {
       "types": "./src/index.ts",
       "import": "./src/index.ts"
-    },
-    "./protocol": {
-      "types": "./src/protocol.ts",
-      "import": "./src/protocol.ts"
-    },
-    "./bun": {
-      "types": "./src/bun.ts",
-      "import": "./src/bun.ts"
-    },
-    "./sqlite-driver": {
-      "types": "./src/sqlite-driver.ts",
-      "import": "./src/sqlite-driver.ts"
     }
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@magnitudedev/integration-protocol": "workspace:*",
-    "@effect-atom/atom": "^0.5.3",
     "effect": "^3.21.2",
     "@effect/platform": "^0.96.0",
-    "@effect/opentelemetry": "^0.63.0",
     "@effect/rpc": "0.75.1",
     "@magnitudedev/ai": "workspace:*",
-    "@magnitudedev/providers": "workspace:*",
     "@magnitudedev/acn-protocol": "workspace:*",
-    "@magnitudedev/effect-query": "workspace:*",
     "@magnitudedev/icn-protocol": "workspace:*",
     "@magnitudedev/openapi-effect": "workspace:*",
-    "@magnitudedev/release": "workspace:*",
-    "@magnitudedev/storage": "workspace:*",
-
     "@magnitudedev/roles": "workspace:*",
-    "@magnitudedev/utils": "workspace:*",
-    "@magnitudedev/version": "workspace:*"
+    "@magnitudedev/utils": "workspace:*"
   },
   "devDependencies": {
     "@effect/platform-bun": "^0.90.0",

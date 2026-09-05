@@ -68,8 +68,20 @@ const previousPackageJson = JSON.parse(await run([
   "show",
   `${releaseCommit}^:packages/launcher/package.json`,
 ], { cwd: PROJECT_ROOT })) as { readonly version?: string }
-if (!previousPackageJson.version || previousPackageJson.version === version) {
-  throw new Error("release commit did not change the Changesets-owned CLI version")
+if (!previousPackageJson.version) {
+  throw new Error("release commit has no previous Changesets-owned CLI version")
+}
+if (previousPackageJson.version === version) {
+  // A Version PR may change only plugins. It must still have changed the release plan.
+  const planAt = (ref: string) => run([
+    "git",
+    "show",
+    `${ref}:packages/release/release-plan.json`,
+  ], { cwd: PROJECT_ROOT }).catch(() => undefined)
+  const [before, after] = await Promise.all([planAt(`${releaseCommit}^`), planAt(releaseCommit)])
+  if (after === undefined || before === after) {
+    throw new Error("release commit changed neither the Changesets-owned CLI version nor the release plan")
+  }
 }
 await run([
   "git",

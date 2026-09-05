@@ -10,8 +10,10 @@ clients (cli/web) → client-common → sdk → acn (daemon)
 ```
 
 - **Clients** import only from `@magnitudedev/client-common` and `@magnitudedev/sdk`. Never from `acn`, `agent`, `acn-protocol`, `ai`, or `providers` directly.
-- **client-common** — shared state, hooks, display sync. Uses one connection-scoped Effect Query `AgentClient` over the SDK-provided ACN transport.
-- **sdk** — typed RPC client, daemon lifecycle (`DaemonSpawner`), `ProviderClient`, binary resolution. Re-exports ACN protocol types.
+- **client-common** — shared state, hooks, display sync. Uses one connection-scoped Effect Query `AgentClient` over the shared SDK instance.
+- **sdk** — private, portable Effect RPC client, fixed-endpoint admission/recovery, and optional service-starter capability. Re-exports pure protocol contracts; no SQLite, process supervision, or query cache.
+- **daemon-management** — private owner-store, process supervision, binary acquisition, and OS-service implementation. Only privileged host composition roots (CLI bootstrap, desktop main, development server) import it.
+- **client-common** owns first-party Query/Mutation/Subscription definitions over SDK operations; `providers` owns provider-client construction.
 - **acn** — server daemon hosting agent runtime, sessions, file ops, display streams. Implements ACN protocol RPCs.
 - **acn-protocol** — wire contract (RPCs, schemas) shared by SDK and ACN. Not imported by clients.
 - **ai** — provider-agnostic contract (`Provider`, `ModelCatalog`, `BoundModel`, `BaseCallOptions`).
@@ -21,7 +23,11 @@ clients (cli/web) → client-common → sdk → acn (daemon)
 - **roles** — role/slot definitions for worker specialization.
 - **storage** — persistent session/config/auth storage.
 
-If a client needs something not in the SDK/ACN: declare it once with a core Effect Query primitive in the appropriate `packages/acn-protocol/src/boundary/` domain group, implement its handler under `packages/acn/src/boundary/`, and consume the group member through the SDK. `AcnRpc` derives the complete RPC protocol from `AcnBoundary` automatically. Add a `client-common` hook if shared.
+For a new backend operation, declare its `Rpc.make` once in the appropriate `packages/acn-protocol/src/boundary/` domain, implement its handler in ACN, and consume the derived SDK method. Add first-party caching/synchronization policy in `packages/client-common/src/operations/` as needed. Effect Query does not generate RPCs. The SDK may ask an injected starter to ensure availability; only daemon-management interprets SQLite/process coordination. Plugin packages bundle the private SDK and inherit its exact RPC-version check.
+
+Finite RPC declarations must apply `replaySafe` or `atMostOnce`; the RPC tree requires a declared
+replay policy. Release preparation, Changesets orchestration, and protocol/plugin version allocation
+belong in `packages/release`; `packages/version` only generates build identity.
 
 ## Session Inspection
 

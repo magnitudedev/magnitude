@@ -2,10 +2,8 @@ import { useCallback } from "react"
 import { Atom, Registry, Result, useAtomSet } from "@effect-atom/atom-react"
 import { Context, Effect, Layer } from "effect"
 import { Mutation, QueryClient } from "@magnitudedev/effect-query"
-import {
-  Models,
-  type CatalogFormModelId,
-} from "@magnitudedev/sdk"
+import { Models } from "../operations"
+import { type CatalogFormModelId } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 import { ClientEffectQuery } from "../state/client-effect-query"
 import { localModelsFromCatalog } from "../model-catalog/projection"

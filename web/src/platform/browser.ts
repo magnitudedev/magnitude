@@ -3,14 +3,10 @@
  *
  * Uses browser APIs: localStorage, navigator.clipboard, window.open, fetch.
  */
-import { Effect, Exit, Scope } from "effect"
+import { Effect, Exit, Layer, Scope } from "effect"
 import { FetchHttpClient } from "@effect/platform"
-import {
-  AcnInstanceManager,
-  makeAcnConnection,
-  makeRemoteAcnInstanceManager,
-  type AcnConnection,
-} from "@magnitudedev/sdk"
+import { MagnitudeClient, MagnitudeServiceStarter } from "@magnitudedev/sdk"
+import { makeFirstPartyConnection, makeRemoteServiceStarter, type FirstPartyConnection } from "@magnitudedev/client-common"
 import type {
   Platform,
   Storage,
@@ -121,16 +117,17 @@ const browserDialogs: Dialogs = {
 
 export async function createBrowserAcnConnection(
   proxyUrl: string = window.location.origin
-): Promise<AcnConnection> {
-  const manager = await Effect.runPromise(
-    makeRemoteAcnInstanceManager(proxyUrl).pipe(
+): Promise<FirstPartyConnection> {
+  const starter = await Effect.runPromise(
+    makeRemoteServiceStarter(proxyUrl).pipe(
       Effect.provide(FetchHttpClient.layer)
     )
   )
   const acnScope = await Effect.runPromise(Scope.make())
   const connection = await Effect.runPromise(
-    makeAcnConnection().pipe(
-      Effect.provideService(AcnInstanceManager, manager),
+    makeFirstPartyConnection(MagnitudeClient.layer({ origin: `${proxyUrl}/acn` }).pipe(
+      Layer.provide([FetchHttpClient.layer, Layer.succeed(MagnitudeServiceStarter, starter)]),
+    )).pipe(
       Effect.provideService(Scope.Scope, acnScope),
       Effect.provide(FetchHttpClient.layer)
     )
@@ -138,7 +135,7 @@ export async function createBrowserAcnConnection(
   const close = await Effect.runPromise(Effect.cached(
     connection.close.pipe(Effect.ensuring(Scope.close(acnScope, Exit.void))),
   ))
-  const scopedConnection: AcnConnection = { ...connection, close }
+  const scopedConnection: FirstPartyConnection = { ...connection, close }
   window.addEventListener("pagehide", (event) => {
     if (event.persisted) return
     Effect.runFork(scopedConnection.close)

@@ -3,7 +3,7 @@ applies_to:
   - inference/crates/icn-api/**
   - inference/crates/icn-server/**
   - packages/icn-protocol/**
-  - packages/sdk/src/acn-jit/**
+  - packages/daemon-management/src/acn-jit/**
   - packages/acn/src/service-lifecycle.ts
   - packages/acn/src/server.ts
   - cli/src/**

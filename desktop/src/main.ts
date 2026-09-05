@@ -1,3 +1,5 @@
+import { makeServiceStarter } from "@magnitudedev/daemon-management"
+import { ServiceStartFailed } from "@magnitudedev/sdk"
 /**
  * Electron main entry — spec §5.1
  *
@@ -31,20 +33,10 @@ import {
   makeEmbeddedBrowserLive,
   type EmbeddedBrowserService,
 } from "./embedded-browser"
-
 // SDK imports — these run in the main process (Node)
-import {
-  makeLocalAcnInstanceManager,
-  ChildProcessSpawner,
-  scopeAcnCandidate,
-  AcnCandidateBootstrapProcessExitUnproven,
-  AcnCandidateBootstrapProcessStopFailed,
-  AcnCandidateParentChannelReleaseFailed,
-  AcnCandidateSpawnFailed,
-  ACN_EXECUTABLE_NAME,
-  SDK_ACN_TARGET,
-  type AcnInstanceManager as AcnInstanceManagerService,
-} from "@magnitudedev/sdk"
+import { makeLocalAcnInstanceManager, ChildProcessSpawner, scopeAcnCandidate, AcnCandidateBootstrapProcessExitUnproven, AcnCandidateBootstrapProcessStopFailed, AcnCandidateParentChannelReleaseFailed, AcnCandidateSpawnFailed, DAEMON_TARGET, type AcnInstanceManager as AcnInstanceManagerService } from "@magnitudedev/daemon-management"
+// SDK imports — these run in the main process (Node)
+import { ACN_EXECUTABLE_NAME } from "@magnitudedev/daemon-management"
 
 // ESM doesn't have __dirname — polyfill it
 const __dirname = nodePath.dirname(fileURLToPath(import.meta.url))
@@ -432,6 +424,7 @@ function defaultLaunchCommand(): Option.Option<Arr.NonEmptyReadonlyArray<string>
     : Option.none()
 }
 
+
 function localDaemonOptions() {
   const binaryPath = findBinaryPath()
   const developmentDataDir = process.env["MAGNITUDE_DEV_DATA_DIR"]
@@ -445,7 +438,7 @@ function localDaemonOptions() {
       onNone: () => ({}),
       onSome: (command) => ({
         launchOverride: {
-          target: SDK_ACN_TARGET,
+          target: DAEMON_TARGET,
           command,
         },
       }),
@@ -502,9 +495,10 @@ const browserRpc = <A>(
   )
 
 const DesktopRpcHandlersLive = DesktopRpcs.toLayer({
-  AcnEnsure: (request) => Stream.unwrap(
+  ServiceStart: () => Stream.unwrap(
     acnManager.pipe(
-      Effect.map((manager) => manager.ensure(request)),
+      Effect.mapError(error => new ServiceStartFailed({ message: String(error) })),
+      Effect.map((manager) => makeServiceStarter(manager).start),
     ),
   ),
   StorageGet: ({ key }) => Effect.sync(() => storageGet(key)),
@@ -617,6 +611,3 @@ app.on("will-quit", () => {
     Effect.runPromise(Scope.close(scope, Exit.void)),
   )
 })
-
-// The renderer releases its local ACN client resources before unload. Renderer
-// teardown does not mutate ACN lifetime.

@@ -1,6 +1,6 @@
 {
   "name": "@magnitudedev/pi-extension",
-  "version": "0.0.1",
+  "version": "0.0.0",
   "description": "Magnitude model controls and inference progress for Pi",
   "type": "module",
   "license": "MIT",
@@ -28,17 +28,22 @@
     "@earendil-works/pi-tui": ">=0.83.0"
   },
   "devDependencies": {
+    "@effect/platform-bun": "^0.90.0",
+    "@magnitudedev/release": "workspace:*",
     "@magnitudedev/utils": "workspace:*",
     "@earendil-works/pi-ai": "0.84.4",
     "@earendil-works/pi-coding-agent": "0.84.4",
     "@earendil-works/pi-tui": "0.84.4",
     "@types/bun": "1.3.14",
     "typescript": "^5.8.3",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "@magnitudedev/sdk": "workspace:*"
   },
   "dependencies": {
-    "@magnitudedev/integration-protocol": "0.0.1",
-    "effect": "3.21.2"
+    "effect": "3.21.2",
+    "@effect/platform": "0.96.1",
+    "@effect/platform-node": "0.107.0",
+    "@effect/rpc": "0.75.1"
   },
   "keywords": [
     "pi-package",

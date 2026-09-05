@@ -1,5 +1,6 @@
-import { Effect, Schema } from "effect"
-import { Group, Mutation, Query, QueryClient } from "@magnitudedev/effect-query"
+import { Rpc } from "@effect/rpc"
+import { replaySafe } from "../transport/recovery"
+import { Schema } from "effect"
 import { ProviderIdSchema } from "@magnitudedev/ai/provider/model"
 import {
   SessionError,
@@ -10,7 +11,7 @@ import {
 } from "../schemas/cloud-usage"
 import { ProviderAuthSchema } from "../schemas/provider-auth"
 
-const GetProviderAuth = Query.make("GetProviderAuth", {
+const GetProviderAuth = Rpc.make("GetProviderAuth", {
   payload: Schema.Struct({
     providerId: ProviderIdSchema,
   }),
@@ -18,31 +19,26 @@ const GetProviderAuth = Query.make("GetProviderAuth", {
     auth: Schema.optionalWith(ProviderAuthSchema, { as: "Option", exact: true }),
   }),
   error: SessionError,
-})
+}).pipe(replaySafe)
 
-const ListProviderAuth = Query.make("ListProviderAuth", {
+const ListProviderAuth = Rpc.make("ListProviderAuth", {
   payload: Schema.Struct({}),
   success: Schema.Struct({
     auths: Schema.Record({ key: ProviderIdSchema, value: ProviderAuthSchema }),
   }),
   error: SessionError,
-})
+}).pipe(replaySafe)
 
-/** Provider auth is not poked by the ACN; the command rereads what it changed. */
-const UpdateProviderAuth = Mutation.make("UpdateProviderAuth", {
-  policy: { recovery: "ReplaySafe" },
+const UpdateProviderAuth = Rpc.make("UpdateProviderAuth", {
   payload: Schema.Struct({
     providerId: ProviderIdSchema,
     auth: ProviderAuthSchema,
   }),
   success: Schema.Struct({}),
   error: SessionError,
-  synchronize: (_, { providerId }) => QueryClient.invalidate(GetProviderAuth.match({ providerId })).pipe(
-    Effect.zipRight(QueryClient.invalidate(ListProviderAuth.match())),
-  ),
-})
+}).pipe(replaySafe)
 
-const GetCloudUsage = Query.make("GetCloudUsage", {
+const GetCloudUsage = Rpc.make("GetCloudUsage", {
   payload: Schema.Struct({
     period: Schema.optional(UsagePeriod),
     days: Schema.optional(Schema.Number),
@@ -50,17 +46,11 @@ const GetCloudUsage = Query.make("GetCloudUsage", {
   }),
   success: CloudUsageResponse,
   error: SessionError,
-})
+}).pipe(replaySafe)
 
-/**
- * Primary-model selection and work admission share one serialization boundary:
- * a turn must never observe the selection before its mutation has synchronized.
- */
-export const turnAdmissionScope = Mutation.MutationScope("turn-admission")
-
-export const Configuration = Group.make({
-  GetProviderAuth,
-  ListProviderAuth,
-  UpdateProviderAuth,
-  GetCloudUsage,
-})
+export const Configuration = {
+  getProviderAuth: GetProviderAuth,
+  listProviderAuth: ListProviderAuth,
+  updateProviderAuth: UpdateProviderAuth,
+  getCloudUsage: GetCloudUsage,
+}

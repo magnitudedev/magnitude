@@ -112,11 +112,10 @@ const OnboardingModelSetupLive = Layer.effect(
 ```
 
 The renderer composition root assembles the complete Layer graph into the connection's existing
-Effect Atom runtime: `createAgentClient(protocolLayer)` is
-`Client.make(AcnBoundary, AcnRpc.layer(AcnBoundary).pipe(Layer.provide(protocolLayer)), (client) =>
-clientServicesLayer(client, …))` — the group the client is made for, the RPC-derived implementation
-Layer, and the client services Layer, in that order. The graph is acquired once for the paired
-connection and Atom registry. A connection change requires a new registry scope; release of that
+Effect Atom runtime. `createAgentClient(sdk)` provides that same `MagnitudeClient` to the
+application operation graph and its composed client services. Client-common definitions call SDK
+operations through DI; there is no RPC adapter or transport reconstruction in Effect Query. The graph is acquired once for the paired
+connection and Atom registry. A new user-owned SDK connection requires a new registry scope; daemon recovery within that SDK does not. Release of that
 scope interrupts all scoped resources and discards all client-owned Atom state.
 
 There is no process-global client Layer and no second domain runtime. Infrastructure needed by
@@ -179,7 +178,7 @@ Query entries, Mutation materializations, or registry state by identity when cac
 responsibility. Such a cache must not be used to manufacture domain-service identity or replace
 Layer scope.
 
-The members of the group client are also different: `Client.make(AcnBoundary, …)` carries every
+The members of the group client are also different: `Client.make(AcnQueries, …)` carries every
 boundary operation, materialized, at its group name (`client.Sessions.GetSession(input)`,
 `client.Agent.SendMessage`). Those are the state mechanism's own surface, derived from the boundary
 group the client is made for — not domain services attached to a client object. Domain services

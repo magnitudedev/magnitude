@@ -1,0 +1,28 @@
+{
+  "name": "@magnitudedev/daemon-management",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./bun": "./src/bun.ts",
+    "./sqlite-driver": "./src/sqlite-driver.ts",
+    "./service": "./src/service.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@effect/platform": "^0.96.0",
+    "@magnitudedev/acn-protocol": "workspace:*",
+    "@magnitudedev/release": "workspace:*",
+    "@magnitudedev/utils": "workspace:*",
+    "@magnitudedev/version": "workspace:*",
+    "effect": "3.21.2",
+    "@magnitudedev/sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "@effect/platform-bun": "^0.90.0",
+    "vitest": "^3.2.4"
+  }
+}

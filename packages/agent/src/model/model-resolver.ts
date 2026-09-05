@@ -1,5 +1,6 @@
 import { Context, Effect, Layer, Option } from 'effect'
-import { ProviderClient, ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema, SlotIdSchema, type ProviderId, type ProviderModelId, type ReasoningEffort, type SlotId } from '@magnitudedev/sdk'
+import { ProviderClient, ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema, type ProviderId, type ProviderModelId, type ReasoningEffort } from '@magnitudedev/providers/client'
+import { SlotIdSchema, type SlotId } from '@magnitudedev/acn-protocol'
 import { AmbientServiceTag, type AmbientService } from '@magnitudedev/event-core'
 import type { RoleId } from '../agents/role-validation'
 import { ConfigAmbient, getSlotConfig, getSlotConfigForRole, type SlotConfig } from '../ambient/config-ambient'

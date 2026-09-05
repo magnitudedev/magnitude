@@ -7,7 +7,7 @@ import {
 } from "@magnitudedev/acn-protocol"
 import { IcnInstances } from "@magnitudedev/icn"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
-import { ReasoningEffortSchema } from "@magnitudedev/sdk"
+import { ReasoningEffortSchema } from "@magnitudedev/providers/client"
 import { MagnitudeStorage, type MagnitudeStorageShape } from "@magnitudedev/storage"
 import { AcnChanges } from "./changes"
 import { LocalModels } from "./local-models"
