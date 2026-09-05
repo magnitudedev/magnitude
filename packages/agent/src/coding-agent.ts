@@ -93,9 +93,10 @@ import { collectSessionContext } from './util/collect-session-context'
 // Engine layers
 
 import { AgentModelResolverLive } from './model/model-resolver'
-
 // Config & Auth
-import { ProviderClient, SlotIdSchema, type ProviderClientShape } from '@magnitudedev/sdk'
+import { ProviderClient, type ProviderClientShape } from '@magnitudedev/providers/client'
+// Config & Auth
+import { SlotIdSchema } from '@magnitudedev/acn-protocol'
 import type { DisplayViewShape, DisplayViewSnapshot } from '@magnitudedev/acn-protocol'
 import type { ForkTurnState } from './projections/turn'
 import type { AgentLifecycleState } from './projections/agent-lifecycle'

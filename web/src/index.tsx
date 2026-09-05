@@ -8,7 +8,7 @@ export {
   usePlatform,
   createAgentClient,
   AgentClientProvider,
-  AcnStartupProvider,
+  ServiceStartupProvider,
   useAgentClient,
   type AgentClient,
   type Platform,

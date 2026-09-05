@@ -18,14 +18,14 @@ import {
 import type {
   BaseCallOptions,
   ProviderRejection,
-} from '@magnitudedev/sdk'
+} from '@magnitudedev/providers/client'
 import {
   ModelSlotConfiguredRemote,
   PRIMARY_SLOT_ID,
   SECONDARY_SLOT_ID,
   type ModelSlotsState,
   type ProviderModelCatalogEntry,
-} from '@magnitudedev/sdk'
+} from '@magnitudedev/acn-protocol'
 import type { JsonValue } from '@magnitudedev/ai'
 import { advisorWindowToPrompt } from '../src/window/render'
 import type { ForkWindowState, WindowEntry } from '../src/window'

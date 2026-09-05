@@ -2,15 +2,8 @@ import { Registry } from "@effect-atom/atom-react"
 import { Deferred, Effect, Fiber, Option } from "effect"
 import { describe, expect, it } from "vitest"
 import { Client, Mutation } from "@magnitudedev/effect-query"
-import {
-  MagnitudeBoundary,
-  PRIMARY_SLOT_ID,
-  SECONDARY_SLOT_ID,
-  ProviderIdSchema,
-  ProviderModelIdSchema,
-  ReasoningEffortSchema,
-  type ModelSlotsState,
-} from "@magnitudedev/sdk"
+import { AcnQueries as MagnitudeBoundary } from "../operations"
+import { PRIMARY_SLOT_ID, SECONDARY_SLOT_ID, ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema, type ModelSlotsState } from "@magnitudedev/sdk"
 import { clientServicesLayer, type ClientServices } from "../state/client-services"
 import type { AcnClientRequirements } from "../state/agent-client"
 import { fakeAcnImplementationsLayer } from "../state/fake-acn-implementations"

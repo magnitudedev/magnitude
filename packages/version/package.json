@@ -10,5 +10,8 @@
     "generate:dev": "bun run scripts/generate-version.ts --dev",
     "test": "bunx --bun vitest run",
     "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "vitest": "^3.2.4"
   }
 }

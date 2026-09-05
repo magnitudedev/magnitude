@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Effect, Option, Schema } from "effect";
-import { AcnHealthResponseSchema } from "@magnitudedev/acn-protocol";
+import { AcnHealthResponseSchema, MAGNITUDE_RPC_VERSION } from "@magnitudedev/acn-protocol";
 import { makeHealthResponse } from "./identity";
 
 describe("ACN identity", () => {
@@ -11,6 +11,7 @@ describe("ACN identity", () => {
       service: "magnitude-acn",
       version: "1.2.3",
       revision: 42,
+      rpcVersion: MAGNITUDE_RPC_VERSION,
       id: "owner-1",
       pid: 1234,
       state: { _tag: "Ready" },

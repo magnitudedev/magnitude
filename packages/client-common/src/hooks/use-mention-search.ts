@@ -4,7 +4,7 @@
 import { useMemo } from "react"
 import { useAtomSet } from "@effect-atom/atom-react"
 import { QueryClient } from "@magnitudedev/effect-query"
-import { Files } from "@magnitudedev/sdk"
+import { Files } from "../operations"
 import { useAgentClient } from "../state/agent-client-context"
 import type { MentionSearchClient } from "./use-file-mentions"
 

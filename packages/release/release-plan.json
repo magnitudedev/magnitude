@@ -1,0 +1,24 @@
+{
+  "format": 2,
+  "cliVersion": "0.0.11",
+  "revision": 28,
+  "rpc": {
+    "version": 1,
+    "fingerprint": "dfba86a156b5dd9647f66bead4d1ed2b22809fb7003955caa94adf6690f5b66f"
+  },
+  "semanticBreaks": [],
+  "plugins": [
+    {
+      "artifact": {
+        "host": "pi",
+        "name": "@magnitudedev/pi-extension",
+        "version": "0.0.0",
+        "rpcVersion": 1,
+        "contentFingerprint": "0cae890db353d9f063a1298bd0f770259d18a27692c4c392fd7561c031e5792c",
+        "filename": "magnitudedev-pi-extension-0.0.0.tgz",
+        "integrity": "sha512-42mcfwQ5tW/061hjTCDu0X4MQhqHlVE+wkj5fR0i+tIalCjEQgjMwzPv02ok1C1Zu5+MVesYefl/hOft2s4vDw=="
+      },
+      "publish": false
+    }
+  ]
+}

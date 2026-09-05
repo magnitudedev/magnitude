@@ -5,7 +5,7 @@ export default defineConfig({
   resolve: {
     alias: [
       { find: "@", replacement: resolve(__dirname, "src") },
-      { find: /^@magnitudedev\/sdk$/, replacement: resolve(__dirname, "../packages/sdk/src/browser.ts") },
+      { find: /^@magnitudedev\/sdk$/, replacement: resolve(__dirname, "../packages/sdk/src/index.ts") },
       { find: "@magnitudedev/client-common", replacement: resolve(__dirname, "../packages/client-common/src/index.ts") },
     ],
   },

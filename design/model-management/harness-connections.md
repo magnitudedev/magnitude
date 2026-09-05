@@ -224,11 +224,28 @@ throughput sums tokens and decode time once for each successful response's final
 uses monotonic time. Starting another run, cancellation, failure, switching providers, or extension disposal clears
 the retained summary and restores Pi's default working message.
 
-The extension owns a scoped observer, live-row timer, and subprocess lifetime. Disposing it cancels
+The extension bundles the private SDK and owns one SDK scope, inference observer, and live-row timer.
+Model commands use existing RPC; the injected SDK starter runs `magnitude service start` when needed.
+The SDK checks the exact RPC version and instance identity. CLI connection management installs the
+exact generated plugin version when nothing usable is present. An installed package of any version
+is compatible when its recorded file hashes verify and its declared RPC version equals the CLI's;
+no other check applies. Unrelated user-owned packages are not replaced.
+
+On a protocol mismatch from an explicit model command, the Pi extension runs
+`magnitude connections sync pi` once per loaded extension, through the same CLI executable used
+for service startup. Concurrent mismatches cannot launch another sync. The CLI selects its own
+exact plugin pin and preserves the ordinary connection ownership rules; the plugin does not select
+versions or install packages directly. Successful sync reloads Pi through its command-context API,
+after leaving the old runtime's scoped work, and ends the old callback without replaying the model
+command. Autocomplete and inference callbacks never install or reload software. Failed or cancelled
+sync does not reload; persistent mismatch requires manual action, not another automatic attempt.
+The SDK continues to report mismatches without owning plugin repair or CLI upgrades.
+
+The extension owns the starter and sync commands' scoped lifetimes. Disposing it cancels
 pending work; terminal request handles and older runs cannot mutate newer presentation. Presentation
 failures do not prevent inference. Status completion lookups share in-flight work and briefly cache
 ready discovery, but never cache initialization or failure. Explicit model selection refreshes status.
-Loading is acknowledged only after server readiness, with a longer bound than discovery or stop.
+Loading is acknowledged only after server readiness, without interpreting CLI output as a model-control protocol.
 
 The repository exposes one `dev:pi` entrypoint. It waits up to 30 seconds for an installed Magnitude
 model to appear, including when initial status snapshots are ready but empty, then selects it, connects

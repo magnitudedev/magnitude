@@ -3,9 +3,9 @@ import type {
   AgentClient,
   Platform,
 } from "@magnitudedev/client-common"
-import type { AcnStartup } from "@magnitudedev/sdk"
+import type { ServiceStartup } from "@magnitudedev/client-common"
 import {
-  AcnStartupProvider,
+  ServiceStartupProvider,
   AgentClientProvider,
   DisplayViewControllerProvider,
   PlatformProvider,
@@ -20,18 +20,18 @@ export function CliApplicationRoot({
 }: {
   readonly platform: Platform
   readonly agentClient: AgentClient
-  readonly startup: AcnStartup
+  readonly startup: ServiceStartup
   readonly app: CliAppProps
 }): ReactNode {
   return (
     <PlatformProvider platform={platform}>
-      <AcnStartupProvider startup={startup}>
+      <ServiceStartupProvider startup={startup}>
         <AgentClientProvider tag={agentClient}>
           <DisplayViewControllerProvider>
             <CliApp {...app} />
           </DisplayViewControllerProvider>
         </AgentClientProvider>
-      </AcnStartupProvider>
+      </ServiceStartupProvider>
     </PlatformProvider>
   )
 }

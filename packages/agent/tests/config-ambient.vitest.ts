@@ -1,19 +1,7 @@
 import { Option } from 'effect'
 import { describe, expect, it } from 'vitest'
-import {
-  ModelSlotConfiguredLocal,
-  ModelSlotConfiguredRemote,
-  ModelSlotUnassigned,
-  ModelVariantLabelSchema,
-  PRIMARY_SLOT_ID,
-  ProviderIdSchema,
-  ProviderModelIdSchema,
-  ReasoningEffortSchema,
-  SECONDARY_SLOT_ID,
-  type ModelSlotsState,
-  type ProviderModelCatalogEntry,
-  type SlotSelection,
-} from '@magnitudedev/sdk'
+import { ModelSlotConfiguredLocal, ModelSlotConfiguredRemote, ModelSlotUnassigned, ModelVariantLabelSchema, PRIMARY_SLOT_ID, SECONDARY_SLOT_ID, type ModelSlotsState, type ProviderModelCatalogEntry, type SlotSelection } from '@magnitudedev/acn-protocol'
+import { ProviderIdSchema, ProviderModelIdSchema, ReasoningEffortSchema } from '@magnitudedev/providers/client'
 import { buildConfigStateFromSlots } from '../src/ambient/config-ambient'
 
 describe('agent model configuration boundary', () => {

@@ -10,7 +10,7 @@ import {
   ProviderIdSchema,
   ProviderModelIdSchema,
   ReasoningEffortSchema,
-} from "@magnitudedev/sdk"
+} from "@magnitudedev/providers/client"
 import {
   localModelSlotAvailability,
   selectableModelCapabilities,

@@ -3,6 +3,8 @@ export default [
   'packages/acn',
   'packages/acn-protocol',
   'packages/sdk',
+  'packages/daemon-management',
+  'packages/release',
   'packages/storage',
   'packages/client-common',
   'packages/providers',

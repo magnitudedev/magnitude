@@ -107,75 +107,33 @@ const cacheProgram = Effect.gen(function*() {
 `fetch` and `ensure` preserve the query's exact error type. Broad filtered `refetch`
 instead returns `QueryBatchError`, because matches may have unrelated error types.
 
-## RPC-backed definitions (`@magnitudedev/effect-query/rpc`)
+## SDK-backed definitions
 
-Core Effect Query defines the runtime operation values and grouping mechanism. A protocol package
-uses `Query.make`, `Mutation.make`, `Subscription.make`, `Query.fromStream`, and `Group.make` once,
-then gives the resulting group to the RPC adapter. The adapter derives `@effect/rpc` clients and
-servers from those same values; application code never declares a parallel RPC registry. Core
-Effect Query has no RPC or transport concept. Execution is supplied through its generic
-implementation service.
+RPC contracts are independent of Effect Query. Define cache and mutation policy around ordinary
+Effect SDK operations; derive payload keys from their existing schemas.
 
 ```ts
-import { Effect, Schema } from "effect"
-import { Client, Group, Mutation, Query, QueryClient, Subscription } from "@magnitudedev/effect-query"
-import * as RpcAdapter from "@magnitudedev/effect-query/rpc"
+import { Effect, Layer } from "effect"
+import { Group, Query, Mutation, Operation, Client } from "@magnitudedev/effect-query"
+import { MagnitudeClient, Sessions as SessionRpcs } from "@magnitudedev/sdk"
 
-export const AcnRpc = RpcAdapter.make()
-
-const GetSession = Query.make("GetSession", {
-  payload: { sessionId: Schema.String },
-  success: SessionSchema,
-  error: SessionError,
-  staleTime: "30 seconds"
+const GetSession = Query.make(SessionRpcs.getSession._tag, {
+  key: Operation.payloadKey(SessionRpcs.getSession.payloadSchema),
+  effect: (input: Parameters<MagnitudeClient["sessions"]["getSession"]>[0]) =>
+    Effect.flatMap(MagnitudeClient, sdk => sdk.sessions.getSession(input)),
+  staleTime: "30 seconds",
 })
-
-const DeleteSession = Mutation.make("DeleteSession", {
-  payload: { sessionId: Schema.String },
-  success: Schema.Struct({}),
-  error: SessionError,
-  scope: ({ sessionId }) => Mutation.MutationScope(`session:${sessionId}`),
-  synchronize: (_, payload) => QueryClient.remove(GetSession.match(payload))
-})
-
-const StreamChanges = Subscription.make("StreamChanges", {
-  payload: {},
-  success: Schema.Struct({ query: Schema.String })
-})
-
-export const Sessions = Group.make({ GetSession, DeleteSession })
-export const Changes = Group.make({ StreamChanges })
-export const AcnBoundary = Group.make({ Sessions, Changes })
+const Sessions = Group.make({ GetSession })
+const Application = Group.make({ Sessions })
+const effectQuery = Client.make(Application, Layer.succeed(MagnitudeClient, existingSdk))
+const session = effectQuery.Sessions.GetSession({ sessionId: "session-1" })
 ```
 
-Servers implement the derived group through `AcnRpc.toLayer(AcnBoundary, handlers)` and serve it
-with `AcnRpc.makeRpcServer(AcnBoundary)`. Clients install RPC-backed implementations with
-`AcnRpc.layer(AcnBoundary)` and make the `Client` **for the group**. The client then carries every
-member of the group, materialized, at its name:
-
-```ts
-const effectQuery = Client.make(AcnBoundary, AcnRpc.layer(AcnBoundary).pipe(Layer.provide(protocolLayer)))
-const session = effectQuery.Sessions.GetSession({ sessionId: "session-1" })   // Query.QueryAtom
-const remove = effectQuery.Sessions.DeleteSession                             // Mutation.MutationAtom
-const changes = effectQuery.Changes.StreamChanges({})                         // Subscription.SubscriptionAtom
-```
-
-A query member is `(input) => QueryAtom`, a mutation member is its `MutationAtom`, a subscription
-member is `(input) => SubscriptionAtom`, and a nested group is its materialized members. Each is
-exactly what the materializer returns for the same definition — the same canonical atom:
-`effectQuery.Sessions.GetSession(input) === effectQuery.query(Sessions.GetSession, input)`. The
-materializers (`query`, `mutation`, `subscription`) remain for definitions outside the group. The
-type is `Client.GroupClient<typeof AcnBoundary, Provided, RuntimeError>`; the members alone are
-`Client.Materialized<typeof AcnBoundary, Provided, RuntimeError>`.
-
-`Client.make(group, …)` checks at construction that every operation of the group can be
-materialized by the client — the constraint the materializers impose per call — and that no
-top-level member is named `runtime`, `query`, `mutation`, or `subscription`.
-
-Cache identity defaults to the canonical structural form of the constructed payload
-(`Key.canonical`); payload, success, and domain-error types come from the operation declaration,
-while implementation failures such as RPC client errors come from the installed implementation
-layer. Declarative `Query.fromStream` defines a query folded over a derived stream RPC.
+Every materialized group member is its canonical atom. Query members return QueryAtoms, mutation
+members are MutationAtoms, and subscription members return SubscriptionAtoms. Payload, success,
+and error types are inferred from the supplied Effect or Stream, not redeclared wire schemas.
+`Client.make` checks that all operation requirements are provided. `Query.fromStream` folds an
+ordinary SDK stream. The library has no RPC declaration, server, transport, or adapter surface.
 
 ## HTTP API-backed definitions
 
@@ -264,7 +222,7 @@ snapshot data:
 ```ts
 import * as Stream from "effect/Stream"
 
-const synchronizeModels = (client: Client.Materialized<typeof AcnBoundary, AcnClientRequirements, never>) =>
+const synchronizeModels = (client: Client.Materialized<typeof Application, AcnClientRequirements, never>) =>
   Subscription.events(client.Models.WatchModelChanges({})).pipe(
     Stream.runForEach((change) =>
       QueryClient.invalidate(Models.GetModel.match({ modelId: change.modelId }))
@@ -272,8 +230,8 @@ const synchronizeModels = (client: Client.Materialized<typeof AcnBoundary, AcnCl
   )
 
 const effectQuery = Client.make(
-  AcnBoundary,
-  AcnRpc.layer(AcnBoundary).pipe(Layer.provide(protocolLayer)),
+  Application,
+  Layer.succeed(MagnitudeClient, existingSdk),
   (client) => Layer.scopedDiscard(Effect.forkScoped(synchronizeModels(client)))
 )
 ```

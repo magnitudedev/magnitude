@@ -7,7 +7,7 @@
 import { Effect, Option, Schema } from 'effect'
 import { JsonRecordSchema, JsonValueSchema, type JsonValue } from '@magnitudedev/utils/schema'
 import { defineHarnessTool } from '@magnitudedev/harness'
-import { ProviderClient, formatWebSearchError } from '@magnitudedev/sdk'
+import { ProviderClient, formatWebSearchError } from '@magnitudedev/providers/client'
 import { ToolErrorSchema } from './errors'
 
 const WebSearchErrorSchema = ToolErrorSchema('WebSearchError', {})

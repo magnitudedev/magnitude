@@ -1,7 +1,5 @@
 import {
-  AcnBoundary,
-  AcnRpc,
-  Configuration,
+  AcnRpcGroup, Configuration,
   Models,
   SessionOperationFailed,
   type DisplayViewShape,
@@ -46,8 +44,7 @@ const normalizeBashOutput = (output: string): string =>
     : output;
 
 /** Exhaustive server implementation of the composed ACN boundary. */
-export const AcnBoundaryLive = AcnRpc.toLayer(AcnBoundary,
-  Effect.gen(function* () {
+export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
     const lifecycle = yield* AcnServiceLifecycle;
     const sessionCommands = yield* SessionCommands;
     const sessionLifecycle = yield* SessionLifecycle;

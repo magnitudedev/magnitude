@@ -10,7 +10,7 @@ import {
   type SlotId,
 } from "@magnitudedev/acn-protocol"
 import { IcnCatalog, IcnCatalogInstallations, IcnClient, IcnInstances } from "@magnitudedev/icn"
-import { projectInferenceLoadPlan } from "@magnitudedev/sdk"
+import { projectInferenceLoadPlan } from "@magnitudedev/acn-protocol"
 import { ModelSlotController } from "./model-slot-controller"
 import { LocalModelRemovals } from "./local-model-removals"
 import { icnCommandFailure, type IcnCommandError } from "./icn-command-failure"

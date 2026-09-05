@@ -9,7 +9,7 @@ import {
   type ProviderModelCatalogEntry,
   type ProviderModelCatalogState,
 } from "@magnitudedev/acn-protocol"
-import type { ProviderId } from "@magnitudedev/sdk"
+import type { ProviderId } from "@magnitudedev/providers/client"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
 import { AcnChanges } from "./changes"
 import { LocalModels } from "./local-models"
@@ -69,6 +69,7 @@ export const projectModelCatalog = (
   return { _tag: "Ready", ...fields }
 }
 
+
 export const ModelCatalogLive: Layer.Layer<
   ModelCatalog,
   never,
@@ -82,7 +83,7 @@ export const ModelCatalogLive: Layer.Layer<
     local.changes.pipe(Stream.map(() => undefined)),
   )
   yield* sourceChanges.pipe(
-    Stream.runForEach(() => changes.publish({ query: Models.GetCatalog.name })),
+    Stream.runForEach(() => changes.publish({ operation: Models.getCatalog._tag })),
     Effect.forkScoped,
   )
   return ModelCatalog.of({

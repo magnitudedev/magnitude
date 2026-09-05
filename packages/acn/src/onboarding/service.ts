@@ -50,7 +50,7 @@ export const OnboardingLive: Layer.Layer<
     return Onboarding.of({
       state: persisted.state,
       complete: persisted.complete.pipe(
-        Effect.zipRight(changes.publish({ query: OnboardingBoundary.GetOnboardingState.name })),
+        Effect.zipRight(changes.publish({ operation: OnboardingBoundary.getOnboardingState._tag })),
       ),
     })
   }),

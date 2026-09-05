@@ -4,18 +4,11 @@
  * Wraps the `__magnitudeDesktop` DesktopApi exposed by the preload bridge.
  * ACN ensurance remains one contract across the Electron boundary.
  */
-import { Effect, Exit, Schema, Scope, Stream } from "effect"
+import { Effect, Exit, Layer, Option, Schema, Scope, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
-import {
-  AcnEnsuranceFailed,
-  AcnAdministrationFailed,
-  AcnEnsuranceError,
-  AcnInstanceManager,
-  makeAcnConnection,
-  type AcnConnection,
-  type AcnEnsureEvent,
-  type AcnInstanceManager as AcnInstanceManagerService,
-} from "@magnitudedev/sdk"
+import { MagnitudeClient, MagnitudeServiceStarter, ServiceStartErrorSchema, ServiceStartFailed, type ServiceStartError, type ServiceStartProgress } from "@magnitudedev/sdk"
+import { makeFirstPartyConnection } from "@magnitudedev/client-common"
+import { type FirstPartyConnection } from "@magnitudedev/client-common"
 import type {
   Platform,
   Storage,
@@ -27,7 +20,7 @@ import type {
 } from "@magnitudedev/client-common"
 import type { DesktopApi, MenuAction } from "./desktop-rpc"
 import {
-  decodeDesktopAcnEnsureEvent,
+  decodeDesktopServiceStartProgress,
   decodeDesktopBrowserWorkspaceState,
 } from "./desktop-rpc"
 
@@ -75,51 +68,30 @@ let api: DesktopApi
 const errorMessage = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause)
 
-const ensuranceError = (cause: unknown) =>
-  Schema.is(AcnEnsuranceError)(cause)
-    ? cause
-    : new AcnEnsuranceFailed({ reason: errorMessage(cause) })
+const startError = (cause: unknown): ServiceStartError =>
+  Schema.decodeUnknownOption(ServiceStartErrorSchema)(cause).pipe(
+    Option.getOrElse(() => new ServiceStartFailed({ message: errorMessage(cause) })),
+  )
 
-function createDesktopAcnManager(
-  desktopApi: DesktopApi,
-): AcnInstanceManagerService {
-  return AcnInstanceManager.of({
-    ensure: (request) =>
-      Stream.asyncPush<AcnEnsureEvent, AcnEnsuranceError>((emit) =>
-        Effect.acquireRelease(
-          Effect.sync(() =>
-            desktopApi.acnEnsurer.ensure(
-              request,
-              (event) => {
-                try {
-                  emit.single(decodeDesktopAcnEnsureEvent(event))
-                } catch (cause) {
-                  emit.fail(ensuranceError(cause))
-                }
-              },
-              (error) => emit.fail(ensuranceError(error)),
-              () => emit.end(),
-            ),
-          ),
-          (unsubscribe) => Effect.sync(unsubscribe),
-        ).pipe(Effect.asVoid),
-      ),
-    stop: Effect.fail(
-      new AcnAdministrationFailed({
-        reason: "Desktop renderer cannot administer the ACN",
-      }),
-    ),
-  })
+function createDesktopStarter(desktopApi: DesktopApi): MagnitudeServiceStarter {
+  return { start: Stream.asyncPush<ServiceStartProgress, ServiceStartError>(emit =>
+    Effect.acquireRelease(Effect.sync(() => desktopApi.serviceStarter.start(
+      event => { try { emit.single(decodeDesktopServiceStartProgress(event)) } catch (cause) { emit.fail(startError(cause)) } },
+      error => emit.fail(startError(error)),
+      () => emit.end(),
+    )), unsubscribe => Effect.sync(unsubscribe)).pipe(Effect.asVoid),
+  ) }
 }
 
 export async function createDesktopAcnConnection(
   desktopApi: DesktopApi,
-): Promise<AcnConnection> {
-  const manager = createDesktopAcnManager(desktopApi)
+): Promise<FirstPartyConnection> {
+  const starter = createDesktopStarter(desktopApi)
   const acnScope = await Effect.runPromise(Scope.make())
   const connection = await Effect.runPromise(
-    makeAcnConnection().pipe(
-      Effect.provideService(AcnInstanceManager, manager),
+    makeFirstPartyConnection(MagnitudeClient.layer().pipe(Layer.provide([
+      FetchHttpClient.layer, Layer.succeed(MagnitudeServiceStarter, starter),
+    ]))).pipe(
       Effect.provideService(Scope.Scope, acnScope),
       Effect.provide(FetchHttpClient.layer),
     ),
@@ -132,7 +104,7 @@ export async function createDesktopAcnConnection(
 
 export async function createDesktopPlatform(
   desktopApi: DesktopApi,
-  connection: AcnConnection,
+  connection: FirstPartyConnection,
 ): Promise<Platform> {
   api = desktopApi
   let browserSnapshot: BrowserWorkspaceState | null = null

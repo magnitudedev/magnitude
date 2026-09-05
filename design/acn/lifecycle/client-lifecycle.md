@@ -1,217 +1,109 @@
 ---
 applies_to:
-  - packages/sdk/src/acn-jit/acn-recovering-client.ts
-  - packages/sdk/src/acn-jit/acn-instance-manager.ts
-  - packages/sdk/src/acn-jit/local-acn-instance-manager.ts
-  - packages/sdk/src/acn-jit/acn-ensurance-coordinator.ts
-  - packages/sdk/src/acn-jit/remote-acn-instance-manager.ts
+  - packages/sdk/src/client.ts
+  - packages/sdk/src/service-starter.ts
+  - packages/sdk/src/connection-errors.ts
   - packages/sdk/src/jit-rpc/**
-  - packages/client-common/src/state/acn-recovery.ts
-  - packages/client-common/src/state/acn-startup.ts
-  - cli/src/features/app-shell/**
-  - cli/src/platform/**
+  - packages/client-common/src/connection/**
+  - packages/client-common/src/state/service-startup.ts
+  - packages/client-common/src/state/service-recovery.ts
+  - cli/src/server/acn-connection.ts
   - desktop/src/*.ts
   - web/src/platform/**
-  - web/scripts/dev-server.ts
 ---
 
-# ACN client lifecycle
+# SDK connection and first-party presentation
 
-Each interactive client owns one `AcnConnection`. The connection owns the client's effective ACN
-identity, exact selected `AcnInstance<AcnReady>`, single-flight selection, recovering transport,
-startup lifecycle observation, recovery occurrences, and one-way close. It does not interpret
-coordination state, probe health, choose replacement, or manage processes; those belong to
-`AcnInstanceManager`. Host adapters such as the terminal and browser platforms contain only
-environment operations; they do not own service acquisition, transport, startup, or recovery.
+The SDK owns one scoped application connection. Construction and observation are passive. The first
+operation, or explicit `connection.connect`, performs admission. Its state is
+`Idle | Connecting(reason, activity?) | Ready(service) | Failed(error) | Closed`.
 
-These are presentation states, not another ACN service lifecycle.
+## Admission and startup
 
-## Presentation state machine
+Admission probes public health at the configured origin, normally loopback port 10100. A Ready
+response must supply the exact supported RPC version and an instance identity before RPC is
+dispatched. HTTP success, a process, or completion of a starter is not sufficient. Protocol mismatch
+is a typed error; the SDK never negotiates, upgrades, downgrades, or replaces mismatched software.
 
-```text
-initial
-`-- [Checking]
-    +-- startup observation ----------------------> [Starting]
-    +-- installation observation -----------------> [Installing]
-    +-- exact ready selection ---------------------> [Ready]
-    `-- terminal selection failure ---------------> [Failed]
+An absent service may invoke an injected `MagnitudeServiceStarter`. The SDK invokes it at most once
+per admission occurrence, observes progress, then verifies public readiness. An already-starting
+service is observed without invoking another starter. Connect-only clients omit that capability.
+The default absolute admission deadline is ten minutes, including starter execution and health
+waiting. Each health request has a two-second bound.
 
-[Starting]
-    +-- starting phase update ---------------------> [Starting]
-    +-- installation begins -----------------------> [Installing]
-    +-- exact ready selection ---------------------> [Ready]
-    `-- terminal selection failure ---------------> [Failed]
+The CLI starter requires only the abstract Effect Platform CommandExecutor. It runs argv
+`magnitude service start`, drains human output, retains bounded stderr for errors, and owns the
+command's cancellation. It neither uses a shell string nor parses a model-control JSON protocol.
+Missing executable, failed command, unavailable service, malformed health, and protocol mismatch
+remain distinguishable failures.
 
-[Installing]
-    +-- download/progress update ------------------> [Installing]
-    +-- non-download startup work -----------------> [Starting]
-    +-- exact ready selection ---------------------> [Ready]
-    `-- terminal selection failure ---------------> [Failed]
+Privileged first-party hosts can supply a direct starter backed by private daemon-management.
+That package alone owns SQLite coordination, exact-process supervision, binary acquisition, and
+OS service administration. The SDK receives progress or failure, never owner rows or launch
+targets. Desktop and web host bridges carry the same startup-only stream; application RPC remains
+on the existing daemon endpoint.
 
-[Failed]
-    +-- retry observes startup --------------------> [Starting]
-    +-- retry observes installation --------------> [Installing]
-    +-- retry selects an already-ready endpoint --> [Ready]
-    `-- retry fails -------------------------------> [Failed]
+## Concurrency and recovery
 
-[Ready]
-    `-- terminal for startup; endpoint recovery uses a fresh occurrence lifecycle
-```
+Concurrent bootstrap, operation, retry, and recovery calls join one shared admission outcome.
+Cancelling a waiter does not cancel that shared attempt. Closing the SDK cancels it and
+terminalizes all waiters. Admission publication and close share one serialized boundary.
 
-Any non-ready state may reach `Ready` when exact endpoint selection succeeds.
+Every RPC carries the selected instance ID; a successor at the same address rejects stale
+dispatch. Confirmed transport loss re-enters admission. Domain errors and caller cancellation
+do not. Finite operations follow their declaration's replay policy: replay-safe reads may retry;
+ambiguous at-most-once mutations report an unknown outcome rather than duplicate side effects.
+Finite declarations must apply `replaySafe` or `atMostOnce` before entering the RPC tree. The type
+system enforces this, and group construction rejects omissions at runtime. Stream recovery follows
+the stream protocol rather than a finite replay annotation. Error adaptation occurs once while
+mapping the RPC dispatch function onto the SDK namespace, for both unary and streaming calls.
+Subscriptions reopen and reread authority. Repeated attempts without meaningful progress have a
+finite bound; a healthy quiet subscription is kept alive by transport frames.
 
-## Bootstrap presentation phases
+Recovery retains the SDK instance, query cache, UI state, and registry. Client-common owns all
+query invalidation and presentation policy. Reconnection invalidates first-party reads because
+change notifications may have been missed.
 
-The startup lifecycle is a projection of authoritative observations available to the client. An
-already-ready selection may move directly from `Checking` to `Ready`; selection does not synthesize
-`PreparingAcn` merely to prove that it is active. This preserves the warm-start guarantee that the
-CLI can check readiness without painting transient progress.
+## First-party presentation
 
-```text
-Client bootstrap
-|
-+-- Checking                                      no deliberate wait; screen hidden
-|
-+-- Starting
-|   |
-|   +-- PreparingAcn                              "Preparing background server"
-|   |   |
-|   |   +-- read owner store                      normally immediate; SQLite contention <= 30s
-|   |   +-- inspect exact process                 normally immediate; facility retry <= 30s
-|   |   +-- classify owner/process group          one coordination pass
-|   |   +-- probe owner health                    <= 2s per request
-|   |   +-- wait between observations             1s polling interval
-|   |   +-- tolerate unobservable live health     <= 30s
-|   |   +-- supervise stale/obsolete daemon shutdown <= 2s shutdown request + 5s graceful
-|   |   |                                           + 2s TERM + 2s KILL
-|   |   +-- resolve daemon launch material         variable; ensurance remains <= 10m total
-|   |   +-- spawn and inspect candidate            normally immediate
-|   |   +-- await candidate owner admission        <= 30s
-|   |   +-- retain replaced candidate exit proof   2s observation + 1s poll cycles; <= 10m total
-|   |   `-- await first authoritative health       1s polling, <= 2s per request
-|   |
-|   +-- WaitingForOwner                          "Waiting for previous Magnitude process"
-|   |   `-- daemon awaits ownership admission     <= 30s candidate admission bound
-|   |
-|   +-- ResolvingLocalInference                  "Preparing local inference"
-|   |   +-- locate inference-server installation
-|   |   +-- verify executable identity
-|   |   `-- verify API, build, target, capabilities
-|   |                                               all daemon startup work <= 5m total
-|   |
-|   +-- LaunchingLocalInference                  "Starting local inference"
-|   |   +-- spawn inference server
-|   |   +-- await and validate startup record
-|   |   +-- validate loopback health identity
-|   |   `-- commit readiness                       all daemon startup work <= 5m total
-|   |
-|   +-- PreparingBackend                         "Preparing <backend> backend for <hardware>"
-|       +-- CPU
-|       +-- Metal
-|       +-- CUDA
-|       `-- Vulkan                                 all daemon startup work <= 5m total
-|   |
-|       `-- explicit ICN discovery reconciliation  all daemon startup work <= 5m total
-|
-+-- Installing                                    "Installing Magnitude"
-|   |
-|   +-- DownloadingDaemon                         network-dependent; ensurance <= 10m total
-|   +-- DownloadingInferenceEngine                network-dependent; daemon startup <= 5m total
-|   `-- StartingMagnitude                         daemon startup <= 5m total
-|
-+-- FinalizingSelection                            no distinct display; previous phase remains
-|   +-- revalidate exact owner and process         store errors terminal; process retry <= 30s
-|   `-- publish exact RPC endpoint                 atomic with the open/closed check
-|
-+-- Ready                                          terminal successful presentation state
-|
-`-- Failed
-    +-- InstallDaemon
-    +-- LaunchDaemon
-    +-- PrepareLocalInference
-    `-- Connect
+Client-common projects SDK connection state into startup `Checking | Starting | Installing |
+Ready | Failed`. Warm startup can move directly from Checking to Ready without painting progress.
+Installation observations preserve measured download weighting and estimated startup progress.
+A failed retry returns to Checking; initial Ready is terminal.
 
-Absolute selection/ensurance deadline: 10m
-```
+After initial readiness, recovery has a separate occurrence and fresh lifecycle. Existing UI
+notification areas consume `Inactive | Recovering(lifecycle) | Recovered`; they do not remount
+the application or implement another admission/retry engine.
 
-The five-minute daemon-startup ceiling is shared by resolving, installing, launching, and backend
-preparation; it is not a fresh five-minute allowance for each displayed phase. Likewise, the
-ten-minute selection deadline bounds the complete manager occurrence rather than resetting for
-each coordination substate. Network transfers have no independent fixed duration beyond those
-enclosing absolute deadlines.
+`FirstPartyConnection` exposes `ServiceStartup`, `ServiceLifecycle`, and `ServiceRecovery`.
+One scoped observer folds SDK changes into presentation history. The pure reducer consumes
+`Connecting.reason`; it does not infer recovery from independent mutable connection flags. Failed
+recovery and its retries share one notice occurrence, and a later recovery gets a new occurrence.
+Download weighting and clock-driven estimates are pure rendering of that history. Observation
+timers are switched with the current presentation and need no per-recovery fiber bookkeeping.
+The lifecycle module declares whether a model's rendering depends on time; connection composition
+does not inspect installation phases to decide when to tick.
 
-## Association and selection
+CLI update discovery and the update-before-download gate remain before bootstrap. Renderer
+construction remains after readiness. Logging, appearance probing, and shutdown ordering retain
+their existing ownership.
 
-```text
-AcnAssociation
-  identity    monotonic minimum ACN identity
-  selected    optional exact AcnInstance<AcnReady>
-
-ActiveSelection
-  one shared deferred outcome
-```
-
-The association starts at the bundled SDK identity. Only successful ready selection adopts a newer
-identity. The instance manager compares the client's target only with exact live owner health: it
-adopts equal or newer revisions and replaces lower revisions. A historical or dead revision has no
-authority, and losing the selected endpoint never regresses the client's effective identity.
-
-Selection is a true single-flight operation. Bootstrap, retry, and application calls share
-one scoped owner and one exact outcome while selection is active; a semaphore that merely queues
-new operations is insufficient. The owner calls `AcnInstanceManager.ensure`, projects progress into
-client presentation, and atomically publishes only terminal `AcnInstance<AcnReady>` values. Every
-typed manager terminal failure is projected to `Failed`; explicit retry starts one new ensure
-occurrence with a fresh absolute deadline.
-
-Terminal presentation formats the semantic manager failure and its typed diagnostics. Transport
-wrappers and first-party clients do not expose internal SDK error tags.
-
-Runtime construction explicitly starts initial selection. Selected-instance publication and the
-open/closed check occur in one admission critical section.
-
-## Recovery
-
-Every RPC carries both URL and exact ACN instance ID. ACN dispatch rejects another occurrence.
-Transport failure clears only the matching failed selection, joins or starts the same selection
-single-flight, then retries the exact request according to its transport contract. Domain failure
-and caller cancellation do not trigger recovery.
-
-Once initial selection has succeeded, every replacement selection owns a fresh lifecycle and a
-monotonic recovery occurrence. The runtime exposes `Inactive | Recovering(lifecycle) | Recovered`
-separately from startup. Clients may project that occurrence into their existing notification area;
-they must not move startup presentation backward, remount application UI, or duplicate selection
-and retry logic.
-
-A successful selection is a point-in-time fact. Retirement may begin after selection; exact request
-addressing prevents misrouting and recovery handles that unavoidable race. Desktop and web preserve
-the same typed ensure stream and cancellation semantics as local execution.
-
-Electron's isolated renderer boundary is a real serialization boundary even though it exposes a
-JavaScript callback facade. The preload encodes each ensure event with its canonical Effect Schema
-before `contextBridge` clones it, and the renderer decodes it before handing it to the SDK runtime.
-Effect data types such as `Option` must never be passed across that boundary as live objects because
-structured cloning removes the symbols and prototypes required by their decoded representation.
-
-Each concrete `RpcClient` owns its own single-consumer protocol receiver.
+Electron progress and errors are schema-encoded before structured cloning and decoded afterward.
+Live Effect Option values and class instances never cross the bridge. Cancellation closes the
+host observation, not an admitted daemon.
 
 ## Close
 
-Close is one-way and idempotent. It marks the runtime closed under selection admission, closes the
-selection scope, and awaits interruption. It performs no ACN lifecycle RPC. Close and scope
-finalization never ensure, discover, replace, launch, or stop an ACN.
+Close is one-way and idempotent. It stops client-owned transport, admission, and observers only.
+It never starts, stops, replaces, or retains ACN, ICN, or models. If close wins the admission race,
+no Ready endpoint can be published afterward.
 
-Selection publication checks `open` under the same admission boundary as close. If close wins, no
-selection is published. Each host invokes runtime close as its
-leading teardown action, explicitly or through its registered finalizer, before destroying runtime
-dependencies.
+## Conformance
 
-## Guarantees
-
-- Only `AcnInstance<AcnReady>` enters endpoint selection.
-- Identity never regresses during one client lifetime.
-- Initial selection, retry, and application recovery share one selection outcome.
-- Transitional assignment and temporary health failure cannot independently become startup failure.
-- Exact addressing prevents a stale selection from reaching a successor.
-- Every Electron ensure event is schema-encoded before and decoded after structured cloning.
-- Close cannot publish an endpoint or invoke ensurance after closing begins.
-- Intentional replacement is not reported as a crash; process output remains diagnostic.
+- Passive construction and observation issue no requests or commands.
+- Only matching Ready health admits operations.
+- Concurrent callers share one startup; waiter cancellation preserves other callers.
+- Scope close cancels startup and prevents subsequent admission.
+- Replacement is fenced by instance ID and rechecks the protocol before redispatch.
+- Startup failure and subsequent recovery are retryable on the same SDK instance.
+- Client-common state and query ownership survive daemon recovery.

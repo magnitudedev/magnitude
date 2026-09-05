@@ -1,10 +1,13 @@
 import {
   AcnEnsuranceError,
   formatAcnEnsuranceError,
-} from "@magnitudedev/sdk"
+} from "@magnitudedev/daemon-management"
 import { Schema } from "effect"
+import { ConnectionErrorSchema, formatConnectionError } from "@magnitudedev/sdk"
 
-export const explainError = (error: unknown): string => typeof error === "object"
+export const explainError = (error: unknown): string => Schema.is(ConnectionErrorSchema)(error)
+  ? formatConnectionError(error)
+  : typeof error === "object"
   && error !== null
   && "reason" in error
   && typeof error.reason === "string"

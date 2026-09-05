@@ -38,7 +38,7 @@ import {
   useSessionPreload,
   useSessionActions,
   useOnboardingModelSetup,
-  useAcnLifecycle,
+  useServiceLifecycle,
   useLocalModels,
   useModelSlots,
   useModelConfig,
@@ -110,11 +110,8 @@ import {
   ROLE_TO_SLOT,
   SECONDARY_SLOT_ID,
 } from "@magnitudedev/sdk"
-import type {
-  AcnLifecycleState,
-  DisplayActor,
-  SessionMetadata,
-} from "@magnitudedev/sdk"
+import type { ServiceLifecycleState } from "@magnitudedev/client-common"
+import type { DisplayActor, SessionMetadata } from "@magnitudedev/sdk"
 import type { SlotId } from "@magnitudedev/sdk"
 import { registerWebCommands } from "./commands/register"
 registerWebCommands()
@@ -801,14 +798,14 @@ function useInterruptAllListener(): void {
 function AppInner({
   initialAcnLifecycle,
 }: {
-  readonly initialAcnLifecycle: AcnLifecycleState
+  readonly initialAcnLifecycle: ServiceLifecycleState
 }): ReactNode {
   // Detect responsive mode (≤640px) — no useEffect, uses matchMedia store
   const isNarrow = useSyncExternalStore(subscribeResponsive, getIsNarrow)
   useMenuActions()
   useInterruptAllListener()
   const platform = usePlatform()
-  const acnLifecycle = useAcnLifecycle(initialAcnLifecycle)
+  const acnLifecycle = useServiceLifecycle(initialAcnLifecycle)
   const onboarding = useOnboardingModelSetup()
   if (acnLifecycle.state._tag !== "Ready") {
     return (
@@ -1069,7 +1066,7 @@ function AuthenticatedAppContent({
 export function App({
   initialAcnLifecycle,
 }: {
-  readonly initialAcnLifecycle: AcnLifecycleState
+  readonly initialAcnLifecycle: ServiceLifecycleState
 }): ReactNode {
   return (
     <DisplayViewControllerProvider>

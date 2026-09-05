@@ -1,10 +1,10 @@
+import { Rpc } from "@effect/rpc"
+import { replaySafe, atMostOnce } from "../transport/recovery"
 import { Schema } from "effect"
-import { Group, Mutation, Query } from "@magnitudedev/effect-query"
 import {
   CreateSessionInitial,
   CreateSessionResult,
   ActiveSessionStatuses as ActiveSessionStatusesSchema,
-  type ActiveSessionStatuses as ActiveSessionStatusesSnapshot,
   SessionPageSchema,
   SessionPageRequestSchema,
   RecentDirectoryPageRequestSchema,
@@ -23,33 +23,27 @@ import {
   SessionNotArchived,
   SessionNotFound,
 } from "../errors"
-import { turnAdmissionScope } from "./configuration"
 
-/** Session pages are fresh until the ACN publishes a session change on `StreamChanges`. */
-const ListSessions = Query.make("ListSessions", {
+const ListSessions = Rpc.make("ListSessions", {
   payload: SessionPageRequestSchema,
   success: SessionPageSchema,
   error: Schema.Union(InvalidSessionPageCursor, SessionInspectionUnavailable),
-  staleTime: Infinity,
-})
+}).pipe(replaySafe)
 
-const ListRecentSessionDirectories = Query.make("ListRecentSessionDirectories", {
+const ListRecentSessionDirectories = Rpc.make("ListRecentSessionDirectories", {
   payload: RecentDirectoryPageRequestSchema,
   success: RecentDirectoryPageSchema,
   error: Schema.Union(InvalidDirectoryPageCursor, SessionInspectionUnavailable),
-  staleTime: Infinity,
-})
+}).pipe(replaySafe)
 
-/** The resident-session status snapshot, folded from the ACN's status stream. */
-const StreamActiveSessionStatuses = Query.fromStream("StreamActiveSessionStatuses", {
+const StreamActiveSessionStatuses = Rpc.make("StreamActiveSessionStatuses", {
   payload: Schema.Struct({}),
   success: ActiveSessionStatusesSchema,
   error: SessionError,
-  reduce: (_, snapshot): ActiveSessionStatusesSnapshot => snapshot,
+  stream: true,
 })
 
-const CreateSession = Mutation.make("CreateSession", {
-  policy: { recovery: "AtMostOnce" },
+const CreateSession = Rpc.make("CreateSession", {
   payload: Schema.Struct({
     cwd: Schema.String,
     sessionId: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
@@ -59,11 +53,9 @@ const CreateSession = Mutation.make("CreateSession", {
   }),
   success: CreateSessionResult,
   error: SessionError,
-  scope: () => turnAdmissionScope,
-})
+}).pipe(atMostOnce)
 
-const PreloadSession = Mutation.make("PreloadSession", {
-  policy: { recovery: "AtMostOnce" },
+const PreloadSession = Rpc.make("PreloadSession", {
   payload: Schema.Struct({
     cwd: Schema.String,
     options: Schema.optionalWith(SessionOptions, { as: "Option", exact: true }),
@@ -71,10 +63,9 @@ const PreloadSession = Mutation.make("PreloadSession", {
   }),
   success: PreloadSessionResult,
   error: SessionError,
-})
+}).pipe(atMostOnce)
 
-const ReleaseSessionPreload = Mutation.make("ReleaseSessionPreload", {
-  policy: { recovery: "ReplaySafe" },
+const ReleaseSessionPreload = Rpc.make("ReleaseSessionPreload", {
   payload: Schema.Struct({
     cwd: Schema.String,
     sessionId: Schema.String,
@@ -83,17 +74,15 @@ const ReleaseSessionPreload = Mutation.make("ReleaseSessionPreload", {
   }),
   success: Schema.Struct({}),
   error: SessionError,
-})
+}).pipe(replaySafe)
 
-const GetSession = Query.make("GetSession", {
+const GetSession = Rpc.make("GetSession", {
   payload: Schema.Struct({ sessionId: Schema.String }),
   success: SessionMetadata,
   error: Schema.Union(SessionNotFound, SessionMetadataUnreadable),
-  staleTime: Infinity,
-})
+}).pipe(replaySafe)
 
-const DeleteArchivedSession = Mutation.make("DeleteArchivedSession", {
-  policy: { recovery: "AtMostOnce" },
+const DeleteArchivedSession = Rpc.make("DeleteArchivedSession", {
   payload: Schema.Struct({ sessionId: Schema.String }),
   success: Schema.Struct({}),
   error: Schema.Union(
@@ -102,7 +91,7 @@ const DeleteArchivedSession = Mutation.make("DeleteArchivedSession", {
     SessionMetadataUnreadable,
     SessionMetadataWriteFailed,
   ),
-})
+}).pipe(atMostOnce)
 
 const SessionCommandError = Schema.Union(
   SessionNotFound,
@@ -110,40 +99,37 @@ const SessionCommandError = Schema.Union(
   SessionMetadataWriteFailed,
 )
 
-const ArchiveSession = Mutation.make("ArchiveSession", {
-  policy: { recovery: "ReplaySafe" },
+const ArchiveSession = Rpc.make("ArchiveSession", {
   payload: Schema.Struct({ sessionId: Schema.String }),
   success: SessionMetadata,
   error: SessionCommandError,
-})
+}).pipe(replaySafe)
 
-const RestoreSession = Mutation.make("RestoreSession", {
-  policy: { recovery: "ReplaySafe" },
+const RestoreSession = Rpc.make("RestoreSession", {
   payload: Schema.Struct({ sessionId: Schema.String }),
   success: SessionMetadata,
   error: SessionCommandError,
-})
+}).pipe(replaySafe)
 
-const SetSessionPinned = Mutation.make("SetSessionPinned", {
-  policy: { recovery: "ReplaySafe" },
+const SetSessionPinned = Rpc.make("SetSessionPinned", {
   payload: Schema.Struct({
     sessionId: Schema.String,
     pinned: Schema.Boolean,
   }),
   success: SessionMetadata,
   error: SessionCommandError,
-})
+}).pipe(replaySafe)
 
-export const Sessions = Group.make({
-  ListSessions,
-  ListRecentSessionDirectories,
-  StreamActiveSessionStatuses,
-  CreateSession,
-  PreloadSession,
-  ReleaseSessionPreload,
-  GetSession,
-  DeleteArchivedSession,
-  ArchiveSession,
-  RestoreSession,
-  SetSessionPinned,
-})
+export const Sessions = {
+  listSessions: ListSessions,
+  listRecentSessionDirectories: ListRecentSessionDirectories,
+  streamActiveSessionStatuses: StreamActiveSessionStatuses,
+  createSession: CreateSession,
+  preloadSession: PreloadSession,
+  releaseSessionPreload: ReleaseSessionPreload,
+  getSession: GetSession,
+  deleteArchivedSession: DeleteArchivedSession,
+  archiveSession: ArchiveSession,
+  restoreSession: RestoreSession,
+  setSessionPinned: SetSessionPinned,
+}

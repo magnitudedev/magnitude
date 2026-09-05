@@ -1,6 +1,6 @@
 ---
 applies_to:
-  - packages/sdk/src/acn-jit/**
+  - packages/daemon-management/src/acn-jit/**
   - packages/acn-protocol/src/acn-identity.ts
   - packages/acn-protocol/src/acn-revision.ts
   - packages/acn-protocol/src/coordination/**
@@ -8,8 +8,8 @@ applies_to:
   - packages/acn/src/ownership-monitor.ts
   - packages/acn/src/icn/**
   - packages/version/scripts/generate-version.ts
-  - packages/version/scripts/advance-acn-revision.ts
-  - packages/version/acn-revision.json
+  - packages/release/release-plan.json
+  - packages/release/src/release-plan.ts
   - desktop/src/main.ts
   - web/scripts/dev-server.ts
 ---
@@ -22,7 +22,7 @@ projects the one shared fact from SQLite; it is neither a daemon nor a generic c
 service.
 
 ```text
-ACN connection --ensure(target)--> AcnInstanceManager <--> AcnOwnerStore
+Privileged service starter --ensure(target)--> AcnInstanceManager <--> AcnOwnerStore
                                                            |
                                                            +--> exact live owner ACN
 ```
@@ -37,9 +37,9 @@ ACN version is ACN identity. PID plus process-start identity names one exact pro
 the instance ID is its RPC identity. Revision is one positive safe integer reported by each live
 owner and used to order it against a client's target.
 
-Each versioned release source allocates one checked-in scalar revision, advanced by one whenever
-Changesets changes the CLI version. Development generation adds a development counter to that
-allocation. It uses an explicitly configured non-negative counter when present; otherwise it
+Each versioned release source allocates one scalar revision in the checked-in release plan,
+advanced by one whenever Changesets changes the CLI version. Development generation adds a
+development counter to that allocation. It uses an explicitly configured non-negative counter when present; otherwise it
 increments the machine-local counter at `~/.magnitude/acn/development-revision-counter`. The
 counter is ephemeral build state. ACN processes observe only the resulting scalar revision; no
 revision is persisted as coordination authority.
@@ -86,7 +86,7 @@ occupies a pid, observes a group's state (leader live, leader replaced, survivor
 waits for group exit, and stops a group with identity-checked TERM → KILL → absence-proof
 escalation. This adapter contains no ACN owner, revision, health, admission, or convergence policy.
 
-The SDK composes six narrow authorities:
+The private daemon-management package composes six narrow authorities:
 
 - `AcnOwnerObserver` reads owner, exact-process, and health facts without mutation.
 - `AcnConvergenceDecider` is a pure total function from one observation snapshot to one action.

@@ -6,7 +6,7 @@ import {
   type ProviderModelCatalogEntry,
   type ProviderModelCatalogState,
 } from "@magnitudedev/acn-protocol"
-import { ProviderIdSchema, ProviderModelIdSchema } from "@magnitudedev/sdk"
+import { ProviderIdSchema, ProviderModelIdSchema } from "@magnitudedev/providers/client"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
 import { projectModelCatalog } from "./model-catalog"
 

@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest"
 import {
   ProviderClient,
   createProviderClient,
-} from "@magnitudedev/sdk"
+} from "@magnitudedev/providers/client"
 import { webSearchTool } from "../src/tools/web-search"
 
 describe("web search tool", () => {

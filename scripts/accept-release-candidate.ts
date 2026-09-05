@@ -1,16 +1,10 @@
 import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
-import {
-  AcnBoundary,
-  AcnRpc,
-  BunDetachedChildProcessSpawner,
-  ChildProcessSpawner,
-  AcnInstanceManager,
-  makeAcnConnection,
-  makeLocalAcnInstanceManager,
-} from "@magnitudedev/sdk"
-import { BunSqliteDriverLayer } from "@magnitudedev/sdk/bun"
-import { Duration, Effect, Exit, Layer, Schema, Scope } from "effect"
+import { MagnitudeClient, MagnitudeServiceStarter } from "@magnitudedev/sdk"
+import { makeServiceStarter } from "@magnitudedev/daemon-management"
+import { BunDetachedChildProcessSpawner, ChildProcessSpawner, makeLocalAcnInstanceManager } from "@magnitudedev/daemon-management"
+import { BunSqliteDriverLayer } from "@magnitudedev/daemon-management/bun"
+import { Duration, Effect, Exit, Layer, Schema, Scope, Stream } from "effect"
 import {
   mkdir,
   mkdtemp,
@@ -201,24 +195,19 @@ const terminateBootstrap = async (pid?: number): Promise<void> => {
   )
 }
 
-const probeBootstrap = Effect.gen(function* () {
-  const connection = yield* makeAcnConnection().pipe(
-    Effect.provideService(AcnInstanceManager, manager),
-  )
 
-  yield* connection.startup.prepare
-  const protocolLayer = connection.protocolLayer.pipe(
-    Layer.provide(FetchHttpClient.layer),
-  )
-  return yield* Effect.gen(function* () {
-    const client = yield* AcnRpc.makeRpcClient(AcnBoundary)
-    return yield* client.Health({})
-  }).pipe(
-    Effect.provide(protocolLayer),
-    Effect.scoped,
-  )
+let candidateStarted = false
+const candidateStarter = MagnitudeServiceStarter.of({
+  start: makeServiceStarter(manager).start.pipe(Stream.concat(Stream.execute(Effect.sync(() => { candidateStarted = true })))),
+})
+const probeBootstrap = Effect.gen(function* () {
+  const client = yield* MagnitudeClient
+  return yield* client.connection.health({})
 }).pipe(
-  Effect.provide(FetchHttpClient.layer),
+  Effect.provide(MagnitudeClient.layer().pipe(Layer.provide([
+    FetchHttpClient.layer,
+    Layer.succeed(MagnitudeServiceStarter, candidateStarter),
+  ]))),
   Effect.scoped,
   Effect.timeout(Duration.millis(BOOTSTRAP_TIMEOUT_MS)),
 )
@@ -228,10 +217,13 @@ const acceptBootstrap = async (): Promise<void> => {
   let healthPid: number | undefined
   try {
     const health = await Effect.runPromise(probeBootstrap)
+    // Never accept or stop a pre-existing service on the fixed application port.
+    if (!candidateStarted) throw new Error("Port 10100 already serves a daemon outside this candidate; run acceptance with that port free")
     if (
       health.service !== "magnitude-acn" ||
       health.version !== manifest.version ||
       health.revision !== manifest.acnRevision ||
+      health.rpcVersion !== manifest.rpc.version ||
       health.state._tag !== "Ready"
     ) {
       throw new Error(
@@ -240,6 +232,8 @@ const acceptBootstrap = async (): Promise<void> => {
     }
     healthPid = health.pid
     await registeredProcess(health.pid)
+    const plugins = process.argv[4]
+    if (plugins) await run(["bun", resolve(import.meta.dir, "accept-integrations.ts"), resolve(plugins), "--daemon"])
     accepted = true
   } finally {
     try {

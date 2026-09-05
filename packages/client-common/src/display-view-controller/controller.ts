@@ -1,14 +1,9 @@
 import { Atom, type Registry } from "@effect-atom/atom-react"
 import { Effect, Option, Stream } from "effect"
 import { Subscription, type Client } from "@magnitudedev/effect-query"
-import {
-  forkIdToKey,
-  type AcnBoundary,
-  type DisplayTimeline,
-  type DisplayViewShape,
-  type StreamDisplayViewFailure,
-  type StreamEvent,
-} from "@magnitudedev/sdk"
+import { forkIdToKey, type DisplayTimeline, type DisplayViewShape, type StreamEvent } from "@magnitudedev/sdk"
+import { type AcnQueries } from "../operations"
+import type { StreamDisplayViewFailure } from "../state/stream-errors"
 import {
   applyStreamEvent,
   ceilToPageMultiple,
@@ -71,7 +66,7 @@ export interface DisplayViewControllerSnapshot {
 }
 
 /** The part of the connection client the controller materializes the display subscription with. */
-export type DisplayViewClient = Pick<Client.GroupClient<typeof AcnBoundary, any, any>, "Display" | "runtime">
+export type DisplayViewClient = Pick<Client.GroupClient<typeof AcnQueries, any, any>, "Display" | "runtime">
 
 export interface DisplayViewControllerOptions {
   readonly client: DisplayViewClient

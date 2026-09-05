@@ -1,7 +1,7 @@
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as Path from "@effect/platform/Path"
-import { BunSqliteDriverLayer } from "@magnitudedev/sdk/bun"
-import { SqliteDriver } from "@magnitudedev/sdk/sqlite-driver"
+import { BunSqliteDriverLayer } from "@magnitudedev/daemon-management/bun"
+import { SqliteDriver } from "@magnitudedev/daemon-management/sqlite-driver"
 import { Effect, Schedule } from "effect"
 
 /** SQLite holds an OS-released lock across processes; elapsed time never steals ownership. */

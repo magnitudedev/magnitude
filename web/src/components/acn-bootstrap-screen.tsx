@@ -4,11 +4,8 @@ import { Option } from "effect"
 import { Button } from "@/components/ui/button"
 import { Progress } from "@/components/ui/progress"
 import { Spinner } from "@/components/ui/spinner"
-import type {
-  AcnInstallationPhase,
-  AcnLifecycleState,
-  AcnStartingPhase,
-} from "@magnitudedev/sdk"
+import type { AcnInstallationPhase } from "@magnitudedev/sdk"
+import type { ServiceLifecycleState, ServiceStartingPhase } from "@magnitudedev/client-common"
 import { MagnitudeMark } from "./magnitude-mark"
 
 const INSTALLATION_PHASE_LABELS: Readonly<
@@ -20,7 +17,7 @@ const INSTALLATION_PHASE_LABELS: Readonly<
 }
 
 const STARTING_PHASE_LABELS: Readonly<
-  Record<Extract<AcnStartingPhase, string>, string>
+  Record<Extract<ServiceStartingPhase, string>, string>
 > = {
   PreparingAcn: "Preparing background server",
   WaitingForOwner: "Waiting for previous Magnitude process",
@@ -29,7 +26,7 @@ const STARTING_PHASE_LABELS: Readonly<
 }
 
 const backendLabel = (
-  backend: Extract<AcnStartingPhase, { readonly _tag: "PreparingBackend" }>[
+  backend: Extract<ServiceStartingPhase, { readonly _tag: "PreparingBackend" }>[
     "backend"
   ]
 ): string =>
@@ -40,7 +37,7 @@ const backendLabel = (
     Vulkan: "Vulkan",
   } as const)[backend._tag]
 
-const startingPhaseLabel = (phase: AcnStartingPhase): string =>
+const startingPhaseLabel = (phase: ServiceStartingPhase): string =>
   typeof phase === "string"
     ? STARTING_PHASE_LABELS[phase]
     : `Preparing ${backendLabel(phase.backend)} backend for ${phase.backend.hardwareLabel}`
@@ -49,7 +46,7 @@ const formatMebibytes = (bytes: number): string =>
   `${(bytes / (1024 * 1024)).toFixed(1)} MiB`
 
 const failureTitle = (
-  state: Extract<AcnLifecycleState, { readonly _tag: "Failed" }>
+  state: Extract<ServiceLifecycleState, { readonly _tag: "Failed" }>
 ): string =>
   state.stage === "InstallDaemon" || state.stage === "PrepareLocalInference"
     ? "Magnitude failed to install"
@@ -60,7 +57,7 @@ export function AcnBootstrapScreen({
   onRetry,
   onQuit,
 }: {
-  readonly state: Exclude<AcnLifecycleState, { readonly _tag: "Ready" }>
+  readonly state: Exclude<ServiceLifecycleState, { readonly _tag: "Ready" }>
   readonly onRetry: () => void
   readonly onQuit?: () => void
 }): ReactNode {

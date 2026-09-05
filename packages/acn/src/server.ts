@@ -35,10 +35,8 @@ import {
   VersionLive,
 } from "@magnitudedev/storage"
 import {
-  AcnHealthResponseSchema,
-  AcnBoundary,
-  AcnRpc,
-} from "@magnitudedev/acn-protocol"
+  MagnitudeHealthResponseSchema,
+  AcnRpcGroup, } from "@magnitudedev/acn-protocol"
 import {
   ProcessGroupController,
   makeAcnOwnerStore,
@@ -264,7 +262,7 @@ function withCors(
 }
 
 const disallowedCorsResponse = HttpServerResponse.empty({ status: 403 })
-const encodeHealthResponse = Schema.encode(AcnHealthResponseSchema)
+const encodeHealthResponse = Schema.encode(MagnitudeHealthResponseSchema)
 
 // OPTIONS preflight handler — catches all OPTIONS requests.
 const OptionsRouteHandler = (request: HttpServerRequest.HttpServerRequest) => {
@@ -831,7 +829,7 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
       const protocol = yield* makeAcnSubscriptionProtocol(rawProtocol).pipe(
         Effect.provide(applicationContext),
       )
-      yield* AcnRpc.makeRpcServer(AcnBoundary).pipe(
+      yield* RpcServer.make(AcnRpcGroup).pipe(
         Effect.provideService(RpcServer.Protocol, protocol),
         Effect.provide(applicationContext),
         Effect.forkIn(applicationScope),

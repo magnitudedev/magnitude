@@ -7,7 +7,7 @@ applies_to:
   - packages/release/src/launcher*.ts
   - packages/launcher/src/wrapper.ts
   - packages/launcher/scripts/build-launcher.ts
-  - packages/sdk/src/binary.ts
+  - packages/daemon-management/src/binary.ts
   - packages/icn/src/lifecycle/release-installation.ts
 ---
 
@@ -18,7 +18,7 @@ Runtime acquisition installs only artifacts selected from the version's release 
 ## Ownership
 
 - The npm launcher acquires CLI.
-- SDK acquires ACN.
+- The private daemon-management package acquires ACN.
 - The ICN lifecycle acquires the ICN base and optional backend pack and composes their installation.
 
 These responsibilities do not overlap.

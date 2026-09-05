@@ -1,11 +1,8 @@
 import * as Terminal from "@effect/platform/Terminal"
-import type {
-  AcnEnsuranceError,
-  AcnLifecycleState,
-  AcnStartup,
-  AcnStartupProgress,
-  BinaryAcquisitionEvent,
-} from "@magnitudedev/sdk"
+import type { BinaryAcquisitionEvent } from "@magnitudedev/daemon-management"
+import type { ConnectionError, AcnStartupProgress } from "@magnitudedev/sdk"
+import type { ServiceLifecycleState } from "@magnitudedev/client-common"
+import type { ServiceStartup } from "@magnitudedev/client-common"
 import { formatStorageSize } from "@magnitudedev/client-common"
 import ansis from "ansis"
 import { Clock, Duration, Effect, Exit, Fiber, Option, Stream } from "effect"
@@ -50,7 +47,7 @@ const completedDownload = (
   })
 }
 
-export const serviceStartupChildPhase = (state: AcnLifecycleState): ChildPhase | null => {
+export const serviceStartupChildPhase = (state: ServiceLifecycleState): ChildPhase | null => {
   if (state._tag === "Installing") {
     if (state.phase === "StartingMagnitude") {
       return {
@@ -115,7 +112,7 @@ export interface InlineServiceStartupPresenter {
     readonly report: (event: BinaryAcquisitionEvent) => Effect.Effect<void>
   }
   readonly acquisitionSucceeded: Effect.Effect<void>
-  readonly run: (startup: AcnStartup) => Effect.Effect<void, AcnEnsuranceError>
+  readonly run: (startup: ServiceStartup) => Effect.Effect<void, ConnectionError>
   readonly clear: Effect.Effect<void>
 }
 
@@ -192,7 +189,7 @@ export const makeInlineServiceStartupPresenter = (
     yield* display(`  ✓ ${row.completed}\n`)
   })
 
-  const present = (state: AcnLifecycleState): Effect.Effect<void> => Effect.gen(function* () {
+  const present = (state: ServiceLifecycleState): Effect.Effect<void> => Effect.gen(function* () {
     if (state._tag === "Checking") return
     if (state._tag === "Failed") {
       // Keep the startup transcript visible so the fatal error that follows
@@ -211,7 +208,7 @@ export const makeInlineServiceStartupPresenter = (
     if (phase !== null) yield* activate(phase)
   })
 
-  const run = (startup: AcnStartup): Effect.Effect<void, AcnEnsuranceError> => Effect.gen(function* () {
+  const run = (startup: ServiceStartup): Effect.Effect<void, ConnectionError> => Effect.gen(function* () {
     const observations = tty
       ? Stream.merge(
           startup.state.changes,

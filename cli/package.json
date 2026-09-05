@@ -45,7 +45,8 @@
     "semver": "^7.7.3",
     "string-width": "^8.1.1",
     "yaml": "^2.9.0",
-    "ansis": "^3.17.0"
+    "ansis": "^3.17.0",
+    "@magnitudedev/daemon-management": "workspace:*"
   },
   "devDependencies": {
     "@magnitudedev/logger": "workspace:*",

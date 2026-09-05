@@ -1,7 +1,7 @@
 import { Effect, Layer, Option, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import type { LocalProviderOffering } from "@magnitudedev/acn-protocol"
-import { ProviderModelIdSchema } from "@magnitudedev/sdk"
+import { ProviderModelIdSchema } from "@magnitudedev/providers/client"
 import { IcnProviderModelResolver } from "@magnitudedev/icn/provider"
 import { LocalProviderOfferings } from "./local-provider-offerings"
 import { LocalProviderResolverLive } from "./local-provider-resolver"

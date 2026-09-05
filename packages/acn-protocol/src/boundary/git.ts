@@ -1,11 +1,14 @@
-import { Group, Query } from "@magnitudedev/effect-query"
+import { Rpc } from "@effect/rpc"
+import { replaySafe } from "../transport/recovery"
 import { GetGitRecentFilesPayload, GitRecentFilesSchema } from "../schemas/git"
 import { InvalidDirectoryPath } from "../errors"
 
-const GetGitRecentFiles = Query.make("GetGitRecentFiles", {
+const GetGitRecentFiles = Rpc.make("GetGitRecentFiles", {
   payload: GetGitRecentFilesPayload,
   success: GitRecentFilesSchema,
   error: InvalidDirectoryPath,
-})
+}).pipe(replaySafe)
 
-export const Git = Group.make({ GetGitRecentFiles })
+export const Git = {
+  getGitRecentFiles: GetGitRecentFiles,
+}

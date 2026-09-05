@@ -10,16 +10,8 @@ import type { RpcClientError } from "@effect/rpc/RpcClientError"
 import { Atom, Registry, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { Context, Effect, Fiber, Layer, Option, Runtime, Stream } from "effect"
 import { Key, QueryClient, Subscription, type Query } from "@magnitudedev/effect-query"
-import {
-  ProjectFiles as ProjectFilesBoundary,
-  type FileContentHash,
-  type ProjectDirectoryListing,
-  type ProjectEntryMove,
-  type ProjectFileSnapshot,
-  type ProjectFileTextSnapshot,
-  type ProjectId,
-  type RelativePath,
-} from "@magnitudedev/sdk"
+import { ProjectFiles as ProjectFilesBoundary } from "../operations"
+import { type FileContentHash, type ProjectDirectoryListing, type ProjectEntryMove, type ProjectFileSnapshot, type ProjectFileTextSnapshot, type ProjectId, type RelativePath } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 import { ClientEffectQuery } from "../state/client-effect-query"
 import { visitProjectDirectoryDemand } from "./demand"

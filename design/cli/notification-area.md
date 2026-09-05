@@ -1,7 +1,7 @@
 ---
 applies_to:
   - packages/client-common/src/state/notification-area-state.ts
-  - packages/client-common/src/state/acn-recovery.ts
+  - packages/client-common/src/state/service-recovery.ts
   - cli/src/app.tsx
   - cli/src/runtime/interactive.tsx
   - cli/src/platform/effect-logger.ts

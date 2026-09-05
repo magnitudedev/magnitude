@@ -9,9 +9,9 @@ import { SessionInspector } from "./session-inspector"
 
 /**
  * The ACN change registry: every change source publishes pokes in the
- * clients' query-identity space, and `StreamChanges` serves the multiplexed
- * stream. Each connected subscriber retains bounded, query-keyed invalidations;
- * repeated keys coalesce and excessive keyed entries broaden to one whole-query
+ * clients' operation-identity space, and `StreamChanges` serves the multiplexed
+ * stream. Each connected subscriber retains bounded, operation-keyed invalidations;
+ * repeated keys coalesce and excessive keyed entries broaden to one whole-operation
  * invalidation. Reconnect rereads authoritative state instead of replaying history.
  */
 export interface AcnChangesApi {
@@ -40,16 +40,16 @@ const addPending = (
   pending: ReadonlyMap<string, PendingQueryInvalidation>,
   change: Change,
 ): ReadonlyMap<string, PendingQueryInvalidation> => {
-  const existing = pending.get(change.query)
+  const existing = pending.get(change.operation)
   if (existing?.all === true) return pending
   const next = new Map(pending)
   if (change.key === undefined) {
-    next.set(change.query, { all: true, keyed: new Map() })
+    next.set(change.operation, { all: true, keyed: new Map() })
     return next
   }
   const keyed = new Map(existing?.keyed)
   keyed.set(keyOf(change), change)
-  next.set(change.query, keyed.size > MAX_PENDING_KEYS_PER_QUERY
+  next.set(change.operation, keyed.size > MAX_PENDING_KEYS_PER_QUERY
     ? { all: true, keyed: new Map() }
     : { all: false, keyed })
   return next
@@ -59,8 +59,8 @@ const makeSubscriber = Effect.gen(function* () {
   const pending = yield* Ref.make<ReadonlyMap<string, PendingQueryInvalidation>>(new Map())
   const available = yield* Queue.sliding<void>(1)
   const take = Ref.getAndSet(pending, new Map()).pipe(
-    Effect.map((queries) => [...queries].flatMap(([query, invalidation]) =>
-      invalidation.all ? [{ query }] : [...invalidation.keyed.values()])),
+    Effect.map((queries) => [...queries].flatMap(([operation, invalidation]) =>
+      invalidation.all ? [{ operation }] : [...invalidation.keyed.values()])),
   )
   return {
     offer: (change: Change) => Ref.update(pending, (current) => addPending(current, change)).pipe(
@@ -105,17 +105,17 @@ export const AcnChangesLive: Layer.Layer<AcnChanges> = Layer.effect(
 )
 
 /** Queries whose authoritative data a project-store commit may change. */
-export const projectChangeQueries: ReadonlyArray<string> = [Projects.ListProjects.name, Projects.InspectProject.name]
+export const projectChangeQueries: ReadonlyArray<string> = [Projects.listProjects._tag, Projects.inspectProject._tag]
 /** Queries whose authoritative data a session-metadata commit may change. */
 export const sessionChangeQueries: ReadonlyArray<string> = [
-  Sessions.ListSessions.name,
-  Sessions.ListRecentSessionDirectories.name,
-  Sessions.GetSession.name,
+  Sessions.listSessions._tag,
+  Sessions.listRecentSessionDirectories._tag,
+  Sessions.getSession._tag,
 ]
 
 /**
  * Forwards storage-level change streams into the registry: a store commit
- * names every query it backs. Versioned snapshots publish their own pokes.
+ * names every operation it backs. Versioned snapshots publish their own pokes.
  */
 export const AcnStorageChangesLive: Layer.Layer<never, never, AcnChanges | ProjectStore | SessionInspector> =
   Layer.scopedDiscard(Effect.gen(function* () {
@@ -124,7 +124,7 @@ export const AcnStorageChangesLive: Layer.Layer<never, never, AcnChanges | Proje
     const sessions = yield* SessionInspector
     const forward = (source: Stream.Stream<unknown>, queries: ReadonlyArray<string>) =>
       source.pipe(
-        Stream.runForEach(() => Effect.forEach(queries, (query) => changes.publish({ query }), { discard: true })),
+        Stream.runForEach(() => Effect.forEach(queries, (operation) => changes.publish({ operation }), { discard: true })),
         Effect.forkScoped,
       )
     yield* forward(projects.changes, projectChangeQueries)

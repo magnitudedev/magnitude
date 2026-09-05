@@ -1,10 +1,10 @@
 import { renderToStaticMarkup } from "react-dom/server"
 import { Option } from "effect"
 import { describe, expect, it, vi } from "vitest"
-import type { AcnLifecycleState } from "@magnitudedev/sdk"
+import type { ServiceLifecycleState } from "@magnitudedev/client-common"
 import { AcnBootstrapScreen } from "./acn-bootstrap-screen"
 
-const render = (state: Exclude<AcnLifecycleState, { readonly _tag: "Ready" }>) =>
+const render = (state: Exclude<ServiceLifecycleState, { readonly _tag: "Ready" }>) =>
   renderToStaticMarkup(
     <AcnBootstrapScreen state={state} onRetry={() => {}} />
   )

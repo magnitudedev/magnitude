@@ -12,7 +12,7 @@ applies_to:
 
 Effect Query is client-common's single reactive operation mechanism. Every client↔ACN interaction
 and every client-composed semantic command with a shared invocation lifecycle is a Query, Mutation,
-or Subscription in one application operation graph. The graph extends `AcnBoundary` without
+or Subscription in one application operation graph. The graph extends client-common's `AcnQueries` without
 altering its transport contract, and every member is materialized once on the connection client. A
 feature exposes the product capability built with the mechanism rather than propagating
 mechanism-level representations.
@@ -152,11 +152,15 @@ operation progress. It exposes observational queries, mutations, and invalidatio
 
 ### Effect Query definitions
 
-Declared Query, Mutation, and Subscription definitions live in the ACN boundary groups in
-`packages/acn-protocol`. Effect-backed application definitions live in client-common and consume
-services through Effect DI. `Group.extend` combines them before client construction. The ACN RPC
-adapter derives RPCs only from `AcnBoundary`; it rejects mixed groups. Definitions capture no
+Query, Mutation, and Subscription definitions live in client-common and consume SDK or local
+services through Effect DI. `Group.extend` combines them before client construction. RPCs are declared independently in the wire contract; client-common operations call the shared
+SDK through Effect DI and derive payload identity from each RPC's schema. Definitions capture no
 client instance, RPC, Atom registry, or React lifecycle.
+
+Small local bindings (`query`, `mutation`, `subscription`, `streamQuery`) derive invocation through
+the SDK service and payload keys from the RPC schema. They contain no cache/replay defaults or
+protocol generation. Domain definitions still explicitly choose freshness, retention, mutation
+scope, synchronization, and stream folding; the helpers only remove repeated binding boilerplate.
 
 When a domain has a client service (the client-di criteria: connection-lifetime state, a resident
 resource such as a keyed watch, reusable operations with dependencies, or a stateful use case), its
@@ -170,7 +174,7 @@ terminal adapter and still returns values and callbacks, not atoms or clients.
 One service instance exists per client connection and owns materialization of a backend domain. It:
 
 - uses the domain's members of that connection's Effect Query client (`ClientEffectQuery`, the
-  materialized `AcnBoundary`);
+  materialized `AcnQueries`);
 - exposes one read-only Atom containing the domain query Result;
 - exposes domain operations as functions returning Effects;
 - exposes semantic derived state or status selectors when presentation needs mutation intent; and

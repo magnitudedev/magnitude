@@ -17,6 +17,7 @@ import {
   type ReleaseArtifact,
 } from "../src/contracts"
 import { ACN_COORDINATION_REVISION } from "@magnitudedev/version"
+import releasePlan from "../release-plan.json"
 import {
   acnArchive,
   backendArchive,
@@ -267,6 +268,8 @@ const manifest = Schema.decodeUnknownSync(ReleaseManifestSchema)({
   acnRevision: ACN_COORDINATION_REVISION,
   tag: releaseTag(version),
   sourceCommit,
+  rpc: releasePlan.rpc,
+  plugins: releasePlan.plugins.map(plugin => plugin.artifact),
   artifacts: artifacts
     .slice()
     .sort((left, right) => left.id.localeCompare(right.id))

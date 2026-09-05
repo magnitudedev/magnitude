@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 import { Context, Deferred, Effect, Fiber, Layer, Option, PubSub, Ref, Stream } from "effect"
-import { Key } from "@magnitudedev/effect-query"
+import * as Key from "@magnitudedev/utils/canonical-key"
 import {
   SessionOperationFailed,
   type DisplayViewShape,

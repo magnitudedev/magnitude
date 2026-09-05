@@ -2,29 +2,8 @@ import { Atom, Registry, Result } from "@effect-atom/atom-react"
 import { Cause, Deferred, Effect, Layer, Option, Queue, Schema, Stream } from "effect"
 import { describe, expect, it, vi } from "vitest"
 import { Client as EffectQueryClient } from "@magnitudedev/effect-query"
-import {
-  MagnitudeBoundary,
-  AssessmentEnvironmentIdSchema,
-  CatalogIntelligenceSchema,
-  CatalogFormModelIdSchema,
-  ModelAssessmentIdSchema,
-  ModelReleaseDateSchema,
-  ModelSlotConfiguredLocal,
-  ModelSlotUnassigned,
-  ModelVariantLabelSchema,
-  PRIMARY_SLOT_ID,
-  ProviderIdSchema,
-  ReasoningEffortSchema,
-  SECONDARY_SLOT_ID,
-  type LocalModel,
-  type ModelAcquisitionFailure,
-  type ModelFailure,
-  type ModelInstanceFailure,
-  type LocalModelsState,
-  type ModelSlotsState,
-  type SlotSelection,
-  type Change,
-} from "@magnitudedev/sdk"
+import { AcnQueries as MagnitudeBoundary } from "../operations"
+import { AssessmentEnvironmentIdSchema, CatalogIntelligenceSchema, CatalogFormModelIdSchema, ModelAssessmentIdSchema, ModelReleaseDateSchema, ModelSlotConfiguredLocal, ModelSlotUnassigned, ModelVariantLabelSchema, PRIMARY_SLOT_ID, ProviderIdSchema, ReasoningEffortSchema, SECONDARY_SLOT_ID, type LocalModel, type ModelAcquisitionFailure, type ModelFailure, type ModelInstanceFailure, type LocalModelsState, type ModelSlotsState, type SlotSelection, type Change } from "@magnitudedev/sdk"
 import { clientServicesLayer, type ClientServices } from "../state/client-services"
 import type { AcnClientRequirements } from "../state/agent-client"
 import { fakeAcnImplementationsLayer } from "../state/fake-acn-implementations"
@@ -539,7 +518,7 @@ const makeHarness = (options: HarnessOptions) => {
             })()
           : makeModel(true)
         models = { ...models, models: [model] }
-        return Queue.offer(changes, { query: "GetModelCatalog" }).pipe(
+        return Queue.offer(changes, { operation: "GetModelCatalog" }).pipe(
           Effect.as({ outcome: "Started" as const }),
         )
       }
@@ -550,7 +529,7 @@ const makeHarness = (options: HarnessOptions) => {
           message: "assignment rejected",
         })
         slots = configuredSlots("None")
-        return Queue.offer(changes, { query: "GetModelSlots" }).pipe(Effect.as({}))
+        return Queue.offer(changes, { operation: "GetModelSlots" }).pipe(Effect.as({}))
       }
       case "LoadModelSlot":
         if (options.replaceSelectionBeforeLoad) {
@@ -563,7 +542,7 @@ const makeHarness = (options: HarnessOptions) => {
         }
         if (options.loadFailure !== undefined) {
           slots = configuredSlots("Failed", instanceId, Option.none(), options.loadFailure)
-          return Queue.offer(changes, { query: "GetModelSlots" }).pipe(
+          return Queue.offer(changes, { operation: "GetModelSlots" }).pipe(
             Effect.zipRight(Effect.fail({
               _tag: "LocalModelMutationFailed" as const,
               code: options.loadFailure.code,
@@ -579,13 +558,13 @@ const makeHarness = (options: HarnessOptions) => {
         // The ICN ensure operation owns acquisition and does not return until
         // the instance is ready. Cancelling this client wait must only detach
         // from the request; the shared ICN acquisition continues.
-        return Queue.offer(changes, { query: "GetModelSlots" }).pipe(
+        return Queue.offer(changes, { operation: "GetModelSlots" }).pipe(
           Effect.zipRight(options.keepLoading ? Effect.never : Effect.succeed({})),
         )
       case "StopModelSlot":
         stoppedInstances.push(instanceId)
         slots = configuredSlots("Stopped", instanceId)
-        return Queue.offer(changes, { query: "GetModelSlots" }).pipe(Effect.as({}))
+        return Queue.offer(changes, { operation: "GetModelSlots" }).pipe(Effect.as({}))
       case "CancelLocalModelSync":
         cancelledDownloads.push(payload.modelId)
         models = {
@@ -595,7 +574,7 @@ const makeHarness = (options: HarnessOptions) => {
             acquisitionState: { _tag: "NotInstalled" },
           }],
         }
-        return Queue.offer(changes, { query: "GetModelCatalog" }).pipe(Effect.as({}))
+        return Queue.offer(changes, { operation: "GetModelCatalog" }).pipe(Effect.as({}))
       case "CompleteOnboarding":
         if (options.keepCompleting) return Effect.never
         if (options.failCompletion) return Effect.fail({
@@ -604,7 +583,7 @@ const makeHarness = (options: HarnessOptions) => {
           message: "completion failed",
         })
         onboardingCompleted = true
-        return Queue.offer(changes, { query: "GetOnboardingState" }).pipe(Effect.as({}))
+        return Queue.offer(changes, { operation: "GetOnboardingState" }).pipe(Effect.as({}))
       default: return Effect.die(new Error(`Unexpected RPC ${name}`))
     }
   }))

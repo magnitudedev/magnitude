@@ -11,7 +11,7 @@ import {
   SECONDARY_SLOT_ID,
   type ModelSlotsState,
   type ProviderModelCatalogEntry,
-} from '@magnitudedev/sdk'
+} from '@magnitudedev/acn-protocol'
 import {
   ProjectionBusTag,
   makeProjectionBusLayer,

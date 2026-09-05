@@ -14,7 +14,7 @@ import {
   type ToolCallId,
   type ToolDefinition,
 } from '@magnitudedev/ai'
-import type { BaseCallOptions, ProviderRejection } from '@magnitudedev/sdk'
+import type { BaseCallOptions, ProviderRejection } from '@magnitudedev/providers/client'
 
 import type { AppEvent, TurnOutcomeEvent } from '../src/events'
 import { AgentModelResolver } from '../src/model/model-resolver'

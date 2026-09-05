@@ -6,7 +6,7 @@ import {
 import { makeIcnApiClient } from "@magnitudedev/icn-protocol/client"
 import * as S from "@magnitudedev/icn-protocol/schemas"
 import { Effect, Option, Stream } from "effect"
-import { MAGNITUDE_INFERENCE_BASE_URL } from "./inference-endpoint"
+import { MAGNITUDE_INFERENCE_BASE_URL } from "@magnitudedev/acn-protocol"
 
 export const ResponseObjectSchema = S.ResponseObject
 export const InferenceModelSchema = S.OpenAiModel

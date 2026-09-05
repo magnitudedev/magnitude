@@ -1,37 +1,22 @@
 import { RpcClientError } from "@effect/rpc"
-import { Cause, Schema } from "effect"
+import { Cause } from "effect"
 import { describe, expect, it } from "vitest"
-import {
-  AcnHealthRequestFailed,
-  AcnHealthResponseInvalid,
-  AcnHealthUnavailable,
-  DownloadFailed,
-} from "@magnitudedev/sdk"
-import { AcnOwnerRecordSchema } from "@magnitudedev/acn-protocol/coordination"
+import { ServiceStartFailed, ServiceUnavailable } from "@magnitudedev/sdk"
 import { classifyStartupError, classifyStreamError } from "./stream-errors"
 
-const healthUnavailable = new AcnHealthUnavailable({
-  owner: Schema.decodeUnknownSync(AcnOwnerRecordSchema)({
-    pid: 42,
-    processStartIdentity: "start-1",
-    port: 14_000,
-  }),
-  attempts: [
-    new AcnHealthRequestFailed({ message: "connection refused" }),
-    new AcnHealthResponseInvalid({ message: "unexpected health service" }),
-  ],
+const healthUnavailable = new ServiceUnavailable({
+  origin: "http://127.0.0.1:10100",
+  message: "Magnitude service at http://127.0.0.1:10100 is unavailable: connection refused",
 })
 
 describe("stream error classification", () => {
   it("preserves a structured ACN availability error nested in transport recovery", () => {
-    const cause = new DownloadFailed({
-      url: "https://example.invalid/acn",
-      status: 503,
-      reason: "artifact unavailable",
+    const cause = new ServiceStartFailed({
+      message: "artifact unavailable",
     })
     const failure = new RpcClientError.RpcClientError({
       reason: "Unknown",
-      message: "ACN unavailable: DownloadFailed",
+      message: "Service start failed",
       cause,
     })
     const classified = classifyStreamError(Cause.fail(failure))
@@ -45,9 +30,8 @@ describe("stream error classification", () => {
 
     expect(classified.isAcnAvailabilityError).toBe(true)
     expect(classified.invariantViolation).toBe(false)
-    expect(classified.message).toContain("http://127.0.0.1:14000/health (PID 42)")
-    expect(classified.message).toContain("Health check 1: request failed: connection refused")
-    expect(classified.message).toContain("Health check 2: response was invalid: unexpected health service")
+    expect(classified.message).toContain("http://127.0.0.1:10100")
+    expect(classified.message).toContain("connection refused")
     expect(classified.message).not.toContain("AcnHealthUnavailable")
     expect(classified.message).not.toContain("AcnEnsuranceFailed")
   })
@@ -62,8 +46,7 @@ describe("stream error classification", () => {
 
     expect(classified.isAcnAvailabilityError).toBe(true)
     expect(classified.invariantViolation).toBe(false)
-    expect(classified.message).toContain("Health check 1: request failed: connection refused")
-    expect(classified.message).toContain("Health check 2: response was invalid: unexpected health service")
+    expect(classified.message).toContain("connection refused")
     expect(classified.message).not.toContain("AcnHealthUnavailable")
     expect(classified.message).not.toContain("AcnEnsuranceFailed")
   })

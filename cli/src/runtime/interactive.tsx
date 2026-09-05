@@ -29,12 +29,8 @@ import {
   type UpdateAction,
 } from "@magnitudedev/release"
 import { logger } from "@magnitudedev/logger"
-import {
-  acnInstallationPresent,
-  SDK_ACN_TARGET,
-  type AcnConnection,
-  type AcnEnsuranceError,
-} from "@magnitudedev/sdk"
+import { acnInstallationPresent, DAEMON_TARGET } from "@magnitudedev/daemon-management"
+import { type FirstPartyConnection } from "@magnitudedev/client-common"
 import {
   interactiveProcessExitCode,
   runInteractiveProcess,
@@ -194,7 +190,7 @@ const preApplicationExit = (
   : { _tag: "Exit", code: 0, notices: [], fatal: Option.none() }
 
 const closeApplication = (
-  connection: AcnConnection,
+  connection: FirstPartyConnection,
   request: ProcessExitRequest,
 ): Effect.Effect<InteractiveSessionResult> => request._tag === "Fatal"
   ? Effect.succeed(fatalResult(request))
@@ -215,11 +211,12 @@ const closeApplication = (
       }),
     )
 
+
 const runInteractiveSession = (
   options: InteractiveLaunchOptions,
 ): Effect.Effect<
   InteractiveSessionResult,
-  CliRendererAcquisitionFailed | StateDocumentError | AcnEnsuranceError | HarnessConnectionError,
+  CliRendererAcquisitionFailed | StateDocumentError | import("@magnitudedev/sdk").ConnectionError | HarnessConnectionError,
   CliUpdater | FileSystem.FileSystem | Path.Path | Scope.Scope
     | CommandExecutor.CommandExecutor | HttpClient.HttpClient | Terminal.Terminal
 > => Effect.gen(function* () {
@@ -288,7 +285,7 @@ const runInteractiveSession = (
   // prompt before any download of the version it would replace. Installation
   // needs the network regardless, so the wait costs nothing real.
   if (Option.isSome(updateMethod)
-    && !(yield* acnInstallationPresent(SDK_ACN_TARGET.identity))) {
+    && !(yield* acnInstallationPresent(DAEMON_TARGET.identity))) {
     const answer = yield* raceExit(discovery.fresh, processExit.await)
     if (answer._tag === "Exit") return preApplicationExit(answer.request)
     freshPending = false
@@ -310,7 +307,7 @@ const runInteractiveSession = (
         debug: options.debug,
       })
       return yield* makeAcnConnectionWithInstanceManager(manager)
-    }),
+    }).pipe(Effect.provide(effectLoggingLayer)),
     processExit.await,
   )
   if (connectionResult._tag === "Exit") return preApplicationExit(connectionResult.request)
@@ -365,10 +362,7 @@ const runInteractiveSession = (
 
   const connected = yield* raceExit(Effect.gen(function* () {
     const harnessConnection = yield* makeHarnessConnection
-    const protocolLayer = connection.protocolLayer.pipe(Layer.provide(
-      Layer.mergeAll(FetchHttpClient.layer, effectLoggingLayer),
-    ))
-    const agentClient = createAgentClient(protocolLayer, {
+    const agentClient = createAgentClient(connection.client, {
       onboardingSetupInitiallyOpen: options.setup,
       harnessConnection,
     })
@@ -459,7 +453,7 @@ export const runInteractiveCommand = (
   options: InteractiveLaunchOptions,
 ): Effect.Effect<
   number,
-  CliRendererAcquisitionFailed | StateDocumentError | AcnEnsuranceError | HarnessConnectionError,
+  CliRendererAcquisitionFailed | StateDocumentError | import("@magnitudedev/sdk").ConnectionError | HarnessConnectionError,
   | CommandExecutor.CommandExecutor
   | FileSystem.FileSystem
   | HttpClient.HttpClient

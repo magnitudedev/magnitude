@@ -25,7 +25,7 @@ import {
 import {
   DesktopRpcError,
   DesktopRpcs,
-  encodeDesktopAcnEnsureEvent,
+  encodeDesktopServiceStartProgress,
   encodeDesktopBrowserWorkspaceState,
   type DesktopApi,
   type DesktopPlatform,
@@ -147,11 +147,11 @@ function makeDesktopApi(): DesktopApi {
     get platform(): DesktopPlatform {
       return process.platform as DesktopPlatform
     },
-    acnEnsurer: {
-      ensure(request, onEvent, onError, onEnd) {
+    serviceStarter: {
+      start(onEvent, onError, onEnd) {
         return desktopRpc.runStream(
-          (client) => client.AcnEnsure(request),
-          (event) => onEvent(encodeDesktopAcnEnsureEvent(event)),
+          (client) => client.ServiceStart({}),
+          (event) => onEvent(encodeDesktopServiceStartProgress(event)),
           onError,
           onEnd,
         )

@@ -1,4 +1,3 @@
-import { Atom, Registry } from "@effect-atom/atom"
 import { FetchHttpClient } from "@effect/platform"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as CommandExecutor from "@effect/platform/CommandExecutor"
@@ -7,11 +6,8 @@ import * as Path from "@effect/platform/Path"
 import * as Terminal from "@effect/platform/Terminal"
 import { BunContext } from "@effect/platform-bun"
 import { formatLocalModelDisplayName } from "@magnitudedev/client-common"
-import { Client } from "@magnitudedev/effect-query"
 import {
   MAGNITUDE_SERVICE_ORIGIN,
-  MagnitudeBoundary,
-  magnitudeImplementationsLayer,
 } from "@magnitudedev/sdk"
 import { Effect, Layer, Option } from "effect"
 import {
@@ -128,18 +124,7 @@ export const runServiceStop = () => runCommand({
 
 const readActiveModel = Effect.scoped(Effect.gen(function* () {
   const connection = yield* existingAcnConnection
-  const registry = Registry.make()
-  yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
-  const client = Client.make(
-    MagnitudeBoundary,
-    magnitudeImplementationsLayer(connection.protocolLayer.pipe(
-      Layer.provide(FetchHttpClient.layer),
-    )),
-  )
-  const catalog = yield* Registry.getResult(
-    registry,
-    Atom.make((get) => get(client.Models.GetCatalog({})).result),
-  )
+  const catalog = yield* connection.client.models.getCatalog({})
   if (catalog._tag === "Initializing") return Option.none<ActiveModel>()
   for (const entry of catalog.models) {
     if (entry._tag !== "Local") continue

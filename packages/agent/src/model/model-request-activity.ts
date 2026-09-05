@@ -1,4 +1,4 @@
-import type { IcnModelPreparation } from '@magnitudedev/sdk'
+import type { IcnModelPreparation } from '@magnitudedev/providers/client'
 import { Ambient } from '@magnitudedev/event-core'
 
 interface ModelRequestTurn {

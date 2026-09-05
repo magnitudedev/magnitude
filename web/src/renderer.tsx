@@ -14,7 +14,7 @@ import {
   PlatformProvider,
   createAgentClient,
   AgentClientProvider,
-  AcnStartupProvider,
+  ServiceStartupProvider,
   initializeAppearance,
   createBrowserPlatform,
   createBrowserAcnConnection,
@@ -32,19 +32,17 @@ async function main() {
   const initialAcnLifecycle = await Effect.runPromise(
     connection.startup.prepare
   )
-  const agentClientTag = createAgentClient(connection.protocolLayer.pipe(
-    Layer.provide(FetchHttpClient.layer),
-  ))
+  const agentClientTag = createAgentClient(connection.client)
 
   root.render(
     <PlatformProvider platform={platform}>
-      <AcnStartupProvider startup={connection.startup}>
+      <ServiceStartupProvider startup={connection.startup}>
         <RegistryProvider defaultIdleTTL={5000}>
           <AgentClientProvider tag={agentClientTag}>
             <App initialAcnLifecycle={initialAcnLifecycle} />
           </AgentClientProvider>
         </RegistryProvider>
-      </AcnStartupProvider>
+      </ServiceStartupProvider>
     </PlatformProvider>
   )
 }

@@ -6,7 +6,7 @@ import {
   createProviderClient,
   type ProviderClientShape,
   type WebSearchSource,
-} from "@magnitudedev/sdk"
+} from "@magnitudedev/providers/client"
 import {
   MagnitudeStorage,
   CustomEndpointNameSchema,

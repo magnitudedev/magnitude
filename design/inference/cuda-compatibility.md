@@ -5,7 +5,7 @@ applies_to:
   - packages/icn-protocol/**
   - packages/acn-protocol/src/schemas/acn-health.ts
   - packages/acn/src/icn/**
-  - packages/sdk/src/acn-jit/**
+  - packages/daemon-management/src/acn-jit/**
   - inference/crates/icn-server/**
   - inference/crates/icn-contracts/**
   - inference/scripts/**

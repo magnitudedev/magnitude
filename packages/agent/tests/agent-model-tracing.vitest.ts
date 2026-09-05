@@ -14,8 +14,8 @@ import {
   type ToolDefinition,
 } from '@magnitudedev/ai'
 import type { AgentModelStartFailure } from '../src/model/model-request-preparation'
-import type { BaseCallOptions, ProviderRejection } from '@magnitudedev/sdk'
-import type { IcnModelPreparation } from '@magnitudedev/sdk'
+import type { BaseCallOptions, ProviderRejection } from '@magnitudedev/providers/client'
+import type { IcnModelPreparation } from '@magnitudedev/providers/client'
 
 const traceMock = vi.hoisted(() => ({
   sessionId: 'session-1' as string | null,

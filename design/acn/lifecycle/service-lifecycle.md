@@ -3,7 +3,7 @@ applies_to:
   - packages/acn/src/service-lifecycle.ts
   - packages/acn/src/server.ts
   - packages/acn/src/server.test.ts
-  - packages/sdk/src/acn-jit/acn-owner-observer.ts
+  - packages/daemon-management/src/acn-jit/acn-owner-observer.ts
   - packages/acn/src/ownership-monitor.ts
   - packages/acn/src/acn-subscriptions.ts
   - packages/acn/src/icn/**

@@ -18,7 +18,8 @@
     "@magnitudedev/sdk": "workspace:*",
     "@magnitudedev/web": "workspace:*",
     "effect": "^3.21.2",
-    "sqlite3": "5.1.7"
+    "sqlite3": "5.1.7",
+    "@magnitudedev/daemon-management": "workspace:*"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",

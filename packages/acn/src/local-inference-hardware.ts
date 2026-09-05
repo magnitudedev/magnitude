@@ -45,7 +45,7 @@ export const LocalInferenceHardwareLive: Layer.Layer<
     Stream.filterMap((state) => state),
   )
   yield* Effect.forkIn(projectedChanges.pipe(
-    Stream.runForEach(() => changes.publish({ query: Models.GetLocalEnvironment.name })),
+    Stream.runForEach(() => changes.publish({ operation: Models.getLocalEnvironment._tag })),
   ), scope)
   // Instance changes can immediately alter available memory. The hardware
   // projection owns invalidating and rebuilding its availability snapshot;

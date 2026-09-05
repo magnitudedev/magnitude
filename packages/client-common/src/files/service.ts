@@ -8,12 +8,8 @@ import { Atom, Registry } from "@effect-atom/atom-react"
 import type { RpcClientError } from "@effect/rpc/RpcClientError"
 import { Context, Effect, Fiber, Layer, Runtime, Stream } from "effect"
 import { Key, QueryClient, Subscription, type Query } from "@magnitudedev/effect-query"
-import {
-  Files as FilesBoundary,
-  type ReadFileFormat,
-  type ReadFileResult,
-  type ResolvePathResult,
-} from "@magnitudedev/sdk"
+import { Files as FilesBoundary } from "../operations"
+import { type ReadFileFormat, type ReadFileResult, type ResolvePathResult } from "@magnitudedev/sdk"
 import { ClientEffectQuery } from "../state/client-effect-query"
 
 export interface FileInput {

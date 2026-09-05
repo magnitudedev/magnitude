@@ -25,14 +25,13 @@
     "@magnitudedev/shell-classifier": "workspace:*",
     "@magnitudedev/skills": "workspace:*",
     "@magnitudedev/ai": "workspace:*",
-    "@magnitudedev/sdk": "workspace:*",
-
     "@magnitudedev/acn-protocol": "workspace:*",
     "@magnitudedev/vcs": "workspace:*",
     "effect": "^3.21.2",
     "ignore": "^7.0.5",
     "luxon": "^3.7.2",
-    "slimdom": "^4.3.5"
+    "slimdom": "^4.3.5",
+    "@magnitudedev/providers": "workspace:*"
   },
   "devDependencies": {
     "@effect/vitest": "^0.25.0",

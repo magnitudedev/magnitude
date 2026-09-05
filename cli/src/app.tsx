@@ -34,7 +34,7 @@ import {
   notificationStatesEquivalent,
   resolveActiveNotificationState,
   deriveAcnRecoveryNotificationState,
-  useAcnRecoveryState,
+  useServiceRecoveryState,
   useLocalModelsSelector,
   useModelSlots,
   useModelSlotActions,
@@ -256,7 +256,7 @@ function CliAppContent(
   const widget = useRecentChatsWidgetState();
   const { showCopiedToast: clipboardToast } = useSelectionAutoCopy();
   const notificationAreaState = useAtomValue(notificationAreaStateAtom);
-  const acnRecoveryState = useAcnRecoveryState();
+  const acnRecoveryState = useServiceRecoveryState();
   const onboardingSetup = props.onboardingSetup;
   const modelSlotsState = Option.getOrNull(Result.value(useModelSlots()));
   const { rootSlotId } = useSlotProfiles();

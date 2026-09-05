@@ -22,7 +22,7 @@ import {
   type ModelResidency,
 } from "@magnitudedev/acn-protocol"
 import { IcnCatalogInstallations, IcnInstances, IcnModelAssessments } from "@magnitudedev/icn"
-import { projectInferenceResidency } from "@magnitudedev/sdk"
+import { projectInferenceResidency } from "@magnitudedev/acn-protocol"
 import type {
   CatalogInstallationOperation,
   CatalogModel,

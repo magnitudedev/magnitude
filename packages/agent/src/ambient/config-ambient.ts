@@ -1,12 +1,11 @@
 import { Ambient } from '@magnitudedev/event-core'
 import { Effect, Schema } from 'effect'
 import { formatModelDisplayName } from '@magnitudedev/acn-protocol'
-
 import {
   ModelFailureSchema,
   type ModelSlotsState,
   type ProviderModelCatalogEntry,
-} from '@magnitudedev/sdk'
+} from '@magnitudedev/acn-protocol'
 import { type SlotId } from '@magnitudedev/roles'
 import {
   ProviderIdSchema,

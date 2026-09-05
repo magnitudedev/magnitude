@@ -1,5 +1,6 @@
+import { Rpc } from "@effect/rpc"
+import { replaySafe, atMostOnce } from "../transport/recovery"
 import { Schema } from "effect"
-import { Group, Mutation, Query, Subscription } from "@magnitudedev/effect-query"
 import {
   ReadFilePayload,
   ReadFileResult,
@@ -33,8 +34,7 @@ const TraversalError = Schema.Union(
   FileSystemUnavailable,
 )
 
-const UploadAttachment = Mutation.make("UploadAttachment", {
-  policy: { recovery: "AtMostOnce" },
+const UploadAttachment = Rpc.make("UploadAttachment", {
   payload: Schema.Struct({
     sessionId: Schema.String,
     filename: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
@@ -46,9 +46,9 @@ const UploadAttachment = Mutation.make("UploadAttachment", {
     filename: Schema.String,
   }),
   error: SessionError,
-})
+}).pipe(atMostOnce)
 
-const ListFiles = Query.make("ListFiles", {
+const ListFiles = Rpc.make("ListFiles", {
   payload: Schema.Struct({
     cwd: Schema.String,
     glob: Schema.optional(Schema.String),
@@ -56,10 +56,9 @@ const ListFiles = Query.make("ListFiles", {
   }),
   success: Schema.Array(Schema.String),
   error: TraversalError,
-})
+}).pipe(replaySafe)
 
-/** Kept fresh by `WatchFile` while the file is observed. */
-const ReadFile = Query.make("ReadFile", {
+const ReadFile = Rpc.make("ReadFile", {
   payload: ReadFilePayload,
   success: ReadFileResult,
   error: Schema.Union(
@@ -69,50 +68,46 @@ const ReadFile = Query.make("ReadFile", {
     PathNotFile,
     FileSystemUnavailable,
   ),
-})
+}).pipe(replaySafe)
 
-const CheckFileExists = Query.make("CheckFileExists", {
+const CheckFileExists = Rpc.make("CheckFileExists", {
   payload: Schema.Struct({ cwd: Schema.String, path: Schema.String }),
   success: Schema.Boolean,
   error: InvalidDirectoryPath,
-})
+}).pipe(replaySafe)
 
-/** Invalidation-only notifications for one host file. */
-const WatchFile = Subscription.make("WatchFile", {
+const WatchFile = Rpc.make("WatchFile", {
   payload: WatchFilePayload,
   success: WatchFileEvent,
   error: InvalidDirectoryPath,
-  gcTime: "30 seconds",
+  stream: true,
 })
 
-const ResolvePath = Query.make("ResolvePath", {
+const ResolvePath = Rpc.make("ResolvePath", {
   payload: ResolvePathPayload,
   success: ResolvePathResult,
   error: InvalidDirectoryPath,
-})
+}).pipe(replaySafe)
 
-/** Mention candidates for one query; results are not retained beyond the moment. */
-const SearchMentions = Query.make("SearchMentions", {
+const SearchMentions = Rpc.make("SearchMentions", {
   payload: SearchMentionsPayload,
   success: SearchMentionsResult,
   error: TraversalError,
-  gcTime: "30 seconds",
-})
+}).pipe(replaySafe)
 
-const SearchDirectories = Query.make("SearchDirectories", {
+const SearchDirectories = Rpc.make("SearchDirectories", {
   payload: SearchDirectoriesPayload,
   success: SearchDirectoriesResult,
   error: InvalidDirectoryPath,
-  gcTime: "30 seconds",
-})
+}).pipe(replaySafe)
 
-export const Files = Group.make({
-  UploadAttachment,
-  ListFiles,
-  ReadFile,
-  CheckFileExists,
-  WatchFile,
-  ResolvePath,
-  SearchMentions,
-  SearchDirectories,
-})
+export const Files = {
+  uploadAttachment: UploadAttachment,
+  listFiles: ListFiles,
+  readFile: ReadFile,
+  checkFileExists: CheckFileExists,
+  watchFile: WatchFile,
+  resolvePath: ResolvePath,
+  searchMentions: SearchMentions,
+  searchDirectories: SearchDirectories,
+}

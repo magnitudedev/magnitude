@@ -10,21 +10,30 @@
     "./executables": "./src/executables.ts",
     "./acquisition": "./src/acquisition.ts",
     "./launcher": "./src/launcher.ts",
-    "./trust": "./src/trust.ts"
+    "./trust": "./src/trust.ts",
+    "./plugins": "./src/plugins.ts",
+    "./plugin-content": "./src/plugin-content.ts",
+    "./plan": "./release-plan.json"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@magnitudedev/utils": "workspace:*",
     "@effect/platform": "^0.96.0",
     "@effect/platform-node": "0.107.0",
     "@magnitudedev/icn-protocol": "workspace:*",
     "@magnitudedev/version": "workspace:*",
     "effect": "3.21.2",
     "mdast-util-from-markdown": "^2.0.3",
-    "tar-stream": "3.2.0"
+    "tar-stream": "3.2.0",
+    "semver": "^7.7.2"
   },
   "devDependencies": {
+    "@changesets/parse": "0.4.3",
+    "@effect/platform-bun": "^0.90.0",
+    "@magnitudedev/acn-protocol": "workspace:*",
+    "vitest": "^3.2.4",
     "@types/bun": "1.3.14",
     "@types/tar-stream": "^3.1.4"
   }

@@ -1,12 +1,7 @@
 import { Atom } from "@effect-atom/atom-react"
 import { createId } from "@magnitudedev/generate-id"
-import type {
-  AcnRecoveryState,
-  LocalModelsState,
-  ModelSlotsState,
-  ProviderModelId,
-  SlotId,
-} from "@magnitudedev/sdk"
+import type { ServiceRecoveryState } from "../connection/connection"
+import type { LocalModelsState, ModelSlotsState, ProviderModelId, SlotId } from "@magnitudedev/sdk"
 import { Effect, Option, Schema } from "effect"
 import { localModelProviderModelId, localModelServingState } from "../local-models/projection"
 import { formatMemorySize } from "../utils/format-bytes"
@@ -129,7 +124,7 @@ const persistentNotificationState = (
   createdAt: 0,
 })
 
-const recoveryActivity = (state: AcnRecoveryState): string | null => {
+const recoveryActivity = (state: ServiceRecoveryState): string | null => {
   if (state._tag !== "Recovering") return null
   const lifecycle = state.lifecycle
   if (lifecycle._tag === "Checking") return "Reconnecting to Magnitude service…"
@@ -160,7 +155,7 @@ const recoveryActivity = (state: AcnRecoveryState): string | null => {
 }
 
 export const deriveAcnRecoveryNotificationState = (
-  state: AcnRecoveryState,
+  state: ServiceRecoveryState,
 ): NotificationState | null => {
   const message = recoveryActivity(state)
   return message === null

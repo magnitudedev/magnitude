@@ -13,8 +13,8 @@ applies_to:
   - cli/src/server/acn-instance-manager.ts
   - cli/src/platform/process-exit.ts
   - cli/src/platform/terminal-appearance.ts
-  - packages/sdk/src/acn-jit/acn-recovering-client.ts
-  - packages/sdk/src/acn-jit/local-acn-require-running-manager.ts
+  - packages/sdk/src/client.ts
+  - packages/daemon-management/src/service-starter.ts
 ---
 
 # CLI startup sequence

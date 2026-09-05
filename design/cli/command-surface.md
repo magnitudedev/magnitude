@@ -6,7 +6,7 @@ applies_to:
   - cli/src/agent-docs/**
   - packages/client-common/src/harness-connections/**
   - cli/src/harness-connections/**
-  - packages/integration-protocol/**
+  - packages/sdk/**
 ---
 
 # Non-interactive CLI contract
@@ -32,8 +32,8 @@ docs [topic-id]
 ```
 
 Removed output flags are not retained as aliases. The acquisition command remains `catalog pull`,
-and there is no global JSON mode. The plugin-facing `models status`, `models load`, and `models stop`
-commands independently accept `--json`.
+and there is no JSON mode. Model status, load, and stop are human-oriented commands;
+plugins call the SDK over RPC instead.
 
 ## Domain ownership
 
@@ -67,69 +67,15 @@ retryability flags, and stack traces.
 Memory uses hardware-conventional units; storage and transfer use decimal units; context uses
 compact token counts; generation speed uses `tok/s`. Rounded values are presentation only.
 
-## Plugin-facing JSON output
+## Plugin service startup
 
-`--json` is a versioned machine contract for model observation and residency control. It is scoped
-to `models status`, `models load`, and `models stop`; it is not inherited globally and does not
-change the default human presentation.
+The CLI provides human-oriented commands and owns daemon administration. Plugins use the private
+bundled Effect SDK and the daemon's existing RPC endpoint for model observation and control.
+There is no model-control JSON CLI protocol or separately published integration-contract package.
 
-Every valid JSON invocation writes exactly one compact JSON document followed by one newline.
-Success writes only to stdout and exits successfully. Runtime failure writes only to stderr and
-exits nonzero. Neither stream contains prose, ANSI escapes, progress animation, or additional JSON
-documents. Commander remains the sole command-line parser: malformed invocations and help use its
-ordinary text output and are not part of the machine contract.
-
-Every document has these common fields:
-
-- `schemaVersion`, currently the integer `1`;
-- `command`, exactly `models.status`, `models.load`, or `models.stop`;
-- `ok`, the success discriminator; and
-- either `data` when `ok` is true or `error.message` when `ok` is false.
-
-The envelopes are exactly:
-
-```text
-{ schemaVersion: 1, command, ok: true, data }
-{ schemaVersion: 1, command, ok: false, error: { message } }
-```
-
-The public integration-protocol package owns these schemas; CLI producers consume them through the
-SDK, and standalone integrations consume the public package without private workspace dependencies.
-The version covers required fields and their meanings. Breaking changes require a new version;
-additive optional fields do not. Consumers ignore unknown fields while validating known fields,
-command identity, and version. Shared wire fixtures exercise both sides of this contract.
-
-`models status --json` preserves the human command's model visibility and deterministic ordering,
-but projects only the stable information required by harness integrations. List and addressed forms
-share one array shape; addressed status returns exactly one model when ready. Optional fields are
-absent rather than `null`.
-
-Status data has exactly these shapes:
-
-```text
-{ state: "initializing", models: [] }
-{ state: "ready", models: Model[] }
-```
-
-Each `Model` has `modelId`, `displayName`, `installation`, and optional `residency`. Installation is
-one of `not_installed`, `installing`, `installed`, `removing`, or `unavailable`. Update availability,
-active updates, and failed updates normalize to `installed` because the existing model remains
-loadable. Installation and removal failures normalize to `unavailable`. Residency is one of
-`unloaded`, `loading`, `ready`, `stopping`, or `failed`; an admitted request and every native loading
-stage normalize to `loading`. JSON status intentionally excludes provenance, assessment, memory,
-context, transfer measurements, internal stages, allocation details, and failure internals. Live
-inference progress belongs to the opted-in Chat Completions stream rather than CLI polling.
-
-The unaddressed status form includes the same models as human output: discovered models and catalog
-models that are installed or have relevant acquisition/removal work. The addressed form may return
-a known not-installed catalog model because it observes the exact requested identity. Initialization
-does not wait for readiness. Unknown or malformed IDs are failures once the authoritative catalog is
-available, preserving existing command behavior.
-
-`models load --json` succeeds after ICN has made the requested model ready and returns only
-`{ modelId }`. `models stop --json` succeeds after the authoritative stop mutation and returns `{}`
-because the success envelope already acknowledges the operation. Integrations use these commands
-for discrete user actions. They do not poll the CLI for live inference progress.
+The SDK's optional CLI starter invokes argv `magnitude service start`. Exit status acknowledges
+the command; the SDK independently verifies Ready health and the exact RPC version before admitting
+operations. Command output remains human text and is not scraped or parsed as an application API.
 
 ## Catalog and recommendation behavior
 
@@ -190,8 +136,4 @@ non-interactive command.
   interpretations.
 - Agent documentation completes onboarding using only the human command surface.
 - Tests cover collection, detail, narrow-width, empty, partial, failure, and redirected forms.
-- Plugin-facing JSON tests cover every normalized installation and residency variant, list and
-  addressed forms, initialization, empty state, deterministic ordering, mutation acknowledgements,
-  structured runtime failures, ordinary parser failures and help, stream separation, newline
-  framing, and schema validation.
-- Enabling JSON cannot change command effects, validation order, mutation admission, or exit status.
+- Model commands reject the removed `--json` option before performing any operation.

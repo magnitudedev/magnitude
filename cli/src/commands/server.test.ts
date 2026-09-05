@@ -1,14 +1,14 @@
 import { describe, expect, it } from "vitest"
 import { Command } from "@commander-js/extra-typings"
-import { ACN_EXECUTABLE_NAME } from "@magnitudedev/sdk"
+import { ACN_EXECUTABLE_NAME } from "@magnitudedev/daemon-management"
 import { Option } from "effect"
 import {
-  developmentServerCommand,
   renderLinuxServerService,
   renderMacServerService,
   renderWindowsServerCommand,
   WINDOWS_RESTART_POLICY_SCRIPT,
-} from "../server/service"
+} from "@magnitudedev/daemon-management/service"
+import { developmentServerCommand } from "../server/service"
 import { registerServiceCommand } from "./server"
 import { renderServiceStatus } from "./server-runtime"
 

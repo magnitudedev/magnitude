@@ -5,12 +5,8 @@
 import { useMemo } from "react"
 import { useAtomSet } from "@effect-atom/atom-react"
 import { QueryClient } from "@magnitudedev/effect-query"
-import {
-  Files,
-  type ReadFileFormat,
-  type ReadFileResult,
-  type ResolvePathResult,
-} from "@magnitudedev/sdk"
+import { Files } from "../operations"
+import { type ReadFileFormat, type ReadFileResult, type ResolvePathResult } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 
 export interface FileReads {

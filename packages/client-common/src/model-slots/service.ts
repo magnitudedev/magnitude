@@ -2,16 +2,8 @@ import { useCallback, useMemo } from "react"
 import { Atom, Registry, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { Context, Effect, Layer, Option } from "effect"
 import { Mutation, QueryClient } from "@magnitudedev/effect-query"
-import {
-  Models,
-  PRIMARY_SLOT_ID,
-  SECONDARY_SLOT_ID,
-  authoritativeSlotSelection,
-  type ModelSlotsState,
-  type ProviderModelIdentity,
-  type SlotId,
-  type SlotSelection,
-} from "@magnitudedev/sdk"
+import { Models } from "../operations"
+import { PRIMARY_SLOT_ID, SECONDARY_SLOT_ID, authoritativeSlotSelection, type ModelSlotsState, type ProviderModelIdentity, type SlotId, type SlotSelection } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 import { ClientEffectQuery } from "../state/client-effect-query"
 

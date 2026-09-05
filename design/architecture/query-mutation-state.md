@@ -401,13 +401,11 @@ lifecycle.
 Each interaction is defined once with the core Effect Query primitives: `Query.make`,
 `Query.fromStream`, `Mutation.make`, or `Subscription.make`. Domain definitions compose through
 `Group.make`, and `Group.extend` recursively adds use-case operations under existing domain groups.
-`AcnBoundary` is the declared transport graph; the application graph extends it with Effect-backed
-client-common definitions before constructing `AgentClient`. The ACN RPC adapter accepts only the
-declared transport graph and supplies exact compile-time implementation coverage. Queries declare
-freshness, while mutations declare
-their scope, recovery policy, and synchronization postcondition on the same values. One
-connection-scoped Effect Query client (the `AgentClient`) is made for the application graph with the
-RPC implementation Layer and client-common service Layers. Client construction fails to typecheck
+RPC declarations are the independent wire authority. Client-common's `AcnQueries` calls the
+shared SDK through Effect DI; the application graph extends it with local semantic operations.
+Queries declare freshness; mutations declare scope and synchronization. Replay policy belongs to
+the RPC declaration, where every SDK consumer shares it. One connection-scoped Effect Query client
+(`AgentClient`) is made for the application graph with the existing SDK instance and client service Layers. Client construction fails to typecheck
 unless those Layers close every declared implementation and embedded Effect requirement. It carries
 every member of the group, materialized,
 at its name — a query member

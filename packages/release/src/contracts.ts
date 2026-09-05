@@ -1,5 +1,6 @@
 import { Data, Effect, Option, Schema } from "effect"
 import type { Backend } from "./targets"
+import { PluginArtifactSchema, PluginHostSchema, RpcReleaseSchema, type PluginHost } from "./plugins"
 
 export const CLI_PACKAGE_NAME = "@magnitudedev/cli"
 
@@ -60,6 +61,8 @@ export const ReleaseManifestSchema = Schema.Struct({
   acnRevision: PositiveInt.pipe(Schema.lessThanOrEqualTo(Number.MAX_SAFE_INTEGER)),
   tag: NonEmpty,
   sourceCommit: Schema.String.pipe(Schema.pattern(/^[a-f0-9]{40}$/)),
+  rpc: RpcReleaseSchema,
+  plugins: Schema.NonEmptyArray(PluginArtifactSchema),
   artifacts: Schema.NonEmptyArray(ReleaseArtifactSchema),
 })
 export type ReleaseManifest = typeof ReleaseManifestSchema.Type
@@ -85,6 +88,14 @@ export const validateReleaseManifest = (
   if (manifest.tag !== releaseTag(manifest.version)) {
     return fail("release tag does not match version")
   }
+  const pluginNames = new Set<string>()
+  const pluginHosts = new Set<PluginHost>()
+  for (const plugin of manifest.plugins) {
+    if (plugin.rpcVersion !== manifest.rpc.version || pluginNames.has(plugin.name) || pluginHosts.has(plugin.host)) return fail("plugin selection does not match the release RPC version")
+    pluginNames.add(plugin.name)
+    pluginHosts.add(plugin.host)
+  }
+  if (PluginHostSchema.literals.some((host) => !pluginHosts.has(host))) return fail("release is missing a plugin selection for a declared host")
   for (const artifact of manifest.artifacts) {
     if (ids.has(artifact.id) || names.has(artifact.filename)) {
       return fail("release artifact IDs and filenames must be unique")

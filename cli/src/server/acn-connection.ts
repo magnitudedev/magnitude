@@ -1,36 +1,27 @@
 import { FetchHttpClient } from "@effect/platform"
-import { BunContext } from "@effect/platform-bun"
-import {
-  AcnInstanceManager,
-  makeAcnConnection,
-  makeLocalAcnRequireRunningInstanceManager,
-  makeLocalAcnStartingInstanceManager,
-  type AcnConnection,
-} from "@magnitudedev/sdk"
-import { BunSqliteDriverLayer } from "@magnitudedev/sdk/bun"
-import { Effect, Scope } from "effect"
+import { type AcnInstanceManager, makeServiceStarter } from "@magnitudedev/daemon-management"
+import { MagnitudeClient, MagnitudeServiceStarter } from "@magnitudedev/sdk"
+import { makeFirstPartyConnection, type FirstPartyConnection } from "@magnitudedev/client-common"
+import { Effect, Layer, Scope, Stream } from "effect"
 
 export const makeAcnConnectionWithInstanceManager = (
   manager: AcnInstanceManager,
-): Effect.Effect<AcnConnection, never, Scope.Scope> => makeAcnConnection().pipe(
-  Effect.provideService(AcnInstanceManager, manager),
+): Effect.Effect<FirstPartyConnection, never, Scope.Scope> => makeFirstPartyConnection(
+  MagnitudeClient.layer().pipe(Layer.provide([
+    FetchHttpClient.layer,
+    Layer.succeed(MagnitudeServiceStarter, makeServiceStarter(manager)),
+  ])),
 )
 
-const makeObservedAcnConnection = (
-  managerEffect: ReturnType<typeof makeLocalAcnRequireRunningInstanceManager>,
-): Effect.Effect<AcnConnection, never, Scope.Scope> => Effect.gen(function* () {
-  const manager = yield* managerEffect.pipe(
-    Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]),
-  )
-  return yield* makeAcnConnectionWithInstanceManager(manager)
-})
-
 /** Connection whose startup requires an already-usable service. */
-export const existingAcnConnection = makeObservedAcnConnection(
-  makeLocalAcnRequireRunningInstanceManager(),
+export const existingAcnConnection = makeFirstPartyConnection(
+  MagnitudeClient.layer({ autoStart: false }).pipe(Layer.provide(FetchHttpClient.layer)),
 )
 
 /** Connection that follows the persistent service launched by `magnitude service start`. */
-export const startingAcnConnection = makeObservedAcnConnection(
-  makeLocalAcnStartingInstanceManager(),
-)
+export const startingAcnConnection = makeFirstPartyConnection(MagnitudeClient.layer().pipe(
+  Layer.provide([
+    FetchHttpClient.layer,
+    Layer.succeed(MagnitudeServiceStarter, { start: Stream.empty }),
+  ]),
+))

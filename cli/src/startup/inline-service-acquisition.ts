@@ -1,4 +1,4 @@
-import type { BinaryAcquisitionEvent } from "@magnitudedev/sdk"
+import type { BinaryAcquisitionEvent } from "@magnitudedev/daemon-management"
 import { formatStorageSize } from "@magnitudedev/client-common"
 
 export interface ServiceAcquisitionChildPhase {

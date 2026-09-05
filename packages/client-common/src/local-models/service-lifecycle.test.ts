@@ -148,13 +148,13 @@ describe("local model query lifecycle", () => {
     const callsBeforeInvalidation = calls
 
     await act(async () => {
-      await Effect.runPromise(invalidations.publish({ query: "GetModelSlots" }))
+      await Effect.runPromise(invalidations.publish({ operation: "GetModelSlots" }))
       await Effect.runPromise(Effect.sleep("10 millis"))
     })
     expect(calls).toBe(callsBeforeInvalidation)
 
     await act(async () => {
-      await Effect.runPromise(invalidations.publish({ query: "GetModelCatalog" }))
+      await Effect.runPromise(invalidations.publish({ operation: "GetModelCatalog" }))
       await Effect.runPromise(Effect.sleep("10 millis"))
     })
     expect(calls).toBe(callsBeforeInvalidation + 1)

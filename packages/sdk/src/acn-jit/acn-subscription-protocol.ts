@@ -1,9 +1,9 @@
 import { Effect, Schema } from "effect"
+import { RpcSchema } from "@effect/rpc"
 import {
   AcnSubscriptionWireItem,
   ACN_SUBSCRIPTION_LIVENESS_TIMEOUT_MS,
-  AcnRpc,
-  AcnBoundary,
+  AcnRpcGroup,
 } from "@magnitudedev/acn-protocol"
 import type { JsonValue } from "@magnitudedev/utils/schema"
 import {
@@ -43,7 +43,10 @@ const decodeChunk: RecoveringStreamProtocol["decodeChunk"] = (values) =>
   })
 
 export const acnSubscriptionProtocol: RecoveringStreamProtocol = {
-  isStream: (tag) => AcnRpc.operation(AcnBoundary, tag)?.stream === true,
+  isStream: (tag) => {
+    const rpc = AcnRpcGroup.requests.get(tag)
+    return rpc !== undefined && RpcSchema.isStreamSchema(rpc.successSchema)
+  },
   decodeChunk,
   livenessTimeoutMs: ACN_SUBSCRIPTION_LIVENESS_TIMEOUT_MS,
   isExitWithoutTermination: isCleanOrInterruptedExit,

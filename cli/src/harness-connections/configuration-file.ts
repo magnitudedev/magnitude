@@ -1,7 +1,7 @@
 import * as FileSystem from "@effect/platform/FileSystem"
 import { Effect, Option, Schema } from "effect"
 import { ConnectionTransaction } from "./transaction"
-import { writeFileAtomic as writeFileAtomicRaw } from "../utils/atomic-file"
+import { writeFileAtomic as writeFileAtomicRaw } from "@magnitudedev/utils/atomic-file"
 
 class ConfigurationChanged extends Schema.TaggedError<ConfigurationChanged>()("ConfigurationChanged", { path: Schema.String }) {
   override get message() { return `Preserved concurrently changed configuration: ${this.path}` }

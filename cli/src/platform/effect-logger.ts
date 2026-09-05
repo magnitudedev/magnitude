@@ -1,7 +1,7 @@
 import { Cause, Layer, Logger } from "effect"
 import { Option } from "effect"
 import type { PushNotification } from "@magnitudedev/client-common"
-import { TracingLayer } from "@magnitudedev/sdk"
+import { TracingLayer } from "@magnitudedev/client-common"
 
 const stringifyMessagePart = (value: unknown): string => {
   if (typeof value === "string") return value

@@ -15,12 +15,7 @@ import {
   type BrowserTabId,
   type BrowserViewportRect,
 } from "@magnitudedev/client-common/platform/embedded-browser"
-import {
-  AcnEnsureEventSchema,
-  AcnEnsureRequestSchema,
-  AcnEnsuranceError,
-  type AcnEnsureRequest,
-} from "@magnitudedev/sdk"
+import { ServiceStartProgressSchema, ServiceStartErrorSchema } from "@magnitudedev/sdk"
 
 export type { MenuAction }
 
@@ -45,10 +40,10 @@ export interface OpenFileOptions {
 }
 
 export const DesktopRpcs = RpcGroup.make(
-  Rpc.make("AcnEnsure", {
-    payload: AcnEnsureRequestSchema,
-    success: AcnEnsureEventSchema,
-    error: AcnEnsuranceError,
+  Rpc.make("ServiceStart", {
+    payload: {},
+    success: ServiceStartProgressSchema,
+    error: ServiceStartErrorSchema,
     stream: true,
   }),
   Rpc.make("StorageGet", {
@@ -172,13 +167,13 @@ export type DesktopRpcClient = RpcClient.FromGroup<
  * Values exposed through contextBridge are structured-cloned, so Effect data
  * types (notably Option) must cross that boundary in their encoded form.
  */
-export type DesktopAcnEnsureEvent = Schema.Schema.Encoded<
-  typeof AcnEnsureEventSchema
+export type DesktopServiceStartProgress = Schema.Schema.Encoded<
+  typeof ServiceStartProgressSchema
 >
-export const encodeDesktopAcnEnsureEvent =
-  Schema.encodeSync(AcnEnsureEventSchema)
-export const decodeDesktopAcnEnsureEvent =
-  Schema.decodeUnknownSync(AcnEnsureEventSchema)
+export const encodeDesktopServiceStartProgress =
+  Schema.encodeSync(ServiceStartProgressSchema)
+export const decodeDesktopServiceStartProgress =
+  Schema.decodeUnknownSync(ServiceStartProgressSchema)
 
 export type DesktopBrowserWorkspaceState = Schema.Schema.Encoded<
   typeof BrowserWorkspaceStateSchema
@@ -192,10 +187,9 @@ export type DesktopPlatform = "darwin" | "win32" | "linux"
 
 export interface DesktopApi {
   readonly platform: DesktopPlatform
-  readonly acnEnsurer: {
-    ensure(
-      request: AcnEnsureRequest,
-      onEvent: (event: DesktopAcnEnsureEvent) => void,
+  readonly serviceStarter: {
+    start(
+      onEvent: (event: DesktopServiceStartProgress) => void,
       onError: (error: unknown) => void,
       onEnd: () => void,
     ): () => void

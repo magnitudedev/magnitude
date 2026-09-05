@@ -8,7 +8,7 @@ import {
   customEndpointProviderId,
   type ProviderId,
   type ProviderModelId,
-} from "@magnitudedev/sdk"
+} from "@magnitudedev/providers/client"
 import { CustomEndpoints } from "./custom-endpoints"
 import { ModelSlotController } from "./model-slot-controller"
 import { ProviderModelCatalog } from "./provider-model-catalog"
