@@ -22,6 +22,7 @@ export interface HarnessConnectionPaths {
   readonly ompSettings: string
   readonly clineProviders: string
   readonly clineModels: string
+  readonly gptme: string
   readonly skillInstallations: Readonly<Record<SkillInstallationTarget, SkillInstallationPaths>>
 }
 
@@ -50,6 +51,7 @@ export const harnessConnectionPaths = (): HarnessConnectionPaths => {
     ompSettings: `${home}/.omp/agent/config.yml`,
     clineProviders: `${clineRoot}/settings/providers.json`,
     clineModels: `${clineRoot}/settings/models.json`,
+    gptme: `${home}/.config/gptme/config.toml`,
     skillInstallations: {
       "shared-agents": skillInstallation(`${home}/.agents/skills`),
       "hermes-user": skillInstallation(`${hermesRoot}/skills`),

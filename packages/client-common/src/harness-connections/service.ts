@@ -11,6 +11,7 @@ export const HarnessIdSchema = Schema.Literal(
   "claude-code",
   "oh-my-pi",
   "cline",
+  "gptme",
 ).pipe(Schema.brand("HarnessId"))
 export type HarnessId = typeof HarnessIdSchema.Type
 
@@ -24,6 +25,7 @@ const harnessPriorityValues = [
   "claude-code",
   "oh-my-pi",
   "cline",
+  "gptme",
 ] as const
 export const HARNESS_PRIORITY: ReadonlyArray<HarnessId> = harnessPriorityValues.map(
   (value) => HarnessIdSchema.make(value),

@@ -6,6 +6,7 @@ import {
   makeCodexConnector,
   type CodexBundledCatalogReader,
 } from "./connectors/codex"
+import { makeGptmeConnector } from "./connectors/gptme"
 import { makeHermesConnector } from "./connectors/hermes"
 import { makeMagnitudeConnector } from "./connectors/magnitude"
 import { makeOhMyPiConnector } from "./connectors/oh-my-pi"
@@ -44,6 +45,7 @@ export const makeHarnessConnectorRegistry = (
     makeClaudeCodeConnector(paths),
     makeOhMyPiConnector(paths),
     makeClineConnector(paths),
+    makeGptmeConnector(paths),
   ]
   return {
     ordered,
