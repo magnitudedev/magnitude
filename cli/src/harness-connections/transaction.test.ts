@@ -106,4 +106,22 @@ describe("cross-process connection locking", () => {
       yield* withConnectionLock(file, Effect.void).pipe(Effect.timeout("2 seconds"))
     }).pipe(Effect.provide(BunContext.layer))))
   })
+
+  it("fails with a typed error naming the lock when a holder never finishes", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "connection-lock-bound-" })
+      const file = `${root}/state`
+      const owner = yield* Command.make("bun", worker, file, "hold").pipe(Command.start)
+      const ready = yield* owner.stdout.pipe(Stream.decodeText(), Stream.take(1), Stream.runCollect)
+      expect(String(ready)).toContain("acquired")
+      const result = yield* Effect.either(withConnectionLock(file, Effect.void, "300 millis"))
+      expect(result._tag === "Left" && result.left._tag).toBe("HarnessConnectionLockTimedOut")
+      if (result._tag === "Left" && result.left._tag === "HarnessConnectionLockTimedOut") {
+        expect(result.left.path).toBe(`${file}.lock.sqlite`)
+      }
+      yield* owner.kill("SIGKILL")
+      yield* Effect.exit(owner.exitCode)
+    }).pipe(Effect.provide(BunContext.layer))))
+  })
 })

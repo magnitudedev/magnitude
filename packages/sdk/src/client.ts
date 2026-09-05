@@ -1,6 +1,7 @@
 import { HttpClient } from "@effect/platform";
 import { RpcClient, RpcClientError, RpcSerialization } from "@effect/rpc";
 import {
+  AcnHealthResponseSchema,
   MagnitudeHealthResponseSchema,
   AcnIdentitySchema,
   AcnInstanceIdSchema,
@@ -11,6 +12,7 @@ import {
   namespaceClient,
   ServiceStartProgressSchema,
   serviceProgressFromHealth,
+  type ServiceStartProgress,
   type TreeClient,
 } from "@magnitudedev/acn-protocol";
 import { FSM } from "@magnitudedev/utils";
@@ -155,7 +157,22 @@ const makeClient = (
 
     const unavailable = (message: string) =>
       new ServiceUnavailable({ origin, message });
-    const probe = http.get(`${origin}/health`).pipe(
+    // A daemon that predates the RPC version answers the older health shape. It is a
+    // real, decodable service speaking version 0, not an invalid response.
+    //
+    // This is the only place that assumption is made. Every health observation the
+    // SDK makes passes through this probe, so nothing downstream sees a health without
+    // an `rpcVersion`. It is deliberately not a default on the wire schema: the daemon
+    // always sends the field, and the schema is part of the RPC contract fingerprint,
+    // so a client-side compatibility decision must not change the contract. Daemon
+    // management reads the older schema directly and orders by revision, not RPC.
+    const decodeHealth = Schema.decodeUnknown(
+      Schema.Union(MagnitudeHealthResponseSchema, AcnHealthResponseSchema)
+    );
+    type ObservedHealth = typeof AcnHealthResponseSchema.Type & {
+      readonly rpcVersion: number;
+    };
+    const probe: Effect.Effect<ObservedHealth, ConnectionError> = http.get(`${origin}/health`).pipe(
       Effect.timeoutFail({
         duration: "2 seconds",
         onTimeout: () => unavailable("Magnitude service health timed out"),
@@ -174,8 +191,10 @@ const makeClient = (
               })
             )
           : response.json.pipe(
-              Effect.flatMap(
-                Schema.decodeUnknown(MagnitudeHealthResponseSchema)
+              Effect.flatMap(decodeHealth),
+              Effect.map(
+                (health): ObservedHealth =>
+                  "rpcVersion" in health ? health : { ...health, rpcVersion: 0 }
               ),
               Effect.mapError(
                 () =>
@@ -202,7 +221,7 @@ const makeClient = (
         })
       );
     const validate = (
-      health: typeof MagnitudeHealthResponseSchema.Type
+      health: ObservedHealth
     ): Effect.Effect<ServiceInfo, ConnectionError> =>
       health.rpcVersion !== MAGNITUDE_RPC_VERSION
         ? Effect.fail(
@@ -218,45 +237,57 @@ const makeClient = (
             rpcVersion: health.rpcVersion,
           });
 
+    // Run the host's starter once, observing health progress while it works.
+    const startService = (start: Stream.Stream<ServiceStartProgress, ConnectionError>) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* report({ _tag: "Starting", phase: "PreparingAcn" });
+          yield* probe.pipe(
+            Effect.flatMap((health) =>
+              Option.match(serviceProgressFromHealth(health.state), {
+                onNone: () => Effect.void,
+                onSome: report,
+              })
+            ),
+            Effect.ignore,
+            Effect.zipRight(Effect.sleep("250 millis")),
+            Effect.forever,
+            Effect.forkScoped
+          );
+          yield* start.pipe(Stream.runForEach(report));
+        })
+      );
+
+    // Every probe is one of: a usable service (ready or still starting), or an
+    // unusable one (absent, undecodable, or the wrong protocol). The starter, when
+    // the host injected one, gets exactly one chance to make an unusable service
+    // usable; after it has run, only a transient absence is tolerated.
     const acquire = Effect.gen(function* () {
       let started = false;
       while (true) {
-        const observed = yield* Effect.either(probe);
-        if (observed._tag === "Left") {
-          if (observed.left._tag !== "ServiceUnavailable")
-            return yield* observed.left;
-          if (!started && Option.isSome(starter)) {
-            started = true;
-            yield* report({ _tag: "Starting", phase: "PreparingAcn" });
-            yield* Effect.scoped(
-              Effect.gen(function* () {
-                // Observe health progress while a shell command is waiting for startup.
-                yield* probe.pipe(
-                  Effect.flatMap((health) =>
-                    Option.match(serviceProgressFromHealth(health.state), {
-                      onNone: () => Effect.void,
-                      onSome: report,
-                    })
-                  ),
-                  Effect.ignore,
-                  Effect.zipRight(Effect.sleep("250 millis")),
-                  Effect.forever,
-                  Effect.forkScoped
-                );
-                yield* starter.value.start.pipe(Stream.runForEach(report));
-              })
-            );
-            continue;
-          }
-          if (!started) return yield* observed.left;
-        } else {
-          const health = observed.right;
-          const service = yield* validate(health);
+        const observed = yield* Effect.either(
+          probe.pipe(
+            Effect.flatMap((health) =>
+              validate(health).pipe(Effect.map((service) => ({ health, service })))
+            )
+          )
+        );
+        if (observed._tag === "Right") {
+          const { health, service } = observed.right;
           if (health.state._tag === "Ready") return service;
           yield* Option.match(serviceProgressFromHealth(health.state), {
             onNone: () => Effect.void,
             onSome: report,
           });
+        } else if (started) {
+          if (observed.left._tag !== "ServiceUnavailable")
+            return yield* observed.left;
+        } else if (Option.isSome(starter)) {
+          started = true;
+          yield* startService(starter.value.start);
+          continue;
+        } else {
+          return yield* observed.left;
         }
         yield* Effect.sleep("250 millis");
       }

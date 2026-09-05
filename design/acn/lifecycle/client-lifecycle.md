@@ -22,12 +22,18 @@ operation, or explicit `connection.connect`, performs admission. Its state is
 
 Admission probes public health at the configured origin, normally loopback port 10100. A Ready
 response must supply the exact supported RPC version and an instance identity before RPC is
-dispatched. HTTP success, a process, or completion of a starter is not sufficient. Protocol mismatch
-is a typed error; the SDK never negotiates, upgrades, downgrades, or replaces mismatched software.
+dispatched. HTTP success, a process, or completion of a starter is not sufficient. A daemon that
+predates the RPC version answers the older health shape and is read as speaking version 0. Protocol
+mismatch is a typed error; the SDK itself never negotiates, upgrades, downgrades, or replaces
+software.
 
-An absent service may invoke an injected `MagnitudeServiceStarter`. The SDK invokes it at most once
-per admission occurrence, observes progress, then verifies public readiness. An already-starting
-service is observed without invoking another starter. Connect-only clients omit that capability.
+Every probe observes a usable service, ready or still starting, or an unusable one: absent,
+undecodable, or the wrong protocol. An unusable service may invoke an injected
+`MagnitudeServiceStarter`. The SDK invokes it at most once per admission occurrence, observes
+progress, then verifies public readiness; after it has run, only a transient absence is tolerated
+and any other answer is final. The host decides what the starter does: the CLI's replaces an older
+daemon, the plugin's asks the installed CLI. An already-starting service is observed without
+invoking another starter. Connect-only clients omit that capability and fail with the typed error.
 The default absolute admission deadline is ten minutes, including starter execution and health
 waiting. Each health request has a two-second bound.
 

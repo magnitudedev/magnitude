@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { prerelease } from "semver";
 import {
   artifactIntegrity,
+  awaitPublishedIntegrity,
   publishedPluginIntegrity,
   requireNpm,
   verifyPublishedPlugins,
@@ -61,6 +62,10 @@ const program = Effect.gen(function* () {
     cwd
   );
   const existing = yield* publishedPluginIntegrity(source.name, version, cwd);
+  if (existing !== null && existing !== expected)
+    return yield* new PluginArtifactError({
+      message: `${source.name}@${version} is already published with integrity ${existing}, not the accepted ${expected}; a registry version is immutable`,
+    });
   const tag = String(prerelease(version)?.[0] ?? "latest");
   if (existing === null)
     yield* requireNpm(
@@ -75,10 +80,8 @@ const program = Effect.gen(function* () {
       ],
       cwd
     );
-  if ((yield* publishedPluginIntegrity(source.name, version, cwd)) !== expected)
-    return yield* new PluginArtifactError({
-      message: "Published CLI does not match the accepted tarball",
-    });
+  // The registry lags a publish; prove it serves the accepted bytes before reporting success.
+  yield* awaitPublishedIntegrity(source.name, version, expected, cwd);
 });
 if (import.meta.main)
   BunRuntime.runMain(program.pipe(Effect.provide(BunContext.layer)));

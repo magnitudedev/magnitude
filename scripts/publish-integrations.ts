@@ -3,6 +3,7 @@ import { Console, Effect } from "effect"
 import { resolve } from "node:path"
 import { canonical } from "@magnitudedev/utils/canonical-key"
 import {
+  awaitPublishedIntegrity,
   publishedPluginIntegrity,
   requireNpm,
   PluginArtifactError,
@@ -49,15 +50,13 @@ const program = Effect.gen(function* () {
         ],
         directory
       )
-    const actual = yield* publishedPluginIntegrity(
+    // The registry lags a publish; prove it serves the accepted bytes before reporting success.
+    yield* awaitPublishedIntegrity(
       artifact.name,
       artifact.version,
+      artifact.integrity,
       directory
     )
-    if (actual !== artifact.integrity)
-      return yield* new PluginArtifactError({
-        message: `Published integrity differs for ${artifact.name}@${artifact.version}. Refresh preparation; never overwrite a version.`,
-      })
     yield* Console.log(`Verified public ${artifact.name}@${artifact.version}`)
   }
 })

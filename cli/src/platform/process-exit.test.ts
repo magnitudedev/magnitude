@@ -1,42 +1,44 @@
-import { Effect, Exit, Scope } from "effect"
+import { Deferred, Effect, Exit, Ref } from "effect"
 import { describe, expect, it } from "vitest"
-import { makeProcessExitSource } from "./process-exit"
+import { untilProcessExit, type ProcessExitRequest } from "./process-exit"
 
-describe("process exit source", () => {
-  it("turns signals into data and removes every listener with its scope", async () => {
-    const signals = [
-      "SIGINT",
-      "SIGTERM",
-      "SIGHUP",
-      "beforeExit",
-      "exit",
-      "uncaughtException",
-      "unhandledRejection",
-    ] as const
-    const initialCounts = signals.map((signal) => process.listenerCount(signal))
-    const initialSigintListeners = new Set(process.rawListeners("SIGINT"))
-    const scope = await Effect.runPromise(Scope.make())
+const source = () => Effect.map(Deferred.make<ProcessExitRequest>(), (request) => ({
+  request,
+  exit: { await: Deferred.await(request) },
+}))
 
-    try {
-      const source = await Effect.runPromise(makeProcessExitSource.pipe(
-        Effect.provideService(Scope.Scope, scope),
-      ))
-      expect(signals.map((signal) => process.listenerCount(signal)))
-        .toEqual(initialCounts.map((count) => count + 1))
+describe("untilProcessExit", () => {
+  it("propagates a startup failure immediately instead of waiting for an exit signal", async () => {
+    const started = Date.now()
+    const exit = await Effect.runPromiseExit(Effect.gen(function* () {
+      const { exit } = yield* source()
+      return yield* untilProcessExit(Effect.fail("service failed to start"), exit)
+    }))
+    expect(Exit.isFailure(exit)).toBe(true)
+    expect(Date.now() - started).toBeLessThan(1_000)
+  })
 
-      const signalListener = process.rawListeners("SIGINT")
-        .find((listener) => !initialSigintListeners.has(listener))
-      expect(signalListener).toBeDefined()
-      signalListener!()
-      await expect(Effect.runPromise(source.await)).resolves.toEqual({
-        _tag: "Signal",
-        signal: "SIGINT",
-      })
-    } finally {
-      await Effect.runPromise(Scope.close(scope, Exit.void))
-    }
+  it("interrupts startup on an exit request and runs its finalizers", async () => {
+    const outcome = await Effect.runPromise(Effect.gen(function* () {
+      const { request, exit } = yield* source()
+      const released = yield* Ref.make(false)
+      const startup = Effect.acquireRelease(Effect.void, () => Ref.set(released, true)).pipe(
+        Effect.zipRight(Effect.never),
+        Effect.scoped,
+      )
+      const result = yield* Effect.fork(untilProcessExit(startup, exit))
+      yield* Deferred.succeed(request, { _tag: "Signal", signal: "SIGINT" })
+      return { result: yield* result.await, released: yield* Ref.get(released) }
+    }))
+    expect(Exit.isSuccess(outcome.result) && outcome.result.value._tag).toBe("Exit")
+    expect(outcome.released).toBe(true)
+  })
 
-    expect(signals.map((signal) => process.listenerCount(signal)))
-      .toEqual(initialCounts)
+  it("returns the startup value when it completes first", async () => {
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const { exit } = yield* source()
+      return yield* untilProcessExit(Effect.succeed(42), exit)
+    }))
+    expect(result).toEqual({ _tag: "Completed", value: 42 })
   })
 })
