@@ -1,5 +1,5 @@
 {
-  "name": "@magnitudedev/pi",
+  "name": "@magnitudedev/pi-extension",
   "version": "0.0.1",
   "description": "Magnitude model controls and inference progress for Pi",
   "type": "module",

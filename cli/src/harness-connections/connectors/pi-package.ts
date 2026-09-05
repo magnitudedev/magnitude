@@ -18,8 +18,8 @@ import {
 } from "./pi-settings"
 
 export const PI_COMPANION_PACKAGE_NAME = "Magnitude for Pi"
-export const PI_COMPANION_PACKAGE_IDENTITY = "@magnitudedev/pi"
-export const PI_COMPANION_PACKAGE_SOURCE = PiPackageSourceSchema.make("npm:@magnitudedev/pi@0.0.1")
+export const PI_COMPANION_PACKAGE_IDENTITY = "@magnitudedev/pi-extension"
+export const PI_COMPANION_PACKAGE_SOURCE = PiPackageSourceSchema.make("npm:@magnitudedev/pi-extension@0.0.1")
 export const PI_COMPANION_EXTENSION_PATH = "dist/magnitude.js"
 const SUPPORTED_PACKAGE_VERSION = "0.0.1"
 

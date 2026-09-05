@@ -11,7 +11,7 @@ magnitude connections add pi
 ```
 
 Restart Pi or run `/reload` after connecting. `PI_CODING_AGENT_DIR`, if set, is honored.
-Installing just `pi install npm:@magnitudedev/pi@0.0.1` does not configure provider models,
+Installing just `pi install npm:@magnitudedev/pi-extension@0.0.1` does not configure provider models,
 install the Magnitude CLI, start its service, or install its agent skill; the connection command
 does all connection configuration and can be run safely after a standalone package install.
 

@@ -50,7 +50,7 @@ assert.equal(result.runtime.pendingProviderRegistrations[0].name, 'magnitude')
 for (const handler of result.extensions[0].handlers.get('session_shutdown') ?? []) await handler({}, {})
 console.log('Packed Magnitude extension loaded through Pi with both commands and provider', process.versions.bun ? 'Bun ' + process.versions.bun : 'Node ' + process.version)
 `)
-  yield* checked("node", [resolve(root, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"), "install", resolve(root, "node_modules/@magnitudedev/pi")], workspace, { PI_CODING_AGENT_DIR: agentDir })
+  yield* checked("node", [resolve(root, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"), "install", resolve(root, "node_modules/@magnitudedev/pi-extension")], workspace, { PI_CODING_AGENT_DIR: agentDir })
   // Native install must use the same isolated agent directory as the loader.
   for (const runtime of ["node", "bun"]) yield* checked(runtime, [probe], root)
   yield* Console.log("Integration tarball acceptance passed (Node and Bun).")
