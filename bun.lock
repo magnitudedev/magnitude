@@ -106,7 +106,7 @@
     },
     "integrations/pi": {
       "name": "@magnitudedev/pi-extension",
-      "version": "0.0.0",
+      "version": "0.0.1-alpha.0",
       "dependencies": {
         "@effect/platform": "0.96.1",
         "@effect/platform-node": "0.107.0",
@@ -418,7 +418,7 @@
     },
     "packages/launcher": {
       "name": "@magnitudedev/cli",
-      "version": "0.0.11",
+      "version": "0.0.12-alpha.0",
       "bin": {
         "magnitude": "bin/magnitude.js",
       },
