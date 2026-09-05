@@ -39,7 +39,7 @@
     "@magnitudedev/version": "0.0.1"
   },
   "changesets": [
-    "rpc-plugins",
-    "wide-images-buffer"
+    "wide-images-buffer",
+    "yellow-kiwis-remain"
   ]
 }
