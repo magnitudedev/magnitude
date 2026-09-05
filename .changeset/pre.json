@@ -38,5 +38,8 @@
     "@magnitudedev/vcs": "0.0.1",
     "@magnitudedev/version": "0.0.1"
   },
-  "changesets": []
+  "changesets": [
+    "rpc-plugins",
+    "wide-images-buffer"
+  ]
 }

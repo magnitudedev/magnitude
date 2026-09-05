@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.12-alpha.0
+
+### Patch Changes
+
+- [#71](https://github.com/magnitudedev/magnitude/pull/71) [`afe6288`](https://github.com/magnitudedev/magnitude/commit/afe6288841ace31b4a4f974003ce9e9f0430ae62) Thanks [@lloydgreenwald](https://github.com/lloydgreenwald)! - Set an explicit HTTP request-body limit so larger image requests are no longer rejected before reaching the handler.
+
 ## 0.0.11
 
 ### Patch Changes
