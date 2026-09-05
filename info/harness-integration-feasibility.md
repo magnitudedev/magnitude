@@ -92,10 +92,10 @@ This preserves Pi's message, tool-call, usage, and error semantics while giving 
 
 ### Packaging and lifecycle
 
-Publish an npm package such as `@magnitudedev/pi` with the `pi-package` keyword and `pi.extensions` entry. Pi's documented lifecycle is:
+Publish an npm package such as `@magnitudedev/pi-extension` with the `pi-package` keyword and `pi.extensions` entry. Pi's documented lifecycle is:
 
-- Install: `pi install npm:@magnitudedev/pi`
-- Remove: `pi remove npm:@magnitudedev/pi`
+- Install: `pi install npm:@magnitudedev/pi-extension`
+- Remove: `pi remove npm:@magnitudedev/pi-extension`
 - Reload the running process with `/reload`, or restart it.
 
 Pi extensions execute with the user's permissions, so CLI failures should be surfaced explicitly and never treated as successful state changes.

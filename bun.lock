@@ -103,7 +103,7 @@
       },
     },
     "integrations/pi": {
-      "name": "@magnitudedev/pi",
+      "name": "@magnitudedev/pi-extension",
       "version": "0.0.1",
       "dependencies": {
         "@magnitudedev/integration-protocol": "0.0.1",
@@ -1064,7 +1064,7 @@
 
     "@magnitudedev/openapi-effect": ["@magnitudedev/openapi-effect@workspace:packages/openapi-effect"],
 
-    "@magnitudedev/pi": ["@magnitudedev/pi@workspace:integrations/pi"],
+    "@magnitudedev/pi-extension": ["@magnitudedev/pi-extension@workspace:integrations/pi"],
 
     "@magnitudedev/providers": ["@magnitudedev/providers@workspace:packages/providers"],
 

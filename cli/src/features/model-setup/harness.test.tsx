@@ -39,7 +39,7 @@ const destinations = [
     skillRequired: true,
     companion: {
       name: "Magnitude for Pi",
-      source: "npm:@magnitudedev/pi@0.0.1",
+      source: "npm:@magnitudedev/pi-extension@0.0.1",
       securityNotice: "Pi extensions execute with your user permissions.",
     },
   },
@@ -138,7 +138,7 @@ describe("harness chooser layout", () => {
       act(() => keyboard.handler?.(keyEvent("down")))
       await act(view.renderOnce)
       const frame = view.captureCharFrame()
-      expect(frame).toContain("Magnitude will install and enable Magnitude for Pi (npm:@magnitudedev/pi@0.0.1).")
+      expect(frame).toContain("Magnitude will install and enable Magnitude for Pi (npm:@magnitudedev/pi-extension@0.0.1).")
       expect(frame).toContain("Pi extensions execute with your user permissions.")
       expect(frame).toContain("[x] Magnitude skill required for agent model management")
     } finally {

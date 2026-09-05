@@ -817,7 +817,7 @@ describe("OnboardingModelSetup", () => {
     const connect = vi.fn(() => Effect.succeed({
       companion: Option.some({
         name: "Magnitude for Pi",
-        source: "npm:@magnitudedev/pi@0.0.1",
+        source: "npm:@magnitudedev/pi-extension@0.0.1",
         securityNotice: "Pi extensions execute with your user permissions.",
         status: "installed" as const,
         activationInstructions: Option.some("Restart existing Pi sessions or run /reload to activate the extension."),
@@ -834,7 +834,7 @@ describe("OnboardingModelSetup", () => {
         connected: false,
         companion: {
           name: "Magnitude for Pi",
-          source: "npm:@magnitudedev/pi@0.0.1",
+          source: "npm:@magnitudedev/pi-extension@0.0.1",
           securityNotice: "Pi extensions execute with your user permissions.",
         },
       }]),
