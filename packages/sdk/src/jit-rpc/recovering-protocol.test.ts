@@ -358,6 +358,31 @@ describe("recovering protocol — operation contract", () => {
     expect(calls()).toBe(1)
   })
 
+  it("retries an at-most-once request rejected by a successor at the same address", async () => {
+    const url = "http://127.0.0.1:10100"
+    const { access, startCalls } = makeFakeEndpointAccess({
+      current: [Option.some(url), Option.none()],
+      startUrl: url,
+    })
+    const requests: HttpClientRequest.HttpClientRequest[] = []
+    const client = HttpClient.make((request) => Effect.sync(() => {
+      requests.push(request)
+      if (requests.length === 1) {
+        return HttpClientResponse.fromWeb(request, new Response(null, { status: 409 }))
+      }
+      return HttpClientResponse.fromWeb(request, new Response(`${JSON.stringify(
+        exitMessage("Ping", extractRequestId(request), Exit.succeed("pong")),
+      )}\n`))
+    }))
+
+    expect(await withClient(access, client, (c) => c.Ping({ value: "ping" }), "AtMostOnce"))
+      .toBe("pong")
+    expect(requests.map((request) => request.url)).toEqual([`${url}/rpc`, `${url}/rpc`])
+    expect(requests.map((request) => request.headers["x-magnitude-acn-id"]))
+      .toEqual([url, `${url}#start-1`])
+    expect(startCalls()).toBe(1)
+  })
+
   it("does not replay an at-most-once request after an ambiguous server failure", async () => {
     const { access } = makeFakeEndpointAccess({ current: [Option.some("http://broken-daemon")] })
     const statusClient = HttpClient.make((request) =>
@@ -394,12 +419,13 @@ describe("recovering protocol — operation contract", () => {
     expect(startCalls()).toBe(0)
   })
 
-  it("treats a stream body ending without an exit as death and re-issues invisibly", async () => {
+  it("resubscribes after stream loss when the successor reuses the same address", async () => {
+    const url = "http://127.0.0.1:10100"
     const { access, startCalls } = makeFakeEndpointAccess({
-      current: [Option.some("http://daemon-1"), Option.none()],
-      startUrl: "http://daemon-2",
+      current: [Option.some(url), Option.none()],
+      startUrl: url,
     })
-    const { client, calls } = makeFakeHttp([
+    const { client, calls, requests } = makeFakeHttp([
       { kind: "lines", make: (id) => [chunkMessage(id, [{ event: "changed", path: "first" }])] },
       {
         kind: "lines",
@@ -415,6 +441,9 @@ describe("recovering protocol — operation contract", () => {
     expect(paths).toEqual(["first", "second"])
     expect(calls()).toBe(2)
     expect(startCalls()).toBe(1)
+    expect(requests().map((request) => request.url)).toEqual([`${url}/rpc`, `${url}/rpc`])
+    expect(requests().map((request) => request.headers["x-magnitude-acn-id"]))
+      .toEqual([url, `${url}#start-1`])
   })
 
   it("surfaces a stream exit without the authoritative terminal control", async () => {

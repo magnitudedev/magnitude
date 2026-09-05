@@ -2,6 +2,8 @@
 applies_to:
   - packages/acn/src/service-lifecycle.ts
   - packages/acn/src/server.ts
+  - packages/acn/src/server.test.ts
+  - packages/sdk/src/acn-jit/acn-owner-observer.ts
   - packages/acn/src/ownership-monitor.ts
   - packages/acn/src/acn-subscriptions.ts
   - packages/acn/src/icn/**
@@ -65,13 +67,20 @@ absolute application-startup ceiling that never restarts. Expiry commits
 ## Per-user service
 
 ACN is installed as a per-user login service and, after owner admission, binds the stable public
-loopback endpoint `127.0.0.1:10100`. Its cross-version health, shutdown, and RPC coordination
-listener remains on the independently bindable endpoint published in the owner record. Keeping
+loopback endpoint `127.0.0.1:10100` for application RPC (`POST /rpc`), health, and inference. RPC
+is served only there. Its cross-version health/shutdown control listener remains on the
+independently bindable endpoint published in the owner record. Keeping
 these listeners distinct preserves concurrent candidate admission and fenced takeover while giving
 saved harness configuration one stable endpoint. Both listeners belong to the same ACN process,
 lifecycle, release, and authority. The platform service manager owns login startup and restart. The
 service remains alive without an RPC client so a saved third-party harness endpoint continues to
 work.
+
+Readiness is published only after the public listener and application dispatch are installed.
+Every RPC requires the selected instance ID; a missing or different ID returns `409` without
+dispatching. Successive daemons reuse the public address, not the instance identity. The control
+listener never serves RPC, including during startup or replacement. Client and daemon routing
+changes ship together; there is no private-port RPC compatibility fallback.
 
 Interactive onboarding may register this service for future user-session startup while its ACN
 connection is the current foreground client. Registration writes the exact service definition and

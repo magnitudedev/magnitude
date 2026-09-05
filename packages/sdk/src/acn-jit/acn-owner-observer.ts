@@ -19,6 +19,7 @@ import {
   type ProcessGroupController,
 } from "@magnitudedev/acn-protocol/coordination"
 import { Context, Duration, Effect, Either, Option, Schedule, Schema } from "effect"
+import { MAGNITUDE_SERVICE_ORIGIN } from "../inference-endpoint"
 import {
   AcnHealthAttemptFailureSchema,
   type AcnHealthAttemptFailure,
@@ -217,7 +218,7 @@ export const makeAcnOwnerObserver = (
       revision: health.revision,
       id: health.id,
       identity: health.version,
-      url: `http://127.0.0.1:${owner.port}`,
+      url: MAGNITUDE_SERVICE_ORIGIN,
       pid: owner.pid,
       processStartIdentity: owner.processStartIdentity,
       lifecycle: new AcnReady({}),

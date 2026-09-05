@@ -66,7 +66,9 @@ const rpcClient = (
 ) => HttpClient.make((request) => Effect.suspend(() => {
   const message = JSON.parse(bodyText(request).split("\n")[0]!) as { id: string; tag: string }
   tags.push(message.tag)
-  const instance = instances.find((candidate) => request.url.startsWith(candidate.url)) ?? instances[0]!
+  const instance = instances.find((candidate) =>
+    candidate.id === request.headers["x-magnitude-acn-id"] && request.url === `${candidate.url}/rpc`)
+  if (instance === undefined) throw new Error("RPC did not target an exact selected instance")
   if (message.tag === "Health" && refuseHealthFor.has(instance.id)) {
     return Effect.fail(new HttpClientError.RequestError({
       request,
@@ -304,11 +306,10 @@ describe("AcnConnection", () => {
     })).pipe(Effect.provide(TestContext.TestContext)))
   })
 
-  it("recovers an application RPC by replacing only its failed exact endpoint", async () => {
+  it("recovers an application RPC when the successor uses the same URL with a new identity", async () => {
     const successor: ReadyInstance = {
       ...ready,
       id: AcnInstanceIdSchema.make("successor-acn"),
-      url: "http://successor-acn",
       pid: 456,
       processStartIdentity: ProcessStartIdentitySchema.make("successor-process"),
     }
