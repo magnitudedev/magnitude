@@ -3,7 +3,7 @@
 This Pi package adds Magnitude model management commands and live local-inference progress to Pi's
 built-in working row above the editor.
 
-Requires Pi 0.84.4–0.84.x and a Magnitude CLI supporting the version-1 `models --json`
+Requires Pi 0.83.0 or newer and a Magnitude CLI supporting the version-1 `models --json`
 contract. Start Magnitude's service and install a local model first, then run:
 
 ```sh
