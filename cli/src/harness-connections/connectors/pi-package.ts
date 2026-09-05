@@ -1,6 +1,6 @@
 import * as Command from "@effect/platform/Command"
 import * as FileSystem from "@effect/platform/FileSystem"
-import { Effect, Option, Schema, Stream } from "effect"
+import { Array, Effect, Option, Schema, Stream, pipe } from "effect"
 import { minimatch } from "minimatch"
 import { basename, dirname, resolve, sep } from "node:path"
 import { homedir } from "node:os"
@@ -8,29 +8,30 @@ import { isDeepStrictEqual } from "node:util"
 import { satisfies } from "semver"
 import type { HarnessCompanionPackage, HarnessCompanionState } from "../contract"
 import type { HarnessConnectionPaths } from "../paths"
-import { jsonObject, readOr, updateJsonc, writeIfChanged } from "../shared"
+import { updateJsonc, writeIfChanged } from "../shared"
 import { ConnectionTransaction } from "../transaction"
 import { writeFileAtomic } from "../../utils/atomic-file"
+import { PiPackageSourceSchema, type PiPackageSource } from "./pi-package-state"
+import {
+  decodePiSettings, piPackageFilters, piPackageSource, readPiSettings, replacePiPackages,
+  type PiPackageEntry, type PiSettings,
+} from "./pi-settings"
 
 export const PI_COMPANION_PACKAGE_NAME = "Magnitude for Pi"
 export const PI_COMPANION_PACKAGE_IDENTITY = "@magnitudedev/pi"
-export const PI_COMPANION_PACKAGE_SOURCE = "npm:@magnitudedev/pi@0.0.1"
+export const PI_COMPANION_PACKAGE_SOURCE = PiPackageSourceSchema.make("npm:@magnitudedev/pi@0.0.1")
 export const PI_COMPANION_EXTENSION_PATH = "dist/magnitude.js"
 const SUPPORTED_PACKAGE_VERSION = "0.0.1"
 
 export class PiPackageError extends Schema.TaggedError<PiPackageError>()("PiPackageError", {
   message: Schema.String,
 }) {}
-const object = (value: unknown): Record<string, unknown> | undefined =>
-  value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined
-const sourceOf = (entry: unknown): string | undefined => {
-  const source = typeof entry === "string" ? entry : object(entry)?.source
-  return typeof source === "string" ? source : undefined
-}
-const isCompanionNpm = (source: string) => source === `npm:${PI_COMPANION_PACKAGE_IDENTITY}`
+const isCompanionNpm = (source: PiPackageSource) => source === `npm:${PI_COMPANION_PACKAGE_IDENTITY}`
   || source.startsWith(`npm:${PI_COMPANION_PACKAGE_IDENTITY}@`)
-const localPath = (source: string, settings: string) => resolve(dirname(settings), source.startsWith("~/") ? `${homedir()}/${source.slice(2)}` : source)
-const sameSource = (left: string, right: string, settings: string) =>
+const localPath = (source: PiPackageSource, settings: string) => PiPackageSourceSchema.make(
+  resolve(dirname(settings), source.startsWith("~/") ? `${homedir()}/${source.slice(2)}` : source),
+)
+const sameSource = (left: PiPackageSource, right: PiPackageSource, settings: string) =>
   left.startsWith("npm:") || right.startsWith("npm:") ? left === right : localPath(left, settings) === localPath(right, settings)
 const posix = (path: string) => path.split(sep).join("/")
 const exact = (pattern: string, root: string) => {
@@ -41,23 +42,22 @@ const matches = (pattern: string, root: string) => [PI_COMPANION_EXTENSION_PATH,
   .some((path) => minimatch(path, posix(pattern)))
 
 /** Mirrors the supported Pi package manager's regular and autoload-disabled filters. */
-export const piPackageExtensionEnabled = (entry: unknown, packageRoot = "/"): boolean => {
+export const piPackageExtensionEnabled = (entry: PiPackageEntry, packageRoot = "/"): boolean => {
   if (typeof entry === "string") return true
-  const config = object(entry)
-  if (!config) return false
-  const filters = config.extensions
-  if (filters === undefined) return config.autoload !== false
-  if (!Array.isArray(filters) || !filters.every((filter): filter is string => typeof filter === "string") || filters.length === 0) return false
-  if (config.autoload === false) {
+  const autoload = Option.getOrElse(entry.autoload, () => true)
+  if (Option.isNone(entry.extensions)) return autoload
+  const filters = entry.extensions.value
+  if (filters.length === 0) return false
+  if (!autoload) {
     let enabled = false
     for (const filter of filters) {
-      const prefix = filter[0]
-      const target = ["+", "-", "!"].includes(prefix!) ? filter.slice(1) : filter
+      const prefix = filter.charAt(0)
+      const target = ["+", "-", "!"].includes(prefix) ? filter.slice(1) : filter
       if (prefix === "+" || prefix === "-" ? exact(target, packageRoot) : matches(target, packageRoot)) enabled = prefix !== "-" && prefix !== "!"
     }
     return enabled
   }
-  const includes = filters.filter((filter) => !["!", "+", "-"].includes(filter[0]!))
+  const includes = filters.filter((filter) => !["!", "+", "-"].includes(filter.charAt(0)))
   let enabled = includes.length === 0 || includes.some((filter) => matches(filter, packageRoot))
   if (filters.some((filter) => filter.startsWith("!") && matches(filter.slice(1), packageRoot))) enabled = false
   if (filters.some((filter) => filter.startsWith("+") && exact(filter.slice(1), packageRoot))) enabled = true
@@ -68,20 +68,19 @@ export const piPackageExtensionEnabled = (entry: unknown, packageRoot = "/"): bo
 const PackageManifest = Schema.Struct({ name: Schema.String, version: Schema.String, pi: Schema.Struct({ extensions: Schema.Array(Schema.String) }) })
 const decodeManifest = Schema.decodeUnknown(Schema.parseJson(PackageManifest))
 
-export const makePiCompanion = (paths: HarnessConnectionPaths, desiredSource = PI_COMPANION_PACKAGE_SOURCE): HarnessCompanionPackage => {
+export const makePiCompanion = (paths: HarnessConnectionPaths, desiredSource: string = PI_COMPANION_PACKAGE_SOURCE): HarnessCompanionPackage => {
   const agentDir = dirname(paths.piSettings)
-  const find = (settings: Record<string, unknown>, source: string, byIdentity = false) => {
-    const packages = Array.isArray(settings.packages) ? settings.packages : []
-    const index = packages.findIndex((entry) => {
-      const candidate = sourceOf(entry)
-      return candidate !== undefined && (sameSource(candidate, source, paths.piSettings) || byIdentity && isCompanionNpm(candidate) && isCompanionNpm(source))
-    })
-    return index < 0 ? undefined : { index, entry: packages[index], source: sourceOf(packages[index])! }
-  }
-  const rootFor = (source: string) => source.startsWith("npm:")
+  const readSettings = readPiSettings(paths.piSettings)
+  const find = (settings: PiSettings, source: PiPackageSource, byIdentity = false) =>
+    pipe(Option.getOrElse(settings.packages, () => []),
+      Array.map((entry, index) => ({ index, entry, source: piPackageSource(entry) })),
+      Array.findFirst((candidate) => sameSource(candidate.source, source, paths.piSettings)
+        || byIdentity && isCompanionNpm(candidate.source) && isCompanionNpm(source)),
+    )
+  const rootFor = (source: PiPackageSource) => source.startsWith("npm:")
     ? resolve(agentDir, "npm/node_modules", PI_COMPANION_PACKAGE_IDENTITY)
     : localPath(source, paths.piSettings)
-  const command = (executable: string, action: "install" | "remove", source: string) => Effect.scoped(Effect.gen(function* () {
+  const command = (executable: string, action: "install" | "remove", source: PiPackageSource) => Effect.scoped(Effect.gen(function* () {
     const process = yield* Command.make(executable, action, source.startsWith("npm:") ? source : localPath(source, paths.piSettings)).pipe(
       Command.env({ PI_CODING_AGENT_DIR: agentDir }), Command.start,
     )
@@ -92,7 +91,7 @@ export const makePiCompanion = (paths: HarnessConnectionPaths, desiredSource = P
     ], { concurrency: "unbounded" })
     if (Number(exitCode) !== 0) return yield* new PiPackageError({ message: `Pi ${action} failed (${exitCode}): ${stderr || stdout}` })
   })).pipe(Effect.timeout("2 minutes"))
-  const inspect = (source: string) => Effect.gen(function* () {
+  const inspect = (source: PiPackageSource) => Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
     const root = rootFor(source)
     if (!(yield* fs.exists(resolve(root, "package.json")))) return false
@@ -111,27 +110,34 @@ export const makePiCompanion = (paths: HarnessConnectionPaths, desiredSource = P
 
   // Native package operations can fail after mutating settings or disk. Register the
   // inverse first, and never overwrite a changed package entry during recovery.
-  const mutate = (executable: string, action: "install" | "remove", source: string) => Effect.gen(function* () {
+  const mutate = (executable: string, action: "install" | "remove", source: PiPackageSource) => Effect.gen(function* () {
     const tx = yield* ConnectionTransaction
-    const beforeText = yield* readOr(paths.piSettings, "{}\n")
-    const beforeSettings = jsonObject(beforeText)
-    const before = find(beforeSettings, source)
+    const beforeDocument = yield* readSettings
+    const before = find(beforeDocument.settings, source)
     yield* tx.compensate(`Pi ${action} ${source}`, Effect.gen(function* () {
-      const text = yield* readOr(paths.piSettings, "{}\n")
-      const current = find(jsonObject(text), source, true)
-      if (current && !sameSource(current.source, source, paths.piSettings)) return yield* new PiPackageError({ message: `Preserved changed Pi package source ${current.source}; manual recovery needed for ${source}.` })
-      if (current && !isDeepStrictEqual(current.entry, before?.entry) && typeof current.entry !== "string") return yield* new PiPackageError({ message: `Preserved concurrently edited Pi package ${source}; manual recovery needed.` })
+      const currentDocument = yield* readSettings
+      const current = find(currentDocument.settings, source, true)
+      if (Option.isSome(current)) {
+        if (!sameSource(current.value.source, source, paths.piSettings)) {
+          return yield* new PiPackageError({ message: `Preserved changed Pi package source ${current.value.source}; manual recovery needed for ${source}.` })
+        }
+        if (typeof current.value.entry !== "string" && !Option.containsWith(isDeepStrictEqual)(
+          Option.map(before, ({ entry }) => entry), current.value.entry,
+        )) {
+          return yield* new PiPackageError({ message: `Preserved concurrently edited Pi package ${source}; manual recovery needed.` })
+        }
+      }
       yield* command(executable, action === "install" ? "remove" : "install", source)
-      const after = yield* readOr(paths.piSettings, "{}\n")
-      const settings = jsonObject(after)
-      const packages = (Array.isArray(settings.packages) ? settings.packages : []).filter((entry) => {
-        const candidate = sourceOf(entry)
-        return candidate === undefined || !sameSource(candidate, source, paths.piSettings)
-      })
-      if (before) packages.splice(Math.min(before.index, packages.length), 0, before.entry)
+      const afterDocument = yield* readSettings
+      const packages = Option.getOrElse(afterDocument.settings.packages, () => [])
+        .filter((entry) => !sameSource(piPackageSource(entry), source, paths.piSettings))
+      if (Option.isSome(before)) packages.splice(Math.min(before.value.index, packages.length), 0, before.value.entry)
       // This recovery write must not register new compensation.
-      const restored = updateJsonc(after, [[["packages"], packages.length === 0 && beforeSettings.packages === undefined ? undefined : packages]])
-      yield* writeFileAtomic(paths.piSettings, isDeepStrictEqual(jsonObject(restored), beforeSettings) ? beforeText : restored)
+      const restored = yield* replacePiPackages(afterDocument,
+        packages.length === 0 && Option.isNone(beforeDocument.settings.packages) ? Option.none() : Option.some(packages))
+      const restoredDocument = yield* decodePiSettings(restored, paths.piSettings)
+      yield* writeFileAtomic(paths.piSettings, isDeepStrictEqual(restoredDocument.settings, beforeDocument.settings)
+        ? beforeDocument.text : restored)
     }))
     yield* command(executable, action, source)
   })
@@ -140,38 +146,40 @@ export const makePiCompanion = (paths: HarnessConnectionPaths, desiredSource = P
     description: { name: PI_COMPANION_PACKAGE_NAME, source: desiredSource, securityNotice: "Pi extensions execute with your user permissions." },
     activationInstructions: Option.some("Restart existing Pi sessions or run /reload to activate the extension."),
     reconcile: ({ installation, previous }) => Effect.gen(function* () {
+      const desired = yield* Schema.decodeUnknown(PiPackageSourceSchema)(desiredSource)
+      let document = yield* readSettings
       yield* verifyHost(installation.executable)
-      let text = yield* readOr(paths.piSettings, "{}\n")
-      let current = find(jsonObject(text), desiredSource, true)
-        ?? (Option.isSome(previous) ? find(jsonObject(text), previous.value.source) : undefined)
+      let current = find(document.settings, desired, true).pipe(
+        Option.orElse(() => Option.flatMap(previous, (state) => find(document.settings, state.source))),
+      )
       let owned = Option.isSome(previous) && previous.value.ownership === "magnitude"
-        && (current === undefined || sameSource(current.source, previous.value.source, paths.piSettings))
+        && (Option.isNone(current) || sameSource(current.value.source, previous.value.source, paths.piSettings))
       let installed = false
-      if (owned && current && !sameSource(current.source, desiredSource, paths.piSettings)) {
-        yield* mutate(installation.executable, "remove", current.source)
-        current = undefined
+      if (owned && Option.isSome(current) && !sameSource(current.value.source, desired, paths.piSettings)) {
+        yield* mutate(installation.executable, "remove", current.value.source)
+        current = Option.none()
       }
-      const configuredSource = current?.source ?? desiredSource
+      const configuredSource = Option.match(current, { onNone: () => desired, onSome: ({ source }) => source })
       const source = configuredSource.startsWith("npm:") ? configuredSource : localPath(configuredSource, paths.piSettings)
-      if (!current || !(yield* inspect(source))) {
-        if (!current) owned = true
+      if (Option.isNone(current) || !(yield* inspect(source))) {
+        if (Option.isNone(current)) owned = true
         yield* mutate(installation.executable, "install", source)
         if (!(yield* inspect(source))) return yield* new PiPackageError({ message: `Pi did not install a usable Magnitude extension at ${rootFor(source)}.` })
         installed = true
-        text = yield* readOr(paths.piSettings, "{}\n")
-        current = find(jsonObject(text), source)
-        if (!current) return yield* new PiPackageError({ message: `Pi did not register ${source}.` })
+        document = yield* readSettings
+        current = find(document.settings, source)
       }
-      const enabled = piPackageExtensionEnabled(current.entry, rootFor(source))
+      if (Option.isNone(current)) return yield* new PiPackageError({ message: `Pi did not register ${source}.` })
+      const { entry, index } = current.value
+      const enabled = piPackageExtensionEnabled(entry, rootFor(source))
       let enablement = Option.isSome(previous) && previous.value.ownership === "pre-existing"
         && sameSource(previous.value.source, source, paths.piSettings) ? previous.value.enablement : Option.none()
       if (!enabled) {
-        const config = object(current.entry) ?? { source }
-        if (config.extensions !== undefined) yield* Schema.decodeUnknown(Schema.Array(Schema.String))(config.extensions)
-        const filters = Array.isArray(config.extensions) ? config.extensions as string[] : []
+        const before = piPackageFilters(entry)
+        const filters = Option.getOrElse(before, () => [])
         const after = [...filters.filter((filter) => !((filter.startsWith("+") || filter.startsWith("-")) && exact(filter.slice(1), rootFor(source)))), `+${PI_COMPANION_EXTENSION_PATH}`]
-        enablement = Option.some({ before: Option.fromNullable(config.extensions as string[] | undefined), after })
-        yield* writeIfChanged(paths.piSettings, text, updateJsonc(text, [[["packages", current.index, "extensions"], after]]))
+        enablement = Option.some({ before, after })
+        yield* writeIfChanged(paths.piSettings, document.text, updateJsonc(document.text, [[["packages", index, "extensions"], after]]))
       }
       const state: HarnessCompanionState = owned
         ? { identity: PI_COMPANION_PACKAGE_IDENTITY, source, ownership: "magnitude" }
@@ -179,14 +187,14 @@ export const makePiCompanion = (paths: HarnessConnectionPaths, desiredSource = P
       return { state, status: installed ? "installed" : enabled ? "already-installed" : "enabled" }
     }),
     disconnect: ({ installation, state }) => Effect.gen(function* () {
-      const text = yield* readOr(paths.piSettings, "{}\n")
-      const current = find(jsonObject(text), state.source)
-      if (!current) return
+      const document = yield* readSettings
+      const current = find(document.settings, state.source)
+      if (Option.isNone(current)) return
       if (state.ownership === "magnitude") { yield* verifyHost(installation.executable); yield* mutate(installation.executable, "remove", state.source); return }
       if (Option.isNone(state.enablement)) return
       const { before, after } = state.enablement.value
-      if (!isDeepStrictEqual(object(current.entry)?.extensions, after)) return
-      yield* writeIfChanged(paths.piSettings, text, updateJsonc(text, [[["packages", current.index, "extensions"], Option.getOrUndefined(before)]]))
+      if (!Option.containsWith(isDeepStrictEqual)(piPackageFilters(current.value.entry), after)) return
+      yield* writeIfChanged(paths.piSettings, document.text, updateJsonc(document.text, [[["packages", current.value.index, "extensions"], Option.getOrUndefined(before)]]))
     }),
   }
 }
