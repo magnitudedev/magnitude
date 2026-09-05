@@ -6,6 +6,7 @@ import {
 } from "@magnitudedev/acn-protocol"
 import { AcnOwnerRecordSchema } from "@magnitudedev/acn-protocol/coordination"
 import { SDK_ACN_TARGET } from "../version"
+import { MAGNITUDE_SERVICE_ORIGIN } from "../inference-endpoint"
 import { runAcnEnsure } from "./acn-instance-manager"
 import {
   AcnRecordedOwnerAbsent,
@@ -64,7 +65,7 @@ describe("require-running ACN manager", () => {
       revision: health.revision,
       id: "instance-1",
       identity: health.version,
-      url: `http://127.0.0.1:${owner.port}`,
+      url: MAGNITUDE_SERVICE_ORIGIN,
       pid: owner.pid,
       processStartIdentity: owner.processStartIdentity,
       lifecycle: { _tag: "Ready" },
@@ -135,7 +136,7 @@ describe("require-running ACN manager", () => {
       revision: health.revision,
       id: health.id,
       identity: health.version,
-      url: `http://127.0.0.1:${owner.port}`,
+      url: MAGNITUDE_SERVICE_ORIGIN,
       pid: owner.pid,
       processStartIdentity: owner.processStartIdentity,
       lifecycle: { _tag: "Ready" },

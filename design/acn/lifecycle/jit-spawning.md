@@ -49,6 +49,11 @@ exact live process identity, HTTP `200` ready health whose PID matches the owner
 meets the client's target, and final rereads confirming the same owner and process occurrence.
 Readiness is selection-time evidence; later transport recovery handles retirement.
 
+Local selection projects the fixed application origin `http://127.0.0.1:10100`, not the owner
+record's private health/shutdown port. That port remains exact-process coordination evidence.
+Successive ready instances share the application origin but have distinct instance identities;
+RPC requests carry the selected instance ID so a successor rejects stale requests before dispatch.
+
 Each host has a private launch path describing the identities that host can launch and how it
 prepares one supported identity. A local development command supports only its exact build
 identity; published-release acquisition supports release identities. Commands never cross host

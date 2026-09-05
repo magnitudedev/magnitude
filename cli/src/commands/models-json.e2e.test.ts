@@ -10,6 +10,7 @@ import {
   ProcessStartIdentitySchema,
   SDK_REVISION,
   SDK_VERSION,
+  MAGNITUDE_SERVICE_ORIGIN,
   type ModelCatalogState,
   type ModelResidency,
 } from "@magnitudedev/sdk"
@@ -172,7 +173,7 @@ describe("model command JSON process boundary", () => {
   }
 
   const server = Bun.serve({
-    port: 0,
+    port: Number(new URL(MAGNITUDE_SERVICE_ORIGIN).port),
     hostname: "127.0.0.1",
     async fetch(request) {
       const url = new URL(request.url)
@@ -182,6 +183,9 @@ describe("model command JSON process boundary", () => {
       }
       if (request.method !== "POST" || url.pathname !== "/rpc") {
         return new Response("Not found", { status: 404 })
+      }
+      if (request.headers.get("x-magnitude-acn-id") !== health().id) {
+        return new Response("Wrong instance", { status: 409 })
       }
       const line = (await request.text()).split("\n").find((candidate) => candidate.length > 0)
       if (line === undefined) return new Response("Missing RPC request", { status: 400 })
@@ -214,17 +218,30 @@ describe("model command JSON process boundary", () => {
     },
   })
 
+  const controlServer = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    fetch(request) {
+      if (request.method === "GET" && new URL(request.url).pathname === "/health") {
+        transportTrace.push("GET private /health")
+        return Response.json(health(), { headers: { connection: "close" } })
+      }
+      return new Response("Not found", { status: 404 })
+    },
+  })
+
   beforeAll(async () => {
     home = await mkdtemp(join(tmpdir(), "magnitude-models-json-e2e-"))
     residency = { _tag: "Unloaded" }
     requests = []
     transportTrace = []
-    if (server.port === undefined) throw new Error("Isolated ACN server has no assigned port")
-    await writeOwnerRecord(home, server.port)
+    if (controlServer.port === undefined) throw new Error("ACN control server has no assigned port")
+    await writeOwnerRecord(home, controlServer.port)
   })
 
   afterAll(async () => {
     server.stop(true)
+    controlServer.stop(true)
     await rm(home, { recursive: true, force: true })
   })
 

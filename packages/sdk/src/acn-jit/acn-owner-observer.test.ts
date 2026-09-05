@@ -17,6 +17,7 @@ import {
 import { Duration, Effect, Fiber, Option, Schema, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
 import { SDK_ACN_TARGET, SDK_VERSION } from "../version"
+import { MAGNITUDE_SERVICE_ORIGIN } from "../inference-endpoint"
 import { makeAcnOwnerObserver } from "./acn-owner-observer"
 
 const owner = Schema.decodeUnknownSync(AcnOwnerRecordSchema)({
@@ -140,6 +141,28 @@ const observeSteps = (
 })
 
 describe("ACN owner health observation", () => {
+  it("checks private owner health but selects the fixed public application endpoint", async () => {
+    await Effect.runPromise(Effect.gen(function* () {
+      const urls: string[] = []
+      const http = HttpClient.make((request) => {
+        urls.push(request.url)
+        return validHealth(request)
+      })
+      const observer = makeAcnOwnerObserver(owners, processes, http)
+      const observation = yield* observer.observe
+      expect(observation._tag).toBe("AcnRecordedOwnerLiveWithHealth")
+      if (observation._tag !== "AcnRecordedOwnerLiveWithHealth") return
+      const ready = yield* observer.confirmReady(observation.owner, observation.health)
+      expect(urls).toEqual([`http://127.0.0.1:${owner.port}/health`])
+      expect(Option.getOrThrow(ready)).toMatchObject({
+        url: MAGNITUDE_SERVICE_ORIGIN,
+        id: health.id,
+        pid: owner.pid,
+        processStartIdentity: owner.processStartIdentity,
+      })
+    }))
+  })
+
   it("uses one request when the primary response is valid ready health", async () => {
     const result = await Effect.runPromise(
       observeSteps([validHealth], 0).pipe(Effect.provide(TestContext.TestContext)),

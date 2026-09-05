@@ -494,14 +494,10 @@ const makeAcnInfrastructure = (
     BunCommandExecutor.layer.pipe(Layer.provide(BunFileSystem.layer)),
     BunPath.layer,
     FetchHttpClient.layer,
-    // Finite unary RPCs may legitimately run for the full duration of model
-    // download or loading. Bun counts an in-flight handler that has not yet
-    // emitted response bytes as idle, so any non-zero server timeout would
-    // turn operation duration into a connection reset.
     BunHttpServer.layer({
       // Candidate coordination endpoints must remain independently bindable so
       // concurrent candidates can reach atomic owner admission. The admitted
-      // process opens the stable public inference listener separately.
+      // process opens the stable public application listener separately.
       port: options.port ?? 0,
       hostname: "127.0.0.1",
       idleTimeout: 0,
@@ -512,12 +508,14 @@ const makeAcnInfrastructure = (
   )
 }
 
-const makePublicInferenceInfrastructure = (lifecycle: AcnServiceLifecycleApi) =>
+const makePublicInfrastructure = (lifecycle: AcnServiceLifecycleApi) =>
   Layer.mergeAll(
     Layer.succeed(AcnServiceLifecycle, lifecycle),
     BunHttpServer.layer({
       port: ACN_PUBLIC_PORT,
       hostname: "127.0.0.1",
+      // Unary RPCs can run throughout model acquisition/loading before emitting
+      // any response bytes. Operation duration must not become an idle timeout.
       idleTimeout: 0,
     }),
     HttpLayerRouter.layer,
@@ -620,7 +618,7 @@ const makeCodexWebSocketProxy = (
 )
 
 const makeInferenceProxy = (
-  icn: Context.Tag.Service<typeof IcnProcess>,
+  icn: InferenceProxyTarget,
   protocol: "openai" | "anthropic" | "codex" | "claude-code",
 ) => {
   const anthropicGateway = protocol === "claude-code"
@@ -688,6 +686,65 @@ const predecessorAbsent = (
   ),
 })
 
+const installAcnHealthRoutes = (
+  router: HttpLayerRouter.HttpRouter,
+  lifecycle: AcnServiceLifecycleApi,
+) => Effect.gen(function* () {
+  yield* router.addGlobalMiddleware((responseEffect) => Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest
+    const host = request.headers.host
+    if (host === undefined || !LOCAL_HTTP_HOST.test(host)) {
+      return HttpServerResponse.text("Invalid Host header", { status: 421 })
+    }
+    return withCors(yield* responseEffect, request)
+  }))
+  yield* router.add("OPTIONS", "/*", OptionsRouteHandler)
+  yield* router.add("GET", "/health", lifecycle.state.pipe(
+    Effect.flatMap((state) => encodeHealthResponse(makeHealthResponse(ACN_VERSION, state)).pipe(
+      Effect.flatMap((body) => HttpServerResponse.json(body, {
+        status: state._tag === "Ready" ? 200 : 503,
+      })),
+    )),
+    Effect.orDie,
+  ))
+})
+
+export const installAcnControlRoutes = (
+  router: HttpLayerRouter.HttpRouter,
+  lifecycle: AcnServiceLifecycleApi,
+) => Effect.gen(function* () {
+  yield* installAcnHealthRoutes(router, lifecycle)
+  yield* router.add("POST", "/shutdown", lifecycle.beginStopping({ reason: "administrative" }).pipe(
+    Effect.as(HttpServerResponse.empty({ status: 202 })),
+  ))
+})
+
+export const installAcnPublicRoutes = (
+  router: HttpLayerRouter.HttpRouter,
+  lifecycle: AcnServiceLifecycleApi,
+  icn: InferenceProxyTarget,
+) => Effect.gen(function* () {
+  yield* installAcnHealthRoutes(router, lifecycle)
+  yield* router.add("POST", "/rpc", Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest
+    return request.headers["x-magnitude-acn-id"] === ACN_INSTANCE_ID
+      ? yield* lifecycle.dispatchRpc
+      : HttpServerResponse.empty({ status: 409 })
+  }))
+  yield* router.prefixed("/inference/v1/proxies/codex").add(
+    "*", "/*", makeInferenceProxy(icn, "codex"),
+  )
+  yield* router.prefixed("/inference/v1").add(
+    "*", "/*", makeInferenceProxy(icn, "openai"),
+  )
+  yield* router.prefixed("/inference/anthropic/proxies/claude-code").add(
+    "*", "/*", makeInferenceProxy(icn, "claude-code"),
+  )
+  yield* router.prefixed("/inference/anthropic").add(
+    "*", "/*", makeInferenceProxy(icn, "anthropic"),
+  )
+})
+
 export const launchAcnServer = (options: AcnServerOptions = {}) =>
   Effect.scoped(Effect.gen(function* () {
     const dataDir = options.dataDir ?? defaultDataDir()
@@ -718,32 +775,7 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
       return yield* new AcnBootstrapRejected({ reason: "ACN requires a loopback TCP endpoint" })
     }
 
-    yield* router.addGlobalMiddleware((responseEffect) => Effect.gen(function* () {
-      const request = yield* HttpServerRequest.HttpServerRequest
-      const host = request.headers.host
-      if (host === undefined || !LOCAL_HTTP_HOST.test(host)) {
-        return HttpServerResponse.text("Invalid Host header", { status: 421 })
-      }
-      return withCors(yield* responseEffect, request)
-    }))
-    yield* router.add("OPTIONS", "/*", OptionsRouteHandler)
-    yield* router.add("GET", "/health", lifecycle.state.pipe(
-      Effect.flatMap((state) => encodeHealthResponse(makeHealthResponse(ACN_VERSION, state)).pipe(
-        Effect.flatMap((body) => HttpServerResponse.json(body, {
-          status: state._tag === "Ready" ? 200 : 503,
-        })),
-      )),
-      Effect.orDie,
-    ))
-    yield* router.add("POST", "/rpc", Effect.gen(function* () {
-      const request = yield* HttpServerRequest.HttpServerRequest
-      return request.headers["x-magnitude-acn-id"] === ACN_INSTANCE_ID
-        ? yield* lifecycle.dispatchRpc
-        : HttpServerResponse.empty({ status: 409 })
-    }))
-    yield* router.add("POST", "/shutdown", lifecycle.beginStopping({ reason: "administrative" }).pipe(
-      Effect.as(HttpServerResponse.empty({ status: 202 })),
-    ))
+    yield* installAcnControlRoutes(router, lifecycle)
     yield* server.serve(router.asHttpEffect()).pipe(Effect.provide(infrastructure))
 
     const expectedOwner = yield* rejectCoordinationFailure(ownerStore.current)
@@ -809,48 +841,12 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
       }
       const icn = Context.get(applicationContext, IcnProcess)
       const publicInfrastructure = yield* Layer.buildWithScope(
-        makePublicInferenceInfrastructure(lifecycle),
+        makePublicInfrastructure(lifecycle),
         applicationScope,
       )
       const publicRouter = Context.get(publicInfrastructure, HttpLayerRouter.HttpRouter)
       const publicServer = Context.get(publicInfrastructure, HttpServer.HttpServer)
-      yield* publicRouter.addGlobalMiddleware((responseEffect) => Effect.gen(function* () {
-        const request = yield* HttpServerRequest.HttpServerRequest
-        const host = request.headers.host
-        if (host === undefined || !LOCAL_HTTP_HOST.test(host)) {
-          return HttpServerResponse.text("Invalid Host header", { status: 421 })
-        }
-        return withCors(yield* responseEffect, request)
-      }))
-      yield* publicRouter.add("OPTIONS", "/*", OptionsRouteHandler)
-      yield* publicRouter.add("GET", "/health", lifecycle.state.pipe(
-        Effect.flatMap((state) => encodeHealthResponse(makeHealthResponse(ACN_VERSION, state)).pipe(
-          Effect.flatMap((body) => HttpServerResponse.json(body, {
-            status: state._tag === "Ready" ? 200 : 503,
-          })),
-        )),
-        Effect.orDie,
-      ))
-      yield* publicRouter.prefixed("/inference/v1/proxies/codex").add(
-        "*",
-        "/*",
-        makeInferenceProxy(icn, "codex"),
-      )
-      yield* publicRouter.prefixed("/inference/v1").add(
-        "*",
-        "/*",
-        makeInferenceProxy(icn, "openai"),
-      )
-      yield* publicRouter.prefixed("/inference/anthropic/proxies/claude-code").add(
-        "*",
-        "/*",
-        makeInferenceProxy(icn, "claude-code"),
-      )
-      yield* publicRouter.prefixed("/inference/anthropic").add(
-        "*",
-        "/*",
-        makeInferenceProxy(icn, "anthropic"),
-      )
+      yield* installAcnPublicRoutes(publicRouter, lifecycle, icn)
       yield* publicServer.serve(publicRouter.asHttpEffect()).pipe(Effect.provide(publicInfrastructure))
       yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie))
       return {
