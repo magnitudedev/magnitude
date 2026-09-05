@@ -227,7 +227,8 @@ failures do not prevent inference. Status completion lookups share in-flight wor
 ready discovery, but never cache initialization or failure. Explicit model selection refreshes status.
 Loading is acknowledged only after server readiness, with a longer bound than discovery or stop.
 
-The repository exposes one `dev:pi` entrypoint. It selects an installed Magnitude model, connects
+The repository exposes one `dev:pi` entrypoint. It waits up to 30 seconds for an installed Magnitude
+model to appear, including when initial status snapshots are ready but empty, then selects it, connects
 Pi through the ordinary connection service using the local package source, and launches
 Pi with a scoped executable for the current source CLI. Temporary executables live outside the
 repository and remain available for the entire child session. This development path exercises the

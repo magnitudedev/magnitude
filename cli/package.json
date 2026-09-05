@@ -48,7 +48,6 @@
     "ansis": "^3.17.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.4",
     "@magnitudedev/logger": "workspace:*",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.3",
