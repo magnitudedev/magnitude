@@ -107,112 +107,166 @@ runtime abstraction is required merely to make computations testable.
 
 ## Shared component definitions
 
-These IDs describe current implementations. Each defines an independently invocable
-boundary; dedicated benchmark coverage is not yet complete. References and derivations
-below identify the required controls and performance models, not an assertion that
-every component is already numerically or performance-qualified. Architecture docs
-select concrete geometry, state layout and child configuration for these definitions.
-Every shared contract binds to the [ceiling catalog](../performance/catalog.md#shared-model-contracts).
-Each currently has one execution-efficiency dimension, identified by its contract
-plus `/EXEC`, such as `MODEL:ATTENTION/EXEC`. Shape, query mode and residency select
-operating points within that dimension. Individual resource costs explain its score.
-Evidence identifies the selected implementation and revision; implementation changes
-reset its scores and affected parent scores under the
-[assessment rules](../performance.md#evidence-and-current-assessments).
-The resource costs described below include diagnostic opportunities; only demands
-justified by the linked derivation enter the optimistic theoretical ceiling.
+Each type below owns its contract, dimension definitions and formula binding.
+Parameters inherit the [origin/platform rules](../performance.md#dimensions-and-parameter-binding).
+`JOIN` and `L` use the [resource algebra](../performance/derivations/resources.md#evaluation-algebra);
+[neural regions](../performance/derivations/neural.md#named-region-bindings) supply the shared terms.
+Implementation estimates use selected execution regions and matched local/parent
+observations under [execution estimation](../performance/derivations/resources.md#execution-estimation).
+References and tests describe controls; they do not assert current performance qualification.
 
-### `MODEL:EMBEDDING:MAG:RESIDENT`
+### `MODEL:EMBEDDING`
 
-- **Contract / implementation:** Look up token rows in resident float or affine
-  weights; the latter gathers encoded rows and dequantizes through MLX. Own lookup
-  composition and execution dependencies, preserving vocabulary identity.
-- **References / tests:** Independently loaded upstream embedding and direct indexing
-  of independently dequantized rows. Check token order, repeats, dtype and values.
-- **Performance / bounds:** Read selected encoded rows and metadata, write decoded
-  activations; include gather/dequantization and dispatch. Model bytes at the relevant
-  cache level rather than charging the entire embedding table per lookup. Repeated
-  tokens may reuse cache lines. Full-vocabulary readout is separate work.
+**Contract.** Look up encoded vocabulary rows, returning the required floating activations with token order,
+precision and lifetime preserved.
 
-### `MODEL:EXPERTS:MAG:RESIDENT_GATHERED`
+**Parameters.** Architecture: width `h`, vocabulary and row encoding. Workload: `m` input tokens, distinct row
+identities and input/output residency.
 
-- **Contract / implementation:** Given hidden rows and expert assignments, return
-  per-selected-expert outputs, before routing-weight reduction. Resident gate/up/down
-  weights feed MLX quantized gathers and architecture-supplied activation. Assignment
-  geometry selects sorted or unsorted execution; caller retains routing semantics.
-- **References / tests:** Upstream expert module and a per-expert gather/matmul oracle.
-  Match weights and activation; exercise assignment order, repeats, sparse/dense
-  utilization and shapes on both sides of sorting selection.
-- **Performance / bounds:** Selected weight bytes plus metadata, three projection
-  costs, activation traffic and assignment sorting/restoration. Count unique expert
-  reuse across rows and physical rereads separately. Small-row fusion can remove
-  launches; larger groups can improve weight reuse. Include the enclosing router
-  and reduction when claiming a feedforward improvement.
+**Composition.** `D_EMBED=EMBED(m,h,rows)` from [embedding](../performance/derivations/neural.md#embedding-and-elementwise-regions).
+Union repeated rows; the vocabulary head is separate work unless joined by its parent.
 
-### `MODEL:ATTENTION:MAG:PAGED`
+**Dimensions.**
 
-- **Contract / implementation:** Prepared Q and a logical paged KV view produce
-  scaled, causal/windowed attention output. Owned `MTL` kernels through MLX compute
-  softmax partials and combine them for supported short queries. Other geometries
-  delegate to `MODEL:ATTENTION:MAG:GATHERED`. Storage append is outside this contract.
-- **References / tests:** The gathered implementation at identical logical histories,
-  plus an independent higher-precision attention equation oracle. Compare masks,
-  row lengths, windows, fragmented views and output values; the child fallback
-  cannot independently validate itself.
-- **Performance / bounds:** For one row, equal K/V width and one query, one ideal
-  KV traversal reads `2 × visible_tokens × kv_heads × head_width × element_bytes`.
-  General queries require counting visible query-key pairs and tile/head reuse.
-  Add query/output, mapping and partial-reduction traffic and roughly four arithmetic
-  operations per query-head/key/head-coordinate pair. Derive bandwidth/compute bounds
-  and reduction dependencies; physical rereads and poor occupancy explain gaps.
+| ID | Metric and boundary | Theoretical bound |
+|---|---|---|
+| `MODEL:EMBEDDING/EXEC` | Elapsed seconds for `u=m` lookups through output readiness. | `L(D_EMBED)`; rate upper bound `m/L`. |
 
-### `MODEL:ATTENTION:MAG:GATHERED`
+**Implementations and controls.**
 
-- **Contract / implementation:** Gather logical paged histories, pad compatible rows,
-  construct causal/window masks and call `MODEL:ATTENTION:MLX:DENSE`. This is an owned
-  adapter around an upstream primitive, not an upstream paged implementation.
-- **References / tests:** Independently materialized logical K/V and per-row attention
-  equations. Test ordering, heterogeneous histories, padding and window boundaries;
-  comparing with the paged path alone cannot establish a shared mask convention.
-- **Performance / bounds:** Compose history gather reads/writes, padding/mask work and
-  the dense child. Longer histories expose materialization costs even when the dense
-  kernel is efficient. Account for actual temporary allocation and valid versus padded
-  work. Replacing it must preserve the logical KV contract without hiding conversion cost.
+#### `MODEL:EMBEDDING:MAG:RESIDENT`
 
-### `MODEL:ATTENTION:MLX:DENSE`
+- **Implementation:** Look up token rows in resident float or affine weights; the latter gathers encoded rows and
+  dequantizes through MLX. Own lookup composition and execution dependencies, preserving
+  vocabulary identity.
+- **Reference / validation:** Independently loaded upstream embedding and direct indexing of independently dequantized rows.
+  Check token order, repeats, dtype and values.
 
-- **Contract / implementation:** Upstream scaled dot-product attention over prepared
-  dense Q/K/V, scale and supported mask. Runtime/primitive source is MLX.
-- **References / tests:** Independent attention equations with higher-precision
-  accumulation, declared output tolerance and matching causal/window visibility.
-  Direct calls serve as a control for wrappers; they do not validate MLX against itself.
-- **Performance / bounds:** Same mathematical attention work as the paged operator,
-  with dense layout and the primitive's tiling/reuse. Model visible pairs, KV traffic,
-  intermediates and actual arithmetic. Decode emphasizes history reads; prefill can
-  reuse tiles. Peak hardware and measured primitive rates are different evidence.
+### `MODEL:EXPERTS`
 
-### `MODEL:GATED_DELTA:MAG:FUSED_UPDATE`
+**Contract.** Given hidden rows and distinct top-k expert assignments, return per-selected-expert
+activations before routing-weight reduction. Preserve the supplied activation and numerical
+contract.
 
-- **Contract / implementation:** Prepared Q/K/V, decay, beta and initial matrix state
-  produce outputs and final state. An owned `MTL` update holds state vectors across
-  its token loop; a state-only form supports accepted-prefix reconciliation. It
-  excludes projections, convolution and input/output preparation.
-- **References / tests:** `MODEL:GATED_DELTA:LM:STANDARD` and an independent explicit
-  recurrence. Compare every requested output, final state and prefix states under
-  the same prepared inputs; include zero/full/partial accepted prefixes.
-- **Performance / bounds:** Count matrix state load/store at invocation boundaries,
-  prepared-input/output traffic and per-token recurrence arithmetic. The token loop
-  is dependent; retaining state avoids a full external-memory round trip per token.
-  Derive a resource/dependency model for actual state geometry, dtype and query width.
-  Preparation and replay costs belong to the enclosing recurrent block.
+**Parameters.** Architecture: hidden/expert widths `h,f_e`, encoded gate/up/down tensors and activation.
+Workload: row assignments `m_e`, with `sum_e m_e=m*t`, output requirements and residency.
 
-### `MODEL:GATED_DELTA:LM:STANDARD`
+**Composition.** `D_EXPERTS=JOIN({MLP(m_e,h,f_e)} for m_e>0)` using
+[projections/experts](../performance/derivations/neural.md#projections-and-experts). Union each selected expert’s
+weights; count each required row/expert evaluation. Output geometry is `m*t*h` at this
+boundary, but may reduce internally in a routed parent.
 
-- **Contract / implementation:** MLX-LM's gated-delta kernel under the same prepared
-  input/output/state computation. Binding conventions do not change its source.
-- **References / tests:** An independently expressed recurrence provides the oracle;
-  the owned update supplies a differential control but is not itself proof of truth.
-- **Performance / bounds:** Use the same recurrence arithmetic and state dimensions
-  as the owned update, inspecting upstream's actual state traffic and query algorithm.
-  Its measured rate is an attainable reference for the selected shape, not a hard
-  bound. No model-level speedup follows from a local update comparison alone.
+**Dimensions.**
+
+| ID | Metric and boundary | Theoretical bound |
+|---|---|---|
+| `MODEL:EXPERTS/EXEC` | Elapsed seconds for `u=m*t` selected expert evaluations, including output readiness. | `L(D_EXPERTS)`; rate upper bound `u/L`. |
+
+**Implementations and controls.**
+
+#### `MODEL:EXPERTS:MAG:RESIDENT_GATHERED`
+
+- **Implementation:** Given hidden rows and expert assignments, return per-selected-expert outputs, before
+  routing-weight reduction. Resident gate/up/down weights feed MLX quantized gathers and
+  architecture-supplied activation. Assignment geometry selects sorted or unsorted execution;
+  caller retains routing semantics.
+- **Reference / validation:** Upstream expert module and a per-expert gather/matmul oracle. Match weights and activation;
+  exercise assignment order, repeats, sparse/dense utilization and shapes on both sides of
+  sorting selection.
+
+### `MODEL:ATTENTION`
+
+**Contract.** Prepared Q and logically equivalent KV histories produce scaled causal/windowed attention.
+Append and state ownership are external; layouts must be matched or explicitly adapted.
+
+**Parameters.** Architecture: `h_q,h_kv,d_k,d_v`, dtypes and numerical contract. Workload: row count `b`,
+query width `q`, old lengths `l_i`, window, scale, masks and boundary residency.
+
+**Composition.** `D_ATTN=ATTN(geometry,visibility)` from [attention](../performance/derivations/neural.md#attention). It contains
+unique visible KV, Q/output and optional conventional QK/weighted-V/softmax work. Layout
+adaptation belongs to the selected implementation estimate; avoid compulsory score matrices
+and duplicate KV-head reads.
+
+**Dimensions.**
+
+| ID | Metric and boundary | Theoretical bound |
+|---|---|---|
+| `MODEL:ATTENTION/EXEC` | Elapsed seconds for `u=bq` queries through attended-output readiness. | `L(D_ATTN)`; rate upper bound `bq/L`. |
+
+**Implementations and controls.**
+
+#### `MODEL:ATTENTION:MAG:PAGED`
+
+- **Implementation:** Prepared Q and a logical paged KV view produce scaled, causal/windowed attention output. Owned
+  `MTL` kernels through MLX compute softmax partials and combine them for supported short
+  queries. Other geometries delegate to `MODEL:ATTENTION:MAG:GATHERED`. Storage append is
+  outside this contract.
+- **Reference / validation:** The gathered implementation at identical logical histories, plus an independent
+  higher-precision attention equation oracle. Compare masks, row lengths, windows, fragmented
+  views and output values; the child fallback cannot independently validate itself.
+- **Benchmark controls:** `operator.attention-metal-16k` and `operator.attention-gathered-16k`
+  compare completed append plus attention at 16K history. This combined boundary
+  does not directly measure `MODEL:ATTENTION/EXEC`.
+
+#### `MODEL:ATTENTION:MAG:GATHERED`
+
+- **Implementation:** Gather logical paged histories, pad compatible rows, construct causal/window masks and call
+  `MODEL:ATTENTION:MLX:DENSE`. This is an owned adapter around an upstream primitive, not an
+  upstream paged implementation.
+- **Reference / validation:** Independently materialized logical K/V and per-row attention equations. Test ordering,
+  heterogeneous histories, padding and window boundaries; comparing with the paged path alone
+  cannot establish a shared mask convention.
+- **Benchmark controls:** `operator.attention-gathered-16k` is the gathered control for
+  `operator.attention-metal-16k`; both include append, so neither isolates attention.
+
+#### `MODEL:ATTENTION:MLX:DENSE`
+
+- **Implementation:** Upstream scaled dot-product attention over prepared dense Q/K/V, scale and supported mask.
+  Runtime/primitive source is MLX.
+- **Reference / validation:** Independent attention equations with higher-precision accumulation, declared output tolerance
+  and matching causal/window visibility. Direct calls serve as a control for wrappers; they do
+  not validate MLX against itself.
+
+### `MODEL:GATED_DELTA`
+
+**Contract.** Prepared Q/K/V, decay, beta and initial matrix state produce requested outputs and final
+state; a state-only reconciliation operation preserves the same update equations.
+
+**Parameters.** Architecture: `h_v,d_k,d_v`, state/input dtypes and update equations. Workload: `b,q`,
+prepared input values, initial/final observability and output versus state-only operation.
+
+**Composition.** `D_DELTA=DELTA(geometry,inputs,state)` from
+[recurrence](../performance/derivations/neural.md#gated-delta-recurrence). Only required initial/final state crosses
+the boundary; state may stay local across tokens. Projections/convolution belong to enclosing
+mixers.
+
+**Dimensions.**
+
+| ID | Metric and boundary | Theoretical bound |
+|---|---|---|
+| `MODEL:GATED_DELTA/EXEC` | Elapsed seconds for `u=bq` updates through required output/state readiness. | `L(D_DELTA)` with the selected output obligation. |
+
+**Implementations and controls.**
+
+#### `MODEL:GATED_DELTA:MAG:FUSED_UPDATE`
+
+- **Implementation:** Prepared Q/K/V, decay, beta and initial matrix state produce outputs and final state. An owned
+  `MTL` update holds state vectors across its token loop; a state-only form supports
+  accepted-prefix reconciliation. It excludes projections, convolution and input/output
+  preparation.
+- **Reference / validation:** `MODEL:GATED_DELTA:LM:STANDARD` and an independent explicit recurrence. Compare every
+  requested output, final state and prefix states under the same prepared inputs; include
+  zero/full/partial accepted prefixes.
+- **Benchmark controls:** `operator.delta-owned` and `operator.delta-owned-prefill-512`
+  time completed prepared-input recurrence for 3 and 512 tokens; corresponding
+  `operator.delta-library` and `operator.delta-library-prefill-512` are upstream
+  controls. These isolate the update, excluding enclosing mixer preparation.
+
+#### `MODEL:GATED_DELTA:LM:STANDARD`
+
+- **Implementation:** MLX-LM's gated-delta kernel under the same prepared input/output/state computation. Binding
+  conventions do not change its source.
+- **Reference / validation:** An independently expressed recurrence provides the oracle; the owned update supplies a
+  differential control but is not itself proof of truth.
+- **Benchmark controls:** `operator.delta-library` and `operator.delta-library-prefill-512`
+  cover completed 3- and 512-token prepared-input updates, matched to the owned controls.

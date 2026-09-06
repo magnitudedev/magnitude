@@ -1,42 +1,44 @@
 # Component identification and assembly
 
-**Stable identifiers name implementations. Assemblies connect those implementations
-into models and engines; evidence establishes what each implementation achieves.**
+**Component types own contracts and composable performance models. Implementations
+realize those contracts. Assemblies select implementations; evidence establishes
+what a particular revision achieves.** The [catalog](performance/catalog.md) links
+each current type and dimension to its authoritative owner.
 
-This vocabulary applies across the engine. [Model composability](models/composability.md)
-defines computational contracts and substitution; [model optimization](models/optimization.md)
-defines performance reasoning and qualification.
-
-## Identifier grammar
+## Identifiers
 
 ```text
-FAMILY:COMPONENT:SOURCE:VARIANT
+FAMILY:COMPONENT                         component type / contract
+FAMILY:COMPONENT:SOURCE:VARIANT          implementation
+FAMILY:COMPONENT/DIMENSION               performance dimension
 ```
 
-Use uppercase names. Colons separate fields; dots express hierarchy inside a
-component address. Use readable words, with underscores for multiword names.
-Source codes are the deliberate abbreviations.
+Names are uppercase. Colons separate fields; dots express hierarchy within a
+component address; underscores separate words within a name. Source and dimension
+codes are concise, explicitly defined abbreviations.
 
 | Field | Meaning | Examples |
 |---|---|---|
-| Family | The subsystem containing the component | `MODEL`, `SCHEDULING`, `KV` |
-| Component | Its responsibility within that family | `QWEN35.ATTENTION`, `ADMISSION`, `APPEND` |
-| Source | Who supplies the implementation or defines its composition | `MLX`, `LM`, `VLM`, `MAG` |
-| Variant | The implementation's distinguishing method | `FUSED`, `PAGED`, `FIFO` |
+| Family | Subsystem containing the component | `MODEL`, `SCHEDULING`, `KV` |
+| Component | Responsibility within that family | `QWEN35.ATTENTION`, `ADMISSION`, `APPEND` |
+| Source | Supplier of the implementation or owner of its composition | `MLX`, `LM`, `VLM`, `MAG` |
+| Variant | Distinguishing implementation method | `PAGED`, `STANDARD`, `FIFO` |
+| Dimension | Performance outcome defined by the type | `EXEC`, `MEM`, `RESTORE` |
 
 ```text
-MODEL:QWEN35.ATTENTION:VLM:STANDARD
-MODEL:QWEN35.ATTENTION:MAG:FUSED
+MODEL:QWEN35.ATTENTION
+MODEL:QWEN35.ATTENTION:MAG:SEPARATE_PROJECTIONS
+MODEL:QWEN35.ATTENTION/EXEC
 MODEL:ATTENTION:MLX:DENSE
-SCHEDULING:ADMISSION:MAG:FIFO
-KV:APPEND:MAG:PAGED
+MODEL:FORWARD:VLM:STANDARD
+STATE:QWEN35/MEM
+STATE:QWEN35/RESTORE
 ```
 
-The component address follows its family's concepts; there is no universal scope
-field. Within `MODEL`, an architecture qualifier such as `QWEN35` or `GEMMA4`
-identifies family-specific computation. An unqualified address such as `ATTENTION`
-identifies shared model computation, subject to its declared capabilities. This
-distinction does not impose a generic/specific classification on other families.
+Within `MODEL`, an architecture qualifier such as `QWEN35` or `GEMMA4` identifies
+architecture-specific computation. An unqualified address such as `ATTENTION`
+identifies shared model computation subject to its capabilities. Other families
+use their own concepts; there is no universal generic/specific scope field.
 
 ## Vocabulary and uniqueness
 
@@ -53,178 +55,70 @@ distinction does not impose a generic/specific classification on other families.
 | `KV` | Physical attention-history storage and operations |
 | `MODEL` | Neural architectures and computational blocks |
 
-Source codes are `MLX` for MLX, `LM` for MLX-LM, `VLM` for MLX-VLM, and `MAG`
-for Magnitude. Additional sources need explicit codes rather than a catch-all.
-
-Each `FAMILY:COMPONENT` address names one contract. Each full ID names one
-implementation of that contract. Its owning design document defines the ID and
-its meaning; other documents reference that definition. Reuse existing names
-rather than inventing synonyms. New families, addresses and variants require
-definitions at the same time as their introduction.
-
-Variants describe methods, not rankings or benchmark results. `STANDARD` denotes
-the source's conventional implementation where no further distinction is needed;
-it does not mean correct by definition or preferred. Avoid opaque numbers and
-labels such as `FAST`, `BEST` or `V2`.
+Each type has one authoritative record in its owner document. Each implementation
+ID names one selectable realization of that type. Definitions introduce new names;
+other documents link to those definitions instead of introducing synonyms. Variants
+describe methods, not rankings or benchmark results. `STANDARD` means conventional,
+not automatically correct or preferred. Avoid opaque numbers and labels such as
+`FAST`, `BEST` or `V2`.
 
 ## Identity and provenance
 
-An ID identifies an implementation, not a loaded instance. Many layers can use
-the same implementation with different weights. Configuration, artifact identity,
-source revisions, dependency versions, hardware and qualification evidence attach
-to the ID rather than becoming part of it.
+Source codes are `MLX` for MLX, `LM` for MLX-LM, `VLM` for MLX-VLM and `MAG` for
+Magnitude. Source attribution follows composition ownership recursively:
 
-File moves and ordinary improvements preserve identity. Separately selectable
-methods get distinct variant IDs. An incompatible contract needs a distinct
-component address; an old ID must not silently acquire a different meaning.
-Measurements always identify the measured revision as well as the component ID.
-Any implementation change resets its current performance assessments and those of
-its actual parent compositions; it does not rename the component or erase history.
-The [assessment rules](performance.md#evidence-and-current-assessments) define the
-fingerprints and evidence required to qualify the new revision.
-
-Source attribution follows composition ownership recursively:
-
-- A Magnitude composition of upstream and owned pieces is `MAG`.
+- A Magnitude composition of upstream/owned pieces is `MAG`.
 - An MLX-VLM composition of MLX operations is `VLM`.
-- A pass-through preserves the upstream component's identity. Any wrapper with
-  its own substantive behavior is described separately.
+- Unchanged pass-through preserves upstream identity; a substantive wrapper has
+  its own separately identified composition.
 
-Children retain their sources. A parent does not concatenate their source codes
-or become `MIXED`; the assembly records that provenance. This is ownership
-precedence at each composition boundary, not a ranking that lets any `MAG` child
-automatically relabel its enclosing upstream component.
+Children retain their own sources. A parent does not concatenate codes or become
+`MIXED`; neither does one owned child automatically relabel an upstream parent.
+Technology is separate: an owned Metal kernel has source `MAG`, technology `MTL`
+and may run through MLX. `MTL` is not a source code.
 
-Implementation technology is a separate property. An owned Metal kernel has
-source `MAG`, technology `MTL`, and can execute through runtime `MLX`. An upstream
-MLX primitive remains source `MLX` even when its backend uses Metal. `MTL` is not
-a source code, and a composed block need not have one technology for all children.
+IDs name implementations, not loaded instances. Layers may share an ID while using
+different weights. Artifact identity, configuration, dependency versions, hardware
+and evidence attach to it. Ordinary improvements and file moves preserve the ID;
+separately selectable methods get distinct variants. An incompatible contract needs
+a distinct type rather than silently changing an old meaning.
 
-## Assemblies and component descriptions
+Implementation fingerprints identify exact measured content and child selections.
+Any implementation change resets current assessments through affected parent
+compositions under the [evidence rules](performance.md#evidence-and-current-assessments).
+It does not erase history or rename the component.
 
-An assembly names selected implementations and their relationships. Dotted
-addresses identify responsibilities; nesting shows actual composition. Shared
-state, weights or execution resources are explicit connections, so an assembly
-is a graph even when displayed as a tree.
+## Definitions and assemblies
 
-Every component in an architecture or engine assembly resolves to one authoritative
-definition. The same ID connects that definition to implementation bindings,
-independent tests, benchmark subjects and result records. Definitions contain:
+The [performance system](performance.md#ownership-and-component-records) defines
+the consistent component record: contract, parameters, composition, dimensions,
+implementations and controls. Contract boundaries include numerical behavior,
+state/aliasing, supported inputs and resource lifetime. A reference identifies the
+boundary and conditions it validates; naming one is not proof of equivalence.
 
-| Property | Required description |
-|---|---|
-| Contract | Computation or policy, inputs/outputs, state effects and lifetime guarantees |
-| Support | Relevant shapes, precision, storage capabilities and configuration constraints |
-| Composition | Constituent IDs, their roles and shared dependencies |
-| Implementation | Source, method and relevant technology/runtime distinctions |
-| Comparison | Available reference implementations or independent oracles, the boundary each validates, and conditions required for a fair comparison |
-| Performance properties | Minimal declared dimensions, their full IDs, metrics/units and observation boundaries; distinguish score dimensions from operating-point coordinates, diagnostics and constraints |
-| Performance model | Optimistic theoretical bound for each dimension, derivation binding, unavoidable demands, composition rules, assumptions and unknowns; reference rates remain separate |
-| Validation | How to exercise the component independently with matched inputs/state and observe outputs, state effects and performance |
-| Qualification | Implemented versus proposed status, supported claims, comparison results and source/configuration/evidence identity |
+Assemblies connect selected implementations and shared dependencies. Ownership and
+sharing form a graph even when displayed as a tree. The current authoritative trees
+are the [engine](engine/components.md#assembly),
+[Qwen](models/architectures/qwen35.md#assembly),
+[Gemma](models/architectures/gemma4.md#assembly) and
+[generic upstream executor](models/architectures/generic-mlx-vlm.md#assembly).
+[Model composability](models/composability.md) defines substitution within those trees.
 
-This applies to primitives, composed blocks and complete engines. Each definition
-explains why its references are appropriate and which properties they establish.
-A reference can be an upstream implementation, an independently qualified internal
-implementation or a mathematical oracle. If none is available, record the gap and
-the independent validation needed; naming a reference is not proof of equivalence.
+These trees describe the actual implementation hierarchy, including conditional
+selections and shared dependencies. Performance evidence does not change their
+structure. Current dimension percentages and supporting benchmark IDs are annotations
+under the [tree convention](performance.md#tree-annotations-and-benchmark-references).
+Implementation identity, performance dimension and benchmark identity remain distinct;
+the benchmark reference resolves to applicable recorded results without adding
+provenance nodes to the assembly.
 
-Every component binds its `FAMILY:COMPONENT` contract to a derivation under the
-[MLX ceiling contract](performance.md). This bound is independent of source and
-variant. The [catalog](performance/catalog.md) records formulas and parameter
-bindings; measured results attach to concrete implementations and revisions.
+Matching types makes implementations comparison/substitution candidates; capabilities,
+layouts and numerical contracts still have to match or be explicitly adapted.
+Reference relationships are not production dependencies. Every identified boundary
+must be independently exercisable, including outputs/state and performance properties.
 
-Every assessment target is `FAMILY:COMPONENT/DIMENSION`, even for a component with
-one dimension. Dimension codes are concise uppercase names, defined per contract
-in the catalog. For example, `MODEL:ATTENTION/EXEC` names execution efficiency;
-`STATE:QWEN35/MEM` and `STATE:QWEN35/RESTORE` distinguish footprint and restoration.
-These IDs are independent of implementation IDs: a result names both its dimension
-and the measured implementation, such as `MODEL:ATTENTION:MAG:PAGED`.
-Trees show one percentage for a single dimension and labeled percentages for
-multiple dimensions; all values retain their full dimension IDs and evidence links.
-
-The ceiling deliberately favors optimistic efficiency. It excludes unproved costs,
-allows legal fusion/reuse and keeps missing capacities symbolic. References do not
-define it, and an implementation approaching it is not required. Parent bounds
-compose unavoidable resource demands across the graph; standalone child times
-and current dispatch/copy costs cannot be promoted to theoretical necessities.
-
-Assembly trees reference these definitions rather than duplicating their claims.
-Test and benchmark records retain the component ID, actual child selection,
-revision, workload and reference identity, so a result can be traced to both a
-specific implementation and its enclosing composition. A testable boundary is an
-observable contract; it need not be a separate kernel or production dispatch.
-
-Matching component addresses makes implementations candidates for comparison and
-substitution; supported layouts and capabilities must still match or be explicitly
-adapted. A reference relationship is not a production dependency.
-
-IDs do not require a runtime registry, object or dispatch for every component.
-Model blocks can fuse and compile across their identified boundaries. Diagnostic
-boundaries must not force production intermediates or synchronization.
-
-## Worked assembly
-
-The following is an illustrative composition using the vocabulary above. It
-shows how a compiled Qwen target could fit into an engine; it is not a declaration
-that every named optimization is implemented or qualified.
-
-```text
-ENGINE:INFERENCE:MAG:STANDARD
-├── SCHEDULING:SERVICE:MAG:TIME_SHARING
-│   ├── SCHEDULING:ADMISSION:MAG:FIFO
-│   └── SCHEDULING:PREFILL:MAG:CHUNKED
-├── BATCHING:ASSEMBLY:MAG:READY_COMPATIBLE
-├── MEMORY:ACCOUNTING:MAG:RESERVATIONS
-├── CACHE:PREFIX:MAG:CHECKPOINTS
-├── EXECUTION:DEVICE:MAG:ASYNC
-├── STATE:QWEN35:MAG:HYBRID
-│   ├── KV:STORE:MAG:PAGED
-│   │   ├── KV:APPEND:MAG:CONTIGUOUS_RUNS
-│   │   └── KV:BRANCH:MAG:COPY_ON_WRITE
-│   └── STATE:RECURRENT:MAG:CHECKPOINTED
-└── GENERATION:SPECULATION:MAG:TARGET_MATCHING
-    ├── target → MODEL:QWEN35:MAG:COMPILED
-    └── drafter → MODEL:QWEN35.MTP:MAG:CONDITIONED
-```
-
-The target expands into model components. Its layer definition selects attention
-or recurrence according to the architecture; the shared implementations retain
-the same IDs across layers and models.
-
-```text
-MODEL:QWEN35:MAG:COMPILED
-├── MODEL:EMBEDDING:MLX:QUANTIZED
-├── MODEL:QWEN35.LAYER:MAG:COMPILED                  repeated per configuration
-│   ├── MODEL:NORMALIZATION:MLX:RMS
-│   ├── mixer: one of
-│   │   ├── MODEL:QWEN35.ATTENTION:MAG:FUSED
-│   │   │   ├── MODEL:PROJECTION:MAG:PACKED
-│   │   │   │   └── MODEL:PROJECTION:MLX:QUANTIZED
-│   │   │   ├── MODEL:QWEN35.ATTENTION.PREPARATION:MAG:FUSED
-│   │   │   ├── MODEL:ATTENTION:MAG:PAGED
-│   │   │   └── MODEL:QWEN35.ATTENTION.OUTPUT:MAG:GATED
-│   │   └── MODEL:QWEN35.RECURRENCE:MAG:COMPILED
-│   │       ├── MODEL:PROJECTION:MAG:PACKED
-│   │       ├── MODEL:QWEN35.RECURRENCE.PREPARATION:MAG:FUSED
-│   │       ├── MODEL:GATED_DELTA:LM:STANDARD
-│   │       └── MODEL:QWEN35.RECURRENCE.OUTPUT:MAG:GATED
-│   ├── MODEL:RESIDUAL_NORMALIZATION:MAG:FUSED
-│   ├── MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
-│   │   ├── MODEL:QWEN35.ROUTER:MAG:FUSED
-│   │   ├── MODEL:EXPERTS:MAG:FUSED
-│   │   ├── MODEL:FEEDFORWARD:MAG:SWIGLU
-│   │   └── MODEL:QWEN35.EXPERT_COMBINATION:MAG:FUSED
-│   └── MODEL:RESIDUAL:MLX:ADD
-├── MODEL:NORMALIZATION:MLX:RMS
-└── MODEL:PROJECTION:MLX:QUANTIZED
-```
-
-The target uses the engine's hybrid state and execution owner; nesting does not
-create private copies of those resources. A paged attention implementation declares
-its required KV view without taking ownership of prefix policy or admission.
-
-For comparison, `MODEL:QWEN35.ATTENTION:VLM:STANDARD` can control the complete
-attention block, while `MODEL:ATTENTION:MLX:DENSE` can control prepared attention
-computation with equivalent logical KV. These references validate different
-boundaries; neither alone qualifies the full engine.
+A component boundary is not a mandatory object, registry lookup, Python call, GPU
+launch or synchronization. Blocks may fuse/compile across boundaries. Test access
+must not impose production intermediates; a fused region can be checked against
+its composed contract. Performance propagation follows the demand/execution rules,
+not a sum of isolated timings or percentages.

@@ -1,57 +1,24 @@
 # Model optimization
 
 **An optimized model minimizes avoidable work and executes the remaining work
-efficiently, with gains established both within blocks and in their composition.**
+efficiently, with gains established within components and their composition.**
 
-[Composability](composability.md) supplies the contracts and replaceable
-implementations. This document defines performance properties and evidence;
-the autonomous operation protocol governs development cycles.
+[Composability](composability.md) defines substitution contracts. The
+[performance system](../performance.md) defines ceiling and implementation evaluation,
+operating points and evidence. This document owns optimization choices and their
+qualification; the autonomous operation protocol governs development cycles.
 
-The architecture trees select implementations; their component definitions are
-the unit of analysis. Shared definitions live in
-[composability](composability.md#shared-component-definitions); architecture-specific
-ones live alongside the [Qwen](architectures/qwen35.md),
-[Gemma](architectures/gemma4.md) and [upstream](architectures/generic-mlx-vlm.md) trees.
-Every node resolves to its own reference, independent check and cost model. Parent
-models use those same IDs rather than maintaining a separate list of unnamed costs.
+## Using component models
 
-## Performance belongs to an operating point
+Start from the actual architecture tree and its type records, located through the
+[catalog](../performance/catalog.md). Compare measured behavior with the bound at a
+matched operating point, then use parent sensitivity to identify meaningful gains.
+A local low-efficiency score alone does not identify the model bottleneck.
 
-An architecture name or the presence of custom kernels does not establish
-optimization. A performance claim identifies the implementation, artifact,
-hardware, precision, batch size, query width, context lengths, state layout,
-residency and requested outputs. Compilation and preparation costs have explicit
-timing boundaries; steady execution and first-use latency are distinct properties.
-
-Prefill, decode and verification have different reuse and parallelism. Their
-implementations may differ while preserving the same model contract. These modes,
-context lengths and batch sizes normally select samples within execution efficiency,
-not separate dimensions. The [catalog](../performance/catalog.md#dimension-definitions)
-declares a split only for meaningful independently moving outcomes, such as state
-footprint and restoration time. Each dimension has a full `FAMILY:COMPONENT/DIMENSION`
-ID, including a lone `/EXEC`. Protect unsampled regimes and auxiliary constraints;
-one favorable sample or dimension cannot compensate for a regression elsewhere.
-
-## Ceilings and headroom
-
-The [MLX ceiling contract](../performance.md) defines the common denominator:
-an optimistic theoretical bound for each declared dimension from unavoidable demands, with
-perfect legal fusion/reuse and no unproved implementation overhead. Reference
-rates remain comparisons; they never define the ceiling.
-
-Each component contract binds to the [derivation catalog](../performance/catalog.md).
-Source and variant select an implementation to measure, not a different standard
-of theoretical efficiency. Bind geometry, state visibility, boundary residency and
-profile capacities before evaluating a formula. No measurements are required to
-write or inspect symbolic derivations; absent capacities and observations remain
-explicitly unset.
-
-Parent bounds combine required work and dependencies using the recursive rules,
-not averages of child percentages or sums of standalone timings. A separate
-measurement-based diagnosis explains actual copying, dispatch, contention and
-other gaps. Unknown constraints loosen the upper bound rather than prematurely
-limiting the target. A realizable implementation near the bound is useful evidence
-of tightness, not a prerequisite for using an optimistic theoretical ceiling.
+Keep reference comparisons and theoretical bounds distinct. A compiled graph,
+custom kernel or faster isolated component does not establish a full-model gain.
+Protect other query/context/batch regimes and independently meaningful dimensions;
+one favorable sample cannot compensate for regressions elsewhere.
 
 ## Structural efficiency
 
@@ -111,9 +78,9 @@ survive engine integration before supporting an engine-wide claim.
 Measurements, failed controls, reference identities and bound assumptions remain
 durable evidence alongside source identities, comparison conditions and raw results.
 Small controlled comparisons support development; broader qualification supports
-milestones. Any implementation change resets all its dimension assessments and those
-of its actual parent compositions to `unmeasured`; unrelated components remain valid.
-Prior samples remain historical. Follow the
-[assessment rules](../performance.md#evidence-and-current-assessments) for fingerprints,
-coverage and derivation-only re-evaluation. These are evidence requirements, not a
-mandate to benchmark every component after every edit.
+milestones. Follow the [assessment rules](../performance.md#evidence-and-current-assessments)
+for coverage, revision invalidation and derivation-only reevaluation. Evidence
+requirements do not mandate benchmarking every component after every edit.
+When adopting results, update affected tree annotations and their existing benchmark
+IDs together under the [tree convention](../performance.md#tree-annotations-and-benchmark-references).
+Clear invalidated values even when replacement measurements are deferred.
