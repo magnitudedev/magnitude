@@ -14,7 +14,7 @@ from magnitude_engine.generation.runtime import (
     ModelCheckpoint,
 )
 
-from .delivery import Delivery, Finished
+from .delivery import Delivery, Finished, PrefillProgress
 from .prefixes.contracts import PrefixIndex
 from .prefixes.index import PrefixIdentity
 from .requests import GenerationRequest, RequestHandle
@@ -72,11 +72,12 @@ class Engine[S, C: ModelCheckpoint]:
         self.last_service: CompletedService | None = None
 
     def submit(
-        self, request: GenerationRequest, *, identity: str | None = None, output_capacity: int = 64
+        self, request: GenerationRequest, *, identity: str | None = None, output_capacity: int = 64,
+        progress: bool = False,
     ) -> RequestHandle:
         """Control threads may submit/cancel/read; they never execute model work."""
         identity = identity or uuid4().hex
-        delivery = Delivery(output_capacity, self.wake.set)
+        delivery = Delivery(output_capacity, self.wake.set, progress=progress)
         with self._lock:
             if self._closed or self._failed:
                 raise RuntimeError("engine is unavailable")
@@ -159,6 +160,7 @@ class Engine[S, C: ModelCheckpoint]:
                 self._active[handle.identity] = ActiveRequest(
                     handle, sequence, 0 if checkpoint is None else checkpoint.length, self.clock()
                 )
+                self._progress(self._active[handle.identity])
             except MemoryError as error:
                 if sequence is not None:
                     sequence.close()
@@ -198,6 +200,13 @@ class Engine[S, C: ModelCheckpoint]:
         except BaseException:
             checkpoint.close()
             raise
+
+    def _progress(self, row: ActiveRequest[S, C]) -> None:
+        if row.handle.delivery.progress_enabled:
+            total = len(row.handle.request.prompt) - 1
+            row.handle.delivery.report(PrefillProgress(
+                total - row.sequence.prefill_remaining, total, row.cached, row.prefill_ns,
+            ))
 
     def tick(self) -> tuple[ServiceMeasurement, ...]:
         self.generation.model.owner.check()
@@ -279,6 +288,7 @@ class Engine[S, C: ModelCheckpoint]:
             measurements.append(ServiceMeasurement(
                 service.identity, "prefill", result, 0, measured.elapsed_ns, measured.batch_size,
             ))
+            self._progress(row)
             if not row.sequence.prefill_remaining:
                 self._retain(row.sequence)
         return tuple(measurements)

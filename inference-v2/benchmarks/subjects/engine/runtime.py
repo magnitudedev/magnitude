@@ -115,7 +115,7 @@ class EngineTrace:
                             break
                         if isinstance(event, Tokens):
                             outputs[index].extend(event.values)
-                        else:
+                        elif isinstance(event, Finished):
                             finishes[index] = event
                             break
                 if all(finish is not None for finish in finishes):

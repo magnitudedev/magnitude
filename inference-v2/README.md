@@ -3,7 +3,7 @@
 An Apple Silicon inference engine with composable model execution, continuous batching,
 prefix reuse, speculative decoding, and a Chat Completions API.
 
-## Run
+## Run the server
 
 Requires Apple Silicon, Python 3.12+, and `uv`. Commands below run from `inference-v2/`.
 
@@ -27,6 +27,23 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 The server binds to loopback. `/health` reports worker readiness and `/v1/models` lists the
 served model. Chat Completions supports streamed and collected text, reasoning, tool calls,
 JSON constraints, sampling, and stop strings. See the [serving contract](../design/inference/serving.md).
+
+## Interactive chat
+
+Run a text conversation directly against a private engine worker:
+
+```sh
+uv run --frozen python -m magnitude_engine.chat \
+  --target /absolute/path/to/model/snapshot --max-tokens 1024
+```
+
+Responses stream live alongside prefill progress. Each turn reports cached/new prompt tokens,
+TTFT, queue time, prefill and decode rates, and draft acceptance when enabled. `/reset` clears
+conversation history, `/exit` quits, and Ctrl-C cancels a response. Use `--prompt "Hello"` for
+one turn, or `--engine-blueprint engine.json` for an authored composition. Model, memory and
+scheduler arguments are shared with the server. See [metric definitions](../design/inference/chat.md).
+For models with a thinking switch, `--no-thinking` requests direct answers; otherwise the
+checkpoint's default applies.
 
 ## Compose an engine
 
@@ -71,6 +88,7 @@ src/magnitude_engine/
   resources/      Memory accounting, resource lifetime and bounded I/O
   worker/         Process supervision and host/worker transport
   serving/        Chat rendering, parsing and HTTP
+  chat/           Interactive text chat and per-turn diagnostics
   blueprints/     Lightweight public composition API
 src/session_bench/  Serving benchmark runner and engine adapters
 benchmarks/        Typed component, model, generation and engine experiments
