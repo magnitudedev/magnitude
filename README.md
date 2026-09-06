@@ -30,7 +30,9 @@ Magnitude is an open source inference server that runs the best local models for
 
 ## Get started
 
-**Send this to your agent to walk through models and setup:**
+### Set up with your agent
+
+Send this prompt to your agent:
 
 ```text
 Set up local models for me with the Magnitude CLI. Install it with `npm i -g @magnitudedev/cli` (or my package manager), then run `magnitude docs onboarding` and follow the instructions.
@@ -38,19 +40,18 @@ Set up local models for me with the Magnitude CLI. Install it with `npm i -g @ma
 
 Your agent will profile your hardware, walk you through the best local models for it, download the ones you pick, and switch itself over to them.
 
-Magnitude supports macOS and Linux. Windows is supported through WSL.
+### Install manually
 
-<details>
-<summary>Want to browse the models directly?</summary>
+Run these commands in your terminal:
 
 ```sh
 npm i -g @magnitudedev/cli
 magnitude setup
 ```
 
-The interactive setup lets you browse the recommended models and choose one yourself.
+The interactive setup profiles your hardware, lets you choose from the recommended models, downloads your selection, and connects it to your harness.
 
-</details>
+Magnitude supports macOS and Linux. Windows is supported through WSL.
 
 ## Why Magnitude?
 
