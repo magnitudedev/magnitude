@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process"
 import { resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { Effect, Exit, Option } from "effect"
@@ -28,6 +29,52 @@ const observedTag = (group: ProcessGroup) =>
   Effect.runPromise(ProcessGroupControllerLive.observe(group)).then((observed) => observed._tag)
 
 describe("ProcessGroupController", () => {
+  it.skipIf(process.platform !== "darwin")(
+    "preserves C-locale process identities across caller locales",
+    async () => {
+      const started = execFileSync("/bin/ps", ["-o", "lstart=", "-p", String(process.pid)], {
+        encoding: "utf8",
+        env: { ...process.env, LC_ALL: "C" },
+      }).trim()
+      const boot = execFileSync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], {
+        encoding: "utf8",
+      }).trim().toLowerCase()
+      const expected = `darwin:${boot}:${started}`
+      const modulePath = fileURLToPath(new URL("./exact-process.ts", import.meta.url))
+      const script = `
+        import { Effect, Option } from "effect"
+        import { ProcessGroupControllerLive } from ${JSON.stringify(modulePath)}
+        const observed = await Effect.runPromise(ProcessGroupControllerLive.inspect(${process.pid}))
+        console.log(Option.getOrThrow(observed).processStartIdentity)
+      `
+      for (const locale of [
+        { LANG: "C", LC_TIME: "C", LC_ALL: "C" },
+        { LANG: "en_US.UTF-8", LC_TIME: "en_GB.UTF-8", LC_ALL: "" },
+        { LANG: "fr_FR.UTF-8", LC_TIME: "", LC_ALL: "" },
+        { LANG: "C", LC_TIME: "C", LC_ALL: "en_GB.UTF-8" },
+      ]) {
+        const child = Bun.spawn([process.execPath, "--eval", script], {
+          env: { ...process.env, ...locale },
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+        })
+        try {
+          const [stdout, stderr, code] = await Promise.all([
+            new Response(child.stdout).text(),
+            new Response(child.stderr).text(),
+            child.exited,
+          ])
+          expect(code, stderr).toBe(0)
+          expect(stdout.trim(), JSON.stringify(locale)).toBe(expected)
+        } finally {
+          child.kill()
+          await child.exited
+        }
+      }
+    },
+  )
+
   it.skipIf(process.platform === "win32")(
     "refuses a replaced leader and stops one real process group",
     async () => {

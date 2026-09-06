@@ -61,6 +61,10 @@ occurrence's loopback control endpoint. The row identifies the latest admitted o
 not establish that it remains alive. A stale row has no serving or version authority; it remains
 only as the exact predecessor value used for atomic replacement.
 
+On macOS, process-start inspection uses the C locale so regional settings cannot change the
+identity of a live process. The existing boot-session and process-start text representation is
+preserved; this does not introduce a new identity encoding or reinterpret persisted owner values.
+
 Revision belongs to observable live health, not durable coordination. A revision orders two live
 ACN targets: an older client may use an equal or greater live revision, while a newer client must
 replace a lower live revision. No revision continues to constrain launch after its process group is
