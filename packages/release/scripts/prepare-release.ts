@@ -2,11 +2,13 @@ import * as Command from "@effect/platform/Command";
 import * as FileSystem from "@effect/platform/FileSystem";
 import { BunContext, BunRuntime } from "@effect/platform-bun";
 import { Console, Effect, Option, Schema } from "effect";
-import { inc } from "semver";
+import { parseDocument } from "yaml";
 import { resolve } from "node:path";
 import { canonical } from "@magnitudedev/utils/canonical-key";
 import { JsonValueSchema } from "@magnitudedev/utils/schema";
 import { verifyPluginContent } from "@magnitudedev/release/plugin-content";
+import { verifyHermesPluginContent } from "../src/hermes-plugin-content";
+import { packHermesPlugin, publishedHermesPlugin, publishedHermesRevision } from "../src/hermes-plugin-artifact";
 import {
   generateVersionFiles,
   readGeneratedRpcVersion,
@@ -31,6 +33,7 @@ import {
   allocateRpcVersion,
   isAwaitingPublication,
   planPlugin,
+  nextPluginVersion,
   PreparedReleaseSchema,
   ReleasePreparationFailed,
   validatePreparedRelease,
@@ -45,22 +48,23 @@ export const releasePlanPath = resolve(
 const generatedChangeset = resolve(root, ".changeset/rpc-plugins.md");
 const markerPath = resolve(root, "packages/release/rpc-breaks");
 const pluginDirectory = resolve(root, "integrations/pi");
+const hermesDirectory = resolve(root, "integrations/hermes");
 const JsonObject = Schema.Record({
   key: Schema.String,
   value: JsonValueSchema,
 });
 
-export const readPreparedRelease = Effect.gen(function* () {
+const readReleasePlan = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   return yield* fs
     .readFileString(releasePlanPath)
     .pipe(
       Effect.flatMap(
         Schema.decodeUnknown(Schema.parseJson(PreparedReleaseSchema))
-      ),
-      Effect.flatMap(validatePreparedRelease)
+      )
     );
 });
+export const readPreparedRelease = readReleasePlan.pipe(Effect.flatMap(validatePreparedRelease));
 
 export const verifyPublicBaseline = (plan: PreparedRelease) =>
   Effect.gen(function* () {
@@ -115,7 +119,9 @@ export const prepareRelease = (mode: "detect" | "allocate" | "verify") =>
           message:
             "packages/release/release-plan.json is missing; seed it with the current revision before preparing",
         });
-      const existing = yield* readPreparedRelease;
+      // Preparation may add a newly supported host to the previous allocation.
+      // Completeness is required of the output, not of the historical input.
+      const existing = yield* readReleasePlan;
       const baseline = yield* readPublicBaseline;
 
       // A merged allocation is not a new public baseline. Do not stack another
@@ -131,7 +137,9 @@ export const prepareRelease = (mode: "detect" | "allocate" | "verify") =>
         const unpublished = yield* Effect.forEach(
           existing.plugins.filter((plugin) => plugin.publish),
           ({ artifact }) =>
-            publishedPluginIntegrity(artifact.name, artifact.version, root).pipe(
+            (artifact.host === "pi"
+              ? publishedPluginIntegrity(artifact.name, artifact.version, root)
+              : publishedHermesRevision(artifact, root).pipe(Effect.map(Option.getOrNull))).pipe(
               Effect.map((integrity) =>
                 integrity === null ? Option.some(artifact) : Option.none()
               )
@@ -203,8 +211,9 @@ export const prepareRelease = (mode: "detect" | "allocate" | "verify") =>
       }
       // Run in a new process: the generated RPC version must not come from this
       // process's already-evaluated protocol module cache.
-      const buildCode = yield* Command.make("bun", "run", "build").pipe(
-        Command.workingDirectory(pluginDirectory),
+      for (const directory of [pluginDirectory, hermesDirectory]) {
+        const buildCode = yield* Command.make("bun", "run", "build").pipe(
+        Command.workingDirectory(directory),
         Command.stdout("inherit"),
         Command.stderr("inherit"),
         Command.exitCode
@@ -213,7 +222,9 @@ export const prepareRelease = (mode: "detect" | "allocate" | "verify") =>
         return yield* new ReleasePreparationFailed({
           message: "Plugin build failed",
         });
+      }
       const { metadata } = yield* verifyPluginContent(pluginDirectory);
+      const { metadata: hermesMetadata } = yield* verifyHermesPluginContent(hermesDirectory);
       // The plugin's baseline is what npm serves, so a plugin-only publication is its own baseline.
       const previousPlugin = yield* publishedPlugin(
         "pi",
@@ -222,6 +233,8 @@ export const prepareRelease = (mode: "detect" | "allocate" | "verify") =>
         channel
       );
       const candidate = yield* planPlugin(metadata, previousPlugin);
+      const previousHermes = yield* publishedHermesPlugin(root, Option.getOrElse(channel, () => "latest"));
+      const hermesCandidate = yield* planPlugin(hermesMetadata, previousHermes);
       if (mode === "detect") {
         const rpcChanged = canonical(existing.rpc) !== canonical(rpc);
         const declared = yield* declaredChangesetReleases(
@@ -237,6 +250,7 @@ export const prepareRelease = (mode: "detect" | "allocate" | "verify") =>
             ...(candidate.publish && !declared.has(metadata.name)
               ? [metadata.name]
               : []),
+            ...(hermesCandidate.publish && !declared.has(hermesMetadata.name) ? [hermesMetadata.name] : []),
           ],
         });
         if (changeset !== undefined) yield* write(generatedChangeset, changeset);
@@ -250,12 +264,12 @@ export const prepareRelease = (mode: "detect" | "allocate" | "verify") =>
         return { pending: false };
       }
       if (mode === "verify") {
-        const selected = existing.plugins.find(
-          (plugin) => plugin.artifact.host === "pi"
-        );
+        yield* validatePreparedRelease(existing);
+        for (const [host, metadata] of [["pi", (yield* verifyPluginContent(pluginDirectory)).metadata], ["hermes", hermesMetadata]] as const) {
+        const selected = existing.plugins.find((plugin) => plugin.artifact.host === host);
         if (selected === undefined)
           return yield* new ReleasePreparationFailed({
-            message: "Release plan omitted the Pi plugin",
+            message: `Release plan omitted the ${host} plugin`,
           });
         if (
           selected.artifact.name !== metadata.name ||
@@ -266,6 +280,7 @@ export const prepareRelease = (mode: "detect" | "allocate" | "verify") =>
           return yield* new ReleasePreparationFailed({
             message: "Bundled plugin contents differ from the prepared release",
           });
+        }
         }
         yield* Console.log(
           "RPC contract, bundled plugin and exact CLI pins verified."
@@ -317,7 +332,7 @@ export const prepareRelease = (mode: "detect" | "allocate" | "verify") =>
             artifact = packed;
             break;
           }
-          const next = inc(version, "patch");
+          const next = nextPluginVersion(version);
           if (next === null)
             return yield* new ReleasePreparationFailed({
               message: "Cannot allocate the next plugin version",
@@ -340,6 +355,37 @@ export const prepareRelease = (mode: "detect" | "allocate" | "verify") =>
           )
         );
       }
+      const hermesPackage = yield* readPackage(hermesDirectory);
+      let hermesVersion = hermesCandidate.version;
+      let hermesArtifact;
+      const writeHermesVersion = Effect.gen(function* () {
+        yield* write(`${hermesDirectory}/package.json`, `${JSON.stringify({ ...hermesPackage, version: hermesVersion }, null, 2)}\n`);
+        const manifest = parseDocument(yield* fs.readFileString(`${hermesDirectory}/plugin.yaml`));
+        manifest.set("version", hermesVersion);
+        yield* write(`${hermesDirectory}/plugin.yaml`, manifest.toString());
+      });
+      if (!hermesCandidate.publish && Option.isSome(previousHermes)) {
+        hermesArtifact = previousHermes.value;
+        yield* writeHermesVersion;
+      } else {
+        const output = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-hermes-allocation-" });
+        for (;;) {
+          yield* writeHermesVersion;
+          const code = yield* Command.make("bun", "run", "build").pipe(
+            Command.workingDirectory(hermesDirectory), Command.stdout("inherit"), Command.stderr("inherit"), Command.exitCode,
+          );
+          if (code !== 0) return yield* new ReleasePreparationFailed({ message: "Hermes plugin rebuild failed" });
+          const packed = yield* packHermesPlugin(hermesDirectory, output);
+          const published = yield* publishedHermesRevision(packed, root);
+          if (Option.isNone(published) || published.value === packed.revision) {
+            hermesArtifact = packed;
+            break;
+          }
+          const next = nextPluginVersion(hermesVersion);
+          if (next === null) return yield* new ReleasePreparationFailed({ message: "Cannot allocate the next Hermes version" });
+          hermesVersion = next;
+        }
+      }
       yield* writePlan({
         format: 2,
         baseline,
@@ -347,7 +393,7 @@ export const prepareRelease = (mode: "detect" | "allocate" | "verify") =>
         revision,
         rpc,
         semanticBreaks,
-        plugins: [{ artifact, publish: candidate.publish }],
+        plugins: [{ artifact, publish: candidate.publish }, { artifact: hermesArtifact, publish: hermesCandidate.publish }],
       });
       for (const marker of markers) yield* fs.remove(`${markerPath}/${marker}`);
       yield* Console.log(

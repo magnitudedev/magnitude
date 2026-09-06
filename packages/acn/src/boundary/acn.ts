@@ -35,6 +35,7 @@ import { ProjectInspector } from "../project-inspector";
 import { ProjectManager } from "../project-manager";
 import { ProjectStore } from "../project-store";
 import { SessionInspector } from "../session-inspector";
+import { InferenceObservations } from "../inference-observations";
 
 const MAX_BASH_OUTPUT_LENGTH = 50_000;
 
@@ -46,6 +47,7 @@ const normalizeBashOutput = (output: string): string =>
 /** Exhaustive server implementation of the composed ACN boundary. */
 export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
     const lifecycle = yield* AcnServiceLifecycle;
+    const inferenceObservations = yield* InferenceObservations;
     const sessionCommands = yield* SessionCommands;
     const sessionLifecycle = yield* SessionLifecycle;
     const sessionInspector = yield* SessionInspector;
@@ -129,6 +131,7 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       });
 
     return {
+      GetInferenceObservations: ({ groupId }) => inferenceObservations.read(groupId),
       // Connection
       Health: () => lifecycle.state.pipe(
         Effect.map((state) => makeHealthResponse(ACN_VERSION, state)),

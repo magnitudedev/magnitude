@@ -369,7 +369,7 @@ const remoteFailure = <A extends RequestOperationDescriptor>(
   );
 };
 
-interface WireEvent {
+export interface WireEvent {
   readonly data: string;
   readonly id: Option.Option<string>;
   readonly event: Option.Option<string>;
@@ -378,7 +378,8 @@ interface WireEvent {
 const utf8Bytes = (value: string): number =>
   new TextEncoder().encode(value).byteLength;
 
-class SseFramer {
+/** Shared bounded SSE framing for generated clients and transparent observers. */
+export class SseFramer {
   private buffer = "";
 
   constructor(private readonly maxFrameBytes: number) {}

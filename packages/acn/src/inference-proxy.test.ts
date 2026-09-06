@@ -34,7 +34,8 @@ describe("ACN inference proxy", () => {
         },
       })
     }) as typeof fetch
-    const signal = new AbortController().signal
+    const abort = new AbortController()
+    const signal = abort.signal
     const result = await proxyInferenceWebRequest(new Request(
       "http://127.0.0.1:10100/inference/v1/chat/completions?stream=true",
       {
@@ -53,7 +54,9 @@ describe("ACN inference proxy", () => {
     expect(forwardedUrl).toBe("http://127.0.0.1:43210/v1/chat/completions?stream=true")
     expect(new Headers(forwarded?.headers).get("authorization")).toBe("Bearer private-icn")
     expect(new Headers(forwarded?.headers).has("x-magnitude-acn-id")).toBe(false)
-    expect(forwarded?.signal).toBe(signal)
+    expect(forwarded?.signal?.aborted).toBe(false)
+    abort.abort()
+    expect(forwarded?.signal?.aborted).toBe(true)
     expect(await new Response(forwarded?.body).text()).toBe("request bytes")
     expect(result.status).toBe(206)
     expect(result.headers.get("connection")).toBeNull()

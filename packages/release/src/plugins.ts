@@ -15,8 +15,8 @@ const PackageName = Schema.String.pipe(
   Schema.pattern(/^@magnitudedev\/[a-z0-9-]+$/)
 );
 const PackageFile = Schema.String.pipe(
-  Schema.pattern(/^(?:dist\/[a-zA-Z0-9_./-]+|README\.md)$/),
-  Schema.filter((path) => !path.split("/").includes(".."))
+  Schema.pattern(/^[a-zA-Z0-9_][a-zA-Z0-9_./-]*$/),
+  Schema.filter((path) => !path.split("/").some(part => part === ".." || part === "." || part === ""))
 );
 
 /** Generated manifest embedded in the plugin, describing its bundled content. */
@@ -28,11 +28,11 @@ export const PluginContentManifestSchema = Schema.Struct({
   files: Schema.Record({ key: PackageFile, value: Sha256Schema }),
 });
 export type PluginContentManifest = typeof PluginContentManifestSchema.Type;
-export const PluginHostSchema = Schema.Literal("pi");
+export const PluginHostSchema = Schema.Literal("pi", "hermes");
 export type PluginHost = typeof PluginHostSchema.Type;
 /** Exact immutable npm tarball selected by a CLI release. */
-export const PluginArtifactSchema = Schema.Struct({
-  host: PluginHostSchema,
+export const NpmPluginArtifactSchema = Schema.Struct({
+  host: Schema.Literal("pi"),
   name: PackageName,
   version: Version,
   rpcVersion: RpcVersion,
@@ -40,6 +40,20 @@ export const PluginArtifactSchema = Schema.Struct({
   filename: Schema.String.pipe(Schema.pattern(/^[a-zA-Z0-9._-]+\.tgz$/)),
   integrity: Schema.String.pipe(Schema.pattern(/^sha512-[a-zA-Z0-9+/]+=*$/)),
 });
+export type NpmPluginArtifact = typeof NpmPluginArtifactSchema.Type;
+/** Hermes's native installer consumes a Git revision, not an npm package. */
+export const HermesPluginArtifactSchema = Schema.Struct({
+  host: Schema.Literal("hermes"),
+  name: Schema.Literal("@magnitudedev/hermes-companion"),
+  version: Version,
+  rpcVersion: RpcVersion,
+  contentFingerprint: Sha256Schema,
+  filename: Schema.String.pipe(Schema.pattern(/^[a-zA-Z0-9._-]+\.bundle$/)),
+  repository: Schema.String.pipe(Schema.pattern(/^https:\/\/github\.com\/[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/)),
+  revision: Schema.String.pipe(Schema.pattern(/^[a-f0-9]{40}$/)),
+});
+export type HermesPluginArtifact = typeof HermesPluginArtifactSchema.Type;
+export const PluginArtifactSchema = Schema.Union(NpmPluginArtifactSchema, HermesPluginArtifactSchema);
 export type PluginArtifact = typeof PluginArtifactSchema.Type;
 export const RpcReleaseSchema = Schema.Struct({
   version: RpcVersion,

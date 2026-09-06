@@ -23,6 +23,7 @@ export interface HarnessConnectorRegistryOptions {
   readonly readCodexBundledCatalog?: CodexBundledCatalogReader
   /** Package lifecycle injection used by deterministic connector tests. */
   readonly piCompanion?: HarnessCompanionPackage
+  readonly hermesCompanion?: HarnessCompanionPackage
   /** Alternate Pi package source used by the repository's local development launcher. */
   readonly piCompanionSource?: string
 }
@@ -38,7 +39,7 @@ export const makeHarnessConnectorRegistry = (
       ...(options.piCompanionSource === undefined ? {} : { packageSource: options.piCompanionSource }),
     }),
     makeOpenCodeConnector(paths),
-    makeHermesConnector(paths),
+    makeHermesConnector(paths, options.hermesCompanion),
     makeOpenClawConnector(paths),
     makeCodexConnector(paths, options.readCodexBundledCatalog),
     makeClaudeCodeConnector(paths),

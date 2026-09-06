@@ -13,12 +13,14 @@
     "./trust": "./src/trust.ts",
     "./plugins": "./src/plugins.ts",
     "./plugin-content": "./src/plugin-content.ts",
+    "./hermes-plugin-content": "./src/hermes-plugin-content.ts",
     "./plan": "./release-plan.json"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "yaml": "^2.8.1",
     "@magnitudedev/utils": "workspace:*",
     "@effect/platform": "^0.96.0",
     "@effect/platform-node": "0.107.0",

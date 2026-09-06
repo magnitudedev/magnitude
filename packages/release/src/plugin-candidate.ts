@@ -6,11 +6,12 @@ import {
   validatePreparedRelease,
 } from "./release-plan";
 import { sha256 } from "./plugin-content";
-import { verifyPluginArtifact, PluginArtifactError } from "./plugin-artifacts";
+import { artifactIntegrity, verifyPluginArtifact, PluginArtifactError } from "./plugin-artifacts";
+import { verifyHermesPluginArtifact } from "./hermes-plugin-artifact";
 
 export const PluginAcceptanceReceiptSchema = Schema.Struct({
   planFingerprint: Schema.String,
-  runtimes: Schema.Tuple(Schema.Literal("node"), Schema.Literal("bun")),
+  runtimes: Schema.Tuple(Schema.Literal("node"), Schema.Literal("bun"), Schema.Literal("hermes")),
   artifacts: Schema.Array(
     Schema.Struct({ filename: Schema.String, integrity: Schema.String })
   ),
@@ -29,15 +30,14 @@ export const readPluginCandidate = (directory: string) =>
         Effect.flatMap(validatePreparedRelease)
       );
     const paths = yield* Effect.forEach(plan.plugins, (plugin) =>
-      verifyPluginArtifact(plugin.artifact, directory)
+      plugin.artifact.host === "hermes" ? verifyHermesPluginArtifact(plugin.artifact, directory) : verifyPluginArtifact(plugin.artifact, directory)
     );
     const receipt: PluginAcceptanceReceipt = {
       planFingerprint: sha256(canonical(plan)),
-      runtimes: ["node", "bun"],
-      artifacts: plan.plugins.map(({ artifact }) => ({
-        filename: artifact.filename,
-        integrity: artifact.integrity,
-      })),
+      runtimes: ["node", "bun", "hermes"],
+      artifacts: yield* Effect.forEach(plan.plugins, ({ artifact }) => fs.readFile(`${directory}/${artifact.filename}`).pipe(
+        Effect.map(bytes => ({ filename: artifact.filename, integrity: artifactIntegrity(bytes) })),
+      )),
     };
     return { plan, paths, receipt };
   });

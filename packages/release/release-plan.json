@@ -8,8 +8,8 @@
   "cliVersion": "0.0.12-alpha.0",
   "revision": 29,
   "rpc": {
-    "version": 1,
-    "fingerprint": "dfba86a156b5dd9647f66bead4d1ed2b22809fb7003955caa94adf6690f5b66f"
+    "version": 2,
+    "fingerprint": "bba6e6b9dd88774668c1b3cba9f6b2f33d70767a30263f516d4991da460f5d25"
   },
   "semanticBreaks": [],
   "plugins": [
@@ -17,11 +17,24 @@
       "artifact": {
         "host": "pi",
         "name": "@magnitudedev/pi-extension",
+        "version": "0.0.1-alpha.1",
+        "rpcVersion": 2,
+        "contentFingerprint": "30c2cbef70c54de8fe15f2c3a9b3f213d8a14d07e9feb4370bf7fe760ee29e0b",
+        "filename": "magnitudedev-pi-extension-0.0.1-alpha.1.tgz",
+        "integrity": "sha512-Y487x3Me6hblunkVZty0+QyaKo6U7apBB1a6w8pb1mUV5eED/Pa9AdyXKsPbWe4KXmalRbHDb+WmjBTEM8WhXA=="
+      },
+      "publish": true
+    },
+    {
+      "artifact": {
+        "host": "hermes",
+        "name": "@magnitudedev/hermes-companion",
         "version": "0.0.1-alpha.0",
-        "rpcVersion": 1,
-        "contentFingerprint": "0cae890db353d9f063a1298bd0f770259d18a27692c4c392fd7561c031e5792c",
-        "filename": "magnitudedev-pi-extension-0.0.1-alpha.0.tgz",
-        "integrity": "sha512-R3ZDIp56NTNAclve/0BePL06Cm9gAxFzal4A8DcFSQQqe0w3Y8WunfOfNFAqv5auFJG9gGqYZJWk84rTbZEYMg=="
+        "rpcVersion": 2,
+        "contentFingerprint": "80dc76114629bb2760cda8ee452f6ebe6192400f91cfb26312cdb3b37a4abba0",
+        "filename": "magnitudedev-hermes-companion-0.0.1-alpha.0.bundle",
+        "repository": "https://github.com/magnitudedev/magnitude",
+        "revision": "6a7d3d86b8223ab712c04a579c614868a2aec691"
       },
       "publish": true
     }

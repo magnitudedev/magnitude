@@ -5,6 +5,7 @@ import {
   allocateRpcVersion,
   isAwaitingPublication,
   planPlugin,
+  nextPluginVersion,
   validatePreparedRelease,
   type PreparedRelease,
   type PublicBaseline,
@@ -27,6 +28,10 @@ const baseline = Option.some<PublicBaseline>({
   cliVersion: "1.0.0",
   rpc: Option.some({ version: 8, fingerprint: hash }),
 });
+const hermesArtifact = {
+  ...artifact, host: "hermes" as const, name: "@magnitudedev/hermes-companion" as const,
+  filename: "hermes.bundle", repository: "https://github.com/magnitudedev/magnitude", revision: "a".repeat(40),
+};
 const published = Option.some(artifact);
 const metadata = {
   name: artifact.name,
@@ -43,7 +48,7 @@ describe("public-baseline release allocation", () => {
     revision: 28,
     rpc: { version: 8, fingerprint: hash },
     semanticBreaks: [],
-    plugins: [{ artifact, publish: false }],
+    plugins: [{ artifact, publish: false }, { artifact: hermesArtifact, publish: false }],
   };
   it("does not block pre exit on an unpublished alpha allocation", () => {
     expect(isAwaitingPublication(prepared, "1.1.0", baseline)).toBe(true);
@@ -74,6 +79,7 @@ describe("public-baseline release allocation", () => {
     const renamed = {
       ...prepared,
       plugins: [
+        { artifact: hermesArtifact, publish: false },
         {
           artifact: { ...artifact, name: "@magnitudedev/renamed-pi" },
           publish: false,
@@ -102,7 +108,7 @@ describe("public-baseline release allocation", () => {
           validatePreparedRelease({
             ...prepared,
             cliVersion,
-            plugins: [{ artifact: { ...artifact, version }, publish: true }],
+            plugins: [{ artifact: { ...artifact, version }, publish: true }, { artifact: { ...hermesArtifact, version }, publish: true }],
           })
         )
       ).then((result) => result._tag);
@@ -159,5 +165,13 @@ describe("public-baseline release allocation", () => {
         )
       ).version
     ).toBe("2.0.0");
+  });
+  it("keeps changed plugin allocations and immutable-version retries in their prerelease channel", async () => {
+    const alpha = { ...artifact, version: "0.0.1-alpha.0" };
+    const result = await Effect.runPromise(planPlugin({ ...metadata, version: alpha.version, rpcVersion: 9 }, Option.some(alpha)));
+    expect(result.version).toBe("0.0.1-alpha.1");
+    expect(nextPluginVersion("0.0.1-alpha.1")).toBe("0.0.1-alpha.2");
+    expect(nextPluginVersion("1.2.3")).toBe("1.2.4");
+    expect(nextPluginVersion("1.2.3", "1.2.3-alpha.0")).toBe("1.2.4-alpha.0");
   });
 });

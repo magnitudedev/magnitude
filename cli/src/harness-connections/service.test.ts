@@ -12,10 +12,14 @@ import { fixturePackageFiles, piPackageFiles } from "./pi-package-fixture"
 import { inspectPluginContent } from "@magnitudedev/release/plugin-content"
 import { MAGNITUDE_RPC_VERSION } from "@magnitudedev/sdk"
 vi.mock("@magnitudedev/release/plan", async () => ({
-  default: { plugins: [{ artifact: (await import("./pi-package-fixture")).fixtureSelection }] },
+  default: { plugins: [
+    { artifact: (await import("./pi-package-fixture")).fixtureSelection },
+    { artifact: { host: "hermes", repository: "https://github.com/magnitudedev/magnitude", revision: "a".repeat(40), contentFingerprint: "a".repeat(64) } },
+  ] },
 }))
 import { HarnessModelSchema, type HarnessCompanionPackage } from "./contract"
 import { PiPackageEntrySchema } from "./connectors/pi-settings"
+import { HermesCompanionStateSchema, HermesPackageRevisionSchema, HermesPackageSourceSchema } from "./connectors/hermes-package-state"
 import {
   ANTHROPIC_BASE_URL,
   CLAUDE_GATEWAY_DISCOVERY,
@@ -146,12 +150,28 @@ const testPiCompanion: HarnessCompanionPackage = {
   disconnect: () => Effect.void,
 }
 
+const testHermesCompanion: HarnessCompanionPackage = {
+  description: { name: "Magnitude for Hermes", source: "hermes-test-package", securityNotice: "Test package" },
+  activationInstructions: Option.some("Restart Hermes."),
+  reconcile: ({ previous }) => Effect.succeed({
+    state: Option.getOrElse(previous, (): typeof HermesCompanionStateSchema.Type => ({
+      identity: "@magnitudedev/hermes-companion" as const,
+      source: HermesPackageSourceSchema.make("https://github.com/magnitudedev/magnitude"),
+      revision: HermesPackageRevisionSchema.make("a".repeat(40)),
+      contentFingerprint: "a".repeat(64), ownership: "magnitude" as const, enablement: Option.none(),
+    })),
+    status: Option.isSome(previous) ? "already-installed" as const : "installed" as const,
+  }),
+  disconnect: () => Effect.void,
+}
+
 const installedService = (paths: HarnessConnectionPaths, resolvedModels = models as ReadonlyArray<(typeof models)[number]>) =>
   makeHarnessConnectionService({
     paths,
     registry: makeHarnessConnectorRegistry(paths, {
       readCodexBundledCatalog: () => Effect.succeed(bundledCodexCatalog),
       piCompanion: testPiCompanion,
+      hermesCompanion: testHermesCompanion,
     }),
     detect: (connector) => Effect.succeed(Option.some({ executable: `/installed/${connector.id}` })),
     resolveModels: Effect.succeed(resolvedModels),

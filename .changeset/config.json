@@ -5,6 +5,6 @@
   "access": "public",
   "baseBranch": "main",
   "updateInternalDependencies": "patch",
-  "ignore": ["@magnitudedev/!(cli|pi-extension)"],
-  "privatePackages": { "version": false, "tag": false }
+  "ignore": ["@magnitudedev/!(cli|pi-extension|hermes-companion)"],
+  "privatePackages": { "version": true, "tag": false }
 }

@@ -14,6 +14,7 @@ import {
   readPreparedRelease,
 } from "../packages/release/scripts/prepare-release";
 import { PreparedReleaseSchema } from "../packages/release/src/release-plan";
+import { acquireHermesPluginArtifact, packHermesPlugin, verifyHermesPluginArtifact } from "../packages/release/src/hermes-plugin-artifact";
 
 const root = resolve(import.meta.dir, "..");
 const program = Effect.gen(function* () {
@@ -25,7 +26,14 @@ const program = Effect.gen(function* () {
   for (const { artifact, publish } of plan.plugins) {
     const file = `${directory}/${artifact.filename}`;
     if (yield* fs.exists(file)) {
-      yield* verifyPluginArtifact(artifact, directory);
+      yield* artifact.host === "hermes" ? verifyHermesPluginArtifact(artifact, directory) : verifyPluginArtifact(artifact, directory);
+      continue;
+    }
+    if (artifact.host === "hermes") {
+      if (publish) {
+        const actual = yield* packHermesPlugin(resolve(root, "integrations/hermes"), directory);
+        if (canonical(actual) !== canonical(artifact)) return yield* new PluginArtifactError({ message: "Hermes package differs from the prepared artifact" });
+      } else yield* acquireHermesPluginArtifact(artifact, directory);
       continue;
     }
     if (publish) {

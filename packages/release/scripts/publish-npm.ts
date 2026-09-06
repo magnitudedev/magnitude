@@ -8,9 +8,9 @@ import {
   awaitPublishedIntegrity,
   publishedPluginIntegrity,
   requireNpm,
-  verifyPublishedPlugins,
   PluginArtifactError,
 } from "../src/plugin-artifacts";
+import { verifyPublishedPlugins } from "../src/plugin-publication";
 import releasePlan from "../release-plan.json";
 import {
   PreparedReleaseSchema,

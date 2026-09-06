@@ -1,0 +1,21 @@
+{
+  "name": "@magnitudedev/hermes-companion",
+  "private": true,
+  "version": "0.0.1-alpha.0",
+  "type": "module",
+  "scripts": {
+    "build": "bun scripts/build.ts",
+    "typecheck": "tsc --noEmit -p desktop-src/tsconfig.json"
+  },
+  "devDependencies": {
+    "@effect/platform": "0.96.1",
+    "@effect/platform-bun": "^0.90.0",
+    "@magnitudedev/sdk": "workspace:*",
+    "@tanstack/react-query": "5.101.2",
+    "@types/bun": "1.3.14",
+    "@types/react": "19.2.17",
+    "effect": "3.21.2",
+    "react": "19.2.7",
+    "typescript": "^5.8.3"
+  }
+}

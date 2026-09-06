@@ -5,7 +5,7 @@ import { fromMarkdown } from "mdast-util-from-markdown"
 import { Effect, Schema } from "effect"
 import { BunContext } from "@effect/platform-bun"
 import { prerelease as semverPrerelease } from "semver"
-import { verifyPublishedPlugins } from "../src/plugin-artifacts"
+import { verifyPublishedPlugins } from "../src/plugin-publication"
 import { ReleaseManifestSchema } from "../src/contracts"
 import { fileSha256 } from "./build/common"
 import {

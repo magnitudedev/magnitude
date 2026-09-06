@@ -7,14 +7,15 @@ applies_to:
   - packages/release/**
   - packages/version/**
   - scripts/*integrations.ts
-  - integrations/pi/scripts/**
+  - integrations/*/scripts/**
+  - .github/actions/setup-hermes/**
 ---
 
 # Release preparation and publication
 
 Changesets assigns package versions. Release preparation derives required changes from the public
 contract and shipped plugin contents before Changesets discovers pending changes. Publication
-consumes accepted tarballs; generic workspace publication is not an alternate release path.
+consumes accepted native package artifacts; generic workspace publication is not an alternate release path.
 
 The release package owns the entire preparation pipeline: contract fingerprinting, public-baseline
 selection, Changesets orchestration, private revision allocation, plugin allocation, and acceptance.
@@ -49,15 +50,16 @@ Markers are consumed by allocation, so a recorded break never re-applies. A numb
 contracts: a reverted contract still takes a fresh number. Several pending changes produce one
 increment, and repeated preparation against the same source is idempotent. Prepared source records the baseline, fingerprint, semantic breaks, plugin
 artifacts, and exact CLI selection. Preparation always reads the real public baselines, GitHub
-releases and npm, so pull-request checks exercise the same allocation without committing it. A
+releases, npm, and Hermes distribution tags, so pull-request checks exercise the same allocation without committing it. A
 merged plan awaiting publication suppresses further automatic allocations until it is published or
-explicitly refreshed; a plugin allocated for publication that npm does not yet serve suppresses
+explicitly refreshed; a plugin allocated for publication that its native distribution does not yet serve suppresses
 them the same way.
 
 Changesets prerelease mode prepares exactly like stable. The RPC version advances on every contract
-change, alpha to alpha included. Plugins bump to prerelease versions, publish under the series'
-dist-tag so `latest` stays stable, and the prerelease CLI pins them exactly. The plugin baseline is
-the version published under that dist-tag, falling back to `latest`. A plan publishes plugins only
+change, alpha to alpha included. Plugins advance within their prerelease channel, including when
+retrying an occupied immutable version. Pi publishes under the series' npm dist-tag so `latest`
+stays stable; Hermes uses versioned immutable Git tags. The prerelease CLI pins both exactly.
+The Pi baseline is the version published under that dist-tag, falling back to `latest`. A plan publishes plugins only
 in its own channel: prerelease CLIs publish prerelease plugin versions, stable CLIs stable ones.
 `pre exit` lets Changesets fold the series into stable versions and the stable path runs. The
 complete pipeline, plugin installation included, is therefore testable in a prerelease series.
@@ -68,13 +70,25 @@ The SDK remains private. Pi bundles its reachable workspace code into an ESM dis
 declares only public Effect/platform dependencies plus host peers. Neither workspace imports nor
 private package runtime dependencies may escape the tarball.
 
+Hermes runs Python in its own environment and loads a bundled Desktop ESM contribution. Its
+generated wire schemas derive from the same ACN boundary. The consumer Git tree contains only
+verified manifest-listed files; it has no repository workspace dependencies. A deterministic,
+parentless distribution commit is transported in a Git bundle for acceptance and publication.
+The native installer receives a repository and exact commit, not the bundle file itself.
+
+Hermes distribution tags are `magnitude-hermes/<version>` in the public Magnitude repository.
+The latest published tag in the selected channel is its independent baseline. Publication imports
+the accepted Git objects and creates that tag without force; a different existing commit is a
+conflict. No generated consumer bundle is committed into the source branch. Changesets versions
+the private Hermes workspace, but it is never published to npm.
+
 A plugin-content fingerprint covers shipped files and install-relevant package fields, including
 dependencies and the embedded RPC version. It excludes its own generated metadata, assigned package
 version, development tooling, and release notes. SDK-only shipped changes therefore require a
 plugin release; unrelated source/test changes do not.
 
-A plugin's baseline is the version npm serves as `latest`, described by the content manifest inside
-its tarball. The CLI release manifest is the baseline for the RPC allocation only. A plugin-only
+A Pi plugin's baseline is the version npm serves as `latest`, described by the content manifest inside
+its tarball. Hermes's baseline is its native distribution tag. The CLI release manifest is the baseline for the RPC allocation only. A plugin-only
 publication therefore becomes its own baseline without a CLI release.
 
 Preparation generates a changeset only for what changed and is not already declared by a human
@@ -84,7 +98,10 @@ Changed plugins receive at least a patch, respecting a larger human Changesets b
 plugins retain the existing published version and artifact bytes. Registry versions are immutable:
 an orphan publication with different bytes requires a new version during preparation.
 
-Each CLI embeds exact plugin name, version, RPC version, content fingerprint, and tarball integrity.
+Each CLI embeds exact plugin name, version, RPC version, and content fingerprint. Pi pins its
+tarball integrity; Hermes pins its public repository and exact content-addressed distribution commit.
+Git bundle encoding may vary without changing that commit. Acceptance additionally hashes the
+actual bundle bytes, so publication cannot substitute a repacked bundle after acceptance.
 That selection is what a fresh installation receives. Compatibility of an installed package is
 decided only by its verified content metadata and an RPC version equal to the CLI's; a newer or
 older plugin built against the same RPC version is accepted without replacement. User-owned
@@ -96,7 +113,7 @@ it does not identify required hosts through hardcoded package names.
 
 Release vocabulary distinguishes four concrete records: `PluginPackageManifest` describes npm
 installation fields; `PluginContentManifest` describes the bundled files and content fingerprint;
-`PluginArtifact` identifies the exact selected tarball and its integrity; `PluginAcceptanceReceipt`
+`PluginArtifact` identifies the selected npm tarball by integrity or Git payload by commit; `PluginAcceptanceReceipt`
 binds successful runtime checks to those bytes and the prepared plan. A content fingerprint decides
 whether a release is needed; tarball integrity proves which bytes were accepted and published.
 
@@ -104,12 +121,13 @@ whether a release is needed; tarball integrity proves which bytes were accepted 
    the CLI version unchanged is accepted only when it changed the release plan; it then publishes
    plugins alone.
 2. Verify the source contract, pinned public baseline, and bundled plugin fingerprints.
-3. Build native artifacts and prepare each selected plugin tarball once; unchanged plugins reuse
-   their public tarballs.
-4. Accept the exact plugin artifacts through isolated Node and Bun Pi installations. Record the
+3. Build native artifacts and prepare each selected plugin artifact once. Unchanged Pi plugins reuse
+   their public tarballs; unchanged Hermes plugins retrieve their exact Git tree without rebuilding code.
+4. Accept the exact plugin artifacts through isolated Node and Bun Pi installations and Hermes's
+   actual native installer/loader. Check CLI-free setup, shared-skill precedence, reload, and removal. Record the
    acceptance against their integrity and release-plan fingerprint.
 5. Recheck the public baseline and source at the commit point.
-6. Publish or verify selected plugins first, consuming the accepted tarballs without repacking.
+6. Publish or verify selected plugins first, consuming the accepted tarballs or Git commits without rebuilding.
 7. Publish the accepted native graph and manifest as the exact GitHub release.
 8. The accepted CLI npm tarball acquires and executes that public release, then is published
    directly. Registry integrity must equal the accepted tarball integrity.

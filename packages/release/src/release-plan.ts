@@ -55,6 +55,12 @@ export const isAwaitingPublication = (
     Option.map(baseline, (baseline) => baseline.cliVersion)
   ) !== cliVersion;
 
+/** An immutable-version collision advances within the candidate's release channel. */
+export const nextPluginVersion = (version: string, candidateVersion = version) => {
+  const channel = prerelease(candidateVersion)?.[0];
+  return channel === undefined ? inc(version, "patch") : inc(version, "prerelease", String(channel));
+};
+
 /**
  * The revision advances by one whenever the CLI version changes since the previous plan,
  * prereleases included, so every distinct CLI version orders above the one before it.
@@ -111,7 +117,7 @@ export const planPlugin = (
       onSome: (previous) =>
         gt(metadata.version, previous.version)
           ? metadata.version
-          : inc(previous.version, "patch"),
+          : nextPluginVersion(previous.version, metadata.version),
     });
     if (version === null)
       return yield* new ReleasePreparationFailed({
