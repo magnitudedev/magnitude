@@ -1,6 +1,6 @@
 {
   "name": "@magnitudedev/pi-extension",
-  "version": "0.0.1-alpha.0",
+  "version": "0.0.1-alpha.1",
   "description": "Magnitude model controls and inference progress for Pi",
   "type": "module",
   "license": "MIT",
