@@ -1,14 +1,16 @@
 import { memo, useState, useCallback, useMemo, useRef } from 'react'
 import { TextAttributes, type KeyEvent, type ScrollBoxRenderable } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
-import { AtomRef } from '@effect-atom/atom-react'
-import { Option } from 'effect'
 import { useTheme } from '../../hooks/use-theme'
-import { useAnimationStep } from '../../hooks/use-animation-time'
+import { subscribeScrollboxActivity } from '../../utils/scroll-helpers'
 
 import { Button } from '../../components/button'
 import { RecentChatEntry } from './recent-chat-entry'
-import type { RecentChat } from '@magnitudedev/client-common'
+import {
+  useInfiniteScroll,
+  type RecentChat,
+  type TimelineScrollAdapter,
+} from '@magnitudedev/client-common'
 
 interface RecentChatsOverlayProps {
   onClose: () => void
@@ -20,8 +22,8 @@ interface RecentChatsOverlayProps {
   loadMore: () => void
 }
 
-/** Threshold in pixels from the bottom to trigger loading more items. */
-const LOAD_MORE_THRESHOLD = 3
+const recentChatOverlayRowId = (chatId: string): string =>
+  `recent-chat-overlay:${chatId}`
 
 export const RecentChatsOverlay = memo(function RecentChatsOverlay({
   onClose,
@@ -34,44 +36,46 @@ export const RecentChatsOverlay = memo(function RecentChatsOverlay({
 }: RecentChatsOverlayProps) {
   const theme = useTheme()
   const [closeHover, setCloseHover] = useState(false)
-  const [selectedIndex, setSelectedIndex] = useState(0)
-  const scrollboxAtomRef = useMemo(
-    () => AtomRef.make<Option.Option<ScrollBoxRenderable>>(Option.none()),
+  const [selectionIndex, setSelectionIndex] = useState(0)
+  const scrollboxRef = useRef<ScrollBoxRenderable | null>(null)
+  const selectedIndex = chats.length === 0
+    ? -1
+    : Math.min(selectionIndex, chats.length - 1)
+
+  const scrollAdapter = useMemo<TimelineScrollAdapter>(
+    () => ({
+      getScrollMetrics: () => {
+        const scrollbox = scrollboxRef.current
+        if (scrollbox === null) return null
+        return {
+          scrollTop: scrollbox.scrollTop,
+          viewportHeight: scrollbox.viewport.height,
+          scrollHeight: scrollbox.scrollHeight,
+        }
+      },
+      setScrollTop: (value) => {
+        scrollboxRef.current?.scrollTo(Math.max(0, value))
+      },
+      subscribeActivity: (handler) => subscribeScrollboxActivity(scrollboxRef.current, handler),
+      stickyThreshold: 2,
+      loadThreshold: 3,
+    }),
     [],
   )
-  const scrolledSinceLoad = useRef(false)
-  const lastScrollTop = useRef(0)
 
-  // Infinite scroll: sample the shared animation clock every 160ms.
-  // This is event-source-driven polling, not a reaction to state.
-  const pollStep = useAnimationStep(hasMore, 160)
-  const lastPollStepRef = useRef(pollStep)
-  if (hasMore && pollStep !== lastPollStepRef.current) {
-    lastPollStepRef.current = pollStep
-    if (!isLoading) {
-      const result = Option.match(scrollboxAtomRef.value, {
-        onNone: () => false,
-        onSome: (sb) => {
-          const viewportHeight = sb.viewport?.height ?? 0
-          const scrollTop = sb.scrollTop ?? 0
-          const scrollHeight = sb.scrollHeight ?? 0
+  useInfiniteScroll({
+    adapter: scrollAdapter,
+    source: { hasMore, loadingMore: isLoading, loadMore },
+    direction: 'bottom',
+    fillViewport: true,
+  })
 
-          if (scrollTop !== lastScrollTop.current) {
-            scrolledSinceLoad.current = true
-            lastScrollTop.current = scrollTop
-          }
-
-          if (scrollHeight <= viewportHeight) return false
-          if (!scrolledSinceLoad.current) return false
-          return scrollHeight - scrollTop - viewportHeight <= LOAD_MORE_THRESHOLD
-        },
-      })
-
-      if (result) {
-        loadMore()
-      }
-    }
-  }
+  const moveSelection = useCallback((index: number) => {
+    const chat = chats[index]
+    if (!chat) return
+    setSelectionIndex(index)
+    scrollboxRef.current?.scrollChildIntoView(recentChatOverlayRowId(chat.id))
+  }, [chats])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.name === 'escape') {
@@ -85,12 +89,12 @@ export const RecentChatsOverlay = memo(function RecentChatsOverlay({
     const plain = !key.ctrl && !key.meta && !key.option
     if (key.name === 'up' && plain) {
       key.preventDefault()
-      setSelectedIndex(prev => Math.max(0, prev - 1))
+      moveSelection(Math.max(0, selectedIndex - 1))
       return
     }
     if (key.name === 'down' && plain) {
       key.preventDefault()
-      setSelectedIndex(prev => Math.min(chats.length - 1, prev + 1))
+      moveSelection(Math.min(chats.length - 1, selectedIndex + 1))
       return
     }
     if ((key.name === 'return' || key.name === 'enter') && plain && !key.shift) {
@@ -98,7 +102,7 @@ export const RecentChatsOverlay = memo(function RecentChatsOverlay({
       const chat = chats[selectedIndex]
       if (chat) onSelect(chat)
     }
-  }, [onClose, chats, selectedIndex, onSelect]))
+  }, [onClose, chats, selectedIndex, onSelect, moveSelection]))
 
   return (
     <box style={{ flexDirection: 'column', height: '100%' }}>
@@ -134,7 +138,7 @@ export const RecentChatsOverlay = memo(function RecentChatsOverlay({
       </box>
 
       <scrollbox
-        ref={(sb: ScrollBoxRenderable | null) => { scrollboxAtomRef.set(Option.fromNullable(sb)) }}
+        ref={(scrollbox: ScrollBoxRenderable | null) => { scrollboxRef.current = scrollbox }}
         scrollX={false}
         scrollbarOptions={{ visible: false }}
         verticalScrollbarOptions={{
@@ -171,15 +175,14 @@ export const RecentChatsOverlay = memo(function RecentChatsOverlay({
             {chats.map((chat, index) => (
               <RecentChatEntry
                 key={chat.id}
+                id={recentChatOverlayRowId(chat.id)}
                 chat={chat}
                 isSelected={index === selectedIndex}
                 onSelect={onSelect}
-                onHover={() => setSelectedIndex(index)}
+                onHover={() => setSelectionIndex(index)}
               />
             ))}
-            {/* Sentinel row: ensures scrollable overflow when hasMore is true
-                so infinite scroll can detect near-bottom position.
-                Also serves as a visual hint that more content exists below. */}
+            {/* Status row for the next page and a visual hint that more content exists. */}
             {hasMore && (
               <box style={{ paddingTop: 1, paddingBottom: 1, paddingLeft: 1 }}>
                 <text style={{ fg: theme.text.supporting }}>
