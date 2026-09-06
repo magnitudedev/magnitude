@@ -1,5 +1,13 @@
 # @magnitudedev/cli
 
+## 0.0.12-alpha.1
+
+### Patch Changes
+
+- [`183f48c`](https://github.com/magnitudedev/magnitude/commit/183f48c9a7b146549ce24c9d52e1ea171376f176) Thanks [@anerli](https://github.com/anerli)! - Fix macOS service detection under non-C locales by making process-start identity formatting consistent with the background service.
+
+- [`dc36e21`](https://github.com/magnitudedev/magnitude/commit/dc36e2191652ae8a8eea35bddf8ef6ad32f76aa7) Thanks [@anerli](https://github.com/anerli)! - fix: assume rpc revision version 0 when not included in health, also try start cli from sdk once if version mismatch
+
 ## 0.0.12-alpha.0
 
 ### Patch Changes
