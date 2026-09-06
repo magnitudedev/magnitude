@@ -74,7 +74,7 @@ class LoadedMTP:
         return LibraryStateStore(
             lambda: [KVCache() for _ in range(self.depth)],
             budget,
-            lambda length: (
+            lambda length, query_tokens: (
                 ((length + KVCache.step - 1) // KVCache.step)
                 * KVCache.step
                 * self.kv_bytes_per_token

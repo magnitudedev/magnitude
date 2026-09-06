@@ -82,6 +82,25 @@ def _can_trim(cache: Cache) -> bool:
     return type(cache) is CacheList and all(_can_trim(c) for c in cache.caches)
 
 
+def _replacement_bytes(cache: Cache, count: int) -> int:
+    """Old KV buffers kept live while the library constructs their replacement."""
+    if type(cache) is CacheList:
+        return sum(_replacement_bytes(child, count) for child in cache.caches)
+    if type(cache) in (ArraysCache, VLMArrayCache) or cache.keys is None:
+        return 0
+    if type(cache) in (RotatingKVCache, VLMRotatingKVCache):
+        length = cache.keys.shape[2]
+        replaces = (count > 1 or length > cache.max_size
+                    or (cache.offset >= length and length < cache.max_size))
+    elif type(cache) is ConcatenateKVCache:
+        replaces = True
+    else:
+        keys = cache.keys[0] if type(cache) is QuantizedKVCache else cache.keys
+        offset = cache.offset - (cache.start_position if type(cache) is ChunkedKVCache else 0)
+        replaces = offset + count > keys.shape[2]
+    return sum(array.nbytes for array in _arrays(cache)) if replaces else 0
+
+
 class CacheImage:
     """Detached cache graph with reserved storage, materialized only when consumed.
 
@@ -162,7 +181,7 @@ class LibraryTransaction:
         self.batch_lease: BatchLease | None = None
         self.indices = tuple(i for i, c in enumerate(state.caches) if not _can_trim(c))
         self.growth_peak, state.staged_growth = state.staged_growth, None
-        need = state.store.capacity(self.base + inputs.count)
+        need = state.store.capacity(self.base + inputs.count, inputs.count)
         self.capacity_bytes = need
         if need < 0:
             raise ValueError("cache capacity estimate must be nonnegative")
@@ -170,10 +189,19 @@ class LibraryTransaction:
         try:
             if state.batch is not None:
                 self.batch_lease = state.batch.acquire()
-            if state.batch is None and need > state.allocated_bytes:
-                self.growth_peak = state.store.budget.reserve(
-                    "library-cache-growth", state.allocated_bytes
+            if state.batch is None:
+                replacement = state.allocated_bytes if need > state.allocated_bytes else 0
+                # A capacity high-water mark can hide physical replacement:
+                # rotating windows concatenate at steady size, and a previous
+                # wide query can prepay more than a later append allocation.
+                physical = sum(
+                    _replacement_bytes(cache, inputs.count) for cache in state.caches
                 )
+                replacement = max(replacement, physical)
+                if replacement:
+                    self.growth_peak = state.store.budget.reserve(
+                        "library-cache-growth", replacement
+                    )
             if state.batch is None and need > state.capacity_bytes:
                 growth = state.store.budget.reserve("library-cache", need - state.capacity_bytes)
             if self.indices and committed_inputs < inputs.count:
@@ -247,7 +275,7 @@ class LibraryStateStore:
         self,
         make_cache: Callable[[], list[Cache]],
         budget: MemoryBudget,
-        capacity: Callable[[int], int],
+        capacity: Callable[[int, int], int],
     ):
         self.make_cache = make_cache
         self.budget = budget
@@ -269,7 +297,7 @@ class LibraryStateStore:
             if tuple(map(type, caches)) != tuple(map(type, checkpoint.image.caches)):
                 raise ValueError("checkpoint cache layout differs from the model")
             need = max(
-                self.capacity(checkpoint.length),
+                self.capacity(checkpoint.length, 0),
                 sum(a.nbytes for a in _arrays(checkpoint.image.caches)),
             )
             reservation = self.budget.reserve("library-cache", need)
@@ -287,12 +315,13 @@ class LibraryStateStore:
 
     def reserve(self, state: LibraryState, input_capacity: int) -> None:
         # Reserve the declared continuation before admission or chained execution.
-        # Storage is still allocated lazily. Replacement peaks use allocated_bytes,
-        # independently of this prepaid capacity, and are charged by begin().
+        # This secures retained history, not a promise about the width of one
+        # forward. begin() separately reserves window extensions and replacement
+        # peaks before executing that forward.
         self._check(state)
         if state.active:
             raise RuntimeError("capacity preparation requires an idle library state")
-        need = self.capacity(state.position + input_capacity)
+        need = self.capacity(state.position + input_capacity, 0)
         if need < 0:
             raise ValueError("cache capacity estimate must be nonnegative")
         if state.batch is None and state.position == 0 and not state.charges:
@@ -324,7 +353,7 @@ class LibraryStateStore:
                 except MemoryError:
                     pass  # Existing storage remains valid if compaction cannot fit its peak.
         end = max(state.position for state in states) + width
-        batch.reserve(self.capacity(end))
+        batch.reserve(self.capacity(end, width))
         if any(isinstance(layer, DenseKV) and layer.keys is not None
                and end > layer.keys.shape[2] for layer in batch.layers):
             states[0].staged_growth = self.budget.reserve(

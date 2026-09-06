@@ -29,7 +29,7 @@ def test_prefill_groups_compatible_work_and_preserves_each_prompt(lengths, batch
     if not batched:
         monkeypatch.setattr(program, "forward_batch", None)
     model = ModelRuntime(program, LibraryStateStore(
-        lambda: [KVCache()], budget, lambda n: 4096,
+        lambda: [KVCache()], budget, lambda n, q: 4096,
     ), ExecutionOwner())
     generation = GenerationRuntime(model, PlainMethod())
     rows = tuple(generation.prepare(
@@ -70,7 +70,7 @@ def test_prompt_batch_allocation_failure_splits_without_losing_committed_peer_st
         return values[:, 0]
 
     model = ModelRuntime(LibraryProgram(call), LibraryStateStore(
-        lambda: [KVCache()], budget, lambda n: 4096,
+        lambda: [KVCache()], budget, lambda n, q: 4096,
     ), ExecutionOwner())
     runtime = GenerationRuntime(model, PlainMethod())
     rows = tuple(runtime.prepare((i, i + 1, i + 2), SamplingPolicy(temperature=0), 1)
@@ -121,7 +121,7 @@ def test_model_batches_combine_output_demands_without_combining_causal_commitmen
             )
 
     model = ModelRuntime(Program(), LibraryStateStore(
-        lambda: [KVCache()], budget, lambda n: 4096,
+        lambda: [KVCache()], budget, lambda n, q: 4096,
     ), ExecutionOwner())
     rows = tuple(model.create() for _ in range(4))
     requests = (

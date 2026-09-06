@@ -151,8 +151,15 @@ class UpstreamLoader(ProgramSource):
 
 
 def native_capacity(arguments, caches):
-    """Conservative reservations for recognized append, rotating and recurrent caches."""
-    from mlx_vlm.models.cache import ArraysCache
+    """Bound retained history and the additional window required by a forward.
+
+    Geometry and element size remain conservative. Rotating caches retain a
+    bounded history, but a multi-token query needs window + query - 1 keys so
+    every query can attend its complete window. Zero query tokens describes
+    retained history for admission; transaction preparation supplies the actual
+    query width before allocating its extension.
+    """
+    from mlx_vlm.models.cache import ArraysCache, RotatingKVCache
 
     heads = max(
         getattr(arguments, "num_key_value_heads", 0),
@@ -191,5 +198,25 @@ def native_capacity(arguments, caches):
                 * arguments.linear_value_head_dim
             )
         )
-    kv_bytes = (len(caches) - recurrent) * heads * width * 2 * 4
-    return lambda position: fixed + (((position + 255) // 256 + 1) * 256 * kv_bytes)
+    kv_bytes = heads * width * 2 * 4
+    layouts = tuple(
+        (getattr(cache, "step", 256),
+         cache.max_size if isinstance(cache, RotatingKVCache) else None)
+        for cache in caches if not isinstance(cache, ArraysCache)
+    )
+
+    def capacity(position: int, query_tokens: int) -> int:
+        if not 0 <= query_tokens <= position:
+            raise ValueError("cache query width must be within the declared end position")
+        tokens = 0
+        for step, window in layouts:
+            allocated = ((position + step - 1) // step + 1) * step
+            if window is not None:
+                allocated = max(
+                    min(allocated, window),
+                    min(position, window + max(0, query_tokens - 1)),
+                )
+            tokens += allocated
+        return fixed + tokens * kv_bytes
+
+    return capacity
