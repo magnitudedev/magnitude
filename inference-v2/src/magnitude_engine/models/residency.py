@@ -44,7 +44,9 @@ class HybridRequirements(PagedRequirements):
 @dataclass(frozen=True)
 class NativeRequirements:
     make_cache: Callable[[], list]
-    capacity: Callable[[int], int]
+    # (end position, query tokens): zero query reserves retained history; a
+    # positive query also covers the cache extension needed by that forward.
+    capacity: Callable[[int, int], int]
     source: object
 
 

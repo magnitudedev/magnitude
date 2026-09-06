@@ -64,6 +64,13 @@ Physical KV placement, page mappings and recurrent images belong to state storag
 Slab allocation is a storage choice; attention computation consumes a compatible
 view without becoming an admission or retention policy.
 
+Native cache reservations distinguish retained history from the extra window needed
+by a multi-token forward. Admission reserves retained capacity through the requested
+context; transaction preparation covers query extensions and replacement peaks before
+execution. A sliding window does not grow with the entire history, but a query can
+temporarily require more than one window. A stable reservation size does not imply
+in-place execution: replacement accounting also follows the physical cache buffers.
+
 Architecture programs compose their embedding, attention/recurrent mixing and
 feed-forward dependencies. Resident or streamed weight implementations retain
 their I/O, scratch and consumer-lifetime complexity behind those contracts.

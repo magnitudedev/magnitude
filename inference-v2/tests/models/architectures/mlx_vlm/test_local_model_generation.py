@@ -35,7 +35,8 @@ def test_local_qwen3_greedy_generation_and_checkpoint_match_library():
         config["num_hidden_layers"] * config["num_key_value_heads"] * config["head_dim"] * 2 * 4
     )
     states = LibraryStateStore(
-        lambda: make_prompt_cache(model), budget, lambda n: ((n + 255) // 256) * 256 * token_bytes
+        lambda: make_prompt_cache(model), budget,
+        lambda n, q: ((n + 255) // 256) * 256 * token_bytes,
     )
     runtime = ModelRuntime(
         LibraryProgram(lambda ids, cache: model(ids, cache=cache)), states, ExecutionOwner()

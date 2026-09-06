@@ -23,7 +23,9 @@ def hybrid():
         caches[1][0] = recurrence[:, -1:]
         return -((recurrence[..., None] - mx.arange(16)) ** 2)
 
-    store = LibraryStateStore(lambda: [KVCache(), ArraysCache(1)], budget, lambda n: 2048 + n * 8)
+    store = LibraryStateStore(
+        lambda: [KVCache(), ArraysCache(1)], budget, lambda n, q: 2048 + n * 8,
+    )
     return ModelRuntime(LibraryProgram(call), store, ExecutionOwner()), budget
 
 
@@ -74,7 +76,7 @@ def test_zero_commit_on_initial_recurrent_state_and_pending_guards():
 
 def test_rotating_cache_rollback_restores_overwritten_history():
     budget = MemoryBudget(1 << 20)
-    store = LibraryStateStore(lambda: [RotatingKVCache(max_size=4)], budget, lambda n: 4096)
+    store = LibraryStateStore(lambda: [RotatingKVCache(max_size=4)], budget, lambda n, q: 4096)
 
     def call(tokens, caches):
         values = tokens.astype(mx.float32).reshape(1, 1, -1, 1)
@@ -113,12 +115,12 @@ def test_prepaid_native_capacity_still_accounts_for_actual_replacement_peaks():
     runtime, budget = hybrid()
     row = runtime.create()
     runtime.reserve(row, 10)
-    reserved = runtime.states.capacity(10)
+    reserved = runtime.states.capacity(10, 0)
     assert budget.snapshot().reserved == reserved
     assert row.state.allocated_bytes == 0
     assert row.state.position == 0 and row.state.caches[0].keys is None
     runtime.prefill(row, (1, 2))
-    allocated = runtime.states.capacity(2)
+    allocated = runtime.states.capacity(2, 2)
     assert row.state.allocated_bytes == allocated
     assert budget.snapshot().reserved == reserved
     # The new cache fits the prepaid allowance, but its old physical allocation
@@ -138,7 +140,7 @@ def test_prepaid_native_capacity_still_accounts_for_actual_replacement_peaks():
 
 def test_forward_failure_disposes_sequence_and_releases_completed_resources():
     budget = MemoryBudget(1 << 20)
-    store = LibraryStateStore(lambda: [KVCache()], budget, lambda n: 4096)
+    store = LibraryStateStore(lambda: [KVCache()], budget, lambda n, q: 4096)
 
     def call(tokens, caches):
         values = tokens.astype(mx.float32).reshape(1, 1, -1, 1)
@@ -174,7 +176,7 @@ def test_real_qwen_attention_program_chunk_checkpoint_and_verify_agree():
         )
     )
     budget = MemoryBudget(1 << 20)
-    store = LibraryStateStore(lambda: [KVCache(), KVCache()], budget, lambda n: 65536)
+    store = LibraryStateStore(lambda: [KVCache(), KVCache()], budget, lambda n, q: 65536)
     runtime = ModelRuntime(
         LibraryProgram(lambda ids, cache: model(ids, cache=cache)), store, ExecutionOwner()
     )
@@ -235,7 +237,7 @@ def test_native_rollback_image_is_lazy_until_rejection(monkeypatch):
 
 def test_lazy_snapshot_preserves_in_place_recurrent_array_mutation():
     budget = MemoryBudget(1 << 20)
-    store = LibraryStateStore(lambda: [ArraysCache(1)], budget, lambda n: 64)
+    store = LibraryStateStore(lambda: [ArraysCache(1)], budget, lambda n, q: 64)
 
     def call(tokens, caches):
         if caches[0][0] is None:

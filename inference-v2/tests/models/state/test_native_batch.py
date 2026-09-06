@@ -20,7 +20,7 @@ def test_native_batch_matches_independent_attention_and_recurrence(accepted, pre
     arena.close()
     assert unused_budget.snapshot().reserved == 0
     budget = MemoryBudget(64 << 20)
-    states = LibraryStateStore(model.make_cache, budget, lambda n: ((n + 255) // 256) * 65536)
+    states = LibraryStateStore(model.make_cache, budget, lambda n, q: ((n + 255) // 256) * 65536)
     physical = []
     def call(tokens, cache):
         physical.append(tokens.shape)
@@ -85,7 +85,7 @@ def test_repairs_respect_existing_physical_storage_groups():
         caches[1][0] = keys.sum(axis=2) + (0 if previous is None else previous)
         return keys[:, 0]
     runtime = ModelRuntime(LibraryProgram(call), LibraryStateStore(
-        lambda: [KVCache(), ArraysCache(1)], budget, lambda n: 4096,
+        lambda: [KVCache(), ArraysCache(1)], budget, lambda n, q: 4096,
     ), ExecutionOwner())
     rows = tuple(runtime.create() for _ in range(4))
     for row in rows:
@@ -114,7 +114,7 @@ def test_departed_storage_is_reused_before_request_admission_needs_more_capacity
         caches[1][0] = keys.sum(axis=2) + (0 if previous is None else previous)
         return keys[:, 0]
     runtime = ModelRuntime(LibraryProgram(call), LibraryStateStore(
-        lambda: [KVCache(), ArraysCache(1)], budget, lambda n: 4096,
+        lambda: [KVCache(), ArraysCache(1)], budget, lambda n, q: 4096,
     ), ExecutionOwner())
     rows = tuple(runtime.create() for _ in range(2))
     advances = runtime.forward_batch(rows, (ModelInputs.from_tokens((2,)),) * 2)
@@ -146,7 +146,7 @@ def test_regrouping_keeps_old_storage_charged_until_lazy_consumers_complete():
         caches[0].update_and_fetch(keys, keys)
         return keys[:, 0]
     runtime = ModelRuntime(LibraryProgram(call), LibraryStateStore(
-        lambda: [KVCache()], budget, lambda n: 4096,
+        lambda: [KVCache()], budget, lambda n, q: 4096,
     ), ExecutionOwner())
     rows = tuple(runtime.create() for _ in range(3))
     advances = runtime.forward_batch(rows[:2], (ModelInputs.from_tokens((2,)),) * 2)
