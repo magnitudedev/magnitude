@@ -8,7 +8,7 @@ import anyio
 from anyio import to_thread
 
 from magnitude_engine.artifacts.tokenizer import TokenizerArtifact
-from magnitude_engine.engine.delivery import Finished
+from magnitude_engine.engine.delivery import Finished, PrefillProgress
 from magnitude_engine.worker.host import Worker
 
 from .parsing import OutputParser, TextDelta, ToolCall
@@ -73,6 +73,8 @@ class ChatService:
                 try:
                     event = await to_thread.run_sync(partial(remote.next, timeout=0.25))
                 except TimeoutError:
+                    continue
+                if isinstance(event, PrefillProgress):
                     continue
                 if isinstance(event, Finished):
                     finish = event

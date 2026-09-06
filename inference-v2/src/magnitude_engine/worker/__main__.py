@@ -79,7 +79,7 @@ def run(parent: int) -> int:
     lifetime = ExitStack()
     try:
         # MLX is imported and initialized only in this disposable process.
-        from magnitude_engine.engine.delivery import Finished
+        from magnitude_engine.engine.delivery import Finished, PrefillProgress
         from magnitude_engine.engine.requests import GenerationRequest
         from magnitude_engine.generation.constraint_spec import ConstraintSpec
         from magnitude_engine.generation.sampling_policy import SamplingPolicy
@@ -123,8 +123,11 @@ def run(parent: int) -> int:
                             "max_tokens",
                             "stop_tokens",
                             "constraint",
+                            "progress",
                         }:
                             raise ValueError("inference command fields differ from protocol")
+                        if type(message["progress"]) is not bool:
+                            raise ValueError("progress subscription must be boolean")
                         request = GenerationRequest(
                             tuple(message["prompt"]),
                             SamplingPolicy(**message["sampling"]),
@@ -149,6 +152,7 @@ def run(parent: int) -> int:
                             request,
                             identity=identity,
                             output_capacity=runtime.output_capacity,
+                            progress=message["progress"],
                         )
                         send({"type": "accepted", "request_id": identity})
                     except (ValueError, TypeError, OverflowError) as error:
@@ -197,7 +201,13 @@ def run(parent: int) -> int:
                         continue
                     send(
                         {
-                            "type": "finished" if isinstance(event, Finished) else "tokens",
+                            "type": (
+                                "finished"
+                                if isinstance(event, Finished)
+                                else "progress"
+                                if isinstance(event, PrefillProgress)
+                                else "tokens"
+                            ),
                             "request_id": identity,
                             "event": asdict(event),
                         }
@@ -205,8 +215,11 @@ def run(parent: int) -> int:
                     reading.remove(identity)
                     if isinstance(event, Finished):
                         del handles[identity]
-            if (runtime.engine.last_service is None and incoming.empty()
-                and not runtime.engine.wake.is_set()):
+            if (
+                runtime.engine.last_service is None
+                and incoming.empty()
+                and not runtime.engine.wake.is_set()
+            ):
                 wake.wait(0.05)
         if failures:
             raise BaseExceptionGroup("private worker transport failed", failures)

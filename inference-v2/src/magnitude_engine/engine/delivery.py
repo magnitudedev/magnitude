@@ -12,6 +12,16 @@ class Tokens:
 
 
 @dataclass(frozen=True)
+class PrefillProgress:
+    """Completed bulk prompt state, including reused tokens; final anchor is separate."""
+
+    completed_tokens: int
+    total_tokens: int
+    cached_tokens: int
+    elapsed_ns: int
+
+
+@dataclass(frozen=True)
 class Finished:
     reason: str
     prompt_tokens: int
@@ -36,9 +46,11 @@ class Delivery:
     errors can always publish a terminal record, even with an unresponsive reader.
     """
 
-    def __init__(self, capacity: int, wake: Callable[[], None]):
+    def __init__(self, capacity: int, wake: Callable[[], None], *, progress: bool = False):
         if type(capacity) is not int or capacity < 1:
             raise ValueError("delivery capacity must be a positive token count")
+        if type(progress) is not bool:
+            raise ValueError("progress subscription must be boolean")
         self.capacity = capacity
         self._wake = wake
         self._condition = Condition()
@@ -46,6 +58,16 @@ class Delivery:
         self._buffered = 0
         self._finish: Finished | None = None
         self._terminal_taken = False
+        self.progress_enabled = progress
+        self._progress: PrefillProgress | None = None
+
+    def report(self, progress: PrefillProgress) -> None:
+        """Latest completed state only; progress never consumes output credit."""
+        if self.progress_enabled:
+            with self._condition:
+                if self._finish is None:
+                    self._progress = progress
+                    self._condition.notify_all()
 
     @property
     def credit(self) -> int:
@@ -73,12 +95,18 @@ class Delivery:
             self._finish = finish
             self._condition.notify_all()
 
-    def take(self, timeout: float | None = None) -> Tokens | Finished:
+    def take(self, timeout: float | None = None) -> Tokens | Finished | PrefillProgress:
         with self._condition:
             if not self._condition.wait_for(
-                lambda: bool(self._chunks) or self._finish is not None, timeout
+                lambda: (
+                    self._progress is not None or bool(self._chunks) or self._finish is not None
+                ),
+                timeout,
             ):
                 raise TimeoutError("request has no available output")
+            if self._progress is not None:
+                progress, self._progress = self._progress, None
+                return progress
             if self._chunks:
                 event = self._chunks.popleft()
                 self._buffered -= len(event.values)

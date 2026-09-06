@@ -272,3 +272,37 @@ def test_abrupt_parent_loss_terminates_its_model_worker(tmp_path):
             child.kill()
         parent.stdout.close()
         parent.stderr.close()
+
+
+def test_private_worker_progress_is_opt_in_and_preserves_warm_request_tokens(tmp_path):
+    from dataclasses import replace
+
+    from magnitude_engine.engine.delivery import PrefillProgress
+
+    config = configuration(tmp_path)
+    config = replace(config, scheduler=replace(config.scheduler, prefill_tokens=1))
+    with Worker(config, startup_timeout=20) as host:
+        outputs = []
+        for cached in (0, 7):
+            request = host.submit(tuple(range(1, 9)), SamplingPolicy(temperature=0), 4,
+                                  progress=True)
+            progress, values = [], []
+            while True:
+                event = request.next(5)
+                if isinstance(event, PrefillProgress):
+                    assert not values
+                    progress.append(event)
+                elif isinstance(event, Finished):
+                    assert event.cached_tokens == cached
+                    break
+                else:
+                    values.extend(event.values)
+            assert progress and progress[-1].completed_tokens == 7
+            assert all(p.total_tokens == 7 and p.cached_tokens == cached for p in progress)
+            assert [p.completed_tokens for p in progress] == sorted(
+                p.completed_tokens for p in progress
+            )
+            assert len(values) == 4
+            outputs.append(values)
+        assert outputs[0] == outputs[1]
+    assert host.process.poll() == 0, host.stderr

@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from magnitude_engine.composition import Blueprint, digest, dumps
 from magnitude_engine.engine.contracts import EngineInstance
-from magnitude_engine.engine.delivery import Finished, Tokens
+from magnitude_engine.engine.delivery import Finished, PrefillProgress, Tokens
 from magnitude_engine.generation.constraint_spec import ConstraintSpec
 from magnitude_engine.generation.sampling_policy import SamplingPolicy
 
@@ -31,7 +31,7 @@ class RemoteRequest:
         self.host, self.identity = host, identity
         self._condition = Condition()
         self._consumer = Lock()
-        self._event: Tokens | Finished | None = None
+        self._event: Tokens | Finished | PrefillProgress | None = None
         self._failure: BaseException | None = None
         self._pending = False
         self._accepted = False
@@ -42,7 +42,7 @@ class RemoteRequest:
         self._cancel_ack = False
         self._terminal: Finished | None = None
 
-    def next(self, timeout: float | None = None) -> Tokens | Finished:
+    def next(self, timeout: float | None = None) -> Tokens | Finished | PrefillProgress:
         deadline = None if timeout is None else monotonic() + timeout
 
         def remaining() -> float | None:
@@ -103,7 +103,7 @@ class RemoteRequest:
         self.host._forget(self.identity)
         return self._terminal
 
-    def _receive(self, event: Tokens | Finished) -> None:
+    def _receive(self, event: Tokens | Finished | PrefillProgress) -> None:
         with self._condition:
             if self._cancelling:
                 return
@@ -214,6 +214,7 @@ class Worker:
         stop_tokens: tuple[int, ...] = (),
         *,
         constraint: ConstraintSpec | None = None,
+        progress: bool = False,
     ) -> RemoteRequest:
         with self._lock:
             self._check()
@@ -231,6 +232,7 @@ class Worker:
                     "max_tokens": max_tokens,
                     "stop_tokens": stop_tokens,
                     "constraint": None if constraint is None else asdict(constraint),
+                    "progress": progress,
                 }
             )
         except BaseException:
@@ -303,6 +305,8 @@ class Worker:
                         request._condition.notify_all()
                 elif kind == "tokens":
                     request._receive(Tokens(tuple(message["event"]["values"])))
+                elif kind == "progress":
+                    request._receive(PrefillProgress(**message["event"]))
                 elif kind == "finished":
                     request._receive(Finished(**message["event"]))
                 elif kind == "cancelled":
