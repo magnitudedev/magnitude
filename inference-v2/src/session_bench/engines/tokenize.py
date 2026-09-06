@@ -20,7 +20,7 @@ def main():
                 template.render(
                     request["messages"],
                     tools=request["tools"],
-                    tool_choice="required",
+                    tool_choice="required" if request["tools"] else "auto",
                     chat_template_kwargs={"enable_thinking": False},
                 ).tokens
             )
@@ -34,7 +34,9 @@ def main():
 
         def count(request):
             messages, tools, choice = _prepare_chat_tool_choice(
-                deepcopy(request["messages"]), request["tools"], "required"
+                deepcopy(request["messages"]),
+                request["tools"] or None,
+                "required" if request["tools"] else None,
             )
             # The stock HTTP route decodes tool arguments before rendering history.
             for message in messages:

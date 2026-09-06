@@ -17,7 +17,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        assert body["max_tokens"] == 32768
+        assert body["max_tokens"] == (32768 if body.get("tools") else 256)
         events = [
             {
                 "id": "fixture",
@@ -58,6 +58,9 @@ class Handler(BaseHTTPRequestHandler):
                 },
             },
         ]
+        if not body.get("tools"):
+            events[0]["choices"][0]["delta"] = {"content": "The story continues."}
+            events[1]["choices"][0]["finish_reason"] = "stop"
         stream = "".join("data: " + json.dumps(event) + "\n\n" for event in events)
         stream += "data: [DONE]\n\n"
         self.send_response(200)

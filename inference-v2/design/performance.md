@@ -124,6 +124,9 @@ fixed. Preserve effects on other dimensions and memory feasibility. Such sensiti
 is a model prediction requiring parent evidence, not a speedup obtained by subtracting
 child percentages. A small inefficient component may have little parent impact.
 
+Context content, preparation and execution modes follow
+[benchmark fixtures](benchmark-fixtures.md).
+
 ## Evidence and current assessments
 
 A ceiling evaluation records the full dimension ID, component-record and reusable-

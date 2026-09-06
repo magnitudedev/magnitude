@@ -1,72 +1,14 @@
-"""Serializable interactions and shared simulated session requests."""
+"""Serializable serving requests and session schedules."""
 
-import hashlib
 import json
-from typing import Literal
+from typing import Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import Field, JsonValue
 
-from .policy import MAX_OUTPUT_TOKENS
+from benchmark_fixtures.interactions import ExpectedCall
+from benchmark_fixtures.records import Record, digest, encoded
 
-
-class Record(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-
-def encoded(value: object) -> str:
-    return json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
-    )
-
-
-def digest(value: object) -> str:
-    return hashlib.sha256(encoded(value).encode()).hexdigest()
-
-
-class ExpectedCall(Record):
-    name: str
-    arguments: dict[str, list[JsonValue]]
-
-
-class Interaction(Record):
-    id: str
-    category: str
-    messages: list[dict[str, JsonValue]]
-    tools: list[dict[str, JsonValue]]
-    expected: list[ExpectedCall]
-    provenance: dict[str, str]
-
-    def completed(self, identity: str) -> list[dict[str, JsonValue]]:
-        calls = []
-        replies = []
-        for index, call in enumerate(self.expected):
-            arguments = {key: values[0] for key, values in call.arguments.items() if values}
-            call_id = f"call_{identity}_{index}"
-            calls.append(
-                {
-                    "id": call_id,
-                    "type": "function",
-                    "function": {
-                        "name": call.name,
-                        "arguments": encoded(arguments),
-                    },
-                }
-            )
-            replies.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": encoded(
-                        {
-                            "ok": True,
-                            "tool": call.name,
-                            "arguments": arguments,
-                        }
-                    ),
-                }
-            )
-        return [*self.messages, {"role": "assistant", "content": "", "tool_calls": calls}, *replies]
-
+from .policy import MAX_OUTPUT_TOKENS, PROSE_OUTPUT_TOKENS
 
 Section = Literal["single", "context", "session", "parallel", "fork", "concurrency", "memory"]
 
@@ -77,12 +19,18 @@ class Request(Record):
     session: str
     checkpoint: int = Field(ge=0)
     concurrency: int = Field(default=1, ge=1)
+    workload: Literal["tools", "prose"] = "tools"
     fixture_id: str
     messages: list[dict[str, JsonValue]]
     tools: list[dict[str, JsonValue]]
     expected: list[ExpectedCall]
+    fixture_provenance: dict[str, JsonValue] = Field(default_factory=dict)
     depends_on: tuple[str, ...] = ()
     release_ms: int = Field(default=0, ge=0)
+
+    @property
+    def output_limit(self) -> int:
+        return PROSE_OUTPUT_TOKENS if self.workload == "prose" else MAX_OUTPUT_TOKENS
 
     def body(self, model: str) -> dict:
         return json.loads(
@@ -90,11 +38,10 @@ class Request(Record):
                 {
                     "model": model,
                     "messages": self.messages,
-                    "tools": self.tools,
-                    "tool_choice": "required",
+                    **({"tools": self.tools, "tool_choice": "required"} if self.tools else {}),
                     "stream": True,
                     "stream_options": {"include_usage": True},
-                    "max_tokens": MAX_OUTPUT_TOKENS,
+                    "max_tokens": self.output_limit,
                     "temperature": 0,
                     "top_p": 1,
                     "seed": 42,
@@ -115,9 +62,34 @@ class Plan(Record):
     @property
     def warmup(self) -> Request:
         first = self.requests[0]
+        if first.workload == "prose":
+            return first.model_copy(
+                update={
+                    "id": "warmup",
+                    "depends_on": (),
+                    "messages": [
+                        {"role": "system", "content": "Independent reading qualification."},
+                        {
+                            "role": "user",
+                            "content": cast(str, first.messages[-1]["content"])[:1024],
+                        },
+                    ],
+                    "fixture_provenance": {
+                        "fixture": "prose.moby-dick",
+                        "recipe": "prose-qualification-v1",
+                        "corpus_digest": self.corpus_digest,
+                    },
+                }
+            )
         return first.model_copy(
             update={
                 "id": "warmup",
+                "fixture_provenance": {
+                    "fixture": "tools.bfcl",
+                    "recipe": "qualification-decision-v1",
+                    "decision": first.fixture_id,
+                    "corpus_digest": self.corpus_digest,
+                },
                 "depends_on": (),
                 "messages": [
                     {"role": "system", "content": "Qualification request, independent history."},

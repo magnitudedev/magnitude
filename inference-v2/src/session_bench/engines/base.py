@@ -9,6 +9,7 @@ import os
 import signal
 import socket
 import sys
+import tempfile
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -17,10 +18,12 @@ from pathlib import Path
 import httpx
 import psutil
 
+from benchmark_fixtures.contexts import Context, Counter
+
 from ..models import Artifact, Target
-from ..policy import CONTEXT_ALIGNMENT, MAX_OUTPUT_TOKENS, STARTUP_TIMEOUT_SECONDS
+from ..policy import CONTEXT_ALIGNMENT, STARTUP_TIMEOUT_SECONDS
 from ..results import RunStore
-from ..sessions import Plan, encoded
+from ..sessions import Plan, Request, encoded
 
 
 async def command(args: list[str], cwd: Path, log: Path, *, env: dict | None = None) -> str:
@@ -81,7 +84,9 @@ def memory_bytes(pid: int) -> int:
 
 def runtime_digest(root: Path) -> str:
     digest = hashlib.sha256()
-    files = sorted((root / "src").rglob("*.py"))
+    files = sorted(
+        p for p in (root / "src").rglob("*") if p.suffix in (".py", ".json") and p.is_file()
+    )
     files += [p for p in (root / "pyproject.toml", root / "uv.lock") if p.is_file()]
     for path in files:
         digest.update(str(path.relative_to(root)).encode())
@@ -272,36 +277,67 @@ class Adapter:
     async def prompt_counts(self, plan: Plan) -> dict[str, int]:
         raise NotImplementedError
 
+    def context_plan(self, context: Context) -> Plan:
+        return Plan(
+            requests=(
+                Request(
+                    id="fixture-sizing",
+                    section="context",
+                    session="fixture-sizing",
+                    checkpoint=0,
+                    fixture_id="tools.bfcl" if context.tools else "prose.moby-dick",
+                    workload="tools" if context.tools else "prose",
+                    messages=context.messages,
+                    tools=context.tools,
+                    expected=[],
+                ),
+            ),
+            parallel_sequences=1,
+            corpus_digest="preparation",
+        )
+
+    @contextlib.asynccontextmanager
+    async def context_counter(self) -> AsyncIterator[Counter]:
+        async def count(context: Context) -> int:
+            return (await self.prompt_counts(self.context_plan(context)))["fixture-sizing"]
+
+        yield count
+
     async def tokenizer_counts(self, plan: Plan, kind: str) -> dict[str, int]:
         if self.runtime is None:
             raise ValueError("Python tokenization requires a prepared engine runtime")
-        output = self.store.path / f"{self.target.id}-prompt-counts.json"
-        args = [
-            "uv",
-            "run",
-            "--frozen",
-            "--no-sync",
-            "python",
-            "-m",
-            "session_bench.engines.tokenize",
-            kind,
-            str(self.artifact.path),
-            str(self.store.path / "requests.jsonl"),
-            str(output),
-        ]
-        await command(
-            args,
-            self.runtime,
-            self.store.path / "logs" / f"{self.target.id}-tokenize.log",
-            env=self.environment(),
-        )
-        return json.loads(output.read_text())
+        with tempfile.TemporaryDirectory(prefix="fixture-tokenize-", dir=self.store.path) as work:
+            source = Path(work) / "requests.jsonl"
+            output = Path(work) / "counts.json"
+            source.write_text(
+                "".join(encoded(r.model_dump(mode="json")) + "\n" for r in plan.prepared_requests)
+            )
+            args = [
+                "uv",
+                "run",
+                "--frozen",
+                "--no-sync",
+                "python",
+                "-m",
+                "session_bench.engines.tokenize",
+                kind,
+                str(self.artifact.path),
+                str(source),
+                str(output),
+            ]
+            await command(
+                args,
+                self.runtime,
+                self.store.path / "logs" / f"{self.target.id}-tokenize.log",
+                env=self.environment(),
+            )
+            return json.loads(output.read_text())
 
     def provisional_capacity(self, plan: Plan) -> int:
         # Only a launch allowance for native tokenization, not a prompt-token measurement.
         size = max(
             len(encoded(r.body(self.served_model())).encode()) for r in plan.prepared_requests
         )
-        needed = size * 2 + MAX_OUTPUT_TOKENS
+        needed = size * 2 + max(r.output_limit for r in plan.prepared_requests)
         aligned = (needed + CONTEXT_ALIGNMENT - 1) // CONTEXT_ALIGNMENT * CONTEXT_ALIGNMENT
         return min(self.artifact.context_limit // CONTEXT_ALIGNMENT * CONTEXT_ALIGNMENT, aligned)

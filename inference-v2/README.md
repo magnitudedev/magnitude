@@ -143,3 +143,27 @@ uv run --frozen pyright
 
 Full type checking includes the oMLX benchmark adapter against its separate reference environment.
 Local-model tests are opt-in; each skipped test names the artifact environment variables it needs.
+
+## Shared benchmark fixtures
+
+See [fixture methodology](design/benchmark-fixtures.md) for content, execution modes
+and provenance. Prepare without loading model weights:
+
+```sh
+uv run --frozen python -m benchmark_fixtures prose.moby-dick \
+  --artifact /path/to/model --context 65536 --continuation 256
+uv run --frozen python -m benchmark_fixtures tools.bfcl \
+  --artifact /path/to/model --context 65536 --continuation 16
+```
+
+Run a declared Qwen model workload with its pinned local artifact:
+
+```sh
+uv run --frozen python -m benchmarks benchmarks.cases.qwen_components:replay_64k \
+  --output runs/qwen-prose-replay-64k.json
+```
+
+The same module declares `replay_4k`, `replay_16k`, `generate_4k`, `generate_64k`,
+`prefill_4k`, `prefill_64k`, and `tools_replay_*`/`tools_generate_*` at 4K and 64K.
+Use a new output path for each run. [Session-bench](session-bench.md) consumes the
+same tool corpus and history builder for serving workloads.

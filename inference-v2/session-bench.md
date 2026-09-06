@@ -2,7 +2,8 @@
 
 `session-bench` measures inference serving with simulated agent sessions: tool decisions,
 long histories, sequential turns, parallel sessions and branches. It uses pinned BFCL V4
-cases to build deterministic inputs. It does not run an agent or produce an official BFCL score.
+cases or Moby Dick passages to build deterministic inputs. It does not run an agent or produce
+an official BFCL score.
 
 ## Run it
 
@@ -30,7 +31,7 @@ missing artifacts through the standard Hub cache and records their content hashe
 
 ```sh
 # Magnitude is the default engine.
-uv run session-bench run --model qwen-q4 --context 1k,4k,16k
+uv run session-bench run --model qwen-q4 --context 4k,16k,64k
 
 # Compare serving engines on the same model artifact.
 uv run session-bench run --model qwen-q4 \
@@ -41,11 +42,15 @@ uv run session-bench run --model qwen-q4 \
 uv run session-bench run --model qwen-q4 \
   --suite session,parallel,fork --context 4k,16k
 
+# Use prose with the same serving schedules.
+uv run session-bench run --model qwen-q4 --prose \
+  --suite context,session --context 4k,16k,64k
+
 # Compare against upstream llama.cpp using the alias's GGUF representation.
 uv run session-bench run --model qwen-q4 \
   --engine magnitude --engine llama.cpp --context 4k
 
-# Inspect the schedule without installing engines or loading/downloading weights.
+# Inspect the selection without installing engines or loading/downloading weights.
 uv run session-bench run --model qwen-q4 --suite all --context 4k --dry-run
 
 uv run session-bench models
@@ -58,14 +63,34 @@ uv run session-bench show <run-id>
 Repeat `--model` and `--engine` to select their combinations. Use repeated
 `--target ENGINE=ARTIFACT` instead for explicit pairs. `--category` accepts comma-separated
 `simple-python`, `parallel`, `parallel-multiple`, or `all`; `--case` selects a specific current decision.
-Canonical background history still comes from the selected categories. `--repeat` repeats the
+Canonical background history still comes from the selected categories. `--dry-run` inspects
+the selection; token-bound histories are prepared when running with the first target. `--repeat` repeats the
 balanced schedule. Add `--json` for machine-readable discovery and results; progress goes to stderr.
+
+## Prose mode
+
+`--prose` selects the shared, downloaded `prose.moby-dick` fixture. Each request asks
+the model to continue a passage, returning only prose. Requests omit tools and tool
+choice. `--category` and `--case` are tool-only filters and cannot accompany `--prose`.
+
+All sections remain available. `single` uses a short passage; `context`, `parallel`
+and `concurrency` use independent reading sessions sized at the requested checkpoints.
+`session` and `memory` preserve previous messages and advance through the book.
+`fork` prepares a parent, then branches from its shared canonical history. Every
+independent session starts at the beginning of the normalized book, with a distinct
+session label. Input construction is defined in [benchmark fixtures](design/benchmark-fixtures.md#session-bench-prose).
+
+Prose generation is autoregressive and allows **256 output tokens**, ending at EOS
+or that budget. Either is a valid performance endpoint; reports record actual output
+lengths. Empty text, tool calls, malformed streams, and context exhaustion before the
+budget are failures. There is no comparison against the book's wording or answer-quality
+score. Later inputs use canonical book text, regardless of what the model generated.
 
 ## Maintained sections and policy
 
 | Section | Traffic |
 | --- | --- |
-| `single` | One natural tool decision without added history; ignores context checkpoints |
+| `single` | One short content request without added history; ignores context checkpoints |
 | `context` | Independent full-prefill requests near each checkpoint |
 | `session` | One sequential session growing through the checkpoints |
 | `parallel` | Four independent sessions released together at each checkpoint |
@@ -74,15 +99,16 @@ balanced schedule. Add `--json` for machine-readable discovery and results; prog
 | `memory` | Four growing sessions with process-tree memory sampling |
 
 Defaults are `context` at `1k,4k,16k`. `k` means 1,024. Checkpoints are approximate **input**
-sizes based on deterministic history selection; reports show actual native prompt counts.
+sizes: shared fixture preparation reaches each target at a complete interaction boundary,
+using the first selected engine’s tokenizer. Reports show each engine’s actual native count.
 All targets receive the same logical messages and tools. Generated answers never change later
 inputs. The decision corpus contains 797 interleaved cases from the pinned three-category subset.
 These sections are serving traffic recipes, not a full evaluation of all 797 decisions.
 
-Every request allows **32,768 output tokens**. There is no setting to lower this ceiling. Normal
+Tool requests allow **32,768 output tokens**. There is no setting to lower this ceiling. Normal
 termination ends generation early. Truncation always fails, even when the partial tool call parses.
 Preparation counts rendered inputs with each engine's tokenizer and reserves the full output
-allowance, with shared capacity rounded up to 256-token allocation boundaries. Insufficient model
+allowance for the selected mode, with shared capacity rounded up to 256-token allocation boundaries. Insufficient model
 context fails explicitly.
 
 Sampling is greedy, with seed 42 where supported and thinking disabled. The initial comparison
@@ -120,9 +146,9 @@ Every run creates `runs/session-bench/<UTC-id>/` automatically, including failed
 | --- | --- |
 | `command.txt` | Copyable command and working directory, expanded to explicit artifact references |
 | `run.json` | Original argv/cwd, selection, host and owner identity |
-| `plan.json`, `requests.jsonl` | Shared schedule, corpus digest, complete input bodies and expectations |
+| `plan.json`, `requests.jsonl` | Shared schedule, corpus digest, fixture provenance, input bodies and expectations |
 | `results.jsonl` | Incrementally saved observations, outcomes, timings and correctness |
-| `summary.json`, `report.md` | Aggregates, denominators, failures and readable summary |
+| `summary.json`, `report.md` | Workload mode, actual prompt/output lengths, aggregates, denominators and failures |
 | `events.jsonl`, `memory.jsonl`, `footprints.jsonl` | Lifecycle and process-tree memory evidence |
 | `logs/` | Engine output and raw request streams |
 | `source/`, artifact/runtime records | Relevant source snapshots, locks, versions and artifact hashes |
@@ -140,8 +166,9 @@ behavior; results do not promise a permanently stable schema or CLI.
 Reports separate client TTFT/completion latency from native phase timings. Stock MLX-VLM's timing
 basis is server token emission and must not be treated as an equivalent native service measurement.
 The JSON summary includes median and nearest-rank p95 client latency, with eligible counts.
-Truncation and execution/protocol failures are excluded from performance statistics. Only `context`
-may include semantically invalid but protocol-complete responses; other sections require correctness.
+Premature truncation and execution/protocol failures are excluded from performance statistics.
+For tools, only `context` may include semantically invalid but protocol-complete responses;
+other sections require correctness. Prose uses the text/protocol and output-budget rules above.
 Exit codes are 0 for complete success, 1 for a benchmark failure, 2 for invalid input, and 130 for
 cancellation.
 
@@ -160,4 +187,5 @@ The focused tests run without loading models. They exercise deterministic histor
 command identity, streaming validation, subprocess lifetime, cancellation and incremental results.
 Type checking resolves the oMLX instrumentation against that adapter's separately locked
 reference environment. It does not add oMLX to the engine's own dependencies.
-The durable behavior contract is in `design/inference/session-bench.md` at the repository root.
+Shared content construction and execution-mode definitions are in
+[benchmark fixtures](design/benchmark-fixtures.md).
