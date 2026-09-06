@@ -95,8 +95,9 @@ const commandOrAbsent = (
   executable: string,
   arguments_: readonly string[],
   absentExitCode: number,
+  env: NodeJS.ProcessEnv,
 ): Effect.Effect<Option.Option<string>, ProcessCommandError> => Effect.async((resume) => {
-  const child = execFile(executable, [...arguments_], { encoding: "utf8" }, (error, stdout) => {
+  const child = execFile(executable, [...arguments_], { encoding: "utf8", env }, (error, stdout) => {
     if (error === null) return resume(Effect.succeed(Option.some(stdout)))
     if (typeof error.code === "number" && error.code === absentExitCode) {
       return resume(Effect.succeed(Option.none()))
@@ -129,7 +130,11 @@ const linuxIdentity = (pid: number): Effect.Effect<Option.Option<string>, Proces
 const darwinIdentity = (
   pid: number,
 ): Effect.Effect<Option.Option<string>, ProcessCommandError> =>
-  commandOrAbsent("/bin/ps", ["-o", "lstart=", "-p", String(pid)], 1).pipe(
+  // Preserve the existing C-locale identity format regardless of the caller's regional settings.
+  commandOrAbsent("/bin/ps", ["-o", "lstart=", "-p", String(pid)], 1, {
+    ...process.env,
+    LC_ALL: "C",
+  }).pipe(
     Effect.flatMap(Option.match({
       onNone: () => Effect.succeed(Option.none()),
       onSome: (started) => command("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"]).pipe(
