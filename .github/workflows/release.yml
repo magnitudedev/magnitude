@@ -181,6 +181,7 @@ jobs:
           MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
           MAGNITUDE_REQUIRE_RELEASE: "true"
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - uses: ./.github/actions/setup-hermes
       - run: bun scripts/accept-integrations.ts
       - uses: actions/upload-artifact@v4
         with:
@@ -248,6 +249,7 @@ jobs:
       - run: bun scripts/prepare-integrations.ts
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/setup-hermes
       - run: bun scripts/accept-integrations.ts
       - uses: actions/upload-artifact@v4
         with:

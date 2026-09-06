@@ -1,4 +1,5 @@
 export { Agent } from "./agent"
+export { Inference } from "./inference"
 export type { InterruptTarget } from "./agent"
 export { Changes } from "./changes"
 export { Configuration } from "./configuration"

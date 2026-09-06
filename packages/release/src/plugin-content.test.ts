@@ -2,6 +2,8 @@ import * as FileSystem from "@effect/platform/FileSystem";
 import { BunContext } from "@effect/platform-bun";
 import { Effect, Option, Schema } from "effect";
 import { describe, expect, it } from "vitest";
+import { writeHermesPluginFixture } from "./hermes-plugin-fixture";
+import { packHermesPlugin } from "./hermes-plugin-artifact";
 import { packageContentFingerprint, sha256 } from "./plugin-content";
 import { artifactIntegrity } from "./plugin-artifacts";
 import {
@@ -58,6 +60,8 @@ describe("plugin artifact identity", () => {
             prefix: "magnitude-plugin-receipt-",
           });
           const bytes = new TextEncoder().encode("packed candidate");
+          yield* writeHermesPluginFixture(`${root}/hermes-source`);
+          const hermesArtifact = yield* packHermesPlugin(`${root}/hermes-source`, root);
           const artifact = {
             host: "pi" as const,
             name: "@magnitudedev/pi-extension",
@@ -74,7 +78,7 @@ describe("plugin artifact identity", () => {
             revision: 1,
             rpc: { version: 1, fingerprint: sha256("wire") },
             semanticBreaks: [],
-            plugins: [{ artifact, publish: true }],
+            plugins: [{ artifact, publish: true }, { artifact: hermesArtifact, publish: true }],
           };
           const writePlan = (cliVersion: string) =>
             Schema.encode(Schema.parseJson(PreparedReleaseSchema))({
@@ -98,6 +102,10 @@ describe("plugin artifact identity", () => {
             (yield* Effect.either(readAcceptedPluginCandidate(root)))._tag
           ).toBe("Left");
           yield* writePlan("1.0.0");
+          const hermesBytes = yield* fs.readFile(`${root}/${hermesArtifact.filename}`);
+          yield* fs.writeFileString(`${root}/${hermesArtifact.filename}`, "tampered Git bundle");
+          expect((yield* Effect.either(readAcceptedPluginCandidate(root)))._tag).toBe("Left");
+          yield* fs.writeFile(`${root}/${hermesArtifact.filename}`, hermesBytes);
           yield* fs.writeFileString(`${root}/pi.tgz`, "tampered");
           expect(
             (yield* Effect.either(readAcceptedPluginCandidate(root)))._tag

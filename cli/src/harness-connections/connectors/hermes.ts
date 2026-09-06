@@ -15,7 +15,8 @@ import {
   writeIfChanged,
 } from "../shared"
 import { parseDocument } from "yaml"
-import type { HarnessConnectionSpec } from "../contract"
+import type { HarnessCompanionPackage, HarnessConnectionSpec } from "../contract"
+import { makeHermesCompanion } from "./hermes-package"
 
 export const hermesProviderConfig = () => ({
   name: "Magnitude",
@@ -31,10 +32,11 @@ export const hermesReasoningOverrides = (models: HarnessConnectionSpec["models"]
   ]),
 )
 
-export const makeHermesConnector = (paths: HarnessConnectionPaths) => defineConnector({
+export const makeHermesConnector = (paths: HarnessConnectionPaths, companion: HarnessCompanionPackage = makeHermesCompanion(paths)) => defineConnector({
   id: "hermes",
   name: "Hermes",
   executable: "hermes",
+  companion,
   skillInstallationTarget: "hermes-user",
   configurationFiles: [paths.hermes],
   connect: (spec) => Effect.gen(function* () {

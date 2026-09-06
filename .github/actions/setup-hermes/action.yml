@@ -1,0 +1,18 @@
+name: Set up Hermes integration tests
+description: Install the official Hermes release in an isolated Python environment
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+    - shell: bash
+      run: |
+        python -m venv "$RUNNER_TEMP/magnitude-hermes"
+        # Official v2026.8.31 (Hermes 0.21.0), pinned for reproducible conformance.
+        # Hermes intentionally forbids wheels; its installer uses a source checkout.
+        git init "$RUNNER_TEMP/magnitude-hermes-source"
+        git -C "$RUNNER_TEMP/magnitude-hermes-source" fetch --depth=1 https://github.com/NousResearch/hermes-agent.git 29112bef099274229cadff79cdff7bf7b99c4b77
+        git -C "$RUNNER_TEMP/magnitude-hermes-source" checkout --detach FETCH_HEAD
+        "$RUNNER_TEMP/magnitude-hermes/bin/pip" install -e "$RUNNER_TEMP/magnitude-hermes-source" jsonschema pytest
+        echo "$RUNNER_TEMP/magnitude-hermes/bin" >> "$GITHUB_PATH"

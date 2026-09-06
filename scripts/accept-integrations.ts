@@ -3,6 +3,7 @@ import * as FileSystem from "@effect/platform/FileSystem"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
 import { Console, Effect, Schema } from "effect"
 import { resolve } from "node:path"
+import { pathToFileURL } from "node:url"
 import {
   readPluginCandidate,
   PluginAcceptanceReceiptSchema,
@@ -62,7 +63,7 @@ const program = Effect.scoped(
     )
     yield* checked(
       "npm",
-      ["install", "--no-audit", "--no-fund", ...candidate.paths],
+      ["install", "--no-audit", "--no-fund", ...candidate.plan.plugins.filter(({ artifact }) => artifact.host === "pi").map(({ artifact }) => resolve(directory, artifact.filename))],
       root
     )
     const agentDir = resolve(root, "agent")
@@ -137,6 +138,25 @@ console.log('Packed Magnitude extension loaded through Pi with all commands and 
     // Native install must use the same isolated agent directory as the loader.
     for (const runtime of ["node", "bun"])
       yield* checked(runtime, [probe], root)
+    for (const { artifact } of candidate.plan.plugins) {
+      if (artifact.host !== "hermes") continue
+      const repository = resolve(root, "hermes-package")
+      // A bundle transports the accepted Git objects. Hermes installs from the
+      // resulting repository using the same immutable commit as publication.
+      yield* checked("git", ["clone", resolve(directory, artifact.filename), repository], root)
+      const home = resolve(root, "hermes-home")
+      const environment = { HERMES_HOME: home, MAGNITUDE_CLI: resolve(root, "missing-magnitude") }
+      yield* checked(process.env.HERMES_EXECUTABLE ?? "hermes", [
+        "plugins", "install", pathToFileURL(repository).href, "--ref", artifact.revision, "--enable",
+      ], workspace, environment)
+      yield* checked(process.env.HERMES_PYTHON ?? "python3", [
+        resolve(import.meta.dir, "../integrations/hermes/tests/consumer_probe.py"),
+      ], workspace, environment)
+      yield* checked(process.env.HERMES_EXECUTABLE ?? "hermes", ["plugins", "remove", "magnitude"], workspace, environment)
+      if (!(yield* fs.exists(resolve(home, "skills/magnitude/SKILL.md")))) {
+        return yield* new IntegrationAcceptanceFailed({ message: "Hermes native remove deleted the shared skill" })
+      }
+    }
     // Re-read hashes after execution; acceptance is tied to immutable input bytes.
     const after = yield* readPluginCandidate(directory)
     if (JSON.stringify(candidate.receipt) !== JSON.stringify(after.receipt))
@@ -149,7 +169,7 @@ console.log('Packed Magnitude extension loaded through Pi with all commands and 
         Schema.parseJson(PluginAcceptanceReceiptSchema, { space: 2 })
       )(candidate.receipt)
     )
-    yield* Console.log("Integration tarball acceptance passed (Node and Bun).")
+    yield* Console.log("Integration acceptance passed (Pi on Node/Bun and native Hermes).")
   })
 )
 

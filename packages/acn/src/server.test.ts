@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest"
 import { ACN_INSTANCE_ID } from "./identity"
 import { makeAcnServiceLifecycle } from "./service-lifecycle"
 import { ACN_PUBLIC_PORT, installAcnControlRoutes, installAcnPublicRoutes } from "./server"
+import { InferenceObservationsLive } from "./inference-observations"
 
 const TestRpcs = RpcGroup.make(
   Rpc.make("Ping", { success: Schema.String }),
@@ -103,6 +104,6 @@ describe("ACN public and control HTTP listeners", () => {
       expect((yield* http.get(`${controlOrigin}/health`)).status).toBe(503)
       expect((yield* rpc(origin, ACN_INSTANCE_ID)).status).toBe(503)
       expect(dispatched).toBe(1)
-    })).pipe(Effect.provide(FetchHttpClient.layer)))
+    })).pipe(Effect.provide(Layer.merge(FetchHttpClient.layer, InferenceObservationsLive))))
   })
 })

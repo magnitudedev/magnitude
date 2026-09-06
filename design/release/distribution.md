@@ -37,6 +37,10 @@ complete native artifact graph. Each artifact record contains its host, kind, fi
 SHA-256, and the compatibility facts required for runtime selection. ICN records also contain their
 native-build identity and backend-module ABI.
 
+The manifest also records the companion packages selected by that release. Acquiring a historical
+release validates its recorded selections; it does not require integrations introduced later.
+Preparation and publication require the complete current companion-host set.
+
 The manifest does not describe build provenance or duplicate platform policy. Platform support is
 a property of the release target and is enforced while building and accepting the candidate.
 

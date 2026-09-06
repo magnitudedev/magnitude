@@ -48,6 +48,7 @@ import { BunSqliteDriverLayer } from "@magnitudedev/acn-protocol/coordination/bu
 import { ProcessGroupControllerLive } from "@magnitudedev/acn-protocol/coordination/exact-process"
 import { IcnProcess, makeIcnProvider } from "@magnitudedev/icn"
 import { AcnBoundaryLive } from "./boundary/acn"
+import { InferenceObservations, InferenceObservationsLive } from "./inference-observations"
 import { defaultDataDir } from "./data-dir"
 import { AgentFactoryLive } from "./agent-factory"
 import { AgentRuntimeLive } from "./agent-runtime"
@@ -442,7 +443,7 @@ const addLocalInferenceServices = <A, E, R>(
     ProviderClientRegistryLive,
     withIcnProvider
   )
-  return withProviderClients
+  return Layer.provideMerge(InferenceObservationsLive, withProviderClients)
 }
 
 const addCommonAcnServices = <A, E, R>(services: Layer.Layer<A, E, R>) => {
@@ -618,6 +619,7 @@ const makeCodexWebSocketProxy = (
 const makeInferenceProxy = (
   icn: InferenceProxyTarget,
   protocol: "openai" | "anthropic" | "codex" | "claude-code",
+  observations: InferenceObservations,
 ) => {
   const anthropicGateway = protocol === "claude-code"
     ? makeAnthropicGateway(icn)
@@ -645,7 +647,9 @@ const makeInferenceProxy = (
           catch: (cause) => new InferenceProxyFailed({ cause }),
         }).pipe(Effect.either)
     if (response._tag === "Right") {
-      return HttpServerResponse.fromWeb(response.right)
+      return HttpServerResponse.fromWeb(protocol === "openai"
+        ? yield* observations.observe(source, response.right)
+        : response.right)
     }
     yield* Effect.logError("Inference gateway failed", response.left)
     const requestId = `req_acn_gateway_${Date.now()}`
@@ -722,6 +726,7 @@ export const installAcnPublicRoutes = (
   lifecycle: AcnServiceLifecycleApi,
   icn: InferenceProxyTarget,
 ) => Effect.gen(function* () {
+  const observations = yield* InferenceObservations
   yield* installAcnHealthRoutes(router, lifecycle)
   yield* router.add("POST", "/rpc", Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest
@@ -730,16 +735,16 @@ export const installAcnPublicRoutes = (
       : HttpServerResponse.empty({ status: 409 })
   }))
   yield* router.prefixed("/inference/v1/proxies/codex").add(
-    "*", "/*", makeInferenceProxy(icn, "codex"),
+    "*", "/*", makeInferenceProxy(icn, "codex", observations),
   )
   yield* router.prefixed("/inference/v1").add(
-    "*", "/*", makeInferenceProxy(icn, "openai"),
+    "*", "/*", makeInferenceProxy(icn, "openai", observations),
   )
   yield* router.prefixed("/inference/anthropic/proxies/claude-code").add(
-    "*", "/*", makeInferenceProxy(icn, "claude-code"),
+    "*", "/*", makeInferenceProxy(icn, "claude-code", observations),
   )
   yield* router.prefixed("/inference/anthropic").add(
-    "*", "/*", makeInferenceProxy(icn, "anthropic"),
+    "*", "/*", makeInferenceProxy(icn, "anthropic", observations),
   )
 })
 
@@ -844,7 +849,7 @@ export const launchAcnServer = (options: AcnServerOptions = {}) =>
       )
       const publicRouter = Context.get(publicInfrastructure, HttpLayerRouter.HttpRouter)
       const publicServer = Context.get(publicInfrastructure, HttpServer.HttpServer)
-      yield* installAcnPublicRoutes(publicRouter, lifecycle, icn)
+      yield* installAcnPublicRoutes(publicRouter, lifecycle, icn).pipe(Effect.provide(applicationContext))
       yield* publicServer.serve(publicRouter.asHttpEffect()).pipe(Effect.provide(publicInfrastructure))
       yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie))
       return {

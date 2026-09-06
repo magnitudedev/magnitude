@@ -15,6 +15,8 @@ import {
 } from "../packages/release/scripts/prepare-release"
 import { rpcFingerprint } from "../packages/release/scripts/rpc-fingerprint"
 import { publishTag } from "../packages/release/scripts/release-channel"
+import { publishHermesPlugin, publishedHermesRevision } from "../packages/release/src/hermes-plugin-artifact"
+import { Option } from "effect"
 
 // Never builds or packs. Only the exact tarballs covered by acceptance can be published.
 const program = Effect.gen(function* () {
@@ -31,6 +33,14 @@ const program = Effect.gen(function* () {
   }
   yield* verifyPublicBaseline(source)
   for (const { artifact, publish } of candidate.plan.plugins) {
+    if (artifact.host === "hermes") {
+      if (publish) yield* publishHermesPlugin(artifact, directory, resolve(import.meta.dir, ".."))
+      else if (!Option.contains(artifact.revision)(yield* publishedHermesRevision(artifact, directory))) {
+        return yield* new PluginArtifactError({ message: "The selected Hermes revision is not published" })
+      }
+      yield* Console.log(`Verified public ${artifact.name}@${artifact.version}`)
+      continue
+    }
     const existing = yield* publishedPluginIntegrity(
       artifact.name,
       artifact.version,

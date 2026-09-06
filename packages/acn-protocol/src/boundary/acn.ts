@@ -13,8 +13,10 @@ import { Files } from "./files"
 import { Changes } from "./changes"
 import { Sessions } from "./sessions"
 import { Configuration } from "./configuration"
+import { Inference } from "./inference"
 
 export const MagnitudeRpcs = {
+  inference: Inference,
   projects: Projects,
   agent: Agent,
   connection: Connection,

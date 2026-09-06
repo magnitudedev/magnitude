@@ -8,10 +8,9 @@ import { Duration, Effect, Either, Option, Schema, Stream } from "effect";
 import { extract } from "tar-stream";
 import { PLUGIN_METADATA_PATH, verifyPluginContent } from "./plugin-content";
 import {
-  PluginArtifactSchema,
+  NpmPluginArtifactSchema,
   PluginContentManifestSchema,
-  type PluginArtifact,
-  type PluginHost,
+  type NpmPluginArtifact,
 } from "./plugins";
 
 export class PluginArtifactError extends Schema.TaggedError<PluginArtifactError>()(
@@ -97,7 +96,7 @@ export const packPlugin = (directory: string, output: string) =>
       return yield* new PluginArtifactError({
         message: "npm pack integrity mismatch",
       });
-    return yield* Schema.decodeUnknown(PluginArtifactSchema)({
+    return yield* Schema.decodeUnknown(NpmPluginArtifactSchema)({
       host: "pi",
       name: metadata.name,
       version: metadata.version,
@@ -109,7 +108,7 @@ export const packPlugin = (directory: string, output: string) =>
   });
 
 export const verifyPluginArtifact = (
-  artifact: PluginArtifact,
+  artifact: NpmPluginArtifact,
   directory: string
 ) =>
   Effect.gen(function* () {
@@ -198,7 +197,7 @@ const PublishedVersion = Schema.Struct({
  * falling back to `latest`, described by the content manifest inside its tarball.
  */
 export const publishedPlugin = (
-  host: PluginHost,
+  host: NpmPluginArtifact["host"],
   name: string,
   cwd: string,
   channel: Option.Option<string> = Option.none()
@@ -225,7 +224,7 @@ export const publishedPlugin = (
           )
         ),
     });
-    if (Option.isNone(viewed)) return Option.none<PluginArtifact>();
+    if (Option.isNone(viewed)) return Option.none<NpmPluginArtifact>();
     const published = yield* Schema.decodeUnknown(
       Schema.parseJson(PublishedVersion)
     )(viewed.value).pipe(
@@ -272,7 +271,7 @@ export const publishedPlugin = (
       return yield* new PluginArtifactError({
         message: `Published ${name}@${published.version} content manifest names a different package`,
       });
-    return Option.some<PluginArtifact>({
+    return Option.some<NpmPluginArtifact>({
       host,
       name,
       version: published.version,
@@ -327,24 +326,3 @@ export const awaitPublishedIntegrity = (
   expected: string,
   cwd: string
 ) => awaitIntegrity(publishedPluginIntegrity(name, version, cwd), expected);
-
-export const verifyPublishedPlugins = (
-  artifacts: readonly PluginArtifact[],
-  cwd: string
-) =>
-  Effect.forEach(
-    artifacts,
-    (artifact) =>
-      publishedPluginIntegrity(artifact.name, artifact.version, cwd).pipe(
-        Effect.flatMap((integrity) =>
-          integrity === artifact.integrity
-            ? Effect.void
-            : Effect.fail(
-                new PluginArtifactError({
-                  message: `Required plugin ${artifact.name}@${artifact.version} is not published with the selected integrity`,
-                })
-              )
-        )
-      ),
-    { discard: true }
-  );

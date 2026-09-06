@@ -77,6 +77,8 @@ const forwardedHeaders = (source: Headers): Headers => {
   headers.delete("host")
   headers.delete("x-magnitude-acn-id")
   headers.delete("magnitude-gateway-model")
+  headers.delete("magnitude-observation-id")
+  headers.delete("magnitude-observation-group")
   for (const header of HOP_BY_HOP_HEADERS) headers.delete(header)
   return headers
 }
@@ -120,7 +122,9 @@ export const proxyOpenAiInferenceRequest = async (
       method: source.method,
       headers,
       body: source.body,
-      signal,
+      // The Effect request fiber owns setup; the incoming HTTP signal also
+      // owns the response lifetime after headers have been returned.
+      signal: AbortSignal.any([source.signal, signal]),
       redirect: "manual",
       decompress: false,
     },

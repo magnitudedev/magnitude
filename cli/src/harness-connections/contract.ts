@@ -16,6 +16,7 @@ import { Option, Schema, type Effect } from "effect"
 import type { SkillInstallationTarget } from "./paths"
 import type { ConnectionTransaction } from "./transaction"
 import { PiCompanionStateSchema } from "./connectors/pi-package-state"
+import { HermesCompanionStateSchema } from "./connectors/hermes-package-state"
 
 const CONNECTOR_MAX_OUTPUT_TOKENS = 32_768
 
@@ -81,7 +82,7 @@ export const HarnessRestoreSchema = Schema.Struct({
 export type HarnessRestore = typeof HarnessRestoreSchema.Type
 
 // Extend this union with each adapter's validated receipt, not opaque serialized host settings.
-export const HarnessCompanionStateSchema = PiCompanionStateSchema
+export const HarnessCompanionStateSchema = Schema.Union(PiCompanionStateSchema, HermesCompanionStateSchema)
 export type HarnessCompanionState = typeof HarnessCompanionStateSchema.Type
 
 export interface HarnessCompanionReconcileSpec {

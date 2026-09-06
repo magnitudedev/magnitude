@@ -156,7 +156,8 @@ export const makePiCompanion = (paths: HarnessConnectionPaths, desiredSource: st
   return {
     description: { name: PI_COMPANION_PACKAGE_NAME, source: desiredSource, securityNotice: "Pi extensions execute with your user permissions." },
     activationInstructions: Option.some("Restart existing Pi sessions or run /reload to activate the extension."),
-    reconcile: ({ installation, previous }) => Effect.gen(function* () {
+    reconcile: ({ installation, previous: receipt }) => Effect.gen(function* () {
+      const previous = Option.filter(receipt, (state) => state.identity === PI_COMPANION_PACKAGE_IDENTITY)
       const desired = yield* Schema.decodeUnknown(PiPackageSourceSchema)(desiredSource)
       let document = yield* readSettings
       yield* verifyHost(installation.executable)
@@ -198,6 +199,7 @@ export const makePiCompanion = (paths: HarnessConnectionPaths, desiredSource: st
       return { state, status: installed ? "installed" : enabled ? "already-installed" : "enabled" }
     }),
     disconnect: ({ installation, state }) => Effect.gen(function* () {
+      if (state.identity !== PI_COMPANION_PACKAGE_IDENTITY) return yield* new PiPackageError({ message: "The companion receipt does not belong to Pi." })
       const document = yield* readSettings
       const current = find(document.settings, state.source)
       if (Option.isNone(current)) return

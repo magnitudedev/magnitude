@@ -1,6 +1,6 @@
 import { Data, Effect, Option, Schema } from "effect"
 import type { Backend } from "./targets"
-import { PluginArtifactSchema, PluginHostSchema, RpcReleaseSchema, type PluginHost } from "./plugins"
+import { PluginArtifactSchema, RpcReleaseSchema, type PluginHost } from "./plugins"
 
 export const CLI_PACKAGE_NAME = "@magnitudedev/cli"
 
@@ -95,7 +95,8 @@ export const validateReleaseManifest = (
     pluginNames.add(plugin.name)
     pluginHosts.add(plugin.host)
   }
-  if (PluginHostSchema.literals.some((host) => !pluginHosts.has(host))) return fail("release is missing a plugin selection for a declared host")
+  // An acquired release describes the hosts shipped at that point in time.
+  // Today's complete host set is enforced when preparing a new release plan.
   for (const artifact of manifest.artifacts) {
     if (ids.has(artifact.id) || names.has(artifact.filename)) {
       return fail("release artifact IDs and filenames must be unique")
