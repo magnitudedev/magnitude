@@ -9,7 +9,7 @@ from typing import Literal
 import httpx
 
 from . import validation
-from .policy import MAX_OUTPUT_TOKENS, REQUEST_TIMEOUT_SECONDS
+from .policy import REQUEST_TIMEOUT_SECONDS
 from .sessions import Record, Request
 
 Outcome = Literal[
@@ -171,9 +171,24 @@ async def measure(
                         finish = choice["finish_reason"]
                 if not done or evidence is None or finish is None:
                     raise ValueError("stream ended without finish, consistent usage and [DONE]")
-                if evidence["usage"]["completion_tokens"] > MAX_OUTPUT_TOKENS:
+                if evidence["usage"]["completion_tokens"] > request.output_limit:
                     raise ValueError("engine exceeded the shared output allowance")
-                if finish == "length":
+                if request.workload == "prose":
+                    if calls or not output.strip() or evidence["usage"]["completion_tokens"] < 1:
+                        raise ValueError("prose response must contain text and no tool calls")
+                    if finish == "length":
+                        if evidence["usage"]["completion_tokens"] != request.output_limit:
+                            outcome, error = (
+                                "truncated",
+                                "context ended before the prose output budget",
+                            )
+                        else:
+                            outcome = "valid"
+                    elif finish == "stop":
+                        outcome = "valid"
+                    else:
+                        raise ValueError(f"unexpected prose finish reason: {finish}")
+                elif finish == "length":
                     outcome, error = "truncated", "engine reached its output or context limit"
                 else:
                     if finish not in ("stop", "tool_calls"):

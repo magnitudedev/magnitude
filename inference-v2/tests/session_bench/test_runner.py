@@ -23,12 +23,12 @@ class FixtureAdapter(Adapter):
         assert data["status"] == "ready"
 
     async def prompt_counts(self, plan):
-        return {r.id: 10 for r in plan.prepared_requests}
+        return {r.id: len(json.dumps(r.messages)) for r in plan.prepared_requests}
 
 
 @pytest.fixture
 def fake_runtime(monkeypatch, interaction):
-    async def corpus(root, categories):
+    async def corpus(categories):
         return [interaction], "test-corpus"
 
     monkeypatch.setattr(runner.corpus, "prepare", corpus)
@@ -121,7 +121,7 @@ async def test_cancel_keeps_completed_result_and_retires_child(
 
 def test_reports_exclude_truncation_but_keep_context_semantic_invalidity():
     evidence = {
-        "usage": {"prompt_tokens": 10},
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2},
         "timings": {"prompt_n": 10, "prompt_ms": 10, "predicted_n": 2, "predicted_ms": 10},
     }
     rows = [

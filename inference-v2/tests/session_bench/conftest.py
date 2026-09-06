@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from session_bench.sessions import ExpectedCall, Interaction
+from benchmark_fixtures.interactions import ExpectedCall, Interaction
 
 
 @pytest.fixture

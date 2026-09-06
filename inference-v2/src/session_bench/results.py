@@ -14,8 +14,6 @@ from pathlib import Path
 
 import psutil
 
-from magnitude_engine.host_info import capture_hardware
-
 from .models import Target, file_hash
 from .sessions import encoded
 
@@ -37,6 +35,7 @@ def public_command(
     categories: tuple[str, ...],
     repeat: int,
     case: str | None = None,
+    prose: bool = False,
 ) -> str:
     args = ["uv", "run", "--frozen", "session-bench", "run"]
     for target in targets:
@@ -46,11 +45,10 @@ def public_command(
         ",".join(sections),
         "--context",
         ",".join(map(str, contexts)),
-        "--category",
-        ",".join(categories),
         "--repeat",
         str(repeat),
     ]
+    args += ["--prose"] if prose else ["--category", ",".join(categories)]
     if case:
         args += ["--case", case]
     return shlex.join(args)
@@ -58,6 +56,8 @@ def public_command(
 
 class RunStore:
     def __init__(self, root: Path, command: str, selection: dict):
+        from magnitude_engine.host_info import capture_hardware
+
         identifier = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex[:8]
         self.path = root / "runs" / "session-bench" / identifier
         self.path.mkdir(parents=True, exist_ok=False)

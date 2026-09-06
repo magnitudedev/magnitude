@@ -86,7 +86,9 @@ def environment(root: Path, *, isolated: bool = False) -> dict[str, object]:
 
     digest = hashlib.sha256()
     for directory in (root / "src", root / "benchmarks"):
-        for path in sorted(directory.rglob("*.py")):
+        for path in sorted(
+            p for p in directory.rglob("*") if p.is_file() and p.suffix in (".py", ".json")
+        ):
             digest.update(str(path.relative_to(root)).encode())
             digest.update(path.read_bytes())
     dependencies = {}

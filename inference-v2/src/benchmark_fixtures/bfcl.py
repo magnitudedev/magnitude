@@ -1,13 +1,14 @@
 """Pinned BFCL source data, normalized independently of any inference engine."""
 
-import hashlib
 import json
 from pathlib import Path
 
 import httpx
 from pydantic import Field
 
-from .sessions import ExpectedCall, Interaction, Record, digest
+from .interactions import ExpectedCall, Interaction
+from .records import Record, digest
+from .storage import cache_root, fetch
 
 CATEGORIES = {
     "simple-python": "simple_python",
@@ -88,28 +89,17 @@ def materialize(question: dict, answer: dict, category: str, commit: str) -> Int
     )
 
 
-async def prepare(root: Path, categories: tuple[str, ...]) -> tuple[list[Interaction], str]:
+async def prepare(
+    categories: tuple[str, ...], *, cache: Path | None = None
+) -> tuple[list[Interaction], str]:
     lock = CorpusLock.model_validate_json((DATA / "bfcl-v4.lock.json").read_text())
     selection = json.loads((DATA / "bfcl-v4.selection.json").read_text())
-    cache = root / ".session-bench" / "corpus" / lock.commit
+    directory = (cache or cache_root()) / "sources" / "bfcl" / lock.commit
     async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
         for item in lock.files:
-            path = cache / item.path
-            content = path.read_bytes() if path.is_file() else b""
-            if hashlib.sha256(content).hexdigest() != item.sha256:
-                url = (
-                    f"https://raw.githubusercontent.com/ShishirPatil/gorilla/{lock.commit}/"
-                    f"{lock.dataRoot}/{item.path}"
-                )
-                response = await client.get(url)
-                response.raise_for_status()
-                content = response.content
-                if hashlib.sha256(content).hexdigest() != item.sha256:
-                    raise ValueError(f"BFCL checksum mismatch: {item.path}")
-                path.parent.mkdir(parents=True, exist_ok=True)
-                temporary = path.with_suffix(".tmp")
-                temporary.write_bytes(content)
-                temporary.replace(path)
+            repository = lock.repository.replace("github.com", "raw.githubusercontent.com")
+            url = f"{repository}/{lock.commit}/{lock.dataRoot}/{item.path}"
+            await fetch(client, url, item.sha256, directory / item.path)
     cohorts = []
     for category, stem in CATEGORIES.items():
 
@@ -117,9 +107,9 @@ async def prepare(root: Path, categories: tuple[str, ...]) -> tuple[list[Interac
             return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
         filename = f"BFCL_v4_{stem}.json"
-        answers = {a["id"]: a for a in read(cache / "possible_answer" / filename)}
+        answers = {a["id"]: a for a in read(directory / "possible_answer" / filename)}
         cohort = []
-        for question in read(cache / filename):
+        for question in read(directory / filename):
             if question["id"] in selection["exclusions"]:
                 continue
             if question["id"] not in answers:

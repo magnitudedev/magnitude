@@ -4,10 +4,14 @@ import json
 import httpx
 import pytest
 
+from benchmark_fixtures.interactions import ExpectedCall
 from session_bench.client import measure
-from session_bench.sessions import ExpectedCall
 from session_bench.suites import compile_plan
 from session_bench.validation import terminal, tool_calls
+
+
+async def count_context(context):
+    return len(json.dumps(context.model_dump(mode="json")))
 
 
 def terminal_event():
@@ -89,7 +93,10 @@ async def observed(interaction, events):
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
-        request = compile_plan([interaction], "c", ("single",), (1024,)).requests[0]
+        request = (await compile_plan(
+            [interaction], "c", ("single",), (1024,),
+            counter=count_context, sizing_identity="test-bytes",
+        )).requests[0]
         return await measure(client, "http://engine", "test", request, lambda _: None)
 
 
@@ -161,7 +168,10 @@ async def test_cancel_records_partial_output(interaction):
 
     saved = []
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
-        request = compile_plan([interaction], "c", ("single",), (1024,)).requests[0]
+        request = (await compile_plan(
+            [interaction], "c", ("single",), (1024,),
+            counter=count_context, sizing_identity="test-bytes",
+        )).requests[0]
         task = asyncio.create_task(
             measure(
                 client, "http://engine", "test", request, lambda _: None, cancelled=saved.append

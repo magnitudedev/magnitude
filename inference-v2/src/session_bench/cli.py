@@ -7,11 +7,15 @@ import signal
 import sys
 from pathlib import Path
 
-from . import corpus, models
-from .policy import DEFAULT_CONTEXTS, ENGINES, MAX_OUTPUT_TOKENS, project_root
+from benchmark_fixtures import bfcl as corpus
+from benchmark_fixtures import prose as prose_source
+from benchmark_fixtures.prose_history import Prose
+
+from . import models
+from .policy import DEFAULT_CONTEXTS, ENGINES, MAX_OUTPUT_TOKENS, PROSE_OUTPUT_TOKENS, project_root
 from .results import inspect_run, public_command
 from .runner import run
-from .suites import SECTIONS, compile_plan
+from .suites import SECTIONS
 
 
 def choices(value: str, allowed: tuple[str, ...]) -> tuple[str, ...]:
@@ -50,13 +54,16 @@ def parser() -> argparse.ArgumentParser:
         default=",".join(map(str, DEFAULT_CONTEXTS)),
         help="input checkpoints, e.g. 4k,16k",
     )
-    execute.add_argument("--category", default="all", help=", ".join(corpus.CATEGORIES))
+    execute.add_argument("--prose", action="store_true", help="continue Moby Dick; no tools")
+    execute.add_argument("--category", default=None, help=", ".join(corpus.CATEGORIES))
     execute.add_argument(
         "--case", help="BFCL decision ID; canonical background history is retained"
     )
     execute.add_argument("--repeat", type=int, default=1, help="repeat the whole balanced schedule")
     execute.add_argument(
-        "--dry-run", action="store_true", help="build sessions without loading models"
+        "--dry-run",
+        action="store_true",
+        help="inspect corpus and schedule selection without loading models",
     )
     execute.add_argument("--json", action="store_true")
     for name in ("models", "engines", "suites", "runs"):
@@ -68,19 +75,24 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-async def dry_run(root, targets, sections, checkpoints, categories, repeat, case):
-    fixtures, corpus_digest = await corpus.prepare(root, categories)
-    plan = compile_plan(fixtures, corpus_digest, sections, checkpoints, case)
+async def dry_run(root, targets, sections, checkpoints, categories, repeat, case, prose=False):
+    if prose:
+        text, provenance = await prose_source.prepare()
+        corpus_digest = Prose(text, provenance).identity
+    else:
+        fixtures, corpus_digest = await corpus.prepare(categories)
+        if case is not None and not any(f.id == case for f in fixtures):
+            raise ValueError(f"unknown or excluded BFCL case: {case}")
     return {
-        "command": public_command(targets, sections, checkpoints, categories, repeat, case),
+        "command": public_command(targets, sections, checkpoints, categories, repeat, case, prose),
         "targets": [target.model_dump() for target in targets],
-        "plan_digest": plan.identity,
-        "requests_per_target_pass": len(plan.requests),
+        "corpus_digest": corpus_digest,
+        "sections": sections,
         "contexts": checkpoints,
-        "parallel_sequences": plan.parallel_sequences,
-        "max_output_tokens": MAX_OUTPUT_TOKENS,
-        "capacity": "pending artifact and tokenizer qualification",
-        "cache_policy": plan.cache_policy,
+        "max_output_tokens": PROSE_OUTPUT_TOKENS if prose else MAX_OUTPUT_TOKENS,
+        "workload": "prose" if prose else "tools",
+        "preparation": "pending first-target tokenizer binding",
+        "cache_policy": "disabled",
     }
 
 
@@ -104,13 +116,24 @@ def main(argv=None) -> int:
             selected = models.select(root, args.model, args.engine, args.target)
             sections = choices(args.suite, tuple(SECTIONS))
             checkpoints = contexts(args.context)
-            categories = choices(args.category, tuple(corpus.CATEGORIES))
+            if args.prose and (args.category is not None or args.case is not None):
+                raise ValueError("--prose cannot be combined with --category or --case")
+            categories = (
+                () if args.prose else choices(args.category or "all", tuple(corpus.CATEGORIES))
+            )
             if args.repeat < 1:
                 raise ValueError("--repeat must be positive")
             if args.dry_run:
                 value = asyncio.run(
                     dry_run(
-                        root, selected, sections, checkpoints, categories, args.repeat, args.case
+                        root,
+                        selected,
+                        sections,
+                        checkpoints,
+                        categories,
+                        args.repeat,
+                        args.case,
+                        args.prose,
                     )
                 )
             else:
@@ -124,6 +147,7 @@ def main(argv=None) -> int:
                         args.repeat,
                         args.case,
                         lambda message: print(message, file=sys.stderr, flush=True),
+                        args.prose,
                     )
                 )
             print(

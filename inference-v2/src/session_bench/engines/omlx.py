@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 import httpx
 
 from .base import Adapter
@@ -50,15 +52,31 @@ class Omlx(Adapter):
                 raise ValueError(f"oMLX readiness mismatch: {key}")
 
     async def prompt_counts(self, plan):
-        counts = {}
         async with self.launch(
             self.provisional_capacity(plan), plan.parallel_sequences, "prepare"
         ) as engine:
-            async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
-                for request in plan.prepared_requests:
-                    response = await client.post(
-                        engine.endpoint + "/session-bench/count", json=request.body(engine.model)
-                    )
-                    response.raise_for_status()
-                    counts[request.id] = response.json()["prompt_tokens"]
+            return await self.render_counts(plan, engine)
+
+    @asynccontextmanager
+    async def context_counter(self):
+        async with self.launch(
+            min(4096, self.artifact.context_limit), 1, "fixture-prepare"
+        ) as engine:
+
+            async def count(context):
+                return (await self.render_counts(self.context_plan(context), engine))[
+                    "fixture-sizing"
+                ]
+
+            yield count
+
+    async def render_counts(self, plan, engine):
+        counts = {}
+        async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
+            for request in plan.prepared_requests:
+                response = await client.post(
+                    engine.endpoint + "/session-bench/count", json=request.body(engine.model)
+                )
+                response.raise_for_status()
+                counts[request.id] = response.json()["prompt_tokens"]
         return counts

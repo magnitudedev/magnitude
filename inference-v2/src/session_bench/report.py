@@ -4,6 +4,8 @@ import math
 import statistics
 from collections import Counter, defaultdict
 
+from .policy import PROSE_OUTPUT_TOKENS
+
 
 def summarize(
     records: list[dict],
@@ -61,6 +63,9 @@ def summarize(
                 "eligible": len(valid),
                 "outcomes": dict(outcomes),
                 "actual_prompt_tokens": sorted(set(prompts)),
+                "actual_completion_tokens": sorted(
+                    {r["terminal"]["usage"]["completion_tokens"] for r in valid}
+                ),
                 "ttft_ms": median("ttft_ms"),
                 "completion_ms": median("completed_ms"),
                 "ttft_p95_ms": p95("ttft_ms"),
@@ -127,11 +132,23 @@ def markdown(summary: dict) -> str:
         "",
         "Latencies and phase rates above are medians; nearest-rank p95 latency is in summary.json.",
         "",
-        "BFCL-derived tool correctness; not an official BFCL leaderboard score.",
+        (
+            "Prose continuation; no answer-quality scoring. "
+            f"Output budget: {PROSE_OUTPUT_TOKENS} tokens. "
+            "EOS or reaching that budget ends a valid measurement; "
+            "actual lengths are in summary.json."
+            if summary.get("workload") == "prose"
+            else "BFCL-derived tool correctness; not an official BFCL leaderboard score."
+        ),
         "",
-        "Context rows may include semantically invalid responses with complete protocol evidence. "
-        "All other sections require valid semantics. "
-        "Truncation and execution failures are excluded.",
+        (
+            "Only protocol-complete text responses are included; premature truncation and "
+            "execution failures are excluded."
+            if summary.get("workload") == "prose"
+            else "Context rows may include semantically invalid responses with complete protocol "
+            "evidence. All other sections require valid semantics. "
+            "Truncation and execution failures are excluded."
+        ),
         "",
         "MLX-VLM generation timing measures server token emission. Its phase rates are shown "
         "for inspection and must not be interpreted as native model-service "
