@@ -53,7 +53,7 @@ def setup():
     backend = CompletionLog()
     owner = ExecutionOwner(backend)
     target = ModelRuntime(
-        TargetProgram(), LibraryStateStore(lambda: [KVCache()], budget, lambda n: 8192), owner
+        TargetProgram(), LibraryStateStore(lambda: [KVCache()], budget, lambda n, q: 8192), owner
     )
     calls = []
 
@@ -82,7 +82,7 @@ def setup():
         project,
     )
     head = ModelRuntime(
-        program, LibraryStateStore(lambda: [KVCache()], budget, lambda n: 8192), owner
+        program, LibraryStateStore(lambda: [KVCache()], budget, lambda n, q: 8192), owner
     )
     method = MTPMethod(
         target=target,

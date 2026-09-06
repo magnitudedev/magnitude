@@ -23,7 +23,7 @@ def make_generation(method):
         next_ids = (tokens + 1) % 7
         return -mx.abs(mx.arange(7)[None, None, :] - next_ids[..., None]) * 2.0
 
-    store = LibraryStateStore(lambda: [KVCache()], budget, lambda n: 8192)
+    store = LibraryStateStore(lambda: [KVCache()], budget, lambda n, q: 8192)
     runtime = ModelRuntime(LibraryProgram(call), store, ExecutionOwner())
     return GenerationRuntime(runtime, method), budget
 

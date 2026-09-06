@@ -8,6 +8,7 @@ from ..contracts import (
     AttentionFactory,
 )
 from .operation import GatedAttention
+from .rotary import QwenRotary
 
 
 @dataclass(eq=False)
@@ -23,7 +24,7 @@ class Attention(AttentionFactory):
             layer.o_proj,
             layer.q_norm,
             layer.k_norm,
-            layer.rope,
+            QwenRotary(layer.rope),
             layer.num_attention_heads,
             layer.num_key_value_heads,
             layer.head_dim,

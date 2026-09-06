@@ -35,7 +35,7 @@ def setup(*, policy=None, retention=8):
 
     model = ModelRuntime(
         LibraryProgram(forward),
-        LibraryStateStore(lambda: [KVCache()], budget, lambda n: 8192),
+        LibraryStateStore(lambda: [KVCache()], budget, lambda n, q: 8192),
         ExecutionOwner(),
     )
     engine = Engine(
@@ -275,7 +275,7 @@ def test_memory_pressure_queues_in_order_until_an_active_request_releases_its_st
 
 def test_request_that_cannot_fit_alone_terminates_without_blocking_following_requests():
     engine, budget, _, _ = setup(retention=0)
-    engine.generation.model.states.capacity = lambda n: 8192 if n < 10 else 16384
+    engine.generation.model.states.capacity = lambda n, q: 8192 if n < 10 else 16384
     budget.limit = 8192
     too_large = engine.submit(request((1,) * 10), identity="large")
     small = engine.submit(request(count=3), identity="small")
