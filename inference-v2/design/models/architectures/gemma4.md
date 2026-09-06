@@ -141,6 +141,18 @@ subtrees. Physical state is an input dependency of the neural components.
 
 ## Performance composition
 
+Every contract in this tree resolves to its [ceiling binding](../../performance/catalog.md#gemma-contracts).
+The [common definition](../../performance.md) provides an optimistic theoretical
+bound per declared dimension, independent of source/variant. References and current
+implementation costs diagnose gaps; they do not limit that bound. Parent accounting
+allows fusion and shared-data reuse before counting unavoidable demands.
+
+Every component defined here has one `/EXEC` dimension: execution efficiency at
+the selected operating point. Query mode, context length and batch size select
+samples; resource utilization and workspace remain diagnostics/constraints.
+Shared components use their own [catalog definitions](../../performance/catalog.md).
+No state or memory percentage is inferred from a KV producer's execution score.
+
 Apply the [shared component models](../composability.md#shared-component-definitions)
 using each producer/consumer's actual head geometry and dtype. A sliding attention
 window limits visible reads but does not prove physical storage is window-bounded.
@@ -154,6 +166,10 @@ which component controls the achievable rate; no architecture-wide numerical
 ceiling has yet been established.
 
 ## Qualification
+
+Current assessments follow the [evidence/reset rules](../../performance.md#evidence-and-current-assessments):
+any implementation change makes its scores and affected parent scores `unmeasured`.
+Historical observations remain tied to their original fingerprints and operating points.
 
 Existing components have tests and diagnostic comparisons, but not every named
 boundary yet has a dedicated independently qualified benchmark subject. The tree

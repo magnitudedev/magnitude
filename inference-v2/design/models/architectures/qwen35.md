@@ -136,7 +136,10 @@ streaming is a separate composition to identify and qualify explicitly.
   are fixed-size but snapshots/replay cost work. Count new writes, required branch
   copies, snapshot bytes and replayed inputs separately. Derive copy bounds from
   byte traffic and repair cost from the recurrent component, without double-counting
-  writes already included in neural block timings.
+  writes already included in neural block timings. `STATE:QWEN35/MEM` evaluates
+  retained footprint; `STATE:QWEN35/RESTORE` evaluates accepted-boundary readiness,
+  including deferred repair. Budget peaks and snapshot creation cost remain visible
+  constraints and enclosing-workload costs.
 
 ### `MODEL:QWEN35.MTP:MAG:CONDITIONED`
 
@@ -154,10 +157,23 @@ streaming is a separate composition to identify and qualify explicitly.
 
 ## Performance composition
 
+Every contract in this tree resolves to its [ceiling binding](../../performance/catalog.md#qwen-contracts).
+The [common definition](../../performance.md) provides an optimistic theoretical
+bound per declared dimension, independent of source/variant. References and current
+implementation costs diagnose gaps; they do not limit that bound. Parent accounting
+allows fusion and shared-data reuse before counting unavoidable demands.
+
+Computational nodes use `/EXEC`, one execution-efficiency percentage at the selected
+operating point. The hybrid state node has `STATE:QWEN35/MEM` and
+`STATE:QWEN35/RESTORE`, shown separately because more retained snapshots can reduce
+repair time. Its [catalog definitions](../../performance/catalog.md#dimension-definitions)
+fix the metrics and boundaries; shared native checkpoints inherit their own dimensions.
+
 Shared component definitions give local byte/compute models. Apply them to the
 actual layer mix: attention reads visible history, recurrence advances fixed-size
-state, and MoE reads selected weights. Derive prefill and decode bounds separately
-under [optimization](../optimization.md). Shared physical resources and dependent
+state, and MoE reads selected weights. Evaluate the same `/EXEC` derivation at
+prefill and decode operating points under [optimization](../optimization.md).
+Shared physical resources and dependent
 stages prevent summing isolated best-case rates into a full-model ceiling.
 
 The current tree has no whole-step compilation, packed projection path or fused
@@ -166,6 +182,10 @@ with independently validated regions and enclosing model measurements. A better
 execution graph can remove costs; present dispatch counts are not an immutable floor.
 
 ## Qualification
+
+Current assessments follow the [evidence/reset rules](../../performance.md#evidence-and-current-assessments):
+any implementation change makes its scores and affected parent scores `unmeasured`.
+Historical observations remain tied to their original fingerprints and operating points.
 
 The IDs above label current implementation responsibilities; dedicated benchmark
 subjects for every boundary are not yet established. Component definitions state
