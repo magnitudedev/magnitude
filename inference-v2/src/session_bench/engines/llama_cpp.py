@@ -1,4 +1,5 @@
 import shutil
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
@@ -70,21 +71,38 @@ class LlamaCpp(Adapter):
             )
 
     async def prompt_counts(self, plan):
-        counts = {}
         async with self.launch(
             self.provisional_capacity(plan), plan.parallel_sequences, "prepare"
         ) as engine:
-            async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
-                for request in plan.prepared_requests:
-                    response = await client.post(
-                        engine.endpoint + "/apply-template", json=request.body(engine.model)
-                    )
-                    response.raise_for_status()
-                    prompt = response.json()["prompt"]
-                    response = await client.post(
-                        engine.endpoint + "/tokenize",
-                        json={"content": prompt, "add_special": True, "parse_special": True},
-                    )
-                    response.raise_for_status()
-                    counts[request.id] = len(response.json()["tokens"])
+            return await self.render_counts(plan, engine)
+
+    @asynccontextmanager
+    async def context_counter(self):
+        # Rendering/tokenization does not evaluate prompts or require a 64K KV allocation.
+        async with self.launch(
+            min(4096, self.artifact.context_limit), 1, "fixture-prepare"
+        ) as engine:
+
+            async def count(context):
+                return (await self.render_counts(self.context_plan(context), engine))[
+                    "fixture-sizing"
+                ]
+
+            yield count
+
+    async def render_counts(self, plan, engine):
+        counts = {}
+        async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
+            for request in plan.prepared_requests:
+                response = await client.post(
+                    engine.endpoint + "/apply-template", json=request.body(engine.model)
+                )
+                response.raise_for_status()
+                prompt = response.json()["prompt"]
+                response = await client.post(
+                    engine.endpoint + "/tokenize",
+                    json={"content": prompt, "add_special": True, "parse_special": True},
+                )
+                response.raise_for_status()
+                counts[request.id] = len(response.json()["tokens"])
         return counts

@@ -12,13 +12,17 @@ from pathlib import Path
 
 import httpx
 
-from . import corpus, report
+from benchmark_fixtures import bfcl as corpus
+from benchmark_fixtures import prose as prose_source
+from benchmark_fixtures.prose_history import Prose
+
+from . import report
 from .client import Observation, measure
 from .engines import ADAPTERS
 from .engines.base import command as subprocess_command
 from .engines.base import runtime_digest
 from .models import Artifact, Target
-from .policy import CONTEXT_ALIGNMENT, MAX_OUTPUT_TOKENS
+from .policy import CONTEXT_ALIGNMENT, MAX_OUTPUT_TOKENS, PROSE_OUTPUT_TOKENS
 from .results import RunStore, atomic_json, public_command
 from .sessions import Plan, Request
 from .suites import compile_plan
@@ -39,16 +43,18 @@ def machine_lock():
             fcntl.flock(stream, fcntl.LOCK_UN)
 
 
-def capacity(counts: list[dict[str, int]], limits: list[int]) -> int:
+def capacity(
+    counts: list[dict[str, int]], limits: list[int], output_limit: int = MAX_OUTPUT_TOKENS
+) -> int:
     if not counts or any(
         not values or any(type(n) is not int or n < 1 for n in values.values()) for values in counts
     ):
         raise ValueError("adapter did not provide valid rendered prompt counts")
-    required = max(max(values.values()) for values in counts) + MAX_OUTPUT_TOKENS
+    required = max(max(values.values()) for values in counts) + output_limit
     required = (required + CONTEXT_ALIGNMENT - 1) // CONTEXT_ALIGNMENT * CONTEXT_ALIGNMENT
     if required > min(limits):
         raise ValueError(
-            f"requests need {required} context tokens including {MAX_OUTPUT_TOKENS} "
+            f"requests need {required} context tokens including {output_limit} "
             f"output headroom; smallest model limit is {min(limits)}"
         )
     return required
@@ -84,6 +90,7 @@ async def execute(
             "block": block,
             "phase": phase,
             "section": request.section,
+            "workload": request.workload,
             "checkpoint": request.checkpoint,
             "concurrency": request.concurrency,
             "session": request.session,
@@ -195,8 +202,9 @@ async def run(
     repeat: int,
     case: str | None,
     progress: Callable[[str], None],
+    prose: bool = False,
 ) -> dict:
-    command = public_command(targets, sections, contexts, categories, repeat, case)
+    command = public_command(targets, sections, contexts, categories, repeat, case, prose)
     store = RunStore(
         root,
         command,
@@ -207,7 +215,8 @@ async def run(
             "categories": categories,
             "repeat": repeat,
             "case": case,
-            "max_output_tokens": MAX_OUTPUT_TOKENS,
+            "workload": "prose" if prose else "tools",
+            "max_output_tokens": PROSE_OUTPUT_TOKENS if prose else MAX_OUTPUT_TOKENS,
         },
     )
     progress(f"Run: {store.path}")
@@ -218,27 +227,16 @@ async def run(
         with machine_lock():
             store.snapshot("session-bench", root)
             source_identity = runtime_digest(root)
-            progress("Preparing pinned BFCL corpus")
-            fixtures, corpus_digest = await corpus.prepare(root, categories)
-            plan = compile_plan(fixtures, corpus_digest, sections, contexts, case)
-            for request in plan.prepared_requests:
-                store.append("requests.jsonl", request.model_dump(mode="json"))
-            blocks = max(2, len(targets)) * repeat
-            order = [
-                targets[i % len(targets) :] + targets[: i % len(targets)] for i in range(blocks)
-            ]
-            planned = len(plan.requests) * len(targets) * blocks
-            atomic_json(
-                store.path / "plan.json",
-                {
-                    "digest": plan.identity,
-                    "parallel_sequences": plan.parallel_sequences,
-                    "cache_policy": plan.cache_policy,
-                    "corpus_digest": corpus_digest,
-                    "planned_requests": planned,
-                    "execution_order": [[target.id for target in row] for row in order],
-                },
-            )
+            if prose:
+                if case is not None:
+                    raise ValueError("--case is only supported for tool fixtures")
+                progress("Preparing pinned Moby Dick")
+                text, provenance = await prose_source.prepare()
+                fixtures = Prose(text, provenance)
+                corpus_digest = fixtures.identity
+            else:
+                progress("Preparing pinned BFCL corpus")
+                fixtures, corpus_digest = await corpus.prepare(categories)
             adapters = {}
             counts = []
             limits = []
@@ -259,22 +257,51 @@ async def run(
                 artifact = Artifact.model_validate_json(artifact_record.read_text())
                 adapter = ADAPTERS[target.engine](root, target, artifact, store)
                 await adapter.prepare()
+                limits.append(artifact.context_limit)
+                atomic_json(store.path / f"{target.id}-runtime.json", adapter.identity)
+                adapters[target.id] = adapter
+            sizing = adapters[targets[0].id]
+            async with sizing.context_counter() as counter:
+                plan = await compile_plan(
+                    fixtures,
+                    corpus_digest,
+                    sections,
+                    contexts,
+                    case,
+                    counter=counter,
+                    sizing_identity=sizing.target.id,
+                )
+            for request in plan.prepared_requests:
+                store.append("requests.jsonl", request.model_dump(mode="json"))
+            blocks = max(2, len(targets)) * repeat
+            order = [
+                targets[i % len(targets) :] + targets[: i % len(targets)] for i in range(blocks)
+            ]
+            planned = len(plan.requests) * len(targets) * blocks
+            atomic_json(
+                store.path / "plan.json",
+                {
+                    "digest": plan.identity,
+                    "parallel_sequences": plan.parallel_sequences,
+                    "cache_policy": plan.cache_policy,
+                    "corpus_digest": corpus_digest,
+                    "planned_requests": planned,
+                    "execution_order": [[target.id for target in row] for row in order],
+                },
+            )
+            for target in targets:
+                adapter = adapters[target.id]
                 prompt_counts = await adapter.prompt_counts(plan)
                 if set(prompt_counts) != {request.id for request in plan.prepared_requests}:
                     raise ValueError(f"incomplete capacity evidence from {target.engine}")
                 counts.append(prompt_counts)
-                limits.append(artifact.context_limit)
-                atomic_json(
-                    store.path / f"{target.id}-artifact.json", artifact.model_dump(mode="json")
-                )
-                atomic_json(store.path / f"{target.id}-runtime.json", adapter.identity)
                 atomic_json(store.path / f"{target.id}-prompt-counts.json", prompt_counts)
-                adapters[target.id] = adapter
-            context_capacity = capacity(counts, limits)
+            output_limit = max(r.output_limit for r in plan.prepared_requests)
+            context_capacity = capacity(counts, limits, output_limit)
             store.event(
                 "prepared",
                 context_capacity=context_capacity,
-                max_output_tokens=MAX_OUTPUT_TOKENS,
+                max_output_tokens=output_limit,
                 plan_digest=plan.identity,
             )
             for block, row in enumerate(order):
@@ -329,6 +356,7 @@ async def run(
         summary["process_footprints"] = [
             json.loads(line) for line in footprint_path.read_text().splitlines()
         ]
+    summary["workload"] = "prose" if prose else "tools"
     summary["path"] = str(store.path)
     summary["hardware"] = store.hardware
     store.complete(summary, report.markdown(summary))

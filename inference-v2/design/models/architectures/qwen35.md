@@ -93,11 +93,14 @@ mixer_j = D_QA_j or D_QR_j according to the artifact
 - **Reference / validation:** Separately loaded stock MLX-VLM target; use MLX-LM as a second control with
   positional/numerical conventions reconciled. Compare layer residuals, logits and logical
   state, then free generation and changing batches.
-- **Benchmark controls:** `model.qwen36-prefill-512` exercises this owned assembly
-  through completed outputs/state, excluding loading and scheduling.
-  `upstream.qwen36-prefill-at-16384` supplies a stock forward comparison at its
-  own operating point; compare only after matching workload bindings. Generation
-  timings also include sampling/publication and cannot directly score this forward.
+- **Benchmark controls:** `model.qwen36-replay-prose.moby-dick-at-65536-n32`
+  exercises completed single-token forwards on a pinned 64K prose context;
+  corresponding 4K/16K and `tools.bfcl` cases vary the declared workload.
+  Context preparation follows [benchmark fixtures](../../benchmark-fixtures.md).
+  `model.qwen36-prefill-512` and `upstream.qwen36-prefill-at-16384` remain synthetic
+  mechanism controls at their own operating points. Match content and boundaries
+  before comparing; generation timings include selection and cannot directly score
+  this forward.
 
 ### `MODEL:QWEN35.ATTENTION`
 
