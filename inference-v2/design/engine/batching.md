@@ -106,3 +106,10 @@ Batching amortizes model execution and weight access across requests. Larger
 batches can improve aggregate throughput while increasing per-request latency,
 workspace and state traffic. Compatibility and memory determine useful batch
 size; batching does not override scheduling's service balance.
+
+## Component models
+
+The [engine component records](components.md) own the contracts, dimensions,
+parameter bindings and independent controls. The [service derivations](../performance/derivations/service.md)
+supply reusable mathematics; [performance](../performance.md) defines evaluation
+and evidence. This document owns the behavior guarantees those models preserve.

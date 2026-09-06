@@ -53,6 +53,11 @@ async def test_real_process_full_run_and_readable_evidence(tmp_path, artifact_pa
     assert inspect_run(path)["status"] == "completed"
     assert str(artifact_path) in (path / "command.txt").read_text()
     assert "Session bench" in (path / "report.md").read_text()
+    initial = json.loads((path / "run.json").read_text())
+    saved = json.loads((path / "summary.json").read_text())
+    assert result["hardware"] == initial["host"]["hardware"] == saved["hardware"]
+    assert result["hardware"]["hostname"] in (path / "report.md").read_text()
+    assert result["hardware"]["memory_bytes"] > 0
     events = [json.loads(line) for line in (path / "events.jsonl").read_text().splitlines()]
     assert sum(event["event"] == "stopped" for event in events) == 2
     assert (path / "memory.jsonl").is_file()
@@ -71,6 +76,8 @@ async def test_preparation_failure_still_has_report(tmp_path, fake_runtime):
         in next((Path(result["path"]) / "logs").glob("*-artifact.log")).read_text()
     )
     assert (Path(result["path"]) / "report.md").is_file()
+    initial = json.loads((Path(result["path"]) / "run.json").read_text())
+    assert result["hardware"] == initial["host"]["hardware"]
 
 
 async def test_cancel_keeps_completed_result_and_retires_child(

@@ -19,6 +19,7 @@ from pathlib import Path
 
 from benchmarks.contracts import Experiment, Observation
 from magnitude_engine.composition import build, digest, dumps
+from magnitude_engine.host_info import capture_hardware
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,7 @@ def environment(root: Path, *, isolated: bool = False) -> dict[str, object]:
         "python": sys.version,
         "platform": platform.platform(),
         "machine": platform.machine(),
+        "hardware": capture_hardware().model_dump(mode="json"),
         "dependencies": dependencies,
         "revision": git("rev-parse", "HEAD"),
         "dirty_files": git("status", "--porcelain", "--", str(root)),

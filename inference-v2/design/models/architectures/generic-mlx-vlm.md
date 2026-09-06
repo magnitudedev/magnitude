@@ -15,10 +15,10 @@ not imply that its cache, batching or modality capabilities are supported here.
 ## Assembly
 
 ```text
-MODEL:EXECUTOR:MAG:UPSTREAM
-├── MODEL:LOADING:MAG:UPSTREAM             construction, not per-token work
-├── MODEL:FORWARD:VLM:STANDARD             neural execution delegated as a unit
-└── STATE:CHECKPOINTS:MAG:NATIVE           cache adaptation and transactions
+MODEL:EXECUTOR:MAG:UPSTREAM    [unmeasured]
+├── MODEL:LOADING:MAG:UPSTREAM    [LAT: unmeasured, MEM: unmeasured] construction, not per-token work
+├── MODEL:FORWARD:VLM:STANDARD    [unmeasured] neural execution delegated as a unit
+└── STATE:CHECKPOINTS:MAG:NATIVE    [MEM: unmeasured, RESTORE: unmeasured] cache adaptation and transactions
 ```
 
 The executor supplies positions, invokes the language forward and publishes its
@@ -27,100 +27,154 @@ semantics. This generic tree stops at the upstream forward because its internal
 architecture varies with the artifact. A claim about one of its internal blocks
 must identify that artifact's block and reference explicitly.
 
-## Components
+## Component definitions
 
-### `MODEL:EXECUTOR:MAG:UPSTREAM`
+Each type below owns its contract, dimension definitions and formula binding.
+Parameters inherit the [origin/platform rules](../../performance.md#dimensions-and-parameter-binding).
+`JOIN` and `L` use the [resource algebra](../../performance/derivations/resources.md#evaluation-algebra);
+[neural regions](../../performance/derivations/neural.md#named-region-bindings) supply the shared terms.
+Implementation estimates use selected execution regions and matched local/parent
+observations under [execution estimation](../../performance/derivations/resources.md#execution-estimation).
+References and tests describe controls; they do not assert current performance qualification.
 
-- **Contract / implementation:** Tokens and logical starting state become requested
-  logits and advanced state. Own position binding, compatible batch assembly,
-  completion roots and resource lifetime around the two runtime children above.
-  No added whole-model compilation; unrequested logits remain unevaluated where
-  their computation is exclusive to those outputs.
-- **References / tests:** Invoke a separately loaded stock MLX-VLM model with the
-  same artifact, tokens, positions and state. Compare logits and subsequent state
-  behavior for single requests, batch changes and restored prefixes.
-- **Performance / bounds:** Model latency is upstream forward plus exposed adapter
-  work. Separate position construction, batch/cache movement, submission and
-  completion from neural execution; do not double-count overlapping work. Stock
-  performance is the integration target. Derive further headroom from the actual
-  model's traffic, arithmetic and dependencies rather than a generic token ceiling.
+### `MODEL:EXECUTOR`
 
-### `MODEL:LOADING:MAG:UPSTREAM`
+**Contract.** Supply inputs/positions, invoke the bound language forward and publish valid outputs/state
+while preserving allocation/completion obligations.
 
-- **Contract / implementation:** Resolve upstream configuration and language module,
-  validate tensor layout, materialize supported text weights and own their budgeted
-  lifetime. Peer modality weights are excluded. Loading failures release resources.
-- **References / tests:** Compare tensor values, names, encodings and model arguments
-  with direct upstream loading. Exercise unsupported layouts and partial failures.
-- **Performance / bounds:** Measure startup latency, bytes read and peak live memory.
-  Model storage reads, format conversion and device materialization by their actual
-  dependencies and bandwidths. Count retained weights once, plus conversion scratch
-  and overlapping allocations. These are `MODEL:LOADING/LAT` and
-  `MODEL:LOADING/MEM`; cold and warm loading are separate operating points.
+**Parameters.** Architecture: selected upstream forward graph and supported native cache/numerical contract.
+Workload: `b,q`, histories, requests, adaptation layout and residency.
 
-### `MODEL:FORWARD:VLM:STANDARD`
+**Composition.** `D_EXECUTOR=JOIN(D_FORWARD,required_input/state/output_adaptation)` using [resource
+algebra](../../performance/derivations/resources.md#evaluation-algebra), [forward](#modelforward) and [native
+checkpoints](#statecheckpoints). Add only newly compulsory boundary information; no fixed
+Python wrapper floor. Actual adapter work belongs to its execution estimate.
 
-- **Contract / implementation:** The pinned upstream standalone language model
-  consumes tokens/native caches and produces logits with updated caches. Its blocks,
-  kernels and numerical conventions remain upstream-owned.
-- **References / tests:** Direct invocation is the reference for our integration.
-  It cannot independently validate its own equations: use an independent model
-  implementation or mathematical block oracle when those equations are in question.
-- **Performance / bounds:** Instantiate the artifact's layer graph, active weight
-  traffic, attention geometry and recurrent work. Prefill and decode have different
-  reuse. The bound follows that graph and hardware resources; upstream timing is
-  evidence of attainment, not a ceiling. No single bound applies to all VLM models.
+**Dimensions.**
 
-### `STATE:CHECKPOINTS:MAG:NATIVE`
+| ID | Metric and boundary | Theoretical bound |
+|---|---|---|
+| `MODEL:EXECUTOR/EXEC` | Elapsed seconds for `u=bq` consumed inputs through outputs/state and required completion. | `L(D_EXECUTOR)`. |
 
-- **Contract / implementation:** Wrap supported upstream cache objects with reserve,
-  begin, advance, checkpoint and restore behavior. Preserve logical positions and
-  state isolation; account for replacement peaks before execution. Shared by generic
-  targets and compatible attached heads, with model-specific capacity geometry.
-- **References / tests:** Compare independently advanced upstream caches and exact
-  logical checkpoint contents. Exercise window crossings, multi-input extensions,
-  rejected suffixes, batch changes and budget failure before mutation.
-- **Performance / bounds:** Track retained bytes, replacement/copy bytes, transient
-  peaks and checkpoint/restore latency. Append caches grow with history; recurrent
-  state is fixed-size; rotating caches retain a window but a query may need
-  `window + query_width - 1` visible keys. Derive movement costs from actual arrays
-  and bandwidth; stable batches should not reconstruct complete histories per token.
-  `STATE:CHECKPOINTS/MEM` scores retained footprint and
-  `STATE:CHECKPOINTS/RESTORE` scores readiness after restoration, including deferred
-  repair. Transient peaks and checkpoint creation costs remain visible constraints
-  and enclosing-workload costs.
+**Implementations and controls.**
 
-## Performance composition
+#### `MODEL:EXECUTOR:MAG:UPSTREAM`
 
-Every contract in this tree resolves to its [ceiling binding](../../performance/catalog.md#generic-upstream-contracts).
-The [common definition](../../performance.md) provides an optimistic theoretical
-bound per declared dimension, independent of source/variant. References and current
-implementation costs diagnose gaps; they do not limit that bound. Parent accounting
-allows fusion and shared-data reuse before counting unavoidable demands.
+- **Implementation:** Tokens and logical starting state become requested logits and advanced state. Own position
+  binding, compatible batch assembly, completion roots and resource lifetime around the two
+  runtime children above. No added whole-model compilation; unrequested logits remain
+  unevaluated where their computation is exclusive to those outputs.
+- **Reference / validation:** Invoke a separately loaded stock MLX-VLM model with the same artifact, tokens, positions and
+  state. Compare logits and subsequent state behavior for single requests, batch changes and
+  restored prefixes.
+- **Benchmark controls:** `model.native-qwen36-prefill-at-16384` measures completed
+  resident forward/state through automatic model selection. Use it here only when
+  its recorded composition resolves to this executor; loading and prefix setup
+  are excluded.
 
-Executor and forward use `/EXEC`, one execution-efficiency percentage each.
-Loading declares `MODEL:LOADING/LAT` and `MODEL:LOADING/MEM`: startup latency and
-peak loading footprint can trade off through staging/conversion concurrency.
-Native checkpoints declare `STATE:CHECKPOINTS/MEM` and `STATE:CHECKPOINTS/RESTORE`:
-retained footprint and restoration time can trade off through checkpoint retention.
-The [catalog definitions](../../performance/catalog.md#dimension-definitions) fix each
-metric and boundary. Tree values are samples at the selected workload, not universal
-scores for every upstream model.
+### `MODEL:LOADING`
 
-The neural model and integration have separate cost models. A slow executor can be
-localized to the forward or to native state/batching overhead. An upstream kernel
-replacement belongs in an explicit architecture assembly, not a hidden exception
-inside this pass-through binding.
+**Contract.** Resolve configuration/modules, validate supported text tensors, materialize weights and own
+their budgeted lifetime; failures release acquired resources.
 
-Use [optimization](../optimization.md) to combine child costs. Native memory
-reservations are capacity obligations, not evidence that those bytes move on every
-forward. Loading belongs in startup measurements, not steady decode throughput.
+**Parameters.** Architecture: required final weight encoding and unique tensor identities. Workload: initial
+artifact/page-cache residency, conversion requirements and observation interval; platform
+supplies storage/memory/conversion upper capacities.
+
+**Composition.** Bind [loading](../../performance/derivations/state.md#loading): pipeline necessary reads/conversion, union tied weights
+and omit unproved temporary-memory floors. Startup latency and peak footprint can trade off
+through concurrent staging/conversion. Cold/warm loading are operating points, not separate
+dimensions.
+
+**Dimensions.**
+
+| ID | Metric and boundary | Theoretical bound |
+|---|---|---|
+| `MODEL:LOADING/LAT` | Seconds from the specified initial artifact/residency state to usable materialized text weights. | `L_load`; efficiency `100*L_load/T_load`. |
+| `MODEL:LOADING/MEM` | Peak live bytes attributable to loading and resulting resident weights over that same interval, including staging/conversion and counting shared backing once. | `M_load_min`; efficiency `100*M_load_min/M_peak`. |
+
+**Implementations and controls.**
+
+#### `MODEL:LOADING:MAG:UPSTREAM`
+
+- **Implementation:** Resolve upstream configuration and language module, validate tensor layout, materialize
+  supported text weights and own their budgeted lifetime. Peer modality weights are excluded.
+  Loading failures release resources.
+- **Reference / validation:** Compare tensor values, names, encodings and model arguments with direct upstream loading.
+  Exercise unsupported layouts and partial failures.
+
+### `MODEL:FORWARD`
+
+**Contract.** Execute the selected upstream language model’s mathematical graph, returning requested
+logits/features and advancing its declared cache state.
+
+**Parameters.** Architecture: explicit upstream operator graph, tensor geometry/encoding, sharing and state
+obligations. Workload: `b,q`, histories, requested outputs and residency. A library name alone
+does not instantiate these parameters.
+
+**Composition.** `D_FORWARD=JOIN(actual_operator_graph,required_external_state/outputs)` using
+[neural](../../performance/derivations/neural.md) and [resource](../../performance/derivations/resources.md#evaluation-algebra) derivations.
+[Qwen](qwen35.md#modelqwen35) and [Gemma](gemma4.md#modelgemma4) bind matching equations;
+other upstream architectures supply their graph explicitly. Unbound graphs stay
+uninstantiated, and library timings never fill the theoretical denominator.
+
+**Dimensions.**
+
+| ID | Metric and boundary | Theoretical bound |
+|---|---|---|
+| `MODEL:FORWARD/EXEC` | Elapsed seconds for `u=bq` consumed inputs through requested neural outputs/state. | `L(D_FORWARD)`. |
+
+**Implementations and controls.**
+
+#### `MODEL:FORWARD:VLM:STANDARD`
+
+- **Implementation:** The pinned upstream standalone language model consumes tokens/native caches and produces
+  logits with updated caches. Its blocks, kernels and numerical conventions remain
+  upstream-owned.
+- **Reference / validation:** Direct invocation is the reference for our integration. It cannot independently validate its
+  own equations: use an independent model implementation or mathematical block oracle when those
+  equations are in question.
+- **Benchmark controls:** `upstream.qwen36-prefill-at-16384` exercises completed stock
+  forward/cache with 512 inputs and a prepared prefix. It excludes engine adaptation;
+  match the selected artifact, runtime and output obligations before scoring.
+
+### `STATE:CHECKPOINTS`
+
+**Contract.** Adapt supported upstream caches to reserve, begin, advance, checkpoint and restore operations
+with row isolation, budget checks and complete state lifetimes.
+
+**Parameters.** Architecture: actual cache types/geometries/encoding and allowed reconstruction. Workload:
+retained/visible histories, checkpoint obligations, advanced/accepted positions, memory budget
+and observation boundary.
+
+**Composition.** Use the [required live union](../../performance/derivations/state.md#required-live-union) over native cache information
+and [restoration cases](../../performance/derivations/state.md#restoration-cases). More retained images may speed
+restore while increasing footprint. Window visibility during a wide advance differs from
+retained history; replacement peaks and creation/advance work remain constraints and enclosing
+costs.
+
+**Dimensions.**
+
+| ID | Metric and boundary | Theoretical bound |
+|---|---|---|
+| `STATE:CHECKPOINTS/MEM` | Retained physical bytes for live state and required restorable checkpoints at the specified lifecycle boundary; shared backing once. | Required materialized union `M_min`; efficiency `100*M_min/M_retained`. |
+| `STATE:CHECKPOINTS/RESTORE` | Seconds to accepted-checkpoint readiness from the specified advanced state, including deferred repair before next use. | `L_restore(initial,accepted,obligations,budget)`; efficiency `100*L/T`. |
+
+**Implementations and controls.**
+
+#### `STATE:CHECKPOINTS:MAG:NATIVE`
+
+- **Implementation:** Wrap supported upstream cache objects with reserve, begin, advance, checkpoint and restore
+  behavior. Preserve logical positions and state isolation; account for replacement peaks before
+  execution. Shared by generic targets and compatible attached heads, with model-specific
+  capacity geometry.
+- **Reference / validation:** Compare independently advanced upstream caches and exact logical checkpoint contents. Exercise
+  window crossings, multi-input extensions, rejected suffixes, batch changes and budget failure
+  before mutation.
 
 ## Qualification
 
-Current assessments follow the [evidence/reset rules](../../performance.md#evidence-and-current-assessments):
-any implementation change makes its scores and affected parent scores `unmeasured`.
-Historical observations remain tied to their original fingerprints and operating points.
+Current scores follow the [assessment rules](../../performance.md#evidence-and-current-assessments).
 
 These IDs describe existing responsibilities; they do not assert universal upstream
 parity. The September 6 native Gemma comparison established matching logits for the

@@ -116,3 +116,10 @@ Sharing prompt work brings peers into decode sooner but can delay the oldest
 prompt's first token. FIFO admission can leave queued requests behind long-lived
 active requests. Time sharing controls contention within this engine; it neither
 guarantees a fixed per-request latency nor controls other GPU processes.
+
+## Component models
+
+The [engine component records](components.md) own the contracts, dimensions,
+parameter bindings and independent controls. The [service derivations](../performance/derivations/service.md)
+supply reusable mathematics; [performance](../performance.md) defines evaluation
+and evidence. This document owns the behavior guarantees those models preserve.
