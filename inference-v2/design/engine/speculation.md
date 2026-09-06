@@ -145,3 +145,10 @@ because ordinary batching already amortizes target weight access. Increasing
 proposal width trades potential accepted output against wasted verification,
 temporary state and longer service intervals; maximum width is not inherently
 optimal.
+
+## Component models
+
+The [engine component records](components.md) own the contracts, dimensions,
+parameter bindings and independent controls. The [service derivations](../performance/derivations/service.md)
+supply reusable mathematics; [performance](../performance.md) defines evaluation
+and evidence. This document owns the behavior guarantees those models preserve.

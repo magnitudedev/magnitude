@@ -330,5 +330,6 @@ async def run(
             json.loads(line) for line in footprint_path.read_text().splitlines()
         ]
     summary["path"] = str(store.path)
+    summary["hardware"] = store.hardware
     store.complete(summary, report.markdown(summary))
     return summary

@@ -143,6 +143,7 @@ def test_python_selector_requires_an_experiment():
 
 def test_cli_describes_then_measures_in_child_and_preserves_existing_evidence(tmp_path):
     import os
+    import platform
     import subprocess
     import sys
 
@@ -162,6 +163,10 @@ def test_cli_describes_then_measures_in_child_and_preserves_existing_evidence(tm
     assert record["status"] == "valid_characterization"
     assert record["environment"]["process"] == "fresh benchmark child"
     assert record["environment"]["pid"] != os.getpid()
+    hardware = record["environment"]["hardware"]
+    assert hardware["hostname"] == platform.node()
+    assert hardware["memory_bytes"] > 0
+    assert "gpus" in hardware and "errors" in hardware
     assert record["statistics_ms"]["count"] == branch.repetitions
     assert len(record["samples"]) == branch.warmup + branch.repetitions
     assert record["environment"]["composition"] == record["experiment"]["subject"]

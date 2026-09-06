@@ -4,6 +4,8 @@ applies_to:
   - inference-v2/tests/benchmarks/**
   - inference-v2/src/session_bench/**
   - inference-v2/tests/session_bench/**
+  - inference-v2/src/magnitude_engine/host_info.py
+  - inference-v2/tests/test_host_info.py
 ---
 
 # Inference benchmarking
@@ -30,7 +32,12 @@ BFCL-derived serving traffic, adapters and reports within the same Python packag
 ## Valid comparisons
 
 Record artifact and runtime identity, composition, input geometry, output work,
-memory policy and timing boundary. Complete asynchronous work inside timing;
+memory policy and timing boundary. Both granular benchmarks and session bench capture
+the executing host's hostname, OS version, model identifier, chip, physical CPU cores,
+memory in bytes and GPU names/core counts before timed work. They use the same typed
+hardware record; unavailable details are null and failed probes retain errors. Hostname
+identifies the execution machine rather than inferring location from an SSH session.
+Complete asynchronous work inside timing;
 keep loading, reset and correctness checks outside unless the claim includes them.
 Measure shared device service once. Per-request participation and public latency
 are different quantities and must be labelled as such.

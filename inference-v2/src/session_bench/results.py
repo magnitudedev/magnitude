@@ -14,6 +14,8 @@ from pathlib import Path
 
 import psutil
 
+from magnitude_engine.host_info import capture_hardware
+
 from .models import Target, file_hash
 from .sessions import encoded
 
@@ -63,6 +65,7 @@ class RunStore:
         self.command = command
         self.root = root
         self.started = now()
+        self.hardware = capture_hardware().model_dump(mode="json")
         self._streams = queue.SimpleQueue()
         self._writer = None
         self._write_error = None
@@ -83,6 +86,7 @@ class RunStore:
                     "platform": platform.platform(),
                     "machine": platform.machine(),
                     "python": sys.version,
+                    "hardware": self.hardware,
                 },
             },
         )

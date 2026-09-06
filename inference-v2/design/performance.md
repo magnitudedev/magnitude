@@ -1,208 +1,236 @@
-# MLX performance ceilings
+# Component performance models
 
-**A ceiling is an optimistic theoretical upper bound on performance, derived from
-unavoidable resource demands under MLX. Reference performance never defines it.** Prefer a
-bound that leaves too much headroom over one that falsely declares saturation.
+**Each component type owns a stable, parameterized performance model. Models
+compose along the component graph to derive theoretical ceilings and estimate
+implementation performance. Percentages are calculated from those two evaluations.**
 
-[Components](components.md) identify implementations and contracts.
-[Derivations](performance/derivations.md) define reusable formulas; the
-[catalog](performance/catalog.md) binds model contracts to them. Architecture trees
-select implementations of those contracts.
+[Component identification](components.md) defines types, implementations and assembly
+relationships. The [catalog](performance/catalog.md) locates their authoritative
+records. Reusable mathematics lives in the derivation library:
+[resources](performance/derivations/resources.md),
+[neural operations](performance/derivations/neural.md),
+[state](performance/derivations/state.md) and
+[service](performance/derivations/service.md).
 
-## Dimensions
+## Ownership and component records
 
-Each component contract defines the smallest set of performance dimensions that
-captures meaningful, independently moving outcomes. Use one percentage when one
-objective suffices. Split only when a single number would conceal a meaningful
-trade-off or an independently important improvement/regression. Never average
-dimensions into an overall score.
+A type's owning document defines its contract and performance model together.
+Shared model types live in [composability](models/composability.md), architecture
+specific types in their architecture document, and engine types in
+[engine components](engine/components.md). The catalog contains links, not a second
+definition. Architecture trees select implementations of these types.
 
-Every dimension has a concise uppercase code and a full identifier, including
-when a contract has only one dimension:
+Each component record has the same fields:
 
-```text
-FAMILY:COMPONENT/DIMENSION
-MODEL:ATTENTION/EXEC
-STATE:QWEN35/MEM
-STATE:QWEN35/RESTORE
-```
+| Field | Owns |
+|---|---|
+| Contract | Required behavior, outputs, state, numerical and lifetime guarantees |
+| Parameters | Architecture/configuration and workload bindings; explicit origins and constraints |
+| Composition | Child types, invocation multiplicities, shared dependencies and the demand expression |
+| Dimensions | Full IDs, metric/unit, observation boundary and bound expression using reusable derivations |
+| Implementations and controls | Variant identities, execution arrangement, references and independent validation |
 
-The catalog defines every such ID: meaning, metric/unit, observation boundary,
-theoretical bound and why it is separate. Codes are scoped to their component
-contract; reuse a code consistently but never infer its metric from spelling alone.
-The dimension ID names the assessment target, independently of implementation source
-and variant. Evidence separately identifies `STATE:QWEN35:MAG:HYBRID` and its revision.
-A single-dimension contract still uses `/DIMENSION` in its full assessment ID; its
-tree node displays one percentage without an unnecessary label. Multiple dimensions
-display their codes beside their percentages.
+Records inherit the platform parameters and assessment rules below. A local record
+states exceptions explicitly. Formula symbols refer to the linked derivation and
+bound artifact geometry; they are not new runtime objects or mandatory dispatches.
 
-Context length, batch size, prefill/decode mode and cache residency normally select
-operating points within a dimension. Bandwidth, arithmetic and dispatch explain
-execution efficiency; they are not automatically separate scores. Additional
-diagnostics and constraints remain visible without becoming headline dimensions.
+## Dimensions and parameter binding
 
-## Meaning of the percentage
+Every dimension has the full ID `FAMILY:COMPONENT/DIMENSION`, independent of source
+and variant. Codes are concise uppercase names, defined by the component record.
+For example, `MODEL:ATTENTION/EXEC` is assessed on a specific
+`MODEL:ATTENTION:MAG:PAGED` revision. The theoretical model belongs to the contract;
+its implementation fingerprint belongs to the observation and estimate.
 
-For a fixed workload producing `u` units of useful work, let `L` be a derived lower
-bound on elapsed time and `T` the measured elapsed time:
+Use one dimension when one objective suffices. Split only for meaningful independent
+outcomes or trade-offs. A single-dimension tree node displays one percentage;
+multiple dimensions display their codes and percentages. Never average dimensions.
+Bandwidth, arithmetic and dispatch are explanations of execution cost, not automatic
+extra dimensions. Prefill/decode mode and context/batch sizes normally select
+operating points within a dimension.
 
-```text
-throughput ceiling U = u / L
-efficiency           = (u / T) / U = L / T
-displayed percentage = 100 × efficiency
-```
+Parameters have explicit origins:
 
-The primary displayed number is efficiency against this upper bound. A loose bound
-understates efficiency; it does not establish how much faster an implementation
-can actually become. Record looseness and assumptions alongside the percentage.
-Do not require a kernel approaching the ceiling before publishing a valid bound.
+| Origin | Binding |
+|---|---|
+| Architecture/configuration | Mathematical equations, shapes, precision/encoding, sharing, state format, optional branches and observable outputs; from artifact/configuration and the contract |
+| Workload | Batch/query widths, histories, initial residency, request arrivals, required checkpoints, output allowances and external readiness; from the trial specification |
+| Platform | Theoretical capacity upper bounds, memory hierarchy and MLX/runtime constraints; from a versioned profile with documented provenance |
+| Data-dependent conditions | Routes, acceptance and stopping outcomes; from an explicit distribution, optimistic range or labeled trace-conditioned sample |
 
-A measurement above the ceiling challenges the derivation, its applicability or
-the measurement. Never clamp it to 100%. If no positive time bound is established,
-report an unbounded/unresolved ceiling and no percentage. A zero-overhead wrapper
-may have meaningful excess time without a meaningful efficiency ratio.
+For neural records, `m=bq` denotes consumed rows, `h` hidden width and `m_out`
+requested logit rows. Weight symbols identify actual encoded tensors, including
+required metadata and sharing. Each record supplies its remaining geometry. Engine
+records bind a request workload and its service constraints instead.
 
-For a footprint dimension, derive a minimum necessary byte count `M_min` and measure
-the corresponding footprint `M`: efficiency is `M_min / M`. This is storage
-efficiency, not a throughput rate. In both cases an optimistic minimum resource
-cost defines the ideal; the percentage measures actual performance against it.
-An unresolved or zero minimum gives no meaningful percentage. A measured cost below
-the minimum challenges the model just as throughput above its ceiling does.
+No implementation timing sets a theoretical capacity. Data-dependent bindings may
+use observed routes or acceptance only as explicit workload conditioning; they must
+not silently change the standard between variants. Changed precision, semantics or
+boundary residency is a changed operating point. Unknown parameters stay symbolic.
 
-Each dimension optimizes its own objective under the declared constraints. The
-separate optima need not be jointly attainable. In particular, state restoration
-may exploit the allowed memory budget while minimum footprint may require replay.
-Do not fix the incumbent snapshot/copy policy in the theoretical denominator.
+## Two evaluations of the same component graph
 
-## Contract and operating point
+**Theoretical evaluation:** instantiate unavoidable demands and compose them with
+[resource rules](performance/derivations/resources.md#evaluation-algebra). Permit
+optimal legal MLX/Metal code, packing, fusion, reuse and overlap. At each parent,
+union shared information and remove eliminable internal transfers before applying
+capacity constraints. Add arithmetic/dependency refinements only under justified
+assumptions. Reference rates never define the ceiling. Prefer an overly optimistic
+bound over a false declaration of saturation.
 
-The contract defines a derivation for each `FAMILY:COMPONENT/DIMENSION`, independent
-of source and variant.
-Equivalent upstream and owned implementations use the same ceiling. Where input
-layouts or observability differ, state those conditions and include adaptation
-when comparing equivalent work. Do not change the denominator to favor a variant.
+**Implementation evaluation:** select the actual variants and execution arrangement.
+Use matched measurements to estimate region costs, actual copies, resource contention,
+submission and completion behavior. Compose those costs through the selected plan
+using [execution estimation](performance/derivations/resources.md#execution-estimation).
+The local component or parent measurement calibrates and checks the estimate.
+Neither observed overhead nor a fitted execution cost changes the theoretical bound.
 
-An operating point fixes:
+Both evaluations follow the component relationships, but their execution boundaries
+may differ. A fused region crossing two components needs a joint cost observation;
+standalone child timings cannot identify its production cost. Missing observations
+remain unknown rather than being replaced with the theoretical best case.
 
-- Mathematical work, supported input domain, shapes and positions; no foreknowledge
-  of the particular answer or future requests.
-- Weight encoding, numerical/output requirements, conditioning and state semantics.
-- Initial residency, memory budget, retained history and required observable outputs.
-- MLX runtime/version, device capacities and relevant memory hierarchy.
-- Useful-work unit and timing boundary: startup, standalone call, fused parent,
-  steady decode interval or request workload.
+What propagates upward is demand, dependencies and execution behavior. A parent
+can combine child execution, memory and restoration properties without inheriting
+all their display dimensions. Shared accounting follows a graph even when the view
+is a tree. Parent percentages are derived at the parent, never averaged from children.
 
-Footprint dimensions specify the ownership boundary and observation instant or
-interval instead of a timing boundary. Shared allocations are counted once.
+## Efficiency and bottleneck importance
 
-Custom Metal, graph compilation, packing, fusion and legal reuse are permitted.
-Changing the model's precision, semantics or useful output is not the same work.
-The formula is portable; a numerical ceiling still depends on a platform profile.
-
-## Resource rule
-
-For each resource `r`, derive a minimum necessary demand `D_r` and use an upper
-capacity `C_r`. Include only justified terms:
+For useful work `u`, a time lower bound `L`, observed time `T`, a footprint lower
+bound `M_min` and observed footprint `M`:
 
 ```text
-L_resource = max_r(D_r / C_r)
-L          = max(L_resource, independently justified dependency/time bounds)
+throughput ceiling = u / L
+execution efficiency = 100 * L / T
+footprint efficiency = 100 * M_min / M
+higher-is-better outcome efficiency = 100 * observed / theoretical_upper
 ```
 
-Competing work on one resource shares its capacity. Different resource constraints
-combine with `max`, not a sum that assumes no overlap. Count conversion, instruction,
-reduction or runtime costs only where necessity and capacity are established.
-Conventional arithmetic counts are conditional on their algorithm class, not proofs
-of minimum work across all algebraic algorithms.
+An estimated time `T_hat` gives an estimated percentage by the same expression.
+The component record defines the exact metric, work unit, boundary and population
+statistic. A mean lower bound cannot score a p95 observation. Separate dimension
+optima need not be jointly attainable under the same constraints.
 
-When uncertain, omit an unproved cost or allow optimistic overlap/reuse and label
-that relaxation. Missing capacity values remain symbolic; do not replace them with
-a slow observed kernel rate. A profile distinguishes authoritative upper capacities
-from estimates and observations. Measured sustained bandwidth alone is not a proved
-maximum. Estimated profiles yield estimated, not certified, numerical ceilings.
+A loose theoretical bound understates efficiency; the gap is not a promise of
+recoverable performance. A zero or unresolved denominator yields no meaningful
+percentage. A result exceeding 100% challenges the bound, its binding or the
+measurement; never clamp it. No positive floor is invented for bookkeeping that
+can legally disappear into its owner.
 
-## Recursive composition
-
-Components expose resource demands and boundary conditions, not just scalar times.
-At the parent boundary:
-
-1. Select the actual mathematical children and invocation multiplicities.
-2. Identify shared data and required externally visible state/output.
-3. Remove intermediate reads/writes and dispatch boundaries that legal fusion can
-   eliminate. Count shared inputs once unless extra transfers are proved necessary.
-4. Aggregate unavoidable demand on each shared resource, then apply its capacity.
-5. Add a serial-stage bound only when those stages cannot overlap even under the
-   allowed fusion, tiling and runtime execution model.
-
-A dependency between values does not prove that entire standalone calls must run
-serially; their work may pipeline or fuse. Summing isolated child minima can therefore
-produce a false ceiling. Unknown extra transfers, dispatches and barriers contribute
-zero to the initial optimistic bound, with the missing constraint made explicit.
-
-The parent is a theoretical evaluation of the contract graph. A separate diagnostic
-model may use measured child timings, actual copies and dispatch counts to explain
-current behavior. Never feed those observations into the theoretical denominator
-merely because the current implementation incurs them.
-
-The display is a tree; accounting follows the dependency/resource graph. Percentages
-are not averaged. Keep exposed time and parent sensitivity available with each node;
-a low-efficiency tiny component need not control full-model performance.
-
-Compose each parent's declared objective from relevant child demands, even when the
-children expose different dimensions. Child memory affects feasibility; child
-restoration time can affect parent execution. Neither implies extra parent score
-dimensions. Recompute the parent's bound rather than combining child percentages.
+Efficiency is distinct from bottleneck importance. Report the parent's predicted
+change under an explicit change to a child's cost/behavior, holding the workload
+fixed. Preserve effects on other dimensions and memory feasibility. Such sensitivity
+is a model prediction requiring parent evidence, not a speedup obtained by subtracting
+child percentages. A small inefficient component may have little parent impact.
 
 ## Evidence and current assessments
 
-A percentage belongs to a dimension, implementation revision and operating point.
-Samples establish performance at those points; they do not prove a score everywhere.
-Retain sample identities, coverage, variability and any interpolation assumptions.
-Distinguish directly measured assessments from estimates between samples. A tree
-view selects an explicit workload/profile and shows one percentage per declared
-dimension, or `unmeasured` / `unresolved`; it never silently extrapolates a global score.
+A ceiling evaluation records the full dimension ID, component-record and reusable-
+formula revisions, all bound inputs, platform profile, assumptions and resulting
+symbolic/numerical bound. It can exist without a measurement.
 
-An assessment records:
+A measurement records the implementation fingerprint, artifact/workload/profile,
+observation boundary, raw metric samples and relevant child/execution arrangement.
+An assessment joins a matching measurement or supported estimate to a ceiling
+evaluation. It preserves both identities, the result, coverage and uncertainty.
+These are information requirements for using recorded results, not separate stores
+or a new evidence registry.
 
-- Full dimension ID, full implementation ID and implementation fingerprint.
-- Artifact/configuration, actual child selections and their fingerprints, relevant
-  dependencies/runtime, operating point and platform-profile revision.
-- Derivation revision, parameter binding, evaluated bound and raw measurement IDs.
-- Result, evidence coverage and uncertainty; whether measured or estimated.
+To update a current estimate:
+
+1. Match the new samples to the dimension, operating point and implementation fingerprint.
+2. Evaluate that dimension's theoretical formula using the matching bindings.
+3. Add the samples to the supported region of the implementation's performance estimate.
+4. Reevaluate affected parent predictions using their composition rules and evidence.
+5. Refresh affected tree percentages and their benchmark references together;
+   remove references that no longer support the displayed value.
+
+Interpolation is an explicit estimation method with a stated supported region and
+uncertainty. Do not mix samples from different variants, numerical contracts or
+platforms without a justified transfer model. Samples do not establish a universal
+score over all contexts/batches. A tree view chooses an explicit workload/profile
+and distinguishes measured, estimated, unmeasured and unresolved values.
 
 **Any implementation change resets all its current dimension assessments to
-`unmeasured`.** Preserve the stable ID and historical results. Apply this transitively
-to every actual parent composition using the changed implementation; unaffected
-components keep their assessments. Fingerprints must cover implementation content,
-selected children and performance-relevant configuration/dependencies, so an unchanged
-parent source file cannot conceal a changed child. Do not carry old scores forward
-on an assumption that the change is performance-neutral. New samples qualify only
-their covered points on the new fingerprint.
+`unmeasured`**, transitively through actual parent compositions using it. Preserve
+stable IDs and historical evidence; unaffected components retain their assessments.
+Fingerprints cover implementation content, selected children and performance-relevant
+configuration/dependencies. A performance-neutral assumption does not qualify a new
+revision. New evidence qualifies only its covered points.
 
-## Derivation records and history
+Changing only a derivation permits reevaluation of matching raw measurements without
+remeasuring. Preserve the old assessment; until reevaluated, its percentage is
+historical. A new denominator must not appear as a code speedup. Implementation
+changes do not automatically invalidate a contract's theoretical derivation.
 
-Each catalog entry identifies its contract, reusable formulas, parameter binding,
-assumptions, relaxations, declared dimensions/metrics and outstanding inputs. A useful bound
-can be symbolic and loose. Improving its tightness is separate from improving code.
+## Tree annotations and benchmark references
 
-Reference a derivation by document section plus content revision/hash. Evaluated
-records preserve the derivation revision, component/source revision, selected child
-IDs, operating point, platform-profile revision, symbolic inputs, evaluated bound
-and measurement identity. No hardware rates or measurements means no invented
-throughput number or efficiency percentage.
+The tree represents the implementation hierarchy. Its structure changes when the
+assembly changes; its annotations change as evidence changes. Put exactly four
+spaces after each implementation ID, followed by brackets. Do not align columns.
 
-Keep observations immutable. A revised derivation may re-evaluate an old observation
-as a new assessment; it must not overwrite the old score or appear as a code speedup.
-Until re-evaluated, its old percentage is historical. Changing only a derivation does
-not invalidate a matching raw measurement or require another benchmark. Changing an
-implementation does not by itself invalidate the contract's theoretical derivation.
-Architecture docs link to their catalog bindings rather than duplicating formulas.
-The existing benchmark system can evaluate these formulas when inputs are available;
-this design does not require another benchmark framework.
+```text
+IMPLEMENTATION_ID    [PERCENT @benchmark.identity]
+IMPLEMENTATION_ID    [DIM: PERCENT @benchmark.identity @another.identity, DIM: unmeasured]
+```
 
-## Current deliverable
+This is syntax, not a performance claim. A single-dimension component omits the
+dimension label; multiple dimensions use every code defined by its type. Write
+`78%` for a percentage computed from a matched measurement, `~78%` for a supported
+implementation estimate, and `unmeasured` when applicable evidence is absent.
+`unresolved` means the theoretical binding yields no usable denominator, including
+a zero bound; it does not mean a benchmark is missing. Notes such as `fallback`
+follow the closing bracket with one space.
 
-The derivations and catalog are symbolic analysis. No benchmark campaign or runtime
-calibration accompanies them. The Qwen static worksheet described in the catalog reads
-configuration and tensor headers only. It supplies geometry and storage quantities,
-not measured traffic, timing or a numerical ceiling.
+Before displaying numbers, state the artifact, workload and platform context next
+to the tree. Each occurrence binds its own shapes, state and invocation scope.
+Repeated IDs do not justify copying a layer's percentage to other layers or taking
+an average. A collapsed repeated node needs a defined aggregate boundary or remains
+unmeasured. Parent values follow the composition rules above.
+
+`@` references are exact existing benchmark `Experiment.identity` values, such as
+`@operator.delta-owned` or `@state.append-runs`. Preserve their spelling; these are
+benchmark identities, distinct from component IDs and from result/run/request IDs.
+List multiple references beside a dimension when they jointly support its value.
+An implementation's validation description names relevant benchmark controls and
+their boundaries; a tree annotation cites only those supporting its current value.
+Do not introduce evidence aliases or a provenance table.
+
+Each reference resolves to the most recent applicable completed, valid recorded
+results of that benchmark. Applicability requires matching implementation content
+and selected children, benchmark definition, artifact/workload, hardware/runtime,
+and the dimension's metric and observation boundary. A name or clean revision alone
+is insufficient; use the recorded implementation/composition digests and environment.
+Do not pool distinct contexts, rejected runs or incompatible revisions. If recorded
+metadata cannot establish applicability, the value remains unmeasured.
+
+An enclosing benchmark is not automatically evidence for a child. For example,
+`operator.attention-metal-16k` times append plus attention, so it cannot directly
+score attention alone. An explicit, supported decomposition may produce an estimate;
+the implementation's validation description must explain the method and limits.
+Reference implementations supply comparisons, never theoretical denominators.
+
+When new applicable results are adopted, recompute the percentage and review its
+references in the same update. A newer incompatible result does not supersede an
+applicable one. An implementation change clears affected percentages and their
+supporting annotations until matching evidence exists. Keep only currently useful
+references; history remains in recorded benchmark results and version control.
+
+## Storage and verification
+
+Durable documents contain definitions, derivations and current tree annotations.
+Existing recorded benchmark results retain samples and full provenance; do not copy
+them into a second evidence store or maintain a separate current-evidence index.
+Session logs remain `./sessions/YY-MM-DD/<name>.md`, relative to the monorepo root,
+with supporting analysis under that date's evidence directories. Existing evidence
+paths remain valid. Preserve content revisions/hashes and historical records when
+documentation moves.
+
+Static verification checks that every current implementation resolves to one type,
+every dimension has a definition/binding, formula links resolve and composition
+identities hold. Numerical ceilings require complete geometry/capacity inputs;
+percentages additionally require measurements or explicitly supported estimates.
+These documentation contracts do not create a runtime registry or a new benchmark
+framework. Engine integration and component correctness remain separate qualification
+requirements under [optimization](models/optimization.md).

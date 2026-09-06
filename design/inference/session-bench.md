@@ -62,7 +62,9 @@ the public invocation and a shell-quoted reproduction command expanded to immuta
 pairs. Reproduction does not read old result schemas or depend on aliases; local paths still require
 the recorded bytes, and exact historical reproduction requires recorded code/dependencies/hardware.
 Relevant source snapshots, artifact hashes, corpus identity, runtime versions and effective policy
-accompany results. Only relevant source is captured, never credentials or the full environment.
+accompany results. The shared benchmark hardware record is captured once before preparation,
+retained in the initial run record and final summary, and identified in the Markdown report.
+Only relevant source is captured, never credentials or the full environment.
 
 Events and completed request results are appended and flushed during execution. Final summaries and
 Markdown are written atomically. Partial failures and cancellation preserve evidence and trigger

@@ -107,6 +107,13 @@ def markdown(summary: dict) -> str:
         "TTFT ms | Completion ms | Prefill tok/s | Decode tok/s |",
         "| --- | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
+    if hardware := summary.get("hardware"):
+        memory_gib = hardware["memory_bytes"] / (1 << 30)
+        lines[2:2] = [
+            f"Host: {hardware['hostname']} · {hardware['chip'] or 'unknown chip'} · "
+            f"{memory_gib:g} GiB RAM · {hardware['os']} {hardware['os_version']}",
+            "",
+        ]
     for row in summary["rows"]:
         lines.append(
             f"| {row['target']} | {row['section']} | {row['concurrency']} | "
