@@ -24,56 +24,34 @@ residency and requested outputs. Compilation and preparation costs have explicit
 timing boundaries; steady execution and first-use latency are distinct properties.
 
 Prefill, decode and verification have different reuse and parallelism. Their
-implementations may differ while preserving the same model contract. Single-session
-latency, aggregate throughput and memory efficiency remain separate properties;
-an improvement in one does not silently compensate for a regression in another.
+implementations may differ while preserving the same model contract. These modes,
+context lengths and batch sizes normally select samples within execution efficiency,
+not separate dimensions. The [catalog](../performance/catalog.md#dimension-definitions)
+declares a split only for meaningful independently moving outcomes, such as state
+footprint and restoration time. Each dimension has a full `FAMILY:COMPONENT/DIMENSION`
+ID, including a lone `/EXEC`. Protect unsampled regimes and auxiliary constraints;
+one favorable sample or dimension cannot compensate for a regression elsewhere.
 
 ## Ceilings and headroom
 
-Each identified model component has the reference and performance description
-required by [component identification](../components.md). An architecture's model
-composes those descriptions at block, layer and whole-model boundaries rather
-than attaching one unexplained throughput target to the architecture. It
-distinguishes three kinds of evidence:
+The [MLX ceiling contract](../performance.md) defines the common denominator:
+an optimistic theoretical bound for each declared dimension from unavoidable demands, with
+perfect legal fusion/reuse and no unproved implementation overhead. Reference
+rates remain comparisons; they never define the ceiling.
 
-| Evidence | Meaning |
-|---|---|
-| Reference target | A comparable implementation demonstrates an attainable rate |
-| Resource bound | Required work and hardware capacity imply a throughput upper bound under stated assumptions |
-| Execution diagnosis | Measured traffic, utilization, dispatch and dependencies explain the current gap and suggest opportunities |
+Each component contract binds to the [derivation catalog](../performance/catalog.md).
+Source and variant select an implementation to measure, not a different standard
+of theoretical efficiency. Bind geometry, state visibility, boundary residency and
+profile capacities before evaluating a formula. No measurements are required to
+write or inspect symbolic derivations; absent capacities and observations remain
+explicitly unset.
 
-For work requiring `D` bytes through a memory level with bandwidth `B`, and `F`
-operations of a given kind with capacity `C`, execution time is at least
-`max(D / B, F / C)`. Account separately for distinct compute resources and memory
-levels. Compose bounds according to the dependency graph: serial work adds,
-overlap must be feasible, and operations sharing a resource share its capacity.
-An aggregate resource bound alone may miss a serial critical path.
-
-For a selected component, instantiate its definition with actual rows, query width,
-visible history, head/matrix geometry, precision and layout. Attach required bytes,
-arithmetic and dependency assumptions to that ID. Evaluate the parent from its
-selected child IDs and integration costs, then compare both parent and children
-with their independent controls. Unknown bandwidth, reuse or overlap requires a
-named discriminating measurement, not an invented numerical ceiling.
-
-| Work | Required accounting |
-|---|---|
-| Projections and experts | Actual weight bytes including quantization metadata, activation traffic, dequantization and arithmetic; selected experts and reuse across rows |
-| Attention | Query geometry, visible KV reads, new KV writes, attention arithmetic, windows, grouped heads and shared KV producers |
-| Recurrence | State reads and writes, convolution history and update arithmetic; sequential decode versus parallel or chunked prefill |
-| Composition | Intermediate materialization, copies, layout conversion, scratch, host graph construction, encoding, synchronization and exposed I/O |
-
-Decode can be limited by weight traffic, KV/state traffic, host submission or
-serial dependencies. Prefill can reuse weights across many tokens, making matrix
-compute, attention I/O and workspace more significant. Neither classification is
-assumed without accounting for the actual architecture and shapes.
-
-Hardware capacity gives an optimistic bound, not a promise of attainment.
-Measured bandwidth and operator latency diagnose current execution; they do not
-limit future targets. Existing launch counts, layouts and intermediate tensors
-are not inherently unavoidable work. Fusion, reuse, overlap and different
-algorithms can change the bound itself. A claim of being near a ceiling requires
-the assumptions and remaining gap to be explicit, beyond matching a reference.
+Parent bounds combine required work and dependencies using the recursive rules,
+not averages of child percentages or sums of standalone timings. A separate
+measurement-based diagnosis explains actual copying, dispatch, contention and
+other gaps. Unknown constraints loosen the upper bound rather than prematurely
+limiting the target. A realizable implementation near the bound is useful evidence
+of tightness, not a prerequisite for using an optimistic theoretical ceiling.
 
 ## Structural efficiency
 
@@ -133,5 +111,9 @@ survive engine integration before supporting an engine-wide claim.
 Measurements, failed controls, reference identities and bound assumptions remain
 durable evidence alongside source identities, comparison conditions and raw results.
 Small controlled comparisons support development; broader qualification supports
-milestones. When implementations change, prior measurements remain historical
-evidence rather than automatically qualifying the new composition.
+milestones. Any implementation change resets all its dimension assessments and those
+of its actual parent compositions to `unmeasured`; unrelated components remain valid.
+Prior samples remain historical. Follow the
+[assessment rules](../performance.md#evidence-and-current-assessments) for fingerprints,
+coverage and derivation-only re-evaluation. These are evidence requirements, not a
+mandate to benchmark every component after every edit.

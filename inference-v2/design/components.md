@@ -78,6 +78,10 @@ File moves and ordinary improvements preserve identity. Separately selectable
 methods get distinct variant IDs. An incompatible contract needs a distinct
 component address; an old ID must not silently acquire a different meaning.
 Measurements always identify the measured revision as well as the component ID.
+Any implementation change resets its current performance assessments and those of
+its actual parent compositions; it does not rename the component or erase history.
+The [assessment rules](performance.md#evidence-and-current-assessments) define the
+fingerprints and evidence required to qualify the new revision.
 
 Source attribution follows composition ownership recursively:
 
@@ -114,8 +118,8 @@ independent tests, benchmark subjects and result records. Definitions contain:
 | Composition | Constituent IDs, their roles and shared dependencies |
 | Implementation | Source, method and relevant technology/runtime distinctions |
 | Comparison | Available reference implementations or independent oracles, the boundary each validates, and conditions required for a fair comparison |
-| Performance properties | Relevant latency, throughput, traffic, memory or service properties and how they scale with the supported workload |
-| Performance model | Derivation from required work and resource capacity, composition of child costs, or reference-based targets; assumptions, remaining headroom and unknowns |
+| Performance properties | Minimal declared dimensions, their full IDs, metrics/units and observation boundaries; distinguish score dimensions from operating-point coordinates, diagnostics and constraints |
+| Performance model | Optimistic theoretical bound for each dimension, derivation binding, unavoidable demands, composition rules, assumptions and unknowns; reference rates remain separate |
 | Validation | How to exercise the component independently with matched inputs/state and observe outputs, state effects and performance |
 | Qualification | Implemented versus proposed status, supported claims, comparison results and source/configuration/evidence identity |
 
@@ -125,17 +129,25 @@ A reference can be an upstream implementation, an independently qualified intern
 implementation or a mathematical oracle. If none is available, record the gap and
 the independent validation needed; naming a reference is not proof of equivalence.
 
-Every component needs an explicit performance model, even before a numerical
-ceiling is established. Distinguish demonstrated reference performance from a
-derived bound. State the quantities, assumptions and missing measurements needed
-to evaluate the model; "not benchmarked" alone is insufficient. Policy components
-can have service, interference and overhead bounds rather than a token-rate ceiling.
+Every component binds its `FAMILY:COMPONENT` contract to a derivation under the
+[MLX ceiling contract](performance.md). This bound is independent of source and
+variant. The [catalog](performance/catalog.md) records formulas and parameter
+bindings; measured results attach to concrete implementations and revisions.
 
-A composite model names its child IDs and explains serial dependencies, feasible
-overlap, shared resources and additional composition costs. It cannot simply sum
-isolated timings or multiply speedups. A primitive derives its model from its own
-algorithm and resource demands. Both may use independent references to challenge
-the derivation. Observed implementation costs do not become permanent limits.
+Every assessment target is `FAMILY:COMPONENT/DIMENSION`, even for a component with
+one dimension. Dimension codes are concise uppercase names, defined per contract
+in the catalog. For example, `MODEL:ATTENTION/EXEC` names execution efficiency;
+`STATE:QWEN35/MEM` and `STATE:QWEN35/RESTORE` distinguish footprint and restoration.
+These IDs are independent of implementation IDs: a result names both its dimension
+and the measured implementation, such as `MODEL:ATTENTION:MAG:PAGED`.
+Trees show one percentage for a single dimension and labeled percentages for
+multiple dimensions; all values retain their full dimension IDs and evidence links.
+
+The ceiling deliberately favors optimistic efficiency. It excludes unproved costs,
+allows legal fusion/reuse and keeps missing capacities symbolic. References do not
+define it, and an implementation approaching it is not required. Parent bounds
+compose unavoidable resource demands across the graph; standalone child times
+and current dispatch/copy costs cannot be promoted to theoretical necessities.
 
 Assembly trees reference these definitions rather than duplicating their claims.
 Test and benchmark records retain the component ID, actual child selection,

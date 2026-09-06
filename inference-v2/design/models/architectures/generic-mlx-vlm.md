@@ -55,7 +55,8 @@ must identify that artifact's block and reference explicitly.
 - **Performance / bounds:** Measure startup latency, bytes read and peak live memory.
   Model storage reads, format conversion and device materialization by their actual
   dependencies and bandwidths. Count retained weights once, plus conversion scratch
-  and overlapping allocations; cold and warm loading are separate operating points.
+  and overlapping allocations. These are `MODEL:LOADING/LAT` and
+  `MODEL:LOADING/MEM`; cold and warm loading are separate operating points.
 
 ### `MODEL:FORWARD:VLM:STANDARD`
 
@@ -84,8 +85,27 @@ must identify that artifact's block and reference explicitly.
   state is fixed-size; rotating caches retain a window but a query may need
   `window + query_width - 1` visible keys. Derive movement costs from actual arrays
   and bandwidth; stable batches should not reconstruct complete histories per token.
+  `STATE:CHECKPOINTS/MEM` scores retained footprint and
+  `STATE:CHECKPOINTS/RESTORE` scores readiness after restoration, including deferred
+  repair. Transient peaks and checkpoint creation costs remain visible constraints
+  and enclosing-workload costs.
 
 ## Performance composition
+
+Every contract in this tree resolves to its [ceiling binding](../../performance/catalog.md#generic-upstream-contracts).
+The [common definition](../../performance.md) provides an optimistic theoretical
+bound per declared dimension, independent of source/variant. References and current
+implementation costs diagnose gaps; they do not limit that bound. Parent accounting
+allows fusion and shared-data reuse before counting unavoidable demands.
+
+Executor and forward use `/EXEC`, one execution-efficiency percentage each.
+Loading declares `MODEL:LOADING/LAT` and `MODEL:LOADING/MEM`: startup latency and
+peak loading footprint can trade off through staging/conversion concurrency.
+Native checkpoints declare `STATE:CHECKPOINTS/MEM` and `STATE:CHECKPOINTS/RESTORE`:
+retained footprint and restoration time can trade off through checkpoint retention.
+The [catalog definitions](../../performance/catalog.md#dimension-definitions) fix each
+metric and boundary. Tree values are samples at the selected workload, not universal
+scores for every upstream model.
 
 The neural model and integration have separate cost models. A slow executor can be
 localized to the forward or to native state/batching overhead. An upstream kernel
@@ -97,6 +117,10 @@ reservations are capacity obligations, not evidence that those bytes move on eve
 forward. Loading belongs in startup measurements, not steady decode throughput.
 
 ## Qualification
+
+Current assessments follow the [evidence/reset rules](../../performance.md#evidence-and-current-assessments):
+any implementation change makes its scores and affected parent scores `unmeasured`.
+Historical observations remain tied to their original fingerprints and operating points.
 
 These IDs describe existing responsibilities; they do not assert universal upstream
 parity. The September 6 native Gemma comparison established matching logits for the

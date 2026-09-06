@@ -112,6 +112,15 @@ boundary; dedicated benchmark coverage is not yet complete. References and deriv
 below identify the required controls and performance models, not an assertion that
 every component is already numerically or performance-qualified. Architecture docs
 select concrete geometry, state layout and child configuration for these definitions.
+Every shared contract binds to the [ceiling catalog](../performance/catalog.md#shared-model-contracts).
+Each currently has one execution-efficiency dimension, identified by its contract
+plus `/EXEC`, such as `MODEL:ATTENTION/EXEC`. Shape, query mode and residency select
+operating points within that dimension. Individual resource costs explain its score.
+Evidence identifies the selected implementation and revision; implementation changes
+reset its scores and affected parent scores under the
+[assessment rules](../performance.md#evidence-and-current-assessments).
+The resource costs described below include diagnostic opportunities; only demands
+justified by the linked derivation enter the optimistic theoretical ceiling.
 
 ### `MODEL:EMBEDDING:MAG:RESIDENT`
 
