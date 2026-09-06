@@ -51,7 +51,9 @@ magnitude setup
 
 The interactive setup profiles your hardware, lets you choose from the recommended models, downloads your selection, and connects it to your harness.
 
-Magnitude supports macOS and Linux. Windows is supported through WSL.
+Native Windows is the target environment and support is under active development. The CLI and
+background service run natively on Windows, while inference backend coverage and some hardware
+paths remain limited or unverified.
 
 ## Why Magnitude?
 

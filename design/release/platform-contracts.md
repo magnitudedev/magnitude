@@ -98,6 +98,17 @@ a runner label alone is not a support contract. Before packaging, the Apple buil
 expected architecture and deployment target of every executable and native library with Apple's
 `vtool`. Those validated files are the exact inputs to the deterministic archive builder.
 
+## Windows contract
+
+The `windows-x64-msvc` host targets 64-bit Windows with the MSVC ABI. Its CLI, ACN, and CPU ICN
+base may use ordinary Windows process, filesystem, and loopback networking facilities and must not
+require WSL. Runtime libraries shipped with the base are installed beside the native files and are
+made available through the Windows loader search path owned by the installation.
+
+Windows accelerator packs are not part of the current release contract. A backend may be added
+only after its native module, redistributable runtime dependencies, loader behavior, and final
+archive execution have been validated on Windows.
+
 ## Required guarantees
 
 - Build-host contents cannot introduce a dependency or raise a platform floor.

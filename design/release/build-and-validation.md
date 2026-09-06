@@ -74,6 +74,10 @@ Linux host archives are then downloaded by separate Ubuntu 22.04 consumer jobs f
 and executed again without reusing the build workspace. This catches dependencies accidentally
 satisfied by the build job.
 
+The Windows x64 host is built and smoke-tested on a Windows runner as part of the host matrix.
+That host gate covers the CLI, ACN, and CPU ICN base only; it does not authorize any Windows
+accelerator backend.
+
 The complete candidate gate additionally installs the packed npm package through Node and Bun,
 acquires CLI, ACN, and ICN through their production paths from an empty data root, reaches ACN/ICN
 readiness and local-model ranking readiness, shuts down the exact owned processes, and proves

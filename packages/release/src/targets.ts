@@ -83,6 +83,14 @@ export const releaseHosts = [
     executableExtension: "",
     cargoFeatures: ["mtmd", "dynamic-backends"],
   },
+  {
+    id: "windows-x64-msvc",
+    runner: "windows-2025",
+    bunTarget: "bun-windows-x64",
+    rustTarget: "x86_64-pc-windows-msvc",
+    executableExtension: ".exe",
+    cargoFeatures: ["mtmd", "dynamic-backends"],
+  },
 ] as const satisfies readonly ReleaseHost[]
 
 const cudaBuilds = [
@@ -121,8 +129,8 @@ const cudaBackendPacks: readonly BackendPack[] = cudaHosts.flatMap(({ host, runn
     cuda,
   })))
 
-// Windows release artifacts are intentionally disabled for now. Runtime support outside the
-// release system remains available to revisit once Windows builds are reliable.
+// Windows currently ships the CPU base only. Backend packs remain disabled until each backend
+// has a verified native Windows build and release validation path.
 export const backendPacks: readonly BackendPack[] = [
   {
     id: "metal-darwin-arm64",

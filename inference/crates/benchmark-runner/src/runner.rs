@@ -1589,7 +1589,7 @@ impl MemoryMonitor {
         let _ = self.stop.send(());
         let peak_bytes = self.task.await.ok();
         MemoryEvidence {
-            source: Some("process-rss-ps".into()),
+            source: Some("process-rss".into()),
             baseline_bytes: Some(self.baseline_bytes),
             peak_bytes,
             retained_bytes: process_rss_bytes(self.process_id).await,
@@ -1598,20 +1598,48 @@ impl MemoryMonitor {
 }
 
 async fn process_rss_bytes(process_id: u32) -> Option<u64> {
-    let output = tokio::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &process_id.to_string()])
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    #[cfg(target_os = "windows")]
+    {
+        let output = tokio::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "(Get-Process -Id {} -ErrorAction SilentlyContinue).WorkingSet64",
+                    process_id
+                ),
+            ])
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        return std::str::from_utf8(&output.stdout)
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok();
     }
-    std::str::from_utf8(&output.stdout)
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .and_then(|kilobytes| kilobytes.checked_mul(1024))
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let output = tokio::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &process_id.to_string()])
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        std::str::from_utf8(&output.stdout)
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .and_then(|kilobytes| kilobytes.checked_mul(1024))
+    }
 }
 
 fn merge_target_result(destination: &mut Option<TargetResult>, mut incoming: TargetResult) {
