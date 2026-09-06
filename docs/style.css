@@ -1,9 +1,22 @@
+/* Match the landing page's logo-to-header ratio within Mintlify's 4rem navbar. */
 .nav-logo {
-    height: 48px !important;
-    max-height: 48px !important;
+    --nav-logo-height: calc(4rem * 32 / 56);
+    height: var(--nav-logo-height) !important;
+    max-height: var(--nav-logo-height) !important;
+    width: auto;
 }
 
+@media (min-width: 768px) {
+    .nav-logo {
+        --nav-logo-height: calc(4rem * 40 / 68);
+    }
+}
 
+@media (min-width: 1024px) {
+    .nav-logo {
+        --nav-logo-height: calc(4rem * 44 / 76);
+    }
+}
 
 .docs-muted-note {
     font-size: 0.875rem;
