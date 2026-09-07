@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest"
 import { ACN_INSTANCE_ID } from "./identity"
 import { makeAcnServiceLifecycle } from "./service-lifecycle"
 import { ACN_PUBLIC_PORT, installAcnControlRoutes, installAcnPublicRoutes } from "./server"
+import { MAGNITUDE_APP_ORIGIN } from "@magnitudedev/acn-protocol"
 
 const TestRpcs = RpcGroup.make(
   Rpc.make("Ping", { success: Schema.String }),
@@ -47,6 +48,24 @@ describe("ACN public and control HTTP listeners", () => {
       const origin = yield* listen(publicRouter, ACN_PUBLIC_PORT)
       expect(origin).toBe("http://127.0.0.1:10100")
       expect(controlOrigin).not.toBe(origin)
+
+      const preflight = (requestOrigin: string) => Effect.promise(() => fetch(`${origin}/health`, {
+        method: "OPTIONS",
+        headers: {
+          origin: requestOrigin,
+          "access-control-request-method": "GET",
+        },
+      }))
+      for (const allowedOrigin of [MAGNITUDE_APP_ORIGIN, "http://localhost:5173"]) {
+        const response = yield* preflight(allowedOrigin)
+        expect(response.status).toBe(204)
+        expect(response.headers.get("access-control-allow-origin")).toBe(allowedOrigin)
+      }
+      for (const rejectedOrigin of ["null", "file://", "https://example.com"]) {
+        const response = yield* preflight(rejectedOrigin)
+        expect(response.status).toBe(403)
+        expect(response.headers.get("access-control-allow-origin")).toBeNull()
+      }
 
       const rpc = (base: string, id: string | undefined, tag = "Ping") => http.execute(
         HttpClientRequest.post(`${base}/rpc`, {

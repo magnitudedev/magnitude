@@ -36,7 +36,9 @@ import {
 } from "@magnitudedev/storage"
 import {
   MagnitudeHealthResponseSchema,
-  AcnRpcGroup, } from "@magnitudedev/acn-protocol"
+  AcnRpcGroup,
+  MAGNITUDE_APP_ORIGIN,
+} from "@magnitudedev/acn-protocol"
 import {
   ProcessGroupController,
   makeAcnOwnerStore,
@@ -232,9 +234,7 @@ const boundedShutdownStep = (
 )
 
 function isAllowedCorsOrigin(origin: string): boolean {
-  return (
-    LOCAL_HTTP_ORIGIN.test(origin) || origin === "file://" || origin === "null"
-  )
+  return LOCAL_HTTP_ORIGIN.test(origin) || origin === MAGNITUDE_APP_ORIGIN
 }
 
 function corsHeadersFor(
