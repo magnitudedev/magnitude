@@ -5,7 +5,6 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 
-from magnitude_engine import components as c
 from magnitude_engine.artifacts.quantization import AffineEncoding
 from magnitude_engine.components import component
 
@@ -83,7 +82,7 @@ class GatedExpertMath:
 
 
 @dataclass(frozen=True)
-@component(c.EXPERTS, source=c.Source.MAG, variant="RESIDENT_GATHERED")
+@component("MODEL:EXPERTS:MAG:RESIDENT_GATHERED")
 class ResidentExperts:
     weights: ExpertWeights
     math: GatedExpertMath

@@ -6,7 +6,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Footer, Select, Static, Tree
 
-from magnitude_engine.components import Configuration, OpaqueParameters
+from performance.facts import Configuration, OpaqueParameters
 from performance.presentation import annotation, edges
 from performance.records import Assembly
 from performance.store import Store

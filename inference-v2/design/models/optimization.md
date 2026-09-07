@@ -81,6 +81,7 @@ Small controlled comparisons support development; broader qualification supports
 milestones. Follow the [assessment rules](../performance.md#stable-compositions-and-evidence)
 for coverage, revision invalidation and derivation-only reevaluation. Evidence
 requirements do not mandate benchmarking every component after every edit.
-When adopting results, update affected tree annotations and their existing benchmark
-IDs together under the [tree convention](../performance.md#tree-annotations-and-benchmark-references).
-Clear invalidated values even when replacement measurements are deferred.
+When adopting results, publish the assessments and their benchmark references through the
+performance store under the [tree convention](../performance.md#tree-annotations-and-benchmark-references).
+Invalidate stale values even when replacement measurements are deferred. Update architecture
+docs when the semantic composition changes; repeated measurements do not rewrite their trees.

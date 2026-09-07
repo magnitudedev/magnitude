@@ -5,7 +5,6 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 
-from magnitude_engine import components as c
 from magnitude_engine.components import component
 from magnitude_engine.models.attention.contracts import PagedAttention
 from magnitude_engine.models.embeddings.contracts import EmbeddingLookup
@@ -20,8 +19,14 @@ from magnitude_engine.models.transforms import PositionTransform, Transform
 from .definition import DEFINITION
 
 
+@component("MODEL:GEMMA4.READOUT:MAG:SOFTCAPPED")
+def readout(projection: Transform, hidden: mx.array, softcap: float | None) -> mx.array:
+    logits = projection(hidden)
+    return logits if softcap is None else mx.tanh(logits / softcap) * softcap
+
+
 @dataclass(frozen=True)
-@component(c.GEMMA_KV, source=c.Source.MAG, variant="PRODUCER")
+@component("MODEL:GEMMA4.KV:MAG:PRODUCER")
 class KVProducer:
     keys: Transform
     values: Transform | None
@@ -44,7 +49,7 @@ class KVProducer:
 
 
 @dataclass(frozen=True)
-@component(c.GEMMA_ATTENTION, source=c.Source.MAG, variant="SHARED_KV")
+@component("MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV")
 class GemmaAttention:
     source: int
     producer: KVProducer | None
@@ -74,7 +79,7 @@ class GemmaAttention:
 
 
 @dataclass(frozen=True)
-@component(c.GEMMA_MLP, source=c.Source.MAG, variant="GEGLU")
+@component("MODEL:GEMMA4.MLP:MAG:GEGLU")
 class GeGLU:
     gate: Transform
     up: Transform
@@ -101,7 +106,7 @@ class GemmaRouter:
 
 
 @dataclass(frozen=True)
-@component(c.GEMMA_EXPERT_BRANCH, source=c.Source.MAG, variant="ROUTED")
+@component("MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED")
 class ExpertBranch:
     router: GemmaRouter
     operation: ExpertOperator
@@ -115,7 +120,7 @@ class ExpertBranch:
 
 
 @dataclass(frozen=True)
-@component(c.GEMMA_FEEDFORWARD, source=c.Source.MAG, variant="BRANCHED")
+@component("MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED")
 class GemmaFeedForward:
     input_norm: Transform
     dense: GeGLU
@@ -133,7 +138,7 @@ class GemmaFeedForward:
 
 
 @dataclass(frozen=True)
-@component(c.GEMMA_INPUTS, source=c.Source.MAG, variant="PER_LAYER")
+@component("MODEL:GEMMA4.INPUTS:MAG:PER_LAYER")
 class PerLayerInputs:
     embedding: EmbeddingLookup
     projection: Transform
@@ -152,7 +157,7 @@ class PerLayerInputs:
 
 
 @dataclass(frozen=True)
-@component(c.GEMMA_INPUTS, source=c.Source.MAG, variant="PER_LAYER")
+@component(PerLayerInputs)
 class LayerInput:
     gate: Transform
     projection: Transform
@@ -172,7 +177,7 @@ class GemmaBlock:
     scalar: mx.array
 
 
-@component(c.GEMMA4, source=c.Source.MAG, variant="LAYERWISE", model=DEFINITION)
+@component("MODEL:GEMMA4:MAG:LAYERWISE", model=DEFINITION)
 class Gemma4Program:
     conditioning: frozenset[str] = frozenset()
 
@@ -235,7 +240,5 @@ class Gemma4Program:
         name = f"residual:{len(self.blocks)}"
         if name in request.features:
             features[name] = hidden
-        logits = self.output(self.norm(hidden)) if request.logits else None
-        if logits is not None and self.softcap is not None:
-            logits = mx.tanh(logits / self.softcap) * self.softcap
+        logits = readout(self.output, self.norm(hidden), self.softcap) if request.logits else None
         return ModelOutput(logits, features)

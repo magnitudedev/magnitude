@@ -11,7 +11,6 @@ from threading import RLock
 import mlx.core as mx
 import numpy as np
 
-from magnitude_engine import components as c
 from magnitude_engine.artifacts.tensors import DTYPE_BYTES
 from magnitude_engine.components import component
 from magnitude_engine.resources.budget import MemoryBudget, Reservation
@@ -72,7 +71,7 @@ class RowLease:
                 self.owner._pending.remove(self)
 
 
-@component(c.EMBEDDING, source=c.Source.MAG, variant="STREAMED")
+@component("MODEL:EMBEDDING:MAG:STREAMED")
 class StreamedEmbedding:
     """Bounded row staging and encoded LRU cache, with serialized lookahead planning.
 

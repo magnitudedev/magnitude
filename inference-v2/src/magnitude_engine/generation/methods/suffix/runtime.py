@@ -6,7 +6,6 @@ from typing import Any
 
 import mlx.core as mx
 
-from magnitude_engine import components as c
 from magnitude_engine.components import component
 from magnitude_engine.generation.proposals import Proposal
 from magnitude_engine.models.operations import Task
@@ -85,7 +84,7 @@ class SuffixSession:
         self.index.clear()
 
 
-@component(c.SPECULATION, source=c.Source.MAG, variant="SUFFIX")
+@component("GENERATION:SPECULATION:MAG:SUFFIX")
 class SuffixMethod:
     def __init__(self, minimum: int = 3, maximum: int = 6):
         if minimum < 1 or maximum < minimum:

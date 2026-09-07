@@ -8,6 +8,8 @@ from typing import Literal
 
 import httpx
 
+from magnitude_engine.components import component
+
 from . import validation
 from .policy import REQUEST_TIMEOUT_SECONDS
 from .sessions import Record, Request
@@ -39,6 +41,7 @@ class Observation(Record):
     error: str | None = None
 
 
+@component("ENGINE:INFERENCE:MAG:SESSION_HTTP")
 async def measure(
     client: httpx.AsyncClient,
     endpoint: str,

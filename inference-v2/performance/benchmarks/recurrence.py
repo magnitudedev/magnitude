@@ -1,8 +1,8 @@
 """Prepared recurrence and resulting state, shared across production implementations."""
 
-from magnitude_engine import components as c
 from performance.assembly import Binding, inspect_component
 from performance.benchmarks.numerics import compare
+from performance.facts import RecurrentGeometry
 from performance.runner import recording
 
 
@@ -27,10 +27,10 @@ def benchmark(
         binding = component
         geometry = geometry or binding.node.parameters
     else:
-        if not isinstance(geometry, c.RecurrentGeometry):
+        if not isinstance(geometry, RecurrentGeometry):
             raise TypeError("standalone recurrence requires RecurrentGeometry")
         binding = inspect_component(component, context=geometry).at("component")
-    if not isinstance(geometry, c.RecurrentGeometry):
+    if not isinstance(geometry, RecurrentGeometry):
         raise TypeError("recurrence requires RecurrentGeometry")
     if geometry.element_bytes != (4 if dtype == "float32" else 2):
         raise ValueError("recurrence dtype differs from bound geometry")

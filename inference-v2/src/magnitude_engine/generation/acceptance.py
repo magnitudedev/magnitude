@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 
-from magnitude_engine import components as c
 from magnitude_engine.components import component
 
 
@@ -20,7 +19,7 @@ class AcceptedPrefix:
         return self.count + 1
 
 
-@component(c.ACCEPTANCE, source=c.Source.MAG, variant="PREFIX")
+@component("GENERATION:ACCEPTANCE:MAG:PREFIX")
 def accept_prefix(
     proposed: mx.array, target_samples: mx.array, stop_tokens: tuple[int, ...] = ()
 ) -> AcceptedPrefix:

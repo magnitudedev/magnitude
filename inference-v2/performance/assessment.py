@@ -5,7 +5,9 @@ from __future__ import annotations
 import statistics
 from dataclasses import asdict
 
-from magnitude_engine import components as c
+from magnitude_engine.components import component_id
+from magnitude_engine.models.state.hybrid import HybridStateStore
+from performance.facts import AttentionGeometry
 from performance.records import Assembly, Profile, digest
 from performance.theory.catalog import MODELS, evaluate, requirements, revision
 from performance.theory.engine import neural_point
@@ -56,10 +58,7 @@ def formulate(graph: Assembly, workload: dict, profile: Profile, *, bindings=Non
         for child in (*node.children.values(), *node.dependencies.values()):
             visit(child)
         inputs = neural_point(point) | {"information_domain": path}
-        if (
-            isinstance(node.parameters, c.AttentionGeometry)
-            and node.parameters.kv_source is not None
-        ):
+        if isinstance(node.parameters, AttentionGeometry) and node.parameters.kv_source is not None:
             inputs["kv_information_domain"] = (
                 path.split(".layers.")[0] + ".kv." + str(node.parameters.kv_source)
             )
@@ -259,7 +258,9 @@ def assess_view(run: dict, observations: dict, state: dict) -> None:
             visit(child)
         key = evidence_key(fingerprints[path], profile.identity, *observation_binding(run, path))
         observation = observations.get(key)
-        if node.component == c.HYBRID_STATE and "MEM" not in (observation or {}):
+        if node.component == component_id(HybridStateStore).kind and "MEM" not in (
+            observation or {}
+        ):
             # This contract owns disjoint KV-arena and recurrent-image backing.
             # Repeated references to the same child remain a single allocation.
             memory = [
@@ -319,7 +320,7 @@ def assess_view(run: dict, observations: dict, state: dict) -> None:
                 if percent > 100 + 1e-9:
                     reason = "observation exceeds theoretical bound"
             assessed[dimension] = {
-                "dimension": f"{node.component.identity}/{dimension}",
+                "dimension": f"{node.component}/{dimension}",
                 "observed": value,
                 "bound": asdict(bound),
                 "percent": percent,

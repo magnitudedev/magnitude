@@ -90,17 +90,24 @@ It does not erase history or rename the component.
 
 ## Blueprints and execution components
 
-`@blueprint` marks immutable construction instructions: configuration, dependency selection
-and serialization to a worker. `@component` marks an actual execution class or operation,
-with a typed contract, source and variant. These are different roles, not two component
-registries. A blueprint selects a constructor; the constructed object carries its execution
-identity. A loader may bind many layer instances from that selection and model weights.
+`@component("MODEL:ATTENTION:MAG:PAGED")` declares the canonical ID once on the
+execution class or operation. The ID is validated and stored as a `ComponentId`.
+Schemas, benchmarks and constructors reference that class or its instances; they
+obtain the ID through `component_id(...)`. There is no separate ID catalog, source
+argument, variant argument or reporting schema in the declaration.
 
-For example, the `Paged` attention blueprint constructs `MetalPagedAttention`, declared as
-`MODEL:ATTENTION:MAG:PAGED`. Its selected prefill operation is an actual child. Capturing the
-loaded model reads that relationship and the layer's geometry; it does not inspect the
-blueprint to invent a second tree. Switching to `Gathered` changes the captured child through
-the same production construction path.
+`@blueprint` marks immutable construction instructions. Its `implementation()` already
+references the constructor. A direct constructor exposes its component ID there; a
+loader's produced execution objects expose their concrete identities after loading.
+A blueprint does not copy IDs or construct a parallel hierarchy.
+
+Capture follows actual children and shared dependencies, attaching the ID from each
+object's declaration. A distinct execution child, such as compiled Qwen decode, carries
+its own declaration. Deliberate implementations sharing an existing identity reference
+its declaring class with `@component(ExistingClass)`; repeating an ID declaration fails.
+
+Serialized graphs retain IDs and explicit edges across processes and machines. Code
+moves preserve the declared ID; executable fingerprints track revisions separately.
 
 Model roots also reference their production `ModelDefinition`, which owns both stable model
 identity and default construction. Performance history uses that identity while recording
@@ -117,17 +124,20 @@ state/aliasing, supported inputs and resource lifetime. A reference identifies t
 boundary and conditions it validates; naming one is not proof of equivalence.
 
 Assemblies connect selected implementations and shared dependencies. Ownership and
-sharing form a graph even when displayed as a tree. The current authoritative trees
+sharing form a graph even when displayed as a tree. Semantic assemblies are documented for the
 are the [engine](engine/components.md#assembly),
 [Qwen](models/architectures/qwen35.md#assembly),
 [Gemma](models/architectures/gemma4.md#assembly) and
 [generic upstream executor](models/architectures/generic-mlx-vlm.md#assembly).
 [Model composability](models/composability.md) defines substitution within those trees.
 
-These trees describe the actual implementation hierarchy, including conditional
-selections and shared dependencies. Performance evidence does not change their
-structure. Current dimension percentages and supporting benchmark IDs are annotations
-under the [tree convention](performance.md#tree-annotations-and-benchmark-references).
+Architecture trees summarize the implementation's semantic structure with canonical IDs.
+Show a repeated layer pattern once, distinguish alternatives from sequential work, and
+identify optional branches and shared dependencies. Grouping labels are explanatory;
+they do not invent component identities. Exact instance counts, paths and selected
+bindings come from runtime captures in the performance tooling, which also owns current
+assessments. A semantic group does not imply one percentage for all its instances.
+Generated performance views use the [tree convention](performance.md#tree-annotations-and-benchmark-references).
 Implementation identity, performance dimension and benchmark identity remain distinct;
 the benchmark reference resolves to applicable recorded results without adding
 provenance nodes to the assembly.

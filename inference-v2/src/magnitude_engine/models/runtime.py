@@ -8,6 +8,8 @@ from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 
+from magnitude_engine.components import component
+
 from .execution import (
     ExecutionOwner,
     ExecutionScope,
@@ -263,6 +265,7 @@ class ModelAdvance[S, C]:
         self.sequence.pending = None
 
 
+@component("MODEL:EXECUTOR:MAG:STANDARD")
 class ModelRuntime[S, C]:
     def __init__(
         self, program: ModelProgram[S], states: ModelStateStore[S, C], owner: ExecutionOwner
