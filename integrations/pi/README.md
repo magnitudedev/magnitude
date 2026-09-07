@@ -44,7 +44,7 @@ does all connection configuration and can be run safely after a standalone packa
 
 The extension bundles Magnitude's private SDK. Model status, loading, and stopping use the existing
 RPC endpoint at port 10100. When necessary the SDK runs `magnitude service start`; it does not use
-CLI output as a model API. If `/load-model` or `/stop-model` encounters a protocol mismatch, the
+CLI output as a model API. If `/stop-model` encounters a protocol mismatch, the
 extension runs `magnitude connections sync pi` once to install the exact plugin version selected by
 the installed CLI, then reloads Pi. Retry your model command after reload; it is never replayed
 automatically. Failed sync reports the error without reloading or looping. Manually owned incompatible
@@ -57,7 +57,6 @@ latency, and token-weighted generation throughput. Pi extensions execute with yo
 Commands:
 
 - `/magnitude-setup` — open Magnitude's graphical model setup inside Pi
-- `/load-model [model-id]` — load an installed model
 - `/stop-model` — stop the active model
 
 Installed Magnitude models appear in Pi's built-in `/model` selector. To discover, compare, install,

@@ -5,7 +5,7 @@ import { minimatch } from "minimatch"
 import { basename, dirname, resolve, sep } from "node:path"
 import { homedir } from "node:os"
 import { isDeepStrictEqual } from "node:util"
-import { satisfies } from "semver"
+import { satisfies, validRange } from "semver"
 import { MAGNITUDE_RPC_VERSION } from "@magnitudedev/sdk"
 import releasePlan from "@magnitudedev/release/plan"
 import { verifyPluginContent } from "@magnitudedev/release/plugin-content"
@@ -103,8 +103,12 @@ export const makePiCompanion = (paths: HarnessConnectionPaths, desiredSource: st
     if (!(yield* fs.exists(resolve(root, "package.json")))) return false
     const manifest = yield* fs.readFileString(resolve(root, "package.json")).pipe(Effect.flatMap(decodeManifest))
     const configuredVersion = source.startsWith(`npm:${PI_COMPANION_PACKAGE_IDENTITY}@`) ? source.slice(`npm:${PI_COMPANION_PACKAGE_IDENTITY}@`.length) : "*"
+    // npm resolves dist-tags at install time; they are not semver constraints.
+    const versionMatchesSource = validRange(configuredVersion) === null
+      ? encodeURIComponent(configuredVersion) === configuredVersion
+      : satisfies(manifest.version, configuredVersion, { includePrerelease: true })
     if (manifest.name !== PI_COMPANION_PACKAGE_IDENTITY
-      || source.startsWith("npm:") && !satisfies(manifest.version, configuredVersion, { includePrerelease: true })
+      || source.startsWith("npm:") && !versionMatchesSource
       || !manifest.pi.extensions.includes(`./${PI_COMPANION_EXTENSION_PATH}`)) {
       return yield* new PiPackageError({ message: `Unsupported Magnitude for Pi package at ${root}; update this package explicitly before connecting.` })
     }
