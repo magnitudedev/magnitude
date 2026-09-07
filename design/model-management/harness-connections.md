@@ -257,6 +257,10 @@ is compatible when its recorded file hashes verify and its declared RPC version 
 no other check applies. Unrelated user-owned packages are not replaced.
 An unversioned npm installation accepts stable and prerelease package versions alike; absence of
 a version constraint cannot implicitly exclude a compatible prerelease.
+An npm dist-tag such as `alpha` or `latest` is an installation selector, not a semantic-version
+range. Reconciliation preserves the user's tag and validates the installed package without resolving
+the tag again or upgrading it. Explicit versions and ranges must still match the installed version;
+tagged installations retain the same content-integrity and RPC-version checks.
 
 On a protocol mismatch from an explicit model command, the Pi extension runs
 `magnitude connections sync pi` once per loaded extension, through the same CLI executable used
@@ -270,9 +274,10 @@ The SDK continues to report mismatches without owning plugin repair or CLI upgra
 
 The extension owns the starter and sync commands' scoped lifetimes. Disposing it cancels
 pending work; terminal request handles and older runs cannot mutate newer presentation. Presentation
-failures do not prevent inference. Status completion lookups share in-flight work and briefly cache
-ready discovery, but never cache initialization or failure. Explicit model selection refreshes status.
-Loading is acknowledged only after server readiness, without interpreting CLI output as a model-control protocol.
+failures do not prevent inference. Installed Magnitude models are selected through Pi's native
+`/model` selector; inference requests load the selected model on demand. The extension does not
+provide a separate load command or model picker. Its `/stop-model` command uses the existing RPC
+without changing Pi's selected model.
 
 The repository exposes one `dev:pi` entrypoint. It waits up to 30 seconds for an installed Magnitude
 model to appear, including when initial status snapshots are ready but empty, then selects it, connects
