@@ -1,15 +1,13 @@
-"""Host-side opinions produce ordinary, inspectable concrete composition."""
+"""Host-side qualification policy selects a production definition's defaults."""
 
 from magnitude_engine.artifacts.source import LocalArtifact
 from magnitude_engine.composition import Blueprint
 
-from .architectures.mlx_vlm.blueprint import Forward, ModelLoader
-from .executor.blueprint import Executor
-from .state.blueprint import Native
+from .architectures.mlx_vlm.definition import DEFINITION
+from .executor.contracts import ExecutorFactory
 
 
-def auto(artifact: Blueprint[LocalArtifact]) -> Executor:
-    # The qualification gate currently selects resident upstream execution.
-    # Architecture/cache compatibility is finalized by the upstream binding.
-    source = ModelLoader(artifact=artifact)
-    return Executor(program=Forward(source=source), state=Native(source=source))
+def auto(artifact: Blueprint[LocalArtifact]) -> Blueprint[ExecutorFactory]:
+    # Qualification still selects resident upstream execution. A promotion changes
+    # this production choice, never a benchmark or presentation registry.
+    return DEFINITION.default(artifact)

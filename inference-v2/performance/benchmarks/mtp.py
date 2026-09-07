@@ -4,6 +4,7 @@ from contextlib import ExitStack
 from dataclasses import replace
 from typing import Any
 
+from magnitude_engine import components as c
 from performance.assembly import Binding, BoundAssembly, inspect_engine, source_files
 from performance.benchmarks.fixtures import record_inputs, tokens
 from performance.benchmarks.numerics import compare
@@ -37,13 +38,13 @@ def benchmark(
         raise ValueError("engine has no attached MTP head")
     generation = engine.engine.generation
     target, head = generation.model, generation.method.head
-    program = getattr(head.program, "_program", head.program)
+    program = assembly.at("draft").instance
     bound = assembly.at("draft" if mode == "execute" else "draft.state")
     if reference:
         sources = source_files(benchmark)
         node = replace(
             bound.node,
-            implementation="MODEL:QWEN35.MTP:MAG:UPSTREAM_ADAPTER",
+            binding=c.Implementation(c.QWEN_MTP, c.Source.MAG, "UPSTREAM_ADAPTER"),
             source=digest(sources),
             children={},
             dependencies={},
@@ -158,7 +159,8 @@ def benchmark(
             mx.array([continuation[:query_tokens]], mx.int32),
             {"previous_hidden": previous[:, history_tokens : history_tokens + query_tokens]},
         )
-        emb = embedding(getattr(program.embedding, "_embedding", program.embedding))
+        embedding_path = assembly.graph.nodes["draft"].children["embedding"]
+        emb = embedding(assembly.at(embedding_path).instance)
         row: Any = None
         caches = []
 

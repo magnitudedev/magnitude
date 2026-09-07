@@ -74,7 +74,7 @@ writes proved necessary at that boundary. With upper bandwidth `B_r`:
 Q_r(D) = max(0, |I_r| - S_r) + |O_r|
 L_data(D) = max_r Q_r(D) / B_r
 L(D) = max(L_data(D), max_c F_c(D) / C_c, L_dependency(D))
-U(D,u) = u / L(D)                         efficiency = L(D) / T
+U(D,u) = u / L(D)                         efficiency_floor = L(D) / T
 ```
 
 Read/write directions share a bandwidth only where the capacity definition says
@@ -124,3 +124,27 @@ Parent sensitivity is a counterfactual evaluation of this same plan with specifi
 child costs or execution choices changed. It is an estimate, not proof of a speedup
 or a percentage to add to other nodes. Changes that alter fusion/overlap, memory
 feasibility or scheduling require reevaluating the plan itself.
+
+## Dependent-phase refinement
+
+`dependent_time_bound` implements `RESOURCE:DEPENDENT_READS`. For phase `i`, let
+`W_i` be incompressible information that must be accessed after its prerequisite is
+available; at most `F` bytes can already be resident. At least `max(0,W_i−F)` bytes
+must cross DRAM. If the contract forbids these accesses overlapping across phase
+barriers, summing gives `T ≥ Σ_i max(0,W_i−F)/B_upper`.
+
+The `DependentPhases` input records the phase demands and a reference to the proof
+establishing those premises. This is a conditional theorem, not an automatic property
+of sequential output tokens. Precomputed summaries, speculation and replay can invalidate
+the required post-barrier accesses. A benchmark name or observed execution cannot prove
+the premises. Without them the evaluator retains the wider, one-read relaxation.
+
+## Checked sensitivity
+
+[sensitivity.py](../../../performance/theory/sensitivity.py) evaluates finite changes:
+serial saving is `n_i Δ_i`; parallel saving is `max_j(n_j t_j) − max_j(n_j t'_j)`.
+The latter handles a change that moves the bottleneck to another child. Joint execution
+has no such inference. Published sensitivity requires compatible child observations,
+a direct parent observation and explicit `composition_tolerance` in seconds/fraction.
+Disagreement flags the declaration and suppresses the prediction. Agreement is a check,
+not a proof; predictions remain conditional on the declared composition surviving the change.

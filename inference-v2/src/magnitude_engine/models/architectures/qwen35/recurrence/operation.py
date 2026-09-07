@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
 from magnitude_engine.models.execution import ExecutionScope
 from magnitude_engine.models.recurrence.gated_delta import GatedDelta
 from magnitude_engine.models.state.hybrid import HybridState
@@ -13,6 +15,7 @@ Transform = Callable[[mx.array], mx.array]
 
 
 @dataclass(frozen=True)
+@component(c.QWEN_RECURRENCE, source=c.Source.MAG, variant="COMPILED_REGION")
 class RecurrentMixer:
     index: int
     operation: GatedDelta

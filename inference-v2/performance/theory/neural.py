@@ -1,35 +1,31 @@
 """Neural requirements under explicit representation and arithmetic assumptions."""
 
+from magnitude_engine.components import AttentionGeometry, RecurrentGeometry
 from performance.theory.resources import Demands, Extent
+from performance.theory.workloads import AttentionWorkload, RecurrentWorkload
 
 
-def attention(p: dict, w: dict) -> Demands:
-    required = ("query_heads", "kv_heads", "key_width", "value_width", "element_bytes")
-    missing = tuple(k for k in required if k not in p)
-    if missing or "histories" not in w or "query_tokens" not in w:
-        return Demands(
-            missing=missing + tuple(k for k in ("histories", "query_tokens") if k not in w)
-        )
-    q, histories = w["query_tokens"], w["histories"]
+def attention(p: AttentionGeometry, w: AttentionWorkload) -> Demands:
+    q, histories = w.query_tokens, w.histories
     if q < 1 or not histories or any(h < 0 for h in histories):
         raise ValueError("invalid attention workload")
-    window = p.get("window")
+    window = p.window
     pairs = sum(
         sum(min(h + j, window) if window else h + j for j in range(1, q + 1)) for h in histories
     )
     visible = sum(min(h + q, window + q - 1) if window else h + q for h in histories)
     b, hq, hk, dk, dv, size = (
         len(histories),
-        p["query_heads"],
-        p["kv_heads"],
-        p["key_width"],
-        p["value_width"],
-        p["element_bytes"],
+        p.query_heads,
+        p.kv_heads,
+        p.key_width,
+        p.value_width,
+        p.element_bytes,
     )
     if min(hq, hk, dk, dv, size) < 1 or hq % hk or (window is not None and window < 1):
         raise ValueError("invalid attention geometry")
-    namespace = w.get("information_domain", "attention")
-    kv_namespace = w.get("kv_information_domain", namespace)
+    namespace = w.information_domain
+    kv_namespace = w.kv_information_domain or namespace
     kv = visible * hk * (dk + dv) * size
     ops = hq * pairs * (2 * dk - 1) + hq * dv * (2 * pairs - b * q)
     return Demands(
@@ -39,9 +35,9 @@ def attention(p: dict, w: dict) -> Demands:
             Extent("activation:" + namespace + ".q", 0, b * q * hq * dk * size),
         ),
         (Extent(namespace + ".output", 0, b * q * hq * dv * size),),
-        {"scalar": ops} if w.get("conventional_arithmetic", False) else {},
+        {"scalar": ops} if w.conventional_arithmetic else {},
         ("fixed representation; arbitrary content-dependent attention",)
-        + (("conventional dot-product arithmetic",) if w.get("conventional_arithmetic") else ()),
+        + (("conventional dot-product arithmetic",) if w.conventional_arithmetic else ()),
     )
 
 
@@ -67,20 +63,14 @@ def affine_bytes(n: int, k: int, bits: int, group_size: int, metadata_bytes: int
     return n * ((k * bits + 7) // 8 + (k + group_size - 1) // group_size * metadata_bytes)
 
 
-def recurrence(p: dict, w: dict) -> Demands:
-    keys = ("key_heads", "value_heads", "key_width", "value_width", "element_bytes")
-    missing = tuple(k for k in keys if k not in p) + tuple(
-        k for k in ("batch_size", "query_tokens") if k not in w
-    )
-    if missing:
-        return Demands(missing=missing)
-    b, q = w["batch_size"], w["query_tokens"]
-    hk, hv, dk, dv, size = (p[k] for k in keys)
+def recurrence(p: RecurrentGeometry, w: RecurrentWorkload) -> Demands:
+    b, q = w.batch_size, w.query_tokens
+    hk, hv, dk, dv, size = p.key_heads, p.value_heads, p.key_width, p.value_width, p.element_bytes
     if min(b, q, hk, hv, dk, dv, size) < 1 or hv % hk:
         raise ValueError("invalid recurrence geometry")
     state = b * hv * dk * dv * 4
     incoming = b * q * (2 * hk * dk * size + hv * dv * size + hv * (size + 4))
-    ns = w.get("information_domain", "recurrence")
+    ns = w.information_domain
     return Demands(
         (Extent(ns + ".state", 0, state), Extent("activation:" + ns + ".inputs", 0, incoming)),
         (Extent(ns + ".next_state", 0, state), Extent(ns + ".outputs", 0, b * q * hv * dv * size)),

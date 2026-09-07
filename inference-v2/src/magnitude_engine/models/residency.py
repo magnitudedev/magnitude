@@ -12,6 +12,7 @@ import mlx.core as mx
 from magnitude_engine.resources.budget import MemoryBudget
 from magnitude_engine.resources.lifetime import Closable
 
+from .definition import ModelDefinition
 from .execution import ExecutionOwner
 from .ownership import OwnedProgram, VocabularyLoan
 from .runtime import ModelRuntime
@@ -28,6 +29,7 @@ class ModelDescriptor:
     vocab_size: int
     tokenizer_identity: str
     implementation: str
+    definition: ModelDefinition
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,7 @@ class BoundProgram:
 class BoundExecutor:
     model: ModelRuntime
     program: BoundProgram
+    selection: str = "candidate"
 
 
 class ModelResources:

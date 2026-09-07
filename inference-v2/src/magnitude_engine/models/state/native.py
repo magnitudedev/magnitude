@@ -26,6 +26,8 @@ from mlx_vlm.models.cache import ArraysCache as VLMArrayCache
 from mlx_vlm.models.cache import KVCache as VLMKVCache
 from mlx_vlm.models.cache import RotatingKVCache as VLMRotatingKVCache
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
 from magnitude_engine.resources.budget import MemoryBudget, Reservation
 from magnitude_engine.resources.retention import RetainedStorage
 
@@ -90,8 +92,11 @@ def _replacement_bytes(cache: Cache, count: int) -> int:
         return 0
     if type(cache) in (RotatingKVCache, VLMRotatingKVCache):
         length = cache.keys.shape[2]
-        replaces = (count > 1 or length > cache.max_size
-                    or (cache.offset >= length and length < cache.max_size))
+        replaces = (
+            count > 1
+            or length > cache.max_size
+            or (cache.offset >= length and length < cache.max_size)
+        )
     elif type(cache) is ConcatenateKVCache:
         replaces = True
     else:
@@ -194,9 +199,7 @@ class LibraryTransaction:
                 # A capacity high-water mark can hide physical replacement:
                 # rotating windows concatenate at steady size, and a previous
                 # wide query can prepay more than a later append allocation.
-                physical = sum(
-                    _replacement_bytes(cache, inputs.count) for cache in state.caches
-                )
+                physical = sum(_replacement_bytes(cache, inputs.count) for cache in state.caches)
                 replacement = max(replacement, physical)
                 if replacement:
                     self.growth_peak = state.store.budget.reserve(
@@ -270,6 +273,7 @@ class LibraryTransaction:
         self.closed = True
 
 
+@component(c.NATIVE_STATE, source=c.Source.MAG, variant="NATIVE")
 class LibraryStateStore:
     def __init__(
         self,
@@ -354,8 +358,10 @@ class LibraryStateStore:
                     pass  # Existing storage remains valid if compaction cannot fit its peak.
         end = max(state.position for state in states) + width
         batch.reserve(self.capacity(end, width))
-        if any(isinstance(layer, DenseKV) and layer.keys is not None
-               and end > layer.keys.shape[2] for layer in batch.layers):
+        if any(
+            isinstance(layer, DenseKV) and layer.keys is not None and end > layer.keys.shape[2]
+            for layer in batch.layers
+        ):
             states[0].staged_growth = self.budget.reserve(
                 "native-batch-growth",
                 sum(a.nbytes for layer in batch.layers for a in layer.arrays()),

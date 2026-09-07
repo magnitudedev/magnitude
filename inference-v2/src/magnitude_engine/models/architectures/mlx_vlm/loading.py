@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass
 
-import mlx.core as mx
 from mlx_vlm.models.cache import make_prompt_cache
 from mlx_vlm.utils import get_model_and_args
 
@@ -27,7 +26,8 @@ from magnitude_engine.models.residency import (
 from magnitude_engine.models.state.native import _SUPPORTED, _arrays, _detach
 from magnitude_engine.resources.io.reader import PositionalReader
 
-from .program import LibraryProgram
+from .definition import DEFINITION
+from .program import LibraryForward, LibraryProgram
 
 
 @dataclass(eq=False)
@@ -112,15 +112,6 @@ class UpstreamLoader(ProgramSource):
             owner="upstream.weights",
         )
         try:
-
-            def call(tokens: mx.array, cache: list) -> mx.array:
-                offset = next((c.offset for c in cache if hasattr(c, "offset")), 0)
-                if isinstance(offset, mx.array) and offset.ndim == 1:
-                    offset = offset[:, None]
-                positions = mx.arange(tokens.shape[1], dtype=mx.int32)[None, :] + offset
-                output = model(tokens, cache=cache, position_ids=positions)
-                return output if isinstance(output, mx.array) else output.logits
-
             identity = tokenizer_identity(self.artifact.directory)
             # Vocabulary sharing is advertised only when this binding can provide
             # the actual lookup/projection pair. Plain execution doesn't require it.
@@ -132,7 +123,7 @@ class UpstreamLoader(ProgramSource):
                     inner.embed_tokens.as_linear if arguments.tie_word_embeddings else model.lm_head
                 )
                 vocabulary = (identity, arguments.vocab_size, embedding, project)
-            owned = OwnedProgram(LibraryProgram(call), (allocation,), vocabulary)
+            owned = OwnedProgram(LibraryProgram(LibraryForward(model)), (allocation,), vocabulary)
             resources.own(owned)
             return BoundProgram(
                 owned,
@@ -142,6 +133,7 @@ class UpstreamLoader(ProgramSource):
                     arguments.vocab_size,
                     identity,
                     f"{language.__module__}.{language.__qualname__}",
+                    DEFINITION,
                 ),
                 NativeRequirements(make_cache, capacity, self),
             )
@@ -200,9 +192,12 @@ def native_capacity(arguments, caches):
         )
     kv_bytes = heads * width * 2 * 4
     layouts = tuple(
-        (getattr(cache, "step", 256),
-         cache.max_size if isinstance(cache, RotatingKVCache) else None)
-        for cache in caches if not isinstance(cache, ArraysCache)
+        (
+            getattr(cache, "step", 256),
+            cache.max_size if isinstance(cache, RotatingKVCache) else None,
+        )
+        for cache in caches
+        if not isinstance(cache, ArraysCache)
     )
 
     def capacity(position: int, query_tokens: int) -> int:

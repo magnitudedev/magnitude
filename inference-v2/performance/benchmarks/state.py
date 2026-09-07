@@ -2,6 +2,7 @@
 
 from contextlib import ExitStack
 
+from magnitude_engine import components as c
 from performance.assembly import Binding, inspect_engine, inspect_state
 from performance.benchmarks.fixtures import record_inputs, tokens
 from performance.benchmarks.model import prefix
@@ -96,7 +97,7 @@ def append(component, *, prefix_tokens, append_tokens=1, granularity="runs", **r
             return Observation(
                 digest(sums),
                 {"physical_kv_bytes": physical},
-                metrics={"MEM": physical} if bound.node.component == "KV:STORE" else {},
+                metrics={"MEM": physical} if bound.node.component == c.KV_STORE else {},
             )
 
         run.measure(
@@ -324,7 +325,7 @@ def restore(
                     complete=lambda _: model.owner.backend.drain(),
                     validate=validate,
                     deterministic=True,
-                    dimension=None if bound.node.component == "KV:STORE" else "RESTORE",
+                    dimension=None if bound.node.component == c.KV_STORE else "RESTORE",
                 )
             finally:
                 if row is not None:
@@ -345,12 +346,23 @@ def recurrent_image(image, *, live_rows=1, checkpoints=4, **record):
 
     from performance.assembly import bind_operation
 
-    layouts = [
-        [{"shape": list(t.shape), "bytes": t.nbytes} for t in layer.tensors]
-        for layer in image.layouts
-    ]
     bound = bind_operation(
-        image, "STATE:RECURRENT:MAG:CHECKPOINTED", parameters={"layouts": layouts}
+        image,
+        c.Implementation(c.RECURRENT_STATE, c.Source.MAG, "CHECKPOINTED"),
+        parameters=c.RecurrentStorage(
+            layouts=tuple(
+                tuple(
+                    c.TensorFacts(
+                        identity=f"recurrent.{i}.{j}",
+                        shape=t.shape,
+                        bytes=t.nbytes,
+                        dtype=str(t.dtype),
+                    )
+                    for j, t in enumerate(layer.tensors)
+                )
+                for i, layer in enumerate(image.layouts)
+            )
+        ),
     )
     workload = {
         "retained_rows": live_rows,

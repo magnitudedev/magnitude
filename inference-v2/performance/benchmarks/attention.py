@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from magnitude_engine import components as c
 from performance.assembly import Binding, inspect_component
 from performance.benchmarks.numerics import compare
 from performance.records import digest
@@ -44,7 +45,15 @@ class Inputs:
 
 
 @contextmanager
-def prepare(*, context_tokens, query_tokens, geometry, fragmented=False, seed=131):
+def prepare(
+    *,
+    context_tokens,
+    query_tokens,
+    geometry: c.AttentionGeometry,
+    dtype="bfloat16",
+    fragmented=False,
+    seed=131,
+):
     import mlx.core as mx
 
     from magnitude_engine.models.state.arena import KVArena, LayerGeometry
@@ -54,8 +63,13 @@ def prepare(*, context_tokens, query_tokens, geometry, fragmented=False, seed=13
 
     if context_tokens < 0 or query_tokens < 1:
         raise ValueError("invalid attention lengths")
-    hq, hk, dk, dv = (geometry[k] for k in ("query_heads", "kv_heads", "key_width", "value_width"))
-    dtype = getattr(mx, geometry.get("dtype", "bfloat16"))
+    hq, hk, dk, dv = (
+        geometry.query_heads,
+        geometry.kv_heads,
+        geometry.key_width,
+        geometry.value_width,
+    )
+    dtype = getattr(mx, dtype)
     total = context_tokens + query_tokens
     pages = (total + 15) // 16
     arena = KVArena(
@@ -83,8 +97,8 @@ def prepare(*, context_tokens, query_tokens, geometry, fragmented=False, seed=13
         kv = read_layer((state,), 0)
         scale = dk**-0.5
         mask = mx.arange(total)[None, :] <= (context_tokens + mx.arange(query_tokens))[:, None]
-        if geometry.get("window") is not None:
-            first = context_tokens + mx.arange(query_tokens) - geometry["window"] + 1
+        if geometry.window is not None:
+            first = context_tokens + mx.arange(query_tokens) - geometry.window + 1
             mask = mask & (mx.arange(total)[None, :] >= first[:, None])
         reference = mx.fast.scaled_dot_product_attention(
             queries.astype(mx.float32),
@@ -101,7 +115,8 @@ def prepare(*, context_tokens, query_tokens, geometry, fragmented=False, seed=13
                 {
                     "recipe": "normal-qkv-v1",
                     "seed": seed,
-                    "geometry": geometry,
+                    "geometry": geometry.model_dump(mode="json"),
+                    "dtype": str(dtype),
                     "context_tokens": context_tokens,
                     "query_tokens": query_tokens,
                 }
@@ -121,7 +136,8 @@ def benchmark(
     *,
     context_tokens,
     query_tokens=1,
-    geometry=None,
+    geometry: c.AttentionGeometry | None = None,
+    dtype="bfloat16",
     fragmented=False,
     inputs=None,
     profile=None,
@@ -131,26 +147,25 @@ def benchmark(
 ):
     import mlx.core as mx
 
-    binding = (
-        component
-        if isinstance(component, Binding)
-        else inspect_component(component).at("component")
-    )
-    if geometry is None:
-        geometry = {
-            k: binding.node.parameters[k]
-            for k in ("query_heads", "kv_heads", "key_width", "value_width", "element_bytes")
-            if k in binding.node.parameters
-        }
-        if len(geometry) != 5:
-            raise ValueError("standalone attention requires explicit geometry")
-        if "window" in binding.node.parameters:
-            geometry["window"] = binding.node.parameters["window"]
+    if isinstance(component, Binding):
+        binding = component
+        if geometry is None:
+            parameters = binding.node.parameters
+            if not isinstance(parameters, c.AttentionGeometry):
+                raise TypeError("bound attention is missing its geometry")
+            geometry = parameters
+    else:
+        if geometry is None:
+            raise ValueError("standalone attention requires typed geometry")
+        binding = inspect_component(component, context=geometry).at("component")
+    if not isinstance(geometry, c.AttentionGeometry):
+        raise TypeError("attention requires AttentionGeometry")
     workload = {
         "histories": [context_tokens],
         "batch_size": 1,
         "query_tokens": query_tokens,
-        "geometry": geometry,
+        "geometry": geometry.model_dump(mode="json"),
+        "dtype": str(dtype),
         "fragmented": fragmented,
         "fixture": "synthetic.normal",
         "seed": 131,
@@ -167,22 +182,22 @@ def benchmark(
     ) as run:
 
         def execute(prepared):
-            shape = (1, geometry["query_heads"], query_tokens, geometry["key_width"])
+            shape = (1, geometry.query_heads, query_tokens, geometry.key_width)
             if (
                 prepared.queries.shape != shape
-                or prepared.queries.dtype.size != geometry["element_bytes"]
+                or prepared.queries.dtype.size != geometry.element_bytes
             ):
                 raise ValueError("prepared attention inputs differ from declared geometry")
             if prepared.kv.lengths != (context_tokens + query_tokens,) or (
-                prepared.kv.keys.shape[0] != geometry["kv_heads"]
-                or prepared.kv.keys.shape[-1] != geometry["key_width"]
-                or prepared.kv.values.shape[-1] != geometry["value_width"]
+                prepared.kv.keys.shape[0] != geometry.kv_heads
+                or prepared.kv.keys.shape[-1] != geometry.key_width
+                or prepared.kv.values.shape[-1] != geometry.value_width
             ):
                 raise ValueError("prepared KV differs from declared geometry")
             workload["input_digest"] = prepared.identity()
             run.measure(
                 lambda: binding.instance.compute(
-                    prepared.queries, prepared.kv, prepared.scale, window=geometry.get("window")
+                    prepared.queries, prepared.kv, prepared.scale, window=geometry.window
                 ),
                 complete=mx.eval,
                 validate=lambda value: compare(value, prepared.reference, atol=2e-3, rtol=2e-3),
@@ -196,6 +211,7 @@ def benchmark(
                 context_tokens=context_tokens,
                 query_tokens=query_tokens,
                 geometry=geometry,
+                dtype=dtype,
                 fragmented=fragmented,
             ) as prepared:
                 execute(prepared)
@@ -223,20 +239,31 @@ def dense_attention(queries, keys, values, *, scale, mask):
     return mx.fast.scaled_dot_product_attention(queries, keys, values, scale=scale, mask=mask)
 
 
-def dense(*, context_tokens, query_tokens=1, geometry, component=None, **record):
+def dense(
+    *,
+    context_tokens,
+    query_tokens=1,
+    geometry: c.AttentionGeometry,
+    dtype="bfloat16",
+    component=None,
+    **record,
+):
     import mlx.core as mx
 
     from performance.assembly import bind_operation
     from performance.benchmarks.references import attention_core_equation
 
     bound = bind_operation(
-        component or dense_attention, "MODEL:ATTENTION:MLX:DENSE", parameters=geometry
+        component or dense_attention,
+        c.Implementation(c.ATTENTION, c.Source.MLX, "DENSE"),
+        parameters=geometry,
     )
     workload = {
         "histories": [context_tokens],
         "query_tokens": query_tokens,
         "batch_size": 1,
-        "geometry": geometry,
+        "geometry": geometry.model_dump(mode="json"),
+        "dtype": str(dtype),
         "fixture": "synthetic.normal",
         "seed": 131,
         "numerical_contract": "fp32-equation-atol2e-3-rtol2e-3",
@@ -248,18 +275,18 @@ def dense(*, context_tokens, query_tokens=1, geometry, component=None, **record)
         boundary="dense-qkv-through-output-ready",
         **record,
     ) as run:
-        dtype = getattr(mx, geometry.get("dtype", "bfloat16"))
-        if dtype.size != geometry["element_bytes"]:
+        dtype = getattr(mx, dtype)
+        if dtype.size != geometry.element_bytes:
             raise ValueError("attention dtype differs from declared representation")
         mx.random.seed(131)
-        q = mx.random.normal(
-            (1, geometry["query_heads"], query_tokens, geometry["key_width"])
-        ).astype(dtype)
+        q = mx.random.normal((1, geometry.query_heads, query_tokens, geometry.key_width)).astype(
+            dtype
+        )
         k = mx.random.normal(
-            (1, geometry["kv_heads"], context_tokens + query_tokens, geometry["key_width"])
+            (1, geometry.kv_heads, context_tokens + query_tokens, geometry.key_width)
         ).astype(dtype)
         v = mx.random.normal(
-            (1, geometry["kv_heads"], context_tokens + query_tokens, geometry["value_width"])
+            (1, geometry.kv_heads, context_tokens + query_tokens, geometry.value_width)
         ).astype(dtype)
         expected = attention_core_equation(q, k, v)
         mx.eval(q, k, v, expected)
@@ -268,7 +295,7 @@ def dense(*, context_tokens, query_tokens=1, geometry, component=None, **record)
                 q,
                 k,
                 v,
-                scale=geometry["key_width"] ** -0.5,
+                scale=geometry.key_width**-0.5,
                 mask="causal" if query_tokens > 1 else None,
             ),
             complete=mx.eval,

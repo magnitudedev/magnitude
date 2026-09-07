@@ -90,6 +90,7 @@ class Bound:
     missing: tuple[str, ...] = ()
     assumptions: tuple[str, ...] = ()
     kind: str | None = None
+    derivation: str = "CONTRACT:RELAXATION"
 
     def __post_init__(self):
         if self.kind is None:
@@ -134,5 +135,60 @@ def time_bound(demand: Demands, profile: Profile) -> Bound:
         "seconds",
         terms=terms,
         missing=tuple(sorted(set(missing))),
-        assumptions=demand.assumptions,
+        assumptions=demand.assumptions
+        + ("capacity inputs are upper bounds, not measured sustainable rates",),
+        derivation="RESOURCE:ROOFLINE",
     )
+
+
+@dataclass(frozen=True)
+class DependentPhases:
+    """Contract certificate, not an inference from an autoregressive benchmark label.
+
+    Each phase must access the declared incompressible information *after* its
+    prerequisite becomes available. No precomputation, persistent summary, replay
+    or speculative execution can discharge that access before the phase barrier.
+    The proof reference must establish these premises for this workload contract.
+    """
+
+    demands: tuple[Demands, ...]
+    proof: str
+
+    def __post_init__(self):
+        if not self.proof or not self.demands:
+            raise ValueError("dependent phases require a contract proof and nonempty demands")
+
+
+def dependent_time_bound(phases: DependentPhases, profile: Profile) -> Bound:
+    """At phase i at most F bytes are resident: T >= sum_i max(0,W_i-F)/B.
+
+    Uses only read traffic; arithmetic and transfer may overlap. The phase
+    barriers must exclude overlap of these reads across phases. Shared weights
+    are intentionally counted again; F is credited anew at every phase.
+    """
+    reads = [
+        time_bound(Demands(inputs=d.inputs, missing=d.missing), profile) for d in phases.demands
+    ]
+    return Bound(
+        None if any(b.value is None for b in reads) else sum(b.value or 0 for b in reads),
+        "seconds",
+        terms={"dependent_reads": sum(b.value or 0 for b in reads)},
+        missing=tuple(sorted({m for b in reads for m in b.missing})),
+        assumptions=(
+            "strict post-barrier information access; no precomputation or replay",
+            phases.proof,
+        ),
+        derivation="RESOURCE:DEPENDENT_READS",
+    )
+
+
+def tightened_time_bound(
+    demand: Demands, profile: Profile, phases: DependentPhases | None = None
+) -> Bound:
+    base = time_bound(demand, profile)
+    if phases is None:
+        return base
+    extra = dependent_time_bound(phases, profile)
+    if extra.value is None or (base.value is not None and base.value >= extra.value):
+        return base
+    return extra

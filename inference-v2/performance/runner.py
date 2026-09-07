@@ -66,7 +66,7 @@ class Run:
             raise ValueError("invalid benchmark measurement configuration")
         self.store, self.clock = store, clock
         self.record = {
-            "schema_version": 1,
+            "schema_version": 2,
             "id": uuid4().hex,
             "status": "running",
             "started_at": now(),
@@ -136,13 +136,13 @@ class Run:
                 "one observation boundary per run; start another run for another boundary"
             )
         self._measured = True
-        from performance.theory.catalog import DIMENSIONS
+        from magnitude_engine.components import implementation
+        from performance.theory.catalog import MODELS
 
-        allowed = DIMENSIONS[
-            self.record["assembly"]["nodes"][self.record["node"]]["implementation"].rsplit(":", 2)[
-                0
-            ]
-        ]
+        contract = implementation(
+            self.record["assembly"]["nodes"][self.record["node"]]["implementation"]
+        ).contract
+        allowed = MODELS[contract].dimensions
         if dimension is not None and dimension not in allowed:
             raise ValueError(f"unsupported timing dimension {dimension}")
         self.record["timing_dimension"] = dimension

@@ -1,5 +1,6 @@
 """Prepared recurrence and resulting state, shared across production implementations."""
 
+from magnitude_engine import components as c
 from performance.assembly import Binding, inspect_component
 from performance.benchmarks.numerics import compare
 from performance.runner import recording
@@ -22,18 +23,21 @@ def benchmark(
 
     from magnitude_engine.models.recurrence.inputs import DeltaInputs
 
-    binding = (
-        component
-        if isinstance(component, Binding)
-        else inspect_component(component).at("component")
-    )
-    geometry = (geometry or binding.node.parameters) | {
-        "element_bytes": 4 if dtype == "float32" else 2
-    }
+    if isinstance(component, Binding):
+        binding = component
+        geometry = geometry or binding.node.parameters
+    else:
+        if not isinstance(geometry, c.RecurrentGeometry):
+            raise TypeError("standalone recurrence requires RecurrentGeometry")
+        binding = inspect_component(component, context=geometry).at("component")
+    if not isinstance(geometry, c.RecurrentGeometry):
+        raise TypeError("recurrence requires RecurrentGeometry")
+    if geometry.element_bytes != (4 if dtype == "float32" else 2):
+        raise ValueError("recurrence dtype differs from bound geometry")
     workload = {
         "query_tokens": query_tokens,
         "batch_size": batch_size,
-        "geometry": geometry,
+        "geometry": geometry.model_dump(mode="json"),
         "dtype": dtype,
         "fixture": "synthetic.normal",
         "seed": 73,
@@ -49,7 +53,10 @@ def benchmark(
         repetitions=repetitions,
     ) as run:
         hk, hv, dk, dv = (
-            geometry[k] for k in ("key_heads", "value_heads", "key_width", "value_width")
+            geometry.key_heads,
+            geometry.value_heads,
+            geometry.key_width,
+            geometry.value_width,
         )
         mx.random.seed(73)
         q = mx.random.normal((batch_size, query_tokens, hk, dk)).astype(getattr(mx, dtype)) / dk

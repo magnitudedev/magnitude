@@ -1,6 +1,6 @@
 from dataclasses import field
 
-from magnitude_engine.composition import Blueprint, component
+from magnitude_engine.composition import Blueprint, blueprint
 from magnitude_engine.models.experts.blueprint import Resident
 from magnitude_engine.models.experts.contracts import ExpertFactory
 
@@ -9,7 +9,7 @@ from ..contracts import (
 )
 
 
-@component
+@blueprint
 class MoE(Blueprint[FeedForwardFactory]):
     experts: Blueprint[ExpertFactory] = field(default_factory=Resident)
 

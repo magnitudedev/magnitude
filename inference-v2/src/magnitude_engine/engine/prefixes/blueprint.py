@@ -1,12 +1,12 @@
 from dataclasses import field
 
-from magnitude_engine.composition import Blueprint, component
+from magnitude_engine.composition import Blueprint, blueprint
 
 from .contracts import PrefixIndex as Prefixes
 from .contracts import RetentionPolicy as Retention
 
 
-@component
+@blueprint
 class LeastRecentlyUsed(Blueprint[Retention]):
     max_entries: int = 32
     max_bytes: int | None = None
@@ -24,7 +24,7 @@ class LeastRecentlyUsed(Blueprint[Retention]):
         return LeastRecentlyUsed
 
 
-@component
+@blueprint
 class Radix(Blueprint[Prefixes]):
     retention: Blueprint[Retention] = field(default_factory=LeastRecentlyUsed)
 

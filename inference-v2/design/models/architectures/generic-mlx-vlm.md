@@ -163,7 +163,7 @@ costs.
 
 ## Qualification
 
-Current scores follow the [assessment rules](../../performance.md#evidence-and-current-assessments).
+Current scores follow the [assessment rules](../../performance.md#stable-compositions-and-evidence).
 
 These IDs describe existing responsibilities; they do not assert universal upstream
 parity. The September 6 native Gemma comparison established matching logits for the

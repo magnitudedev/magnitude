@@ -5,6 +5,9 @@ from typing import Any
 
 import mlx.core as mx
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
+
 from ..state.views import PagedKV
 from .contracts import PagedAttention
 from .gathered import GatheredAttention, validate_attention
@@ -120,6 +123,7 @@ def _combine() -> Any:
     )
 
 
+@component(c.ATTENTION, source=c.Source.MAG, variant="PAGED")
 class MetalPagedAttention:
     """Short query blocks use page addresses; prefill delegates to its own operator.
 
@@ -156,17 +160,31 @@ class MetalPagedAttention:
         count = queries.shape[2]
         covered = max(kv.lengths) if window is None else min(max(kv.lengths), window + count - 1)
         return self.apply(
-            queries, kv.keys, kv.values, kv.table.device,
+            queries,
+            kv.keys,
+            kv.values,
+            kv.table.device,
             mx.array([length - count for length in kv.lengths], mx.int32),
-            page_size=kv.page_size, table_width=kv.table.width, covered=covered,
-            scale=scale, window=window,
+            page_size=kv.page_size,
+            table_width=kv.table.width,
+            covered=covered,
+            scale=scale,
+            window=window,
         )
 
     def apply(
-        self, queries: mx.array, keys: mx.array, values: mx.array,
-        pages: mx.array, positions: mx.array, *,
-        page_size: int, table_width: int, covered: int,
-        scale: float, window: int | None = None,
+        self,
+        queries: mx.array,
+        keys: mx.array,
+        values: mx.array,
+        pages: mx.array,
+        positions: mx.array,
+        *,
+        page_size: int,
+        table_width: int,
+        covered: int,
+        scale: float,
+        window: int | None = None,
     ) -> mx.array:
         """Pure launch on validated storage; positions and mappings remain tensor inputs."""
         count = queries.shape[2]
@@ -188,9 +206,7 @@ class MetalPagedAttention:
             while cells % sharing:
                 sharing -= 1
             threadgroup = (32, 1, sharing)
-        layout = mx.array(
-            [keys.shape[1], page_size, splits, table_width, window or 0], mx.int32
-        )
+        layout = mx.array([keys.shape[1], page_size, splits, table_width, window or 0], mx.int32)
         partial = _partials()(
             inputs=[
                 queries,

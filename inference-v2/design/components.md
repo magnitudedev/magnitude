@@ -85,8 +85,28 @@ a distinct type rather than silently changing an old meaning.
 
 Implementation fingerprints identify exact measured content and child selections.
 Any implementation change resets current assessments through affected parent
-compositions under the [evidence rules](performance.md#evidence-and-current-assessments).
+compositions under the [evidence rules](performance.md#stable-compositions-and-evidence).
 It does not erase history or rename the component.
+
+## Blueprints and execution components
+
+`@blueprint` marks immutable construction instructions: configuration, dependency selection
+and serialization to a worker. `@component` marks an actual execution class or operation,
+with a typed contract, source and variant. These are different roles, not two component
+registries. A blueprint selects a constructor; the constructed object carries its execution
+identity. A loader may bind many layer instances from that selection and model weights.
+
+For example, the `Paged` attention blueprint constructs `MetalPagedAttention`, declared as
+`MODEL:ATTENTION:MAG:PAGED`. Its selected prefill operation is an actual child. Capturing the
+loaded model reads that relationship and the layer's geometry; it does not inspect the
+blueprint to invent a second tree. Switching to `Gathered` changes the captured child through
+the same production construction path.
+
+Model roots also reference their production `ModelDefinition`, which owns both stable model
+identity and default construction. Performance history uses that identity while recording
+implementation changes as snapshots. [Performance bindings](performance.md#binding-the-executed-composition)
+define how typed schemas read execution structure without adding reporting machinery to
+numerical code.
 
 ## Definitions and assemblies
 

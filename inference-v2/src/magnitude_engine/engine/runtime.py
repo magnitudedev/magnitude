@@ -7,6 +7,8 @@ from threading import Event, Lock
 from time import perf_counter_ns
 from uuid import uuid4
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
 from magnitude_engine.generation.constraint_spec import ConstraintError
 from magnitude_engine.generation.runtime import (
     GenerationRuntime,
@@ -46,6 +48,7 @@ class ServiceMeasurement:
     batch_size: int = 1
 
 
+@component(c.ENGINE, source=c.Source.MAG, variant="STANDARD")
 class Engine[S, C: ModelCheckpoint]:
     def __init__(
         self,
@@ -71,8 +74,13 @@ class Engine[S, C: ModelCheckpoint]:
         self._failed = False
         self.last_service: CompletedService | None = None
 
+    @component(c.ADMISSION, source=c.Source.MAG, variant="FIFO")
     def submit(
-        self, request: GenerationRequest, *, identity: str | None = None, output_capacity: int = 64,
+        self,
+        request: GenerationRequest,
+        *,
+        identity: str | None = None,
+        output_capacity: int = 64,
         progress: bool = False,
     ) -> RequestHandle:
         """Control threads may submit/cancel/read; they never execute model work."""
@@ -204,9 +212,14 @@ class Engine[S, C: ModelCheckpoint]:
     def _progress(self, row: ActiveRequest[S, C]) -> None:
         if row.handle.delivery.progress_enabled:
             total = len(row.handle.request.prompt) - 1
-            row.handle.delivery.report(PrefillProgress(
-                total - row.sequence.prefill_remaining, total, row.cached, row.prefill_ns,
-            ))
+            row.handle.delivery.report(
+                PrefillProgress(
+                    total - row.sequence.prefill_remaining,
+                    total,
+                    row.cached,
+                    row.prefill_ns,
+                )
+            )
 
     def tick(self) -> tuple[ServiceMeasurement, ...]:
         self.generation.model.owner.check()
@@ -229,16 +242,21 @@ class Engine[S, C: ModelCheckpoint]:
                 if row.handle.cancelled.is_set():
                     self._finish(row, "cancelled")
             self._admit()
-            prompt_groups = self.generation.prefill_groups(tuple(
-                row.sequence for row in self._active.values()
-                if row.sequence.prefill_remaining and row.handle.delivery.credit
-            ))
+            prompt_groups = self.generation.prefill_groups(
+                tuple(
+                    row.sequence
+                    for row in self._active.values()
+                    if row.sequence.prefill_remaining and row.handle.delivery.credit
+                )
+            )
             membership = {
                 sequence: index for index, group in enumerate(prompt_groups) for sequence in group
             }
             facts = tuple(
                 Runnable(
-                    row.handle.identity, row.sequence.prefill_remaining, row.handle.delivery.credit,
+                    row.handle.identity,
+                    row.sequence.prefill_remaining,
+                    row.handle.delivery.credit,
                     membership.get(row.sequence),
                 )
                 for row in self._active.values()
@@ -274,10 +292,13 @@ class Engine[S, C: ModelCheckpoint]:
             tuple(service.tokens for _, service in scheduled),
             clock=self.clock,
         )
-        self._observe(CompletedService(
-            "prefill", max(0, self.clock() - start) if scheduled else 0,
-            sum(result.outcome for result in outcomes if isinstance(result.outcome, int)),
-        ))
+        self._observe(
+            CompletedService(
+                "prefill",
+                max(0, self.clock() - start) if scheduled else 0,
+                sum(result.outcome for result in outcomes if isinstance(result.outcome, int)),
+            )
+        )
         measurements = []
         for (row, service), measured in zip(scheduled, outcomes, strict=True):
             result = measured.outcome
@@ -285,9 +306,16 @@ class Engine[S, C: ModelCheckpoint]:
             if isinstance(result, (MemoryError, ConstraintError)):
                 self._finish(row, "error", str(result))
                 continue
-            measurements.append(ServiceMeasurement(
-                service.identity, "prefill", result, 0, measured.elapsed_ns, measured.batch_size,
-            ))
+            measurements.append(
+                ServiceMeasurement(
+                    service.identity,
+                    "prefill",
+                    result,
+                    0,
+                    measured.elapsed_ns,
+                    measured.batch_size,
+                )
+            )
             self._progress(row)
             if not row.sequence.prefill_remaining:
                 self._retain(row.sequence)
@@ -309,17 +337,14 @@ class Engine[S, C: ModelCheckpoint]:
             # Publish the first token on its own: it closes prompt service and
             # establishes TTFT before any bounded continuation span is issued.
             tuple(
-                1 if row.first_token_ns is None else service.tokens
-                for row, service in scheduled
+                1 if row.first_token_ns is None else service.tokens for row, service in scheduled
             ),
             clock=self.clock,
             budget_ns=budget_ns,
         )
         # Per-row metrics include shared batch time for each participant. Fairness
         # accounts for the completed round once, before delivery and prefix retention.
-        self._observe(
-            CompletedService("decode", max(0, self.clock() - start) if scheduled else 0)
-        )
+        self._observe(CompletedService("decode", max(0, self.clock() - start) if scheduled else 0))
         measurements = []
         for (row, service), measured in zip(scheduled, outcomes, strict=True):
             result = measured.outcome
@@ -327,9 +352,16 @@ class Engine[S, C: ModelCheckpoint]:
             if row.first_token_ns is None:
                 row.first_decode_ns += measured.elapsed_ns
             if result is None:
-                measurements.append(ServiceMeasurement(
-                    service.identity, "decode", 0, 0, measured.elapsed_ns, measured.batch_size,
-                ))
+                measurements.append(
+                    ServiceMeasurement(
+                        service.identity,
+                        "decode",
+                        0,
+                        0,
+                        measured.elapsed_ns,
+                        measured.batch_size,
+                    )
+                )
                 continue
             if isinstance(result, (MemoryError, ConstraintError)):
                 self._finish(row, "error", str(result))

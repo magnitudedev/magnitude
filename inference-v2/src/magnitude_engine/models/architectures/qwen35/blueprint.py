@@ -1,7 +1,7 @@
 from dataclasses import field
 
 from magnitude_engine.artifacts.source import LocalArtifact
-from magnitude_engine.composition import Blueprint, component
+from magnitude_engine.composition import Blueprint, blueprint
 from magnitude_engine.models.contracts import ProgramSource
 from magnitude_engine.models.embeddings.blueprint import Resident
 from magnitude_engine.models.embeddings.contracts import EmbeddingFactory
@@ -18,7 +18,7 @@ from .feedforward.blueprint import MoE
 from .recurrence.blueprint import Mixer
 
 
-@component
+@blueprint
 class Program(Blueprint[ProgramSource]):
     artifact: Blueprint[LocalArtifact]
     embedding: Blueprint[EmbeddingFactory] = field(default_factory=Resident)

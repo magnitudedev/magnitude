@@ -491,6 +491,6 @@ Existing controls cover lifecycle, state, sampling and service behavior; not eve
 boundary has dedicated performance measurements. The engine/service objectives
 include supplied model work; local bookkeeping dimensions do not claim ownership
 of another copy of that work. Preserve observation boundaries when estimating costs.
-Current scores follow the [assessment rules](../performance.md#evidence-and-current-assessments),
+Current scores follow the [assessment rules](../performance.md#stable-compositions-and-evidence),
 including implementation/child fingerprints and transitive invalidation. A correct
 control does not establish a numerical ceiling or measured efficiency.

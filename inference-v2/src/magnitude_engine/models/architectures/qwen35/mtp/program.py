@@ -6,16 +6,21 @@ from typing import Any
 
 import mlx.core as mx
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
 from magnitude_engine.models.embeddings.contracts import EmbeddingLookup
 from magnitude_engine.models.execution import ExecutionScope
 from magnitude_engine.models.inputs import ModelInputs
 from magnitude_engine.models.runtime import ForwardRequest, ModelOutput
 from magnitude_engine.models.state.native import LibraryState
 
+from ..definition import DEFINITION
+
 Transform = Callable[[mx.array], mx.array]
 
 
 @dataclass(frozen=True)
+@component(c.QWEN_MTP, source=c.Source.MAG, variant="CONDITIONED", model=DEFINITION)
 class MTPProgram:
     embedding: EmbeddingLookup
     normalize_embedding: Transform
@@ -36,8 +41,9 @@ class MTPProgram:
         scope: ExecutionScope,
     ) -> ModelOutput:
         caches = state.caches if state.batch is None else state.store.batch_caches((state,))
-        output = self._forward(inputs.tokens, inputs.conditioning["previous_hidden"], caches,
-                               request, scope)
+        output = self._forward(
+            inputs.tokens, inputs.conditioning["previous_hidden"], caches, request, scope
+        )
         state.store.publish_batch((state,))
         return output
 
@@ -45,7 +51,9 @@ class MTPProgram:
         output = self._forward(
             mx.concatenate([row.tokens for row in inputs]),
             mx.concatenate([row.conditioning["previous_hidden"] for row in inputs]),
-            states[0].store.batch_caches(states), request, scope,
+            states[0].store.batch_caches(states),
+            request,
+            scope,
         )
         states[0].store.publish_batch(states)
         return output

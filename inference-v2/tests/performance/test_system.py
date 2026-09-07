@@ -3,6 +3,7 @@ from dataclasses import replace
 
 import pytest
 
+from magnitude_engine import components as c
 from performance.assembly import BoundAssembly
 from performance.records import Assembly, Node, Observation, Profile
 from performance.runner import recording
@@ -20,12 +21,12 @@ def binding(*, parent="v1", child="stable", mode="serial"):
         "root",
         {
             "root": Node(
-                "MODEL:QWEN35:MAG:LAYERWISE",
+                c.implementation("MODEL:QWEN35:MAG:LAYERWISE"),
                 parent,
                 children={"attention": "attention"},
                 execution=mode,
             ),
-            "attention": Node("MODEL:ATTENTION:MAG:PAGED", child),
+            "attention": Node(c.implementation("MODEL:ATTENTION:MAG:PAGED"), child),
         },
         "test",
     )
@@ -214,7 +215,15 @@ def test_zero_bound_and_missing_capacity_are_not_fake_efficiencies():
 
 def test_dimensions_select_evidence_independently_and_version_contracts(tmp_path):
     graph = Assembly(
-        "state", {"state": Node("STATE:RECURRENT:MAG:CHECKPOINTED", "source")}, "state"
+        "state",
+        {
+            "state": Node(
+                c.implementation("STATE:RECURRENT:MAG:CHECKPOINTED"),
+                "source",
+                c.RecurrentStorage(layouts=()),
+            )
+        },
+        "state",
     )
     bound = BoundAssembly(graph, {"state": Operator()}, {}).at("state")
     point = {
@@ -292,14 +301,16 @@ def test_preflight_shared_kv_and_invalid_inputs_are_data():
         "model",
         {
             "model": Node(
-                "MODEL:GEMMA4:MAG:LAYERWISE",
+                c.implementation("MODEL:GEMMA4:MAG:LAYERWISE"),
                 "x",
-                parameters={"arrays": {}},
+                parameters=c.NeuralParameters(),
                 children={"a": "model.layers.0.attention", "b": "model.layers.1.attention"},
             ),
             **{
                 f"model.layers.{i}.attention": Node(
-                    "MODEL:ATTENTION:MAG:GATHERED", "x", parameters=leaf
+                    c.implementation("MODEL:ATTENTION:MAG:GATHERED"),
+                    "x",
+                    parameters=c.AttentionGeometry(**leaf),
                 )
                 for i in range(2)
             },
@@ -340,6 +351,7 @@ async def test_tui_and_document_use_published_assessments(tmp_path, size):
 
     measured(binding(), "attention", tmp_path)
     second = binding(mode="joint")
+    second.graph = replace(second.graph, artifacts={"test": "another-model"})
     measured(second, "root", tmp_path)
     store = Store(tmp_path)
     state = store.state()
@@ -466,20 +478,31 @@ def test_hybrid_memory_composes_disjoint_backing_once(tmp_path):
     graph = Assembly(
         "state",
         {
-            "state": Node("STATE:QWEN35:MAG:HYBRID", "s", children={"kv": "kv", "recurrent": "r"}),
-            "kv": Node(
-                "KV:STORE:MAG:PAGED",
+            "state": Node(
+                c.implementation("STATE:QWEN35:MAG:HYBRID"),
                 "s",
-                parameters={
-                    "layers": [
-                        {"kv_heads": 1, "key_width": 2, "value_width": 2, "element_bytes": 2}
-                    ]
-                },
+                c.Configuration(),
+                children={"kv": "kv", "recurrent": "r"},
+            ),
+            "kv": Node(
+                c.implementation("KV:STORE:MAG:PAGED"),
+                "s",
+                parameters=c.KVStorage(
+                    layers=(c.KVGeometry(heads=1, key_width=2, value_width=2),),
+                    element_bytes=2,
+                    page_size=16,
+                    slab_pages=32,
+                    max_pages=1024,
+                ),
             ),
             "r": Node(
-                "STATE:RECURRENT:MAG:CHECKPOINTED",
+                c.implementation("STATE:RECURRENT:MAG:CHECKPOINTED"),
                 "s",
-                parameters={"layouts": [[{"shape": [1, 4], "bytes": 16}]]},
+                parameters=c.RecurrentStorage(
+                    layouts=(
+                        (c.TensorFacts(identity="state", shape=(1, 4), bytes=16, dtype="float32"),),
+                    )
+                ),
             ),
         },
         "hybrid",
