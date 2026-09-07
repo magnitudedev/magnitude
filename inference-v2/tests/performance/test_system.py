@@ -14,7 +14,7 @@ from performance.facts import (
     RecurrentStorage,
     TensorFacts,
 )
-from performance.records import Assembly, Node, Observation, Profile
+from performance.records import Assembly, CompositionOrigin, Node, Observation, Profile
 from performance.runner import recording
 from performance.store import Store
 from performance.theory.resources import Demands, Extent, join, subtract, time_bound
@@ -40,6 +40,14 @@ def binding(*, parent="v1", child="stable", mode="serial"):
         "test",
     )
     return BoundAssembly(graph, {"root": Operator(), "attention": Operator()}, {})
+
+
+def production_binding(**kwargs):
+    bound = binding(**kwargs)
+    bound.graph = replace(
+        bound.graph, origin=CompositionOrigin("QWEN35", "engine", selection="default")
+    )
+    return bound
 
 
 POINT = {
@@ -358,8 +366,8 @@ async def test_tui_and_document_use_published_assessments(tmp_path, size):
     from performance.presentation import export_document, render_tree
     from performance.tui.app import PerformanceApp
 
-    measured(binding(), "attention", tmp_path)
-    second = binding(mode="joint")
+    measured(production_binding(), "attention", tmp_path)
+    second = production_binding(mode="joint")
     second.graph = replace(second.graph, artifacts={"test": "another-model"})
     measured(second, "root", tmp_path)
     store = Store(tmp_path)
@@ -391,7 +399,7 @@ async def test_tui_and_document_use_published_assessments(tmp_path, size):
         assert tree.root.data == "root"
         # A newly published generation keeps the selected component and expansion.
         tree.select_node(tree.root.children[0])
-        measured(binding(), "attention", tmp_path, seconds=2)
+        measured(production_binding(), "attention", tmp_path, seconds=2)
         app.action_refresh()
         await pilot.pause()
         assert tree.cursor_node.data == "attention"
@@ -421,7 +429,7 @@ async def test_tui_empty_store_is_visible(tmp_path):
         await pilot.pause()
         assert pilot.app.query_one(Select).disabled
         assert pilot.app.query_one(Tree).region.height >= 18
-        assert "No recorded compositions" in str(pilot.app.query_one(Tree).root.label)
+        assert "No recorded production configurations" in str(pilot.app.query_one(Tree).root.label)
 
 
 def test_concurrent_imports_publish_one_complete_generation(tmp_path):
@@ -539,3 +547,80 @@ def test_hybrid_memory_composes_disjoint_backing_once(tmp_path):
     assert value["bound"]["value"] == 32
     assert value["estimated"]
     assert len(value["evidence"]) == 2
+
+
+def test_program_formulation_substitutes_compiled_region_without_duplicate_work():
+    from performance.facts import NeuralParameters
+    from performance.theory.composition import program
+    from performance.theory.workloads import NeuralWorkload
+
+    leaf = Demands((Extent("weights", 0, 100),), operations={"scalar": 50})
+    compiled = join(leaf, Demands(operations={"scalar": 7}))
+    children = {"layer": leaf, "decode": compiled}
+    assert program(NeuralParameters(), NeuralWorkload(query_tokens=1), children) == compiled
+    wide = program(NeuralParameters(), NeuralWorkload(query_tokens=2), children)
+    assert wide.operations == {"scalar": 50}
+    assert wide.inputs == leaf.inputs
+    ordinary = program(NeuralParameters(), NeuralWorkload(query_tokens=1), {"layer": leaf})
+    assert ordinary.operations == leaf.operations
+
+
+def test_tui_reads_only_changed_publication_without_rebuilding(tmp_path, monkeypatch):
+    measured(production_binding(), "attention", tmp_path)
+    # Unrelated experiments remain recorded, but do not become selectable configs.
+    measured(binding(), "root", tmp_path)
+    candidate = production_binding()
+    candidate.graph = replace(candidate.graph, origin=CompositionOrigin("OTHER", "engine"))
+    measured(candidate, "root", tmp_path)
+    store = Store(tmp_path)
+    monkeypatch.setattr(store, "refresh", lambda: pytest.fail("TUI must not rebuild"))
+    full = store.state()
+    current = store.current()
+    assert len(current["compositions"]) == 1
+    assert len(full["compositions"]) == 3
+    identity, selected = next(iter(current["compositions"].items()))
+    assert selected["current_assessments"] == full["compositions"][identity]["current_assessments"]
+    for key, value in current["components"].items():
+        assert value == full["components"][key]
+    with monkeypatch.context() as patch:
+        patch.setattr(json, "load", lambda *args: pytest.fail("unchanged state must not be parsed"))
+        for _ in range(100):
+            assert store.current() is current
+    measured(production_binding(child="new"), "attention", tmp_path)
+    newer = store.current()
+    assert newer["generation"] != current["generation"]
+    assert len(newer["compositions"][identity]["revisions"]) == 1
+    empty = Store(tmp_path / "empty")
+    monkeypatch.setattr(empty, "refresh", lambda: pytest.fail("empty TUI must not rebuild"))
+    assert empty.current()["compositions"] == {}
+    assert not empty.root.exists()
+
+
+def test_production_labels_identify_generation_configuration():
+    from performance.tui.app import composition_label
+
+    bound = production_binding()
+
+    def record(settings):
+        graph = bound.graph.record()
+        graph["nodes"]["root"]["parameters"] = {"settings": settings}
+        return {
+            "label": "Qwen3.6-35B-A3B-4bit",
+            "current_revision": "current",
+            "revisions": {"current": graph},
+        }
+
+    plain = composition_label(record({"context_tokens": 66176, "parallel_sequences": 1}))
+    mtp = composition_label(
+        record(
+            {
+                "context_tokens": 66176,
+                "parallel_sequences": 1,
+                "speculative_backend": "mtp",
+                "max_draft_tokens": 2,
+            }
+        )
+    )
+    assert plain == "Qwen3.6-35B-A3B-4bit · Plain · capacity 66,176 tokens · 1 sequence"
+    assert "MTP · 2 drafts" in mtp
+    assert plain != mtp

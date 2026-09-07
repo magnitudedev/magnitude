@@ -51,9 +51,8 @@ class SuffixSession:
         self.indexed = 0 if checkpoint is None else checkpoint.indexed
         self.index = {} if checkpoint is None else dict(checkpoint.index)
 
-    def prefill(self, tokens: tuple[int, ...], features: Mapping[str, mx.array]) -> None:
-        # Context arrives at proposal time; indexing remains incremental.
-        pass
+    def prefill(self, tokens: tuple[int, ...], features: Mapping[str, mx.array]) -> Task[None]:
+        yield from ()
 
     def observe(self, verification: Verification) -> None:
         # Suffix proposals own no neural state to reconcile.

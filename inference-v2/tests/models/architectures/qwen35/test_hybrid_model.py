@@ -421,7 +421,8 @@ def test_causal_spans_reserve_pages_before_pinning_and_retain_consumed_eos(atten
     actual, reference = [], []
     while not warm.finished:
         actual.extend(warm.step(4).tokens)
-        assert not target.owner._pending and not arena._pins
+        assert len(target.owner._pending) <= 1
+        assert bool(arena._pins) == bool(target.owner._pending)
     while not cold.finished:
         reference.extend(cold.step().tokens)
     assert actual == reference

@@ -25,17 +25,25 @@ class QwenRotary:
             if dims < 2 or dims % 2:
                 raise ValueError("Qwen rotary dimensions must be positive and even")
             self.rotation = Qwen3_5RotaryEmbedding(
-                dims, base=operation.base, mrope_section=[dims // 2, 0, 0],
+                dims,
+                base=operation.base,
+                mrope_section=[dims // 2, 0, 0],
             )
 
     def __call__(
-        self, queries: mx.array, keys: mx.array, *, offset: int | mx.array,
+        self,
+        queries: mx.array,
+        keys: mx.array,
+        *,
+        offset: int | mx.array,
     ) -> tuple[mx.array, mx.array]:
         if self.rotation is None:
             return self.operation(queries, offset=offset), self.operation(keys, offset=offset)
         if (
-            queries.ndim != 4 or keys.ndim != 4
-            or queries.shape[0] != keys.shape[0] or queries.shape[2:] != keys.shape[2:]
+            queries.ndim != 4
+            or keys.ndim != 4
+            or queries.shape[0] != keys.shape[0]
+            or queries.shape[2:] != keys.shape[2:]
             or min(*queries.shape, *keys.shape) < 1
             or self.rotation.dim > queries.shape[3]
             or queries.dtype != keys.dtype

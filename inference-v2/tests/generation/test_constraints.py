@@ -90,13 +90,15 @@ def test_forced_mtp_blocks_skip_projection_observe_features_and_restore_fresh_ma
     assert first.tokens == (1, 2, 3, 4) and first.forced == 4
     assert first.proposed == first.accepted == 0
     assert requests == [(4, False)] and not calls
-    assert [token for token, _ in row.method.buffer] == [1, 2, 3, 4]
+    assert [token for token, _ in row.method.buffer] == [1, 2, 3]
+    assert row.method.pending.value.item() == 3
     checkpoint = row.checkpoint()
     prompt = tuple(row.context)
     actual, rounds = collect(row, 4)
     assert actual == (5, 6, 8, 9, 10, 11, 127)
     assert any(r.proposed for r in rounds) and calls
-    assert pairs[0].tolist() == [[[1, 0], [2, 1], [3, 2], [4, 3], [5, 4]]]
+    assert pairs[0].tolist() == [[[1, 0], [2, 1], [3, 2], [4, 3]]]
+    assert pairs[1].tolist() == [[[5, 4]]]
     assert row.model.state.position == len(row.context) - 1
     restored = runtime.create(
         prompt, SamplingPolicy(temperature=0), 2, checkpoint=checkpoint, constraint=spec

@@ -31,7 +31,11 @@ class HardwareInfo(BaseModel):
 
 def _read(*command: str) -> str:
     return subprocess.run(
-        command, check=True, capture_output=True, text=True, timeout=10,
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
     ).stdout.strip()
 
 
@@ -45,17 +49,25 @@ def capture_hardware() -> HardwareInfo:
     if platform.system() == "Darwin":
         try:
             values = _read(
-                "/usr/sbin/sysctl", "-n", "hw.model", "machdep.cpu.brand_string",
-                "hw.physicalcpu", "hw.memsize",
+                "/usr/sbin/sysctl",
+                "-n",
+                "hw.model",
+                "machdep.cpu.brand_string",
+                "hw.physicalcpu",
+                "hw.memsize",
             ).splitlines()
             model, chip, cores, memory = values
             cpu_cores, memory_bytes = int(cores), int(memory)
         except (OSError, subprocess.SubprocessError, ValueError) as error:
             errors.append(f"sysctl: {error}")
         try:
-            displays = json.loads(_read(
-                "/usr/sbin/system_profiler", "-json", "SPDisplaysDataType",
-            ))["SPDisplaysDataType"]
+            displays = json.loads(
+                _read(
+                    "/usr/sbin/system_profiler",
+                    "-json",
+                    "SPDisplaysDataType",
+                )
+            )["SPDisplaysDataType"]
             gpus = tuple(
                 GPUInfo(name=display["sppci_model"], cores=display.get("sppci_cores"))
                 for display in displays

@@ -101,6 +101,8 @@ class KVArena:
         grow: bool = True,
         before: int | None = None,
     ) -> tuple[int, ...]:
+        if self._pins:
+            raise MemoryError("KV placement requires completion of pending consumers")
         self._idle()
         plan = self.allocator.plan(count, hints, grow=grow, before=before)
         if plan.capacity != self.allocator.capacity:

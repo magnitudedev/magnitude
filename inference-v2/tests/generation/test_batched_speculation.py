@@ -72,7 +72,7 @@ def test_cancelling_suspended_round_does_not_cancel_shared_peer(boundary):
     rows = [runtime.create((1, 2), SamplingPolicy(temperature=0), 20) for _ in range(2)]
     for _ in range(boundary):
         runtime.step_many(tuple(rows), (5, 5), budget_ns=1)
-        assert not target.owner._pending, "returning service must leave safe device lifetimes"
+        assert all(not work.done for work in target.owner._pending)
     rows[0].close()
     while not rows[1].finished:
         result = runtime.step_many((rows[1],), (5,), budget_ns=1)[0]
@@ -95,7 +95,7 @@ def test_dependency_yields_preserve_submission_pipeline_without_per_forward_fenc
 
         def submit(self, arrays):
             self.submitted += 1
-            super().submit(arrays)
+            return super().submit(arrays)
 
         def complete(self, arrays):
             self.completed += 1
@@ -116,8 +116,8 @@ def test_dependency_yields_preserve_submission_pipeline_without_per_forward_fenc
     services = runtime.step_many(sequences, (5,) * rows)
     assert all(service.outcome is not None for service in services)
     assert completion.submitted >= 3
-    assert completion.drained == 1, 'dependent operations must share a retirement fence'
-    assert completion.completed == (1 if speculative else 0)
+    assert completion.drained == 0, "normal service must not drain the device queue"
+    assert completion.completed >= 1
     for row in sequences:
         row.close()
     target.owner.close()
@@ -130,11 +130,11 @@ def test_publishable_result_returns_before_another_requests_draft_chain_finishes
     ready = runtime.create((1, 2), SamplingPolicy(temperature=0), 12)
     drafting = runtime.create((1, 2), SamplingPolicy(temperature=0), 12)
     drafting.step(1)
-    outcomes = runtime.step_many((ready, drafting), (4, 4))
+    outcomes = runtime.step_many((ready, drafting), (1, 4))
     assert outcomes[0].outcome.tokens == (3,)
     assert outcomes[1].outcome is None
     assert len(head_calls) == 1  # Only catch-up; the dependency chain has not completed.
-    assert not target.owner._pending
+    assert all(not work.done for work in target.owner._pending)
     with pytest.raises(ValueError, match='reserved output allowance'):
         drafting.step(1)
     while not ready.finished or not drafting.finished:

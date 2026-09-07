@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import mlx.core as mx
 
@@ -24,6 +25,12 @@ class ProgramLease:
         if not self.closed:
             self.owner._users -= 1
             self.closed = True
+
+
+@dataclass(frozen=True)
+class VocabularyBindings:
+    embedding: EmbeddingLookup
+    project: Callable[[mx.array], mx.array]
 
 
 class VocabularyLoan:
@@ -56,10 +63,10 @@ class VocabularyLoan:
         self.owner.check()
         return self._project(hidden)
 
-    def bindings(self) -> EmbeddingLookup:
-        if self.closed or self._embedding is None:
+    def bindings(self) -> VocabularyBindings:
+        if self.closed or self._embedding is None or self._project is None:
             raise RuntimeError("vocabulary loan is closed")
-        return self._embedding
+        return VocabularyBindings(self._embedding, self._project)
 
     def close(self) -> None:
         if not self.closed:

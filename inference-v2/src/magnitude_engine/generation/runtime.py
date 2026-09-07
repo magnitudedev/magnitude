@@ -184,7 +184,7 @@ class GenerationSequence[S, C: ModelCheckpoint]:
             )
             yield from complete(advance)
             advance.accept(count)
-            self.method.prefill(tokens, advance.output.features)
+            yield from self.method.prefill(tokens, advance.output.features)
             self.prefilled += count
             self.target_position += count
             return count
@@ -223,6 +223,7 @@ class GenerationSequence[S, C: ModelCheckpoint]:
                 position=len(self.context),
                 sampler=self.sampler,
                 allowance=min(token_allowance, self.max_tokens - self.generated),
+                remaining=self.max_tokens - self.generated,
                 stop_tokens=self.stop_tokens,
             )
             self.target_position += result.evaluated_inputs
@@ -340,10 +341,10 @@ class GenerationSequence[S, C: ModelCheckpoint]:
             else ("length" if self.generated == self.max_tokens else None)
         )
         self.finished = reason is not None
-        # An unfinished sequence leaves exactly one causal anchor to consume.
-        # EOS lookahead may consume the final emitted token before stopping.
+        # Causal feedback may already have consumed the last published token to
+        # predict its successor. Other methods retain one unevaluated anchor.
         if self.target_position != len(self.context) - 1 and not (
-            reason == "stop" and self.target_position == len(self.context)
+            isinstance(self.method, CausalSession) and self.target_position == len(self.context)
         ):
             raise RuntimeError("target consumed a prefix inconsistent with emitted context")
         return reason

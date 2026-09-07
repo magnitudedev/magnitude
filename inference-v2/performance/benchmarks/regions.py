@@ -214,7 +214,7 @@ def benchmark(
             prompt=p["prompt"],
         )
         control: Callable[..., Any] | None = None
-        hidden = indices = None
+        hidden = indices = scores = None
         if component == component_id(GatedAttention).kind:
             hidden = p["mixer"][index][0]
             control = (
@@ -231,11 +231,8 @@ def benchmark(
         elif component == component_id(ResidentExperts).kind:
             hidden = p["ff"][index]
             parent = program.blocks[index].feedforward
-            probabilities = mx.softmax(parent.router(hidden), axis=-1, precise=True)
-            indices = mx.argpartition(probabilities, kth=-parent.top_k, axis=-1)[
-                ..., -parent.top_k :
-            ]
-            mx.eval(indices)
+            indices, scores, _ = parent.route(hidden)
+            mx.eval(indices, scores)
             workload["distinct_experts"] = len(set(cast(list[int], indices.reshape(-1).tolist())))
             control = references.experts(op)
         elif component == component_id(ResidentEmbedding).kind:
@@ -299,9 +296,9 @@ def benchmark(
                         outputs = [value, *row.state.slots[op.index].pending.values]
                 elif component == component_id(ResidentExperts).kind:
                     outputs = [
-                        call(hidden, indices)
+                        call(hidden, indices, scores)
                         if use_reference
-                        else op.compute(hidden, indices, scope)
+                        else op.compute(hidden, indices, scores, scope)
                     ]
                 else:
                     outputs = [call(hidden) if use_reference else op.compute(hidden, scope)]

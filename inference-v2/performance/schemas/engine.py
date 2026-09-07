@@ -66,6 +66,8 @@ def generation(
         if isinstance(a.method, SuffixMethod)
         else {}
     )
+    if isinstance(method, MTPMethod):
+        settings.update(capacity=method.capacity, target_feature=method.target_feature)
     return Fields(
         Configuration(settings=settings),
         children=children,

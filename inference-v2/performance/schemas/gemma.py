@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 
+from magnitude_engine.models.architectures.gemma4.decode import ResidentDecode
 from magnitude_engine.models.architectures.gemma4.program import (
     ExpertBranch,
     GeGLU,
@@ -12,6 +13,7 @@ from magnitude_engine.models.architectures.gemma4.program import (
     LayerInput,
     PerLayerInputs,
 )
+from magnitude_engine.models.architectures.gemma4.program import evaluate as gemma_evaluate
 from magnitude_engine.models.architectures.gemma4.program import readout as gemma_readout
 from performance.bindings import Fields, Use, foreign, neural, schema
 from performance.facts import AttentionGeometry, NeuralParameters
@@ -127,8 +129,7 @@ def layer_input(a: LayerInput, context: Use) -> Fields[NeuralParameters]:
     )
 
 
-@schema(Gemma4Program)
-def gemma4_program(a: Gemma4Program, context: None) -> Fields[NeuralParameters]:
+def gemma4_program(a: Gemma4Program | ResidentDecode, context: None) -> Fields[NeuralParameters]:
     children = {"embedding": Use(a.embedding)}
     if a.per_layer is not None:
         children["inputs"] = Use(a.per_layer)
@@ -151,6 +152,15 @@ def gemma4_program(a: Gemma4Program, context: None) -> Fields[NeuralParameters]:
         gemma_readout,
         neural(operands={"output": a.output}, settings={"softcap": a.softcap}),
     )
+    if isinstance(a, Gemma4Program) and a.decode is not None:
+        children["decode"] = Use(a.decode)
     return neural(
-        operands=operands, children=children, settings={"embedding_scale": a.embedding_scale}
+        operands=operands,
+        children=children,
+        settings={"embedding_scale": a.embedding_scale},
+        sources=(gemma_evaluate,),
     )
+
+
+schema(Gemma4Program)(gemma4_program)
+schema(ResidentDecode)(gemma4_program)

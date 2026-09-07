@@ -13,6 +13,7 @@ from magnitude_engine.resources.retention import RetainedStorage
 from .arena import KVArena
 from .placement import PlacementHints, runs
 from .table import PageMap, PageTable
+from .tail import TailRow
 
 
 @dataclass(eq=False)
@@ -69,6 +70,7 @@ class SequencePages:
         self._mapping: PageMap | None = None
         self.length = 0
         self.origin = 0
+        self.tail: TailRow | None = None
         self._written = [0] * len(store.arena.layers)
         self.closed = False
 
@@ -95,6 +97,8 @@ class SequencePages:
         self._live()
         if end < self.length:
             raise ValueError("capacity cannot precede committed length")
+        if self.tail is not None and end > self.tail.start + self.tail.image.capacity:
+            self.flush_tail()
         size = self.store.arena.page_size
         need = (end + size - 1) // size - len(self._pages)
         if need > 0:
@@ -129,6 +133,8 @@ class SequencePages:
     @component("KV:APPEND:MAG:CONTIGUOUS_RUNS")
     def write(self, layer: int, start: int, keys: mx.array, values: mx.array) -> None:
         """Append one layer's KV. Commit publishes length only after every layer wrote it."""
+        if self.tail is not None:
+            raise RuntimeError("seal the append tail before incremental writes")
         end = start + keys.shape[1]
         if values.shape[1] != keys.shape[1]:
             raise ValueError("layer writes require matching key/value lengths")
@@ -176,6 +182,7 @@ class SequencePages:
         self._live()
         if any(position != self.length for position in self._written):
             raise RuntimeError("checkpoint requires a reconciled model state")
+        self.flush_tail()
         self.store.arena.complete()
         identity = next(self.store._identities)
         size = self.store.arena.page_size
@@ -215,14 +222,64 @@ class SequencePages:
                 page.written = min(size, end - index * size)
         self.length = end
         self._written = [end] * len(self._written)
+        if self.tail is not None and end <= self.tail.start:
+            self.tail.close()
+            self.tail = None
+
+    def flush_tail(self) -> None:
+        """Seal accepted append values before checkpointing or wider execution."""
+        tail = self.tail
+        if tail is None:
+            return
+        self._live()
+        arena = self.store.arena
+        # Sealing replaces tensor versions within already owned page addresses.
+        # Existing execution pins retain their inputs; no layout mutation occurs.
+        if any(position != self.length for position in self._written):
+            raise RuntimeError("seal requires a reconciled append boundary")
+        size = arena.page_size
+        cursor = tail.start
+        while cursor < self.length:
+            index, offset = divmod(cursor, size)
+            page = self._pages[index]
+            if page.writer != self._identity or offset < page.protected:
+                raise RuntimeError("sealing would alter an immutable prefix")
+            stop = min(self.length, (index + 1) * size)
+            while stop < self.length:
+                next_index = stop // size
+                if self._pages[next_index].address != page.address + next_index - index:
+                    break
+                next_page = self._pages[next_index]
+                if next_page.writer != self._identity or next_page.protected:
+                    break
+                stop = min(self.length, (next_index + 1) * size)
+            for layer in range(len(arena.layers)):
+                k, v = tail.layer(layer)
+                arena.write(
+                    layer,
+                    page.address,
+                    offset,
+                    k[:, cursor - tail.start : stop - tail.start],
+                    v[:, cursor - tail.start : stop - tail.start],
+                )
+            cursor = stop
+        arena.complete()
+        tail.close()
+        self.tail = None
+        arena.counters["tail_seals"] += 1
 
     def read(self, layer: int) -> tuple[mx.array, mx.array]:
-        return self.store.arena.gather(layer, self.addresses, self.length)
+        from .views import read_layer
+
+        if not self.length:
+            return self.store.arena.gather(layer, self.addresses, 0)
+        return read_layer((self,), layer).gather(0)
 
     def compact(self) -> int:
         """Use existing holes only, and only when the complete run table improves."""
         self._live()
         self.store.arena._idle()
+        self.flush_tail()
         movable = [
             p
             for p in self._pages
@@ -257,6 +314,9 @@ class SequencePages:
         for page in self._pages:
             self.store._detach(self, page)
         self._pages.clear()
+        if self.tail is not None:
+            self.tail.close()
+            self.tail = None
         self._mapping = None
         del self.store._sequences[self._identity]
         self.closed = True

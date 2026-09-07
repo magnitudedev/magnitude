@@ -19,6 +19,7 @@ from magnitude_engine.artifacts.tensors import TensorCatalog, read_json
 from magnitude_engine.models.contracts import HeadBinding, ProgramSource
 from magnitude_engine.models.embeddings.contracts import EmbeddingFactory
 from magnitude_engine.models.loading.materialization import bind_operations, prepare_layout
+from magnitude_engine.models.loading.packing import ProjectionPack
 from magnitude_engine.models.loading.parameters import affine_encodings
 from magnitude_engine.models.loading.partitions import EmbeddingPartition, ExpertPartition
 from magnitude_engine.models.loading.validation import canonical_names
@@ -122,11 +123,25 @@ def load_qwen35(
             encodings,
             mlp.activation,
         )
+    packs = []
+    for index, layer in enumerate(model.layers):
+        if layer.is_linear:
+            prefix = f"model.layers.{index}.linear_attn."
+            names = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+        else:
+            prefix = f"model.layers.{index}.self_attn."
+            names = ("q_proj", "k_proj", "v_proj")
+        packs.append(ProjectionPack(tuple(prefix + name for name in names)))
+        if index in expert_partitions:
+            prefix = f"model.layers.{index}.mlp."
+            packs.append(ProjectionPack((prefix + "gate", prefix + "shared_expert_gate")))
     operations = bind_operations(
         model,
         tensors,
         budget=budget,
         reader=reader,
+        packs=tuple(packs),
+        encodings=encodings,
         embeddings={"tokens": (embedding_partition, embedding_factory)},
         experts={
             index: (partition, feedforward.experts)
@@ -145,6 +160,7 @@ def load_qwen35(
             recurrence=recurrence,
             feedforward=feedforward,
             state_dtype=dtype,
+            projections=operations.parameters.projections,
         )
         project = model.model.embed_tokens.as_linear if args.tie_word_embeddings else model.lm_head
         program = OwnedProgram(

@@ -10,6 +10,7 @@ from magnitude_engine.artifacts.quantization import AffineEncoding
 from magnitude_engine.components import component
 
 from ..execution import ExecutionScope
+from .metal import lookup
 
 
 @dataclass
@@ -35,16 +36,14 @@ class ResidentAffineEmbedding:
     encoding: AffineEncoding
 
     def __call__(self, rows: mx.array) -> mx.array:
-        flat = rows.reshape(-1)
-        output = mx.dequantize(
-            self.weight[flat],
-            self.scales[flat],
-            self.biases[flat],
-            group_size=self.encoding.group_size,
+        return lookup(
+            rows,
+            self.weight,
+            self.scales,
+            self.biases,
             bits=self.encoding.bits,
-            mode="affine",
+            group_size=self.encoding.group_size,
         )
-        return output.reshape(*rows.shape, output.shape[-1])
 
     def lookup(self, rows: mx.array, scope: ExecutionScope) -> mx.array:
         output = self(rows)
