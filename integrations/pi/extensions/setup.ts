@@ -119,7 +119,7 @@ export const validateSetupTermination = (termination: InteractiveProcessTerminat
   }
   if (termination.code === 130) return Effect.succeed(false)
   return termination.code === 0 ? Effect.succeed(true) : Effect.fail(failure(
-    `Magnitude setup failed (exit ${termination.code}). Check the terminal error above; if setup-pi is unsupported, update @magnitudedev/cli. Run /magnitude-setup to retry.`,
+    `Magnitude setup failed (exit ${termination.code}). Check the terminal error above; if setup --host pi is unsupported, update @magnitudedev/cli. Run /magnitude-setup to retry.`,
   ))
 }
 
@@ -145,7 +145,7 @@ export const PiSetupLive = Layer.effect(PiSetup, Effect.gen(function* () {
       const executable = yield* withPiPreparation(ctx, setMessage => prepareMagnitudeCli(ctx.cwd, setMessage))
       const termination = yield* withPiTerminal(ctx, runInteractiveProcess({
           executable,
-          args: ["setup-pi"],
+          args: ["setup", "--host", "pi"],
           environment: process.env,
           workingDirectory: ctx.cwd,
       }))
