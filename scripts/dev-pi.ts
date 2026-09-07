@@ -5,7 +5,7 @@ import * as BunContext from "@effect/platform-bun/BunContext"
 import * as BunRuntime from "@effect/platform-bun/BunRuntime"
 import { ProviderModelIdSchema, localModelIsInstalled, type ModelCatalogState, type LocalModel, formatConnectionError } from "@magnitudedev/sdk"
 import { HarnessIdSchema } from "@magnitudedev/client-common"
-import { harnessConnectionPaths, makeHarnessConnectionService, makeHarnessConnectorRegistry } from "../cli/src/harness-connections/service"
+import { makeHarnessConnectionService, piDevelopmentConnectionOptions } from "../cli/src/harness-connections/service"
 import {
   interactiveProcessExitCode,
   runInteractiveProcess,
@@ -32,8 +32,8 @@ const acnEntrypoint = resolve(projectRoot, "packages/acn/src/binary.ts")
 const piPackageSource = resolve(projectRoot, "integrations/pi")
 const encodeJsonString = Schema.encodeSync(Schema.parseJson(Schema.String))
 
-export const piDevelopmentArgs = (modelId: string, skillFile: string): string[] => [
-  "--model", `magnitude/${modelId}`,
+export const piDevelopmentArgs = (modelId: string | undefined, skillFile: string): string[] => [
+  ...(modelId === undefined ? [] : ["--model", `magnitude/${modelId}`]),
   // Pi also discovers ~/.agents/skills outside PI_CODING_AGENT_DIR. Explicit
   // skills remain enabled with --no-skills; ambient discovery must not win.
   "--no-skills", "--skill", skillFile,
@@ -77,6 +77,11 @@ export const awaitPiDevelopmentModel = <E, R>(
 }
 
 const program = Effect.scoped(Effect.gen(function* () {
+  const args = process.argv.slice(2)
+  if (args.some(arg => arg !== "--setup")) {
+    return yield* new PiDevelopmentFailed({ message: "Usage: bun run dev:pi [--setup]" })
+  }
+  const freshSetup = args.includes("--setup")
   const fs = yield* FileSystem.FileSystem
   const temporaryDirectory = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-dev-" })
   const magnitudeExecutable = resolve(temporaryDirectory, "magnitude")
@@ -87,14 +92,8 @@ const program = Effect.scoped(Effect.gen(function* () {
   yield* fs.chmod(magnitudeExecutable, 0o755)
 
   const piDirectory = resolve(temporaryDirectory, "pi")
-  const defaults = harnessConnectionPaths()
-  const paths = {
-    ...defaults,
-    manifest: resolve(temporaryDirectory, "connections.json"),
-    piModels: resolve(piDirectory, "models.json"),
-    piSettings: resolve(piDirectory, "settings.json"),
-    skillInstallations: { ...defaults.skillInstallations, "shared-agents": { skillFile: resolve(temporaryDirectory, "skills/magnitude/SKILL.md") } },
-  }
+  const connectionOptions = piDevelopmentConnectionOptions(temporaryDirectory)
+  const { paths } = connectionOptions
   yield* Command.make("bun", "run", "build").pipe(Command.workingDirectory(piPackageSource), Command.exitCode,
     Effect.flatMap((code) => code === 0 ? Effect.void : Effect.fail(new PiDevelopmentFailed({ message: "Could not build the local Pi extension" }))))
 
@@ -137,23 +136,34 @@ const program = Effect.scoped(Effect.gen(function* () {
     })),
   )
 
-  yield* Console.log("Waiting for an installed Magnitude model...")
-  const model = yield* awaitPiDevelopmentModel(acnConnection.client.models.getCatalog({}))
-  yield* Console.log(`Connecting the local Pi package with ${model.modelId}...`)
-  const connection = yield* makeHarnessConnectionService({
-    paths,
-    registry: makeHarnessConnectorRegistry(paths, { piCompanionSource: piPackageSource }),
-  })
-  yield* connection.connect(HarnessIdSchema.make("pi"), { model: Option.some(ProviderModelIdSchema.make(model.modelId)) })
+  let modelId: string | undefined
+  if (freshSetup) {
+    yield* Console.log("Installing only the local Pi package into a fresh temporary profile...")
+    const code = yield* Command.make("pi", "install", piPackageSource).pipe(
+      Command.env({ PI_CODING_AGENT_DIR: piDirectory }),
+      Command.exitCode,
+    )
+    if (code !== 0) return yield* new PiDevelopmentFailed({ message: "Could not install the local Pi package" })
+  } else {
+    yield* Console.log("Waiting for an installed Magnitude model...")
+    const model = yield* awaitPiDevelopmentModel(acnConnection.client.models.getCatalog({}))
+    modelId = model.modelId
+    yield* Console.log(`Connecting the local Pi package with ${model.modelId}...`)
+    const connection = yield* makeHarnessConnectionService(connectionOptions)
+    yield* connection.connect(HarnessIdSchema.make("pi"), { model: Option.some(ProviderModelIdSchema.make(model.modelId)) })
+  }
 
   yield* Console.log("Launching Pi with the local Magnitude CLI and extension...")
   const pi = yield* runInteractiveProcess({
     executable: "pi",
-    args: piDevelopmentArgs(model.modelId, paths.skillInstallations["shared-agents"].skillFile),
+    args: piDevelopmentArgs(modelId, freshSetup
+      ? resolve(piPackageSource, "dist/skills/magnitude/SKILL.md")
+      : paths.skillInstallations["shared-agents"].skillFile),
     environment: {
       ...process.env,
       MAGNITUDE_CLI: magnitudeExecutable,
       PI_CODING_AGENT_DIR: piDirectory,
+      MAGNITUDE_PI_DEVELOPMENT_ROOT: temporaryDirectory,
     },
   })
   yield* requireSuccess("Pi", pi)

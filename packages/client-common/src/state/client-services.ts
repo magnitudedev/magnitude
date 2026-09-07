@@ -31,6 +31,7 @@ export type ClientServices =
 
 export interface ClientServicesOptions {
   readonly onboardingSetupInitiallyOpen?: boolean
+  readonly onboardingSetupHost?: OnboardingModelSetupConfig["host"]
   readonly harnessConnection?: HarnessConnection
 }
 
@@ -64,6 +65,7 @@ export const clientServicesLayer = (
     Layer.provideMerge(domains),
     Layer.provide(Layer.succeed(OnboardingModelSetupConfig, {
       initiallyOpen: options.onboardingSetupInitiallyOpen ?? false,
+      host: options.onboardingSetupHost,
     })),
   )
 }

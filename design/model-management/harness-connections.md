@@ -214,13 +214,26 @@ or restart.
 Native Pi package installation also bundles the canonical Magnitude usage skill, using it only when
 no skill of that name is already loaded and automatic skills have not been disabled. Loading the
 extension does not require the CLI or contact the service. The first eligible fresh interactive
-startup offers local-model setup with a Yes/No dialog. Acceptance sends the canonical onboarding
-prompt to the existing agent; rejection or cancellation retains a conversation-area reminder for
+startup offers local-model setup with a Yes/No dialog. Acceptance directly invokes the same setup
+action as `/magnitude-setup`, temporarily handing the terminal to the shared graphical CLI setup;
+it never routes command text through the agent. Rejection or cancellation retains a conversation-area reminder for
 `/magnitude-setup`. An exclusive profile-local receipt prevents repeat offers across processes,
 reloads, and package updates. Existing Magnitude configurations, conversations, pending work, editor
 input, and command-line prompts suppress the offer without consuming it; headless modes do likewise.
-Manual setup remains available independently of the receipt. The agent owns CLI installation and
-guided setup; the package does not install a private CLI dependency or alter executable lookup.
+Manual setup remains available independently of the receipt. Accepting setup installs an absent
+ambient CLI through Magnitude's public npm distribution before opening graphical setup; no separate
+Magnitude installation is a first-run prerequisite. Installation and capability checks run in the
+background while Pi retains the terminal and shows its native cancellable spinner. Success hides
+installer output; failures show bounded diagnostics and permit an explicit retry. Cancellation or
+disposal terminates scoped subprocess work and closes the spinner. Only the graphical model setup
+releases Pi's terminal ownership.
+Existing incompatible or broken CLIs and explicit executable overrides are reported, never silently
+replaced. Loading the extension, declining setup, and headless operation do not install software.
+The package does not install a private CLI dependency or alter executable lookup. Hosted setup
+uses the same connection transaction as headless and ordinary interactive setup, then selects the
+exact returned model in the existing Pi session. Manual commands then reload resources. First-run
+events retain the already-loaded extension and usage skill; they do not require command-only reload
+authority or newer chat-message dispatch APIs.
 
 During a Magnitude request, the Pi companion uses Pi's native working row rather than an extension
 footer status. Model loading and prefill temporarily replace the generic working message; generation
@@ -278,6 +291,13 @@ It borrows the fixed service endpoint only from a stopped state or the installed
 after Pi exits, it stops the development daemon and restores whether the installed service was
 running. An already-running unmanaged daemon is rejected because its launch state cannot be safely
 reconstructed.
+
+`dev:pi --setup` instead installs only the local package into a fresh temporary Pi profile and
+exercises first-run onboarding without preconfiguring a model. Hosted CLI commands inherit the
+development connection root, local package source, and isolated configuration/skill paths. This
+source-only override never installs a temporary executable as an OS login service; the launcher
+already owns that service's lifetime. Both modes share the real model store, so acquisition and
+residency have real disk and memory effects.
 
 ## Conformance
 

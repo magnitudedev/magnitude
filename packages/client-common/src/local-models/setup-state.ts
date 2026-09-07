@@ -168,6 +168,7 @@ export type OnboardingModelSetupContent =
       readonly _tag: "HarnessHandoff"
       readonly plan: HarnessLaunchPlan
     }
+  | { readonly _tag: "ReturnToHost"; readonly modelId: ModelId }
   | { readonly _tag: "Closing" }
 
 export type OnboardingModelSetupState =

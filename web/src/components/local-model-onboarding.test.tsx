@@ -94,6 +94,8 @@ describe("LocalModelOnboarding preparation", () => {
         setup={{
           ...setup,
           view: Result.success({
+            _tag: "Open",
+            exitKind: "Skip",
             notice: Option.none(),
             content: {
               _tag: "Preparation",

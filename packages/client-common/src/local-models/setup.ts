@@ -21,6 +21,7 @@ import { localModelProviderModelId, localModelServingState } from "./projection"
 import { LocalModels } from "./service"
 import {
   HarnessConnection,
+  HarnessConnectionError,
   type HarnessDestination,
   type HarnessId,
   type HarnessLaunchPlan,
@@ -124,9 +125,12 @@ type OnboardingModelSetupLifecycle =
       readonly _tag: "HarnessHandoff"
       readonly plan: HarnessLaunchPlan
     }
+  | { readonly _tag: "ReturnToHost"; readonly modelId: ModelId }
 
 export interface OnboardingModelSetupConfig {
   readonly initiallyOpen: boolean
+  /** Configure the hosting harness in place rather than launch another process. */
+  readonly host?: HarnessId
 }
 
 export const OnboardingModelSetupConfig = Context.GenericTag<OnboardingModelSetupConfig>(
@@ -244,6 +248,12 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
           exitKind,
           notice: Option.none(),
           content: { _tag: "Closing" },
+        })
+      }
+      if (current._tag === "ReturnToHost") {
+        return Result.success<OnboardingModelSetupState>({
+          _tag: "Open", exitKind: "Close", notice: Option.none(),
+          content: { _tag: "ReturnToHost", modelId: current.modelId },
         })
       }
       if (current._tag === "HarnessHandoff") {
@@ -585,6 +595,36 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
     Effect.flatMap((effectiveExit) => Deferred.done(invocation.done, Exit.asVoid(effectiveExit))),
   )
 
+  // One application path. Fence cleanup by the exact admitted value so every
+  // failure, including interruption/defects, releases nonterminal client state.
+  const applyHarness = (
+    applying: Extract<OnboardingModelSetupLifecycle, { readonly _tag: "ApplyingHarness" }>,
+    options: { readonly launchOnStartup: boolean; readonly installSkill: boolean },
+  ) => Effect.gen(function* () {
+    const { selected, harness, completeOnFinish } = applying
+    yield* harnessConnection.connect(harness, {
+      model: Option.some(selected.modelId),
+      ...options,
+    })
+    const destination: OnboardingModelSetupLifecycle = config.host !== undefined
+      ? { _tag: "ReturnToHost", modelId: selected.modelId }
+      : { _tag: "HarnessHandoff", plan: yield* harnessConnection.launch(harness, selected.modelId) }
+    if (completeOnFinish) yield* onboarding.complete
+    yield* admissionLock.withPermits(1)(Effect.sync(() => {
+      if (registry.get(lifecycle) !== applying) return
+      registry.set(lifecycle, config.host === undefined && harness === "magnitude"
+        ? closedLifecycle : destination)
+    }))
+  }).pipe(Effect.onExit((exit) => admissionLock.withPermits(1)(Effect.sync(() => {
+    if (Exit.isSuccess(exit) || registry.get(lifecycle) !== applying) return
+    registry.set(lifecycle, {
+      _tag: "Resting", retainedOpen: true,
+      notice: Option.map(Cause.failureOption(exit.cause), (failure): OnboardingModelSetupNotice => ({
+        failure, subject: { _tag: "Setup" },
+      })),
+    })
+  }))))
+
   const runSelection = (
     invocation: SelectionInvocation,
     resolved: ResolvedChoice,
@@ -599,12 +639,24 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
     })
     const selected = yield* ready
     const destinations = yield* harnessConnection.list
-    yield* admissionLock.withPermits(1)(Effect.sync(() => {
+    const applying = yield* admissionLock.withPermits(1)(Effect.gen(function* () {
       const current = registry.get(lifecycle)
-      if (current._tag === "Selecting" && current.invocation === invocation) {
-        registry.set(lifecycle, { _tag: "ChoosingHarness", selected, destinations, completeOnFinish })
+      if (current._tag !== "Selecting" || current.invocation !== invocation
+        || (yield* Deferred.isDone(invocation.cancellation))) {
+        return yield* new OnboardingModelSelectionCancelled()
       }
+      if (config.host === undefined) {
+        registry.set(lifecycle, { _tag: "ChoosingHarness", selected, destinations, completeOnFinish })
+        return Option.none()
+      }
+      if (!destinations.some((destination) => destination.id === config.host && destination.selectable)) {
+        return yield* new HarnessConnectionError({ operation: "connect", harness: config.host, message: "The hosting harness is not available" })
+      }
+      const applying = { _tag: "ApplyingHarness" as const, selected, harness: config.host, completeOnFinish }
+      registry.set(lifecycle, applying)
+      return Option.some(applying)
     }))
+    if (Option.isSome(applying)) yield* applyHarness(applying.value, { installSkill: true, launchOnStartup: true })
     return "Completed" as const
   }).pipe(
     Effect.catchTag("OnboardingModelSelectionCancelled", () =>
@@ -711,31 +763,10 @@ const makeOnboardingModelSetup = Effect.gen(function* () {
     if (!current.destinations.some((destination) => destination.id === harness && destination.selectable)) {
       return yield* new OnboardingModelSetupNotActive()
     }
-    registry.set(lifecycle, { _tag: "ApplyingHarness", selected: current.selected, harness, completeOnFinish: current.completeOnFinish })
-    return { selected: current.selected, completeOnFinish: current.completeOnFinish }
-  })).pipe(Effect.flatMap(({ selected, completeOnFinish }) => Effect.gen(function* () {
-    yield* harnessConnection.connect(harness, {
-      model: Option.some(selected.modelId),
-      installSkill: options.installSkill,
-      launchOnStartup: options.launchOnStartup,
-    })
-    const plan = yield* harnessConnection.launch(harness, selected.modelId)
-    if (completeOnFinish) yield* onboarding.complete
-    yield* admissionLock.withPermits(1)(Effect.sync(() => {
-      registry.set(lifecycle, harness === "magnitude"
-        ? closedLifecycle
-        : { _tag: "HarnessHandoff", plan })
-    }))
-  }).pipe(Effect.catchAll((error) => admissionLock.withPermits(1)(Effect.sync(() => {
-    registry.set(lifecycle, {
-      _tag: "Resting",
-      retainedOpen: true,
-      notice: Option.some<OnboardingModelSetupNotice>({
-        failure: error,
-        subject: { _tag: "Setup" },
-      }),
-    })
-  })).pipe(Effect.zipRight(Effect.fail(error)))))))
+    const applying = { _tag: "ApplyingHarness" as const, selected: current.selected, harness, completeOnFinish: current.completeOnFinish }
+    registry.set(lifecycle, applying)
+    return applying
+  })).pipe(Effect.flatMap((applying) => applyHarness(applying, options)))
 
   const terminalizeClosing = (
     invocation: ClosingInvocation,

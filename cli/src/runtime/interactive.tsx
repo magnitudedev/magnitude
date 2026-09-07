@@ -17,6 +17,8 @@ import type * as Terminal from "@effect/platform/Terminal"
 import { FetchHttpClient } from "@effect/platform"
 import {
   createAgentClient,
+  AgentClientProvider,
+  HarnessIdSchema,
   onboardingModelSetupViewAtom,
   pushNotificationAtom,
   stopDisplayViewController,
@@ -37,7 +39,7 @@ import {
 } from "@magnitudedev/utils/process"
 import type { StateDocumentError } from "@magnitudedev/storage"
 import { Array as Arr, Effect, Fiber, Layer, Option, Schema, Scope, Stream } from "effect"
-import type { SessionOptions } from "@magnitudedev/sdk"
+import type { ModelId, SessionOptions } from "@magnitudedev/sdk"
 import type { CliAppProps, SessionStart } from "../app"
 import type { AuthSource } from "../state/cli-atoms"
 import { getLastSessionId } from "../state/last-session"
@@ -59,6 +61,9 @@ import {
 import { terminalAppearanceAtom } from "../hooks/use-theme"
 import { executeUpdate } from "../features/update/execute"
 import { CliUpdater, makeCliUpdater } from "../features/update/updater"
+import { HostedSetupScreen } from "../features/model-setup/setup-screen"
+import { SetupHostContext } from "../features/model-setup/setup-frame"
+import { HOSTED_SETUP_PROTOCOL_VERSION, hostedSetupFailure, type HostedSetupResult } from "@magnitudedev/client-common/harness-connections/hosted-setup"
 import { CliApplicationRoot } from "./root"
 import { makeHarnessConnection } from "../harness-connections/service"
 import { makeAcnConnectionWithInstanceManager } from "../server/acn-connection"
@@ -75,6 +80,7 @@ export class CliRendererAcquisitionFailed extends Schema.TaggedError<CliRenderer
 export interface InteractiveLaunchOptions {
   readonly debug: boolean
   readonly setup: boolean
+  readonly setupHost?: "pi"
   readonly developmentBuild: boolean
   readonly sessionStart: SessionStart
   readonly initialPrompt: string | undefined
@@ -83,6 +89,7 @@ export interface InteractiveLaunchOptions {
 }
 
 type InteractiveSessionResult =
+  | { readonly _tag: "HostedCompleted"; readonly modelId: ModelId }
   | {
       readonly _tag: "UpdateRequested"
       readonly action: UpdateAction
@@ -108,7 +115,7 @@ type PreparedApplication =
   | {
       readonly _tag: "Prepared"
       readonly connection: FirstPartyConnection
-      readonly handoff: Effect.Effect<HarnessLaunchPlan>
+      readonly handoff: Effect.Effect<Extract<InteractiveSessionResult, { readonly _tag: "LaunchHarness" | "HostedCompleted" }>>
     }
 
 const acquireRegistry = Effect.acquireRelease(
@@ -241,7 +248,8 @@ const prepareApplication = (
   // Update interaction happens only on plain interactive launches with a
   // known owning package manager; discovery itself still runs and caches.
   const updateMethod: Option.Option<PackageManager> =
-    (options.initialPrompt?.length ?? 0) === 0
+    options.setupHost === undefined
+    && (options.initialPrompt?.length ?? 0) === 0
     && process.stdin.isTTY === true
     && process.stdout.isTTY === true
       ? updater.packageManager
@@ -346,8 +354,14 @@ const prepareApplication = (
   }
 
   const harnessConnection = yield* makeHarnessConnection
+  const host = options.setupHost === undefined ? null
+    : (yield* harnessConnection.list).find((destination) => destination.id === options.setupHost) ?? null
+  if (options.setupHost !== undefined && (host === null || !host.selectable)) {
+    return yield* new CliRendererAcquisitionFailed({ reason: "Pi is not available on PATH." })
+  }
   const agentClient = createAgentClient(connection.client, {
     onboardingSetupInitiallyOpen: options.setup,
+    onboardingSetupHost: options.setupHost === undefined ? undefined : HarnessIdSchema.make(options.setupHost),
     harnessConnection,
   })
   // Warm the onboarding view so the first frame is not empty. Best-effort and
@@ -368,14 +382,26 @@ const prepareApplication = (
   const renderer = yield* acquireRenderer
   yield* installTerminalAppearanceRuntime(renderer, registry)
   const root = yield* acquireRoot(renderer)
-  yield* renderRoot(
-    root,
-    registry,
-    makeTerminalAdapter(),
-    agentClient,
-    connection.startup,
-    app,
-  )
+  if (host === null) {
+    yield* renderRoot(
+      root,
+      registry,
+      makeTerminalAdapter(),
+      agentClient,
+      connection.startup,
+      app,
+    )
+  } else {
+    yield* Effect.sync(() => root.render(
+      <RegistryContext.Provider value={registry}>
+        <AgentClientProvider tag={agentClient}>
+          <SetupHostContext.Provider value={{ ...host, developmentService: process.env.MAGNITUDE_PI_DEVELOPMENT_ROOT !== undefined }}>
+            <HostedSetupScreen />
+          </SetupHostContext.Provider>
+        </AgentClientProvider>
+      </RegistryContext.Provider>,
+    ))
+  }
 
   // A discovery answer arriving after the app committed surfaces as one
   // notification line; the prompt would interrupt real work now.
@@ -399,10 +425,14 @@ const prepareApplication = (
     registry,
     onboardingModelSetupViewAtom(agentClient),
   ).pipe(
-    Stream.filterMap((result) => Option.flatMap(Result.value(result), (state) =>
-      state._tag === "Open" && state.content._tag === "HarnessHandoff"
-        ? Option.some(state.content.plan)
-        : Option.none())),
+    Stream.filterMap((result) => Option.flatMap(Result.value(result), (state): Option.Option<
+      Extract<InteractiveSessionResult, { readonly _tag: "LaunchHarness" | "HostedCompleted" }>
+    > => {
+      if (state._tag !== "Open") return Option.none()
+      if (state.content._tag === "ReturnToHost") return Option.some({ _tag: "HostedCompleted", modelId: state.content.modelId })
+      if (state.content._tag === "HarnessHandoff") return Option.some({ _tag: "LaunchHarness", plan: state.content.plan })
+      return Option.none()
+    })),
     Stream.runHead,
     Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed })),
   )
@@ -427,12 +457,12 @@ const runInteractiveSession = (
   // the user exits or a harness handoff is chosen.
   const outcome = yield* Effect.raceFirst(
     processExit.await.pipe(Effect.map((request) => ({ _tag: "Exit" as const, request }))),
-    handoff.pipe(Effect.map((plan) => ({ _tag: "Launch" as const, plan }))),
+    handoff.pipe(Effect.map((result) => ({ _tag: "Launch" as const, result }))),
   )
   if (outcome._tag === "Exit") return yield* closeApplication(connection, outcome.request)
   yield* connection.close.pipe(Effect.ignore)
   stopDisplayViewController()
-  return { _tag: "LaunchHarness", plan: outcome.plan }
+  return outcome.result
 })
 
 const writeSessionResult = (
@@ -495,8 +525,23 @@ export const runInteractiveCommand = (
       })),
     )
   }
+  if (result._tag === "HostedCompleted") return 0
   yield* writeSessionResult(result)
   return result.code
+})
+
+/** A hosted screen never launches another harness or enters the Magnitude chat. */
+export const runHostedSetup = (options: InteractiveLaunchOptions) => Effect.gen(function* () {
+  const updater = yield* makeCliUpdater({ currentVersion: CLI_VERSION, developmentBuild: options.developmentBuild })
+  const result = yield* Effect.scoped(runInteractiveSession(options).pipe(Effect.provideService(CliUpdater, updater)))
+  if (result._tag === "HostedCompleted") return {
+    protocolVersion: HOSTED_SETUP_PROTOCOL_VERSION, _tag: "Completed", modelId: result.modelId,
+  } satisfies HostedSetupResult
+  if (result._tag === "Exit" && result.code === 0) return {
+    protocolVersion: HOSTED_SETUP_PROTOCOL_VERSION, _tag: "Cancelled",
+  } satisfies HostedSetupResult
+  return hostedSetupFailure(result._tag === "Exit" && Option.isSome(result.fatal)
+    ? result.fatal.value.message : "Hosted setup could not finish. Run magnitude setup directly to resolve it.")
 })
 
 const developmentLaunchCommand = (
