@@ -85,7 +85,7 @@ ownership, lifetime, and failure contracts as the design takes shape.
 
 Investigate, model, inspect, experiment, prototype, and implement as appropriate. Keep
 changes attributable and reversible. Use focused correctness checks and small benchmarks
-to resolve the current question. Reuse existing typed subjects; give expensive experiments
+to resolve the current question. Reuse the ordinary functions in `performance/benchmarks/`; give expensive experiments
 a timeout and a decision to resolve. Increase measurement only when it can distinguish
 a meaningful effect. Reserve broader testing for consolidation and milestones.
 
@@ -105,6 +105,10 @@ Apply these evidence rules throughout the cycle:
 - **Completed measurement:** Run device benchmarks sequentially, including across agents.
   Record interference and complete device work inside timing. Include or exclude setup
   and compilation consistently. Instrumentation must not add production synchronization.
+- **Executable assessments:** Use the captured implementation graph, formulas in
+  `performance/theory/`, and automatic result recording. Preflight required dimensions
+  before a population campaign. Generate assembly annotations from the published state;
+  keep benchmark setup, provenance and progress prose out of Assembly sections.
 - **Durable evidence:** Preserve commands, source/dependency/artifact identities, raw
   samples, failures, and conditions. Do not overwrite evidence, attribute old measurements
   to changed code, or select reruns to obtain a favorable result.

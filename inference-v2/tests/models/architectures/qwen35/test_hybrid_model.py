@@ -100,7 +100,10 @@ def setup(moe=False, bits=None, *, attention=None, head_width=16, dtype=mx.float
 
 @pytest.mark.parametrize("accepted", [0, 1, 3, 4])
 @pytest.mark.parametrize("moe,bits", [(False, None), (True, 4), (True, 8)])
-@pytest.mark.parametrize("attention", [GatheredAttention(), MetalPagedAttention()])
+@pytest.mark.parametrize(
+    "attention",
+    [GatheredAttention(), MetalPagedAttention(), MetalPagedAttention(heads_per_group=2)],
+)
 def test_hybrid_reconciliation_matches_library_without_transformer_replay(
     accepted, moe, bits, attention
 ):
@@ -317,8 +320,8 @@ def test_batch_reservation_failure_unwinds_earlier_rows_without_poisoning():
     for row in rows:
         runtime.prefill(row, (1, 2))
     reserved = budget.snapshot().reserved
-    cost = sum(s.layout.nbytes + s.layout.trace_bytes_per_token for s in rows[0].state.slots)
-    budget.limit = reserved + cost  # Enough for row zero, but not row one.
+    cost = sum(s.layout.nbytes for s in rows[0].state.slots)
+    budget.limit = reserved + cost  # One destination row fits; the physical batch does not.
     with pytest.raises(MemoryError):
         runtime.forward_batch(rows, (ModelInputs.from_tokens((3,)),) * 2)
     assert budget.snapshot().reserved == reserved
@@ -387,7 +390,10 @@ def test_hybrid_known_causal_prefix_cannot_be_rejected():
     assert budget.snapshot().reserved == 0
 
 
-@pytest.mark.parametrize("attention", [GatheredAttention(), MetalPagedAttention()])
+@pytest.mark.parametrize(
+    "attention",
+    [GatheredAttention(), MetalPagedAttention(), MetalPagedAttention(heads_per_group=2)],
+)
 def test_causal_spans_reserve_pages_before_pinning_and_retain_consumed_eos(attention):
     from magnitude_engine.generation.methods.plain.runtime import PlainMethod
     from magnitude_engine.generation.runtime import GenerationRuntime
@@ -425,4 +431,76 @@ def test_causal_spans_reserve_pages_before_pinning_and_retain_consumed_eos(atten
     row.close()
     target.owner.close()
     arena.close()
+    assert budget.snapshot().reserved == 0
+
+
+@pytest.mark.parametrize("moe,bits,dtype", [(False, None, mx.float32), (True, 4, mx.bfloat16)])
+def test_compiled_decode_preserves_mixed_positions_rollback_and_features(moe, bits, dtype):
+    from magnitude_engine.models.inputs import ModelInputs
+    from magnitude_engine.models.runtime import ForwardRequest
+
+    _, runtime, arena, budget = setup(
+        moe, bits, attention=MetalPagedAttention(heads_per_group=2), head_width=32, dtype=dtype
+    )
+    program = runtime.program
+    decoder = program.decode
+    assert decoder is not None
+    checkpoints = []
+    for prefix in [(1, 2, 3), (1, 2, 3, 4, 5, 6, 7)]:
+        row = runtime.create()
+        runtime.prefill(row, prefix)
+        checkpoints.append(row.checkpoint())
+        row.close()
+
+    def replay(compiled):
+        program.decode = decoder if compiled else None
+        rows = tuple(runtime.create(checkpoint) for checkpoint in checkpoints)
+        outputs = []
+        try:
+            for index in range(4):
+                request = ForwardRequest(
+                    logits=index != 1,
+                    features=frozenset(("residual:0", "residual:2", "residual:4")),
+                    committed_inputs=0 if index == 0 else 1,
+                )
+                advances = runtime.forward_batch(
+                    rows,
+                    tuple(ModelInputs.from_tokens((8 + index + row,)) for row in range(2)),
+                    request,
+                )
+                for row, advance in enumerate(advances):
+                    result = advance.output
+                    arrays = tuple(result.features[name] for name in sorted(result.features))
+                    if result.logits is not None:
+                        arrays += (result.logits,)
+                    mx.eval(arrays)
+                    outputs.extend(arrays)
+                    # One peer rejects the first token; their positions then diverge further.
+                    advance.accept(0 if index == 0 and row == 0 else 1)
+                    advance.complete()
+            for row in rows:
+                for layer in range(len(arena.layers)):
+                    outputs.extend(row.state.pages.read(layer))
+                outputs.extend(a for slot in row.state.slots for a in slot.values)
+            mx.eval(outputs)
+            return tuple(outputs), tuple(row.state.position for row in rows)
+        finally:
+            for row in rows:
+                row.close()
+
+    try:
+        expected, expected_positions = replay(False)
+        actual, actual_positions = replay(True)
+        assert actual_positions == expected_positions == (6, 11)
+        for a, e in zip(actual, expected, strict=True):
+            if dtype == mx.bfloat16:
+                assert bool(mx.array_equal(a, e).item())
+            else:
+                assert bool(mx.allclose(a, e, rtol=1e-5, atol=1e-5).item())
+        assert len(decoder.functions) <= 4
+    finally:
+        program.decode = decoder
+        for checkpoint in checkpoints:
+            checkpoint.close()
+        arena.close()
     assert budget.snapshot().reserved == 0

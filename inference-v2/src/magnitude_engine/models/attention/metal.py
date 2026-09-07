@@ -129,6 +129,8 @@ class MetalPagedAttention:
     copy-on-write and execution pins; this operator owns only attention execution.
     """
 
+    partition_tokens = 128
+
     def __init__(self, prefill: PagedAttention | None = None, *, heads_per_group: int = 1):
         if heads_per_group not in (1, 2, 4):
             raise ValueError("native attention head sharing must be 1, 2 or 4")
@@ -152,26 +154,48 @@ class MetalPagedAttention:
         if not self.supports(queries, kv):
             return self.prefill.compute(queries, kv, scale, window=window)
         count = queries.shape[2]
-        span = 128
         covered = max(kv.lengths) if window is None else min(max(kv.lengths), window + count - 1)
+        return self.apply(
+            queries, kv.keys, kv.values, kv.table.device,
+            mx.array([length - count for length in kv.lengths], mx.int32),
+            page_size=kv.page_size, table_width=kv.table.width, covered=covered,
+            scale=scale, window=window,
+        )
+
+    def apply(
+        self, queries: mx.array, keys: mx.array, values: mx.array,
+        pages: mx.array, positions: mx.array, *,
+        page_size: int, table_width: int, covered: int,
+        scale: float, window: int | None = None,
+    ) -> mx.array:
+        """Pure launch on validated storage; positions and mappings remain tensor inputs."""
+        count = queries.shape[2]
+        span = self.partition_tokens
         splits = (covered + span - 1) // span
-        rows = len(kv.lengths) * queries.shape[1] * count
-        dk, dv = kv.keys.shape[-1], kv.values.shape[-1]
-        group = queries.shape[1] // kv.keys.shape[0]
-        heads = min(self.heads_per_group, group) if count == 1 else 1
+        rows = queries.shape[0] * queries.shape[1] * count
+        dk, dv = keys.shape[-1], values.shape[-1]
+        group = queries.shape[1] // keys.shape[0]
+        heads = min(self.heads_per_group, group)
         while group % heads:
             heads -= 1
-        page_stride = kv.table.width
-        pages = kv.table.device
-        positions = mx.array([length - count for length in kv.lengths], mx.int32)
+        threadgroup = (32, 4, 1)
+        cells = (group // heads) * count
+        if cells > 1:
+            # Neighboring query/head cells share a KV head. Keep their SIMD groups
+            # together, including short verification blocks, instead of separating
+            # those identical history reads into different context partitions.
+            sharing = min(4, cells)
+            while cells % sharing:
+                sharing -= 1
+            threadgroup = (32, 1, sharing)
         layout = mx.array(
-            [kv.keys.shape[1], kv.page_size, splits, page_stride, window or 0], mx.int32
+            [keys.shape[1], page_size, splits, table_width, window or 0], mx.int32
         )
         partial = _partials()(
             inputs=[
                 queries,
-                kv.keys,
-                kv.values,
+                keys,
+                values,
                 pages,
                 positions,
                 layout,
@@ -181,13 +205,13 @@ class MetalPagedAttention:
                 ("DK", dk),
                 ("DV", dv),
                 ("HQ", queries.shape[1]),
-                ("HK", kv.keys.shape[0]),
+                ("HK", keys.shape[0]),
                 ("TQ", count),
                 ("SPAN", span),
                 ("HEADS", heads),
             ],
             grid=(32, splits, rows // heads),
-            threadgroup=(32, 4, 1),
+            threadgroup=threadgroup,
             output_shapes=[(rows, splits, dv + 2)],
             output_dtypes=[mx.float32],
         )[0]
@@ -196,6 +220,6 @@ class MetalPagedAttention:
             template=[("Out", queries.dtype), ("DV", dv)],
             grid=(32, rows, 1),
             threadgroup=(32, 1, 1),
-            output_shapes=[(len(kv.lengths), queries.shape[1], count, dv)],
+            output_shapes=[(queries.shape[0], queries.shape[1], count, dv)],
             output_dtypes=[queries.dtype],
         )[0]

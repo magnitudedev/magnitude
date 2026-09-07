@@ -15,21 +15,14 @@ not imply that its cache, batching or modality capabilities are supported here.
 ## Assembly
 
 ```text
-MODEL:EXECUTOR:MAG:UPSTREAM    [unmeasured]
-├── MODEL:LOADING:MAG:UPSTREAM    [LAT: unmeasured, MEM: unmeasured] construction, not per-token work
-├── MODEL:FORWARD:VLM:STANDARD    [unmeasured] neural execution delegated as a unit
-└── STATE:CHECKPOINTS:MAG:NATIVE    [MEM: unmeasured, RESTORE: unmeasured] cache adaptation and transactions
+MODEL:FORWARD:VLM:STANDARD
+└── state · STATE:CHECKPOINTS:MAG:NATIVE
 ```
-
-The executor supplies positions, invokes the language forward and publishes its
-state. The state adapter owns reservations and checkpoints; upstream owns neural
-semantics. This generic tree stops at the upstream forward because its internal
-architecture varies with the artifact. A claim about one of its internal blocks
-must identify that artifact's block and reference explicitly.
 
 ## Component definitions
 
-Each type below owns its contract, dimension definitions and formula binding.
+Each type below defines its behavior and mathematical assumptions. Executable bindings
+are owned by the [performance catalog](../../performance.md#ownership-and-component-records).
 Parameters inherit the [origin/platform rules](../../performance.md#dimensions-and-parameter-binding).
 `JOIN` and `L` use the [resource algebra](../../performance/derivations/resources.md#evaluation-algebra);
 [neural regions](../../performance/derivations/neural.md#named-region-bindings) supply the shared terms.
@@ -67,10 +60,7 @@ Python wrapper floor. Actual adapter work belongs to its execution estimate.
 - **Reference / validation:** Invoke a separately loaded stock MLX-VLM model with the same artifact, tokens, positions and
   state. Compare logits and subsequent state behavior for single requests, batch changes and
   restored prefixes.
-- **Benchmark controls:** `model.native-qwen36-prefill-at-16384` measures completed
-  resident forward/state through automatic model selection. Use it here only when
-  its recorded composition resolves to this executor; loading and prefix setup
-  are excluded.
+
 
 ### `MODEL:LOADING`
 
@@ -134,9 +124,7 @@ uninstantiated, and library timings never fill the theoretical denominator.
 - **Reference / validation:** Direct invocation is the reference for our integration. It cannot independently validate its
   own equations: use an independent model implementation or mathematical block oracle when those
   equations are in question.
-- **Benchmark controls:** `upstream.qwen36-prefill-at-16384` exercises completed stock
-  forward/cache with 512 inputs and a prepared prefix. It excludes engine adaptation;
-  match the selected artifact, runtime and output obligations before scoring.
+
 
 ### `STATE:CHECKPOINTS`
 
@@ -171,6 +159,7 @@ costs.
 - **Reference / validation:** Compare independently advanced upstream caches and exact logical checkpoint contents. Exercise
   window crossings, multi-input extensions, rejected suffixes, batch changes and budget failure
   before mutation.
+
 
 ## Qualification
 

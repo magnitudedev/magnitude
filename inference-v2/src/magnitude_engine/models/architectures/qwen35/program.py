@@ -12,6 +12,7 @@ from magnitude_engine.models.inputs import ModelInputs
 from magnitude_engine.models.runtime import ForwardRequest, ModelOutput
 from magnitude_engine.models.state.hybrid import HybridState
 
+from .decode import ResidentDecode
 from .feedforward.operation import (
     FeedForward,
 )
@@ -48,6 +49,7 @@ class Qwen35Program:
         self.norm = norm
         self.output = output
         self.features = frozenset(f"residual:{i}" for i in range(len(blocks) + 1))
+        self.decode = ResidentDecode(self) if ResidentDecode.supports(self) else None
 
     def forward(
         self,
@@ -72,6 +74,13 @@ class Qwen35Program:
         tokens = (
             inputs[0].tokens if len(inputs) == 1 else mx.concatenate([row.tokens for row in inputs])
         )
+        if (
+            tokens.shape[1] == 1
+            and self.decode is not None
+            and self.blocks is self.decode.blocks
+            and self.output is self.decode.output
+        ):
+            return self.decode.forward(tokens, states, request)
         hidden = self.embedding.lookup(tokens, scope)
         features = {}
         for index, block in enumerate(self.blocks):

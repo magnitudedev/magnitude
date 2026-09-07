@@ -155,6 +155,10 @@ class RunStore:
         temporary.write_text(markdown)
         temporary.replace(self.path / "report.md")
         self.event("finished", status=summary["status"])
+        from performance.session import ingest
+        from performance.store import Store
+
+        ingest(self.path, Store(self.root / "runs" / "performance"))
 
 
 def inspect_run(path: Path) -> dict:

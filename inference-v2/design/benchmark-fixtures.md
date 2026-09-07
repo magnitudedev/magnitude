@@ -49,18 +49,33 @@ book tokens. Tool replay uses a rendered declared completion of the pending deci
 requiring that rendering preserve the prompt prefix. It never pads a short completion;
 a replay requiring more tokens fails. Record actual generated lengths, including EOS.
 
-The model subject times forward execution, state transactions and completion;
+The model benchmark times forward execution, state transactions and completion;
 generation also includes synchronous greedy selection. Prefix preparation, restoration,
 downloads and tokenization are outside timing. Generation prepares all but the last
 prompt token so its first measured forward produces the first output token. This
 boundary is distinct from pipelined engine service and HTTP serving measurements.
 Session-bench continues to own those serving measurements and session schedules.
 
+### Engine workload validation
+
+Engine/generation hierarchy cases use a declared fixed output count and record
+actual generated tokens, completed state/delivery, prefix reuse and repeated-run
+determinism. These characterize service under the specified workload. Numerical
+model equivalence is qualified separately with matched inputs and geometry; fixed
+replay controls hold future inputs constant when free generation diverges.
+
+Exact greedy equality across different legal chunk/batch geometries is not a
+universal workload oracle: stock upstream Qwen also changes logits and continuations
+across those geometries. Existing independent-output checks remain available for
+experiments that explicitly require that equivalence. A corrected workload contract
+gets a distinct benchmark identity; failed earlier checks remain rejected evidence.
+No numerical tolerance changes follow from this distinction.
+
 ### Session-bench prose
 
 `--prose` uses the same pinned book with a chat continuation recipe,
 `prose-chat-history-v1`. It wraps each passage in a request to return only its prose
-continuation. This differs from the model subject's raw, unwrapped token window;
+continuation. This differs from the model benchmark's raw, unwrapped token window;
 the recipe identity keeps those observations distinct.
 
 An independent reading session begins at the book's start. Preparation extends a

@@ -15,34 +15,258 @@ must not inherit qualification from the generic upstream adapter.
 ## Assembly
 
 ```text
-MODEL:GEMMA4:MAG:LAYERWISE    [unmeasured]
-├── MODEL:EMBEDDING:MAG:RESIDENT    [unmeasured]
-├── MODEL:GEMMA4.INPUTS:MAG:PER_LAYER    [unmeasured] when configured
-├── repeated layer assembly: attention → residual → feedforward → residual
-│   │                       → optional input contribution → layer scaling
-│   ├── MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV    [unmeasured]
-│   │   ├── MODEL:GEMMA4.KV:MAG:PRODUCER    [unmeasured] producer layers only
-│   │   └── MODEL:ATTENTION:MAG:PAGED    [unmeasured]
-│   │       └── MODEL:ATTENTION:MAG:GATHERED    [unmeasured] fallback
-│   │           └── MODEL:ATTENTION:MLX:DENSE    [unmeasured]
-│   ├── MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED    [unmeasured]
-│   │   ├── MODEL:GEMMA4.MLP:MAG:GEGLU    [unmeasured]
-│   │   └── MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED    [unmeasured] routed layers only
-│   │       └── MODEL:EXPERTS:MAG:RESIDENT_GATHERED    [unmeasured]
-│   └── MODEL:GEMMA4.INPUTS:MAG:PER_LAYER    [unmeasured] consumes prepared inputs
-└── MODEL:GEMMA4.READOUT:MAG:SOFTCAPPED    [unmeasured]
+MODEL:GEMMA4:MAG:LAYERWISE
+├── embedding · MODEL:EMBEDDING:MAG:RESIDENT
+├── layers.0.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.0.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.1.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.1.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.2.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.2.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.3.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.3.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.4.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.4.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.5.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.5.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.6.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.6.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.7.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.7.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.8.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.8.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.9.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.9.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.10.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.10.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.11.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.11.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.12.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.12.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.13.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.13.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.14.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.14.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.15.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.15.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.16.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.16.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.17.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.17.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.18.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.18.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.19.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.19.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.20.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.20.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.21.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.21.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.22.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.22.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.23.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.23.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.24.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.24.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.25.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.25.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.26.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.26.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.27.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.27.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.28.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.28.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── layers.29.feedforward · MODEL:GEMMA4.FEEDFORWARD:MAG:BRANCHED
+│   ├── dense · MODEL:GEMMA4.MLP:MAG:GEGLU
+│   └── experts · MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED
+│       └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.29.mixer · MODEL:GEMMA4.ATTENTION:MAG:SHARED_KV
+│   ├── attention · MODEL:ATTENTION:MAG:PAGED
+│   │   └── fallback · MODEL:ATTENTION:MAG:GATHERED
+│   └── producer · MODEL:GEMMA4.KV:MAG:PRODUCER
+├── readout · MODEL:GEMMA4.READOUT:MAG:SOFTCAPPED
+└── state · KV:STORE:MAG:PAGED
+    ├── append · KV:APPEND:MAG:CONTIGUOUS_RUNS
+    └── branch · KV:BRANCH:MAG:COPY_ON_WRITE
 ```
-
-Shared embedding, attention and expert IDs resolve to the
-[shared component definitions](../composability.md#shared-component-definitions).
-The per-layer input component prepares shared input once and contributes at each
-layer; the repeated ID does not mean repeated full preparation. KV consumers use
-an earlier producer's stored history through explicit connections, not copied
-subtrees. Physical state is an input dependency of the neural components.
 
 ## Component definitions
 
-Each type below owns its contract, dimension definitions and formula binding.
+Each type below defines its behavior and mathematical assumptions. Executable bindings
+are owned by the [performance catalog](../../performance.md#ownership-and-component-records).
 Parameters inherit the [origin/platform rules](../../performance.md#dimensions-and-parameter-binding).
 `JOIN` and `L` use the [resource algebra](../../performance/derivations/resources.md#evaluation-algebra);
 [neural regions](../../performance/derivations/neural.md#named-region-bindings) supply the shared terms.
@@ -88,10 +312,7 @@ D_GEMMA = JOIN(scaled D_EMBED, optional input preparation,
 - **Reference / validation:** Independently loaded stock MLX-VLM Gemma. Compare layer residuals, requested features, logits
   and logical KV with matched inputs and weights; exercise dense/routed variants and optional
   features explicitly.
-- **Benchmark controls:** `model.native-gemma4-26b-qat-q4-prefill-at-1024` exercises
-  automatic model selection. Its recorded composition must select this owned
-  assembly before it can support its percentage; generic upstream results do not
-  qualify this implementation.
+
 
 ### `MODEL:GEMMA4.ATTENTION`
 
@@ -321,8 +542,8 @@ not be an extra external pass.
 Current scores follow the [assessment rules](../../performance.md#evidence-and-current-assessments).
 
 Existing components have tests and diagnostic comparisons, but not every named
-boundary yet has a dedicated independently qualified benchmark subject. The tree
-identifies where those subjects belong; it does not claim they already exist.
+boundary yet has a dedicated independently qualified benchmark function. The tree
+identifies where those measurements belong; it does not claim they already exist.
 
 Historical custom 16K comparisons left numerical parity open. Native Gemma
 long-context qualification applies to the generic adapter, not this assembly.

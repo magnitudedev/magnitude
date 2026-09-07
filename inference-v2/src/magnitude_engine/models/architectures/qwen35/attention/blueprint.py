@@ -11,7 +11,7 @@ from ..contracts import (
 
 @component
 class Attention(Blueprint[AttentionFactory]):
-    computation: Blueprint[PagedAttention] = field(default_factory=Paged)
+    computation: Blueprint[PagedAttention] = field(default_factory=lambda: Paged(heads_per_group=2))
 
     @staticmethod
     def implementation() -> type[AttentionFactory]:

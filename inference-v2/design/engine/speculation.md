@@ -83,6 +83,12 @@ state summarizes the inputs it consumed and cannot generally be repaired by
 changing a length counter. Required replay is real model work and participates
 in scheduling and batching.
 
+One-input recurrent advances need only their initial and final states. Fully
+committed inputs likewise need no interior-prefix repair trace. Reserve and
+retain that trace only for wider tentative advances; their known input prefix
+is uniform across the physical batch, while final acceptance remains per request.
+Initial and destination state images remain charged through device completion.
+
 A drafter may lag the target when its method permits deferred catch-up. That
 obligation remains explicit and must be satisfied before the drafter's next use.
 A reusable prefix therefore includes target state, drafter state or a valid
