@@ -361,6 +361,9 @@ class DescriptorState:
     def complete_committed(self):
         return False
 
+    def prune_completed(self):
+        pass
+
 
 class DescriptorRuntime:
     """Controlled compatibility and zero neural work; engine grouping stays real."""

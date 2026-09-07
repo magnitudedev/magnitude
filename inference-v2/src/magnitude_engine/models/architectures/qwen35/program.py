@@ -10,6 +10,7 @@ from magnitude_engine.components import component
 from magnitude_engine.models.embeddings.contracts import EmbeddingLookup
 from magnitude_engine.models.execution import ExecutionScope
 from magnitude_engine.models.inputs import ModelInputs
+from magnitude_engine.models.normalization import residual_norm
 from magnitude_engine.models.runtime import ForwardRequest, ModelOutput
 from magnitude_engine.models.state.hybrid import HybridState
 
@@ -78,28 +79,62 @@ class Qwen35Program:
         arena = states[0].pages.store.arena
         if any(state.pages.store.arena is not arena for state in states):
             raise ValueError("Qwen batch states must share physical storage")
-        scope.enter(arena.pin())
         tokens = (
             inputs[0].tokens if len(inputs) == 1 else mx.concatenate([row.tokens for row in inputs])
         )
-        if (
-            tokens.shape[1] == 1
-            and self.decode is not None
-            and self.blocks is self.decode.blocks
-            and self.output is self.decode.output
-        ):
-            return self.decode.forward(tokens, states, request)
+        compiled = tokens.shape[1] == 1 and self.decode is not None and self.decode.matches(self)
+        if not compiled:
+            for state in states:
+                state.pages.flush_tail()
+        scope.enter(arena.pin())
+        if compiled:
+            assert self.decode is not None
+            return self.decode.forward(tokens, states, request, scope)
         hidden = self.embedding.lookup(tokens, scope)
-        features = {}
-        for index, block in enumerate(self.blocks):
-            name = f"residual:{index}"
-            if name in request.features:
-                features[name] = hidden
-            hidden = hidden + block.mixer.compute_batch(block.mixer_norm(hidden), states, scope)
-            hidden = hidden + block.feedforward.compute(block.feedforward_norm(hidden), scope)
-        name = f"residual:{len(self.blocks)}"
+        logits, features = evaluate(
+            hidden,
+            blocks=self.blocks,
+            norm=self.norm,
+            output=self.output,
+            mix=lambda mixer, x: mixer.compute_batch(x, states, scope),
+            feed=lambda feedforward, x: feedforward.compute(x, scope),
+            request=request,
+        )
+        return ModelOutput(logits[0] if logits else None, features)
+
+
+def evaluate(
+    hidden: mx.array,
+    *,
+    blocks: tuple[HybridBlock, ...],
+    norm: Transform,
+    output: Transform,
+    mix: Callable[[Mixer, mx.array], mx.array],
+    feed: Callable[[FeedForward, mx.array], mx.array],
+    request: ForwardRequest,
+) -> tuple[tuple[mx.array, ...], dict[str, mx.array]]:
+    """The architecture's single residual stream, independent of state/residency binding."""
+    features = {}
+    final_required = request.logits or f"residual:{len(blocks)}" in request.features
+    normalized = blocks[0].mixer_norm(hidden)
+    for index, block in enumerate(blocks):
+        name = f"residual:{index}"
         if name in request.features:
             features[name] = hidden
-        return ModelOutput(
-            readout(self.output, self.norm(hidden)) if request.logits else None, features
-        )
+        mixed = mix(block.mixer, normalized)
+        # The final mixer must advance state. Its stateless suffix is unnecessary
+        # when neither logits nor the final residual were requested.
+        if index + 1 == len(blocks) and not final_required:
+            break
+        hidden, normalized = residual_norm(hidden, mixed, block.feedforward_norm)
+        value = feed(block.feedforward, normalized)
+        if index + 1 == len(blocks) and not request.logits:
+            hidden = hidden + value
+        else:
+            next_norm = blocks[index + 1].mixer_norm if index + 1 < len(blocks) else norm
+            hidden, normalized = residual_norm(hidden, value, next_norm)
+    name = f"residual:{len(blocks)}"
+    if name in request.features:
+        features[name] = hidden
+    logits = (readout(output, normalized),) if request.logits else ()
+    return logits, features

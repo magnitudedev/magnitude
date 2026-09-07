@@ -35,7 +35,6 @@ def main():
     if args.command == "tui":
         from performance.tui.app import PerformanceApp
 
-        store.refresh()
         PerformanceApp(store).run()
     elif args.command == "migrate":
         from performance.migration import migrate

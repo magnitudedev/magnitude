@@ -20,8 +20,11 @@ if TYPE_CHECKING:
 class DenseBatch:
     @staticmethod
     def supports(states: tuple[LibraryState, ...]) -> bool:
-        return all(type(cache) in (KVCache, VLMKVCache, ArraysCache, VLMArrayCache)
-                   for state in states for cache in state.caches)
+        return all(
+            type(cache) in (KVCache, VLMKVCache, ArraysCache, VLMArrayCache)
+            for state in states
+            for cache in state.caches
+        )
 
     def __init__(self, states: tuple[LibraryState, ...]):
         self.store = states[0].store
@@ -87,8 +90,10 @@ class DenseBatch:
 
     def view(self, states: tuple[LibraryState, ...]) -> list[Any]:
         indices = tuple(self.states.index(state) for state in states)
-        return [KVView(layer, indices) if isinstance(layer, DenseKV) else layer.view(indices)
-                for layer in self.layers]
+        return [
+            KVView(layer, indices) if isinstance(layer, DenseKV) else layer.view(indices)
+            for layer in self.layers
+        ]
 
     def publish(self) -> None:
         for layer in self.layers:
@@ -145,14 +150,18 @@ class DenseKV:
             return
         sample = populated[0]
         width = max(cache.keys.shape[2] for cache in populated)
-        self.keys = mx.zeros((batch.width, sample.keys.shape[1], width, sample.keys.shape[3]),
-                             dtype=sample.keys.dtype)
-        self.values = mx.zeros((batch.width, sample.values.shape[1], width, sample.values.shape[3]),
-                               dtype=sample.values.dtype)
+        self.keys = mx.zeros(
+            (batch.width, sample.keys.shape[1], width, sample.keys.shape[3]),
+            dtype=sample.keys.dtype,
+        )
+        self.values = mx.zeros(
+            (batch.width, sample.values.shape[1], width, sample.values.shape[3]),
+            dtype=sample.values.dtype,
+        )
         for row, cache in enumerate(caches):
             if cache.keys is not None and cache.offset:
-                self.keys[row:row + 1, :, :cache.offset] = cache.keys[:, :, :cache.offset]
-                self.values[row:row + 1, :, :cache.offset] = cache.values[:, :, :cache.offset]
+                self.keys[row : row + 1, :, : cache.offset] = cache.keys[:, :, : cache.offset]
+                self.values[row : row + 1, :, : cache.offset] = cache.values[:, :, : cache.offset]
 
     def arrays(self) -> tuple[mx.array, ...]:
         if self.keys is None:
@@ -167,8 +176,8 @@ class DenseKV:
         for index, state in enumerate(self.batch.states):
             if state.batch is self.batch:
                 cache = state.caches[self.index]
-                cache.keys = self.keys[index:index + 1]
-                cache.values = self.values[index:index + 1]
+                cache.keys = self.keys[index : index + 1]
+                cache.values = self.values[index : index + 1]
 
 
 class DenseArrays:
@@ -182,9 +191,13 @@ class DenseArrays:
         self.active: tuple[tuple[int, ...], Any] | None = None
         for column in zip(*self.sources, strict=True):
             sample = next((value for value in column if value is not None), None)
-            self.values.append(None if sample is None else mx.concatenate([
-                mx.zeros_like(sample) if value is None else value for value in column
-            ]))
+            self.values.append(
+                None
+                if sample is None
+                else mx.concatenate(
+                    [mx.zeros_like(sample) if value is None else value for value in column]
+                )
+            )
 
     def arrays(self) -> tuple[mx.array, ...]:
         return tuple(value for value in self.values if value is not None)
@@ -198,14 +211,14 @@ class DenseArrays:
                 if value is not self.sources[row][field]:
                     backing = self.values[field]
                     if backing is not None:
-                        backing[row:row + 1] = 0 if value is None else value
+                        backing[row : row + 1] = 0 if value is None else value
                     self.sources[row][field] = value
         cache = self.cache_type(len(self.values))
         for field, value in enumerate(self.values):
             if value is not None:
-                cache[field] = value if indices == tuple(range(self.batch.width)) else value[
-                    mx.array(indices)
-                ]
+                cache[field] = (
+                    value if indices == tuple(range(self.batch.width)) else value[mx.array(indices)]
+                )
         self.active = indices, cache
         return cache
 
@@ -226,7 +239,7 @@ class DenseArrays:
                 backing[mx.array(indices)] = result
             self.values[field] = backing
             for row in indices:
-                value = backing[row:row + 1]
+                value = backing[row : row + 1]
                 self.batch.states[row].caches[self.index][field] = value
                 self.sources[row][field] = value
 
@@ -250,34 +263,53 @@ class KVView:
         return mask[:, None]
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
-        if keys.ndim != 4 or values.ndim != 4 or keys.shape[:3] != values.shape[:3] \
-                or keys.shape[0] != len(self.indices):
+        if (
+            keys.ndim != 4
+            or values.ndim != 4
+            or keys.shape[:3] != values.shape[:3]
+            or keys.shape[0] != len(self.indices)
+        ):
             raise ValueError("batched KV updates must align with selected rows")
         layer = self.layer
         end = max(self.positions) + keys.shape[2]
         capacity = ((end + 255) // 256) * 256
         if layer.keys is None:
-            layer.keys = mx.zeros((layer.batch.width, keys.shape[1], capacity, keys.shape[3]),
-                                  dtype=keys.dtype)
-            layer.values = mx.zeros((layer.batch.width, values.shape[1], capacity, values.shape[3]),
-                                    dtype=values.dtype)
+            layer.keys = mx.zeros(
+                (layer.batch.width, keys.shape[1], capacity, keys.shape[3]), dtype=keys.dtype
+            )
+            layer.values = mx.zeros(
+                (layer.batch.width, values.shape[1], capacity, values.shape[3]), dtype=values.dtype
+            )
         elif end > layer.keys.shape[2]:
             assert layer.values is not None
             extra = capacity - layer.keys.shape[2]
-            layer.keys = mx.concatenate([layer.keys, mx.zeros(
-                (layer.batch.width, keys.shape[1], extra, keys.shape[3]), dtype=keys.dtype)],
-                axis=2)
-            layer.values = mx.concatenate([layer.values, mx.zeros(
-                (layer.batch.width, values.shape[1], extra, values.shape[3]), dtype=values.dtype)],
-                axis=2)
+            layer.keys = mx.concatenate(
+                [
+                    layer.keys,
+                    mx.zeros(
+                        (layer.batch.width, keys.shape[1], extra, keys.shape[3]), dtype=keys.dtype
+                    ),
+                ],
+                axis=2,
+            )
+            layer.values = mx.concatenate(
+                [
+                    layer.values,
+                    mx.zeros(
+                        (layer.batch.width, values.shape[1], extra, values.shape[3]),
+                        dtype=values.dtype,
+                    ),
+                ],
+                axis=2,
+            )
         assert layer.values is not None
         contiguous = self.indices == tuple(
             range(self.indices[0], self.indices[0] + len(self.indices))
         )
         if contiguous and len(set(self.positions)) == 1:
             start = self.positions[0]
-            layer.keys[self.indices[0]:self.indices[-1] + 1, :, start:end] = keys
-            layer.values[self.indices[0]:self.indices[-1] + 1, :, start:end] = values
+            layer.keys[self.indices[0] : self.indices[-1] + 1, :, start:end] = keys
+            layer.values[self.indices[0] : self.indices[-1] + 1, :, start:end] = values
         else:
             rows = mx.array(self.indices)[:, None, None]
             positions = self.offset[:, None] + mx.arange(keys.shape[2])[None]
@@ -289,8 +321,10 @@ class KVView:
         self.offset += keys.shape[2]
         layer.refresh()
         if contiguous:
-            return (layer.keys[self.indices[0]:self.indices[-1] + 1, :, :end],
-                    layer.values[self.indices[0]:self.indices[-1] + 1, :, :end])
+            return (
+                layer.keys[self.indices[0] : self.indices[-1] + 1, :, :end],
+                layer.values[self.indices[0] : self.indices[-1] + 1, :, :end],
+            )
         selected = mx.array(self.indices)
         return layer.keys[selected, :, :end], layer.values[selected, :, :end]
 

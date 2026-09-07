@@ -144,6 +144,9 @@ class ModelSequence[S, C]:
         self.complete_committed()
         return self.runtime.states.checkpoint(self.state)
 
+    def prune_completed(self) -> None:
+        self._committed[:] = [work for work in self._committed if not work.done]
+
     def complete_committed(self) -> bool:
         """Retire committed work; report whether any execution was still pending."""
         self.runtime.owner.check()
@@ -158,6 +161,9 @@ class ModelSequence[S, C]:
         if self.closed:
             return
         self.runtime.owner.check()
+        # Releasing a row can free addresses in an arena shared with peer work.
+        # Complete those consumers before physical storage becomes reusable.
+        self.runtime.owner.complete()
         self.complete_committed()
         if self.pending is not None:
             self.pending.complete()
@@ -332,8 +338,15 @@ class ModelRuntime[S, C]:
             raise ValueError("capacity preparation requires this model's idle sequence")
         if type(input_capacity) is not int or input_capacity < 1:
             raise ValueError("model input capacity must be a positive integer")
-        sequence.complete_committed()
-        self.states.reserve(sequence.state, input_capacity)
+        try:
+            self.states.reserve(sequence.state, input_capacity)
+        except MemoryError:
+            # A physical allocation may require retiring pins from any peer in
+            # the shared arena. No neural work or sampling has started here.
+            if not self.owner.complete():
+                raise
+            sequence.prune_completed()
+            self.states.reserve(sequence.state, input_capacity)
 
     def can_batch(self, sequences: tuple[ModelSequence[S, C], ...]) -> bool:
         return self.program.forward_batch is not None and (

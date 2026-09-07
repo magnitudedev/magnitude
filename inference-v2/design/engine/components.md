@@ -181,8 +181,9 @@ shared weights and independent row state.
 
 ### `EXECUTION:DEVICE`
 
-**Contract.** One execution owner submits lazy work and retains leases until completion; scopes/spans
-combine obligations.
+**Contract.** One execution owner submits lazy work and retains leases until completion.
+Each submission has a completion dependency covering all outputs and state writes;
+completing it does not drain unrelated later work.
 
 **Parameters.** Workload: supplied graph, output roots, leases, device/host dependencies and required
 completion boundary. Configuration: selected execution arrangement and allowed observation
@@ -204,7 +205,7 @@ graph construction is not completed neural work.
 
 #### `EXECUTION:DEVICE:MAG:ASYNC`
 
-- **Implementation:** MLX async submission under scopes/spans; pending executions retain leases until completion or a safe drain proves retirement. If forward preparation fails before execution, committed work may retire before one unchanged retry; execution failures remain terminal.
+- **Implementation:** MLX async submission with per-execution completion dependencies; pending executions retain leases until completion or a safe failure drain proves retirement. If forward preparation fails before execution, committed work may retire before one unchanged retry; execution failures remain terminal.
 - **Reference / validation:** Fake completion backend and lease-lifetime oracle, then equivalent synchronous MLX execution;
   execution tests exercise failure and retirement.
 

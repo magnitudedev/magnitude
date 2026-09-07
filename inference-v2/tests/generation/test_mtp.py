@@ -108,7 +108,6 @@ def observation(inputs, accepted_inputs, bonus):
 def test_mtp_seeding_chaining_rejection_and_buffered_alignment():
     target, method, budget, _, calls, pairs = setup()
     session = method.create(target=target)
-    session.prefill((1, 2, 3), {})
     assert run(session.propose((1, 2, 3), 3)).host() == ()
     assert not calls and session.position == 0
     session.observe(observation((7,), 1, 8))
@@ -174,7 +173,7 @@ def test_bound_mtp_generation_matches_plain_and_observes_when_proposals_disabled
     policy = SamplingPolicy(temperature=temperature, seed=13)
     speculative = GenerationRuntime(target, method).create((1, 2, 3), policy, 19)
     plain = GenerationRuntime(target, PlainMethod()).create((1, 2, 3), policy, 19)
-    assert not calls
+    assert len(calls) == 1 and calls[0].shape[1] == 1  # shifted prompt head prefill
     a, b, accepted = [], [], 0
     rounds = 0
     while not speculative.finished:
@@ -185,7 +184,7 @@ def test_bound_mtp_generation_matches_plain_and_observes_when_proposals_disabled
     while not plain.finished:
         b.extend(plain.step().tokens)
     assert a == b and accepted > 5
-    assert calls[0].shape[1] == 2  # first two plain observations flush together
+    assert calls[1].shape[1] == 2  # committed catch-up precedes the actual anchor
     speculative.close()
     plain.close()
     target.owner.close()
@@ -247,9 +246,13 @@ def test_mtp_state_transitions_match_reviewed_reference(poc_module):
         reference.observe(original, list(inputs), accepted, bonus, {0: features})
         ours.observe(Verification(inputs, accepted + 1, bonus, {"residual:1": features}))
         assert ours.position == original.position
-        assert [token for token, _ in ours.buffer] == [token for token, _ in original.buffer]
-        for (_, actual), (_, expected) in zip(ours.buffer, original.buffer, strict=True):
+        # The reference binds bonus immediately. Ours retains its conditioning
+        # without binding a token outside the checkpoint's consumed prefix.
+        assert [token for token, _ in ours.buffer] == [token for token, _ in original.buffer[:-1]]
+        for (_, actual), (_, expected) in zip(ours.buffer, original.buffer[:-1], strict=True):
             assert mx.array_equal(actual.value, expected).item()
+        assert original.buffer[-1][0] == bonus
+        assert mx.array_equal(ours.pending.value, original.buffer[-1][1]).item()
 
     observe((3,), 0, 4)
     context.append(4)
@@ -293,5 +296,54 @@ def test_mtp_proposal_is_not_read_back_before_target_verification(monkeypatch):
         ready = False
         sequence.step(5)
     sequence.close()
+    target.owner.close()
+    assert budget.snapshot().reserved == 0
+
+
+@pytest.mark.parametrize("chunks", [(7,), (1, 1, 1, 1, 1, 1, 1), (2, 3, 2)])
+def test_prompt_conditioning_is_shifted_across_chunks(chunks):
+    target, method, budget, _, _, pairs = setup()
+    session = method.create(target=target)
+    tokens = tuple(range(10, 17))
+    offset = 0
+    for count in chunks:
+        values = tokens[offset : offset + count]
+        run(session.prefill(values, observation(values, count, 99).features))
+        offset += count
+    assert session.position == 6
+    assert session.pending.value.item() == 16
+    actual = mx.concatenate(pairs, axis=1)
+    assert actual.tolist() == [[[token, token - 1] for token in range(11, 17)]]
+    assert run(session.propose((*tokens, 77), 2)).host() == (78, 79)
+    assert pairs[-2].tolist() == [[[77, 16]]]
+    session.observe(observation((77, 78, 79), 1, 80))
+    assert session.position == 7
+    session.close()
+    target.owner.close()
+    assert budget.snapshot().reserved == 0
+
+
+@pytest.mark.parametrize("after_decode", [False, True])
+@pytest.mark.parametrize("extension", [(), (43, 44, 45)])
+def test_checkpoint_reuses_only_committed_history_with_a_different_next_token(after_decode, extension):
+    target, method, budget, _, _, pairs = setup()
+    runtime = GenerationRuntime(target, method)
+    policy = SamplingPolicy(temperature=0)
+    original = runtime.create((1, 2, 3), policy, 8)
+    if after_decode:
+        original.step(4)
+    checkpoint = original.checkpoint()
+    prompt = (*checkpoint.tokens, *extension, 77)
+    original.close()
+    restored = runtime.create(prompt, policy, 8, checkpoint=checkpoint, chunk_size=1)
+    checkpoint.close()
+    pair_start = len(pairs)
+    deferred = len(restored.method.buffer)
+    result = restored.step(4)
+    assert result.tokens == (78, 79, 80, 81)
+    consumed = mx.concatenate(pairs[pair_start:], axis=1).tolist()[0]
+    assert consumed[deferred:] == [[77, prompt[-2]], [78, 78], [79, 79]]
+    assert restored.target_position == len(prompt) + 3
+    restored.close()
     target.owner.close()
     assert budget.snapshot().reserved == 0

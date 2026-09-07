@@ -3,8 +3,9 @@
 ## Scope
 
 **The model composes owned hybrid blocks and upstream operations. Resident
-single-input execution compiles their tensor transitions together; state preparation
-and publication remain outside compilation.** This covers the
+single-input execution compiles their tensor transitions together. Both execution paths
+use one architecture equation for the residual stream, features and readout; state
+preparation and publication remain outside compilation.** This covers the
 accepted Qwen3.5-family text layouts, including compatible Qwen3.6 artifacts, dense
 or routed feedforward, and converted affine weights.
 
@@ -20,13 +21,13 @@ MODEL:QWEN35:MAG:LAYERWISE
 ├── Embedding · MODEL:EMBEDDING:MAG:RESIDENT
 ├── Repeated hybrid layer
 │   ├── Mixer (selected per layer)
-│   │   ├── Attention · MODEL:QWEN35.ATTENTION:MAG:SEPARATE_PROJECTIONS
+│   │   ├── Attention · MODEL:QWEN35.ATTENTION:MAG:GROUPED_PROJECTIONS
 │   │   │   └── MODEL:ATTENTION:MAG:PAGED
 │   │   │       └── Fallback · MODEL:ATTENTION:MAG:GATHERED
 │   │   └── Recurrence · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
 │   │       └── Update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
 │   └── Feedforward (selected by configuration)
-│       ├── Dense · MODEL:QWEN35.FEEDFORWARD:LM:DENSE
+│       ├── Dense · MODEL:QWEN35.FEEDFORWARD:MAG:DENSE
 │       └── Routed · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
 │           └── Experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
 ├── Readout · MODEL:QWEN35.READOUT:MAG:STANDARD
@@ -87,18 +88,21 @@ mixer_j = D_QA_j or D_QR_j according to the artifact
 - **Implementation:** Compile the resident single-input layer assembly, including
   independent batched rows, requested residual features, readout and functional
   attention/recurrent updates. Embedding, attention projection/finish, routing and
-  expert math are shared with layerwise execution. Wider inputs and unsupported
+  expert math are shared with layerwise execution. A continuous residual stream fuses
+  each update with the following RMS normalization, including the final readout norm.
+  Wider inputs and unsupported
   storage/operator compositions use the layerwise implementation below.
-- **State boundary:** State storage prepares already-reserved writable addresses
-  and pinned buffer views. Tensor execution returns new buffer versions; state
+- **State boundary:** State storage prepares pinned, read-only history and bounded
+  writable append buffers. Tensor execution returns only changed buffer versions; state
   storage installs the complete validated result as a tentative boundary. Existing
   transactions own acceptance, rejection and completion lifetime. Compilation
   neither allocates physical pages nor grants writes to retained prefixes.
 - **Specialization:** Positions and physical addresses are tensor operands. Cache
   specialization follows batch size, physical capacity, requested outputs and the
-  attention launch horizon. Pad page maps to attention partitions so ordinary
-  storage-page growth does not retrace the whole model; retain at most four compiled
-  geometries. Padding changes neither causal visibility nor required attention splits.
+  attention launch horizon. Bucket page-map width independently of allocator slabs
+  and append capacity; retain at most four compiled geometries.
+  Actual positions govern causal visibility. Combined append backing exposes contiguous
+  K/V views and requires one bounded write per producer.
 - **Reference / validation:** Compare complete outputs and logical state with the
   layerwise implementation, including mixed positions, page growth, rejection,
   requested features and changing output requirements. Preserve eager sigmoid-gate
@@ -145,11 +149,12 @@ new KV logical bytes = m*h_kv*d*(s_k+s_v)
 
 **Implementations and controls.**
 
-#### `MODEL:QWEN35.ATTENTION:MAG:SEPARATE_PROJECTIONS`
+#### `MODEL:QWEN35.ATTENTION:MAG:GROUPED_PROJECTIONS`
 
-- **Implementation:** Project Q plus output gate, K and V separately; normalize Q/K, apply paired rotary transforms,
-  append KV, run the selected attention child, then gate and project its output. MLX operation
-  composition. The default paged child reuses each KV read across two query heads for
+- **Implementation:** Pack compatible Q/gate, K and V projections into one allocation and operation.
+  Narrow execution fuses unpacking, Q/K normalization and paired text rotary transforms;
+  append KV, run the selected attention child, then gate and project its output.
+  The default paged child reuses each KV read across two query heads for
   single-token execution when the head geometry permits; wider query blocks retain
   per-head execution.
 - **Reference / validation:** Stock Qwen gated attention with matched weights and logical history. Compare prepared Q/K/V,
@@ -194,8 +199,9 @@ convolution bytes = b*(z-1)*c*s_conv
 
 #### `MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION`
 
-- **Implementation:** Separate QKV, output-gate and decay/beta projections feed convolution, normalization and a
-  replaceable gated-delta update, followed by gated normalization/output projection. The tensor
+- **Implementation:** Compatible QKV, output-gate and decay/beta projections share one packed operation.
+  Narrow execution fuses convolution, normalization and gate preparation before the
+  replaceable gated-delta update, followed by upstream gated normalization and output projection. The tensor
   region compiles; state staging and transaction effects remain outside it. The default update
   is the shared `MODEL:GATED_DELTA:MAG:FUSED_UPDATE`; its upstream alternative is
   `MODEL:GATED_DELTA:LM:STANDARD`.
@@ -235,18 +241,23 @@ F_weighted_reduction = m*h*(2t-1)                conventional scalar model
 
 **Implementations and controls.**
 
-#### `MODEL:QWEN35.FEEDFORWARD:LM:DENSE`
+#### `MODEL:QWEN35.FEEDFORWARD:MAG:DENSE`
 
-- **Implementation:** Pass through the bound upstream gated dense MLP.
+- **Implementation:** Single-row affine execution fuses gate/up projections and SiLU
+  activation, then applies the bound down projection. Other geometries use the bound
+  upstream gated MLP. Both consume the same parameter tensors.
 - **Reference / validation:** Independent MLX-VLM MLP and explicit gate/up/activation/down equations with the same weights;
   compare output before the enclosing residual.
 
 
 #### `MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED`
 
-- **Implementation:** Router softmax, top-k and optional renormalization; selected expert evaluation; weighted
-  reduction plus a sigmoid-gated shared MLP. Uses the shared expert child; routing and
-  combination remain separate MLX operations.
+- **Implementation:** Compatible router/shared-gate projections share one packed operation.
+  Narrow execution fuses softmax, top-k, optional renormalization and the shared gate.
+  Compatible resident routed and shared experts execute together, including their
+  weighted sum. The architecture supplies routing and the shared coefficient; the
+  expert kernels preserve projection, activation and BF16 accumulation boundaries.
+  Other geometries and streamed experts retain separate shared execution.
 - **Reference / validation:** Complete upstream routed/shared MLP. Compare assignments, probabilities, selected outputs and
   final sum with representative routing patterns.
 

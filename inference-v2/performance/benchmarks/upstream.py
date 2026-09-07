@@ -29,6 +29,8 @@ def forward(
     import numpy as np
     from mlx_vlm.models.cache import make_prompt_cache
 
+    from magnitude_engine.models.state.native import _arrays, _detach
+
     language = getattr(model, "language_model", model)
     from performance.assembly import inspect_upstream
 
@@ -80,6 +82,7 @@ def forward(
         record_inputs(run, prompt=prompt, continuation=continuation[:measured_tokens])
         history = prompt[:-1] if mode == "generate" else prompt
         caches = []
+        saved = None
 
         def invoke(values):
             result = language(inputs=values, cache=caches)
@@ -90,13 +93,21 @@ def forward(
             mx.synchronize()
 
         def reset():
-            nonlocal caches
+            nonlocal caches, saved
             complete()
-            caches = make_prompt_cache(language)
-            for start in range(0, len(history), prefill_tokens):
-                logits = invoke(mx.array([history[start : start + prefill_tokens]], mx.int32))
-                mx.eval(logits)
-                complete()
+            if saved is None:
+                caches = make_prompt_cache(language)
+                for start in range(0, len(history), prefill_tokens):
+                    logits = invoke(mx.array([history[start : start + prefill_tokens]], mx.int32))
+                    mx.eval(logits)
+                    complete()
+                saved = _detach(caches)
+                mx.eval(*_arrays(saved))
+            # Prefix construction is outside this measurement. Restore the same
+            # completed native cache for each trial, including recurrent and ring
+            # metadata, instead of repeating long-context prefill for every sample.
+            caches = _detach(saved)
+            complete()
             mx.reset_peak_memory()
 
         def execute():

@@ -201,7 +201,7 @@ def test_execution_pin_blocks_layout_changes_but_allows_reserved_writes():
     sequence = storage.create()
     sequence.reserve(4)
     with storage.arena.pin():
-        with pytest.raises(RuntimeError, match="pin"):
+        with pytest.raises(MemoryError, match="pending"):
             sequence.reserve(8)
         with pytest.raises(RuntimeError, match="pin"):
             sequence.close()

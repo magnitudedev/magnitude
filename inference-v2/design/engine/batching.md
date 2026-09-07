@@ -67,13 +67,16 @@ The physical representation determines how that is achieved:
 | Paged / slab-backed KV | Each request has its own visible page/run view; storage placement is separate from batch membership |
 | Recurrent state | Each request retains its own recurrent state, even when rows share a physical allocation |
 
-A request leaving the batch cannot invalidate peers' state. Physical allocations
-remain charged while any request or unfinished device work still depends on them.
+A request leaving the batch cannot invalidate peers' state. Before its physical addresses
+are freed, outstanding consumers of the shared arena complete; their logical progress
+remains independent. Physical allocations remain charged while any request or
+unfinished device work still depends on them.
 State growth, batch formation and tentative verification state must fit memory
 before execution. If preparation exhausts memory while earlier committed work
 still retains resources, complete that work for the affected requests and retry
 the same prepared execution once. Retry requires preparation to have rolled back
-without submitting model work, and completion to have retired pending work.
+without submitting model work, and completion to have retired pending work. Capacity
+growth may require completing consumers from peers sharing the same arena.
 Ordinary advancement adds no completion barrier; execution failures are terminal.
 If the group still cannot fit, split its prepared work into smaller groups without
 repeating sampling or proposal construction. Charge failed preparation and recovery

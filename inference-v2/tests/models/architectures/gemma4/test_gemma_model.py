@@ -67,6 +67,9 @@ def compose_gemma(*, bits, shared, attention, global_width=64):
             layer.router.per_expert_scale = mx.linspace(0.4, 1.7, 8)
     if bits is not None:
         nn.quantize(model, group_size=32, bits=bits)
+    # Match loaded artifacts: parameters are fixed values, not a lazy random
+    # quantization graph that compilation can fuse with neural execution.
+    mx.eval(model.parameters())
     experts = {}
     for index, layer in enumerate(model.layers):
         if not layer.enable_moe:
@@ -270,3 +273,127 @@ def test_gemma_swaps_both_embedding_tables_and_experts_through_owned_contracts(t
     for resource in (*embeddings.values(), *banks, scratch, reader, arena):
         resource.close()
     assert budget.snapshot().reserved == 0
+
+
+@pytest.mark.parametrize("bits", [None, 4, 8])
+@pytest.mark.parametrize("shared", [False, True])
+def test_compiled_decode_keeps_shared_producers_across_tail_rollover_and_rejection(bits, shared):
+    model, runtime, arena, budget = compose_gemma(
+        bits=bits, shared=shared, attention=MetalPagedAttention(), global_width=512
+    )
+    assert runtime.program.decode is not None
+    prefixes = [tuple(range(1, 4)), tuple(range(1, 20))]
+    rows = tuple(runtime.create() for _ in prefixes)
+    for row, prefix in zip(rows, prefixes, strict=True):
+        runtime.prefill(row, prefix)
+    request = ForwardRequest(features=frozenset({"residual:4"}))
+    for index in range(20):
+        tokens = tuple(21 + (index + row) % 30 for row in range(2))
+        advances = runtime.forward_batch(
+            rows, tuple(ModelInputs.from_tokens((token,)) for token in tokens), request
+        )
+        for row_index, (advance, token) in enumerate(zip(advances, tokens, strict=True)):
+            advance.complete()
+            prefix = prefixes[row_index]
+            expected = model(mx.array([[*prefix, token]])).logits[:, -1:]
+            assert mx.allclose(advance.output.logits, expected, atol=1e-4, rtol=1e-4).item()
+            assert advance.output.features["residual:4"].shape == (1, 1, 64)
+            accepted = 0 if row_index == 1 and index % 3 == 0 else 1
+            advance.accept(accepted)
+            prefixes[row_index] = (*prefix, token) if accepted else prefix
+        assert rows[0].state.tail is not None
+        assert all(
+            row.state.length == len(prefix) for row, prefix in zip(rows, prefixes, strict=True)
+        )
+    assert arena.counters["tail_appended_tokens"] == 20 * 2 * len(arena.layers)
+    # A fork seals its parent's live tail. A later wide forward must seal the
+    # other row too, before ordinary page writes become authoritative again.
+    checkpoint = rows[0].checkpoint()
+    fork = runtime.create(checkpoint)
+    for row, prefix in zip((*rows, fork), (*prefixes, prefixes[0]), strict=True):
+        advance = runtime.forward(row, (51, 52))
+        advance.complete()
+        expected = model(mx.array([[*prefix, 51, 52]])).logits[:, -2:]
+        assert mx.allclose(advance.output.logits, expected, atol=1e-4, rtol=1e-4).item()
+        advance.accept(2)
+        assert row.state.tail is None
+        row.close()
+    checkpoint.close()
+    runtime.owner.close()
+    arena.close()
+    assert budget.snapshot().reserved == 0
+
+
+def test_compiled_feature_only_decode_completes_producer_state():
+    _, runtime, arena, budget = compose_gemma(bits=4, shared=True, attention=MetalPagedAttention())
+    row = runtime.create()
+    runtime.prefill(row, (1, 2, 3))
+    advance = runtime.forward(row, (4,), ForwardRequest(logits=False))
+    advance.complete()
+    advance.accept(1)
+    assert advance.output.logits is None
+    assert row.state.tail is not None
+    expected = tuple(row.state.read(i) for i in range(len(arena.layers)))
+    checkpoint = row.checkpoint()
+    restored = runtime.create(checkpoint)
+    for i, (k, v) in enumerate(expected):
+        actual_k, actual_v = restored.state.read(i)
+        assert mx.array_equal(actual_k, k).item()
+        assert mx.array_equal(actual_v, v).item()
+    restored.close()
+    checkpoint.close()
+    row.close()
+    runtime.owner.close()
+    arena.close()
+    assert budget.snapshot().reserved == 0
+
+
+def test_text_loading_keeps_declared_media_out_of_parameter_materialization(tmp_path, monkeypatch):
+    import json
+    from dataclasses import asdict
+
+    from mlx.utils import tree_flatten
+
+    from magnitude_engine.models.architectures.gemma4.loading import load_gemma4
+    from magnitude_engine.models.embeddings.binding import Resident as EmbeddingFactory
+    from magnitude_engine.models.experts.binding import Resident as ExpertFactory
+    from magnitude_engine.resources.io.reader import PositionalReader
+
+    model, runtime, arena, _ = compose_gemma(bits=4, shared=True, attention=GatheredAttention())
+    runtime.owner.close()
+    arena.close()
+    parameters = {"language_model." + k: v for k, v in tree_flatten(model.parameters())}
+    media = {f"{kind}_tower.test.weight": mx.ones((8, 8)) for kind in ("audio", "vision")}
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), {**parameters, **media})
+    config = {"text_config": asdict(model.args), "quantization": {"bits": 4, "group_size": 32}}
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+    monkeypatch.setattr(
+        "magnitude_engine.models.architectures.gemma4.loading.tokenizer_identity", lambda _: "test"
+    )
+    budget, reader = MemoryBudget(32 << 20), PositionalReader(workers=1)
+
+    def load():
+        return load_gemma4(
+            tmp_path,
+            budget=budget,
+            reader=reader,
+            attention=GatheredAttention(),
+            embedding_factory=EmbeddingFactory(),
+            per_layer_embedding_factory=EmbeddingFactory(),
+            expert_factory=ExpertFactory(),
+        )
+
+    try:
+        with pytest.raises(ValueError, match="declared configuration"):
+            load()
+        assert budget.snapshot().reserved == 0
+        config.update(audio_config={"model_type": "test"}, vision_config={"model_type": "test"})
+        config_path.write_text(json.dumps(config))
+        loaded = load()
+        assert set(loaded.media_tensors) == set(media)
+        assert budget.snapshot().reserved == sum(t.nbytes for t in parameters.values())
+        loaded.close()
+        assert budget.snapshot().reserved == 0
+    finally:
+        reader.close()

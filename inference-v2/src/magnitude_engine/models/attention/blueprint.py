@@ -8,7 +8,7 @@ from .contracts import PagedAttention
 @blueprint
 class Paged(Blueprint[PagedAttention]):
     prefill: Blueprint[PagedAttention] = field(default_factory=lambda: Gathered())
-    heads_per_group: int = 1
+    heads_per_group: int = 2
 
     def __post_init__(self) -> None:
         if self.heads_per_group not in (1, 2, 4):

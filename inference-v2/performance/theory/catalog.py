@@ -171,13 +171,11 @@ register(
 for owner in (
     ResidentEmbedding,
     ResidentExperts,
-    Qwen35Program,
     GatedAttention,
     RecurrentMixer,
     RoutedFeedForward,
     qwen_readout,
     MTPProgram,
-    Gemma4Program,
     PerLayerInputs,
     GemmaAttention,
     KVProducer,
@@ -189,6 +187,10 @@ for owner in (
 ):
     register(
         owner, Model(NeuralParameters, NeuralWorkload, ("EXEC",), composition.model, execution)
+    )
+for owner in (Qwen35Program, Gemma4Program):
+    register(
+        owner, Model(NeuralParameters, NeuralWorkload, ("EXEC",), composition.program, execution)
     )
 register(LibraryProgram, Model(OpaqueParameters, Workload, ("EXEC",), explicit, execution))
 

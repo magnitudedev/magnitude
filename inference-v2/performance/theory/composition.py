@@ -74,3 +74,10 @@ def model(p: NeuralParameters, w: NeuralWorkload, children: dict[str, Demands]) 
         for c in children.values()
     ]
     return join(local, *parts)
+
+
+def program(p: NeuralParameters, w: NeuralWorkload, children: dict[str, Demands]) -> Demands:
+    """A resident decode region replaces the layerwise invocation; it is not extra work."""
+    if w.query_tokens == 1 and "decode" in children:
+        return children["decode"]
+    return model(p, w, {name: demand for name, demand in children.items() if name != "decode"})

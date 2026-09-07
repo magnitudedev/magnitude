@@ -121,5 +121,5 @@ def streamed_experts(a: StreamedExperts, top_k: int) -> Fields[NeuralParameters]
 
 
 alias(OwnedProgram, lambda a: a.bindings())
-alias(VocabularyLoan, lambda a: a.bindings())
+alias(VocabularyLoan, lambda a: a.bindings().embedding)
 alias(PagedStateStore, lambda a: a.pages)

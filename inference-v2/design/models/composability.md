@@ -30,6 +30,12 @@ not every individual tensor operation.
 An **implementation** realizes a block's contract using MLX operations, upstream
 operators, custom kernels, or a composition of them.
 
+A compiled resident region binds the same architecture equation and neural components
+as scoped execution. State access and resource handling differ; the model's residual
+stream and branch ordering have one definition. Its invocation
+replaces the corresponding layerwise work; formulation must select the applicable
+execution region rather than add both paths' demands.
+
 | Contract property | What must be explicit |
 |---|---|
 | Computation | Required outputs, mathematical behavior and numerical equivalence requirements |
@@ -138,7 +144,8 @@ Union repeated rows; the vocabulary head is separate work unless joined by its p
 #### `MODEL:EMBEDDING:MAG:RESIDENT`
 
 - **Implementation:** Look up token rows in resident float or affine weights; the latter gathers encoded rows and
-  dequantizes through MLX. Own lookup composition and execution dependencies, preserving
+  dequantizes in a fused row-lookup kernel through MLX. Own lookup composition and
+  execution dependencies, preserving
   vocabulary identity.
 - **Reference / validation:** Independently loaded upstream embedding and direct indexing of independently dequantized rows.
   Check token order, repeats, dtype and values.
@@ -146,17 +153,17 @@ Union repeated rows; the vocabulary head is separate work unless joined by its p
 
 ### `MODEL:EXPERTS`
 
-**Contract.** Given hidden rows and distinct top-k expert assignments, return per-selected-expert
-activations before routing-weight reduction. Preserve the supplied activation and numerical
-contract.
+**Contract.** Given hidden rows, selected expert IDs and their coefficients, return the weighted
+sum of expert outputs. Routing chooses IDs and coefficients; execution owns projection,
+activation and reduction, preserving the supplied activation and numerical contract.
 
 **Parameters.** Architecture: hidden/expert widths `h,f_e`, encoded gate/up/down tensors and activation.
 Workload: row assignments `m_e`, with `sum_e m_e=m*t`, output requirements and residency.
 
 **Composition.** `D_EXPERTS=JOIN({MLP(m_e,h,f_e)} for m_e>0)` using
 [projections/experts](../performance/derivations/neural.md#projections-and-experts). Union each selected expert’s
-weights; count each required row/expert evaluation. Output geometry is `m*t*h` at this
-boundary, but may reduce internally in a routed parent.
+weights; count each required row/expert evaluation. Output geometry is `m*h`.
+Per-expert hidden vectors are internal intermediates and need not be materialized.
 
 **Dimensions.**
 
@@ -168,10 +175,10 @@ boundary, but may reduce internally in a routed parent.
 
 #### `MODEL:EXPERTS:MAG:RESIDENT_GATHERED`
 
-- **Implementation:** Given hidden rows and expert assignments, return per-selected-expert outputs, before
-  routing-weight reduction. Resident gate/up/down weights feed MLX quantized gathers and
-  architecture-supplied activation. Assignment geometry selects sorted or unsorted execution;
-  caller retains routing semantics.
+- **Implementation:** Resident encoded weights execute selected experts and their weighted sum.
+  Compatible short-row SwiGLU prepares affine inputs once, reuses them across output
+  tiles, and fuses gate/up/activation with preparation for the down/reduction kernel;
+  other geometries use MLX gathers and the supplied activation. Routing remains caller-owned.
 - **Reference / validation:** Upstream expert module and a per-expert gather/matmul oracle. Match weights and activation;
   exercise assignment order, repeats, sparse/dense utilization and shapes on both sides of
   sorting selection.
@@ -202,9 +209,11 @@ and duplicate KV-head reads.
 
 - **Implementation:** Prepared Q and a logical paged KV view produce scaled, causal/windowed attention output. Owned
   `MTL` kernels through MLX compute softmax partials and combine them for supported short
-  queries. For single-query grouped attention, SIMD groups sharing one KV head are
-  placed in the same threadgroup using the intrinsic query/KV head ratio; this changes
-  launch geometry while preserving the shader equations. Other geometries delegate to `MODEL:ATTENTION:MAG:GATHERED`. Storage append is
+  queries. Small histories reduce within one kernel; intermediate histories use
+  fixed token partitions. Long histories use a bounded number of partitions,
+  cooperative query/head tiles and parallel partial reduction.
+  All paths read the same page maps and bounded append buffers, accumulating partials in
+  FP32. Other geometries delegate to `MODEL:ATTENTION:MAG:GATHERED`. Storage append is
   outside this contract.
 - **Reference / validation:** The gathered implementation at identical logical histories, plus an independent
   higher-precision attention equation oracle. Compare masks, row lengths, windows, fragmented

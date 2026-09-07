@@ -241,7 +241,7 @@ def test_first_token_closes_prompt_service_before_bounded_plain_decode():
     engine.generation = GenerationRuntime(engine.generation.model, PlainMethod())
     handle = engine.submit(GenerationRequest((0,), SamplingPolicy(temperature=0), 7))
     first = engine.tick()
-    assert len(first) == 1 and first[0].output_tokens == first[0].input_tokens == 1
+    assert len(first) == 1 and first[0].output_tokens == 1 and first[0].input_tokens == 2
     assert tokens(available(handle)) == (1,)
     second = engine.tick()
     assert len(second) == 1 and second[0].output_tokens == second[0].input_tokens == 4

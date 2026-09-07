@@ -4,6 +4,8 @@
 
 **An owned assembly that preserves Gemma's normalization, branching and KV-sharing
 semantics while making each computational region independently comparable.**
+Layerwise and resident execution share the architecture equation; compilation and
+state publication bind that equation without defining a second model loop.
 The current binding accepts supported Gemma 4 text configurations with affine
 weights, dense/routed branches and optional per-layer inputs. MLX-VLM supplies
 configuration, parameter containers and the independent model reference.
@@ -16,6 +18,7 @@ must not inherit qualification from the generic upstream adapter.
 
 ```text
 MODEL:GEMMA4:MAG:LAYERWISE
+├── Resident decode · MODEL:GEMMA4:MAG:RESIDENT_COMPILED
 ├── Embedding · MODEL:EMBEDDING:MAG:RESIDENT
 ├── Optional input preparation · MODEL:GEMMA4.INPUTS:MAG:PER_LAYER
 ├── Repeated layer
@@ -77,10 +80,21 @@ D_GEMMA = JOIN(scaled D_EMBED, optional input preparation,
 
 - **Implementation:** Scale embedding, prepare optional layer inputs, run configured layers with their
   norms/residuals and layer scalars, then read out. Python builds the graph each forward; there
-  is no whole-model compiled step.
+  eligible resident single-token forwards use the compiled composition below.
 - **Reference / validation:** Independently loaded stock MLX-VLM Gemma. Compare layer residuals, requested features, logits
   and logical KV with matched inputs and weights; exercise dense/routed variants and optional
   features explicitly.
+
+#### `MODEL:GEMMA4:MAG:RESIDENT_COMPILED`
+
+- **Implementation:** Compile the same neural bindings into a tensor transition.
+  Each KV producer writes one bounded append image; later shared readers consume
+  that updated image with their own query and window. State preparation, validation,
+  installation and resource lifetime remain outside compilation. Wide or streamed
+  execution uses the layerwise path after sealing live append images.
+- **Reference / validation:** The layerwise composition and independent MLX-VLM
+  execution, with fixed weights, inputs and logical history. Cover shared readers,
+  unequal row lengths, rejected tokens, append rollover, forks and feature-only output.
 
 
 ### `MODEL:GEMMA4.ATTENTION`
@@ -207,8 +221,8 @@ materialization.
 
 #### `MODEL:GEMMA4.MLP:MAG:GEGLU`
 
-- **Implementation:** Separate gate/up projections, approximate GeGLU activation and down projection using MLX
-  operations and upstream weight modules.
+- **Implementation:** Separate gate/up projections, approximate GeGLU activation
+  and down projection using MLX operations and upstream weight modules.
 - **Reference / validation:** Upstream dense MLP and explicit projection/activation equations; compare outputs before
   surrounding norms and residuals.
 
@@ -236,8 +250,8 @@ distinct from Qwen’s full-score softmax.
 #### `MODEL:GEMMA4.EXPERT_BRANCH:MAG:ROUTED`
 
 - **Implementation:** Normalize router input, select top-k scores, softmax selected scores and apply per-expert
-  scales. Evaluate the shared expert child from its separately normalized input, reduce weighted
-  outputs and normalize the result.
+  scales. The shared expert child evaluates and reduces selected experts from the separately
+  normalized input; the branch normalizes the combined result.
 - **Reference / validation:** Upstream router and routed branch. Compare expert selection, weights, scaled outputs and
   branch result with real routing distributions and ties.
 
@@ -322,5 +336,5 @@ restoration before broad claims, and retain the selected component IDs with resu
 Evidence: `sessions/26-09-06/evidence/cycle-005/comparison-16384.json` and
 `sessions/26-09-06/evidence/cycle-006/comparison.json`, relative to the monorepo root.
 
-Whole-step compilation and fused projection/GeGLU paths remain opportunities;
-qualification must preserve dense/routed branches, optional inputs and KV sharing.
+Further kernel specialization must preserve dense/routed branches, optional inputs
+and KV sharing. Media tensors remain separate from owned text parameter loading.

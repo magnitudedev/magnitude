@@ -41,7 +41,7 @@ class MethodSession(Protocol):
     features: frozenset[str]
     prefill_features: frozenset[str]
 
-    def prefill(self, tokens: tuple[int, ...], features: Mapping[str, mx.array]) -> None: ...
+    def prefill(self, tokens: tuple[int, ...], features: Mapping[str, mx.array]) -> Task[None]: ...
     def propose(self, context: Sequence[int], limit: int) -> Task[Proposal]: ...
     def observe(self, verification: Verification) -> None: ...
     def checkpoint(self) -> MethodCheckpoint: ...
@@ -67,9 +67,11 @@ class CausalSession(Protocol):
     """An ordinary method can advance a bounded span using device token feedback.
 
     The caller supplies a history-independent sampler and an output allowance.
-    All issued model work must complete before return. Every evaluated input
-    belongs to emitted context and is committed. A consumed EOS is valid history:
-    the target can include that final token; otherwise it ends just before it.
+    Every evaluated input belongs to emitted context and is committed. At most
+    one successor prediction may remain submitted across calls, consuming the last
+    emitted token. The method owns that prediction until use or close; checkpoints
+    retain the consumed prefix and exclude the prediction. The remaining output
+    limit prohibits lookahead past the final requested prediction.
     """
 
     def decode_causal(
@@ -81,5 +83,6 @@ class CausalSession(Protocol):
         position: int,
         sampler: SequenceSampler,
         allowance: int,
+        remaining: int,
         stop_tokens: tuple[int, ...],
     ) -> Task[CausalResult]: ...

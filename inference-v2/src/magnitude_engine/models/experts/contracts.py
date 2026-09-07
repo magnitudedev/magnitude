@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 class ExpertOperator(Protocol):
     def compute(
-        self, hidden: mx.array, assignments: mx.array, scope: ExecutionScope
+        self, hidden: mx.array, assignments: mx.array, scores: mx.array, scope: ExecutionScope
     ) -> mx.array: ...
 
 

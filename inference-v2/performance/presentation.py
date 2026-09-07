@@ -3,6 +3,47 @@
 from performance.records import Assembly
 
 
+def production_state(state: dict) -> dict:
+    """Keep current production assemblies and their published evidence for browsing.
+
+    This is a projection, not another assessment: historical revisions and standalone
+    experiments remain in the full store, and all selected values are unchanged.
+    """
+    compositions = {}
+    keys = set()
+    for identity, record in state.get("compositions", {}).items():
+        revision = record["current_revision"]
+        graph = record["revisions"][revision]
+        if (
+            record.get("selection") != "default"
+            or (graph.get("origin") or {}).get("scope") != "engine"
+        ):
+            continue
+        compositions[identity] = record | {"revisions": {revision: graph}}
+        for field in ("current_assessments", "historical_assessments"):
+            for dimensions in record.get(field, {}).values():
+                keys.update(dimensions.values())
+    components = {key: state["components"][key] for key in keys}
+    profiles = {value["profile"] for value in components.values()}
+    evidence = {
+        run
+        for component in components.values()
+        for dimension in component["dimensions"].values()
+        for run in dimension["evidence"]
+    }
+    return {
+        "generation": state.get("generation", "empty"),
+        "compositions": compositions,
+        "components": components,
+        "profiles": {key: state["profiles"][key] for key in profiles},
+        "runs": {
+            key: run
+            for key, run in state.get("runs", {}).items()
+            if key in evidence or run["composition"] in compositions
+        },
+    }
+
+
 def dimensions(state: dict, view: dict, path: str) -> dict:
     key = view["assessments"].get(path)
     return state["components"].get(key, {}).get("dimensions", {})

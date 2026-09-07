@@ -141,3 +141,83 @@ def test_materialization_partitions_are_preflighted_and_failure_closes_previous_
         ("expert", frozenset(names[1:])),
         "close embedding",
     ]
+
+
+@pytest.mark.parametrize("bits", [None, 4, 8])
+def test_projection_packing_reads_final_layout_once_and_preserves_equation(tmp_path, bits):
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+
+    from magnitude_engine.artifacts.quantization import AffineEncoding
+    from magnitude_engine.models.loading.packing import ProjectionPack
+    from magnitude_engine.models.loading.parameters import materialize_parameters
+    from magnitude_engine.models.projections import ParallelProjections
+    from performance.benchmarks.references import separate_projections
+
+    mx.random.seed(293)
+    reference = nn.Module()
+    reference.a, reference.b = nn.Linear(64, 32), nn.Linear(64, 96)
+    if bits is not None:
+        nn.quantize(reference, bits=bits, group_size=64)
+    arrays = dict(tree_flatten(reference.parameters()))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), arrays)
+    tensors = logical_tensors(TensorCatalog.inspect(tmp_path), declaration=None)
+    encoding = (
+        {} if bits is None else {name + ".weight": AffineEncoding(bits, 64) for name in ("a", "b")}
+    )
+    model = nn.Module()
+    model.a, model.b = nn.Linear(64, 32), nn.Linear(64, 96)
+    if bits is not None:
+        nn.quantize(model, bits=bits, group_size=64)
+    # Exactly the original byte demand fits, so duplicate resident packing cannot pass.
+    expected_bytes = sum(t.nbytes for t in tensors.values())
+    budget, reader = MemoryBudget(expected_bytes), PositionalReader(workers=2)
+    allocation = materialize_parameters(
+        model,
+        tensors,
+        budget=budget,
+        reader=reader,
+        owner="weights",
+        packs=(ProjectionPack(("a", "b")),),
+        encodings=encoding,
+    )
+    try:
+        grouped = ParallelProjections((model.a, model.b), allocation.projections[("a", "b")])
+        control = separate_projections(grouped)
+        for rows in (1, 17):
+            x = mx.random.normal((rows, 64))
+            outputs = grouped(x)
+            for actual, original, borrowed in zip(
+                outputs, (reference.a, reference.b), control, strict=True
+            ):
+                assert mx.allclose(actual, original(x), atol=1e-5, rtol=1e-5).item()
+                assert mx.allclose(actual, borrowed(x), atol=1e-5, rtol=1e-5).item()
+        assert budget.snapshot().reserved == expected_bytes
+        for name, value in tree_flatten(model.parameters()):
+            assert mx.array_equal(value, arrays[name]).item()
+    finally:
+        allocation.close()
+        reader.close()
+    assert budget.snapshot().reserved == 0
+
+
+def test_logical_concatenation_interleaves_fragmented_expert_rows(tmp_path):
+    from magnitude_engine.models.loading.packing import concatenate
+
+    tensors = logical_tensors(
+        expert_artifact(tmp_path / "split", split=True),
+        declaration=declaration(),
+        expert_schema=schema(),
+    )
+    base = "language_model.model.layers.0.mlp.switch_mlp"
+    gate, up = tensors[base + ".gate_proj.weight"], tensors[base + ".up_proj.weight"]
+    packed = concatenate("packed", (gate, up), 1)
+    budget, reader = MemoryBudget(1024), PositionalReader(workers=2)
+    weights = ResidentMaterializer(budget, reader, owner="packed").materialize({"packed": packed})
+    try:
+        expected = mx.array([[[float(10 * e + p)] * 2 for p in (0, 0, 1, 1)] for e in range(3)])
+        assert mx.array_equal(weights.arrays["packed"], expected).item()
+    finally:
+        weights.close()
+        reader.close()
+    assert budget.snapshot().reserved == 0

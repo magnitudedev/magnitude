@@ -20,6 +20,8 @@ from magnitude_engine.resources.budget import MemoryBudget
         (130, 8, 128, 128, False),
         (1023, 1, 256, 256, True),
         (4093, 3, 256, 256, True),
+        (8193, 8, 128, 256, True),
+        (8193, 5, 512, 512, False),
         (257, 3, 512, 512, True),
         (129, 1, 64, 64, False),
         (1023, 1, 128, 128, False),
@@ -69,9 +71,23 @@ def test_paged_attention_matches_causal_sdpa_with_poisoned_unused_storage(
         state.write(0, 0, keys[0, :, :prefix], values[0, :, :prefix])
         state.commit(prefix)
     append_layer((state,), 0, keys[:, :, prefix:], values[:, :, prefix:])
-    actual = MetalPagedAttention(heads_per_group=head_sharing).compute(
-        queries, read_layer((state,), 0, pending_tokens=count), dk**-0.5
-    )
+    operation = MetalPagedAttention(heads_per_group=head_sharing)
+    view = read_layer((state,), 0, pending_tokens=count)
+    actual = operation.compute(queries, view, dk**-0.5)
+    if prefix > 8192:
+        padded = operation.apply(
+            queries,
+            view.keys,
+            view.values,
+            view.table.device,
+            mx.array([prefix], mx.int32),
+            page_size=view.page_size,
+            table_width=view.table.width,
+            covered=((total + 511) // 512) * 512,
+            scale=dk**-0.5,
+        )
+        # Compiled capacity buckets must not alter reductions over identical logical KV.
+        assert mx.array_equal(actual, padded).item()
     mask = mx.arange(total)[None, :] <= (prefix + mx.arange(count))[:, None]
     # Unequal key/value widths can route the library to BF16 intermediate
     # matmuls. Qualify the FP32 accumulation contract against FP32 attention,
@@ -133,11 +149,19 @@ def test_single_query_views_exclude_poisoned_history_and_unused_physical_pages(
 
 
 @pytest.mark.parametrize("operator", ["native", "gathered"])
-@pytest.mark.parametrize("prefixes,count", [((0, 129), 1), ((3, 130, 1, 1023), 3)])
+@pytest.mark.parametrize(
+    "prefixes,count,tail",
+    [
+        ((0, 129), 1, False),
+        ((3, 130, 1, 1023), 3, False),
+        ((1, 8193), 5, False),
+        ((17, 65533), 5, True),
+    ],
+)
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
 @pytest.mark.parametrize("query_heads", [2, 6, 16])
 def test_attention_batches_distinct_positions_and_shared_checkpoint(
-    operator, prefixes, count, dtype, query_heads
+    operator, prefixes, count, tail, dtype, query_heads
 ):
     from magnitude_engine.models.attention.gathered import GatheredAttention
 
@@ -147,7 +171,7 @@ def test_attention_batches_distinct_positions_and_shared_checkpoint(
         (LayerGeometry(2, 32, 64),),
         page_size=16,
         slab_pages=8,
-        max_pages=160,
+        max_pages=max(160, sum((p + count + 15) // 16 for p in prefixes) + 8),
         budget=budget,
         dtype=dtype,
     )
@@ -174,7 +198,28 @@ def test_attention_batches_distinct_positions_and_shared_checkpoint(
     values = mx.stack([v[:, -count:] for _, v in histories])
     op = MetalPagedAttention(heads_per_group=2) if operator == "native" else GatheredAttention()
     append_layer(states, 0, keys, values)
-    actual = op.compute(queries, read_layer(states, 0, pending_tokens=count), 32**-0.5)
+    view = read_layer(states, 0, pending_tokens=count)
+    if tail:
+        from dataclasses import replace
+
+        from magnitude_engine.models.state.views import AppendView
+
+        physical_k, physical_v = mx.array(view.keys), mx.array(view.values)
+        # A page-only peer shares the batch with bounded append buffers.
+        tails: list[AppendView | None] = [None]
+        for row in range(1, len(states)):
+            start = prefixes[row] - 3
+            k, v = histories[row]
+            tk = mx.full((2, 512, 32), float("nan"), dtype)
+            tv = mx.full((2, 512, 64), float("nan"), dtype)
+            tk[:, : count + 3], tv[:, : count + 3] = k[:, start:], v[:, start:]
+            tails.append(AppendView(tk, tv, start))
+            for pos in range(start, prefixes[row] + count):
+                address = view.pages[row][pos // 16] * 16 + pos % 16
+                physical_k[:, address] = float("nan")
+                physical_v[:, address] = float("nan")
+        view = replace(view, keys=physical_k, values=physical_v, tails=tuple(tails))
+    actual = op.compute(queries, view, 32**-0.5)
     expected = []
     oracle_dtype = mx.float32 if operator == "native" else dtype
     for row, ((k, v), prefix) in enumerate(zip(histories, prefixes, strict=True)):

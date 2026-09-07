@@ -40,7 +40,7 @@ def benchmark(
     generation = engine.engine.generation
     sampling = SamplingPolicy(temperature=0)
     workload = {
-        "context_tokens": context_tokens,
+        "requested_context_tokens": context_tokens,
         "output_tokens": output_tokens,
         "batch_size": rows,
         "token_allowance": token_allowance,
@@ -72,10 +72,13 @@ def benchmark(
                 for i in range(rows)
             ]
             prompts = [p.prompt for p in prepared]
-        if len(prompts) != rows or any(len(p) != context_tokens + i for i, p in enumerate(prompts)):
-            raise ValueError("prompts differ from requested row lengths")
-        record_inputs(run, prompts=prompts)
+        if len(prompts) != rows or any(not p for p in prompts):
+            raise ValueError("provide a nonempty prompt for each requested row")
+        # Rendered tool messages cannot always hit an exact token target. Evidence
+        # and formulas bind the actual tokenizer output, not the requested size.
+        record_inputs(run, prompts=prompts, provenance=[p.provenance for p in prepared])
         workload["histories"] = [len(p) for p in prompts]
+        workload["context_tokens"] = len(prompts[0])
         checkpoints, expected, sequences = [], [], []
         reference = GenerationRuntime(generation.model, PlainMethod())
         for prompt in prompts:
@@ -146,7 +149,16 @@ def benchmark(
             ):
                 raise ValueError("generation did not complete requested output")
             if validation == "independent" and outputs != expected:
-                raise ValueError("generation differs from independent plain execution")
+                for row, (actual, control) in enumerate(zip(outputs, expected, strict=True)):
+                    for index, (token, reference_token) in enumerate(
+                        zip(actual, control, strict=True)
+                    ):
+                        if token != reference_token:
+                            raise ValueError(
+                                "generation differs from independent plain execution: "
+                                f"row {row}, output {index}, "
+                                f"got {token}, expected {reference_token}"
+                            )
             return Observation(
                 hashlib.sha256(json.dumps(outputs).encode()).hexdigest(),
                 {

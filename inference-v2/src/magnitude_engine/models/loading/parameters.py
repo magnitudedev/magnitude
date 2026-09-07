@@ -1,6 +1,7 @@
 """Shared resident parameter construction, independent of neural family semantics."""
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
@@ -25,7 +26,18 @@ from ..experts.computation import (
     QuantizedProjection,
     ResidentExperts,
 )
+from .packing import ProjectionPack
 from .validation import configure_affine_modules, validate_parameters
+
+
+@dataclass
+class BoundParameters:
+    allocation: ModelAllocation
+    projections: dict[tuple[str, ...], nn.Module]
+
+    def close(self) -> None:
+        self.projections.clear()
+        self.allocation.close()
 
 
 def affine_encodings(
@@ -62,7 +74,7 @@ def load_resident_parameters(
     reader: PositionalReader,
     owner: str,
     excluded: frozenset[str] = frozenset(),
-) -> ModelAllocation:
+) -> BoundParameters:
     configure_affine_modules(model, encodings)
     validate_parameters(model, {name: tensor.shape for name, tensor in tensors.items()})
     return materialize_parameters(
@@ -83,20 +95,40 @@ def materialize_parameters(
     reader: PositionalReader,
     owner: str,
     excluded: frozenset[str] = frozenset(),
-) -> ModelAllocation:
+    packs: tuple[ProjectionPack, ...] = (),
+    encodings: dict[str, AffineEncoding] | None = None,
+) -> BoundParameters:
     """Install a validated parameter partition after geometry/ownership binding."""
     if not excluded <= tensors.keys():
         raise ValueError("excluded tensors are outside the validated model layout")
+    selected = {name: tensor for name, tensor in tensors.items() if name not in excluded}
+    accepted = []
+    for pack in packs:
+        plan = pack.plan(selected, encodings or {})
+        if plan is None:
+            continue
+        for name in pack.names:
+            for suffix in ("weight", "scales", "biases", "bias"):
+                selected.pop(name + "." + suffix, None)
+        selected.update(plan)
+        accepted.append((pack, plan))
     weights: ResidentTensors = ResidentMaterializer(budget, reader, owner=owner).materialize(
-        {name: tensor for name, tensor in tensors.items() if name not in excluded}
+        selected
     )
     allocation = ModelAllocation({owner: weights})
     try:
-        model.load_weights(list(weights.arrays.items()), strict=not excluded)
+        arrays = dict(weights.arrays)
+        projections = {}
+        for pack, plan in accepted:
+            projections[pack.names] = pack.module(weights.arrays, encodings or {})
+            arrays.update(pack.views(weights.arrays, tensors))
+            for name in plan:
+                del arrays[name]
+        model.load_weights(list(arrays.items()), strict=not excluded)
     except BaseException:
         allocation.close()
         raise
-    return allocation
+    return BoundParameters(allocation, projections)
 
 
 def resident_embedding(module: Any) -> tuple[EmbeddingLookup, mx.Dtype]:

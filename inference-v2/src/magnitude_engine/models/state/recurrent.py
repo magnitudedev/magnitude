@@ -233,3 +233,12 @@ def write_batch(
                 values if len(rows) == 1 else tuple(mx.array(a[index : index + 1]) for a in values),
             )
     return tuple(row.values(slot.layer) for row, slot in zip(rows, slots, strict=True))
+
+
+def stage_boundaries(
+    slots: tuple[RecurrentSlot, ...], values: tuple[mx.array, ...], length: int
+) -> None:
+    """Publish a reserved recurrent output whose accepted prefix is either endpoint."""
+    outputs = write_batch(slots, values)
+    for slot, output in zip(slots, outputs, strict=True):
+        slot.stage(RecurrentBoundaries(slot.values, output, length))

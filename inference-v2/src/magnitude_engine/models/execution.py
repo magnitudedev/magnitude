@@ -23,15 +23,20 @@ class CompletionBackend(Protocol):
     Python graph handles. drain completes all submitted work on this owner.
     """
 
-    def submit(self, arrays: tuple[mx.array, ...]) -> None: ...
+    def submit(self, arrays: tuple[mx.array, ...]) -> tuple[mx.array, ...]: ...
     def complete(self, arrays: tuple[mx.array, ...]) -> None: ...
     def drain(self) -> None: ...
 
 
 class MLXCompletion:
-    def submit(self, arrays: tuple[mx.array, ...]) -> None:
-        if arrays:
-            mx.async_eval(*arrays)
+    def submit(self, arrays: tuple[mx.array, ...]) -> tuple[mx.array, ...]:
+        if not arrays:
+            return ()
+        # Depends carries completion of every state write without retaining large
+        # Python output handles or requiring a fence on unrelated later work.
+        ticket = mx.depends(mx.array(0, mx.int32), arrays)
+        mx.async_eval(ticket)
+        return (ticket,)
 
     def complete(self, arrays: tuple[mx.array, ...]) -> None:
         if arrays:
@@ -70,9 +75,13 @@ class ExecutionOwner:
         self.check()
         return ExecutionScope(self)
 
-    def span(self) -> ExecutionSpan:
+    def complete(self) -> bool:
+        """Complete owned work before a shared layout change; report whether any existed."""
         self.check()
-        return ExecutionSpan(self)
+        pending = tuple(self._pending)
+        for execution in pending:
+            execution.complete()
+        return bool(pending)
 
     @property
     def requires_disposal(self) -> bool:
@@ -120,7 +129,7 @@ class PendingExecution:
         self.roots = roots
         self._leases = leases
         self.done = False
-        self._span: ExecutionSpan | None = None
+        self._submitted = False
         owner._pending.add(self)
 
     def retain(self, lease: ResourceLease) -> None:
@@ -130,21 +139,22 @@ class PendingExecution:
             raise RuntimeError("cannot retain resources after execution completes")
         self._leases = (*self._leases, lease)
 
-    def submit(self) -> None:
+    def submit(self, *consumers: mx.array) -> None:
         self.owner.check()
-        if self.done or self._span is not None:
+        if self.done:
+            self.owner.backend.submit(tuple(consumers))
+            return
+        if self._submitted and not consumers:
             return
         try:
-            self.owner.backend.submit(self.roots)
+            self.roots = self.owner.backend.submit((*self.roots, *consumers))
+            self._submitted = True
         except BaseException as error:
             self._fail(error)
 
     def complete(self) -> None:
         self.owner.check()
         if self.done:
-            return
-        if self._span is not None:
-            self._span.complete()
             return
         try:
             self.owner.backend.complete(self.roots)
@@ -176,70 +186,6 @@ class PendingExecution:
         if failures:
             self.owner._failed = True
             raise BaseExceptionGroup("resource retirement failed", failures)
-
-
-class ExecutionSpan:
-    """A bounded set of submitted executions with one resource retirement fence.
-
-    The backend owns submitted buffers. Keeping their obsolete Python graphs alive
-    prevents reuse across dependent forwards, so members discard roots after submit.
-    Their leases remain owned by PendingExecution until the common device drain.
-    Completing any member completes the entire span; no member can retire early.
-    """
-
-    def __init__(self, owner: ExecutionOwner):
-        self.owner = owner
-        self._members: list[PendingExecution] = []
-        self._closed = False
-
-    @property
-    def closed(self) -> bool:
-        return self._closed
-
-    def submit(self, execution: PendingExecution, *consumers: mx.array) -> None:
-        """Submit model roots and downstream consumers under the same leases."""
-        self.owner.check()
-        if self._closed or execution.owner is not self.owner:
-            raise ValueError("execution span is closed or belongs to another owner")
-        if execution.done or execution._span is not None:
-            raise ValueError("execution is already completed or belongs to a span")
-        execution.roots = (*execution.roots, *consumers)
-        execution.submit()
-        execution._span = self
-        execution.roots = ()
-        self._members.append(execution)
-
-    def complete(self) -> None:
-        if self._closed:
-            return
-        self.owner.check()
-        if self._members:
-            try:
-                self.owner.backend.drain()
-            except BaseException:
-                # A failed fence cannot prove buffer safety. Keep every lease;
-                # the only safe recovery is disposal of the worker process.
-                self.owner._failed = True
-                raise
-        self._closed = True
-        failures = []
-        for execution in self._members:
-            try:
-                execution._release()
-            except BaseException as error:
-                failures.append(error)
-        self._members.clear()
-        if failures:
-            raise BaseExceptionGroup("execution span retirement failed", failures)
-
-    def __enter__(self) -> ExecutionSpan:
-        self.owner.check()
-        if self._closed:
-            raise RuntimeError("execution span is closed")
-        return self
-
-    def __exit__(self, _kind: object, _error: object, _traceback: object) -> None:
-        self.complete()
 
 
 class ExecutionScope:

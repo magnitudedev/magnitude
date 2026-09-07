@@ -5,7 +5,6 @@ there is no all-request draft/verify stage barrier or per-forward fence.
 """
 
 from collections.abc import Callable
-from contextlib import ExitStack
 from dataclasses import dataclass
 from time import perf_counter_ns
 from typing import cast
@@ -71,7 +70,7 @@ def serve[T](
     clock: Callable[[], int] = perf_counter_ns,
     budget_ns: int | None = None,
 ) -> None:
-    """Return ready results; retain peers at a completed service boundary.
+    """Return ready results; retain peers and bounded work across service boundaries.
 
     The deadline is soft: an indivisible device operation may overrun it. No
     timing fence is inserted between dependent forwards. Bounded round widths
@@ -81,8 +80,6 @@ def serve[T](
         raise ValueError("execution service budget must be positive")
     started = clock()
     completed = sum(row.done for row in rows)
-    lifetime = ExitStack()
-    spans = {}
     sequences = set()
     try:
         for row in rows:
@@ -161,13 +158,7 @@ def serve[T](
                     executions.setdefault(op.execution, []).extend(op.consumers)
                 start = clock()
                 for execution, consumers in executions.items():
-                    owner = execution.owner
-                    if execution.done:
-                        owner.backend.submit(tuple(consumers))
-                        continue
-                    if owner not in spans or spans[owner].closed:
-                        spans[owner] = lifetime.enter_context(owner.span())
-                    spans[owner].submit(execution, *consumers)
+                    execution.submit(*consumers)
                 elapsed = clock() - start
                 for row in submissions:
                     row.elapsed_ns += elapsed
@@ -204,14 +195,16 @@ def serve[T](
     except BaseException:
         for row in rows:
             row.close()
+        for sequence in sequences:
+            sequence.runtime.owner.complete()
         raise
     finally:
         try:
-            lifetime.close()
             for sequence in sequences:
-                if sequence.pending is not None:
-                    sequence.pending.complete()
-                sequence.complete_committed()
+                sequence.prune_completed()
+            if any(isinstance(row.result, (MemoryError, ConstraintError)) for row in rows):
+                for sequence in sequences:
+                    sequence.runtime.owner.complete()
         finally:
             for row in rows:
                 if row.done:

@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 from magnitude_engine.models.attention.contracts import PagedAttention
+from magnitude_engine.models.projections import ParallelProjections
 
 from ..contracts import (
     AttentionFactory,
@@ -15,12 +16,10 @@ from .rotary import QwenRotary
 class Attention(AttentionFactory):
     computation: PagedAttention
 
-    def bind(self, layer, slot: int) -> GatedAttention:
+    def bind(self, layer, slot: int, inputs: ParallelProjections) -> GatedAttention:
         return GatedAttention(
             slot,
-            layer.q_proj,
-            layer.k_proj,
-            layer.v_proj,
+            inputs,
             layer.o_proj,
             layer.q_norm,
             layer.k_norm,

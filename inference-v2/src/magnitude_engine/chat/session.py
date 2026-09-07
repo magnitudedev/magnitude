@@ -13,8 +13,12 @@ from magnitude_engine.worker.host import Worker
 
 class ChatSession:
     def __init__(
-        self, worker: Worker, artifact: TokenizerArtifact, system: str = "",
-        *, thinking: bool | None = None,
+        self,
+        worker: Worker,
+        artifact: TokenizerArtifact,
+        system: str = "",
+        *,
+        thinking: bool | None = None,
     ):
         self.worker, self.artifact = worker, artifact
         if (
@@ -39,7 +43,8 @@ class ChatSession:
     ) -> Generator[PrefillProgress | TextDelta | Finished, None, None]:
         messages = [*self.messages, {"role": "user", "content": text}]
         prompt = self.template.render(
-            messages, tool_choice="none",
+            messages,
+            tool_choice="none",
             chat_template_kwargs=(
                 {} if self.thinking is None else {"enable_thinking": self.thinking}
             ),

@@ -1,4 +1,5 @@
 """One request-level tool selection shared by prompt rendering and output constraints."""
+
 from dataclasses import dataclass
 
 
@@ -13,8 +14,11 @@ class ToolSelection:
         if not self.required:
             return messages
         subject = (
-            f"the supplied tool {self.name!r}" if self.name is not None
-            else "at least one of the supplied tools" if parallel else "one of the supplied tools"
+            f"the supplied tool {self.name!r}"
+            if self.name is not None
+            else "at least one of the supplied tools"
+            if parallel
+            else "one of the supplied tools"
         )
         instruction = f"Call {subject} to answer this request."
         if messages[0]["role"] == "system":

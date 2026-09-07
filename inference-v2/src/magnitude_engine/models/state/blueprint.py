@@ -6,7 +6,7 @@ from .contracts import StateFactory
 
 @blueprint
 class PagedHybrid(Blueprint[StateFactory]):
-    page_size: int = 16
+    page_size: int = 256
     slab_pages: int = 32
 
     def __post_init__(self) -> None:

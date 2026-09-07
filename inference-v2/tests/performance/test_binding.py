@@ -204,6 +204,7 @@ def test_attached_head_boundaries(engine, tmp_path):
         MTPParameters,
     )
     from magnitude_engine.models.architectures.qwen35.mtp.program import MTPProgram
+    from magnitude_engine.models.ownership import OwnedProgram
     from magnitude_engine.models.runtime import ModelRuntime
     from magnitude_engine.models.state.native import LibraryStateStore
     from performance.benchmarks.mtp import benchmark
@@ -225,15 +226,19 @@ def test_attached_head_boundaries(engine, tmp_path):
         linear_key_head_dim=32,
         linear_value_head_dim=32,
     )
+    owner = OwnedProgram(target.program, (), vocabulary=(
+        "test-vocabulary", 64, target.program.embedding, target.program.output,
+    ))
+    vocabulary = owner.borrow_vocabulary()
     p = MTPParameters(args)
     program = MTPProgram(
-        target.program.embedding,
+        vocabulary,
         p.pre_fc_norm_embedding,
         p.pre_fc_norm_hidden,
         p.fc,
         tuple(AttentionStep(layer) for layer in p.layers),
         p.norm,
-        target.program.output,
+        vocabulary.project,
     )
     head = ModelRuntime(
         program,
@@ -244,7 +249,7 @@ def test_attached_head_boundaries(engine, tmp_path):
         target=target,
         head=head,
         target_feature="residual:4",
-        project=target.program.output,
+        project=vocabulary.project,
         capacity=2,
         budget=engine.budget,
         identity="test-head",
@@ -267,6 +272,9 @@ def test_attached_head_boundaries(engine, tmp_path):
             repetitions=1,
         )
         assert result.record["status"] == "complete"
+
+    vocabulary.close()
+    owner.close()
 
 
 def test_batched_and_generation_benchmarks(engine, tmp_path):
@@ -521,3 +529,56 @@ def test_compiled_qwen_has_a_real_identified_child_with_shared_blocks():
         assert decoded.children["embedding"] == root.children["embedding"]
     finally:
         arena.close()
+
+
+def test_generation_binds_actual_rendered_fixture_lengths(engine, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from performance.benchmarks import generation
+    from performance.records import Profile
+
+    monkeypatch.setattr(
+        generation,
+        "tokens",
+        lambda *args, **kwargs: SimpleNamespace(
+            prompt=(1, 2, 3, 4, 5, 6), provenance={"fixture": "tools.bfcl"}
+        ),
+    )
+    result = generation.benchmark(
+        engine,
+        context_tokens=4,
+        output_tokens=2,
+        validation="workload",
+        profile=Profile({}, {}),
+        output=tmp_path,
+        warmup=0,
+        repetitions=1,
+    )
+    assert result.record["status"] == "complete"
+    workload = result.record["workload"]
+    assert workload["requested_context_tokens"] == 4
+    assert workload["context_tokens"] == 6
+    assert workload["histories"] == [6]
+    assert result.record["inputs"]["provenance"] == [{"fixture": "tools.bfcl"}]
+
+
+def test_explicit_external_control_captures_its_own_source_and_constants(tmp_path):
+    import importlib.util
+    import sys
+
+    from performance.assembly import source_key
+
+    path = tmp_path / 'external_control.py'
+    path.write_text('FACTOR = 2\ndef execute(x):\n    return x * FACTOR\n')
+    spec = importlib.util.spec_from_file_location('external_control', path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        original, files = source_key((module.execute,))
+        assert files == {'external_control': path.read_text()}
+        module.FACTOR = 3
+        changed, _ = source_key((module.execute,))
+        assert original != changed
+    finally:
+        del sys.modules[spec.name]

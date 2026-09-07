@@ -150,6 +150,7 @@ class Engine[S, C: ModelCheckpoint]:
             if handle.request.max_tokens == 0:
                 self._terminal(handle, "length")
                 continue
+            self.generation.model.owner.complete()
             lease = self.prefixes.match(self._identity(handle.request.prompt))
             sequence = None
             try:
@@ -278,6 +279,7 @@ class Engine[S, C: ModelCheckpoint]:
             raise
 
     def _prefill(self, services: tuple[Service, ...]) -> tuple[ServiceMeasurement, ...]:
+        self.generation.model.owner.complete()
         scheduled = []
         for service in services:
             row = self._active[service.identity]
@@ -333,8 +335,8 @@ class Engine[S, C: ModelCheckpoint]:
         start = self.clock()
         outcomes = self.generation.step_many(
             tuple(row.sequence for row, _ in scheduled),
-            # Publish the first token on its own: it closes prompt service and
-            # establishes TTFT before any bounded continuation span is issued.
+            # Publish the first token on its own. Causal execution may already
+            # have submitted one successor, but it does not wait for that result.
             tuple(
                 1 if row.first_token_ns is None else service.tokens for row, service in scheduled
             ),

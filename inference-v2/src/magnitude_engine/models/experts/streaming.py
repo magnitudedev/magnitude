@@ -30,7 +30,9 @@ class StreamedExperts:
         self.bank, self.scratch, self.reader = bank, scratch, reader
         self.residency = Residency(source.experts, bank.slots)
 
-    def compute(self, hidden: mx.array, assignments: mx.array, scope: ExecutionScope) -> mx.array:
+    def compute(
+        self, hidden: mx.array, assignments: mx.array, scores: mx.array, scope: ExecutionScope
+    ) -> mx.array:
         # MLX's tolist annotation cannot express the known rank-one shape.
         logical = cast(list[int], assignments.reshape(-1).tolist())
         if any(
@@ -46,7 +48,7 @@ class StreamedExperts:
                 self.source, tuple((expert, expert) for expert in unique), self.reader
             )
             output = self.math.apply(
-                self.scratch.weights, hidden, assignments, expand_assignments=True
+                self.scratch.weights, hidden, assignments, scores, expand_assignments=True
             )
             scope.depend(output)
             scope.retire(lease, output)
@@ -71,6 +73,8 @@ class StreamedExperts:
             self.residency.finish(transfer, publish=True)
         self.residency.touch(unique)
         physical = mx.array([self.residency.resolve(expert) for expert in logical], dtype=mx.int32)
-        output = self.math.apply(self.bank.weights, hidden, physical.reshape(assignments.shape))
+        output = self.math.apply(
+            self.bank.weights, hidden, physical.reshape(assignments.shape), scores
+        )
         scope.depend(output)
         return output

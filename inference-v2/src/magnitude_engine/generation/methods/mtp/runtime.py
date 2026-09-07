@@ -11,8 +11,8 @@ from magnitude_engine.components import component
 from magnitude_engine.generation.features import RetainedFeature
 from magnitude_engine.generation.proposals import Proposal
 from magnitude_engine.models.inputs import ModelInputs
-from magnitude_engine.models.operations import Task, forward, project_vocabulary, submit
-from magnitude_engine.models.runtime import ForwardRequest, ModelRuntime
+from magnitude_engine.models.operations import Task, complete, forward, project_vocabulary, submit
+from magnitude_engine.models.runtime import ForwardRequest, ModelAdvance, ModelRuntime
 from magnitude_engine.models.state.native import LibraryCheckpoint, LibraryState
 from magnitude_engine.resources.budget import MemoryBudget
 from magnitude_engine.resources.retention import RetainedStorage
@@ -36,21 +36,21 @@ class MTPCheckpoint:
     def __init__(self, session: MTPSession):
         self.owner = session.binding
         self.closed = False
-        tensors = ([session.seed.value] if session.seed is not None else []) + [
+        tensors = ([session.pending.value] if session.pending is not None else []) + [
             h.value for _, h in session.buffer
         ]
         self.reservation = session.binding.budget.reserve(
             "mtp-checkpoint", sum(a.nbytes for a in tensors)
         )
         self.head: LibraryCheckpoint | None = None
-        self.seed: mx.array | None = None
+        self.pending: mx.array | None = None
         self.buffer: list[tuple[int, mx.array]] = []
         self.position = session.position
         try:
             self.head = session.row.checkpoint()
-            self.seed = None if session.seed is None else mx.array(session.seed.value)
+            self.pending = None if session.pending is None else mx.array(session.pending.value)
             self.buffer = [(token, mx.array(hidden.value)) for token, hidden in session.buffer]
-            mx.eval(*([] if self.seed is None else [self.seed]), *(h for _, h in self.buffer))
+            mx.eval(*([] if self.pending is None else [self.pending]), *(h for _, h in self.buffer))
         except BaseException:
             self.close()
             raise
@@ -60,91 +60,112 @@ class MTPCheckpoint:
             return
         if self.head is not None:
             self.head.close()
-        self.seed = None
+        self.pending = None
         self.buffer.clear()
         self.reservation.close()
         self.closed = True
 
 
 class MTPSession:
-    prefill_features: frozenset[str] = frozenset()
+    """Head history follows committed inputs; the final target feature awaits its successor.
+
+    A checkpoint contains no token beyond its target prefix. Known committed pairs may
+    wait in buffer, but the next anchor is supplied by the actual continuation.
+    """
 
     def __init__(self, binding: MTPMethod, checkpoint: MTPCheckpoint | None):
         self.binding = binding
-        self.features = frozenset({binding.target_feature})
+        self.features = self.prefill_features = frozenset({binding.target_feature})
         self.row = binding.head.create(None if checkpoint is None else checkpoint.head)
         self.position = 0 if checkpoint is None else checkpoint.position
-        self.seed: RetainedFeature | None = None
+        self.pending: RetainedFeature | None = None
         self.buffer: list[tuple[int, RetainedFeature]] = []
         self.appended = 0
         self.proposed: Proposal | None = None
-        self.proposal: RetainedFeature | None = None
         self.closed = False
         try:
             if checkpoint is not None:
-                if checkpoint.seed is not None:
-                    self.seed = RetainedFeature(checkpoint.seed, binding.budget)
+                if checkpoint.pending is not None:
+                    self.pending = RetainedFeature(checkpoint.pending, binding.budget)
                 for token, value in checkpoint.buffer:
                     self.buffer.append((token, RetainedFeature(value, binding.budget)))
         except BaseException:
             self.close()
             raise
 
-    def prefill(self, tokens: tuple[int, ...], features: Mapping[str, mx.array]) -> None:
-        # Released Qwen MTP starts from the first target decode, not prompt-head prefill.
-        pass
+    def _features(self, tokens: tuple[int, ...], features: Mapping[str, mx.array]) -> mx.array:
+        hidden = features[self.binding.target_feature]
+        if not tokens or hidden.shape[:2] != (1, len(tokens)):
+            raise ValueError("target features do not align with consumed inputs")
+        return hidden
+
+    def prefill(self, tokens: tuple[int, ...], features: Mapping[str, mx.array]) -> Task[None]:
+        if self.closed or self.proposed is not None:
+            raise RuntimeError("MTP prefill requires an idle live method state")
+        hidden = self._features(tokens, features)
+        yield from self._flush()
+        previous = hidden[:, :-1]
+        shifted = tokens[1:]
+        consumed = ()
+        if self.pending is not None:
+            previous = mx.concatenate([self.pending.value, previous], axis=1)
+            shifted = tokens
+            consumed = (self.pending,)
+        replacement = RetainedFeature(hidden[:, -1:], self.binding.budget)
+        try:
+            if shifted:
+                advance = yield from self._forward(
+                    mx.array([shifted], dtype=mx.int32), previous, consumed
+                )
+                yield from complete(advance)
+            self.pending = replacement
+            self.row.complete_committed()
+        except BaseException:
+            replacement.close()
+            raise
 
     def _forward(
         self, tokens: mx.array, previous: mx.array, consumed: tuple[RetainedFeature, ...] = ()
-    ) -> Task[mx.array]:
+    ) -> Task[ModelAdvance[LibraryState, LibraryCheckpoint]]:
         advance = yield from forward(
             self.row,
             ModelInputs(tokens, {"previous_hidden": previous}),
-            ForwardRequest(False, frozenset({"draft_hidden"})),
+            ForwardRequest(False, frozenset({"draft_hidden"}), committed_inputs=tokens.shape[1]),
         )
         for feature in consumed:
             advance.execution.retain(feature)
         yield from submit(advance)
         advance.accept_all_lazily()
         self.position += tokens.shape[1]
-        return advance.output.features["draft_hidden"]
+        return advance
 
     def _flush(self) -> Task[None]:
         if not self.buffer:
             return
         tokens = mx.array([[token for token, _ in self.buffer]], dtype=mx.int32)
         previous = mx.concatenate([hidden.value for _, hidden in self.buffer], axis=1)
-        hidden = yield from self._forward(
-            tokens, previous, tuple(value for _, value in self.buffer)
-        )
+        yield from self._forward(tokens, previous, tuple(value for _, value in self.buffer))
         self.buffer.clear()
-        replacement = RetainedFeature(hidden[:, -1:], self.binding.budget)
-        if self.seed is not None:
-            self.seed.close()
-        self.seed = replacement
 
     def propose(self, context: Sequence[int], limit: int) -> Task[Proposal]:
         if self.closed or self.proposed is not None:
             raise RuntimeError("MTP proposal requires an idle live method state")
-        if limit <= 0:
+        if limit <= 0 or self.pending is None:
             return Proposal.from_tokens(())
         yield from self._flush()
-        if self.seed is None:
-            return Proposal.from_tokens(())
-        width = min(limit, self.binding.capacity)
-        hidden = self.seed.value
-        tokens, learned = [], []
-        for index in range(width):
+        advance = yield from self._forward(
+            mx.array([[context[-1]]], dtype=mx.int32), self.pending.value, (self.pending,)
+        )
+        self.pending = None
+        hidden = advance.output.features["draft_hidden"]
+        tokens = []
+        for index in range(min(limit, self.binding.capacity)):
             if index:
-                hidden = yield from self._forward(tokens[-1], hidden)
+                advance = yield from self._forward(tokens[-1], hidden)
+                hidden = advance.output.features["draft_hidden"]
                 self.appended += 1
-            learned.append(hidden[:, -1:])
             logits = yield from project_vocabulary(self.binding.project, hidden[:, -1:])
             tokens.append(mx.argmax(logits, axis=-1).astype(mx.int32))
-        replacement = RetainedFeature(mx.concatenate(learned, axis=1), self.binding.budget)
-        if self.proposal is not None:
-            self.proposal.close()
-        self.proposal = replacement
         output = mx.concatenate(tokens, axis=1)
         self.proposed = Proposal(output.reshape(-1))
         return self.proposed
@@ -159,15 +180,18 @@ class MTPSession:
         accepted = verification.accepted_inputs - 1
         if not 0 <= accepted < len(verification.inputs):
             raise ValueError("MTP observation has an invalid accepted prefix")
-        hidden = verification.features[self.binding.target_feature]
-        if hidden.shape[:2] != (1, len(verification.inputs)):
-            raise ValueError("target features do not align with verification inputs")
+        hidden = self._features(verification.inputs, verification.features)
         self.row.complete_committed()
         keep = min(accepted, self.appended)
         drop = self.appended - keep
         if drop:
             self.binding.head.rewind(self.row, self.position - drop)
             self.position -= drop
+        # Without drafting (one output slot or forced inputs), the anchor still
+        # needs its preceding target feature. Never store the unpublished successor.
+        if self.pending is not None:
+            self.buffer.append((verification.inputs[0], self.pending))
+            self.pending = None
         self.appended = 0
         self.proposed = None
         for i in range(keep, accepted):
@@ -177,12 +201,7 @@ class MTPSession:
                     RetainedFeature(hidden[:, i : i + 1], self.binding.budget),
                 )
             )
-        self.buffer.append(
-            (
-                verification.next_token,
-                RetainedFeature(hidden[:, accepted : accepted + 1], self.binding.budget),
-            )
-        )
+        self.pending = RetainedFeature(hidden[:, accepted : accepted + 1], self.binding.budget)
 
     def checkpoint(self) -> MTPCheckpoint:
         if self.closed or self.proposed is not None:
@@ -193,15 +212,12 @@ class MTPSession:
         if self.closed:
             return
         self.row.close()
-        if self.seed is not None:
-            self.seed.close()
-            self.seed = None
+        if self.pending is not None:
+            self.pending.close()
+            self.pending = None
         for _, feature in self.buffer:
             feature.close()
         self.buffer.clear()
-        if self.proposal is not None:
-            self.proposal.close()
-            self.proposal = None
         self.closed = True
 
 
