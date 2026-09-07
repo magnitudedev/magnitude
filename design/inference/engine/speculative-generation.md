@@ -157,7 +157,7 @@ Retained checkpoints detach their row so prefix retention does not pin peer stat
 | EOS or output limit inside a proposal | Publish only the permitted prefix; discard unreachable work and preserve the exact consumed position |
 | History penalties or grammar constraints | Preview per-request state along candidates; commit only published history |
 | Join, finish, cancellation, or slow consumer | Change eligibility at service boundaries; skip unsubmitted cancelled work and drain submitted work safely |
-| Batch allocation cannot fit | Reserve before execution; split prepared operations without proposing again or resampling |
+| Batch allocation cannot fit | After preparation rolls back, retire outstanding committed work before one unchanged retry; otherwise split without proposing again or resampling |
 | One operation cannot fit | Resolve/discard its tentative state safely; defer or fail that request rather than silently exceed capacity |
 | Device/completion failure | Fail the execution owner when safe isolation is impossible; never report speculative state as committed |
 

@@ -2,8 +2,9 @@
 
 ## Scope
 
-**The current model is an assembly of owned hybrid blocks and upstream operations;
-whole-model compiled/fused decode remains an optimization gap.** This covers the
+**The model composes owned hybrid blocks and upstream operations. Resident
+single-input execution compiles their tensor transitions together; state preparation
+and publication remain outside compilation.** This covers the
 accepted Qwen3.5-family text layouts, including compatible Qwen3.6 artifacts, dense
 or routed feedforward, and converted affine weights.
 
@@ -15,38 +16,190 @@ follows [component identification](../../components.md).
 ## Assembly
 
 ```text
-MODEL:QWEN35:MAG:LAYERWISE    [unmeasured]
-├── MODEL:EMBEDDING:MAG:RESIDENT    [unmeasured]
-├── repeated layer assembly: norm → mixer → residual → norm → feedforward → residual
-│   ├── mixer: one of
-│   │   ├── MODEL:QWEN35.ATTENTION:MAG:SEPARATE_PROJECTIONS    [unmeasured]
-│   │   │   └── MODEL:ATTENTION:MAG:PAGED    [unmeasured]
-│   │   │       └── MODEL:ATTENTION:MAG:GATHERED    [unmeasured] fallback
-│   │   │           └── MODEL:ATTENTION:MLX:DENSE    [unmeasured]
-│   │   └── MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION    [unmeasured]
-│   │       └── MODEL:GATED_DELTA:MAG:FUSED_UPDATE    [unmeasured]
-│   └── feedforward: one of
-│       ├── MODEL:QWEN35.FEEDFORWARD:LM:DENSE    [unmeasured]
-│       └── MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED    [unmeasured]
-│           └── MODEL:EXPERTS:MAG:RESIDENT_GATHERED    [unmeasured]
-└── MODEL:QWEN35.READOUT:MAG:STANDARD    [unmeasured]
-
-State dependency: STATE:QWEN35:MAG:HYBRID    [MEM: unmeasured, RESTORE: unmeasured]
-Optional drafter: MODEL:QWEN35.MTP:MAG:CONDITIONED    [unmeasured]
-                  └── STATE:CHECKPOINTS:MAG:NATIVE    [MEM: unmeasured, RESTORE: unmeasured]
+MODEL:QWEN35:MAG:RESIDENT_COMPILED
+├── embedding · MODEL:EMBEDDING:MAG:RESIDENT
+├── layers.0.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.0.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.1.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.1.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.2.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.2.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.3.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.3.mixer · MODEL:QWEN35.ATTENTION:MAG:SEPARATE_PROJECTIONS
+│   └── attention · MODEL:ATTENTION:MAG:PAGED
+│       └── fallback · MODEL:ATTENTION:MAG:GATHERED
+├── layers.4.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.4.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.5.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.5.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.6.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.6.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.7.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.7.mixer · MODEL:QWEN35.ATTENTION:MAG:SEPARATE_PROJECTIONS
+│   └── attention · MODEL:ATTENTION:MAG:PAGED
+│       └── fallback · MODEL:ATTENTION:MAG:GATHERED
+├── layers.8.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.8.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.9.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.9.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.10.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.10.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.11.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.11.mixer · MODEL:QWEN35.ATTENTION:MAG:SEPARATE_PROJECTIONS
+│   └── attention · MODEL:ATTENTION:MAG:PAGED
+│       └── fallback · MODEL:ATTENTION:MAG:GATHERED
+├── layers.12.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.12.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.13.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.13.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.14.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.14.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.15.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.15.mixer · MODEL:QWEN35.ATTENTION:MAG:SEPARATE_PROJECTIONS
+│   └── attention · MODEL:ATTENTION:MAG:PAGED
+│       └── fallback · MODEL:ATTENTION:MAG:GATHERED
+├── layers.16.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.16.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.17.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.17.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.18.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.18.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.19.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.19.mixer · MODEL:QWEN35.ATTENTION:MAG:SEPARATE_PROJECTIONS
+│   └── attention · MODEL:ATTENTION:MAG:PAGED
+│       └── fallback · MODEL:ATTENTION:MAG:GATHERED
+├── layers.20.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.20.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.21.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.21.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.22.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.22.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.23.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.23.mixer · MODEL:QWEN35.ATTENTION:MAG:SEPARATE_PROJECTIONS
+│   └── attention · MODEL:ATTENTION:MAG:PAGED
+│       └── fallback · MODEL:ATTENTION:MAG:GATHERED
+├── layers.24.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.24.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.25.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.25.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.26.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.26.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.27.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.27.mixer · MODEL:QWEN35.ATTENTION:MAG:SEPARATE_PROJECTIONS
+│   └── attention · MODEL:ATTENTION:MAG:PAGED
+│       └── fallback · MODEL:ATTENTION:MAG:GATHERED
+├── layers.28.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.28.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.29.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.29.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.30.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.30.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.31.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.31.mixer · MODEL:QWEN35.ATTENTION:MAG:SEPARATE_PROJECTIONS
+│   └── attention · MODEL:ATTENTION:MAG:PAGED
+│       └── fallback · MODEL:ATTENTION:MAG:GATHERED
+├── layers.32.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.32.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.33.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.33.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.34.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.34.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.35.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.35.mixer · MODEL:QWEN35.ATTENTION:MAG:SEPARATE_PROJECTIONS
+│   └── attention · MODEL:ATTENTION:MAG:PAGED
+│       └── fallback · MODEL:ATTENTION:MAG:GATHERED
+├── layers.36.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.36.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.37.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.37.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.38.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.38.mixer · MODEL:QWEN35.RECURRENCE:MAG:COMPILED_REGION
+│   └── update · MODEL:GATED_DELTA:MAG:FUSED_UPDATE
+├── layers.39.feedforward · MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED
+│   └── experts · MODEL:EXPERTS:MAG:RESIDENT_GATHERED
+├── layers.39.mixer · MODEL:QWEN35.ATTENTION:MAG:SEPARATE_PROJECTIONS
+│   └── attention · MODEL:ATTENTION:MAG:PAGED
+│       └── fallback · MODEL:ATTENTION:MAG:GATHERED
+├── readout · MODEL:QWEN35.READOUT:MAG:STANDARD
+└── state · STATE:QWEN35:MAG:HYBRID
+    ├── kv · KV:STORE:MAG:PAGED    [99.23% @state.append]
+    │   ├── append · KV:APPEND:MAG:CONTIGUOUS_RUNS
+    │   └── branch · KV:BRANCH:MAG:COPY_ON_WRITE
+    └── recurrent · STATE:RECURRENT:MAG:CHECKPOINTED
 ```
-
-Shared embedding, attention and expert IDs resolve to the
-[shared component definitions](../composability.md#shared-component-definitions).
-Native checkpoints resolve to the [generic adapter](generic-mlx-vlm.md#statecheckpointsmagnative).
-The repeated layer assembly expresses ordering, not another runtime dispatch.
-Norms, projections and residuals inside a component remain testable regions without
-requiring an ID for every tensor operation. This tree selects resident weights;
-streaming is a separate composition to identify and qualify explicitly.
 
 ## Component definitions
 
-Each type below owns its contract, dimension definitions and formula binding.
+Each type below defines its behavior and mathematical assumptions. Executable bindings
+are owned by the [performance catalog](../../performance.md#ownership-and-component-records).
 Parameters inherit the [origin/platform rules](../../performance.md#dimensions-and-parameter-binding).
 `JOIN` and `L` use the [resource algebra](../../performance/derivations/resources.md#evaluation-algebra);
 [neural regions](../../performance/derivations/neural.md#named-region-bindings) supply the shared terms.
@@ -84,6 +237,29 @@ mixer_j = D_QA_j or D_QR_j according to the artifact
 
 **Implementations and controls.**
 
+#### `MODEL:QWEN35:MAG:RESIDENT_COMPILED`
+
+- **Implementation:** Compile the resident single-input layer assembly, including
+  independent batched rows, requested residual features, readout and functional
+  attention/recurrent updates. Embedding, attention projection/finish, routing and
+  expert math are shared with layerwise execution. Wider inputs and unsupported
+  storage/operator compositions use the layerwise implementation below.
+- **State boundary:** State storage prepares already-reserved writable addresses
+  and pinned buffer views. Tensor execution returns new buffer versions; state
+  storage installs the complete validated result as a tentative boundary. Existing
+  transactions own acceptance, rejection and completion lifetime. Compilation
+  neither allocates physical pages nor grants writes to retained prefixes.
+- **Specialization:** Positions and physical addresses are tensor operands. Cache
+  specialization follows batch size, physical capacity, requested outputs and the
+  attention launch horizon. Pad page maps to attention partitions so ordinary
+  storage-page growth does not retrace the whole model; retain at most four compiled
+  geometries. Padding changes neither causal visibility nor required attention splits.
+- **Reference / validation:** Compare complete outputs and logical state with the
+  layerwise implementation, including mixed positions, page growth, rejection,
+  requested features and changing output requirements. Preserve eager sigmoid-gate
+  arithmetic under fusion. Stock MLX-VLM remains the independent model reference.
+
+
 #### `MODEL:QWEN35:MAG:LAYERWISE`
 
 - **Implementation:** Advance the configured hybrid layer sequence and state, returning requested logits/features.
@@ -93,14 +269,7 @@ mixer_j = D_QA_j or D_QR_j according to the artifact
 - **Reference / validation:** Separately loaded stock MLX-VLM target; use MLX-LM as a second control with
   positional/numerical conventions reconciled. Compare layer residuals, logits and logical
   state, then free generation and changing batches.
-- **Benchmark controls:** `model.qwen36-replay-prose.moby-dick-at-65536-n32`
-  exercises completed single-token forwards on a pinned 64K prose context;
-  corresponding 4K/16K and `tools.bfcl` cases vary the declared workload.
-  Context preparation follows [benchmark fixtures](../../benchmark-fixtures.md).
-  `model.qwen36-prefill-512` and `upstream.qwen36-prefill-at-16384` remain synthetic
-  mechanism controls at their own operating points. Match content and boundaries
-  before comparing; generation timings include selection and cannot directly score
-  this forward.
+
 
 ### `MODEL:QWEN35.ATTENTION`
 
@@ -135,10 +304,13 @@ new KV logical bytes = m*h_kv*d*(s_k+s_v)
 
 - **Implementation:** Project Q plus output gate, K and V separately; normalize Q/K, apply paired rotary transforms,
   append KV, run the selected attention child, then gate and project its output. MLX operation
-  composition.
+  composition. The default paged child reuses each KV read across two query heads for
+  single-token execution when the head geometry permits; wider query blocks retain
+  per-head execution.
 - **Reference / validation:** Stock Qwen gated attention with matched weights and logical history. Compare prepared Q/K/V,
   gate, output and appended state; use independently computed rotary values to diagnose upstream
   convention differences.
+
 
 ### `MODEL:QWEN35.RECURRENCE`
 
@@ -186,6 +358,7 @@ convolution bytes = b*(z-1)*c*s_conv
   prepared inputs, convolution history, matrix state and output across one/many inputs, batching
   and accepted-prefix restoration.
 
+
 ### `MODEL:QWEN35.FEEDFORWARD`
 
 **Contract.** Produce the configured dense or routed/shared-expert feedforward output, preserving Qwen
@@ -223,6 +396,7 @@ F_weighted_reduction = m*h*(2t-1)                conventional scalar model
 - **Reference / validation:** Independent MLX-VLM MLP and explicit gate/up/activation/down equations with the same weights;
   compare output before the enclosing residual.
 
+
 #### `MODEL:QWEN35.FEEDFORWARD:MAG:ROUTED`
 
 - **Implementation:** Router softmax, top-k and optional renormalization; selected expert evaluation; weighted
@@ -230,6 +404,7 @@ F_weighted_reduction = m*h*(2t-1)                conventional scalar model
   combination remain separate MLX operations.
 - **Reference / validation:** Complete upstream routed/shared MLP. Compare assignments, probabilities, selected outputs and
   final sum with representative routing patterns.
+
 
 ### `MODEL:QWEN35.READOUT`
 
@@ -257,6 +432,7 @@ target boundary. Omit absent readout; it does not receive a 100% score.
   compute logits only when requested.
 - **Reference / validation:** Stock final norm/head from identical residuals; check tied weights, precision and
   requested-output behavior independently of the transformer.
+
 
 ### `STATE:QWEN35`
 
@@ -296,6 +472,7 @@ M_min = required unique materialized union, not M_live times checkpoint count
 - **Reference / validation:** Independently advanced upstream KV/recurrent caches and explicit prefix replay; compare
   logical contents after branching, restore and unequal verification acceptance, including
   budget and lifetime failures.
+
 
 ### `MODEL:QWEN35.MTP`
 
@@ -339,26 +516,15 @@ F_combine = m*h*(4h-1)
   logical positions. Compare hidden outputs, logits and cache transitions independently before
   testing full speculative generation.
 
+
 ## Qualification
 
-Current scores follow the [assessment rules](../../performance.md#evidence-and-current-assessments).
+Prepared region controls capture actual layer inputs in an untimed forward, then use
+`performance.benchmarks.regions` to compare the selected operation with a borrowed-weight
+upstream control. State and outputs are checked independently. Parent measurements run
+without capture wrappers or retained diagnostic intermediates.
 
-The IDs above label current implementation responsibilities; dedicated benchmark
-subjects for every boundary are not yet established. Component definitions state
-what must be compared, not that every comparison has already passed.
-
-Historical 16K decode matched stock continuations; 32K divergence and timing
-variability remained unresolved. No broad custom speedup is established. Record
-future results against the selected IDs, source revision and full child configuration;
-protect dense/MoE variants, long contexts, batch changes and multi-input execution.
-
-Evidence: `sessions/26-09-06/evidence/cycle-004/comparison.json`, relative to the
-monorepo root. The PoC is a separate reference implementation, not this source state.
-
-The current assembly has no whole-step compilation, packed projection path or fused
-MoE implementation. Optimized substitutions must preserve the type contracts and
-qualify both their local regions and enclosing model.
-
-Static configuration/header geometry is recorded under
-`sessions/26-09-06/evidence/ceiling-derivations/`, relative to the monorepo root.
-It supplies parameter evidence without measured traffic, timing or efficiency.
+Model replay, generated continuation, batched prefill, hybrid restoration and MTP use the
+corresponding functions in `performance.benchmarks`. Protect dense/routed variants, long
+contexts and multi-input execution. Each benchmark records its precise numerical contract;
+reference throughput is a comparison and never a ceiling.

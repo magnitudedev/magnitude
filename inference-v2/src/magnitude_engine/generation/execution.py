@@ -218,26 +218,40 @@ def _forward[T](rows: list[Continuation[T]], clock: Callable[[], int]) -> None:
         frozenset(feature for op in calls for feature in op.request.features),
         calls[0].request.committed_inputs,
     )
-    try:
-        advances = (
-            (runtime.forward(calls[0].sequence, calls[0].inputs, request),)
-            if len(calls) == 1 else runtime.forward_batch(
-                tuple(op.sequence for op in calls), tuple(op.inputs for op in calls),
-                request,
+    for attempt in range(2):
+        try:
+            advances = (
+                (runtime.forward(calls[0].sequence, calls[0].inputs, request),)
+                if len(calls) == 1 else runtime.forward_batch(
+                    tuple(op.sequence for op in calls), tuple(op.inputs for op in calls),
+                    request,
+                )
             )
-        )
-    except MemoryError as error:
-        if len(rows) > 1 and all(
-            not op.sequence.failed and op.sequence.pending is None for op in calls
-        ):
+            break
+        except MemoryError as error:
+            recoverable = all(
+                not op.sequence.failed and op.sequence.pending is None for op in calls
+            )
+            if recoverable and attempt == 0:
+                # Preparation rolled back before neural execution. Retire earlier
+                # committed work before retrying this unchanged ready operation;
+                # normal forwards keep their submission overlap and never fence here.
+                retired = False
+                for op in calls:
+                    retired |= op.sequence.complete_committed()
+                if retired:
+                    continue
+            if recoverable and len(rows) > 1:
+                elapsed = clock() - start
+                for row in rows:
+                    row.elapsed_ns += elapsed
+                    _forward([row], clock)
+                return
+            elapsed = clock() - start
             for row in rows:
-                _forward([row], clock)
+                row.elapsed_ns += elapsed
+                row.result, row.done, row.ready = error, True, None
             return
-        elapsed = clock() - start
-        for row in rows:
-            row.elapsed_ns += elapsed
-            row.result, row.done, row.ready = error, True, None
-        return
     elapsed = clock() - start
     for row, advance in zip(rows, advances, strict=True):
         row.elapsed_ns += elapsed

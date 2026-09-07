@@ -21,6 +21,10 @@ from magnitude_engine.resources.budget import MemoryBudget
         (1023, 1, 256, 256, True),
         (4093, 3, 256, 256, True),
         (257, 3, 512, 512, True),
+        (129, 1, 64, 64, False),
+        (1023, 1, 128, 128, False),
+        (4093, 1, 256, 256, False),
+        (257, 1, 512, 512, False),
     ],
 )
 def test_paged_attention_matches_causal_sdpa_with_poisoned_unused_storage(
@@ -92,10 +96,48 @@ def test_paged_attention_matches_causal_sdpa_with_poisoned_unused_storage(
 
 
 @pytest.mark.parametrize("operator", ["native", "gathered"])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("window", [1, 17, 129, None])
+def test_single_query_views_exclude_poisoned_history_and_unused_physical_pages(
+    operator, dtype, window
+):
+    from magnitude_engine.models.attention.gathered import GatheredAttention
+    from magnitude_engine.models.state.table import PageMap, PageTable
+    from magnitude_engine.models.state.views import PagedKV
+
+    mx.random.seed(892)
+    length, width, page_size = 133, 128, 16
+    start = 0 if window is None else max(0, length - window)
+    # The requested window is adjacent even though the earlier history is not.
+    pages = (1, 4, 5, 6, 7, 8, 9, 10, 11)
+    keys = mx.full((2, 14 * page_size, width), float("nan"), dtype)
+    values = mx.full(keys.shape, float("nan"), dtype)
+    logical_k = mx.random.normal((2, length - start, width)).astype(dtype)
+    logical_v = mx.random.normal(logical_k.shape).astype(dtype)
+    for index in range(start, length):
+        physical = pages[index // page_size] * page_size + index % page_size
+        keys[:, physical] = logical_k[:, index - start]
+        values[:, physical] = logical_v[:, index - start]
+    kv = PagedKV(keys, values, page_size, PageTable((PageMap(pages, 14),)), (length,))
+    q = mx.random.normal((1, 8, 1, width)).astype(dtype)
+    op = MetalPagedAttention() if operator == "native" else GatheredAttention()
+    actual = op.compute(q, kv, width**-0.5, window=window)
+    expected = mx.fast.scaled_dot_product_attention(
+        q.astype(mx.float32),
+        logical_k[None].astype(mx.float32),
+        logical_v[None].astype(mx.float32),
+        scale=width**-0.5,
+    ).astype(dtype)
+    tolerance = 1e-5 if dtype == mx.float32 else 2e-3
+    assert mx.allclose(actual, expected, atol=tolerance, rtol=tolerance).item()
+
+
+@pytest.mark.parametrize("operator", ["native", "gathered"])
 @pytest.mark.parametrize("prefixes,count", [((0, 129), 1), ((3, 130, 1, 1023), 3)])
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("query_heads", [2, 6, 16])
 def test_attention_batches_distinct_positions_and_shared_checkpoint(
-    operator, prefixes, count, dtype
+    operator, prefixes, count, dtype, query_heads
 ):
     from magnitude_engine.models.attention.gathered import GatheredAttention
 
@@ -127,7 +169,7 @@ def test_attention_batches_distinct_positions_and_shared_checkpoint(
     states = (*states, branch)
     prefixes = (*prefixes, prefixes[-1])
     histories.append(histories[-1])
-    queries = mx.random.normal((len(states), 8, count, 32)).astype(dtype)
+    queries = mx.random.normal((len(states), query_heads, count, 32)).astype(dtype)
     keys = mx.stack([k[:, -count:] for k, _ in histories])
     values = mx.stack([v[:, -count:] for _, v in histories])
     op = MetalPagedAttention(heads_per_group=2) if operator == "native" else GatheredAttention()

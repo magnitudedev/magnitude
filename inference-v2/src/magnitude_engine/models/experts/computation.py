@@ -85,8 +85,11 @@ class ResidentExperts:
     weights: ExpertWeights
     math: GatedExpertMath
 
+    def __call__(self, hidden: mx.array, assignments: mx.array) -> mx.array:
+        return self.math.apply(self.weights, hidden, assignments)
+
     def compute(self, hidden: mx.array, assignments: mx.array, scope: ExecutionScope) -> mx.array:
         # Resident weights require no scratch-retirement boundary. Consumers
         # determine liveness; rooting the expanded expert outputs here would keep
         # every layer's intermediates alive and force dead prefill computation.
-        return self.math.apply(self.weights, hidden, assignments)
+        return self(hidden, assignments)

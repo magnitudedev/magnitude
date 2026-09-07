@@ -142,11 +142,15 @@ class ModelSequence[S, C]:
         self.complete_committed()
         return self.runtime.states.checkpoint(self.state)
 
-    def complete_committed(self) -> None:
+    def complete_committed(self) -> bool:
+        """Retire committed work; report whether any execution was still pending."""
         self.runtime.owner.check()
+        retired = False
         for execution in self._committed:
+            retired |= not execution.done
             execution.complete()
         self._committed.clear()
+        return retired
 
     def close(self) -> None:
         if self.closed:

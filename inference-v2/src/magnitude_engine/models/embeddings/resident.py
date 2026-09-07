@@ -15,8 +15,11 @@ from ..execution import ExecutionScope
 class ResidentEmbedding:
     weight: mx.array
 
+    def __call__(self, rows: mx.array) -> mx.array:
+        return self.weight[rows]
+
     def lookup(self, rows: mx.array, scope: ExecutionScope) -> mx.array:
-        output = self.weight[rows]
+        output = self(rows)
         scope.depend(output)
         return output
 
@@ -28,7 +31,7 @@ class ResidentAffineEmbedding:
     biases: mx.array
     encoding: AffineEncoding
 
-    def lookup(self, rows: mx.array, scope: ExecutionScope) -> mx.array:
+    def __call__(self, rows: mx.array) -> mx.array:
         flat = rows.reshape(-1)
         output = mx.dequantize(
             self.weight[flat],
@@ -38,6 +41,9 @@ class ResidentAffineEmbedding:
             bits=self.encoding.bits,
             mode="affine",
         )
-        output = output.reshape(*rows.shape, output.shape[-1])
+        return output.reshape(*rows.shape, output.shape[-1])
+
+    def lookup(self, rows: mx.array, scope: ExecutionScope) -> mx.array:
+        output = self(rows)
         scope.depend(output)
         return output

@@ -1,5 +1,8 @@
 # Service and generation derivations
 
+Executable formulation: [theory/engine.py](../../../performance/theory/engine.py).
+The evaluator records the assumptions and bindings actually used for each bound.
+
 Component owners bind these formulas to admission, scheduling, batching, caching
 and generation contracts. [Resource algebra](resources.md#evaluation-algebra) supplies
 model demand and capacity accounting; [state derivations](state.md) supply storage

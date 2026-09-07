@@ -1,5 +1,8 @@
 # Neural derivations
 
+Executable formulation: [theory/neural.py](../../../performance/theory/neural.py).
+The evaluator records the assumptions and bindings actually used for each bound.
+
 These reusable regions produce demand descriptions for the
 [resource algebra](resources.md#evaluation-algebra). Component records supply
 geometry, tensor identities, precision, output obligations and numerical contracts.

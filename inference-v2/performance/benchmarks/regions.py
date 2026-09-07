@@ -1,0 +1,368 @@
+"""Capture architecture inputs once; measure each real component independently."""
+
+from collections.abc import Callable
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass, replace
+from typing import Any, cast
+
+from performance.assembly import Binding, BoundAssembly, inspect_engine, source_files
+from performance.benchmarks import references
+from performance.benchmarks.fixtures import record_inputs, tokens
+from performance.benchmarks.model import prefix
+from performance.benchmarks.numerics import compare
+from performance.records import Assembly, Observation, digest
+from performance.runner import recording
+
+
+@dataclass
+class CaptureMixer:
+    inner: Any
+    index: int
+    captured: dict
+
+    def compute_batch(self, hidden, states, scope):
+        if hasattr(self.inner, "operation") and hasattr(self.inner.operation, "graph"):
+            slot = states[0].slots[self.inner.index]
+            self.captured[self.index] = (hidden, *slot.values)
+        else:
+            self.captured[self.index] = (hidden,)
+        return self.inner.compute_batch(hidden, states, scope)
+
+
+@dataclass
+class CaptureFeedForward:
+    inner: Any
+    index: int
+    captured: dict
+
+    def compute(self, hidden, scope):
+        self.captured[self.index] = hidden
+        return self.inner.compute(hidden, scope)
+
+
+@contextmanager
+def capture(
+    engine,
+    *,
+    context_tokens,
+    query_tokens,
+    fixture="prose.moby-dick",
+    prompt=None,
+    continuation=None,
+):
+    import mlx.core as mx
+
+    from magnitude_engine.models.runtime import ForwardRequest
+
+    model = engine.engine.generation.model
+    program = getattr(model.program, "_program", model.program)
+    if type(program).__name__ != "Qwen35Program":
+        raise TypeError("this input capture binds the Qwen layer contract")
+    provenance = {}
+    if prompt is None:
+        prepared = tokens(
+            engine.properties["target_path"],
+            fixture=fixture,
+            context_tokens=context_tokens,
+            continuation_tokens=query_tokens,
+        )
+        prompt, continuation, provenance = (
+            prepared.prompt,
+            prepared.continuation,
+            prepared.provenance,
+        )
+    if continuation is None or len(continuation) < query_tokens:
+        raise ValueError("insufficient captured continuation")
+    values = {
+        "tokens": mx.array([continuation[:query_tokens]], mx.int32),
+        "prompt": tuple(prompt),
+        "producer": inspect_engine(engine).graph.component_keys()["target"],
+        "ff": {},
+        "mixer": {},
+        "kv": [],
+        "provenance": provenance,
+        "context_tokens": len(prompt),
+        "query_tokens": query_tokens,
+    }
+    with prefix(model, prompt) as checkpoint:
+        values["checkpoint"] = checkpoint
+        row = model.create(checkpoint)
+        blocks = program.blocks
+        try:
+            values["kv"] = [
+                tuple(a[None] for a in row.state.pages.read(i))
+                for i in range(len(row.state.pages.store.arena.layers))
+            ]
+            mx.eval(values["kv"])
+            program.blocks = tuple(
+                replace(
+                    block,
+                    mixer=CaptureMixer(block.mixer, i, values["mixer"]),
+                    feedforward=CaptureFeedForward(block.feedforward, i, values["ff"]),
+                )
+                for i, block in enumerate(blocks)
+            )
+            last = f"residual:{len(blocks)}"
+            step = model.forward(
+                row,
+                continuation[:query_tokens],
+                ForwardRequest(
+                    features=frozenset(("residual:0", last)), committed_inputs=query_tokens
+                ),
+            )
+            step.accept(query_tokens)
+            step.complete()
+            values["last_hidden"] = step.output.features[last]
+            values["readout"] = step.output.logits
+            values["embedded"] = step.output.features["residual:0"]
+            mx.eval(values["ff"], values["mixer"], values["last_hidden"], values["embedded"])
+        finally:
+            program.blocks = blocks
+            row.close()
+        yield values
+
+
+def benchmark(
+    engine,
+    path,
+    *,
+    context_tokens,
+    query_tokens=1,
+    fixture="prose.moby-dick",
+    prepared=None,
+    reference=False,
+    attention_oracle="fp32-equation",
+    **record,
+):
+    import mlx.core as mx
+    from mlx_lm.models.cache import ArraysCache, KVCache
+
+    from magnitude_engine.models.inputs import ModelInputs
+    from magnitude_engine.models.state.views import read_layer
+
+    assembly = inspect_engine(engine)
+    bound = assembly.at(path)
+    model = engine.engine.generation.model
+    program = getattr(model.program, "_program", model.program)
+    op = bound.instance
+    component = bound.node.component
+    index = int(path.split(".layers.")[1].split(".")[0]) if ".layers." in path else None
+    # Reference adapters borrow the exact bound weights. They are isolated controls;
+    # their measurements do not pretend the production parent invoked the adapter.
+    if reference:
+        sources = source_files(references.attention)
+        node = replace(
+            bound.node,
+            implementation=f"{component}:MAG:UPSTREAM_ADAPTER",
+            source=digest(sources),
+            children={},
+            dependencies={},
+        )
+        bound = Binding(
+            BoundAssembly(
+                Assembly(path, {path: node}, node.implementation, assembly.graph.artifacts),
+                {path: op},
+                sources,
+            ),
+            path,
+        )
+    workload = {
+        "histories": [context_tokens],
+        "context_tokens": context_tokens,
+        "query_tokens": query_tokens,
+        "batch_size": 1,
+        "fixture": fixture,
+        "attention_oracle": attention_oracle,
+        "numerical_contract": {"atol": 0.002, "rtol": 0.002},
+    }
+    with (
+        recording(bound, benchmark="neural.region", workload=workload, **record) as run,
+        ExitStack() as life,
+    ):
+        p = prepared or life.enter_context(
+            capture(
+                engine, context_tokens=context_tokens, query_tokens=query_tokens, fixture=fixture
+            )
+        )
+        if p["context_tokens"] != context_tokens or p["query_tokens"] != query_tokens:
+            raise ValueError("prepared input operating point differs")
+        record_inputs(
+            run,
+            provenance=p["provenance"],
+            tokens=p["tokens"].tolist(),
+            producer=p["producer"],
+            prompt=p["prompt"],
+        )
+        control: Callable[..., Any] | None = None
+        hidden = indices = None
+        if component.endswith(".ATTENTION"):
+            hidden = p["mixer"][index][0]
+            control = (
+                references.attention_equation(op)
+                if attention_oracle == "fp32-equation"
+                else references.attention(op)
+            )
+        elif component.endswith(".RECURRENCE"):
+            hidden = p["mixer"][index][0]
+            control = references.recurrence(op.operation)
+        elif component.endswith(".FEEDFORWARD"):
+            hidden = p["ff"][index]
+            control = references.feedforward(op) if hasattr(op, "experts") else op.call
+        elif component == "MODEL:EXPERTS":
+            hidden = p["ff"][index]
+            parent = program.blocks[index].feedforward
+            probabilities = mx.softmax(parent.router(hidden), axis=-1, precise=True)
+            indices = mx.argpartition(probabilities, kth=-parent.top_k, axis=-1)[
+                ..., -parent.top_k :
+            ]
+            mx.eval(indices)
+            workload["distinct_experts"] = len(set(cast(list[int], indices.reshape(-1).tolist())))
+            control = references.experts(op)
+        elif component == "MODEL:EMBEDDING":
+            control = references.embedding(op)
+            workload["distinct_input_tokens"] = len(set(p["tokens"].reshape(-1).tolist()))
+        elif not component.endswith(".READOUT"):
+            raise TypeError(f"no invocation contract for {component}")
+        row: Any = None
+        transaction = None
+        caches = []
+
+        def reset():
+            nonlocal row, transaction, caches
+            if transaction is not None:
+                transaction.close()
+                transaction = None
+            if row is not None:
+                row.close()
+                row = None
+            if component.endswith((".ATTENTION", ".RECURRENCE")):
+                row = model.create(p["checkpoint"])
+                model.reserve(row, query_tokens)
+                if component.endswith(".RECURRENCE"):
+                    transaction = model.states.begin(
+                        row.state, ModelInputs(p["tokens"]), committed_inputs=query_tokens
+                    )
+            caches = []
+            for keys, values in p["kv"]:
+                cache = KVCache()
+                cache.keys, cache.values, cache.offset = keys, values, keys.shape[2]
+                caches.append(cache)
+
+        def execute(use_reference):
+            call = cast(Callable[..., Any], control)
+            with model.owner.scope() as scope:
+                if component == "MODEL:EMBEDDING":
+                    outputs = [
+                        call(p["tokens"]) if use_reference else op.lookup(p["tokens"], scope)
+                    ]
+                elif component.endswith(".READOUT"):
+                    outputs = [program.output(program.norm(p["last_hidden"]))]
+                elif component.endswith(".ATTENTION"):
+                    scope.enter(row.state.pages.store.arena.pin())
+                    outputs = [
+                        call(
+                            hidden,
+                            cache=caches[op.index],
+                            mask="causal" if query_tokens > 1 else None,
+                        )
+                        if use_reference
+                        else op.compute_batch(hidden, (row.state,), scope)
+                    ]
+                elif component.endswith(".RECURRENCE"):
+                    if use_reference:
+                        cache = ArraysCache(2)
+                        cache[0], cache[1] = p["mixer"][index][1:]
+                        value = call(hidden, cache=cache)
+                        outputs = [value, cache[0], cache[1]]
+                    else:
+                        value = op.compute_batch(hidden, (row.state,), scope)
+                        outputs = [value, *row.state.slots[op.index].pending.values]
+                elif component == "MODEL:EXPERTS":
+                    outputs = [
+                        call(hidden, indices)
+                        if use_reference
+                        else op.compute(hidden, indices, scope)
+                    ]
+                else:
+                    outputs = [call(hidden) if use_reference else op.compute(hidden, scope)]
+                pending = scope.seal(*outputs)
+            return outputs, pending
+
+        def complete(result):
+            result[1].complete()
+
+        try:
+            reset()
+            wanted = execute(True)
+            complete(wanted)
+            expected = wanted[0]
+            expected_kv = None
+            if component.endswith(".ATTENTION"):
+                cache = caches[op.index]
+                end = context_tokens + query_tokens
+                expected_kv = (cache.keys[:, :, :end], cache.values[:, :, :end])
+                mx.eval(expected_kv)
+
+            def validate(result):
+                observed = compare(result[0], expected, atol=0.002, rtol=0.002)
+                if component.endswith(".RECURRENCE"):
+                    compare(result[0][-1], expected[-1], atol=1e-5, rtol=1e-5)
+                if expected_kv is not None:
+                    if reference:
+                        cache = caches[op.index]
+                        current = cache.keys[:, :, :end], cache.values[:, :, :end]
+                    else:
+                        view = read_layer((row.state.pages,), op.index, pending_tokens=query_tokens)
+                        current = tuple(a[None] for a in view.gather(0))
+                    compare(current, expected_kv)
+                return Observation(
+                    observed.output_digest,
+                    observed.counters,
+                    {"fixture": p["provenance"], "prepared_inputs": True},
+                )
+
+            run.measure(
+                lambda: execute(reference),
+                prepare=reset,
+                complete=complete,
+                validate=validate,
+                deterministic=True,
+            )
+        finally:
+            if transaction is not None:
+                transaction.close()
+            if row is not None:
+                row.close()
+    return run
+
+
+def qwen_layers(
+    engine, *, context_tokens=4096, query_tokens=1, fixture="prose.moby-dick", **record
+):
+    graph = inspect_engine(engine).graph
+    results = []
+    # Shared capture is deliberately outside all parent measurements.
+    with capture(
+        engine, context_tokens=context_tokens, query_tokens=query_tokens, fixture=fixture
+    ) as inputs:
+        for path, node in graph.nodes.items():
+            if node.component in (
+                "MODEL:EMBEDDING",
+                "MODEL:QWEN35.ATTENTION",
+                "MODEL:QWEN35.RECURRENCE",
+                "MODEL:QWEN35.FEEDFORWARD",
+                "MODEL:EXPERTS",
+                "MODEL:QWEN35.READOUT",
+            ):
+                results.append(
+                    benchmark(
+                        engine,
+                        path,
+                        context_tokens=context_tokens,
+                        query_tokens=query_tokens,
+                        fixture=fixture,
+                        prepared=inputs,
+                        **record,
+                    )
+                )
+    return results

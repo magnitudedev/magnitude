@@ -70,8 +70,14 @@ The physical representation determines how that is achieved:
 A request leaving the batch cannot invalidate peers' state. Physical allocations
 remain charged while any request or unfinished device work still depends on them.
 State growth, batch formation and tentative verification state must fit memory
-before execution. If a group cannot fit, split its prepared work into smaller
-groups without repeating sampling or proposal construction.
+before execution. If preparation exhausts memory while earlier committed work
+still retains resources, complete that work for the affected requests and retry
+the same prepared execution once. Retry requires preparation to have rolled back
+without submitting model work, and completion to have retired pending work.
+Ordinary advancement adds no completion barrier; execution failures are terminal.
+If the group still cannot fit, split its prepared work into smaller groups without
+repeating sampling or proposal construction. Charge failed preparation and recovery
+to the service that incurred them.
 
 ## Divergent progress
 

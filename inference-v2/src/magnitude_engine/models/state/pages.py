@@ -103,16 +103,16 @@ class SequencePages:
                 self.store._pages[address] = page
                 self._pages.append(page)
 
-    def write(self, layer: int, start: int, keys: mx.array, values: mx.array) -> None:
-        """Append one layer's KV. Commit publishes length only after every layer wrote it."""
+    def _validate_write(self, layer: int, start: int, end: int) -> None:
+        """Check append authority before either direct or prepared tensor execution."""
         self._live()
-        end = start + keys.shape[1]
         size = self.store.arena.page_size
         if (
-            start != self._written[layer]
+            not 0 <= layer < len(self._written)
+            or start != self._written[layer]
             or start < self.length
+            or end < start
             or end > len(self._pages) * size
-            or values.shape[1] != keys.shape[1]
         ):
             raise ValueError("layer writes must append contiguously within reserved capacity")
         # Validate every destination before enqueuing any layer mutation. Immutable
@@ -123,6 +123,14 @@ class SequencePages:
                 offset = start % size if index == start // size else 0
                 if page.writer != self._identity or offset < page.protected:
                     raise RuntimeError("write would alter an immutable page prefix")
+
+    def write(self, layer: int, start: int, keys: mx.array, values: mx.array) -> None:
+        """Append one layer's KV. Commit publishes length only after every layer wrote it."""
+        end = start + keys.shape[1]
+        if values.shape[1] != keys.shape[1]:
+            raise ValueError("layer writes require matching key/value lengths")
+        self._validate_write(layer, start, end)
+        size = self.store.arena.page_size
         cursor = start
         while cursor < end:
             index, offset = divmod(cursor, size)

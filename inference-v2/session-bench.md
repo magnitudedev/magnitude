@@ -172,6 +172,11 @@ other sections require correctness. Prose uses the text/protocol and output-budg
 Exit codes are 0 for complete success, 1 for a benchmark failure, 2 for invalid input, and 130 for
 cancellation.
 
+Completed request observations also enter `runs/performance/` automatically, with their
+originating hardware and HTTP boundary. `python -m performance import RUN_DIRECTORY`
+imports an existing session run idempotently. These observations do not score internal
+model components or replace session-bench's detailed reports.
+
 ## Development
 
 From `inference-v2/`:

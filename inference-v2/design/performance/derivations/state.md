@@ -1,5 +1,8 @@
 # State and storage derivations
 
+Executable formulation: [theory/state.py](../../../performance/theory/state.py).
+The evaluator records the assumptions and bindings actually used for each bound.
+
 These formulas bind retained information, required movement and readiness to the
 [resource algebra](resources.md#evaluation-algebra). Owners specify representations,
 sharing, memory budgets, lifecycle boundaries and legal reconstruction strategies.

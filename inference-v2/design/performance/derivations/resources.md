@@ -1,5 +1,8 @@
 # Resource and composition derivations
 
+Executable formulation: [theory/resources.py](../../../performance/theory/resources.py).
+The evaluator records the assumptions and bindings actually used for each bound.
+
 This library defines demand descriptions, capacities and composition for
 [component performance models](../../performance.md). Component records bind its
 parameters and observation boundaries. All rates are theoretical upper capacities;

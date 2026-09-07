@@ -107,7 +107,8 @@ runtime abstraction is required merely to make computations testable.
 
 ## Shared component definitions
 
-Each type below owns its contract, dimension definitions and formula binding.
+Each type below defines its behavior and mathematical assumptions. Executable bindings
+are owned by the [performance catalog](../performance.md#ownership-and-component-records).
 Parameters inherit the [origin/platform rules](../performance.md#dimensions-and-parameter-binding).
 `JOIN` and `L` use the [resource algebra](../performance/derivations/resources.md#evaluation-algebra);
 [neural regions](../performance/derivations/neural.md#named-region-bindings) supply the shared terms.
@@ -142,6 +143,7 @@ Union repeated rows; the vocabulary head is separate work unless joined by its p
 - **Reference / validation:** Independently loaded upstream embedding and direct indexing of independently dequantized rows.
   Check token order, repeats, dtype and values.
 
+
 ### `MODEL:EXPERTS`
 
 **Contract.** Given hidden rows and distinct top-k expert assignments, return per-selected-expert
@@ -174,6 +176,7 @@ boundary, but may reduce internally in a routed parent.
   exercise assignment order, repeats, sparse/dense utilization and shapes on both sides of
   sorting selection.
 
+
 ### `MODEL:ATTENTION`
 
 **Contract.** Prepared Q and logically equivalent KV histories produce scaled causal/windowed attention.
@@ -199,14 +202,14 @@ and duplicate KV-head reads.
 
 - **Implementation:** Prepared Q and a logical paged KV view produce scaled, causal/windowed attention output. Owned
   `MTL` kernels through MLX compute softmax partials and combine them for supported short
-  queries. Other geometries delegate to `MODEL:ATTENTION:MAG:GATHERED`. Storage append is
+  queries. For single-query grouped attention, SIMD groups sharing one KV head are
+  placed in the same threadgroup using the intrinsic query/KV head ratio; this changes
+  launch geometry while preserving the shader equations. Other geometries delegate to `MODEL:ATTENTION:MAG:GATHERED`. Storage append is
   outside this contract.
 - **Reference / validation:** The gathered implementation at identical logical histories, plus an independent
   higher-precision attention equation oracle. Compare masks, row lengths, windows, fragmented
   views and output values; the child fallback cannot independently validate itself.
-- **Benchmark controls:** `operator.attention-metal-16k` and `operator.attention-gathered-16k`
-  compare completed append plus attention at 16K history. This combined boundary
-  does not directly measure `MODEL:ATTENTION/EXEC`.
+
 
 #### `MODEL:ATTENTION:MAG:GATHERED`
 
@@ -216,8 +219,7 @@ and duplicate KV-head reads.
 - **Reference / validation:** Independently materialized logical K/V and per-row attention equations. Test ordering,
   heterogeneous histories, padding and window boundaries; comparing with the paged path alone
   cannot establish a shared mask convention.
-- **Benchmark controls:** `operator.attention-gathered-16k` is the gathered control for
-  `operator.attention-metal-16k`; both include append, so neither isolates attention.
+
 
 #### `MODEL:ATTENTION:MLX:DENSE`
 
@@ -226,6 +228,7 @@ and duplicate KV-head reads.
 - **Reference / validation:** Independent attention equations with higher-precision accumulation, declared output tolerance
   and matching causal/window visibility. Direct calls serve as a control for wrappers; they do
   not validate MLX against itself.
+
 
 ### `MODEL:GATED_DELTA`
 
@@ -257,10 +260,7 @@ mixers.
 - **Reference / validation:** `MODEL:GATED_DELTA:LM:STANDARD` and an independent explicit recurrence. Compare every
   requested output, final state and prefix states under the same prepared inputs; include
   zero/full/partial accepted prefixes.
-- **Benchmark controls:** `operator.delta-owned` and `operator.delta-owned-prefill-512`
-  time completed prepared-input recurrence for 3 and 512 tokens; corresponding
-  `operator.delta-library` and `operator.delta-library-prefill-512` are upstream
-  controls. These isolate the update, excluding enclosing mixer preparation.
+
 
 #### `MODEL:GATED_DELTA:LM:STANDARD`
 
@@ -268,5 +268,3 @@ mixers.
   conventions do not change its source.
 - **Reference / validation:** An independently expressed recurrence provides the oracle; the owned update supplies a
   differential control but is not itself proof of truth.
-- **Benchmark controls:** `operator.delta-library` and `operator.delta-library-prefill-512`
-  cover completed 3- and 512-token prepared-input updates, matched to the owned controls.

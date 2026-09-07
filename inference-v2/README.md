@@ -26,7 +26,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 The server binds to loopback. `/health` reports worker readiness and `/v1/models` lists the
 served model. Chat Completions supports streamed and collected text, reasoning, tool calls,
-JSON constraints, sampling, and stop strings. See the [serving contract](../design/inference/serving.md).
+JSON constraints, sampling, and stop strings.
 
 ## Interactive chat
 
@@ -41,7 +41,7 @@ Responses stream live alongside prefill progress. Each turn reports cached/new p
 TTFT, queue time, prefill and decode rates, and draft acceptance when enabled. `/reset` clears
 conversation history, `/exit` quits, and Ctrl-C cancels a response. Use `--prompt "Hello"` for
 one turn, or `--engine-blueprint engine.json` for an authored composition. Model, memory and
-scheduler arguments are shared with the server. See [metric definitions](../design/inference/chat.md).
+scheduler arguments are shared with the server.
 For models with a thinking switch, `--no-thinking` requests direct answers; otherwise the
 checkpoint's default applies.
 
@@ -91,7 +91,7 @@ src/magnitude_engine/
   chat/           Interactive text chat and per-turn diagnostics
   blueprints/     Lightweight public composition API
 src/session_bench/  Serving benchmark runner and engine adapters
-benchmarks/        Typed component, model, generation and engine experiments
+performance/       Captured graphs, executable theory, component benchmarks and TUI
 tests/             Tests grouped by the same responsibilities
 ```
 
@@ -100,43 +100,61 @@ live under `models/architectures/`; shared operators and state storage have thei
 The engine coordinates requests, generation coordinates model progress, and executors own
 computation and state. Models receive resource dependencies, not the scheduler or prefix index.
 
-Design: [composition](../design/inference/composition.md),
-[scheduler](../design/inference/engine/scheduler.md),
-[state and speculative generation](../design/inference/engine/speculative-generation.md).
+Design: [components](design/components.md), [model composition](design/models/composability.md),
+[engine](design/engine/components.md) and [performance](design/performance.md).
 
 ## Benchmarks
 
-Select a typed Python experiment as `module:variable`. Preview its composition or run it in
-an isolated child process:
+Benchmarks are ordinary functions accepting actual components. Results are written automatically
+under `runs/performance/`; variants and sweeps use ordinary Python in the corresponding domain
+module. There is no benchmark blueprint or case selector.
 
 ```sh
-uv run --frozen python -m benchmarks benchmarks.cases.attention:metal --describe
-uv run --frozen python -m benchmarks benchmarks.cases.state:branch \
-  --output runs/state-branch.json
+uv run --frozen python - <<'PYTHON'
+from magnitude_engine.models.attention.gathered import GatheredAttention
+from magnitude_engine.models.attention.metal import MetalPagedAttention
+from performance.benchmarks.attention import benchmark
+
+geometry = dict(query_heads=8, kv_heads=2, key_width=128, value_width=128, element_bytes=2)
+for implementation in (GatheredAttention(), MetalPagedAttention()):
+    result = benchmark(implementation, geometry=geometry, context_tokens=4096)
+    print(result.path)
+PYTHON
+
+uv run --frozen python -m performance tui
+uv run --frozen python -m performance pull m4-pro-01 /Users/ec2-user/magnitude-mlx/inference-v2/runs/performance
+uv run --frozen python -m performance rebuild
+uv run --frozen python -m performance check
 ```
 
-Use a new output path for each run. Results preserve the composition, source identity, raw
-samples, validation outcomes and counters. Setup and validation are outside timing; device
-completion is inside it.
+`check` reports missing evidence/bindings and inconsistent assessments; zero theoretical floors
+remain explicit. To audit a planned graph before collecting samples, call
+`performance.assessment.preflight(assembly.graph, workload, profile)`.
+Platform capacities must be justified upper bounds; absent bindings do not produce percentages.
 
-| Cases under `benchmarks.cases` | Measurement |
-|---|---|
-| `attention`, `recurrence`, `state` | Operators and KV storage |
-| `single_session`, `upstream`, `parity` | Prefill/decode and matched execution controls |
-| `prefill_batch`, `continuous_batching` | Shared model work and concurrent engine service |
-| `generation` | Plain/speculative generation and cold/warm engine workloads |
-| `baseline_models` | Model and quantization substitutions |
+For a loaded engine, `inspect_engine(engine).at("target.layers.3.mixer.attention")` binds the
+real selected operator and geometry. Pass it to the same `benchmark` function. Model, generation,
+state, control and complete-engine measurements live beside their reusable Python cases in
+`performance/benchmarks/`. A recording may bind descendant operating points explicitly for
+cross-composition evidence reuse; it never attributes a parent timer to its children.
 
-For BFCL-derived workloads through actual servers, use [session-bench](session-bench.md).
-It documents model aliases, reference runtimes, session shapes and result inspection.
-The [benchmarking design](../design/inference/benchmarking.md) defines measurement boundaries
-and comparison requirements.
+`python -m performance render VIEW_ID --document design/models/architectures/qwen35.md`
+replaces that document's Assembly block from the published state at that operating point.
+The TUI has one composition selector and shows the latest applicable evidence per component.
+Use arrows to navigate and expand the tree; selected-component details show the actual
+hardware, workload and evidence. Press `c` to change composition, `f` to focus a subtree,
+Escape to return and `q` to quit.
+`import DIRECTORY` ingests finalized bundles; `incomplete` and `recover RUN_ID` inspect and
+finalize journals left by dead local processes. Completed records cannot be overwritten.
+
+[Session-bench](session-bench.md) shares prose/tool fixtures and automatically contributes its
+HTTP observations to this store. Its original request records and reports remain available.
 
 ## Checks
 
 ```sh
 uv run --frozen pytest
-uv run --frozen ruff check src tests benchmarks
+uv run --frozen ruff check src tests performance
 uv sync --frozen --project session-bench-runtimes/omlx
 uv run --frozen pyright
 ```
@@ -156,14 +174,12 @@ uv run --frozen python -m benchmark_fixtures tools.bfcl \
   --artifact /path/to/model --context 65536 --continuation 16
 ```
 
-Run a declared Qwen model workload with its pinned local artifact:
+For an already loaded engine, run a persisted context sweep directly:
 
-```sh
-uv run --frozen python -m benchmarks benchmarks.cases.qwen_components:replay_64k \
-  --output runs/qwen-prose-replay-64k.json
+```python
+from performance.benchmarks.model import prose
+results = prose(engine, contexts=(4096, 16384, 65536), mode="replay", measured_tokens=32)
 ```
 
-The same module declares `replay_4k`, `replay_16k`, `generate_4k`, `generate_64k`,
-`prefill_4k`, `prefill_64k`, and `tools_replay_*`/`tools_generate_*` at 4K and 64K.
-Use a new output path for each run. [Session-bench](session-bench.md) consumes the
-same tool corpus and history builder for serving workloads.
+The output budget and mode are workload parameters. Replay consumes fixed fixture tokens;
+generation feeds predictions back. Session-bench's HTTP budgets retain their own serving boundary.

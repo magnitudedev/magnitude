@@ -20,11 +20,14 @@ class RecurrentMixer:
     def compute_batch(
         self, hidden: mx.array, states: tuple[HybridState, ...], scope: ExecutionScope
     ) -> mx.array:
+        commitments = tuple(
+            state.active.committed_inputs if state.active is not None else 0 for state in states
+        )
+        if not commitments or any(value != commitments[0] for value in commitments):
+            raise ValueError("recurrent batch requires a uniform committed-input prefix")
         return self.operation.compute_batch(
             hidden,
             tuple(s.slots[self.index] for s in states),
             scope,
-            committed_inputs=min(
-                state.active.committed_inputs if state.active is not None else 0 for state in states
-            ),
+            committed_inputs=commitments[0],
         )

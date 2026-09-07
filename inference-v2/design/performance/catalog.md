@@ -4,8 +4,9 @@ Definitions live with their component owners. This index contains identities and
 links only; [performance](../performance.md) defines evaluation and evidence rules.
 Reusable mathematics lives in [resources](derivations/resources.md),
 [neural operations](derivations/neural.md), [state](derivations/state.md) and
-[service](derivations/service.md). Formula/parameter bindings and metric boundaries
-are authoritative in the linked component records.
+[service](derivations/service.md). Executable dimension definitions and dispatch live in
+[theory/catalog.py](../../performance/theory/catalog.py). The component records explain
+contracts and assumptions; current calculations come from those functions.
 
 ## Shared model contracts
 
