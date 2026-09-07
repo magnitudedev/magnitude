@@ -96,7 +96,9 @@ consumer acceptance, and must verify the published integrity; an existing versio
 
 Integration preparation packs each selected companion once. Acceptance installs those exact
 tarballs outside the workspace and loads the extension through the supported harness's native
-package and resource loader under Node and Bun. Accepted bytes and their receipt are persisted;
+package and resource loader under Node and Bun. Integration acceptance checks only that installation
+succeeds and the extension loads without errors. Feature behavior belongs in integration tests.
+Accepted bytes and their receipt are persisted;
 publication does not repack them. Private workspace dependencies cannot escape into the packed
 artifact. Shared SDK/wire changes trigger these checks as well as integration changes. Local
 acceptance never publishes packages. Prereleases skip plugin release preparation/publication

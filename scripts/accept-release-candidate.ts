@@ -233,7 +233,7 @@ const acceptBootstrap = async (): Promise<void> => {
     healthPid = health.pid
     await registeredProcess(health.pid)
     const plugins = process.argv[4]
-    if (plugins) await run(["bun", resolve(import.meta.dir, "accept-integrations.ts"), resolve(plugins), "--daemon"])
+    if (plugins) await run(["bun", resolve(import.meta.dir, "accept-integrations.ts"), resolve(plugins)])
     accepted = true
   } finally {
     try {
