@@ -79,9 +79,12 @@ class HybridTransaction:
         self.count = count
         self.reconciled = False
         self.closed = False
+        # Initial/final images already cover one-input and fully causal advances.
+        # Only wider tentative work retains a trace for interior-prefix repair.
+        trace_count = count if count > 1 and committed_inputs < count else 0
         self.trace_reservation = state.store.budget.reserve(
             "recurrent-advance",
-            count * sum(s.layout.trace_bytes_per_token for s in state.slots),
+            trace_count * sum(s.layout.trace_bytes_per_token for s in state.slots),
         )
         try:
             state.pages.reserve(self.base + count)

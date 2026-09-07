@@ -8,36 +8,19 @@ defines parameter origins, two evaluations and evidence handling. The
 ## Assembly
 
 ```text
-ENGINE:INFERENCE:MAG:STANDARD    [RATE: unmeasured, TTFT: unmeasured, GAP: unmeasured]
-├── SCHEDULING:ADMISSION:MAG:FIFO    [unmeasured]
-├── SCHEDULING:SERVICE:MAG:TIME_SHARING    [RATE: unmeasured, TTFT: unmeasured, GAP: unmeasured]
-│   └── SCHEDULING:PREFILL:MAG:CHUNKED    [unmeasured]
-├── BATCHING:ASSEMBLY:MAG:READY_COMPATIBLE    [unmeasured]
-├── EXECUTION:DEVICE:MAG:ASYNC    [unmeasured]
-├── MEMORY:ACCOUNTING:MAG:RESERVATIONS    [unmeasured]
-├── CACHE:PREFIX:MAG:CHECKPOINTS    [unmeasured]
-├── selected logical state
-│   ├── STATE:CHECKPOINTS:MAG:NATIVE    [MEM: unmeasured, RESTORE: unmeasured] upstream cache path
-│   ├── STATE:QWEN35:MAG:HYBRID    [MEM: unmeasured, RESTORE: unmeasured] Qwen target path
-│   │   └── STATE:RECURRENT:MAG:CHECKPOINTED    [MEM: unmeasured, RESTORE: unmeasured]
-│   └── KV:STORE:MAG:PAGED    [unmeasured] shared physical dependency
-│       ├── KV:APPEND:MAG:CONTIGUOUS_RUNS    [unmeasured]
-│       └── KV:BRANCH:MAG:COPY_ON_WRITE    [unmeasured]
-└── selected generation
-    ├── GENERATION:PLAIN:MAG:TARGET    [unmeasured]
-    └── GENERATION:SPECULATION:MAG:TARGET_MATCHING    [unmeasured]
-        ├── selected target model
-        ├── selected proposal method / attached model
-        ├── GENERATION:SAMPLING:MAG:POSITION_KEYED    [unmeasured] shared with plain generation
-        └── GENERATION:ACCEPTANCE:MAG:PREFIX    [unmeasured]
+ENGINE:INFERENCE:MAG:STANDARD
+├── admission · SCHEDULING:ADMISSION:MAG:FIFO
+├── batching · BATCHING:ASSEMBLY:MAG:READY_COMPATIBLE
+├── execution · EXECUTION:DEVICE:MAG:ASYNC
+├── generation · GENERATION:PLAIN:MAG:TARGET
+│   ├── sampling · GENERATION:SAMPLING:MAG:POSITION_KEYED
+│   ├── target · MODEL:QWEN35:MAG:RESIDENT_COMPILED …
+│   └── execution · EXECUTION:DEVICE:MAG:ASYNC ↗ execution
+├── memory · MEMORY:ACCOUNTING:MAG:RESERVATIONS
+├── prefixes · CACHE:PREFIX:MAG:CHECKPOINTS
+└── scheduling · SCHEDULING:SERVICE:MAG:TIME_SHARING
+    └── prefill · SCHEDULING:PREFILL:MAG:CHUNKED
 ```
-
-The physical KV store is used by paged targets; it is not an additional copy of
-native or hybrid state. Model IDs resolve to the [Qwen](../models/architectures/qwen35.md),
-[Gemma](../models/architectures/gemma4.md) or [generic](../models/architectures/generic-mlx-vlm.md)
-assembly. Proposal methods without an independently specified model graph do not
-inherit MTP's model bound. Engine nesting shows dependencies, not exclusive ownership
-of all the child work or independent time intervals to sum.
 
 ## Component definitions
 
@@ -80,10 +63,7 @@ dimensions.
 - **Implementation:** One execution-owner composition binds request admission, time-shared service, model/state dependencies and generation.
 - **Reference / validation:** Matched upstream generation for neural outputs; finite request-trace oracle for
   lifecycle/service; compare real request outputs and completion boundaries.
-- **Benchmark controls:** `engine.qwen36-2-plain-waves`, `engine.qwen36-2-mtp-waves`
-  and `engine.qwen36-2-upstream-waves` exercise two request waves with different
-  generation compositions. Bind the actual service interval for `RATE`; total
-  elapsed time alone cannot establish `TTFT` or `GAP`.
+
 
 ### `SCHEDULING:ADMISSION`
 
@@ -197,9 +177,7 @@ shared weights and independent row state.
 - **Implementation:** Ready continuations regroup by operation compatibility; stable state is reused and memory-infeasible groups split without rebuilding proposals.
 - **Reference / validation:** Enumerated legal partitions; batched generation versus independently advanced rows, including
   unequal acceptance and membership changes.
-- **Benchmark controls:** `model.qwen36-prefill-4x512-shared` and
-  `model.qwen36-prefill-4x512-independent` compare completed four-row prefill.
-  These include model execution and do not isolate assembly latency.
+
 
 ### `EXECUTION:DEVICE`
 
@@ -226,7 +204,7 @@ graph construction is not completed neural work.
 
 #### `EXECUTION:DEVICE:MAG:ASYNC`
 
-- **Implementation:** MLX async submission under scopes/spans; pending executions retain leases until completion or a safe drain proves retirement.
+- **Implementation:** MLX async submission under scopes/spans; pending executions retain leases until completion or a safe drain proves retirement. If forward preparation fails before execution, committed work may retire before one unchanged retry; execution failures remain terminal.
 - **Reference / validation:** Fake completion backend and lease-lifetime oracle, then equivalent synchronous MLX execution;
   execution tests exercise failure and retirement.
 
@@ -257,6 +235,7 @@ positive time floor is not presumed.
 - **Reference / validation:** Independent live-allocation union and budget event trace; exercise sharing, replacement peaks,
   failure and release.
 
+
 ### `CACHE:PREFIX`
 
 **Contract.** Namespace-aware prefix trie with complete generation checkpoints, leases and bounded retention.
@@ -283,6 +262,7 @@ objectives.
 - **Implementation:** Namespace-keyed compressed token trie with checkpoint leases and configured retention policy.
 - **Reference / validation:** Linear longest-compatible-prefix search and tiny offline retention oracle; prefix-retention
   tests and restored-versus-replayed outputs.
+
 
 ### `KV:STORE`
 
@@ -312,6 +292,7 @@ contract.
 - **Reference / validation:** Dense logical KV arrays and a unique-allocation ledger; page/placement tests across growth,
   reuse and relocation.
 
+
 ### `KV:APPEND`
 
 **Contract.** Append new K/V through logical page/run placement without changing protected prefixes.
@@ -335,9 +316,7 @@ protected old history does not imply a compulsory copy.
 
 - **Implementation:** Maps row positions to arena pages/runs and writes the new K/V region while preserving protected history.
 - **Reference / validation:** Dense concatenation oracle; inspect new payload and peer histories across page boundaries.
-- **Benchmark controls:** `state.append-runs` and `state.append-pages` compare completed
-  512-token writes after a 16K prefix across ten KV layers, excluding allocation.
-  Bind that full write geometry when evaluating append execution.
+
 
 ### `KV:BRANCH`
 
@@ -364,9 +343,7 @@ prove a universal whole-prefix copy demand.
 - **Implementation:** Shares protected immutable page backing and detaches affected storage when later mutation requires independence.
 - **Reference / validation:** Independent dense cloned histories as a semantic control; branch, mutate and release in
   different orders.
-- **Benchmark controls:** `state.partial-branch` covers allocation, partial-prefix
-  branching and completed writes to both continuations. It is a combined state
-  diagnostic, not a direct branch-only latency measurement.
+
 
 ### `STATE:RECURRENT`
 
@@ -398,6 +375,7 @@ advance/creation costs remain enclosing obligations.
 - **Reference / validation:** Independent recurrence from a saved prefix; reconcile first/interior/final accepted boundaries
   and compare restored state and next output.
 
+
 ### `GENERATION:PLAIN`
 
 **Contract.** Consume the anchor, sample a target output and preserve the next anchor/state boundary.
@@ -422,10 +400,7 @@ the required output boundary determines demand.
 
 - **Implementation:** Target advancement followed by position-addressed sampling and state/anchor publication.
 - **Reference / validation:** Independently stepped target sampler with the same position keys, stopping and constraints.
-- **Benchmark controls:** `generation.qwen36-128-1-plain-shared` measures the owned
-  target generation path; `generation.native-qwen36-decode-at-16384-span-4` uses
-  automatic model selection. Both include sampling/publication and exclude prompt
-  preparation; bind their distinct model graphs and contexts separately.
+
 
 ### `GENERATION:SPECULATION`
 
@@ -454,10 +429,7 @@ deferred catch-up remain explicit. Other methods need their own draft graph/stat
 - **Implementation:** Proposal generation, target-sampled prefix matching and per-request accepted-boundary reconciliation.
 - **Reference / validation:** Plain target continuation with identical logical sampling positions; test zero/full/partial
   acceptance, stop and divergent batched progress.
-- **Benchmark controls:** `generation.qwen36-128-2-mtp-shared` and
-  `generation.qwen36-128-2-plain-shared` compare speculative and plain generation
-  on the same target workload. The speculative measurement includes proposal,
-  verification and reconciliation; it does not isolate MTP head execution.
+
 
 ### `GENERATION:SAMPLING`
 
@@ -487,6 +459,7 @@ external vocabulary tensor or host fence.
 - **Reference / validation:** Explicit distribution/greedy equations and position-key controls; sampling tests with
   policies, ties and regrouping.
 
+
 ### `GENERATION:ACCEPTANCE`
 
 **Contract.** Select the consecutive matching nonterminal prefix and its target bonus token.
@@ -510,6 +483,7 @@ pairs; rejected suffix work and cumulative-product arrays are not theoretical re
 
 - **Implementation:** MLX match/terminal masks and cumulative prefix products derive the accepted count and target bonus token.
 - **Reference / validation:** Scalar prefix scan; exhaustive short proposal/sample/terminal combinations.
+
 
 ## Qualification and attribution
 

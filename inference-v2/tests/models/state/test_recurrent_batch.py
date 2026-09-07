@@ -91,9 +91,9 @@ def test_recurrent_batch_partial_admission_failure_releases_shared_destination()
         state_bytes = sum(layout.nbytes for layout in runtime.states.layouts)
         trace_bytes = sum(layout.trace_bytes_per_token for layout in runtime.states.layouts)
         # Destination for every row fits, but only the first row's trace fits.
-        budget.limit = before + 3 * state_bytes + trace_bytes
+        budget.limit = before + 3 * state_bytes + 2 * trace_bytes
         with pytest.raises(MemoryError, match="recurrent-advance"):
-            forward(runtime, rows)
+            runtime.forward_batch(rows, (ModelInputs.from_tokens((4, 5)),) * len(rows))
         assert budget.snapshot().reserved == before
         assert all(row.state.active is None and not row.failed for row in rows)
         budget.limit = 8 << 20

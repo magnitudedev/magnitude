@@ -31,7 +31,7 @@ from .suites import compile_plan
 @contextlib.contextmanager
 def machine_lock():
     # This lock is process coordination only, never alias configuration or result storage.
-    path = Path(tempfile.gettempdir()) / f"magnitude-session-bench-{os.getuid()}.lock"
+    path = Path(tempfile.gettempdir()) / f"magnitude-inference-measurement-{os.getuid()}.lock"
     with path.open("a+") as stream:
         try:
             fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
