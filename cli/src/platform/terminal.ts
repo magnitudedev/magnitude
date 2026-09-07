@@ -64,16 +64,26 @@ export const makeTerminalAdapter = (): Platform => ({
   notifications: noopNotifications,
   dialogs: noopDialogs,
   async openLink(url: string): Promise<void> {
-    const opener = process.platform === "darwin" ? "open" : "xdg-open"
+    const opener = process.platform === "darwin"
+      ? "open"
+      : process.platform === "win32"
+        ? "explorer.exe"
+        : "xdg-open"
     Bun.spawn([opener, url])
   },
   async openPath(path: string): Promise<void> {
-    const opener = process.platform === "darwin" ? "open" : "xdg-open"
+    const opener = process.platform === "darwin"
+      ? "open"
+      : process.platform === "win32"
+        ? "explorer.exe"
+        : "xdg-open"
     Bun.spawn([opener, path])
   },
   showItemInFolder(path: string): void {
     if (process.platform === "darwin") {
       Bun.spawn(["open", "-R", path])
+    } else if (process.platform === "win32") {
+      Bun.spawn(["explorer.exe", `/select,${path}`])
     }
   },
   fetch: globalThis.fetch.bind(globalThis),

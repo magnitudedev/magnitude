@@ -24,7 +24,7 @@ jobs:
     outputs:
       hosts: ${{ steps.matrix.outputs.hosts }}
       backends: ${{ steps.matrix.outputs.backends }}
-      linuxHosts: ${{ steps.matrix.outputs.linuxHosts }}
+      consumerHosts: ${{ steps.matrix.outputs.consumerHosts }}
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
@@ -217,11 +217,11 @@ jobs:
           path: release/${{ matrix.id }}/
           if-no-files-found: error
 
-  linux-consumer:
+  host-consumer:
     needs: [matrix, host]
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.matrix.outputs.linuxHosts) }}
+      matrix: ${{ fromJSON(needs.matrix.outputs.consumerHosts) }}
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -238,7 +238,7 @@ jobs:
       - run: bun run packages/release/scripts/validate-host.ts "${{ matrix.id }}" "release/${{ matrix.id }}"
 
   candidate:
-    needs: [matrix, host, backend, linux-consumer]
+    needs: [matrix, host, backend, host-consumer]
     if: inputs.validate_candidate
     runs-on: ubuntu-22.04
     steps:

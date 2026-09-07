@@ -56,7 +56,9 @@ Interactive setup:
 
 Magnitude supports the Magnitude Harness, Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline.
 
-Magnitude supports macOS and Linux. Windows is supported through WSL.
+Native Windows is the target environment and support is under active development. The CLI and
+background service run natively on Windows, while inference backend coverage and some hardware
+paths remain limited or unverified.
 
 ## Start working
 
@@ -70,10 +72,6 @@ You do not need to learn the Magnitude CLI. Your agent can inspect Magnitude and
 
 ## Windows
 
-On Windows, install WSL first:
-
-```powershell
-wsl --install
-```
-
-Restart the computer, open WSL, then follow the installation steps above.
+Native Windows is supported while we continue to expand and validate hardware backends.
+Install the CLI from PowerShell using the commands above. If a selected model or backend is
+not available on your hardware yet, choose a currently supported configuration.

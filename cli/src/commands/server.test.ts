@@ -28,7 +28,7 @@ describe("Magnitude service definitions", () => {
   it("registers development startup against the local ACN entrypoint", () => {
     expect(developmentServerCommand("/opt/bun")).toEqual([
       "/opt/bun",
-      expect.stringMatching(/packages\/acn\/src\/binary\.ts$/),
+      expect.stringMatching(/[\\/]packages[\\/]acn[\\/]src[\\/]binary\.ts$/),
       "serve",
     ])
   })

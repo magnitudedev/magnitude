@@ -2,7 +2,7 @@
  * CliApp — the orchestrator (spec §5.6, category: Orchestrator).
  *
  * Wires infrastructure (stream subscription, startup flow, terminal
- * keyboard, selection auto-copy), gates rendering (windows → auth →
+ * keyboard, selection auto-copy), gates rendering (auth →
  * connection error → loading), and composes the feature containers into the
  * terminal layout. No feature logic, no rendering primitives beyond layout
  * boxes and the startup header slot.
@@ -62,7 +62,6 @@ import { BOX_CHARS } from "./utils/ui-constants";
 import type { ActionId } from "./types/ui-actions";
 
 import { FatalErrorScreen } from "./features/app-shell/connection-error";
-import { WindowsWarningScreen } from "./features/app-shell/windows-warning";
 import { StartupHeader } from "./features/chat-timeline/startup-header";
 import { Button } from "./components/button";
 import { ChatTimelineContainer } from "./features/chat-timeline/container";
@@ -127,10 +126,6 @@ function CliEnvironmentGate({
   const exitApp = useCallback(() => {
     process.kill(process.pid, "SIGINT");
   }, []);
-
-  if (process.platform === "win32") {
-    return <WindowsWarningScreen onExit={exitApp} />;
-  }
 
   if (connectionError && !connectionError.reconnecting) {
     return (

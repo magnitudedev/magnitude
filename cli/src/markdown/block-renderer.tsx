@@ -190,8 +190,12 @@ const SpanRenderer = memo(function SpanRenderer({
       if (zone.kind === 'file') {
         onOpenFile?.(zone.path, zone.section)
       } else if (zone.kind === 'url') {
-        const isMac = process.platform === 'darwin'
-        Bun.spawn([isMac ? 'open' : 'xdg-open', zone.url])
+        const opener = process.platform === 'darwin'
+          ? 'open'
+          : process.platform === 'win32'
+            ? 'explorer.exe'
+            : 'xdg-open'
+        Bun.spawn([opener, zone.url])
       } else {
         onOpenArtifact?.(zone.name, zone.section)
       }

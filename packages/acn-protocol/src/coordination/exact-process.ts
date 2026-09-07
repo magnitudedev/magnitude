@@ -180,7 +180,7 @@ const inspect: ProcessGroupController["inspect"] = (pid) => platformIdentity(pid
   })),
 )
 
-/** Whether anything still answers to the group id — without distinguishing whose processes they are. */
+/** Whether anything in the tracked process tree is still present. */
 const unixMembersPresent = (
   group: ProcessGroup,
 ): Effect.Effect<boolean, ProcessGroupObservationFailed> =>
@@ -203,19 +203,38 @@ const unixMembersPresent = (
 
 const windowsMembersPresent = (
   group: ProcessGroup,
-): Effect.Effect<boolean, ProcessGroupObservationFailed> => inspect(group.leader.pid).pipe(
-  Effect.mapError((error) => new ProcessGroupObservationFailed({
-    group,
-    message: error.message,
-  })),
-  Effect.flatMap((occupant) =>
-    Option.exists(occupant, (found) => found.processStartIdentity === group.leader.processStartIdentity)
-      ? Effect.succeed(true)
-      : Effect.fail(new ProcessGroupObservationFailed({
-          group,
-          message: "native Windows cannot prove descendant-tree absence after the recorded root exits; use WSL",
-        }))),
-)
+): Effect.Effect<boolean, ProcessGroupObservationFailed> => {
+  const script = [
+    `$root = ${group.leader.pid}`,
+    "$processes = @(Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object ProcessId,ParentProcessId)",
+    "$pending = [System.Collections.Generic.Queue[int]]::new()",
+    "$pending.Enqueue($root)",
+    "$seen = [System.Collections.Generic.HashSet[int]]::new()",
+    "$present = 0",
+    "while ($pending.Count -gt 0) {",
+    "  $parent = $pending.Dequeue()",
+    "  if (-not $seen.Add($parent)) { continue }",
+    "  if ($processes | Where-Object { [int]$_.ProcessId -eq $parent }) { $present++ }",
+    "  foreach ($process in $processes) {",
+    "    if ([int]$process.ParentProcessId -eq $parent) { $pending.Enqueue([int]$process.ProcessId) }",
+    "  }",
+    "}",
+    "$present",
+  ].join(" ")
+
+  return command("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    script,
+  ]).pipe(
+    Effect.map((output) => Number.parseInt(output.trim(), 10) > 0),
+    Effect.mapError((error) => new ProcessGroupObservationFailed({
+      group,
+      message: error.message,
+    })),
+  )
+}
 
 const membersPresent = (group: ProcessGroup): Effect.Effect<boolean, ProcessGroupObservationFailed> =>
   process.platform === "win32" ? windowsMembersPresent(group) : unixMembersPresent(group)

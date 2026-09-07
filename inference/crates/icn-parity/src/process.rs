@@ -237,6 +237,13 @@ async fn kill_process_tree(child: &mut tokio::process::Child, process_id: Option
             libc::kill(-(process_id as i32), libc::SIGKILL);
         }
     }
+    #[cfg(target_os = "windows")]
+    if let Some(process_id) = process_id {
+        let _ = tokio::process::Command::new("taskkill.exe")
+            .args(["/PID", &process_id.to_string(), "/T", "/F"])
+            .status()
+            .await;
+    }
     let _ = child.kill().await;
 }
 

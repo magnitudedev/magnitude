@@ -17,6 +17,7 @@ export const ManagedServiceHost = Context.GenericTag<ManagedServiceHost>("@magni
 const stopLocalAcn = Effect.flatMap(ManagedServiceHost, host => host.stop)
 
 const SERVICE_LABEL = "dev.magnitude.acn"
+const WINDOWS_TASK_NAME = "MagnitudeInference"
 const PUBLIC_HEALTH = `${MAGNITUDE_SERVICE_ORIGIN}/health`
 
 export class ServerServiceError extends Data.TaggedError("ServerServiceError")<{
@@ -64,6 +65,29 @@ const positivePid = (value: string | undefined): Option.Option<number> => {
   return Number.isSafeInteger(pid) && pid > 0 ? Option.some(pid) : Option.none()
 }
 
+export const parseWindowsServicePid = (output: string): Option.Option<number> =>
+  positivePid(output.trim())
+
+/** Resolve the process started by the named task without relying on localized task output. */
+export const WINDOWS_SERVICE_PID_SCRIPT = [
+  `$task = Get-ScheduledTask -TaskName '${WINDOWS_TASK_NAME}' -ErrorAction Stop`,
+  "if ($task.State -ne 'Running') { exit 0 }",
+  "$action = @($task.Actions | Where-Object { $_.Execute } | Select-Object -First 1)",
+  "if ($action.Count -eq 0) { exit 0 }",
+  "$execute = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string]$action[0].Execute))",
+  "$arguments = [string]$action[0].Arguments",
+  "$process = Get-CimInstance Win32_Process | Where-Object {",
+  "  $_.ExecutablePath -and ([IO.Path]::GetFullPath($_.ExecutablePath) -ieq $execute) -and",
+  "  $_.CommandLine -and ($arguments.Length -eq 0 -or $_.CommandLine.Contains($arguments))",
+  "} | Select-Object -First 1",
+  "if ($null -ne $process) { $process.ProcessId }",
+].join("; ")
+
+export const WINDOWS_SERVICE_ENABLED_SCRIPT = [
+  `$task = Get-ScheduledTask -TaskName '${WINDOWS_TASK_NAME}' -ErrorAction Stop`,
+  "if ($task.State -eq 'Disabled') { exit 1 }",
+].join("; ")
+
 const platformServicePid = process.platform === "darwin"
   ? commandString([
       "launchctl",
@@ -80,9 +104,32 @@ const platformServicePid = process.platform === "darwin"
         Effect.map((output) => positivePid(output.trim())),
         Effect.orElseSucceed(() => Option.none<number>()),
       )
+    : process.platform === "win32"
+      ? commandString([
+          "powershell.exe",
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          WINDOWS_SERVICE_PID_SCRIPT,
+        ]).pipe(
+          Effect.map(parseWindowsServicePid),
+          Effect.orElseSucceed(() => Option.none<number>()),
+        )
     : Effect.succeed(Option.none<number>())
 
 const platformServiceIsActive = platformServicePid.pipe(Effect.map(Option.isSome))
+
+const platformServiceIsEnabled = process.platform === "linux"
+  ? commandSucceeds(["systemctl", "--user", "is-enabled", "--quiet", "magnitude.service"])
+  : process.platform === "win32"
+    ? commandSucceeds([
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        WINDOWS_SERVICE_ENABLED_SCRIPT,
+      ])
+    : Effect.succeed(true)
 
 const xml = (value: string) => value
   .replaceAll("&", "&amp;")
@@ -122,7 +169,7 @@ export const renderWindowsServerCommand = (command: ReadonlyArray<string>): stri
   command.map(windowsCommandQuote).join(" ")
 
 export const WINDOWS_RESTART_POLICY_SCRIPT = [
-  "$task = Get-ScheduledTask -TaskName 'MagnitudeInference' -ErrorAction Stop",
+  `$task = Get-ScheduledTask -TaskName '${WINDOWS_TASK_NAME}' -ErrorAction Stop`,
   "$task.Settings.ExecutionTimeLimit = 'PT0S'",
   "$task.Settings.DisallowStartIfOnBatteries = $false",
   "$task.Settings.StopIfGoingOnBatteries = $false",
@@ -202,15 +249,15 @@ const installAndStartService = (command: ReadonlyArray<string>) => Effect.gen(fu
   if (process.platform === "win32") {
     const taskCommand = renderWindowsServerCommand(command)
     yield* run([
-      "schtasks", "/Create", "/TN", "MagnitudeInference", "/TR", taskCommand,
+      "schtasks", "/Create", "/TN", WINDOWS_TASK_NAME, "/TR", taskCommand,
       "/SC", "ONLOGON", "/RL", "LIMITED", "/F",
     ])
     yield* run([
       "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
       WINDOWS_RESTART_POLICY_SCRIPT,
     ])
-    yield* run(["schtasks", "/Change", "/TN", "MagnitudeInference", "/ENABLE"])
-    yield* run(["schtasks", "/Run", "/TN", "MagnitudeInference"])
+    yield* run(["schtasks", "/Change", "/TN", WINDOWS_TASK_NAME, "/ENABLE"])
+    yield* run(["schtasks", "/Run", "/TN", WINDOWS_TASK_NAME])
     return
   }
   return yield* fail(`Unsupported platform: ${process.platform}`)
@@ -237,10 +284,10 @@ export const installServiceOnStartup = Effect.gen(function* () {
   if (process.platform === "win32") {
     const taskCommand = renderWindowsServerCommand(command)
     yield* run([
-      "schtasks", "/Create", "/TN", "MagnitudeInference", "/TR", taskCommand,
+      "schtasks", "/Create", "/TN", WINDOWS_TASK_NAME, "/TR", taskCommand,
       "/SC", "ONLOGON", "/RL", "LIMITED", "/F",
     ])
-    yield* run(["schtasks", "/Change", "/TN", "MagnitudeInference", "/ENABLE"])
+    yield* run(["schtasks", "/Change", "/TN", WINDOWS_TASK_NAME, "/ENABLE"])
     return
   }
   return yield* fail(`Unsupported platform: ${process.platform}`)
@@ -255,7 +302,7 @@ export const stopService = Effect.gen(function* () {
   } else if (process.platform === "linux") {
     yield* run(["systemctl", "--user", "stop", "magnitude.service"], true)
   } else if (process.platform === "win32") {
-    yield* run(["schtasks", "/End", "/TN", "MagnitudeInference"], true)
+    yield* run(["schtasks", "/End", "/TN", WINDOWS_TASK_NAME], true)
   }
   yield* stopLocalAcn.pipe(Effect.ignore)
 })
@@ -298,7 +345,7 @@ export const startInstalledService = Effect.gen(function* () {
     : process.platform === "linux"
       ? yield* fs.exists(linuxServicePath())
       : process.platform === "win32"
-        ? yield* commandSucceeds(["schtasks", "/Query", "/TN", "MagnitudeInference"])
+        ? yield* commandSucceeds(["schtasks", "/Query", "/TN", WINDOWS_TASK_NAME])
         : false
   if (!installed) return yield* fail("Magnitude service is not installed; run `magnitude service install`")
   const platformActive = yield* platformServiceIsActive
@@ -312,8 +359,8 @@ export const startInstalledService = Effect.gen(function* () {
   } else if (process.platform === "linux") {
     yield* run(["systemctl", "--user", "start", "magnitude.service"])
   } else if (process.platform === "win32") {
-    yield* run(["schtasks", "/Change", "/TN", "MagnitudeInference", "/ENABLE"])
-    yield* run(["schtasks", "/Run", "/TN", "MagnitudeInference"])
+    yield* run(["schtasks", "/Change", "/TN", WINDOWS_TASK_NAME, "/ENABLE"])
+    yield* run(["schtasks", "/Run", "/TN", WINDOWS_TASK_NAME])
   } else return yield* fail(`Unsupported platform: ${process.platform}`)
   yield* awaitReady
 })
@@ -330,7 +377,7 @@ export const uninstallService = Effect.gen(function* () {
     yield* fs.remove(linuxServicePath()).pipe(Effect.ignore)
     yield* run(["systemctl", "--user", "daemon-reload"], true)
   } else if (process.platform === "win32") {
-    yield* run(["schtasks", "/Delete", "/TN", "MagnitudeInference", "/F"], true)
+    yield* run(["schtasks", "/Delete", "/TN", WINDOWS_TASK_NAME, "/F"], true)
   } else return yield* fail(`Unsupported platform: ${process.platform}`)
 })
 
@@ -341,11 +388,9 @@ export const serviceStatus = Effect.gen(function* () {
     : process.platform === "linux"
       ? yield* fs.exists(linuxServicePath())
       : process.platform === "win32"
-        ? yield* commandSucceeds(["schtasks", "/Query", "/TN", "MagnitudeInference"])
+        ? yield* commandSucceeds(["schtasks", "/Query", "/TN", WINDOWS_TASK_NAME])
         : false
-  const enabled = !installed ? false : process.platform === "linux"
-    ? yield* commandSucceeds(["systemctl", "--user", "is-enabled", "--quiet", "magnitude.service"])
-    : true
+  const enabled = !installed ? false : yield* platformServiceIsEnabled
   const health = yield* Effect.option(probeHealth)
   const managerPid = yield* platformServicePid
   const managed = installed && Option.isSome(managerPid) && Option.isSome(health)
