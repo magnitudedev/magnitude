@@ -30,9 +30,10 @@ for non-interactive subprocesses but do not satisfy this contract.
 
 Pi-hosted setup uses the same primitive in the opposite direction. Pi's custom UI leases its
 terminal, stops its TUI before launching Magnitude, and restarts/redraws it only after the child
-has exited or been terminated and reaped. The private setup result is decoded after terminal
-restoration. Resource reload occurs only after the process and temporary-file scopes have closed.
-CLI installation and capability checks are non-interactive preparation: they use scoped piped
+has exited or been terminated and reaped. Exit status distinguishes completion, cancellation, and
+failure. Only successful completion reads the primary model through the existing SDK, after terminal
+restoration. Resource reload occurs only after the process and SDK scopes have closed.
+CLI installation and executable checks are non-interactive preparation: they use scoped piped
 subprocesses while Pi keeps rendering its native cancellable loader. Their output never inherits
 the terminal. Cancelling preparation reaps subprocess work before closing the loader.
 

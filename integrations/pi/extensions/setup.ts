@@ -2,15 +2,14 @@ import * as Command from "@effect/platform/Command"
 import * as CommandExecutor from "@effect/platform/CommandExecutor"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as NodeContext from "@effect/platform-node/NodeContext"
+import { FetchHttpClient } from "@effect/platform"
 import { delimiter, join } from "node:path"
 import { stripVTControlCharacters } from "node:util"
 import { Context, Effect, Exit, Fiber, Layer, ManagedRuntime, Schema, Scope, Stream } from "effect"
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent"
 import { CancellableLoader, type TUI } from "@earendil-works/pi-tui"
 import { runInteractiveProcess, type InteractiveProcessTermination } from "@magnitudedev/utils/process"
-import {
-  HostedSetupCapability, HostedSetupResult, HOSTED_SETUP_MAX_RESULT_BYTES, HOSTED_SETUP_PROTOCOL_VERSION,
-} from "@magnitudedev/client-common/harness-connections/hosted-setup"
+import { MagnitudeClient, formatConnectionError, type ProviderModelId } from "@magnitudedev/sdk"
 
 export class PiSetupFailed extends Schema.TaggedError<PiSetupFailed>()("PiSetupFailed", {
   message: Schema.String,
@@ -24,16 +23,15 @@ export const prepareMagnitudeCli = (cwd: string, setMessage: (message: string) =
   const override = process.env.MAGNITUDE_CLI?.trim()
   const executable = override || "magnitude"
   const probe = Effect.scoped(Effect.gen(function* () {
-    const child = yield* Command.make(executable, "setup", "--host-protocol").pipe(Command.start)
-    const [code, output, stderr] = yield* Effect.all([
+    const child = yield* Command.make(executable, "--version").pipe(Command.start)
+    const [code, , stderr] = yield* Effect.all([
       child.exitCode,
-      child.stdout.pipe(Stream.decodeText(), Stream.runFold("", (text, part) => (text + part).slice(0, 4_097))),
+      Stream.runDrain(child.stdout),
       child.stderr.pipe(Stream.decodeText(), Stream.runFold("", (text, part) => (text + part).slice(-4_096))),
     ], { concurrency: "unbounded" })
-    if (code !== 0 || output.length > 4_096) return yield* failure(`Magnitude's setup capability check failed at ${executable} (exit ${code}). ${stripVTControlCharacters(stderr).trim().slice(-600)}${override ? " Check MAGNITUDE_CLI." : ""}`)
-    return output
+    if (code !== 0) return yield* failure(`Magnitude could not run at ${executable} (exit ${code}). ${stripVTControlCharacters(stderr).trim().slice(-600)}${override ? " Check MAGNITUDE_CLI." : ""}`)
   }))
-  const capability = yield* probe.pipe(Effect.catchIf(
+  yield* probe.pipe(Effect.catchIf(
     error => !override && error._tag === "SystemError" && error.reason === "NotFound",
     error => Effect.gen(function* () {
       // PATH lookup can report ENOENT for a non-executable file or a launcher
@@ -55,9 +53,6 @@ export const prepareMagnitudeCli = (cwd: string, setMessage: (message: string) =
     }),
   ), Effect.timeout("10 minutes"), Effect.mapError(error => error instanceof PiSetupFailed ? error
     : failure(`Could not prepare Magnitude: ${String(error)}. Run /magnitude-setup to retry${override ? ", or check MAGNITUDE_CLI" : ""}.`)))
-  yield* Schema.decodeUnknown(Schema.parseJson(HostedSetupCapability))(capability).pipe(
-    Effect.mapError(() => failure(`The Magnitude CLI at ${executable} does not support hosted setup. Update @magnitudedev/cli${override ? ", or check MAGNITUDE_CLI" : ""}.`)),
-  )
   return executable
 })
 
@@ -117,15 +112,28 @@ export const withPiTerminal = <A, E, R>(ctx: ExtensionContext, work: Effect.Effe
     }).pipe(Effect.zipRight(Effect.promise(closed))),
   )
 
-export const validateSetupTermination = (result: HostedSetupResult, termination: InteractiveProcessTermination) => {
-  if (termination._tag !== "Exited" || (termination.code === 0) !== (result._tag !== "Failed")) {
-    return Effect.fail(failure("Magnitude setup exited without a consistent completion result. Run /magnitude-setup to retry."))
+export const validateSetupTermination = (termination: InteractiveProcessTermination) => {
+  if (termination._tag === "Signaled") {
+    return termination.signal === "SIGINT" ? Effect.succeed(false)
+      : Effect.fail(failure(`Magnitude setup stopped unexpectedly (${termination.signal}). Run /magnitude-setup to retry.`))
   }
-  return result._tag === "Failed" ? Effect.fail(failure(result.message)) : Effect.succeed(result)
+  if (termination.code === 130) return Effect.succeed(false)
+  return termination.code === 0 ? Effect.succeed(true) : Effect.fail(failure(
+    `Magnitude setup failed (exit ${termination.code}). Check the terminal error above; if setup-pi is unsupported, update @magnitudedev/cli. Run /magnitude-setup to retry.`,
+  ))
 }
 
+export const readSetupModel = Effect.gen(function* () {
+  const client = yield* MagnitudeClient
+  const { slots } = yield* client.models.getSlots({}).pipe(Effect.mapError(error =>
+    failure(`Magnitude setup completed, but the selected model could not be read: ${error._tag === "RpcClientError" ? error.message : formatConnectionError(error)}. Run /reload and select it with /model.`)))
+  if (slots.primary._tag !== "ConfiguredLocal") return yield* failure("Magnitude setup completed, but no local primary model is configured. Run /reload and select a Magnitude model with /model.")
+  return slots.primary.selection.providerModelId
+})
+
+type PiSetupResult = { readonly _tag: "Completed"; readonly modelId: ProviderModelId } | { readonly _tag: "Cancelled" }
 export interface PiSetup {
-  readonly run: (ctx: ExtensionContext) => Effect.Effect<HostedSetupResult, PiSetupFailed>
+  readonly run: (ctx: ExtensionContext) => Effect.Effect<PiSetupResult, PiSetupFailed>
 }
 export const PiSetup = Context.GenericTag<PiSetup>("pi/PiSetup")
 
@@ -134,31 +142,20 @@ export const PiSetupLive = Layer.effect(PiSetup, Effect.gen(function* () {
   const executor = yield* CommandExecutor.CommandExecutor
   return {
     run: (ctx) => Effect.scoped(Effect.gen(function* () {
-      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-setup-" })
-      const resultPath = `${directory}/result.json`
       const executable = yield* withPiPreparation(ctx, setMessage => prepareMagnitudeCli(ctx.cwd, setMessage))
       const termination = yield* withPiTerminal(ctx, runInteractiveProcess({
           executable,
-          args: ["setup", "--host", "pi", "--result-file", resultPath],
+          args: ["setup-pi"],
           environment: process.env,
           workingDirectory: ctx.cwd,
       }))
-      if (termination._tag === "Signaled" && termination.signal === "SIGINT") {
-        return { protocolVersion: HOSTED_SETUP_PROTOCOL_VERSION, _tag: "Cancelled" } as const
-      }
-      if (termination._tag === "Signaled") {
-        return yield* failure(`Magnitude setup stopped unexpectedly (${termination.signal}). Run /magnitude-setup to retry.`)
-      }
-      const stat = yield* fs.stat(resultPath).pipe(Effect.mapError(() =>
-        failure("Magnitude setup exited without a completion result. Run /magnitude-setup to retry.")))
-      if (stat.type !== "File" || stat.size > BigInt(HOSTED_SETUP_MAX_RESULT_BYTES)) {
-        return yield* failure("Magnitude setup returned an invalid or oversized result")
-      }
-      const result = yield* fs.readFileString(resultPath).pipe(
-        Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(HostedSetupResult))),
-        Effect.mapError(() => failure("Magnitude setup did not return a valid completion result. Run /magnitude-setup to retry.")),
-      )
-      return yield* validateSetupTermination(result, termination)
+      if (!(yield* validateSetupTermination(termination))) return { _tag: "Cancelled" } as const
+      // Only a successful setup needs SDK access. No service startup or polling on
+      // extension load, a declined offer, or a cancelled/failed child.
+      const modelId = yield* readSetupModel.pipe(Effect.provide(
+        MagnitudeClient.layer({ autoStart: false }).pipe(Layer.provide(FetchHttpClient.layer)),
+      ))
+      return { _tag: "Completed", modelId } as const
     })).pipe(
       Effect.provideService(CommandExecutor.CommandExecutor, executor),
       Effect.provideService(FileSystem.FileSystem, fs),

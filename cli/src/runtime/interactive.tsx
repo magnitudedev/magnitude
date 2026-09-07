@@ -63,7 +63,6 @@ import { executeUpdate } from "../features/update/execute"
 import { CliUpdater, makeCliUpdater } from "../features/update/updater"
 import { HostedSetupScreen } from "../features/model-setup/setup-screen"
 import { SetupHostContext } from "../features/model-setup/setup-frame"
-import { HOSTED_SETUP_PROTOCOL_VERSION, hostedSetupFailure, type HostedSetupResult } from "@magnitudedev/client-common/harness-connections/hosted-setup"
 import { CliApplicationRoot } from "./root"
 import { makeHarnessConnection } from "../harness-connections/service"
 import { makeAcnConnectionWithInstanceManager } from "../server/acn-connection"
@@ -534,14 +533,12 @@ export const runInteractiveCommand = (
 export const runHostedSetup = (options: InteractiveLaunchOptions) => Effect.gen(function* () {
   const updater = yield* makeCliUpdater({ currentVersion: CLI_VERSION, developmentBuild: options.developmentBuild })
   const result = yield* Effect.scoped(runInteractiveSession(options).pipe(Effect.provideService(CliUpdater, updater)))
-  if (result._tag === "HostedCompleted") return {
-    protocolVersion: HOSTED_SETUP_PROTOCOL_VERSION, _tag: "Completed", modelId: result.modelId,
-  } satisfies HostedSetupResult
-  if (result._tag === "Exit" && result.code === 0) return {
-    protocolVersion: HOSTED_SETUP_PROTOCOL_VERSION, _tag: "Cancelled",
-  } satisfies HostedSetupResult
-  return hostedSetupFailure(result._tag === "Exit" && Option.isSome(result.fatal)
-    ? result.fatal.value.message : "Hosted setup could not finish. Run magnitude setup directly to resolve it.")
+  if (result._tag === "HostedCompleted") return 0
+  if (result._tag === "Exit") {
+    yield* writeSessionResult(result)
+    return result.code === 0 ? 130 : result.code
+  }
+  return 1
 })
 
 const developmentLaunchCommand = (

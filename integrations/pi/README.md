@@ -17,8 +17,9 @@ are needed. If Magnitude is missing, accepting setup installs the CLI with
 `npm install --global @magnitudedev/cli` before opening onboarding. Pi stays visible with its native
 spinner: “Installing Magnitude…”. Installer output is suppressed; failures
 show a concise diagnostic. Escape cancels preparation, and `/magnitude-setup` retries.
-An existing CLI is preserved and must support hosted setup; an incompatible version reports an
-update requirement rather than being silently replaced.
+An existing CLI is preserved. The extension uses a private setup command, not public `setup` flags.
+If an older CLI does not recognize that command, update it explicitly and retry; it is never silently
+replaced.
 
 No or Escape leaves “You can set up local models anytime with `/magnitude-setup`.” in the conversation.
 The offer is remembered per Pi profile across restarts, reloads, and package updates. Existing
