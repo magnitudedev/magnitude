@@ -1,9 +1,9 @@
-from magnitude_engine.composition import Blueprint, component
+from magnitude_engine.composition import Blueprint, blueprint
 
 from .contracts import Scheduler
 
 
-@component
+@blueprint
 class TimeShared(Blueprint[Scheduler]):
     max_active: int = 8
     max_queued: int = 128
@@ -16,8 +16,10 @@ class TimeShared(Blueprint[Scheduler]):
         if (
             not 1 <= self.max_active <= 64
             or min(self.max_queued, self.prefill_tokens, self.decode_tokens) < 1
-            or (self.prefill_stall_seconds is not None
-                and not 0 < self.prefill_stall_seconds < float("inf"))
+            or (
+                self.prefill_stall_seconds is not None
+                and not 0 < self.prefill_stall_seconds < float("inf")
+            )
             or not 0 < self.decode_share < 1
         ):
             raise ValueError("invalid scheduler capacity")

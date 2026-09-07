@@ -7,6 +7,8 @@ from itertools import count
 
 import mlx.core as mx
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
 from magnitude_engine.resources.retention import RetainedStorage
 
 from .arena import KVArena
@@ -81,7 +83,8 @@ class SequencePages:
         self._live()
         if self._mapping is None:
             self._mapping = PageMap(
-                tuple(p.address for p in self._pages), self.store.arena.allocator.capacity,
+                tuple(p.address for p in self._pages),
+                self.store.arena.allocator.capacity,
             )
         return self._mapping
 
@@ -124,6 +127,7 @@ class SequencePages:
                 if page.writer != self._identity or offset < page.protected:
                     raise RuntimeError("write would alter an immutable page prefix")
 
+    @component(c.KV_APPEND, source=c.Source.MAG, variant="CONTIGUOUS_RUNS")
     def write(self, layer: int, start: int, keys: mx.array, values: mx.array) -> None:
         """Append one layer's KV. Commit publishes length only after every layer wrote it."""
         end = start + keys.shape[1]
@@ -259,6 +263,7 @@ class SequencePages:
         self.closed = True
 
 
+@component(c.KV_STORE, source=c.Source.MAG, variant="PAGED")
 class PageStore:
     """Own physical sharing and state handles; retention holds checkpoint handles only."""
 
@@ -278,6 +283,7 @@ class PageStore:
             self._read_table = PageTable(mappings)
         return self._read_table
 
+    @component(c.KV_BRANCH, source=c.Source.MAG, variant="COPY_ON_WRITE")
     def create(self, checkpoint: KVCheckpoint | None = None) -> SequencePages:
         self.arena._idle()
         if checkpoint and (checkpoint.closed or checkpoint._store is not self):

@@ -1,13 +1,33 @@
-"""Component contracts choose functions, not implementations or construction graphs."""
+"""Typed formulation definitions; the only ID decoding is at the record boundary."""
 
-from dataclasses import asdict
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+from pydantic import BaseModel, TypeAdapter
+
+from magnitude_engine import components as c
 from performance.records import Node, Profile, digest
 from performance.theory import composition, engine, neural, state
-from performance.theory.resources import Bound, Demands, Extent, join, time_bound
+from performance.theory.resources import (
+    Bound,
+    Demands,
+    Extent,
+    join,
+    tightened_time_bound,
+    time_bound,
+)
+from performance.theory.workloads import (
+    AttentionWorkload,
+    ControlWorkload,
+    NeuralWorkload,
+    RecurrentWorkload,
+    ServiceWorkload,
+    StateWorkload,
+    Workload,
+)
 
-# A metric has one unit and population meaning throughout collection and display.
 METRICS = {
     "EXEC": {"unit": "seconds", "meaning": "operation through required completion"},
     "LAT": {"unit": "seconds", "meaning": "boundary latency"},
@@ -19,50 +39,200 @@ METRICS = {
     "GAP": {"unit": "seconds", "meaning": "maximum adjacent publication gap"},
 }
 
-DIMENSIONS = {
-    "ENGINE:INFERENCE": ("RATE", "TTFT", "GAP"),
-    "SCHEDULING:ADMISSION": ("LAT",),
-    "SCHEDULING:SERVICE": ("RATE", "TTFT", "GAP"),
-    "SCHEDULING:PREFILL": ("EXEC",),
-    "BATCHING:ASSEMBLY": ("EXEC",),
-    "EXECUTION:DEVICE": ("EXEC",),
-    "MEMORY:ACCOUNTING": ("EXEC",),
-    "CACHE:PREFIX": ("REUSE",),
-    "KV:STORE": ("MEM",),
-    "KV:APPEND": ("EXEC",),
-    "KV:BRANCH": ("EXEC",),
-    "STATE:RECURRENT": ("MEM", "RESTORE"),
-    "STATE:CHECKPOINTS": ("MEM", "RESTORE"),
-    "STATE:QWEN35": ("MEM", "RESTORE"),
-    "GENERATION:PLAIN": ("EXEC",),
-    "GENERATION:SPECULATION": ("EXEC",),
-    "GENERATION:SAMPLING": ("EXEC",),
-    "GENERATION:ACCEPTANCE": ("EXEC",),
-    "MODEL:LOADING": ("LAT", "MEM"),
-}
-for component in (
-    "EXECUTOR",
-    "FORWARD",
-    "EMBEDDING",
-    "ATTENTION",
-    "GATED_DELTA",
-    "EXPERTS",
-    "QWEN35",
-    "QWEN35.ATTENTION",
-    "QWEN35.RECURRENCE",
-    "QWEN35.FEEDFORWARD",
-    "QWEN35.READOUT",
-    "QWEN35.MTP",
-    "GEMMA4",
-    "GEMMA4.INPUTS",
-    "GEMMA4.ATTENTION",
-    "GEMMA4.KV",
-    "GEMMA4.FEEDFORWARD",
-    "GEMMA4.MLP",
-    "GEMMA4.EXPERT_BRANCH",
-    "GEMMA4.READOUT",
+
+@dataclass(frozen=True)
+class Model[P: c.Facts, W: BaseModel]:
+    contract: c.Contract[P]
+    workload: type[W]
+    dimensions: tuple[str, ...]
+    demands: Callable[[P, W, dict[str, Demands]], Demands]
+    bounds: Callable[[P, W, Profile, Demands, dict[str, dict[str, Bound]]], dict[str, Bound]]
+
+    def inputs(self, node: Node, raw: dict) -> tuple[P, W]:
+        import json
+
+        w = TypeAdapter(self.workload).validate_json(json.dumps(raw))
+        p = node.parameters
+        # Standalone geometry is an explicit binding, not guessed from an operator.
+        if p is None and self.contract in (c.ATTENTION, c.RECURRENCE) and "geometry" in raw:
+            p = self.contract.read(raw["geometry"])
+        if not isinstance(p, self.contract.parameters):
+            raise ValueError(f"missing {self.contract.identity} parameters")
+        return p, w
+
+
+MODELS: dict[c.Contract[Any], Model[Any, Any]] = {}
+
+
+def register[P: c.Facts, W: BaseModel](model: Model[P, W]) -> None:
+    if model.contract in MODELS:
+        raise ValueError(f"duplicate theory for {model.contract.identity}")
+    MODELS[model.contract] = model
+
+
+def execution(p, w, profile, demand, children):
+    return {"EXEC": tightened_time_bound(demand, profile, w.dependent_phases)}
+
+
+def bookkeeping(p, w, children):
+    return Demands(assumptions=("local bookkeeping may fuse into its owner",))
+
+
+def explicit(p, w: Workload, children):
+    if w.required_inputs is None and not children:
+        return Demands(missing=("mathematical required_inputs or child regions",))
+    return join(Demands(w.required_inputs or (), w.required_outputs), *children.values())
+
+
+register(
+    Model(
+        c.ATTENTION,
+        AttentionWorkload,
+        ("EXEC",),
+        lambda p, w, ch: neural.attention(p, w),
+        execution,
+    )
+)
+register(
+    Model(
+        c.RECURRENCE,
+        RecurrentWorkload,
+        ("EXEC",),
+        lambda p, w, ch: neural.recurrence(p, w),
+        execution,
+    )
+)
+for contract in c.CONTRACTS:
+    if contract.parameters is c.NeuralParameters:
+        register(Model(contract, NeuralWorkload, ("EXEC",), composition.model, execution))
+register(Model(c.FORWARD, Workload, ("EXEC",), explicit, execution))
+
+
+def storage_bounds(p, w, profile, demand, children):
+    return {
+        "MEM": state.retained(p, w, {k: v for k, v in children.items() if "MEM" in v}),
+        "RESTORE": state.restore(p, w, profile),
+    }
+
+
+for contract in (c.RECURRENT_STATE, c.NATIVE_STATE, c.HYBRID_STATE):
+    register(Model(contract, StateWorkload, ("MEM", "RESTORE"), bookkeeping, storage_bounds))
+register(
+    Model(
+        c.KV_STORE,
+        StateWorkload,
+        ("MEM",),
+        bookkeeping,
+        lambda p, w, profile, d, ch: {"MEM": state.retained(p, w)},
+    )
+)
+register(
+    Model(c.KV_APPEND, StateWorkload, ("EXEC",), lambda p, w, ch: state.append(p, w), execution)
+)
+
+
+def service_bounds(p, w, profile, demand, children):
+    return {
+        dimension: engine.service(dimension, w, demand, profile)
+        for dimension in ("RATE", "TTFT", "GAP")
+    }
+
+
+register(
+    Model(
+        c.ENGINE,
+        ServiceWorkload,
+        ("RATE", "TTFT", "GAP"),
+        lambda p, w, ch: engine.service_information(explicit(p, w, ch)),
+        service_bounds,
+    )
+)
+register(Model(c.SCHEDULING, ServiceWorkload, ("RATE", "TTFT", "GAP"), bookkeeping, service_bounds))
+register(
+    Model(
+        c.PREFIX,
+        ControlWorkload,
+        ("REUSE",),
+        bookkeeping,
+        lambda p, w, profile, d, ch: {"REUSE": engine.reuse(w)},
+    )
+)
+for contract, dimension in (
+    (c.MEMORY, "EXEC"),
+    (c.BATCHING, "EXEC"),
+    (c.KV_BRANCH, "EXEC"),
+    (c.ADMISSION, "LAT"),
 ):
-    DIMENSIONS[f"MODEL:{component}"] = ("EXEC",)
+    register(
+        Model(
+            contract,
+            ControlWorkload,
+            (dimension,),
+            bookkeeping,
+            lambda p, w, profile, d, ch, dimension=dimension: {
+                dimension: Bound(
+                    0, "seconds", assumptions=("bookkeeping may disappear into its owner",)
+                )
+            },
+        )
+    )
+register(Model(c.PREFILL, Workload, ("EXEC",), bookkeeping, execution))
+for contract in (c.GENERATION, c.SPECULATION):
+    register(
+        Model(
+            contract,
+            Workload,
+            ("EXEC",),
+            lambda p, w, ch: join(*(ch[k] for k in ("target", "draft") if k in ch)),
+            execution,
+        )
+    )
+
+
+def sampling(p, w: ControlWorkload, children):
+    if w.vocabulary is None or w.positions is None or w.element_bytes is None:
+        return Demands(missing=("vocabulary, positions and element_bytes",))
+    return Demands(
+        (Extent("sampling:logits", 0, w.vocabulary * w.positions * w.element_bytes),),
+        assumptions=("arbitrary-logit sampling; all candidates may matter",),
+    )
+
+
+def acceptance(p, w: ControlWorkload, children):
+    if w.width is None or w.rounds is None:
+        return Demands(missing=("width and rounds",))
+    return Demands(
+        (Extent("acceptance:prefix", 0, w.rounds * (12 if w.width else 4)),),
+        assumptions=("earliest possible mismatch; int32 tokens",),
+    )
+
+
+def device(p, w: ControlWorkload, children):
+    return (
+        bookkeeping(p, w, children)
+        if w.elements is None
+        else Demands(
+            (Extent("device:input", 0, w.elements * 4),),
+            assumptions=("closed-form affine graph; intermediate passes eliminated",),
+        )
+    )
+
+
+register(Model(c.SAMPLING, ControlWorkload, ("EXEC",), sampling, execution))
+register(Model(c.ACCEPTANCE, ControlWorkload, ("EXEC",), acceptance, execution))
+register(Model(c.DEVICE, ControlWorkload, ("EXEC",), device, execution))
+register(
+    Model(
+        c.LOADING,
+        StateWorkload,
+        ("LAT", "MEM"),
+        explicit,
+        lambda p, w, profile, d, ch: {"LAT": time_bound(d, profile), "MEM": state.retained(p, w)},
+    )
+)
+
+if set(MODELS) != set(c.CONTRACTS):
+    raise RuntimeError("every production component contract needs a theoretical definition")
 
 
 def revision() -> str:
@@ -70,129 +240,12 @@ def revision() -> str:
 
 
 def requirements(node: Node, workload: dict, children: dict[str, Demands]) -> Demands:
-    p = node.parameters | workload.get("geometry", {})
-    if node.component == "MODEL:ATTENTION":
-        return neural.attention(p, workload)
-    if node.component == "MODEL:GATED_DELTA":
-        return neural.recurrence(p, workload)
-    if node.component in (
-        "MEMORY:ACCOUNTING",
-        "BATCHING:ASSEMBLY",
-        "KV:BRANCH",
-        "SCHEDULING:ADMISSION",
-        "CACHE:PREFIX",
-        "SCHEDULING:PREFILL",
-        "SCHEDULING:SERVICE",
-        "EXECUTION:DEVICE",
-    ):
-        if node.component != "EXECUTION:DEVICE" or "elements" not in workload:
-            return Demands(assumptions=("local bookkeeping may fuse into its owner",))
-    if node.component == "KV:APPEND":
-        return state.append(p, workload)
-    if node.component == "GENERATION:SAMPLING":
-        missing = tuple(
-            k for k in ("vocabulary", "positions", "element_bytes") if k not in workload
-        )
-        if missing:
-            return Demands(missing=missing)
-        size = workload["vocabulary"] * workload["positions"] * workload["element_bytes"]
-        return Demands(
-            (Extent("sampling:logits", 0, size),),
-            assumptions=("arbitrary-logit sampling; all candidates may matter",),
-        )
-    if node.component == "GENERATION:ACCEPTANCE":
-        if not all(k in workload for k in ("width", "rounds")):
-            return Demands(missing=("width and rounds",))
-        size = workload["rounds"] * (12 if workload["width"] else 4)
-        return Demands(
-            (Extent("acceptance:prefix", 0, size),),
-            assumptions=("earliest possible mismatch; int32 tokens",),
-        )
-    if node.component == "EXECUTION:DEVICE" and "elements" in workload:
-        return Demands(
-            (Extent("device:input", 0, workload["elements"] * 4),),
-            assumptions=("closed-form affine graph; intermediate passes eliminated",),
-        )
-    if node.component in ("GENERATION:PLAIN", "GENERATION:SPECULATION") and "target" in children:
-        # Sampling and acceptance consume internally produced tensors. Relax their
-        # cost rather than pretending a missing standalone input crosses this boundary.
-        return join(*(children[k] for k in ("target", "draft") if k in children))
-    if node.component == "MODEL:FORWARD" and p.get("opaque"):
-        if "required_inputs" not in workload:
-            return Demands(missing=("opaque forward: mathematical required_inputs binding",))
-        return Demands(
-            tuple(Extent(**e) for e in workload["required_inputs"]),
-            assumptions=("explicit opaque-forward mathematical binding",),
-        )
-    if node.component.startswith("MODEL:") and "arrays" in p:
-        return composition.model(node.component, p, workload, children)
-    # Public region bindings allow a new component's mathematical projections to
-    # reuse the same equations without embedding equations in a benchmark.
-    local = [
-        neural.projection(
-            workload.get("batch_size", 1) * workload.get("query_tokens", 1),
-            r["input_width"],
-            r["output_width"],
-            identity=r["identity"],
-            encoded_bytes=r["encoded_bytes"],
-            element_bytes=r["element_bytes"],
-        )
-        for r in p.get("projections", ())
-    ]
-    if "required_inputs" in workload:
-        local.append(
-            Demands(
-                tuple(Extent(**e) for e in workload["required_inputs"]),
-                assumptions=("declared required input domain",),
-            )
-        )
-    if local or children:
-        combined = join(
-            *local,
-            *children.values(),
-            retained=tuple(Extent(**e) for e in workload.get("required_outputs", ())),
-        )
-        return (
-            engine.service_information(combined)
-            if node.component == "ENGINE:INFERENCE"
-            else combined
-        )
-    return Demands(missing=(f"{node.component} required input/region binding",))
+    model = MODELS[node.component]
+    return model.demands(*model.inputs(node, workload), children)
 
 
 def evaluate(
-    node: Node,
-    workload: dict,
-    profile: Profile,
-    demand: Demands,
-    children: dict[str, dict[str, Bound]],
+    node: Node, workload: dict, profile: Profile, demand: Demands, children
 ) -> dict[str, Bound]:
-    if node.component not in DIMENSIONS:
-        raise ValueError(f"undefined component contract: {node.component}")
-    result = {}
-    for dimension in DIMENSIONS[node.component]:
-        if dimension == "MEM":
-            bound = state.retained(
-                node.parameters, workload, {k: v for k, v in children.items() if "MEM" in v}
-            )
-        elif dimension == "RESTORE":
-            bound = state.restore(node.parameters, workload, profile)
-        elif dimension == "REUSE":
-            bound = engine.reuse(workload)
-        elif node.component in (
-            "MEMORY:ACCOUNTING",
-            "BATCHING:ASSEMBLY",
-            "KV:BRANCH",
-            "SCHEDULING:ADMISSION",
-        ):
-            bound = Bound(0, "seconds", assumptions=("bookkeeping may disappear into its owner",))
-        elif dimension in ("RATE", "TTFT", "GAP"):
-            bound = engine.service(dimension, workload, demand, profile)
-        else:
-            bound = time_bound(demand, profile)
-        result[dimension] = bound
-    return result
-
-
-def serialized_bounds(bounds):
-    return {key: asdict(value) for key, value in bounds.items()}
+    model = MODELS[node.component]
+    return model.bounds(*model.inputs(node, workload), profile, demand, children)

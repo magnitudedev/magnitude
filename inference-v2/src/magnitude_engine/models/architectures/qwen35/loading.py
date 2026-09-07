@@ -41,6 +41,7 @@ from .contracts import (
     FeedForwardFactory,
     RecurrentFactory,
 )
+from .definition import DEFINITION
 
 if TYPE_CHECKING:
     from .mtp.loading import LoadedMTP
@@ -202,6 +203,7 @@ class Qwen35Source(ProgramSource):
                 loaded.arguments.vocab_size,
                 loaded.tokenizer_identity,
                 "qwen35.Program",
+                DEFINITION,
             ),
             HybridRequirements(loaded.attention, loaded.state_dtype, loaded.recurrence),
         )

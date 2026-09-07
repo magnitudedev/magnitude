@@ -1,13 +1,13 @@
 from dataclasses import field
 
 from magnitude_engine.artifacts.source import LocalArtifact
-from magnitude_engine.composition import Blueprint, component
+from magnitude_engine.composition import Blueprint, blueprint
 from magnitude_engine.models.contracts import ProgramSource
 from magnitude_engine.resources.io.blueprint import PositionalReader
 from magnitude_engine.resources.io.reader import PositionalReader as Reader
 
 
-@component
+@blueprint
 class Head(Blueprint[ProgramSource]):
     artifact: Blueprint[LocalArtifact]
     target: Blueprint[ProgramSource]

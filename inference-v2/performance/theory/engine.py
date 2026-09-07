@@ -7,11 +7,12 @@ Publication GAP has a zero floor if the contract permits buffering outputs; a
 positive bound requires an immediate-publication dependency contract.
 """
 
-from performance.theory.resources import Bound, Demands, time_bound
+from performance.theory.resources import Bound, Demands, tightened_time_bound, time_bound
+from performance.theory.workloads import ControlWorkload, ServiceWorkload
 
 
-def reuse(w: dict) -> Bound:
-    eligible = w.get("eligible_prefix_tokens")
+def reuse(w: ControlWorkload) -> Bound:
+    eligible = w.eligible_prefix_tokens
     if eligible is None:
         return Bound(None, "tokens", "upper", missing=("eligible_prefix_tokens",))
     if eligible < 0:
@@ -19,7 +20,7 @@ def reuse(w: dict) -> Bound:
     return Bound(eligible, "tokens", "upper", assumptions=("fixed eligible prefix workload",))
 
 
-def service(dimension, w, demand, profile):
+def service(dimension, w: ServiceWorkload, demand, profile):
     if dimension == "GAP":
         return Bound(
             0,
@@ -31,15 +32,16 @@ def service(dimension, w, demand, profile):
         )
     lower = time_bound(demand, profile)
     if dimension == "TTFT":
-        if w.get("statistics", {}).get("TTFT") != "max":
+        if w.statistics.TTFT != "max":
             return Bound(None, "seconds", missing=("supported TTFT population statistic: max",))
         # The parameter-read relaxation also applies to the first publication:
         # it does not charge later outputs or internal state built by prefill.
         return lower
-    units = w.get("output_tokens")
+    lower = tightened_time_bound(demand, profile, w.dependent_phases)
+    units = w.output_tokens
     if units is None:
         return Bound(None, "tokens/second", "upper", missing=("output_tokens",))
-    units *= w.get("rows", 1) * w.get("waves", 1)
+    units *= w.rows * w.waves
     if lower.value is None:
         return Bound(
             None, "tokens/second", "upper", missing=lower.missing, assumptions=lower.assumptions

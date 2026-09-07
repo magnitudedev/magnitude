@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
 from magnitude_engine.models.attention.contracts import PagedAttention
 from magnitude_engine.models.embeddings.contracts import EmbeddingLookup
 from magnitude_engine.models.execution import ExecutionScope
@@ -15,8 +17,11 @@ from magnitude_engine.models.state.pages import SequencePages, append_layer
 from magnitude_engine.models.state.views import read_layer
 from magnitude_engine.models.transforms import PositionTransform, Transform
 
+from .definition import DEFINITION
+
 
 @dataclass(frozen=True)
+@component(c.GEMMA_KV, source=c.Source.MAG, variant="PRODUCER")
 class KVProducer:
     keys: Transform
     values: Transform | None
@@ -39,6 +44,7 @@ class KVProducer:
 
 
 @dataclass(frozen=True)
+@component(c.GEMMA_ATTENTION, source=c.Source.MAG, variant="SHARED_KV")
 class GemmaAttention:
     source: int
     producer: KVProducer | None
@@ -68,6 +74,7 @@ class GemmaAttention:
 
 
 @dataclass(frozen=True)
+@component(c.GEMMA_MLP, source=c.Source.MAG, variant="GEGLU")
 class GeGLU:
     gate: Transform
     up: Transform
@@ -94,6 +101,7 @@ class GemmaRouter:
 
 
 @dataclass(frozen=True)
+@component(c.GEMMA_EXPERT_BRANCH, source=c.Source.MAG, variant="ROUTED")
 class ExpertBranch:
     router: GemmaRouter
     operation: ExpertOperator
@@ -107,6 +115,7 @@ class ExpertBranch:
 
 
 @dataclass(frozen=True)
+@component(c.GEMMA_FEEDFORWARD, source=c.Source.MAG, variant="BRANCHED")
 class GemmaFeedForward:
     input_norm: Transform
     dense: GeGLU
@@ -124,6 +133,7 @@ class GemmaFeedForward:
 
 
 @dataclass(frozen=True)
+@component(c.GEMMA_INPUTS, source=c.Source.MAG, variant="PER_LAYER")
 class PerLayerInputs:
     embedding: EmbeddingLookup
     projection: Transform
@@ -142,6 +152,7 @@ class PerLayerInputs:
 
 
 @dataclass(frozen=True)
+@component(c.GEMMA_INPUTS, source=c.Source.MAG, variant="PER_LAYER")
 class LayerInput:
     gate: Transform
     projection: Transform
@@ -161,6 +172,7 @@ class GemmaBlock:
     scalar: mx.array
 
 
+@component(c.GEMMA4, source=c.Source.MAG, variant="LAYERWISE", model=DEFINITION)
 class Gemma4Program:
     conditioning: frozenset[str] = frozenset()
 

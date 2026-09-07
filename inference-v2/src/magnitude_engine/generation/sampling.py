@@ -7,6 +7,9 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
+
 from .sampling_policy import SamplingPolicy
 
 
@@ -25,6 +28,7 @@ def position_key(seed: int, position: int) -> mx.array:
     return mx.random.key(mixed ^ (mixed >> 31))
 
 
+@component(c.SAMPLING, source=c.Source.MAG, variant="POSITION_KEYED")
 class SequenceSampler:
     def __init__(self, policy: SamplingPolicy):
         self.policy = policy
@@ -48,8 +52,7 @@ class SequenceSampler:
         # preserves their ordering and adds a redundant full-vocabulary pass.
         # Arithmetic penalties and stochastic normalization still use FP32.
         result = (
-            raw if policy.temperature == 0 and not policy.uses_history
-            else raw.astype(mx.float32)
+            raw if policy.temperature == 0 and not policy.uses_history else raw.astype(mx.float32)
         )
         if preview_tokens is not None and (
             preview_tokens.ndim != 1 or preview_tokens.dtype != mx.int32

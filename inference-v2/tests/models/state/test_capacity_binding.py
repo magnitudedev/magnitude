@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
+from magnitude_engine.models.architectures.qwen35.definition import DEFINITION
 from magnitude_engine.models.residency import ModelDescriptor, ModelResources, PagedRequirements
 from magnitude_engine.models.state.arena import LayerGeometry
 from magnitude_engine.models.state.binding import PagedHybridFactory
@@ -14,7 +15,7 @@ def test_declared_context_is_reachable_for_all_rows_with_whole_slab_growth(conte
     budget = MemoryBudget(16 << 20)
     resources = ModelResources(budget=budget, context_tokens=context, max_active=rows)
     bound = SimpleNamespace(
-        descriptor=ModelDescriptor("fixture", context, 64, "fixture", "fixture"),
+        descriptor=ModelDescriptor("fixture", context, 64, "fixture", "fixture", DEFINITION),
         state=PagedRequirements((LayerGeometry(1, 2, 2),), mx.float32),
     )
     states = PagedHybridFactory(page_size=16, slab_pages=32).create(bound, resources)

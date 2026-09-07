@@ -38,6 +38,7 @@ from magnitude_engine.resources.budget import MemoryBudget
 from magnitude_engine.resources.io.reader import PositionalReader
 
 from .binding import bind_gemma4
+from .definition import DEFINITION
 
 
 @dataclass(frozen=True)
@@ -205,6 +206,7 @@ class Gemma4Source(ProgramSource):
                     loaded.arguments.vocab_size,
                     loaded.tokenizer_identity,
                     "gemma4.Program",
+                    DEFINITION,
                 ),
                 PagedRequirements(loaded.attention, loaded.state_dtype),
             )

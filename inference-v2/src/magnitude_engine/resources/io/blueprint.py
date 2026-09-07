@@ -1,9 +1,9 @@
-from magnitude_engine.composition import Blueprint, component
+from magnitude_engine.composition import Blueprint, blueprint
 
 from .reader import PositionalReader as Reader
 
 
-@component
+@blueprint
 class PositionalReader(Blueprint[Reader]):
     workers: int = 4
     max_pending: int = 4

@@ -8,6 +8,7 @@ service timings are retained as evidence and never substituted for HTTP duration
 import json
 from pathlib import Path
 
+from magnitude_engine import components as c
 from performance.records import Assembly, Node, Profile, digest
 from performance.store import Store
 
@@ -46,7 +47,7 @@ def ingest(directory: Path, store: Store) -> dict:
             "runtime": runtime,
         }
         checksum = digest(source)
-        identity = digest({"session_bridge": 1, "source": checksum})[:32]
+        identity = digest({"session_bridge": 2, "source": checksum})[:32]
         if (store.root / "runs" / identity / "run.json").exists():
             duplicate += 1
             continue
@@ -60,13 +61,15 @@ def ingest(directory: Path, store: Store) -> dict:
             "metadata": artifact["metadata"],
         }
         implementation = Node(
-            "ENGINE:INFERENCE:MAG:SESSION_HTTP",
+            c.Implementation(c.ENGINE, c.Source.MAG, "SESSION_HTTP"),
             digest(runtime.get("files", runtime)),
-            {
-                "server": target.rsplit("-", 1)[0],
-                "opaque_server": True,
-                "artifact": digest(artifact_key),
-            },
+            c.Configuration(
+                settings={
+                    "server": target.rsplit("-", 1)[0],
+                    "opaque_server": True,
+                    "artifact": digest(artifact_key),
+                }
+            ),
         )
         graph = Assembly(
             "service", {"service": implementation}, f"{target} · HTTP", {"target": artifact_key}
@@ -106,7 +109,7 @@ def ingest(directory: Path, store: Store) -> dict:
         if completion is None:
             raise ValueError("session observation has no recorded completion event")
         record = {
-            "schema_version": 1,
+            "schema_version": 2,
             "id": identity,
             "status": status,
             "started_at": header["started_at"],

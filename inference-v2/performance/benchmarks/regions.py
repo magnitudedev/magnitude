@@ -5,6 +5,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
+from magnitude_engine import components as c
 from performance.assembly import Binding, BoundAssembly, inspect_engine, source_files
 from performance.benchmarks import references
 from performance.benchmarks.fixtures import record_inputs, tokens
@@ -52,11 +53,13 @@ def capture(
 ):
     import mlx.core as mx
 
+    from magnitude_engine.models.architectures.qwen35.program import Qwen35Program
     from magnitude_engine.models.runtime import ForwardRequest
 
     model = engine.engine.generation.model
-    program = getattr(model.program, "_program", model.program)
-    if type(program).__name__ != "Qwen35Program":
+    assembly = inspect_engine(engine)
+    program = assembly.at("target").instance
+    if not isinstance(program, Qwen35Program):
         raise TypeError("this input capture binds the Qwen layer contract")
     provenance = {}
     if prompt is None:
@@ -76,7 +79,7 @@ def capture(
     values = {
         "tokens": mx.array([continuation[:query_tokens]], mx.int32),
         "prompt": tuple(prompt),
-        "producer": inspect_engine(engine).graph.component_keys()["target"],
+        "producer": assembly.graph.component_keys()["target"],
         "ff": {},
         "mixer": {},
         "kv": [],
@@ -143,7 +146,7 @@ def benchmark(
     assembly = inspect_engine(engine)
     bound = assembly.at(path)
     model = engine.engine.generation.model
-    program = getattr(model.program, "_program", model.program)
+    program = assembly.at("target").instance
     op = bound.instance
     component = bound.node.component
     index = int(path.split(".layers.")[1].split(".")[0]) if ".layers." in path else None
@@ -153,7 +156,7 @@ def benchmark(
         sources = source_files(references.attention)
         node = replace(
             bound.node,
-            implementation=f"{component}:MAG:UPSTREAM_ADAPTER",
+            binding=c.Implementation(component, c.Source.MAG, "UPSTREAM_ADAPTER"),
             source=digest(sources),
             children={},
             dependencies={},
@@ -195,20 +198,20 @@ def benchmark(
         )
         control: Callable[..., Any] | None = None
         hidden = indices = None
-        if component.endswith(".ATTENTION"):
+        if component == c.QWEN_ATTENTION:
             hidden = p["mixer"][index][0]
             control = (
                 references.attention_equation(op)
                 if attention_oracle == "fp32-equation"
                 else references.attention(op)
             )
-        elif component.endswith(".RECURRENCE"):
+        elif component == c.QWEN_RECURRENCE:
             hidden = p["mixer"][index][0]
             control = references.recurrence(op.operation)
-        elif component.endswith(".FEEDFORWARD"):
+        elif component == c.QWEN_FEEDFORWARD:
             hidden = p["ff"][index]
             control = references.feedforward(op) if hasattr(op, "experts") else op.call
-        elif component == "MODEL:EXPERTS":
+        elif component == c.EXPERTS:
             hidden = p["ff"][index]
             parent = program.blocks[index].feedforward
             probabilities = mx.softmax(parent.router(hidden), axis=-1, precise=True)
@@ -218,10 +221,10 @@ def benchmark(
             mx.eval(indices)
             workload["distinct_experts"] = len(set(cast(list[int], indices.reshape(-1).tolist())))
             control = references.experts(op)
-        elif component == "MODEL:EMBEDDING":
+        elif component == c.EMBEDDING:
             control = references.embedding(op)
             workload["distinct_input_tokens"] = len(set(p["tokens"].reshape(-1).tolist()))
-        elif not component.endswith(".READOUT"):
+        elif not (component == c.QWEN_READOUT):
             raise TypeError(f"no invocation contract for {component}")
         row: Any = None
         transaction = None
@@ -235,10 +238,10 @@ def benchmark(
             if row is not None:
                 row.close()
                 row = None
-            if component.endswith((".ATTENTION", ".RECURRENCE")):
+            if component in (c.QWEN_ATTENTION, c.QWEN_RECURRENCE):
                 row = model.create(p["checkpoint"])
                 model.reserve(row, query_tokens)
-                if component.endswith(".RECURRENCE"):
+                if component == c.QWEN_RECURRENCE:
                     transaction = model.states.begin(
                         row.state, ModelInputs(p["tokens"]), committed_inputs=query_tokens
                     )
@@ -251,13 +254,13 @@ def benchmark(
         def execute(use_reference):
             call = cast(Callable[..., Any], control)
             with model.owner.scope() as scope:
-                if component == "MODEL:EMBEDDING":
+                if component == c.EMBEDDING:
                     outputs = [
                         call(p["tokens"]) if use_reference else op.lookup(p["tokens"], scope)
                     ]
-                elif component.endswith(".READOUT"):
+                elif component == c.QWEN_READOUT:
                     outputs = [program.output(program.norm(p["last_hidden"]))]
-                elif component.endswith(".ATTENTION"):
+                elif component == c.QWEN_ATTENTION:
                     scope.enter(row.state.pages.store.arena.pin())
                     outputs = [
                         call(
@@ -268,7 +271,7 @@ def benchmark(
                         if use_reference
                         else op.compute_batch(hidden, (row.state,), scope)
                     ]
-                elif component.endswith(".RECURRENCE"):
+                elif component == c.QWEN_RECURRENCE:
                     if use_reference:
                         cache = ArraysCache(2)
                         cache[0], cache[1] = p["mixer"][index][1:]
@@ -277,7 +280,7 @@ def benchmark(
                     else:
                         value = op.compute_batch(hidden, (row.state,), scope)
                         outputs = [value, *row.state.slots[op.index].pending.values]
-                elif component == "MODEL:EXPERTS":
+                elif component == c.EXPERTS:
                     outputs = [
                         call(hidden, indices)
                         if use_reference
@@ -297,7 +300,7 @@ def benchmark(
             complete(wanted)
             expected = wanted[0]
             expected_kv = None
-            if component.endswith(".ATTENTION"):
+            if component == c.QWEN_ATTENTION:
                 cache = caches[op.index]
                 end = context_tokens + query_tokens
                 expected_kv = (cache.keys[:, :, :end], cache.values[:, :, :end])
@@ -305,7 +308,7 @@ def benchmark(
 
             def validate(result):
                 observed = compare(result[0], expected, atol=0.002, rtol=0.002)
-                if component.endswith(".RECURRENCE"):
+                if component == c.QWEN_RECURRENCE:
                     compare(result[0][-1], expected[-1], atol=1e-5, rtol=1e-5)
                 if expected_kv is not None:
                     if reference:

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
 from magnitude_engine.resources.budget import MemoryBudget
 from magnitude_engine.resources.retention import RetainedStorage
 
@@ -183,6 +185,7 @@ class _Preparation:
     begun: int = 0
 
 
+@component(c.HYBRID_STATE, source=c.Source.MAG, variant="HYBRID")
 class HybridStateStore:
     def __init__(
         self, pages: PageStore, layouts: tuple[RecurrentLayout, ...], budget: MemoryBudget

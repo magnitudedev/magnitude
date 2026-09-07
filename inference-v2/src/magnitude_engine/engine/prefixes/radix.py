@@ -1,8 +1,12 @@
 """Retain semantic prefixes under the injected retention policy."""
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
+
 from .contracts import PrefixIndex, RetentionPolicy
 
 
+@component(c.PREFIX, source=c.Source.MAG, variant="CHECKPOINTS")
 class Radix(PrefixIndex):
     def __init__(self, *, retention: RetentionPolicy):
         super().__init__()

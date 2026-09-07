@@ -1,11 +1,11 @@
 from dataclasses import field
 
-from magnitude_engine.composition import Blueprint, component
+from magnitude_engine.composition import Blueprint, blueprint
 
 from .contracts import PagedAttention
 
 
-@component
+@blueprint
 class Paged(Blueprint[PagedAttention]):
     prefill: Blueprint[PagedAttention] = field(default_factory=lambda: Gathered())
     heads_per_group: int = 1
@@ -21,7 +21,7 @@ class Paged(Blueprint[PagedAttention]):
         return MetalPagedAttention
 
 
-@component
+@blueprint
 class Gathered(Blueprint[PagedAttention]):
     @staticmethod
     def implementation() -> type[PagedAttention]:

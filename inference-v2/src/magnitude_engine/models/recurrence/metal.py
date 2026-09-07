@@ -7,6 +7,9 @@ from typing import Any
 
 import mlx.core as mx
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
+
 from .inputs import DeltaInputs
 
 
@@ -97,6 +100,7 @@ def _kernel(state_only: bool) -> Any:
     )
 
 
+@component(c.RECURRENCE, source=c.Source.MAG, variant="FUSED_UPDATE")
 class MetalDelta:
     """Native recurrence; long lengths normally share one runtime-count kernel.
 

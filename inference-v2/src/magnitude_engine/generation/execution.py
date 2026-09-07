@@ -12,6 +12,8 @@ from typing import cast
 
 import mlx.core as mx
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
 from magnitude_engine.models.operations import (
     Complete,
     Forward,
@@ -54,16 +56,20 @@ class Continuation[T]:
         self.task.close()
 
 
-def execute[T](tasks: tuple[Task[T], ...], *, clock: Callable[[], int] = perf_counter_ns
-               ) -> tuple[Continuation[T], ...]:
+def execute[T](
+    tasks: tuple[Task[T], ...], *, clock: Callable[[], int] = perf_counter_ns
+) -> tuple[Continuation[T], ...]:
     rows = tuple(Continuation(task) for task in tasks)
     while any(not row.done for row in rows):
         serve(rows, clock=clock)
     return rows
 
 
+@component(c.BATCHING, source=c.Source.MAG, variant="READY_COMPATIBLE")
 def serve[T](
-    rows: tuple[Continuation[T], ...], *, clock: Callable[[], int] = perf_counter_ns,
+    rows: tuple[Continuation[T], ...],
+    *,
+    clock: Callable[[], int] = perf_counter_ns,
     budget_ns: int | None = None,
 ) -> None:
     """Return ready results; retain peers at a completed service boundary.
@@ -101,8 +107,12 @@ def serve[T](
                 elif isinstance(op, Repair):
                     sequences.add(op.advance.sequence)
                     repairs.setdefault(
-                        (id(op.advance.sequence.runtime), op.inputs.count,
-                         id(op.advance.sequence.runtime.repair_group(op.advance.sequence))), []
+                        (
+                            id(op.advance.sequence.runtime),
+                            op.inputs.count,
+                            id(op.advance.sequence.runtime.repair_group(op.advance.sequence)),
+                        ),
+                        [],
                     ).append(row)
                 elif isinstance(op, ProjectVocabulary):
                     projections.setdefault(
@@ -113,17 +123,20 @@ def serve[T](
             for group in groups.values():
                 _forward(group, clock)
             for group in projections.values():
-                calls = tuple(row.ready for row in group
-                              if isinstance(row.ready, ProjectVocabulary))
+                calls = tuple(
+                    row.ready for row in group if isinstance(row.ready, ProjectVocabulary)
+                )
                 start = clock()
-                hidden = calls[0].hidden if len(calls) == 1 else mx.concatenate(
-                    [op.hidden for op in calls]
+                hidden = (
+                    calls[0].hidden
+                    if len(calls) == 1
+                    else mx.concatenate([op.hidden for op in calls])
                 )
                 logits = calls[0].project(hidden)
                 elapsed = clock() - start
                 for index, row in enumerate(group):
                     row.elapsed_ns += elapsed
-                    row.resume(logits if len(calls) == 1 else logits[index:index + 1], clock)
+                    row.resume(logits if len(calls) == 1 else logits[index : index + 1], clock)
             for group in repairs.values():
                 calls = tuple(row.ready for row in group if isinstance(row.ready, Repair))
                 start = clock()
@@ -162,8 +175,14 @@ def serve[T](
                     row.resume(None, clock)
             if observations:
                 start = clock()
-                mx.eval(*(a for row in observations if isinstance(row.ready, Observe)
-                          for a in row.ready.arrays))
+                mx.eval(
+                    *(
+                        a
+                        for row in observations
+                        if isinstance(row.ready, Observe)
+                        for a in row.ready.arrays
+                    )
+                )
                 elapsed = clock() - start
                 for row in observations:
                     row.elapsed_ns += elapsed
@@ -222,8 +241,10 @@ def _forward[T](rows: list[Continuation[T]], clock: Callable[[], int]) -> None:
         try:
             advances = (
                 (runtime.forward(calls[0].sequence, calls[0].inputs, request),)
-                if len(calls) == 1 else runtime.forward_batch(
-                    tuple(op.sequence for op in calls), tuple(op.inputs for op in calls),
+                if len(calls) == 1
+                else runtime.forward_batch(
+                    tuple(op.sequence for op in calls),
+                    tuple(op.inputs for op in calls),
                     request,
                 )
             )

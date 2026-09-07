@@ -1,17 +1,20 @@
-from types import SimpleNamespace
-
 import pytest
 
+from magnitude_engine import components as c
 from performance.assembly import inspect_component, inspect_engine
 from performance.records import Assembly, Node
 
 
 def test_graph_identity_preserves_aliases_but_not_occurrence_paths():
-    leaf = Node("MODEL:ATTENTION:MAG:PAGED", "leaf")
+    leaf = Node(c.implementation("MODEL:ATTENTION:MAG:PAGED"), "leaf")
     shared = Assembly(
         "root",
         {
-            "root": Node("MODEL:QWEN35:MAG:LAYERWISE", "parent", children={"a": "one", "b": "one"}),
+            "root": Node(
+                c.implementation("MODEL:QWEN35:MAG:LAYERWISE"),
+                "parent",
+                children={"a": "one", "b": "one"},
+            ),
             "one": leaf,
         },
         "shared",
@@ -19,7 +22,11 @@ def test_graph_identity_preserves_aliases_but_not_occurrence_paths():
     separate = Assembly(
         "root",
         {
-            "root": Node("MODEL:QWEN35:MAG:LAYERWISE", "parent", children={"a": "one", "b": "two"}),
+            "root": Node(
+                c.implementation("MODEL:QWEN35:MAG:LAYERWISE"),
+                "parent",
+                children={"a": "one", "b": "two"},
+            ),
             "one": leaf,
             "two": leaf,
         },
@@ -29,13 +36,15 @@ def test_graph_identity_preserves_aliases_but_not_occurrence_paths():
         "top",
         {
             "top": Node(
-                "MODEL:QWEN35:MAG:LAYERWISE", "parent", children={"a": "bottom", "b": "bottom"}
+                c.implementation("MODEL:QWEN35:MAG:LAYERWISE"),
+                "parent",
+                children={"a": "bottom", "b": "bottom"},
             ),
             "bottom": leaf,
         },
         "renamed",
     )
-    assert shared.identity != separate.identity
+    assert shared.identity == separate.identity
     assert shared.revision != separate.revision
     assert shared.identity == renamed.identity
     assert shared.component_keys()["one"] == separate.component_keys()["two"]
@@ -62,12 +71,16 @@ def engine(monkeypatch):
     monkeypatch.setattr(
         "performance.assembly.artifact_identity", lambda path: {"test": "tiny-qwen"}
     )
-    residency = SimpleNamespace(
+    from magnitude_engine.engine.binding import EngineResidency
+
+    residency = EngineResidency.__new__(EngineResidency)
+    values = dict(
         output_capacity=8,
         engine=engine,
         budget=budget,
         properties={"target_path": "/test/tiny-qwen", "speculative_backend": None},
     )
+    residency.__dict__.update(values)
     yield residency
     engine.close()
     arena.close()
@@ -79,11 +92,18 @@ def test_actual_qwen_engine_relationships(engine):
     assert graph.nodes["target"].dependencies["state"] == "target.state"
     assert graph.nodes["generation"].children["target"] == "target"
     assert len([p for p in graph.nodes if p.endswith("mixer")]) == 4
-    assert graph.nodes["target.layers.1.mixer.attention"].parameters["key_width"] == 16
+    assert graph.nodes["target.layers.1.mixer.attention"].parameters.key_width == 16
     assert graph.nodes["target.state"].children["kv"] == "target.state.kv"
-    assert graph.nodes["target.state.kv"].parameters["layers"][0]["heads"] == 2
+    assert graph.nodes["target.state.kv"].parameters.layers[0].heads == 2
     assert graph.identity == inspect_engine(engine).graph.identity
     assert graph.revision == inspect_engine(engine).graph.revision
+    standalone = inspect_component(
+        engine.engine.generation.model.program, artifacts=graph.artifacts
+    ).graph
+    assert (
+        graph.component_keys()["target.embedding"]
+        == standalone.component_keys()["component.embedding"]
+    )
 
 
 def test_actual_gemma_sharing():
@@ -100,7 +120,7 @@ def test_actual_gemma_sharing():
         assert (
             graph.nodes["component.layers.3.inputs"].dependencies["prepared"] == "component.inputs"
         )
-        assert graph.nodes["component.layers.1.mixer.attention"].parameters["key_width"] == 64
+        assert graph.nodes["component.layers.1.mixer.attention"].parameters.key_width == 64
     finally:
         arena.close()
 
@@ -361,13 +381,13 @@ def test_windowed_attention_binds_actual_work_and_input_identity(tmp_path):
         GatheredAttention(),
         context_tokens=5,
         query_tokens=3,
-        geometry=dict(
+        dtype="float32",
+        geometry=c.AttentionGeometry(
             query_heads=2,
             kv_heads=1,
             key_width=32,
             value_width=32,
             element_bytes=4,
-            dtype="float32",
             window=3,
         ),
         warmup=0,
@@ -377,3 +397,106 @@ def test_windowed_attention_binds_actual_work_and_input_identity(tmp_path):
     )
     assert result.record["status"] == "complete"
     assert result.record["workload"]["input_digest"]
+
+
+def test_blueprint_selection_is_the_captured_execution_component():
+    from magnitude_engine.composition import build, dumps, loads
+    from magnitude_engine.models.attention.blueprint import Gathered, Paged
+
+    geometry = c.AttentionGeometry(
+        query_heads=8, kv_heads=2, key_width=128, value_width=128, element_bytes=2
+    )
+    captures = []
+    for selected in (Gathered(), Paged(heads_per_group=2)):
+        with build(loads(dumps(selected))) as live:
+            bound = inspect_component(live, context=geometry)
+            assert bound.at("component").instance is live
+            assert bound.graph.nodes["component"].binding == c.component_of(live).identity(live)
+            captures.append(bound.graph)
+    assert captures[0].nodes["component"].implementation.endswith(":GATHERED")
+    assert captures[1].nodes["component"].implementation.endswith(":PAGED")
+    assert captures[1].nodes["component"].children == {"fallback": "component.fallback"}
+
+
+def test_engine_captures_budget_policy_and_suffix_method(engine):
+    from magnitude_engine.engine.memory.policy import Budgeted, EvictPrefixesBeforeRejecting
+    from magnitude_engine.generation.methods.suffix.runtime import SuffixMethod
+
+    engine.budget = Budgeted(limit_bytes=1 << 30, pressure=EvictPrefixesBeforeRejecting())
+    engine.engine.generation.method = SuffixMethod(minimum=2, maximum=8)
+    graph = inspect_engine(engine).graph
+    assert graph.nodes["memory"].implementation == "MEMORY:ACCOUNTING:MAG:BUDGETED"
+    assert graph.nodes["generation"].implementation == "GENERATION:SPECULATION:MAG:SUFFIX"
+    assert graph.nodes["generation"].parameters.settings == {"minimum": 2, "maximum": 8}
+    assert "acceptance" in graph.nodes["generation"].children
+    assert "draft" not in graph.nodes["generation"].children
+
+
+def test_shared_kernel_uses_preserve_distinct_geometries(monkeypatch):
+    from magnitude_engine.models.attention.gathered import GatheredAttention
+    from performance.bindings import SCHEMAS, Fields, Use, schema
+
+    @c.component(c.ENGINE, source=c.Source.MAG, variant="TEST")
+    class AssemblyFixture:
+        def __init__(self):
+            self.attention = GatheredAttention()
+
+    monkeypatch.setitem(SCHEMAS, AssemblyFixture, None)
+    del SCHEMAS[AssemblyFixture]
+
+    @schema(AssemblyFixture)
+    def fields(a: AssemblyFixture, _: None) -> Fields[c.Configuration]:
+        return Fields(
+            c.Configuration(),
+            children={
+                str(i): Use(
+                    a.attention,
+                    c.AttentionGeometry(
+                        query_heads=8,
+                        kv_heads=2,
+                        key_width=16 * (i + 1),
+                        value_width=16,
+                        element_bytes=2,
+                    ),
+                )
+                for i in range(24)
+            },
+            sources=(GatheredAttention,),
+        )
+
+    bound = inspect_component(AssemblyFixture())
+    assert len(bound.graph.nodes) == 25
+    assert [bound.graph.nodes[f"component.{i}"].parameters.key_width for i in range(24)] == [
+        16 * (i + 1) for i in range(24)
+    ]
+    assert len({id(bound.objects[f"component.{i}"]) for i in range(24)}) == 1
+
+
+def test_library_capture_reads_the_executed_model_binding():
+    from types import SimpleNamespace
+
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    from magnitude_engine.models.architectures.mlx_vlm.program import LibraryForward, LibraryProgram
+
+    class LanguageModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = nn.Embedding(8, 4)
+
+        def __call__(self, tokens, *, cache, position_ids):
+            return SimpleNamespace(logits=self.embedding(tokens) + position_ids[..., None])
+
+    model = LanguageModel()
+    program = LibraryProgram(LibraryForward(model))
+    tokens = mx.array([[1, 2], [3, 4]])
+    positions = mx.array([[5, 6], [9, 10]])
+    output = program.call(tokens, [SimpleNamespace(offset=mx.array([5, 9]))])
+    assert mx.allclose(output, model.embedding(tokens) + positions[..., None]).item()
+    bound = inspect_component(program, artifacts={"target": {"fixture": "library"}})
+    assert bound.at("component").instance is program
+    assert (
+        sum(t.bytes for t in bound.graph.nodes["component"].parameters.arrays.values())
+        == model.embedding.weight.nbytes
+    )

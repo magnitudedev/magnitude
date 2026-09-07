@@ -15,7 +15,7 @@ def annotation(values: dict, *, references=False, unknown=False) -> str:
             if unknown:
                 result.append(f"{name}: —" if len(values) > 1 else "—")
             continue
-        number = ("~" if value["estimated"] else "") + f"{value['percent']:.2f}%"
+        number = ("~" if value["estimated"] else "") + f"≥{value['percent']:.2f}%"
         label = f"{name}: {number}" if len(values) > 1 else number
         if references and value.get("benchmark") and value["benchmark"] != "composed":
             label += " @" + value["benchmark"]

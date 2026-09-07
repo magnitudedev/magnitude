@@ -6,6 +6,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Footer, Select, Static, Tree
 
+from magnitude_engine.components import Configuration, OpaqueParameters
 from performance.presentation import annotation, edges
 from performance.records import Assembly
 from performance.store import Store
@@ -21,7 +22,13 @@ def composition_label(record):
         model = config.get("model_type", "Upstream model")
         bits = config.get("quantization", {}).get("bits")
         label = f"{model} · {bits}-bit · MLX VLM forward" if bits else f"{model} · MLX VLM forward"
-    return label
+    return label + (
+        " · candidate"
+        if record.get("selection") == "candidate"
+        else " · historical"
+        if record.get("selection") == "historical"
+        else ""
+    )
 
 
 def metric(value, unit):
@@ -100,7 +107,7 @@ class PerformanceApp(App):
                     "Run or import a benchmark to populate this view.", id="details", markup=False
                 )
         yield Static(
-            "Current evidence per component · — no efficiency · ~ estimated",
+            "≥ efficiency floor · — no current evidence · ~ composed estimate",
             id="status",
             markup=False,
         )
@@ -232,12 +239,28 @@ class PerformanceApp(App):
             return
         node = self.graph.nodes[path]
         lines = [Text(node.implementation, style="bold"), Text(path, style="dim")]
-        if node.parameters.get("opaque") or node.parameters.get("opaque_server"):
+        if isinstance(node.parameters, OpaqueParameters) or (
+            isinstance(node.parameters, Configuration)
+            and node.parameters.settings.get("opaque_server")
+        ):
             lines.append(Text("\nUpstream component; internal hierarchy not captured."))
         values = self._values(path)
-        if not any(v["observed"] is not None for v in values.values()):
+        if not any(v["observed"] is not None for v in values.values()) and not self.state[
+            "compositions"
+        ][self.composition_id].get("historical_assessments", {}).get(path):
             lines.append(Text("\nNo matching measurement for this component yet."))
         record = self.state["compositions"][self.composition_id]
+        historical = record.get("historical_assessments", {}).get(path, {})
+        for dimension, key in historical.items():
+            previous = self.state["components"][key]
+            value = previous["dimensions"][dimension]
+            lines.append(Text(f"\n{dimension} · changed since measurement", style="yellow"))
+            lines.append(
+                Text(f"Previous observed: {metric(value['observed'], value['bound']['unit'])}")
+            )
+            lines.append(Text("Historical evidence; does not score this implementation."))
+            for run in value["evidence"]:
+                lines.append(Text(str(self.store.root / "runs" / run / "run.json"), style="dim"))
         for dimension, value in values.items():
             bound = value["bound"]
             lines.append(Text(f"\n{dimension}", style="bold cyan"))
@@ -245,7 +268,7 @@ class PerformanceApp(App):
             kind = "Minimum" if bound["direction"] == "lower" else "Maximum"
             lines.append(Text(f"{kind}     {metric(bound['value'], bound['unit'])}"))
             percent = (
-                "—" if value["percent"] is None or value["issue"] else f"{value['percent']:.2f}%"
+                "—" if value["percent"] is None or value["issue"] else f"≥{value['percent']:.2f}%"
             )
             lines.append(
                 Text(f"Efficiency  {percent}" + (" (estimated)" if value["estimated"] else ""))
@@ -255,6 +278,18 @@ class PerformanceApp(App):
             if value["observed"] is not None:
                 key = record["current_assessments"][path][dimension]
                 assessment = self.state["components"][key]
+                for role, prediction in assessment.get("sensitivity", {}).items():
+                    if prediction["issue"]:
+                        lines.append(Text(prediction["issue"], style="yellow"))
+                    else:
+                        child_saving = metric(prediction["child_seconds_saved"], "seconds")
+                        parent_saving = metric(prediction["predicted_seconds_saved"], "seconds")
+                        lines.append(
+                            Text(
+                                f"If {role} saves {child_saving}: parent saves {parent_saving} "
+                                "under declared composition."
+                            )
+                        )
                 profile = self.state["profiles"][assessment["profile"]]
                 hardware = profile["hardware"]
                 machine = " · ".join(
@@ -276,6 +311,21 @@ class PerformanceApp(App):
             if bound["assumptions"]:
                 lines.append(Text("\nDerivation assumptions", style="bold"))
                 lines.extend(Text(str(item)) for item in bound["assumptions"])
+        recent = [
+            (identity, run)
+            for identity, run in self.state["runs"].items()
+            if run["composition"] == self.composition_id and run.get("node") == path
+        ]
+        if recent:
+            lines.append(Text("\nRecent runs", style="bold"))
+            for identity, run in sorted(
+                recent, key=lambda item: (item[1]["completed_at"] or "", item[0]), reverse=True
+            )[:5]:
+                lines.append(Text(f"{run['selection']} · {run['status']} · {run['benchmark']}"))
+                lines.append(Text(str(run["completed_at"]), style="dim"))
+                lines.append(
+                    Text(str(self.store.root / "runs" / identity / "run.json"), style="dim")
+                )
         self.query_one("#details", Static).update(Group(*lines))
         self.query_one("#details-scroll", VerticalScroll).scroll_home(animate=False)
 

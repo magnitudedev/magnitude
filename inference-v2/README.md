@@ -47,8 +47,10 @@ checkpoint's default applies.
 
 ## Compose an engine
 
-Blueprints are typed, immutable dependency declarations. The host serializes the composition;
+`@blueprint` declares typed, immutable construction instructions. The host serializes the composition;
 the worker builds and owns its live components. Shared dependencies retain their identity.
+`@component` identifies actual execution classes and operations. Performance schemas read their
+existing runtime bindings; numerical implementations do not build reporting trees.
 
 ```python
 from pathlib import Path
@@ -111,11 +113,12 @@ module. There is no benchmark blueprint or case selector.
 
 ```sh
 uv run --frozen python - <<'PYTHON'
+from magnitude_engine.components import AttentionGeometry
 from magnitude_engine.models.attention.gathered import GatheredAttention
 from magnitude_engine.models.attention.metal import MetalPagedAttention
 from performance.benchmarks.attention import benchmark
 
-geometry = dict(query_heads=8, kv_heads=2, key_width=128, value_width=128, element_bytes=2)
+geometry = AttentionGeometry(query_heads=8, kv_heads=2, key_width=128, value_width=128, element_bytes=2)
 for implementation in (GatheredAttention(), MetalPagedAttention()):
     result = benchmark(implementation, geometry=geometry, context_tokens=4096)
     print(result.path)

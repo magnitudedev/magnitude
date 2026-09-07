@@ -78,7 +78,7 @@ survive engine integration before supporting an engine-wide claim.
 Measurements, failed controls, reference identities and bound assumptions remain
 durable evidence alongside source identities, comparison conditions and raw results.
 Small controlled comparisons support development; broader qualification supports
-milestones. Follow the [assessment rules](../performance.md#evidence-and-current-assessments)
+milestones. Follow the [assessment rules](../performance.md#stable-compositions-and-evidence)
 for coverage, revision invalidation and derivation-only reevaluation. Evidence
 requirements do not mandate benchmarking every component after every edit.
 When adopting results, update affected tree annotations and their existing benchmark

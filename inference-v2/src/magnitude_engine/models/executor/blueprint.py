@@ -1,11 +1,11 @@
-from magnitude_engine.composition import Blueprint, component
+from magnitude_engine.composition import Blueprint, blueprint
 
 from ..contracts import ProgramSource
 from ..state.contracts import StateFactory
 from .contracts import ExecutorFactory
 
 
-@component
+@blueprint
 class Executor(Blueprint[ExecutorFactory]):
     program: Blueprint[ProgramSource]
     state: Blueprint[StateFactory]

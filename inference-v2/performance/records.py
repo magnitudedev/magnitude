@@ -5,9 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import re
 from dataclasses import asdict, dataclass, field
+from functools import cached_property
 from typing import Any
+
+from magnitude_engine.components import Configuration, Facts, Implementation
+from magnitude_engine.components import implementation as read_implementation
 
 
 def encoded(value: Any) -> str:
@@ -20,28 +23,72 @@ def digest(value: Any) -> str:
 
 @dataclass(frozen=True)
 class Node:
-    implementation: str
+    binding: Implementation[Any]
     source: str
-    parameters: dict = field(default_factory=dict)
+    parameters: Facts | None = None
     children: dict[str, str] = field(default_factory=dict)
     dependencies: dict[str, str] = field(default_factory=dict)
-    # Execution composition must be declared, never inferred from a display tree.
     execution: str = "joint"
+    configuration: Configuration = field(default_factory=Configuration)
 
     def __post_init__(self):
-        if not re.fullmatch(
-            r"[A-Z0-9_.]+:[A-Z0-9_.]+:(MLX|LM|VLM|MAG):[A-Z0-9_]+", self.implementation
-        ):
-            raise ValueError(f"invalid implementation ID: {self.implementation}")
         if not self.source:
             raise ValueError("implementation source fingerprint is required")
+        if self.parameters is not None and not isinstance(
+            self.parameters, self.binding.contract.parameters
+        ):
+            raise TypeError("node parameters do not satisfy its contract")
         if self.execution not in ("joint", "serial", "parallel"):
             raise ValueError("invalid execution composition")
-        encoded(asdict(self))
 
     @property
-    def component(self) -> str:
-        return ":".join(self.implementation.split(":")[:2])
+    def implementation(self) -> str:
+        return self.binding.identity
+
+    @property
+    def component(self):
+        return self.binding.contract
+
+    def record(self) -> dict:
+        return dict(
+            implementation=self.implementation,
+            source=self.source,
+            parameters=self.parameters.model_dump(mode="json")
+            if self.parameters is not None
+            else None,
+            children=self.children,
+            dependencies=self.dependencies,
+            execution=self.execution,
+            configuration=self.configuration.model_dump(mode="json"),
+        )
+
+    @classmethod
+    def read(cls, value: dict):
+        binding = read_implementation(value["implementation"])
+        parameters = value["parameters"]
+        return cls(
+            binding,
+            value["source"],
+            None if parameters is None else binding.contract.read(parameters),
+            value.get("children", {}),
+            value.get("dependencies", {}),
+            value.get("execution", "joint"),
+            Configuration.model_validate(value.get("configuration", {})),
+        )
+
+
+@dataclass(frozen=True)
+class CompositionOrigin:
+    definition: str
+    scope: str
+    configuration: str = "default"
+    selection: str = "candidate"
+
+    def __post_init__(self):
+        if self.selection not in ("default", "candidate", "historical"):
+            raise ValueError("invalid composition selection")
+        if not self.definition or not self.scope or not self.configuration:
+            raise ValueError("composition requires a production identity and scope")
 
 
 @dataclass(frozen=True)
@@ -50,6 +97,7 @@ class Assembly:
     nodes: dict[str, Node]
     label: str
     artifacts: dict = field(default_factory=dict)
+    origin: CompositionOrigin | None = None
 
     def __post_init__(self):
         if self.root not in self.nodes:
@@ -78,8 +126,11 @@ class Assembly:
                 node = self.nodes[path]
                 records[index] = {
                     "implementation": node.implementation,
-                    "parameters": node.parameters,
+                    "parameters": node.parameters.model_dump(mode="json")
+                    if node.parameters is not None
+                    else None,
                     "execution": node.execution,
+                    "configuration": node.configuration.model_dump(mode="json"),
                     "source": node.source if revision else None,
                     "children": {k: visit(v) for k, v in sorted(node.children.items())},
                     "dependencies": {k: visit(v) for k, v in sorted(node.dependencies.items())},
@@ -94,21 +145,49 @@ class Assembly:
 
     @property
     def identity(self) -> str:
-        return digest({"root": self._keys(False)[self.root], "artifacts": self.artifacts})
+        if self.origin is None:
+            # Standalone components have a stable contract entry, with variants in history.
+            return digest(
+                {"component": self.nodes[self.root].component.identity, "artifacts": self.artifacts}
+            )
+        return digest(
+            {
+                "definition": self.origin.definition,
+                "scope": self.origin.scope,
+                "configuration": self.origin.configuration,
+                "artifacts": self.artifacts,
+            }
+        )
 
-    @property
+    @cached_property
     def revision(self) -> str:
-        return self._keys(True)[self.root]
+        return self._component_keys[self.root]
 
-    def component_keys(self) -> dict[str, str]:
+    @cached_property
+    def _component_keys(self) -> dict[str, str]:
         return self._keys(True)
 
+    def component_keys(self) -> dict[str, str]:
+        return self._component_keys
+
     def record(self) -> dict:
-        return asdict(self)
+        return dict(
+            root=self.root,
+            nodes={k: v.record() for k, v in self.nodes.items()},
+            label=self.label,
+            artifacts=self.artifacts,
+            origin=asdict(self.origin) if self.origin else None,
+        )
 
     @classmethod
     def read(cls, value: dict) -> Assembly:
-        return cls(**{**value, "nodes": {k: Node(**v) for k, v in value["nodes"].items()}})
+        return cls(
+            value["root"],
+            {k: Node.read(v) for k, v in value["nodes"].items()},
+            value["label"],
+            value.get("artifacts", {}),
+            CompositionOrigin(**value["origin"]) if value.get("origin") else None,
+        )
 
 
 @dataclass(frozen=True)

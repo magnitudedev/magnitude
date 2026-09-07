@@ -192,6 +192,7 @@ class MTPSource(ProgramSource):
                     target.descriptor.vocab_size,
                     target.descriptor.tokenizer_identity,
                     "mtp.Head",
+                    target.descriptor.definition,
                 ),
                 NativeRequirements(caches.make_cache, caches.capacity, self),
                 DraftRequirements(

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import pytest
 
 from magnitude_engine import blueprints as bp
-from magnitude_engine.composition import Blueprint, component
+from magnitude_engine.composition import Blueprint, blueprint
 from magnitude_engine.engine.prefixes.contracts import RetentionPolicy
 from magnitude_engine.engine.prefixes.index import PrefixIdentity
 from magnitude_engine.resources.retention import RetainedStorage
@@ -96,7 +96,7 @@ def test_retention_implementation_is_injected_through_its_contract():
         def select(self, eligible):
             return eligible[-1:]
 
-    @component
+    @blueprint
     class KeepOldestBP(Blueprint[RetentionPolicy]):
         max_entries: int = 1
         max_bytes: int | None = None

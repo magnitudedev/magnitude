@@ -10,45 +10,45 @@ unless the workload supplies distinct selected experts.
 
 from dataclasses import replace
 
+from magnitude_engine.components import NeuralParameters, WeightUse
 from performance.theory.resources import Demands, Extent, join
+from performance.theory.workloads import NeuralWorkload
 
 
-def weights(component: str, p: dict, w: dict) -> Demands:
-    arrays = p.get("arrays")
-    if arrays is None:
-        return Demands(missing=(f"{component}: captured parameter tensors",))
+def weights(p: NeuralParameters, w: NeuralWorkload) -> Demands:
+    arrays = p.arrays
     extents = []
     for item in arrays.values():
-        size = item["bytes"]
-        shape = item["shape"]
-        if component == "MODEL:EMBEDDING":
+        size = item.bytes
+        shape = item.shape
+        if p.weight_use == WeightUse.EMBEDDING:
             if not shape or shape[0] < 1:
                 raise ValueError("embedding requires a positive vocabulary")
-            rows = w.get("distinct_input_tokens", 1)
-            if not 1 <= rows <= min(shape[0], w.get("batch_size", 1) * w.get("query_tokens", 1)):
+            rows = w.distinct_input_tokens
+            if not 1 <= rows <= min(shape[0], w.batch_size * w.query_tokens):
                 raise ValueError("distinct embedding rows exceed input domain")
             size = size // shape[0] * rows
-        elif component == "MODEL:EXPERTS":
+        elif p.weight_use == WeightUse.EXPERTS:
             if not shape or shape[0] < 1:
                 raise ValueError("expert tensors require a positive expert axis")
-            count = w.get("distinct_experts", p.get("top_k"))
+            count = w.distinct_experts if w.distinct_experts is not None else p.top_k
             if count is None:
                 return Demands(missing=("top_k or distinct_experts",))
             if not 1 <= count <= shape[0]:
                 raise ValueError("selected experts exceed expert domain")
             size = size // shape[0] * count
-        extents.append(Extent("weight:" + item["identity"], 0, size))
+        extents.append(Extent("weight:" + item.identity, 0, size))
     operations = {}
-    if w.get("conventional_arithmetic"):
-        uses = w.get("batch_size", 1) * w.get("query_tokens", 1)
-        if w.get("mode") in ("generate", "replay"):
-            uses *= w.get("measured_tokens", 1)
+    if w.conventional_arithmetic:
+        uses = w.batch_size * w.query_tokens
+        if w.mode in ("generate", "replay"):
+            uses *= w.measured_tokens
         operations["scalar"] = sum(
             uses
-            * matrix["output_width"]
-            * (2 * matrix["input_width"] - 1)
-            * (p.get("top_k", 1) if matrix["experts"] else 1)
-            for matrix in p.get("matrices", ())
+            * matrix.output_width
+            * (2 * matrix.input_width - 1)
+            * ((p.top_k or 1) if matrix.experts else 1)
+            for matrix in p.matrices
         )
     return Demands(
         tuple(extents),
@@ -61,8 +61,8 @@ def weights(component: str, p: dict, w: dict) -> Demands:
     )
 
 
-def model(component: str, p: dict, w: dict, children: dict[str, Demands]) -> Demands:
-    local = weights(component, p, w)
+def model(p: NeuralParameters, w: NeuralWorkload, children: dict[str, Demands]) -> Demands:
+    local = weights(p, w)
     # Child activation operands are produced by this composite. Parameter and
     # historical-state identities survive; their overlap is unioned by JOIN.
     parts = [

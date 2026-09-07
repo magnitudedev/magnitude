@@ -1,8 +1,8 @@
-from magnitude_engine.composition import Blueprint, component
+from magnitude_engine.composition import Blueprint, blueprint
 from magnitude_engine.generation.contracts import MethodFactory
 
 
-@component
+@blueprint
 class Suffix(Blueprint[MethodFactory]):
     minimum: int = 3
     maximum: int = 6

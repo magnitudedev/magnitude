@@ -251,8 +251,7 @@ class ModelAdvance[S, C]:
 
     def finish_accept(self, count: int) -> None:
         self.sequence.check()
-        if (self.resolved or self.sequence.pending is not self
-            or count != self._accepted):
+        if self.resolved or self.sequence.pending is not self or count != self._accepted:
             raise ValueError("commit must finish the prepared accepted prefix exactly once")
         try:
             self.transaction.finish(count)
@@ -286,10 +285,13 @@ class ModelRuntime[S, C]:
             raise ValueError("repair requires distinct sequences")
         for advance, row in zip(advances, inputs, strict=True):
             advance.sequence.check()
-            if (advance.sequence.runtime is not self or advance.resolved
+            if (
+                advance.sequence.runtime is not self
+                or advance.resolved
                 or advance.sequence.pending is not advance
                 or not 0 < row.count == advance._accepted
-                or row.count != inputs[0].count):
+                or row.count != inputs[0].count
+            ):
                 raise ValueError("repair requires compatible unresolved advances")
         batch = self.program.forward_batch
         groups = tuple(self.repair_group(a.sequence) for a in advances)
@@ -337,8 +339,11 @@ class ModelRuntime[S, C]:
         )
 
     def repair_group(self, sequence: ModelSequence[S, C]) -> object:
-        return (self.states.repair_group(sequence.state)
-                if isinstance(self.states, BatchedStateStore) else self)
+        return (
+            self.states.repair_group(sequence.state)
+            if isinstance(self.states, BatchedStateStore)
+            else self
+        )
 
     def rewind(self, sequence: ModelSequence[S, C], position: int) -> None:
         sequence.check()

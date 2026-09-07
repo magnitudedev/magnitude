@@ -14,6 +14,7 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("tui")
     sub.add_parser("rebuild")
+    sub.add_parser("migrate")
     sub.add_parser("list")
     sub.add_parser("check")
     sub.add_parser("incomplete")
@@ -36,6 +37,10 @@ def main():
 
         store.refresh()
         PerformanceApp(store).run()
+    elif args.command == "migrate":
+        from performance.migration import migrate
+
+        print(json.dumps(migrate(store), indent=2))
     elif args.command == "import":
         if (
             args.source.is_dir()

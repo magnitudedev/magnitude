@@ -1,13 +1,13 @@
 from dataclasses import field
 
-from magnitude_engine.composition import Blueprint, component
+from magnitude_engine.composition import Blueprint, blueprint
 from magnitude_engine.resources.io.blueprint import PositionalReader
 from magnitude_engine.resources.io.reader import PositionalReader as Reader
 
 from .contracts import EmbeddingFactory
 
 
-@component
+@blueprint
 class Resident(Blueprint[EmbeddingFactory]):
     @staticmethod
     def implementation() -> type[EmbeddingFactory]:
@@ -16,7 +16,7 @@ class Resident(Blueprint[EmbeddingFactory]):
         return Resident
 
 
-@component
+@blueprint
 class Streamed(Blueprint[EmbeddingFactory]):
     cache_bytes: int = 64 << 20
     max_pending: int = 2

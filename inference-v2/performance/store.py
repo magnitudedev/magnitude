@@ -39,13 +39,15 @@ def locked(root: Path):
 
 
 def validate_run(run: dict) -> None:
-    if run.get("schema_version") != 1 or run.get("status") not in (
+    if run.get("schema_version") != 2 or run.get("status") not in (
         "running",
         "complete",
         "failed",
         "interrupted",
     ):
-        raise ValueError("invalid run schema/status")
+        raise ValueError(
+            "invalid run schema/status; schema-1 stores require: python -m performance migrate"
+        )
     identity = run.get("id", "")
     if len(identity) != 32 or any(c not in "0123456789abcdef" for c in identity):
         raise ValueError("invalid run identity")

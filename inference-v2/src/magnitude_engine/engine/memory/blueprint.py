@@ -1,12 +1,12 @@
 from dataclasses import field
 
-from magnitude_engine.composition import Blueprint, component
+from magnitude_engine.composition import Blueprint, blueprint
 
 from .contracts import MemoryPolicy as Budget
 from .contracts import PressurePolicy as Pressure
 
 
-@component
+@blueprint
 class EvictPrefixesBeforeRejecting(Blueprint[Pressure]):
     @staticmethod
     def implementation() -> type[Pressure]:
@@ -15,7 +15,7 @@ class EvictPrefixesBeforeRejecting(Blueprint[Pressure]):
         return EvictPrefixesBeforeRejecting
 
 
-@component
+@blueprint
 class Budgeted(Blueprint[Budget]):
     limit_bytes: int = 28 << 30
     pressure: Blueprint[Pressure] = field(default_factory=EvictPrefixesBeforeRejecting)

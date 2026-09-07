@@ -4,6 +4,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from threading import get_ident
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
 from magnitude_engine.resources.budget import Reservation
 
 from ..prefixes.contracts import PrefixIndex
@@ -21,6 +23,7 @@ class EvictPrefixesBeforeRejecting(PressurePolicy):
         return True
 
 
+@component(c.MEMORY, source=c.Source.MAG, variant="BUDGETED")
 class Budgeted(MemoryPolicy):
     def __init__(self, *, limit_bytes: int, pressure: PressurePolicy):
         super().__init__(limit_bytes)

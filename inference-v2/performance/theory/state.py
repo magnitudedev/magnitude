@@ -1,11 +1,13 @@
-"""Materialized retained information; bookkeeping and restoration are distinct."""
+"""Materialized state bounds under explicit representation contracts."""
 
 import math
 
+from magnitude_engine.components import Facts, KVStorage, RecurrentStorage
 from performance.theory.resources import Bound, Demands, Extent, time_bound
+from performance.theory.workloads import StateWorkload
 
 
-def retained(p: dict, w: dict, children: dict[str, dict[str, Bound]] | None = None) -> Bound:
+def retained(p: Facts, w: StateWorkload, children=None) -> Bound:
     if children:
         terms = {}
         for name, dimensions in children.items():
@@ -19,29 +21,24 @@ def retained(p: dict, w: dict, children: dict[str, dict[str, Bound]] | None = No
             terms=terms,
             assumptions=("union of required materialized child allocations",),
         )
-    if "retained_shapes" in w:
+    if w.retained_shapes is not None:
         terms = {}
-        for item in w["retained_shapes"]:
-            if any(d < 0 for d in item["shape"]) or item["element_bytes"] <= 0:
-                raise ValueError("invalid retained tensor shape/encoding")
-            size = math.prod(item["shape"]) * item["element_bytes"]
-            if item["identity"] in terms and terms[item["identity"]] != size:
+        for item in w.retained_shapes:
+            if any(d < 0 for d in item.shape):
+                raise ValueError("invalid retained tensor shape")
+            size = math.prod(item.shape) * item.element_bytes
+            if item.identity in terms and terms[item.identity] != size:
                 raise ValueError("inconsistent shared retained shape")
-            terms[item["identity"]] = size
+            terms[item.identity] = size
         return Bound(
             sum(terms.values()),
             "bytes",
             terms=terms,
             assumptions=("required materialized representation",),
         )
-    if "layouts" in p and "retained_rows" in w:
-        rows = w["retained_rows"]
-        if rows < 0:
-            raise ValueError("negative retained row count")
-        terms = {
-            f"recurrent.{i}.{j}": t["bytes"] * rows
-            for i, layout in enumerate(p["layouts"])
-            for j, t in enumerate(layout)
+    if isinstance(p, RecurrentStorage) and w.retained_rows is not None:
+        terms: dict[str, float] = {
+            t.identity: t.bytes * w.retained_rows for layout in p.layouts for t in layout
         }
         return Bound(
             sum(terms.values()),
@@ -49,56 +46,49 @@ def retained(p: dict, w: dict, children: dict[str, dict[str, Bound]] | None = No
             terms=terms,
             assumptions=("distinct logically required recurrent rows",),
         )
-    if "layers" not in p or "retained_positions" not in w:
+    if isinstance(p, KVStorage) and w.retained_positions is not None:
+        terms: dict[str, float] = {
+            f"kv.{i}": w.retained_positions
+            * layer.heads
+            * (layer.key_width + layer.value_width)
+            * p.element_bytes
+            for i, layer in enumerate(p.layers)
+        }
         return Bound(
-            None,
+            sum(terms.values()),
             "bytes",
-            missing=("retained_shapes, or bound layouts and retained rows/positions",),
+            terms=terms,
+            assumptions=("uncompressed declared KV representation",),
         )
-    positions = w["retained_positions"]
-    if positions < 0:
-        raise ValueError("negative retained position count")
-    terms = {
-        f"kv.{i}": positions
-        * layer.get("kv_heads", layer.get("heads"))
-        * (layer["key_width"] + layer["value_width"])
-        * layer.get("element_bytes", p.get("element_bytes", 2))
-        for i, layer in enumerate(p["layers"])
-    }
     return Bound(
-        sum(terms.values()),
-        "bytes",
-        terms=terms,
-        assumptions=("uncompressed declared KV representation",),
+        None, "bytes", missing=("retained shapes or bound storage and retained rows/positions",)
     )
 
 
-def append(p: dict, w: dict) -> Demands:
-    if "layers" not in p or "append_tokens" not in w:
-        return Demands(missing=("layer geometry and append_tokens",))
-    logical = retained(p, {"retained_positions": w["append_tokens"]})
+def append(p: KVStorage, w: StateWorkload) -> Demands:
+    if w.append_tokens is None:
+        return Demands(missing=("append_tokens",))
+    logical = retained(p, StateWorkload(retained_positions=w.append_tokens))
     return Demands(
         (Extent("append:inputs", 0, int(logical.value or 0)),),
         assumptions=("new logical KV payload only; COW copies may be eliminated",),
     )
 
 
-def restore(p: dict, w: dict, profile=None) -> Bound:
-    if w.get("restore_mode") == "saved_boundary":
+def restore(p: Facts, w: StateWorkload, profile) -> Bound:
+    if w.restore_mode == "saved_boundary":
         return Bound(0, "seconds", assumptions=("immutable state may be selected by reference",))
-    if w.get("restore_mode") == "accepted_prefix":
-        # A legal implementation may retain each committed prefix during advance.
-        # This contract does not require reconstruction after the timed boundary.
+    if w.restore_mode == "accepted_prefix":
         return Bound(
             0,
             "seconds",
             assumptions=("advance may retain the accepted prefix; selection can be by reference",),
         )
-    if "reconstruction_inputs" in w and profile is not None:
+    if w.reconstruction_inputs is not None:
         return time_bound(
             Demands(
-                tuple(Extent(**item) for item in w["reconstruction_inputs"]),
-                operations=w.get("reconstruction_operations", {}),
+                w.reconstruction_inputs,
+                operations=w.reconstruction_operations,
                 assumptions=("declared reconstruction-only input boundary",),
             ),
             profile,

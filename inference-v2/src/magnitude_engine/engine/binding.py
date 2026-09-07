@@ -35,6 +35,8 @@ class EngineResidency(EngineInstance):
             mx.set_cache_limit(256 << 20)
             loaded = generation.load(self.resources)
             descriptor = loaded.target.program.descriptor
+            self.selection = loaded.target.selection
+            self.target = loaded.target
             self.engine = Engine(
                 loaded.runtime,
                 namespace=(

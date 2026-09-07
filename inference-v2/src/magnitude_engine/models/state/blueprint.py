@@ -1,10 +1,10 @@
-from magnitude_engine.composition import Blueprint, component
+from magnitude_engine.composition import Blueprint, blueprint
 
 from ..contracts import ProgramSource
 from .contracts import StateFactory
 
 
-@component
+@blueprint
 class PagedHybrid(Blueprint[StateFactory]):
     page_size: int = 16
     slab_pages: int = 32
@@ -20,7 +20,7 @@ class PagedHybrid(Blueprint[StateFactory]):
         return PagedHybridFactory
 
 
-@component
+@blueprint
 class Native(Blueprint[StateFactory]):
     source: Blueprint[ProgramSource]
 

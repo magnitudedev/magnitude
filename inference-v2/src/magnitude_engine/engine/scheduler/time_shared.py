@@ -3,10 +3,14 @@
 from dataclasses import dataclass, field
 from math import isfinite
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
+
 from .contracts import CompletedService, Runnable, Schedule, Scheduler, Service
 
 
 @dataclass
+@component(c.SCHEDULING, source=c.Source.MAG, variant="TIME_SHARING")
 class TimeShared(Scheduler):
     max_active: int = 8
     max_queued: int = 128
@@ -27,9 +31,10 @@ class TimeShared(Scheduler):
                 for n in (self.max_active, self.max_queued, self.prefill_tokens, self.decode_tokens)
             )
             or self.max_active > 64
-            or (self.prefill_stall_seconds is not None and (
-                not isfinite(self.prefill_stall_seconds) or self.prefill_stall_seconds <= 0
-            ))
+            or (
+                self.prefill_stall_seconds is not None
+                and (not isfinite(self.prefill_stall_seconds) or self.prefill_stall_seconds <= 0)
+            )
             or not isfinite(self.decode_share)
             or not 0 < self.decode_share < 1
         ):
@@ -48,24 +53,32 @@ class TimeShared(Scheduler):
         self._contended = contended
 
         interruption_ns = (
-            None if self.prefill_stall_seconds is None
+            None
+            if self.prefill_stall_seconds is None
             else max(1, int(self.prefill_stall_seconds * 1e9))
         )
         if decoding and (
-            not waiting or first_round or self._decode_debt_ns > 0
+            not waiting
+            or first_round
+            or self._decode_debt_ns > 0
             or (interruption_ns is not None and self._prefill_run_ns >= interruption_ns)
         ):
             plan = Schedule(
                 "decode",
-                tuple(Service(row.identity, min(row.output_credit, self.decode_tokens))
-                      for row in decoding),
+                tuple(
+                    Service(row.identity, min(row.output_credit, self.decode_tokens))
+                    for row in decoding
+                ),
                 interruption_ns if contended else None,
             )
         elif waiting:
             oldest = waiting[0]
-            waiting = tuple(row for row in waiting if row is oldest or (
-                oldest.prefill_group is not None and row.prefill_group == oldest.prefill_group
-            ))
+            waiting = tuple(
+                row
+                for row in waiting
+                if row is oldest
+                or (oldest.prefill_group is not None and row.prefill_group == oldest.prefill_group)
+            )
             count = self.prefill_tokens
             if decoding and interruption_ns is not None and self._prefill_rate is not None:
                 remaining_seconds = (interruption_ns - self._prefill_run_ns) / 1e9
@@ -74,9 +87,10 @@ class TimeShared(Scheduler):
             # Equal chunk widths expose batching without padding or fabricated KV.
             selected = waiting[:count]
             width = max(1, count // len(selected))
-            plan = Schedule("prefill", tuple(
-                Service(row.identity, min(row.prefill_remaining, width)) for row in selected
-            ))
+            plan = Schedule(
+                "prefill",
+                tuple(Service(row.identity, min(row.prefill_remaining, width)) for row in selected),
+            )
         else:
             return None
         self._pending = plan
@@ -87,8 +101,10 @@ class TimeShared(Scheduler):
         if plan is None or service.phase != plan.phase:
             raise ValueError("service feedback must match the selected phase")
         if (
-            type(service.elapsed_ns) is not int or service.elapsed_ns < 0
-            or type(service.input_tokens) is not int or service.input_tokens < 0
+            type(service.elapsed_ns) is not int
+            or service.elapsed_ns < 0
+            or type(service.input_tokens) is not int
+            or service.input_tokens < 0
         ):
             raise ValueError("service duration and input count must be nonnegative integers")
         self._pending = None

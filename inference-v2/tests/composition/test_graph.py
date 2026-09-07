@@ -3,7 +3,7 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
-from magnitude_engine.composition import Blueprint, Catalog, build, component, digest, dumps, loads
+from magnitude_engine.composition import Blueprint, Catalog, blueprint, build, digest, dumps, loads
 
 
 class Value:
@@ -24,7 +24,7 @@ class Pair:
         self.left, self.right = left, right
 
 
-@component
+@blueprint
 class Leaf(Blueprint[Value]):
     number: int
 
@@ -33,7 +33,7 @@ class Leaf(Blueprint[Value]):
         return Value
 
 
-@component
+@blueprint
 class Branch(Blueprint[Pair]):
     left: Blueprint[Value]
     right: Blueprint[Value]
@@ -114,7 +114,7 @@ def test_invalid_graph_never_constructs_runtime(corruption):
 
 
 def test_all_wiring_is_checked_before_any_runtime_construction():
-    @component
+    @blueprint
     class Broken(Blueprint[Value]):
         wrong: int
 
@@ -139,7 +139,7 @@ def test_cleanup_continues_and_preserves_primary_and_cleanup_failures():
             events.append(self.number)
             raise ValueError(f"close {self.number}")
 
-    @component
+    @blueprint
     class ResourceBP(Blueprint[Resource]):
         number: int
 
@@ -151,7 +151,7 @@ def test_cleanup_continues_and_preserves_primary_and_cleanup_failures():
         def __init__(self, *, children: tuple[Resource, ...]):
             raise RuntimeError("parent failed")
 
-    @component
+    @blueprint
     class ParentBP(Blueprint[Parent]):
         children: tuple[Blueprint[Resource], ...]
 

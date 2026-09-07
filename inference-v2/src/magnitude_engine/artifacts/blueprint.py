@@ -1,11 +1,11 @@
 from pathlib import Path
 
-from magnitude_engine.composition import Blueprint, component
+from magnitude_engine.composition import Blueprint, blueprint
 
 from .source import LocalArtifact
 
 
-@component
+@blueprint
 class Local(Blueprint[LocalArtifact]):
     path: str
 
