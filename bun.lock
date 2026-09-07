@@ -106,7 +106,7 @@
     },
     "integrations/pi": {
       "name": "@magnitudedev/pi-extension",
-      "version": "0.0.1-alpha.1",
+      "version": "0.0.1-alpha.2",
       "dependencies": {
         "@effect/platform": "0.96.1",
         "@effect/platform-node": "0.107.0",
@@ -118,6 +118,7 @@
         "@earendil-works/pi-coding-agent": "0.84.4",
         "@earendil-works/pi-tui": "0.84.4",
         "@effect/platform-bun": "^0.90.0",
+        "@magnitudedev/client-common": "workspace:*",
         "@magnitudedev/release": "workspace:*",
         "@magnitudedev/sdk": "workspace:*",
         "@magnitudedev/utils": "workspace:*",
@@ -418,7 +419,7 @@
     },
     "packages/launcher": {
       "name": "@magnitudedev/cli",
-      "version": "0.0.12-alpha.1",
+      "version": "0.0.12-alpha.2",
       "bin": {
         "magnitude": "bin/magnitude.js",
       },
