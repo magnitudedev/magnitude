@@ -17,8 +17,8 @@ The non-interactive CLI is a human-readable, agent-usable projection of Magnitud
 It does not expose transport documents or internal state graphs. Bare `magnitude` and `magnitude
 setup` remain interactive entrypoints and are outside this presentation contract.
 
-Pi's private `setup-pi` terminal adapter is hidden from public help. It is not part of
-the human or agent command vocabulary; ordinary `setup` has no host or result options.
+Pi invokes `setup --host pi` through a private `--host` option hidden from public help.
+The option accepts only `pi` and is not part of the human or agent command vocabulary.
 
 The public command vocabulary is:
 

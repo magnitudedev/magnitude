@@ -297,8 +297,8 @@ by the exact admitted lifecycle value.
 The hosted frame labels the last step `Connect Pi` and otherwise preserves the shared setup layout,
 without an additional connection, package, or permissions banner.
 
-The hidden `setup-pi` entrypoint is private to the Pi extension and rejects chat inputs and positional
-arguments. Public `setup` exposes no integration flags. There is no capability negotiation, result
+The Pi extension invokes `setup --host pi`. The `--host` option accepts only `pi`, is hidden from
+help, and rejects chat inputs and positional arguments in hosted mode. There is no capability negotiation, result
 file, or separate host protocol. Exit 0 means connected, 130 means cancelled, and other nonzero exits
 mean failure. After success, Pi reads the current local primary model once using the existing SDK
 without auto-starting the service. This observes current shared selection, not an invocation-specific

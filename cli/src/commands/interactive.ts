@@ -1,4 +1,4 @@
-import type { Command } from "@commander-js/extra-typings"
+import { Option, type Command } from "@commander-js/extra-typings"
 
 const loadRuntime = () => import("./interactive-command-runtime")
 
@@ -21,19 +21,18 @@ export const registerInteractiveCommand = (program: Command): void => {
       runInteractiveCommand(opts, globals))
   })
 
-  program
+  const setupCommand = program
     .command("setup")
     .description("Interactive first time setup for installing a model and connecting it to a harness")
-    .action(() => {
+    .addOption(new Option("--host <harness>", "Return to the hosting harness after setup").choices(["pi"]).hideHelp())
+    .action((opts) => {
+      if (opts.host === "pi") {
+        if (Object.values(interactiveCommand.opts()).some(value => value !== undefined)) {
+          setupCommand.error("Pi setup cannot be combined with chat options")
+        }
+        return import("./pi-setup-runtime").then(({ runPiSetup }) => runPiSetup())
+      }
       return loadRuntime().then(({ runSetupCommand }) =>
         runSetupCommand(interactiveCommand.opts()))
-    })
-
-  const piSetupCommand = program.command("setup-pi", { hidden: true })
-    .action(() => {
-      if (Object.values(interactiveCommand.opts()).some(value => value !== undefined)) {
-        piSetupCommand.error("Pi setup cannot be combined with chat options")
-      }
-      return import("./pi-setup-runtime").then(({ runPiSetup }) => runPiSetup())
     })
 }

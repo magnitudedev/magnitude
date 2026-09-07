@@ -21,7 +21,7 @@ describe("actual setup child boundary", () => {
       const executable = `${directory}/magnitude`
       yield* fs.writeFileString(executable, `#!/usr/bin/env node
 if (process.argv[2] === '--version') process.exit(0)
-if (process.argv[2] !== 'setup-pi' || process.argv.length !== 3) process.exit(2)
+if (process.argv.slice(2).join(' ') !== 'setup --host pi') process.exit(2)
 if (${encodeString(scenario)} === 'signal') process.kill(process.pid, 'SIGKILL')
 process.exit(${scenario === "cancelled" ? 130 : 1})
 `)
