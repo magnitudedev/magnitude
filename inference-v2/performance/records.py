@@ -9,8 +9,8 @@ from dataclasses import asdict, dataclass, field
 from functools import cached_property
 from typing import Any
 
-from magnitude_engine.components import Configuration, Facts, Implementation
-from magnitude_engine.components import implementation as read_implementation
+from magnitude_engine.components import ComponentId
+from performance.facts import Configuration, Facts
 
 
 def encoded(value: Any) -> str:
@@ -23,7 +23,7 @@ def digest(value: Any) -> str:
 
 @dataclass(frozen=True)
 class Node:
-    binding: Implementation[Any]
+    binding: ComponentId
     source: str
     parameters: Facts | None = None
     children: dict[str, str] = field(default_factory=dict)
@@ -32,10 +32,14 @@ class Node:
     configuration: Configuration = field(default_factory=Configuration)
 
     def __post_init__(self):
+        from performance.theory.catalog import parameter_type
+
+        if not isinstance(self.binding, ComponentId):
+            raise TypeError("nodes require a ComponentId from a declaration or decoded record")
         if not self.source:
             raise ValueError("implementation source fingerprint is required")
         if self.parameters is not None and not isinstance(
-            self.parameters, self.binding.contract.parameters
+            self.parameters, parameter_type(self.binding.kind)
         ):
             raise TypeError("node parameters do not satisfy its contract")
         if self.execution not in ("joint", "serial", "parallel"):
@@ -43,11 +47,11 @@ class Node:
 
     @property
     def implementation(self) -> str:
-        return self.binding.identity
+        return str(self.binding)
 
     @property
     def component(self):
-        return self.binding.contract
+        return self.binding.kind
 
     def record(self) -> dict:
         return dict(
@@ -64,12 +68,14 @@ class Node:
 
     @classmethod
     def read(cls, value: dict):
-        binding = read_implementation(value["implementation"])
+        from performance.theory.catalog import read_parameters
+
+        binding = ComponentId(value["implementation"])
         parameters = value["parameters"]
         return cls(
             binding,
             value["source"],
-            None if parameters is None else binding.contract.read(parameters),
+            None if parameters is None else read_parameters(binding.kind, parameters),
             value.get("children", {}),
             value.get("dependencies", {}),
             value.get("execution", "joint"),
@@ -148,7 +154,7 @@ class Assembly:
         if self.origin is None:
             # Standalone components have a stable contract entry, with variants in history.
             return digest(
-                {"component": self.nodes[self.root].component.identity, "artifacts": self.artifacts}
+                {"component": self.nodes[self.root].component, "artifacts": self.artifacts}
             )
         return digest(
             {

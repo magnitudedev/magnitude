@@ -6,9 +6,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from magnitude_engine import components as c
+from magnitude_engine.components import component
 from performance.assembly import Binding, inspect_component
 from performance.benchmarks.numerics import compare
+from performance.facts import AttentionGeometry
 from performance.records import digest
 from performance.runner import recording
 
@@ -49,7 +50,7 @@ def prepare(
     *,
     context_tokens,
     query_tokens,
-    geometry: c.AttentionGeometry,
+    geometry: AttentionGeometry,
     dtype="bfloat16",
     fragmented=False,
     seed=131,
@@ -136,7 +137,7 @@ def benchmark(
     *,
     context_tokens,
     query_tokens=1,
-    geometry: c.AttentionGeometry | None = None,
+    geometry: AttentionGeometry | None = None,
     dtype="bfloat16",
     fragmented=False,
     inputs=None,
@@ -151,14 +152,14 @@ def benchmark(
         binding = component
         if geometry is None:
             parameters = binding.node.parameters
-            if not isinstance(parameters, c.AttentionGeometry):
+            if not isinstance(parameters, AttentionGeometry):
                 raise TypeError("bound attention is missing its geometry")
             geometry = parameters
     else:
         if geometry is None:
             raise ValueError("standalone attention requires typed geometry")
         binding = inspect_component(component, context=geometry).at("component")
-    if not isinstance(geometry, c.AttentionGeometry):
+    if not isinstance(geometry, AttentionGeometry):
         raise TypeError("attention requires AttentionGeometry")
     workload = {
         "histories": [context_tokens],
@@ -233,6 +234,7 @@ def verification(component, *, geometry=None, contexts=(4096, 65536), queries=(2
     ]
 
 
+@component("MODEL:ATTENTION:MLX:DENSE")
 def dense_attention(queries, keys, values, *, scale, mask):
     import mlx.core as mx
 
@@ -243,7 +245,7 @@ def dense(
     *,
     context_tokens,
     query_tokens=1,
-    geometry: c.AttentionGeometry,
+    geometry: AttentionGeometry,
     dtype="bfloat16",
     component=None,
     **record,
@@ -255,7 +257,7 @@ def dense(
 
     bound = bind_operation(
         component or dense_attention,
-        c.Implementation(c.ATTENTION, c.Source.MLX, "DENSE"),
+        dense_attention,
         parameters=geometry,
     )
     workload = {

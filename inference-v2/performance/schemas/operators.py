@@ -1,6 +1,5 @@
 """Operand and use schemas for reusable model operations."""
 
-from magnitude_engine import components as c
 from magnitude_engine.models.attention.gathered import GatheredAttention
 from magnitude_engine.models.attention.metal import MetalPagedAttention
 from magnitude_engine.models.embeddings.resident import ResidentAffineEmbedding, ResidentEmbedding
@@ -13,79 +12,87 @@ from magnitude_engine.models.recurrence.mlx import MLXDelta
 from magnitude_engine.models.recurrence.reference import DeltaReference
 from magnitude_engine.models.state.paged import PagedStateStore
 from performance.bindings import Fields, Use, alias, neural, schema
+from performance.facts import (
+    AttentionGeometry,
+    Configuration,
+    NeuralParameters,
+    RecurrentGeometry,
+    TensorFacts,
+    WeightUse,
+)
 
 
-@schema(GatheredAttention, context=c.AttentionGeometry)
-def gathered(a: GatheredAttention, geometry: c.AttentionGeometry) -> Fields[c.AttentionGeometry]:
+@schema(GatheredAttention, context=AttentionGeometry)
+def gathered(a: GatheredAttention, geometry: AttentionGeometry) -> Fields[AttentionGeometry]:
     return Fields(geometry)
 
 
-@schema(MetalPagedAttention, context=c.AttentionGeometry)
-def paged(a: MetalPagedAttention, geometry: c.AttentionGeometry) -> Fields[c.AttentionGeometry]:
+@schema(MetalPagedAttention, context=AttentionGeometry)
+def paged(a: MetalPagedAttention, geometry: AttentionGeometry) -> Fields[AttentionGeometry]:
     return Fields(
         geometry,
         children={"fallback": Use(a.prefill, geometry)},
-        configuration=c.Configuration(
+        configuration=Configuration(
             settings={"partition_tokens": a.partition_tokens, "heads_per_group": a.heads_per_group}
         ),
     )
 
 
-@schema(DeltaReference, context=c.RecurrentGeometry)
-def reference(a: DeltaReference, geometry: c.RecurrentGeometry) -> Fields[c.RecurrentGeometry]:
+@schema(DeltaReference, context=RecurrentGeometry)
+def reference(a: DeltaReference, geometry: RecurrentGeometry) -> Fields[RecurrentGeometry]:
     return Fields(geometry)
 
 
-@schema(MLXDelta, context=c.RecurrentGeometry)
-def mlx(a: MLXDelta, geometry: c.RecurrentGeometry) -> Fields[c.RecurrentGeometry]:
+@schema(MLXDelta, context=RecurrentGeometry)
+def mlx(a: MLXDelta, geometry: RecurrentGeometry) -> Fields[RecurrentGeometry]:
     return Fields(geometry)
 
 
-@schema(MetalDelta, context=c.RecurrentGeometry)
-def delta(a: MetalDelta, geometry: c.RecurrentGeometry) -> Fields[c.RecurrentGeometry]:
+@schema(MetalDelta, context=RecurrentGeometry)
+def delta(a: MetalDelta, geometry: RecurrentGeometry) -> Fields[RecurrentGeometry]:
     return Fields(
         geometry,
-        configuration=c.Configuration(settings={"specialize_prefill": a.specialize_prefill}),
+        configuration=Configuration(settings={"specialize_prefill": a.specialize_prefill}),
     )
 
 
 @schema(ResidentEmbedding)
-def embedding(a: ResidentEmbedding, _: None) -> Fields[c.NeuralParameters]:
-    return neural(operands={"weight": a.weight}, weight_use=c.WeightUse.EMBEDDING)
+def embedding(a: ResidentEmbedding, _: None) -> Fields[NeuralParameters]:
+    return neural(operands={"weight": a.weight}, weight_use=WeightUse.EMBEDDING)
 
 
 @schema(ResidentAffineEmbedding)
-def affine(a: ResidentAffineEmbedding, _: None) -> Fields[c.NeuralParameters]:
+def affine(a: ResidentAffineEmbedding, _: None) -> Fields[NeuralParameters]:
     return neural(
         operands={"weight": a.weight, "scales": a.scales, "biases": a.biases},
-        weight_use=c.WeightUse.EMBEDDING,
+        weight_use=WeightUse.EMBEDDING,
     )
 
 
 @schema(ResidentExperts, context=int)
-def experts(a: ResidentExperts, top_k: int) -> Fields[c.NeuralParameters]:
+def experts(a: ResidentExperts, top_k: int) -> Fields[NeuralParameters]:
     return neural(
         operands={"up": a.weights.up, "gate": a.weights.gate, "down": a.weights.down},
         top_k=top_k,
-        weight_use=c.WeightUse.EXPERTS,
+        weight_use=WeightUse.EXPERTS,
         sources=(a.math.apply, a.math.activation),
     )
 
 
 @schema(StreamedEmbedding)
-def streamed_embedding(a: StreamedEmbedding, _: None) -> Fields[c.NeuralParameters]:
+def streamed_embedding(a: StreamedEmbedding, _: None) -> Fields[NeuralParameters]:
     table = a.table
     return Fields(
-        c.NeuralParameters(
+        NeuralParameters(
             arrays={
-                "encoded": c.TensorFacts(
+                "encoded": TensorFacts(
                     identity="encoded",
                     shape=(table.rows, table.row_bytes),
                     bytes=table.rows * table.row_bytes,
                     dtype="uint8",
                 )
             },
-            weight_use=c.WeightUse.EMBEDDING,
+            weight_use=WeightUse.EMBEDDING,
             settings={"cache_bytes": a.cache_bytes, "max_pending": a.max_pending},
         ),
         sources=(RowLease, a.reader),
@@ -93,19 +100,19 @@ def streamed_embedding(a: StreamedEmbedding, _: None) -> Fields[c.NeuralParamete
 
 
 @schema(StreamedExperts, context=int)
-def streamed_experts(a: StreamedExperts, top_k: int) -> Fields[c.NeuralParameters]:
+def streamed_experts(a: StreamedExperts, top_k: int) -> Fields[NeuralParameters]:
     source = a.source
     return Fields(
-        c.NeuralParameters(
+        NeuralParameters(
             arrays={
-                "encoded": c.TensorFacts(
+                "encoded": TensorFacts(
                     identity="encoded",
                     shape=(source.experts, source.expert_bytes),
                     bytes=source.experts * source.expert_bytes,
                     dtype="uint8",
                 )
             },
-            weight_use=c.WeightUse.EXPERTS,
+            weight_use=WeightUse.EXPERTS,
             top_k=top_k,
             settings={"slots": a.bank.slots},
         ),

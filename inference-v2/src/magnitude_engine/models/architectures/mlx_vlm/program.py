@@ -6,7 +6,6 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 
-from magnitude_engine import components as c
 from magnitude_engine.components import component
 from magnitude_engine.models.execution import ExecutionScope
 from magnitude_engine.models.inputs import ModelInputs
@@ -31,7 +30,7 @@ class LibraryForward:
         return output if isinstance(output, mx.array) else output.logits
 
 
-@component(c.FORWARD, source=c.Source.VLM, variant="STANDARD", model=DEFINITION)
+@component("MODEL:FORWARD:VLM:STANDARD", model=DEFINITION)
 class LibraryProgram:
     """A bound library call; family adapters provide richer named features separately.
 

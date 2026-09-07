@@ -2,9 +2,10 @@
 
 from typing import cast
 
-from magnitude_engine import components as c
+from magnitude_engine.components import component
 from performance.assembly import BoundAssembly, bind_operation
 from performance.benchmarks.fixtures import record_inputs, tokens
+from performance.facts import Configuration
 from performance.records import Assembly, Observation, digest
 from performance.runner import recording
 
@@ -177,13 +178,12 @@ def batch(
     from time import perf_counter_ns
 
     import mlx.core as mx
-    from mlx_vlm.generate.ar import BatchGenerator
     from mlx_vlm.utils import StoppingCriteria
 
     binding = bind_operation(
-        BatchGenerator.__init__,
-        c.Implementation(c.ENGINE, c.Source.VLM, "BATCH_GENERATOR"),
-        parameters=c.Configuration(settings={"prefill_tokens": prefill_tokens, "max_batch": rows}),
+        batch_generator,
+        batch_generator,
+        parameters=Configuration(settings={"prefill_tokens": prefill_tokens, "max_batch": rows}),
     )
     from dataclasses import replace
 
@@ -236,7 +236,7 @@ def batch(
             outputs, intervals, first_times, gaps = [], [], [], []
             for _ in range(waves):
                 start = perf_counter_ns()
-                generator = BatchGenerator(
+                generator = batch_generator(
                     model.language_model,
                     processor,
                     max_tokens=output_tokens,
@@ -319,3 +319,10 @@ def batch(
         finally:
             tokenizer.stopping_criteria = previous_stopping
     return run
+
+
+@component("ENGINE:INFERENCE:VLM:BATCH_GENERATOR")
+def batch_generator(*args, **kwargs):
+    from mlx_vlm.generate.ar import BatchGenerator
+
+    return BatchGenerator(*args, **kwargs)

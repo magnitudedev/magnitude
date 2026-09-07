@@ -3,8 +3,17 @@ from dataclasses import replace
 
 import pytest
 
-from magnitude_engine import components as c
+from magnitude_engine.components import ComponentId
 from performance.assembly import BoundAssembly
+from performance.facts import (
+    AttentionGeometry,
+    Configuration,
+    KVGeometry,
+    KVStorage,
+    NeuralParameters,
+    RecurrentStorage,
+    TensorFacts,
+)
 from performance.records import Assembly, Node, Observation, Profile
 from performance.runner import recording
 from performance.store import Store
@@ -21,12 +30,12 @@ def binding(*, parent="v1", child="stable", mode="serial"):
         "root",
         {
             "root": Node(
-                c.implementation("MODEL:QWEN35:MAG:LAYERWISE"),
+                ComponentId("MODEL:QWEN35:MAG:LAYERWISE"),
                 parent,
                 children={"attention": "attention"},
                 execution=mode,
             ),
-            "attention": Node(c.implementation("MODEL:ATTENTION:MAG:PAGED"), child),
+            "attention": Node(ComponentId("MODEL:ATTENTION:MAG:PAGED"), child),
         },
         "test",
     )
@@ -218,9 +227,9 @@ def test_dimensions_select_evidence_independently_and_version_contracts(tmp_path
         "state",
         {
             "state": Node(
-                c.implementation("STATE:RECURRENT:MAG:CHECKPOINTED"),
+                ComponentId("STATE:RECURRENT:MAG:CHECKPOINTED"),
                 "source",
-                c.RecurrentStorage(layouts=()),
+                RecurrentStorage(layouts=()),
             )
         },
         "state",
@@ -301,16 +310,16 @@ def test_preflight_shared_kv_and_invalid_inputs_are_data():
         "model",
         {
             "model": Node(
-                c.implementation("MODEL:GEMMA4:MAG:LAYERWISE"),
+                ComponentId("MODEL:GEMMA4:MAG:LAYERWISE"),
                 "x",
-                parameters=c.NeuralParameters(),
+                parameters=NeuralParameters(),
                 children={"a": "model.layers.0.attention", "b": "model.layers.1.attention"},
             ),
             **{
                 f"model.layers.{i}.attention": Node(
-                    c.implementation("MODEL:ATTENTION:MAG:GATHERED"),
+                    ComponentId("MODEL:ATTENTION:MAG:GATHERED"),
                     "x",
-                    parameters=c.AttentionGeometry(**leaf),
+                    parameters=AttentionGeometry(**leaf),
                 )
                 for i in range(2)
             },
@@ -479,16 +488,16 @@ def test_hybrid_memory_composes_disjoint_backing_once(tmp_path):
         "state",
         {
             "state": Node(
-                c.implementation("STATE:QWEN35:MAG:HYBRID"),
+                ComponentId("STATE:QWEN35:MAG:HYBRID"),
                 "s",
-                c.Configuration(),
+                Configuration(),
                 children={"kv": "kv", "recurrent": "r"},
             ),
             "kv": Node(
-                c.implementation("KV:STORE:MAG:PAGED"),
+                ComponentId("KV:STORE:MAG:PAGED"),
                 "s",
-                parameters=c.KVStorage(
-                    layers=(c.KVGeometry(heads=1, key_width=2, value_width=2),),
+                parameters=KVStorage(
+                    layers=(KVGeometry(heads=1, key_width=2, value_width=2),),
                     element_bytes=2,
                     page_size=16,
                     slab_pages=32,
@@ -496,11 +505,11 @@ def test_hybrid_memory_composes_disjoint_backing_once(tmp_path):
                 ),
             ),
             "r": Node(
-                c.implementation("STATE:RECURRENT:MAG:CHECKPOINTED"),
+                ComponentId("STATE:RECURRENT:MAG:CHECKPOINTED"),
                 "s",
-                parameters=c.RecurrentStorage(
+                parameters=RecurrentStorage(
                     layouts=(
-                        (c.TensorFacts(identity="state", shape=(1, 4), bytes=16, dtype="float32"),),
+                        (TensorFacts(identity="state", shape=(1, 4), bytes=16, dtype="float32"),),
                     )
                 ),
             ),

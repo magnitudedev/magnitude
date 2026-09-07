@@ -1,6 +1,5 @@
 """Read engine relationships from their actual construction bindings."""
 
-from magnitude_engine import components as c
 from magnitude_engine.engine.binding import EngineResidency
 from magnitude_engine.engine.memory.policy import Budgeted
 from magnitude_engine.engine.prefixes.radix import Radix
@@ -16,6 +15,7 @@ from magnitude_engine.generation.sampling import SequenceSampler
 from magnitude_engine.models.execution import ExecutionOwner
 from magnitude_engine.resources.budget import MemoryBudget
 from performance.bindings import Fields, Use, operation, port, schema
+from performance.facts import Configuration
 
 
 def model(runtime) -> Use:
@@ -23,9 +23,9 @@ def model(runtime) -> Use:
 
 
 @schema(Engine, context=EngineResidency)
-def engine(a: Engine, binding: EngineResidency) -> Fields[c.Configuration]:
+def engine(a: Engine, binding: EngineResidency) -> Fields[Configuration]:
     return Fields(
-        c.Configuration(
+        Configuration(
             settings={
                 k: v
                 for k, v in binding.properties.items()
@@ -52,7 +52,7 @@ def engine(a: Engine, binding: EngineResidency) -> Fields[c.Configuration]:
 
 def generation(
     method: PlainMethod | MTPMethod | SuffixMethod, a: GenerationRuntime
-) -> Fields[c.Configuration]:
+) -> Fields[Configuration]:
     children = {
         "target": model(a.model),
         "sampling": port(SequenceSampler.__init__, SequenceSampler),
@@ -67,7 +67,7 @@ def generation(
         else {}
     )
     return Fields(
-        c.Configuration(settings=settings),
+        Configuration(settings=settings),
         children=children,
         dependencies={"execution": Use(a.model.owner)},
         sources=(a,),
@@ -79,9 +79,9 @@ for method_type in (PlainMethod, MTPMethod, SuffixMethod):
 
 
 @schema(TimeShared, context=GenerationRuntime | None)
-def scheduler(a: TimeShared, generation: GenerationRuntime | None) -> Fields[c.Configuration]:
+def scheduler(a: TimeShared, generation: GenerationRuntime | None) -> Fields[Configuration]:
     return Fields(
-        c.Configuration(
+        Configuration(
             settings={
                 "max_active": a.max_active,
                 "max_queued": a.max_queued,
@@ -94,9 +94,9 @@ def scheduler(a: TimeShared, generation: GenerationRuntime | None) -> Fields[c.C
 
 
 @schema(Radix)
-def prefix(a: Radix, _: None) -> Fields[c.Configuration]:
+def prefix(a: Radix, _: None) -> Fields[Configuration]:
     return Fields(
-        c.Configuration(
+        Configuration(
             settings={"max_entries": a.retention.max_entries, "max_bytes": a.retention.max_bytes}
         ),
         sources=(a.retention,),
@@ -104,15 +104,15 @@ def prefix(a: Radix, _: None) -> Fields[c.Configuration]:
 
 
 @schema(Budgeted)
-def budgeted(a: Budgeted, _: None) -> Fields[c.Configuration]:
-    return Fields(c.Configuration(settings={"limit": a.limit}), sources=(a.pressure,))
+def budgeted(a: Budgeted, _: None) -> Fields[Configuration]:
+    return Fields(Configuration(settings={"limit": a.limit}), sources=(a.pressure,))
 
 
 @schema(MemoryBudget)
-def budget(a: MemoryBudget, _: None) -> Fields[c.Configuration]:
-    return Fields(c.Configuration(settings={"limit": a.limit}))
+def budget(a: MemoryBudget, _: None) -> Fields[Configuration]:
+    return Fields(Configuration(settings={"limit": a.limit}))
 
 
 @schema(ExecutionOwner)
-def device(a: ExecutionOwner, _: None) -> Fields[c.Configuration]:
-    return Fields(c.Configuration())
+def device(a: ExecutionOwner, _: None) -> Fields[Configuration]:
+    return Fields(Configuration())

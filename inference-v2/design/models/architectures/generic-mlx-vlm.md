@@ -15,8 +15,9 @@ not imply that its cache, batching or modality capabilities are supported here.
 ## Assembly
 
 ```text
-MODEL:FORWARD:VLM:STANDARD
-└── state · STATE:CHECKPOINTS:MAG:NATIVE
+MODEL:EXECUTOR:MAG:STANDARD
+├── Upstream language model · MODEL:FORWARD:VLM:STANDARD
+└── Native cache adapter · STATE:CHECKPOINTS:MAG:NATIVE
 ```
 
 ## Component definitions
@@ -51,7 +52,7 @@ Python wrapper floor. Actual adapter work belongs to its execution estimate.
 
 **Implementations and controls.**
 
-#### `MODEL:EXECUTOR:MAG:UPSTREAM`
+#### `MODEL:EXECUTOR:MAG:STANDARD`
 
 - **Implementation:** Tokens and logical starting state become requested logits and advanced state. Own position
   binding, compatible batch assembly, completion roots and resource lifetime around the two
@@ -85,7 +86,7 @@ dimensions.
 
 **Implementations and controls.**
 
-#### `MODEL:LOADING:MAG:UPSTREAM`
+#### `MODEL:LOADING:MAG:RESIDENT`
 
 - **Implementation:** Resolve upstream configuration and language module, validate tensor layout, materialize
   supported text weights and own their budgeted lifetime. Peer modality weights are excluded.

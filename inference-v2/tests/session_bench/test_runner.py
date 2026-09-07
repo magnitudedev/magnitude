@@ -182,7 +182,7 @@ async def test_sigterm_reaches_managed_cleanup(monkeypatch):
             cleaned.append(True)
             return {"status": "cancelled"}
 
-    monkeypatch.setattr(cli, "run", pending)
+    monkeypatch.setattr(runner, "run", pending)
     assert (await cli.managed_run())["status"] == "cancelled"
     assert cleaned == [True]
 

@@ -4,7 +4,7 @@ from contextlib import ExitStack
 from dataclasses import replace
 from typing import Any
 
-from magnitude_engine import components as c
+from magnitude_engine.components import component, component_id
 from performance.assembly import Binding, BoundAssembly, inspect_engine, source_files
 from performance.benchmarks.fixtures import record_inputs, tokens
 from performance.benchmarks.numerics import compare
@@ -13,6 +13,7 @@ from performance.records import Assembly, Observation, digest
 from performance.runner import recording
 
 
+@component("MODEL:QWEN35.MTP:MAG:UPSTREAM_ADAPTER")
 def benchmark(
     engine,
     *,
@@ -44,7 +45,7 @@ def benchmark(
         sources = source_files(benchmark)
         node = replace(
             bound.node,
-            binding=c.Implementation(c.QWEN_MTP, c.Source.MAG, "UPSTREAM_ADAPTER"),
+            binding=component_id(benchmark),
             source=digest(sources),
             children={},
             dependencies={},

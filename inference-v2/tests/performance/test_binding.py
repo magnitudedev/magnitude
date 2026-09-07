@@ -1,17 +1,19 @@
 import pytest
 
-from magnitude_engine import components as c
+from magnitude_engine.components import ComponentId, component, component_id
+from magnitude_engine.engine.runtime import Engine
 from performance.assembly import inspect_component, inspect_engine
+from performance.facts import AttentionGeometry, Configuration
 from performance.records import Assembly, Node
 
 
 def test_graph_identity_preserves_aliases_but_not_occurrence_paths():
-    leaf = Node(c.implementation("MODEL:ATTENTION:MAG:PAGED"), "leaf")
+    leaf = Node(ComponentId("MODEL:ATTENTION:MAG:PAGED"), "leaf")
     shared = Assembly(
         "root",
         {
             "root": Node(
-                c.implementation("MODEL:QWEN35:MAG:LAYERWISE"),
+                ComponentId("MODEL:QWEN35:MAG:LAYERWISE"),
                 "parent",
                 children={"a": "one", "b": "one"},
             ),
@@ -23,7 +25,7 @@ def test_graph_identity_preserves_aliases_but_not_occurrence_paths():
         "root",
         {
             "root": Node(
-                c.implementation("MODEL:QWEN35:MAG:LAYERWISE"),
+                ComponentId("MODEL:QWEN35:MAG:LAYERWISE"),
                 "parent",
                 children={"a": "one", "b": "two"},
             ),
@@ -36,7 +38,7 @@ def test_graph_identity_preserves_aliases_but_not_occurrence_paths():
         "top",
         {
             "top": Node(
-                c.implementation("MODEL:QWEN35:MAG:LAYERWISE"),
+                ComponentId("MODEL:QWEN35:MAG:LAYERWISE"),
                 "parent",
                 children={"a": "bottom", "b": "bottom"},
             ),
@@ -54,7 +56,6 @@ def test_graph_identity_preserves_aliases_but_not_occurrence_paths():
 def engine(monkeypatch):
     from magnitude_engine.engine.prefixes.radix import Radix
     from magnitude_engine.engine.prefixes.retention import LeastRecentlyUsed
-    from magnitude_engine.engine.runtime import Engine
     from magnitude_engine.engine.scheduler.time_shared import TimeShared
     from magnitude_engine.generation.methods.plain.runtime import PlainMethod
     from magnitude_engine.generation.runtime import GenerationRuntime
@@ -382,7 +383,7 @@ def test_windowed_attention_binds_actual_work_and_input_identity(tmp_path):
         context_tokens=5,
         query_tokens=3,
         dtype="float32",
-        geometry=c.AttentionGeometry(
+        geometry=AttentionGeometry(
             query_heads=2,
             kv_heads=1,
             key_width=32,
@@ -403,7 +404,7 @@ def test_blueprint_selection_is_the_captured_execution_component():
     from magnitude_engine.composition import build, dumps, loads
     from magnitude_engine.models.attention.blueprint import Gathered, Paged
 
-    geometry = c.AttentionGeometry(
+    geometry = AttentionGeometry(
         query_heads=8, kv_heads=2, key_width=128, value_width=128, element_bytes=2
     )
     captures = []
@@ -411,7 +412,7 @@ def test_blueprint_selection_is_the_captured_execution_component():
         with build(loads(dumps(selected))) as live:
             bound = inspect_component(live, context=geometry)
             assert bound.at("component").instance is live
-            assert bound.graph.nodes["component"].binding == c.component_of(live).identity(live)
+            assert bound.graph.nodes["component"].binding == component_id(live)
             captures.append(bound.graph)
     assert captures[0].nodes["component"].implementation.endswith(":GATHERED")
     assert captures[1].nodes["component"].implementation.endswith(":PAGED")
@@ -436,7 +437,7 @@ def test_shared_kernel_uses_preserve_distinct_geometries(monkeypatch):
     from magnitude_engine.models.attention.gathered import GatheredAttention
     from performance.bindings import SCHEMAS, Fields, Use, schema
 
-    @c.component(c.ENGINE, source=c.Source.MAG, variant="TEST")
+    @component("ENGINE:INFERENCE:MAG:TEST")
     class AssemblyFixture:
         def __init__(self):
             self.attention = GatheredAttention()
@@ -445,13 +446,13 @@ def test_shared_kernel_uses_preserve_distinct_geometries(monkeypatch):
     del SCHEMAS[AssemblyFixture]
 
     @schema(AssemblyFixture)
-    def fields(a: AssemblyFixture, _: None) -> Fields[c.Configuration]:
+    def fields(a: AssemblyFixture, _: None) -> Fields[Configuration]:
         return Fields(
-            c.Configuration(),
+            Configuration(),
             children={
                 str(i): Use(
                     a.attention,
-                    c.AttentionGeometry(
+                    AttentionGeometry(
                         query_heads=8,
                         kv_heads=2,
                         key_width=16 * (i + 1),
@@ -500,3 +501,23 @@ def test_library_capture_reads_the_executed_model_binding():
         sum(t.bytes for t in bound.graph.nodes["component"].parameters.arrays.values())
         == model.embedding.weight.nbytes
     )
+
+
+def test_compiled_qwen_has_a_real_identified_child_with_shared_blocks():
+    from magnitude_engine.models.architectures.qwen35.decode import ResidentDecode
+    from magnitude_engine.models.architectures.qwen35.program import Qwen35Program
+    from magnitude_engine.models.attention.metal import MetalPagedAttention
+    from tests.models.architectures.qwen35.test_hybrid_model import setup
+
+    _, runtime, arena, _ = setup(attention=MetalPagedAttention(), head_width=32)
+    try:
+        bound = inspect_component(runtime.program, artifacts={"target": {"fixture": "compiled"}})
+        root = bound.graph.nodes["component"]
+        decoded = bound.graph.nodes[root.children["decode"]]
+        assert root.binding == component_id(Qwen35Program)
+        assert decoded.binding == component_id(ResidentDecode)
+        assert bound.at(root.children["decode"]).instance is runtime.program.decode
+        assert decoded.children["layers.0.mixer"] == root.children["layers.0.mixer"]
+        assert decoded.children["embedding"] == root.children["embedding"]
+    finally:
+        arena.close()

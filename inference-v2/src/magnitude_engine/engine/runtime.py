@@ -7,7 +7,6 @@ from threading import Event, Lock
 from time import perf_counter_ns
 from uuid import uuid4
 
-from magnitude_engine import components as c
 from magnitude_engine.components import component
 from magnitude_engine.generation.constraint_spec import ConstraintError
 from magnitude_engine.generation.runtime import (
@@ -48,7 +47,7 @@ class ServiceMeasurement:
     batch_size: int = 1
 
 
-@component(c.ENGINE, source=c.Source.MAG, variant="STANDARD")
+@component("ENGINE:INFERENCE:MAG:STANDARD")
 class Engine[S, C: ModelCheckpoint]:
     def __init__(
         self,
@@ -74,7 +73,7 @@ class Engine[S, C: ModelCheckpoint]:
         self._failed = False
         self.last_service: CompletedService | None = None
 
-    @component(c.ADMISSION, source=c.Source.MAG, variant="FIFO")
+    @component("SCHEDULING:ADMISSION:MAG:FIFO")
     def submit(
         self,
         request: GenerationRequest,

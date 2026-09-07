@@ -9,7 +9,6 @@ from typing import Protocol, cast
 
 import mlx.core as mx
 
-from magnitude_engine import components as c
 from magnitude_engine.components import component
 from magnitude_engine.models.inputs import ModelInputs
 from magnitude_engine.models.operations import Task, accept, complete, forward, observe
@@ -451,7 +450,7 @@ class GenerationRuntime[S, C: ModelCheckpoint]:
                 groups.append([sequence])
         return tuple(tuple(group) for group in groups)
 
-    @component(c.PREFILL, source=c.Source.MAG, variant="CHUNKED")
+    @component("SCHEDULING:PREFILL:MAG:CHUNKED")
     def prefill_many(
         self,
         sequences: tuple[GenerationSequence[S, C], ...],

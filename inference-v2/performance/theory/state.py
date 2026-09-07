@@ -2,7 +2,7 @@
 
 import math
 
-from magnitude_engine.components import Facts, KVStorage, RecurrentStorage
+from performance.facts import Facts, KVStorage, RecurrentStorage
 from performance.theory.resources import Bound, Demands, Extent, time_bound
 from performance.theory.workloads import StateWorkload
 

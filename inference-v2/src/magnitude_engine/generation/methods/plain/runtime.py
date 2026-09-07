@@ -6,7 +6,6 @@ from typing import Any, cast
 
 import mlx.core as mx
 
-from magnitude_engine import components as c
 from magnitude_engine.components import component
 from magnitude_engine.generation.proposals import Proposal
 from magnitude_engine.generation.sampling import SequenceSampler
@@ -106,7 +105,7 @@ class PlainSession:
         pass
 
 
-@component(c.GENERATION, source=c.Source.MAG, variant="TARGET")
+@component("GENERATION:PLAIN:MAG:TARGET")
 class PlainMethod:
     identity = "plain"
 

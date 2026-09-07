@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-from magnitude_engine import components as c
 from magnitude_engine.components import component
 
 from .inputs import DeltaInputs
 
 
-@component(c.RECURRENCE, source=c.Source.MAG, variant="REFERENCE")
+@component("MODEL:GATED_DELTA:MAG:REFERENCE")
 class DeltaReference:
     """Direct equations, used to qualify fused implementations and unusual geometry."""
 

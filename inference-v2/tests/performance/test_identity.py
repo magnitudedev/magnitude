@@ -2,13 +2,16 @@ from dataclasses import replace
 
 import pytest
 
-from magnitude_engine import components as c
 from magnitude_engine.artifacts.blueprint import Local
 from magnitude_engine.blueprints import dumps, loads
+from magnitude_engine.components import component, component_id, component_of
 from magnitude_engine.composition import digest as blueprint_digest
 from magnitude_engine.models.architectures.qwen35.definition import DEFINITION
+from magnitude_engine.models.attention.gathered import GatheredAttention
+from magnitude_engine.resources.budget import MemoryBudget
 from performance.assembly import source_key
 from performance.assessment import rebuild
+from performance.facts import AttentionGeometry, Configuration
 from performance.records import CompositionOrigin
 from performance.theory.resources import Demands, DependentPhases, Extent, dependent_time_bound
 from performance.theory.sensitivity import predict
@@ -98,11 +101,10 @@ def replacement_kernel():
 
 
 def test_typed_contract_rejects_wrong_geometry():
-    from magnitude_engine.models.attention.gathered import GatheredAttention
     from performance.assembly import inspect_component
 
     with pytest.raises(TypeError, match="requires AttentionGeometry"):
-        inspect_component(GatheredAttention(), context=c.Configuration())
+        inspect_component(GatheredAttention(), context=Configuration())
 
 
 def test_migration_preserves_raw_history_and_is_idempotent(tmp_path):
@@ -136,7 +138,7 @@ def test_launch_configuration_changes_evidence_without_renaming_component():
     from magnitude_engine.models.attention.metal import MetalPagedAttention
     from performance.assembly import inspect_component
 
-    geometry = c.AttentionGeometry(
+    geometry = AttentionGeometry(
         query_heads=8, kv_heads=2, key_width=128, value_width=128, element_bytes=2
     )
     a = inspect_component(MetalPagedAttention(heads_per_group=1), context=geometry).graph
@@ -151,31 +153,31 @@ def test_component_declaration_leaves_execution_unchanged_and_is_explicit():
             return x + 1
 
     original_call = Operation.__call__
-    declared = c.component(c.GENERATION, source=c.Source.MAG, variant="TEST")(Operation)
+    declared = component("GENERATION:PLAIN:MAG:TEST")(Operation)
     assert declared is Operation
     assert declared.__call__ is original_call
     assert declared()(3) == 4
-    assert c.component_of(declared()).identity(declared()).identity == "GENERATION:PLAIN:MAG:TEST"
+    assert str(component_id(declared())) == "GENERATION:PLAIN:MAG:TEST"
 
     class Undeclared(Operation):
         pass
 
     with pytest.raises(TypeError, match="undeclared"):
-        c.component_of(Undeclared())
+        component_of(Undeclared())
 
 
 def test_binding_schema_must_match_declared_contract():
     from performance.bindings import Fields, schema
 
-    @c.component(c.ATTENTION, source=c.Source.MAG, variant="TEST")
+    @component("MODEL:ATTENTION:MAG:TEST")
     class WrongSchema:
         pass
 
     with pytest.raises(TypeError, match="wrong parameter schema"):
 
         @schema(WrongSchema)
-        def fields(a: WrongSchema, _: None) -> Fields[c.Configuration]:
-            return Fields(c.Configuration())
+        def fields(a: WrongSchema, _: None) -> Fields[Configuration]:
+            return Fields(Configuration())
 
 
 def test_reporting_tag_does_not_change_executable_fingerprint(monkeypatch):
@@ -189,7 +191,7 @@ def test_reporting_tag_does_not_change_executable_fingerprint(monkeypatch):
     def metadata_change(owner):
         source = getsource(owner)
         return (
-            source.replace('variant="PAGED"', 'variant="RENAMED"')
+            source.replace("MODEL:ATTENTION:MAG:PAGED", "MODEL:ATTENTION:MAG:RENAMED")
             if owner is MetalPagedAttention
             else source
         )
@@ -203,7 +205,44 @@ def test_benchmark_uses_actual_component_variant():
     from performance.assembly import bind_operation, inspect_component
 
     policy = Budgeted(limit_bytes=1024, pressure=EvictPrefixesBeforeRejecting())
-    standalone = bind_operation(policy, c.Implementation(c.MEMORY, c.Source.MAG, "RESERVATIONS"))
+    standalone = bind_operation(policy, MemoryBudget)
     captured = inspect_component(policy).at("component")
     assert standalone.node.implementation == "MEMORY:ACCOUNTING:MAG:BUDGETED"
     assert standalone.node == captured.node
+
+
+@pytest.mark.parametrize(
+    "identity",
+    ["qwen", "MODEL:QWEN35:MAG", "MODEL:QWEN35:OTHER:STANDARD", "MODEL:QWEN35:MAG:bad-variant"],
+)
+def test_invalid_component_ids_fail_at_declaration(identity):
+    with pytest.raises(ValueError, match="invalid component ID"):
+        component(identity)
+
+
+def test_identity_is_declared_once_and_explicit_sharing_uses_the_class():
+    @component("MODEL:ATTENTION:MAG:DECLARATION_TEST")
+    class Original:
+        pass
+
+    @component(Original)
+    class Shared:
+        pass
+
+    assert component_id(Shared) is component_id(Original)
+    with pytest.raises(ValueError, match="already declared"):
+
+        @component(str(component_id(Original)))
+        class Conflicting:
+            pass
+
+
+def test_blueprint_references_the_identity_of_its_actual_constructor():
+    from magnitude_engine.composition import build
+    from magnitude_engine.models.attention.blueprint import Paged
+    from magnitude_engine.models.attention.metal import MetalPagedAttention
+
+    selected = Paged()
+    assert selected.implementation() is MetalPagedAttention
+    with build(selected) as live:
+        assert component_id(live) is component_id(selected.implementation())
