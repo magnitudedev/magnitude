@@ -1,5 +1,11 @@
 # @magnitudedev/pi-extension
 
+## 0.0.1-alpha.3
+
+### Patch Changes
+
+- [`6fbb57f`](https://github.com/magnitudedev/magnitude/commit/6fbb57fed6c1c0e833a0109a24b3485773899f9d) Thanks [@anerli](https://github.com/anerli)! - simplify pi onboard logic
+
 ## 0.0.1-alpha.2
 
 ### Patch Changes
