@@ -3,7 +3,7 @@ import * as FileSystem from "@effect/platform/FileSystem"
 import { Effect } from "effect"
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent"
 import { describe, expect, it, vi } from "vitest"
-import { canOfferSetup, claimSetupOffer, offerSetup, registerMagnitudeOnboarding, SETUP_PROMPT, SETUP_QUESTION, SETUP_REMINDER } from "../extensions/onboarding"
+import { canOfferSetup, claimSetupOffer, offerSetup, registerMagnitudeOnboarding, SETUP_QUESTION, SETUP_REMINDER } from "../extensions/onboarding"
 
 const context = (overrides: Record<string, unknown> = {}) => ({
   mode: "tui", isIdle: () => true, hasPendingMessages: () => false,
@@ -20,17 +20,20 @@ describe("Magnitude setup", () => {
       const confirm = vi.fn(async () => answer)
       const sendUserMessage = vi.fn()
       const sendMessage = vi.fn()
-      const pi = { sendUserMessage, sendMessage } as unknown as ExtensionAPI
+      const runSetup = vi.fn(async () => true)
+      const pi = { sendUserMessage, sendMessage, getCommands: () => [{ name: "magnitude-setup" }] } as unknown as ExtensionAPI
       const ctx = context({ ui: { confirm } })
       const signal = new AbortController().signal
-      yield* offerSetup(pi, ctx, directory, signal)
-      yield* offerSetup(pi, ctx, directory, signal)
+      yield* offerSetup(pi, ctx, directory, signal, runSetup)
+      yield* offerSetup(pi, ctx, directory, signal, runSetup)
       expect(confirm).toHaveBeenCalledExactlyOnceWith(SETUP_QUESTION, "", { signal })
       if (answer) {
-        expect(sendUserMessage).toHaveBeenCalledExactlyOnceWith(SETUP_PROMPT)
+        expect(runSetup).toHaveBeenCalledExactlyOnceWith(ctx)
+        expect(sendUserMessage).not.toHaveBeenCalled()
         expect(sendMessage).not.toHaveBeenCalled()
       } else {
         expect(sendUserMessage).not.toHaveBeenCalled()
+        expect(runSetup).not.toHaveBeenCalled()
         expect(sendMessage).toHaveBeenCalledExactlyOnceWith({ customType: "magnitude-setup", content: SETUP_REMINDER, display: true })
       }
     })).pipe(Effect.provide(NodeFileSystem.layer)))
@@ -43,7 +46,9 @@ describe("Magnitude setup", () => {
       const sendUserMessage = vi.fn()
       const sendMessage = vi.fn()
       const ctx = context({ ui: { confirm: async () => { abort.abort(); return true } } })
-      yield* offerSetup({ sendUserMessage, sendMessage } as unknown as ExtensionAPI, ctx, directory, abort.signal)
+      const runSetup = vi.fn(async () => true)
+      yield* offerSetup({ sendUserMessage, sendMessage } as unknown as ExtensionAPI, ctx, directory, abort.signal, runSetup)
+      expect(runSetup).not.toHaveBeenCalled()
       expect(sendUserMessage).not.toHaveBeenCalled()
       expect(sendMessage).not.toHaveBeenCalled()
     })).pipe(Effect.provide(NodeFileSystem.layer)))
@@ -76,13 +81,12 @@ describe("Magnitude setup", () => {
   it("allows an empty new interactive session with CLI options", () => {
     expect(canOfferSetup(context(), ["--model", "some-model", "--no-context-files"])).toBe(true)
   })
-  it("manual setup sends the exact prompt once and never invokes a CLI", async () => {
+  it("registers graphical setup without invoking it at extension load", async () => {
     const registerCommand = vi.fn()
     const sendUserMessage = vi.fn()
     const dispose = registerMagnitudeOnboarding({ registerCommand, sendUserMessage, on: vi.fn() } as unknown as ExtensionAPI)
     expect(registerCommand.mock.calls[0]![0]).toBe("magnitude-setup")
-    await registerCommand.mock.calls[0]![1].handler("", context())
-    expect(sendUserMessage).toHaveBeenCalledExactlyOnceWith(SETUP_PROMPT)
+    expect(sendUserMessage).not.toHaveBeenCalled()
     await dispose()
   })
   it("manual setup does not interrupt an active task", async () => {

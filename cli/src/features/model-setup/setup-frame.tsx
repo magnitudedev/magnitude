@@ -1,7 +1,13 @@
-import { type ReactNode } from "react"
+import { createContext, useContext, type ReactNode } from "react"
 import { TextAttributes } from "@opentui/core"
 import { wrapTextToWordLines } from "@magnitudedev/client-common"
 import { useTheme } from "../../hooks/use-theme"
+import type { HarnessDestination } from "@magnitudedev/client-common"
+
+/** Immutable terminal host description, supplied by the CLI composition root. */
+export const SetupHostContext = createContext<(HarnessDestination & {
+  readonly developmentService: boolean
+}) | null>(null)
 
 export type SetupStage = "choose" | "install" | "harness"
 
@@ -47,6 +53,8 @@ export function SetupStepper({
 }): ReactNode {
   const theme = useTheme()
   const activeIndex = stage === "choose" ? 0 : stage === "install" ? 1 : 2
+  const host = useContext(SetupHostContext)
+  const labels = host === null ? SETUP_STEP_LABELS : ["Choose model", "Install model", `Connect ${host.name}`]
 
   if (vertical) {
     return (
@@ -58,7 +66,7 @@ export function SetupStepper({
         flexShrink: 0,
         marginBottom: 1,
       }}>
-        {SETUP_STEP_LABELS.map((label, position) => (
+        {labels.map((label, position) => (
           <box key={label} style={{ flexDirection: "column", flexShrink: 0 }}>
             <text style={{ fg: position === activeIndex ? theme.accent : theme.text.body }}>
               {position <= activeIndex ? "●" : "○"} {label}
@@ -81,7 +89,7 @@ export function SetupStepper({
       flexShrink: 0,
       marginBottom: 1,
     }}>
-      {SETUP_STEP_LABELS.map((label, position) => (
+      {labels.map((label, position) => (
         <text key={label} style={{ fg: position === activeIndex ? theme.accent : theme.text.body }}>
           {position <= activeIndex ? "●" : "○"} {label}{position < SETUP_STEP_LABELS.length - 1 ? ` ${position < activeIndex ? "════" : "────"} ` : ""}
         </text>

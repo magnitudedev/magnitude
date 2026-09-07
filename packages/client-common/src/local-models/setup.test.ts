@@ -13,6 +13,7 @@ import { localModelOptions } from "./options"
 import { onboardingModelSetupNoticeMessage } from "./failure-messages"
 import {
   HarnessIdSchema,
+  HarnessConnectionError,
   type HarnessConnection,
 } from "../harness-connections/service"
 import {
@@ -176,6 +177,22 @@ const configuredSlots = (
     }),
   },
 })
+
+const hostedConnection = () => {
+  const pi = HarnessIdSchema.make("pi")
+  const connect = vi.fn((): ReturnType<HarnessConnection["connect"]> => Effect.succeed({
+    companion: Option.none(), skillInstalled: true, startupInstalled: true,
+  }))
+  const service: HarnessConnection = {
+    list: Effect.succeed([{ id: pi, name: "Pi", availability: "Installed", selectable: true, connected: false }]),
+    connect,
+    launch: () => Effect.die("Hosted setup must never launch a harness"),
+    sync: () => Effect.succeed([]), disconnect: () => Effect.void,
+    installSkill: () => Effect.die("Use the connection transaction"),
+    installStartup: Effect.die("Use the connection transaction"),
+  }
+  return { service, connect }
+}
 
 describe("projectOnboardingModelSetupContent", () => {
   it("clamps the connection-scoped ranking preference", () => {
@@ -366,6 +383,7 @@ describe("projectOnboardingModelSetupContent", () => {
 
 interface HarnessOptions {
   readonly installed: boolean
+  readonly host?: "pi"
   readonly onboardingCompleted?: boolean
   readonly initiallyOpen?: boolean
   readonly initiallyDownloading?: boolean
@@ -595,6 +613,7 @@ const makeHarness = (options: HarnessOptions) => {
     ),
     (client) => clientServicesLayer(client, {
       onboardingSetupInitiallyOpen: options.initiallyOpen,
+      onboardingSetupHost: options.host === undefined ? undefined : HarnessIdSchema.make(options.host),
       ...(options.harnessConnection === undefined ? {} : { harnessConnection: options.harnessConnection }),
     }),
   )
@@ -791,7 +810,7 @@ describe("OnboardingModelSetup", () => {
     harness.registry.dispose()
   })
 
-  it("uses the shared connection transaction for Pi companion, skill, and startup setup", async () => {
+  it.each([undefined, "pi"] as const)("uses the shared connection transaction for Pi companion, skill, and startup setup (host %s)", async (host) => {
     const pi = HarnessIdSchema.make("pi")
     const connect = vi.fn(() => Effect.succeed({
       companion: Option.some({
@@ -831,17 +850,19 @@ describe("OnboardingModelSetup", () => {
       installSkill: () => Effect.die("onboarding must not call the legacy standalone skill operation"),
       installStartup: Effect.die("onboarding must not call the legacy standalone startup operation"),
     }
-    const harness = makeHarness({ installed: true, ready: true, harnessConnection })
+    const launch = vi.spyOn(harnessConnection, "launch")
+    const harness = makeHarness({ installed: true, ready: true, harnessConnection, host })
     await Effect.runPromise(execute(harness.registry, harness.service.select, providerModelId))
-    await Effect.runPromise(waitForView(
-      harness,
-      (state) => state._tag === "Open" && state.content._tag === "Harness",
-    ))
-
-    await Effect.runPromise(execute(harness.registry, harness.service.continueWithPi, undefined))
+    if (host === undefined) {
+      await Effect.runPromise(waitForView(
+        harness,
+        (state) => state._tag === "Open" && state.content._tag === "Harness",
+      ))
+      await Effect.runPromise(execute(harness.registry, harness.service.continueWithPi, undefined))
+    }
     const state = await Effect.runPromise(waitForView(
       harness,
-      (value) => value._tag === "Open" && value.content._tag === "HarnessHandoff",
+      (value) => value._tag === "Open" && value.content._tag === (host === undefined ? "HarnessHandoff" : "ReturnToHost"),
     ))
 
     expect(connect).toHaveBeenCalledOnce()
@@ -850,14 +871,46 @@ describe("OnboardingModelSetup", () => {
       installSkill: true,
       launchOnStartup: true,
     })
-    expect(state).toMatchObject({
+    expect(state).toMatchObject(host === undefined ? {
       content: {
         _tag: "HarnessHandoff",
         plan: { harness: "pi", command: "pi" },
       },
-    })
+    } : { content: { _tag: "ReturnToHost", modelId: providerModelId } })
+    expect(launch).toHaveBeenCalledTimes(host === undefined ? 1 : 0)
     expect(harness.onboardingCompleted()).toBe(true)
     harness.registry.dispose()
+  })
+
+  it.each([true, false])("hosted setup connects only after acquisition and loading (installed %s)", async installed => {
+    const connection = hostedConnection()
+    const harness = makeHarness({ installed, host: "pi", harnessConnection: connection.service })
+    try {
+      await Effect.runPromise(execute(harness.registry, harness.service.select, providerModelId))
+      await Effect.runPromise(waitForView(harness, state => state._tag === "Open" && state.content._tag === "ReturnToHost"))
+      expect(connection.connect).toHaveBeenCalledOnce()
+      expect(harness.calls).toContain("LoadModelSlot")
+      expect(harness.calls.includes("SyncLocalModel")).toBe(!installed)
+      expect(harness.onboardingCompleted()).toBe(true)
+    } finally { harness.registry.dispose() }
+  })
+
+  it("hosted setup retains a connection failure and retries without reloading a ready model", async () => {
+    const connection = hostedConnection()
+    connection.connect.mockImplementationOnce(() => Effect.fail(new HarnessConnectionError({ operation: "connect", message: "startup unavailable" })))
+    const harness = makeHarness({ installed: true, ready: true, host: "pi", harnessConnection: connection.service })
+    try {
+      await Effect.runPromise(execute(harness.registry, harness.service.select, providerModelId))
+      const state = await Effect.runPromise(waitForView(harness, state => state._tag === "Open" && Option.isSome(state.notice)))
+      expect(state).toMatchObject({ notice: { value: { failure: { message: "startup unavailable" } } } })
+      expect(harness.onboardingCompleted()).toBe(false)
+      harness.registry.set(harness.service.select, Atom.Reset)
+      await Effect.runPromise(execute(harness.registry, harness.service.select, providerModelId))
+      await Effect.runPromise(waitForView(harness, state => state._tag === "Open" && state.content._tag === "ReturnToHost"))
+      expect(connection.connect).toHaveBeenCalledTimes(2)
+      expect(harness.calls).not.toContain("LoadModelSlot")
+      expect(harness.onboardingCompleted()).toBe(true)
+    } finally { harness.registry.dispose() }
   })
 
   it("does not consume the stale pre-sync catalog while the replacement read is pending", async () => {

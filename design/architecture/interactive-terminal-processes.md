@@ -3,6 +3,7 @@ applies_to:
   - packages/utils/src/process/**
   - packages/launcher/src/cli-process-spawner.ts
   - cli/src/runtime/interactive.tsx
+  - integrations/pi/extensions/setup.ts
 ---
 
 # Interactive terminal processes
@@ -26,6 +27,14 @@ the child when its owning Effect scope is interrupted.
 This contract governs both the npm launcher handing the terminal to the native Magnitude CLI and
 the native CLI handing it to an external harness. General-purpose command executors remain valid
 for non-interactive subprocesses but do not satisfy this contract.
+
+Pi-hosted setup uses the same primitive in the opposite direction. Pi's custom UI leases its
+terminal, stops its TUI before launching Magnitude, and restarts/redraws it only after the child
+has exited or been terminated and reaped. The private setup result is decoded after terminal
+restoration. Resource reload occurs only after the process and temporary-file scopes have closed.
+CLI installation and capability checks are non-interactive preparation: they use scoped piped
+subprocesses while Pi keeps rendering its native cancellable loader. Their output never inherits
+the terminal. Cancelling preparation reaps subprocess work before closing the loader.
 
 ## Required guarantees
 

@@ -9,6 +9,13 @@ import { DefaultResourceLoader } from "@earendil-works/pi-coding-agent"
 import { parseArgs } from "../node_modules/@earendil-works/pi-coding-agent/dist/cli/args.js"
 
 describe("Pi development resource isolation", () => {
+  it("allows package-first onboarding without a preconfigured model", () => {
+    const args = parseArgs(piDevelopmentArgs(undefined, "/checkout/dist/skills/magnitude/SKILL.md"))
+    expect(args.model).toBeUndefined()
+    expect(args.messages).toEqual([])
+    expect(args.noSkills).toBe(true)
+    expect(args.skills).toEqual(["/checkout/dist/skills/magnitude/SKILL.md"])
+  })
   it("loads only the explicit checkout skill despite a conflicting auto-discovered skill, including reload", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem

@@ -10,9 +10,15 @@ pi install npm:@magnitudedev/pi-extension
 ```
 
 On the next fresh interactive Pi launch, Magnitude asks **“Set up local models with Magnitude now?”**
-Yes sends this prompt to your current Pi agent and starts onboarding:
-
-> Set up local models for me with the Magnitude CLI. Install it with `npm i -g @magnitudedev/cli` (or my package manager), then run `magnitude docs onboarding` and follow the instructions.
+Yes opens Magnitude's actual graphical setup in the same terminal, including its model rankings,
+radar, downloads, and loading progress. It connects Pi automatically at the final step, then returns
+to the same Pi conversation with the selected model active. No agent prompt or cloud credentials
+are needed. If Magnitude is missing, accepting setup installs the CLI with
+`npm install --global @magnitudedev/cli` before opening onboarding. Pi stays visible with its native
+spinner: “Installing Magnitude…”. Installer output is suppressed; failures
+show a concise diagnostic. Escape cancels preparation, and `/magnitude-setup` retries.
+An existing CLI is preserved and must support hosted setup; an incompatible version reports an
+update requirement rather than being silently replaced.
 
 No or Escape leaves “You can set up local models anytime with `/magnitude-setup`.” in the conversation.
 The offer is remembered per Pi profile across restarts, reloads, and package updates. Existing
@@ -20,9 +26,9 @@ Magnitude model configurations, non-interactive modes, conversations, and startu
 alone. Run `/magnitude-setup` whenever you want to start onboarding yourself.
 
 The package includes the Magnitude usage skill; an already-loaded skill of that name takes
-precedence without a collision warning. `--no-skills` disables this fallback too. The CLI is not
-an npm dependency and is not required to load the extension. Your Pi agent needs a working model
-and credentials to carry out onboarding.
+precedence without a collision warning. `--no-skills` disables this fallback too. No separate CLI
+installation is needed. npm must be available with a writable global prefix, as for a normal npm
+CLI installation. Merely loading the extension does not install software.
 
 If you already have Magnitude and a local model, connect directly:
 
@@ -49,7 +55,7 @@ latency, and token-weighted generation throughput. Pi extensions execute with yo
 
 Commands:
 
-- `/magnitude-setup` — ask your current agent to set up Magnitude local models
+- `/magnitude-setup` — open Magnitude's graphical model setup inside Pi
 - `/load-model [model-id]` — load an installed model
 - `/stop-model` — stop the active model
 
@@ -74,3 +80,16 @@ builds and runs the checkout's inference runtime,
 and keeps the current source CLI available until Pi exits. Exiting Pi stops the development runtime
 and restores the service state that existed before launch. The launcher inherits the current
 environment; it does not start or configure tracing.
+
+To test the first-run setup offer with no preconfigured Magnitude provider:
+
+```sh
+bun run dev:pi --setup
+```
+
+This installs only the checkout's package into the temporary Pi profile. Accept the setup offer,
+choose a model, and return to Pi to chat. Both development modes keep connection files and skills
+inside the temporary profile, and do not change login-startup registration. They share the machine's
+real model storage and inference service: downloads consume disk space and selected models use
+memory. The launcher restores the prior managed service after Pi exits. Ordinary installed setup
+does enable login startup.

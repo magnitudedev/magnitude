@@ -96,6 +96,9 @@ When a cached update is offered, the prompt renders inline before service work. 
 interrupt an in-progress inline startup, but always renders before OpenTUI is created. The prompt
 has three choices: update now, skip this launch, skip until the next version.
 Noninteractive launches and launches with an initial prompt never show it.
+Pi-hosted setup also suppresses update interaction: its child must preserve the terminal-host result
+contract and must not replace itself through the update/relaunch flow. Incompatible CLI preflight
+reports explicit install/update guidance in Pi. Ordinary discovery may still refresh its cache.
 
 Accepting an update completes the inline terminal scope before invoking the package manager; no
 React root or OpenTUI renderer exists yet.

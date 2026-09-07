@@ -28,6 +28,7 @@
     "@earendil-works/pi-tui": ">=0.83.0"
   },
   "devDependencies": {
+    "@magnitudedev/client-common": "workspace:*",
     "@effect/platform-bun": "^0.90.0",
     "@magnitudedev/release": "workspace:*",
     "@magnitudedev/utils": "workspace:*",
