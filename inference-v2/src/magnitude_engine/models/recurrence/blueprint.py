@@ -1,9 +1,9 @@
-from magnitude_engine.composition import Blueprint, component
+from magnitude_engine.composition import Blueprint, blueprint
 
 from .contracts import DeltaRecurrence
 
 
-@component
+@blueprint
 class Delta(Blueprint[DeltaRecurrence]):
     specialize_prefill: bool = False
 
@@ -14,7 +14,7 @@ class Delta(Blueprint[DeltaRecurrence]):
         return MetalDelta
 
 
-@component
+@blueprint
 class Reference(Blueprint[DeltaRecurrence]):
     @staticmethod
     def implementation() -> type[DeltaRecurrence]:
@@ -23,7 +23,7 @@ class Reference(Blueprint[DeltaRecurrence]):
         return DeltaReference
 
 
-@component
+@blueprint
 class MLX(Blueprint[DeltaRecurrence]):
     @staticmethod
     def implementation() -> type[DeltaRecurrence]:

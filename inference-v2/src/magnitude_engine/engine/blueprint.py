@@ -1,6 +1,6 @@
 from dataclasses import field
 
-from magnitude_engine.composition import Blueprint, component
+from magnitude_engine.composition import Blueprint, blueprint
 from magnitude_engine.generation.contracts import GenerationFactory
 
 from .contracts import EngineInstance
@@ -12,7 +12,7 @@ from .scheduler.blueprint import TimeShared
 from .scheduler.contracts import Scheduler
 
 
-@component
+@blueprint
 class Engine(Blueprint[EngineInstance]):
     generation: Blueprint[GenerationFactory]
     scheduler: Blueprint[Scheduler] = field(default_factory=TimeShared)

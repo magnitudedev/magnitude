@@ -539,7 +539,7 @@ not be an extra external pass.
 
 ## Qualification
 
-Current scores follow the [assessment rules](../../performance.md#evidence-and-current-assessments).
+Current scores follow the [assessment rules](../../performance.md#stable-compositions-and-evidence).
 
 Existing components have tests and diagnostic comparisons, but not every named
 boundary yet has a dedicated independently qualified benchmark function. The tree

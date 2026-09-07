@@ -1,7 +1,7 @@
 from dataclasses import field
 
 from magnitude_engine.artifacts.source import LocalArtifact
-from magnitude_engine.composition import Blueprint, component
+from magnitude_engine.composition import Blueprint, blueprint
 from magnitude_engine.models.attention.blueprint import Paged
 from magnitude_engine.models.attention.contracts import PagedAttention
 from magnitude_engine.models.contracts import ProgramSource
@@ -13,7 +13,7 @@ from magnitude_engine.resources.io.blueprint import PositionalReader
 from magnitude_engine.resources.io.reader import PositionalReader as Reader
 
 
-@component
+@blueprint
 class Program(Blueprint[ProgramSource]):
     artifact: Blueprint[LocalArtifact]
     attention: Blueprint[PagedAttention] = field(default_factory=Paged)

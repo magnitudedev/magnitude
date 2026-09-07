@@ -6,6 +6,8 @@ from typing import Protocol
 
 import mlx.core as mx
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
 from magnitude_engine.models.activations import sigmoid_gate
 from magnitude_engine.models.execution import ExecutionScope
 from magnitude_engine.models.experts.contracts import ExpertOperator
@@ -18,6 +20,7 @@ class FeedForward(Protocol):
 
 
 @dataclass(frozen=True)
+@component(c.QWEN_FEEDFORWARD, source=c.Source.LM, variant="DENSE")
 class DenseFeedForward:
     call: Transform
 
@@ -26,6 +29,7 @@ class DenseFeedForward:
 
 
 @dataclass(frozen=True)
+@component(c.QWEN_FEEDFORWARD, source=c.Source.MAG, variant="ROUTED")
 class RoutedFeedForward:
     router: Transform
     experts: ExpertOperator

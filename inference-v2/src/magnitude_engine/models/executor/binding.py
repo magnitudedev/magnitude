@@ -19,3 +19,15 @@ class ModelExecutor(ExecutorFactory):
             return BoundExecutor(ModelRuntime(program.program, states, resources.owner), program)
 
         return resources.once(self, construct)
+
+
+class DefaultExecutor(ExecutorFactory):
+    """A validated production-default selection; candidates use ordinary executors."""
+
+    def __init__(self, *, definition: str, artifact, executor: ExecutorFactory):
+        self.definition, self.artifact, self.executor = definition, artifact, executor
+
+    def load(self, resources: ModelResources) -> BoundExecutor:
+        from dataclasses import replace
+
+        return replace(self.executor.load(resources), selection="default")

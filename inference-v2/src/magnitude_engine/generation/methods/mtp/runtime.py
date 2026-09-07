@@ -7,6 +7,8 @@ from typing import Any
 
 import mlx.core as mx
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
 from magnitude_engine.generation.features import RetainedFeature
 from magnitude_engine.generation.proposals import Proposal
 from magnitude_engine.models.inputs import ModelInputs
@@ -204,6 +206,7 @@ class MTPSession:
         self.closed = True
 
 
+@component(c.SPECULATION, source=c.Source.MAG, variant="TARGET_MATCHING")
 class MTPMethod:
     def __init__(
         self,
@@ -230,6 +233,7 @@ class MTPMethod:
         self.target, self.head = target, head
         self.target_feature, self.project = target_feature, project
         self.capacity, self.budget = capacity, budget
+        self.artifact_path = identity
         self.identity = f"mtp:{identity}:{capacity}:{target_feature}"
 
     def create(

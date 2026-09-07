@@ -12,6 +12,8 @@ from typing import Protocol
 
 import mlx.core as mx
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
 from magnitude_engine.resources.budget import MemoryBudget
 
 
@@ -52,6 +54,7 @@ class RecurrentLayout:
         return sum(t.nbytes for t in self.tensors)
 
 
+@component(c.RECURRENT_STATE, source=c.Source.MAG, variant="CHECKPOINTED")
 class RecurrentImage:
     """Write each layer once, then share immutable rows until their last lease ends."""
 

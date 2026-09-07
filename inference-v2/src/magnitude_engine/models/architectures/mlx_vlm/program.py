@@ -1,15 +1,37 @@
 """The library forward is one program implementation, not an engine policy."""
 
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import mlx.core as mx
+import mlx.nn as nn
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
 from magnitude_engine.models.execution import ExecutionScope
 from magnitude_engine.models.inputs import ModelInputs
 from magnitude_engine.models.runtime import ForwardRequest, ModelOutput
 from magnitude_engine.models.state.native import LibraryState
 
+from .definition import DEFINITION
 
+
+@dataclass(frozen=True)
+class LibraryForward:
+    """Bind the upstream language model to our token/cache calling convention."""
+
+    model: nn.Module
+
+    def __call__(self, tokens: mx.array, cache: list) -> mx.array:
+        offset = next((c.offset for c in cache if hasattr(c, "offset")), 0)
+        if isinstance(offset, mx.array) and offset.ndim == 1:
+            offset = offset[:, None]
+        positions = mx.arange(tokens.shape[1], dtype=mx.int32)[None, :] + offset
+        output = self.model(tokens, cache=cache, position_ids=positions)
+        return output if isinstance(output, mx.array) else output.logits
+
+
+@component(c.FORWARD, source=c.Source.VLM, variant="STANDARD", model=DEFINITION)
 class LibraryProgram:
     """A bound library call; family adapters provide richer named features separately.
 
@@ -37,7 +59,8 @@ class LibraryProgram:
         return ModelOutput(logits if request.logits else None)
 
     def forward_batch(self, inputs, states, request, scope) -> ModelOutput:
-        logits = self.call(mx.concatenate([row.tokens for row in inputs]),
-                           states[0].store.batch_caches(states))
+        logits = self.call(
+            mx.concatenate([row.tokens for row in inputs]), states[0].store.batch_caches(states)
+        )
         states[0].store.publish_batch(states)
         return ModelOutput(logits if request.logits else None)

@@ -51,7 +51,7 @@ def validate(value: object, annotation: Any) -> object:
     origin, args = get_origin(annotation), get_args(annotation)
     if origin is Blueprint:
         if not isinstance(value, Blueprint):
-            raise TypeError("a component dependency must be a blueprint")
+            raise TypeError("a blueprint dependency must be a blueprint")
         (expected,) = args
         actual = result_type(type(value))
         if actual is not expected and not issubclass(actual, expected):
@@ -82,10 +82,10 @@ def validate(value: object, annotation: Any) -> object:
 
 
 @dataclass_transform(frozen_default=True, kw_only_default=True, eq_default=False)
-def component[C: type](cls: C) -> C:
+def blueprint[C: type](cls: C) -> C:
     """Make a frozen declaration; no registry mutation or implementation import."""
     if not issubclass(cls, Blueprint):
-        raise TypeError("@component requires a Blueprint subclass")
+        raise TypeError("@blueprint requires a Blueprint subclass")
     original = cls.__dict__.get("__post_init__")
 
     def checked(self: Blueprint) -> None:

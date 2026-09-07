@@ -3,9 +3,13 @@
 import mlx.core as mx
 from mlx_lm.models.gated_delta import gated_delta_kernel
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
+
 from .inputs import DeltaInputs
 
 
+@component(c.RECURRENCE, source=c.Source.LM, variant="STANDARD")
 class MLXDelta:
     def advance(self, inputs: DeltaInputs, state: mx.array) -> tuple[mx.array, mx.array]:
         return gated_delta_kernel(

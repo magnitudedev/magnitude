@@ -6,6 +6,9 @@ from collections import Counter
 from dataclasses import dataclass
 from threading import RLock
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
+
 
 @dataclass(frozen=True)
 class Usage:
@@ -38,6 +41,7 @@ class Reservation:
         self.close()
 
 
+@component(c.MEMORY, source=c.Source.MAG, variant="RESERVATIONS")
 class MemoryBudget:
     """A worker-wide reservation ledger; observed OS usage is a separate measurement.
 

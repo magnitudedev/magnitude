@@ -2,6 +2,7 @@
 
 from typing import cast
 
+from magnitude_engine import components as c
 from performance.assembly import BoundAssembly, bind_operation
 from performance.benchmarks.fixtures import record_inputs, tokens
 from performance.records import Assembly, Observation, digest
@@ -181,8 +182,8 @@ def batch(
 
     binding = bind_operation(
         BatchGenerator.__init__,
-        "ENGINE:INFERENCE:VLM:BATCH_GENERATOR",
-        parameters={"prefill_tokens": prefill_tokens, "max_batch": rows},
+        c.Implementation(c.ENGINE, c.Source.VLM, "BATCH_GENERATOR"),
+        parameters=c.Configuration(settings={"prefill_tokens": prefill_tokens, "max_batch": rows}),
     )
     from dataclasses import replace
 

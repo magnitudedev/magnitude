@@ -6,6 +6,8 @@ from typing import Protocol
 
 import mlx.core as mx
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
 from magnitude_engine.models.embeddings.contracts import EmbeddingLookup
 from magnitude_engine.models.execution import ExecutionScope
 from magnitude_engine.models.inputs import ModelInputs
@@ -13,6 +15,7 @@ from magnitude_engine.models.runtime import ForwardRequest, ModelOutput
 from magnitude_engine.models.state.hybrid import HybridState
 
 from .decode import ResidentDecode
+from .definition import DEFINITION
 from .feedforward.operation import (
     FeedForward,
 )
@@ -34,6 +37,12 @@ class HybridBlock:
     feedforward: FeedForward
 
 
+@component(
+    c.QWEN35,
+    source=c.Source.MAG,
+    variant=lambda p: "RESIDENT_COMPILED" if p.decode is not None else "LAYERWISE",
+    model=DEFINITION,
+)
 class Qwen35Program:
     conditioning: frozenset[str] = frozenset()
 

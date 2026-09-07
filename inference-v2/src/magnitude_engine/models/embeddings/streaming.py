@@ -11,7 +11,9 @@ from threading import RLock
 import mlx.core as mx
 import numpy as np
 
+from magnitude_engine import components as c
 from magnitude_engine.artifacts.tensors import DTYPE_BYTES
+from magnitude_engine.components import component
 from magnitude_engine.resources.budget import MemoryBudget, Reservation
 from magnitude_engine.resources.io.reader import PositionalReader, Read
 
@@ -37,14 +39,14 @@ class RowLease:
             raise RuntimeError("row lease is closed")
         rows = self.future.result()
         components, offset = [], 0
-        for component in self.owner.table.shards[0]:
-            width = component.shape[1] * DTYPE_BYTES[component.dtype]
+        for part in self.owner.table.shards[0]:
+            width = part.shape[1] * DTYPE_BYTES[part.dtype]
             raw = np.ascontiguousarray(rows.encoded[:, offset : offset + width])
             dtype = {"U32": np.uint32, "BF16": np.uint16, "F16": np.float16, "F32": np.float32}[
-                component.dtype
+                part.dtype
             ]
             value = mx.array(raw.view(dtype))
-            if component.dtype == "BF16":
+            if part.dtype == "BF16":
                 value = value.view(mx.bfloat16)
             components.append(value)
             offset += width
@@ -70,6 +72,7 @@ class RowLease:
                 self.owner._pending.remove(self)
 
 
+@component(c.EMBEDDING, source=c.Source.MAG, variant="STREAMED")
 class StreamedEmbedding:
     """Bounded row staging and encoded LRU cache, with serialized lookahead planning.
 
@@ -175,8 +178,8 @@ class StreamedEmbedding:
             shard = bisect_right(self._boundaries, row) - 1
             local = row - self._boundaries[shard]
             offset = 0
-            for component in self.table.shards[shard]:
-                source = component.row(local)
+            for part in self.table.shards[shard]:
+                source = part.row(local)
                 reads.append(
                     Read(source, memoryview(encoded[index, offset : offset + source.size]))
                 )

@@ -56,6 +56,11 @@ class VocabularyLoan:
         self.owner.check()
         return self._project(hidden)
 
+    def bindings(self) -> EmbeddingLookup:
+        if self.closed or self._embedding is None:
+            raise RuntimeError("vocabulary loan is closed")
+        return self._embedding
+
     def close(self) -> None:
         if not self.closed:
             self._embedding = None
@@ -117,6 +122,11 @@ class OwnedProgram[S]:
         scope.acquire(self.acquire)
         assert self._program is not None and self._program.forward_batch is not None
         return self._program.forward_batch(inputs, states, request, scope)
+
+    def bindings(self) -> ModelProgram[S]:
+        self.check()
+        assert self._program is not None
+        return self._program
 
     def close(self) -> None:
         if self._users or self._loans:

@@ -1,9 +1,9 @@
-from magnitude_engine.composition import Blueprint, component
+from magnitude_engine.composition import Blueprint, blueprint
 from magnitude_engine.generation.contracts import MethodFactory
 from magnitude_engine.models.executor.contracts import ExecutorFactory
 
 
-@component
+@blueprint
 class MTP(Blueprint[MethodFactory]):
     drafter: Blueprint[ExecutorFactory]
     max_draft_tokens: int | None = None

@@ -9,6 +9,8 @@ from typing import Protocol, cast
 
 import mlx.core as mx
 
+from magnitude_engine import components as c
+from magnitude_engine.components import component
 from magnitude_engine.models.inputs import ModelInputs
 from magnitude_engine.models.operations import Task, accept, complete, forward, observe
 from magnitude_engine.models.runtime import (
@@ -177,7 +179,8 @@ class GenerationSequence[S, C: ModelCheckpoint]:
         try:
             inputs = ModelInputs.from_tokens(tokens)
             advance = yield from forward(
-                self.model, inputs,
+                self.model,
+                inputs,
                 ForwardRequest(False, self.method.prefill_features, committed_inputs=count),
             )
             yield from complete(advance)
@@ -210,12 +213,16 @@ class GenerationSequence[S, C: ModelCheckpoint]:
     def round(self, token_allowance: int) -> Task[GenerationResult]:
         self._check_step(token_allowance)
         if (
-            self.constraint is None and not self.sampler.policy.uses_history
+            self.constraint is None
+            and not self.sampler.policy.uses_history
             and isinstance(self.method, CausalSession)
         ):
             result = yield from self.method.decode_causal(
-                self.runtime.model, self.model, anchor=self.context[-1],
-                position=len(self.context), sampler=self.sampler,
+                self.runtime.model,
+                self.model,
+                anchor=self.context[-1],
+                position=len(self.context),
+                sampler=self.sampler,
                 allowance=min(token_allowance, self.max_tokens - self.generated),
                 stop_tokens=self.stop_tokens,
             )
@@ -329,7 +336,8 @@ class GenerationSequence[S, C: ModelCheckpoint]:
         self.sampler.observe(emitted)
         self.generated += len(emitted)
         reason = (
-            "stop" if emitted[-1] in self.stop_tokens
+            "stop"
+            if emitted[-1] in self.stop_tokens
             else ("length" if self.generated == self.max_tokens else None)
         )
         self.finished = reason is not None
@@ -427,7 +435,8 @@ class GenerationRuntime[S, C: ModelCheckpoint]:
         self.constraints = constraints
 
     def prefill_groups(
-        self, sequences: tuple[GenerationSequence[S, C], ...],
+        self,
+        sequences: tuple[GenerationSequence[S, C], ...],
     ) -> tuple[tuple[GenerationSequence[S, C], ...], ...]:
         """Describe compatible prompt work before policy divides its token allowance."""
         groups: list[list[GenerationSequence[S, C]]] = []
@@ -442,6 +451,7 @@ class GenerationRuntime[S, C: ModelCheckpoint]:
                 groups.append([sequence])
         return tuple(tuple(group) for group in groups)
 
+    @component(c.PREFILL, source=c.Source.MAG, variant="CHUNKED")
     def prefill_many(
         self,
         sequences: tuple[GenerationSequence[S, C], ...],
@@ -456,10 +466,13 @@ class GenerationRuntime[S, C: ModelCheckpoint]:
             or any(s.runtime is not self for s in sequences)
         ):
             raise ValueError("prefill service requires distinct owned rows and aligned allowances")
-        results = execute(tuple(
-            sequence.prefill_task(limit)
-            for sequence, limit in zip(sequences, token_allowances, strict=True)
-        ), clock=clock)
+        results = execute(
+            tuple(
+                sequence.prefill_task(limit)
+                for sequence, limit in zip(sequences, token_allowances, strict=True)
+            ),
+            clock=clock,
+        )
         services = []
         for sequence, result in zip(sequences, results, strict=True):
             outcome = result.result

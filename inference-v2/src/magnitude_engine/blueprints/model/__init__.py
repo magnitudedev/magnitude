@@ -1,3 +1,4 @@
+from magnitude_engine.models.definition import Default
 from magnitude_engine.models.executor.blueprint import Executor
 from magnitude_engine.models.resolution import auto
 
@@ -14,6 +15,7 @@ from . import (
 )
 
 __all__ = [
+    "Default",
     "Executor",
     "auto",
     "artifacts",

@@ -1,13 +1,13 @@
 from dataclasses import field
 
-from magnitude_engine.composition import Blueprint, component
+from magnitude_engine.composition import Blueprint, blueprint
 from magnitude_engine.resources.io.blueprint import PositionalReader
 from magnitude_engine.resources.io.reader import PositionalReader as Reader
 
 from .contracts import ExpertFactory
 
 
-@component
+@blueprint
 class Resident(Blueprint[ExpertFactory]):
     @staticmethod
     def implementation() -> type[ExpertFactory]:
@@ -16,7 +16,7 @@ class Resident(Blueprint[ExpertFactory]):
         return Resident
 
 
-@component
+@blueprint
 class Streamed(Blueprint[ExpertFactory]):
     slots: int = 8
     reader: Blueprint[Reader] = field(default_factory=PositionalReader)
