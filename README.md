@@ -92,7 +92,10 @@ No. Prompts, files, and models stay on your machine.
 
 ### Can it run completely offline?
 
-Yes. Once Magnitude and a model are downloaded, no internet connection needed.
+Yes, once Magnitude, a model, and any external harness executable are already
+installed. Claude Code is distributed separately and must be staged while
+online; Magnitude then routes it to the local model without network access.
+See the [Claude Code offline guide](https://docs.magnitude.dev/claude-code-offline).
 
 ### Can I use models outside the catalog?
 

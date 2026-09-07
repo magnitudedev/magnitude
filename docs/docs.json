@@ -65,6 +65,7 @@
         "pages": [
             "introduction",
             "get-started",
+            "claude-code-offline",
             "models",
             "inference",
             "magnitude-harness",

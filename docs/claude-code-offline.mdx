@@ -1,0 +1,78 @@
+---
+title: Claude Code offline
+description: "Use Claude Code with Magnitude's local models without network access"
+icon: wifi-off
+---
+
+Magnitude can run Claude Code against a downloaded local model, but it cannot
+distribute or install the Claude Code executable. Claude Code must be obtained
+from Anthropic's supported distribution channel, and any required account
+authentication must be completed before disconnecting from the network.
+
+This means a **first-time, fully offline installation of Claude Code is not
+supported by this repository**. The supported workflow is to stage the
+software and model while online, then use the local gateway offline.
+
+## Stage the machine while online
+
+Install Magnitude and Claude Code using their normal installation methods, then
+complete Magnitude setup and choose a model:
+
+```sh
+npm install -g @magnitudedev/cli
+magnitude setup
+```
+
+The setup flow installs the Magnitude service, downloads the selected model,
+and can connect Claude Code automatically. If Claude Code is already installed,
+connect it explicitly after the model is installed:
+
+```sh
+magnitude connections add claude-code --set-model <model-id> --install-skill
+```
+
+Replace `<model-id>` with the exact ID shown by `magnitude catalog
+recommendations` or `magnitude models status`. The command writes Claude Code's
+user settings and configures the local Anthropic gateway; it does not store an
+Anthropic credential.
+
+Before going offline, verify that the model is installed and the service starts
+successfully:
+
+```sh
+magnitude models status <model-id>
+magnitude service start
+magnitude connections list
+```
+
+Keep the installed Claude Code executable, Magnitude CLI, Magnitude service
+installation, and model files on the same machine. Copying only the repository
+does not copy these runtime artifacts.
+
+## Use Claude Code offline
+
+After staging is complete, disconnect the machine and start Claude Code
+normally. Magnitude routes the selected `anthropic-local/<model-id>` model to
+the local service; prompts, files, and model inference remain on the machine.
+
+If the service is not running, start it before Claude Code:
+
+```sh
+magnitude service start
+claude
+```
+
+Do not use a hosted Claude model while offline. Hosted models retain their
+normal Anthropic authentication and require network access.
+
+## What still needs network access
+
+- The initial Claude Code distribution or installer.
+- The initial Magnitude CLI and inference runtime acquisition.
+- Downloading the selected model (or staging a valid supported cache).
+- Anthropic account authentication or hosted-model requests.
+
+Once those artifacts are present and valid, Magnitude's cached installation and
+local model runtime are usable without internet access. If the executable,
+runtime, or model is missing or invalid, offline repair is not possible; restore
+the missing artifact while online.
