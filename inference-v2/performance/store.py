@@ -89,6 +89,8 @@ def validate_run(run: dict) -> None:
 class Store:
     def __init__(self, root: Path = DEFAULT_STORE):
         self.root = Path(root)
+        self._current_signature = None
+        self._current = None
 
     def runs(self) -> list[dict]:
         result = []
@@ -111,6 +113,25 @@ class Store:
     def state(self) -> dict:
         path = self.root / "state.json"
         return json.loads(path.read_text()) if path.exists() else self.refresh()
+
+    def current(self) -> dict:
+        """Read published production state once per atomic replacement, never rebuild."""
+        from performance.presentation import production_state
+
+        path = self.root / "state.json"
+        try:
+            # fstat the opened file so an overlapping publication cannot associate
+            # the contents of one generation with another generation's signature.
+            with path.open() as stream:
+                info = os.fstat(stream.fileno())
+                signature = (info.st_ino, info.st_mtime_ns, info.st_size)
+                if self._current is None or signature != self._current_signature:
+                    self._current = production_state(json.load(stream))
+                    self._current_signature = signature
+        except FileNotFoundError:
+            self._current = production_state({})
+            self._current_signature = None
+        return self._current
 
     def ingest(self, run: dict) -> bool:
         return bool(self.ingest_many([run])["imported"])

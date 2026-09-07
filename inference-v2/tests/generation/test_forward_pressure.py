@@ -1,4 +1,4 @@
-"""Device-free preparation recovery through real model transactions and spans."""
+"""Device-free preparation recovery through real model transactions and completion dependencies."""
 
 from types import SimpleNamespace
 
@@ -76,7 +76,7 @@ class Program:
 
 def run(rows, limit, *, fail_program=False, fail_drain=False):
     events = []
-    owner = ExecutionOwner(Backend(events, fail_drain=fail_drain))
+    owner = ExecutionOwner(Backend(events, fail_complete=fail_drain, fail_drain=fail_drain))
     store, program = Store(limit), Program(fail=fail_program)
     runtime = ModelRuntime(program, store, owner)
     sequences = tuple(runtime.create() for _ in range(rows))
@@ -105,18 +105,18 @@ def test_pressure_retires_shared_committed_span_and_retries_only_preparation(row
     assert program.calls == [(0,) * rows, (1,) * rows]
     assert sorted(publications) == [(row, pos) for row in range(rows) for pos in range(2)]
     assert len(store.errors) == 1
-    assert events.count("drain") == 2
-    assert store.budget.snapshot().reserved == 0
+    assert events.count("complete") == 1 and "drain" not in events
+    assert store.budget.snapshot().reserved == rows
     for sequence in sequences:
         assert not sequence.failed and sequence.pending is None
         sequence.close()
     owner.close()
 
 
-def test_without_pressure_all_forwards_keep_one_shared_retirement_fence():
+def test_without_pressure_submitted_work_retires_only_at_explicit_completion():
     owner, store, program, sequences, events, publications, tasks = run(2, 4)
     assert [row.result for row in execute(tasks)] == [2, 2]
-    assert not store.errors and events.count("drain") == 1
+    assert not store.errors and "drain" not in events and "complete" not in events
     assert len(publications) == 4 and len(program.calls) == 2
     for sequence in sequences:
         sequence.close()
@@ -171,7 +171,7 @@ def test_persistent_preparation_failure_retries_once_after_retirement():
     result = execute(tasks)
     assert result[0].result is error and failures == [1, 1]
     assert program.calls == [(0,)] and publications == [(0, 0)]
-    assert events.count("drain") == 1
+    assert events.count("complete") == 1 and "drain" not in events
     assert store.budget.snapshot().reserved == 0
     sequences[0].close()
     owner.close()

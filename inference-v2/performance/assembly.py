@@ -9,7 +9,7 @@ import json
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from magnitude_engine.components import component_id, component_of
@@ -81,6 +81,14 @@ def source_key(owners: tuple[object, ...]) -> tuple[str, dict[str, str]]:
                 else self.generic_visit(node)
             )
 
+    # Explicit controls can live outside this repository (for example a POC).
+    # Follow their own package as well as the supported execution packages.
+    packages = {"magnitude_engine", "mlx_lm", "mlx_vlm", "mlx.nn", "performance", "tests"}
+    for value in owners:
+        value = inspect.unwrap(cast(Any, value))
+        owner = value if inspect.isroutine(value) or inspect.isclass(value) else type(value)
+        packages.add(owner.__module__.split(".")[0])
+
     def visit(value):
         value = inspect.unwrap(value)
         owner = (
@@ -92,9 +100,7 @@ def source_key(owners: tuple[object, ...]) -> tuple[str, dict[str, str]]:
             return
         seen.add(id(owner))
         module = owner.__module__
-        if not module.startswith(
-            ("magnitude_engine", "mlx_lm", "mlx_vlm", "mlx.nn", "performance", "tests")
-        ):
+        if not any(module == package or module.startswith(package + ".") for package in packages):
             return
         try:
             tree = RuntimeCode().visit(ast.parse(textwrap.dedent(inspect.getsource(owner))))

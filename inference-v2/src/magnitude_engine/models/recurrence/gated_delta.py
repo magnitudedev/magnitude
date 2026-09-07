@@ -7,11 +7,11 @@ import mlx.core as mx
 
 from ..execution import ExecutionScope
 from ..state.recurrent import (
-    RecurrentBoundaries,
     RecurrentLayout,
     RecurrentSlot,
     StateTensor,
     read_batch,
+    stage_boundaries,
     write_batch,
 )
 from .contracts import DeltaRecurrence
@@ -95,9 +95,7 @@ class GatedDelta:
         conv, memory = read_batch(slots)
         if count == 1 or committed_inputs == count:
             output, new_conv, updated = self._advance(hidden, conv, memory)
-            row_values = write_batch(slots, (new_conv, updated))
-            for slot, values in zip(slots, row_values, strict=True):
-                slot.stage(RecurrentBoundaries(slot.values, values, count))
+            stage_boundaries(slots, (new_conv, updated), count)
             if count > 1:
                 scope.submit_state(new_conv, updated)
             return output

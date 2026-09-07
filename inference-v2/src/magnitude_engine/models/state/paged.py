@@ -62,7 +62,10 @@ class PagedStateStore:
 
     def arrays(self, state: SequencePages) -> tuple[mx.array, ...]:
         self._check(state)
-        return (*self.pages.arena.keys, *self.pages.arena.values)
+        arrays = (*self.pages.arena.keys, *self.pages.arena.values)
+        if state.tail is not None:
+            arrays += state.tail.image.buffers
+        return arrays
 
     def checkpoint(self, state: SequencePages) -> KVCheckpoint:
         self._check(state)

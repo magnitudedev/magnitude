@@ -5,14 +5,14 @@ from dataclasses import dataclass
 import mlx.nn as nn
 
 from magnitude_engine.artifacts.layouts import LogicalTensor
-from magnitude_engine.artifacts.materialization import ModelAllocation
 from magnitude_engine.artifacts.quantization import AffineEncoding
 from magnitude_engine.resources.budget import MemoryBudget
 from magnitude_engine.resources.io.reader import PositionalReader
 
 from ..embeddings.contracts import EmbeddingFactory, EmbeddingLookup
 from ..experts.contracts import ExpertFactory, ExpertOperator
-from .parameters import materialize_parameters
+from .packing import ProjectionPack
+from .parameters import BoundParameters, materialize_parameters
 from .partitions import (
     EmbeddingPartition,
     ExpertPartition,
@@ -23,7 +23,7 @@ from .validation import configure_affine_modules, validate_parameters
 
 @dataclass
 class BoundOperations:
-    allocation: ModelAllocation
+    parameters: BoundParameters
     resources: OperationResources
     embeddings: dict[str, EmbeddingLookup]
     experts: dict[int, ExpertOperator]
@@ -34,7 +34,7 @@ class BoundOperations:
         try:
             self.resources.close()
         finally:
-            self.allocation.close()
+            self.parameters.close()
 
 
 def prepare_layout(
@@ -52,6 +52,8 @@ def bind_operations(
     experts: dict[int, tuple[ExpertPartition, ExpertFactory]],
     budget: MemoryBudget,
     reader: PositionalReader,
+    packs: tuple[ProjectionPack, ...] = (),
+    encodings: dict[str, AffineEncoding] | None = None,
 ) -> BoundOperations:
     excluded: frozenset[str] = frozenset()
     assigned: set[str] = set()
@@ -76,6 +78,8 @@ def bind_operations(
         reader=reader,
         owner="model.weights",
         excluded=excluded,
+        packs=packs,
+        encodings=encodings,
     )
     resources = OperationResources(budget)
     try:

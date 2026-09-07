@@ -37,6 +37,7 @@ def benchmark(
     prompt=None,
     continuation=None,
     eos_tokens=None,
+    accepted_tokens=None,
     profile=None,
     output=None,
     warmup=2,
@@ -46,19 +47,26 @@ def benchmark(
 
     from magnitude_engine.models.runtime import ForwardRequest
 
-    if mode not in ("replay", "prefill", "generate") or measured_tokens < 1:
+    if mode not in ("replay", "prefill", "generate", "verify") or measured_tokens < 1:
         raise ValueError("invalid model execution mode")
+    if accepted_tokens is not None and (
+        mode != "verify" or not 0 <= accepted_tokens <= measured_tokens
+    ):
+        raise ValueError("accepted prefix requires verification and must fit its input")
+    accepted = measured_tokens if accepted_tokens is None else accepted_tokens
     assembly = inspect_engine(engine)
     model = engine.engine.generation.model
     workload = {
         "context_tokens": context_tokens,
         "histories": [context_tokens],
         "batch_size": 1,
-        "query_tokens": measured_tokens if mode == "prefill" else 1,
+        "query_tokens": measured_tokens if mode in ("prefill", "verify") else 1,
         "measured_tokens": measured_tokens,
         "mode": mode,
         "fixture": fixture,
     }
+    if mode == "verify":
+        workload["accepted_tokens"] = accepted
     with recording(
         assembly.at("target"),
         benchmark="model." + mode,
@@ -109,7 +117,12 @@ def benchmark(
 
             def execute():
                 generated, last = [], None
-                if mode == "prefill":
+                if mode == "verify":
+                    advance = model.forward(sequence, continuation[:measured_tokens])
+                    advance.accept(accepted)
+                    advance.complete()
+                    last = advance.output.logits
+                elif mode == "prefill":
                     model.prefill(sequence, continuation[:measured_tokens])
                 else:
                     token = prompt[-1]
@@ -133,7 +146,7 @@ def benchmark(
                 last, generated = result
                 saved = sequence.checkpoint()
                 try:
-                    consumed = len(generated) if mode == "generate" else measured_tokens
+                    consumed = len(generated) if mode == "generate" else accepted
                     if saved.length != len(history) + consumed:
                         raise ValueError("model committed boundary differs from consumed inputs")
                 finally:

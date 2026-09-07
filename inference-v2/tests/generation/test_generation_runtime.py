@@ -108,6 +108,7 @@ def test_plain_path_observes_bound_method_even_with_zero_proposal_budget():
             self.observed = []
 
         def prefill(self, tokens, features):
+            yield from ()
             self.prefilled.extend(tokens)
 
         def propose(self, context, limit):
@@ -212,7 +213,7 @@ def test_live_checkpoint_cannot_cross_target_residencies_even_with_the_same_meth
     SamplingPolicy(temperature=0.7, seed=19, frequency_penalty=0.2),
 ])
 @pytest.mark.parametrize("allowance", [2, 4, 9])
-def test_causal_spans_match_single_steps_and_drain_at_every_service(policy, allowance):
+def test_causal_continuations_match_single_steps_with_bounded_pending_work(policy, allowance):
     runtime, budget = make_generation(PlainMethod())
     reference = runtime.create((1, 2, 3), policy, 19)
     expected, _ = collect(reference, 0)
@@ -223,10 +224,11 @@ def test_causal_spans_match_single_steps_and_drain_at_every_service(policy, allo
         result = row.step(allowance)
         assert 1 <= len(result.tokens) <= allowance
         assert result.proposed == result.accepted == result.forced == 0
-        assert result.evaluated_inputs == len(result.tokens)
-        assert not runtime.model.owner._pending
-        assert not row.model._committed and row.model.pending is None
-        assert row.model.state.position == len(row.context) - 1
+        assert row.model.pending is None  # All inputs are logically committed.
+        pending = not row.finished and not policy.uses_history
+        assert len(runtime.model.owner._pending) == int(pending)
+        assert len(row.model._committed) == int(pending)
+        assert row.model.state.position == len(row.context) - 1 + int(pending)
         actual.extend(result.tokens)
     assert tuple(actual) == expected
     checkpoint = row.checkpoint()
@@ -237,6 +239,23 @@ def test_causal_spans_match_single_steps_and_drain_at_every_service(policy, allo
     warm.close()
     cold.close()
     checkpoint.close()
+    row.close()
+    assert budget.snapshot().reserved == 0
+
+
+def test_final_carried_prediction_needs_no_additional_model_capacity(monkeypatch):
+    runtime, budget = make_generation(PlainMethod())
+    row = runtime.create((1, 2, 3), SamplingPolicy(temperature=0), 5)
+    row.step(4)
+    assert len(runtime.model.owner._pending) == 1
+
+    def no_capacity(*args, **kwargs):
+        raise MemoryError("no room for another forward")
+
+    monkeypatch.setattr(runtime.model, "reserve", no_capacity)
+    result = row.step(1)
+    assert len(result.tokens) == 1 and result.evaluated_inputs == 0
+    assert row.finished and not runtime.model.owner._pending
     row.close()
     assert budget.snapshot().reserved == 0
 
@@ -256,8 +275,8 @@ def test_causal_eos_preserves_consumed_history_and_recurrent_checkpoint(stop):
     result = row.step(4)
     assert result.tokens == expected[:stop]
     assert result.finish_reason == "stop"
-    assert result.evaluated_inputs == min(stop + 1, 4)
-    boundary = len(row.context) if stop < 4 else len(row.context) - 1
+    assert result.evaluated_inputs == stop + 1
+    boundary = len(row.context)
     assert row.target_position == row.model.state.position == boundary
     assert row.model.state.caches[0].offset == boundary
     assert not target.owner._pending

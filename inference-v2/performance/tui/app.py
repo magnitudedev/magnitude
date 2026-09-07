@@ -17,18 +17,20 @@ def composition_label(record):
     label = record["label"]
     if label.startswith("models--"):
         label = label.split("--", 2)[-1]
-    if label == "VLM forward":
-        config = graph.get("artifacts", {}).get("target", {}).get("config", {})
-        model = config.get("model_type", "Upstream model")
-        bits = config.get("quantization", {}).get("bits")
-        label = f"{model} · {bits}-bit · MLX VLM forward" if bits else f"{model} · MLX VLM forward"
-    return label + (
-        " · candidate"
-        if record.get("selection") == "candidate"
-        else " · historical"
-        if record.get("selection") == "historical"
-        else ""
-    )
+    settings = (graph["nodes"][graph["root"]]["parameters"] or {}).get("settings", {})
+    backend = settings.get("speculative_backend")
+    mode = backend.upper() if backend else "Plain"
+    drafts = settings.get("max_draft_tokens")
+    if backend and drafts:
+        mode += f" · {drafts} drafts"
+    parts = [label, mode]
+    context = settings.get("context_tokens")
+    if context is not None:
+        parts.append(f"capacity {context:,} tokens")
+    parallel = settings.get("parallel_sequences")
+    if parallel is not None:
+        parts.append(f"{parallel} sequence" + ("s" if parallel != 1 else ""))
+    return " · ".join(parts)
 
 
 def metric(value, unit):
@@ -99,12 +101,14 @@ class PerformanceApp(App):
         self._shown = None
 
     def compose(self) -> ComposeResult:
-        yield Select([], prompt="Choose composition", id="composition")
+        yield Select([], prompt="Choose production configuration", id="composition")
         with Horizontal(id="main"):
-            yield Tree("No recorded compositions", id="tree")
+            yield Tree("No recorded production configurations", id="tree")
             with VerticalScroll(id="details-scroll"):
                 yield Static(
-                    "Run or import a benchmark to populate this view.", id="details", markup=False
+                    "No production configuration recorded. Run or import an engine benchmark.",
+                    id="details",
+                    markup=False,
                 )
         yield Static(
             "≥ efficiency floor · — no current evidence · ~ composed estimate",
@@ -125,16 +129,14 @@ class PerformanceApp(App):
         self.query_one(Select).expanded = True
 
     def action_refresh(self):
-        state = self.store.state()
+        state = self.store.current()
         if state.get("generation") == self.state.get("generation"):
             return
         self.state = state
         records = state.get("compositions", {})
-        # Full assemblies precede opaque standalone controls on first opening.
         ordered = sorted(
             records,
             key=lambda k: (
-                -len(records[k]["revisions"][records[k]["current_revision"]]["nodes"]),
                 composition_label(records[k]),
                 k,
             ),
@@ -170,9 +172,9 @@ class PerformanceApp(App):
         record = self.state.get("compositions", {}).get(self.composition_id)
         if not record:
             self.graph = None
-            tree.reset("No recorded compositions")
+            tree.reset("No recorded production configurations")
             self.query_one("#details", Static).update(
-                "Run or import a benchmark to populate this view."
+                "No production configuration recorded. Run or import an engine benchmark."
             )
             return
         identity = (self.composition_id, record["current_revision"])

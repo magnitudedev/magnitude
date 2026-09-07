@@ -102,8 +102,12 @@ class ChatTemplate:
             names.add(name)
         kwargs = dict(chat_template_kwargs or {})
         if {
-            "tools", "conversation", "add_generation_prompt", "tokenize",
-            "tool_choice", "parallel_tool_calls",
+            "tools",
+            "conversation",
+            "add_generation_prompt",
+            "tokenize",
+            "tool_choice",
+            "parallel_tool_calls",
         } & kwargs.keys():
             raise ValueError("template kwargs cannot override chat rendering inputs")
         selection = select_tools(tools, tool_choice)

@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 
+from magnitude_engine.models.experts.computation import affine_mlp
 from magnitude_engine.models.experts.contracts import ExpertFactory
 
 from ..contracts import (
@@ -17,14 +18,15 @@ from .operation import (
 class MoE(FeedForwardFactory):
     experts: ExpertFactory
 
-    def bind(self, layer, expert):
+    def bind(self, layer, expert, routing):
         if expert is None:
             return DenseFeedForward(layer)
+        assert routing is not None
         return RoutedFeedForward(
-            layer.gate,
+            routing,
             expert,
             layer.shared_expert,
-            layer.shared_expert_gate,
             layer.top_k,
             layer.norm_topk_prob,
+            affine_mlp(layer.shared_expert),
         )

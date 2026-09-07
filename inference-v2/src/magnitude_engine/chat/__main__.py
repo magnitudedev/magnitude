@@ -24,7 +24,9 @@ def main() -> int:
     parser.add_argument("--seed", type=int)
     parser.add_argument("--system", default="")
     parser.add_argument(
-        "--thinking", action=argparse.BooleanOptionalAction, default=None,
+        "--thinking",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="set the model template's enable_thinking option; otherwise use its default",
     )
     parser.add_argument(

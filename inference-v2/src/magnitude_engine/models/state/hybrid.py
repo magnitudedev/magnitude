@@ -88,6 +88,8 @@ class HybridTransaction:
             trace_count * sum(s.layout.trace_bytes_per_token for s in state.slots),
         )
         try:
+            if count > 1:
+                state.pages.flush_tail()
             state.pages.reserve(self.base + count)
         except BaseException:
             self.trace_reservation.close()
@@ -290,6 +292,9 @@ class HybridStateStore:
     def arrays(self, state: HybridState) -> tuple[mx.array, ...]:
         self._check(state)
         arrays = [*self.pages.arena.keys, *self.pages.arena.values]
+        if state.pages.tail is not None:
+            image = state.pages.tail.image
+            arrays.extend(image.buffers)
         for slot in state.slots:
             arrays.extend(slot.values if slot.pending is None else slot.pending.values)
         return tuple(arrays)

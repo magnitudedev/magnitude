@@ -29,7 +29,10 @@ Committed target state + next input (anchor)
 
 The **anchor** is the next token the target must consume: initially the final
 prompt token, normally the last emitted token thereafter. It is part of the
-conversation but is not yet represented in the target's consumed state.
+conversation but is not yet represented in the target's consumed state. Plain causal
+feedback may instead retain an already-computed successor across service calls: its
+target state includes the final published token. That prediction is method-local and
+is not part of a reusable checkpoint; checkpoints describe only consumed history.
 
 Proposal width is bounded by the round's output allowance, remaining context
 and available memory. An output allowance of `m` permits at most `m − 1`
@@ -94,6 +97,12 @@ obligation remains explicit and must be satisfied before the drafter's next use.
 A reusable prefix therefore includes target state, drafter state or a valid
 reconstruction path, and any outstanding alignment obligation. Target KV alone
 does not guarantee that drafting can resume.
+
+MTP conditions each consumed token on the preceding target hidden state, including
+across prompt chunks. Its checkpoint retains only committed head history, deferred
+committed pairs and the final target feature. The successor token is supplied by
+the resumed continuation; no token outside the checkpoint prefix is retained as
+head state. Head prefill uses the same cooperative model operations as drafting.
 
 ## Batching without a fixed cohort
 

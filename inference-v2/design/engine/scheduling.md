@@ -32,9 +32,10 @@ before its resources can be reused.
 | Unit | Work granted | Completion |
 |---|---|---|
 | Prefill service | One aggregate token allowance across compatible pending prompts | Selected chunks have advanced prompt state |
-| Decode round | One bounded generation step for every ready request | Each participating request has completed its step |
+| Decode round | One bounded generation step for every ready request | Each participating request has a publishable result or a retained continuation |
 
-A plain generation step produces one token. A speculative step is a
+A plain service publishes a bounded number of tokens and may retain one successor
+prediction across services. A speculative step is a
 [draft–verify–accept round](speculation.md), potentially producing several.
 A round can pause at a model-operation boundary and resume later; it need not
 hold the device until every participant has published output.
@@ -100,15 +101,16 @@ Consecutive prefill services share the optional duration budget. Exhausting it
 forces a decode round even if time-share accounting would permit more prefill.
 Without a duration target, token bounds and measured time sharing still apply.
 
-Charge completed physical execution time once, including drafting, verification
+Charge service elapsed time once, including drafting, verification
 and repair in decode service. A batch serving four requests is one service cost,
 not four. Emitted token count is not a clock: a speculative round can do useful
 work before publishing anything.
 
 These are soft timing bounds. An indivisible operation can overrun a target,
 and bounded device lookahead must leave opportunities to reschedule. Yielding
-does not itself require a GPU synchronization; accounting uses completion
-boundaries already required by execution.
+does not itself require a GPU synchronization. Plain service can leave one successor
+in flight; subsequent service observes its completion. Prompt-phase transitions and
+shared-layout changes complete outstanding consumers before proceeding.
 
 ## Consequences
 

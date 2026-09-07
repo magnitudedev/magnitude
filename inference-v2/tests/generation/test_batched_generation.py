@@ -94,7 +94,7 @@ def test_engine_physically_batches_ready_rows_and_excludes_cancelled_or_blocked_
         for i in range(4)
     )
     first = engine.tick()
-    assert shapes == [(4, 1, 64)]
+    assert shapes == [(4, 1, 64), (4, 1, 64)]
     assert all(m.batch_size == 4 for m in first)
     handles[1].cancel()
     events = [[], [], available(handles[2]), available(handles[3])]
@@ -105,7 +105,7 @@ def test_engine_physically_batches_ready_rows_and_excludes_cancelled_or_blocked_
         events[3].extend(available(handles[3]))
         if handles[2].delivery.finish and handles[3].delivery.finish:
             break
-    assert shapes[1:] and all(s[0] == 2 for s in shapes[1:])
+    assert shapes[2:] and all(s[0] == 2 for s in shapes[2:])
     assert tokens(events[2]) == expected[2] and tokens(events[3]) == expected[3]
     assert isinstance(events[2][-1], Finished)
     assert handles[0].delivery.finish is None

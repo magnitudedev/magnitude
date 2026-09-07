@@ -7,7 +7,9 @@ import mlx.core as mx
 
 from magnitude_engine.components import component
 
+from ..state.decode import DecodeKV
 from ..state.views import PagedKV
+from . import tiled
 from .contracts import PagedAttention
 from .gathered import GatheredAttention, validate_attention
 
@@ -16,7 +18,18 @@ from .gathered import GatheredAttention, validate_attention
 def _partials() -> Any:
     return mx.fast.metal_kernel(
         name="magnitude_paged_attention_partials",
-        input_names=["queries", "keys", "values", "pages", "positions", "layout", "scale"],
+        input_names=[
+            "queries",
+            "keys",
+            "values",
+            "pages",
+            "positions",
+            "layout",
+            "scale",
+            "tail_keys",
+            "tail_values",
+            "tail_starts",
+        ],
         output_names=["partial"],
         source="""
         uint lane = thread_position_in_grid.x;
@@ -53,16 +66,22 @@ def _partials() -> Any:
             // Resolve a physical page once, then consume its contiguous keys.
             uint page_index = position / layout[1];
             uint page_end = min(last, (page_index + 1) * layout[1]);
+            bool in_tail = TAIL > 0 && position >= uint(tail_starts[sequence]);
+            if (TAIL > 0 && !in_tail) page_end = min(page_end, uint(tail_starts[sequence]));
             uint physical = pages[sequence * layout[3] + page_index] * layout[1]
                 + position % layout[1];
-            size_t address = size_t(kh) * layout[0] + physical;
+            size_t address = in_tail
+                ? (size_t(sequence) * HK + kh) * TAIL + position - uint(tail_starts[sequence])
+                : size_t(kh) * layout[0] + physical;
+            auto source_keys = in_tail ? tail_keys : keys;
+            auto source_values = in_tail ? tail_values : values;
             for (; position < page_end; ++position, ++address) {
                 float key[DK / 32];
                 float value[DV / 32];
                 for (uint i = 0; i < DK / 32; ++i)
-                    key[i] = float(keys[address * DK + lane + 32 * i]);
+                    key[i] = float(source_keys[address * DK + lane + 32 * i]);
                 for (uint i = 0; i < DV / 32; ++i)
-                    value[i] = float(values[address * DV + lane + 32 * i]);
+                    value[i] = float(source_values[address * DV + lane + 32 * i]);
                 for (uint h = 0; h < HEADS; ++h) {
                     float score = 0.0f;
                     for (uint i = 0; i < DK / 32; ++i) score += query[h][i] * key[i];
@@ -134,7 +153,7 @@ class MetalPagedAttention:
 
     partition_tokens = 128
 
-    def __init__(self, prefill: PagedAttention | None = None, *, heads_per_group: int = 1):
+    def __init__(self, prefill: PagedAttention | None = None, *, heads_per_group: int = 2):
         if heads_per_group not in (1, 2, 4):
             raise ValueError("native attention head sharing must be 1, 2 or 4")
         self.prefill = prefill if prefill is not None else GatheredAttention()
@@ -169,6 +188,7 @@ class MetalPagedAttention:
             covered=covered,
             scale=scale,
             window=window,
+            tail=kv.tail_batch(),
         )
 
     def apply(
@@ -184,8 +204,25 @@ class MetalPagedAttention:
         covered: int,
         scale: float,
         window: int | None = None,
+        tail: tuple[mx.array, mx.array, mx.array] | None = None,
     ) -> mx.array:
         """Pure launch on validated storage; positions and mappings remain tensor inputs."""
+        if (covered <= 512 or covered > 64 * self.partition_tokens) and queries.shape[
+            1
+        ] // keys.shape[0] <= 32:
+            return tiled.apply(
+                queries,
+                keys,
+                values,
+                pages,
+                positions,
+                page_size=page_size,
+                table_width=table_width,
+                covered=covered,
+                scale=scale,
+                window=window,
+                tail=tail,
+            )
         count = queries.shape[2]
         span = self.partition_tokens
         splits = (covered + span - 1) // span
@@ -215,6 +252,7 @@ class MetalPagedAttention:
                 positions,
                 layout,
                 mx.array([scale], mx.float32),
+                *(tail if tail is not None else (keys, values, positions)),
             ],
             template=[
                 ("DK", dk),
@@ -224,6 +262,7 @@ class MetalPagedAttention:
                 ("TQ", count),
                 ("SPAN", span),
                 ("HEADS", heads),
+                ("TAIL", tail[0].shape[2] if tail is not None else 0),
             ],
             grid=(32, splits, rows // heads),
             threadgroup=threadgroup,
@@ -238,3 +277,28 @@ class MetalPagedAttention:
             output_shapes=[(queries.shape[0], queries.shape[1], count, dv)],
             output_dtypes=[queries.dtype],
         )[0]
+
+    def decode(
+        self,
+        queries: mx.array,
+        kv: DecodeKV,
+        layer: int,
+        scale: float,
+        *,
+        window: int | None = None,
+    ) -> mx.array:
+        """Bind the same attention operation to a prepared resident state transition."""
+        covered = kv.page_size * kv.table_width
+        return self.apply(
+            queries,
+            kv.keys[layer],
+            kv.values[layer],
+            kv.pages,
+            kv.positions,
+            page_size=kv.page_size,
+            table_width=kv.table_width,
+            covered=min(covered, window) if window else covered,
+            scale=scale,
+            window=window,
+            tail=kv.tail(layer),
+        )

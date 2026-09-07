@@ -49,7 +49,7 @@ class LoadedGemma4:
     state_dtype: mx.Dtype
     encoding: AffineEncoding
     tokenizer_identity: str
-    vision_tensors: Mapping[str, LogicalTensor]
+    media_tensors: Mapping[str, LogicalTensor]
 
     def close(self) -> None:
         self.program.close()
@@ -80,14 +80,17 @@ def load_gemma4(
     tensors = canonical_names(
         logical_tensors(TensorCatalog.inspect(directory), declaration=None), "language_model."
     )
-    vision = {
-        name: tensor
-        for name, tensor in tensors.items()
-        if name.startswith(("vision_tower.", "embed_vision."))
-    }
-    if vision and not config.get("vision_config"):
-        raise ValueError("vision tensor component has no declared configuration")
-    tensors = {name: tensor for name, tensor in tensors.items() if name not in vision}
+    media = {}
+    for modality in ("vision", "audio"):
+        partition = {
+            name: tensor
+            for name, tensor in tensors.items()
+            if name.startswith((f"{modality}_tower.", f"embed_{modality}."))
+        }
+        if partition and not config.get(f"{modality}_config"):
+            raise ValueError(f"{modality} tensor component has no declared configuration")
+        media.update(partition)
+    tensors = {name: tensor for name, tensor in tensors.items() if name not in media}
     identity = tokenizer_identity(directory)
     model = LanguageModel(args)
     model.eval()
@@ -169,7 +172,7 @@ def load_gemma4(
             binding.program, (operations,), (identity, args.vocab_size, embedding, project)
         )
         return LoadedGemma4(
-            program, args, binding.attention, dtype, default, identity, MappingProxyType(vision)
+            program, args, binding.attention, dtype, default, identity, MappingProxyType(media)
         )
     except BaseException:
         operations.close()
