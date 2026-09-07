@@ -1,9 +1,14 @@
 {
   "name": "@magnitudedev/pi-extension",
   "version": "0.0.1-alpha.4",
-  "description": "Magnitude model controls and inference progress for Pi",
+  "description": "Run local AI models in Pi with Magnitude",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/magnitudedev/magnitude.git",
+    "directory": "integrations/pi"
+  },
   "publishConfig": {
     "access": "public"
   },
@@ -12,6 +17,7 @@
     "README.md"
   ],
   "pi": {
+    "image": "https://raw.githubusercontent.com/magnitudedev/magnitude/main/assets/readme/pi-preview.png",
     "extensions": [
       "./dist/magnitude.js"
     ]
