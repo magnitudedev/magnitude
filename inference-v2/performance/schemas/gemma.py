@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass
 
-from magnitude_engine import components as c
 from magnitude_engine.models.architectures.gemma4.program import (
     ExpertBranch,
     GeGLU,
@@ -13,7 +12,9 @@ from magnitude_engine.models.architectures.gemma4.program import (
     LayerInput,
     PerLayerInputs,
 )
+from magnitude_engine.models.architectures.gemma4.program import readout as gemma_readout
 from performance.bindings import Fields, Use, foreign, neural, schema
+from performance.facts import AttentionGeometry, NeuralParameters
 from performance.parameters import projection_output_width, projection_shape
 
 
@@ -24,7 +25,7 @@ class GemmaAttentionUse:
 
 
 @schema(KVProducer)
-def kv_producer(a: KVProducer, context: None) -> Fields[c.NeuralParameters]:
+def kv_producer(a: KVProducer, context: None) -> Fields[NeuralParameters]:
     return neural(
         operands={
             "keys": a.keys,
@@ -38,11 +39,11 @@ def kv_producer(a: KVProducer, context: None) -> Fields[c.NeuralParameters]:
 
 
 @schema(GemmaAttention, context=GemmaAttentionUse)
-def gemma_attention(a: GemmaAttention, context: GemmaAttentionUse) -> Fields[c.NeuralParameters]:
+def gemma_attention(a: GemmaAttention, context: GemmaAttentionUse) -> Fields[NeuralParameters]:
     producer, shared = (context.producer, context.shared)
     _, size = projection_shape(producer.keys)
     width = projection_output_width(producer.keys) // producer.heads
-    geometry = c.AttentionGeometry(
+    geometry = AttentionGeometry(
         query_heads=a.heads,
         kv_heads=producer.heads,
         key_width=width,
@@ -67,12 +68,12 @@ def gemma_attention(a: GemmaAttention, context: GemmaAttentionUse) -> Fields[c.N
 
 
 @schema(GeGLU)
-def geglu(a: GeGLU, context: None) -> Fields[c.NeuralParameters]:
+def geglu(a: GeGLU, context: None) -> Fields[NeuralParameters]:
     return neural(operands={"gate": a.gate, "up": a.up, "down": a.down})
 
 
 @schema(ExpertBranch)
-def expert_branch(a: ExpertBranch, context: None) -> Fields[c.NeuralParameters]:
+def expert_branch(a: ExpertBranch, context: None) -> Fields[NeuralParameters]:
     return neural(
         operands={
             "router": a.router.projection,
@@ -88,7 +89,7 @@ def expert_branch(a: ExpertBranch, context: None) -> Fields[c.NeuralParameters]:
 
 
 @schema(GemmaFeedForward)
-def gemma_feed_forward(a: GemmaFeedForward, context: None) -> Fields[c.NeuralParameters]:
+def gemma_feed_forward(a: GemmaFeedForward, context: None) -> Fields[NeuralParameters]:
     children = {"dense": Use(a.dense)}
     if a.experts is not None:
         children["experts"] = Use(a.experts)
@@ -103,7 +104,7 @@ def gemma_feed_forward(a: GemmaFeedForward, context: None) -> Fields[c.NeuralPar
 
 
 @schema(PerLayerInputs)
-def per_layer_inputs(a: PerLayerInputs, context: None) -> Fields[c.NeuralParameters]:
+def per_layer_inputs(a: PerLayerInputs, context: None) -> Fields[NeuralParameters]:
     return neural(
         operands={"projection": a.projection, "norm": a.norm},
         children={"embedding": Use(a.embedding)},
@@ -118,7 +119,7 @@ def per_layer_inputs(a: PerLayerInputs, context: None) -> Fields[c.NeuralParamet
 
 
 @schema(LayerInput, context=Use)
-def layer_input(a: LayerInput, context: Use) -> Fields[c.NeuralParameters]:
+def layer_input(a: LayerInput, context: Use) -> Fields[NeuralParameters]:
     prepared = context
     return neural(
         operands={"gate": a.gate, "projection": a.projection, "norm": a.norm},
@@ -127,7 +128,7 @@ def layer_input(a: LayerInput, context: Use) -> Fields[c.NeuralParameters]:
 
 
 @schema(Gemma4Program)
-def gemma4_program(a: Gemma4Program, context: None) -> Fields[c.NeuralParameters]:
+def gemma4_program(a: Gemma4Program, context: None) -> Fields[NeuralParameters]:
     children = {"embedding": Use(a.embedding)}
     if a.per_layer is not None:
         children["inputs"] = Use(a.per_layer)
@@ -147,7 +148,7 @@ def gemma4_program(a: Gemma4Program, context: None) -> Fields[c.NeuralParameters
         operands[f"layers.{i}.scalar"] = block.scalar
     children["readout"] = foreign(
         a.output,
-        c.Implementation(c.GEMMA_READOUT, c.Source.MAG, "SOFTCAPPED"),
+        gemma_readout,
         neural(operands={"output": a.output}, settings={"softcap": a.softcap}),
     )
     return neural(

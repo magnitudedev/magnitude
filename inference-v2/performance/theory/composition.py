@@ -10,7 +10,7 @@ unless the workload supplies distinct selected experts.
 
 from dataclasses import replace
 
-from magnitude_engine.components import NeuralParameters, WeightUse
+from performance.facts import NeuralParameters, WeightUse
 from performance.theory.resources import Demands, Extent, join
 from performance.theory.workloads import NeuralWorkload
 

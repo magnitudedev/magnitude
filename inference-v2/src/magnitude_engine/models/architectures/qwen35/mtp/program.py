@@ -6,7 +6,6 @@ from typing import Any
 
 import mlx.core as mx
 
-from magnitude_engine import components as c
 from magnitude_engine.components import component
 from magnitude_engine.models.embeddings.contracts import EmbeddingLookup
 from magnitude_engine.models.execution import ExecutionScope
@@ -20,7 +19,7 @@ Transform = Callable[[mx.array], mx.array]
 
 
 @dataclass(frozen=True)
-@component(c.QWEN_MTP, source=c.Source.MAG, variant="CONDITIONED", model=DEFINITION)
+@component("MODEL:QWEN35.MTP:MAG:CONDITIONED", model=DEFINITION)
 class MTPProgram:
     embedding: EmbeddingLookup
     normalize_embedding: Transform

@@ -2,10 +2,13 @@
 
 from contextlib import ExitStack
 
-from magnitude_engine import components as c
+from magnitude_engine.components import component_id
+from magnitude_engine.models.state.pages import PageStore
+from magnitude_engine.models.state.recurrent import RecurrentImage
 from performance.assembly import Binding, inspect_engine, inspect_state
 from performance.benchmarks.fixtures import record_inputs, tokens
 from performance.benchmarks.model import prefix
+from performance.facts import RecurrentStorage, TensorFacts
 from performance.records import Observation, digest
 from performance.runner import recording
 
@@ -97,7 +100,9 @@ def append(component, *, prefix_tokens, append_tokens=1, granularity="runs", **r
             return Observation(
                 digest(sums),
                 {"physical_kv_bytes": physical},
-                metrics={"MEM": physical} if bound.node.component == c.KV_STORE else {},
+                metrics={"MEM": physical}
+                if bound.node.component == component_id(PageStore).kind
+                else {},
             )
 
         run.measure(
@@ -325,7 +330,9 @@ def restore(
                     complete=lambda _: model.owner.backend.drain(),
                     validate=validate,
                     deterministic=True,
-                    dimension=None if bound.node.component == c.KV_STORE else "RESTORE",
+                    dimension=None
+                    if bound.node.component == component_id(PageStore).kind
+                    else "RESTORE",
                 )
             finally:
                 if row is not None:
@@ -348,11 +355,11 @@ def recurrent_image(image, *, live_rows=1, checkpoints=4, **record):
 
     bound = bind_operation(
         image,
-        c.Implementation(c.RECURRENT_STATE, c.Source.MAG, "CHECKPOINTED"),
-        parameters=c.RecurrentStorage(
+        RecurrentImage,
+        parameters=RecurrentStorage(
             layouts=tuple(
                 tuple(
-                    c.TensorFacts(
+                    TensorFacts(
                         identity=f"recurrent.{i}.{j}",
                         shape=t.shape,
                         bytes=t.nbytes,

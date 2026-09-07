@@ -2,13 +2,12 @@
 
 import mlx.core as mx
 
-from magnitude_engine import components as c
 from magnitude_engine.components import component
 
 from ..state.views import PagedKV
 
 
-@component(c.ATTENTION, source=c.Source.MAG, variant="GATHERED")
+@component("MODEL:ATTENTION:MAG:GATHERED")
 class GatheredAttention:
     """Reference execution over logical KV, including heterogeneous causal windows."""
 

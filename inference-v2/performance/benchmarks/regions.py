@@ -5,7 +5,13 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
-from magnitude_engine import components as c
+from magnitude_engine.components import component_id
+from magnitude_engine.models.architectures.qwen35.attention.operation import GatedAttention
+from magnitude_engine.models.architectures.qwen35.feedforward.operation import RoutedFeedForward
+from magnitude_engine.models.architectures.qwen35.program import readout as qwen_readout
+from magnitude_engine.models.architectures.qwen35.recurrence.operation import RecurrentMixer
+from magnitude_engine.models.embeddings.resident import ResidentEmbedding
+from magnitude_engine.models.experts.computation import ResidentExperts
 from performance.assembly import Binding, BoundAssembly, inspect_engine, source_files
 from performance.benchmarks import references
 from performance.benchmarks.fixtures import record_inputs, tokens
@@ -156,7 +162,18 @@ def benchmark(
         sources = source_files(references.attention)
         node = replace(
             bound.node,
-            binding=c.Implementation(component, c.Source.MAG, "UPSTREAM_ADAPTER"),
+            binding=component_id(
+                {
+                    component_id(GatedAttention).kind: references.attention_equation
+                    if attention_oracle == "fp32-equation"
+                    else references.attention,
+                    component_id(RecurrentMixer).kind: references.recurrence,
+                    component_id(RoutedFeedForward).kind: references.feedforward,
+                    component_id(ResidentExperts).kind: references.experts,
+                    component_id(ResidentEmbedding).kind: references.embedding,
+                    component_id(qwen_readout).kind: references.readout,
+                }[component]
+            ),
             source=digest(sources),
             children={},
             dependencies={},
@@ -198,20 +215,20 @@ def benchmark(
         )
         control: Callable[..., Any] | None = None
         hidden = indices = None
-        if component == c.QWEN_ATTENTION:
+        if component == component_id(GatedAttention).kind:
             hidden = p["mixer"][index][0]
             control = (
                 references.attention_equation(op)
                 if attention_oracle == "fp32-equation"
                 else references.attention(op)
             )
-        elif component == c.QWEN_RECURRENCE:
+        elif component == component_id(RecurrentMixer).kind:
             hidden = p["mixer"][index][0]
             control = references.recurrence(op.operation)
-        elif component == c.QWEN_FEEDFORWARD:
+        elif component == component_id(RoutedFeedForward).kind:
             hidden = p["ff"][index]
             control = references.feedforward(op) if hasattr(op, "experts") else op.call
-        elif component == c.EXPERTS:
+        elif component == component_id(ResidentExperts).kind:
             hidden = p["ff"][index]
             parent = program.blocks[index].feedforward
             probabilities = mx.softmax(parent.router(hidden), axis=-1, precise=True)
@@ -221,10 +238,10 @@ def benchmark(
             mx.eval(indices)
             workload["distinct_experts"] = len(set(cast(list[int], indices.reshape(-1).tolist())))
             control = references.experts(op)
-        elif component == c.EMBEDDING:
+        elif component == component_id(ResidentEmbedding).kind:
             control = references.embedding(op)
             workload["distinct_input_tokens"] = len(set(p["tokens"].reshape(-1).tolist()))
-        elif not (component == c.QWEN_READOUT):
+        elif not (component == component_id(qwen_readout).kind):
             raise TypeError(f"no invocation contract for {component}")
         row: Any = None
         transaction = None
@@ -238,10 +255,10 @@ def benchmark(
             if row is not None:
                 row.close()
                 row = None
-            if component in (c.QWEN_ATTENTION, c.QWEN_RECURRENCE):
+            if component in (component_id(GatedAttention).kind, component_id(RecurrentMixer).kind):
                 row = model.create(p["checkpoint"])
                 model.reserve(row, query_tokens)
-                if component == c.QWEN_RECURRENCE:
+                if component == component_id(RecurrentMixer).kind:
                     transaction = model.states.begin(
                         row.state, ModelInputs(p["tokens"]), committed_inputs=query_tokens
                     )
@@ -254,13 +271,13 @@ def benchmark(
         def execute(use_reference):
             call = cast(Callable[..., Any], control)
             with model.owner.scope() as scope:
-                if component == c.EMBEDDING:
+                if component == component_id(ResidentEmbedding).kind:
                     outputs = [
                         call(p["tokens"]) if use_reference else op.lookup(p["tokens"], scope)
                     ]
-                elif component == c.QWEN_READOUT:
+                elif component == component_id(qwen_readout).kind:
                     outputs = [program.output(program.norm(p["last_hidden"]))]
-                elif component == c.QWEN_ATTENTION:
+                elif component == component_id(GatedAttention).kind:
                     scope.enter(row.state.pages.store.arena.pin())
                     outputs = [
                         call(
@@ -271,7 +288,7 @@ def benchmark(
                         if use_reference
                         else op.compute_batch(hidden, (row.state,), scope)
                     ]
-                elif component == c.QWEN_RECURRENCE:
+                elif component == component_id(RecurrentMixer).kind:
                     if use_reference:
                         cache = ArraysCache(2)
                         cache[0], cache[1] = p["mixer"][index][1:]
@@ -280,7 +297,7 @@ def benchmark(
                     else:
                         value = op.compute_batch(hidden, (row.state,), scope)
                         outputs = [value, *row.state.slots[op.index].pending.values]
-                elif component == c.EXPERTS:
+                elif component == component_id(ResidentExperts).kind:
                     outputs = [
                         call(hidden, indices)
                         if use_reference
@@ -300,7 +317,7 @@ def benchmark(
             complete(wanted)
             expected = wanted[0]
             expected_kv = None
-            if component == c.QWEN_ATTENTION:
+            if component == component_id(GatedAttention).kind:
                 cache = caches[op.index]
                 end = context_tokens + query_tokens
                 expected_kv = (cache.keys[:, :, :end], cache.values[:, :, :end])
@@ -308,7 +325,7 @@ def benchmark(
 
             def validate(result):
                 observed = compare(result[0], expected, atol=0.002, rtol=0.002)
-                if component == c.QWEN_RECURRENCE:
+                if component == component_id(RecurrentMixer).kind:
                     compare(result[0][-1], expected[-1], atol=1e-5, rtol=1e-5)
                 if expected_kv is not None:
                     if reference:

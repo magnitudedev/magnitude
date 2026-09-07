@@ -14,7 +14,6 @@ from benchmark_fixtures.prose_history import Prose
 from . import models
 from .policy import DEFAULT_CONTEXTS, ENGINES, MAX_OUTPUT_TOKENS, PROSE_OUTPUT_TOKENS, project_root
 from .results import inspect_run, public_command
-from .runner import run
 from .suites import SECTIONS
 
 
@@ -97,6 +96,8 @@ async def dry_run(root, targets, sections, checkpoints, categories, repeat, case
 
 
 async def managed_run(*args):
+    from .runner import run
+
     task = asyncio.current_task()
     assert task is not None
     loop = asyncio.get_running_loop()

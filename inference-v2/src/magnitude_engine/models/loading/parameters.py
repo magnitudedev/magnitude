@@ -13,6 +13,7 @@ from magnitude_engine.artifacts.materialization import (
     ResidentTensors,
 )
 from magnitude_engine.artifacts.quantization import AffineEncoding
+from magnitude_engine.components import component
 from magnitude_engine.models.embeddings.resident import ResidentAffineEmbedding, ResidentEmbedding
 from magnitude_engine.resources.budget import MemoryBudget
 from magnitude_engine.resources.io.reader import PositionalReader
@@ -51,6 +52,7 @@ def affine_encodings(
     return encodings
 
 
+@component("MODEL:LOADING:MAG:RESIDENT")
 def load_resident_parameters(
     model: nn.Module,
     tensors: dict[str, LogicalTensor],

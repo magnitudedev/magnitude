@@ -7,7 +7,56 @@ from typing import Any
 
 from pydantic import BaseModel, TypeAdapter
 
-from magnitude_engine import components as c
+from magnitude_engine.components import component_id
+from magnitude_engine.engine.prefixes.radix import Radix
+from magnitude_engine.engine.runtime import Engine
+from magnitude_engine.engine.scheduler.time_shared import TimeShared
+from magnitude_engine.generation.acceptance import accept_prefix
+from magnitude_engine.generation.execution import serve
+from magnitude_engine.generation.methods.mtp.runtime import MTPMethod
+from magnitude_engine.generation.methods.plain.runtime import PlainMethod
+from magnitude_engine.generation.runtime import GenerationRuntime
+from magnitude_engine.generation.sampling import SequenceSampler
+from magnitude_engine.models.architectures.gemma4.program import (
+    ExpertBranch,
+    GeGLU,
+    Gemma4Program,
+    GemmaAttention,
+    GemmaFeedForward,
+    KVProducer,
+    PerLayerInputs,
+)
+from magnitude_engine.models.architectures.gemma4.program import readout as gemma_readout
+from magnitude_engine.models.architectures.mlx_vlm.program import LibraryProgram
+from magnitude_engine.models.architectures.qwen35.attention.operation import GatedAttention
+from magnitude_engine.models.architectures.qwen35.feedforward.operation import RoutedFeedForward
+from magnitude_engine.models.architectures.qwen35.mtp.program import MTPProgram
+from magnitude_engine.models.architectures.qwen35.program import Qwen35Program
+from magnitude_engine.models.architectures.qwen35.program import readout as qwen_readout
+from magnitude_engine.models.architectures.qwen35.recurrence.operation import RecurrentMixer
+from magnitude_engine.models.attention.gathered import GatheredAttention
+from magnitude_engine.models.embeddings.resident import ResidentEmbedding
+from magnitude_engine.models.execution import ExecutionOwner
+from magnitude_engine.models.experts.computation import ResidentExperts
+from magnitude_engine.models.loading.parameters import load_resident_parameters
+from magnitude_engine.models.recurrence.reference import DeltaReference
+from magnitude_engine.models.runtime import ModelRuntime
+from magnitude_engine.models.state.hybrid import HybridStateStore
+from magnitude_engine.models.state.native import LibraryStateStore
+from magnitude_engine.models.state.pages import PageStore, SequencePages
+from magnitude_engine.models.state.recurrent import RecurrentImage
+from magnitude_engine.resources.budget import MemoryBudget
+from performance.facts import (
+    AttentionGeometry,
+    Configuration,
+    Facts,
+    KVStorage,
+    NativeStorage,
+    NeuralParameters,
+    OpaqueParameters,
+    RecurrentGeometry,
+    RecurrentStorage,
+)
 from performance.records import Node, Profile, digest
 from performance.theory import composition, engine, neural, state
 from performance.theory.resources import (
@@ -41,8 +90,8 @@ METRICS = {
 
 
 @dataclass(frozen=True)
-class Model[P: c.Facts, W: BaseModel]:
-    contract: c.Contract[P]
+class Model[P: Facts, W: BaseModel]:
+    parameters: type[P]
     workload: type[W]
     dimensions: tuple[str, ...]
     demands: Callable[[P, W, dict[str, Demands]], Demands]
@@ -54,20 +103,35 @@ class Model[P: c.Facts, W: BaseModel]:
         w = TypeAdapter(self.workload).validate_json(json.dumps(raw))
         p = node.parameters
         # Standalone geometry is an explicit binding, not guessed from an operator.
-        if p is None and self.contract in (c.ATTENTION, c.RECURRENCE) and "geometry" in raw:
-            p = self.contract.read(raw["geometry"])
-        if not isinstance(p, self.contract.parameters):
-            raise ValueError(f"missing {self.contract.identity} parameters")
+        if (
+            p is None
+            and self.parameters in (AttentionGeometry, RecurrentGeometry)
+            and "geometry" in raw
+        ):
+            p = TypeAdapter(self.parameters).validate_python(raw["geometry"])
+        if not isinstance(p, self.parameters):
+            raise ValueError(f"missing {self.parameters.__name__} parameters")
         return p, w
 
 
-MODELS: dict[c.Contract[Any], Model[Any, Any]] = {}
+MODELS: dict[str, Model[Any, Any]] = {}
 
 
-def register[P: c.Facts, W: BaseModel](model: Model[P, W]) -> None:
-    if model.contract in MODELS:
-        raise ValueError(f"duplicate theory for {model.contract.identity}")
-    MODELS[model.contract] = model
+def register[P: Facts, W: BaseModel](owner: object, model: Model[P, W]) -> None:
+    kind = component_id(owner).kind
+    if kind in MODELS:
+        raise ValueError(f"duplicate theory for {kind}")
+    MODELS[kind] = model
+
+
+def parameter_type(kind: str) -> type[Facts]:
+    return MODELS[kind].parameters
+
+
+def read_parameters(kind: str, raw: dict) -> Facts:
+    import json
+
+    return TypeAdapter(parameter_type(kind)).validate_json(json.dumps(raw), strict=True)
 
 
 def execution(p, w, profile, demand, children):
@@ -85,27 +149,48 @@ def explicit(p, w: Workload, children):
 
 
 register(
+    GatheredAttention,
     Model(
-        c.ATTENTION,
+        AttentionGeometry,
         AttentionWorkload,
         ("EXEC",),
         lambda p, w, ch: neural.attention(p, w),
         execution,
-    )
+    ),
 )
 register(
+    DeltaReference,
     Model(
-        c.RECURRENCE,
+        RecurrentGeometry,
         RecurrentWorkload,
         ("EXEC",),
         lambda p, w, ch: neural.recurrence(p, w),
         execution,
-    )
+    ),
 )
-for contract in c.CONTRACTS:
-    if contract.parameters is c.NeuralParameters:
-        register(Model(contract, NeuralWorkload, ("EXEC",), composition.model, execution))
-register(Model(c.FORWARD, Workload, ("EXEC",), explicit, execution))
+for owner in (
+    ResidentEmbedding,
+    ResidentExperts,
+    Qwen35Program,
+    GatedAttention,
+    RecurrentMixer,
+    RoutedFeedForward,
+    qwen_readout,
+    MTPProgram,
+    Gemma4Program,
+    PerLayerInputs,
+    GemmaAttention,
+    KVProducer,
+    GemmaFeedForward,
+    GeGLU,
+    ExpertBranch,
+    gemma_readout,
+    ModelRuntime,
+):
+    register(
+        owner, Model(NeuralParameters, NeuralWorkload, ("EXEC",), composition.model, execution)
+    )
+register(LibraryProgram, Model(OpaqueParameters, Workload, ("EXEC",), explicit, execution))
 
 
 def storage_bounds(p, w, profile, demand, children):
@@ -115,19 +200,27 @@ def storage_bounds(p, w, profile, demand, children):
     }
 
 
-for contract in (c.RECURRENT_STATE, c.NATIVE_STATE, c.HYBRID_STATE):
-    register(Model(contract, StateWorkload, ("MEM", "RESTORE"), bookkeeping, storage_bounds))
+for owner, parameters in (
+    (RecurrentImage, RecurrentStorage),
+    (LibraryStateStore, NativeStorage),
+    (HybridStateStore, Configuration),
+):
+    register(
+        owner, Model(parameters, StateWorkload, ("MEM", "RESTORE"), bookkeeping, storage_bounds)
+    )
 register(
+    PageStore,
     Model(
-        c.KV_STORE,
+        KVStorage,
         StateWorkload,
         ("MEM",),
         bookkeeping,
         lambda p, w, profile, d, ch: {"MEM": state.retained(p, w)},
-    )
+    ),
 )
 register(
-    Model(c.KV_APPEND, StateWorkload, ("EXEC",), lambda p, w, ch: state.append(p, w), execution)
+    SequencePages.write,
+    Model(KVStorage, StateWorkload, ("EXEC",), lambda p, w, ch: state.append(p, w), execution),
 )
 
 
@@ -139,33 +232,39 @@ def service_bounds(p, w, profile, demand, children):
 
 
 register(
+    Engine,
     Model(
-        c.ENGINE,
+        Configuration,
         ServiceWorkload,
         ("RATE", "TTFT", "GAP"),
         lambda p, w, ch: engine.service_information(explicit(p, w, ch)),
         service_bounds,
-    )
+    ),
 )
-register(Model(c.SCHEDULING, ServiceWorkload, ("RATE", "TTFT", "GAP"), bookkeeping, service_bounds))
 register(
+    TimeShared,
+    Model(Configuration, ServiceWorkload, ("RATE", "TTFT", "GAP"), bookkeeping, service_bounds),
+)
+register(
+    Radix,
     Model(
-        c.PREFIX,
+        Configuration,
         ControlWorkload,
         ("REUSE",),
         bookkeeping,
         lambda p, w, profile, d, ch: {"REUSE": engine.reuse(w)},
-    )
+    ),
 )
-for contract, dimension in (
-    (c.MEMORY, "EXEC"),
-    (c.BATCHING, "EXEC"),
-    (c.KV_BRANCH, "EXEC"),
-    (c.ADMISSION, "LAT"),
+for owner, dimension in (
+    (MemoryBudget, "EXEC"),
+    (serve, "EXEC"),
+    (PageStore.create, "EXEC"),
+    (Engine.submit, "LAT"),
 ):
     register(
+        owner,
         Model(
-            contract,
+            Configuration,
             ControlWorkload,
             (dimension,),
             bookkeeping,
@@ -174,18 +273,22 @@ for contract, dimension in (
                     0, "seconds", assumptions=("bookkeeping may disappear into its owner",)
                 )
             },
-        )
+        ),
     )
-register(Model(c.PREFILL, Workload, ("EXEC",), bookkeeping, execution))
-for contract in (c.GENERATION, c.SPECULATION):
+register(
+    GenerationRuntime.prefill_many,
+    Model(Configuration, Workload, ("EXEC",), bookkeeping, execution),
+)
+for owner in (PlainMethod, MTPMethod):
     register(
+        owner,
         Model(
-            contract,
+            Configuration,
             Workload,
             ("EXEC",),
             lambda p, w, ch: join(*(ch[k] for k in ("target", "draft") if k in ch)),
             execution,
-        )
+        ),
     )
 
 
@@ -218,21 +321,19 @@ def device(p, w: ControlWorkload, children):
     )
 
 
-register(Model(c.SAMPLING, ControlWorkload, ("EXEC",), sampling, execution))
-register(Model(c.ACCEPTANCE, ControlWorkload, ("EXEC",), acceptance, execution))
-register(Model(c.DEVICE, ControlWorkload, ("EXEC",), device, execution))
+register(SequenceSampler, Model(Configuration, ControlWorkload, ("EXEC",), sampling, execution))
+register(accept_prefix, Model(Configuration, ControlWorkload, ("EXEC",), acceptance, execution))
+register(ExecutionOwner, Model(Configuration, ControlWorkload, ("EXEC",), device, execution))
 register(
+    load_resident_parameters,
     Model(
-        c.LOADING,
+        Configuration,
         StateWorkload,
         ("LAT", "MEM"),
         explicit,
         lambda p, w, profile, d, ch: {"LAT": time_bound(d, profile), "MEM": state.retained(p, w)},
-    )
+    ),
 )
-
-if set(MODELS) != set(c.CONTRACTS):
-    raise RuntimeError("every production component contract needs a theoretical definition")
 
 
 def revision() -> str:

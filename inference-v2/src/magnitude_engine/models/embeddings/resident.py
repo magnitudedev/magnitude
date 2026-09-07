@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 
-from magnitude_engine import components as c
 from magnitude_engine.artifacts.quantization import AffineEncoding
 from magnitude_engine.components import component
 
@@ -14,7 +13,7 @@ from ..execution import ExecutionScope
 
 
 @dataclass
-@component(c.EMBEDDING, source=c.Source.MAG, variant="RESIDENT")
+@component("MODEL:EMBEDDING:MAG:RESIDENT")
 class ResidentEmbedding:
     weight: mx.array
 
@@ -28,7 +27,7 @@ class ResidentEmbedding:
 
 
 @dataclass
-@component(c.EMBEDDING, source=c.Source.MAG, variant="RESIDENT")
+@component(ResidentEmbedding)
 class ResidentAffineEmbedding:
     weight: mx.array
     scales: mx.array

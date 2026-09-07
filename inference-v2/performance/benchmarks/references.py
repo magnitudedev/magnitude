@@ -10,6 +10,8 @@ from mlx_lm.models.qwen3_5 import GatedDeltaNet
 from mlx_lm.models.qwen3_next import Qwen3NextSparseMoeBlock
 from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU
 
+from magnitude_engine.components import component
+
 
 def switch_linear(projection):
     # Module initialization supplies bookkeeping only; avoid allocating random weights.
@@ -25,6 +27,7 @@ def switch_linear(projection):
     return module
 
 
+@component("MODEL:EXPERTS:MAG:UPSTREAM_ADAPTER")
 def experts(operation):
     module = SimpleNamespace(
         up_proj=switch_linear(operation.weights.up),
@@ -36,6 +39,7 @@ def experts(operation):
     return partial(SwitchGLU.__call__, cast(Any, module))
 
 
+@component("MODEL:QWEN35.FEEDFORWARD:MAG:UPSTREAM_ADAPTER")
 def feedforward(operation):
     module = SimpleNamespace(
         gate=operation.router,
@@ -49,6 +53,7 @@ def feedforward(operation):
     return partial(Qwen3NextSparseMoeBlock.__call__, cast(Any, module))
 
 
+@component("MODEL:QWEN35.RECURRENCE:MAG:UPSTREAM_ADAPTER")
 def recurrence(operation):
     g = operation.graph
     module = SimpleNamespace(
@@ -74,6 +79,7 @@ def recurrence(operation):
     return partial(GatedDeltaNet.__call__, cast(Any, module))
 
 
+@component("MODEL:EMBEDDING:MAG:UPSTREAM_ADAPTER")
 def embedding(operation):
     if not hasattr(operation, "encoding"):
         module = nn.Embedding.__new__(nn.Embedding)
@@ -93,6 +99,7 @@ def embedding(operation):
     return module
 
 
+@component("MODEL:QWEN35.ATTENTION:MAG:UPSTREAM_ADAPTER")
 def attention(operation):
     from mlx_vlm.models.qwen3_5.language import Qwen3_5Attention, Qwen3_5RotaryEmbedding
 
@@ -146,6 +153,7 @@ def attention_core_equation(queries, keys, values):
     return attended.reshape(batch, hq, count, d).astype(queries.dtype)
 
 
+@component("MODEL:QWEN35.ATTENTION:MAG:FP32_EQUATION")
 def attention_equation(operation):
     """Gated attention with the explicit FP32 softmax/reduction contract.
 
@@ -161,3 +169,17 @@ def attention_equation(operation):
         return operation.output(attended * mx.sigmoid(gate))
 
     return apply
+
+
+@component("MODEL:QWEN35.READOUT:MAG:UPSTREAM_ADAPTER")
+def readout(operation):
+    return operation
+
+
+@component("MODEL:FORWARD:LM:STANDARD")
+class LMForward:
+    def __init__(self, model):
+        self.model = model
+
+    def __call__(self, *args, **kwargs):
+        return self.model(*args, **kwargs)

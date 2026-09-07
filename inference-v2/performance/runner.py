@@ -136,12 +136,12 @@ class Run:
                 "one observation boundary per run; start another run for another boundary"
             )
         self._measured = True
-        from magnitude_engine.components import implementation
+        from magnitude_engine.components import ComponentId
         from performance.theory.catalog import MODELS
 
-        contract = implementation(
+        contract = ComponentId(
             self.record["assembly"]["nodes"][self.record["node"]]["implementation"]
-        ).contract
+        ).kind
         allowed = MODELS[contract].dimensions
         if dimension is not None and dimension not in allowed:
             raise ValueError(f"unsupported timing dimension {dimension}")

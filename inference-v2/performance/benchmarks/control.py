@@ -3,17 +3,22 @@
 from dataclasses import dataclass
 from typing import Any, cast
 
-from magnitude_engine import components as c
+from magnitude_engine.engine.prefixes.radix import Radix
+from magnitude_engine.engine.scheduler.time_shared import TimeShared
+from magnitude_engine.generation.acceptance import accept_prefix
+from magnitude_engine.generation.execution import serve
+from magnitude_engine.generation.sampling import SequenceSampler
+from magnitude_engine.models.execution import ExecutionOwner
+from magnitude_engine.resources.budget import MemoryBudget
 from performance.assembly import bind_operation
 from performance.records import Observation, digest
 from performance.runner import recording
 
 
 def accounting(component=None, *, transactions=1024, pressure=False, **record):
-    from magnitude_engine.resources.budget import MemoryBudget
 
     component = component or MemoryBudget(12288)
-    bound = bind_operation(component, c.Implementation(c.MEMORY, c.Source.MAG, "RESERVATIONS"))
+    bound = bind_operation(component, MemoryBudget)
     budget = bound.instance
     with recording(
         bound,
@@ -70,12 +75,11 @@ class MetadataCheckpoint:
 
 def prefix_lookup(component=None, *, context_tokens=4096, entries=32, queries=64, **record):
     from magnitude_engine.engine.prefixes.index import PrefixIdentity
-    from magnitude_engine.engine.prefixes.radix import Radix
     from magnitude_engine.engine.prefixes.retention import LeastRecentlyUsed
 
     owned = component is None
     component = component or Radix(retention=LeastRecentlyUsed(entries, None))
-    bound = bind_operation(component, c.Implementation(c.PREFIX, c.Source.MAG, "CHECKPOINTS"))
+    bound = bind_operation(component, Radix)
     store = bound.instance
     workload = {
         "context_tokens": context_tokens,
@@ -139,7 +143,6 @@ def sampling(component=None, *, vocabulary=248320, positions=4, policy="greedy",
     import mlx.core as mx
     import numpy as np
 
-    from magnitude_engine.generation.sampling import SequenceSampler
     from magnitude_engine.generation.sampling_policy import SamplingPolicy
 
     if policy not in ("greedy", "filtered", "categorical"):
@@ -152,7 +155,7 @@ def sampling(component=None, *, vocabulary=248320, positions=4, policy="greedy",
             top_p=0.9 if policy == "filtered" else 1,
         )
     )
-    bound = bind_operation(component, c.Implementation(c.SAMPLING, c.Source.MAG, "POSITION_KEYED"))
+    bound = bind_operation(component, SequenceSampler)
     workload = {
         "vocabulary": vocabulary,
         "positions": positions,
@@ -193,11 +196,7 @@ def sampling(component=None, *, vocabulary=248320, positions=4, policy="greedy",
 def acceptance(component=None, *, width=4, rounds=64, **record):
     import mlx.core as mx
 
-    from magnitude_engine.generation.acceptance import accept_prefix
-
-    bound = bind_operation(
-        component or accept_prefix, c.Implementation(c.ACCEPTANCE, c.Source.MAG, "PREFIX")
-    )
+    bound = bind_operation(component or accept_prefix, accept_prefix)
     with recording(
         bound, benchmark="control.acceptance", workload={"width": width, "rounds": rounds}, **record
     ) as run:
@@ -239,12 +238,8 @@ def device(component=None, *, elements=4096, operations=8, execution="scoped", *
     import mlx.core as mx
     import numpy as np
 
-    from magnitude_engine.models.execution import ExecutionOwner
-
     owned = component is None
-    bound = bind_operation(
-        component or ExecutionOwner(), c.Implementation(c.DEVICE, c.Source.MAG, "ASYNC")
-    )
+    bound = bind_operation(component or ExecutionOwner(), ExecutionOwner)
     owner = bound.instance
     with recording(
         bound,
@@ -296,11 +291,10 @@ def device(component=None, *, elements=4096, operations=8, execution="scoped", *
 
 def scheduling(component=None, *, rounds=128, **record):
     from magnitude_engine.engine.scheduler.contracts import CompletedService, Runnable
-    from magnitude_engine.engine.scheduler.time_shared import TimeShared
 
     bound = bind_operation(
         component or TimeShared(prefill_tokens=512, decode_share=0.5),
-        c.Implementation(c.SCHEDULING, c.Source.MAG, "TIME_SHARING"),
+        TimeShared,
     )
     scheduler = bound.instance
     with recording(
@@ -394,9 +388,7 @@ def ready_assembly(component=None, *, rows=32, capacity=4, **record):
     from magnitude_engine.models.operations import Forward
     from magnitude_engine.models.runtime import ForwardRequest
 
-    bound = bind_operation(
-        component or execute, c.Implementation(c.BATCHING, c.Source.MAG, "READY_COMPATIBLE")
-    )
+    bound = bind_operation(component or execute, serve)
     with recording(
         bound,
         benchmark="control.ready_assembly",

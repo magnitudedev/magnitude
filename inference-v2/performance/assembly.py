@@ -12,8 +12,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from magnitude_engine import components as c
+from magnitude_engine.components import component_id, component_of
+from magnitude_engine.models.architectures.mlx_vlm.program import LibraryProgram
 from performance.bindings import Fields, Use, foreign, read, resolve
+from performance.facts import NeuralParameters, OpaqueParameters, TensorFacts
 from performance.parameters import materialize, tensors
 from performance.records import Assembly, CompositionOrigin, Node, digest
 
@@ -45,7 +47,7 @@ def source_key(owners: tuple[object, ...]) -> tuple[str, dict[str, str]]:
             ]
             return self.generic_visit(node)
 
-        def visit_FunctionDef(self, node):
+        def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef):
             node.decorator_list = [
                 d
                 for d in node.decorator_list
@@ -65,6 +67,9 @@ def source_key(owners: tuple[object, ...]) -> tuple[str, dict[str, str]]:
             if node.args.kwarg:
                 node.args.kwarg.annotation = None
             return self.generic_visit(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+            return self.visit_FunctionDef(node)
 
         def visit_AnnAssign(self, node):
             return ast.Assign(targets=[node.target], value=node.value) if node.value else None
@@ -202,7 +207,7 @@ class _Capture:
         key = (
             id(reference.value),
             id(reference.context),
-            implementation.identity,
+            str(implementation),
             tuple((k, id(v.value)) for k, v in reference.dependencies.items()),
         )
         if key in self.seen:
@@ -219,9 +224,9 @@ class _Capture:
         }
         parameters = fields.parameters
         live_tensors = {}
-        if isinstance(parameters, c.NeuralParameters):
+        if isinstance(parameters, NeuralParameters):
             parameters, live_tensors = materialize(parameters, fields.operands)
-        elif isinstance(parameters, c.OpaqueParameters):
+        elif isinstance(parameters, OpaqueParameters):
             live_tensors = {
                 f"{role}.{name}": tensor
                 for role, operand in fields.operands.items()
@@ -230,14 +235,14 @@ class _Capture:
             parameters = parameters.model_copy(
                 update={
                     "arrays": {
-                        name: c.TensorFacts(
+                        name: TensorFacts(
                             identity=name, shape=t.shape, bytes=t.nbytes, dtype=str(t.dtype)
                         )
                         for name, t in live_tensors.items()
                     }
                 }
             )
-        if isinstance(parameters, (c.NeuralParameters, c.OpaqueParameters)):
+        if isinstance(parameters, (NeuralParameters, OpaqueParameters)):
             arrays = {}
             for name, fact in parameters.arrays.items():
                 tensor = live_tensors.get(name)
@@ -252,6 +257,7 @@ class _Capture:
             parameters = parameters.model_copy(update={"arrays": arrays})
         owners = (
             reference.value,
+            *((reference.declaration,) if reference.declaration is not None else ()),
             *fields.sources,
             *(
                 o.__self__ if inspect.ismethod(o) else o
@@ -289,7 +295,7 @@ def inspect_component(
     root = capture.visit(reference, path)
     declaration = None
     try:
-        declaration = c.component_of(resolve(reference).value)
+        declaration = component_of(resolve(reference).value)
     except TypeError:
         pass  # Upstream operation adapters have no production model definition.
     definition = declaration.model if declaration is not None else None
@@ -307,12 +313,15 @@ def inspect_upstream(model, *, artifact: str) -> BoundAssembly:
     from magnitude_engine.models.architectures.mlx_vlm.definition import DEFINITION
 
     artifacts = {"target": artifact_identity(artifact)}
-    source = c.Source.LM if type(model).__module__.startswith("mlx_lm.") else c.Source.VLM
+    from performance.benchmarks.references import LMForward
+
+    declaration = LMForward if type(model).__module__.startswith("mlx_lm.") else LibraryProgram
+    source = component_id(declaration).rsplit(":", 2)[1]
     bound = inspect_component(
         foreign(
             model,
-            c.Implementation(c.FORWARD, source, "STANDARD"),
-            Fields(c.OpaqueParameters(), operands={"model": model}),
+            declaration,
+            Fields(OpaqueParameters(), operands={"model": model}),
         ),
         path="target",
         artifacts=artifacts,
@@ -339,7 +348,7 @@ def inspect_engine(residency) -> BoundAssembly:
     capture = _Capture(artifacts)
     root = capture.visit(Use(residency.engine, residency), "engine")
     target = resolve(Use(residency.engine.generation.model.program)).value
-    definition = c.component_of(target).model
+    definition = component_of(target).model
     if definition is None:
         raise TypeError("engine target must declare its production model definition")
     # Preserve public occurrence paths without encoding another architecture.
@@ -370,20 +379,21 @@ def inspect_engine(residency) -> BoundAssembly:
     return BoundAssembly(graph, objects, capture.sources)
 
 
-def bind_operation(component, implementation: c.Implementation, *, parameters=None) -> Binding:
+def bind_operation(component, declaration: object, *, parameters=None) -> Binding:
+    expected = component_id(declaration)
     if isinstance(component, Binding):
-        if component.node.component != implementation.contract:
+        if component.node.component != expected.kind:
             raise ValueError("benchmark and component contracts differ")
         return component
     from performance import schemas  # noqa: F401
     from performance.bindings import SCHEMAS, operation
 
     try:
-        declaration = c.component_of(component)
+        selected = component_of(component)
     except TypeError:
-        declaration = None
-    if declaration is not None:
-        if declaration.contract != implementation.contract:
+        selected = None
+    if selected is not None:
+        if selected.id.kind != expected.kind:
             raise ValueError("benchmark and component contracts differ")
         shape = SCHEMAS.get(type(component))
         if shape is not None:
@@ -393,8 +403,10 @@ def bind_operation(component, implementation: c.Implementation, *, parameters=No
         return inspect_component(operation(component, parameters)).at("component")
     # External controls cannot carry our declaration; their adapter is explicit.
     if parameters is None:
-        parameters = implementation.contract.parameters()
-    return inspect_component(foreign(component, implementation, Fields(parameters))).at("component")
+        from performance.theory.catalog import parameter_type
+
+        parameters = parameter_type(expected.kind)()
+    return inspect_component(foreign(component, declaration, Fields(parameters))).at("component")
 
 
 def inspect_state(store, *, path="state") -> BoundAssembly:

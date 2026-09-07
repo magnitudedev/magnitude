@@ -13,11 +13,16 @@
   are evidence, not proofs of ceilings. Do not exclude legal optimizations to lower a bound.
 - Keep theory and benchmarking outside production execution. Reuse production identities
   and actual runtime bindings; never maintain a separate benchmark model definition.
-- `@blueprint` declares serialized construction; `@component` identifies actual execution.
+- `@blueprint` declares serialized construction. `@component("FULL:CANONICAL:SOURCE:VARIANT")`
+  declares an execution ID once.
+  Other Python code references the declaring class or instance through `component_id(...)`;
+  never reconstruct IDs from pieces or maintain a parallel ID catalog.
   Numerical implementations contain no performance descriptions or tree builders. Keep
   typed binding schemas, operand inspection and formulas under `performance/`. If needed,
   a small `bindings()` method may expose existing typed runtime objects, never build metadata.
 - Preserve raw history. Changed implementations need new evidence; unchanged components
   retain compatible evidence. Formula changes recompute assessments without new measurements.
-- Assembly sections contain generated trees and supported values only. Put investigation
+- Architecture assembly sections show semantic hierarchies with canonical IDs, collapsing
+  repeated instances and identifying optional/shared components. Exact runtime trees and
+  current assessments belong in performance tooling. Put investigation
   notes and provenance in results or session logs. Do not use sub-agents unless explicitly asked.

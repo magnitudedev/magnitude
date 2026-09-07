@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 
+from magnitude_engine.components import component
 from magnitude_engine.models.attention.metal import MetalPagedAttention
 from magnitude_engine.models.embeddings.resident import ResidentAffineEmbedding, ResidentEmbedding
 from magnitude_engine.models.experts.computation import ResidentExperts
@@ -17,6 +18,7 @@ from magnitude_engine.models.state.hybrid import HybridState
 from magnitude_engine.models.state.recurrent import RecurrentBoundaries, read_batch, write_batch
 
 from .attention.operation import GatedAttention
+from .definition import DEFINITION
 from .feedforward.operation import DenseFeedForward, RoutedFeedForward
 from .recurrence.operation import RecurrentMixer
 
@@ -24,6 +26,7 @@ if TYPE_CHECKING:
     from .program import Qwen35Program
 
 
+@component("MODEL:QWEN35:MAG:RESIDENT_COMPILED", model=DEFINITION)
 class ResidentDecode:
     def __init__(self, program: Qwen35Program):
         self.embedding = program.embedding
@@ -68,6 +71,8 @@ class ResidentDecode:
         if key in self.functions:
             self.functions.move_to_end(key)
             return self.functions[key]
+        from .program import readout
+
         embedding, blocks = self.embedding, self.blocks
         norm, output_projection = self.norm, self.output
         assert isinstance(embedding, (ResidentEmbedding, ResidentAffineEmbedding))
@@ -127,7 +132,7 @@ class ResidentDecode:
             name = f"residual:{len(blocks)}"
             if name in feature_names:
                 features[name] = hidden
-            logits = (output_projection(norm(hidden)),) if request.logits else ()
+            logits = (readout(output_projection, norm(hidden)),) if request.logits else ()
             return logits, features, tuple(next_keys), tuple(next_values), tuple(next_recurrent)
 
         compiled = mx.compile(step)
@@ -158,9 +163,7 @@ class ResidentDecode:
         )
         recurrent = tuple(read_batch(group) for group in slots)
         initial = tuple(tuple(slot.values for slot in group) for group in slots)
-        fn = self._function(
-            append.page_size, width, append.capacity, len(states), request
-        )
+        fn = self._function(append.page_size, width, append.capacity, len(states), request)
         logits, features, keys, values, final = fn(
             tokens,
             append.positions,

@@ -8,9 +8,11 @@ service timings are retained as evidence and never substituted for HTTP duration
 import json
 from pathlib import Path
 
-from magnitude_engine import components as c
+from magnitude_engine.components import component_id
+from performance.facts import Configuration
 from performance.records import Assembly, Node, Profile, digest
 from performance.store import Store
+from session_bench.client import measure
 
 
 def ingest(directory: Path, store: Store) -> dict:
@@ -61,9 +63,9 @@ def ingest(directory: Path, store: Store) -> dict:
             "metadata": artifact["metadata"],
         }
         implementation = Node(
-            c.Implementation(c.ENGINE, c.Source.MAG, "SESSION_HTTP"),
+            component_id(measure),
             digest(runtime.get("files", runtime)),
-            c.Configuration(
+            Configuration(
                 settings={
                     "server": target.rsplit("-", 1)[0],
                     "opaque_server": True,

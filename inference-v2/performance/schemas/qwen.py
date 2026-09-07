@@ -1,20 +1,21 @@
 """Typed field schemas over the architecture's execution bindings."""
 
-from magnitude_engine import components as c
 from magnitude_engine.models.architectures.qwen35.attention.operation import GatedAttention
+from magnitude_engine.models.architectures.qwen35.decode import ResidentDecode
 from magnitude_engine.models.architectures.qwen35.feedforward.operation import (
     DenseFeedForward,
     RoutedFeedForward,
 )
 from magnitude_engine.models.architectures.qwen35.mtp.program import MTPProgram
 from magnitude_engine.models.architectures.qwen35.program import Qwen35Program
+from magnitude_engine.models.architectures.qwen35.program import readout as qwen_readout
 from magnitude_engine.models.architectures.qwen35.recurrence.operation import RecurrentMixer
 from performance.bindings import Fields, Use, foreign, neural, schema
+from performance.facts import AttentionGeometry, NeuralParameters, RecurrentGeometry
 from performance.parameters import projection_shape
 
 
-@schema(Qwen35Program)
-def qwen35_program(a: Qwen35Program, context: None) -> Fields[c.NeuralParameters]:
+def qwen35_program(a: Qwen35Program | ResidentDecode, context: None) -> Fields[NeuralParameters]:
     children = {"embedding": Use(a.embedding)}
     operands = {"norm": a.norm}
     for i, block in enumerate(a.blocks):
@@ -24,19 +25,19 @@ def qwen35_program(a: Qwen35Program, context: None) -> Fields[c.NeuralParameters
         operands[f"layers.{i}.post_norm"] = block.feedforward_norm
     children["readout"] = foreign(
         a.output,
-        c.Implementation(c.QWEN_READOUT, c.Source.MAG, "STANDARD"),
+        qwen_readout,
         neural(operands={"output": a.output}),
     )
-    return neural(
-        operands=operands, children=children, sources=() if a.decode is None else (a.decode,)
-    )
+    if isinstance(a, Qwen35Program) and a.decode is not None:
+        children["decode"] = Use(a.decode)
+    return neural(operands=operands, children=children)
 
 
 @schema(RecurrentMixer)
-def recurrent_mixer(a: RecurrentMixer, context: None) -> Fields[c.NeuralParameters]:
+def recurrent_mixer(a: RecurrentMixer, context: None) -> Fields[NeuralParameters]:
     graph = a.operation.graph
     _, size = projection_shape(graph.qkv)
-    geometry = c.RecurrentGeometry(
+    geometry = RecurrentGeometry(
         key_heads=graph.key_heads,
         value_heads=graph.value_heads,
         key_width=graph.key_width,
@@ -62,9 +63,9 @@ def recurrent_mixer(a: RecurrentMixer, context: None) -> Fields[c.NeuralParamete
 
 
 @schema(GatedAttention)
-def gated_attention(a: GatedAttention, context: None) -> Fields[c.NeuralParameters]:
+def gated_attention(a: GatedAttention, context: None) -> Fields[NeuralParameters]:
     _, size = projection_shape(a.queries_and_gate)
-    geometry = c.AttentionGeometry(
+    geometry = AttentionGeometry(
         query_heads=a.query_heads,
         kv_heads=a.kv_heads,
         key_width=a.head_width,
@@ -86,12 +87,12 @@ def gated_attention(a: GatedAttention, context: None) -> Fields[c.NeuralParamete
 
 
 @schema(DenseFeedForward)
-def dense_feed_forward(a: DenseFeedForward, context: None) -> Fields[c.NeuralParameters]:
+def dense_feed_forward(a: DenseFeedForward, context: None) -> Fields[NeuralParameters]:
     return neural(operands={"mlp": a.call})
 
 
 @schema(RoutedFeedForward)
-def routed_feed_forward(a: RoutedFeedForward, context: None) -> Fields[c.NeuralParameters]:
+def routed_feed_forward(a: RoutedFeedForward, context: None) -> Fields[NeuralParameters]:
     return neural(
         operands={"router": a.router, "shared": a.shared, "shared_gate": a.shared_gate},
         children={"experts": Use(a.experts, a.top_k)},
@@ -100,7 +101,7 @@ def routed_feed_forward(a: RoutedFeedForward, context: None) -> Fields[c.NeuralP
 
 
 @schema(MTPProgram)
-def mtp_program(a: MTPProgram, context: None) -> Fields[c.NeuralParameters]:
+def mtp_program(a: MTPProgram, context: None) -> Fields[NeuralParameters]:
     return neural(
         operands={
             "embedding_norm": a.normalize_embedding,
@@ -112,3 +113,7 @@ def mtp_program(a: MTPProgram, context: None) -> Fields[c.NeuralParameters]:
         },
         children={"embedding": Use(a.embedding)},
     )
+
+
+schema(Qwen35Program)(qwen35_program)
+schema(ResidentDecode)(qwen35_program)

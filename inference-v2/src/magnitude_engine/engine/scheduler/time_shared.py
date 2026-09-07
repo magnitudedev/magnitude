@@ -3,14 +3,13 @@
 from dataclasses import dataclass, field
 from math import isfinite
 
-from magnitude_engine import components as c
 from magnitude_engine.components import component
 
 from .contracts import CompletedService, Runnable, Schedule, Scheduler, Service
 
 
 @dataclass
-@component(c.SCHEDULING, source=c.Source.MAG, variant="TIME_SHARING")
+@component("SCHEDULING:SERVICE:MAG:TIME_SHARING")
 class TimeShared(Scheduler):
     max_active: int = 8
     max_queued: int = 128

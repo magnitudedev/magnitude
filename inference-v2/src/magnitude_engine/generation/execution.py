@@ -12,7 +12,6 @@ from typing import cast
 
 import mlx.core as mx
 
-from magnitude_engine import components as c
 from magnitude_engine.components import component
 from magnitude_engine.models.operations import (
     Complete,
@@ -65,7 +64,7 @@ def execute[T](
     return rows
 
 
-@component(c.BATCHING, source=c.Source.MAG, variant="READY_COMPATIBLE")
+@component("BATCHING:ASSEMBLY:MAG:READY_COMPATIBLE")
 def serve[T](
     rows: tuple[Continuation[T], ...],
     *,

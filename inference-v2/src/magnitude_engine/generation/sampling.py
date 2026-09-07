@@ -7,7 +7,6 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 
-from magnitude_engine import components as c
 from magnitude_engine.components import component
 
 from .sampling_policy import SamplingPolicy
@@ -28,7 +27,7 @@ def position_key(seed: int, position: int) -> mx.array:
     return mx.random.key(mixed ^ (mixed >> 31))
 
 
-@component(c.SAMPLING, source=c.Source.MAG, variant="POSITION_KEYED")
+@component("GENERATION:SAMPLING:MAG:POSITION_KEYED")
 class SequenceSampler:
     def __init__(self, policy: SamplingPolicy):
         self.policy = policy

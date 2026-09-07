@@ -2,7 +2,7 @@
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from magnitude_engine.components import AttentionGeometry, RecurrentGeometry
+from performance.facts import AttentionGeometry, RecurrentGeometry
 from performance.theory.resources import DependentPhases, Extent
 
 

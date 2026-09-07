@@ -8,7 +8,8 @@ consume its serialized facts; production does not depend on performance tooling.
 
 | Owner | Responsibility |
 |---|---|
-| [Production contracts](../src/magnitude_engine/components.py) | Typed component contracts and execution declarations |
+| [Execution declarations](../src/magnitude_engine/components.py) | Canonical IDs on actual classes and operations |
+| [facts.py](../performance/facts.py) | Typed parameter records for capture and formula inputs |
 | [schemas/](../performance/schemas/) | Typed readers of actual runtime children, dependencies, operands and use geometry |
 | [assembly.py](../performance/assembly.py) | Capture those bindings, materialize tensor facts and fingerprint executable dependencies |
 | [theory/](../performance/theory/) | Executable requirements, dimension contracts and theoretical bounds |
@@ -25,9 +26,9 @@ assumptions; they do not maintain another set of numerical assessments.
 
 ## Binding the executed composition
 
-`@component` on an execution class or operation declares its contract, source and variant.
+`@component` declares a complete canonical ID on the execution class or operation.
 The decorator returns the original object: no wrapper, registry lookup or reporting call is
-inserted into execution. Model roots reference the same `ModelDefinition` that constructs
+inserted into execution. All Python consumers reference that class or its instances. Model roots reference the same `ModelDefinition` that constructs
 the production default. `@blueprint` owns serialization and construction independently.
 
 A typed schema reads the selected live object's existing fields. `Fields` separates local
@@ -62,9 +63,11 @@ Inputs come from four places:
 - Platform: capacity upper bounds and residency constraints, with provenance in `Profile`.
 - Conditioning: explicitly recorded routing, acceptance or output behavior.
 
-A contract pairs a stable ID with its parameter type. Execution declarations, typed binding
-schemas and registered formulas share that contract; workloads are validated separately. IDs are rendered for records
-and presentation, never used to guess Python classes or attributes.
+Formulas register against execution classes or operations. Registration derives the component
+type from the canonical ID and associates that type with its parameter record and workload.
+Implementations of the same type share its formulation. Binding schemas must return the
+registered parameter type. Saved results decode IDs at the persistence boundary and validate
+parameters through that same formulation; IDs never guess Python classes or attributes.
 
 No measured reference speed becomes a theoretical capacity. Unknown capacity bindings
 remain explicit. `assessment.preflight(graph, workload, profile)` evaluates every node
@@ -171,7 +174,10 @@ IMPLEMENTATION_ID    [DIM: ≥PERCENT @benchmark.identity]
 Use exactly four spaces before annotations. One dimension omits its label; multiple
 dimensions use their uppercase codes. `~` marks an explicit execution estimate. Unavailable
 or inconsistent percentages receive no documentation annotation or citation. The TUI shows
-their raw costs and reasons. Assembly sections contain only generated trees and numbers.
+their raw costs and reasons. Generated exports contain captured trees and supported numbers.
+Architecture design docs retain semantic assemblies with IDs under the
+[assembly convention](components.md#definitions-and-assemblies); do not replace them with
+full captured trees or copy instance-specific scores onto collapsed layer patterns.
 
 `@benchmark.identity` is the semantic name recorded by the measurement function, independent
 of its filename, implementation variant and run ID. It resolves through the selected

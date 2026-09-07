@@ -5,7 +5,6 @@ from typing import Any
 
 import mlx.core as mx
 
-from magnitude_engine import components as c
 from magnitude_engine.components import component
 
 from ..state.views import PagedKV
@@ -123,7 +122,7 @@ def _combine() -> Any:
     )
 
 
-@component(c.ATTENTION, source=c.Source.MAG, variant="PAGED")
+@component("MODEL:ATTENTION:MAG:PAGED")
 class MetalPagedAttention:
     """Short query blocks use page addresses; prefill delegates to its own operator.
 

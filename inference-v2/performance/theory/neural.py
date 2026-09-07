@@ -1,6 +1,6 @@
 """Neural requirements under explicit representation and arithmetic assumptions."""
 
-from magnitude_engine.components import AttentionGeometry, RecurrentGeometry
+from performance.facts import AttentionGeometry, RecurrentGeometry
 from performance.theory.resources import Demands, Extent
 from performance.theory.workloads import AttentionWorkload, RecurrentWorkload
 

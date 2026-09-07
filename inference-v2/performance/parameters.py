@@ -8,7 +8,7 @@ from collections.abc import Mapping
 import mlx.core as mx
 import mlx.nn as nn
 
-from magnitude_engine.components import (
+from performance.facts import (
     MatrixFacts,
     NeuralParameters,
     TensorFacts,

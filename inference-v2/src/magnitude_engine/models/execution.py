@@ -9,7 +9,6 @@ from typing import Protocol
 
 import mlx.core as mx
 
-from magnitude_engine import components as c
 from magnitude_engine.components import component
 
 
@@ -42,7 +41,7 @@ class MLXCompletion:
         mx.synchronize()
 
 
-@component(c.DEVICE, source=c.Source.MAG, variant="ASYNC")
+@component("EXECUTION:DEVICE:MAG:ASYNC")
 class ExecutionOwner:
     """Target and drafter share one host execution owner, not one thread per model.
 

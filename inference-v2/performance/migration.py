@@ -6,8 +6,18 @@ import json
 import shutil
 from dataclasses import asdict
 
-from magnitude_engine import components as c
+from magnitude_engine.components import ComponentId, component_id
+from magnitude_engine.models.embeddings.resident import ResidentEmbedding
+from magnitude_engine.models.experts.computation import ResidentExperts
+from performance.facts import (
+    Configuration,
+    NeuralParameters,
+    RecurrentStorage,
+    TensorFacts,
+    WeightUse,
+)
 from performance.records import CompositionOrigin, digest
+from performance.theory.catalog import parameter_type
 
 
 def convert(original: dict) -> dict:
@@ -19,37 +29,37 @@ def convert(original: dict) -> dict:
     notes = {}
     graph = run["assembly"]
     for path, node in graph["nodes"].items():
-        binding = c.implementation(node["implementation"])
+        binding = ComponentId(node["implementation"])
         raw = node.get("parameters") or {}
-        kind = binding.contract.parameters
+        kind = parameter_type(binding.kind)
         try:
-            if kind is c.Configuration:
-                facts = c.Configuration(
+            if kind is Configuration:
+                facts = Configuration(
                     settings={
                         k: v
                         for k, v in raw.items()
                         if isinstance(v, (str, int, float, bool)) or v is None
                     }
                 )
-            elif kind is c.NeuralParameters:
+            elif kind is NeuralParameters:
                 use = (
-                    c.WeightUse.EMBEDDING
-                    if binding.contract == c.EMBEDDING
-                    else c.WeightUse.EXPERTS
-                    if binding.contract == c.EXPERTS
-                    else c.WeightUse.FULL
+                    WeightUse.EMBEDDING
+                    if binding.kind == component_id(ResidentEmbedding).kind
+                    else WeightUse.EXPERTS
+                    if binding.kind == component_id(ResidentExperts).kind
+                    else WeightUse.FULL
                 )
-                facts = c.NeuralParameters(
+                facts = NeuralParameters(
                     arrays=raw.get("arrays", {}), weight_use=use, top_k=raw.get("top_k")
                 )
                 notes[path] = (
                     "Recorded tensor extents retained; untyped matrix arithmetic not promoted."
                 )
-            elif kind is c.RecurrentStorage:
-                facts = c.RecurrentStorage(
+            elif kind is RecurrentStorage:
+                facts = RecurrentStorage(
                     layouts=tuple(
                         tuple(
-                            c.TensorFacts(identity=f"{path}:{i}:{j}", dtype="recorded", **v)
+                            TensorFacts(identity=f"{path}:{i}:{j}", dtype="recorded", **v)
                             for j, v in enumerate(row)
                         )
                         for i, row in enumerate(raw["layouts"])

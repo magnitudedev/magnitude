@@ -4,7 +4,6 @@ from typing import cast
 
 import mlx.core as mx
 
-from magnitude_engine import components as c
 from magnitude_engine.components import component
 from magnitude_engine.resources.io.reader import PositionalReader
 
@@ -14,7 +13,7 @@ from .computation import GatedExpertMath
 from .residency import Residency, Transfer
 
 
-@component(c.EXPERTS, source=c.Source.MAG, variant="STREAMED")
+@component("MODEL:EXPERTS:MAG:STREAMED")
 class StreamedExperts:
     def __init__(
         self,

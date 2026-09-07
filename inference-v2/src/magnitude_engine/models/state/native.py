@@ -26,7 +26,6 @@ from mlx_vlm.models.cache import ArraysCache as VLMArrayCache
 from mlx_vlm.models.cache import KVCache as VLMKVCache
 from mlx_vlm.models.cache import RotatingKVCache as VLMRotatingKVCache
 
-from magnitude_engine import components as c
 from magnitude_engine.components import component
 from magnitude_engine.resources.budget import MemoryBudget, Reservation
 from magnitude_engine.resources.retention import RetainedStorage
@@ -273,7 +272,7 @@ class LibraryTransaction:
         self.closed = True
 
 
-@component(c.NATIVE_STATE, source=c.Source.MAG, variant="NATIVE")
+@component("STATE:CHECKPOINTS:MAG:NATIVE")
 class LibraryStateStore:
     def __init__(
         self,

@@ -5,7 +5,6 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 
-from magnitude_engine import components as c
 from magnitude_engine.components import component
 from magnitude_engine.models.activations import sigmoid_gate
 from magnitude_engine.models.attention.contracts import PagedAttention
@@ -20,7 +19,7 @@ Transform = Callable[[mx.array], mx.array]
 
 
 @dataclass(frozen=True)
-@component(c.QWEN_ATTENTION, source=c.Source.MAG, variant="SEPARATE_PROJECTIONS")
+@component("MODEL:QWEN35.ATTENTION:MAG:SEPARATE_PROJECTIONS")
 class GatedAttention:
     index: int
     queries_and_gate: Transform

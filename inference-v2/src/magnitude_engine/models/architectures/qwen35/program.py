@@ -6,7 +6,6 @@ from typing import Protocol
 
 import mlx.core as mx
 
-from magnitude_engine import components as c
 from magnitude_engine.components import component
 from magnitude_engine.models.embeddings.contracts import EmbeddingLookup
 from magnitude_engine.models.execution import ExecutionScope
@@ -23,6 +22,11 @@ from .feedforward.operation import (
 Transform = Callable[[mx.array], mx.array]
 
 
+@component("MODEL:QWEN35.READOUT:MAG:STANDARD")
+def readout(projection: Transform, hidden: mx.array) -> mx.array:
+    return projection(hidden)
+
+
 class Mixer(Protocol):
     def compute_batch(
         self, hidden: mx.array, states: tuple[HybridState, ...], scope: ExecutionScope
@@ -37,12 +41,7 @@ class HybridBlock:
     feedforward: FeedForward
 
 
-@component(
-    c.QWEN35,
-    source=c.Source.MAG,
-    variant=lambda p: "RESIDENT_COMPILED" if p.decode is not None else "LAYERWISE",
-    model=DEFINITION,
-)
+@component("MODEL:QWEN35:MAG:LAYERWISE", model=DEFINITION)
 class Qwen35Program:
     conditioning: frozenset[str] = frozenset()
 
@@ -101,4 +100,6 @@ class Qwen35Program:
         name = f"residual:{len(self.blocks)}"
         if name in request.features:
             features[name] = hidden
-        return ModelOutput(self.output(self.norm(hidden)) if request.logits else None, features)
+        return ModelOutput(
+            readout(self.output, self.norm(hidden)) if request.logits else None, features
+        )

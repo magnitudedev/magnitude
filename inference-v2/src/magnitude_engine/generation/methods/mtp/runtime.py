@@ -7,7 +7,6 @@ from typing import Any
 
 import mlx.core as mx
 
-from magnitude_engine import components as c
 from magnitude_engine.components import component
 from magnitude_engine.generation.features import RetainedFeature
 from magnitude_engine.generation.proposals import Proposal
@@ -206,7 +205,7 @@ class MTPSession:
         self.closed = True
 
 
-@component(c.SPECULATION, source=c.Source.MAG, variant="TARGET_MATCHING")
+@component("GENERATION:SPECULATION:MAG:TARGET_MATCHING")
 class MTPMethod:
     def __init__(
         self,

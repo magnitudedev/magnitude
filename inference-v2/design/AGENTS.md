@@ -3,6 +3,10 @@ This is NOT the top level "design" doc and does not participate in that system.
 These docs are meant as a HIGH LEVEL, HIGH SIGNAL source of truth.
 
 Assembly sections contain only the component tree and supported numerical annotations.
+Architecture trees show the semantic composition with canonical component IDs: collapse
+repeated layers, label alternatives and optional branches, and show shared dependencies.
+Do not paste full runtime captures or enumerate individual layer instances. Exact captured
+compositions and their current assessments belong in the performance tooling.
 Never add benchmark setup, hardware/shape inventories, provenance paragraphs, progress
 reports, investigation notes, or explanations of missing results around the tree.
 Those belong in existing benchmark records or session evidence, not design documents.

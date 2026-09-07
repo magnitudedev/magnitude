@@ -113,7 +113,7 @@ module. There is no benchmark blueprint or case selector.
 
 ```sh
 uv run --frozen python - <<'PYTHON'
-from magnitude_engine.components import AttentionGeometry
+from performance.facts import AttentionGeometry
 from magnitude_engine.models.attention.gathered import GatheredAttention
 from magnitude_engine.models.attention.metal import MetalPagedAttention
 from performance.benchmarks.attention import benchmark
