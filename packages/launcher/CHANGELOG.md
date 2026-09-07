@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.12-alpha.4
+
+### Patch Changes
+
+- [`6b894d9`](https://github.com/magnitudedev/magnitude/commit/6b894d93c709b98e11470356ebb3030401fbdfdf) Thanks [@anerli](https://github.com/anerli)! - fix pi package pre tag parsing
+
 ## 0.0.12-alpha.3
 
 ### Patch Changes
