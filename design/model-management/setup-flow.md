@@ -290,23 +290,23 @@ An immutable `host: pi` client-service configuration replaces destination select
 application through the existing `HarnessConnection` transaction. Ready selection goes directly to
 `ApplyingHarness`, with skill and login startup enabled, and then `ReturnToHost { modelId }` only
 after reconciliation and any required durable completion succeed. Ordinary setup retains destination
-selection and its existing launch behavior. Model readiness or a zero exit alone never implies
-successful connection. Application cleanup is fenced by the exact admitted lifecycle value.
+selection and its existing launch behavior. Model readiness alone never implies successful connection;
+the private command exits successfully only after connection completes. Application cleanup is fenced
+by the exact admitted lifecycle value.
 
 The hosted frame labels the last step `Connect Pi` and otherwise preserves the shared setup layout,
 without an additional connection, package, or permissions banner.
 
-`setup --host-protocol` returns the shared terminal-host protocol version without starting the service.
-`setup --host pi --result-file <absolute-path>` requires both options and rejects chat inputs. The
-host allocates a private temporary directory. The CLI requires a new writable result target and
-atomically writes a versioned Completed, Cancelled, or Failed result after terminal teardown. The
-parent reads once after child exit, limits the file to 16 KiB, validates the shared Effect Schema
-and exit/result consistency, and removes the temporary directory before model activation. This
-contract is independent of daemon RPC and is not general-purpose CLI JSON output.
+The hidden `setup-pi` entrypoint is private to the Pi extension and rejects chat inputs and positional
+arguments. Public `setup` exposes no integration flags. There is no capability negotiation, result
+file, or separate host protocol. Exit 0 means connected, 130 means cancelled, and other nonzero exits
+mean failure. After success, Pi reads the current local primary model once using the existing SDK
+without auto-starting the service. This observes current shared selection, not an invocation-specific
+snapshot. Lookup failure is reported as a post-setup activation failure, never as failed installation.
 
 Pi permits one setup while idle in TUI mode. Its terminal is stopped before child execution and
 restored/redrawn after child reaping, including cancellation and failures. On success it refreshes
-the model registry, selects the exact returned Magnitude model, and reloads resources as its last
+the model registry, selects the SDK-observed Magnitude model, and reloads resources as its last
 action when invoked from a command. Cancellation leaves the existing Pi model alone. First-run
 acceptance invokes the same setup and model-activation action directly, retaining the already-loaded
 extension and skill without a command-only resource reload. It never sends an LLM prompt. Setup requires a compatible installed CLI but no

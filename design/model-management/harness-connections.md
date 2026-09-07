@@ -222,7 +222,7 @@ reloads, and package updates. Existing Magnitude configurations, conversations, 
 input, and command-line prompts suppress the offer without consuming it; headless modes do likewise.
 Manual setup remains available independently of the receipt. Accepting setup installs an absent
 ambient CLI through Magnitude's public npm distribution before opening graphical setup; no separate
-Magnitude installation is a first-run prerequisite. Installation and capability checks run in the
+Magnitude installation is a first-run prerequisite. Installation and executable checks run in the
 background while Pi retains the terminal and shows its native cancellable spinner. Success hides
 installer output; failures show bounded diagnostics and permit an explicit retry. Cancellation or
 disposal terminates scoped subprocess work and closes the spinner. Only the graphical model setup
@@ -231,7 +231,8 @@ Existing incompatible or broken CLIs and explicit executable overrides are repor
 replaced. Loading the extension, declining setup, and headless operation do not install software.
 The package does not install a private CLI dependency or alter executable lookup. Hosted setup
 uses the same connection transaction as headless and ordinary interactive setup, then selects the
-exact returned model in the existing Pi session. Manual commands then reload resources. First-run
+current local primary model, read once through the SDK after a successful child exit, in the existing
+Pi session. Failed or cancelled setup does not query or change Pi's model. Manual commands then reload resources. First-run
 events retain the already-loaded extension and usage skill; they do not require command-only reload
 authority or newer chat-message dispatch APIs.
 

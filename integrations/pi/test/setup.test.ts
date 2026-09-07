@@ -1,42 +1,29 @@
 import { Deferred, Effect, Fiber, Layer, Schema } from "effect"
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent"
 import { describe, expect, it, vi } from "vitest"
-import { ModelIdSchema } from "@magnitudedev/sdk"
+import { ConnectionClosed, MagnitudeClient, ProviderModelIdSchema } from "@magnitudedev/sdk"
 import { FileSystem } from "@effect/platform"
 import * as Command from "@effect/platform/Command"
 import { NodeContext } from "@effect/platform-node"
-import { PiSetup, PiSetupFailed, PiSetupLive, prepareMagnitudeCli, registerMagnitudeSetup, validateSetupTermination, withPiTerminal, withPiPreparation } from "../extensions/setup"
+import { PiSetup, PiSetupFailed, PiSetupLive, prepareMagnitudeCli, readSetupModel, registerMagnitudeSetup, validateSetupTermination, withPiTerminal, withPiPreparation } from "../extensions/setup"
 import type { CancellableLoader } from "@earendil-works/pi-tui"
 
-const modelId = ModelIdSchema.make("test:gguf:q4")
-const completed = { _tag: "Completed", protocolVersion: 1, modelId } as const
-const cancelled = { _tag: "Cancelled", protocolVersion: 1 } as const
-const failed = { _tag: "Failed", protocolVersion: 1, message: "installation failed" } as const
+const modelId = ProviderModelIdSchema.make("test:gguf:q4")
+const completed = { _tag: "Completed", modelId } as const
+const cancelled = { _tag: "Cancelled" } as const
 const encodeString = Schema.encodeSync(Schema.parseJson(Schema.String))
 
-describe("actual hosted child boundary", () => {
-  it.each(["completed", "cancelled", "failed", "missing", "malformed", "oversized", "contradictory", "signal", "old-cli"])("handles %s and cleans the result directory", async scenario => {
+describe("actual setup child boundary", () => {
+  it.each(["cancelled", "failed", "signal", "old-cli"])("restores Pi after %s without model lookup", async scenario => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
-      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "pi-host-fixture-" })
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "pi-setup-fixture-" })
       const executable = `${directory}/magnitude`
-      const receipt = `${directory}/receipt`
       yield* fs.writeFileString(executable, `#!/usr/bin/env node
-import { writeFileSync } from 'node:fs'
-if (process.argv.includes('--host-protocol')) {
-  console.log(${scenario === "old-cli" ? "'{\"protocolVersion\":0}'" : "'{\"protocolVersion\":1}'"})
-} else {
-  const path = process.argv[process.argv.indexOf('--result-file') + 1]
-  writeFileSync(${encodeString(receipt)}, path)
-  const scenario = ${encodeString(scenario)}
-  if (scenario === 'signal') process.kill(process.pid, 'SIGKILL')
-  if (scenario !== 'missing') writeFileSync(path, scenario === 'malformed' ? '{' : scenario === 'oversized' ? 'x'.repeat(17000) : JSON.stringify(
-    scenario === 'failed' ? { _tag: 'Failed', protocolVersion: 1, message: 'fixture failure' } :
-    scenario === 'cancelled' ? { _tag: 'Cancelled', protocolVersion: 1 } :
-    { _tag: 'Completed', protocolVersion: 1, modelId: 'test:gguf:q4' }
-  ))
-  process.exitCode = scenario === 'failed' || scenario === 'contradictory' ? 1 : 0
-}
+if (process.argv[2] === '--version') process.exit(0)
+if (process.argv[2] !== 'setup-pi' || process.argv.length !== 3) process.exit(2)
+if (${encodeString(scenario)} === 'signal') process.kill(process.pid, 'SIGKILL')
+process.exit(${scenario === "cancelled" ? 130 : 1})
 `)
       yield* fs.chmod(executable, 0o755)
       const previous = process.env.MAGNITUDE_CLI
@@ -49,34 +36,23 @@ if (process.argv.includes('--host-protocol')) {
       const ctx = { cwd: directory, ui: { custom: (factory: Function) => new Promise<void>(resolve => {
         factory({ terminal: { write: () => calls.push("reset") }, stop: () => calls.push("stop"), start: () => calls.push("start"), requestRender: () => {} }, { fg: (_: string, text: string) => text }, {}, resolve)
       }) } } as unknown as ExtensionContext
-      const result = yield* Effect.flatMap(PiSetup, setup => setup.run(ctx)).pipe(
-        Effect.provide(PiSetupLive), Effect.either,
-      )
-      if (scenario === "completed" || scenario === "cancelled") {
-        expect(result).toMatchObject({ _tag: "Right", right: scenario === "completed" ? completed : cancelled })
-      } else {
-        expect(result._tag).toBe("Left")
-      }
-      if (scenario === "old-cli") {
-        expect(calls).toEqual([])
-        expect(yield* fs.exists(receipt)).toBe(false)
-      } else {
-        expect(calls).toEqual(["stop", "reset", "start"])
-        const resultPath = yield* fs.readFileString(receipt)
-        expect(yield* fs.exists(resultPath)).toBe(false)
-      }
+      const result = yield* Effect.flatMap(PiSetup, setup => setup.run(ctx)).pipe(Effect.provide(PiSetupLive), Effect.either)
+      if (scenario === "cancelled") expect(result).toMatchObject({ _tag: "Right", right: cancelled })
+      else expect(result._tag).toBe("Left")
+      expect(calls).toEqual(["stop", "reset", "start"])
+      expect(yield* fs.readDirectory(directory)).toEqual(["magnitude"])
     })).pipe(Effect.provide(NodeContext.layer)))
   })
 })
 
 describe("first-encounter CLI installation", () => {
-  it.each(["missing", "existing", "incompatible", "nonzero", "override", "permission", "npm-failed", "npm-missing", "interrupted", "bad-install"])("handles %s without an ambient installation", async scenario => {
+  it.each(["missing", "existing", "old-version", "nonzero", "override", "permission", "npm-failed", "npm-missing", "interrupted", "bad-install"])("handles %s without an ambient installation", async scenario => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
       const directory = yield* fs.makeTempDirectoryScoped({ prefix: "pi-cli-bootstrap-" })
       const executable = `${directory}/magnitude`
       const receipt = `${directory}/install.json`
-      const cli = `#!${process.execPath}\nconsole.log('{"protocolVersion":1}')\n`
+      const cli = `#!${process.execPath}\nif (process.argv[2] !== '--version') process.exit(2)\nconsole.log('0.0.1')\n`
       const previousPath = process.env.PATH
       const previousOverride = process.env.MAGNITUDE_CLI
       yield* Effect.addFinalizer(() => Effect.sync(() => {
@@ -88,8 +64,8 @@ describe("first-encounter CLI installation", () => {
       process.env.PATH = directory
       delete process.env.MAGNITUDE_CLI
       if (scenario === "override") process.env.MAGNITUDE_CLI = `${directory}/explicit-missing`
-      if (["existing", "incompatible", "nonzero", "permission"].includes(scenario)) {
-        yield* fs.writeFileString(executable, scenario === "incompatible" ? `#!${process.execPath}\nconsole.log('{}')\n` : cli + (scenario === "nonzero" ? "process.exitCode = 1\n" : ""))
+      if (["existing", "old-version", "nonzero", "permission"].includes(scenario)) {
+        yield* fs.writeFileString(executable, scenario === "old-version" ? `#!${process.execPath}\nconsole.log('0.0.0')\n` : cli + (scenario === "nonzero" ? "process.exitCode = 1\n" : ""))
         yield* fs.chmod(executable, scenario === "permission" ? 0o644 : 0o755)
       }
       if (scenario !== "npm-missing") {
@@ -99,7 +75,7 @@ fs.writeFileSync(${encodeString(receipt)}, JSON.stringify(process.argv.slice(2))
 console.log('hidden npm output')
 if (${encodeString(scenario)} === 'npm-failed') { console.error('EACCES: test prefix not writable'); process.exit(1) }
 if (${encodeString(scenario)} === 'interrupted') process.kill(process.pid, 'SIGTERM')
-fs.writeFileSync(${encodeString(executable)}, ${encodeString(scenario === "bad-install" ? `#!${process.execPath}\nconsole.log('{}')\n` : cli)}, { mode: 0o755 })
+fs.writeFileSync(${encodeString(executable)}, ${encodeString(scenario === "bad-install" ? `#!${process.execPath}\nprocess.exit(1)\n` : cli)}, { mode: 0o755 })
 `)
         yield* fs.chmod(`${directory}/npm`, 0o755)
       }
@@ -111,7 +87,7 @@ fs.writeFileSync(${encodeString(executable)}, ${encodeString(scenario === "bad-i
         expect(result).toMatchObject({ _tag: "Left", left: { message: expect.stringContaining("EACCES: test prefix not writable") } })
         expect(messages).toEqual(["Installing Magnitude…"])
       }
-      if (scenario === "missing" || scenario === "existing") {
+      if (scenario === "missing" || scenario === "existing" || scenario === "old-version") {
         expect(result).toMatchObject({ _tag: "Right", right: "magnitude" })
         // Re-entry must reuse the newly installed CLI, not install again.
         expect(yield* prepareMagnitudeCli(directory)).toBe("magnitude")
@@ -179,20 +155,38 @@ describe("Pi preparation spinner", () => {
   })
 })
 
-describe("hosted setup result", () => {
-  it.each([completed, cancelled])("accepts a successful $_tag exit", async result => {
-    expect(await Effect.runPromise(validateSetupTermination(result, { _tag: "Exited", code: 0 }))).toEqual(result)
+describe("setup exit status", () => {
+  it.each([[0, true], [130, false]] as const)("interprets exit %i", async (code, expected) => {
+    expect(await Effect.runPromise(validateSetupTermination({ _tag: "Exited", code }))).toBe(expected)
   })
-  it.each([
-    [completed, 1], [cancelled, 1], [failed, 0],
-  ] as const)("rejects inconsistent result and exit code", async (result, code) => {
-    await expect(Effect.runPromise(validateSetupTermination(result, { _tag: "Exited", code }))).rejects.toThrow("consistent completion")
+  it.each([1, 2, 127])("rejects failure exit %i", async code => {
+    await expect(Effect.runPromise(validateSetupTermination({ _tag: "Exited", code }))).rejects.toThrow("setup failed")
   })
-  it("preserves a reported failure", async () => {
-    await expect(Effect.runPromise(validateSetupTermination(failed, { _tag: "Exited", code: 1 }))).rejects.toThrow("installation failed")
+  it("treats SIGINT as cancellation", async () => {
+    expect(await Effect.runPromise(validateSetupTermination({ _tag: "Signaled", signal: "SIGINT" }))).toBe(false)
   })
-  it("does not activate a model after an unexpected signal", async () => {
-    await expect(Effect.runPromise(validateSetupTermination(completed, { _tag: "Signaled", signal: "SIGTERM" }))).rejects.toThrow("consistent completion")
+  it("reports an unexpected signal", async () => {
+    await expect(Effect.runPromise(validateSetupTermination({ _tag: "Signaled", signal: "SIGTERM" }))).rejects.toThrow("unexpectedly")
+  })
+})
+
+describe("setup SDK lookup", () => {
+  it("reports a failed lookup without retrying setup", async () => {
+    const getSlots = vi.fn(() => Effect.fail(new ConnectionClosed({})))
+    await expect(Effect.runPromise(readSetupModel.pipe(
+      Effect.provideService(MagnitudeClient, { models: { getSlots } } as unknown as MagnitudeClient),
+    ))).rejects.toThrow("Magnitude setup completed, but the selected model could not be read: Magnitude client is closed. Run /reload and select it with /model.")
+    expect(getSlots).toHaveBeenCalledExactlyOnceWith({})
+  })
+  it.each(["ConfiguredLocal", "Unassigned", "Resolving", "ConfiguredRemote"])("handles %s primary model", async tag => {
+    const getSlots = vi.fn(() => Effect.succeed({ slots: { primary: { _tag: tag, selection: { providerModelId: modelId } } } }))
+    const result = await Effect.runPromise(readSetupModel.pipe(
+      Effect.provideService(MagnitudeClient, { models: { getSlots } } as unknown as MagnitudeClient),
+      Effect.either,
+    ))
+    expect(getSlots).toHaveBeenCalledExactlyOnceWith({})
+    if (tag === "ConfiguredLocal") expect(result).toMatchObject({ _tag: "Right", right: modelId })
+    else expect(result).toMatchObject({ _tag: "Left", left: { message: expect.stringContaining("no local primary model") } })
   })
 })
 
