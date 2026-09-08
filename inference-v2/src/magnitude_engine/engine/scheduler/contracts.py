@@ -41,6 +41,7 @@ class CompletedService:
     phase: Phase
     elapsed_ns: int
     input_tokens: int = 0
+    preparation_ns: int = 0
 
 
 class Scheduler(ABC):

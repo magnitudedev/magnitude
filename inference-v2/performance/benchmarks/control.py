@@ -374,6 +374,9 @@ class DescriptorRuntime:
     def can_batch(self, rows):
         return len(rows) <= self.capacity
 
+    def input_key(self, sequence, count):
+        return None
+
     def forward(self, row, inputs, request):
         self.records.append((tuple([row.identity]), inputs.count, request.committed_inputs))
         return row.identity

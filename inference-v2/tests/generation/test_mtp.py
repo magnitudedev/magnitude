@@ -35,8 +35,11 @@ class TargetProgram:
         return self._forward(inputs.tokens, caches, request)
 
     def forward_batch(self, inputs, states, request, scope):
-        return self._forward(mx.concatenate([row.tokens for row in inputs]),
-                             states[0].store.batch_caches(states), request)
+        return self._forward(
+            mx.concatenate([row.tokens for row in inputs]),
+            states[0].store.batch_caches(states),
+            request,
+        )
 
     def _forward(self, tokens, caches, request):
         value = tokens.astype(mx.float32)[..., None]
@@ -94,6 +97,40 @@ def setup():
         identity="test-head",
     )
     return target, method, budget, backend, calls, pairs
+
+
+def test_mtp_prefill_uses_aligned_successor_embeddings_across_chunk_boundaries():
+    target, method, budget, _, _, pairs = setup()
+    method.input_feature = "embedded"
+    session = method.create(target=target)
+    # Placeholder ID 9 represents distinct image features, not vocabulary row 9.
+    run(
+        session.prefill(
+            (1, 9, 9),
+            {
+                "residual:1": mx.array([[[10.0], [20.0], [30.0]]]),
+                "embedded": mx.array([[[1.0], [72.0], [83.0]]]),
+            },
+        )
+    )
+    assert pairs[0].tolist() == [[[72.0, 10.0], [83.0, 20.0]]]
+    checkpoint = session.checkpoint()
+    restored = method.create(checkpoint, target=target)
+    run(
+        restored.prefill(
+            (9, 4),
+            {
+                "residual:1": mx.array([[[40.0], [50.0]]]),
+                "embedded": mx.array([[[94.0], [4.0]]]),
+            },
+        )
+    )
+    assert pairs[-1].tolist() == [[[94.0, 30.0], [4.0, 40.0]]]
+    restored.close()
+    checkpoint.close()
+    session.close()
+    target.owner.close()
+    assert budget.snapshot().reserved == 0
 
 
 def observation(inputs, accepted_inputs, bonus):
@@ -325,7 +362,9 @@ def test_prompt_conditioning_is_shifted_across_chunks(chunks):
 
 @pytest.mark.parametrize("after_decode", [False, True])
 @pytest.mark.parametrize("extension", [(), (43, 44, 45)])
-def test_checkpoint_reuses_only_committed_history_with_a_different_next_token(after_decode, extension):
+def test_checkpoint_reuses_only_committed_history_with_a_different_next_token(
+    after_decode, extension
+):
     target, method, budget, _, _, pairs = setup()
     runtime = GenerationRuntime(target, method)
     policy = SamplingPolicy(temperature=0)

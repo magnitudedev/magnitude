@@ -76,6 +76,12 @@ adapters. Shared computation depends on explicit tensors and contracts. Architec
 differences such as rotary conventions, normalization or expert routing remain
 visible in the owning architecture rather than emerging from incidental imports.
 
+[Input semantics](inputs.md) follow the same boundary: model-owned preparation produces
+explicit operands and legal continuation boundaries. The scheduler sees work and
+resource requirements; storage sees allocation and visibility; kernels see their
+mathematical operands. Adding vision does not introduce family or modality branches
+into service policy, speculation, or physical state allocation.
+
 ## Composition without execution barriers
 
 ```text
@@ -97,6 +103,15 @@ the tensor computation. State storage owns allocation and visibility; blocks
 consume compatible views and perform their declared updates. Resources remain
 owned until dependent device work completes. Streaming may require explicit
 execution segments without moving I/O or residency policy into neural equations.
+
+Lease acquisition reports unavailable capacity before neural work using that lease.
+Its factory rolls back on failure. Resource contention identifies the actual blocking
+leases: the execution owner may retire their prior consumers and retry acquisition.
+It does not synchronize unrelated executions or release a lease held by the current
+computation. Unowned or still-busy resources fail explicitly. General allocation
+pressure separately permits completion of prior owned work to free memory. Neither
+case replays numerical work. Finite streaming banks therefore compose with
+asynchronous generation without family-specific scheduling rules.
 
 Prefill, decode and verification share model semantics while allowing different
 implementations. Selection follows supported tensor geometry, precision and state

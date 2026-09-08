@@ -19,7 +19,10 @@ from performance.facts import Configuration
 
 
 def model(runtime) -> Use:
-    return Use(runtime.program, dependencies={"state": Use(runtime.states)})
+    dependencies = {"state": Use(runtime.states)}
+    if runtime.preparation is not None:
+        dependencies["inputs"] = Use(runtime.preparation)
+    return Use(runtime.program, dependencies=dependencies)
 
 
 @schema(Engine, context=EngineResidency)
@@ -35,6 +38,7 @@ def engine(a: Engine, binding: EngineResidency) -> Fields[Configuration]:
                     "tokenizer_identity",
                     "memory_bytes",
                     "program_implementation",
+                    "image_processor",
                 )
             }
         ),

@@ -1,5 +1,6 @@
-"""Generic MLX-VLM text-program binding; upstream selects the architecture."""
+"""MLX-VLM composition with explicit bindings for conditional model semantics."""
 
+from copy import deepcopy
 from dataclasses import dataclass
 
 from mlx_vlm.models.cache import make_prompt_cache
@@ -55,6 +56,14 @@ class UpstreamLoader(ProgramSource):
     def _load(self, resources: ModelResources) -> BoundProgram:
         config = self.artifact.configuration()
         text = config.get("text_config", config)
+        if config.get("vision_config") and text.get("model_type", "").removesuffix("_text") not in (
+            "qwen3_5",
+            "qwen3_5_moe",
+            "gemma4",
+        ):
+            raise ValueError(
+                "this full vision architecture requires a qualified model input adapter"
+            )
         # Text-only converted checkpoints can retain a language-config type. Resolve
         # its upstream package first; family execution never enters worker dispatch.
         discovery = dict(config)
@@ -94,8 +103,8 @@ class UpstreamLoader(ProgramSource):
             logical_tensors(TensorCatalog.inspect(self.artifact.directory), declaration=None),
             "language_model.",
         )
-        # The source is explicitly a text program. Peer modality weights stay in
-        # the artifact and are never advertised as executable conditioning inputs.
+        # Materialize the decoder partition once. The qualified conditional binding
+        # below owns its encoder/projector partition under the same resource scope.
         tensors = {
             name: tensor
             for name, tensor in all_tensors.items()
@@ -123,7 +132,49 @@ class UpstreamLoader(ProgramSource):
                     inner.embed_tokens.as_linear if arguments.tie_word_embeddings else model.lm_head
                 )
                 vocabulary = (identity, arguments.vocab_size, embedding, project)
-            owned = OwnedProgram(LibraryProgram(LibraryForward(model)), (allocation,), vocabulary)
+            inputs = input_forward = None
+            if config.get("vision_config") and text.get("model_type", "").removesuffix("_text") in (
+                "qwen3_5",
+                "qwen3_5_moe",
+            ):
+                from ..qwen35.library import QwenForward
+                from ..qwen35.vision import QwenVision
+
+                full = architecture.ModelConfig.from_dict(deepcopy(config))
+                inputs = resources.own(
+                    QwenVision(
+                        self.artifact,
+                        full,
+                        {
+                            name: tensor
+                            for name, tensor in all_tensors.items()
+                            if name.startswith("vision_tower.")
+                        },
+                        self.reader,
+                        resources,
+                    )
+                )
+                input_forward = QwenForward(model).forward_inputs
+            elif config.get("vision_config") and text.get("model_type") == "gemma4_text":
+                from ..gemma4.library import GemmaForward
+                from ..gemma4.vision import GemmaVision
+                from ..gemma4.vision import configuration as gemma_configuration
+
+                inputs = resources.own(
+                    GemmaVision(
+                        self.artifact,
+                        gemma_configuration(config),
+                        all_tensors,
+                        self.reader,
+                        resources,
+                    )
+                )
+                input_forward = GemmaForward(model).forward_inputs
+            owned = OwnedProgram(
+                LibraryProgram(LibraryForward(model), input_forward=input_forward),
+                (allocation,),
+                vocabulary,
+            )
             resources.own(owned)
             return BoundProgram(
                 owned,
@@ -136,6 +187,7 @@ class UpstreamLoader(ProgramSource):
                     DEFINITION,
                 ),
                 NativeRequirements(make_cache, capacity, self),
+                inputs=inputs,
             )
         except BaseException:
             allocation.close()

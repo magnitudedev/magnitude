@@ -5,25 +5,26 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from time import perf_counter_ns
-from typing import Protocol, cast
+from typing import cast
 
 import mlx.core as mx
 
 from magnitude_engine.components import component
+from magnitude_engine.models.context import InputSource, ModelCheckpoint, StateCheckpoint
 from magnitude_engine.models.inputs import ModelInputs
 from magnitude_engine.models.operations import Task, accept, complete, forward, observe
+from magnitude_engine.models.prompt import Prompt
 from magnitude_engine.models.runtime import (
     ForwardRequest,
     ModelAdvance,
     ModelRuntime,
     ModelSequence,
 )
-from magnitude_engine.resources.retention import RetainedStorage
 
 from .acceptance import accept_prefix
 from .constraint_spec import ConstraintError, ConstraintSpec
 from .constraints import ConstraintCompiler, TokenConstraint
-from .execution import Continuation, execute, run, serve
+from .execution import Continuation, run, serve
 from .methods.contracts import (
     CausalSession,
     GenerationMethod,
@@ -36,32 +37,22 @@ from .sampling import SequenceSampler
 from .sampling_policy import SamplingPolicy
 
 
-class ModelCheckpoint(Protocol):
-    @property
-    def reclaimable(self) -> bool: ...
-
-    length: int
-    closed: bool
-
-    def close(self) -> None: ...
-    def retained_storage(self) -> tuple[RetainedStorage, ...]: ...
-
-
-class GenerationCheckpoint[C: ModelCheckpoint]:
+class GenerationCheckpoint[C: StateCheckpoint]:
     def __init__(
         self,
-        model: C,
+        model: ModelCheckpoint[C],
         method: MethodCheckpoint,
         identity: str,
-        tokens: tuple[int, ...],
+        prompt: Prompt,
         model_domain: object,
     ):
         self.model = model
         self.method = method
         self.identity = identity
         self.model_domain = model_domain
-        self.tokens = tokens
-        self.length = len(tokens)
+        self.prompt = prompt
+        self.tokens = prompt.tokens
+        self.length = len(prompt.tokens)
         self.closed = False
 
     @property
@@ -101,6 +92,7 @@ class PreparedGeneration:
     proposal: Proposal
     forced: tuple[int, ...]
     request: ForwardRequest
+    anchor: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -112,18 +104,20 @@ class GenerationService:
 
 @dataclass(frozen=True)
 class PrefillService:
-    outcome: int | MemoryError | ConstraintError
+    outcome: int | MemoryError | ConstraintError | None
     elapsed_ns: int
     batch_size: int
+    preparation_ns: int = 0
+    row_preparation_ns: int = 0
 
 
-class GenerationSequence[S, C: ModelCheckpoint]:
+class GenerationSequence[S, C: StateCheckpoint]:
     def __init__(
         self,
         runtime: GenerationRuntime[S, C],
         model: ModelSequence[S, C],
         method: MethodSession,
-        prompt: tuple[int, ...],
+        prompt: Prompt,
         sampler: SequenceSampler,
         max_tokens: int,
         stop_tokens: tuple[int, ...],
@@ -133,8 +127,15 @@ class GenerationSequence[S, C: ModelCheckpoint]:
         self.runtime = runtime
         self.model = model
         self.method = method
-        self.context = list(prompt)
-        self.prompt_length = len(prompt)
+        self.prompt = prompt
+        self.context = list(prompt.tokens)
+        self.proposal_context: list[int | None] = (
+            cast(list[int | None], self.context) if not prompt.spans else list(prompt.tokens)
+        )
+        for span in prompt.spans:
+            if not span.language:
+                self.proposal_context[span.start : span.end] = [None] * (span.end - span.start)
+        self.prompt_length = len(prompt.tokens)
         self.prefilled = prefilled
         self.target_position = prefilled
         self.sampler = sampler
@@ -147,10 +148,11 @@ class GenerationSequence[S, C: ModelCheckpoint]:
         self.constraint = constraint
         self._round: Continuation[GenerationResult] | None = None
         self._round_allowance = 0
+        self._prefill: Continuation[int] | None = None
 
     @property
     def prefill_remaining(self) -> int:
-        return self.prompt_length - 1 - self.prefilled
+        return self.prompt.anchor_start - self.prefilled
 
     def reserve_prompt(self) -> None:
         """Secure target state through the known prompt and its first decode input.
@@ -158,7 +160,7 @@ class GenerationSequence[S, C: ModelCheckpoint]:
         This does not execute prompt tokens. Allocation failures leave admission
         free to close this prepared continuation and retry when peers release memory.
         """
-        self.runtime.model.reserve(self.model, self.prefill_remaining + 1)
+        self.runtime.model.reserve(self.model, self.prompt_length - self.prefilled)
 
     def prefill(self, allowance: int) -> int:
         """Advance one bounded prompt chunk, then return control to service policy."""
@@ -171,7 +173,10 @@ class GenerationSequence[S, C: ModelCheckpoint]:
             raise RuntimeError("generation sequence cannot prefill")
         if type(allowance) is not int or allowance < 1:
             raise ValueError("prefill allowance must be a positive integer")
-        count = min(allowance, self.prefill_remaining)
+        count = (
+            self.prompt.advance(self.prefilled, allowance, end=self.prompt.anchor_start)
+            - self.prefilled
+        )
         if count == 0:
             return 0
         tokens = tuple(self.context[self.prefilled : self.prefilled + count])
@@ -212,7 +217,8 @@ class GenerationSequence[S, C: ModelCheckpoint]:
     def round(self, token_allowance: int) -> Task[GenerationResult]:
         self._check_step(token_allowance)
         if (
-            self.constraint is None
+            self.target_position >= self.prompt_length - 1
+            and self.constraint is None
             and not self.sampler.policy.uses_history
             and isinstance(self.method, CausalSession)
         ):
@@ -230,7 +236,10 @@ class GenerationSequence[S, C: ModelCheckpoint]:
             reason = self._publish(result.tokens)
             return GenerationResult(result.tokens, 0, 0, reason, result.evaluated_inputs)
         self.runtime.model.reserve(
-            self.model, min(token_allowance, self.max_tokens - self.generated)
+            self.model,
+            max(1, self.prompt_length - self.target_position)
+            + min(token_allowance, self.max_tokens - self.generated)
+            - 1,
         )
         work = yield from self._prepare_step(token_allowance)
         advance = yield from forward(self.model, work.inputs, work.request)
@@ -250,7 +259,12 @@ class GenerationSequence[S, C: ModelCheckpoint]:
     def _prepare_step(self, token_allowance: int) -> Task[PreparedGeneration]:
         self._check_step(token_allowance)
         remaining = self.max_tokens - self.generated
-        limit = min(token_allowance, remaining) - 1
+        anchor_tokens = tuple(self.context[self.target_position :])
+        # A dependent final prompt unit must complete before a drafter can use
+        # its features. Its last output predicts the first generated token.
+        limit = 0 if len(anchor_tokens) > 1 else min(token_allowance, remaining) - 1
+        if self.proposal_context[-1] is None:
+            limit = 0
         try:
             forced = () if self.constraint is None else self.constraint.forced()[: limit + 1]
             stop = next((i for i, token in enumerate(forced) if token in self.stop_tokens), None)
@@ -259,11 +273,11 @@ class GenerationSequence[S, C: ModelCheckpoint]:
             proposed = (
                 Proposal.from_tokens(forced[:-1])
                 if forced
-                else (yield from self.method.propose(self.context, limit))
+                else (yield from self.method.propose(self.proposal_context, limit))
             )
             if proposed.count > limit:
                 raise RuntimeError("generation method exceeded its proposal allowance")
-            anchor = mx.array([[self.context[-1]]], dtype=mx.int32)
+            anchor = mx.array([anchor_tokens], dtype=mx.int32)
             inputs = ModelInputs(
                 mx.concatenate([anchor, proposed.tokens[None]], axis=1)
                 if proposed.count
@@ -275,9 +289,11 @@ class GenerationSequence[S, C: ModelCheckpoint]:
                 forced,
                 ForwardRequest(
                     logits=not bool(forced),
-                    features=self.method.features,
-                    committed_inputs=inputs.count if forced else 1,
+                    features=self.method.features
+                    | (self.method.prefill_features if len(anchor_tokens) > 1 else frozenset()),
+                    committed_inputs=inputs.count if forced else len(anchor_tokens),
                 ),
+                anchor_tokens,
             )
         except BaseException:
             self.failed = True
@@ -287,6 +303,8 @@ class GenerationSequence[S, C: ModelCheckpoint]:
         self, work: PreparedGeneration, advance: ModelAdvance[S, C]
     ) -> Task[GenerationResult]:
         inputs, proposed, forced = work.inputs, work.proposal, work.forced
+        assert work.anchor
+        last_anchor = work.anchor[-1]
         try:
             logits = advance.output.logits
             if forced:
@@ -296,7 +314,7 @@ class GenerationSequence[S, C: ModelCheckpoint]:
                     raise RuntimeError(
                         "generation requires one logit vector per verification input"
                     )
-                samples = self._sample_verification(logits[0], proposed)
+                samples = self._sample_verification(logits[0, len(work.anchor) - 1 :], proposed)
                 if proposed.count:
                     accepted = accept_prefix(proposed.tokens, samples, self.stop_tokens)
                     yield from observe(accepted.count, accepted.bonus)
@@ -311,11 +329,27 @@ class GenerationSequence[S, C: ModelCheckpoint]:
                 for token in emitted:
                     if not self.constraint.consume(token):
                         raise RuntimeError("constraint rejected a committed token")
-            yield from accept(advance, count + 1)
-            self.target_position += count + 1
+            yield from accept(advance, count + len(work.anchor))
+            self.target_position += count + len(work.anchor)
+            if len(work.anchor) > 1:
+                yield from self.method.prefill(
+                    work.anchor[:-1],
+                    {
+                        name: value[:, : len(work.anchor) - 1]
+                        for name, value in advance.output.features.items()
+                    },
+                )
             self.method.observe(
                 Verification(
-                    (self.context[-1], *host_proposal), count + 1, bonus, advance.output.features
+                    (last_anchor, *host_proposal),
+                    count + 1,
+                    bonus,
+                    {
+                        name: value[:, len(work.anchor) - 1 :]
+                        for name, value in advance.output.features.items()
+                    }
+                    if len(work.anchor) > 1
+                    else advance.output.features,
                 )
             )
             reason = self._publish(emitted)
@@ -333,6 +367,8 @@ class GenerationSequence[S, C: ModelCheckpoint]:
 
     def _publish(self, emitted: tuple[int, ...]) -> str | None:
         self.context.extend(emitted)
+        if self.proposal_context is not self.context:
+            self.proposal_context.extend(emitted)
         self.sampler.observe(emitted)
         self.generated += len(emitted)
         reason = (
@@ -383,7 +419,7 @@ class GenerationSequence[S, C: ModelCheckpoint]:
         self.model.check()
         if self.failed or self.closed:
             raise RuntimeError("cannot retain failed or closed generation state")
-        if self._round is not None:
+        if self._round is not None or self._prefill is not None:
             raise RuntimeError("checkpoint requires a completed generation round")
         model = self.model.checkpoint()
         try:
@@ -400,7 +436,7 @@ class GenerationSequence[S, C: ModelCheckpoint]:
             model,
             method,
             self.runtime.method.identity,
-            tuple(self.context[:boundary]),
+            self.prompt.extend(tuple(self.context[self.prompt_length :])).prefix(boundary),
             self.runtime.model.checkpoint_domain,
         )
 
@@ -408,6 +444,9 @@ class GenerationSequence[S, C: ModelCheckpoint]:
         if self.closed:
             return
         errors = []
+        if self._prefill is not None:
+            self._prefill.close()
+            self._prefill = None
         if self._round is not None:
             self._round.close()
             self._round = None
@@ -423,7 +462,7 @@ class GenerationSequence[S, C: ModelCheckpoint]:
             raise BaseExceptionGroup("generation sequence release failed", errors)
 
 
-class GenerationRuntime[S, C: ModelCheckpoint]:
+class GenerationRuntime[S, C: StateCheckpoint]:
     def __init__(
         self,
         model: ModelRuntime[S, C],
@@ -458,6 +497,7 @@ class GenerationRuntime[S, C: ModelCheckpoint]:
         token_allowances: tuple[int, ...],
         *,
         clock: Callable[[], int] = perf_counter_ns,
+        budget_ns: int | None = None,
     ) -> tuple[PrefillService, ...]:
         """Complete bounded prompt work through ordinary compatible model operations."""
         if (
@@ -466,21 +506,30 @@ class GenerationRuntime[S, C: ModelCheckpoint]:
             or any(s.runtime is not self for s in sequences)
         ):
             raise ValueError("prefill service requires distinct owned rows and aligned allowances")
-        results = execute(
-            tuple(
-                sequence.prefill_task(limit)
-                for sequence, limit in zip(sequences, token_allowances, strict=True)
-            ),
-            clock=clock,
+        for sequence, limit in zip(sequences, token_allowances, strict=True):
+            if sequence._prefill is None:
+                sequence._prefill = Continuation(sequence.prefill_task(limit))
+        results = tuple(
+            sequence._prefill for sequence in sequences if sequence._prefill is not None
         )
+        before = tuple((row.elapsed_ns, row.preparation_ns) for row in results)
+        preparation_ns = serve(results, clock=clock, budget_ns=budget_ns)
         services = []
-        for sequence, result in zip(sequences, results, strict=True):
+        for sequence, result, (elapsed, prepared) in zip(sequences, results, before, strict=True):
             outcome = result.result
             if isinstance(outcome, (MemoryError, ConstraintError)):
                 sequence.failed = True
-            if outcome is None:
-                raise RuntimeError("prompt service did not complete")
-            services.append(PrefillService(outcome, result.elapsed_ns, result.batch_size))
+            if result.done:
+                sequence._prefill = None
+            services.append(
+                PrefillService(
+                    outcome,
+                    result.elapsed_ns - elapsed,
+                    result.batch_size,
+                    preparation_ns,
+                    result.preparation_ns - prepared,
+                )
+            )
         return tuple(services)
 
     def step_many(
@@ -535,7 +584,7 @@ class GenerationRuntime[S, C: ModelCheckpoint]:
 
     def create(
         self,
-        prompt: tuple[int, ...],
+        prompt: Prompt | tuple[int, ...],
         sampling: SamplingPolicy,
         max_tokens: int,
         stop_tokens: tuple[int, ...] = (),
@@ -543,11 +592,18 @@ class GenerationRuntime[S, C: ModelCheckpoint]:
         checkpoint: GenerationCheckpoint[C] | None = None,
         *,
         constraint: ConstraintSpec | None = None,
+        inputs: InputSource | None = None,
     ) -> GenerationSequence[S, C]:
         if type(chunk_size) is not int or chunk_size < 1:
             raise ValueError("prefill chunk size must be a positive integer")
         sequence = self.prepare(
-            prompt, sampling, max_tokens, stop_tokens, checkpoint, constraint=constraint
+            prompt,
+            sampling,
+            max_tokens,
+            stop_tokens,
+            checkpoint,
+            constraint=constraint,
+            inputs=inputs,
         )
         try:
             while sequence.prefill_remaining:
@@ -559,18 +615,20 @@ class GenerationRuntime[S, C: ModelCheckpoint]:
 
     def prepare(
         self,
-        prompt: tuple[int, ...],
+        prompt: Prompt | tuple[int, ...],
         sampling: SamplingPolicy,
         max_tokens: int,
         stop_tokens: tuple[int, ...] = (),
         checkpoint: GenerationCheckpoint[C] | None = None,
         *,
         constraint: ConstraintSpec | None = None,
+        inputs: InputSource | None = None,
     ) -> GenerationSequence[S, C]:
         """Create or restore linked state without executing any prompt tokens."""
+        prompt = Prompt(prompt) if isinstance(prompt, tuple) else prompt
         if (
-            not prompt
-            or any(type(t) is not int or not 0 <= t < 2**31 for t in (*prompt, *stop_tokens))
+            not prompt.tokens
+            or any(type(t) is not int or not 0 <= t < 2**31 for t in stop_tokens)
             or type(max_tokens) is not int
             or max_tokens < 0
         ):
@@ -581,12 +639,13 @@ class GenerationRuntime[S, C: ModelCheckpoint]:
                 checkpoint.closed
                 or checkpoint.model_domain is not self.model.checkpoint_domain
                 or checkpoint.identity != self.method.identity
-                or checkpoint.length >= len(prompt)
-                or prompt[: checkpoint.length] != checkpoint.tokens
+                or checkpoint.length > prompt.anchor_start
+                or not prompt.boundary(checkpoint.length)
+                or prompt.prefix(checkpoint.length) != checkpoint.prompt
             ):
                 raise ValueError("generation checkpoint does not match this method and prompt")
             start = checkpoint.length
-        model = self.model.create(None if checkpoint is None else checkpoint.model)
+        model = self.model.create(None if checkpoint is None else checkpoint.model, inputs=inputs)
         method = None
         matcher = None
         try:
@@ -600,7 +659,7 @@ class GenerationRuntime[S, C: ModelCheckpoint]:
             if not (method.features | method.prefill_features) <= self.model.program.features:
                 raise ValueError("target lacks generation method's required features")
             sampler = SequenceSampler(sampling)
-            sampler.observe(prompt)
+            sampler.observe(prompt.language_tokens())
             return GenerationSequence(
                 self, model, method, prompt, sampler, max_tokens, stop_tokens, start, matcher
             )

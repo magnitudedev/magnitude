@@ -8,6 +8,17 @@ from magnitude_engine.engine.scheduler.time_shared import TimeShared
 ROWS = (Runnable("prompt", 100_000, 64), Runnable("decode", 0, 64))
 
 
+def test_preparation_counts_towards_service_share_without_distorting_token_rate():
+    policy = TimeShared(prefill_stall_seconds=0.04)
+    advance(policy)
+    plan = policy.select(ROWS)
+    assert plan.phase == "prefill" and plan.budget_ns == 40_000_000
+    policy.observe(CompletedService("prefill", 90_000_000, 100, 80_000_000))
+    assert policy._prefill_rate == 10000
+    assert policy._decode_debt_ns == 80_000_000  # Includes the first decode round's credit.
+    assert policy.select(ROWS).phase == "decode"
+
+
 def advance(policy, rows=ROWS, *, decode_ms=10, prefill_ms=40):
     plan = policy.select(rows)
     assert plan is not None
@@ -20,8 +31,18 @@ def advance(policy, rows=ROWS, *, decode_ms=10, prefill_ms=40):
 def test_equal_share_repays_a_prompt_chunk_with_multiple_decode_rounds():
     policy = TimeShared()
     assert [advance(policy).phase for _ in range(12)] == [
-        "decode", "prefill", "decode", "decode", "decode", "prefill",
-        "decode", "decode", "decode", "decode", "prefill", "decode",
+        "decode",
+        "prefill",
+        "decode",
+        "decode",
+        "decode",
+        "prefill",
+        "decode",
+        "decode",
+        "decode",
+        "decode",
+        "prefill",
+        "decode",
     ]
 
 
@@ -53,8 +74,18 @@ def test_time_allocation_stays_within_one_indivisible_service(durations, percent
 def test_overshoot_credit_is_preserved_instead_of_rounding_each_chunk_up():
     policy = TimeShared()
     plans = [advance(policy, decode_ms=30, prefill_ms=20).phase for _ in range(10)]
-    assert plans == ["decode", "prefill", "prefill", "decode", "prefill",
-                     "prefill", "decode", "prefill", "decode", "prefill"]
+    assert plans == [
+        "decode",
+        "prefill",
+        "prefill",
+        "decode",
+        "prefill",
+        "prefill",
+        "decode",
+        "prefill",
+        "decode",
+        "prefill",
+    ]
 
 
 def test_decode_credit_cannot_extend_a_prefill_interruption_indefinitely():
@@ -107,8 +138,11 @@ def test_prompt_order_chunk_duration_and_decode_output_allowances():
     assert warmup is not None
     policy.observe(CompletedService("prefill", 100_000_000, 10))
     rows = (
-        Runnable("oldest", 100, 8, "compatible"), Runnable("blocked", 0, 0),
-        Runnable("a", 0, 2), Runnable("b", 0, 8), Runnable("later", 20, 8, "compatible"),
+        Runnable("oldest", 100, 8, "compatible"),
+        Runnable("blocked", 0, 0),
+        Runnable("a", 0, 2),
+        Runnable("b", 0, 8),
+        Runnable("later", 20, 8, "compatible"),
     )
     assert advance(policy, rows).services == (Service("a", 2), Service("b", 4))
     plan = policy.select(rows)
@@ -117,7 +151,8 @@ def test_prompt_order_chunk_duration_and_decode_output_allowances():
     policy.observe(CompletedService("prefill", 40_000_000, 4))
     # No decode contention: the duration target no longer limits prompt throughput.
     assert advance(policy, (rows[0], rows[-1])).services == (
-        Service("oldest", 32), Service("later", 20),
+        Service("oldest", 32),
+        Service("later", 20),
     )
 
 
@@ -178,10 +213,17 @@ def test_selection_requires_matching_completion_and_reset_clears_learning():
     assert advance(policy).services == (Service("prompt", 64),)
 
 
-@pytest.mark.parametrize("kwargs", [
-    {"decode_share": 0}, {"decode_share": 1}, {"decode_share": float("nan")},
-    {"prefill_stall_seconds": float("inf")}, {"prefill_tokens": 0}, {"max_active": 65},
-])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"decode_share": 0},
+        {"decode_share": 1},
+        {"decode_share": float("nan")},
+        {"prefill_stall_seconds": float("inf")},
+        {"prefill_tokens": 0},
+        {"max_active": 65},
+    ],
+)
 def test_invalid_policy_is_rejected(kwargs):
     with pytest.raises(ValueError):
         TimeShared(**kwargs)

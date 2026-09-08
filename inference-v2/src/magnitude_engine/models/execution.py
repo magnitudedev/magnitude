@@ -18,6 +18,14 @@ class ResourceLease(Protocol):
     def close(self) -> None: ...
 
 
+class ResourceBusy(RuntimeError):
+    """Capacity is held by these exact leases, not an unspecified allocation failure."""
+
+    def __init__(self, message: str, blockers: tuple[ResourceLease, ...]):
+        super().__init__(message)
+        self.blockers = blockers
+
+
 class CompletionBackend(Protocol):
     """Submission owns device buffers until execution finishes, independently of
     Python graph handles. drain completes all submitted work on this owner.
@@ -79,6 +87,19 @@ class ExecutionOwner:
         """Complete owned work before a shared layout change; report whether any existed."""
         self.check()
         pending = tuple(self._pending)
+        for execution in pending:
+            execution.complete()
+        return bool(pending)
+
+    def complete_consumers(self, leases: tuple[ResourceLease, ...]) -> bool:
+        """Retire prior executions holding requested capacity; current scopes stay live."""
+        self.check()
+        blockers = {id(lease) for lease in leases}
+        pending = tuple(
+            execution
+            for execution in self._pending
+            if any(id(lease) in blockers for lease in execution._leases)
+        )
         for execution in pending:
             execution.complete()
         return bool(pending)
@@ -209,8 +230,23 @@ class ExecutionScope:
             raise RuntimeError("execution scope is sealed")
 
     def acquire[L: ResourceLease](self, factory: Callable[[], L]) -> L:
+        """Acquire a lease; capacity pressure may retire prior owned consumers.
+
+        A factory must roll back acquisition on failure. Only allocation is retried,
+        never neural work or this scope's existing leases. An allocation still held
+        by the current scope remains unavailable and fails normally.
+        """
         self._check()
-        lease = factory()
+        try:
+            lease = factory()
+        except ResourceBusy as error:
+            if not self.owner.complete_consumers(error.blockers):
+                raise
+            lease = factory()
+        except MemoryError:
+            if not self.owner.complete():
+                raise
+            lease = factory()
         self._leases.append(lease)
         return lease
 

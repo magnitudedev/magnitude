@@ -1,4 +1,4 @@
-"""Bind the pinned MLX-LM Qwen text parameter layout to owned execution.
+"""Bind Qwen language parameters to owned execution under the full VLM configuration.
 
 Library modules are borrowed weight/operation containers. This binding neither
 patches their execution nor loads the tensors assigned to a streaming owner.

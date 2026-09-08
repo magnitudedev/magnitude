@@ -24,6 +24,7 @@ from magnitude_engine.models.state.arena import KVArena
 from magnitude_engine.models.state.hybrid import HybridStateStore
 from magnitude_engine.models.state.pages import PageStore
 from magnitude_engine.resources.budget import MemoryBudget
+from tests.models.architectures.qwen35.library import vision_language_parameters
 
 
 @pytest.mark.model
@@ -36,7 +37,7 @@ def test_local_dense_hybrid_rejection_and_continuation_match_library():
     assert not model.args.num_experts
     embed = model.model.embed_tokens
     binding = bind_qwen35(
-        model,
+        vision_language_parameters(model),
         embedding=ResidentAffineEmbedding(
             embed.weight, embed.scales, embed.biases, AffineEncoding(embed.bits, embed.group_size)
         ),

@@ -27,8 +27,8 @@ Committed target state + next input (anchor)
                  └── final token becomes the next anchor
 ```
 
-The **anchor** is the next token the target must consume: initially the final
-prompt token, normally the last emitted token thereafter. It is part of the
+The **anchor** is the next legal input unit the target must consume: initially the final
+prompt unit, normally the last emitted token thereafter. It is part of the
 conversation but is not yet represented in the target's consumed state. Plain causal
 feedback may instead retain an already-computed successor across service calls: its
 target state includes the final published token. That prediction is method-local and
@@ -103,6 +103,14 @@ across prompt chunks. Its checkpoint retains only committed head history, deferr
 committed pairs and the final target feature. The successor token is supplied by
 the resumed continuation; no token outside the checkpoint prefix is retained as
 head state. Head prefill uses the same cooperative model operations as drafting.
+
+For conditioned inputs, the head consumes the actual successor embedding paired
+with the preceding target feature. A placeholder token lookup cannot reconstruct
+that pair. Target coordinates and head positions remain owned by their respective
+model contracts. A final indivisible conditioning unit is consumed completely before
+language proposals begin. Suffix matching treats nonlanguage positions as barriers;
+history penalties likewise use eligible language tokens. These operations consume
+[semantic input contracts](../models/inputs.md), without interpreting image formats.
 
 ## Batching without a fixed cohort
 

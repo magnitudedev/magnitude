@@ -89,6 +89,7 @@ class TimeShared(Scheduler):
             plan = Schedule(
                 "prefill",
                 tuple(Service(row.identity, min(row.prefill_remaining, width)) for row in selected),
+                interruption_ns if contended else None,
             )
         else:
             return None
@@ -104,6 +105,8 @@ class TimeShared(Scheduler):
             or service.elapsed_ns < 0
             or type(service.input_tokens) is not int
             or service.input_tokens < 0
+            or type(service.preparation_ns) is not int
+            or not 0 <= service.preparation_ns <= service.elapsed_ns
         ):
             raise ValueError("service duration and input count must be nonnegative integers")
         self._pending = None
@@ -121,8 +124,9 @@ class TimeShared(Scheduler):
                 self._decode_debt_ns = max(
                     -service.elapsed_ns, self._decode_debt_ns - service.elapsed_ns
                 )
-        if service.phase == "prefill" and service.input_tokens and service.elapsed_ns:
-            rate = service.input_tokens * 1e9 / service.elapsed_ns
+        prompt_ns = service.elapsed_ns - service.preparation_ns
+        if service.phase == "prefill" and service.input_tokens and prompt_ns > 0:
+            rate = service.input_tokens * 1e9 / prompt_ns
             self._prefill_rate = (
                 rate if self._prefill_rate is None else 0.7 * self._prefill_rate + 0.3 * rate
             )

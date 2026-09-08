@@ -18,6 +18,7 @@ from magnitude_engine.engine.contracts import EngineInstance
 from magnitude_engine.engine.delivery import Finished, PrefillProgress, Tokens
 from magnitude_engine.generation.constraint_spec import ConstraintSpec
 from magnitude_engine.generation.sampling_policy import SamplingPolicy
+from magnitude_engine.models.preparation import PreparedMedia
 
 from .framing import Frame, read_frame, write_frame
 
@@ -137,7 +138,7 @@ class Worker:
         self._lock = Lock()
         self._close_lock = Lock()
         self._requests: dict[str, RemoteRequest] = {}
-        self._commands: queue.Queue[dict | None] = queue.Queue(1)
+        self._commands: queue.Queue[Frame | None] = queue.Queue(1)
         self._ready = Event()
         self._started = Event()
         self._closing = False
@@ -190,10 +191,10 @@ class Worker:
         if self._closing:
             raise WorkerUnavailable("model worker is closing")
 
-    def _send(self, message: dict) -> None:
+    def _send(self, message: dict, buffers: tuple[bytes, ...] = ()) -> None:
         self._check()
         try:
-            self._commands.put(message, timeout=1)
+            self._commands.put(Frame(self.generation, message, buffers), timeout=1)
         except queue.Full as error:
             raise WorkerUnavailable("worker command writer is backpressured") from error
 
@@ -215,6 +216,7 @@ class Worker:
         *,
         constraint: ConstraintSpec | None = None,
         progress: bool = False,
+        media: PreparedMedia | None = None,
     ) -> RemoteRequest:
         with self._lock:
             self._check()
@@ -233,7 +235,9 @@ class Worker:
                     "stop_tokens": stop_tokens,
                     "constraint": None if constraint is None else asdict(constraint),
                     "progress": progress,
-                }
+                    "media": None if media is None else media.encode(),
+                },
+                () if media is None else media.buffers,
             )
         except BaseException:
             self._forget(request.identity)
@@ -270,7 +274,10 @@ class Worker:
                 message = self._commands.get()
                 if message is None:
                     return
-                write_frame(cast(BinaryIO, self.process.stdin), Frame(self.generation, message))
+                try:
+                    write_frame(cast(BinaryIO, self.process.stdin), message)
+                finally:
+                    message.close()
         except BaseException as error:
             self._fail(WorkerUnavailable(f"worker command transport failed: {error}"))
 
@@ -335,7 +342,7 @@ class Worker:
                 return
             self._closing = True
             try:
-                self._commands.put_nowait({"type": "shutdown"})
+                self._commands.put_nowait(Frame(self.generation, {"type": "shutdown"}))
             except queue.Full:
                 pass
             try:

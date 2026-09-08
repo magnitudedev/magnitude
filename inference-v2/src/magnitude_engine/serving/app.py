@@ -1,6 +1,6 @@
 """HTTP adaptation; model execution remains in the private worker."""
 
-from contextlib import aclosing
+from contextlib import aclosing, asynccontextmanager
 from functools import partial
 from typing import cast
 
@@ -24,7 +24,15 @@ def error_payload(message: str, kind: str = "invalid_request_error") -> dict:
 def create_app(
     service: ChatService | None = None, *, lifespan: Lifespan[FastAPI] | None = None
 ) -> FastAPI:
-    app = FastAPI(title="Magnitude inference", lifespan=lifespan)
+    @asynccontextmanager
+    async def service_lifetime(app):
+        try:
+            yield
+        finally:
+            if service is not None:
+                await to_thread.run_sync(service.close)
+
+    app = FastAPI(title="Magnitude inference", lifespan=lifespan or service_lifetime)
     app.state.service = service
 
     def ready() -> ChatService:

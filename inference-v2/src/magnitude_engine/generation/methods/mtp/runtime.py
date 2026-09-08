@@ -10,6 +10,8 @@ import mlx.core as mx
 from magnitude_engine.components import component
 from magnitude_engine.generation.features import RetainedFeature
 from magnitude_engine.generation.proposals import Proposal
+from magnitude_engine.models.context import ModelCheckpoint
+from magnitude_engine.models.embeddings.replacement import EmbeddedInputs
 from magnitude_engine.models.inputs import ModelInputs
 from magnitude_engine.models.operations import Task, complete, forward, project_vocabulary, submit
 from magnitude_engine.models.runtime import ForwardRequest, ModelAdvance, ModelRuntime
@@ -42,7 +44,7 @@ class MTPCheckpoint:
         self.reservation = session.binding.budget.reserve(
             "mtp-checkpoint", sum(a.nbytes for a in tensors)
         )
-        self.head: LibraryCheckpoint | None = None
+        self.head: ModelCheckpoint[LibraryCheckpoint] | None = None
         self.pending: mx.array | None = None
         self.buffer: list[tuple[int, mx.array]] = []
         self.position = session.position
@@ -75,7 +77,10 @@ class MTPSession:
 
     def __init__(self, binding: MTPMethod, checkpoint: MTPCheckpoint | None):
         self.binding = binding
-        self.features = self.prefill_features = frozenset({binding.target_feature})
+        self.features = frozenset({binding.target_feature})
+        self.prefill_features = self.features | (
+            frozenset({binding.input_feature}) if binding.input_feature else frozenset()
+        )
         self.row = binding.head.create(None if checkpoint is None else checkpoint.head)
         self.position = 0 if checkpoint is None else checkpoint.position
         self.pending: RetainedFeature | None = None
@@ -115,7 +120,12 @@ class MTPSession:
         try:
             if shifted:
                 advance = yield from self._forward(
-                    mx.array([shifted], dtype=mx.int32), previous, consumed
+                    mx.array([shifted], dtype=mx.int32),
+                    previous,
+                    consumed,
+                    embedded=None
+                    if self.binding.input_feature is None
+                    else features[self.binding.input_feature][:, len(tokens) - len(shifted) :],
                 )
                 yield from complete(advance)
             self.pending = replacement
@@ -125,11 +135,20 @@ class MTPSession:
             raise
 
     def _forward(
-        self, tokens: mx.array, previous: mx.array, consumed: tuple[RetainedFeature, ...] = ()
+        self,
+        tokens: mx.array,
+        previous: mx.array,
+        consumed: tuple[RetainedFeature, ...] = (),
+        *,
+        embedded: mx.array | None = None,
     ) -> Task[ModelAdvance[LibraryState, LibraryCheckpoint]]:
         advance = yield from forward(
             self.row,
-            ModelInputs(tokens, {"previous_hidden": previous}),
+            ModelInputs(
+                tokens,
+                {"previous_hidden": previous},
+                None if embedded is None else EmbeddedInputs(embedded),
+            ),
             ForwardRequest(False, frozenset({"draft_hidden"}), committed_inputs=tokens.shape[1]),
         )
         for feature in consumed:
@@ -147,11 +166,13 @@ class MTPSession:
         yield from self._forward(tokens, previous, tuple(value for _, value in self.buffer))
         self.buffer.clear()
 
-    def propose(self, context: Sequence[int], limit: int) -> Task[Proposal]:
+    def propose(self, context: Sequence[int | None], limit: int) -> Task[Proposal]:
         if self.closed or self.proposed is not None:
             raise RuntimeError("MTP proposal requires an idle live method state")
         if limit <= 0 or self.pending is None:
             return Proposal.from_tokens(())
+        if context[-1] is None:
+            raise ValueError("MTP proposals require a language successor")
         yield from self._flush()
         advance = yield from self._forward(
             mx.array([[context[-1]]], dtype=mx.int32), self.pending.value, (self.pending,)
@@ -233,6 +254,7 @@ class MTPMethod:
         capacity: int,
         budget: MemoryBudget,
         identity: str,
+        input_feature: str | None = None,
     ):
         if capacity < 1 or target_feature not in target.program.features or not identity:
             raise ValueError("invalid MTP capacity, target feature or artifact identity")
@@ -246,6 +268,9 @@ class MTPMethod:
                 "MTP head does not provide the required conditioned execution contract"
             )
         self.target, self.head = target, head
+        if input_feature is not None and input_feature not in target.program.features:
+            raise ValueError("target does not expose the head's aligned input feature")
+        self.input_feature = input_feature
         self.target_feature, self.project = target_feature, project
         self.capacity, self.budget = capacity, budget
         self.artifact_path = identity

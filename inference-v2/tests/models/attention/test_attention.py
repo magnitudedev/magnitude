@@ -10,6 +10,64 @@ from magnitude_engine.models.state.views import read_layer
 from magnitude_engine.resources.budget import MemoryBudget
 
 
+@pytest.mark.parametrize("window", [3, 32])
+def test_image_block_local_visibility_matches_independent_rectangular_mask(window):
+    mx.random.seed(72)
+    budget = MemoryBudget(1 << 20)
+    arena = KVArena(
+        (LayerGeometry(1, 32, 32),),
+        page_size=4,
+        slab_pages=4,
+        max_pages=16,
+        budget=budget,
+        dtype=mx.float32,
+    )
+    store = PageStore(arena)
+    states = (store.create(), store.create())
+    count, prefixes = 6, (3, 7)
+    ends, histories = [], []
+    for state, prefix in zip(states, prefixes, strict=True):
+        total = prefix + count
+        state.reserve(total)
+        keys, values = mx.random.normal((1, total, 32)), mx.random.normal((1, total, 32))
+        state.write(0, 0, keys[:, :prefix], values[:, :prefix])
+        state.commit(prefix)
+        append_layer((state,), 0, keys[None, :, prefix:], values[None, :, prefix:])
+        histories.append((keys, values))
+        # Four soft image tokens surrounded by ordinary text.
+        ends.append([prefix + 1, prefix + 5, prefix + 5, prefix + 5, prefix + 5, total])
+    queries = mx.random.normal((2, 2, count, 32))
+    actual = MetalPagedAttention().compute(
+        queries,
+        read_layer(states, 0, pending_tokens=count),
+        32**-0.5,
+        window=window,
+        key_ends=mx.array(ends, mx.int32),
+    )
+    expected = []
+    for index, ((keys, values), prefix) in enumerate(zip(histories, prefixes, strict=True)):
+        mask = mx.array(
+            [
+                [
+                    ((k <= q) or (prefix + 1 <= q < prefix + 5 and prefix + 1 <= k < prefix + 5))
+                    and k > q - window
+                    for k in range(prefix + count)
+                ]
+                for q in range(prefix, prefix + count)
+            ]
+        )
+        expected.append(
+            mx.fast.scaled_dot_product_attention(
+                queries[index : index + 1], keys[None], values[None], scale=32**-0.5, mask=mask
+            )
+        )
+    assert mx.allclose(actual, mx.concatenate(expected), atol=2e-6).item()
+    for state in states:
+        state.close()
+    arena.close()
+    assert budget.snapshot().reserved == 0
+
+
 @pytest.mark.parametrize("batch", [2, 9])
 def test_short_attention_reduction_does_not_depend_on_peer_count(batch):
     mx.random.seed(19)

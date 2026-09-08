@@ -118,7 +118,7 @@ def load_mtp(
     capacity = block - 1 if capacity is None else capacity
     if type(capacity) is not int or capacity < 1:
         raise ValueError("MTP proposal capacity must be a positive integer")
-    args = replace(target.arguments, num_hidden_layers=depth, full_attention_interval=1)
+    args = replace(head, num_hidden_layers=depth, full_attention_interval=1)
     tensors = canonical_names(
         logical_tensors(TensorCatalog.inspect(directory), declaration=None), "mtp."
     )
@@ -200,6 +200,7 @@ class MTPSource(ProgramSource):
                     head.target_feature,
                     head.capacity,
                     head.vocabulary,
+                    "residual:0",
                 ),
             )
 

@@ -5,15 +5,17 @@ there is no all-request draft/verify stage barrier or per-forward fence.
 """
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import perf_counter_ns
 from typing import cast
 
 import mlx.core as mx
 
 from magnitude_engine.components import component
+from magnitude_engine.models.computation import ComputationCapacityError, evaluate
 from magnitude_engine.models.operations import (
     Complete,
+    Compute,
     Forward,
     Observe,
     Operation,
@@ -37,6 +39,8 @@ class Continuation[T]:
     started: bool = False
     elapsed_ns: int = 0
     batch_size: int = 1
+    preparation_ns: int = 0
+    preparations: set = field(default_factory=set)
 
     def resume(self, value: Response, clock: Callable[[], int]) -> None:
         start = clock()
@@ -69,7 +73,7 @@ def serve[T](
     *,
     clock: Callable[[], int] = perf_counter_ns,
     budget_ns: int | None = None,
-) -> None:
+) -> int:
     """Return ready results; retain peers and bounded work across service boundaries.
 
     The deadline is soft: an indivisible device operation may overrun it. No
@@ -81,6 +85,8 @@ def serve[T](
     started = clock()
     completed = sum(row.done for row in rows)
     sequences = set()
+    owners = set()
+    preparation_ns = 0
     try:
         for row in rows:
             if not row.started:
@@ -93,12 +99,22 @@ def serve[T](
             groups: dict[tuple, list[Continuation[T]]] = {}
             repairs: dict[tuple, list[Continuation[T]]] = {}
             projections: dict[tuple, list[Continuation[T]]] = {}
+            computations: dict[tuple, list[Continuation[T]]] = {}
             for row in ready:
                 op = row.ready
-                if isinstance(op, Forward):
+                if isinstance(op, Compute):
+                    owners.add(op.work.owner)
+                    computations.setdefault((id(op.work.owner), op.work.batch_key), []).append(row)
+                elif isinstance(op, Forward):
                     sequences.add(op.sequence)
                     groups.setdefault(
-                        (id(op.sequence.runtime), op.inputs.count, op.request.committed_inputs), []
+                        (
+                            id(op.sequence.runtime),
+                            op.inputs.count,
+                            op.request.committed_inputs,
+                            op.sequence.runtime.input_key(op.sequence, op.inputs.count),
+                        ),
+                        [],
                     ).append(row)
                 elif isinstance(op, Repair):
                     sequences.add(op.advance.sequence)
@@ -107,6 +123,9 @@ def serve[T](
                             id(op.advance.sequence.runtime),
                             op.inputs.count,
                             id(op.advance.sequence.runtime.repair_group(op.advance.sequence)),
+                            op.advance.sequence.runtime.input_key(
+                                op.advance.sequence, op.inputs.count
+                            ),
                         ),
                         [],
                     ).append(row)
@@ -118,6 +137,10 @@ def serve[T](
             # A verifier can finish while another request is still drafting.
             for group in groups.values():
                 _forward(group, clock)
+            for group in computations.values():
+                preparation_start = clock()
+                _compute(group, clock)
+                preparation_ns += clock() - preparation_start
             for group in projections.values():
                 calls = tuple(
                     row.ready for row in group if isinstance(row.ready, ProjectVocabulary)
@@ -180,6 +203,7 @@ def serve[T](
             # Physical completion is shared, while subsequent state publication
             # remains row-local. Do not charge unrelated execution groups to peers.
             completion_groups = {}
+            prepared = False
             for row in completions:
                 assert isinstance(row.ready, Complete)
                 completion_groups.setdefault(row.ready.execution, []).append(row)
@@ -187,16 +211,39 @@ def serve[T](
                 start = clock()
                 execution.complete()
                 elapsed = clock() - start
+                if any(execution in row.preparations for row in group):
+                    preparation_ns += elapsed
+                    prepared = True
                 for row in group:
                     row.elapsed_ns += elapsed
+                    if execution in row.preparations:
+                        row.preparation_ns += elapsed
+                        row.preparations.remove(execution)
                     row.resume(None, clock)
-            if budget_ns is not None and clock() - started >= budget_ns:
+            if prepared or (budget_ns is not None and clock() - started >= budget_ns):
                 break
+        # A stateless prerequisite is one physical service quantum. Finish its
+        # submitted work before returning to scheduling, so a subsequent decode
+        # or admission cannot absorb unmeasured encoder time. Its continuation
+        # is ready to resume its next operation and has published no decoder progress yet.
+        pending = {execution for row in rows for execution in row.preparations}
+        for execution in pending:
+            start = clock()
+            execution.complete()
+            elapsed = clock() - start
+            preparation_ns += elapsed
+            for row in rows:
+                if execution in row.preparations:
+                    row.elapsed_ns += elapsed
+                    row.preparation_ns += elapsed
+                    row.preparations.remove(execution)
     except BaseException:
         for row in rows:
             row.close()
         for sequence in sequences:
-            sequence.runtime.owner.complete()
+            owners.add(sequence.runtime.owner)
+        for owner in owners:
+            owner.complete()
         raise
     finally:
         try:
@@ -204,11 +251,44 @@ def serve[T](
                 sequence.prune_completed()
             if any(isinstance(row.result, (MemoryError, ConstraintError)) for row in rows):
                 for sequence in sequences:
-                    sequence.runtime.owner.complete()
+                    owners.add(sequence.runtime.owner)
+                for owner in owners:
+                    owner.complete()
         finally:
             for row in rows:
                 if row.done:
                     row.close()
+    return preparation_ns
+
+
+def _compute[T](rows: list[Continuation[T]], clock: Callable[[], int]) -> None:
+    calls = tuple(row.ready for row in rows if isinstance(row.ready, Compute))
+    start = clock()
+    try:
+        results = evaluate(tuple(op.work for op in calls))
+    except MemoryError as error:
+        elapsed = clock() - start
+        if isinstance(error, ComputationCapacityError) and calls[0].work.owner.complete():
+            for row in rows:
+                row.elapsed_ns += elapsed
+            _compute(rows, clock)
+            return
+        if isinstance(error, ComputationCapacityError) and len(rows) > 1:
+            for row in rows:
+                row.elapsed_ns += elapsed
+                _compute([row], clock)
+            return
+        for row in rows:
+            row.elapsed_ns += elapsed
+            row.result, row.done, row.ready = error, True, None
+        return
+    elapsed = clock() - start
+    for row, result in zip(rows, results, strict=True):
+        row.elapsed_ns += elapsed
+        row.preparation_ns += elapsed
+        row.preparations.add(result.execution)
+        row.batch_size = max(row.batch_size, len(rows))
+        row.resume(result, clock)
 
 
 def _forward[T](rows: list[Continuation[T]], clock: Callable[[], int]) -> None:

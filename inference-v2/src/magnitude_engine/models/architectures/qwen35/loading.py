@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
-from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+from mlx_lm.models.switch_layers import SwiGLU
+from mlx_vlm.models.qwen3_5.config import ModelConfig, TextConfig
+from mlx_vlm.utils import get_model_and_args
 
 from magnitude_engine.artifacts.identity import tokenizer_identity
 from magnitude_engine.artifacts.layouts import LogicalTensor, logical_tensors
@@ -51,13 +54,14 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class LoadedQwen35:
     program: OwnedProgram[HybridState]
-    arguments: TextModelArgs
+    arguments: TextConfig
     attention: tuple[LayerGeometry, ...]
     recurrence: tuple[RecurrentLayout, ...]
     state_dtype: mx.Dtype
     encoding: AffineEncoding
     tokenizer_identity: str
     vision_tensors: Mapping[str, LogicalTensor]
+    configuration: ModelConfig | None
 
     def close(self) -> None:
         self.program.close()
@@ -75,9 +79,22 @@ def load_qwen35(
 ) -> LoadedQwen35:
     directory = directory.expanduser().resolve()
     config = read_json(directory / "config.json")
-    args = TextModelArgs.from_dict(config.get("text_config", config))
-    if args.model_type not in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"):
+    model_type = config.get("text_config", config).get("model_type")
+    if model_type not in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"):
         raise ValueError("artifact is not a supported Qwen3.5-family text model")
+    architecture, _ = get_model_and_args({"model_type": model_type.removesuffix("_text")})
+    full = (
+        architecture.ModelConfig.from_dict(
+            {**deepcopy(config), "model_type": model_type.removesuffix("_text")}
+        )
+        if config.get("vision_config")
+        else None
+    )
+    args = (
+        full.text_config
+        if full is not None
+        else architecture.TextConfig.from_dict(deepcopy(config.get("text_config", config)))
+    )
     quantization = config.get("quantization", config.get("text_config", {}).get("quantization", {}))
     if not quantization or quantization.get("mode", "affine") != "affine":
         raise ValueError("this construction path requires converted MLX affine tensors")
@@ -92,7 +109,7 @@ def load_qwen35(
     # artifact records for separate construction instead of loading unused weights.
     tensors = {name: tensor for name, tensor in tensors.items() if name not in vision}
     identity = tokenizer_identity(directory)
-    model = TextModel(args)
+    model = architecture.LanguageModel(args, full)
     model.eval()
     encodings = affine_encodings(tensors, quantization, prefix="language_model.")
     # Configure and validate the full header layout before assigning ownership.
@@ -121,7 +138,10 @@ def load_qwen35(
             mlp.down_proj,
             {key: tensor for key, tensor in tensors.items() if key.startswith(name + ".")},
             encodings,
-            mlp.activation,
+            # Both pinned upstream Qwen SwiGLU implementations compute
+            # silu(gate) * up. Bind the qualified numerical primitive used by
+            # resident and streamed expert kernels, independently of module identity.
+            SwiGLU(),
         )
     packs = []
     for index, layer in enumerate(model.layers):
@@ -175,6 +195,7 @@ def load_qwen35(
             default,
             identity,
             MappingProxyType(vision),
+            full,
         )
     except BaseException:
         operations.close()
@@ -211,6 +232,22 @@ class Qwen35Source(ProgramSource):
 
     def load(self, resources: ModelResources) -> BoundProgram:
         loaded = self.loaded(resources)
+        inputs = None
+        if loaded.configuration is not None:
+            from .vision import QwenVision
+
+            inputs = resources.once(
+                loaded,
+                lambda: resources.own(
+                    QwenVision(
+                        self.artifact,
+                        loaded.configuration,
+                        loaded.vision_tensors,
+                        self.reader,
+                        resources,
+                    )
+                ),
+            )
         return BoundProgram(
             loaded.program,
             ModelDescriptor(
@@ -222,6 +259,7 @@ class Qwen35Source(ProgramSource):
                 DEFINITION,
             ),
             HybridRequirements(loaded.attention, loaded.state_dtype, loaded.recurrence),
+            inputs=inputs,
         )
 
 

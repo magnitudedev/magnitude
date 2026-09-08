@@ -173,7 +173,7 @@ def benchmark(
             if row is not None:
                 mx.eval(*head.states.arrays(row.state))
             caches = []
-            for source in checkpoint.image.caches:
+            for source in checkpoint.storage.image.caches:
                 cache = KVCache()
                 cache.offset = source.offset
                 cache.keys, cache.values = source.keys, source.values
@@ -234,7 +234,9 @@ def benchmark(
             if any(c.offset != position for c in current):
                 raise ValueError("MTP cache position differs from the requested boundary")
             wanted = (
-                expected_kv if mode == "execute" else [c.state for c in checkpoint.image.caches]
+                expected_kv
+                if mode == "execute"
+                else [c.state for c in checkpoint.storage.image.caches]
             )
             for cache, expected_state in zip(current, wanted, strict=True):
                 compare(

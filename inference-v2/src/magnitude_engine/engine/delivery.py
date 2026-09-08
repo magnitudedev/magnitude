@@ -37,6 +37,9 @@ class Finished:
     prefill_ns: int = 0
     decode_ns: int = 0
     first_decode_ns: int = 0
+    preparation_ns: int = 0
+    media_tokens: int = 0
+    cached_input_features: int = 0
 
 
 class Delivery:

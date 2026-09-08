@@ -2,6 +2,7 @@
 
 import mlx.core as mx
 
+from magnitude_engine.composition import dumps
 from magnitude_engine.generation.contracts import GenerationFactory
 from magnitude_engine.models.residency import ModelResources
 
@@ -45,7 +46,9 @@ class EngineResidency(EngineInstance):
                 scheduler=scheduler,
                 prefixes=prefixes,
             )
-            memory.bind_reclaimer(lambda: memory.pressure.relieve(prefixes))
+            memory.bind_reclaimer(
+                lambda: self.resources.input_features.reclaim() or memory.pressure.relieve(prefixes)
+            )
             self.properties = {
                 "context_tokens": min(context_tokens, descriptor.context_tokens),
                 "vocab_size": descriptor.vocab_size,
@@ -59,6 +62,11 @@ class EngineResidency(EngineInstance):
                 "output_capacity": output_capacity,
                 "retained_prefixes": prefixes.retention.max_entries,
                 "program_implementation": descriptor.implementation,
+                "image_processor": (
+                    None
+                    if loaded.target.program.inputs is None
+                    else dumps(loaded.target.program.inputs.processor)
+                ),
             }
         except BaseException:
             self.resources.close()

@@ -30,5 +30,6 @@ class MTP(MethodFactory):
             capacity=capacity,
             budget=resources.budget,
             identity=head.program.descriptor.path,
+            input_feature=contract.input_feature,
         )
         return method, capacity, "mtp"

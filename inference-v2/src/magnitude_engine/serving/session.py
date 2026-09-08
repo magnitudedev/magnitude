@@ -8,6 +8,7 @@ import anyio
 from anyio import to_thread
 
 from magnitude_engine.artifacts.tokenizer import TokenizerArtifact
+from magnitude_engine.composition import loads
 from magnitude_engine.engine.delivery import Finished, PrefillProgress
 from magnitude_engine.worker.host import Worker
 
@@ -27,11 +28,15 @@ class ChatFinished:
 class ChatService:
     def __init__(self, host: Worker, artifact: TokenizerArtifact, model: str):
         self.host, self.artifact, self.model = host, artifact, model
-        self.template = ChatTemplate(artifact)
+        processor = host.properties.get("image_processor")
+        self.template = ChatTemplate(artifact, None if processor is None else loads(processor))
         if artifact.vocabulary != host.properties["vocab_size"]:
             raise ValueError("host tokenizer vocabulary differs from the ready worker")
         if artifact.identity != host.properties["tokenizer_identity"]:
             raise ValueError("host tokenizer identity differs from the ready worker")
+
+    def close(self) -> None:
+        self.template.close()
 
     def prepare(self, request: ChatRequest) -> PreparedChat:
         prompt = self.template.render(
@@ -60,6 +65,7 @@ class ChatService:
                 request.output_limit,
                 self.artifact.eos_tokens,
                 constraint=prompt.constraint,
+                media=prompt.media,
             )
         )
         decoder = TokenText(self.artifact.tokenizer)

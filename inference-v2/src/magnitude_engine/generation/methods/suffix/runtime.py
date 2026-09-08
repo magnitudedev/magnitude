@@ -2,7 +2,7 @@
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import mlx.core as mx
 
@@ -58,7 +58,7 @@ class SuffixSession:
         # Suffix proposals own no neural state to reconcile.
         pass
 
-    def propose(self, context: Sequence[int], limit: int) -> Task[Proposal]:
+    def propose(self, context: Sequence[int | None], limit: int) -> Task[Proposal]:
         yield from ()
         length = len(context)
         if limit <= 0 or length <= self.minimum:
@@ -68,12 +68,22 @@ class SuffixSession:
         # Index earlier end positions once, so lookup cost does not grow with context.
         for end in range(self.indexed + 1, length):
             for width in range(self.minimum, min(end, self.maximum) + 1):
-                self.index[tuple(context[end - width : end])] = end
+                key = tuple(context[end - width : end])
+                if all(token is not None for token in key):
+                    self.index[cast(tuple[int, ...], key)] = end
         self.indexed = length - 1
         for width in range(min(self.maximum, length - 1), self.minimum - 1, -1):
-            end = self.index.get(tuple(context[length - width :]))
+            key = tuple(context[length - width :])
+            if any(token is None for token in key):
+                continue
+            end = self.index.get(cast(tuple[int, ...], key))
             if end is not None:
-                return Proposal.from_tokens(tuple(context[end : end + limit]))
+                tokens = []
+                for token in context[end : end + limit]:
+                    if token is None:
+                        break
+                    tokens.append(token)
+                return Proposal.from_tokens(tuple(tokens))
         return Proposal.from_tokens(())
 
     def checkpoint(self) -> SuffixCheckpoint:

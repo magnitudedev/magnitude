@@ -17,10 +17,12 @@ class QwenRotary:
     specialized library operators retain their own declared scaling semantics.
     """
 
-    def __init__(self, operation: PositionTransform):
+    def __init__(self, operation: PositionTransform | Qwen3_5RotaryEmbedding):
         self.operation = operation
         self.rotation: Qwen3_5RotaryEmbedding | None = None
-        if type(operation) is nn.RoPE and not operation.traditional and operation.scale == 1:
+        if isinstance(operation, Qwen3_5RotaryEmbedding):
+            self.rotation = operation
+        elif type(operation) is nn.RoPE and not operation.traditional and operation.scale == 1:
             dims = operation.dims
             if dims < 2 or dims % 2:
                 raise ValueError("Qwen rotary dimensions must be positive and even")
@@ -38,7 +40,10 @@ class QwenRotary:
         offset: int | mx.array,
     ) -> tuple[mx.array, mx.array]:
         if self.rotation is None:
-            return self.operation(queries, offset=offset), self.operation(keys, offset=offset)
+            if isinstance(offset, mx.array) and offset.ndim > 1:
+                raise ValueError("this rotary binding does not support explicit coordinates")
+            operation = cast(PositionTransform, self.operation)
+            return operation(queries, offset=offset), operation(keys, offset=offset)
         if (
             queries.ndim != 4
             or keys.ndim != 4
@@ -50,6 +55,12 @@ class QwenRotary:
             or queries.dtype not in (mx.float32, mx.float16, mx.bfloat16)
         ):
             raise ValueError("Qwen rotary requires aligned floating query/key tensors")
+        if isinstance(offset, mx.array) and offset.ndim == 3:
+            if offset.shape != (3, queries.shape[0], queries.shape[2]) or offset.dtype != mx.int32:
+                raise ValueError("Qwen multimodal coordinates must have shape [3, rows, tokens]")
+            return cast(
+                tuple[mx.array, mx.array], self.rotation.apply_rotary(queries, keys, offset)
+            )
         offsets = mx.array([offset], mx.int32) if isinstance(offset, int) else offset.reshape(-1)
         if offsets.size not in (1, queries.shape[0]) or offsets.dtype != mx.int32:
             raise ValueError("Qwen rotary positions must be scalar or per-row int32 offsets")

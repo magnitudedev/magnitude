@@ -8,6 +8,11 @@ import mlx.core as mx
 
 from magnitude_engine.components import component
 from magnitude_engine.models.embeddings.contracts import EmbeddingLookup
+from magnitude_engine.models.embeddings.replacement import (
+    EmbeddedInputs,
+    EmbeddingReplacement,
+    replace,
+)
 from magnitude_engine.models.execution import ExecutionScope
 from magnitude_engine.models.inputs import ModelInputs
 from magnitude_engine.models.runtime import ForwardRequest, ModelOutput
@@ -41,7 +46,12 @@ class MTPProgram:
     ) -> ModelOutput:
         caches = state.caches if state.batch is None else state.store.batch_caches((state,))
         output = self._forward(
-            inputs.tokens, inputs.conditioning["previous_hidden"], caches, request, scope
+            inputs.tokens,
+            inputs.conditioning["previous_hidden"],
+            caches,
+            request,
+            scope,
+            (inputs.data,),
         )
         state.store.publish_batch((state,))
         return output
@@ -53,12 +63,26 @@ class MTPProgram:
             states[0].store.batch_caches(states),
             request,
             scope,
+            tuple(row.data for row in inputs),
         )
         states[0].store.publish_batch(states)
         return output
 
-    def _forward(self, tokens, previous, caches, request, scope) -> ModelOutput:
-        embedded = self.embedding.lookup(tokens, scope)
+    def _forward(self, tokens, previous, caches, request, scope, data) -> ModelOutput:
+        if any(value is not None and not isinstance(value, EmbeddedInputs) for value in data):
+            raise ValueError("MTP inputs require the paired target's embedding stream")
+        if all(isinstance(value, EmbeddedInputs) for value in data):
+            embedded = mx.concatenate([value.values for value in data])
+        else:
+            embedded = self.embedding.lookup(tokens, scope)
+            if any(value is not None for value in data):
+                embedded = replace(
+                    embedded,
+                    tuple(
+                        () if value is None else (EmbeddingReplacement(0, value.values),)
+                        for value in data
+                    ),
+                )
         if embedded.shape != previous.shape or len(caches) != len(self.layers):
             raise ValueError("MTP conditioning or state geometry differs from the head")
         hidden = self.combine(

@@ -13,7 +13,13 @@ if TYPE_CHECKING:
 
 class PagedAttention(Protocol):
     def compute(
-        self, queries: mx.array, kv: PagedKV, scale: float, *, window: int | None = None
+        self,
+        queries: mx.array,
+        kv: PagedKV,
+        scale: float,
+        *,
+        window: int | None = None,
+        key_ends: mx.array | None = None,
     ) -> mx.array: ...
 
 

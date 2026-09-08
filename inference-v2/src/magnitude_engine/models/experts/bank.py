@@ -9,6 +9,7 @@ import mlx.core as mx
 from magnitude_engine.artifacts.layouts import LogicalTensor
 from magnitude_engine.artifacts.quantization import AffineEncoding
 from magnitude_engine.kernels.contractions.weights import ExpertWeights, QuantizedProjection
+from magnitude_engine.models.execution import ResourceBusy
 from magnitude_engine.resources.budget import MemoryBudget
 from magnitude_engine.resources.io.reader import PositionalReader, Read
 
@@ -79,7 +80,7 @@ class BankLease:
 
     def close(self) -> None:
         if not self.closed:
-            self.bank._leased = False
+            self.bank._lease = None
             self.closed = True
 
 
@@ -90,7 +91,7 @@ class ExpertBank:
         if not 0 < slots <= source.experts:
             raise ValueError("bank capacity exceeds logical experts")
         self.slots = slots
-        self._leased = False
+        self._lease: BankLease | None = None
         self._closed = False
         self._encoding = source.encoding
         self._geometry = tuple(
@@ -124,10 +125,12 @@ class ExpertBank:
         return self._weights
 
     def acquire(self) -> BankLease:
-        if self._closed or self._leased:
-            raise RuntimeError("expert bank is closed or still leased by an earlier execution")
-        self._leased = True
-        return BankLease(self)
+        if self._closed:
+            raise RuntimeError("expert bank is closed")
+        if self._lease is not None:
+            raise ResourceBusy("expert bank is still leased", (self._lease,))
+        self._lease = BankLease(self)
+        return self._lease
 
     def fill(
         self,
@@ -135,7 +138,7 @@ class ExpertBank:
         destinations: tuple[tuple[int, int], ...],
         reader: PositionalReader,
     ) -> None:
-        if self._closed or not self._leased:
+        if self._closed or self._lease is None:
             raise RuntimeError("expert transport requires an exclusive bank lease")
         geometry = tuple((t.dtype, t.shape[1:]) for p in source.projections for t in p.components)
         if geometry != self._geometry or source.encoding != self._encoding:
@@ -169,7 +172,7 @@ class ExpertBank:
     def close(self) -> None:
         if self._closed:
             return
-        if self._leased:
+        if self._lease is not None:
             raise RuntimeError("retire expert consumers before closing their bank")
         self.arrays = ()
         self._weights = None

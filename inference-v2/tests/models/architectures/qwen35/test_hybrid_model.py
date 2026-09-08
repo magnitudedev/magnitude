@@ -21,6 +21,7 @@ from magnitude_engine.models.state.arena import KVArena
 from magnitude_engine.models.state.hybrid import HybridStateStore
 from magnitude_engine.models.state.pages import PageStore
 from magnitude_engine.resources.budget import MemoryBudget
+from tests.models.architectures.qwen35.library import vision_language_parameters
 
 
 def setup(moe=False, bits=None, *, attention=None, head_width=16, dtype=mx.float32):
@@ -77,7 +78,7 @@ def setup(moe=False, bits=None, *, attention=None, head_width=16, dtype=mx.float
                 GatedExpertMath(lambda up, gate: nn.silu(gate) * up),
             )
     binding = bind_qwen35(
-        model,
+        vision_language_parameters(model),
         embedding=embedding,
         experts=experts,
         attention=Attention(attention if attention is not None else GatheredAttention()),
@@ -167,11 +168,15 @@ def test_hybrid_reservation_failure_keeps_committed_state_usable():
     assert budget.snapshot().reserved == 0
 
 
-def test_full_hybrid_program_swaps_streamed_experts_without_library_patches(tmp_path):
+@pytest.mark.parametrize("conditioned", [False, True])
+def test_full_hybrid_program_swaps_streamed_experts_without_library_patches(tmp_path, conditioned):
     from magnitude_engine.artifacts.layouts import logical_tensors
     from magnitude_engine.artifacts.tensors import TensorCatalog
+    from magnitude_engine.models.architectures.qwen35.inputs import QwenInputs
+    from magnitude_engine.models.embeddings.replacement import EmbeddingReplacement
     from magnitude_engine.models.experts.bank import ExpertBank, ExpertSource, ProjectionSource
     from magnitude_engine.models.experts.streaming import StreamedExperts
+    from magnitude_engine.models.inputs import ModelInputs
     from magnitude_engine.resources.io.reader import PositionalReader
 
     model, resident, arena, budget = setup(moe=True, bits=4)
@@ -213,7 +218,7 @@ def test_full_hybrid_program_swaps_streamed_experts_without_library_patches(tmp_
         for i, source in enumerate(sources)
     }
     binding = bind_qwen35(
-        model,
+        vision_language_parameters(model),
         embedding=resident.program.embedding,
         experts=operations,
         attention=Attention(GatheredAttention()),
@@ -224,8 +229,16 @@ def test_full_hybrid_program_swaps_streamed_experts_without_library_patches(tmp_
     streamed = ModelRuntime(binding.program, resident.states, resident.owner)
     expected = resident.create()
     actual = streamed.create()
+    prompt = (1, 2, 3)
+    if conditioned:
+        prompt = ModelInputs(
+            mx.array([prompt], mx.int32),
+            data=QwenInputs(
+                mx.array([0], mx.int32), (EmbeddingReplacement(1, mx.random.normal((1, 1, 64))),)
+            ),
+        )
     for runtime, row in ((resident, expected), (streamed, actual)):
-        runtime.prefill(row, (1, 2, 3))
+        runtime.prefill(row, prompt)
         verify = runtime.forward(row, (4, 5, 6))
         verify.accept(1)
     resident_step = resident.forward(expected, (7,))

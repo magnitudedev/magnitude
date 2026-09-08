@@ -16,6 +16,7 @@ contracts and assumptions; current calculations come from those functions.
 | [MODEL:EXPERTS](../models/composability.md#modelexperts) | [MODEL:EXPERTS/EXEC](../models/composability.md#modelexperts) |
 | [MODEL:ATTENTION](../models/composability.md#modelattention) | [MODEL:ATTENTION/EXEC](../models/composability.md#modelattention) |
 | [MODEL:GATED_DELTA](../models/composability.md#modelgated_delta) | [MODEL:GATED_DELTA/EXEC](../models/composability.md#modelgated_delta) |
+| [MODEL:INPUT_FEATURES](../models/inputs.md#modelinput_features) | [MODEL:INPUT_FEATURES/EXEC](../models/inputs.md#modelinput_features) |
 
 ## Generic upstream contracts
 
@@ -31,6 +32,7 @@ contracts and assumptions; current calculations come from those functions.
 | Component type | Dimensions |
 |---|---|
 | [MODEL:QWEN35](../models/architectures/qwen35.md#modelqwen35) | [MODEL:QWEN35/EXEC](../models/architectures/qwen35.md#modelqwen35) |
+| [MODEL:QWEN35.VISION](../models/architectures/qwen35.md#modelqwen35vision) | [MODEL:QWEN35.VISION/EXEC](../models/architectures/qwen35.md#modelqwen35vision) |
 | [MODEL:QWEN35.ATTENTION](../models/architectures/qwen35.md#modelqwen35attention) | [MODEL:QWEN35.ATTENTION/EXEC](../models/architectures/qwen35.md#modelqwen35attention) |
 | [MODEL:QWEN35.RECURRENCE](../models/architectures/qwen35.md#modelqwen35recurrence) | [MODEL:QWEN35.RECURRENCE/EXEC](../models/architectures/qwen35.md#modelqwen35recurrence) |
 | [MODEL:QWEN35.FEEDFORWARD](../models/architectures/qwen35.md#modelqwen35feedforward) | [MODEL:QWEN35.FEEDFORWARD/EXEC](../models/architectures/qwen35.md#modelqwen35feedforward) |
@@ -43,6 +45,7 @@ contracts and assumptions; current calculations come from those functions.
 | Component type | Dimensions |
 |---|---|
 | [MODEL:GEMMA4](../models/architectures/gemma4.md#modelgemma4) | [MODEL:GEMMA4/EXEC](../models/architectures/gemma4.md#modelgemma4) |
+| [MODEL:GEMMA4.VISION](../models/architectures/gemma4.md#modelgemma4vision) | [MODEL:GEMMA4.VISION/EXEC](../models/architectures/gemma4.md#modelgemma4vision) |
 | [MODEL:GEMMA4.ATTENTION](../models/architectures/gemma4.md#modelgemma4attention) | [MODEL:GEMMA4.ATTENTION/EXEC](../models/architectures/gemma4.md#modelgemma4attention) |
 | [MODEL:GEMMA4.KV](../models/architectures/gemma4.md#modelgemma4kv) | [MODEL:GEMMA4.KV/EXEC](../models/architectures/gemma4.md#modelgemma4kv) |
 | [MODEL:GEMMA4.FEEDFORWARD](../models/architectures/gemma4.md#modelgemma4feedforward) | [MODEL:GEMMA4.FEEDFORWARD/EXEC](../models/architectures/gemma4.md#modelgemma4feedforward) |

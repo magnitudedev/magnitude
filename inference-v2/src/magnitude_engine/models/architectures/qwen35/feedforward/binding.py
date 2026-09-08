@@ -38,6 +38,8 @@ class MoE(FeedForwardFactory):
             expert,
             bind_dense(layer.shared_expert),
             layer.top_k,
-            layer.norm_topk_prob,
+            # MLX-VLM Qwen always normalizes selected routing probabilities;
+            # the independently qualified LM container exposes the same policy.
+            getattr(layer, "norm_topk_prob", True),
             affine_mlp(layer.shared_expert),
         )

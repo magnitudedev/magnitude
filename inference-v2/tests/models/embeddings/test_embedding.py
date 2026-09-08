@@ -7,7 +7,7 @@ from magnitude_engine.artifacts.tensors import TensorCatalog
 from magnitude_engine.models.embeddings.resident import ResidentAffineEmbedding
 from magnitude_engine.models.embeddings.streaming import StreamedEmbedding
 from magnitude_engine.models.embeddings.table import AffineRowTable
-from magnitude_engine.models.execution import ExecutionOwner
+from magnitude_engine.models.execution import ExecutionOwner, ResourceBusy
 from magnitude_engine.resources.budget import MemoryBudget
 from magnitude_engine.resources.io.reader import PositionalReader
 
@@ -75,12 +75,38 @@ def test_bounded_lookahead_and_invalid_rows_release_reservations(tmp_path):
             lookup.prepare(ids)
         assert budget.snapshot().reserved == 0
     lease = lookup.prepare(np.array([0, 1, 2]))
-    with pytest.raises(MemoryError, match="queue"):
+    with pytest.raises(ResourceBusy, match="queue"):
         lookup.prepare(np.array([1]))
     lease.close()
     assert budget.snapshot().reserved == 0
     lookup.close()
     reader.close()
+
+
+def test_execution_pressure_retires_previous_staging_without_changing_rows(tmp_path):
+    table, resident = table_fixture(tmp_path, mx.float32, 4)
+    budget = MemoryBudget(1 << 20)
+    reader = PositionalReader()
+    lookup = StreamedEmbedding(table, reader, budget, cache_bytes=0, max_pending=1)
+    owner = ExecutionOwner()
+    results = []
+    previous = None
+    for tokens in ((0, 4), (8, 3), (1, 6)):
+        with owner.scope() as scope:
+            ids = mx.array(tokens, mx.int32)
+            actual = lookup.lookup(ids, scope)
+            expected = resident.lookup(ids, scope)
+            results.append((actual, expected))
+            if previous is not None:
+                assert previous.done
+            previous = scope.seal(actual, expected)
+            previous.submit()
+    owner.complete()
+    assert all(mx.array_equal(actual, expected).item() for actual, expected in results)
+    lookup.close()
+    reader.close()
+    owner.close()
+    assert budget.snapshot().reserved == 0
 
 
 def test_short_read_fails_without_publishing_partial_rows_or_leaking_staging(tmp_path):

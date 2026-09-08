@@ -50,6 +50,7 @@ class LoadedGemma4:
     encoding: AffineEncoding
     tokenizer_identity: str
     media_tensors: Mapping[str, LogicalTensor]
+    configuration: dict
 
     def close(self) -> None:
         self.program.close()
@@ -172,7 +173,14 @@ def load_gemma4(
             binding.program, (operations,), (identity, args.vocab_size, embedding, project)
         )
         return LoadedGemma4(
-            program, args, binding.attention, dtype, default, identity, MappingProxyType(media)
+            program,
+            args,
+            binding.attention,
+            dtype,
+            default,
+            identity,
+            MappingProxyType(media),
+            config,
         )
     except BaseException:
         operations.close()
@@ -201,6 +209,19 @@ class Gemma4Source(ProgramSource):
                     expert_factory=self.experts,
                 )
             )
+            inputs = None
+            if loaded.configuration.get("vision_config"):
+                from .vision import GemmaVision, configuration
+
+                inputs = resources.own(
+                    GemmaVision(
+                        self.artifact,
+                        configuration(loaded.configuration),
+                        loaded.media_tensors,
+                        self.reader,
+                        resources,
+                    )
+                )
             return BoundProgram(
                 loaded.program,
                 ModelDescriptor(
@@ -212,6 +233,7 @@ class Gemma4Source(ProgramSource):
                     DEFINITION,
                 ),
                 PagedRequirements(loaded.attention, loaded.state_dtype),
+                inputs=inputs,
             )
 
         return resources.once(self, construct)

@@ -21,34 +21,94 @@ def parent_watchdog(parent: int, stop: Event) -> None:
             os._exit(70)
 
 
+def prepare_request(runtime, frame: Frame):
+    """Interpret admitted input within this call; only the request retains its arrays."""
+    from magnitude_engine.engine.requests import GenerationRequest
+    from magnitude_engine.generation.constraint_spec import ConstraintSpec
+    from magnitude_engine.generation.sampling_policy import SamplingPolicy
+    from magnitude_engine.models.preparation import PreparedMedia
+
+    message = frame.message
+    if set(message) != {
+        "type",
+        "request_id",
+        "prompt",
+        "sampling",
+        "max_tokens",
+        "stop_tokens",
+        "constraint",
+        "progress",
+        "media",
+    }:
+        raise ValueError("inference command fields differ from protocol")
+    if type(message["progress"]) is not bool:
+        raise ValueError("progress subscription must be boolean")
+    prompt, inputs = tuple(message["prompt"]), None
+    if message["media"] is not None:
+        preparation = runtime.engine.generation.model.preparation
+        if preparation is None:
+            raise ValueError("this model composition does not support image input")
+        prompt, inputs = preparation.prepare(
+            prompt, PreparedMedia.decode(message["media"], frame.buffers)
+        )
+    elif frame.buffers:
+        raise ValueError("numerical buffers require prepared media metadata")
+    request = GenerationRequest(
+        prompt,
+        SamplingPolicy(**message["sampling"]),
+        message["max_tokens"],
+        tuple(message["stop_tokens"]),
+        None if message["constraint"] is None else ConstraintSpec(**message["constraint"]),
+        inputs=inputs,
+    )
+    if any(token >= runtime.properties["vocab_size"] for token in request.prompt.tokens):
+        raise ValueError("input token is outside the target vocabulary")
+    if len(request.prompt.tokens) + request.max_tokens > runtime.properties["context_tokens"]:
+        raise ValueError("request exceeds the configured context capacity")
+    return request
+
+
 def run(parent: int) -> int:
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     stop, wake, retired = Event(), Event(), Event()
     Thread(target=parent_watchdog, args=(parent, retired), daemon=True).start()
     first = read_frame(sys.stdin.buffer)
-    if set(first.message) != {"type", "blueprint", "digest"} or first.message["type"] != "load":
+    if (
+        set(first.message) != {"type", "blueprint", "digest"}
+        or first.message["type"] != "load"
+        or first.buffers
+    ):
         raise ValueError("first worker command must describe one engine residency")
     blueprint = loads(first.message["blueprint"])
     if not isinstance(blueprint, EngineBlueprint) or digest(blueprint) != first.message["digest"]:
         raise ValueError("worker load requires a verified engine blueprint")
-    incoming: queue.Queue[dict] = queue.Queue(64)
+    incoming: queue.Queue[Frame] = queue.Queue(64)
     outgoing: queue.Queue[Frame | None] = queue.Queue(64)
     failures = []
+
+    def reserve_input(message: dict, size: int):
+        assert runtime is not None
+        prompt = message.get("prompt")
+        if message.get("type") != "infer" or not isinstance(prompt, list):
+            raise ValueError("only inference commands may carry numerical buffers")
+        return runtime.budget.reserve("prepared-input-transport", 3 * size + len(prompt) * 16)
 
     def receive() -> None:
         try:
             while not stop.is_set():
-                message = read_frame(sys.stdin.buffer, first.generation).message
-                if message == {"type": "shutdown"}:
+                frame = read_frame(sys.stdin.buffer, first.generation, reserve=reserve_input)
+                if frame.message == {"type": "shutdown"}:
                     stop.set()
                     break
                 while not stop.is_set():
                     try:
-                        incoming.put(message, timeout=0.1)
+                        incoming.put(frame, timeout=0.1)
                         wake.set()
                         break
                     except queue.Full:
                         continue
+                else:
+                    frame.close()
         except EOFError:
             stop.set()
         except BaseException as error:
@@ -72,19 +132,19 @@ def run(parent: int) -> int:
     def send(message: dict) -> None:
         outgoing.put_nowait(Frame(first.generation, message))
 
-    Thread(target=receive, daemon=True).start()
     writer = Thread(target=transmit, daemon=True)
     writer.start()
     runtime = None
+    reader = None
+    input_charges = {}
     lifetime = ExitStack()
     try:
         # MLX is imported and initialized only in this disposable process.
         from magnitude_engine.engine.delivery import Finished, PrefillProgress
-        from magnitude_engine.engine.requests import GenerationRequest
-        from magnitude_engine.generation.constraint_spec import ConstraintSpec
-        from magnitude_engine.generation.sampling_policy import SamplingPolicy
 
         runtime = lifetime.enter_context(build(blueprint))
+        reader = Thread(target=receive, daemon=True)
+        reader.start()
         send(
             {
                 "type": "ready",
@@ -105,80 +165,57 @@ def run(parent: int) -> int:
                 if outgoing.full():
                     break
                 try:
-                    message = incoming.get_nowait()
+                    frame = incoming.get_nowait()
+                    message = frame.message
                 except queue.Empty:
                     break
-                kind, identity = message.get("type"), message.get("request_id")
-                if not isinstance(identity, str) or not 1 <= len(identity) <= 128:
-                    raise ValueError("worker request identity is invalid")
-                if kind == "infer":
-                    if identity in handles:
-                        raise ValueError("duplicate live worker request")
-                    try:
-                        if set(message) != {
-                            "type",
-                            "request_id",
-                            "prompt",
-                            "sampling",
-                            "max_tokens",
-                            "stop_tokens",
-                            "constraint",
-                            "progress",
-                        }:
-                            raise ValueError("inference command fields differ from protocol")
-                        if type(message["progress"]) is not bool:
-                            raise ValueError("progress subscription must be boolean")
-                        request = GenerationRequest(
-                            tuple(message["prompt"]),
-                            SamplingPolicy(**message["sampling"]),
-                            message["max_tokens"],
-                            tuple(message["stop_tokens"]),
-                            None
-                            if message["constraint"] is None
-                            else ConstraintSpec(**message["constraint"]),
-                        )
-                        if any(
-                            token >= runtime.properties["vocab_size"] for token in request.prompt
-                        ):
-                            raise ValueError("input token is outside the target vocabulary")
-                        if (
-                            len(request.prompt) + request.max_tokens
-                            > runtime.properties["context_tokens"]
-                        ):
-                            raise ValueError("request exceeds the configured context capacity")
-                        if len(handles) >= 1024:
-                            raise OverflowError("worker request delivery capacity is full")
-                        handles[identity] = runtime.engine.submit(
-                            request,
-                            identity=identity,
-                            output_capacity=runtime.output_capacity,
-                            progress=message["progress"],
-                        )
-                        send({"type": "accepted", "request_id": identity})
-                    except (ValueError, TypeError, OverflowError) as error:
-                        send({"type": "error", "request_id": identity, "message": str(error)})
-                elif kind in ("read", "cancel") and set(message) == {"type", "request_id"}:
-                    handle = handles.get(identity)
-                    if kind == "cancel":
-                        if handle is None:
-                            send({"type": "cancelled", "request_id": identity, "event": None})
+                try:
+                    kind, identity = message.get("type"), message.get("request_id")
+                    if not isinstance(identity, str) or not 1 <= len(identity) <= 128:
+                        raise ValueError("worker request identity is invalid")
+                    if kind == "infer":
+                        if identity in handles:
+                            raise ValueError("duplicate live worker request")
+                        try:
+                            if frame.error is not None:
+                                raise frame.error
+                            if len(handles) >= 1024:
+                                raise OverflowError("worker request delivery capacity is full")
+                            handles[identity] = runtime.engine.submit(
+                                prepare_request(runtime, frame),
+                                identity=identity,
+                                output_capacity=runtime.output_capacity,
+                                progress=message["progress"],
+                            )
+                            if frame.lease is not None:
+                                input_charges[identity], frame.lease = frame.lease, None
+                            send({"type": "accepted", "request_id": identity})
+                        except (ValueError, TypeError, OverflowError, MemoryError) as error:
+                            send({"type": "error", "request_id": identity, "message": str(error)})
+                    elif kind in ("read", "cancel") and set(message) == {"type", "request_id"}:
+                        handle = handles.get(identity)
+                        if kind == "cancel":
+                            if handle is None:
+                                send({"type": "cancelled", "request_id": identity, "event": None})
+                            else:
+                                handle.cancel()
+                                cancelling.add(identity)
+                        elif handle is None:
+                            send(
+                                {
+                                    "type": "error",
+                                    "request_id": identity,
+                                    "message": "request is unavailable",
+                                }
+                            )
+                        elif identity in reading:
+                            raise ValueError("only one read may be outstanding per request")
                         else:
-                            handle.cancel()
-                            cancelling.add(identity)
-                    elif handle is None:
-                        send(
-                            {
-                                "type": "error",
-                                "request_id": identity,
-                                "message": "request is unavailable",
-                            }
-                        )
-                    elif identity in reading:
-                        raise ValueError("only one read may be outstanding per request")
+                            reading.add(identity)
                     else:
-                        reading.add(identity)
-                else:
-                    raise ValueError("unknown worker command or fields")
+                        raise ValueError("unknown worker command or fields")
+                finally:
+                    frame.close()
             runtime.engine.tick()
             for identity, handle in tuple(handles.items()):
                 if outgoing.full():
@@ -192,6 +229,8 @@ def run(parent: int) -> int:
                         }
                     )
                     del handles[identity]
+                    if identity in input_charges:
+                        input_charges.pop(identity).close()
                     reading.discard(identity)
                     cancelling.remove(identity)
                 elif identity in reading and identity not in cancelling:
@@ -215,6 +254,8 @@ def run(parent: int) -> int:
                     reading.remove(identity)
                     if isinstance(event, Finished):
                         del handles[identity]
+                        if identity in input_charges:
+                            input_charges.pop(identity).close()
             if (
                 runtime.engine.last_service is None
                 and incoming.empty()
@@ -233,7 +274,13 @@ def run(parent: int) -> int:
         return 1
     finally:
         stop.set()
+        if reader is not None:
+            reader.join(timeout=0.2)
+        while not incoming.empty():
+            incoming.get_nowait().close()
         lifetime.close()
+        for charge in input_charges.values():
+            charge.close()
         try:
             outgoing.put(None, timeout=0.5)
             writer.join(timeout=0.5)
