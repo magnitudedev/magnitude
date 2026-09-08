@@ -18,15 +18,17 @@ uint begin = origin + block * span + ci * subspan;
 uint end = min(origin + (block + 1) * span, begin + subspan);
 end = min(end, pos + min(uint(TQ), (qt + 1) * QT));
 // Fixed tile loops must unroll: dynamically indexed arrays spill registers.
-float query[HP][QT][PK], output[HP][QT][PV];
+// Keep cached inputs in their exact storage dtype; widen at FP32 arithmetic use.
+In query[HP][QT][PK];
+float output[HP][QT][PV];
 float maxima[HP][QT], sums[HP][QT];
 _Pragma("clang loop unroll(full)") for (uint h = 0; h < HP; ++h)
 _Pragma("clang loop unroll(full)") for (uint t = 0; t < QT; ++t) {
     uint token = qt * QT + t;
     _Pragma("clang loop unroll(full)") for (uint i = 0; i < PK; ++i)
         query[h][t][i] = token < TQ
-            ? float(q[((row * HQ + kh * G + head + h) * TQ + token) * DK + lane * PK + i])
-            : 0.0f;
+            ? q[((row * HQ + kh * G + head + h) * TQ + token) * DK + lane * PK + i]
+            : In(0);
     _Pragma("clang loop unroll(full)") for (uint i = 0; i < PV; ++i) output[h][t][i] = 0.0f;
     maxima[h][t] = -INFINITY; sums[h][t] = 0.0f;
 }
@@ -42,27 +44,27 @@ while (p < end) {
     // Issue a bounded tile of independent loads before dependent scores.
     // Consumption stays in logical key order, including page/tail edges.
     for (; p < stop; p += KT, address += KT) {
-        float key[KT][PK], value[KT][PV];
+        In key[KT][PK], value[KT][PV];
         _Pragma("clang loop unroll(full)") for (uint u = 0; u < KT; ++u) {
             if (p + u >= stop) continue;
             if (PK % 4 == 0) {
                 auto src = reinterpret_cast<const device vec<In, 4>*>(
                     kp + (address + u) * DK + lane * PK);
                 _Pragma("clang loop unroll(full)") for (uint i = 0; i < PK / 4; ++i) {
-                    float4 x = float4(src[i]);
+                    vec<In, 4> x = src[i];
                     _Pragma("clang loop unroll(full)") for (uint j = 0; j < 4; ++j) key[u][i * 4 + j] = x[j];
                 }
             } else _Pragma("clang loop unroll(full)") for (uint i = 0; i < PK; ++i)
-                key[u][i] = float(kp[(address + u) * DK + lane * PK + i]);
+                key[u][i] = kp[(address + u) * DK + lane * PK + i];
             if (PV % 4 == 0) {
                 auto src = reinterpret_cast<const device vec<In, 4>*>(
                     vp + (address + u) * DV + lane * PV);
                 _Pragma("clang loop unroll(full)") for (uint i = 0; i < PV / 4; ++i) {
-                    float4 x = float4(src[i]);
+                    vec<In, 4> x = src[i];
                     _Pragma("clang loop unroll(full)") for (uint j = 0; j < 4; ++j) value[u][i * 4 + j] = x[j];
                 }
             } else _Pragma("clang loop unroll(full)") for (uint i = 0; i < PV; ++i)
-                value[u][i] = float(vp[(address + u) * DV + lane * PV + i]);
+                value[u][i] = vp[(address + u) * DV + lane * PV + i];
         }
         _Pragma("clang loop unroll(full)") for (uint u = 0; u < KT; ++u) {
             if (p + u >= stop) continue;
@@ -73,13 +75,13 @@ while (p < end) {
                     || (WINDOW > 0 && p + u + WINDOW <= pos + token)) continue;
                 float score = 0.0f;
                 _Pragma("clang loop unroll(full)") for (uint i = 0; i < PK; ++i)
-                    score += query[h][t][i] * key[u][i];
+                    score += float(query[h][t][i]) * float(key[u][i]);
                 score = simd_sum(score) * scale[0];
                 float peak = max(maxima[h][t], score);
                 float a = exp(maxima[h][t] - peak), b = exp(score - peak);
                 sums[h][t] = sums[h][t] * a + b;
                 _Pragma("clang loop unroll(full)") for (uint i = 0; i < PV; ++i)
-                    output[h][t][i] = output[h][t][i] * a + b * value[u][i];
+                    output[h][t][i] = output[h][t][i] * a + b * float(value[u][i]);
                 maxima[h][t] = peak;
             }
         }
