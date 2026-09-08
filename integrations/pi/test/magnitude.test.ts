@@ -1,12 +1,25 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
+import { SessionManager } from "@earendil-works/pi-coding-agent"
 import { describe, expect, it, vi } from "vitest"
 import magnitudeExtension from "../extensions/magnitude"
 
 describe("Magnitude Pi extension", () => {
+  it("keeps summary entries out of Pi's model context", () => {
+    const session = SessionManager.inMemory("/tmp")
+    session.appendMessage({ role: "user", content: "hello", timestamp: 1 })
+    const before = session.buildSessionContext().messages
+    session.appendCustomEntry("magnitude-inference-summary", {
+      modelName: "Model", elapsedMs: 107000, ttftMs: 3400, generatedTokens: 100, decodeMs: 2000,
+    })
+    expect(session.getEntries().some((entry) => entry.type === "custom")).toBe(true)
+    expect(session.buildSessionContext().messages).toEqual(before)
+  })
   it.each([false, true])("uses the real Pi parser's semantic outcome (error=%s)", async (failed) => {
     const events = new Map<string, (...args: any[]) => any>()
     const registerProvider = vi.fn()
-    magnitudeExtension({ registerProvider, registerCommand: vi.fn(), on: (name: string, handler: (...args: any[]) => any) => events.set(name, handler) } as unknown as ExtensionAPI)
+    const appendEntry = vi.fn()
+    const registerEntryRenderer = vi.fn()
+    magnitudeExtension({ registerProvider, appendEntry, registerEntryRenderer, registerCommand: vi.fn(), on: (name: string, handler: (...args: any[]) => any) => events.set(name, handler) } as unknown as ExtensionAPI)
     const ui = { setWidget: vi.fn(), setWorkingMessage: vi.fn() }
     await events.get("session_start")!({}, { ui })
     const model = { id: "local", name: "Model", api: "openai-completions", provider: "magnitude", baseUrl: "http://localhost/v1", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 10000, maxTokens: 100 }
@@ -20,10 +33,10 @@ describe("Magnitude Pi extension", () => {
     const result = await stream.result()
     expect(result.stopReason).toBe(failed ? "error" : "stop")
     events.get("agent_settled")!()
-    if (!failed) await vi.waitFor(() => expect(ui.setWidget.mock.calls.some((call) => typeof call[1] === "function")).toBe(true))
+    if (!failed) await vi.waitFor(() => expect(appendEntry).toHaveBeenCalledTimes(1))
     else {
       await new Promise((resolve) => setTimeout(resolve, 20))
-      expect(ui.setWidget.mock.calls.some((call) => typeof call[1] === "function")).toBe(false)
+      expect(appendEntry).not.toHaveBeenCalled()
     }
     await events.get("session_shutdown")!()
   })
@@ -31,8 +44,10 @@ describe("Magnitude Pi extension", () => {
     const events = new Map<string, (...args: unknown[]) => void>()
     const commands: string[] = []
     const registerProvider = vi.fn()
+    const appendEntry = vi.fn()
+    const registerEntryRenderer = vi.fn()
     const pi = {
-      registerProvider,
+      registerProvider, appendEntry, registerEntryRenderer,
       registerCommand: (name: string) => commands.push(name),
       on: (name: string, handler: (...args: unknown[]) => void) => events.set(name, handler),
     } as unknown as ExtensionAPI
@@ -60,7 +75,20 @@ describe("Magnitude Pi extension", () => {
     events.get("agent_settled")?.()
     events.get("model_select")?.({ model: { provider: "openai" } })
     expect(setWorkingMessage).toHaveBeenLastCalledWith()
-    expect(setWidget).toHaveBeenLastCalledWith("magnitude-inference-summary", undefined)
+    expect(setWidget).not.toHaveBeenCalled()
+    expect(appendEntry).not.toHaveBeenCalled()
+    expect(registerEntryRenderer).toHaveBeenCalledWith("magnitude-inference-summary", expect.any(Function))
+    const render = registerEntryRenderer.mock.calls[0]![1]
+    const fg = vi.fn((_color: string, text: string) => text)
+    const data = { modelName: "Model", elapsedMs: 237999, ttftMs: 3400, generatedTokens: 100, decodeMs: 2000 }
+    const restored = JSON.parse(JSON.stringify(data))
+    const component = render({ data: restored }, { expanded: false }, { fg })
+    expect(component.render(200).join("").trim()).toBe("● Model worked for 3m 57s · 3.4s TTFT · 50.0 tok/s")
+    expect(fg).toHaveBeenCalledWith("muted", expect.any(String))
+    expect(component.render(35).length).toBeGreaterThan(1)
+    for (const data of [null, {}, { ...restored, elapsedMs: -1 }, { ...restored, decodeMs: Infinity }]) {
+      expect(render({ data }, {}, { fg })).toBeUndefined()
+    }
     await events.get("session_shutdown")?.()
   })
 })

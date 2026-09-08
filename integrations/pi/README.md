@@ -1,95 +1,63 @@
 # Magnitude for Pi
 
-This Pi package adds Magnitude model management commands and live local-inference progress to Pi's
-built-in working row above the editor.
+Run Pi on local models. Free, private, and offline.
 
-Requires Pi 0.83.0 or newer. Install from your terminal:
+Magnitude runs the best local models for your hardware, plugged into the agent you already use.
+It profiles your machine, recommends the models that fit, then downloads, tunes, and runs them.
+
+## Get started
+
+Install the extension:
 
 ```sh
 pi install npm:@magnitudedev/pi-extension
 ```
 
-On the next fresh interactive Pi launch, Magnitude asks **“Set up local models with Magnitude now?”**
-Yes opens Magnitude's actual graphical setup in the same terminal, including its model rankings,
-radar, downloads, and loading progress. It connects Pi automatically at the final step, then returns
-to the same Pi conversation with the selected model active. No agent prompt or cloud credentials
-are needed. If Magnitude is missing, accepting setup installs the CLI with
-`npm install --global @magnitudedev/cli` before opening onboarding. Pi stays visible with its native
-spinner: “Installing Magnitude…”. Installer output is suppressed; failures
-show a concise diagnostic. Escape cancels preparation, and `/magnitude-setup` retries.
-An existing CLI is preserved. The extension invokes `magnitude setup --host pi`; `--host` is hidden from help.
-If an older CLI does not recognize that option, update it explicitly and retry; it is never silently
-replaced.
+Open Pi and accept the setup offer. Magnitude walks you through the best models for your machine,
+downloads your selection, and connects it to Pi. You don't need Magnitude installed beforehand.
 
-No or Escape leaves “You can set up local models anytime with `/magnitude-setup`.” in the conversation.
-The offer is remembered per Pi profile across restarts, reloads, and package updates. Existing
-Magnitude model configurations, non-interactive modes, conversations, and startup prompts are left
-alone. Run `/magnitude-setup` whenever you want to start onboarding yourself.
+You can also start setup anytime with `/magnitude-setup`.
 
-The package includes the Magnitude usage skill; an already-loaded skill of that name takes
-precedence without a collision warning. `--no-skills` disables this fallback too. No separate CLI
-installation is needed. npm must be available with a writable global prefix, as for a normal npm
-CLI installation. Merely loading the extension does not install software.
+Requires Pi 0.83.0 or newer. Magnitude supports macOS and Linux, and Windows through WSL.
+An internet connection is needed for installation and model downloads; after that, you can work offline.
 
-If you already have Magnitude and a local model, connect directly:
+## Why Magnitude?
+
+- **Free to run:** no token costs, API keys, or rate limits
+- **Private and offline:** local model requests stay on your machine
+- **Recommends what fits:** the best models for your hardware, with estimated tok/s
+- **Tuned end to end:** inference settings chosen for your machine
+- **Models on demand:** loaded when Pi needs them, unloaded when idle or memory gets tight
+- **Live performance stats:** see model loading, prompt processing, and time spent working
+
+After each completed run, a summary shows the model, time worked, time to first token, and tokens per
+second. It stays in your chat history so you can refer back to it.
+
+## Using your models
+
+Choose an installed Magnitude model from Pi's `/model` selector. To discover or install more models,
+ask your agent:
+
+```text
+Use Magnitude to recommend the best local models for my hardware and help me install one.
+```
+
+Use `/magnitude-setup` to run guided setup again, or `/stop-model` to unload the active model and
+free its memory.
+
+### Already using Magnitude?
+
+Connect your installed models to Pi:
 
 ```sh
 magnitude connections add pi
 ```
 
-Restart Pi or run `/reload` after connecting. `PI_CODING_AGENT_DIR`, if set, is honored.
-Installing the package directly does not configure provider models,
-install the Magnitude CLI, or start its service; the connection command
-does all connection configuration and can be run safely after a standalone package install.
+Then restart Pi or run `/reload`.
 
-The extension bundles Magnitude's private SDK. Model status, loading, and stopping use the existing
-RPC endpoint at port 10100. When necessary the SDK runs `magnitude service start`; it does not use
-CLI output as a model API. If `/stop-model` encounters a protocol mismatch, the
-extension runs `magnitude connections sync pi` once to install the exact plugin version selected by
-the installed CLI, then reloads Pi. Retry your model command after reload; it is never replayed
-automatically. Failed sync reports the error without reloading or looping. Manually owned incompatible
-packages are not replaced. Autocomplete and inference callbacks never trigger an update. During
-requests to the `magnitude` provider, it opts into Magnitude progress events and uses Pi's working
-row for model loading, prefill, and active-work timing. When Pi successfully completes a run, a one-line summary
-immediately above the editor shows the model's display name, total Pi agent-run time, first-token
-latency, and token-weighted generation throughput. Pi extensions execute with your user permissions.
+## Learn more
 
-Commands:
-
-- `/magnitude-setup` — open Magnitude's graphical model setup inside Pi
-- `/stop-model` — stop the active model
-
-Installed Magnitude models appear in Pi's built-in `/model` selector. To discover, compare, install,
-or remove models from the Magnitude catalog, ask the agent; the connection installs Magnitude's
-agent skill and the agent uses the `magnitude catalog` and `magnitude connections` commands.
-
-Set `MAGNITUDE_CLI` to an alternate Magnitude executable path when developing or testing the package.
-`magnitude connections add pi` selects an exact compatible package and verifies its bundled contents.
-The SDK is a build-time workspace dependency, not a separately published or installed package.
-
-From a Magnitude source checkout, run the complete local connection and TUI flow with:
-
-```sh
-bun run dev:pi
-```
-
-This builds and installs the package from `integrations/pi` into an isolated Pi configuration,
-with temporary connection receipts and agent skill. Pi runs in the caller's working directory.
-It uses the normal connection service,
-builds and runs the checkout's inference runtime,
-and keeps the current source CLI available until Pi exits. Exiting Pi stops the development runtime
-and restores the service state that existed before launch. The launcher inherits the current
-environment; it does not start or configure tracing.
-
-To test the first-run setup offer with no preconfigured Magnitude provider:
-
-```sh
-bun run dev:pi --setup
-```
-
-This installs only the checkout's package into the temporary Pi profile. Accept the setup offer,
-choose a model, and return to Pi to chat. Both development modes keep connection files and skills
-inside the temporary profile, and do not change login-startup registration. They share the machine's
-real model storage and inference service: downloads consume disk space and selected models use
-memory. The launcher restores the prior managed service after Pi exits. Ordinary installed setup
-does enable login startup.
+- [Documentation](https://docs.magnitude.dev)
+- [GitHub](https://github.com/magnitudedev/magnitude)
+- [Discord](https://discord.gg/EHt48pPWdC)
+- [Report an issue](https://github.com/magnitudedev/magnitude/issues)

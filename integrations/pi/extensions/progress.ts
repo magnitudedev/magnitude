@@ -1,10 +1,18 @@
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent"
-import { Text } from "@earendil-works/pi-tui"
 import { defineFSM, type StateUnion } from "@magnitudedev/utils/fsm"
 import { Data, Effect, Fiber, Option, Queue, Schema } from "effect"
 import type { MagnitudeObservation, MagnitudeProgress, MagnitudeTimings } from "./protocol"
 
-export const MAGNITUDE_SUMMARY_WIDGET_KEY = "magnitude-inference-summary"
+export const MAGNITUDE_SUMMARY_ENTRY_TYPE = "magnitude-inference-summary"
+const Milliseconds = Schema.Number.pipe(Schema.finite(), Schema.nonNegative())
+export const ProgressSummary = Schema.Struct({
+  modelName: Schema.String,
+  elapsedMs: Milliseconds,
+  ttftMs: Milliseconds,
+  generatedTokens: Schema.Number.pipe(Schema.int(), Schema.nonNegative()),
+  decodeMs: Milliseconds,
+})
+export type ProgressSummary = typeof ProgressSummary.Type
 const RequestId = Schema.Number.pipe(Schema.int(), Schema.brand("ProgressRequestId"))
 type RequestId = typeof RequestId.Type
 type LivePhase = { readonly progress: MagnitudeProgress; readonly startedAt: number; readonly modelName: string }
@@ -58,27 +66,32 @@ export interface ProgressResponse {
 const seconds = (ms: number) => `${(Math.max(0, ms) / 1_000).toFixed(1)}s`
 const count = (n: number) => n < 1_000 ? String(Math.round(n))
   : `${(n / (n < 1_000_000 ? 1_000 : 1_000_000)).toFixed(1).replace(/\.0$/, "")}${n < 1_000_000 ? "k" : "m"}`
-const duration = (ms: number) => {
+export const formatElapsed = (ms: number) => {
   const s = Math.floor(Math.max(0, ms) / 1_000)
-  return s === 0 ? "<1 second" : s < 60 ? `${s} second${s === 1 ? "" : "s"}`
-    : s % 60 === 0 ? `${s / 60} minute${s === 60 ? "" : "s"}` : `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`
 }
+export const formatSummary = (summary: ProgressSummary): string =>
+  `● ${summary.modelName} worked for ${summary.elapsedMs < 1_000 ? "<1s" : formatElapsed(summary.elapsedMs)}`
+  + ` · ${seconds(summary.ttftMs)} TTFT`
+  + (summary.decodeMs > 0 && summary.generatedTokens > 0
+    ? ` · ${(summary.generatedTokens * 1_000 / summary.decodeMs).toFixed(1)} tok/s` : "")
 export const formatLiveProgress = ({ progress, modelName, startedAt }: LivePhase, now: number): string | undefined => {
   switch (progress.phase) {
     case "queued": case "preparing": return undefined
-    case "model_loading": return `Loading ${modelName} into memory · ${Math.round(Math.max(0, Math.min(1, progress.fraction)) * 100)}% · ${seconds(now - startedAt)}`
-    case "generating": return `Working · ${seconds(now - startedAt)}`
+    case "model_loading": return `Loading ${modelName} into memory · ${Math.round(Math.max(0, Math.min(1, progress.fraction)) * 100)}% · ${formatElapsed(now - startedAt)}`
+    case "generating": return `Working · ${formatElapsed(now - startedAt)}`
     case "prefill": {
       const cached = Math.min(progress.cached_tokens, progress.total_tokens)
       const completed = Math.min(Math.max(progress.completed_tokens, cached), progress.total_tokens)
-      return `Prefilling prompt · ${count(completed - cached)} / ${count(progress.total_tokens - cached)} tokens · ${count(cached)} cached · ${seconds(now - startedAt)}`
+      return `Prefilling prompt · ${count(completed - cached)} / ${count(progress.total_tokens - cached)} tokens · ${count(cached)} cached · ${formatElapsed(now - startedAt)}`
     }
   }
 }
 
 /** One session scope owns the timer; only observations for its active run can mutate presentation. */
 export const makeProgressTracker = (
-  ui: Pick<ExtensionUIContext, "setWidget" | "setWorkingMessage">,
+  ui: Pick<ExtensionUIContext, "setWorkingMessage">,
+  appendSummary: (summary: ProgressSummary) => void,
   now: () => number = () => performance.now(),
 ) => Effect.gen(function* () {
   let state: RunState = new Idle()
@@ -88,7 +101,6 @@ export const makeProgressTracker = (
   let nextResponseId = 0
   const wake = yield* Queue.sliding<void>(1)
   const present = (f: () => void) => Effect.sync(f).pipe(Effect.catchAllCause(() => Effect.void))
-  const clearSummary = present(() => ui.setWidget(MAGNITUDE_SUMMARY_WIDGET_KEY, undefined))
   const resetRow = present(() => ui.setWorkingMessage())
   const render = present(() => { if (active) ui.setWorkingMessage(formatLiveProgress(active.phase, now())) })
   const finalize = Effect.gen(function* () {
@@ -98,13 +110,16 @@ export const makeProgressTracker = (
     const settled = state
     state = runMachine.transition(settled, "Idle", {})
     const timings = [...settled.run.completed.entries()].filter(([id]) => settled.run.accepted.has(id)).sort(([a], [b]) => a - b).map(([, value]) => value)
-    if ([...settled.run.responses.values()].some((outcome) => !Option.getOrElse(outcome, () => false)) || timings.length === 0) { yield* clearSummary; return }
+    if ([...settled.run.responses.values()].some((outcome) => !Option.getOrElse(outcome, () => false)) || timings.length === 0) return
     const tokens = timings.reduce((sum, t) => sum + t.predicted_n, 0)
     const decodeMs = timings.reduce((sum, t) => sum + t.predicted_ms, 0)
-    const summary = `● ${settled.run.modelName} worked for ${duration(settled.settledAt - settled.run.startedAt)}`
-      + ` · ${seconds(timings[0]!.time_to_first_token_ms)} TTFT`
-      + (decodeMs > 0 && tokens > 0 ? ` · ${(tokens * 1_000 / decodeMs).toFixed(1)} tok/s` : "")
-    yield* present(() => ui.setWidget(MAGNITUDE_SUMMARY_WIDGET_KEY, (_tui, theme) => new Text(theme.fg("muted", summary), 0, 0)))
+    yield* present(() => appendSummary(ProgressSummary.make({
+      modelName: settled.run.modelName,
+      elapsedMs: Math.max(0, settled.settledAt - settled.run.startedAt),
+      ttftMs: timings[0]!.time_to_first_token_ms,
+      generatedTokens: tokens,
+      decodeMs,
+    })))
   })
   const clear = Effect.gen(function* () {
     if (state._tag === "Disposed") return
@@ -112,14 +127,12 @@ export const makeProgressTracker = (
     active = undefined
     latest = undefined
     yield* resetRow
-    yield* clearSummary
   })
   const startRun = (modelName: string) => Effect.gen(function* () {
     if (state._tag === "Disposed") return
     if (state._tag === "Settled") yield* clear
     if (state._tag !== "Idle") return
     state = runMachine.transition(state, "Working", { run: { startedAt: now(), modelName, requests: new Map(), completed: new Map(), responses: new Map(), accepted: new Set<RequestId>() } })
-    yield* clearSummary
   })
   const timer = yield* Effect.forever(Effect.gen(function* () {
     yield* Queue.take(wake)
@@ -154,7 +167,7 @@ export const makeProgressTracker = (
           if (request._tag !== "Closed") run!.requests.set(id, requestMachine.transition(request, "Closed", {}))
           run!.completed.delete(id)
         }
-        if (!successful && latest !== undefined && requests.includes(latest)) { active = undefined; yield* resetRow; yield* clearSummary }
+        if (!successful && latest !== undefined && requests.includes(latest)) { active = undefined; yield* resetRow }
         yield* finalize
       })
       const begin: Effect.Effect<ProgressRequest> = Effect.gen(function* () {
