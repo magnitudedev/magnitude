@@ -108,10 +108,14 @@ queries retain the upstream matrix path.
 Dense tiles share weights across input rows. Wide multi-row projections can materialize
 native input preparation and pack sums once for reuse across output tiles. Inline and
 materialized preparation preserve the same arithmetic; eliminating an intermediate is
-not automatically an optimization. Gate/up shares route grouping and input traversal,
+not automatically an optimization. Reused packs cache unscaled integer coefficients in
+half-width registers: four-bit shifted masks and eight-bit integers are exactly
+representable. Scales, affine correction and accumulation remain FP32. Fixed register
+loops expand statically; the lane/K traversal and reduction order remain unchanged.
+Gate/up shares route grouping and input traversal,
 with separate handwritten coefficient/accumulator bodies for each projection.
 
-Dense tiles share weights across input rows. Expert schedules use direct fused execution
+Expert schedules use direct fused execution
 for sparse assignments and grouped execution when reuse can amortize sorting and the
 intermediate down result. Grouped output returns to logical assignment order before
 weighted combination. Changing a tile, assignment order or physical bank capacity may
