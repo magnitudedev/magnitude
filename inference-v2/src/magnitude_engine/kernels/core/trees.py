@@ -1,5 +1,6 @@
 """Separate dynamic array operands from immutable Python call structure."""
 
+import math
 from dataclasses import dataclass, fields, is_dataclass
 from typing import Any, cast
 
@@ -51,8 +52,6 @@ def flatten(value: Any, *, leaf_type: type = mx.array) -> tuple[Tree, tuple[Any,
         if x is None or isinstance(x, (bool, int, float, str, mx.Dtype)):
             # A float's representation retains signed zero and makes NaN keying explicit.
             if isinstance(x, float):
-                import math
-
                 if not math.isfinite(x):
                     raise ValueError("static computation parameters must be finite")
             return Tree("static", (type(x), x.hex() if isinstance(x, float) else x))

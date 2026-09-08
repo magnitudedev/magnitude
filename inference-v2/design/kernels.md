@@ -45,12 +45,25 @@ Categories depend on the core and explicit numerical dependencies, never model o
 scheduler implementations. Model components keep their semantic IDs and call the
 category operations.
 
-`@operation` owns a numerical definition and its registered `.metal` bindings;
-`@computation` expands ordinary composition. Immutable parameterized numerical leaves
-use the same `Primitive` interface internally. Bindings carry array specifications,
-never runtime array values. Registration closes on first specialization. An optional
-`.infer` callback returns output `Tensor` specifications when tracing the reference
-would be expensive.
+`@kernels.kernel(source=..., function=...)` binds one Python declaration to a
+handwritten Metal function. Its body receives tensor descriptions and static parameters,
+validates them and returns one execution description. Calling it with arrays returns
+MLX arrays. Output geometry comes from that description; there are no separate numerical
+leaf subclasses, registration callbacks, inference methods or author-written launch calls.
+A complete opaque dispatch uses the same decorator with a `Dispatch` description.
+
+Ordinary Python functions compose these calls with MLX expressions. `kernels.compile`
+accepts MLX's compilation options and returns its native compiled callable. Our pass runs
+inside MLX tracing, then hands the transformed graph back to MLX. A small native bridge
+inspects graph dependencies and reconnects original primitives; unfamiliar operations
+retain their actual MLX implementation and streams. There is no export/replay interpreter
+and no second execution dispatcher. Captured input/output state belongs to MLX, and the
+user function runs once per native trace. Shapeless compilation retains MLX's behavior
+without applying fixed-shape fusion. It does not confer symbolic-shape or derivative
+support on kernels that lack it.
+
+`kernels.explain(compiled)` and `kernels.artifact(compiled)` inspect the latest trace
+without wrapping the native callable. No Python planning occurs on warm compiled calls.
 
 A binding describes logical tiles, dtype, thread ownership, reduction completion,
 participation, scratch and effects at a Metal function or hook boundary. The planner
@@ -92,6 +105,12 @@ a different multiply/add expression. Short-query binding covers request batches 
 verification positions; unsupported encodings use independent upstream rows, while wide
 queries retain the upstream matrix path.
 
+Dense tiles share weights across input rows. Wide multi-row projections can materialize
+native input preparation and pack sums once for reuse across output tiles. Inline and
+materialized preparation preserve the same arithmetic; eliminating an intermediate is
+not automatically an optimization. Gate/up shares route grouping and input traversal,
+with separate handwritten coefficient/accumulator bodies for each projection.
+
 Dense tiles share weights across input rows. Expert schedules use direct fused execution
 for sparse assignments and grouped execution when reuse can amortize sorting and the
 intermediate down result. Grouped output returns to logical assignment order before
@@ -111,10 +130,10 @@ building blocks and operands. It records:
 - **Boundary obligations:** outputs, state reads/writes, alias constraints and launch geometry.
 
 Plans describe execution beneath existing components. They do not reconstruct an
-architecture from names or introduce a second model graph. `@computation` automatically
-captures ordinary MLX expressions and declared operations. A shared planner selects
-eligible implementations and fusion from typed dependencies and bounded policies;
-model authors do not supply operation-pair recipes. Unsupported connections remain
+architecture from names or introduce a second model graph. Mechanisms validate proposed
+regions and return plans carrying their emission decisions. The graph planner selects
+among these plans subject to dependency, stream and resource constraints. Emission uses
+the selected plan without re-running a separate eligibility or interface dispatch tree. Unsupported connections remain
 explicit array boundaries, with retained MLX execution among the eligible alternatives.
 
 For a gated projection, a plan can express:
@@ -187,11 +206,12 @@ Specialize on relevant encoding, dtype, geometry, layout, numerical contract and
 capabilities. Dynamic validity and positions remain operands where possible. Kernel
 selection must preserve the operation's contract across batch membership and storage
 changes. Reject unsupported combinations before submitting device work. Make required row
-contiguity explicit in the MLX graph. An unsupported export adapter retains the original
-computation under automatic policy; a forced policy fails clearly.
+contiguity explicit in the MLX graph. Unrecognized operations remain native boundaries;
+invalid declarations fail instead of silently changing implementations.
 
 Reuse generated kernels across compatible invocations. Caches are bounded, and
-specializations distinguish the MLX device/stream. Source registration snapshots code;
+standalone specializations distinguish the MLX device/stream; compiled functions retain
+MLX's stream semantics. Declarations snapshot source code;
 reloading a changed declaration creates a new identity, while changing files beneath
 an already-bound executable does not silently change its behavior. Cache validity includes every
 code-affecting plan/source dependency and compilation option; operand addresses and

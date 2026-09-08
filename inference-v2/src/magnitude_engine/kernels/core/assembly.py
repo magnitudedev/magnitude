@@ -13,7 +13,7 @@ class Assembly:
     sources: tuple[tuple[str, str], ...]
 
 
-def source_files(source: Source) -> tuple[tuple[str, str], ...]:
+def merge_sources(sources) -> tuple[tuple[str, str], ...]:
     resolved: dict[str, str] = {}
     definitions: dict[str, Source] = {}
     visiting: set[str] = set()
@@ -32,8 +32,13 @@ def source_files(source: Source) -> tuple[tuple[str, str], ...]:
         definitions[item.path] = item
         visiting.remove(item.path)
 
-    visit(source)
+    for source in sources:
+        visit(source)
     return tuple(resolved.items())
+
+
+def source_files(source: Source) -> tuple[tuple[str, str], ...]:
+    return merge_sources((source,))
 
 
 def declaration(scalar: Scalar) -> str:
@@ -46,3 +51,22 @@ def assemble(source: Source, constants: tuple[Scalar, ...] = ()) -> Assembly:
     header = "".join(map(declaration, constants))
     header += "\n".join(text for _, text in sources[:-1])
     return Assembly(sources[-1][1], header, sources)
+
+
+@dataclass(frozen=True)
+class Captures:
+    """One generated ABI for typed captured operands."""
+
+    names: tuple[str, ...]
+
+    @property
+    def parameters(self):
+        return ", ".join(f"typename A{i}" for i in range(len(self.names)))
+
+    @property
+    def arguments(self):
+        return ", ".join(f"decltype({name})" for name in self.names)
+
+    @property
+    def fields(self):
+        return tuple(f"A{i} {name};" for i, name in enumerate(self.names))

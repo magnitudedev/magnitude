@@ -1,8 +1,12 @@
 // A complete row reduction. Hooks see native elements; no partial result escapes.
-template<typename T, uint WIDTH, uint THREADS, uint CHUNKS, typename Body, typename Weight>
-inline void magnitude_rms(const thread Body& body, Weight weight,
-                          float eps, uint row, uint tid, ushort lane, ushort group,
-                          threadgroup float* partial) {
+template<typename Row, typename Weight>
+inline void magnitude_rms(const thread Row& body, Weight weight,
+                          float eps, threadgroup float* partial) {
+    using T = typename Row::Value;
+    constexpr uint WIDTH = Row::width, THREADS = Row::threads;
+    constexpr uint CHUNKS = (WIDTH + THREADS * 4 - 1) / (THREADS * 4);
+    uint tid = body.thread_index;
+    ushort lane = body.lane, group = body.simd_group;
     float features[CHUNKS * 4];
     float squares = 0.0f;
     #pragma clang loop unroll(full)
@@ -11,7 +15,7 @@ inline void magnitude_rms(const thread Body& body, Weight weight,
         if (column + 4 <= WIDTH) {
             #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
-                float value = float(body.input(size_t(row) * WIDTH + column + i));
+                float value = float(body.load(column + i));
                 features[chunk * 4 + i] = value;
                 squares += value * value;
             }
@@ -36,7 +40,7 @@ inline void magnitude_rms(const thread Body& body, Weight weight,
             for (uint i = 0; i < 4; ++i) {
                 T original = T(features[chunk * 4 + i]);
                 T result = T(float(T(features[chunk * 4 + i] * inverse)) * float(weight[column + i]));
-                body.output(size_t(row) * WIDTH + column + i, result, original);
+                body.store(column + i, result, original);
             }
         }
     }

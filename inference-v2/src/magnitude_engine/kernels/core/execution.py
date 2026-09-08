@@ -7,6 +7,7 @@ from functools import cached_property
 import mlx.core as mx
 
 from .graph import Graph
+from .kernel import BoundKernel, ConstantInputs
 
 
 @dataclass(frozen=True)
@@ -71,7 +72,6 @@ class ExecutionPlan:
 
     def artifact(self):
         """Export the actual compiler plan and sources without executing it."""
-        from .kernel import BoundKernel, ConstantInputs
 
         def value(v):
             return {"name": v.name, "shape": v.tensor.shape, "dtype": str(v.tensor.dtype)}

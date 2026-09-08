@@ -1,6 +1,7 @@
 """Immutable numerical dataflow, independent of Metal execution arrangement."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from math import prod
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
@@ -20,7 +21,6 @@ class Tensor:
 
     @property
     def size(self) -> int:
-        from math import prod
 
         return prod(self.shape)
 
@@ -37,6 +37,7 @@ class Node:
     inputs: tuple[Value, ...]
     outputs: tuple[Value, ...]
     attributes: tuple[Any, ...] = ()
+    native: Any = field(default=None, compare=False, hash=False, repr=False)
 
 
 @dataclass(frozen=True)

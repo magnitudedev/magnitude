@@ -2,18 +2,19 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from contextvars import ContextVar
 from functools import lru_cache
 from typing import TYPE_CHECKING
+
+from ._graph import identity
+from .runtime import generated_kernel
 
 if TYPE_CHECKING:
     from .metal import Binding
 import mlx.core as mx
 
+from .context import markers
 from .graph import Tensor
 from .runtime import execution_context
-
-markers: ContextVar[dict | None] = ContextVar("magnitude_numerical_markers", default=None)
 
 
 class Primitive(ABC):
@@ -40,7 +41,6 @@ class Primitive(ABC):
         active = markers.get()
         if active is None:
             return self.specialize(inputs)(*arrays)
-        from .runtime import generated_kernel, kernel_name
 
         # This source deliberately cannot execute. The capture adapter replaces the
         # marker with this exact declaration; it never interprets numerical source.
@@ -50,8 +50,7 @@ class Primitive(ABC):
         names = tuple(f"a{i}" for i in range(len(arrays)))
         results = tuple(f"o{i}" for i in range(len(outputs)))
         kernel = generated_kernel(source, names, results)
-        active["custom_kernel_" + kernel_name(source, names, results)] = self
-        return tuple(
+        result = tuple(
             kernel(
                 inputs=list(arrays),
                 grid=(1, 1, 1),
@@ -60,6 +59,9 @@ class Primitive(ABC):
                 output_dtypes=[t.dtype for t in outputs],
             )
         )
+
+        active[identity(result[0])] = self
+        return result
 
 
 @lru_cache(maxsize=256)

@@ -1,95 +1,82 @@
-"""Canonical encoded contractions and graph-derived scalar finalization."""
-
-from dataclasses import dataclass
+"""Canonical affine arithmetic with reusable inline or materialized input preparation."""
 
 import mlx.core as mx
 
-from ..core.fragments import lower_fragments
-from ..core.graph import Graph, Node, Tensor, signature
+from .. import kernel
+from ..core.graph import Tensor
 from ..core.metal import (
-    Binding,
+    ArgumentType,
     BlockedRows,
     ColumnStart,
+    Dispatch,
     FragmentFold,
     Lane,
     MetalType,
     ReadOnly,
     RowIndices,
-    TensorSpec,
 )
-from ..core.plan import Source
-from ..core.primitive import Primitive
-from .tiles import TILE, packing, row_tile
+from ..core.plan import Launch, Source
+from .tiles import ENCODED, packing, row_tile
 
-AFFINE = Source("contractions/affine.metal", (TILE, Source("core/fragments.metal")))
+AFFINE = Source("contractions/affine.metal", (ENCODED, Source("core/fragments.metal")))
+PREPARE = Source("contractions/affine_input.metal", (Source("contractions/encoded.metal"),))
 
 
-@dataclass(frozen=True)
-class Affine(Primitive):
-    """Affine encoded dot with a fixed 32-lane, packed K traversal.
+def whole(tensor):
+    return ReadOnly(tensor[(slice(None),) * tensor.ndim])
 
-    Input pack sums retain native arithmetic; encoded dot accumulation and the
-    lane reduction are FP32, followed by exactly one native output conversion.
-    Row/expert placement must not alter this arithmetic.
-    """
 
-    bits: int
-    group_size: int
+@kernel(source=PREPARE)
+def prepare_input(x, *, bits, pack):
+    if bits not in (4, 8) or pack not in (32 // bits, 64 // bits):
+        raise ValueError("unsupported affine preparation packing")
+    if x.shape[-1] % pack:
+        raise ValueError("input width must contain whole affine packs")
+    rows, width = x.size // x.shape[-1], x.shape[-1]
+    return Dispatch(
+        {"x": x},
+        {
+            "prepared": Tensor(x.shape, mx.float32),
+            "sums": Tensor((rows, width // pack), mx.float32),
+        },
+        Launch((rows * width // pack, 1, 1), (256, 1, 1)),
+        (("T", x.dtype), ("M", rows), ("K", width), ("BITS", bits), ("PACK", pack)),
+    )
 
-    def infer(self, inputs):
-        x, w, s, b = inputs
-        k, n = x.shape[-1], w.shape[-2]
-        if (
-            len(w.shape) != 2
-            or w.dtype != mx.uint32
-            or w.shape[-1] * 32 != k * self.bits
-            or s != b
-            or s.shape != (n, k // self.group_size)
-            or s.dtype != x.dtype
-            or x.dtype not in (mx.float16, mx.bfloat16, mx.float32)
-            or packing(k, n, self.bits, self.group_size) is None
-        ):
-            raise ValueError("unsupported canonical affine geometry or encoding")
-        return (Tensor((*x.shape[:-1], n), x.dtype),)
 
-    def bindings(self, values) -> tuple[Binding, ...]:
-        output = self.infer(tuple(v.tensor for v in values))[0]
-        count, n = output.size // output.shape[-1], output.shape[-1]
-        if not count:
-            return ()
-        x, w, s, b = (TensorSpec(v) for v in values)
-
-        def whole(t):
-            return ReadOnly(t[(slice(None),) * t.ndim])
-
-        rows = row_tile(count, 4)
-        pack = packing(x.shape[-1], n, self.bits, self.group_size)
-        assert pack is not None  # infer already checked this encoding
-        return (
-            Binding(
-                AFFINE,
-                "magnitude_affine_fold",
-                FragmentFold(
-                    output,
-                    BlockedRows(count, n, rows),
-                    dict(x=whole(x), rows=RowIndices(), first=ColumnStart(), lane=Lane()),
-                    (x.dtype, self.bits, pack, x.shape[-1], rows),
-                    MetalType(
-                        "AffineStep",
-                        (x.dtype, self.bits, pack, x.shape[-1], n, self.group_size, rows),
-                        (whole(w), whole(s), whole(b)),
-                    ),
-                    pack,
-                ),
-            ),
-        )
-
-    def lower(self, inputs):
-        values = signature(("x", "w", "s", "b"), inputs)
-        outputs = signature(("out",), self.infer(inputs))
-        if outputs[0].tensor.size == 0:
-            return lambda *args: (mx.zeros(outputs[0].tensor.shape, outputs[0].tensor.dtype),)
-        node = Node(self, values, outputs)
-        return lower_fragments(
-            Graph(values, outputs, (), (node,)), {node: self.bindings(values)[0]}
-        )
+@kernel(source=AFFINE, function="magnitude_affine_fold")
+def affine(x, w, s, b, sums, *, bits, group_size, prepared=False):
+    """Fixed lane traversal, FP32 accumulation and one native output conversion."""
+    k, n = x.shape[-1], w.shape[-2]
+    native = s.dtype
+    if (
+        w.ndim != 2
+        or w.dtype != mx.uint32
+        or w.shape[-1] * 32 != k * bits
+        or s.value.tensor != b.value.tensor
+        or s.shape != (n, k // group_size)
+        or native not in (mx.float16, mx.bfloat16, mx.float32)
+        or x.dtype != (mx.float32 if prepared else native)
+        or packing(k, n, bits, group_size) is None
+    ):
+        raise ValueError("unsupported canonical affine geometry or encoding")
+    pack = packing(k, n, bits, group_size)
+    assert pack is not None
+    count = x.size // k
+    if prepared and (sums.shape != (count, k // pack) or sums.dtype != mx.float32):
+        raise ValueError("prepared sums disagree with the affine input geometry")
+    output = Tensor((*x.shape[:-1], n), native)
+    rows = row_tile(count, 4)
+    source = whole(x)
+    return FragmentFold(
+        output,
+        BlockedRows(count, n, rows),
+        dict(x=source, sums=whole(sums), rows=RowIndices(), first=ColumnStart(), lane=Lane()),
+        (native, bits, pack, k, rows, prepared, ArgumentType(source), ArgumentType(whole(sums))),
+        MetalType(
+            "AffineStep",
+            (native, bits, pack, k, n, group_size, rows),
+            (whole(w), whole(s), whole(b)),
+        ),
+        pack,
+    )

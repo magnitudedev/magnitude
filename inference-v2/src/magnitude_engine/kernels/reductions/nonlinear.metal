@@ -17,3 +17,9 @@ float magnitude_decay(T input, T bias, float log_rate) {
     T softplus = maximum + log1p(metal::exp(minimum - maximum));
     return metal::precise::exp(-metal::precise::exp(log_rate) * softplus);
 }
+
+// Match the standalone MLX sigmoid boundary, including its native exp rounding.
+template<typename T>
+T magnitude_sigmoid(T value) {
+    return magnitude_native_sigmoid<T, true>(float(value));
+}

@@ -1,6 +1,7 @@
-"""Composable MLX computations backed by typed handwritten Metal."""
+"""Handwritten Metal declarations and compatible MLX compilation."""
 
-from .core.computation import computation
-from .core.operation import operation
+from .core import metal
+from .core.compiler import artifact, compile, explain
+from .core.declaration import kernel
 
-__all__ = ["computation", "operation"]
+__all__ = ["kernel", "compile", "explain", "artifact", "metal"]
