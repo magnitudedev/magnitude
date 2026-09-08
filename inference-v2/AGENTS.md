@@ -5,6 +5,13 @@
 - Run one measurement at a time per machine; parallelize across machines. Do not sync while a run is active. Compare baseline and candidate on the same machine.
 - Copy results and logs back locally, preserving which source was measured.
 
+# Kernel implementation
+
+- Owned Metal kernels live in computational categories under `src/magnitude_engine/kernels/`.
+  Use `kernels/core` for named plans, source assembly and MLX invocation; keep numerical
+  source in `.metal` files and model/state policy in its existing owners.
+  Follow `design/kernels.md`; do not restore model-local kernel strings or duplicate launch signatures.
+
 # Performance ceilings
 
 - A performance ceiling must remain an upper bound on what the declared contract permits.

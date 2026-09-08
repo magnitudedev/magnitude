@@ -14,6 +14,11 @@ independent target reference and the explicitly adapted standard rotary calculat
 The program exposes residual features, not media conditioning. Source attribution
 follows [component identification](../../components.md).
 
+Owned operations follow [model composability](../composability.md) and
+[kernel construction](../../kernels.md). Qwen owns recurrent/attention selection,
+routing, SwiGLU and residual ordering; shared numerical implementations own tile
+execution. Generated specializations remain beneath these semantic components.
+
 ## Assembly
 
 ```text

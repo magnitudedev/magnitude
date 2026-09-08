@@ -137,6 +137,7 @@ def benchmark(
     *,
     context_tokens,
     query_tokens=1,
+    rows=1,
     fixture="prose.moby-dick",
     prepared=None,
     reference=False,
@@ -155,6 +156,11 @@ def benchmark(
     program = assembly.at("target").instance
     op = bound.instance
     component = bound.node.component
+    if rows < 1 or (
+        rows > 1
+        and component in (component_id(GatedAttention).kind, component_id(RecurrentMixer).kind)
+    ):
+        raise ValueError("multiple captured rows require a stateless region")
     index = int(path.split(".layers.")[1].split(".")[0]) if ".layers." in path else None
     # Reference adapters borrow the exact bound weights. They are isolated controls;
     # their measurements do not pretend the production parent invoked the adapter.
@@ -187,10 +193,11 @@ def benchmark(
             path,
         )
     workload = {
-        "histories": [context_tokens],
+        "histories": [context_tokens] * rows,
         "context_tokens": context_tokens,
         "query_tokens": query_tokens,
-        "batch_size": 1,
+        "batch_size": rows,
+        "input_layout": "captured-row" if rows == 1 else "replicated-captured-row",
         "fixture": fixture,
         "attention_oracle": attention_oracle,
         "numerical_contract": {"atol": 0.002, "rtol": 0.002},
@@ -227,7 +234,9 @@ def benchmark(
             control = references.recurrence(op.operation)
         elif component == component_id(RoutedFeedForward).kind:
             hidden = p["ff"][index]
-            control = references.feedforward(op) if hasattr(op, "experts") else op.call
+            control = (
+                references.feedforward(op) if hasattr(op, "experts") else references.dense(op.call)
+            )
         elif component == component_id(ResidentExperts).kind:
             hidden = p["ff"][index]
             parent = program.blocks[index].feedforward
@@ -238,8 +247,20 @@ def benchmark(
         elif component == component_id(ResidentEmbedding).kind:
             control = references.embedding(op)
             workload["distinct_input_tokens"] = len(set(p["tokens"].reshape(-1).tolist()))
-        elif not (component == component_id(qwen_readout).kind):
+        elif component == component_id(qwen_readout).kind:
+            hidden = program.norm(p["last_hidden"])
+            control = references.readout(op)
+        else:
             raise TypeError(f"no invocation contract for {component}")
+        if hidden is not None:
+            hidden = mx.contiguous(mx.repeat(hidden, rows, axis=0)) if rows > 1 else hidden
+            mx.eval(hidden)
+        if indices is not None and rows > 1:
+            assert scores is not None
+            indices, scores = (mx.contiguous(mx.repeat(a, rows, axis=0)) for a in (indices, scores))
+            mx.eval(indices, scores)
+        input_tokens = mx.repeat(p["tokens"], rows, axis=0) if rows > 1 else p["tokens"]
+        mx.eval(input_tokens)
         row: Any = None
         transaction = None
         caches = []
@@ -270,10 +291,10 @@ def benchmark(
             with model.owner.scope() as scope:
                 if component == component_id(ResidentEmbedding).kind:
                     outputs = [
-                        call(p["tokens"]) if use_reference else op.lookup(p["tokens"], scope)
+                        call(input_tokens) if use_reference else op.lookup(input_tokens, scope)
                     ]
                 elif component == component_id(qwen_readout).kind:
-                    outputs = [program.output(program.norm(p["last_hidden"]))]
+                    outputs = [call(hidden) if use_reference else op(hidden)]
                 elif component == component_id(GatedAttention).kind:
                     scope.enter(row.state.pages.store.arena.pin())
                     outputs = [

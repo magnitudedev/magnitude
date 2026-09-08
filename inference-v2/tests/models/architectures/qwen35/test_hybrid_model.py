@@ -4,6 +4,7 @@ import pytest
 from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
 
 from magnitude_engine.artifacts.quantization import AffineEncoding
+from magnitude_engine.kernels.contractions.weights import ExpertWeights, QuantizedProjection
 from magnitude_engine.models.architectures.qwen35.attention.binding import Attention
 from magnitude_engine.models.architectures.qwen35.binding import bind_qwen35
 from magnitude_engine.models.architectures.qwen35.feedforward.binding import MoE
@@ -13,12 +14,7 @@ from magnitude_engine.models.attention.metal import MetalPagedAttention
 from magnitude_engine.models.embeddings.resident import ResidentAffineEmbedding, ResidentEmbedding
 from magnitude_engine.models.execution import ExecutionOwner
 from magnitude_engine.models.experts.binding import Resident as ResidentExpertFactory
-from magnitude_engine.models.experts.computation import (
-    ExpertWeights,
-    GatedExpertMath,
-    QuantizedProjection,
-    ResidentExperts,
-)
+from magnitude_engine.models.experts.computation import GatedExpertMath, ResidentExperts
 from magnitude_engine.models.recurrence.metal import MetalDelta
 from magnitude_engine.models.runtime import ModelRuntime
 from magnitude_engine.models.state.arena import KVArena

@@ -15,17 +15,13 @@ from magnitude_engine.artifacts.materialization import (
 )
 from magnitude_engine.artifacts.quantization import AffineEncoding
 from magnitude_engine.components import component
+from magnitude_engine.kernels.contractions.weights import ExpertWeights, QuantizedProjection
 from magnitude_engine.models.embeddings.resident import ResidentAffineEmbedding, ResidentEmbedding
 from magnitude_engine.resources.budget import MemoryBudget
 from magnitude_engine.resources.io.reader import PositionalReader
 
 from ..embeddings.contracts import EmbeddingLookup
-from ..experts.computation import (
-    ExpertWeights,
-    GatedExpertMath,
-    QuantizedProjection,
-    ResidentExperts,
-)
+from ..experts.computation import GatedExpertMath, ResidentExperts
 from .packing import ProjectionPack
 from .validation import configure_affine_modules, validate_parameters
 

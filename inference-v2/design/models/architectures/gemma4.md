@@ -14,6 +14,11 @@ IDs follow [component identification](../../components.md). The program exposes
 text inputs and residual features, not media execution. Current owned execution
 must not inherit qualification from the generic upstream adapter.
 
+Owned operations follow [model composability](../composability.md) and
+[kernel construction](../../kernels.md). Gemma retains its normalization, GeGLU,
+scaling, input branches and producer-sharing semantics while reusing compatible
+contraction and attention implementations. Kernel plans do not redefine that assembly.
+
 ## Assembly
 
 ```text

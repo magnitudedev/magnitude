@@ -8,10 +8,9 @@ import mlx.core as mx
 
 from magnitude_engine.artifacts.layouts import LogicalTensor
 from magnitude_engine.artifacts.quantization import AffineEncoding
+from magnitude_engine.kernels.contractions.weights import ExpertWeights, QuantizedProjection
 from magnitude_engine.resources.budget import MemoryBudget
 from magnitude_engine.resources.io.reader import PositionalReader, Read
-
-from .computation import ExpertWeights, QuantizedProjection
 
 
 @dataclass(frozen=True)

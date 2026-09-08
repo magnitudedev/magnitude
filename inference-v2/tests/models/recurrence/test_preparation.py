@@ -2,7 +2,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from magnitude_engine.models.recurrence.preparation import prepare
+from magnitude_engine.kernels.recurrence.preparation import prepare
 
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])

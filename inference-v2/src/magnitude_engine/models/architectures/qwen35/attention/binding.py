@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 
 from magnitude_engine.models.attention.contracts import PagedAttention
-from magnitude_engine.models.projections import ParallelProjections
+from magnitude_engine.models.projections import ParallelProjections, bind_linear
 
 from ..contracts import (
     AttentionFactory,
@@ -20,7 +20,7 @@ class Attention(AttentionFactory):
         return GatedAttention(
             slot,
             inputs,
-            layer.o_proj,
+            bind_linear(layer.o_proj),
             layer.q_norm,
             layer.k_norm,
             QwenRotary(layer.rope),

@@ -13,10 +13,37 @@ from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU
 from magnitude_engine.components import component
 
 
+def linear(operation):
+    """Borrow parameters into stock execution, including owned linear subclasses."""
+    if not isinstance(operation, (nn.Linear, nn.QuantizedLinear)):
+        return operation
+    cls = nn.QuantizedLinear if isinstance(operation, nn.QuantizedLinear) else nn.Linear
+    module = cls.__new__(cls)
+    nn.Module.__init__(module)
+    for name, value in operation.parameters().items():
+        module[name] = value
+    if isinstance(operation, nn.QuantizedLinear):
+        module.bits, module.group_size, module.mode = (
+            operation.bits,
+            operation.group_size,
+            operation.mode,
+        )
+        module.biases = operation.biases
+    module.eval()
+    return module
+
+
+def dense(operation):
+    gate, up, down = (
+        linear(getattr(operation, name)) for name in ("gate_proj", "up_proj", "down_proj")
+    )
+    return lambda hidden: down(nn.silu(gate(hidden)) * up(hidden))
+
+
 def separate_projections(group):
     """Reconstruct upstream operations from encoded views, independently of grouped execution."""
     if not group.packed:
-        return tuple(group.operations)
+        return tuple(map(linear, group.operations))
     packed = group.operations[0]
     result, offset = [], 0
     for width in group.sizes:
@@ -83,7 +110,7 @@ def feedforward(operation):
         top_k=operation.top_k,
         norm_topk_prob=operation.normalize,
         switch_mlp=switch_experts(operation.experts),
-        shared_expert=operation.shared,
+        shared_expert=dense(operation.shared),
         shared_expert_gate=shared_gate,
         sharding_group=None,
     )
@@ -112,7 +139,7 @@ def recurrence(operation):
         A_log=g.log_rates,
         dt_bias=g.time_bias,
         norm=norm,
-        out_proj=g.output,
+        out_proj=linear(g.output),
         sharding_group=None,
         training=False,
     )
@@ -151,8 +178,11 @@ def attention(operation):
     module.num_attention_heads = operation.query_heads
     module.head_dim = operation.head_width
     module.scale = operation.head_width**-0.5
-    module.q_proj, module.k_proj, module.v_proj = separate_projections(operation.inputs)
-    module.o_proj = operation.output
+    for name, projection in zip(
+        ("q_proj", "k_proj", "v_proj"), separate_projections(operation.inputs), strict=True
+    ):
+        module[name] = projection
+    module["o_proj"] = linear(operation.output)
     module.q_norm, module.k_norm = operation.query_norm, operation.key_norm
     dims = operation.positions.rotation.dim
     module.rotary_emb = Qwen3_5RotaryEmbedding(
@@ -203,20 +233,21 @@ def attention_equation(operation):
     """
 
     projections = separate_projections(operation.inputs)
+    output = linear(operation.output)
 
     def apply(hidden, *, cache, mask=None):
         q, k, v, gate = attention_projections(operation, hidden, cache.offset, projections)
         k, v = cache.update_and_fetch(k, v)
         attended = attention_core_equation(q, k, v)
         attended = attended.transpose(0, 2, 1, 3).reshape(hidden.shape[0], hidden.shape[1], -1)
-        return operation.output(attended * mx.sigmoid(gate))
+        return output(attended * mx.sigmoid(gate))
 
     return apply
 
 
 @component("MODEL:QWEN35.READOUT:MAG:UPSTREAM_ADAPTER")
 def readout(operation):
-    return operation
+    return linear(operation)
 
 
 @component("MODEL:FORWARD:LM:STANDARD")

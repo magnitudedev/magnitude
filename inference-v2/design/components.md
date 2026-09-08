@@ -88,6 +88,12 @@ Any implementation change resets current assessments through affected parent
 compositions under the [evidence rules](performance.md#stable-compositions-and-evidence).
 It does not erase history or rename the component.
 
+[Kernel plans](kernels.md#kernel-plans), Metal helpers and generated specializations
+are internal implementation structure. They do not each acquire a component ID or
+become assembly nodes. Their executable dependencies contribute to the owning
+component fingerprint. A separately selectable numerical method still follows the
+ordinary implementation-identity rules.
+
 ## Blueprints and execution components
 
 `@component("MODEL:ATTENTION:MAG:PAGED")` declares the canonical ID once on the

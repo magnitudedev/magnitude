@@ -45,6 +45,13 @@ Unknown execution types or mismatched parameter contracts fail capture explicitl
 
 Benchmarks accept an actual object or a binding from this capture. Theory consumes the typed
 serialized facts. Neither has its own implementation catalog or copy of the model hierarchy.
+For [generated kernels](kernels.md), capture includes the selected plan, transitive
+Metal sources, generator dependencies and code-affecting compilation options. Record
+the MLX/compiler environment needed to identify execution. These facts come from the
+actual bound implementation; capture must not reconstruct its plan. Generated source
+remains inspectable, and neither source generation nor a new specialization creates a
+new stable model composition. Code-affecting changes invalidate dependent evidence.
+
 Changing a selected child changes the next capture automatically. Changing schema-derived
 facts changes evidence compatibility; editing a reporting declaration alone does not change
 the numerical source fingerprint. Changing an implementation ID still changes its identity.
@@ -84,6 +91,11 @@ is part of the mathematical contract. Prefer an optimistic performance upper bou
 a false claim that an implementation has reached its limit. A ceiling may be too high;
 it must never be too low under its premises. Tighten it only with a mathematical proof
 that the added resource demand is unavoidable for every permitted implementation.
+
+A selected kernel plan describes actual execution, not the legal limit of a component.
+Its materialized intermediates, repeated loads and synchronization may inform execution
+estimates; they cannot become unavoidable demands merely because the plan contains them.
+Any restriction on numerical algorithms in a ceiling must follow the declared contract.
 
 Implementation evaluation selects matching observations. A measured parent owns its
 actual metric; child times are not added to it. An explicitly serial execution region may

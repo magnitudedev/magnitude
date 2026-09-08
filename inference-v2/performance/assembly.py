@@ -13,6 +13,9 @@ from typing import Any, cast
 from uuid import uuid4
 
 from magnitude_engine.components import component_id, component_of
+from magnitude_engine.kernels.core.assembly import source_files as metal_sources
+from magnitude_engine.kernels.core.plan import Program
+from magnitude_engine.kernels.core.runtime import execute as execute_kernel
 from magnitude_engine.models.architectures.mlx_vlm.program import LibraryProgram
 from performance.bindings import Fields, Use, foreign, read, resolve
 from performance.facts import NeuralParameters, OpaqueParameters, TensorFacts
@@ -89,6 +92,14 @@ def source_key(owners: tuple[object, ...]) -> tuple[str, dict[str, str]]:
         owner = value if inspect.isroutine(value) or inspect.isclass(value) else type(value)
         packages.add(owner.__module__.split(".")[0])
 
+    def program_sources(program: Program, key: str):
+        sources = metal_sources(program.body)
+        symbols[key] = json.dumps({"name": program.name, "sources": [path for path, _ in sources]})
+        for path, text in sources:
+            files["magnitude_engine.kernels/" + path] = text
+            symbols["metal:" + path] = text
+        visit(execute_kernel)
+
     def visit(value):
         value = inspect.unwrap(value)
         owner = (
@@ -118,6 +129,8 @@ def source_key(owners: tuple[object, ...]) -> tuple[str, dict[str, str]]:
                     callable(dependency) and inspect.isfunction(inspect.unwrap(dependency))
                 ) or inspect.isclass(dependency):
                     visit(dependency)
+                elif isinstance(dependency, Program):
+                    program_sources(dependency, module + "." + node.id)
                 elif isinstance(dependency, (str, int, float, bool, tuple)):
                     try:
                         symbols[module + "." + node.id] = json.dumps(dependency, allow_nan=False)
@@ -131,6 +144,8 @@ def source_key(owners: tuple[object, ...]) -> tuple[str, dict[str, str]]:
                         callable(dependency) and inspect.isfunction(inspect.unwrap(dependency))
                     ) or inspect.isclass(dependency):
                         visit(dependency)
+                    elif isinstance(dependency, Program):
+                        program_sources(dependency, parent.__name__ + "." + node.attr)
 
     for owner in owners:
         visit(owner)

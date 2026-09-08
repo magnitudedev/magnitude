@@ -6,11 +6,11 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 
+from magnitude_engine.kernels.recurrence.preparation import prepare
 from magnitude_engine.models.projections import ParallelProjections
 
 from .contracts import DeltaRecurrence
 from .inputs import DeltaInputs
-from .preparation import prepare
 
 Transform = Callable[[mx.array], mx.array]
 

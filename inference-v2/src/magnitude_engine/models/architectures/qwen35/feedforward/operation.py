@@ -8,18 +8,13 @@ import mlx.core as mx
 from mlx_lm.models.switch_layers import SwiGLU
 
 from magnitude_engine.components import component
+from magnitude_engine.kernels.contractions import experts as expert_kernels
+from magnitude_engine.kernels.contractions.weights import ExpertWeights, QuantizedProjection
+from magnitude_engine.kernels.reductions.routing import select
 from magnitude_engine.models.execution import ExecutionScope
-from magnitude_engine.models.experts import metal
-from magnitude_engine.models.experts.computation import (
-    ExpertWeights,
-    QuantizedProjection,
-    ResidentExperts,
-    affine_mlp,
-)
+from magnitude_engine.models.experts.computation import ResidentExperts, affine_mlp
 from magnitude_engine.models.experts.contracts import ExpertOperator
 from magnitude_engine.models.projections import ParallelProjections
-
-from .routing import select
 
 Transform = Callable[[mx.array], mx.array]
 
@@ -51,10 +46,12 @@ class DenseFeedForward:
         object.__setattr__(self, "_weights", expanded)
 
     def __call__(self, hidden: mx.array) -> mx.array:
-        if self._weights is not None and hidden.size // hidden.shape[-1] == 1:
+        if self._weights is not None and (
+            hidden.size // hidden.shape[-1] == 1 or (hidden.ndim == 3 and hidden.shape[1] <= 8)
+        ):
             indices = mx.zeros(hidden.shape[:-1] + (1,), mx.int32)
-            if metal.supported(self._weights, hidden, indices):
-                activation = metal.activate(self._weights, hidden, indices).reshape(
+            if expert_kernels.supported(self._weights, hidden, indices):
+                activation = expert_kernels.activate(self._weights, hidden, indices).reshape(
                     *hidden.shape[:-1], self._weights.gate.weight.shape[1]
                 )
                 return self.call.down_proj(activation)
@@ -85,7 +82,7 @@ class RoutedFeedForward:
     def route(self, hidden: mx.array) -> tuple[mx.array, mx.array, mx.array]:
         if (
             self.routing.packed
-            and hidden.size // hidden.shape[-1] <= 8
+            and (hidden.shape[1] <= 8 or hidden.size // hidden.shape[-1] <= 8)
             and self.routing.sizes[0] <= 1024
             and self.top_k <= 16
         ):
@@ -107,9 +104,11 @@ class RoutedFeedForward:
             isinstance(experts, ResidentExperts)
             and isinstance(experts.math.activation, SwiGLU)
             and self.shared_weights is not None
-            and metal.shared_supported(experts.weights, self.shared_weights, hidden, indices)
+            and expert_kernels.shared_supported(
+                experts.weights, self.shared_weights, hidden, indices
+            )
         ):
-            return metal.apply(
+            return expert_kernels.apply(
                 experts.weights,
                 hidden,
                 indices,

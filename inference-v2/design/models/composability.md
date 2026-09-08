@@ -6,6 +6,8 @@ can be compared and replaced independently, then fused and compiled together.**
 This defines composition within a model executor. The engine coordinates requests;
 the executor advances model state and owns the resources needed for that execution.
 [Optimization](optimization.md) defines how implementation choices earn their place.
+[Kernel construction](../kernels.md) defines numerical building blocks, execution plans
+and generated Metal through MLX.
 [Component identification](../components.md) defines stable IDs and assembly notation.
 
 The model descriptions are assemblies of identified implementations:
@@ -29,6 +31,11 @@ not every individual tensor operation.
 
 An **implementation** realizes a block's contract using MLX operations, upstream
 operators, custom kernels, or a composition of them.
+
+Reusable numerical operations own arithmetic and state-transition behavior. Their
+kernel plans own physical execution beneath that boundary. Architectures bind actual
+weights and connect operations; they do not assemble Metal source or choose thread tiles.
+The same operation can serve multiple architectures when its numerical contract matches.
 
 A compiled resident region binds the same architecture equation and neural components
 as scoped execution. State access and resource handling differ; the model's residual
@@ -72,11 +79,12 @@ visible in the owning architecture rather than emerging from incidental imports.
 ## Composition without execution barriers
 
 ```text
-Architecture:        embedding → [mixer → feedforward] × layers → readout
-                                      │
-Block implementation:    MLX operations / upstream operators / owned kernels
-                                      │
-Execution:                  fused and compiled tensor regions
+Architecture: embedding → [mixer → feedforward] × layers → readout
+    │
+    ├── MLX / upstream operations
+    └── Owned operations → kernel plans → generated Metal
+    │
+Execution: MLX tensor regions and dependencies
 ```
 
 A block boundary does not require a Python dispatch, GPU launch, synchronization
@@ -94,6 +102,12 @@ Prefill, decode and verification share model semantics while allowing different
 implementations. Selection follows supported tensor geometry, precision and state
 layout within the bound model implementation. [Batching](../engine/batching.md)
 supplies compatible work; scheduling does not choose architecture kernels.
+
+Owned one-token decode must preserve each request's numerical operation when batch
+membership changes. Sharing weights and input loads is independent of per-request
+accumulation; no particular physical request-axis layout is prescribed. Physical placement
+and padding must not redefine logical reductions. Wider prefill and verification may use
+different qualified algorithms with explicit numerical and continuation-state contracts.
 
 ## Independent comparison and reuse
 
@@ -176,8 +190,8 @@ Per-expert hidden vectors are internal intermediates and need not be materialize
 #### `MODEL:EXPERTS:MAG:RESIDENT_GATHERED`
 
 - **Implementation:** Resident encoded weights execute selected experts and their weighted sum.
-  Compatible short-row SwiGLU prepares affine inputs once, reuses them across output
-  tiles, and fuses gate/up/activation with preparation for the down/reduction kernel;
+  Compatible short-row SwiGLU fuses gate/up/activation, writes native activations
+  and consumes them in a fused down/reduction kernel;
   other geometries use MLX gathers and the supplied activation. Routing remains caller-owned.
 - **Reference / validation:** Upstream expert module and a per-expert gather/matmul oracle. Match weights and activation;
   exercise assignment order, repeats, sparse/dense utilization and shapes on both sides of

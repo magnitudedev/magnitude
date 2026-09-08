@@ -3,7 +3,7 @@
 import mlx.core as mx
 import pytest
 
-from magnitude_engine.models.activations import sigmoid_gate
+from magnitude_engine.kernels.reductions.gating import sigmoid_gate
 
 
 def equal(a, b):

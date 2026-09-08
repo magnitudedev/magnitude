@@ -3,7 +3,7 @@ import mlx.nn as nn
 import pytest
 from mlx_vlm.models.qwen3_5.language import Qwen3_5RotaryEmbedding
 
-from magnitude_engine.models.architectures.qwen35.attention.preparation import prepare
+from magnitude_engine.kernels.attention.preparation import prepare
 
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])

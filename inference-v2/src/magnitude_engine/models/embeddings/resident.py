@@ -8,9 +8,9 @@ import mlx.core as mx
 
 from magnitude_engine.artifacts.quantization import AffineEncoding
 from magnitude_engine.components import component
+from magnitude_engine.kernels.contractions.embedding import lookup
 
 from ..execution import ExecutionScope
-from .metal import lookup
 
 
 @dataclass

@@ -7,6 +7,7 @@ from typing import Any
 from magnitude_engine.models.attention.contracts import PagedAttention
 from magnitude_engine.models.embeddings.contracts import EmbeddingLookup
 from magnitude_engine.models.experts.contracts import ExpertOperator
+from magnitude_engine.models.projections import bind_linear, bind_readout
 from magnitude_engine.models.state.arena import LayerGeometry
 
 from .program import (
@@ -62,8 +63,8 @@ def bind_gemma4(
             physical[index] = len(geometries)
             geometries.append(geometry)
             producer = KVProducer(
-                a.k_proj,
-                None if a.use_k_eq_v else a.v_proj,
+                bind_linear(a.k_proj),
+                None if a.use_k_eq_v else bind_linear(a.v_proj),
                 a.k_norm,
                 a.v_norm,
                 a.rope,
@@ -82,7 +83,9 @@ def bind_gemma4(
         if index in routed:
             r = layer.router
             expert_branch = ExpertBranch(
-                GemmaRouter(r.proj, r.scale, r.per_expert_scale, r.eps, r.config.top_k_experts),
+                GemmaRouter(
+                    bind_linear(r.proj), r.scale, r.per_expert_scale, r.eps, r.config.top_k_experts
+                ),
                 experts[index],
                 layer.pre_feedforward_layernorm_2,
                 layer.post_feedforward_layernorm_2,
@@ -93,10 +96,10 @@ def bind_gemma4(
                 GemmaAttention(
                     physical[source],
                     producer,
-                    a.q_proj,
+                    bind_linear(a.q_proj),
                     a.q_norm,
                     a.rope,
-                    a.o_proj,
+                    bind_linear(a.o_proj),
                     a.n_heads,
                     inner.window_size if a.is_sliding else None,
                     attention,
@@ -104,14 +107,16 @@ def bind_gemma4(
                 layer.post_attention_layernorm,
                 GemmaFeedForward(
                     layer.pre_feedforward_layernorm,
-                    GeGLU(m.gate_proj, m.up_proj, m.down_proj),
+                    GeGLU(
+                        bind_linear(m.gate_proj), bind_linear(m.up_proj), bind_linear(m.down_proj)
+                    ),
                     layer.post_feedforward_layernorm,
                     layer.post_feedforward_layernorm_1 if expert_branch is not None else None,
                     expert_branch,
                 ),
                 LayerInput(
-                    layer.per_layer_input_gate,
-                    layer.per_layer_projection,
+                    bind_linear(layer.per_layer_input_gate),
+                    bind_linear(layer.per_layer_projection),
                     layer.post_per_layer_input_norm,
                 )
                 if width
@@ -122,7 +127,7 @@ def bind_gemma4(
     per_layer = (
         PerLayerInputs(
             per_layer_embedding,
-            inner.per_layer_model_projection,
+            bind_linear(inner.per_layer_model_projection),
             inner.per_layer_projection_norm,
             len(layers),
             width,
@@ -133,7 +138,7 @@ def bind_gemma4(
         if per_layer_embedding is not None
         else None
     )
-    output = inner.embed_tokens.as_linear if model.tie_word_embeddings else model.lm_head
+    output = bind_readout(inner.embed_tokens if model.tie_word_embeddings else model.lm_head)
     return Gemma4Binding(
         Gemma4Program(
             embedding,

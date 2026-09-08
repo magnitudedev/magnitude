@@ -45,6 +45,12 @@ This separates **query width** from **history length**. Two requests with one
 new token each can batch despite different histories; a one-token decode and
 a five-input verification use different execution groups.
 
+Compatible batching must preserve each request's declared numerical operation as peers
+join, leave or change order. A longer peer or padded capacity cannot redefine that
+request's reduction. The [kernel implementation](../kernels.md) owns physical tiling
+and weight reuse; batching supplies logical rows, positions and validity. Different
+query-width algorithms remain subject to their explicit numerical/state contracts.
+
 ## State across steps
 
 Persistent batches reuse useful physical state instead of separating and

@@ -8,7 +8,8 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from magnitude_engine.components import component
-from magnitude_engine.models.activations import sigmoid_gate
+from magnitude_engine.kernels.attention.preparation import prepare
+from magnitude_engine.kernels.reductions.gating import sigmoid_gate
 from magnitude_engine.models.attention.contracts import DecodeAttention, PagedAttention
 from magnitude_engine.models.execution import ExecutionScope
 from magnitude_engine.models.projections import ParallelProjections
@@ -17,7 +18,6 @@ from magnitude_engine.models.state.hybrid import HybridState
 from magnitude_engine.models.state.pages import append_layer
 from magnitude_engine.models.state.views import read_layer
 
-from .preparation import prepare
 from .rotary import QwenRotary
 
 Transform = Callable[[mx.array], mx.array]
@@ -62,7 +62,7 @@ class GatedAttention:
         rotation = self.positions.rotation
         if (
             self.inputs.packed
-            and batch * count <= 8
+            and (count == 1 or batch * count <= 8)
             and 32 <= self.head_width <= 1024
             and rotation is not None
             and rotation.dim <= self.head_width

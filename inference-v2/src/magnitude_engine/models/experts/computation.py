@@ -9,38 +9,10 @@ from mlx_lm.models.switch_layers import SwiGLU
 
 from magnitude_engine.artifacts.quantization import AffineEncoding
 from magnitude_engine.components import component
+from magnitude_engine.kernels.contractions import experts as expert_kernels
+from magnitude_engine.kernels.contractions.weights import ExpertWeights, QuantizedProjection
 
 from ..execution import ExecutionScope
-from . import metal
-
-
-@dataclass(frozen=True)
-class QuantizedProjection:
-    weight: mx.array
-    scales: mx.array
-    biases: mx.array
-    encoding: AffineEncoding
-
-    def apply(self, inputs: mx.array, assignments: mx.array, *, sorted_indices: bool) -> mx.array:
-        return mx.gather_qmm(
-            inputs,
-            self.weight,
-            self.scales,
-            self.biases,
-            rhs_indices=assignments,
-            transpose=True,
-            group_size=self.encoding.group_size,
-            bits=self.encoding.bits,
-            mode="affine",
-            sorted_indices=sorted_indices,
-        )
-
-
-@dataclass(frozen=True)
-class ExpertWeights:
-    up: QuantizedProjection
-    gate: QuantizedProjection
-    down: QuantizedProjection
 
 
 def affine_mlp(layer) -> ExpertWeights | None:
@@ -80,8 +52,10 @@ class GatedExpertMath:
             raise ValueError("expert assignments must match hidden rows and have nonempty top-k")
         if scores.shape != assignments.shape or scores.dtype != hidden.dtype:
             raise ValueError("expert coefficients must match routes and hidden dtype")
-        if isinstance(self.activation, SwiGLU) and metal.supported(weights, hidden, assignments):
-            return metal.apply(weights, hidden, assignments, scores)
+        if isinstance(self.activation, SwiGLU) and expert_kernels.supported(
+            weights, hidden, assignments
+        ):
+            return expert_kernels.apply(weights, hidden, assignments, scores)
         shape = assignments.shape
         top_k = shape[-1]
         rows = hidden.reshape(-1, hidden.shape[-1])

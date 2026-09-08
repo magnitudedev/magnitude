@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import cache
-from typing import Any
 
 import mlx.core as mx
+
+from magnitude_engine.kernels.state.plans import update_tail
 
 from ..execution import ExecutionScope
 from .pages import SequencePages
@@ -42,57 +42,6 @@ class DecodeKV:
             self.values[layer].shape[-1],
         )
         return keys, values, self.starts
-
-
-@cache
-def _append_kernel() -> Any:
-    return mx.fast.metal_kernel(
-        name="magnitude_append_tail",
-        input_names=["previous", "keys", "values", "offsets"],
-        output_names=["output"],
-        source="""
-        uint i = thread_position_in_grid.x;
-        constexpr uint NK = B * H * C * K;
-        if (i >= B * H * C * (K + V)) return;
-        bool key = i < NK;
-        uint j = key ? i : i - NK;
-        uint width = key ? K : V;
-        uint channel = j % width;
-        uint position = (j / width) % C;
-        uint head = (j / width / C) % H;
-        uint row = j / width / C / H;
-        int token = int(position) - offsets[row];
-        if (token >= 0 && token < N) {
-            uint source = ((row * H + head) * N + uint(token)) * width + channel;
-            output[i] = key ? keys[source] : values[source];
-        } else {
-            output[i] = previous[i];
-        }
-    """,
-    )
-
-
-def update_tail(
-    buffer: mx.array, new_keys: mx.array, new_values: mx.array, offsets: mx.array, capacity: int
-) -> mx.array:
-    """One bounded write over contiguous K and V regions of the same allocation."""
-    batch, heads, count, key_width = new_keys.shape
-    value_width = new_values.shape[-1]
-    return _append_kernel()(
-        inputs=[buffer, new_keys, new_values, offsets],
-        template=[
-            ("B", batch),
-            ("H", heads),
-            ("C", capacity),
-            ("K", key_width),
-            ("V", value_width),
-            ("N", count),
-        ],
-        grid=(buffer.size, 1, 1),
-        threadgroup=(256, 1, 1),
-        output_shapes=[buffer.shape],
-        output_dtypes=[buffer.dtype],
-    )[0]
 
 
 class PreparedDecodeAppend:
