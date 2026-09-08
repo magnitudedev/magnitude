@@ -232,7 +232,8 @@ replaced. Loading the extension, declining setup, and headless operation do not 
 The package does not install a private CLI dependency or alter executable lookup. Hosted setup
 uses the same connection transaction as headless and ordinary interactive setup, then selects the
 current local primary model, read once through the SDK after a successful child exit, in the existing
-Pi session. Failed or cancelled setup does not query or change Pi's model. Manual commands then reload resources. First-run
+Pi session before returning terminal ownership and redrawing Pi, so the footer reflects the selection
+without waiting for keyboard input. Failed or cancelled setup does not query or change Pi's model. Manual commands then reload resources. First-run
 events retain the already-loaded extension and usage skill; they do not require command-only reload
 authority or newer chat-message dispatch APIs.
 
