@@ -1,19 +1,22 @@
 ---
 title: Introduction
-description: "Run your agent on local models. Free, private, and offline."
+description: "Local models, tuned for your Mac."
 icon: compass
 ---
 
-Magnitude is an open source inference server that runs the best local models for your hardware, plugged into the agent you already use. It profiles your machine, recommends the models that fit, then downloads, tunes, and runs them. Works with Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline, or use the built-in harness.
+Magnitude is an open source inference server for Apple silicon. It profiles your Mac, recommends the best models for it, then downloads, tunes, and runs them. Plugs into Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline, or use the built-in harness.
+
+<img className="hidden dark:block" src="/ecosystem-dark.png" alt="Your existing agent connected to Magnitude, which runs local models for your Mac." />
+<img className="block dark:hidden" src="/ecosystem-light.png" alt="Your existing agent connected to Magnitude, which runs local models for your Mac." />
 
 ## Why Magnitude?
 
+- **Knows your Mac:** profiles your hardware to assess fit and estimate tok/s per model
+- **Recommends the best models:** ranked by speed, accuracy, intelligence, and memory
+- **Tuned end to end:** speculative decoding and more, all set for your Mac
+- **Easy setup:** one command and your agent is running local models
 - **Free to run:** no token costs, API keys, or rate limits
-- **Fully private and offline:** models, prompts, and files stay on your machine
-- **Agent-first setup:** one prompt and your agent walks you through the rest
-- **Knows your hardware:** profiles your chip, memory, and bandwidth
-- **Recommends what fits:** the best models for your machine, with estimated tok/s
-- **Tuned end to end:** speculative decoding, concurrency, all set for your machine
+- **Fully private and offline:** models, prompts, and files stay on your Mac
 - **Models on demand:** loaded on request, unloaded when idle or memory fills
 - **Open source:** Apache 2.0, yours to modify
 

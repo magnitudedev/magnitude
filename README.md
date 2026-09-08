@@ -8,7 +8,7 @@
 
 <h1 align="center">Magnitude</h1>
 
-<p align="center"><strong>Run your agent on local models. Free, private, and offline.</strong></p>
+<p align="center"><strong>Local models, tuned for your Mac.</strong></p>
 
 <p align="center">
   <a href="https://docs.magnitude.dev"><img src="https://img.shields.io/badge/%F0%9F%93%95-Docs-0369a1?style=flat-square&labelColor=0369a1&color=gray" alt="Documentation"></a>
@@ -18,21 +18,28 @@
   <a href="https://www.npmjs.com/package/@magnitudedev/cli"><img src="https://img.shields.io/npm/v/%40magnitudedev%2Fcli" alt="npm version"></a>
 </p>
 
-Magnitude is an open source inference server that runs the best local models for your hardware, plugged into the agent you already use. It profiles your machine, recommends the models that fit, then downloads, tunes, and runs them. Works with Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline, or use the built-in harness.
+Magnitude is an open source inference server for Apple silicon. It profiles your Mac, recommends the best models for it, then downloads, tunes, and runs them. Plugs into Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline, or use the built-in harness.
 
 ⭐ Help us reach more developers and grow the Magnitude community. Star this repo!
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/readme/ecosystem-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="assets/readme/ecosystem-light.png">
-  <img alt="Pi, OpenCode, Hermes, Codex, Claude Code, and OpenClaw connected to Magnitude, which runs local models for your hardware." src="assets/readme/ecosystem-light.png">
+  <img alt="Pi, OpenCode, Hermes, Codex, Claude Code, and OpenClaw connected to Magnitude, which runs local models for your Mac." src="assets/readme/ecosystem-light.png">
 </picture>
 
 ## Get started
 
-### Set up with your agent
+See what your Mac can run:
 
-Send this prompt to your agent:
+```sh
+npm i -g @magnitudedev/cli
+magnitude setup
+```
+
+Setup profiles your hardware, ranks models by speed, accuracy, intelligence, and memory, and connects your harness to the one you pick.
+
+Or let your agent handle it. Send this to Pi, Claude Code, OpenCode, or whatever you use:
 
 ```text
 Set up local models for me with the Magnitude CLI. Install it with `npm i -g @magnitudedev/cli` (or my package manager), then run `magnitude docs onboarding` and follow the instructions.
@@ -40,27 +47,14 @@ Set up local models for me with the Magnitude CLI. Install it with `npm i -g @ma
 
 Your agent will profile your hardware, walk you through the best local models for it, download the ones you pick, and switch itself over to them.
 
-### Install manually
-
-Run these commands in your terminal:
-
-```sh
-npm i -g @magnitudedev/cli
-magnitude setup
-```
-
-The interactive setup profiles your hardware, lets you choose from the recommended models, downloads your selection, and connects it to your harness.
-
-Magnitude supports macOS and Linux. Windows is supported through WSL.
-
 ## Why Magnitude?
 
+- **Knows your Mac:** profiles your hardware to assess fit and estimate tok/s per model
+- **Recommends the best models:** ranked by speed, accuracy, intelligence, and memory
+- **Tuned end to end:** speculative decoding and more, all set for your Mac
+- **Easy setup:** one command and your agent is running local models
 - **Free to run:** no token costs, API keys, or rate limits
-- **Fully private and offline:** models, prompts, and files stay on your machine
-- **Agent-first setup:** one prompt and your agent walks you through the rest
-- **Knows your hardware:** profiles your chip, memory, and bandwidth
-- **Recommends what fits:** the best models for your machine, with estimated tok/s
-- **Tuned end to end:** speculative decoding, concurrency, all set for your machine
+- **Fully private and offline:** models, prompts, and files stay on your Mac
 - **Models on demand:** loaded on request, unloaded when idle or memory fills
 - **Open source:** Apache 2.0, yours to modify
 
@@ -68,35 +62,31 @@ Magnitude supports macOS and Linux. Windows is supported through WSL.
 
 ### What is Magnitude?
 
-An open source inference server that runs the best local models for your hardware, plugged into the agent you already use. It profiles your machine, recommends the models that fit, then downloads, tunes, and runs them.
+An open source inference server for Apple silicon. It profiles your Mac, recommends the best models for it, then downloads, tunes, and runs them. Plug it into the agent you already use.
 
-### What hardware do I need?
+### Why only Mac?
 
-There's no fixed minimum. Magnitude profiles your hardware and recommends the best models for your machine. More memory lets you run larger models.
+Apple silicon is the best consumer hardware for local models, and building for one platform lets us optimize the whole stack for it, from model selection down to the kernels.
 
-### Why not just have my agent set up Ollama?
+### How does it know what my Mac can run?
 
-Your agent would be guessing. It doesn't know your hardware, which quant fits, or how fast it'll run. Magnitude gives it a catalog with recommendations computed for your machine, an onboarding flow that writes your harness config, and inference built for agent workloads. Models load just in time and unload when idle or memory gets tight.
+Magnitude profiles your chip, memory, and bandwidth, then estimates fit and tok/s for every model in the catalog. It ranks them by speed, accuracy, intelligence, and memory so you can pick.
+
+### What Mac do I need?
+
+Any Apple silicon Mac (M1 or later, 2020 onward) running macOS 15 or newer. Intel Macs aren't supported. There's no fixed minimum beyond that. More memory lets you run larger models.
 
 ### Which harnesses work with it?
 
 Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline. During setup, your agent connects your harness to the model you pick. Or use Magnitude's built-in harness.
 
-### Do I need to manage Magnitude after setup?
+### Do I need to manage it after setup?
 
-No. It runs in the background, loads models when your agent needs them, and unloads them when idle or memory gets tight. Your agent can install or switch models through the Magnitude CLI anytime.
+No. It runs in the background, loads models when your agent needs them, and unloads them when idle or memory gets tight. Your agent can install or switch models through the CLI anytime.
 
-### Does my data go to the cloud?
+### Is it private?
 
-No. Prompts, files, and models stay on your machine.
-
-### Can it run completely offline?
-
-Yes. Once Magnitude and a model are downloaded, no internet connection needed.
-
-### Can I use models outside the catalog?
-
-Yes. You can [download compatible GGUF models from Hugging Face](https://docs.magnitude.dev/models#download-a-model-outside-the-catalog) and use them in Magnitude.
+Yes. Prompts, files, and models stay on your Mac. Once a model is downloaded, no internet connection is needed.
 
 ## Learn more
 
