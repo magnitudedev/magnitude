@@ -10,7 +10,7 @@ MAX_SOURCE_BYTES = 16 << 20
 MAX_PIXELS = 16_000_000
 
 
-def extract_images(messages: list[dict]) -> list[Image.Image]:
+def replace_image_parts(messages: list[dict]) -> list[Image.Image]:
     """Replace ordered API image parts with template markers, returning RGB sources.
 
     This local API accepts inline base64 images. Network fetch and local filesystem

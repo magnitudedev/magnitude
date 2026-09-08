@@ -152,3 +152,72 @@ def test_model_checkpoint_rejects_other_residency_and_closed_handles():
     runtime.owner.close()
     peer.owner.close()
     assert budget.snapshot().reserved == peer_budget.snapshot().reserved == 0
+
+
+@pytest.mark.parametrize("family", ["qwen35", "gemma4"])
+def test_span_features_survive_execution_pins_and_family_checkpoint_rules(family):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from magnitude_engine.models.features import Feature, FeatureCache
+    from magnitude_engine.models.prompt import InputSpan, Prompt
+    from magnitude_engine.resources.budget import MemoryBudget
+
+    budget, cache = MemoryBudget(4096), FeatureCache()
+    span = InputSpan(1, 3, b"image", indivisible=family == "gemma4")
+    prompt = Prompt((1, 2, 2, 3), (span,))
+
+    class Encoder:
+        pass
+
+    encoder = Encoder()
+    encoder.budget, encoder.cache = budget, cache
+    encoder.config = SimpleNamespace(
+        vision_config=SimpleNamespace(out_hidden_size=4),
+        text_config=SimpleNamespace(hidden_size=4),
+    )
+    if family == "qwen35":
+        from magnitude_engine.models.architectures.qwen35.vision import ImageInput, QwenSource
+
+        source = QwenSource(
+            encoder,
+            prompt,
+            np.broadcast_to(np.arange(4), (3, 4)),
+            (ImageInput(span, (1, 1, 2), np.zeros((1,))),),
+        )
+    else:
+        from magnitude_engine.models.architectures.gemma4.vision import GemmaSource, ImageInput
+
+        source = GemmaSource(encoder, prompt, (ImageInput(span, np.zeros((1,)), np.zeros((1,))),))
+    feature = Feature(32, budget).acquire()
+    feature.feature.value = mx.ones((1, 2, 4))
+    cache.put(encoder, span.identity, feature)
+    feature.close()
+    context = source.bind(None)
+    assert list(context.prepare(0, 3)) == [] and context.cache_hits == 1
+    cache.close()
+    assert context.boundary(2) == (family == "qwen35")
+    operands = context.assemble(ModelInputs.from_tokens((1, 2, 2)), 0)
+    assert operands.data.embeddings[0].values.shape == (1, 2, 4)
+    pinned = context.acquire(1, 2)
+    checkpoint = context.checkpoint(2 if family == "qwen35" else 3)
+    assert list(context.prepare(3, 1)) == []
+    context.close()
+    assert budget.snapshot().reserved == 32  # Execution still owns the feature.
+    if family == "qwen35":
+        with pytest.raises(ValueError, match="partial"):
+            checkpoint.restore()
+        restored = source.bind(checkpoint)
+        checkpoint.close()
+        pinned.close()
+        assert budget.snapshot().reserved == 32  # Partial-image continuation owns it now.
+        assert restored.assemble(ModelInputs.from_tokens((2,)), 2).data.embeddings
+    else:
+        restored = checkpoint.restore()
+        checkpoint.close()
+        pinned.close()
+        assert budget.snapshot().reserved == 0
+    assert restored.assemble(ModelInputs.from_tokens((4,)), 4).count == 1
+    restored.close()
+    assert budget.snapshot().reserved == 0

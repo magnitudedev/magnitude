@@ -146,9 +146,9 @@ class ChatTemplate:
         )
         images = []
         if self.image_processor is not None:
-            from .images import extract_images
+            from .images import replace_image_parts
 
-            images = extract_images(normalized)
+            images = replace_image_parts(normalized)
         tokenizer = self.artifact.tokenizer
         text = tokenizer.apply_chat_template(
             normalized,

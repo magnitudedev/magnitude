@@ -13,6 +13,7 @@ import pytest
 from magnitude_engine import blueprints as bp
 from magnitude_engine.engine.delivery import Finished, Tokens
 from magnitude_engine.generation.sampling_policy import SamplingPolicy
+from magnitude_engine.worker.admission import read_admitted_frame
 from magnitude_engine.worker.framing import MAX_FRAME_BYTES, VERSION, Frame, read_frame, write_frame
 from magnitude_engine.worker.host import Worker, WorkerUnavailable
 from tests.models.architectures.qwen35.test_construction import artifact_pair
@@ -326,9 +327,9 @@ def test_binary_buffers_are_reserved_before_read_and_rejection_preserves_next_fr
         assert stream.tell() < next_position - len(payload)
         return budget.reserve("input", size)
 
-    rejected = read_frame(stream, "g", reserve=reserve)
+    rejected = read_admitted_frame(stream, "g", reserve=reserve)
     assert isinstance(rejected.error, MemoryError)
-    assert rejected.buffers == () and budget.snapshot().reserved == 0
+    assert rejected.frame.buffers == () and budget.snapshot().reserved == 0
     assert seen[0][1] == len(payload) + 6
     assert read_frame(stream, "g").message == {"type": "cancel"}
 
@@ -342,10 +343,12 @@ def test_binary_buffers_preserve_exact_values_and_release_on_truncation():
     write_frame(stream, frame)
     encoded = stream.getvalue()
     stream.seek(0)
-    restored = read_frame(stream, "g", reserve=lambda _, n: budget.reserve("input", n))
-    assert restored == frame and budget.snapshot().reserved == 4
+    restored = read_admitted_frame(stream, "g", reserve=lambda _, n: budget.reserve("input", n))
+    assert restored.frame == frame and budget.snapshot().reserved == 4
     restored.close()
     assert budget.snapshot().reserved == 0
     with pytest.raises(EOFError):
-        read_frame(io.BytesIO(encoded[:-1]), "g", reserve=lambda _, n: budget.reserve("input", n))
+        read_admitted_frame(
+            io.BytesIO(encoded[:-1]), "g", reserve=lambda _, n: budget.reserve("input", n)
+        )
     assert budget.snapshot().reserved == 0
