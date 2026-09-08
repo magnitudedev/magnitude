@@ -2,9 +2,12 @@
 
 import mlx.core as mx
 
-from magnitude_engine.kernels.core import Input, KernelPlan, Launch, Output, Program, Source
+from magnitude_engine.kernels.core import computation
 
-SIGMOID_GATE = Program("sigmoid_gate", Source("reductions/sigmoid_gate.metal"))
+
+@computation
+def _sigmoid_gate(values, gates):
+    return values * mx.sigmoid(gates)
 
 
 def sigmoid_gate(values: mx.array, gates: mx.array) -> mx.array:
@@ -20,18 +23,4 @@ def sigmoid_gate(values: mx.array, gates: mx.array) -> mx.array:
         raise ValueError("sigmoid gate requires aligned floating tensors")
     if values.size == 0:
         return values
-    return KernelPlan(
-        program=SIGMOID_GATE,
-        inputs=(
-            Input("values", values),
-            Input("gates", gates),
-        ),
-        outputs=(Output("output", values.shape, values.dtype),),
-        launch=Launch((values.size, 1, 1), (256, 1, 1)),
-        template=(
-            ("T", values.dtype),
-            ("N", values.size),
-            ("WIDTH", values.shape[-1]),
-            ("SHARED", gates.shape[-1] == 1),
-        ),
-    ).run()[0]
+    return _sigmoid_gate(values, gates)

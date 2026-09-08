@@ -3,7 +3,7 @@
 **Numerical operations define behavior. Kernel plans arrange its execution. Reusable
 Metal code and generated entry points realize those plans through MLX.**
 
-This defines the intended construction boundary for owned kernels.
+This defines the construction boundary for owned kernels.
 [Model composability](models/composability.md) owns architecture and operation contracts;
 [optimization](models/optimization.md) owns implementation selection and qualification.
 Kernel construction also serves state operations where the same execution mechanisms
@@ -12,8 +12,9 @@ apply. It does not own model assembly, request policy or physical allocation.
 ## Responsibilities
 
 ```text
-Bound operation + actual tensor/state views
-    → numerical building blocks + kernel plan
+Python/MLX computation + actual tensor/state views
+    → captured operations + numerical/state requirements
+    → automatic implementation selection + kernel plan
     → specialized Metal entry point + matching launch configuration
     → MLX arrays and execution dependencies
 ```
@@ -23,7 +24,8 @@ Bound operation + actual tensor/state views
 | Architecture | Equations, weight interpretation, connections, positions and required outputs |
 | Numerical operation | Arithmetic, rounding, reductions, supported inputs and state effects |
 | Kernel plan | Tile ownership, data access/reuse, placement, dependencies and execution partition |
-| Generator and Metal library | Realize the plan with reusable arithmetic and target code |
+| Metal implementation | Handwritten algorithm and typed tile/hook interface |
+| Planner and generator | Connect compatible implementations and emit entry points |
 | MLX invocation | Bind array operands and launch arguments; return arrays in the dependency graph |
 | State and execution owners | Supply valid views, control commitment and retain resources through completion |
 
@@ -34,20 +36,31 @@ work and batching groups compatible operations without inspecting kernel plans.
 
 ## Implementation organization
 
-`kernels/core/` owns plan records, source assembly and MLX invocation/caching.
-Computational categories own their planning functions and adjacent `.metal` sources:
+`kernels/core/` owns capture, typed interfaces, automatic planning, source assembly
+and MLX invocation/caching. Computational categories own operation declarations,
+implementation bindings and adjacent `.metal` sources:
 `contractions/`, `reductions/`, `attention/`, `recurrence/` and `state/` for KV writes.
 Encoded operands belong with contractions; architecture loading binds those operands.
 Categories depend on the core and explicit numerical dependencies, never model or
 scheduler implementations. Model components keep their semantic IDs and call the
 category operations.
 
-A plan binds named inputs, output shapes/dtypes, launch geometry, template parameters
-and finite scalar specializations to a source dependency graph. The source graph holds
-immutable content snapshots. Assembly emits each dependency once; the runtime derives
-both the kernel signature and positional MLX arguments from the same named bindings.
-Kernel-family source encodes the selected arithmetic and reduction ordering. The core
-validates construction; it does not prove arbitrary Metal arithmetic correct.
+`@operation` owns a numerical definition and its registered `.metal` bindings;
+`@computation` expands ordinary composition. Immutable parameterized numerical leaves
+use the same `Primitive` interface internally. Bindings carry array specifications,
+never runtime array values. Registration closes on first specialization. An optional
+`.infer` callback returns output `Tensor` specifications when tracing the reference
+would be expensive.
+
+A binding describes logical tiles, dtype, thread ownership, reduction completion,
+participation, scratch and effects at a Metal function or hook boundary. The planner
+derives connections and launch boundaries from these interfaces and graph dependencies.
+The generated launch binding supplies both the kernel signature and MLX arguments.
+Source dependencies are immutable content snapshots, emitted once per assembly.
+The core checks declared composition requirements; qualification establishes that
+handwritten Metal actually meets them. Current mechanisms cover completed scalar/SIMD
+tiles, blocked row fragments, ordered traversal and cooperative row hooks. New collective
+or exchange mechanisms need qualification; arbitrary Metal is not parsed or reordered.
 
 ## Numerical building blocks
 
@@ -98,9 +111,11 @@ building blocks and operands. It records:
 - **Boundary obligations:** outputs, state reads/writes, alias constraints and launch geometry.
 
 Plans describe execution beneath existing components. They do not reconstruct an
-architecture from names or introduce a second model graph. Start with deliberate plan
-families for supported operations; automatic fusion and schedule search are additional
-capabilities, not implied by having an IR.
+architecture from names or introduce a second model graph. `@computation` automatically
+captures ordinary MLX expressions and declared operations. A shared planner selects
+eligible implementations and fusion from typed dependencies and bounded policies;
+model authors do not supply operation-pair recipes. Unsupported connections remain
+explicit array boundaries, with retained MLX execution among the eligible alternatives.
 
 For a gated projection, a plan can express:
 
@@ -126,15 +141,23 @@ Generation specializes and connects those functions, emits the kernel entry poin
 and derives its matching MLX launch signature. It must not maintain a separate operand
 order or output layout in an independently written launcher.
 
+Numerical loops and statements remain Metal, not Python statement builders. Complete
+tile calls expose returned fragments. Typed input/output hooks and ordered drivers
+expose internal composition where it enables useful reuse. Generated adapters connect
+those hooks; an opaque function does not acquire internal fusion from metadata alone.
+
 Use structured plan data and template specialization instead of scattered source-string
 substitutions. MLX may receive source text at its API boundary; that text is a generated
 artifact, not the authoritative representation of the operation. Retain inspectable
 generated source so failures can be traced to the selected plan and source functions.
 
 Metal helper calls compose inside the generated kernel without creating MLX arrays or
-additional launches. Python composition remains ordinary array computation. Fusion
-between custom kernels must be implemented explicitly; MLX compilation does not imply
-that arbitrary custom kernels will merge.
+additional launches. Python composition remains ordinary array computation. Complete
+attention, recurrence, embedding, routing and KV-write bodies can bind as opaque kernels
+through the same invocation boundary; opacity does not imply internal fusion. Our planner
+implements automatic custom-region fusion; MLX compilation supplies execution and does
+not imply that arbitrary custom kernel bodies will merge. Warm compiled execution
+performs no Python capture, plan search or source generation.
 
 ## Legal composition
 
@@ -163,9 +186,14 @@ tiles remain fast together.
 Specialize on relevant encoding, dtype, geometry, layout, numerical contract and target
 capabilities. Dynamic validity and positions remain operands where possible. Kernel
 selection must preserve the operation's contract across batch membership and storage
-changes. Reject unsupported combinations before submitting device work.
+changes. Reject unsupported combinations before submitting device work. Make required row
+contiguity explicit in the MLX graph. An unsupported export adapter retains the original
+computation under automatic policy; a forced policy fails clearly.
 
-Reuse generated kernels across compatible invocations. Cache validity includes every
+Reuse generated kernels across compatible invocations. Caches are bounded, and
+specializations distinguish the MLX device/stream. Source registration snapshots code;
+reloading a changed declaration creates a new identity, while changing files beneath
+an already-bound executable does not silently change its behavior. Cache validity includes every
 code-affecting plan/source dependency and compilation option; operand addresses and
 benchmark identity do not define a numerical implementation. Generating a kernel is
 not a reason to allocate a new [component ID](components.md#identity-and-provenance).

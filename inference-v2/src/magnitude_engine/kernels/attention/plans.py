@@ -2,15 +2,12 @@
 
 import mlx.core as mx
 
-from magnitude_engine.kernels.core import Input, KernelPlan, Launch, Output, Program, Source
+from ..core.graph import Tensor
+from ..core.kernel import dispatch
+from ..core.plan import Launch, Source
 
-TILED_PARTIALS = Program(
-    "magnitude_attention_tiles",
-    Source("attention/tiled_partials.metal"),
-)
-
-
-TILED_COMBINE = Program("magnitude_attention_tile_sum", Source("attention/tiled_combine.metal"))
+TILED_PARTIALS = Source("attention/tiled_partials.metal")
+TILED_COMBINE = Source("attention/tiled_combine.metal")
 
 
 def tiled_attention(
@@ -19,7 +16,6 @@ def tiled_attention(
     batch, hq, count, dk = q.shape
     hk, capacity, dv = v.shape
     group = hq // hk
-    # At most 32 additional float registers per lane for independent KV loads.
     key_tile = 1 if count > 1 else max(1, min(4, 1024 // (dk + dv)))
     query_tile = min(count, max(1, 32 // (max(dk, dv) // 32)))
     single_pass = covered <= 512
@@ -29,7 +25,6 @@ def tiled_attention(
         heads -= 1
     blocks = 1 if single_pass else min(64, (covered + 127) // 128)
     query_groups = (count + query_tile - 1) // query_tile
-    # Batch row count does not enter this subdivision; covered is supplied by the caller.
     subchunks = max(
         1,
         min(
@@ -40,24 +35,24 @@ def tiled_attention(
         ),
     )
     rows = batch * hq * count
-    partial, maximum, denominator = KernelPlan(
-        program=TILED_PARTIALS,
+    partial, maximum, denominator = dispatch(
+        TILED_PARTIALS,
         inputs=(
-            Input("q", q),
-            Input("k", k),
-            Input("v", v),
-            Input("pages", pages),
-            Input("positions", positions),
+            ("q", q),
+            ("k", k),
+            ("v", v),
+            ("pages", pages),
+            ("positions", positions),
             *(
-                Input(n, v)
+                (n, v)
                 for n, v in zip(("tk", "tv", "starts"), tail or (k, v, positions), strict=True)
             ),
-            Input("scale", mx.array([scale], mx.float32)),
+            ("scale", mx.array([scale], mx.float32)),
         ),
         outputs=(
-            Output("partial", (rows, blocks, dv), q.dtype if single_pass else mx.float32),
-            Output("maximum", (rows, blocks), mx.float32),
-            Output("denominator", (rows, blocks), mx.float32),
+            ("partial", Tensor((rows, blocks, dv), q.dtype if single_pass else mx.float32)),
+            ("maximum", Tensor((rows, blocks), mx.float32)),
+            ("denominator", Tensor((rows, blocks), mx.float32)),
         ),
         launch=Launch(
             (
@@ -90,35 +85,21 @@ def tiled_attention(
             ("WINDOW", window or 0),
             ("TAIL", tail[0].shape[2] if tail else 0),
         ),
-    ).run()
+    )
     if single_pass:
         return partial.reshape(batch, hq, count, dv)
     groups = min(8, blocks)
-    return KernelPlan(
-        program=TILED_COMBINE,
-        inputs=(
-            Input("partial", partial),
-            Input("maximum", maximum),
-            Input("denominator", denominator),
-        ),
-        outputs=(Output("output", (batch, hq, count, dv), q.dtype),),
+    return dispatch(
+        TILED_COMBINE,
+        inputs=(("partial", partial), ("maximum", maximum), ("denominator", denominator)),
+        outputs=(("output", Tensor((batch, hq, count, dv), q.dtype)),),
         launch=Launch((32 * groups, rows, 1), (32 * groups, 1, 1)),
-        template=(
-            ("In", q.dtype),
-            ("DV", dv),
-            ("BLOCKS", blocks),
-            ("GROUPS", groups),
-        ),
-    ).run()[0]
+        template=(("In", q.dtype), ("DV", dv), ("BLOCKS", blocks), ("GROUPS", groups)),
+    )[0]
 
 
-PARTITIONED_PARTIALS = Program(
-    "magnitude_paged_attention_partials", Source("attention/partitioned_partials.metal")
-)
-
-PARTITIONED_COMBINE = Program(
-    "magnitude_paged_attention_combine", Source("attention/partitioned_combine.metal")
-)
+PARTITIONED_PARTIALS = Source("attention/partitioned_partials.metal")
+PARTITIONED_COMBINE = Source("attention/partitioned_combine.metal")
 
 
 def attend(
@@ -170,18 +151,18 @@ def attend(
             sharing -= 1
         threadgroup = (32, 1, sharing)
     layout = mx.array([keys.shape[1], page_size, splits, table_width, window or 0], mx.int32)
-    partial = KernelPlan(
-        program=PARTITIONED_PARTIALS,
+    partial = dispatch(
+        PARTITIONED_PARTIALS,
         inputs=(
-            Input("queries", queries),
-            Input("keys", keys),
-            Input("values", values),
-            Input("pages", pages),
-            Input("positions", positions),
-            Input("layout", layout),
-            Input("scale", mx.array([scale], mx.float32)),
+            ("queries", queries),
+            ("keys", keys),
+            ("values", values),
+            ("pages", pages),
+            ("positions", positions),
+            ("layout", layout),
+            ("scale", mx.array([scale], mx.float32)),
             *(
-                Input(n, v)
+                (n, v)
                 for n, v in zip(
                     ("tail_keys", "tail_values", "tail_starts"),
                     tail if tail is not None else (keys, values, positions),
@@ -189,7 +170,7 @@ def attend(
                 )
             ),
         ),
-        outputs=(Output("partial", (rows, splits, dv + 2), mx.float32),),
+        outputs=(("partial", Tensor((rows, splits, dv + 2), mx.float32)),),
         launch=Launch((32, splits, rows // heads), threadgroup),
         template=(
             ("DK", dk),
@@ -201,11 +182,13 @@ def attend(
             ("HEADS", heads),
             ("TAIL", tail[0].shape[2] if tail is not None else 0),
         ),
-    ).run()[0]
-    return KernelPlan(
-        program=PARTITIONED_COMBINE,
-        inputs=(Input("partial", partial), Input("layout", layout)),
-        outputs=(Output("output", (queries.shape[0], queries.shape[1], count, dv), queries.dtype),),
+    )[0]
+    return dispatch(
+        PARTITIONED_COMBINE,
+        inputs=(("partial", partial), ("layout", layout)),
+        outputs=(
+            ("output", Tensor((queries.shape[0], queries.shape[1], count, dv), queries.dtype)),
+        ),
         launch=Launch((32, rows, 1), (32, 1, 1)),
         template=(("Out", queries.dtype), ("DV", dv)),
-    ).run()[0]
+    )[0]

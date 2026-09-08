@@ -14,8 +14,12 @@ from uuid import uuid4
 
 from magnitude_engine.components import component_id, component_of
 from magnitude_engine.kernels.core.assembly import source_files as metal_sources
-from magnitude_engine.kernels.core.plan import Program
-from magnitude_engine.kernels.core.runtime import execute as execute_kernel
+from magnitude_engine.kernels.core.computation import Executable
+from magnitude_engine.kernels.core.execution import ExecutionPlan, OperandBinding
+from magnitude_engine.kernels.core.kernel import BoundKernel, ConstantInputs
+from magnitude_engine.kernels.core.operation import Invocation, Operation
+from magnitude_engine.kernels.core.plan import Source
+from magnitude_engine.kernels.core.runtime import generated_kernel
 from magnitude_engine.models.architectures.mlx_vlm.program import LibraryProgram
 from performance.bindings import Fields, Use, foreign, read, resolve
 from performance.facts import NeuralParameters, OpaqueParameters, TensorFacts
@@ -38,6 +42,9 @@ def source_key(owners: tuple[object, ...]) -> tuple[str, dict[str, str]]:
     symbols, files, seen = {}, {}, set()
 
     class RuntimeCode(ast.NodeTransformer):
+        def __init__(self, keep_bindings=False):
+            self.keep_bindings = keep_bindings
+
         def visit_ClassDef(self, node):
             node.decorator_list = [
                 d
@@ -60,7 +67,7 @@ def source_key(owners: tuple[object, ...]) -> tuple[str, dict[str, str]]:
                     and d.func.id == "component"
                 )
             ]
-            if node.name == "bindings":
+            if node.name == "bindings" and not self.keep_bindings:
                 return None
             node.returns = None
             for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs):
@@ -92,15 +99,51 @@ def source_key(owners: tuple[object, ...]) -> tuple[str, dict[str, str]]:
         owner = value if inspect.isroutine(value) or inspect.isclass(value) else type(value)
         packages.add(owner.__module__.split(".")[0])
 
-    def program_sources(program: Program, key: str):
-        sources = metal_sources(program.body)
-        symbols[key] = json.dumps({"name": program.name, "sources": [path for path, _ in sources]})
+    def program_sources(source: Source, key: str):
+        sources = metal_sources(source)
+        symbols[key] = json.dumps({"sources": [path for path, _ in sources]})
         for path, text in sources:
             files["magnitude_engine.kernels/" + path] = text
             symbols["metal:" + path] = text
-        visit(execute_kernel)
+        visit(generated_kernel)
 
     def visit(value):
+        if isinstance(value, Executable):
+            visit(value.call)
+            for node in value.graph.nodes:
+                if not isinstance(node.operation, str):
+                    visit(node.operation)
+        if isinstance(value, ExecutionPlan):
+            for region in value.regions:
+                visit(region.call)
+        if isinstance(value, ConstantInputs):
+            visit(value.kernel)
+        if isinstance(value, OperandBinding):
+            visit(value.call)
+        if isinstance(value, Invocation):
+            visit(value.declaration)
+        if isinstance(value, Operation):
+            if value._infer is not None:
+                visit(value._infer)
+            for implementation in value.implementations:
+                program_sources(
+                    implementation.source,
+                    value.__module__ + "." + value.__qualname__ + ":" + implementation.function,
+                )
+                visit(implementation.interface)
+        if isinstance(value, BoundKernel):
+            symbols["generated:" + digest((value.source, value.header))] = repr(
+                (
+                    value.source,
+                    value.header,
+                    value.launch,
+                    value.template,
+                    value.inputs,
+                    value.outputs,
+                )
+            )
+            for path, text in value.sources:
+                files["magnitude_engine.kernels/" + path] = text
         value = inspect.unwrap(value)
         owner = (
             value
@@ -114,7 +157,9 @@ def source_key(owners: tuple[object, ...]) -> tuple[str, dict[str, str]]:
         if not any(module == package or module.startswith(package + ".") for package in packages):
             return
         try:
-            tree = RuntimeCode().visit(ast.parse(textwrap.dedent(inspect.getsource(owner))))
+            tree = RuntimeCode(module.startswith("magnitude_engine.kernels")).visit(
+                ast.parse(textwrap.dedent(inspect.getsource(owner)))
+            )
         except (OSError, TypeError):
             return
         key = module + "." + owner.__qualname__
@@ -129,11 +174,18 @@ def source_key(owners: tuple[object, ...]) -> tuple[str, dict[str, str]]:
                     callable(dependency) and inspect.isfunction(inspect.unwrap(dependency))
                 ) or inspect.isclass(dependency):
                     visit(dependency)
-                elif isinstance(dependency, Program):
+                elif isinstance(dependency, Source):
                     program_sources(dependency, module + "." + node.id)
-                elif isinstance(dependency, (str, int, float, bool, tuple)):
+                elif isinstance(dependency, (str, int, float, bool, tuple)) or (
+                    node.id.isupper() and isinstance(dependency, (dict, frozenset))
+                ):
                     try:
-                        symbols[module + "." + node.id] = json.dumps(dependency, allow_nan=False)
+                        constant = (
+                            sorted(dependency) if isinstance(dependency, frozenset) else dependency
+                        )
+                        symbols[module + "." + node.id] = json.dumps(
+                            constant, allow_nan=False, sort_keys=True
+                        )
                     except (TypeError, ValueError):
                         pass
             elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
@@ -144,7 +196,7 @@ def source_key(owners: tuple[object, ...]) -> tuple[str, dict[str, str]]:
                         callable(dependency) and inspect.isfunction(inspect.unwrap(dependency))
                     ) or inspect.isclass(dependency):
                         visit(dependency)
-                    elif isinstance(dependency, Program):
+                    elif isinstance(dependency, Source):
                         program_sources(dependency, parent.__name__ + "." + node.attr)
 
     for owner in owners:
