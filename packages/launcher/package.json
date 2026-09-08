@@ -1,6 +1,6 @@
 {
   "name": "@magnitudedev/cli",
-  "version": "0.0.13",
+  "version": "0.0.14",
   "description": "Magnitude AI coding agent",
   "license": "Apache-2.0",
   "repository": {

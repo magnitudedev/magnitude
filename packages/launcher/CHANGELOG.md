@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.14
+
+### Patch Changes
+
+- [`cfe32b7`](https://github.com/magnitudedev/magnitude/commit/cfe32b74c9cb03fc428e5a03abaee39899749c53) Thanks [@anerli](https://github.com/anerli)! - update pi plugin UI
+
 ## 0.0.13
 
 ### Patch Changes
