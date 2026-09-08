@@ -4,6 +4,8 @@
 Metal code and generated entry points realize those plans through MLX.**
 
 This defines the construction boundary for owned kernels.
+[Kernel optimization](development/kernel-optimization.md) defines principles for improving
+their execution while preserving these contracts.
 [Model composability](models/composability.md) owns architecture and operation contracts;
 [optimization](models/optimization.md) owns implementation selection and qualification.
 Kernel construction also serves state operations where the same execution mechanisms
