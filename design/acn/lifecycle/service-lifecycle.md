@@ -4,6 +4,7 @@ applies_to:
   - packages/acn/src/server.ts
   - packages/acn/src/server.test.ts
   - packages/daemon-management/src/acn-jit/acn-owner-observer.ts
+  - packages/daemon-management/src/service.ts
   - packages/acn/src/ownership-monitor.ts
   - packages/acn/src/acn-subscriptions.ts
   - packages/acn/src/icn/**
@@ -74,7 +75,10 @@ these listeners distinct preserves concurrent candidate admission and fenced tak
 saved harness configuration one stable endpoint. Both listeners belong to the same ACN process,
 lifecycle, release, and authority. The platform service manager owns login startup and restart. The
 service remains alive without an RPC client so a saved third-party harness endpoint continues to
-work.
+work. On macOS, the login service uses the Standard process classification: serving user-requested
+inference must not inherit Background resource restrictions merely because the service has no
+window. Explicit service start reconciles a changed installed definition by reloading the job;
+startup registration alone does not change the running job's classification.
 
 Readiness is published only after the public listener and application dispatch are installed.
 Every RPC requires the selected instance ID; a missing or different ID returns `409` without
