@@ -1,20 +1,26 @@
 """Connect complete blocked fragments without architecture-specific graph matching."""
 
+from functools import partial
+
 from ._emitter import Index, Symbol, emit, expression
-from .assembly import source_files
-from .elementwise import address, scalar_program
+from .assembly import Captures, merge_sources, source_files
+from .elementwise import address, scalar_program, supported
+from .graph import signature
 from .kernel import BoundKernel
 from .metal import (
     ArgumentType,
     ColumnStart,
+    FragmentCall,
     FragmentFold,
     GroupPosition,
+    OrderedReduction,
     RowIndices,
     SIMDIndex,
     argument,
     dtype_name,
 )
 from .plan import Launch
+from .proposal import Proposal
 
 
 def fragment_argument(value):
@@ -33,7 +39,8 @@ def lower_fragments(graph, bindings):
     first = next(iter(bindings.values())).interface
     layout = first.layout
     roots = graph.inputs
-    sources, values = {}, {}
+    sources = dict(merge_sources(b.source for b in bindings.values()))
+    values = {}
     row = f"{layout.permutation.name}[base + r]" if layout.permutation else "base + r"
     lines = [
         "uint lane = thread_index_in_simdgroup;",
@@ -48,12 +55,6 @@ def lower_fragments(graph, bindings):
     adapters = []
     for i, (node, binding) in enumerate(bindings.items()):
         interface = binding.interface
-        if interface.layout != layout or interface.output != first.output:
-            raise ValueError("fragment ownership or output geometry disagrees")
-        for path, text in source_files(binding.source):
-            if path in sources and sources[path] != text:
-                raise ValueError(f"conflicting Metal dependency: {path}")
-            sources[path] = text
         if isinstance(interface, FragmentFold):
             key = (
                 binding.source,
@@ -101,7 +102,6 @@ def lower_fragments(graph, bindings):
     for i, output in enumerate(graph.outputs):
         lines.append(f"out{i}[index] = {expression(values[output.name])};")
     lines.append("} } }")
-    from .graph import signature
 
     return BoundKernel(
         roots,
@@ -151,6 +151,9 @@ struct {name} {{
     {" ".join(members)}
     struct State {{ {" ".join(state)} }};
     struct Result {{ {" ".join(result)} }};
+    void select(uint bank, bool shared) {{
+        {" ".join(f"b{i}.select(bank, shared);" for i in range(len(types)))}
+    }}
     void prepare(uint k, uint first) {{
         {" ".join(f"b{i}.prepare(k, first);" for i in range(len(types)))}
     }}
@@ -176,25 +179,30 @@ struct {name} {{
 
 def lower_ordered(graph, producer, production, reduction, fold):
     interface = production.interface
-    if isinstance(interface, FragmentFold) or interface.layout.tile_rows != 1:
-        raise ValueError("ordered fragment connection requires a complete single-row producer")
-    if fold.interface.input != producer.outputs[0]:
-        raise ValueError("ordered fold must consume its connected producer")
     shape = fold.interface.output.shape
     slots = fold.interface.input.tensor.shape[-2]
     columns, rows = shape[-1], fold.interface.output.size // shape[-1]
     roots = graph.inputs
-    fields = [f"A{i} {v.name};" for i, v in enumerate(roots)]
-    parameters = ", ".join(f"typename A{i}" for i in range(len(roots)))
-    argument_types = ", ".join(f"decltype({v.name})" for v in roots)
+    captures = Captures(tuple(v.name for v in roots))
+    fields, parameters, argument_types = captures.fields, captures.parameters, captures.arguments
     dtype = dtype_name(fold.interface.output.dtype)
     arguments = ", ".join(fragment_argument(a) for a in interface.arguments.values())
     call = f"{production.function}<{type_parameters(interface.template)}>({arguments})"
+    prepare = ""
+    if isinstance(interface, FragmentFold):
+        body = interface.body
+        prepare = (
+            f"{body.name}<{type_parameters(body.template)}> step{{"
+            + ", ".join(fragment_argument(a) for a in body.arguments)
+            + "};"
+        )
+        call = f"{production.function}<{type_parameters(interface.template)}>({arguments}, step)"
     header = f"""template<{parameters}>
 struct OrderedProducer {{
     {" ".join(fields)}
     MagnitudeFragment<{dtype}, 4> operator()(uint row, uint first, uint lane) const {{
         int logical_rows[1] = {{int(row)}};
+        {prepare}
         return {call};
     }}
 }};"""
@@ -211,13 +219,7 @@ if (lane == 0) {{
     for (uint c = 0; c < 4; ++c)
         if (first + c < {columns}) out0[size_t(row) * {columns} + first + c] = result.values[c];
 }}"""
-    sources = {}
-    for s in (production.source, fold.source):
-        for path, text in source_files(s):
-            if path in sources and sources[path] != text:
-                raise ValueError(f"conflicting Metal dependency: {path}")
-            sources[path] = text
-    from .graph import signature
+    sources = dict(merge_sources((production.source, fold.source)))
 
     return BoundKernel(
         roots,
@@ -228,3 +230,86 @@ if (lane == 0) {{
         Launch((64, (columns + 7) // 8, rows), (64, 1, 1)),
         description="completed producer tiles → ordered slot reduction; no intermediate array",
     )
+
+
+def lower_reduction(graph, node, binding):
+    """Execute the same ordered driver against materialized completed fragments."""
+    interface = binding.interface
+    dtype = dtype_name(interface.output.dtype)
+    columns = interface.output.shape[-1]
+    rows = interface.output.size // columns
+    slots = interface.input.tensor.shape[-2]
+    step = interface.body
+    producer = f"""struct ArrayProducer {{
+        const device {dtype}* values;
+        MagnitudeFragment<{dtype}, 4> operator()(uint row, uint first, uint lane) const {{
+            MagnitudeFragment<{dtype}, 4> result;
+            for (uint c = 0; c < 4; ++c)
+                result.values[c] = first + c < {columns}
+                    ? values[size_t(row)*{columns}+first+c] : {dtype}(0);
+            return result;
+        }}
+    }};"""
+    arguments = ", ".join(fragment_argument(a) for a in step.arguments)
+    source = f"""ArrayProducer producer{{{interface.input.name}}};
+{step.name}<{type_parameters(step.template)}> reducer{{{arguments}}};
+uint row = threadgroup_position_in_grid.z;
+uint first = threadgroup_position_in_grid.y * 8 + simdgroup_index_in_threadgroup * 4;
+uint lane = thread_index_in_simdgroup;
+auto result = {binding.function}<{slots}>(row, first, lane, producer, reducer);
+if (lane == 0) for (uint c = 0; c < 4; ++c)
+    if (first + c < {columns}) out0[size_t(row)*{columns}+first+c] = result.values[c];"""
+    sources = source_files(binding.source)
+    return BoundKernel(
+        graph.inputs,
+        signature(("out0",), (interface.output,)),
+        source,
+        "\n".join(t for _, t in sources) + "\n" + producer,
+        sources,
+        Launch((64, (columns + 7) // 8, rows), (64, 1, 1)),
+        description="materialized fragments → ordered slot reduction",
+    )
+
+
+def plan_fragments(graph, bindings):
+    if not bindings or not all(isinstance(b.interface, FragmentCall) for b in bindings.values()):
+        return None
+    first = next(iter(bindings.values())).interface
+    if not all(
+        b.interface.layout == first.layout and b.interface.output == first.output
+        for b in bindings.values()
+    ):
+        return None
+    produced = {v for n in graph.nodes for v in n.outputs}
+    if any(v in produced for n in bindings for v in n.inputs):
+        return None
+    if not all(
+        supported(n) and n.outputs[0].tensor.shape == first.output.shape
+        for n in graph.nodes
+        if n not in bindings
+    ):
+        return None
+    if any(v.tensor.shape != first.output.shape for v in graph.outputs):
+        return None
+    return Proposal(graph, partial(lower_fragments, graph, bindings))
+
+
+def plan_ordered(graph, bindings):
+    reductions = [(n, b) for n, b in bindings.items() if isinstance(b.interface, OrderedReduction)]
+    if len(reductions) != 1 or len(graph.nodes) != len(bindings):
+        return None
+    node, binding = reductions[0]
+    if len(bindings) == 1:
+        return Proposal(graph, partial(lower_reduction, graph, node, binding))
+    if len(bindings) != 2:
+        return None
+    producer, production = next((n, b) for n, b in bindings.items() if n != node)
+    interface = production.interface
+    if (
+        not isinstance(interface, FragmentCall)
+        or interface.layout.tile_rows != 1
+        or binding.interface.input != producer.outputs[0]
+        or graph.outputs != node.outputs
+    ):
+        return None
+    return Proposal(graph, partial(lower_ordered, graph, producer, production, node, binding))

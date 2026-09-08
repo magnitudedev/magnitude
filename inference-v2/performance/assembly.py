@@ -14,10 +14,9 @@ from uuid import uuid4
 
 from magnitude_engine.components import component_id, component_of
 from magnitude_engine.kernels.core.assembly import source_files as metal_sources
-from magnitude_engine.kernels.core.computation import Executable
+from magnitude_engine.kernels.core.declaration import Call, Kernel
 from magnitude_engine.kernels.core.execution import ExecutionPlan, OperandBinding
 from magnitude_engine.kernels.core.kernel import BoundKernel, ConstantInputs
-from magnitude_engine.kernels.core.operation import Invocation, Operation
 from magnitude_engine.kernels.core.plan import Source
 from magnitude_engine.kernels.core.runtime import generated_kernel
 from magnitude_engine.models.architectures.mlx_vlm.program import LibraryProgram
@@ -108,11 +107,6 @@ def source_key(owners: tuple[object, ...]) -> tuple[str, dict[str, str]]:
         visit(generated_kernel)
 
     def visit(value):
-        if isinstance(value, Executable):
-            visit(value.call)
-            for node in value.graph.nodes:
-                if not isinstance(node.operation, str):
-                    visit(node.operation)
         if isinstance(value, ExecutionPlan):
             for region in value.regions:
                 visit(region.call)
@@ -120,17 +114,11 @@ def source_key(owners: tuple[object, ...]) -> tuple[str, dict[str, str]]:
             visit(value.kernel)
         if isinstance(value, OperandBinding):
             visit(value.call)
-        if isinstance(value, Invocation):
+        if isinstance(value, Call):
             visit(value.declaration)
-        if isinstance(value, Operation):
-            if value._infer is not None:
-                visit(value._infer)
-            for implementation in value.implementations:
-                program_sources(
-                    implementation.source,
-                    value.__module__ + "." + value.__qualname__ + ":" + implementation.function,
-                )
-                visit(implementation.interface)
+        if isinstance(value, Kernel):
+            program_sources(value.source, value.__module__ + "." + value.__qualname__)
+            visit(value.function)
         if isinstance(value, BoundKernel):
             symbols["generated:" + digest((value.source, value.header))] = repr(
                 (
@@ -165,6 +153,10 @@ def source_key(owners: tuple[object, ...]) -> tuple[str, dict[str, str]]:
         key = module + "." + owner.__qualname__
         symbols[key] = ast.dump(tree, include_attributes=False)
         files.update(source_files(owner))
+        if module == "magnitude_engine.kernels.core.native":
+            from magnitude_engine.kernels.core import _graph
+            files["magnitude_engine.kernels/core/graph.cpp"] = _graph.source
+            symbols["native:graph.cpp"] = _graph.source
         namespace = vars(inspect.getmodule(owner))
         # Follow referenced global executable symbols, not every import in the file.
         for node in ast.walk(tree):

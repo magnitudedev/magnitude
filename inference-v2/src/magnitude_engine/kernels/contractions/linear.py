@@ -2,14 +2,23 @@
 
 import mlx.core as mx
 
-from ..core.computation import computation
-from .affine import Affine
+from .. import compile
+from .affine import affine, prepare_input
 from .tiles import packing
 
 
-@computation
+@compile
 def _projection(inputs, weight, scales, biases, *, bits, group_size):
-    return Affine(bits, group_size)(inputs, weight, scales, biases)[0]
+    rows, width = inputs.size // inputs.shape[-1], inputs.shape[-1]
+    prepared = rows > 1 and weight.shape[-2] >= 4 * width
+    values, sums = (
+        prepare_input(inputs, bits=bits, pack=packing(width, weight.shape[-2], bits, group_size))
+        if prepared
+        else (inputs, inputs)
+    )
+    return affine(
+        values, weight, scales, biases, sums, bits=bits, group_size=group_size, prepared=prepared
+    )
 
 
 def apply(
@@ -29,4 +38,6 @@ def apply(
         or biases.dtype != inputs.dtype
     ):
         return None
+    if not inputs.size:
+        return mx.zeros((*inputs.shape[:-1], outputs), inputs.dtype)
     return _projection(inputs, weight, scales, biases, bits=bits, group_size=group_size)

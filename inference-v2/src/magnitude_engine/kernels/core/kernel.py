@@ -7,7 +7,7 @@ import mlx.core as mx
 
 from .assembly import source_files
 from .graph import Tensor, Value
-from .plan import Launch, Parameter, Scalar, Source
+from .plan import Launch, Parameter, Scalar, Source, identifier
 from .primitive import Primitive
 from .runtime import generated_kernel
 
@@ -59,7 +59,6 @@ class BoundKernel:
     _kernel: Any = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
-        from .plan import identifier
 
         names = [v.name for v in (*self.inputs, *self.outputs)]
         names.extend(k for k, _ in self.template)
@@ -104,7 +103,6 @@ class BoundKernel:
 
 def dispatch(source, *, inputs, outputs, launch, template=(), constants=()):
     """Bind array operands to the same immutable launch used by compiled regions."""
-    from .graph import Tensor, Value
 
     operands = tuple(Value(name, Tensor(array.shape, array.dtype)) for name, array in inputs)
     results = tuple(Value(name, tensor) for name, tensor in outputs)

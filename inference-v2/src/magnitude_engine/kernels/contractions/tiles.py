@@ -1,8 +1,8 @@
 """Shared affine arithmetic and bounded row-reuse schedules."""
 
-from magnitude_engine.kernels.core import Source
+from ..core.plan import Source
 
-TILE = Source("contractions/tile.metal", (Source("contractions/encoded.metal"),))
+ENCODED = Source("contractions/encoded.metal")
 
 
 def row_tile(rows: int, maximum: int) -> int:

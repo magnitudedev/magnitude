@@ -27,16 +27,22 @@ struct AffineStep {
     }
 };
 
-template<typename T, int BITS, int PACK, int K, int R, typename Body>
+template<typename T, int BITS, int PACK, int K, int R, bool PREPARED, typename Input, typename Sums, typename Body>
 inline typename Body::Result magnitude_affine_fold(
-    const device T* x, const thread int* rows, uint first, uint lane, thread Body& body) {
+    Input x, Sums sums, const thread int* rows, uint first, uint lane, thread Body& body) {
     typename Body::State state = {};
     for (uint k = lane * PACK; k < K; k += 32 * PACK) {
         body.prepare(k, first);
         for (uint r = 0; r < R; ++r) {
             if (rows[r] < 0) continue;
             float values[PACK];
-            float sum = magnitude_load<T, BITS, PACK>(x + size_t(rows[r]) * K + k, values);
+            float sum;
+            if constexpr (PREPARED) {
+                for (uint i = 0; i < PACK; ++i) values[i] = x[size_t(rows[r]) * K + k + i];
+                sum = sums[size_t(rows[r]) * (K / PACK) + k / PACK];
+            } else {
+                sum = magnitude_load<T, BITS, PACK>(x + size_t(rows[r]) * K + k, values);
+            }
             body.step(state, r, values, sum);
         }
     }

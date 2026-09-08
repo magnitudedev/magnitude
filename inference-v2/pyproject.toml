@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling>=1.27", "mlx==0.32.2", "nanobind==2.15.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -35,6 +35,8 @@ dev = [
 
 [project.scripts]
 session-bench = "session_bench.cli:main"
+
+[tool.hatch.build.hooks.custom]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/magnitude_engine", "src/session_bench", "src/benchmark_fixtures", "performance"]
