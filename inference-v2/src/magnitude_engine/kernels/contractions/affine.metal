@@ -4,11 +4,12 @@ struct AffineStep {
     const device uint* weight;
     const device T* scales;
     const device T* biases;
-    AffinePack<BITS, PACK> prepared[4];
+    AffinePack<BITS, PACK, (R > 1)> prepared[4];
     struct State { float acc[R][4]; };
     using Result = MagnitudeFragment<T, R * 4>;
 
     void prepare(uint k, uint first) {
+        #pragma clang loop unroll(full)
         for (uint c = 0; c < 4; ++c) {
             uint column = min(first + c, uint(N - 1));
             size_t g = size_t(column) * (K / GROUP) + k / GROUP;
@@ -17,12 +18,16 @@ struct AffineStep {
         }
     }
     void step(thread State& state, uint row, const thread float* values, float sum) const {
+        #pragma clang loop unroll(full)
         for (uint c = 0; c < 4; ++c) state.acc[row][c] += prepared[c].dot(values, sum);
     }
     Result finish(thread State& state, uint lane) const {
         Result result;
-        for (uint r = 0; r < R; ++r)
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < R; ++r) {
+            #pragma clang loop unroll(full)
             for (uint c = 0; c < 4; ++c) result.values[r * 4 + c] = T(simd_sum(state.acc[r][c]));
+        }
         return result;
     }
 };
@@ -33,11 +38,13 @@ inline typename Body::Result magnitude_affine_fold(
     typename Body::State state = {};
     for (uint k = lane * PACK; k < K; k += 32 * PACK) {
         body.prepare(k, first);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < R; ++r) {
             if (rows[r] < 0) continue;
             float values[PACK];
             float sum;
             if constexpr (PREPARED) {
+                #pragma clang loop unroll(full)
                 for (uint i = 0; i < PACK; ++i) values[i] = x[size_t(rows[r]) * K + k + i];
                 sum = sums[size_t(rows[r]) * (K / PACK) + k / PACK];
             } else {
