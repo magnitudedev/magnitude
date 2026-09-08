@@ -23,7 +23,12 @@ class ToolSelection:
         instruction = f"Call {subject} to answer this request."
         if messages[0]["role"] == "system":
             first = dict(messages[0])
-            first["content"] = f"{first['content']}\n\n{instruction}".strip()
+            content = first["content"]
+            first["content"] = (
+                [*content, {"type": "text", "text": instruction}]
+                if isinstance(content, list)
+                else f"{content}\n\n{instruction}".strip()
+            )
             return [first, *messages[1:]]
         return [{"role": "system", "content": instruction}, *messages]
 

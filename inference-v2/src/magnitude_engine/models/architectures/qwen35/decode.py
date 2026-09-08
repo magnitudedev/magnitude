@@ -86,7 +86,18 @@ class ResidentDecode:
         embedding, blocks, norm, output = self.embedding, self.blocks, self.norm, self.output
         assert isinstance(embedding, (ResidentEmbedding, ResidentAffineEmbedding))
 
-        def step(tokens, positions, offsets, pages, keys, values, tails, starts, recurrent):
+        def step(
+            tokens,
+            positions,
+            offsets,
+            pages,
+            keys,
+            values,
+            tails,
+            starts,
+            recurrent,
+            rotary_positions=None,
+        ):
             kv = DecodeKV(
                 page_size, table_width, positions, offsets, pages, keys, values, list(tails), starts
             )
@@ -94,7 +105,7 @@ class ResidentDecode:
 
             def mix(mixer, hidden):
                 if isinstance(mixer, GatedAttention):
-                    return mixer.decode(hidden, kv)
+                    return mixer.decode(hidden, kv, rotary_positions)
                 assert isinstance(mixer, RecurrentMixer)
                 value, conv, memory = mixer.operation.graph.advance(
                     hidden, *next_recurrent[mixer.index]
@@ -133,6 +144,7 @@ class ResidentDecode:
         states: tuple[HybridState, ...],
         request: ForwardRequest,
         scope: ExecutionScope,
+        positions: mx.array | None = None,
     ) -> ModelOutput:
         append = prepare_decode_append(tuple(state.pages for state in states), scope)
         width, pages = append.padded_table()
@@ -151,6 +163,7 @@ class ResidentDecode:
             append.tails,
             append.tail_starts,
             recurrent,
+            *((positions,) if positions is not None else ()),
         )
         append.install(tails)
         for group, output in zip(slots, final, strict=True):

@@ -13,7 +13,7 @@ import pytest
 from magnitude_engine import blueprints as bp
 from magnitude_engine.engine.delivery import Finished, Tokens
 from magnitude_engine.generation.sampling_policy import SamplingPolicy
-from magnitude_engine.worker.framing import MAX_FRAME_BYTES, Frame, read_frame, write_frame
+from magnitude_engine.worker.framing import MAX_FRAME_BYTES, VERSION, Frame, read_frame, write_frame
 from magnitude_engine.worker.host import Worker, WorkerUnavailable
 from tests.models.architectures.qwen35.test_construction import artifact_pair
 
@@ -45,7 +45,7 @@ def test_private_framing_handles_short_io_and_rejects_invalid_envelopes_before_a
     invalid = b'{"version":1,"generation":"g","message":{"value":NaN}}'
     with pytest.raises(ValueError, match="non-finite"):
         read_frame(io.BytesIO(struct.pack(">I", len(invalid)) + invalid))
-    for value in (True, 2):
+    for value in (True, VERSION - 1, VERSION + 1):
         invalid = json.dumps({"version": value, "generation": "g", "message": {}}).encode()
         with pytest.raises(ValueError, match="version"):
             read_frame(io.BytesIO(struct.pack(">I", len(invalid)) + invalid))
@@ -284,8 +284,9 @@ def test_private_worker_progress_is_opt_in_and_preserves_warm_request_tokens(tmp
     with Worker(config, startup_timeout=20) as host:
         outputs = []
         for cached in (0, 7):
-            request = host.submit(tuple(range(1, 9)), SamplingPolicy(temperature=0), 4,
-                                  progress=True)
+            request = host.submit(
+                tuple(range(1, 9)), SamplingPolicy(temperature=0), 4, progress=True
+            )
             progress, values = [], []
             while True:
                 event = request.next(5)
@@ -306,3 +307,45 @@ def test_private_worker_progress_is_opt_in_and_preserves_warm_request_tokens(tmp
             outputs.append(values)
         assert outputs[0] == outputs[1]
     assert host.process.poll() == 0, host.stderr
+
+
+def test_binary_buffers_are_reserved_before_read_and_rejection_preserves_next_frame():
+    from magnitude_engine.resources.budget import MemoryBudget
+
+    stream = io.BytesIO()
+    payload = b"pixels" * 20000
+    write_frame(stream, Frame("g", {"type": "infer"}, (payload, b"coords")))
+    next_position = stream.tell()
+    write_frame(stream, Frame("g", {"type": "cancel"}))
+    stream.seek(0)
+    budget = MemoryBudget(1)
+    seen = []
+
+    def reserve(message, size):
+        seen.append((message, size, stream.tell()))
+        assert stream.tell() < next_position - len(payload)
+        return budget.reserve("input", size)
+
+    rejected = read_frame(stream, "g", reserve=reserve)
+    assert isinstance(rejected.error, MemoryError)
+    assert rejected.buffers == () and budget.snapshot().reserved == 0
+    assert seen[0][1] == len(payload) + 6
+    assert read_frame(stream, "g").message == {"type": "cancel"}
+
+
+def test_binary_buffers_preserve_exact_values_and_release_on_truncation():
+    from magnitude_engine.resources.budget import MemoryBudget
+
+    budget = MemoryBudget(100)
+    frame = Frame("g", {"type": "infer"}, (b"\x00\xff\x80", b"\x01"))
+    stream = Fragmented()
+    write_frame(stream, frame)
+    encoded = stream.getvalue()
+    stream.seek(0)
+    restored = read_frame(stream, "g", reserve=lambda _, n: budget.reserve("input", n))
+    assert restored == frame and budget.snapshot().reserved == 4
+    restored.close()
+    assert budget.snapshot().reserved == 0
+    with pytest.raises(EOFError):
+        read_frame(io.BytesIO(encoded[:-1]), "g", reserve=lambda _, n: budget.reserve("input", n))
+    assert budget.snapshot().reserved == 0

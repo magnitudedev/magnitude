@@ -1,11 +1,14 @@
 """Checkpoint-owned prompt rendering, with explicit semantic output and constraint metadata."""
 
 import json
+from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import dataclass
 
 from magnitude_engine.artifacts.tokenizer import TokenizerArtifact
+from magnitude_engine.composition import Blueprint, build
 from magnitude_engine.generation.constraint_spec import ConstraintSpec
+from magnitude_engine.models.preparation import ImagePreparation, PreparedMedia
 
 from .formats import ChatFormat, format_for
 from .grammar import chat_constraint
@@ -21,9 +24,10 @@ class PreparedChat:
     constraint: ConstraintSpec | None
     reasoning_prefilled: bool
     boundaries: tuple[int, ...]
+    media: PreparedMedia | None = None
 
 
-def normalize_messages(messages: list[dict]) -> list[dict]:
+def normalize_messages(messages: list[dict], *, allow_images: bool = False) -> list[dict]:
     result = deepcopy(messages)
     if not result:
         raise ValueError("chat requires at least one message")
@@ -34,14 +38,25 @@ def normalize_messages(messages: list[dict]) -> list[dict]:
         if isinstance(content, list):
             parts = []
             for part in content:
+                if isinstance(part, dict) and part.get("type") == "image_url" and allow_images:
+                    if set(part) != {"type", "image_url"}:
+                        raise ValueError(
+                            "image content part fields differ from the request contract"
+                        )
+                    parts.append(part)
+                    continue
                 if not isinstance(part, dict) or part.get("type") != "text":
                     raise ValueError(
                         "this text renderer requires a media-aware renderer for non-text parts"
                     )
                 if not isinstance(part.get("text"), str):
                     raise ValueError("text content parts require a string")
-                parts.append(part["text"])
-            message["content"] = "".join(parts)
+                parts.append(part)
+            message["content"] = (
+                parts
+                if any(part["type"] == "image_url" for part in parts)
+                else "".join(part["text"] for part in parts)
+            )
         elif content is None:
             message["content"] = ""
         elif not isinstance(content, str):
@@ -58,8 +73,18 @@ def normalize_messages(messages: list[dict]) -> list[dict]:
 
 
 class ChatTemplate:
-    def __init__(self, artifact: TokenizerArtifact):
+    def __init__(
+        self,
+        artifact: TokenizerArtifact,
+        image_processor: Blueprint[ImagePreparation] | None = None,
+    ):
         self.artifact = artifact
+        self._lifetime = ExitStack()
+        self.image_processor = (
+            None
+            if image_processor is None
+            else self._lifetime.enter_context(build(image_processor))
+        )
         self.format = format_for(artifact.family)
         self.markers = (
             frozenset()
@@ -75,6 +100,9 @@ class ChatTemplate:
                 if len(artifact.tokenizer.encode(marker, add_special_tokens=False)) == 1
             )
         )
+
+    def close(self) -> None:
+        self._lifetime.close()
 
     def render(
         self,
@@ -112,7 +140,15 @@ class ChatTemplate:
             raise ValueError("template kwargs cannot override chat rendering inputs")
         selection = select_tools(tools, tool_choice)
         tools = list(selection.tools)
-        normalized = selection.instruct(normalize_messages(messages), parallel=parallel_tool_calls)
+        normalized = selection.instruct(
+            normalize_messages(messages, allow_images=self.image_processor is not None),
+            parallel=parallel_tool_calls,
+        )
+        images = []
+        if self.image_processor is not None:
+            from .images import extract_images
+
+            images = extract_images(normalized)
         tokenizer = self.artifact.tokenizer
         text = tokenizer.apply_chat_template(
             normalized,
@@ -123,6 +159,10 @@ class ChatTemplate:
             tokenize=False,
             **kwargs,
         )
+        media = None
+        if images:
+            assert self.image_processor is not None
+            text, media = self.image_processor.process(text, images, tokenizer)
         tokens = tuple(tokenizer.encode(text, add_special_tokens=False))
         if not tokens:
             raise ValueError("chat template produced an empty prompt")
@@ -146,4 +186,6 @@ class ChatTemplate:
             reasoning_prefilled=prefilled,
             response_format=response_format,
         )
-        return PreparedChat(text, tokens, self.format, tools, constraint, prefilled, boundaries)
+        return PreparedChat(
+            text, tokens, self.format, tools, constraint, prefilled, boundaries, media
+        )

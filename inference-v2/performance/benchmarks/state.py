@@ -306,7 +306,8 @@ def restore(
                 if hasattr(row.state, "pages") and hasattr(row.state, "recurrent"):
                     arena = row.state.pages.store.arena
                     images = {
-                        id(r.image): r.image for r in (row.state.recurrent, checkpoint.recurrent)
+                        id(r.image): r.image
+                        for r in (row.state.recurrent, checkpoint.storage.recurrent)
                     }
                     physical = sum(a.nbytes for a in (*arena.keys, *arena.values))
                     physical += sum(

@@ -28,14 +28,18 @@ def main() -> None:
     @asynccontextmanager
     async def lifespan(app):
         host = await to_thread.run_sync(partial(Worker.start, engine=engine))
+        service = None
         try:
             artifact = await to_thread.run_sync(
                 partial(TokenizerArtifact.load, Path(host.properties["target_path"]))
             )
-            app.state.service = ChatService(host, artifact, args.model)
+            service = await to_thread.run_sync(partial(ChatService, host, artifact, args.model))
+            app.state.service = service
             yield
         finally:
             with anyio.CancelScope(shield=True):
+                if service is not None:
+                    await to_thread.run_sync(service.close)
                 await to_thread.run_sync(host.close)
 
     uvicorn.run(create_app(lifespan=lifespan), host="127.0.0.1", port=args.port)

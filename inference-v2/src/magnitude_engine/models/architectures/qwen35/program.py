@@ -8,17 +8,20 @@ import mlx.core as mx
 
 from magnitude_engine.components import component
 from magnitude_engine.models.embeddings.contracts import EmbeddingLookup
+from magnitude_engine.models.embeddings.replacement import replace
 from magnitude_engine.models.execution import ExecutionScope
 from magnitude_engine.models.inputs import ModelInputs
 from magnitude_engine.models.normalization import residual_norm
 from magnitude_engine.models.runtime import ForwardRequest, ModelOutput
 from magnitude_engine.models.state.hybrid import HybridState
 
+from .attention.operation import GatedAttention
 from .decode import ResidentDecode
 from .definition import DEFINITION
 from .feedforward.operation import (
     FeedForward,
 )
+from .inputs import QwenInputs, batch_positions
 
 Transform = Callable[[mx.array], mx.array]
 
@@ -82,21 +85,32 @@ class Qwen35Program:
         tokens = (
             inputs[0].tokens if len(inputs) == 1 else mx.concatenate([row.tokens for row in inputs])
         )
+        positions = batch_positions(inputs, tuple(state.position for state in states))
+        replacements = tuple(
+            row.data.embeddings if isinstance(row.data, QwenInputs) else () for row in inputs
+        )
         compiled = tokens.shape[1] == 1 and self.decode is not None and self.decode.matches(self)
+        compiled = compiled and not any(replacements)
         if not compiled:
             for state in states:
                 state.pages.flush_tail()
         scope.enter(arena.pin())
         if compiled:
             assert self.decode is not None
-            return self.decode.forward(tokens, states, request, scope)
+            return self.decode.forward(tokens, states, request, scope, positions)
         hidden = self.embedding.lookup(tokens, scope)
+        if any(replacements):
+            hidden = replace(hidden, replacements)
         logits, features = evaluate(
             hidden,
             blocks=self.blocks,
             norm=self.norm,
             output=self.output,
-            mix=lambda mixer, x: mixer.compute_batch(x, states, scope),
+            mix=lambda mixer, x: (
+                mixer.compute_batch(x, states, scope, positions)
+                if positions is not None and isinstance(mixer, GatedAttention)
+                else mixer.compute_batch(x, states, scope)
+            ),
             feed=lambda feedforward, x: feedforward.compute(x, scope),
             request=request,
         )

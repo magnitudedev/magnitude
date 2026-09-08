@@ -27,6 +27,7 @@ from magnitude_engine.models.architectures.gemma4.program import (
     PerLayerInputs,
 )
 from magnitude_engine.models.architectures.gemma4.program import readout as gemma_readout
+from magnitude_engine.models.architectures.gemma4.vision import GemmaVision
 from magnitude_engine.models.architectures.mlx_vlm.program import LibraryProgram
 from magnitude_engine.models.architectures.qwen35.attention.operation import GatedAttention
 from magnitude_engine.models.architectures.qwen35.feedforward.operation import RoutedFeedForward
@@ -34,10 +35,12 @@ from magnitude_engine.models.architectures.qwen35.mtp.program import MTPProgram
 from magnitude_engine.models.architectures.qwen35.program import Qwen35Program
 from magnitude_engine.models.architectures.qwen35.program import readout as qwen_readout
 from magnitude_engine.models.architectures.qwen35.recurrence.operation import RecurrentMixer
+from magnitude_engine.models.architectures.qwen35.vision import QwenVision
 from magnitude_engine.models.attention.gathered import GatheredAttention
 from magnitude_engine.models.embeddings.resident import ResidentEmbedding
 from magnitude_engine.models.execution import ExecutionOwner
 from magnitude_engine.models.experts.computation import ResidentExperts
+from magnitude_engine.models.features import FeatureCache
 from magnitude_engine.models.loading.parameters import load_resident_parameters
 from magnitude_engine.models.recurrence.reference import DeltaReference
 from magnitude_engine.models.runtime import ModelRuntime
@@ -193,6 +196,8 @@ for owner in (Qwen35Program, Gemma4Program):
         owner, Model(NeuralParameters, NeuralWorkload, ("EXEC",), composition.program, execution)
     )
 register(LibraryProgram, Model(OpaqueParameters, Workload, ("EXEC",), explicit, execution))
+for owner in (QwenVision, GemmaVision):
+    register(owner, Model(OpaqueParameters, Workload, ("EXEC",), explicit, execution))
 
 
 def storage_bounds(p, w, profile, demand, children):
@@ -259,6 +264,7 @@ register(
 )
 for owner, dimension in (
     (MemoryBudget, "EXEC"),
+    (FeatureCache, "EXEC"),
     (serve, "EXEC"),
     (PageStore.create, "EXEC"),
     (Engine.submit, "LAT"),

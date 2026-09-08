@@ -12,8 +12,9 @@ from magnitude_engine.generation.constraint_spec import ConstraintError
 from magnitude_engine.generation.runtime import (
     GenerationRuntime,
     GenerationSequence,
-    ModelCheckpoint,
 )
+from magnitude_engine.models.context import StateCheckpoint
+from magnitude_engine.models.prompt import Prompt
 
 from .delivery import Delivery, Finished, PrefillProgress
 from .prefixes.contracts import PrefixIndex
@@ -23,7 +24,7 @@ from .scheduler.contracts import CompletedService, Runnable, Scheduler, Service
 
 
 @dataclass
-class ActiveRequest[S, C: ModelCheckpoint]:
+class ActiveRequest[S, C: StateCheckpoint]:
     handle: RequestHandle
     sequence: GenerationSequence[S, C]
     cached: int
@@ -35,6 +36,7 @@ class ActiveRequest[S, C: ModelCheckpoint]:
     prefill_ns: int = 0
     decode_ns: int = 0
     first_decode_ns: int = 0
+    preparation_ns: int = 0
 
 
 @dataclass(frozen=True)
@@ -48,7 +50,7 @@ class ServiceMeasurement:
 
 
 @component("ENGINE:INFERENCE:MAG:STANDARD")
-class Engine[S, C: ModelCheckpoint]:
+class Engine[S, C: StateCheckpoint]:
     def __init__(
         self,
         generation: GenerationRuntime[S, C],
@@ -98,8 +100,8 @@ class Engine[S, C: ModelCheckpoint]:
         self.wake.set()
         return handle
 
-    def _identity(self, tokens: tuple[int, ...]) -> PrefixIdentity:
-        return PrefixIdentity(self.namespace, tuple((token, b"") for token in tokens))
+    def _identity(self, prompt: Prompt) -> PrefixIdentity:
+        return PrefixIdentity(self.namespace, prompt.identities())
 
     def _terminal(
         self,
@@ -112,7 +114,7 @@ class Engine[S, C: ModelCheckpoint]:
         handle.delivery.terminate(
             Finished(
                 reason,
-                len(handle.request.prompt),
+                len(handle.request.prompt.tokens),
                 0 if row is None else row.sequence.generated,
                 0 if row is None else row.cached,
                 0 if row is None else row.proposed,
@@ -127,6 +129,15 @@ class Engine[S, C: ModelCheckpoint]:
                 0 if row is None else row.prefill_ns,
                 0 if row is None else row.decode_ns,
                 0 if row is None else row.first_decode_ns,
+                0 if row is None else row.preparation_ns,
+                sum(
+                    span.end - span.start
+                    for span in handle.request.prompt.spans
+                    if not span.language
+                ),
+                0
+                if row is None or row.sequence.model.inputs is None
+                else row.sequence.model.inputs.cache_hits,
             )
         )
         with self._lock:
@@ -151,7 +162,10 @@ class Engine[S, C: ModelCheckpoint]:
                 self._terminal(handle, "length")
                 continue
             self.generation.model.owner.complete()
-            lease = self.prefixes.match(self._identity(handle.request.prompt))
+            prompt = handle.request.prompt
+            lease = self.prefixes.match(
+                self._identity(prompt), exclude_last=len(prompt.tokens) - prompt.anchor_start
+            )
             sequence = None
             try:
                 checkpoint = None if lease is None else lease.checkpoint
@@ -163,6 +177,7 @@ class Engine[S, C: ModelCheckpoint]:
                     request.stop_tokens,
                     checkpoint,
                     constraint=request.constraint,
+                    inputs=request.inputs,
                 )
                 sequence.reserve_prompt()
                 self._active[handle.identity] = ActiveRequest(
@@ -204,14 +219,16 @@ class Engine[S, C: ModelCheckpoint]:
             checkpoint.close()
             return
         try:
-            self.prefixes.retain(self._identity(checkpoint.tokens), checkpoint)
+            self.prefixes.retain(
+                PrefixIdentity(self.namespace, checkpoint.prompt.identities()), checkpoint
+            )
         except BaseException:
             checkpoint.close()
             raise
 
     def _progress(self, row: ActiveRequest[S, C]) -> None:
         if row.handle.delivery.progress_enabled:
-            total = len(row.handle.request.prompt) - 1
+            total = row.handle.request.prompt.anchor_start
             row.handle.delivery.report(
                 PrefillProgress(
                     total - row.sequence.prefill_remaining,
@@ -266,7 +283,7 @@ class Engine[S, C: ModelCheckpoint]:
                 return ()
             if plan.phase == "decode":
                 return self._decode(plan.services, plan.budget_ns)
-            return self._prefill(plan.services)
+            return self._prefill(plan.services, plan.budget_ns)
         except BaseException as error:
             with self._lock:
                 self._failed = True
@@ -278,8 +295,9 @@ class Engine[S, C: ModelCheckpoint]:
                 ) from error
             raise
 
-    def _prefill(self, services: tuple[Service, ...]) -> tuple[ServiceMeasurement, ...]:
-        self.generation.model.owner.complete()
+    def _prefill(
+        self, services: tuple[Service, ...], budget_ns: int | None = None
+    ) -> tuple[ServiceMeasurement, ...]:
         scheduled = []
         for service in services:
             row = self._active[service.identity]
@@ -290,20 +308,30 @@ class Engine[S, C: ModelCheckpoint]:
         start = self.clock()
         outcomes = self.generation.prefill_many(
             tuple(row.sequence for row, _ in scheduled),
-            tuple(service.tokens for _, service in scheduled),
+            tuple(
+                self.prefixes.prefill_allowance(
+                    row.sequence.prefilled,
+                    service.tokens,
+                    row.sequence.prompt.retention_boundaries,
+                )
+                for row, service in scheduled
+            ),
             clock=self.clock,
+            budget_ns=budget_ns,
         )
         self._observe(
             CompletedService(
                 "prefill",
                 max(0, self.clock() - start) if scheduled else 0,
                 sum(result.outcome for result in outcomes if isinstance(result.outcome, int)),
+                max((result.preparation_ns for result in outcomes), default=0),
             )
         )
         measurements = []
         for (row, service), measured in zip(scheduled, outcomes, strict=True):
             result = measured.outcome
             row.prefill_ns += measured.elapsed_ns
+            row.preparation_ns += measured.row_preparation_ns
             if isinstance(result, (MemoryError, ConstraintError)):
                 self._finish(row, "error", str(result))
                 continue
@@ -311,14 +339,17 @@ class Engine[S, C: ModelCheckpoint]:
                 ServiceMeasurement(
                     service.identity,
                     "prefill",
-                    result,
+                    0 if result is None else result,
                     0,
                     measured.elapsed_ns,
                     measured.batch_size,
                 )
             )
             self._progress(row)
-            if not row.sequence.prefill_remaining:
+            if isinstance(result, int) and (
+                not row.sequence.prefill_remaining
+                or row.sequence.prefilled in row.sequence.prompt.retention_boundaries
+            ):
                 self._retain(row.sequence)
         return tuple(measurements)
 

@@ -6,9 +6,15 @@ from typing import Any
 
 import mlx.core as mx
 
+from .computation import Computation, Computed
 from .execution import PendingExecution
 from .inputs import ModelInputs
 from .runtime import ForwardRequest, ModelAdvance, ModelSequence
+
+
+@dataclass(frozen=True)
+class Compute:
+    work: Computation
 
 
 @dataclass(frozen=True)
@@ -46,14 +52,23 @@ class ProjectVocabulary:
     hidden: mx.array
 
 
-type Operation = Forward | Observe | Submit | Complete | Repair | ProjectVocabulary
-type Response = ModelAdvance[Any, Any] | mx.array | None
+type Operation = Compute | Forward | Observe | Submit | Complete | Repair | ProjectVocabulary
+type Response = Computed | ModelAdvance[Any, Any] | mx.array | None
 type Task[T] = Generator[Operation, Response, T]
+
+
+def compute(work: Computation) -> Task[Computed]:
+    result = yield Compute(work)
+    if not isinstance(result, Computed):
+        raise RuntimeError("computation omitted its owned outputs")
+    return result
 
 
 def forward(
     sequence: ModelSequence[Any, Any], inputs: ModelInputs, request: ForwardRequest
 ) -> Task[ModelAdvance[Any, Any]]:
+    if sequence.inputs is not None:
+        yield from sequence.inputs.prepare(sequence.position, inputs.count)
     advance = yield Forward(sequence, inputs, request)
     if not isinstance(advance, ModelAdvance):
         raise RuntimeError("forward operation omitted its state advance")

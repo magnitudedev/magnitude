@@ -6,12 +6,13 @@
 single-input execution compiles their tensor transitions together. Both execution paths
 use one architecture equation for the residual stream, features and readout; state
 preparation and publication remain outside compilation.** This covers the
-accepted Qwen3.5-family text layouts, including compatible Qwen3.6 artifacts, dense
+accepted Qwen3.5-family layouts, including compatible Qwen3.6 artifacts, dense
 or routed feedforward, and converted affine weights.
 
-MLX-LM supplies configuration and parameter containers. MLX-VLM supplies the
-independent target reference and the explicitly adapted standard rotary calculation.
-The program exposes residual features, not media conditioning. Source attribution
+MLX-VLM supplies the full conditional configuration, language parameters, vision
+encoder, and explicitly adapted rotary calculation. Qualified MLX-LM primitives
+remain usable beneath owned operations and the attached drafter. The complete
+model binds [input semantics](../inputs.md) alongside its decoder. Source attribution
 follows [component identification](../../components.md).
 
 Owned operations follow [model composability](../composability.md) and
@@ -23,6 +24,8 @@ execution. Generated specializations remain beneath these semantic components.
 
 ```text
 MODEL:QWEN35:MAG:LAYERWISE
+├── Optional image preparation · MODEL:QWEN35.PREPARATION:MAG:IMAGES
+├── Optional image encoder/projector · MODEL:QWEN35.VISION:VLM:STANDARD
 ├── Embedding · MODEL:EMBEDDING:MAG:RESIDENT
 ├── Repeated hybrid layer
 │   ├── Mixer (selected per layer)
@@ -48,6 +51,14 @@ Optional attached drafter · MODEL:QWEN35.MTP:MAG:CONDITIONED
 ```
 
 ## Component definitions
+
+Image preparation supplies projected embedding spans and three-axis coordinates.
+Causal image spans can cross prompt chunks; only intersecting feature slices are
+injected. Physical KV positions still count decoder inputs. Continued rotary positions
+retain their model-defined offset through batching, restore, verification and repair.
+Generated single-token execution uses the same compiled decoder with explicit rotary
+positions. The paired MTP head consumes aligned successor embeddings during prompt
+catch-up, including image features, together with the preceding target residual.
 
 Each type below defines its behavior and mathematical assumptions. Executable bindings
 are owned by the [performance catalog](../../performance.md#ownership-and-component-records).
@@ -389,3 +400,27 @@ Model replay, generated continuation, batched prefill, hybrid restoration and MT
 corresponding functions in `performance.benchmarks`. Protect dense/routed variants, long
 contexts and multi-input execution. Each benchmark records its precise numerical contract;
 reference throughput is a comparison and never a ceiling.
+
+### `MODEL:QWEN35.PREPARATION`
+
+**Contract.** Translate ordered source images and the artifact's chat representation
+into bounded prepared pixels, image geometry, and an expanded decoder layout. The
+processor identity includes the artifact, preparation implementation and pinned
+processor behavior. This is CPU input interpretation, separate from neural encoding.
+
+`MODEL:QWEN35.PREPARATION:MAG:IMAGES` applies the artifact's PIL image processor,
+validates its output schema, and expands one placeholder per image into the required
+soft-token span. It exposes no device cache or generation-loop state.
+
+### `MODEL:QWEN35.VISION`
+
+**Contract.** Encode prepared image patches and project them into decoder-width
+features without autoregressive state. Independent images remain isolated when
+packed into one upstream encoder invocation. Output slices retain their own
+completion and allocation obligations.
+
+`MODEL:QWEN35.VISION:VLM:STANDARD` uses the pinned VLM vision tower and projector.
+The captured parameter record contains the actual weights and shares bounded feature
+retention through [model inputs](../inputs.md). `MODEL:QWEN35.VISION/EXEC` observes
+encoder/projector execution through completed outputs. It is an opaque upstream
+workload record; it supplies no fabricated analytical efficiency denominator.
