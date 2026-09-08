@@ -9,3 +9,6 @@ dist/
 runs/
 models.local.json
 .session-bench/
+
+# Built by the package installation hook.
+src/magnitude_engine/kernels/core/_graph*.so

@@ -6,8 +6,9 @@ functions and ordered drivers live in Metal; this module declares their interfac
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from math import prod
 from types import MappingProxyType
 from typing import Any
@@ -16,14 +17,33 @@ import mlx.core as mx
 
 from ._emitter import Binary, Expression, Literal, Symbol, expression
 from .graph import Tensor, Value
-from .plan import Source, identifier
+from .plan import Launch, Parameter, Scalar, Source, identifier
 
 
-class Unsupported:
-    pass
+@dataclass(frozen=True)
+class Dispatch:
+    """A complete handwritten dispatch with named operands and outputs."""
 
+    arguments: Mapping[str, TensorSpec]
+    outputs: Mapping[str, Tensor]
+    launch: Launch
+    template: tuple[tuple[str, Parameter], ...] = ()
+    constants: tuple[Scalar, ...] = ()
 
-UNSUPPORTED = Unsupported()
+    def __post_init__(self):
+        if not self.outputs:
+            raise ValueError("a kernel must declare its outputs")
+        names = (*self.arguments, *self.outputs)
+        if len(set(names)) != len(names):
+            raise ValueError("kernel operands and outputs require unique names")
+        for name in names:
+            identifier(name)
+        if not all(isinstance(v, TensorSpec) for v in self.arguments.values()):
+            raise TypeError("dispatch arguments must bind tensor operands")
+        if not all(isinstance(v, Tensor) for v in self.outputs.values()):
+            raise TypeError("dispatch outputs must declare tensor geometry")
+        object.__setattr__(self, "arguments", MappingProxyType(dict(self.arguments)))
+        object.__setattr__(self, "outputs", MappingProxyType(dict(self.outputs)))
 
 
 @dataclass(frozen=True)
@@ -164,7 +184,6 @@ class Float:
     value: float
 
     def __post_init__(self):
-        import math
 
         if not math.isfinite(self.value):
             raise ValueError("Float requires a finite literal")
@@ -229,84 +248,6 @@ class TileCall:
                 raise TypeError(f"unsupported Metal call argument: {type(arg).__name__}")
             if isinstance(arg, Lane) and not isinstance(self.scope, SIMDGroup):
                 raise ValueError("Lane requires SIMD participation")
-
-
-@dataclass(frozen=True)
-class Iteration:
-    axis: str
-    extent: int
-    start: Lane
-    step: int = 32
-
-    def __post_init__(self):
-        identifier(self.axis)
-        if self.extent < 0 or not isinstance(self.start, Lane) or self.step != 32:
-            raise ValueError("ordered fold requires ascending lane-strided iteration")
-
-    @property
-    def index(self):
-        return Index(Symbol(self.axis))
-
-
-@dataclass(frozen=True)
-class Sample:
-    name: str
-    view: View
-
-    def __post_init__(self):
-        identifier(self.name)
-        if self.view.shape:
-            raise ValueError("fold sample must be a scalar")
-
-
-@dataclass(frozen=True)
-class State:
-    name: str
-    dtype: mx.Dtype
-
-    def __post_init__(self):
-        identifier(self.name)
-
-
-@dataclass(frozen=True)
-class Call:
-    function: str
-    arguments: tuple[Any, ...]
-
-    def __init__(self, function, *arguments):
-        identifier(function)
-        object.__setattr__(self, "function", function)
-        object.__setattr__(self, "arguments", arguments)
-
-
-@dataclass(frozen=True)
-class OrderedFold:
-    domain: Domain
-    scope: SIMDGroup
-    arguments: Mapping[str, Any]
-    iteration: Iteration
-    shared_inputs: tuple[Sample, ...]
-    state: tuple[State, ...]
-    initial: Mapping[State, Float]
-    step: Call
-    finish: Call
-    result: Replicated
-
-    def __post_init__(self):
-        call = TileCall(self.domain, self.scope, self.arguments, self.result)
-        object.__setattr__(self, "arguments", call.arguments)
-        object.__setattr__(self, "initial", MappingProxyType(dict(self.initial)))
-        if len(self.state) != 1 or len(self.shared_inputs) != 1:
-            raise ValueError("qualified scalar fold requires one state and one shared sample")
-        if set(self.initial) != set(self.state):
-            raise ValueError("every carried state needs exactly one initializer")
-        allowed = (*self.state, *self.shared_inputs)
-        for call in (self.step, self.finish):
-            if any(
-                not isinstance(arg, (Load, Float, UInt)) and arg not in allowed
-                for arg in call.arguments
-            ):
-                raise ValueError("fold hook uses an undeclared state or sample")
 
 
 @dataclass(frozen=True)
@@ -378,6 +319,7 @@ class RowTransform:
     scope: Threadgroup
     arguments: Mapping[str, Any]
     template: tuple[Any, ...] = ()
+    row_api: bool = False
 
     def __post_init__(self):
         if not self.output.shape or self.output.shape[-1] < 1:
@@ -578,15 +520,10 @@ def _range(value, axes):
 
 
 def validate_interface(interface):
-    from dataclasses import fields, is_dataclass
 
     axes = {}
-    if isinstance(interface, (TileCall, OrderedFold)):
+    if isinstance(interface, TileCall):
         axes.update((f"coord_{name}", (0, extent - 1)) for name, extent in interface.domain.axes)
-    if isinstance(interface, OrderedFold):
-        axes[interface.iteration.axis] = (0, interface.iteration.extent - 1)
-        if isinstance(interface.result, Distributed):
-            raise ValueError("ordered scalar fold returns a replicated completed result")
 
     def validate(value):
         if isinstance(value, View):
@@ -608,4 +545,22 @@ def validate_interface(interface):
     validate(interface)
 
 
-type Interface = TileCall | OrderedFold | RowTransform | FragmentCall | OrderedReduction
+type Interface = TileCall | RowTransform | FragmentCall | OrderedReduction
+
+
+def Rows(x, *, threads, parameters=None, scratch=None):
+    """Bind a handwritten row function to native element loads and completed stores."""
+    arguments = {}
+    for name, value in (parameters or {}).items():
+        if isinstance(value, TensorSpec):
+            value = ReadOnly(value[(slice(None),) * value.ndim])
+        elif isinstance(value, float):
+            value = Float(value)
+        elif isinstance(value, int):
+            value = UInt(value)
+        arguments[name] = value
+    for name, value in (scratch or {}).items():
+        if name in arguments:
+            raise ValueError("scratch and parameter names must be unique")
+        arguments[name] = value
+    return RowTransform(x.value.tensor, x.value, Threadgroup(threads), arguments, row_api=True)

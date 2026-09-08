@@ -5,11 +5,11 @@ from dataclasses import replace
 import mlx.core as mx
 import pytest
 
-from magnitude_engine.kernels.core import Kernel, Launch, Scalar, Source
 from magnitude_engine.kernels.core import plan as plan_module
 from magnitude_engine.kernels.core.assembly import assemble
 from magnitude_engine.kernels.core.graph import Tensor, Value
-from magnitude_engine.kernels.core.kernel import dispatch
+from magnitude_engine.kernels.core.kernel import Kernel, dispatch
+from magnitude_engine.kernels.core.plan import Launch, Scalar, Source
 from performance.assembly import source_key
 
 PROGRAM: Source | None = None
@@ -54,18 +54,17 @@ def test_named_bindings_and_scalar_specializations(sources):
 
 
 def test_opaque_dispatch_retains_its_boundary_inside_automatic_composition(sources):
-    from magnitude_engine.kernels import computation
+    from magnitude_engine import kernels
 
-    @computation
+    @kernels.compile
     def region(x):
         # Repeated operands require an explicit argument mapping in the actual plan.
         return mx.tanh(invoke(x, x))
 
     x = mx.arange(37, dtype=mx.float32)
-    bound = region.specialize(x)
-    assert len(bound.call.regions) == 2
-    assert mx.allclose(bound(x), mx.tanh(x * 4)).item()
-    artifact = bound.artifact()
+    assert mx.allclose(region(x), mx.tanh(x * 4)).item()
+    artifact = kernels.artifact(region)
+    assert len(artifact["regions"]) == 2
     assert artifact["regions"][0]["source"]
     assert artifact["regions"][0]["argument_binding"]["operands"] == (0, 0)
 

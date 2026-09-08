@@ -5,6 +5,8 @@ GPU algorithms, reductions and memory protocols are authored in Metal.
 
 from dataclasses import dataclass
 
+from .plan import identifier
+
 
 class Expression:
     def __bool__(self):
@@ -16,7 +18,6 @@ class Symbol(Expression):
     name: str
 
     def __post_init__(self):
-        from .plan import identifier
 
         identifier(self.name)
         if self.name in {

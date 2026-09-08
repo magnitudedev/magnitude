@@ -11,7 +11,10 @@
   Use `kernels/core` for capture, typed bindings, automatic composition, source assembly
   and the single MLX invocation boundary; keep numerical
   source in `.metal` files and model/state policy in its existing owners.
-  Follow `design/kernels.md`; do not restore model-local kernel strings or duplicate launch signatures.
+  Author through `@kernels.kernel` and compose with `kernels.compile`; use
+  `kernels.explain/artifact` for inspection. The native graph bridge is built at package
+  installation, never on first inference. Follow `design/kernels.md`; do not restore
+  numerical Primitive subclasses, export/replay fallbacks or duplicate launch signatures.
 
 # Performance ceilings
 

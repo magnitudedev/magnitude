@@ -4,8 +4,8 @@ from typing import TYPE_CHECKING
 
 import mlx.core as mx
 
-from ..core.computation import computation
-from .selection import RouteSum, SelectedAffine
+from .. import compile
+from .selection import route_sum, selected_affine
 
 if TYPE_CHECKING:
     from .weights import ExpertWeights
@@ -83,49 +83,67 @@ def _assignments(
     return ids, order
 
 
-@computation
-def _gate_up(hidden, gate, up, shared_gate, shared_up, ids, order, *, slots, shared):
-    dot = SelectedAffine(gate.encoding.bits, gate.encoding.group_size, slots, shared)
-    g = dot(
+@compile
+def _gate_up(
+    hidden, gate, up, shared_gate, shared_up, ids, order, *, bits, group_size, slots, shared
+):
+    g = selected_affine(
         hidden,
         ids,
         order,
-        gate.weight,
-        gate.scales,
-        gate.biases,
-        shared_gate.weight,
-        shared_gate.scales,
-        shared_gate.biases,
-    )[0]
-    u = dot(
+        *gate,
+        *shared_gate,
+        bits=bits,
+        group_size=group_size,
+        slots=slots,
+        shared=shared,
+    )
+    u = selected_affine(
         hidden,
         ids,
         order,
-        up.weight,
-        up.scales,
-        up.biases,
-        shared_up.weight,
-        shared_up.scales,
-        shared_up.biases,
-    )[0]
+        *up,
+        *shared_up,
+        bits=bits,
+        group_size=group_size,
+        slots=slots,
+        shared=shared,
+    )
     return (g * mx.sigmoid(g)).astype(hidden.dtype) * u
 
 
-@computation
-def _down(activation, down, shared_down, ids, order, scores, shared_score, *, slots, shared):
-    dot = SelectedAffine(down.encoding.bits, down.encoding.group_size, slots, shared, per_slot=True)
-    projected = dot(
+@compile
+def _down(
+    activation,
+    down,
+    shared_down,
+    ids,
+    order,
+    scores,
+    shared_score,
+    *,
+    bits,
+    group_size,
+    slots,
+    shared,
+):
+    projected = selected_affine(
         activation,
         ids,
         order,
-        down.weight,
-        down.scales,
-        down.biases,
-        shared_down.weight,
-        shared_down.scales,
-        shared_down.biases,
-    )[0]
-    return RouteSum(shared)(projected, scores, shared_score)[0]
+        *down,
+        *shared_down,
+        bits=bits,
+        group_size=group_size,
+        slots=slots,
+        shared=shared,
+        per_slot=True,
+    )
+    return route_sum(projected, scores, shared_score, shared=shared)
+
+
+def operands(projection):
+    return projection.weight, projection.scales, projection.biases
 
 
 def _activate(weights, hidden, assignments, shared, ids, order):
@@ -135,12 +153,14 @@ def _activate(weights, hidden, assignments, shared, ids, order):
     )
     return gate(
         hidden,
-        weights.gate,
-        weights.up,
-        shared_gate,
-        shared_up,
+        operands(weights.gate),
+        operands(weights.up),
+        operands(shared_gate),
+        operands(shared_up),
         ids,
         order,
+        bits=weights.gate.encoding.bits,
+        group_size=weights.gate.encoding.group_size,
         slots=assignments.shape[-1] + (shared is not None),
         shared=shared is not None,
     )
@@ -161,12 +181,14 @@ def apply(weights, hidden, assignments, scores, *, shared=None, shared_score=Non
     down = _down
     return down(
         activation,
-        weights.down,
-        shared.down if shared is not None else weights.down,
+        operands(weights.down),
+        operands(shared.down if shared is not None else weights.down),
         ids,
         order,
         scores.reshape(rows, -1),
         shared_score if shared_score is not None else scores,
+        bits=weights.down.encoding.bits,
+        group_size=weights.down.encoding.group_size,
         slots=assignments.shape[-1] + (shared is not None),
         shared=shared is not None,
     ).reshape(hidden.shape)

@@ -2,12 +2,23 @@
 
 import mlx.core as mx
 
-from magnitude_engine.kernels.core import computation
+from .. import compile, kernel, metal
 
 
-@computation
+@kernel(source="nonlinear.metal", function="magnitude_sigmoid")
+def native_sigmoid(x):
+    domain = metal.Domain(item=x.size)
+    (i,) = domain.indices
+    return metal.TileCall(
+        domain, metal.Thread(), {"x": metal.Load(x[i])}, metal.Replicated((i,), x.dtype)
+    )
+
+
+@compile
 def _sigmoid_gate(values, gates):
-    return values * mx.sigmoid(gates)
+    shape = values.shape
+    x = mx.broadcast_to(gates, shape).reshape(-1)
+    return (values.reshape(-1) * native_sigmoid(x)).reshape(shape)
 
 
 def sigmoid_gate(values: mx.array, gates: mx.array) -> mx.array:
