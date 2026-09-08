@@ -154,6 +154,8 @@ const writeServiceFile = (file: string, contents: string) =>
   writeFileAtomic(file, contents).pipe(Effect.mapError((error) => fail(String(error))))
 
 const macServicePath = () => `${homedir()}/Library/LaunchAgents/${SERVICE_LABEL}.plist`
+// Inference serves user requests; Background imposes resource limits that can
+// severely reduce decode throughput even though the service has no window.
 export const renderMacServerService = (command: ReadonlyArray<string>) => `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -162,7 +164,7 @@ export const renderMacServerService = (command: ReadonlyArray<string>) => `<?xml
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>2</integer>
-  <key>ProcessType</key><string>Background</string>
+  <key>ProcessType</key><string>Standard</string>
   <key>StandardOutPath</key><string>${xml(`${defaultDataDir()}/logs/acn-service.log`)}</string>
   <key>StandardErrorPath</key><string>${xml(`${defaultDataDir()}/logs/acn-service.log`)}</string>
 </dict></plist>
