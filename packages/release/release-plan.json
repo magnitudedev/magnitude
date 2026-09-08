@@ -1,12 +1,16 @@
 {
   "format": 2,
   "baseline": {
-    "tag": "@magnitudedev/cli@0.0.11",
-    "sourceCommit": "27aa9ca98c404e31741e1c6b76bcf2a960ebb327",
-    "cliVersion": "0.0.11"
+    "tag": "@magnitudedev/cli@0.0.12",
+    "sourceCommit": "ce40e443736838d13c3e1f7cbcb377c0914986de",
+    "cliVersion": "0.0.12",
+    "rpc": {
+      "version": 1,
+      "fingerprint": "dfba86a156b5dd9647f66bead4d1ed2b22809fb7003955caa94adf6690f5b66f"
+    }
   },
-  "cliVersion": "0.0.12",
-  "revision": 34,
+  "cliVersion": "0.0.13",
+  "revision": 35,
   "rpc": {
     "version": 1,
     "fingerprint": "dfba86a156b5dd9647f66bead4d1ed2b22809fb7003955caa94adf6690f5b66f"
@@ -23,7 +27,7 @@
         "filename": "magnitudedev-pi-extension-0.0.1.tgz",
         "integrity": "sha512-TAyDyEO3ZeQqgWdOf44QGh+OJfwDAbZ+9kn8iIs6/C5ywyyX3aDD9Nc2nA3W1NIN4ctYP/oGr3wA4EaW85JwDA=="
       },
-      "publish": true
+      "publish": false
     }
   ]
 }
