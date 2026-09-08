@@ -8,7 +8,8 @@
 # Kernel implementation
 
 - Owned Metal kernels live in computational categories under `src/magnitude_engine/kernels/`.
-  Use `kernels/core` for named plans, source assembly and MLX invocation; keep numerical
+  Use `kernels/core` for capture, typed bindings, automatic composition, source assembly
+  and the single MLX invocation boundary; keep numerical
   source in `.metal` files and model/state policy in its existing owners.
   Follow `design/kernels.md`; do not restore model-local kernel strings or duplicate launch signatures.
 

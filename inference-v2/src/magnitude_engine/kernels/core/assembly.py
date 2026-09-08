@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from functools import cache
 
-from .plan import Program, Scalar, Source
+from .plan import Scalar, Source
 
 
 @dataclass(frozen=True)
@@ -41,8 +41,8 @@ def declaration(scalar: Scalar) -> str:
 
 
 @cache
-def assemble(program: Program, constants: tuple[Scalar, ...] = ()) -> Assembly:
-    sources = source_files(program.body)
+def assemble(source: Source, constants: tuple[Scalar, ...] = ()) -> Assembly:
+    sources = source_files(source)
     header = "".join(map(declaration, constants))
     header += "\n".join(text for _, text in sources[:-1])
     return Assembly(sources[-1][1], header, sources)

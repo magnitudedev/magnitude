@@ -5,25 +5,27 @@ from dataclasses import replace
 import mlx.core as mx
 import pytest
 
-from magnitude_engine.kernels.core import Input, KernelPlan, Launch, Output, Program, Scalar, Source
+from magnitude_engine.kernels.core import Kernel, Launch, Scalar, Source
 from magnitude_engine.kernels.core import plan as plan_module
 from magnitude_engine.kernels.core.assembly import assemble
+from magnitude_engine.kernels.core.graph import Tensor, Value
+from magnitude_engine.kernels.core.kernel import dispatch
 from performance.assembly import source_key
 
-PROGRAM: Program | None = None
+PROGRAM: Source | None = None
 
 
 def invoke(x, y, scale=2.0, reverse=False):
     assert PROGRAM is not None
-    inputs = (Input("x", x), Input("y", y))
-    return KernelPlan(
+    inputs = (("x", x), ("y", y))
+    return dispatch(
         PROGRAM,
-        inputs[::-1] if reverse else inputs,
-        (Output("result", x.shape, x.dtype),),
-        Launch((x.size, 1, 1), (32, 1, 1)),
+        inputs=inputs[::-1] if reverse else inputs,
+        outputs=(("result", Tensor(x.shape, x.dtype)),),
+        launch=Launch((x.size, 1, 1), (32, 1, 1)),
         template=(("T", x.dtype),),
         constants=(Scalar("SCALE", scale),),
-    ).run()[0]
+    )[0]
 
 
 @pytest.fixture
@@ -36,7 +38,7 @@ def sources(tmp_path, monkeypatch):
     monkeypatch.setattr(plan_module, "files", lambda package: tmp_path)
 
     def bind():
-        return Program("construction_test", Source("body.metal", (Source("helper.metal"),)))
+        return Source("body.metal", (Source("helper.metal"),))
 
     monkeypatch.setattr(__import__(__name__, fromlist=["PROGRAM"]), "PROGRAM", bind())
     return tmp_path, bind
@@ -49,6 +51,23 @@ def test_named_bindings_and_scalar_specializations(sources):
     assert mx.array_equal(invoke(x, y, scale=3.0), 2 * x + 3).item()
     compiled = mx.compile(lambda a, b: invoke(a, b, scale=3.0))
     assert mx.array_equal(compiled(x, y), 2 * x + 3).item()
+
+
+def test_opaque_dispatch_retains_its_boundary_inside_automatic_composition(sources):
+    from magnitude_engine.kernels import computation
+
+    @computation
+    def region(x):
+        # Repeated operands require an explicit argument mapping in the actual plan.
+        return mx.tanh(invoke(x, x))
+
+    x = mx.arange(37, dtype=mx.float32)
+    bound = region.specialize(x)
+    assert len(bound.call.regions) == 2
+    assert mx.allclose(bound(x), mx.tanh(x * 4)).item()
+    artifact = bound.artifact()
+    assert artifact["regions"][0]["source"]
+    assert artifact["regions"][0]["argument_binding"]["operands"] == (0, 0)
 
 
 def test_source_snapshots_and_transitive_fingerprints(sources, monkeypatch):
@@ -77,7 +96,7 @@ def test_shared_source_dependency_is_emitted_once(sources):
         "body.metal",
         (Source("left.metal", (helper,)), Source("right.metal", (helper,))),
     )
-    result = assemble(Program("diamond", body))
+    result = assemble(body)
     assert [p for p, _ in result.sources] == [
         "helper.metal",
         "left.metal",
@@ -90,18 +109,18 @@ def test_shared_source_dependency_is_emitted_once(sources):
 def test_invalid_plan_rejected_before_device_submission(sources):
     assert PROGRAM is not None
     x = mx.ones(1)
-    plan = KernelPlan(
+    plan = Kernel(
+        (Value("x", Tensor(x.shape, x.dtype)),),
+        (Value("result", Tensor((1,), mx.float32)),),
         PROGRAM,
-        (Input("x", x),),
-        (Output("result", (1,), mx.float32),),
         Launch((1, 1, 1), (32, 1, 1)),
     )
     with pytest.raises(ValueError, match="unique"):
-        replace(plan, inputs=(Input("x", x), Input("x", x)))
+        replace(plan, inputs=(Value("x", Tensor(x.shape, x.dtype)),) * 2).bind()
     with pytest.raises(ValueError, match="identifier"):
-        replace(plan, inputs=(Input("x; invalid", x),))
+        replace(plan, inputs=(Value("x; invalid", Tensor(x.shape, x.dtype)),)).bind()
     with pytest.raises(ValueError, match="nonnegative"):
-        replace(plan, outputs=(Output("result", (-1,), mx.float32),))
+        replace(plan, outputs=(Value("result", Tensor((-1,), mx.float32)),)).bind()
     with pytest.raises(ValueError, match="positive"):
         Launch((0, 1, 1), (32, 1, 1))
     with pytest.raises(ValueError, match="1024"):
@@ -118,9 +137,9 @@ def test_dependency_order_participates_in_executable_identity(sources, monkeypat
     (directory / "second.metal").write_text("#undef VALUE\n#define VALUE 2\n")
     first, second = Source("first.metal"), Source("second.metal")
     module = __import__(__name__, fromlist=["PROGRAM"])
-    monkeypatch.setattr(module, "PROGRAM", Program("order", Source("body.metal", (first, second))))
+    monkeypatch.setattr(module, "PROGRAM", Source("body.metal", (first, second)))
     before = source_key((invoke,))[0]
-    monkeypatch.setattr(module, "PROGRAM", Program("order", Source("body.metal", (second, first))))
+    monkeypatch.setattr(module, "PROGRAM", Source("body.metal", (second, first)))
     assert source_key((invoke,))[0] != before
 
 
@@ -129,7 +148,7 @@ def test_scalar_cache_preserves_integer_arithmetic_and_signed_zero(sources, monk
     (directory / "body.metal").write_text(
         "uint i = thread_position_in_grid.x; result[i] = 1 / SCALE;"
     )
-    program = Program("scalar_types", Source("body.metal"))
+    program = Source("body.metal")
     monkeypatch.setattr(__import__(__name__, fromlist=["PROGRAM"]), "PROGRAM", program)
     x = mx.ones(1)
     assert invoke(x, x, scale=2).item() == 0
@@ -138,3 +157,12 @@ def test_scalar_cache_preserves_integer_arithmetic_and_signed_zero(sources, monk
         assemble(program, (Scalar("SCALE", 0.0),)).header
         != assemble(program, (Scalar("SCALE", -0.0),)).header
     )
+
+
+def test_scalar_lowering_tables_participate_in_source_identity(monkeypatch):
+    from magnitude_engine.kernels.core import elementwise
+
+    before = source_key((elementwise.scalar_program,))[0]
+    monkeypatch.setitem(elementwise.UNARY, "Sin", "metal::sin")
+    after = source_key((elementwise.scalar_program,))[0]
+    assert after != before

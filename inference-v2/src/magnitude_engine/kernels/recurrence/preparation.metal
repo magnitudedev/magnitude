@@ -16,15 +16,7 @@ for (int tt = 0; tt < TT; ++tt) {
     for (int t = 0; t < K - 1; ++t) acc += static_cast<float>(w[c * K + t]) * win[t];
     acc += static_cast<float>(w[c * K + (K - 1)]) * xin;
     float r = static_cast<float>(static_cast<T>(acc));
-    // Match MLX SiLU with input-dtype rounding at each sigmoid/product stage.
-    float val;
-    {
-        T e = static_cast<T>(metal::exp(metal::abs(r)));
-        T dd = static_cast<T>(1.0f + static_cast<float>(e));
-        T yy = static_cast<T>(1.0f / static_cast<float>(dd));
-        T sgm = r < 0.0f ? yy : static_cast<T>(1.0f - static_cast<float>(yy));
-        val = static_cast<float>(static_cast<T>(r * static_cast<float>(sgm)));
-    }
+    float val = float(T(r * float(magnitude_native_sigmoid<T, false>(r))));
     for (int t = 0; t < K - 2; ++t) win[t] = win[t + 1];
     win[K - 2] = xin;
     float ss = simd_sum(val * val);
@@ -51,19 +43,8 @@ for (int tt = 0; tt < TT; ++tt) {
     }
     if (c < HV) {
         float bb = static_cast<float>(pr[CK + CV + c]);
-        {   // mx.sigmoid on T: 1/(1+precise::exp(|x|)) with per-op rounding, flipped for x >= 0
-            T e = static_cast<T>(metal::precise::exp(metal::abs(bb)));
-            T dd = static_cast<T>(1.0f + static_cast<float>(e));
-            T yy = static_cast<T>(1.0f / static_cast<float>(dd));
-            beta[(row * TT + tt) * HV + c] = bb < 0.0f ? yy : T(1.0f - float(yy));
-        }
-        float aa = float(T(float(pr[CK + CV + HV + c]) + float(dt_bias[c])));
-        // Match MLX LogAddExp's typed operators and overloads, including half exp/log1p.
-        T av = T(aa);
-        T maximum = metal::max(av, T(0));
-        T minimum = metal::min(av, T(0));
-        T sp = maximum + log1p(metal::exp(minimum - maximum));
-        g[(row * TT + tt) * HV + c] = metal::precise::exp(-metal::precise::exp(A_log[c]) * sp);
+        beta[(row * TT + tt) * HV + c] = magnitude_native_sigmoid<T, true>(bb);
+        g[(row * TT + tt) * HV + c] = magnitude_decay<T>(pr[CK + CV + HV + c], dt_bias[c], A_log[c]);
     }
 }
 for (int t = 0; t < K - 1; ++t) ns[t * CK + c] = static_cast<T>(win[t]);
