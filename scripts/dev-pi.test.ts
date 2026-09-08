@@ -2,13 +2,31 @@ import type { ModelCatalogState } from "@magnitudedev/sdk"
 import { makeInstalledCatalogModel, makeCatalogOnlyModel } from "../cli/src/features/local-inference/test-fixtures"
 import { Effect, Fiber, Option, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
-import { awaitPiDevelopmentModel, piDevelopmentArgs } from "./dev-pi"
+import { awaitPiDevelopmentModel, piDevelopmentArgs, resolvePiDevelopmentExecutable } from "./dev-pi"
+import { delimiter } from "node:path"
 import { FileSystem } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import { DefaultResourceLoader } from "@earendil-works/pi-coding-agent"
 import { parseArgs } from "../node_modules/@earendil-works/pi-coding-agent/dist/cli/args.js"
 
 describe("Pi development resource isolation", () => {
+  it("uses installed Pi even when Bun puts a dependency-local Pi first on PATH", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-path-" })
+      const dependency = `${root}/node_modules/.bin`
+      const installed = `${root}/bin`
+      for (const directory of [dependency, installed]) {
+        yield* fs.makeDirectory(directory, { recursive: true })
+        yield* fs.writeFileString(`${directory}/pi`, "#!/bin/sh\nexit 0\n")
+        yield* fs.chmod(`${directory}/pi`, 0o755)
+      }
+      expect(yield* resolvePiDevelopmentExecutable([dependency, installed].join(delimiter))).toBe(`${installed}/pi`)
+      const missing = yield* Effect.exit(resolvePiDevelopmentExecutable(dependency))
+      expect(missing._tag).toBe("Failure")
+      expect(String(missing)).toContain("Pi is not installed on your PATH")
+    })).pipe(Effect.provide(BunContext.layer)))
+  })
   it("allows package-first onboarding without a preconfigured model", () => {
     const args = parseArgs(piDevelopmentArgs(undefined, "/checkout/dist/skills/magnitude/SKILL.md"))
     expect(args.model).toBeUndefined()

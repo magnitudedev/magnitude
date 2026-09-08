@@ -5,7 +5,7 @@ import * as BunContext from "@effect/platform-bun/BunContext"
 import * as BunRuntime from "@effect/platform-bun/BunRuntime"
 import { ProviderModelIdSchema, localModelIsInstalled, type ModelCatalogState, type LocalModel, formatConnectionError } from "@magnitudedev/sdk"
 import { HarnessIdSchema } from "@magnitudedev/client-common"
-import { makeHarnessConnectionService, piDevelopmentConnectionOptions } from "../cli/src/harness-connections/service"
+import { harnessExecutableSearchPath, makeHarnessConnectionService, piDevelopmentConnectionOptions } from "../cli/src/harness-connections/service"
 import {
   interactiveProcessExitCode,
   runInteractiveProcess,
@@ -43,6 +43,13 @@ class PiDevelopmentFailed extends Schema.TaggedError<PiDevelopmentFailed>()(
   "PiDevelopmentFailed",
   { message: Schema.String },
 ) {}
+
+export const resolvePiDevelopmentExecutable = (searchPath = process.env.PATH ?? "") =>
+  Effect.sync(() => Bun.which("pi", { PATH: harnessExecutableSearchPath(searchPath) })).pipe(
+    Effect.flatMap((executable) => executable === null
+      ? Effect.fail(new PiDevelopmentFailed({ message: "Pi is not installed on your PATH" }))
+      : Effect.succeed(executable)),
+  )
 
 const requireSuccess = (operation: string, termination: InteractiveProcessTermination) => {
   const exitCode = interactiveProcessExitCode(termination)
@@ -82,6 +89,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     return yield* new PiDevelopmentFailed({ message: "Usage: bun run dev:pi [--setup]" })
   }
   const freshSetup = args.includes("--setup")
+  const piExecutable = yield* resolvePiDevelopmentExecutable()
   const fs = yield* FileSystem.FileSystem
   const temporaryDirectory = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-pi-dev-" })
   const magnitudeExecutable = resolve(temporaryDirectory, "magnitude")
@@ -139,7 +147,7 @@ const program = Effect.scoped(Effect.gen(function* () {
   let modelId: string | undefined
   if (freshSetup) {
     yield* Console.log("Installing only the local Pi package into a fresh temporary profile...")
-    const code = yield* Command.make("pi", "install", piPackageSource).pipe(
+    const code = yield* Command.make(piExecutable, "install", piPackageSource).pipe(
       Command.env({ PI_CODING_AGENT_DIR: piDirectory }),
       Command.exitCode,
     )
@@ -153,9 +161,9 @@ const program = Effect.scoped(Effect.gen(function* () {
     yield* connection.connect(HarnessIdSchema.make("pi"), { model: Option.some(ProviderModelIdSchema.make(model.modelId)) })
   }
 
-  yield* Console.log("Launching Pi with the local Magnitude CLI and extension...")
+  yield* Console.log(`Launching ${piExecutable} with the local Magnitude CLI and extension...`)
   const pi = yield* runInteractiveProcess({
-    executable: "pi",
+    executable: piExecutable,
     args: piDevelopmentArgs(modelId, freshSetup
       ? resolve(piPackageSource, "dist/skills/magnitude/SKILL.md")
       : paths.skillInstallations["shared-agents"].skillFile),

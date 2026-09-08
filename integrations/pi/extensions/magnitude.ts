@@ -4,10 +4,15 @@ import { openAICompletionsApi } from "@earendil-works/pi-ai/compat"
 import { registerMagnitudeCommands } from "./commands"
 import { registerMagnitudeOnboarding } from "./onboarding"
 import { makeObservingFetch } from "./observing-fetch"
-import { makeProgressTracker, type ProgressTracker } from "./progress"
-import { Effect, Exit, Scope } from "effect"
+import { makeProgressTracker, type ProgressTracker, ProgressSummary, formatSummary, MAGNITUDE_SUMMARY_ENTRY_TYPE } from "./progress"
+import { Text } from "@earendil-works/pi-tui"
+import { Effect, Exit, Option, Schema, Scope } from "effect"
 
 export default function magnitudeExtension(pi: ExtensionAPI): void {
+  pi.registerEntryRenderer(MAGNITUDE_SUMMARY_ENTRY_TYPE, (entry, _options, theme) => {
+    const summary = Schema.decodeUnknownOption(ProgressSummary)(entry.data)
+    return Option.isSome(summary) ? new Text(theme.fg("muted", formatSummary(summary.value)), 0, 0) : undefined
+  })
   // Pi aliases this public entrypoint in both its bundled and npm extension loaders.
   const completions = openAICompletionsApi()
   let tracker: ProgressTracker | undefined
@@ -44,7 +49,9 @@ export default function magnitudeExtension(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     if (scope) await Effect.runPromise(Scope.close(scope, Exit.void))
     scope = Effect.runSync(Scope.make())
-    tracker = await Effect.runPromise(makeProgressTracker(ctx.ui).pipe(Scope.extend(scope)))
+    tracker = await Effect.runPromise(makeProgressTracker(ctx.ui,
+      (summary) => pi.appendEntry(MAGNITUDE_SUMMARY_ENTRY_TYPE, summary),
+    ).pipe(Scope.extend(scope)))
   })
   pi.on("model_select", (event) => {
     if (event.model.provider !== "magnitude") perform(tracker?.clear)

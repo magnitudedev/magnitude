@@ -242,12 +242,18 @@ is presented as timed work. The companion treats transport requests and a Pi age
 lifecycles: request progress owns the live row, while `agent_start` through `agent_settled` owns the
 retained summary. Completion restores Pi's default working message and presents the model display
 name, total agent-run wall time, the first request's time to first token, and token-weighted generation
-throughput in one widget line immediately above the editor. Pi's stock parser decides semantic
+throughput in one muted, persistent transcript entry below the completed response. Entries remain
+in conversation history across subsequent runs and session restoration without entering model context.
+Live phase and completed-run durations use whole seconds: `1s` through `59s`, then `1m 0s`,
+`1m 1s`, and so on, with unbounded minutes. Below one second, live timers show `0s` and
+completed summaries show `<1s`;
+TTFT and generation throughput retain their measurement precision. Pi's stock parser decides semantic
 success; HTTP EOF alone cannot authorize a summary. Responses and their retry attempts are tracked
 independently, including overlapping and delayed observations. Timings are cumulative snapshots;
 throughput sums tokens and decode time once for each successful response's final request. Run duration
-uses monotonic time. Starting another run, cancellation, failure, switching providers, or extension disposal clears
-the retained summary and restores Pi's default working message.
+uses monotonic time. Starting another run, cancellation, failure, switching providers, or extension disposal
+cannot erase completed transcript entries. Cancellation and failure do not append successful summaries;
+cleanup restores Pi's default working message and prevents late events from appending to another session.
 
 The extension bundles the private SDK and owns one SDK scope, inference observer, and live-row timer.
 Model commands use existing RPC; the injected SDK starter runs `magnitude service start` when needed.
@@ -279,8 +285,10 @@ failures do not prevent inference. Installed Magnitude models are selected throu
 provide a separate load command or model picker. Its `/stop-model` command uses the existing RPC
 without changing Pi's selected model.
 
-The repository exposes one `dev:pi` entrypoint. It waits up to 30 seconds for an installed Magnitude
-model to appear, including when initial status snapshots are ready but empty, then selects it, connects
+The repository exposes one `dev:pi` entrypoint. Both package-first installation and interactive launch
+use the user's ambient Pi executable, excluding dependency-local binaries added to PATH by package
+runners. It waits up to 30 seconds for an installed Magnitude model to appear, including when initial
+status snapshots are ready but empty, then selects it, connects
 Pi through the ordinary connection service using the local package source, and launches
 Pi with a scoped executable for the current source CLI. Temporary executables live outside the
 repository and remain available for the entire child session. This development path exercises the
