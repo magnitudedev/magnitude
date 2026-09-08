@@ -12,7 +12,7 @@ import mlx.nn as nn
 
 from magnitude_engine.models.embeddings.contracts import EmbeddingLookup
 from magnitude_engine.models.experts.contracts import ExpertOperator
-from magnitude_engine.models.projections import ParallelProjections
+from magnitude_engine.models.projections import ParallelProjections, bind_readout
 from magnitude_engine.models.state.arena import LayerGeometry
 from magnitude_engine.models.state.recurrent import RecurrentLayout
 
@@ -82,7 +82,9 @@ def bind_qwen35(
                 layer.input_layernorm, mixer, layer.post_attention_layernorm, block_feedforward
             )
         )
-    output = model.model.embed_tokens.as_linear if model.args.tie_word_embeddings else model.lm_head
+    output = bind_readout(
+        model.model.embed_tokens if model.args.tie_word_embeddings else model.lm_head
+    )
     return Qwen35Binding(
         Qwen35Program(embedding, tuple(blocks), model.model.norm, output),
         tuple(geometries),

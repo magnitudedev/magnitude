@@ -92,7 +92,7 @@ def test_source_hash_tracks_cached_kernel_and_ignores_unreferenced_global(monkey
     first, _ = source_key((metal.MetalPagedAttention,))
     monkeypatch.setattr(metal, "irrelevant_global", 123, raising=False)
     assert source_key((metal.MetalPagedAttention,))[0] == first
-    monkeypatch.setattr(metal, "_partials", replacement_kernel)
+    monkeypatch.setattr(metal.plans, "attend", replacement_kernel)
     assert source_key((metal.MetalPagedAttention,))[0] != first
 
 

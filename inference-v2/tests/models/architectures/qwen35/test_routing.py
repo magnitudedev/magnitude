@@ -1,7 +1,7 @@
 import mlx.core as mx
 import pytest
 
-from magnitude_engine.models.architectures.qwen35.feedforward.routing import select
+from magnitude_engine.kernels.reductions.routing import select
 
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])

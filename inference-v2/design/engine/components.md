@@ -184,6 +184,8 @@ shared weights and independent row state.
 **Contract.** One execution owner submits lazy work and retains leases until completion.
 Each submission has a completion dependency covering all outputs and state writes;
 completing it does not drain unrelated later work.
+[Generated kernels](../kernels.md) participate in these same completion obligations;
+local kernel synchronization does not retire external resources.
 
 **Parameters.** Workload: supplied graph, output roots, leases, device/host dependencies and required
 completion boundary. Configuration: selected execution arrangement and allowed observation
@@ -268,7 +270,10 @@ objectives.
 ### `KV:STORE`
 
 **Contract.** Store logical histories in a shared paged arena, preserving identity independently of physical
-placement.
+placement. Consumers receive views with explicit logical positions, validity and physical
+access. Relocation or fragmentation must preserve the consumer's numerical operation;
+allocation geometry does not define its reduction. Storage owns placement and visibility,
+while [kernel plans](../kernels.md) own traversal and execution.
 
 **Parameters.** Architecture: producer/head/key/value geometry and encoding. Workload: required retained
 positions, shared prefixes/producers, checkpoint obligations and lifecycle observation

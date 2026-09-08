@@ -33,8 +33,8 @@ def tensors(value: object) -> dict[str, mx.array]:
         return {
             f"{i}.{name}": a for i, child in enumerate(value) for name, a in tensors(child).items()
         }
+    from magnitude_engine.kernels.contractions.weights import QuantizedProjection
     from magnitude_engine.models.architectures.qwen35.mtp.loading import AttentionStep
-    from magnitude_engine.models.experts.computation import QuantizedProjection
 
     if isinstance(value, QuantizedProjection):
         return {"weight": value.weight, "scales": value.scales, "biases": value.biases}
@@ -50,7 +50,7 @@ def projection_shape(value: object) -> tuple[int, int]:
         return value.weight.shape[-1], value.weight.dtype.size
     if isinstance(value, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
         return value.weight.shape[-1] * 32 // value.bits, value.scales.dtype.size
-    from magnitude_engine.models.experts.computation import QuantizedProjection
+    from magnitude_engine.kernels.contractions.weights import QuantizedProjection
 
     if isinstance(value, QuantizedProjection):
         return value.weight.shape[-1] * 32 // value.encoding.bits, value.scales.dtype.size
@@ -58,7 +58,7 @@ def projection_shape(value: object) -> tuple[int, int]:
 
 
 def materialize(parameters: NeuralParameters, operands: Mapping[str, object]):
-    from magnitude_engine.models.experts.computation import QuantizedProjection
+    from magnitude_engine.kernels.contractions.weights import QuantizedProjection
 
     arrays, matrices, bound_tensors = {}, [], {}
     configuration = dict(parameters.settings)

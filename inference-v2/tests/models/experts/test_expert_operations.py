@@ -6,14 +6,10 @@ from mlx_lm.models.switch_layers import SwitchGLU
 from magnitude_engine.artifacts.layouts import logical_tensors
 from magnitude_engine.artifacts.quantization import AffineEncoding
 from magnitude_engine.artifacts.tensors import TensorCatalog
+from magnitude_engine.kernels.contractions.weights import ExpertWeights, QuantizedProjection
 from magnitude_engine.models.execution import ExecutionOwner
 from magnitude_engine.models.experts.bank import ExpertBank, ExpertSource, ProjectionSource
-from magnitude_engine.models.experts.computation import (
-    ExpertWeights,
-    GatedExpertMath,
-    QuantizedProjection,
-    ResidentExperts,
-)
+from magnitude_engine.models.experts.computation import GatedExpertMath, ResidentExperts
 from magnitude_engine.models.experts.streaming import StreamedExperts
 from magnitude_engine.resources.budget import MemoryBudget
 from magnitude_engine.resources.io.reader import PositionalReader
@@ -112,7 +108,7 @@ def test_shared_prefill_scratch_retires_its_consumer_inside_a_model_scope(tmp_pa
 @pytest.mark.parametrize("rows", [1, 3])
 @pytest.mark.parametrize("width", [512, 1024])
 def test_fused_selected_experts_match_independent_upstream_equation(dtype, bits, rows, width):
-    from magnitude_engine.models.experts import metal
+    from magnitude_engine.kernels.contractions import experts as metal
 
     mx.random.seed(485)
     library = SwitchGLU(width, 512, 4)
@@ -142,7 +138,7 @@ def test_weighted_expert_reduction_preserves_small_bf16_contributions():
 
     from mlx_lm.models.switch_layers import SwiGLU
 
-    from magnitude_engine.models.experts import metal
+    from magnitude_engine.kernels.contractions import experts as metal
     from performance.benchmarks.references import experts
 
     def projection(output, width):
@@ -170,10 +166,10 @@ def test_weighted_expert_reduction_preserves_small_bf16_contributions():
     assert mx.array_equal(actual, expected).item()
 
 
-def test_sorted_expert_boundary_uses_upstream_matrix_reduction():
+def test_wide_query_experts_use_upstream_matrix_reduction():
     from mlx_lm.models.switch_layers import SwiGLU
 
-    from magnitude_engine.models.experts import metal
+    from magnitude_engine.kernels.contractions import experts as metal
 
     mx.random.seed(495)
     library = SwitchGLU(1024, 512, 8)
@@ -191,8 +187,8 @@ def test_sorted_expert_boundary_uses_upstream_matrix_reduction():
             for name in ("up", "gate", "down")
         )
     )
-    hidden = mx.random.normal((1, 8, 1024)).astype(mx.bfloat16)
-    indices = (mx.arange(64) * 3 % 5).reshape(1, 8, 8)
+    hidden = mx.random.normal((1, 16, 1024)).astype(mx.bfloat16)
+    indices = (mx.arange(128) * 3 % 5).reshape(1, 16, 8)
     scores = mx.softmax(mx.random.normal(indices.shape).astype(mx.bfloat16), axis=-1)
     assert not metal.supported(weights, hidden, indices)
     actual = GatedExpertMath(SwiGLU()).apply(weights, hidden, indices, scores)
@@ -205,7 +201,7 @@ def test_sorted_expert_boundary_uses_upstream_matrix_reduction():
 def test_joint_shared_and_routed_experts_preserve_complete_mixture(dtype, bits):
     from mlx_lm.models.qwen3_next import Qwen3NextMLP
 
-    from magnitude_engine.models.experts import metal
+    from magnitude_engine.kernels.contractions import experts as metal
     from magnitude_engine.models.experts.computation import affine_mlp
 
     mx.random.seed(938)
@@ -233,3 +229,68 @@ def test_joint_shared_and_routed_experts_preserve_complete_mixture(dtype, bits):
     )
     expected = (routed(hidden, routes) * scores[..., None]).sum(-2) + shared(hidden) * coefficient
     assert mx.allclose(actual, expected, atol=0.002, rtol=0.002).item()
+
+
+@pytest.mark.parametrize("batch,query", [(2, 1), (3, 2), (9, 1), (2, 8)])
+@pytest.mark.parametrize("shared", [False, True])
+def test_expert_row_grouping_preserves_routes_and_physical_relocation(batch, query, shared):
+    from mlx_lm.models.qwen3_next import Qwen3NextMLP
+
+    from magnitude_engine.kernels.contractions import experts as metal
+    from magnitude_engine.models.experts.computation import affine_mlp
+
+    mx.random.seed(294)
+    routed = SwitchGLU(1024, 512, 8)
+    companion = Qwen3NextMLP(1024, 512)
+    for layer in (routed, companion):
+        layer.set_dtype(mx.bfloat16)
+        nn.quantize(layer, group_size=64, bits=4)
+        layer.eval()
+    weights = ExpertWeights(
+        *(
+            QuantizedProjection(p.weight, p.scales, p.biases, AffineEncoding(4, 64))
+            for p in (routed.up_proj, routed.gate_proj, routed.down_proj)
+        )
+    )
+    shared_weights = affine_mlp(companion) if shared else None
+    hidden = mx.random.normal((batch, query, 1024)).astype(mx.bfloat16)
+    # Repeated, distinct and out-of-order routes; regrouping cannot reorder the sum.
+    indices = (mx.arange(batch * query * 8) * 3 % 5).reshape(batch, query, 8)
+    scores = mx.softmax(mx.random.normal(indices.shape).astype(mx.bfloat16), axis=-1)
+    coefficient = mx.full((batch, query, 1), 0.3, mx.bfloat16)
+
+    def execute(x, ids, score, factor, bank=weights):
+        return metal.apply(bank, x, ids, score, shared=shared_weights, shared_score=factor)
+
+    mx.eval(routed.parameters(), companion.parameters(), hidden, indices, scores, coefficient)
+    actual = mx.compile(execute)(hidden, indices, scores, coefficient)
+    flat = [a.reshape(batch * query, 1, -1) for a in (hidden, indices, scores, coefficient)]
+    expected = mx.concatenate(
+        [execute(*(a[i : i + 1] for a in flat)) for i in range(batch * query)]
+    ).reshape(actual.shape)
+    assert mx.array_equal(actual, expected).item()
+    relocated = ExpertWeights(
+        *(
+            QuantizedProjection(p.weight[::-1], p.scales[::-1], p.biases[::-1], p.encoding)
+            for p in (weights.up, weights.gate, weights.down)
+        )
+    )
+    assert mx.array_equal(
+        execute(hidden, 7 - indices, scores, coefficient, relocated), actual
+    ).item()
+    assert mx.array_equal(
+        execute(hidden[::-1], indices[::-1], scores[::-1], coefficient[::-1]), actual[::-1]
+    ).item()
+
+    padded = ExpertWeights(
+        *(
+            QuantizedProjection(
+                mx.concatenate([p.weight] * 32),
+                mx.concatenate([p.scales] * 32),
+                mx.concatenate([p.biases] * 32),
+                p.encoding,
+            )
+            for p in (weights.up, weights.gate, weights.down)
+        )
+    )
+    assert mx.array_equal(execute(hidden, indices, scores, coefficient, padded), actual).item()

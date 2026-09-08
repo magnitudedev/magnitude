@@ -32,6 +32,7 @@ def benchmark(
     *,
     context_tokens,
     measured_tokens=32,
+    rows=1,
     mode="replay",
     fixture="prose.moby-dick",
     prompt=None,
@@ -45,10 +46,13 @@ def benchmark(
 ):
     import mlx.core as mx
 
+    from magnitude_engine.models.inputs import ModelInputs
     from magnitude_engine.models.runtime import ForwardRequest
 
     if mode not in ("replay", "prefill", "generate", "verify") or measured_tokens < 1:
         raise ValueError("invalid model execution mode")
+    if rows < 1 or (rows > 1 and mode not in ("replay", "verify")):
+        raise ValueError("multiple rows require fixed-input replay or verification")
     if accepted_tokens is not None and (
         mode != "verify" or not 0 <= accepted_tokens <= measured_tokens
     ):
@@ -58,8 +62,8 @@ def benchmark(
     model = engine.engine.generation.model
     workload = {
         "context_tokens": context_tokens,
-        "histories": [context_tokens],
-        "batch_size": 1,
+        "histories": [context_tokens] * rows,
+        "batch_size": rows,
         "query_tokens": measured_tokens if mode in ("prefill", "verify") else 1,
         "measured_tokens": measured_tokens,
         "mode": mode,
@@ -101,39 +105,49 @@ def benchmark(
             raise ValueError("insufficient prompt or continuation inputs")
         record_inputs(run, prompt=prompt, continuation=continuation[:measured_tokens])
         history = prompt[:-1] if mode == "generate" else prompt
-        workload["histories"], workload["context_tokens"] = [len(history)], len(history)
+        workload["histories"], workload["context_tokens"] = [len(history)] * rows, len(history)
         with prefix(
             model, history, chunk_size=engine.engine.scheduler.prefill_tokens
         ) as checkpoint:
-            sequence = None
+            sequences = []
+
+            def close():
+                for sequence in sequences:
+                    sequence.close()
+                sequences.clear()
 
             def reset():
-                nonlocal sequence
-                if sequence is not None:
-                    sequence.close()
-                sequence = model.create(checkpoint)
-                model.reserve(sequence, measured_tokens + 1)
+                close()
+                for _ in range(rows):
+                    sequence = model.create(checkpoint)
+                    sequences.append(sequence)
+                    model.reserve(sequence, measured_tokens + 1)
                 mx.reset_peak_memory()
+
+            def forward(values, request, count):
+                advances = (
+                    (model.forward(sequences[0], values, request),)
+                    if rows == 1
+                    else model.forward_batch(
+                        tuple(sequences), (ModelInputs.from_tokens(values),) * rows, request
+                    )
+                )
+                for advance in advances:
+                    advance.accept(count)
+                    advance.complete()
+                return mx.concatenate([advance.output.logits for advance in advances])
 
             def execute():
                 generated, last = [], None
                 if mode == "verify":
-                    advance = model.forward(sequence, continuation[:measured_tokens])
-                    advance.accept(accepted)
-                    advance.complete()
-                    last = advance.output.logits
+                    last = forward(continuation[:measured_tokens], ForwardRequest(), accepted)
                 elif mode == "prefill":
-                    model.prefill(sequence, continuation[:measured_tokens])
+                    model.prefill(sequences[0], continuation[:measured_tokens])
                 else:
                     token = prompt[-1]
                     for i in range(measured_tokens):
                         value = token if mode == "generate" else continuation[i]
-                        advance = model.forward(
-                            sequence, (value,), ForwardRequest(committed_inputs=1)
-                        )
-                        advance.accept(1)
-                        advance.complete()
-                        last = advance.output.logits
+                        last = forward((value,), ForwardRequest(committed_inputs=1), 1)
                         if mode == "generate":
                             token = cast(int, mx.argmax(last[0, -1]).item())
                             generated.append(token)
@@ -142,22 +156,26 @@ def benchmark(
                 return last, generated
 
             def validate(result):
-                assert sequence is not None
                 last, generated = result
-                saved = sequence.checkpoint()
-                try:
-                    consumed = len(generated) if mode == "generate" else accepted
-                    if saved.length != len(history) + consumed:
-                        raise ValueError("model committed boundary differs from consumed inputs")
-                finally:
-                    saved.close()
+                for sequence in sequences:
+                    saved = sequence.checkpoint()
+                    try:
+                        consumed = len(generated) if mode == "generate" else accepted
+                        if saved.length != len(history) + consumed:
+                            raise ValueError(
+                                "model committed boundary differs from consumed inputs"
+                            )
+                    finally:
+                        saved.close()
                 h = hashlib.sha256(
                     bytes(memoryview(last.astype(mx.float32))) if last is not None else b""
                 ).hexdigest()
                 return Observation(
                     h,
                     {
-                        "input_tokens": len(generated) if mode == "generate" else measured_tokens,
+                        "input_tokens": len(generated)
+                        if mode == "generate"
+                        else measured_tokens * rows,
                         "output_tokens": len(generated),
                         "mlx_peak_bytes": mx.get_peak_memory(),
                     },
@@ -173,8 +191,7 @@ def benchmark(
                     deterministic=mode != "prefill",
                 )
             finally:
-                if sequence is not None:
-                    sequence.close()
+                close()
     return run
 
 
