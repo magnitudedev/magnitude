@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.13
+
+### Patch Changes
+
+- [`d7ad43d`](https://github.com/magnitudedev/magnitude/commit/d7ad43df99763a7460f0e0449ad9cab606ca6648) Thanks [@anerli](https://github.com/anerli)! - fix: use Standard instead of Background process type for macOS service to prevent throttling
+
 ## 0.0.12
 
 ### Patch Changes
