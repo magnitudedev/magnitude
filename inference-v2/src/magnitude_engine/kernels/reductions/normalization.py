@@ -1,38 +1,93 @@
-"""RMS reduction plans with explicit native rounding and fused finalization."""
+"""RMS reduction and native scalar composition over a cooperative Metal driver."""
 
-from magnitude_engine.kernels.core import Input, KernelPlan, Launch, Output, Program, Scalar, Source
+from dataclasses import dataclass
 
-RESIDUAL_NORM = Program("magnitude_residual_norm", Source("reductions/residual_norm.metal"))
+import mlx.core as mx
 
-GATED_NORM = Program("magnitude_gated_norm", Source("reductions/gated_norm.metal"))
+from ..core.computation import computation
+from ..core.metal import (
+    Binding,
+    Float,
+    GroupPosition,
+    Lane,
+    ReadOnly,
+    RowTransform,
+    Scratch,
+    SIMDIndex,
+    TensorSpec,
+    Threadgroup,
+    ThreadPosition,
+)
+from ..core.plan import Source
+from ..core.primitive import Primitive
+
+RMS = Source("reductions/rms.metal")
 
 
+@dataclass(frozen=True)
+class RMSNorm(Primitive):
+    eps: float
+
+    def infer(self, inputs):
+        x, weight = inputs
+        if weight.shape != (x.shape[-1],) or x.dtype != weight.dtype:
+            raise ValueError("RMS requires native weights matching the feature width")
+        return (x,)
+
+    def bindings(self, values):
+        x, weight = values
+        if x.tensor.shape[-1] % 128:
+            return ()
+        width = x.tensor.shape[-1]
+        threads = min(width // 4, 1024)
+        return (
+            Binding(
+                RMS,
+                "magnitude_rms",
+                RowTransform(
+                    x.tensor,
+                    x,
+                    Threadgroup(threads),
+                    arguments=dict(
+                        weight=ReadOnly(TensorSpec(weight)[:]),
+                        eps=Float(self.eps),
+                        row=GroupPosition("y"),
+                        tid=ThreadPosition(),
+                        lane=Lane(),
+                        group=SIMDIndex(),
+                        partial=Scratch(mx.float32, 32),
+                    ),
+                    template=(
+                        x.tensor.dtype,
+                        width,
+                        threads,
+                        (width + threads * 4 - 1) // (threads * 4),
+                    ),
+                ),
+            ),
+        )
+
+    def lower(self, inputs):
+        from ..core.graph import Graph, Node, signature
+        from ..core.hooks import row_transform
+
+        values = signature(("x", "weight"), inputs)
+        output = signature(("out",), self.infer(inputs))
+        node = Node(self, values, output)
+        bindings = self.bindings(values)
+        if not bindings:
+            return mx.compile(lambda x, weight: (mx.fast.rms_norm(x, weight, self.eps),))
+        return row_transform(Graph(values, output, (), (node,)), node, bindings[0])
+
+
+@computation
 def residual_norm(x, update, weight, eps):
-    width = x.shape[-1]
-    threads = min(width // 4, 1024)
-    result = KernelPlan(
-        program=RESIDUAL_NORM,
-        inputs=(Input("x", x), Input("a", update), Input("w1", weight)),
-        outputs=(Output("xnew", x.shape, x.dtype), Output("normalized", x.shape, x.dtype)),
-        launch=Launch((threads, x.size // width, 1), (threads, 1, 1)),
-        template=(
-            ("T", x.dtype),
-            ("D", width),
-            ("THREADS", threads),
-            ("NCHUNK", (width + threads * 4 - 1) // (threads * 4)),
-        ),
-        constants=(Scalar("EPS", eps),),
-    ).run()
-    return (result[0], result[1])
+    residual = (x + update).astype(x.dtype)
+    return residual, RMSNorm(eps)(residual, weight)[0]
 
 
+@computation
 def gated_norm(hidden, gate, weight, eps):
-    width = hidden.shape[-1]
-    return KernelPlan(
-        program=GATED_NORM,
-        inputs=(Input("x", hidden), Input("gate", gate), Input("w", weight)),
-        outputs=(Output("out", hidden.shape, hidden.dtype),),
-        launch=Launch((width // 4, hidden.size // width, 1), (width // 4, 1, 1)),
-        template=(("T", hidden.dtype), ("D", width)),
-        constants=(Scalar("EPS", eps),),
-    ).run()[0]
+    normalized = RMSNorm(eps)(hidden, weight)[0]
+    z = gate.astype(mx.float32)
+    return ((z * mx.sigmoid(z)) * normalized.astype(mx.float32)).astype(hidden.dtype)

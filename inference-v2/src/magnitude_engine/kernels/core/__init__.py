@@ -1,5 +1,19 @@
-"""Typed kernel plans, source assembly and MLX execution."""
+"""Typed Metal composition and MLX execution."""
 
-from .plan import Input, KernelPlan, Launch, Output, Program, Scalar, Source
+from .computation import Computation, Executable, computation
+from .kernel import Kernel
+from .operation import operation
+from .plan import Launch, Scalar, Source
+from .scheduling import MLX
 
-__all__ = ["Input", "KernelPlan", "Launch", "Output", "Program", "Scalar", "Source"]
+__all__ = [
+    "Computation",
+    "Executable",
+    "computation",
+    "operation",
+    "Kernel",
+    "Launch",
+    "Scalar",
+    "Source",
+    "MLX",
+]

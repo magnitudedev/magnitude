@@ -1,31 +1,14 @@
-"""Selected-expert execution with reusable affine inputs and fused epilogues.
-
-Gate/up writes native activations; down consumes them directly. Each projection
-keeps affine input preparation local while preserving MLX's BF16 boundaries.
-"""
+"""Expert computation: selected dots, scalar activation and ordered route sum."""
 
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
 
-from magnitude_engine.kernels.core import Input, KernelPlan, Launch, Output, Program, Source
-
-from .tiles import TILE, row_tile
+from ..core.computation import computation
+from .selection import RouteSum, SelectedAffine
 
 if TYPE_CHECKING:
     from .weights import ExpertWeights
-
-
-GATE_UP = Program(
-    "magnitude_expert_gate_up",
-    Source("contractions/gate_up.metal", (TILE,)),
-)
-
-
-DOWN = Program(
-    "magnitude_expert_down_sum",
-    Source("contractions/down.metal", (TILE,)),
-)
 
 
 def supported(weights: "ExpertWeights", hidden: mx.array, assignments: mx.array) -> bool:
@@ -80,16 +63,12 @@ def shared_supported(
     )
 
 
-SELECTED = Program("magnitude_selected_down", Source("contractions/selected.metal", (TILE,)))
-COMBINE = Program("magnitude_expert_combine", Source("contractions/combine.metal"))
-
-
 def _assignments(
     weights: "ExpertWeights",
     assignments: mx.array,
     rows: int,
     shared: bool,
-) -> tuple[mx.array, mx.array, int]:
+) -> tuple[mx.array, mx.array]:
     ids = assignments.reshape(rows, -1)
     if shared:
         ids = mx.concatenate(
@@ -101,137 +80,93 @@ def _assignments(
     # use direct tiles; dense assignments can amortize those costs through reuse.
     reuse = rows > 1 and ids.size >= 2 * experts
     order = mx.argsort(ids) if reuse and experts > 1 else mx.arange(ids.size, dtype=mx.uint32)
-    # Paired gate/up carries twice the live accumulators of a linear projection.
-    return ids, order, row_tile(ids.size, maximum=4) if reuse else 1
+    return ids, order
 
 
-def _activate(
-    weights: "ExpertWeights",
-    hidden: mx.array,
-    assignments: mx.array,
-    shared: "ExpertWeights | None",
-    ids: mx.array,
-    order: mx.array,
-    tile: int,
-) -> mx.array:
-    gate, up = weights.gate, weights.up
-    rows, width = hidden.size // hidden.shape[-1], hidden.shape[-1]
-    top_k, intermediate = assignments.shape[-1], gate.weight.shape[1]
-    slots = top_k + (shared is not None)
-    sg, su = (shared.gate, shared.up) if shared is not None else (gate, up)
-    return KernelPlan(
-        program=GATE_UP,
-        inputs=(
-            Input("x", hidden),
-            Input("ids", ids),
-            Input("order", order),
-            Input("wg", gate.weight),
-            Input("sg_", gate.scales),
-            Input("bg_", gate.biases),
-            Input("wu", up.weight),
-            Input("su_", up.scales),
-            Input("bu_", up.biases),
-            Input("wsg", sg.weight),
-            Input("ssg", sg.scales),
-            Input("bsg", sg.biases),
-            Input("wsu", su.weight),
-            Input("ssu", su.scales),
-            Input("bsu", su.biases),
-        ),
-        outputs=(Output("out", (rows, slots, intermediate), hidden.dtype),),
-        launch=Launch((64, intermediate // 8, (ids.size + tile - 1) // tile), (64, 1, 1)),
-        template=(
-            ("T", hidden.dtype),
-            ("K", width),
-            ("N", intermediate),
-            ("TOPK", top_k),
-            ("SHARED", shared is not None),
-            ("E", gate.weight.shape[0]),
-            ("M", ids.size),
-            ("R", tile),
-            ("BITS", gate.encoding.bits),
-            ("GROUP", gate.encoding.group_size),
-            ("PACK", 64 // gate.encoding.bits),
-        ),
-    ).run()[0]
+@computation
+def _gate_up(hidden, gate, up, shared_gate, shared_up, ids, order, *, slots, shared):
+    dot = SelectedAffine(gate.encoding.bits, gate.encoding.group_size, slots, shared)
+    g = dot(
+        hidden,
+        ids,
+        order,
+        gate.weight,
+        gate.scales,
+        gate.biases,
+        shared_gate.weight,
+        shared_gate.scales,
+        shared_gate.biases,
+    )[0]
+    u = dot(
+        hidden,
+        ids,
+        order,
+        up.weight,
+        up.scales,
+        up.biases,
+        shared_up.weight,
+        shared_up.scales,
+        shared_up.biases,
+    )[0]
+    return (g * mx.sigmoid(g)).astype(hidden.dtype) * u
 
 
-def activate(
-    weights: "ExpertWeights",
-    hidden: mx.array,
-    assignments: mx.array,
-    shared: "ExpertWeights | None" = None,
-) -> mx.array:
+@computation
+def _down(activation, down, shared_down, ids, order, scores, shared_score, *, slots, shared):
+    dot = SelectedAffine(down.encoding.bits, down.encoding.group_size, slots, shared, per_slot=True)
+    projected = dot(
+        activation,
+        ids,
+        order,
+        down.weight,
+        down.scales,
+        down.biases,
+        shared_down.weight,
+        shared_down.scales,
+        shared_down.biases,
+    )[0]
+    return RouteSum(shared)(projected, scores, shared_score)[0]
+
+
+def _activate(weights, hidden, assignments, shared, ids, order):
+    gate = _gate_up
+    shared_gate, shared_up = (
+        (shared.gate, shared.up) if shared is not None else (weights.gate, weights.up)
+    )
+    return gate(
+        hidden,
+        weights.gate,
+        weights.up,
+        shared_gate,
+        shared_up,
+        ids,
+        order,
+        slots=assignments.shape[-1] + (shared is not None),
+        shared=shared is not None,
+    )
+
+
+def activate(weights, hidden, assignments, shared=None):
     rows = hidden.size // hidden.shape[-1]
-    ids, order, tile = _assignments(weights, assignments, rows, shared is not None)
-    return _activate(weights, hidden, assignments, shared, ids, order, tile)
+    ids, order = _assignments(weights, assignments, rows, shared is not None)
+    return _activate(weights, hidden, assignments, shared, ids, order)
 
 
-def apply(
-    weights: "ExpertWeights",
-    hidden: mx.array,
-    assignments: mx.array,
-    scores: mx.array,
-    *,
-    shared: "ExpertWeights | None" = None,
-    shared_score: mx.array | None = None,
-) -> mx.array:
-    down = weights.down
-    rows, width = hidden.size // hidden.shape[-1], hidden.shape[-1]
-    top_k, intermediate = assignments.shape[-1], weights.gate.weight.shape[1]
+def apply(weights, hidden, assignments, scores, *, shared=None, shared_score=None):
+    rows = hidden.size // hidden.shape[-1]
     if shared is not None and shared_score is None:
         raise ValueError("shared expert requires its coefficient")
-    ids, order, tile = _assignments(weights, assignments, rows, shared is not None)
-    activation = _activate(weights, hidden, assignments, shared, ids, order, tile)
-    sd = shared.down if shared is not None else down
-    operands = (
-        Input("x", activation),
-        Input("w", down.weight),
-        Input("scales", down.scales),
-        Input("biases", down.biases),
-        Input("wsh", sd.weight),
-        Input("ssh", sd.scales),
-        Input("bsh", sd.biases),
-    )
-    coefficients = (
-        Input("scores", scores.reshape(rows, top_k)),
-        Input("shared_score", shared_score if shared_score is not None else scores),
-    )
-    template = (
-        ("T", hidden.dtype),
-        ("K", intermediate),
-        ("N", width),
-        ("SHARED", shared is not None),
-        ("BITS", down.encoding.bits),
-        ("GROUP", down.encoding.group_size),
-        ("PACK", 64 // down.encoding.bits),
-    )
-    if tile == 1:
-        # Direct tiles keep projection and ordered combination in one launch.
-        return KernelPlan(
-            program=DOWN,
-            inputs=operands + (Input("inds", assignments.reshape(rows, top_k)),) + coefficients,
-            outputs=(Output("out", hidden.shape, hidden.dtype),),
-            launch=Launch((64, width // 8, rows), (64, 1, 1)),
-            template=template + (("TOPK", top_k),),
-        ).run()[0]
-    projected = KernelPlan(
-        program=SELECTED,
-        inputs=operands + (Input("ids", ids), Input("order", order)),
-        outputs=(Output("out", (rows, ids.size // rows, width), hidden.dtype),),
-        launch=Launch((64, width // 8, (ids.size + tile - 1) // tile), (64, 1, 1)),
-        template=template + (("E", down.weight.shape[0]), ("M", ids.size), ("R", tile)),
-    ).run()[0]
-    return KernelPlan(
-        program=COMBINE,
-        inputs=(Input("x", projected),) + coefficients,
-        outputs=(Output("out", hidden.shape, hidden.dtype),),
-        launch=Launch((rows * width, 1, 1), (256, 1, 1)),
-        template=(
-            ("T", hidden.dtype),
-            ("M", rows),
-            ("N", width),
-            ("TOPK", top_k),
-            ("SHARED", shared is not None),
-        ),
-    ).run()[0]
+    ids, order = _assignments(weights, assignments, rows, shared is not None)
+    activation = _activate(weights, hidden, assignments, shared, ids, order)
+    down = _down
+    return down(
+        activation,
+        weights.down,
+        shared.down if shared is not None else weights.down,
+        ids,
+        order,
+        scores.reshape(rows, -1),
+        shared_score if shared_score is not None else scores,
+        slots=assignments.shape[-1] + (shared is not None),
+        shared=shared is not None,
+    ).reshape(hidden.shape)

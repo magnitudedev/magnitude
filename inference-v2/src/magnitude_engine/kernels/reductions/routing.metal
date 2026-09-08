@@ -71,7 +71,6 @@ for (uint rank = 0; rank < TOPK; ++rank) {
 if (tid == 0) {
     float norm = 0.0f;
     for (uint rank = 0; rank < TOPK; ++rank) norm = float(T(norm + selected[rank]));
-    norm = float(T(norm));
     for (uint rank = 0; rank < TOPK; ++rank)
         scores[row * TOPK + rank] = T(NORMALIZE ? selected[rank] / norm : selected[rank]);
     T gate = logits[row * (EXPERTS + 1) + EXPERTS];
