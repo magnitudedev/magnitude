@@ -133,7 +133,7 @@ export const readSetupModel = Effect.gen(function* () {
 
 type PiSetupResult = { readonly _tag: "Completed"; readonly modelId: ProviderModelId } | { readonly _tag: "Cancelled" }
 export interface PiSetup {
-  readonly run: (ctx: ExtensionContext) => Effect.Effect<PiSetupResult, PiSetupFailed>
+  readonly run: (ctx: ExtensionContext, activateModel: (modelId: ProviderModelId) => Effect.Effect<void, PiSetupFailed>) => Effect.Effect<PiSetupResult, PiSetupFailed>
 }
 export const PiSetup = Context.GenericTag<PiSetup>("pi/PiSetup")
 
@@ -141,21 +141,25 @@ export const PiSetupLive = Layer.effect(PiSetup, Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const executor = yield* CommandExecutor.CommandExecutor
   return {
-    run: (ctx) => Effect.scoped(Effect.gen(function* () {
+    run: (ctx, activateModel) => Effect.scoped(Effect.gen(function* () {
       const executable = yield* withPiPreparation(ctx, setMessage => prepareMagnitudeCli(ctx.cwd, setMessage))
-      const termination = yield* withPiTerminal(ctx, runInteractiveProcess({
+      return yield* withPiTerminal(ctx, Effect.gen(function* () {
+        const termination = yield* runInteractiveProcess({
           executable,
           args: ["setup", "--host", "pi"],
           environment: process.env,
           workingDirectory: ctx.cwd,
+        })
+        if (!(yield* validateSetupTermination(termination))) return { _tag: "Cancelled" } as const
+        // Only a successful setup needs SDK access. No service startup or polling on
+        // extension load, a declined offer, or a cancelled/failed child.
+        const modelId = yield* readSetupModel.pipe(Effect.provide(
+          MagnitudeClient.layer({ autoStart: false }).pipe(Layer.provide(FetchHttpClient.layer)),
+        ))
+        // Restore and redraw Pi only after its session holds the selected model.
+        yield* activateModel(modelId)
+        return { _tag: "Completed", modelId } as const
       }))
-      if (!(yield* validateSetupTermination(termination))) return { _tag: "Cancelled" } as const
-      // Only a successful setup needs SDK access. No service startup or polling on
-      // extension load, a declined offer, or a cancelled/failed child.
-      const modelId = yield* readSetupModel.pipe(Effect.provide(
-        MagnitudeClient.layer({ autoStart: false }).pipe(Layer.provide(FetchHttpClient.layer)),
-      ))
-      return { _tag: "Completed", modelId } as const
     })).pipe(
       Effect.provideService(CommandExecutor.CommandExecutor, executor),
       Effect.provideService(FileSystem.FileSystem, fs),
@@ -175,17 +179,15 @@ export const registerMagnitudeSetup = (
     if (ctx.mode !== "tui") return yield* failure("Run /magnitude-setup in Pi's interactive terminal.")
     if (!ctx.isIdle() || ctx.hasPendingMessages()) return yield* failure("Wait for the current task to finish, then run /magnitude-setup.")
     const setup = yield* PiSetup
-    const result = yield* setup.run(ctx)
-    if (result._tag !== "Completed") return false
-    yield* Effect.tryPromise({
+    const result = yield* setup.run(ctx, modelId => Effect.tryPromise({
       try: async () => {
         await ctx.modelRegistry.refresh()
-        const model = ctx.modelRegistry.find("magnitude", result.modelId)
+        const model = ctx.modelRegistry.find("magnitude", modelId)
         if (!model || !(await pi.setModel(model))) throw new Error("The selected model is not available in Pi")
       },
       catch: error => failure(`Magnitude setup completed, but Pi could not activate the model: ${String(error)}. Run /reload and select it with /model.`),
-    })
-    return true
+    }))
+    return result._tag === "Completed"
   })
   const run = (ctx: ExtensionContext) => runtime.runPromise(Effect.forkIn(
     gate.withPermitsIfAvailable(1)(action(ctx)).pipe(

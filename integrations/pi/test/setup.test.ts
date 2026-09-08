@@ -36,7 +36,9 @@ process.exit(${scenario === "cancelled" ? 130 : 1})
       const ctx = { cwd: directory, ui: { custom: (factory: Function) => new Promise<void>(resolve => {
         factory({ terminal: { write: () => calls.push("reset") }, stop: () => calls.push("stop"), start: () => calls.push("start"), requestRender: () => {} }, { fg: (_: string, text: string) => text }, {}, resolve)
       }) } } as unknown as ExtensionContext
-      const result = yield* Effect.flatMap(PiSetup, setup => setup.run(ctx)).pipe(Effect.provide(PiSetupLive), Effect.either)
+      const activate = vi.fn(() => Effect.void)
+      const result = yield* Effect.flatMap(PiSetup, setup => setup.run(ctx, activate)).pipe(Effect.provide(PiSetupLive), Effect.either)
+      expect(activate).not.toHaveBeenCalled()
       if (scenario === "cancelled") expect(result).toMatchObject({ _tag: "Right", right: cancelled })
       else expect(result._tag).toBe("Left")
       expect(calls).toEqual(["stop", "reset", "start"])
@@ -228,7 +230,7 @@ describe("Pi terminal ownership", () => {
 })
 
 describe("setup command", () => {
-  const harness = (run = vi.fn<PiSetup["run"]>(() => Effect.succeed(completed))) => {
+  const harness = (run = vi.fn<PiSetup["run"]>((_ctx, activate) => activate(modelId).pipe(Effect.as(completed)))) => {
     const registerCommand = vi.fn()
     const setModel = vi.fn(async () => true)
     const model = { id: modelId, provider: "magnitude" }
@@ -258,6 +260,25 @@ describe("setup command", () => {
       expect(await h.start()).toBe(true)
       expect(h.run).toHaveBeenCalledOnce()
       expect(h.setModel).toHaveBeenCalledOnce()
+      expect(h.ctx.reload).not.toHaveBeenCalled()
+    } finally { await h.dispose() }
+  })
+  it.each([true, false])("restores the startup footer after model activation settles (success=%s)", async successful => {
+    const order: string[] = []
+    const h = harness(vi.fn((ctx, activate) => withPiTerminal(ctx, activate(modelId).pipe(Effect.as(completed)))))
+    Object.assign(h.ctx.ui, { custom: (factory: Function) => new Promise<void>(resolve => {
+      factory({ terminal: { write: () => {} }, stop: () => order.push("stop"),
+        start: () => order.push("start"), requestRender: () => order.push("render"),
+      }, {}, {}, resolve)
+    }) })
+    h.setModel.mockImplementation(async () => {
+      await Promise.resolve()
+      order.push("activate")
+      return successful
+    })
+    try {
+      expect(await h.start()).toBe(successful)
+      expect(order).toEqual(["stop", "activate", "start", "render"])
       expect(h.ctx.reload).not.toHaveBeenCalled()
     } finally { await h.dispose() }
   })
