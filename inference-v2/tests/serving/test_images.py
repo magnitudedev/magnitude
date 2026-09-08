@@ -4,7 +4,7 @@ import io
 import pytest
 from PIL import Image
 
-from magnitude_engine.serving.images import extract_images
+from magnitude_engine.serving.images import replace_image_parts
 from magnitude_engine.serving.template import normalize_messages
 
 
@@ -29,7 +29,7 @@ def test_image_parts_preserve_order_and_historical_message_association():
         {"role": "user", "content": "Compare them."},
     ]
     prepared = normalize_messages(messages, allow_images=True)
-    images = extract_images(prepared)
+    images = replace_image_parts(prepared)
     assert [image.getpixel((0, 0)) for image in images] == [(255, 0, 0), (0, 0, 255)]
     assert prepared[0]["content"] == [
         {"type": "text", "text": "First"},
@@ -53,7 +53,7 @@ def test_image_parts_preserve_order_and_historical_message_association():
 )
 def test_invalid_or_disallowed_sources_fail_before_model_preparation(url):
     with pytest.raises(ValueError):
-        extract_images(
+        replace_image_parts(
             [
                 {
                     "role": "user",
@@ -100,4 +100,4 @@ def test_required_tool_instruction_preserves_ordered_system_content_and_sources(
         "text": "Call the supplied tool 'describe' to answer this request.",
     }
     assert len(messages[0]["content"]) == 2
-    assert extract_images(instructed)[0].getpixel((0, 0)) == (255, 0, 0)
+    assert replace_image_parts(instructed)[0].getpixel((0, 0)) == (255, 0, 0)

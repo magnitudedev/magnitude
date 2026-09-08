@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-from contextlib import ExitStack
 from dataclasses import dataclass
+from functools import partial
 
 import mlx.core as mx
 import numpy as np
@@ -15,7 +15,7 @@ from magnitude_engine.artifacts.identity import processor_identity
 from magnitude_engine.artifacts.source import LocalArtifact
 from magnitude_engine.components import component, component_id
 from magnitude_engine.models.computation import Computation
-from magnitude_engine.models.context import InputCheckpoint
+from magnitude_engine.models.context import InputCheckpoint, InputContinuation, SpanContext
 from magnitude_engine.models.embeddings.replacement import EmbeddingReplacement
 from magnitude_engine.models.features import FeatureLease, FeatureSet
 from magnitude_engine.models.inputs import ModelInputs
@@ -67,7 +67,7 @@ class QwenVision:
             self.model = None
             self.parameters.close()
 
-    def prepare(self, tokens: tuple[int, ...], media: PreparedMedia):
+    def prepare(self, tokens: tuple[int, ...], media: PreparedMedia) -> tuple[Prompt, QwenSource]:
         if self.closed or media.processor != self.identity:
             raise ValueError("Qwen media processor differs from the bound artifact")
         tensors = {t.name: t for t in media.tensors}
@@ -209,7 +209,7 @@ class QwenSource:
         count = min(position, len(self.prompt.tokens))
         return 0 if count == 0 else int(self.coordinates[:, :count].max()) + 1 - count
 
-    def bind(self, checkpoint: InputCheckpoint | None):
+    def bind(self, checkpoint: InputCheckpoint | None) -> QwenContext:
         if checkpoint is not None and (
             not isinstance(checkpoint, QwenCheckpoint)
             or checkpoint.closed
@@ -224,79 +224,40 @@ class QwenSource:
         return tuple(image.span.identity for image in self.images if image.span.start < position)
 
 
-class QwenContinuation:
-    cache_hits = 0
-
+class QwenContinuation(InputContinuation):
     def __init__(self, delta: int, identities: tuple[bytes, ...] = ()):
         self.delta = delta
         self.identities = identities
 
-    def boundary(self, position):
-        return type(position) is int and position >= 0
-
-    def acquire(self, position, count):
-        return ExitStack()
-
-    def prepare(self, position, count):
-        yield from ()
-
-    def assemble(self, inputs, position):
+    def assemble(self, inputs: ModelInputs, position: int) -> ModelInputs:
         return ModelInputs(
             inputs.tokens,
             inputs.conditioning,
             QwenInputs(mx.array([position + self.delta], mx.int32)),
         )
 
-    def batch_key(self, position, count):
-        return None
-
-    def checkpoint(self, position):
+    def checkpoint(self, position: int) -> QwenCheckpoint:
         return QwenCheckpoint(position, self.delta, {}, self.identities)
 
-    def close(self):
-        pass
 
-
-class QwenContext(QwenContinuation):
+class QwenContext(SpanContext[ImageInput], QwenContinuation):
     def __init__(self, source: QwenSource, features: dict[bytes, FeatureLease]):
-        super().__init__(
-            source.delta(len(source.prompt.tokens)), source.identities(len(source.prompt.tokens))
+        QwenContinuation.__init__(
+            self,
+            source.delta(len(source.prompt.tokens)),
+            source.identities(len(source.prompt.tokens)),
         )
         self.source = source
-        self.features = FeatureSet(
-            source.encoder, source.encoder.budget, source.encoder.cache, features
+        SpanContext.__init__(
+            self,
+            source.prompt,
+            source.images,
+            FeatureSet(source.encoder, source.encoder.budget, source.encoder.cache, features),
+            source.encoder.config.vision_config.out_hidden_size * 4,
+            partial(EncodeImage, source.encoder),
         )
 
-    @property
-    def cache_hits(self):
-        return self.features.cache_hits
-
-    def prepare(self, position, count):
-        self.features.keep(
-            {image.span.identity for image in self.source.images if image.span.end > position}
-        )
-        for image in self.source.images:
-            if image.span.start >= position + count or image.span.end <= position:
-                continue
-            size = (
-                (image.span.end - image.span.start)
-                * self.source.encoder.config.vision_config.out_hidden_size
-                * 4
-            )
-            yield from self.features.prepare(
-                image.span.identity,
-                size,
-                lambda lease, image=image: EncodeImage(self.source.encoder, image, lease),
-            )
-
-    def acquire(self, position, count):
-        return self.features.pin(
-            image.span.identity
-            for image in self.source.images
-            if image.span.start < position + count and image.span.end > position
-        )
-
-    def assemble(self, inputs, position):
+    def assemble(self, inputs: ModelInputs, position: int) -> ModelInputs:
         length = len(self.source.prompt.tokens)
         if position >= length:
             return super().assemble(inputs, position)
@@ -322,7 +283,7 @@ class QwenContext(QwenContinuation):
             QwenInputs(mx.array(coordinates[:, None], mx.int32), tuple(embeddings)),
         )
 
-    def checkpoint(self, position):
+    def checkpoint(self, position: int) -> QwenCheckpoint:
         partial = {
             image.span.identity
             for image in self.source.images
@@ -334,9 +295,6 @@ class QwenContext(QwenContinuation):
             self.features.checkpoint(partial),
             self.source.identities(position),
         )
-
-    def close(self):
-        self.features.close()
 
 
 class QwenCheckpoint:

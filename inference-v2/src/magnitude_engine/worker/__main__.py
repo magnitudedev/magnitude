@@ -12,6 +12,7 @@ from threading import Event, Thread
 from magnitude_engine.composition import build, digest, dumps, loads
 from magnitude_engine.engine.blueprint import Engine as EngineBlueprint
 
+from .admission import AdmittedFrame, read_admitted_frame
 from .framing import Frame, read_frame, write_frame
 
 
@@ -82,7 +83,7 @@ def run(parent: int) -> int:
     blueprint = loads(first.message["blueprint"])
     if not isinstance(blueprint, EngineBlueprint) or digest(blueprint) != first.message["digest"]:
         raise ValueError("worker load requires a verified engine blueprint")
-    incoming: queue.Queue[Frame] = queue.Queue(64)
+    incoming: queue.Queue[AdmittedFrame] = queue.Queue(64)
     outgoing: queue.Queue[Frame | None] = queue.Queue(64)
     failures = []
 
@@ -96,19 +97,22 @@ def run(parent: int) -> int:
     def receive() -> None:
         try:
             while not stop.is_set():
-                frame = read_frame(sys.stdin.buffer, first.generation, reserve=reserve_input)
-                if frame.message == {"type": "shutdown"}:
+                admitted = read_admitted_frame(
+                    sys.stdin.buffer, first.generation, reserve=reserve_input
+                )
+                if admitted.frame.message == {"type": "shutdown"}:
+                    admitted.close()
                     stop.set()
                     break
                 while not stop.is_set():
                     try:
-                        incoming.put(frame, timeout=0.1)
+                        incoming.put(admitted, timeout=0.1)
                         wake.set()
                         break
                     except queue.Full:
                         continue
                 else:
-                    frame.close()
+                    admitted.close()
         except EOFError:
             stop.set()
         except BaseException as error:
@@ -165,7 +169,8 @@ def run(parent: int) -> int:
                 if outgoing.full():
                     break
                 try:
-                    frame = incoming.get_nowait()
+                    admitted = incoming.get_nowait()
+                    frame = admitted.frame
                     message = frame.message
                 except queue.Empty:
                     break
@@ -177,8 +182,8 @@ def run(parent: int) -> int:
                         if identity in handles:
                             raise ValueError("duplicate live worker request")
                         try:
-                            if frame.error is not None:
-                                raise frame.error
+                            if admitted.error is not None:
+                                raise admitted.error
                             if len(handles) >= 1024:
                                 raise OverflowError("worker request delivery capacity is full")
                             handles[identity] = runtime.engine.submit(
@@ -187,8 +192,8 @@ def run(parent: int) -> int:
                                 output_capacity=runtime.output_capacity,
                                 progress=message["progress"],
                             )
-                            if frame.lease is not None:
-                                input_charges[identity], frame.lease = frame.lease, None
+                            if admitted.lease is not None:
+                                input_charges[identity], admitted.lease = admitted.lease, None
                             send({"type": "accepted", "request_id": identity})
                         except (ValueError, TypeError, OverflowError, MemoryError) as error:
                             send({"type": "error", "request_id": identity, "message": str(error)})
@@ -215,7 +220,7 @@ def run(parent: int) -> int:
                     else:
                         raise ValueError("unknown worker command or fields")
                 finally:
-                    frame.close()
+                    admitted.close()
             runtime.engine.tick()
             for identity, handle in tuple(handles.items()):
                 if outgoing.full():
