@@ -2,11 +2,8 @@
 
 import json
 import struct
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import BinaryIO
-
-from magnitude_engine.resources.budget import Reservation
 
 VERSION = 3
 MAX_FRAME_BYTES = 48 << 20
@@ -19,14 +16,9 @@ class Frame:
     generation: str
     message: dict
     buffers: tuple[bytes, ...] = ()
-    lease: Reservation | None = field(default=None, compare=False, repr=False)
-    error: MemoryError | None = field(default=None, compare=False, repr=False)
 
     def close(self) -> None:
         self.buffers = ()
-        if self.lease is not None:
-            self.lease.close()
-            self.lease = None
 
 
 def _object(pairs: list[tuple[str, object]]) -> dict:
@@ -63,12 +55,25 @@ def _lengths(value: object) -> tuple[int, ...]:
     return tuple(value)
 
 
-def read_frame(
-    stream: BinaryIO,
-    generation: str | None = None,
-    *,
-    reserve: Callable[[dict, int], Reservation] | None = None,
-) -> Frame:
+@dataclass(frozen=True)
+class Header:
+    generation: str
+    message: dict
+    lengths: tuple[int, ...]
+
+    def read(self, stream: BinaryIO) -> Frame:
+        return Frame(self.generation, self.message, tuple(_read(stream, n) for n in self.lengths))
+
+    def discard(self, stream: BinaryIO) -> None:
+        """Consume the payload in bounded scratch space, preserving the next frame."""
+        remaining = sum(self.lengths)
+        while remaining:
+            count = min(remaining, 65536)
+            _read(stream, count)
+            remaining -= count
+
+
+def read_header(stream: BinaryIO, generation: str | None = None) -> Header:
     length = struct.unpack(">I", _read(stream, 4))[0]
     if not 0 < length <= MAX_FRAME_BYTES:
         raise ValueError("worker frame exceeds protocol size bound")
@@ -84,27 +89,11 @@ def read_frame(
         or (generation is not None and value["generation"] != generation)
     ):
         raise ValueError("worker frame has an incompatible version, generation or envelope")
-    lengths = _lengths(value["buffers"])
-    frame = Frame(value["generation"], value["message"])
-    try:
-        if lengths and reserve is not None:
-            try:
-                frame.lease = reserve(frame.message, sum(lengths))
-            except MemoryError as error:
-                # Rejection consumes bounded scratch, preserving framing for control
-                # and later requests without materializing an unadmitted payload.
-                frame.error = error
-                remaining = sum(lengths)
-                while remaining:
-                    count = min(remaining, 65536)
-                    _read(stream, count)
-                    remaining -= count
-                return frame
-        frame.buffers = tuple(_read(stream, count) for count in lengths)
-        return frame
-    except BaseException:
-        frame.close()
-        raise
+    return Header(value["generation"], value["message"], _lengths(value["buffers"]))
+
+
+def read_frame(stream: BinaryIO, generation: str | None = None) -> Frame:
+    return read_header(stream, generation).read(stream)
 
 
 def _write(stream: BinaryIO, data: bytes) -> None:

@@ -7,6 +7,10 @@ boundary; neither generation nor the allocator interprets the input state.
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+from collections.abc import Callable
+from contextlib import ExitStack
+from functools import partial
 from typing import TYPE_CHECKING, Protocol
 
 from magnitude_engine.resources.retention import RetainedStorage
@@ -14,11 +18,13 @@ from magnitude_engine.resources.retention import RetainedStorage
 if TYPE_CHECKING:
     from magnitude_engine.composition import Blueprint
 
+    from .computation import Computation
     from .execution import ResourceLease
+    from .features import FeatureLease, FeatureSet
     from .inputs import ModelInputs
     from .operations import Task
     from .preparation import ImagePreparation, PreparedMedia
-    from .prompt import Prompt
+    from .prompt import InputSpan, Prompt
 
 
 class StateCheckpoint(Protocol):
@@ -64,6 +70,88 @@ class InputState(Protocol):
 
     def checkpoint(self, position: int) -> InputCheckpoint: ...
     def close(self) -> None: ...
+
+
+class InputContinuation(ABC):
+    """Input semantics after preparation resources have been released."""
+
+    @property
+    def cache_hits(self) -> int:
+        return 0
+
+    def boundary(self, position: int) -> bool:
+        return type(position) is int and position >= 0
+
+    def acquire(self, position: int, count: int) -> ResourceLease:
+        return ExitStack()
+
+    def prepare(self, position: int, count: int) -> Task[None]:
+        yield from ()
+
+    @abstractmethod
+    def assemble(self, inputs: ModelInputs, position: int) -> ModelInputs: ...
+
+    def batch_key(self, position: int, count: int) -> object:
+        return None
+
+    @abstractmethod
+    def checkpoint(self, position: int) -> InputCheckpoint: ...
+
+    def close(self) -> None:
+        return None
+
+
+class SpannedInput(Protocol):
+    @property
+    def span(self) -> InputSpan: ...
+
+
+class SpanContext[I: SpannedInput](InputContinuation):
+    """Prepare and pin only the features intersecting a decoder span.
+
+    Families supply the computation and numerical assembly. Span legality and
+    feature lifetime are shared regardless of the input's architecture.
+    """
+
+    def __init__(
+        self,
+        prompt: Prompt,
+        items: tuple[I, ...],
+        features: FeatureSet,
+        bytes_per_token: int,
+        encode: Callable[[I, FeatureLease], Computation],
+    ):
+        self.prompt, self.items, self.features = prompt, items, features
+        self.bytes_per_token, self.encode = bytes_per_token, encode
+
+    def boundary(self, position: int) -> bool:
+        return (
+            type(position) is int and position >= len(self.prompt.tokens)
+        ) or self.prompt.boundary(position)
+
+    @property
+    def cache_hits(self) -> int:
+        return self.features.cache_hits
+
+    def prepare(self, position: int, count: int) -> Task[None]:
+        self.features.keep({item.span.identity for item in self.items if item.span.end > position})
+        for item in self.items:
+            if item.span.start < position + count and item.span.end > position:
+                yield from self.features.prepare(
+                    item.span.identity,
+                    (item.span.end - item.span.start) * self.bytes_per_token,
+                    partial(self.encode, item),
+                )
+
+    def acquire(self, position: int, count: int) -> ResourceLease:
+        return self.features.pin(
+            item.span.identity
+            for item in self.items
+            if item.span.start < position + count and item.span.end > position
+        )
+
+    def close(self) -> None:
+        self.features.close()
 
 
 class InputSource(Protocol):

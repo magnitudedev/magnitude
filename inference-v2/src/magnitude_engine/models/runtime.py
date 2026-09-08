@@ -346,11 +346,7 @@ class ModelRuntime[S, C: StateCheckpoint]:
         try:
             with self.owner.scope() as scope:
                 for advance, row in zip(advances, inputs, strict=True):
-                    sequence = advance.sequence
-                    if sequence.inputs is not None:
-                        scope.acquire(
-                            partial(sequence.inputs.acquire, sequence.position, row.count)
-                        )
+                    self._pin_inputs(scope, advance.sequence, row.count)
                 if len(advances) == 1:
                     self.program.forward(inputs[0], states[0], ForwardRequest(False), scope)
                 else:
@@ -429,6 +425,10 @@ class ModelRuntime[S, C: StateCheckpoint]:
             None if sequence.inputs is None else sequence.inputs.batch_key(sequence.position, count)
         )
 
+    def _pin_inputs(self, scope: ExecutionScope, sequence: ModelSequence[S, C], count: int) -> None:
+        if sequence.inputs is not None:
+            scope.acquire(partial(sequence.inputs.acquire, sequence.position, count))
+
     def _validate_boundaries(
         self, sequence: ModelSequence[S, C], count: int, committed: int
     ) -> None:
@@ -480,8 +480,7 @@ class ModelRuntime[S, C: StateCheckpoint]:
         )
         try:
             with self.owner.scope() as scope:
-                if sequence.inputs is not None:
-                    scope.acquire(partial(sequence.inputs.acquire, sequence.position, inputs.count))
+                self._pin_inputs(scope, sequence, inputs.count)
                 output = self.program.forward(inputs, sequence.state, request, scope)
                 if request.logits and output.logits is None:
                     raise RuntimeError("model program omitted requested logits")
@@ -563,10 +562,7 @@ class ModelRuntime[S, C: StateCheckpoint]:
         try:
             with self.owner.scope() as scope:
                 for sequence, row in zip(sequences, inputs, strict=True):
-                    if sequence.inputs is not None:
-                        scope.acquire(
-                            partial(sequence.inputs.acquire, sequence.position, row.count)
-                        )
+                    self._pin_inputs(scope, sequence, row.count)
                 output = forward(inputs, tuple(s.state for s in sequences), request, scope)
                 if request.logits and output.logits is None:
                     raise RuntimeError("batched model omitted requested logits")

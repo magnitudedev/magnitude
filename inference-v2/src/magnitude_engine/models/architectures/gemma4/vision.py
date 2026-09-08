@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-from contextlib import ExitStack
 from dataclasses import dataclass
+from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -17,10 +17,12 @@ from magnitude_engine.artifacts.blueprint import Local
 from magnitude_engine.artifacts.identity import processor_identity
 from magnitude_engine.artifacts.source import LocalArtifact
 from magnitude_engine.components import component, component_id
+from magnitude_engine.models.context import InputCheckpoint, InputContinuation, SpanContext
 from magnitude_engine.models.embeddings.replacement import EmbeddingReplacement
 from magnitude_engine.models.features import FeatureLease, FeatureSet
 from magnitude_engine.models.inputs import ModelInputs
 from magnitude_engine.models.loading.parameters import affine_encodings, load_resident_parameters
+from magnitude_engine.models.preparation import PreparedMedia
 from magnitude_engine.models.prompt import InputSpan, Prompt
 from magnitude_engine.models.residency import ModelResources
 
@@ -91,7 +93,7 @@ class GemmaVision:
             self.model = None
             self.parameters.close()
 
-    def prepare(self, tokens, media):
+    def prepare(self, tokens: tuple[int, ...], media: PreparedMedia) -> tuple[Prompt, GemmaSource]:
         if self.closed or media.processor != self.identity:
             raise ValueError("Gemma media processor differs from the bound artifact")
         tensors = {t.name: t.array() for t in media.tensors}
@@ -226,10 +228,10 @@ class GemmaSource:
     prompt: Prompt
     images: tuple[ImageInput, ...]
 
-    def identities(self, position):
+    def identities(self, position: int) -> tuple[bytes, ...]:
         return tuple(image.span.identity for image in self.images if image.span.start < position)
 
-    def bind(self, checkpoint):
+    def bind(self, checkpoint: InputCheckpoint | None) -> GemmaContext:
         if checkpoint is not None and (
             not isinstance(checkpoint, GemmaCheckpoint)
             or checkpoint.closed
@@ -240,75 +242,31 @@ class GemmaSource:
         return GemmaContext(self)
 
 
-class GemmaContinuation:
-    cache_hits = 0
-
+class GemmaContinuation(InputContinuation):
     def __init__(self, identities=()):
         self.identities = identities
 
-    def boundary(self, position):
-        return type(position) is int and position >= 0
-
-    def acquire(self, position, count):
-        return ExitStack()
-
-    def prepare(self, position, count):
-        yield from ()
-
-    def assemble(self, inputs, position):
+    def assemble(self, inputs: ModelInputs, position: int) -> ModelInputs:
         return inputs
 
-    def batch_key(self, position, count):
-        return None
-
-    def checkpoint(self, position):
+    def checkpoint(self, position: int) -> GemmaCheckpoint:
         return GemmaCheckpoint(position, self.identities)
 
-    def close(self):
-        pass
 
-
-class GemmaContext(GemmaContinuation):
-    def __init__(self, source):
-        super().__init__(source.identities(len(source.prompt.tokens)))
+class GemmaContext(SpanContext[ImageInput], GemmaContinuation):
+    def __init__(self, source: GemmaSource):
+        GemmaContinuation.__init__(self, source.identities(len(source.prompt.tokens)))
         self.source = source
-        self.features = FeatureSet(source.encoder, source.encoder.budget, source.encoder.cache)
-
-    def boundary(self, position):
-        return (
-            type(position) is int and position >= len(self.source.prompt.tokens)
-        ) or self.source.prompt.boundary(position)
-
-    @property
-    def cache_hits(self):
-        return self.features.cache_hits
-
-    def prepare(self, position, count):
-        self.features.keep(
-            {image.span.identity for image in self.source.images if image.span.end > position}
-        )
-        for image in self.source.images:
-            if image.span.start >= position + count or image.span.end <= position:
-                continue
-            size = (
-                (image.span.end - image.span.start)
-                * self.source.encoder.config.text_config.hidden_size
-                * 4
-            )
-            yield from self.features.prepare(
-                image.span.identity,
-                size,
-                lambda lease, image=image: EncodeImage(self.source.encoder, image, lease),
-            )
-
-    def acquire(self, position, count):
-        return self.features.pin(
-            image.span.identity
-            for image in self.source.images
-            if image.span.start < position + count and image.span.end > position
+        SpanContext.__init__(
+            self,
+            source.prompt,
+            source.images,
+            FeatureSet(source.encoder, source.encoder.budget, source.encoder.cache),
+            source.encoder.config.text_config.hidden_size * 4,
+            partial(EncodeImage, source.encoder),
         )
 
-    def assemble(self, inputs, position):
+    def assemble(self, inputs: ModelInputs, position: int) -> ModelInputs:
         end = position + inputs.count
         embeddings = []
         language = np.ones((1, inputs.count), dtype=bool)
@@ -342,11 +300,8 @@ class GemmaContext(GemmaContinuation):
             ),
         )
 
-    def checkpoint(self, position):
+    def checkpoint(self, position: int) -> GemmaCheckpoint:
         return GemmaCheckpoint(position, self.source.identities(position))
-
-    def close(self):
-        self.features.close()
 
 
 class GemmaCheckpoint:

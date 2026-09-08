@@ -8,6 +8,7 @@ from mlx_vlm.models.base import create_attention_mask
 from mlx_vlm.models.gemma4.language import LanguageModel
 
 from magnitude_engine.models.embeddings.replacement import replace
+from magnitude_engine.models.state.native_batch import KVView
 
 from .inputs import GemmaInputs, batch_key_ends
 
@@ -55,7 +56,7 @@ class GemmaForward:
                 # Cache masks describe their own packed key coordinates. Vision
                 # only adds future keys in this same atomic forward; past keys
                 # retain the cache's existing window and padding visibility.
-                if hasattr(state, "positions"):
+                if isinstance(state, KVView):
                     keys = mx.arange(mask.shape[-1])[None, None]
                     queries = (
                         mx.array(offsets, mx.int32)[:, None, None] + mx.arange(count)[None, :, None]
