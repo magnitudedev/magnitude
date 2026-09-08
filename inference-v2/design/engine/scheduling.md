@@ -31,7 +31,7 @@ before its resources can be reused.
 
 | Unit | Work granted | Completion |
 |---|---|---|
-| Prefill service | One aggregate token allowance across compatible pending prompts | Selected chunks have advanced prompt state |
+| Prefill service | One aggregate token allowance across compatible pending prompts, including ready prerequisites | Completed prompt advancement or a retained preparation continuation |
 | Decode round | One bounded generation step for every ready request | Each participating request has a publishable result or a retained continuation |
 
 A plain service publishes a bounded number of tokens and may retain one successor
@@ -59,6 +59,17 @@ The allowance is a total across requests, not 1,024 tokens per request.
 
 The allowance also respects available memory. Prefill may use larger chunks
 when there are no ready generations to interrupt.
+
+Prepared inputs declare valid advancement boundaries. A chunk ends before an
+indivisible dependency span or consumes that whole span when it is the next unit.
+The scheduler does not interpret why the span is indivisible. A hard memory or input
+limit remains binding even when a soft token allowance must extend to make progress.
+
+Prompt continuations can pause after prerequisite work and resume without repeating
+preparation. Completed encoder work contributes service time and decode debt, but
+contributes no decoder tokens. The prompt-rate estimator excludes that preparation
+time. A stateless prerequisite completes its physical execution within the service
+that launched it, so admission or another phase cannot absorb its unmeasured cost.
 
 ## Selecting the next phase
 
@@ -109,8 +120,9 @@ work before publishing anything.
 These are soft timing bounds. An indivisible operation can overrun a target,
 and bounded device lookahead must leave opportunities to reschedule. Yielding
 does not itself require a GPU synchronization. Plain service can leave one successor
-in flight; subsequent service observes its completion. Prompt-phase transitions and
-shared-layout changes complete outstanding consumers before proceeding.
+in flight; subsequent service observes its completion. Shared-layout changes complete
+outstanding consumers before proceeding. Preparation completion does not publish an
+incomplete decoder span or force unrelated request progress.
 
 ## Consequences
 

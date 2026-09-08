@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 
 from magnitude_engine.components import component
 
+from .context import InputFactory, InputSource, InputState, ModelCheckpoint, StateCheckpoint
 from .execution import (
     ExecutionOwner,
     ExecutionScope,
@@ -118,11 +120,17 @@ class BatchedStateStore[S](Protocol):
         ...
 
 
-class ModelSequence[S, C]:
+class ModelSequence[S, C: StateCheckpoint]:
     """A model's sequence state; generation owns its relationship to other models."""
 
     def __init__(
-        self, runtime: ModelRuntime[S, C], state: S, program_lease: ResourceLease | None = None
+        self,
+        runtime: ModelRuntime[S, C],
+        state: S,
+        program_lease: ResourceLease | None = None,
+        *,
+        position: int = 0,
+        inputs: InputState | None = None,
     ):
         self.runtime = runtime
         self.state = state
@@ -131,18 +139,30 @@ class ModelSequence[S, C]:
         self.closed = False
         self.failed = False
         self._program_lease = program_lease
+        self.position = position
+        self.inputs = inputs
 
     def check(self) -> None:
         self.runtime.owner.check()
         if self.closed or self.failed:
             raise RuntimeError("model sequence is unavailable")
 
-    def checkpoint(self) -> C:
+    def checkpoint(self) -> ModelCheckpoint[C]:
         self.check()
         if self.pending is not None:
             raise RuntimeError("checkpoint requires reconciled model state")
         self.complete_committed()
-        return self.runtime.states.checkpoint(self.state)
+        if self.inputs is not None and not self.inputs.boundary(self.position):
+            raise ValueError("checkpoint requires an independent input boundary")
+        storage = self.runtime.states.checkpoint(self.state)
+        try:
+            if storage.length != self.position:
+                raise RuntimeError("model and storage continuation positions disagree")
+            inputs = None if self.inputs is None else self.inputs.checkpoint(self.position)
+            return ModelCheckpoint(storage, inputs, self.runtime.checkpoint_domain)
+        except BaseException:
+            storage.close()
+            raise
 
     def prune_completed(self) -> None:
         self._committed[:] = [work for work in self._committed if not work.done]
@@ -170,13 +190,15 @@ class ModelSequence[S, C]:
             self.pending.transaction.close()
             self.pending = None
         self.runtime.states.release(self.state)
+        if self.inputs is not None:
+            self.inputs.close()
         if self._program_lease is not None:
             self._program_lease.close()
             self._program_lease = None
         self.closed = True
 
 
-class ModelAdvance[S, C]:
+class ModelAdvance[S, C: StateCheckpoint]:
     """Lazy output plus an obligation to reconcile exactly one input prefix."""
 
     def __init__(
@@ -229,6 +251,7 @@ class ModelAdvance[S, C]:
         else:
             self.sequence._committed.append(self.execution)
         self.sequence.pending = None
+        self.sequence.position += self.inputs.count
         self.resolved = True
 
     def accept(self, count: int) -> None:
@@ -244,6 +267,10 @@ class ModelAdvance[S, C]:
             raise RuntimeError("model advance is already reconciled")
         if not self.committed_inputs <= count <= self.inputs.count:
             raise ValueError("accepted length is outside the model advance commitment")
+        if self.sequence.inputs is not None and not self.sequence.inputs.boundary(
+            self.sequence.position + count
+        ):
+            raise ValueError("accepted length is not an independent input boundary")
         try:
             self.complete()
             try:
@@ -269,16 +296,23 @@ class ModelAdvance[S, C]:
             raise
         self.resolved = True
         self.sequence.pending = None
+        self.sequence.position += count
 
 
 @component("MODEL:EXECUTOR:MAG:STANDARD")
-class ModelRuntime[S, C]:
+class ModelRuntime[S, C: StateCheckpoint]:
     def __init__(
-        self, program: ModelProgram[S], states: ModelStateStore[S, C], owner: ExecutionOwner
+        self,
+        program: ModelProgram[S],
+        states: ModelStateStore[S, C],
+        owner: ExecutionOwner,
+        *,
+        preparation: InputFactory | None = None,
     ):
         self.program = program
         self.states = states
         self.owner = owner
+        self.preparation = preparation
         # Live state handles cannot cross a model residency. Persisted state needs
         # a separately validated import operation, not reuse of an in-memory handle.
         self.checkpoint_domain = object()
@@ -311,6 +345,12 @@ class ModelRuntime[S, C]:
         states = tuple(a.sequence.state for a in advances)
         try:
             with self.owner.scope() as scope:
+                for advance, row in zip(advances, inputs, strict=True):
+                    sequence = advance.sequence
+                    if sequence.inputs is not None:
+                        scope.acquire(
+                            partial(sequence.inputs.acquire, sequence.position, row.count)
+                        )
                 if len(advances) == 1:
                     self.program.forward(inputs[0], states[0], ForwardRequest(False), scope)
                 else:
@@ -322,12 +362,35 @@ class ModelRuntime[S, C]:
                 advance.sequence.failed = True
             raise
 
-    def create(self, checkpoint: C | None = None) -> ModelSequence[S, C]:
+    def create(
+        self, checkpoint: ModelCheckpoint[C] | None = None, *, inputs: InputSource | None = None
+    ) -> ModelSequence[S, C]:
         self.owner.check()
+        if checkpoint is not None and (
+            checkpoint.closed or checkpoint.domain is not self.checkpoint_domain
+        ):
+            raise ValueError("checkpoint belongs to another model residency or is closed")
         lease = self.program.acquire() if isinstance(self.program, AllocatedProgram) else None
+        context = None
         try:
-            return ModelSequence(self, self.states.create(checkpoint), lease)
+            previous = None if checkpoint is None else checkpoint.inputs
+            context = (
+                inputs.bind(previous)
+                if inputs is not None
+                else None
+                if previous is None
+                else previous.restore()
+            )
+            return ModelSequence(
+                self,
+                self.states.create(None if checkpoint is None else checkpoint.storage),
+                lease,
+                position=0 if checkpoint is None else checkpoint.length,
+                inputs=context,
+            )
         except BaseException:
+            if context is not None:
+                context.close()
             if lease is not None:
                 lease.close()
             raise
@@ -361,14 +424,33 @@ class ModelRuntime[S, C]:
             else self
         )
 
+    def input_key(self, sequence: ModelSequence[S, C], count: int) -> object:
+        return (
+            None if sequence.inputs is None else sequence.inputs.batch_key(sequence.position, count)
+        )
+
+    def _validate_boundaries(
+        self, sequence: ModelSequence[S, C], count: int, committed: int
+    ) -> None:
+        if sequence.inputs is not None and not all(
+            sequence.inputs.boundary(sequence.position + offset) for offset in (0, committed, count)
+        ):
+            raise ValueError("model advancement requires independent input boundaries")
+
     def rewind(self, sequence: ModelSequence[S, C], position: int) -> None:
         sequence.check()
         if sequence.runtime is not self or sequence.pending is not None:
             raise ValueError("rewind requires this model's idle sequence")
         if not isinstance(self.states, RewindableState):
             raise ValueError("this model state does not support direct rewind")
+        if type(position) is not int or not 0 <= position <= sequence.position:
+            raise ValueError("rewind position must be inside committed model history")
+        self._validate_boundaries(sequence, 0, 0)
+        if sequence.inputs is not None and not sequence.inputs.boundary(position):
+            raise ValueError("rewind requires an independent input boundary")
         sequence.complete_committed()
         self.states.rewind(sequence.state, position)
+        sequence.position = position
 
     def forward(
         self,
@@ -388,13 +470,18 @@ class ModelRuntime[S, C]:
             raise ValueError("model conditioning differs from its declared inputs")
         if not request.features <= self.program.features:
             raise ValueError("model program does not provide the requested features")
+        self._validate_boundaries(sequence, inputs.count, request.committed_inputs)
         if isinstance(self.states, BatchedStateStore):
             self.states.prepare_batch((sequence.state,), inputs.count)
+        if sequence.inputs is not None:
+            inputs = sequence.inputs.assemble(inputs, sequence.position)
         transaction = self.states.begin(
             sequence.state, inputs, committed_inputs=request.committed_inputs
         )
         try:
             with self.owner.scope() as scope:
+                if sequence.inputs is not None:
+                    scope.acquire(partial(sequence.inputs.acquire, sequence.position, inputs.count))
                 output = self.program.forward(inputs, sequence.state, request, scope)
                 if request.logits and output.logits is None:
                     raise RuntimeError("model program omitted requested logits")
@@ -447,11 +534,21 @@ class ModelRuntime[S, C]:
                 raise ValueError("model batch inputs require equal nonempty widths")
             if set(row.conditioning) != self.program.conditioning:
                 raise ValueError("model conditioning differs from its declared inputs")
+            self._validate_boundaries(sequence, row.count, request.committed_inputs)
+        key = self.input_key(sequences[0], inputs[0].count)
+        if any(
+            self.input_key(s, row.count) != key for s, row in zip(sequences, inputs, strict=True)
+        ):
+            raise ValueError("model batch requires compatible input semantics")
         if not request.features <= self.program.features:
             raise ValueError("model program does not provide the requested features")
         if isinstance(self.states, BatchedStateStore):
             self.states.prepare_batch(tuple(s.state for s in sequences), inputs[0].count)
         transactions: list[StateTransaction] = []
+        inputs = tuple(
+            row if sequence.inputs is None else sequence.inputs.assemble(row, sequence.position)
+            for sequence, row in zip(sequences, inputs, strict=True)
+        )
         try:
             for sequence, row in zip(sequences, inputs, strict=True):
                 transactions.append(
@@ -465,6 +562,11 @@ class ModelRuntime[S, C]:
             raise
         try:
             with self.owner.scope() as scope:
+                for sequence, row in zip(sequences, inputs, strict=True):
+                    if sequence.inputs is not None:
+                        scope.acquire(
+                            partial(sequence.inputs.acquire, sequence.position, row.count)
+                        )
                 output = forward(inputs, tuple(s.state for s in sequences), request, scope)
                 if request.logits and output.logits is None:
                     raise RuntimeError("batched model omitted requested logits")

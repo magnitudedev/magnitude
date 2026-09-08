@@ -5,8 +5,15 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
+from typing import Protocol
 
 import mlx.core as mx
+
+
+class InputData(Protocol):
+    """Concrete architecture payload; replay preserves its own slicing semantics."""
+
+    def prefix(self, count: int) -> InputData: ...
 
 
 @dataclass(frozen=True)
@@ -21,6 +28,7 @@ class ModelInputs:
 
     tokens: mx.array
     conditioning: Mapping[str, mx.array] = field(default_factory=dict)
+    data: InputData | None = None
 
     def __post_init__(self) -> None:
         if self.tokens.ndim != 2 or self.tokens.shape[0] != 1 or self.tokens.dtype != mx.int32:
@@ -46,4 +54,5 @@ class ModelInputs:
         return ModelInputs(
             self.tokens[:, :count],
             {name: value[:, :count] for name, value in self.conditioning.items()},
+            None if self.data is None else self.data.prefix(count),
         )

@@ -62,12 +62,12 @@ def test_stable_recurrent_batch_reuses_tensors_and_charges_physical_images_throu
         assert rows[2].state.recurrent.image is image
         assert budget.snapshot().owners["recurrent-state"] == 4 * size
         checkpoint = rows[2].checkpoint()
-        assert checkpoint.recurrent.image.width == 1
+        assert checkpoint.storage.recurrent.image.width == 1
         rows[2].close()
         assert image.closed
         assert budget.snapshot().owners["recurrent-state"] == 2 * size
         branch = runtime.create(checkpoint)
-        assert branch.state.recurrent.image is not checkpoint.recurrent.image
+        assert branch.state.recurrent.image is not checkpoint.storage.recurrent.image
         runtime.prefill(branch, (7,))
     finally:
         if branch is not None:

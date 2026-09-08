@@ -42,8 +42,25 @@ class LibraryProgram:
     features: frozenset[str] = frozenset()
     conditioning: frozenset[str] = frozenset()
 
-    def __init__(self, call: Callable[[mx.array, list], mx.array]):
+    def __init__(
+        self,
+        call: Callable[[mx.array, list], mx.array],
+        *,
+        input_forward: Callable[[tuple[ModelInputs, ...], list, tuple[int, ...]], mx.array]
+        | None = None,
+    ):
         self.call = call
+        self.input_forward = input_forward
+
+    def _call(self, inputs: tuple[ModelInputs, ...], caches: list, positions: tuple[int, ...]):
+        if self.input_forward is not None:
+            return self.input_forward(inputs, caches, positions)
+        if any(row.data is not None for row in inputs):
+            raise ValueError("this library forward has no adapter for model input data")
+        tokens = (
+            inputs[0].tokens if len(inputs) == 1 else mx.concatenate([row.tokens for row in inputs])
+        )
+        return self.call(tokens, caches)
 
     def forward(
         self,
@@ -53,13 +70,13 @@ class LibraryProgram:
         scope: ExecutionScope,
     ) -> ModelOutput:
         caches = state.caches if state.batch is None else state.store.batch_caches((state,))
-        logits = self.call(inputs.tokens, caches)
+        logits = self._call((inputs,), caches, (state.position,))
         state.store.publish_batch((state,))
         return ModelOutput(logits if request.logits else None)
 
     def forward_batch(self, inputs, states, request, scope) -> ModelOutput:
-        logits = self.call(
-            mx.concatenate([row.tokens for row in inputs]), states[0].store.batch_caches(states)
+        logits = self._call(
+            inputs, states[0].store.batch_caches(states), tuple(state.position for state in states)
         )
         states[0].store.publish_batch(states)
         return ModelOutput(logits if request.logits else None)

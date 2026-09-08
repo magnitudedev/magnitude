@@ -49,7 +49,7 @@ class PlainSession:
     def prefill(self, tokens: tuple[int, ...], features: Mapping[str, mx.array]) -> Task[None]:
         yield from ()
 
-    def propose(self, context: Sequence[int], limit: int) -> Task[Proposal]:
+    def propose(self, context: Sequence[int | None], limit: int) -> Task[Proposal]:
         yield from ()
         return Proposal.from_tokens(())
 

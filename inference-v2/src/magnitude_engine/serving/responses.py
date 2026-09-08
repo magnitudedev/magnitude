@@ -63,12 +63,22 @@ class ChatResponse:
                 draft_n_accepted=finish.accepted_tokens,
                 speculative_backend=self.speculative_backend,
             )
+        prompt_details = {"cached_tokens": finish.cached_tokens}
+        if finish.media_tokens:
+            prompt_details.update(
+                media_tokens=finish.media_tokens,
+                text_tokens=finish.prompt_tokens - finish.media_tokens,
+            )
+            timings.update(
+                preparation_ms=finish.preparation_ns / 1e6,
+                cached_input_features=finish.cached_input_features,
+            )
         return {
             "usage": {
                 "prompt_tokens": finish.prompt_tokens,
                 "completion_tokens": finish.generated_tokens,
                 "total_tokens": finish.prompt_tokens + finish.generated_tokens,
-                "prompt_tokens_details": {"cached_tokens": finish.cached_tokens},
+                "prompt_tokens_details": prompt_details,
             },
             "timings": timings,
             "engine": {

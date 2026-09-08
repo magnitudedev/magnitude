@@ -16,7 +16,10 @@ class ModelExecutor(ExecutorFactory):
         def construct() -> BoundExecutor:
             program = self.program.load(resources)
             states = self.state.create(program, resources)
-            return BoundExecutor(ModelRuntime(program.program, states, resources.owner), program)
+            return BoundExecutor(
+                ModelRuntime(program.program, states, resources.owner, preparation=program.inputs),
+                program,
+            )
 
         return resources.once(self, construct)
 

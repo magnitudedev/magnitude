@@ -40,9 +40,17 @@ class MetalPagedAttention:
         )
 
     def compute(
-        self, queries: mx.array, kv: PagedKV, scale: float, *, window: int | None = None
+        self,
+        queries: mx.array,
+        kv: PagedKV,
+        scale: float,
+        *,
+        window: int | None = None,
+        key_ends: mx.array | None = None,
     ) -> mx.array:
-        validate_attention(queries, kv, window)
+        validate_attention(queries, kv, window, key_ends)
+        if key_ends is not None:
+            return self.prefill.compute(queries, kv, scale, window=window, key_ends=key_ends)
         if not self.supports(queries, kv):
             return self.prefill.compute(queries, kv, scale, window=window)
         count = queries.shape[2]

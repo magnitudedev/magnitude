@@ -22,3 +22,20 @@ def tokenizer_identity(directory: Path) -> str:
             digest.update(len(value).to_bytes(8, "little"))
             digest.update(value)
     return digest.hexdigest()
+
+
+def processor_identity(directory: Path, implementation: str) -> str:
+    """Bind media interpretation to its artifact settings and exact adapter dependency."""
+    from importlib.metadata import version
+
+    digest = hashlib.sha256(tokenizer_identity(directory).encode())
+    for value in (implementation, version("transformers")):
+        digest.update(value.encode())
+    for name in ("preprocessor_config.json", "processor_config.json"):
+        path = directory / name
+        if path.is_file():
+            value = path.read_bytes()
+            digest.update(name.encode())
+            digest.update(len(value).to_bytes(8, "little"))
+            digest.update(value)
+    return digest.hexdigest()

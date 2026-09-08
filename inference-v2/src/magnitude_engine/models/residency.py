@@ -12,8 +12,10 @@ import mlx.core as mx
 from magnitude_engine.resources.budget import MemoryBudget
 from magnitude_engine.resources.lifetime import Closable
 
+from .context import InputFactory
 from .definition import ModelDefinition
 from .execution import ExecutionOwner
+from .features import FeatureCache
 from .ownership import OwnedProgram, VocabularyLoan
 from .runtime import ModelRuntime
 from .state.arena import LayerGeometry
@@ -58,6 +60,7 @@ class DraftRequirements:
     target_feature: str
     capacity: int
     vocabulary: VocabularyLoan
+    input_feature: str | None = None
 
 
 @dataclass(frozen=True)
@@ -66,6 +69,7 @@ class BoundProgram:
     descriptor: ModelDescriptor
     state: PagedRequirements | NativeRequirements
     drafting: DraftRequirements | None = None
+    inputs: InputFactory | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +86,7 @@ class ModelResources:
         self.lifetime = ExitStack()
         self.owner = ExecutionOwner()
         self._instances: dict[int, tuple[object, Any]] = {}
+        self.input_features = self.own(FeatureCache())
 
     def once(self, source: object, construct: Callable[[], T]) -> T:
         """Sharing is by declaration instance, within this residency only."""

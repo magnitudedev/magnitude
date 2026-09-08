@@ -23,7 +23,7 @@ class Attention(AttentionFactory):
             bind_linear(layer.o_proj),
             layer.q_norm,
             layer.k_norm,
-            QwenRotary(layer.rope),
+            QwenRotary(layer.rotary_emb),
             layer.num_attention_heads,
             layer.num_key_value_heads,
             layer.head_dim,

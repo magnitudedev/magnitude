@@ -1,4 +1,5 @@
 """Prompt batching uses the same model/state contract as generation rounds."""
+
 import mlx.core as mx
 import pytest
 from mlx_lm.models.cache import KVCache
@@ -13,8 +14,76 @@ from magnitude_engine.models.state.native import LibraryStateStore
 from magnitude_engine.resources.budget import MemoryBudget
 
 
-@pytest.mark.parametrize('lengths', [(8,), (8, 8, 8), (8, 4, 8)])
-@pytest.mark.parametrize('batched', [False, True])
+def test_prefill_exposes_preparation_as_progress_before_consuming_decoder_inputs():
+    from contextlib import ExitStack
+
+    from magnitude_engine.models.operations import Complete, compute
+    from tests.generation.test_computation import Work
+
+    budget = MemoryBudget(1 << 20)
+    owner = ExecutionOwner()
+    calls = []
+
+    class Inputs:
+        cache_hits = 0
+
+        def __init__(self):
+            self.ready, self.closed = False, False
+
+        def boundary(self, position):
+            return True
+
+        def prepare(self, position, count):
+            if not self.ready:
+                result = yield from compute(Work(owner, 2, calls))
+                yield Complete(result.execution)
+                self.ready = True
+
+        def assemble(self, inputs, position):
+            assert self.ready
+            return inputs
+
+        def acquire(self, position, count):
+            return ExitStack()
+
+        def batch_key(self, position, count):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    def call(tokens, caches):
+        values = tokens.astype(mx.float32)[:, None, :, None]
+        caches[0].update_and_fetch(values, values)
+        return values[:, 0]
+
+    model = ModelRuntime(
+        LibraryProgram(call),
+        LibraryStateStore(
+            lambda: [KVCache()],
+            budget,
+            lambda n, q: 4096,
+        ),
+        owner,
+    )
+    generation = GenerationRuntime(model, PlainMethod())
+    row = generation.prepare((1, 2, 3), SamplingPolicy(temperature=0), 1)
+    context = Inputs()
+    row.model.inputs = context
+    first = generation.prefill_many((row,), (2,))[0]
+    assert first.outcome is None and first.preparation_ns > 0
+    assert row.prefilled == row.model.position == 0
+    second = generation.prefill_many((row,), (2,))[0]
+    assert second.outcome == 2 and second.preparation_ns == 0
+    assert row.prefilled == row.model.position == 2
+    assert calls == [(2,)]
+    row.close()
+    owner.close()
+    assert context.closed and budget.snapshot().reserved == 0
+
+
+@pytest.mark.parametrize("lengths", [(8,), (8, 8, 8), (8, 4, 8)])
+@pytest.mark.parametrize("batched", [False, True])
 def test_prefill_groups_compatible_work_and_preserves_each_prompt(lengths, batched, monkeypatch):
     budget = MemoryBudget(1 << 20)
     calls = []
@@ -28,13 +97,24 @@ def test_prefill_groups_compatible_work_and_preserves_each_prompt(lengths, batch
     program = LibraryProgram(call)
     if not batched:
         monkeypatch.setattr(program, "forward_batch", None)
-    model = ModelRuntime(program, LibraryStateStore(
-        lambda: [KVCache()], budget, lambda n, q: 4096,
-    ), ExecutionOwner())
+    model = ModelRuntime(
+        program,
+        LibraryStateStore(
+            lambda: [KVCache()],
+            budget,
+            lambda n, q: 4096,
+        ),
+        ExecutionOwner(),
+    )
     generation = GenerationRuntime(model, PlainMethod())
-    rows = tuple(generation.prepare(
-        tuple(range(length + 1)), SamplingPolicy(temperature=0), 2,
-    ) for length in lengths)
+    rows = tuple(
+        generation.prepare(
+            tuple(range(length + 1)),
+            SamplingPolicy(temperature=0),
+            2,
+        )
+        for length in lengths
+    )
     try:
         groups = generation.prefill_groups(rows)
         assert groups == ((rows,) if batched else tuple((row,) for row in rows))
@@ -69,12 +149,19 @@ def test_prompt_batch_allocation_failure_splits_without_losing_committed_peer_st
         caches[0].update_and_fetch(values, values)
         return values[:, 0]
 
-    model = ModelRuntime(LibraryProgram(call), LibraryStateStore(
-        lambda: [KVCache()], budget, lambda n, q: 4096,
-    ), ExecutionOwner())
+    model = ModelRuntime(
+        LibraryProgram(call),
+        LibraryStateStore(
+            lambda: [KVCache()],
+            budget,
+            lambda n, q: 4096,
+        ),
+        ExecutionOwner(),
+    )
     runtime = GenerationRuntime(model, PlainMethod())
-    rows = tuple(runtime.prepare((i, i + 1, i + 2), SamplingPolicy(temperature=0), 1)
-                 for i in range(3))
+    rows = tuple(
+        runtime.prepare((i, i + 1, i + 2), SamplingPolicy(temperature=0), 1) for i in range(3)
+    )
     try:
         for row in rows:
             row.reserve_prompt()
@@ -103,7 +190,7 @@ def test_model_batches_combine_output_demands_without_combining_causal_commitmen
     calls = []
 
     class Program:
-        features = frozenset({'hidden', 'residual'})
+        features = frozenset({"hidden", "residual"})
         conditioning = frozenset()
 
         def forward(self, inputs, state, request, scope):
@@ -120,13 +207,19 @@ def test_model_batches_combine_output_demands_without_combining_causal_commitmen
                 {name: values[..., None] for name in request.features},
             )
 
-    model = ModelRuntime(Program(), LibraryStateStore(
-        lambda: [KVCache()], budget, lambda n, q: 4096,
-    ), ExecutionOwner())
+    model = ModelRuntime(
+        Program(),
+        LibraryStateStore(
+            lambda: [KVCache()],
+            budget,
+            lambda n, q: 4096,
+        ),
+        ExecutionOwner(),
+    )
     rows = tuple(model.create() for _ in range(4))
     requests = (
-        ForwardRequest(False, frozenset({'hidden'}), 1),
-        ForwardRequest(True, frozenset({'residual'}), 1),
+        ForwardRequest(False, frozenset({"hidden"}), 1),
+        ForwardRequest(True, frozenset({"residual"}), 1),
         ForwardRequest(False, committed_inputs=1),
         ForwardRequest(True, committed_inputs=0),
     )
@@ -143,7 +236,7 @@ def test_model_batches_combine_output_demands_without_combining_causal_commitmen
         results = execute(tuple(task(row, req) for row, req in zip(rows, requests, strict=True)))
         assert [result.result for result in results] == [1] * 4
         assert calls == [
-            (3, ForwardRequest(True, frozenset({'hidden', 'residual'}), 1)),
+            (3, ForwardRequest(True, frozenset({"hidden", "residual"}), 1)),
             (1, ForwardRequest(True, committed_inputs=0)),
         ]
     finally:

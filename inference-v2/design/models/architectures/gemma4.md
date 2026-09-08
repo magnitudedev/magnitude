@@ -10,9 +10,17 @@ The current binding accepts supported Gemma 4 text configurations with affine
 weights, dense/routed branches and optional per-layer inputs. MLX-VLM supplies
 configuration, parameter containers and the independent model reference.
 
-IDs follow [component identification](../../components.md). The program exposes
-text inputs and residual features, not media execution. Current owned execution
-must not inherit qualification from the generic upstream adapter.
+IDs follow [component identification](../../components.md). The complete model binds
+[image input semantics](../inputs.md) alongside the decoder. Owned execution and the
+generic upstream adapter require separate numerical qualification.
+
+Image features replace scaled token embeddings before per-layer projection. Media
+positions use the declared zero vocabulary input in the per-layer branch. With vision
+bidirectionality enabled, each image's soft-token span is indivisible: local attention
+sees the complete image block while retaining its lower sliding-window bound; global
+attention stays causal. Rectangular queries after a cached text prefix obey the same
+rule. Producer sharing remains unchanged. After image consumption, ordinary text
+continuation uses the resident compiled path without image operands.
 
 Owned operations follow [model composability](../composability.md) and
 [kernel construction](../../kernels.md). Gemma retains its normalization, GeGLU,
@@ -23,6 +31,8 @@ contraction and attention implementations. Kernel plans do not redefine that ass
 
 ```text
 MODEL:GEMMA4:MAG:LAYERWISE
+├── Optional image preparation · MODEL:GEMMA4.PREPARATION:MAG:IMAGES
+├── Optional image encoder/projector · MODEL:GEMMA4.VISION:VLM:STANDARD
 ├── Resident decode · MODEL:GEMMA4:MAG:RESIDENT_COMPILED
 ├── Embedding · MODEL:EMBEDDING:MAG:RESIDENT
 ├── Optional input preparation · MODEL:GEMMA4.INPUTS:MAG:PER_LAYER
@@ -343,3 +353,27 @@ Evidence: `sessions/26-09-06/evidence/cycle-005/comparison-16384.json` and
 
 Further kernel specialization must preserve dense/routed branches, optional inputs
 and KV sharing. Media tensors remain separate from owned text parameter loading.
+
+### `MODEL:GEMMA4.PREPARATION`
+
+**Contract.** Translate ordered source images and the artifact's chat representation
+into bounded prepared patches, patch coordinates, soft-token counts and an expanded
+decoder layout. This CPU interpretation is distinct from per-layer decoder inputs
+and from vision encoding.
+
+`MODEL:GEMMA4.PREPARATION:MAG:IMAGES` applies the artifact's PIL image processor,
+validates its exact output schema and expands the image boundary markers and soft
+tokens. Processor identity covers the artifact and preparation behavior.
+
+### `MODEL:GEMMA4.VISION`
+
+**Contract.** Encode prepared patches and project them into decoder-width image
+features. Compatible patch geometries can share an encoder batch with independent
+row outputs. Encoding has no autoregressive state and does not choose decoder
+attention visibility.
+
+`MODEL:GEMMA4.VISION:VLM:STANDARD` composes the pinned VLM vision tower and image
+projector. Its captured parameter record contains both modules and shares bounded
+feature retention through [model inputs](../inputs.md). `MODEL:GEMMA4.VISION/EXEC`
+observes encoder/projector execution through completed outputs. It is an opaque
+upstream workload record with no fabricated analytical efficiency denominator.

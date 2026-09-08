@@ -16,7 +16,7 @@ from magnitude_engine.components import component
 from magnitude_engine.resources.budget import MemoryBudget, Reservation
 from magnitude_engine.resources.io.reader import PositionalReader, Read
 
-from ..execution import ExecutionScope
+from ..execution import ExecutionScope, ResourceBusy
 from .table import AffineRowTable
 
 
@@ -130,7 +130,7 @@ class StreamedEmbedding:
             if self._closed:
                 raise RuntimeError("embedding lookup is closed")
             if len(self._pending) >= self.max_pending:
-                raise MemoryError("embedding lookahead queue is full")
+                raise ResourceBusy("embedding lookahead queue is full", tuple(self._pending))
             while True:
                 try:
                     reservation = self.budget.reserve(f"{self.owner}.staging", charge)

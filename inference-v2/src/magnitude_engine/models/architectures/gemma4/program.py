@@ -10,6 +10,7 @@ import mlx.nn as nn
 from magnitude_engine.components import component
 from magnitude_engine.models.attention.contracts import DecodeAttention, PagedAttention
 from magnitude_engine.models.embeddings.contracts import EmbeddingLookup
+from magnitude_engine.models.embeddings.replacement import replace
 from magnitude_engine.models.execution import ExecutionScope
 from magnitude_engine.models.experts.contracts import ExpertOperator
 from magnitude_engine.models.inputs import ModelInputs
@@ -21,6 +22,7 @@ from magnitude_engine.models.transforms import PositionTransform, Transform
 
 from .decode import ResidentDecode
 from .definition import DEFINITION
+from .inputs import GemmaInputs, batch_key_ends
 
 ExpertCall = Callable[[mx.array, mx.array, mx.array], mx.array]
 
@@ -82,7 +84,11 @@ class GemmaAttention:
         return self.output(attended.transpose(0, 2, 1, 3).reshape(batch, count, -1))
 
     def compute(
-        self, hidden: mx.array, states: tuple[SequencePages, ...], scope: ExecutionScope
+        self,
+        hidden: mx.array,
+        states: tuple[SequencePages, ...],
+        scope: ExecutionScope,
+        key_ends: mx.array | None = None,
     ) -> mx.array:
         count = hidden.shape[1]
         offsets = mx.array([state.length for state in states], dtype=mx.int32)
@@ -91,7 +97,11 @@ class GemmaAttention:
             keys, values = self.producer.project(hidden, offsets)
             append_layer(states, self.source, keys, values)
         kv = read_layer(states, self.source, pending_tokens=count)
-        attended = self.operation.compute(q, kv, 1.0, window=self.window)
+        attended = (
+            self.operation.compute(q, kv, 1.0, window=self.window, key_ends=key_ends)
+            if key_ends is not None and self.window is not None
+            else self.operation.compute(q, kv, 1.0, window=self.window)
+        )
         if self.producer is not None and count > 1:
             scope.submit_state(kv.keys, kv.values)
         return self.finish(attended)
@@ -263,11 +273,15 @@ class Gemma4Program:
         tokens = (
             inputs[0].tokens if len(inputs) == 1 else mx.concatenate([i.tokens for i in inputs])
         )
+        interpreted = any(row.data is not None for row in inputs)
+        if any(row.data is not None and not isinstance(row.data, GemmaInputs) for row in inputs):
+            raise ValueError("Gemma received incompatible model input operands")
         compiled = (
             tokens.shape[1] == 1
             and self.decode is not None
             and self.decode.matches(self)
             and all(g.key_width in (32, 64, 128, 256, 512) for g in arena.layers)
+            and not interpreted
         )
         if not compiled:
             for state in states:
@@ -277,7 +291,29 @@ class Gemma4Program:
             assert self.decode is not None
             return self.decode.forward(tokens, states, request, scope)
         hidden = self.embedding.lookup(tokens, scope)
-        lookup = self.per_layer.embedding.lookup(tokens, scope) if self.per_layer else None
+        lookup_tokens, key_ends = tokens, None
+        prepare: Callable[[mx.array], mx.array] | None = None
+        if interpreted:
+            language = mx.concatenate(
+                [
+                    row.data.language
+                    if isinstance(row.data, GemmaInputs)
+                    else mx.ones_like(row.tokens, mx.bool_)
+                    for row in inputs
+                ]
+            )
+            key_ends = batch_key_ends(inputs, tuple(state.length for state in states))
+            lookup_tokens = mx.where(language, tokens, 0)
+            replacements = tuple(
+                row.data.embeddings if isinstance(row.data, GemmaInputs) else () for row in inputs
+            )
+
+            def inject(scaled):
+                return replace(scaled, replacements)
+
+            prepare = inject
+
+        lookup = self.per_layer.embedding.lookup(lookup_tokens, scope) if self.per_layer else None
         logits, features = evaluate(
             hidden,
             lookup,
@@ -287,9 +323,10 @@ class Gemma4Program:
             norm=self.norm,
             output=self.output,
             softcap=self.softcap,
-            attend=lambda attention, x: attention.compute(x, states, scope),
+            attend=lambda attention, x: attention.compute(x, states, scope, key_ends),
             feed=lambda feedforward, x: feedforward.compute(x, scope),
             request=request,
+            prepare=prepare,
         )
         return ModelOutput(logits[0] if logits else None, features)
 
@@ -307,9 +344,12 @@ def evaluate(
     attend: Callable[[GemmaAttention, mx.array], mx.array],
     feed: Callable[[GemmaFeedForward, mx.array], mx.array],
     request: ForwardRequest,
+    prepare: Callable[[mx.array], mx.array] | None = None,
 ) -> tuple[tuple[mx.array, ...], dict[str, mx.array]]:
     """One Gemma composition for compiled and resource-scoped execution."""
     hidden = hidden * embedding_scale
+    if prepare is not None:
+        hidden = prepare(hidden)
     layer_inputs = None
     if per_layer is not None:
         assert layer_lookup is not None

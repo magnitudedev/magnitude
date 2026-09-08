@@ -116,7 +116,6 @@ def test_scratch_retirement_uses_lease_identity_not_value_equality():
     assert events == ["complete", "second", "complete", "first"]
 
 
-
 def test_completing_one_submission_does_not_drain_or_retire_its_successor():
     events = []
     owner = ExecutionOwner(Backend(events))
@@ -163,4 +162,82 @@ def test_resubmission_extends_the_same_completion_obligation():
     assert pending.roots == (root, consumer)
     pending.complete()
     assert events == ["submit", "submit", "complete", "release"]
+    owner.close()
+
+
+def test_capacity_retry_never_retires_a_resource_owned_by_the_current_scope():
+    events = []
+    owner = ExecutionOwner(Backend(events))
+    busy = False
+
+    class Slot:
+        def close(self):
+            nonlocal busy
+            busy = False
+            events.append("release-slot")
+
+    def acquire():
+        nonlocal busy
+        if busy:
+            raise MemoryError("slot occupied")
+        busy = True
+        return Slot()
+
+    with owner.scope() as previous:
+        previous.acquire(lambda: Lease(events, "previous"))
+        execution = previous.seal()
+    with owner.scope() as current:
+        current.acquire(acquire)
+        with pytest.raises(MemoryError, match="occupied"):
+            current.acquire(acquire)
+        assert execution.done and busy
+        assert events == ["complete", "previous"]
+        pending = current.seal()
+    pending.complete()
+    assert not busy
+    owner.close()
+
+
+def test_resource_contention_retires_only_actual_prior_consumers():
+    from magnitude_engine.models.execution import ResourceBusy
+
+    events = []
+    owner = ExecutionOwner(Backend(events))
+    blocked = Lease(events, "blocked")
+    with owner.scope() as scope:
+        scope.acquire(lambda: blocked)
+        prior = scope.seal()
+    with owner.scope() as scope:
+        scope.acquire(lambda: Lease(events, "unrelated"))
+        unrelated = scope.seal()
+
+    def acquire():
+        if not prior.done:
+            raise ResourceBusy("occupied", (blocked,))
+        return Lease(events, "new")
+
+    with owner.scope() as scope:
+        scope.acquire(acquire)
+        assert prior.done and not unrelated.done
+        assert events == ["complete", "blocked"]
+    owner.close()
+
+
+def test_current_and_unowned_busy_leases_fail_without_synchronizing_peers():
+    from magnitude_engine.models.execution import ResourceBusy
+
+    events = []
+    owner = ExecutionOwner(Backend(events))
+    with owner.scope() as previous:
+        previous.acquire(lambda: Lease(events, "unrelated"))
+        pending = previous.seal()
+    with owner.scope() as current:
+        lease = current.acquire(lambda: Lease(events, "current"))
+
+        def acquire():
+            raise ResourceBusy("occupied", (lease,))
+
+        with pytest.raises(ResourceBusy):
+            current.acquire(acquire)
+        assert not pending.done and events == []
     owner.close()

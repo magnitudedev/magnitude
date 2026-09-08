@@ -35,6 +35,12 @@ single execution is outside this design.
 | State and conditioning | Must support the same physical execution, including attention/recurrent state and required conditioning |
 | Causal boundary | Must support the same treatment of inputs already known to be committed versus tentative inputs |
 | Requested outputs | Combine required logits and features where supported; differing output needs alone do not split execution |
+| Input interpretation | Respect model-declared compatibility; positions, embedding replacements, and visibility remain independent per row |
+
+Stateless input computations form their own ready groups by the bound executable
+and supported geometry. Encoder grouping and decoder grouping are independent:
+different image shapes may encode separately and later share decoder execution.
+Neither group establishes a permanent cohort or a new scheduling policy.
 
 Context lengths may differ if the execution supports independent positions and
 validity. Sampling settings, constraints, stopping conditions and eventual

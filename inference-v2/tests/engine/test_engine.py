@@ -151,7 +151,7 @@ def test_complete_prefix_reuse_and_retention_eviction_are_detached_from_sampling
     before = len(calls)
     warm = engine.submit(request(original.request.prompt, count=5, seed=99))
     warm_events = finish(engine, warm)
-    assert warm_events[-1].cached_tokens == len(original.request.prompt) - 1
+    assert warm_events[-1].cached_tokens == len(original.request.prompt.tokens) - 1
     assert len(calls) - before <= 5  # no prompt forward on this compatible hit
     assert original_events[-1].cached_tokens == 0
     cold = engine.generation.create(warm.request.prompt, warm.request.sampling, 5)
@@ -233,7 +233,6 @@ def test_zero_output_request_completes_even_when_all_active_rows_are_backpressur
     assert budget.snapshot().reserved == 0
 
 
-
 def test_first_token_closes_prompt_service_before_bounded_plain_decode():
     from magnitude_engine.generation.methods.plain.runtime import PlainMethod
 
@@ -310,8 +309,10 @@ def test_phase_feedback_counts_completed_execution_once_and_excludes_retention(m
 
     def decode(sequences, allowances, *, clock, budget_ns):
         now[0] += 10_000_000
-        return tuple(GenerationService(GenerationResult((1,), 0, 0, None, 1),
-                                       10_000_000, len(sequences)) for _ in sequences)
+        return tuple(
+            GenerationService(GenerationResult((1,), 0, 0, None, 1), 10_000_000, len(sequences))
+            for _ in sequences
+        )
 
     monkeypatch.setattr(engine.generation, "step_many", decode)
     first = engine.tick()
@@ -321,7 +322,7 @@ def test_phase_feedback_counts_completed_execution_once_and_excludes_retention(m
 
     sequence = engine._active[prompt.identity].sequence
 
-    def prefill(sequences, allowances, *, clock):
+    def prefill(sequences, allowances, *, clock, budget_ns=None):
         now[0] += 40_000_000
         for row, allowance in zip(sequences, allowances, strict=True):
             row.prefilled += allowance
@@ -347,10 +348,10 @@ def test_phase_feedback_counts_completed_execution_once_and_excludes_retention(m
 def test_unfinished_generation_service_reports_progress_without_publishing_a_token():
     engine, budget, _, _ = setup(retention=0)
     engine.scheduler.prefill_stall_seconds = 1e-9
-    decoding = engine.submit(request((1,), count=4), identity='decoding')
-    prompting = engine.submit(request((1,) * 8, count=2), identity='prompting')
+    decoding = engine.submit(request((1,), count=4), identity="decoding")
+    prompting = engine.submit(request((1,) * 8, count=2), identity="prompting")
     first = engine.tick()
-    assert engine.last_service.phase == 'decode'
+    assert engine.last_service.phase == "decode"
     assert len(first) == 1 and first[0].output_tokens == 0 and first[0].elapsed_ns > 0
     assert available(decoding) == []
     outputs = {decoding.identity: [], prompting.identity: []}
@@ -360,7 +361,36 @@ def test_unfinished_generation_service_reports_progress_without_publishing_a_tok
             outputs[handle.identity].extend(available(handle))
         if all(handle.delivery.finish for handle in (decoding, prompting)):
             break
-    assert len(tokens(outputs['decoding'])) == 4
-    assert len(tokens(outputs['prompting'])) == 2
+    assert len(tokens(outputs["decoding"])) == 4
+    assert len(tokens(outputs["prompting"])) == 2
+    engine.close()
+    assert budget.snapshot().reserved == 0
+
+
+@pytest.mark.parametrize("retention", [0, 32])
+def test_retention_owns_optional_boundaries_and_preserves_both_sides_of_conditioning(retention):
+    from magnitude_engine.models.prompt import InputSpan, Prompt
+
+    engine, budget, calls, _ = setup(policy=TimeShared(prefill_tokens=64), retention=retention)
+    prompt = Prompt(
+        tuple(i % 7 for i in range(20)),
+        (
+            InputSpan(3, 6, b"first"),
+            InputSpan(9, 12, b"second"),
+        ),
+    )
+    handle = engine.submit(request(prompt, count=1), identity="cold")
+    result = finish(engine, handle)
+    assert tokens(result) == (6,)
+    assert [len(call) for call in calls] == ([19, 1] if not retention else [3, 3, 3, 3, 7, 1])
+    if retention:
+        # A changed source retains preceding text. Changed text after a source
+        # retains the completed image; reducing fragmentation must not lose either.
+        changed_image = Prompt(prompt.tokens, (InputSpan(3, 6, b"changed"), prompt.spans[1]))
+        result = finish(engine, engine.submit(request(changed_image, count=1), identity="image"))
+        assert result[-1].cached_tokens == 3
+        changed_text = Prompt((*prompt.tokens[:12], 6, *prompt.tokens[13:]), prompt.spans)
+        result = finish(engine, engine.submit(request(changed_text, count=1), identity="text"))
+        assert result[-1].cached_tokens == 12
     engine.close()
     assert budget.snapshot().reserved == 0

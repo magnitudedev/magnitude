@@ -38,12 +38,19 @@ class GatedAttention:
     attention: PagedAttention
 
     def compute_batch(
-        self, hidden: mx.array, states: tuple[HybridState, ...], scope: ExecutionScope
+        self,
+        hidden: mx.array,
+        states: tuple[HybridState, ...],
+        scope: ExecutionScope,
+        positions: int | mx.array | None = None,
     ) -> mx.array:
         batch, count, _ = hidden.shape
-        positions = (
-            states[0].position if batch == 1 else mx.array([s.position for s in states], mx.int32)
-        )
+        if positions is None:
+            positions = (
+                states[0].position
+                if batch == 1
+                else mx.array([s.position for s in states], mx.int32)
+            )
         q, k, v, gate = self.project(hidden, positions)
         pages = tuple(s.pages for s in states)
         append_layer(pages, self.index, k, v)
@@ -62,6 +69,7 @@ class GatedAttention:
         rotation = self.positions.rotation
         if (
             self.inputs.packed
+            and (isinstance(positions, int) or positions.ndim <= 1)
             and (count == 1 or batch * count <= 8)
             and 32 <= self.head_width <= 1024
             and rotation is not None
@@ -100,9 +108,11 @@ class GatedAttention:
         attended = attended.transpose(0, 2, 1, 3).reshape(batch, count, -1)
         return self.output(sigmoid_gate(attended, gate))
 
-    def decode(self, hidden: mx.array, kv: DecodeKV) -> mx.array:
+    def decode(self, hidden: mx.array, kv: DecodeKV, positions: mx.array | None = None) -> mx.array:
         assert isinstance(self.attention, DecodeAttention)
-        queries, keys, values, gate = self.project(hidden, kv.positions)
+        queries, keys, values, gate = self.project(
+            hidden, kv.positions if positions is None else positions
+        )
         kv.append(self.index, keys, values)
         attended = self.attention.decode(queries, kv, self.index, self.head_width**-0.5)
         return self.finish(attended, gate)

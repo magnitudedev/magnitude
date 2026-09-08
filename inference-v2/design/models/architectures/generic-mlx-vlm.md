@@ -8,19 +8,23 @@ Each node below has a definition here; references identify comparison controls,
 not additional production dependencies.
 
 The current path supports standalone text modules exposed by MLX-VLM, resident
-float or affine weights, and explicitly adapted native caches. It exposes logits,
-not intermediate features or media conditioning. Upstream model availability does
-not imply that its cache, batching or modality capabilities are supported here.
+float or affine weights, and explicitly adapted native caches. Qualified full Qwen
+and Gemma artifacts additionally bind their model-owned input preparation, encoders
+and row-local language input adapters. Other conditional architectures fail binding;
+upstream availability alone does not qualify their inputs, caches or batching.
 
-The upstream numerical implementation remains authoritative in this pass-through
-assembly. [Owned kernel construction](../../kernels.md) does not require translating
-it into an owned execution IR.
+Upstream language blocks remain the numerical implementation. The Qwen adapter
+supplies explicit row-local rotary coordinates; the Gemma adapter supplies its
+distinct causal global and image-aware local visibility. Mutable upstream generation
+wrapper state is not request state. [Owned kernel construction](../../kernels.md)
+does not require translating library blocks into an owned execution IR.
 
 ## Assembly
 
 ```text
 MODEL:EXECUTOR:MAG:STANDARD
 ├── Upstream language model · MODEL:FORWARD:VLM:STANDARD
+├── Optional model input adapter and encoder · see Qwen / Gemma
 └── Native cache adapter · STATE:CHECKPOINTS:MAG:NATIVE
 ```
 
@@ -93,7 +97,8 @@ dimensions.
 #### `MODEL:LOADING:MAG:RESIDENT`
 
 - **Implementation:** Resolve upstream configuration and language module, validate tensor layout, materialize
-  supported text weights and own their budgeted lifetime. Peer modality weights are excluded.
+  supported text weights and own their budgeted lifetime. Qualified vision weights belong
+  to the separate model input encoder; unsupported peer modalities are not loaded.
   Loading failures release resources.
 - **Reference / validation:** Compare tensor values, names, encodings and model arguments with direct upstream loading.
   Exercise unsupported layouts and partial failures.

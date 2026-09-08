@@ -9,6 +9,7 @@ from magnitude_engine.models.embeddings.blueprint import Resident as ResidentEmb
 from magnitude_engine.models.embeddings.contracts import EmbeddingFactory
 from magnitude_engine.models.experts.blueprint import Resident as ResidentExperts
 from magnitude_engine.models.experts.contracts import ExpertFactory
+from magnitude_engine.models.preparation import ImagePreparation
 from magnitude_engine.resources.io.blueprint import PositionalReader
 from magnitude_engine.resources.io.reader import PositionalReader as Reader
 
@@ -27,3 +28,14 @@ class Program(Blueprint[ProgramSource]):
         from .loading import Gemma4Source
 
         return Gemma4Source
+
+
+@blueprint
+class Images(Blueprint[ImagePreparation]):
+    artifact: Blueprint[LocalArtifact]
+
+    @staticmethod
+    def implementation() -> type[ImagePreparation]:
+        from .preparation import GemmaImages
+
+        return GemmaImages
