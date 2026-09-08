@@ -9,6 +9,8 @@ operating points and evidence. This document owns optimization choices and their
 qualification; the autonomous operation protocol governs development cycles.
 [Kernel construction](../kernels.md) owns the representation and generation of
 numerical implementations; this document owns which arrangements earn adoption.
+[Kernel optimization principles](../development/kernel-optimization.md) explain
+resource costs, reuse, representation and execution choices within those boundaries.
 
 ## Using component models
 
