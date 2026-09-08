@@ -12,6 +12,10 @@ float or affine weights, and explicitly adapted native caches. It exposes logits
 not intermediate features or media conditioning. Upstream model availability does
 not imply that its cache, batching or modality capabilities are supported here.
 
+The upstream numerical implementation remains authoritative in this pass-through
+assembly. [Owned kernel construction](../../kernels.md) does not require translating
+it into an owned execution IR.
+
 ## Assembly
 
 ```text

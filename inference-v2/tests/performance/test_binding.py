@@ -7,6 +7,34 @@ from performance.facts import AttentionGeometry, Configuration
 from performance.records import Assembly, Node
 
 
+@pytest.mark.parametrize("quantized", [False, True])
+def test_projection_reference_borrows_weights_but_uses_stock_execution(quantized):
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    from magnitude_engine.models.projections import bind_linear
+    from performance.benchmarks.references import linear
+
+    source = (
+        nn.QuantizedLinear(256, 128, bias=True, group_size=64, bits=4)
+        if quantized
+        else nn.Linear(256, 128, bias=True)
+    )
+    source.set_dtype(mx.bfloat16)
+    owned = bind_linear(source)
+    reference = linear(owned)
+    assert type(reference) is type(source)
+    assert reference is not owned
+    assert reference.weight is owned.weight
+    assert reference.bias is owned.bias
+    if quantized:
+        assert reference.scales is owned.scales
+        assert reference.biases is owned.biases
+    inputs = mx.random.normal((2, 1, 256)).astype(mx.bfloat16)
+    assert mx.array_equal(reference(inputs), source(inputs)).item()
+
+
+
 def test_graph_identity_preserves_aliases_but_not_occurrence_paths():
     leaf = Node(ComponentId("MODEL:ATTENTION:MAG:PAGED"), "leaf")
     shared = Assembly(
@@ -143,13 +171,19 @@ def test_model_and_restore_boundaries(engine, tmp_path):
     for mode in ("replay", "prefill", "generate"):
         result = benchmark(engine, measured_tokens=2, mode=mode, **options)
         assert result.record["status"] == "complete"
+    for mode in ("replay", "verify"):
+        result = benchmark(engine, measured_tokens=2, rows=2, mode=mode, **options)
+        assert result.record["status"] == "complete"
+        assert result.record["workload"]["batch_size"] == 2
+        assert result.record["samples"][0]["observation"]["counters"]["input_tokens"] == 4
     for advance, accepted in ((0, 0), (2, 1)):
         result = restore(engine, advance_tokens=advance, accepted_tokens=accepted, **options)
         assert result.record["status"] == "complete"
         assert "RESTORE" in result.record["samples"][0]["observation"]["metrics"]
 
 
-def test_real_layer_region_controls(engine, tmp_path):
+def test_real_layer_region_controls(engine, tmp_path, monkeypatch):
+    from performance.benchmarks import references
     from performance.benchmarks.regions import benchmark, capture
     from performance.records import Profile
 
@@ -173,6 +207,20 @@ def test_real_layer_region_controls(engine, tmp_path):
         ):
             result = benchmark(engine, path, prepared=inputs, **options)
             assert result.record["status"] == "complete"
+        for path in ("target.embedding", "target.layers.0.feedforward", "target.readout"):
+            for reference in (False, True):
+                result = benchmark(
+                    engine, path, prepared=inputs, rows=2, reference=reference, **options
+                )
+                assert result.record["status"] == "complete"
+                assert result.record["workload"]["batch_size"] == 2
+
+        def rejected_reference(hidden):
+            raise RuntimeError("independent readout invoked")
+
+        monkeypatch.setattr(references, "linear", lambda _: rejected_reference)
+        with pytest.raises(RuntimeError, match="independent readout invoked"):
+            benchmark(engine, "target.readout", prepared=inputs, **options)
 
 
 def test_whole_engine_waves(engine, tmp_path):

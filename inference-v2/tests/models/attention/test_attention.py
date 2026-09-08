@@ -10,6 +10,34 @@ from magnitude_engine.models.state.views import read_layer
 from magnitude_engine.resources.budget import MemoryBudget
 
 
+@pytest.mark.parametrize("batch", [2, 9])
+def test_short_attention_reduction_does_not_depend_on_peer_count(batch):
+    mx.random.seed(19)
+    queries = mx.random.normal((batch, 32, 1, 256)).astype(mx.bfloat16)
+    keys = mx.random.normal((2, 512, 256)).astype(mx.bfloat16)
+    values = mx.random.normal((2, 512, 256)).astype(mx.bfloat16)
+    mx.eval(queries, keys, values)
+    operation = MetalPagedAttention()
+
+    def apply(q):
+        rows = q.shape[0]
+        return operation.apply(
+            q,
+            keys,
+            values,
+            mx.broadcast_to(mx.array([[0, 1]], mx.int32), (rows, 2)),
+            mx.full((rows,), 382, mx.int32),
+            page_size=256,
+            table_width=2,
+            covered=512,
+            scale=256**-0.5,
+            window=None,
+        )
+
+    expected = mx.concatenate([apply(row[None]) for row in queries])
+    assert mx.array_equal(apply(queries), expected).item()
+
+
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("head_sharing", [1, 2, 4])
 @pytest.mark.parametrize(

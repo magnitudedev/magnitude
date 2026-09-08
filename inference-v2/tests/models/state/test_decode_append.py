@@ -306,7 +306,7 @@ def test_compiled_append_does_not_replace_or_return_full_history(storage, scope)
 @pytest.mark.parametrize("count", [1, 3])
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
 def test_combined_tail_write_preserves_independent_rows_and_unequal_widths(widths, count, dtype):
-    from magnitude_engine.models.state.decode import update_tail
+    from magnitude_engine.kernels.state.plans import update_tail
     from magnitude_engine.models.state.tail import split_tail
 
     batch, heads, capacity = 3, 2, 16
