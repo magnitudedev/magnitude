@@ -10,9 +10,17 @@ from pathlib import Path
 from benchmark_fixtures import bfcl as corpus
 from benchmark_fixtures import prose as prose_source
 from benchmark_fixtures.prose_history import Prose
+from benchmark_fixtures.ruler import RulerFixture
 
 from . import models
-from .policy import DEFAULT_CONTEXTS, ENGINES, MAX_OUTPUT_TOKENS, PROSE_OUTPUT_TOKENS, project_root
+from .policy import (
+    DEFAULT_CONTEXTS,
+    ENGINES,
+    MAX_OUTPUT_TOKENS,
+    PROSE_OUTPUT_TOKENS,
+    RETRIEVAL_OUTPUT_TOKENS,
+    project_root,
+)
 from .results import inspect_run, public_command
 from .suites import SECTIONS
 
@@ -26,14 +34,14 @@ def choices(value: str, allowed: tuple[str, ...]) -> tuple[str, ...]:
     return selected
 
 
-def contexts(value: str) -> tuple[int, ...]:
+def contexts(value: str, *, preserve_order: bool = False) -> tuple[int, ...]:
     result = []
     for part in value.lower().split(","):
         number = int(part[:-1]) * 1024 if part.endswith("k") else int(part)
         if number <= 0:
             raise ValueError("context targets must be positive")
         result.append(number)
-    return tuple(sorted(set(result)))
+    return tuple(result) if preserve_order else tuple(sorted(set(result)))
 
 
 def parser() -> argparse.ArgumentParser:
@@ -53,7 +61,15 @@ def parser() -> argparse.ArgumentParser:
         default=",".join(map(str, DEFAULT_CONTEXTS)),
         help="input checkpoints, e.g. 4k,16k",
     )
-    execute.add_argument("--prose", action="store_true", help="continue Moby Dick; no tools")
+    workload = execute.add_mutually_exclusive_group()
+    workload.add_argument("--prose", action="store_true", help="continue Moby Dick; no tools")
+    workload.add_argument("--retrieval", action="store_true", help="score RULER-derived retrieval")
+    execute.add_argument("--retrieval-variant", choices=("single", "multiquery"))
+    execute.add_argument("--retrieval-seed", type=int)
+    execute.add_argument("--retrieval-queries", type=int)
+    execute.add_argument(
+        "--needle-depth", type=float, help="fraction of distractor records before facts"
+    )
     execute.add_argument("--category", default=None, help=", ".join(corpus.CATEGORIES))
     execute.add_argument(
         "--case", help="BFCL decision ID; canonical background history is retained"
@@ -74,8 +90,21 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-async def dry_run(root, targets, sections, checkpoints, categories, repeat, case, prose=False):
-    if prose:
+async def dry_run(
+    root,
+    targets,
+    sections,
+    checkpoints,
+    categories,
+    repeat,
+    case,
+    prose=False,
+    retrieval: RulerFixture | None = None,
+    needle_depth: float = 0.5,
+):
+    if retrieval is not None:
+        corpus_digest = retrieval.identity
+    elif prose:
         text, provenance = await prose_source.prepare()
         corpus_digest = Prose(text, provenance).identity
     else:
@@ -83,13 +112,23 @@ async def dry_run(root, targets, sections, checkpoints, categories, repeat, case
         if case is not None and not any(f.id == case for f in fixtures):
             raise ValueError(f"unknown or excluded BFCL case: {case}")
     return {
-        "command": public_command(targets, sections, checkpoints, categories, repeat, case, prose),
+        "command": public_command(
+            targets, sections, checkpoints, categories, repeat, case, prose, retrieval, needle_depth
+        ),
         "targets": [target.model_dump() for target in targets],
         "corpus_digest": corpus_digest,
         "sections": sections,
         "contexts": checkpoints,
-        "max_output_tokens": PROSE_OUTPUT_TOKENS if prose else MAX_OUTPUT_TOKENS,
-        "workload": "prose" if prose else "tools",
+        "max_output_tokens": (
+            RETRIEVAL_OUTPUT_TOKENS
+            if retrieval
+            else PROSE_OUTPUT_TOKENS
+            if prose
+            else MAX_OUTPUT_TOKENS
+        ),
+        "workload": "retrieval" if retrieval else "prose" if prose else "tools",
+        "retrieval": retrieval.model_dump(mode="json") if retrieval else None,
+        "needle_depth": needle_depth if retrieval else None,
         "preparation": "pending first-target tokenizer binding",
         "cache_policy": "disabled",
     }
@@ -116,11 +155,40 @@ def main(argv=None) -> int:
         if args.command == "run":
             selected = models.select(root, args.model, args.engine, args.target)
             sections = choices(args.suite, tuple(SECTIONS))
-            checkpoints = contexts(args.context)
-            if args.prose and (args.category is not None or args.case is not None):
-                raise ValueError("--prose cannot be combined with --category or --case")
+            checkpoints = contexts(args.context, preserve_order=args.retrieval)
+            if (args.prose or args.retrieval) and (
+                args.category is not None or args.case is not None
+            ):
+                raise ValueError("--prose/--retrieval cannot be combined with --category or --case")
+            retrieval_options = (
+                args.retrieval_variant,
+                args.retrieval_seed,
+                args.retrieval_queries,
+                args.needle_depth,
+            )
+            if not args.retrieval and any(value is not None for value in retrieval_options):
+                raise ValueError("retrieval options require --retrieval")
+            retrieval = None
+            needle_depth = 0.5 if args.needle_depth is None else args.needle_depth
+            if not 0 <= needle_depth <= 1:
+                raise ValueError("--needle-depth must be between zero and one")
+            if args.retrieval:
+                variant = args.retrieval_variant or "single"
+                retrieval = RulerFixture(
+                    seed=42 if args.retrieval_seed is None else args.retrieval_seed,
+                    variant=variant,
+                    queries=(
+                        args.retrieval_queries
+                        if args.retrieval_queries is not None
+                        else 4
+                        if variant == "multiquery"
+                        else 1
+                    ),
+                )
             categories = (
-                () if args.prose else choices(args.category or "all", tuple(corpus.CATEGORIES))
+                ()
+                if args.prose or args.retrieval
+                else choices(args.category or "all", tuple(corpus.CATEGORIES))
             )
             if args.repeat < 1:
                 raise ValueError("--repeat must be positive")
@@ -135,6 +203,8 @@ def main(argv=None) -> int:
                         args.repeat,
                         args.case,
                         args.prose,
+                        retrieval,
+                        needle_depth,
                     )
                 )
             else:
@@ -149,6 +219,8 @@ def main(argv=None) -> int:
                         args.case,
                         lambda message: print(message, file=sys.stderr, flush=True),
                         args.prose,
+                        retrieval,
+                        needle_depth,
                     )
                 )
             print(

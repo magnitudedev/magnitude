@@ -15,6 +15,7 @@ import httpx
 from benchmark_fixtures import bfcl as corpus
 from benchmark_fixtures import prose as prose_source
 from benchmark_fixtures.prose_history import Prose
+from benchmark_fixtures.ruler import RetrievalAnswers, RulerFixture
 
 from . import report
 from .client import Observation, measure
@@ -22,7 +23,12 @@ from .engines import ADAPTERS
 from .engines.base import command as subprocess_command
 from .engines.base import runtime_digest
 from .models import Artifact, Target
-from .policy import CONTEXT_ALIGNMENT, MAX_OUTPUT_TOKENS, PROSE_OUTPUT_TOKENS
+from .policy import (
+    CONTEXT_ALIGNMENT,
+    MAX_OUTPUT_TOKENS,
+    PROSE_OUTPUT_TOKENS,
+    RETRIEVAL_OUTPUT_TOKENS,
+)
 from .results import RunStore, atomic_json, public_command
 from .sessions import Plan, Request
 from .suites import compile_plan
@@ -94,9 +100,12 @@ async def execute(
             "checkpoint": request.checkpoint,
             "concurrency": request.concurrency,
             "session": request.session,
+            "fixture_id": request.fixture_id,
             "timing_basis": adapter.timing_basis,
             "observation": observation.model_dump(mode="json", exclude_none=True),
         }
+        if isinstance(request.expected, RetrievalAnswers):
+            row["retrieval_total"] = len(request.expected.values)
         records.append(row)
         store.append("results.jsonl", row)
         store.event(
@@ -107,7 +116,11 @@ async def execute(
             phase=phase,
             outcome=observation.outcome,
         )
-        progress(f"{adapter.target.id} {request.id}: {observation.outcome}")
+        detail = ""
+        if observation.retrieval is not None:
+            score = observation.retrieval
+            detail = f"; retrieval {score.correct}/{score.total}, exact={score.exact_match}"
+        progress(f"{adapter.target.id} {request.id}: {observation.outcome}{detail}")
 
     async with httpx.AsyncClient(
         timeout=None,
@@ -203,8 +216,15 @@ async def run(
     case: str | None,
     progress: Callable[[str], None],
     prose: bool = False,
+    retrieval: RulerFixture | None = None,
+    needle_depth: float = 0.5,
 ) -> dict:
-    command = public_command(targets, sections, contexts, categories, repeat, case, prose)
+    if retrieval is not None and (prose or categories or case is not None):
+        raise ValueError("retrieval cannot be combined with prose or tool selection")
+    command = public_command(
+        targets, sections, contexts, categories, repeat, case, prose, retrieval, needle_depth
+    )
+    workload = "retrieval" if retrieval else "prose" if prose else "tools"
     store = RunStore(
         root,
         command,
@@ -215,8 +235,16 @@ async def run(
             "categories": categories,
             "repeat": repeat,
             "case": case,
-            "workload": "prose" if prose else "tools",
-            "max_output_tokens": PROSE_OUTPUT_TOKENS if prose else MAX_OUTPUT_TOKENS,
+            "workload": workload,
+            "retrieval": retrieval.model_dump(mode="json") if retrieval else None,
+            "needle_depth": needle_depth if retrieval else None,
+            "max_output_tokens": (
+                RETRIEVAL_OUTPUT_TOKENS
+                if retrieval
+                else PROSE_OUTPUT_TOKENS
+                if prose
+                else MAX_OUTPUT_TOKENS
+            ),
         },
     )
     progress(f"Run: {store.path}")
@@ -227,7 +255,11 @@ async def run(
         with machine_lock():
             store.snapshot("session-bench", root)
             source_identity = runtime_digest(root)
-            if prose:
+            if retrieval is not None:
+                progress("Preparing RULER-derived retrieval fixtures")
+                fixtures = retrieval
+                corpus_digest = retrieval.identity
+            elif prose:
                 if case is not None:
                     raise ValueError("--case is only supported for tool fixtures")
                 progress("Preparing pinned Moby Dick")
@@ -270,6 +302,7 @@ async def run(
                     case,
                     counter=counter,
                     sizing_identity=sizing.target.id,
+                    needle_depth=needle_depth,
                 )
             for request in plan.prepared_requests:
                 store.append("requests.jsonl", request.model_dump(mode="json"))
@@ -356,7 +389,7 @@ async def run(
         summary["process_footprints"] = [
             json.loads(line) for line in footprint_path.read_text().splitlines()
         ]
-    summary["workload"] = "prose" if prose else "tools"
+    summary["workload"] = workload
     summary["path"] = str(store.path)
     summary["hardware"] = store.hardware
     store.complete(summary, report.markdown(summary))

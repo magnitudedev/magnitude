@@ -8,6 +8,7 @@ from typing import Literal
 
 import httpx
 
+from benchmark_fixtures.ruler import RetrievalAnswers, RetrievalScore
 from magnitude_engine.components import component
 
 from . import validation
@@ -39,6 +40,7 @@ class Observation(Record):
     finish_reason: str | None = None
     terminal: dict | None = None
     error: str | None = None
+    retrieval: RetrievalScore | None = None
 
 
 @component("ENGINE:INFERENCE:MAG:SESSION_HTTP")
@@ -59,6 +61,7 @@ async def measure(
     finish = evidence = None
     outcome: Outcome = "protocol-error"
     error = None
+    retrieval = None
     body = request.body(model)
     for key, value in (extensions or {}).items():
         if key in body:
@@ -80,6 +83,7 @@ async def measure(
             finish_reason=finish,
             terminal=evidence,
             error=error,
+            retrieval=retrieval,
         )
 
     done = False
@@ -193,6 +197,20 @@ async def measure(
                         raise ValueError(f"unexpected prose finish reason: {finish}")
                 elif finish == "length":
                     outcome, error = "truncated", "engine reached its output or context limit"
+                elif isinstance(request.expected, RetrievalAnswers):
+                    if finish != "stop" or calls:
+                        raise ValueError(
+                            "retrieval response must finish with stop and no tool calls"
+                        )
+                    if evidence["usage"]["completion_tokens"] < 1:
+                        raise ValueError("retrieval response must report generated tokens")
+                    retrieval = request.expected.score(output)
+                    outcome = "valid" if retrieval.exact_match else "invalid"
+                    error = (
+                        None
+                        if retrieval.exact_match
+                        else "retrieval answer does not match expected values"
+                    )
                 else:
                     if finish not in ("stop", "tool_calls"):
                         raise ValueError(f"unexpected finish reason: {finish}")

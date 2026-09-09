@@ -2,8 +2,8 @@
 
 `session-bench` measures inference serving with simulated agent sessions: tool decisions,
 long histories, sequential turns, parallel sessions and branches. It uses pinned BFCL V4
-cases or Moby Dick passages to build deterministic inputs. It does not run an agent or produce
-an official BFCL score.
+cases, Moby Dick passages or RULER-derived retrieval fixtures to build deterministic inputs.
+It does not run an agent or produce official BFCL or RULER scores.
 
 ## Run it
 
@@ -85,6 +85,72 @@ or that budget. Either is a valid performance endpoint; reports record actual ou
 lengths. Empty text, tool calls, malformed streams, and context exhaustion before the
 budget are failures. There is no comparison against the book's wording or answer-quality
 score. Later inputs use canonical book text, regardless of what the model generated.
+
+## Retrieval mode and fixture API
+
+`--retrieval` selects deterministic key/value retrieval over synthetic distractor records.
+The local recipe adapts RULER's record-haystack and multi-query tasks with stable indexed
+facts, explicit placement and strict JSON scoring. It records the upstream revision and
+local recipe identity; it requires no corpus download or upstream runtime.
+
+```sh
+uv run session-bench run --model qwen-q4 --retrieval \
+  --retrieval-variant multiquery --retrieval-queries 4 --retrieval-seed 42 \
+  --needle-depth 0.5 --suite context --context 4k,16k,32k,4k
+```
+
+Retrieval preserves checkpoint order and repeats. Each lane keeps the same facts and question
+across sizes; additional lanes use successive seeds. `single` requires one query; `multiquery`
+supports up to 16. The CLI defaults to one query for `single` and four for `multiquery`.
+`--needle-depth` is the fraction of distractor records before the target fact block (0 to 1).
+The API supports up to 65,536 distractor records, and fails explicitly beyond that capacity.
+
+```python
+from benchmark_fixtures.ruler import RulerFixture
+
+fixture = RulerFixture(seed=42, variant="multiquery", haystack="records", queries=4)
+prepared = await fixture.prepare(
+    target=16_384,
+    counter=tokenizer.count,          # async (Context) -> int; full chat rendering
+    sizing_identity=tokenizer.identity,
+    needle_depth=0.5,
+)
+
+prepared.content     # Context(messages=..., tools=[]): send through normal inference
+prepared.tokens      # Actual input count from the supplied renderer
+prepared.expected    # RetrievalAnswers; .values is the expected key/value mapping
+prepared.provenance  # Recipe, upstream revision, seed, depth, positions and input digest
+
+score = prepared.score(response_text)
+score.exact_match    # Entire JSON object matches; extra keys fail
+score.correct        # Number of correctly retrieved fields
+score.total          # Number of requested fields
+score.format_valid   # JSON object of strings, without duplicate keys
+```
+
+`prepare` is independent of previous calls: 8K → 32K → 8K reproduces the original 8K
+input with the same renderer. Resizing changes distractors; changing depth moves the facts.
+Neither changes the target facts or question. Targets are approximate input sizes at complete
+record boundaries; zero selects the minimal fixture. Prepared records support the existing
+Pydantic serialization API. `needle_record_positions` are exact indices;
+`needle_prefix_render_tokens` counts separately rendered partial contexts, not exact token
+offsets within the complete prompt.
+
+All traffic sections support retrieval. `session`/`memory` execute resized snapshots, and
+`fork` releases repeated probes after a parent probe. Probe answers never enter later inputs.
+These are full-prefill snapshots; retained-prefix reuse remains disabled. Retrieval scores
+alone do not establish cache residency or that a particular quantization kernel was exercised.
+
+Retrieval allows 1,024 output tokens and requires normal termination. Length termination is
+truncation even if the output parses. Strict JSON scoring rejects duplicate keys, non-string
+values and substring answers. Per-field accuracy is a partial diagnostic; extra keys fail
+exact accuracy even when all requested fields are correct. Progress displays field counts
+and exact results. Reports include exact-answer and field accuracy with failure-inclusive
+denominators: unscored requests earn zero. Latency includes correct and incorrect
+protocol-complete responses, excluding truncation and execution failures.
+
+`--retrieval` and `--prose` are mutually exclusive. Neither accepts tool filters
+`--category`/`--case`; retrieval-specific options require `--retrieval`.
 
 ## Maintained sections and policy
 
