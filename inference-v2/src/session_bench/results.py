@@ -14,6 +14,8 @@ from pathlib import Path
 
 import psutil
 
+from benchmark_fixtures.ruler import RulerFixture
+
 from .models import Target, file_hash
 from .sessions import encoded
 
@@ -36,6 +38,8 @@ def public_command(
     repeat: int,
     case: str | None = None,
     prose: bool = False,
+    retrieval: RulerFixture | None = None,
+    needle_depth: float = 0.5,
 ) -> str:
     args = ["uv", "run", "--frozen", "session-bench", "run"]
     for target in targets:
@@ -48,7 +52,20 @@ def public_command(
         "--repeat",
         str(repeat),
     ]
-    args += ["--prose"] if prose else ["--category", ",".join(categories)]
+    if retrieval is not None:
+        args += [
+            "--retrieval",
+            "--retrieval-variant",
+            retrieval.variant,
+            "--retrieval-seed",
+            str(retrieval.seed),
+            "--retrieval-queries",
+            str(retrieval.queries),
+            "--needle-depth",
+            str(needle_depth),
+        ]
+    else:
+        args += ["--prose"] if prose else ["--category", ",".join(categories)]
     if case:
         args += ["--case", case]
     return shlex.join(args)

@@ -4,7 +4,7 @@ import math
 import statistics
 from collections import Counter, defaultdict
 
-from .policy import PROSE_OUTPUT_TOKENS
+from .policy import PROSE_OUTPUT_TOKENS, RETRIEVAL_OUTPUT_TOKENS
 
 
 def summarize(
@@ -33,7 +33,10 @@ def summarize(
             r["observation"]
             for r in values
             if r["observation"]["outcome"] == "valid"
-            or (section == "context" and r["observation"]["outcome"] == "invalid")
+            or (
+                (section == "context" or r.get("workload") == "retrieval")
+                and r["observation"]["outcome"] == "invalid"
+            )
         ]
 
         def median(field, valid=valid):
@@ -75,6 +78,26 @@ def summarize(
                 "timing_basis": values[0]["timing_basis"],
             }
         )
+        if values[0].get("workload") == "retrieval":
+            scores = [
+                r["observation"]["retrieval"]
+                for r in values
+                if r["observation"]["outcome"] in ("valid", "invalid")
+                and r["observation"].get("retrieval") is not None
+            ]
+            total = sum(r["retrieval_total"] for r in values)
+            correct = sum(score["correct"] for score in scores)
+            exact = sum(score["exact_match"] for score in scores)
+            rows[-1]["retrieval"] = {
+                "requests": len(values),
+                "scored": len(scores),
+                "exact_matches": exact,
+                "exact_accuracy": exact / len(values),
+                "correct": correct,
+                "total": total,
+                "field_accuracy": correct / total,
+                "format_valid": sum(score["format_valid"] for score in scores),
+            }
     return {
         "format": 1,
         "id": run_id,
@@ -128,12 +151,33 @@ def markdown(summary: dict) -> str:
             f"{number(row['completion_ms'])} | {number(row['prefill_tokens_per_second'])} | "
             f"{number(row['decode_tokens_per_second'])} |"
         )
+    retrieval_rows = [row for row in summary["rows"] if "retrieval" in row]
+    if retrieval_rows:
+        lines += [
+            "",
+            "| Target | Section | Concurrency | Context target | "
+            "Exact answers | Retrieved fields |",
+            "| --- | --- | ---: | ---: | --- | --- |",
+        ]
+        for row in retrieval_rows:
+            score = row["retrieval"]
+            lines.append(
+                f"| {row['target']} | {row['section']} | {row['concurrency']} | "
+                f"{row['context_target']} | {score['exact_matches']}/{score['requests']} "
+                f"({100 * score['exact_accuracy']:.1f}%) | {score['correct']}/{score['total']} "
+                f"({100 * score['field_accuracy']:.1f}%) |"
+            )
     lines += [
         "",
         "Latencies and phase rates above are medians; nearest-rank p95 latency is in summary.json.",
         "",
         (
-            "Prose continuation; no answer-quality scoring. "
+            "RULER-derived retrieval; strict JSON answers, not an official RULER score. "
+            f"Output budget: {RETRIEVAL_OUTPUT_TOKENS} tokens. "
+            "All recorded requests enter accuracy denominators; unscored failures earn zero. "
+            "Partial field accuracy does not penalize extra keys; exact accuracy does."
+            if summary.get("workload") == "retrieval"
+            else "Prose continuation; no answer-quality scoring. "
             f"Output budget: {PROSE_OUTPUT_TOKENS} tokens. "
             "EOS or reaching that budget ends a valid measurement; "
             "actual lengths are in summary.json."
@@ -142,7 +186,10 @@ def markdown(summary: dict) -> str:
         ),
         "",
         (
-            "Only protocol-complete text responses are included; premature truncation and "
+            "Retrieval latency includes correct and incorrect protocol-complete responses. "
+            "Truncation and execution failures are excluded from latency, but retained in accuracy."
+            if summary.get("workload") == "retrieval"
+            else "Only protocol-complete text responses are included; premature truncation and "
             "execution failures are excluded."
             if summary.get("workload") == "prose"
             else "Context rows may include semantically invalid responses with complete protocol "

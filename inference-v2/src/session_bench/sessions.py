@@ -3,12 +3,13 @@
 import json
 from typing import Literal, cast
 
-from pydantic import Field, JsonValue
+from pydantic import Field, JsonValue, model_validator
 
 from benchmark_fixtures.interactions import ExpectedCall
 from benchmark_fixtures.records import Record, digest, encoded
+from benchmark_fixtures.ruler import RetrievalAnswers
 
-from .policy import MAX_OUTPUT_TOKENS, PROSE_OUTPUT_TOKENS
+from .policy import MAX_OUTPUT_TOKENS, PROSE_OUTPUT_TOKENS, RETRIEVAL_OUTPUT_TOKENS
 
 Section = Literal["single", "context", "session", "parallel", "fork", "concurrency", "memory"]
 
@@ -19,17 +20,29 @@ class Request(Record):
     session: str
     checkpoint: int = Field(ge=0)
     concurrency: int = Field(default=1, ge=1)
-    workload: Literal["tools", "prose"] = "tools"
+    workload: Literal["tools", "prose", "retrieval"] = "tools"
     fixture_id: str
     messages: list[dict[str, JsonValue]]
     tools: list[dict[str, JsonValue]]
-    expected: list[ExpectedCall]
+    expected: list[ExpectedCall] | RetrievalAnswers
     fixture_provenance: dict[str, JsonValue] = Field(default_factory=dict)
     depends_on: tuple[str, ...] = ()
     release_ms: int = Field(default=0, ge=0)
 
+    @model_validator(mode="after")
+    def answer_contract(self):
+        if (self.workload == "retrieval") != isinstance(self.expected, RetrievalAnswers):
+            raise ValueError(
+                "retrieval requests require RetrievalAnswers; other workloads require calls"
+            )
+        if self.workload == "retrieval" and self.tools:
+            raise ValueError("retrieval requests do not use tools")
+        return self
+
     @property
     def output_limit(self) -> int:
+        if self.workload == "retrieval":
+            return RETRIEVAL_OUTPUT_TOKENS
         return PROSE_OUTPUT_TOKENS if self.workload == "prose" else MAX_OUTPUT_TOKENS
 
     def body(self, model: str) -> dict:
@@ -58,9 +71,12 @@ class Plan(Record):
     corpus_digest: str
     # Sharing canonical history is not evidence that an engine retained a prefix.
     cache_policy: Literal["disabled"] = "disabled"
+    qualification: Request | None = None
 
     @property
     def warmup(self) -> Request:
+        if self.qualification is not None:
+            return self.qualification
         first = self.requests[0]
         if first.workload == "prose":
             return first.model_copy(
