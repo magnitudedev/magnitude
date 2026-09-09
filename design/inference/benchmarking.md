@@ -1,5 +1,7 @@
 ---
 applies_to:
+  - inference-v2/performance/**
+  - inference-v2/tests/performance/**
   - inference-v2/benchmarks/**
   - inference-v2/tests/benchmarks/**
   - inference-v2/src/session_bench/**
@@ -37,6 +39,16 @@ the executing host's hostname, OS version, model identifier, chip, physical CPU 
 memory in bytes and GPU names/core counts before timed work. They use the same typed
 hardware record; unavailable details are null and failed probes retain errors. Hostname
 identifies the execution machine rather than inferring location from an SSH session.
+The shared measurement lifecycle also records actual sensor temperatures in Celsius
+before setup, periodically throughout the run, and after cleanup. Retain timestamped
+per-sensor readings, probe duration, sensor grouping, time-weighted means, extrema
+and coverage alongside each run; averages exclude missing readings and gaps. CPU/GPU
+group labels describe sensor associations, not documented core identities. Unavailable
+probes remain explicit errors rather than zero temperatures or thermal-pressure substitutes.
+The trace covers the whole run, including setup and warmup, and survives managed
+failure and cancellation. Sampling runs outside timed operations without GPU work;
+its overhead is not subtracted from measurements. Recording does not imply a cooldown
+policy or establish that a comparison is thermally matched.
 Complete asynchronous work inside timing;
 keep loading, reset and correctness checks outside unless the claim includes them.
 Measure shared device service once. Per-request participation and public latency

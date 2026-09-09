@@ -74,6 +74,10 @@ the recorded bytes, and exact historical reproduction requires recorded code/dep
 Relevant source snapshots, artifact hashes, corpus identity, runtime versions and effective policy
 accompany results. The shared benchmark hardware record is captured once before preparation,
 retained in the initial run record and final summary, and identified in the Markdown report.
+The shared benchmark temperature recorder spans preparation through engine cleanup;
+its per-sensor Celsius trace and summary remain attached when serving observations
+are imported into the performance store. Reports label temperature aggregates as
+whole-run evidence, rather than attributing them to individual requests or targets.
 Only relevant source is captured, never credentials or the full environment.
 
 Events and completed request results are appended and flushed during execution. Final summaries and

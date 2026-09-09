@@ -152,6 +152,11 @@ class RunStore:
             p for p in (root / "src").rglob("*") if p.is_file() and p.suffix in (".py", ".json")
         )
         candidates += [p for p in (root / "pyproject.toml", root / "uv.lock") if p.is_file()]
+        candidates += [
+            root / "performance" / name
+            for name in ("thermals.py", "temperature.py")
+            if (root / "performance" / name).is_file()
+        ]
         for path in candidates:
             relative = path.relative_to(root)
             destination = source / relative
