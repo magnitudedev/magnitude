@@ -6,6 +6,7 @@ from pathlib import Path
 import psutil
 import pytest
 
+from performance import thermals
 from session_bench import report, runner
 from session_bench.client import Observation
 from session_bench.engines.base import Adapter
@@ -31,6 +32,16 @@ def fake_runtime(monkeypatch, interaction):
     async def corpus(categories):
         return [interaction], "test-corpus"
 
+    class Probe:
+        source = "test-SMC"
+
+        def read(self):
+            return {"sensors_c": {"Tp01": 65.0, "Tg01": 45.0}, "errors": {}}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(thermals, "AppleSMC", Probe)
     monkeypatch.setattr(runner.corpus, "prepare", corpus)
     monkeypatch.setitem(runner.ADAPTERS, "magnitude", FixtureAdapter)
 
@@ -58,6 +69,13 @@ async def test_real_process_full_run_and_readable_evidence(tmp_path, artifact_pa
     assert result["hardware"] == initial["host"]["hardware"] == saved["hardware"]
     assert result["hardware"]["hostname"] in (path / "report.md").read_text()
     assert result["hardware"]["memory_bytes"] > 0
+    assert result["thermals"] == saved["thermals"]
+    assert result["thermals"]["channels"]["cpu_mean"]["start_c"] == 65.0
+    assert result["thermals"]["channels"]["gpu_mean"]["end_c"] == 45.0
+    assert "Time-weighted mean °C" in (path / "report.md").read_text()
+    imported = list((tmp_path / "runs" / "performance" / "runs").glob("*/run.json"))
+    assert imported
+    assert json.loads(imported[0].read_text())["external"]["thermals"] == saved["thermals"]
     events = [json.loads(line) for line in (path / "events.jsonl").read_text().splitlines()]
     assert sum(event["event"] == "stopped" for event in events) == 2
     assert (path / "memory.jsonl").is_file()
@@ -70,6 +88,8 @@ async def test_preparation_failure_still_has_report(tmp_path, fake_runtime):
     )
     assert result["status"] == "failed"
     assert result["completed"] == 0
+    assert result["thermals"]["sample_count"] >= 2
+    assert result["thermals"]["channels"]["cpu_mean"]["end_c"] == 65.0
     assert "command failed" in result["error"]
     assert (
         "model directory"
@@ -111,6 +131,7 @@ async def test_cancel_keeps_completed_result_and_retires_child(
     task.cancel()
     result = await task
     assert result["status"] == "cancelled"
+    assert result["thermals"]["channels"]["gpu_mean"]["end_c"] == 45.0
     path = Path(result["path"])
     rows = [json.loads(line) for line in (path / "results.jsonl").read_text().splitlines()]
     assert any(r["phase"] == "measured" and r["observation"]["outcome"] == "valid" for r in rows)
