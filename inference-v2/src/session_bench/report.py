@@ -142,6 +142,28 @@ def markdown(summary: dict) -> str:
             f"{memory_gib:g} GiB RAM · {hardware['os']} {hardware['os_version']}",
             "",
         ]
+    if thermals := summary.get("thermals"):
+        thermal_lines = [
+            f"Temperatures: {thermals['status']} · whole run, including setup and warmup.",
+            "",
+        ]
+        if thermals.get("channels"):
+            thermal_lines += [
+                "| Sensors | Start °C | End °C | Time-weighted mean °C | Hottest sensor °C |",
+                "| --- | ---: | ---: | ---: | ---: |",
+            ]
+            for group in ("cpu", "gpu"):
+                mean = thermals["channels"][f"{group}_mean"]
+                peak = thermals["channels"][f"{group}_max"]
+                thermal_lines.append(
+                    f"| {group.upper()}-associated | {number(mean['start_c'])} | "
+                    f"{number(mean['end_c'])} | {number(mean['mean_c'])} | "
+                    f"{number(peak['max_c'])} |"
+                )
+            thermal_lines += ["", "[Per-sensor temperature trace](thermals.jsonl).", ""]
+        if errors := thermals.get("errors"):
+            thermal_lines += [f"Temperature probe errors: {errors}", ""]
+        lines[2:2] = thermal_lines
     for row in summary["rows"]:
         lines.append(
             f"| {row['target']} | {row['section']} | {row['concurrency']} | "

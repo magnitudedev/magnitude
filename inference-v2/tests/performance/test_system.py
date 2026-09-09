@@ -164,6 +164,11 @@ def test_failure_and_interrupt_are_persisted(tmp_path):
                 run.measure(fail)
         record = json.loads(run.path.read_text())
         assert record["status"] in ("failed", "interrupted")
+        assert record["thermals"]["sample_count"] >= 2
+        trace = [
+            json.loads(line) for line in (run.directory / "thermals.jsonl").read_text().splitlines()
+        ]
+        assert trace[0]["phase"] == "start" and trace[-1]["phase"] == "end"
         assert len(record["samples"]) == 1
         assert all(
             d["observed"] is None

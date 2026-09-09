@@ -16,6 +16,7 @@ from benchmark_fixtures import bfcl as corpus
 from benchmark_fixtures import prose as prose_source
 from benchmark_fixtures.prose_history import Prose
 from benchmark_fixtures.ruler import RetrievalAnswers, RulerFixture
+from performance.thermals import ThermalRecorder
 
 from . import report
 from .client import Observation, measure
@@ -251,8 +252,9 @@ async def run(
     records = []
     planned = 0
     status, error = "failed", None
+    thermals = ThermalRecorder(store.path)
     try:
-        with machine_lock():
+        with machine_lock(), thermals:
             store.snapshot("session-bench", root)
             source_identity = runtime_digest(root)
             if retrieval is not None:
@@ -392,5 +394,6 @@ async def run(
     summary["workload"] = workload
     summary["path"] = str(store.path)
     summary["hardware"] = store.hardware
+    summary["thermals"] = thermals.summary
     store.complete(summary, report.markdown(summary))
     return summary

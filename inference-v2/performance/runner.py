@@ -25,6 +25,7 @@ from performance.assembly import Binding
 from performance.records import Observation, Profile, digest, encoded
 from performance.store import DEFAULT_STORE, Store, atomic
 from performance.theory.catalog import revision
+from performance.thermals import ThermalRecorder
 
 
 def now() -> str:
@@ -97,6 +98,10 @@ class Run:
                 for p in sorted((Path(__file__).parent / "benchmarks").glob("*.py"))
             },
             "runner_source": Path(__file__).read_text(),
+            "thermal_sources": {
+                name: Path(__file__).with_name(name).read_text()
+                for name in ("thermals.py", "temperature.py")
+            },
             "case_sources": {
                 frame.filename: Path(frame.filename).read_text()
                 for frame in inspect.stack()[1:]
@@ -165,11 +170,13 @@ class Run:
                     try:
                         if prepare is not None:
                             prepare()
+                        sample["started_at"] = now()
                         start = self.clock()
                         output = operation()
                         if complete is not None:
                             complete(output)
                         elapsed = self.clock() - start
+                        sample["completed_at"] = now()
                         if elapsed < 0:
                             raise ValueError("measurement clock moved backwards")
                         sample["elapsed_ns"] = elapsed
@@ -242,12 +249,14 @@ def recording(
     )
     lock = Path(tempfile.gettempdir()) / f"magnitude-inference-measurement-{os.getuid()}.lock"
     lease = lock.open("a")
+    thermals = ThermalRecorder(run.directory)
     try:
         try:
             fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise RuntimeError("another inference measurement owns this machine") from error
-        yield run
+        with thermals:
+            yield run
         if not run._measured:
             raise ValueError("recording ended without a measurement")
         if revision() != run.record["formula_revision"]:
@@ -262,6 +271,7 @@ def recording(
         run.record["error"] = "".join(traceback.format_exception(error))
         raise
     finally:
+        run.record["thermals"] = thermals.summary
         run.record["completed_at"] = now()
         run.record["checksum"] = digest(run.record)
         try:

@@ -5,6 +5,7 @@ server stays opaque unless it exported an actual component graph. Native model
 service timings are retained as evidence and never substituted for HTTP durations.
 """
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -20,6 +21,12 @@ def ingest(directory: Path, store: Store) -> dict:
     header = json.loads((directory / "run.json").read_text())
     if "hardware" not in header.get("host", {}):
         raise ValueError("session result lacks hardware provenance; retain as historical evidence")
+    thermal_path = directory / "thermals.json"
+    thermals = json.loads(thermal_path.read_text()) if thermal_path.exists() else None
+    if thermals is not None:
+        with (directory / "thermals.jsonl").open("rb") as trace:
+            if hashlib.file_digest(trace, "sha256").hexdigest() != thermals["trace_sha256"]:
+                raise ValueError("session temperature trace checksum mismatch")
     results = directory / "results.jsonl"
     if not results.exists():
         return {"imported": 0, "duplicate": 0}
@@ -47,6 +54,7 @@ def ingest(directory: Path, store: Store) -> dict:
             "request": request,
             "artifact": artifact,
             "runtime": runtime,
+            "thermals": thermals,
         }
         checksum = digest(source)
         identity = digest({"session_bridge": 2, "source": checksum})[:32]

@@ -214,6 +214,7 @@ Every run creates `runs/session-bench/<UTC-id>/` automatically, including failed
 | `run.json` | Original argv/cwd, selection, host and owner identity |
 | `plan.json`, `requests.jsonl` | Shared schedule, corpus digest, fixture provenance, input bodies and expectations |
 | `results.jsonl` | Incrementally saved observations, outcomes, timings and correctness |
+| `thermals.jsonl`, `thermals.json` | CPU/GPU-associated SMC sensor temperatures in °C: one-second trace, start/end, time-weighted means, peaks, coverage and probe errors; includes setup, warmup and cleanup |
 | `summary.json`, `report.md` | Workload mode, actual prompt/output lengths, aggregates, denominators and failures |
 | `events.jsonl`, `memory.jsonl`, `footprints.jsonl` | Lifecycle and process-tree memory evidence |
 | `logs/` | Engine output and raw request streams |
