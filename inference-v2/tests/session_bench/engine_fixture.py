@@ -17,7 +17,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        assert body["max_tokens"] == (32768 if body.get("tools") else 256)
+        records = next(
+            (
+                m["content"]
+                for m in body["messages"]
+                if m.get("content", "").startswith("Records:\n")
+            ),
+            None,
+        )
+        assert body["max_tokens"] == (1024 if records else 32768 if body.get("tools") else 256)
         events = [
             {
                 "id": "fixture",
@@ -61,6 +69,13 @@ class Handler(BaseHTTPRequestHandler):
         if not body.get("tools"):
             events[0]["choices"][0]["delta"] = {"content": "The story continues."}
             events[1]["choices"][0]["finish_reason"] = "stop"
+        if records:
+            records, query = records.split("\n\n")
+            values = dict(line.split(": ") for line in records.splitlines()[1:])
+            keys = query.split(": ", 1)[1].split(", ")
+            events[0]["choices"][0]["delta"] = {
+                "content": json.dumps({key: values[key] for key in keys})
+            }
         stream = "".join("data: " + json.dumps(event) + "\n\n" for event in events)
         stream += "data: [DONE]\n\n"
         self.send_response(200)

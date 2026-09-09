@@ -1,10 +1,14 @@
 """Fixed session shapes; user selections choose context checkpoints, not engine settings."""
 
+from typing import NamedTuple
+
 from pydantic import TypeAdapter
 
-from benchmark_fixtures.contexts import Counter, History
+from benchmark_fixtures.contexts import Context, Counter, History
 from benchmark_fixtures.interactions import Interaction
 from benchmark_fixtures.prose_history import Prose, ProseHistory
+from benchmark_fixtures.records import digest
+from benchmark_fixtures.ruler import RulerFixture
 
 from .sessions import Plan, Request, Section
 
@@ -19,27 +23,57 @@ SECTIONS = {
 }
 
 
+class SessionInput(NamedTuple):
+    identity: str
+    content: History | ProseHistory | RulerFixture
+    needle_depth: float
+
+
 async def history_request(
-    history, identity, section, checkpoint, counter, sizing_identity, depends=()
+    history: SessionInput, identity, section, checkpoint, counter, sizing_identity, depends=()
 ):
-    prepared = await history.prepare(checkpoint, counter, sizing_identity)
+    session, content, needle_depth = history
+    if isinstance(content, RulerFixture):
+        prepared = await content.prepare(
+            checkpoint, counter, sizing_identity, needle_depth=needle_depth
+        )
+        return Request(
+            id=identity,
+            section=section,
+            session=session,
+            checkpoint=checkpoint,
+            fixture_id=content.identity,
+            workload="retrieval",
+            messages=prepared.content.messages,
+            tools=[],
+            expected=prepared.expected,
+            depends_on=tuple(depends),
+            fixture_provenance=prepared.provenance,
+        )
+    prepared = await content.prepare(checkpoint, counter, sizing_identity)
     return Request(
         id=identity,
         section=section,
-        session=history.identity,
+        session=session,
         checkpoint=checkpoint,
-        fixture_id=history.current.id,
-        workload="prose" if isinstance(history, ProseHistory) else "tools",
+        fixture_id=content.current.id,
+        workload="prose" if isinstance(content, ProseHistory) else "tools",
         messages=prepared.content.messages,
         tools=prepared.content.tools,
-        expected=history.current.expected,
+        expected=content.current.expected,
         depends_on=tuple(depends),
         fixture_provenance=prepared.provenance,
     )
 
 
+def complete(history: SessionInput) -> None:
+    # Retrieval snapshots never append answers: that would leak the probe into later inputs.
+    if not isinstance(history.content, RulerFixture):
+        history.content.complete()
+
+
 async def compile_plan(
-    fixtures: list[Interaction] | Prose,
+    fixtures: list[Interaction] | Prose | RulerFixture,
     corpus_digest: str,
     sections: tuple[str, ...],
     contexts: tuple[int, ...],
@@ -47,27 +81,33 @@ async def compile_plan(
     *,
     counter: Counter,
     sizing_identity: str,
+    needle_depth: float = 0.5,
 ) -> Plan:
     selected = (
-        [] if isinstance(fixtures, Prose) else [f for f in fixtures if case is None or f.id == case]
+        [f for f in fixtures if case is None or f.id == case] if isinstance(fixtures, list) else []
     )
-    if isinstance(fixtures, Prose):
+    if not isinstance(fixtures, list):
         if case is not None:
             raise ValueError("--case is only supported for tool fixtures")
     elif not selected:
         raise ValueError(f"unknown or excluded BFCL case: {case}")
 
-    def history_for(identity: str, index: int = 0) -> History | ProseHistory:
+    def history_for(identity: str, index: int = 0) -> SessionInput:
         if isinstance(fixtures, Prose):
-            return ProseHistory(fixtures, identity)
-        return History(fixtures, identity, selected[index % len(selected)])
+            content = ProseHistory(fixtures, identity)
+        elif isinstance(fixtures, RulerFixture):
+            # Lane selection is independent of section, checkpoint and sizing search.
+            content = fixtures.model_copy(update={"seed": fixtures.seed + index})
+        else:
+            content = History(fixtures, identity, selected[index % len(selected)])
+        return SessionInput(identity, content, needle_depth)
 
     requests = []
     capacity = 1
     # The fixture selection for one section is independent of other selected sections.
     for section in TypeAdapter(tuple[Section, ...]).validate_python(sections):
         if section == "single":
-            if isinstance(fixtures, Prose):
+            if not isinstance(fixtures, list):
                 requests.append(
                     await history_request(
                         history_for("single"), "single", section, 0, counter, sizing_identity
@@ -98,9 +138,11 @@ async def compile_plan(
             capacity = max(capacity, lanes)
             histories = [history_for(f"{section}-{i}", i) for i in range(lanes)]
             previous: list[str | None] = [None] * lanes
-            for checkpoint in contexts:
+            for step, checkpoint in enumerate(contexts):
                 for i, history in enumerate(histories):
                     identity = f"{section}-{i}-t{checkpoint}"
+                    if isinstance(fixtures, RulerFixture):
+                        identity += f"-s{step}"
                     requests.append(
                         (
                             await history_request(
@@ -114,11 +156,11 @@ async def compile_plan(
                             )
                         ).model_copy(update={"concurrency": lanes})
                     )
-                    history.complete()
+                    complete(history)
                     previous[i] = identity
             continue
         previous_group = []
-        for checkpoint in contexts:
+        for step, checkpoint in enumerate(contexts):
             for count in (
                 (1, 2, 4, 8)
                 if section == "concurrency"
@@ -128,6 +170,8 @@ async def compile_plan(
             ):
                 capacity = max(capacity, count)
                 group = f"{section}-t{checkpoint}-c{count}"
+                if isinstance(fixtures, RulerFixture):
+                    group += f"-s{step}"
                 shared = history_for(group) if section == "fork" else None
                 dependencies = previous_group
                 if shared:
@@ -141,7 +185,7 @@ async def compile_plan(
                         dependencies,
                     )
                     requests.append(parent)
-                    shared.complete()
+                    complete(shared)
                     dependencies = [parent.id]
                 current_group = []
                 for i in range(count):
@@ -159,4 +203,39 @@ async def compile_plan(
                     requests.append(request.model_copy(update={"concurrency": count}))
                     current_group.append(identity)
                 previous_group = current_group
-    return Plan(requests=tuple(requests), parallel_sequences=capacity, corpus_digest=corpus_digest)
+    qualification = None
+    if isinstance(fixtures, RulerFixture):
+        qualification = await history_request(
+            history_for("qualification", 1_000_000),
+            "warmup",
+            "single",
+            0,
+            counter,
+            sizing_identity,
+        )
+        messages = [dict(message) for message in qualification.messages]
+        messages[0]["content"] = "Independent retrieval qualification. " + str(
+            messages[0]["content"]
+        )
+        qualification_context = Context(messages=messages)
+        qualification = qualification.model_copy(
+            update={
+                "messages": messages,
+                "fixture_provenance": {
+                    **{
+                        key: value
+                        for key, value in qualification.fixture_provenance.items()
+                        if key != "needle_prefix_render_tokens"
+                    },
+                    "recipe": "ruler-qualification-v1",
+                    "actual_context_tokens": await counter(qualification_context),
+                    "content_digest": digest(qualification_context.model_dump(mode="json")),
+                },
+            }
+        )
+    return Plan(
+        requests=tuple(requests),
+        parallel_sequences=capacity,
+        corpus_digest=corpus_digest,
+        qualification=qualification,
+    )

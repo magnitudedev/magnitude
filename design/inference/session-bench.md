@@ -25,18 +25,23 @@ The old Magnitude llama.cpp/ICN engine is not a target. Engine source directory 
 
 ## Work and measurement
 
-Pinned and hash-verified BFCL interactions build deterministic requests and canonical completed
-history. Request bodies, expectations and dependencies are shared across targets. Observed output
+Pinned and hash-verified BFCL interactions, pinned prose, and versioned RULER-derived synthetic
+retrieval recipes build deterministic requests. Tool and prose workloads construct canonical completed
+history. Retrieval fixes facts and questions independently of sizing and uses complete distractor
+records to resize context; evidence depth moves the fact block without changing its answers.
+Retrieval checkpoints preserve requested order and repeats, and never replay probe answers into
+later snapshots. Request bodies, expectations and dependencies are shared across targets. Observed output
 never becomes the input to subsequent shared requests. Context targets are approximate input sizes;
 terminal engine counts are authoritative measurements. Session, independent concurrency, fork,
 concurrency pressure and memory sections describe offered traffic; evidence explicitly distinguishes
 history sharing from actual retained-prefix reuse. No retention claim follows from session shape alone.
 
-Every measured request has a fixed 32,768 completion-token allowance, with no CLI or environment
-override. Engine capacity must cover rendered inputs plus that full allowance within model limits.
+Tool requests have a fixed 32,768 completion-token allowance, prose 256 and retrieval 1,024, with no
+CLI or environment override. Engine capacity must cover rendered inputs plus that full allowance within model limits.
 Shared capacity rounds up to 256-token allocation boundaries.
 Preparation tokenization is capacity evidence, never measured token evidence. Length termination is
-truncation, including parseable partial tool calls, and never contributes successful performance.
+truncation for tools and retrieval, including parseable partial answers. Prose may terminate normally
+at its full output budget; ending for length before that budget is truncation.
 Sampling is greedy, seed 42 where supported, and model-selected thinking is disabled.
 
 Adapters own engine preparation, launch, readiness and cleanup; shared code owns session scheduling,
@@ -51,6 +56,11 @@ Terminal usage and native timing counters must agree. No native time or token co
 from text or client latency. Different artifacts/templates or observed prompt counts prevent strict
 comparison. Stock MLX-VLM emission timing is labeled and excluded from cross-engine native phase
 ratios. Tool calls are matched as a multiset with complete assignment across overlapping alternatives.
+Retrieval answers are exact JSON string mappings with duplicate keys rejected. Report whole-answer
+accuracy and partial field accuracy separately; additional keys fail whole-answer equality. Retrieval
+qualification uses a separate short fixture. Synthetic fixtures retain upstream reference, local recipe,
+seed, sizing identity, requested/actual lengths, record positions and content digest. Rebuilding a size
+with the same fixture and renderer reproduces the same input, independently of prior preparations.
 Different generated prose or tool encodings are real serving-work differences, not evidence of
 slower neural execution. Use fixed-work component/engine controls from the
 [benchmark hierarchy](benchmarking.md) to isolate those costs.
@@ -73,14 +83,18 @@ appear completed. Historical formats need no migration or execution support; raw
 self-contained reports remain accessible.
 
 Reports show failure/invalid/truncated counts and metric denominators. Context scaling may summarize
-semantically invalid but protocol-complete results, separately from correctness. Other sections
-require both gates. Protocol/transport errors, timeouts, cancellation and truncation never enter
-performance summaries. Warmup and qualification are separate from measured observations.
+semantically invalid but protocol-complete results, separately from correctness. Retrieval includes
+both correct and incorrect protocol-complete answers in latency summaries for every section; all
+recorded retrieval requests enter accuracy denominators, with unscored failures earning zero.
+Other tool sections require both gates. Protocol/transport errors, timeouts, cancellation and truncation
+never enter performance summaries. Warmup and qualification are separate from measured observations.
 
 ## Acceptance
 
 Tests demonstrate deterministic shared sessions, local alias resolution, alias-independent saved
 commands, immutable output policy, input-plus-output capacity checks, fragmented SSE handling,
 terminal consistency, non-greedy semantic matching, cancellation cleanup and persistent partial
-results. Adapter integration is qualified against the actual serving interface, not an invented
+results. Retrieval tests additionally demonstrate reversible resizing, stable facts, depth control,
+strict answer matching, no answer leakage and failure-inclusive accuracy denominators.
+Adapter integration is qualified against the actual serving interface, not an invented
 benchmark-only inference implementation. Unsupported capabilities fail explicitly.

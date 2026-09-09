@@ -10,6 +10,7 @@ and result storage stay with their respective runners.
 |---|---|---|
 | `prose.moby-dick` | A contiguous token window from the pinned Project Gutenberg text; subsequent book tokens form the replay continuation | Sustained prose context and continuation |
 | `tools.bfcl` | Pinned BFCL questions, tool schemas and declared calls assembled into complete interactions | Structured tool history and a pending tool decision |
+| `retrieval.ruler` | Versioned RULER-derived synthetic records with stable facts and resizable distractors | Exact single- or multi-query retrieval with known answers |
 
 Moby Dick is downloaded from the URL in its checked-in source lock and verified by
 SHA-256. Normalize line endings and remove the Gutenberg wrapper; retain the book's
@@ -35,6 +36,16 @@ messages and tools, then records each target's native rendered count. Target ord
 therefore participates in fixture preparation. Model comparisons use the same
 prepared token sequence when their tokenizer/rendering contract matches. Canonical
 JSON key order is shared between sizing, saved requests and execution.
+
+Retrieval preparation is stateless: seed and query selection determine target facts,
+independently of the size search and previous preparations. Complete distractor records
+reach the consumer's rendered context target. Depth determines the fraction of distractors
+before the fact block. Resizing can grow or shrink without changing answers; input digests
+and exact record positions identify each prepared snapshot. Separately rendered prefix
+counts describe evidence depth without claiming exact offsets in the full token stream.
+The RULER-derived recipe and upstream reference are versioned, and records are generated
+locally without downloading a corpus. Strict JSON string mappings provide whole-answer and
+per-field scores. Execution and measurement remain with the consuming runner.
 
 ## Execution modes
 
@@ -96,7 +107,7 @@ response and timing/usage evidence. It does not score the continuation against t
 
 Use both prose and tools when qualifying whole-model behavior, including 4K, 16K and
 at least 64K context. Start with short controlled runs; longer sampling belongs at
-acceptance boundaries. These fixtures characterize performance, not answer quality.
+acceptance boundaries. Prose characterizes performance, not answer quality; retrieval has explicit scoring.
 Existing session-bench validation remains a separate runner policy.
 
 Synthetic component inputs are appropriate when the relevant conditions are controlled:
