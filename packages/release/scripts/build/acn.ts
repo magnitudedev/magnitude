@@ -11,6 +11,7 @@ import {
 } from "../../../../scripts/release-target"
 import { run } from "./common"
 import { ACN_EXECUTABLE_NAME } from "../../src/executables"
+import { compileAppleBun, runAppleBuild } from "../apple/compile-bun"
 
 const PROJECT_ROOT = resolve(import.meta.dir, "../../../..")
 const RG_EMBED = resolve(PROJECT_ROOT, "packages/ripgrep/src/rg-embed.ts")
@@ -45,6 +46,7 @@ export const buildAcnBinary = async (target: string): Promise<string> => {
     resolve(PROJECT_ROOT, "packages/ripgrep/bin"),
     bunTargetToRipgrepTarget(target),
   )
+  if (info.platform === "darwin") return withRipgrepEmbed(false, () => runAppleBuild(compileAppleBun(resolve(PROJECT_ROOT, "packages/acn/src/binary.ts"), binary, target, "acn")))
   await withRipgrepEmbed(info.platform === "windows", () =>
     run([
       "bun",
@@ -55,8 +57,5 @@ export const buildAcnBinary = async (target: string): Promise<string> => {
       `--outfile=${binary}`,
     ], { cwd: PROJECT_ROOT }),
   )
-  if (info.platform === "darwin") {
-    await run(["codesign", "--force", "--deep", "--sign", "-", binary])
-  }
   return binary
 }

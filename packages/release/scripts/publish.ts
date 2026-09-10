@@ -1,3 +1,4 @@
+import { verifyAppleReceipts } from "./apple/verify-receipts"
 import { createHash } from "node:crypto"
 import { readdir, readFile, stat } from "node:fs/promises"
 import { resolve } from "node:path"
@@ -65,6 +66,7 @@ const candidate = resolve(process.argv[2] ?? "release-candidate")
 const manifest = Schema.decodeUnknownSync(
   Schema.parseJson(ReleaseManifestSchema),
 )(await readFile(resolve(candidate, "magnitude-release.json"), "utf8"))
+await Effect.runPromise(verifyAppleReceipts(resolve(required("MAGNITUDE_APPLE_RECEIPTS")), candidate).pipe(Effect.provide(BunContext.layer)))
 const changelog = await readFile(
   resolve(import.meta.dir, "../../launcher/CHANGELOG.md"),
   "utf8",

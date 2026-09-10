@@ -2,6 +2,8 @@ import { mkdir } from "node:fs/promises"
 import { resolve } from "node:path"
 import { getTargetInfo } from "../../../../scripts/release-target"
 import { run } from "./common"
+import { compileAppleBun, runAppleBuild } from "../apple/compile-bun"
+import { signAppleCode } from "../apple/signing"
 
 const PROJECT_ROOT = resolve(import.meta.dir, "../../../..")
 
@@ -14,6 +16,11 @@ export const buildCliBinary = async (target: string): Promise<string> => {
     `magnitude-cli${info.executableExt}`,
   )
   await mkdir(resolve(PROJECT_ROOT, "bin"), { recursive: true })
+  if (info.platform === "darwin") {
+    await runAppleBuild(compileAppleBun(resolve(PROJECT_ROOT, "cli/src/index.tsx"), binary, target, "cli"))
+    await runAppleBuild(signAppleCode(binary, "dev.magnitude.cli", "bun"))
+    return binary
+  }
   await run([
     "bun",
     "build",
@@ -30,8 +37,5 @@ export const buildCliBinary = async (target: string): Promise<string> => {
     "--define",
     `process.arch=${JSON.stringify(info.arch)}`,
   ], { cwd: PROJECT_ROOT })
-  if (info.platform === "darwin") {
-    await run(["codesign", "--force", "--deep", "--sign", "-", binary])
-  }
   return binary
 }

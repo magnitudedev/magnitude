@@ -1,40 +1,22 @@
-import { mkdir } from 'node:fs/promises'
+import { chmod, mkdir, rename } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { getTarget, getVersion, isWindows } from './platform'
+import { isWindows } from './platform'
 
-const BIN_DIR = join(homedir(), '.magnitude', 'bin')
-const VERSION_MARKER = join(BIN_DIR, 'rg.version')
+// Extracted executables are keyed by the embedded payload's digest, not the
+// upstream version: a re-signed rg with the same version must never reuse a
+// previously extracted unsigned copy. Each release therefore owns an immutable
+// file, and an old release still running keeps its own.
+const RIPGREP_DIR = join(homedir(), '.magnitude', 'bin', 'ripgrep')
 
 let cachedPath: string | null = null
 let resolvePromise: Promise<string> | null = null
 
-function getRgBinPath(): string {
-  return join(BIN_DIR, isWindows() ? 'rg.exe' : 'rg')
-}
-
-function versionString(): string {
-  const target = getTarget()
-  return `${getVersion(target)}|${target}`
-}
-
-async function versionMatches(): Promise<boolean> {
-  try {
-    return (await Bun.file(VERSION_MARKER).text()).trim() === versionString()
-  } catch {
-    return false
-  }
-}
-
-async function getRgPath(): Promise<string> {
+async function embeddedPayload(): Promise<Uint8Array> {
   // Dynamic import so this is only resolved at runtime, not during
   // workspace builds or bundling that would try to parse the binary as JS.
   const { rgPath } = await import('./rg-embed')
-  return rgPath
-}
-
-async function extractEmbedded(): Promise<string> {
-  const rgPath = await getRgPath()
   const file = Bun.file(rgPath)
   if (!await file.exists()) {
     throw new Error(
@@ -42,33 +24,37 @@ async function extractEmbedded(): Promise<string> {
       'This binary was built incorrectly.'
     )
   }
+  return new Uint8Array(await file.arrayBuffer())
+}
 
-  await mkdir(BIN_DIR, { recursive: true })
-  const binPath = getRgBinPath()
-  await Bun.write(binPath, file)
+async function extractEmbedded(): Promise<string> {
+  const bytes = await embeddedPayload()
+  const digest = createHash('sha256').update(bytes).digest('hex')
+  const directory = join(RIPGREP_DIR, digest)
+  const binPath = join(directory, isWindows() ? 'rg.exe' : 'rg')
+  if (await Bun.file(binPath).exists()) return binPath
 
-  if (!isWindows()) {
-    const proc = Bun.spawn(['chmod', '755', binPath], { stdout: 'ignore', stderr: 'ignore' })
-    await proc.exited
+  await mkdir(directory, { recursive: true })
+  // Publish by rename: an executable is never rewritten in place while a
+  // concurrent process may be running it. Competing publishers write identical bytes.
+  const temporary = join(directory, `.rg-${process.pid}-${Date.now()}`)
+  await Bun.write(temporary, bytes)
+  if (!isWindows()) await chmod(temporary, 0o755)
+  try {
+    await rename(temporary, binPath)
+  } catch (error) {
+    if (!await Bun.file(binPath).exists()) throw error
   }
-
-  await Bun.write(VERSION_MARKER, versionString())
   return binPath
 }
 
 /**
  * Resolve the path to the ripgrep binary.
- * Uses cached binary if available, otherwise extracts from the embedded binary.
- * No download fallback — missing rg is a packaging/build failure.
+ * Uses the extracted binary for this exact embedded payload if present,
+ * otherwise extracts it. No download fallback — missing rg is a build failure.
  */
 export async function resolveRgPath(): Promise<string> {
   if (cachedPath) return cachedPath
-
-  const binPath = getRgBinPath()
-  if (await Bun.file(binPath).exists() && await versionMatches()) {
-    cachedPath = binPath
-    return binPath
-  }
 
   if (!resolvePromise) {
     resolvePromise = extractEmbedded().then(path => {

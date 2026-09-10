@@ -18,6 +18,9 @@ const matrices = {
       toolkit: "cuda" in pack ? pack.cuda.toolkitVersion : "",
     })),
   },
+  appleHosts: {
+    include: releaseHosts.filter((host) => host.id.startsWith("darwin-")).map((host) => ({ id: host.id, runner: host.runner })),
+  },
   linuxHosts: {
     include: releaseHosts
       .filter((host) => host.id.startsWith("linux-"))
@@ -29,6 +32,7 @@ const output = process.env.GITHUB_OUTPUT
 if (output) {
   await appendFile(output, `hosts=${JSON.stringify(matrices.hosts)}\n`)
   await appendFile(output, `backends=${JSON.stringify(matrices.backends)}\n`)
+  await appendFile(output, `appleHosts=${JSON.stringify(matrices.appleHosts)}\n`)
   await appendFile(output, `linuxHosts=${JSON.stringify(matrices.linuxHosts)}\n`)
 } else {
   console.log(JSON.stringify(matrices, null, 2))

@@ -47,6 +47,22 @@ deployment target recorded in release artifacts. Before packaging, the Apple bui
 executable and native library with Apple's `vtool`, selecting the expected release architecture and
 rejecting a missing deployment declaration or a minimum newer than 13.0.
 
+## Apple signing and notarization
+
+Trusted release jobs import a Developer ID Application identity and a notarytool API-key profile into
+an ephemeral keychain. Untrusted validation jobs use explicit ad-hoc signing and cannot produce
+production acceptance receipts. Ad-hoc execution omits Hardened Runtime because it has no team
+identity for library validation; production runtime acceptance requires Developer ID. Native libraries and Bun-embedded native files are signed before
+embedding; executables use Hardened Runtime and the Bun executables receive JIT entitlements.
+The service is the app's main executable, so sealing the app signs it. No broad
+library-validation exception is enabled by default.
+
+Apple must accept the CLI, inference payload, app, and backend submissions. A rejected or incomplete
+submission fails the build and retains diagnostic logs. The app ticket is stapled and validated before
+final archiving and checksums. Private receipts bind publisher, commit, submissions, and final native
+archive digests. Independent Apple consumer jobs execute the downloaded host archives and verify
+signatures and the stapled app. Real login/permission UI acceptance remains a signed macOS test.
+
 ## Archive validation
 
 Assembly validates every host base and every legal base-plus-backend composition. For Linux, every

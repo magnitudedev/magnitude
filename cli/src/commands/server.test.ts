@@ -16,8 +16,8 @@ describe("Magnitude service definitions", () => {
   it("registers only the public service command group", () => {
     const program = new Command().name("magnitude")
     registerServiceCommand(program)
-    expect(program.commands.map((command) => command.name())).toEqual(["service"])
-    expect(program.commands[0]!.commands.map((command) => command.name())).toEqual([
+    expect(program.commands.map((command) => command.name())).toEqual(["native-runtime-check", "service"])
+    expect(program.commands[1]!.commands.map((command) => command.name())).toEqual([
       "install",
       "uninstall",
       "start",

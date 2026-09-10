@@ -1,3 +1,8 @@
+import { acnExecutableRelativePath } from "../../src/macos-app"
+import { buildMacApp } from "../apple/build-app"
+import { appleSigning, signAppleCode, appleCommand } from "../apple/signing"
+import { runAppleBuild } from "../apple/compile-bun"
+import { notarizeAppleUnit, regularAppleFiles, writeAppleReceipt } from "../apple/distribution"
 import {
   chmod,
   mkdir,
@@ -37,6 +42,7 @@ import {
 } from "./common"
 import { buildIcnBinary } from "../../../../inference/scripts/compile"
 import { ACN_COORDINATION_REVISION } from "@magnitudedev/version"
+import { appleRequirement } from "../../src/trust"
 import {
   ACN_EXECUTABLE_NAME,
   ICN_EXECUTABLE_NAME,
@@ -193,18 +199,18 @@ export const smokeHostArchives = async (
     ) throw new Error(`${host.id} CLI archive returned the wrong version`)
     if (
       (await run([
-        resolve(acnRoot, `bin/${ACN_EXECUTABLE_NAME}${extension}`),
+        resolve(acnRoot, acnExecutableRelativePath(host.id)),
         "version",
       ])).trim() !== version
     ) throw new Error(`${host.id} ACN archive returned the wrong version`)
     if (
       Number((await run([
-        resolve(acnRoot, `bin/${ACN_EXECUTABLE_NAME}${extension}`),
+        resolve(acnRoot, acnExecutableRelativePath(host.id)),
         "coordination-revision",
       ])).trim()) !== ACN_COORDINATION_REVISION
     ) throw new Error(`${host.id} ACN archive returned the wrong coordination revision`)
     if (!(await run([
-      resolve(acnRoot, `bin/${ACN_EXECUTABLE_NAME}${extension}`),
+      resolve(acnRoot, acnExecutableRelativePath(host.id)),
       "doctor",
     ])).includes("ripgrep")) {
       throw new Error(`${host.id} ACN archive has no working embedded ripgrep`)
@@ -234,6 +240,14 @@ export const smokeHostArchives = async (
       }
     const icnBinary = resolve(icnRoot, `bin/${ICN_EXECUTABLE_NAME}${extension}`)
     await smokeIcnServer(icnBinary, declaration, icnRoot, environment)
+    if (host.id.startsWith("darwin-")) {
+      await run([resolve(cliRoot, "bin/magnitude-cli"), "native-runtime-check"])
+      const app = resolve(acnRoot, "Magnitude.app")
+      const signing = await runAppleBuild(appleSigning)
+      await run(["/usr/bin/codesign", "--verify", "--deep", "--strict", "-R", `=${appleRequirement("dev.magnitude.service", signing.team)}`, app])
+      await run(["/usr/bin/codesign", "--verify", "--strict", "-R", `=${appleRequirement("dev.magnitude.cli", signing.team)}`, resolve(cliRoot, "bin/magnitude-cli")])
+      if (signing.mode === "developer-id") await run(["/usr/bin/xcrun", "stapler", "validate", app])
+    }
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -298,8 +312,12 @@ export const buildHostArtifacts = async (
   ])
 
   if (host.id.startsWith("darwin-")) {
+    for (const kind of ["cli", "acn"]) {
+      const embedded = await runAppleBuild(regularAppleFiles(resolve(PROJECT_ROOT, "bin/apple-inputs", kind)))
+      await verifyAppleDeploymentTarget(host.id, embedded.map((file) => file.source))
+    }
     for (const file of [icn.binary, ...icn.runtimeLibraries, ...cpuModules]) {
-      await run(["codesign", "--force", "--sign", "-", file])
+      await runAppleBuild(signAppleCode(file, `dev.magnitude.inference.${basename(file)}`, file === icn.binary ? "native" : "library"))
     }
   }
   await chmod(cli, 0o755)
@@ -330,7 +348,11 @@ export const buildHostArtifacts = async (
   const cliArchivePath = resolve(output, cliArchive(host.id))
   const acnArchivePath = resolve(output, acnArchive(host.id))
   const icnArchivePath = resolve(output, icnBaseArchive(host.id))
-  await buildArchive(
+  const cliNotary = host.id.startsWith("darwin-")
+    ? await runAppleBuild(notarizeAppleUnit("cli", output, [cli, resolve(PROJECT_ROOT, "bin/apple-inputs/cli")])) : Option.none()
+  const icnNotary = host.id.startsWith("darwin-")
+    ? await runAppleBuild(notarizeAppleUnit("inference", output, [icn.binary, ...icn.runtimeLibraries, ...cpuModules])) : Option.none()
+  const cliArtifact = await buildArchive(
     cliArchivePath,
     resolve(output, `cli-${host.id}.artifact.json`),
     {
@@ -349,7 +371,20 @@ export const buildHostArtifacts = async (
       mode: 0o755,
     }],
   )
-  await buildArchive(
+  let acnSources: readonly ArchiveSource[] = [{ path: `bin/${ACN_EXECUTABLE_NAME}${host.executableExtension}`, source: acn, mode: 0o755 }]
+  const notarizations = [cliNotary, icnNotary]
+  if (host.id.startsWith("darwin-")) {
+    const version = (JSON.parse(await readFile(resolve(PROJECT_ROOT, "packages/launcher/package.json"), "utf8")) as { version: string }).version
+    const appRoot = resolve(output, ".app-build")
+    const app = await runAppleBuild(buildMacApp(appRoot, acn, version, ACN_COORDINATION_REVISION))
+    notarizations.push(await runAppleBuild(notarizeAppleUnit("app", output, [app, resolve(PROJECT_ROOT, "bin/apple-inputs/acn")])))
+    if ((await runAppleBuild(appleSigning)).mode === "developer-id") {
+      await runAppleBuild(appleCommand("/usr/bin/xcrun", "stapler", "staple", app))
+      await runAppleBuild(appleCommand("/usr/bin/xcrun", "stapler", "validate", app))
+    }
+    acnSources = (await runAppleBuild(regularAppleFiles(app))).map((file) => ({ ...file, path: `Magnitude.app/${file.path}` }))
+  }
+  const acnArtifact = await buildArchive(
     acnArchivePath,
     resolve(output, `acn-${host.id}.artifact.json`),
     {
@@ -362,11 +397,7 @@ export const buildHostArtifacts = async (
       backendModuleAbi: Option.none(),
       compatibility: Option.none(),
     },
-    [{
-      path: `bin/${ACN_EXECUTABLE_NAME}${host.executableExtension}`,
-      source: acn,
-      mode: 0o755,
-    }],
+    acnSources,
   )
   const icnArtifact = await buildArchive(
     icnArchivePath,
@@ -403,6 +434,10 @@ export const buildHostArtifacts = async (
     icnArchivePath,
     icnArtifact,
   )
+  if (host.id.startsWith("darwin-")) {
+    await runAppleBuild(writeAppleReceipt(output, [cliArtifact, acnArtifact, icnArtifact], notarizations, true))
+    await rm(resolve(output, ".app-build"), { recursive: true, force: true })
+  }
 }
 
 if (import.meta.main) {

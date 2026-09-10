@@ -9,6 +9,7 @@ import { Context, Effect, Either, Layer, Option, Runtime } from "effect"
 import type { ReleaseArtifact } from "./contracts"
 import { ReleaseAcquisitionError } from "./errors"
 import type { ArtifactByteProgress } from "./installation-progress"
+import { MACOS_APP_NAME, MACOS_REQUIRED_FILES } from "./macos-app"
 import {
   ACN_EXECUTABLE_NAME,
   ICN_EXECUTABLE_NAME,
@@ -65,6 +66,13 @@ const validateLayout = (
     (host) => host === "windows-x64-msvc",
   ) ? ".exe" : ""
   if (artifact.kind === "cli" || artifact.kind === "acn") {
+    if (artifact.kind === "acn" && Option.exists(artifact.host, (host) => host.startsWith("darwin-"))) {
+      if (MACOS_REQUIRED_FILES.some((file) => !paths.has(`${MACOS_APP_NAME}/${file}`)) ||
+          [...paths].some((file) => !file.startsWith(`${MACOS_APP_NAME}/Contents/`))) {
+        return archiveError(`${artifact.id} has an invalid Magnitude.app layout`)
+      }
+      return Effect.void
+    }
     const expected = artifact.kind === "cli"
       ? `bin/magnitude-cli${extension}`
       : `bin/${ACN_EXECUTABLE_NAME}${extension}`
@@ -146,9 +154,12 @@ const extractWithNodeStreams = (
       const gunzip = createGunzip()
       const root = resolve(destination)
       const paths = new Set<string>()
+      const foldedPaths = new Set<string>()
       let entries = 0
       let expanded = 0
       reader.on("entry", (header, stream, next) => {
+        // Rejected headers have no file pipeline yet; tar-stream still errors their child stream.
+        stream.on("error", (cause) => reader.destroy(cause))
         const fail = (cause: Error): void => {
           stream.resume()
           reader.destroy(cause)
@@ -162,7 +173,8 @@ const extractWithNodeStreams = (
           fail(relative.left)
           return
         }
-        if (paths.has(relative.right) || ++entries > ENTRY_LIMIT) {
+        const folded = relative.right.normalize("NFD").toLowerCase()
+        if (foldedPaths.has(folded) || ++entries > ENTRY_LIMIT) {
           fail(
             archiveError(
               `duplicate or excessive archive entry ${relative.right}`,
@@ -171,6 +183,7 @@ const extractWithNodeStreams = (
           return
         }
         paths.add(relative.right)
+        foldedPaths.add(folded)
         const output = resolve(root, relative.right)
         if (!output.startsWith(`${root}${sep}`)) {
           fail(archiveError(`${relative.right} escapes staging`))
