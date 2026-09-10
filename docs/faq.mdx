@@ -6,19 +6,19 @@ icon: message-circle-question-mark
 
 ## What is Magnitude?
 
-An open source inference server for Apple silicon. It profiles your Mac, recommends the best models for it, then downloads, tunes, and runs them. Plug it into the agent you already use.
+An open source inference server for the hardware you already have. It profiles your machine, recommends the right models for it, then downloads, tunes, and runs them. Plug it into the agent you already use.
 
-## Why only Mac?
-
-Apple silicon is the best consumer hardware for local models, and building for one platform lets us optimize the whole stack for it, from model selection down to the kernels.
-
-## How does it know what my Mac can run?
+## How does it know what my machine can run?
 
 Magnitude profiles your chip, memory, and bandwidth, then estimates fit and tok/s for every model in the catalog. It ranks them by speed, accuracy, intelligence, and memory so you can pick.
 
-## What Mac do I need?
+## What hardware do I need?
 
-Any Apple silicon Mac (M1 or later, 2020 onward) running macOS 15 or newer. Intel Macs aren't supported. There's no fixed minimum beyond that. More memory lets you run larger models.
+There's no fixed minimum. Magnitude profiles your machine and recommends what runs well on it. More memory lets you run larger models.
+
+## What platforms does it support?
+
+macOS, Linux, and Windows through WSL. Metal, CUDA, and Vulkan on the GPU side, or CPU only. Magnitude profiles whatever you have and recommends models that fit.
 
 ## Which harnesses work with it?
 
@@ -30,4 +30,4 @@ No. It runs in the background, loads models when your agent needs them, and unlo
 
 ## Is it private?
 
-Yes. Prompts, files, and models stay on your Mac. Once a model is downloaded, no internet connection is needed.
+Yes. Prompts, files, and models stay on your machine. Once a model is downloaded, no internet connection is needed.

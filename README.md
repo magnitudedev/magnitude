@@ -8,7 +8,7 @@
 
 <h1 align="center">Magnitude</h1>
 
-<p align="center"><strong>Local models, tuned for your Mac.</strong></p>
+<p align="center"><strong>The best way to run local models on your machine</strong></p>
 
 <p align="center">
   <a href="https://docs.magnitude.dev"><img src="https://img.shields.io/badge/%F0%9F%93%95-Docs-0369a1?style=flat-square&labelColor=0369a1&color=gray" alt="Documentation"></a>
@@ -18,15 +18,11 @@
   <a href="https://www.npmjs.com/package/@magnitudedev/cli"><img src="https://img.shields.io/npm/v/%40magnitudedev%2Fcli" alt="npm version"></a>
 </p>
 
-Magnitude is an open source inference server for Apple silicon. It profiles your Mac, recommends the best models for it, then downloads, tunes, and runs them. Plugs into Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline, or use the built-in harness.
+Magnitude is an open source inference server for the hardware you already have. It profiles your machine, recommends the right models for it, then downloads, tunes, and runs them. Plug it into Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, or Cline, or use the built-in harness.
 
 ⭐ Help us reach more developers and grow the Magnitude community. Star this repo!
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/ecosystem-dark.png">
-  <source media="(prefers-color-scheme: light)" srcset="assets/readme/ecosystem-light.png">
-  <img alt="Pi, OpenCode, Hermes, Codex, Claude Code, and OpenClaw connected to Magnitude, which runs local models for your Mac." src="assets/readme/ecosystem-light.png">
-</picture>
+![Magnitude demo: run local models on your machine](assets/readme/demo9-9.gif)
 
 ## Get started
 
@@ -49,12 +45,12 @@ Your agent will profile your hardware, walk you through the best local models fo
 
 ## Why Magnitude?
 
-- **Knows your Mac:** profiles your hardware to assess fit and estimate tok/s per model
+- **Knows your machine:** profiles your hardware to assess fit and estimate tok/s per model
 - **Recommends the best models:** ranked by speed, accuracy, intelligence, and memory
-- **Tuned end to end:** speculative decoding and more, all set for your Mac
+- **Tuned end to end:** speculative decoding and more, all set for your hardware
 - **Easy setup:** one command and your agent is running local models
 - **Free to run:** no token costs, API keys, or rate limits
-- **Fully private and offline:** models, prompts, and files stay on your Mac
+- **Fully private and offline:** models, prompts, and files stay on your machine
 - **Models on demand:** loaded on request, unloaded when idle or memory fills
 - **Open source:** Apache 2.0, yours to modify
 
@@ -62,19 +58,19 @@ Your agent will profile your hardware, walk you through the best local models fo
 
 ### What is Magnitude?
 
-An open source inference server for Apple silicon. It profiles your Mac, recommends the best models for it, then downloads, tunes, and runs them. Plug it into the agent you already use.
+An open source inference server for the hardware you already have. It profiles your machine, recommends the right models for it, then downloads, tunes, and runs them. Plug it into the agent you already use.
 
-### Why only Mac?
-
-Apple silicon is the best consumer hardware for local models, and building for one platform lets us optimize the whole stack for it, from model selection down to the kernels.
-
-### How does it know what my Mac can run?
+### How does it know what my machine can run?
 
 Magnitude profiles your chip, memory, and bandwidth, then estimates fit and tok/s for every model in the catalog. It ranks them by speed, accuracy, intelligence, and memory so you can pick.
 
-### What Mac do I need?
+### What hardware do I need?
 
-Any Apple silicon Mac (M1 or later, 2020 onward) running macOS 15 or newer. Intel Macs aren't supported. There's no fixed minimum beyond that. More memory lets you run larger models.
+There's no fixed minimum. Magnitude profiles your machine and recommends what runs well on it. More memory lets you run larger models.
+
+### What platforms does it support?
+
+macOS, Linux, and Windows through WSL. Metal, CUDA, and Vulkan on the GPU side, or CPU only. Magnitude profiles whatever you have and recommends models that fit.
 
 ### Which harnesses work with it?
 
@@ -86,7 +82,7 @@ No. It runs in the background, loads models when your agent needs them, and unlo
 
 ### Is it private?
 
-Yes. Prompts, files, and models stay on your Mac. Once a model is downloaded, no internet connection is needed.
+Yes. Prompts, files, and models stay on your machine. Once a model is downloaded, no internet connection is needed.
 
 ## Learn more
 
