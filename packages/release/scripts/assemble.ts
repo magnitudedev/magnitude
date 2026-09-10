@@ -1,3 +1,4 @@
+import { MACOS_APP_NAME, MACOS_REQUIRED_FILES } from "../src/macos-app"
 import { createHash } from "node:crypto"
 import {
   copyFile,
@@ -96,6 +97,13 @@ const validateLayout = async (
   const listing = await archiveListing(archive)
   const host = Option.getOrThrow(artifact.host)
   const extension = host === "windows-x64-msvc" ? ".exe" : ""
+  if (artifact.kind === "acn" && host.startsWith("darwin-")) {
+    if (MACOS_REQUIRED_FILES.some((file) => !listing.includes(`${MACOS_APP_NAME}/${file}`)) ||
+        listing.some((file) => !file.startsWith(`${MACOS_APP_NAME}/Contents/`) || file.split("/").some((part) => part === ".." || part === "." || part === ""))) {
+      throw new Error(`${artifact.id} has an invalid app bundle layout`)
+    }
+    return
+  }
   if (artifact.kind === "cli" || artifact.kind === "acn") {
     const expected = [artifact.kind === "cli"
       ? `bin/magnitude-cli${extension}`

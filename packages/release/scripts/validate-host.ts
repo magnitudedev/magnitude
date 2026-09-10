@@ -1,3 +1,6 @@
+import { writeAppleConsumerReceipt } from "./apple/distribution"
+import { runAppleBuild } from "./apple/compile-bun"
+import { fileSha256 } from "./build/common"
 import { readFile } from "node:fs/promises"
 import { resolve } from "node:path"
 import { Schema } from "effect"
@@ -15,6 +18,12 @@ const artifact = Schema.decodeUnknownSync(Schema.parseJson(ReleaseArtifactSchema
   await readFile(resolve(root, `icn-base-${hostId}.artifact.json`), "utf8")
 )
 
+const artifacts = hostId.startsWith("darwin-") ? await Promise.all(["cli", "acn", "icn-base"].map(async (kind) => {
+  const metadata = Schema.decodeUnknownSync(Schema.parseJson(ReleaseArtifactSchema))(await readFile(resolve(root, `${kind}-${hostId}.artifact.json`), "utf8"))
+  if (await fileSha256(resolve(root, metadata.filename)) !== metadata.sha256) throw new Error(`Consumer received changed ${metadata.id} bytes`)
+  return metadata
+})) : []
+
 await smokeHostArchives(
   host,
   resolve(root, cliArchive(hostId)),
@@ -22,3 +31,5 @@ await smokeHostArchives(
   resolve(root, icnBaseArchive(hostId)),
   artifact
 )
+
+if (hostId.startsWith("darwin-")) await runAppleBuild(writeAppleConsumerReceipt(root, artifacts))

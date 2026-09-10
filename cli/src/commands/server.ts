@@ -3,6 +3,10 @@ import type { Command } from "@commander-js/extra-typings"
 const loadRuntime = () => import("./server-runtime")
 
 export const registerServiceCommand = (program: Command): void => {
+  // Release-only probe: the signed CLI must still load its native renderer and run Bun under Hardened Runtime.
+  program.command("native-runtime-check", { hidden: true })
+    .action(() => import("./native-runtime-check").then(({ runNativeRuntimeCheck }) => runNativeRuntimeCheck()))
+
   const service = program.command("service")
     .description("Manage the Magnitude background service")
 

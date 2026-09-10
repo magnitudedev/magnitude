@@ -1,3 +1,5 @@
+import { acnExecutableRelativePath, MACOS_BUNDLE_ID } from "@magnitudedev/release/macos-app";
+import { verifyAppleCode } from "@magnitudedev/release/trust";
 import * as Command from "@effect/platform/Command";
 import * as CommandExecutor from "@effect/platform/CommandExecutor";
 import * as FileSystem from "@effect/platform/FileSystem";
@@ -61,8 +63,7 @@ const acnRoot = (dataDir: string, version: string) =>
   join(releaseRoot(dataDir), "acn", version, currentHost());
 const pointerPath = (dataDir: string, version: string) =>
   join(acnRoot(dataDir, version), "current.txt");
-const executableName = () =>
-  `${ACN_EXECUTABLE_NAME}${process.platform === "win32" ? ".exe" : ""}`;
+const executableRelativePath = () => acnExecutableRelativePath(currentHost());
 
 const validateBinaryVersion = (
   binaryPath: string,
@@ -137,15 +138,17 @@ const cachedAcn = (
     const executable = path.join(
       acnRoot(dataDir, version),
       digest,
-      "bin",
-      executableName()
+      executableRelativePath()
     );
     if (
       !(yield* fs.exists(executable).pipe(Effect.orElseSucceed(() => false)))
     ) {
       return Option.none();
     }
-    const valid = yield* validateBinaryVersion(executable, version).pipe(
+    const valid = yield* (process.platform === "darwin"
+      ? verifyAppleCode(path.dirname(path.dirname(path.dirname(executable))), MACOS_BUNDLE_ID)
+      : Effect.void).pipe(
+      Effect.zipRight(validateBinaryVersion(executable, version)),
       Effect.zipRight(expectedRevision === undefined
         ? Effect.void
         : validateBinaryRevision(executable, expectedRevision)),
@@ -242,10 +245,13 @@ const ensureAcn = (
       onSome: ({ report }) => report({ _tag: "Planned", plan }),
     });
     const destination = path.join(acnRoot(dataDir, version), artifact.sha256);
-    const executable = path.join(destination, "bin", executableName());
+    const executable = path.join(destination, executableRelativePath());
 
     if (yield* fs.exists(destination).pipe(Effect.orElseSucceed(() => false))) {
-      const valid = yield* validateBinaryVersion(executable, version).pipe(
+      const valid = yield* (process.platform === "darwin"
+      ? verifyAppleCode(path.dirname(path.dirname(path.dirname(executable))), MACOS_BUNDLE_ID)
+      : Effect.void).pipe(
+      Effect.zipRight(validateBinaryVersion(executable, version)),
         Effect.as(true),
         Effect.catchAll(() => Effect.succeed(false))
       );
@@ -268,6 +274,9 @@ const ensureAcn = (
         Effect.mapError(acquisitionFailure(version))
       );
       acquired = true;
+    }
+    if (process.platform === "darwin") {
+      yield* verifyAppleCode(path.dirname(path.dirname(path.dirname(executable))), MACOS_BUNDLE_ID).pipe(Effect.mapError(acquisitionFailure(version)));
     }
     yield* validateBinaryVersion(executable, version);
     if (expectedRevision !== undefined) {
@@ -300,8 +309,7 @@ export const acnInstallationPresent = (
     const executable = path.join(
       acnRoot(dataDir, version),
       digest,
-      "bin",
-      executableName()
+      executableRelativePath()
     );
     return yield* fs.exists(executable).pipe(Effect.orElseSucceed(() => false));
   });

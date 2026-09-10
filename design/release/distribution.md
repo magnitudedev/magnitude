@@ -18,7 +18,8 @@ artifacts. The release graph is product configuration, not a plugin system.
 | Artifact | Published for | Contents |
 | --- | --- | --- |
 | CLI | every host | one `bin/magnitude-cli` executable |
-| ACN | every host | one `bin/magnitude-service` executable with embedded ripgrep |
+| ACN | Apple hosts | signed, notarized, stapled `Magnitude.app` whose main executable is `magnitude-service` with embedded ripgrep, plus metadata and icon |
+| ACN | other hosts | one `bin/magnitude-service` executable with embedded ripgrep |
 | ICN base | every host | one `bin/magnitude-inference` executable, planner inputs, common runtime libraries, and CPU modules |
 | ICN backend pack | compatible hosts | one Metal, CUDA, or Vulkan module family and its redistributable runtime libraries |
 
@@ -39,6 +40,10 @@ native-build identity and backend-module ABI.
 
 The manifest does not describe build provenance or duplicate platform policy. Platform support is
 a property of the release target and is enforced while building and accepting the candidate.
+
+The app bundle exists so the macOS service can be notarized and stapled; it adds no process,
+window, or menu item, and the per-user LaunchAgent runs the executable inside it. The CLI,
+inference artifacts, and models remain outside the app.
 
 ## Distribution contract
 

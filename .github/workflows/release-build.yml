@@ -6,6 +6,10 @@ on:
       source_commit:
         required: true
         type: string
+      apple_distribution:
+        required: false
+        default: false
+        type: boolean
       validate_candidate:
         required: true
         type: boolean
@@ -17,6 +21,8 @@ env:
   BUN_VERSION: "1.3.14"
   RUST_VERSION: "1.91.1"
   NPM_VERSION: "11.6.2"
+  MAGNITUDE_SOURCE_COMMIT: ${{ inputs.source_commit }}
+  MAGNITUDE_APPLE_DISTRIBUTION: ${{ inputs.apple_distribution && 'developer-id' || 'adhoc' }}
 
 jobs:
   matrix:
@@ -25,6 +31,7 @@ jobs:
       hosts: ${{ steps.matrix.outputs.hosts }}
       backends: ${{ steps.matrix.outputs.backends }}
       linuxHosts: ${{ steps.matrix.outputs.linuxHosts }}
+      appleHosts: ${{ steps.matrix.outputs.appleHosts }}
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
@@ -62,6 +69,7 @@ jobs:
           if-no-files-found: error
 
   host:
+    environment: ${{ inputs.apple_distribution && 'apple-release' || 'release-validation' }}
     needs: [matrix, catalog]
     strategy:
       fail-fast: false
@@ -93,14 +101,38 @@ jobs:
         with:
           name: catalog-inputs
           path: catalog-inputs
+      - name: Import Apple release credentials
+        if: runner.os == 'macOS' && inputs.apple_distribution
+        run: bash packages/release/scripts/apple/credentials.sh
+        env:
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_NOTARY_API_KEY_P8: ${{ secrets.APPLE_NOTARY_API_KEY_P8 }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
       - run: bun run packages/release/scripts/build/host.ts "${{ matrix.id }}" catalog-inputs "release/${{ matrix.id }}"
       - uses: actions/upload-artifact@v4
         with:
           name: host-${{ matrix.id }}
           path: release/${{ matrix.id }}/
           if-no-files-found: error
+      - name: Retain Apple notarization diagnostics
+        if: always() && runner.os == 'macOS' && inputs.apple_distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple-diagnostics-${{ matrix.id }}
+          path: release/${{ matrix.id }}/.apple/*.json
+          include-hidden-files: true
+          retention-days: 14
+          if-no-files-found: ignore
+      - name: Remove temporary Apple credentials
+        if: always() && runner.os == 'macOS' && inputs.apple_distribution
+        run: bash packages/release/scripts/apple/cleanup-credentials.sh
 
   backend:
+    environment: ${{ inputs.apple_distribution && 'apple-release' || 'release-validation' }}
     needs: matrix
     strategy:
       fail-fast: false
@@ -210,12 +242,35 @@ jobs:
           cuda: "${{ matrix.toolkit }}.0"
           method: network
       - run: bun install --frozen-lockfile
+      - name: Import Apple release credentials
+        if: runner.os == 'macOS' && inputs.apple_distribution
+        run: bash packages/release/scripts/apple/credentials.sh
+        env:
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_NOTARY_API_KEY_P8: ${{ secrets.APPLE_NOTARY_API_KEY_P8 }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
       - run: bun run packages/release/scripts/build/backend.ts "${{ matrix.id }}" "release/${{ matrix.id }}"
       - uses: actions/upload-artifact@v4
         with:
           name: backend-${{ matrix.id }}
           path: release/${{ matrix.id }}/
           if-no-files-found: error
+      - name: Retain Apple notarization diagnostics
+        if: always() && runner.os == 'macOS' && inputs.apple_distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple-diagnostics-${{ matrix.id }}
+          path: release/${{ matrix.id }}/.apple/*.json
+          include-hidden-files: true
+          retention-days: 14
+          if-no-files-found: ignore
+      - name: Remove temporary Apple credentials
+        if: always() && runner.os == 'macOS' && inputs.apple_distribution
+        run: bash packages/release/scripts/apple/cleanup-credentials.sh
 
   linux-consumer:
     needs: [matrix, host]
@@ -237,8 +292,37 @@ jobs:
           path: release/${{ matrix.id }}
       - run: bun run packages/release/scripts/validate-host.ts "${{ matrix.id }}" "release/${{ matrix.id }}"
 
+  apple-consumer:
+    needs: [matrix, host]
+    environment: ${{ inputs.apple_distribution && 'apple-release' || 'release-validation' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.appleHosts) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_commit }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: host-${{ matrix.id }}
+          path: release/${{ matrix.id }}
+      - run: bun run packages/release/scripts/validate-host.ts "${{ matrix.id }}" "release/${{ matrix.id }}"
+        env:
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apple-consumer-${{ matrix.id }}
+          path: release/${{ matrix.id }}/apple-consumer.receipt.json
+          if-no-files-found: error
+
   candidate:
-    needs: [matrix, host, backend, linux-consumer]
+    needs: [matrix, host, backend, linux-consumer, apple-consumer]
     if: inputs.validate_candidate
     runs-on: ubuntu-22.04
     steps:

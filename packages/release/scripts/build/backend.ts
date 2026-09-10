@@ -1,3 +1,6 @@
+import { signAppleCode } from "../apple/signing"
+import { runAppleBuild } from "../apple/compile-bun"
+import { notarizeAppleUnit, writeAppleReceipt } from "../apple/distribution"
 import { access, mkdir, rm } from "node:fs/promises"
 import { basename, resolve } from "node:path"
 import { Option } from "effect"
@@ -96,7 +99,7 @@ export const buildBackendArtifact = async (
   await verifyAppleDeploymentTarget(host.id, [...modules, ...runtime])
   if (host.id.startsWith("darwin-")) {
     for (const file of [...modules, ...runtime]) {
-      await run(["codesign", "--force", "--sign", "-", file])
+      await runAppleBuild(signAppleCode(file, `dev.magnitude.inference.${basename(file)}`, "library"))
     }
   }
   const sources: ArchiveSource[] = [
@@ -111,7 +114,9 @@ export const buildBackendArtifact = async (
       mode: 0o755,
     })),
   ]
-  await buildArchive(
+  const notarization = host.id.startsWith("darwin-")
+    ? await runAppleBuild(notarizeAppleUnit(pack.id, output, [...modules, ...runtime])) : Option.none()
+  const artifact = await buildArchive(
     resolve(output, backendArchive(pack)),
     resolve(output, `icn-backend-${pack.id}.artifact.json`),
     {
@@ -126,6 +131,7 @@ export const buildBackendArtifact = async (
     },
     sources,
   )
+  if (host.id.startsWith("darwin-")) await runAppleBuild(writeAppleReceipt(output, [artifact], [notarization], false))
 }
 
 if (import.meta.main) {

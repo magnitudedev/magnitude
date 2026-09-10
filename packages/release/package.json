@@ -11,6 +11,7 @@
     "./acquisition": "./src/acquisition.ts",
     "./launcher": "./src/launcher.ts",
     "./trust": "./src/trust.ts",
+    "./macos-app": "./src/macos-app.ts",
     "./plugins": "./src/plugins.ts",
     "./plugin-content": "./src/plugin-content.ts",
     "./plan": "./release-plan.json"

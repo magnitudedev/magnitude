@@ -134,8 +134,14 @@ jobs:
     with:
       source_commit: ${{ needs.preflight.outputs.source_commit }}
       validate_candidate: false
+      apple_distribution: true
+    secrets: inherit
 
   publish:
+    environment: apple-release
+    env:
+      MAGNITUDE_APPLE_RECEIPTS: release-artifacts
+      MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
     needs: [preflight, build]
     if: needs.preflight.outputs.action == 'release'
     runs-on: ubuntu-22.04
@@ -160,6 +166,10 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: backend-*
+          path: release-artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: apple-consumer-*
           path: release-artifacts
       - run: npm install --global "npm@${NPM_VERSION}"
       - run: bun scripts/prepare-integrations.ts
@@ -187,12 +197,17 @@ jobs:
           path: release/integration-candidate
           if-no-files-found: ignore
           overwrite: true
+      - name: Verify the complete Apple distribution before any publication
+        run: bun packages/release/scripts/apple/verify-receipts.ts release-artifacts release-candidate
+        env:
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
       - run: bun scripts/publish-integrations.ts
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - run: bun run packages/release/scripts/publish.ts release-candidate
         env:
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
       - name: Verify public CLI acquisition

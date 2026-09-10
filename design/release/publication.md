@@ -120,6 +120,11 @@ workflow runs plugin preparation, acceptance, and publication on their own from 
 source; unchanged plugins verify as no-ops. There is no separate manual plugin workflow, and no
 path blesses an arbitrary main commit.
 
+Apple production publication additionally requires the complete Developer ID/notarization receipt
+graph from trusted build jobs. Before any plugin or native publication, compare the candidate
+manifest and archive bytes to those accepted digests. Ad-hoc builds and missing, stale, or changed
+receipts cannot authorize publication. Signing, notarization, and stapling precede final checksums.
+
 ## Recovery
 
 Private GitHub drafts are retryable. Public assets and npm versions are immutable. An ambiguous
