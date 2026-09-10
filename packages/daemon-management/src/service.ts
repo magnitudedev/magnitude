@@ -8,6 +8,7 @@ import { homedir } from "node:os"
 import type { AcnAdministrationFailed } from "./errors"
 
 import { writeFileAtomic } from "@magnitudedev/utils/atomic-file"
+import { MACOS_BUNDLE_ID } from "@magnitudedev/release/macos-app"
 
 export interface ManagedServiceHost {
   readonly launchCommand: Option.Option<ReadonlyArray<string>>
@@ -165,6 +166,7 @@ export const renderMacServerService = (command: ReadonlyArray<string>) => `<?xml
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>2</integer>
   <key>ProcessType</key><string>Standard</string>
+  <key>AssociatedBundleIdentifiers</key><array><string>${MACOS_BUNDLE_ID}</string></array>
   <key>StandardOutPath</key><string>${xml(`${defaultDataDir()}/logs/acn-service.log`)}</string>
   <key>StandardErrorPath</key><string>${xml(`${defaultDataDir()}/logs/acn-service.log`)}</string>
 </dict></plist>
@@ -188,9 +190,23 @@ WantedBy=default.target
 const installAndStartService = (command: ReadonlyArray<string>) => Effect.gen(function* () {
   if (process.platform === "darwin") {
     const service = macServicePath()
-    yield* writeServiceFile(service, renderMacServerService(command))
     const domain = `gui/${process.getuid?.() ?? 0}`
+    const fs = yield* FileSystem.FileSystem
+    // Login Items groups a legacy agent under the app named by AssociatedBundleIdentifiers only
+    // when the record is created fresh; rewriting an existing plist keeps its old parent. So the
+    // old definition is removed before the new one is written, and the app is registered with
+    // Launch Services so the association can resolve on a machine that has never seen it.
     yield* run(["launchctl", "bootout", domain, service], true)
+    yield* fs.remove(service).pipe(Effect.ignore)
+    const executable = command[0]
+    if (executable !== undefined && executable.includes(".app/Contents/MacOS/")) {
+      const app = executable.slice(0, executable.indexOf(".app/") + ".app".length)
+      yield* run([
+        "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
+        "-f", app,
+      ], true)
+    }
+    yield* writeServiceFile(service, renderMacServerService(command))
     yield* run(["launchctl", "enable", `${domain}/${SERVICE_LABEL}`])
     yield* run(["launchctl", "bootstrap", domain, service])
     return

@@ -41,6 +41,8 @@ describe("Magnitude service definitions", () => {
     )
     expect(rendered).toContain("<key>RunAtLoad</key><true/>")
     expect(rendered).toContain("<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>")
+    // Login Items shows the app's name and icon for the agent only through this association.
+    expect(rendered).toContain("<key>AssociatedBundleIdentifiers</key><array><string>dev.magnitude.service</string></array>")
   })
 
   it("renders a user service with shell-safe argv and restart policy", () => {
