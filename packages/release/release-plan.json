@@ -1,16 +1,16 @@
 {
   "format": 2,
   "baseline": {
-    "tag": "@magnitudedev/cli@0.0.13",
-    "sourceCommit": "4f5d96eeebbdd6883923cf70412c54aabbd7846f",
-    "cliVersion": "0.0.13",
+    "tag": "@magnitudedev/cli@0.0.14",
+    "sourceCommit": "6bb0e6f8030cdfe903a6bd2c410b52faa86d39f0",
+    "cliVersion": "0.0.14",
     "rpc": {
       "version": 1,
       "fingerprint": "dfba86a156b5dd9647f66bead4d1ed2b22809fb7003955caa94adf6690f5b66f"
     }
   },
-  "cliVersion": "0.0.14",
-  "revision": 36,
+  "cliVersion": "0.0.15-alpha.0",
+  "revision": 37,
   "rpc": {
     "version": 1,
     "fingerprint": "dfba86a156b5dd9647f66bead4d1ed2b22809fb7003955caa94adf6690f5b66f"
@@ -21,11 +21,11 @@
       "artifact": {
         "host": "pi",
         "name": "@magnitudedev/pi-extension",
-        "version": "0.0.2",
+        "version": "0.0.3-alpha.0",
         "rpcVersion": 1,
-        "contentFingerprint": "eb4eac2538369de2dabb2c65f7ac94bd518c5de6bfc26d12af33cad167a6748a",
-        "filename": "magnitudedev-pi-extension-0.0.2.tgz",
-        "integrity": "sha512-xfUyJLhv9Urg94x3RpEglrfbsarnFs04sFhVU39pVP/Gy2NVfjstJmFm3jRvP5VkNOg4b//hREcobcuvXzYRng=="
+        "contentFingerprint": "8de1ffd943ecccad03f811d1b61bad853c2f0fb249308e8aecd00a8a504ed7fd",
+        "filename": "magnitudedev-pi-extension-0.0.3-alpha.0.tgz",
+        "integrity": "sha512-blUtTbaNf8K9LerI2Tl9Zy6uSZEJcAyqF4pqng6LJXsYDCctVr9gAXD2VTRGEVgzHdw/rpGQp9truglvdZ1RHg=="
       },
       "publish": true
     }
