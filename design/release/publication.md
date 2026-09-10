@@ -70,19 +70,21 @@ private package runtime dependencies may escape the tarball.
 
 A plugin-content fingerprint covers shipped files and install-relevant package fields, including
 dependencies and the embedded RPC version. It excludes its own generated metadata, assigned package
-version, development tooling, and release notes. SDK-only shipped changes therefore require a
-plugin release; unrelated source/test changes do not.
+version, development tooling, and release notes. The fingerprint identifies which bytes a plan
+ships; it does not by itself require a release. The RPC version is the compatibility contract.
 
 A plugin's baseline is the version npm serves as `latest`, described by the content manifest inside
 its tarball. The CLI release manifest is the baseline for the RPC allocation only. A plugin-only
 publication therefore becomes its own baseline without a CLI release.
 
-Preparation generates a changeset only for what changed and is not already declared by a human
-changeset: the plugin when its content fingerprint differs from npm latest, and the CLI when the RPC
-allocation differs from the CLI baseline. A plugin-only change produces a plugin-only Version PR.
-Changed plugins receive at least a patch, respecting a larger human Changesets bump. Unchanged
-plugins retain the existing published version and artifact bytes. Registry versions are immutable:
-an orphan publication with different bytes requires a new version during preparation.
+Preparation generates a changeset for exactly one reason: the RPC allocation differs from the CLI
+baseline. That changeset names the CLI and every bundled plugin not already declared by a human
+changeset, as one file per RPC version. Nothing else is derived. A plugin is published only when
+the RPC version changed or a changeset bumped its package version; a plugin whose bundled content
+drifted without either is not released and the plan reuses its published version and artifact
+bytes. Verification of a reused plugin checks its RPC version against the rebuild and its bytes
+against the registry. Registry versions are immutable: an orphan publication with different bytes
+requires a new version during preparation.
 
 Each CLI embeds exact plugin name, version, RPC version, content fingerprint, and tarball integrity.
 That selection is what a fresh installation receives. Compatibility of an installed package is
@@ -103,7 +105,8 @@ whether a release is needed; tarball integrity proves which bytes were accepted 
 1. Preflight selects source/version and rejects conflicting public state. A Version PR that left
    the CLI version unchanged is accepted only when it changed the release plan; it then publishes
    plugins alone.
-2. Verify the source contract, pinned public baseline, and bundled plugin fingerprints.
+2. Verify the source contract, pinned public baseline, and each selected plugin: rebuilt
+   fingerprint for a publication, registry integrity for a reused artifact.
 3. Build native artifacts and prepare each selected plugin tarball once; unchanged plugins reuse
    their public tarballs.
 4. Accept the exact plugin artifacts through isolated Node and Bun Pi installations. Record the

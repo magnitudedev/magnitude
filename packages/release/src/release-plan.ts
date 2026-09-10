@@ -99,10 +99,13 @@ export const planPlugin = (
   previous: Option.Option<PluginArtifact>
 ) =>
   Effect.gen(function* () {
+    // A plugin ships only for a new RPC contract or a changeset-driven version bump. Content
+    // drift alone (a rebuilt SDK, an undeclared source change) reuses the published artifact:
+    // the RPC version is the compatibility contract, not the bundled bytes.
     if (
       Option.isSome(previous) &&
       previous.value.rpcVersion === metadata.rpcVersion &&
-      previous.value.contentFingerprint === metadata.contentFingerprint
+      !gt(metadata.version, previous.value.version)
     ) {
       return { publish: false, version: previous.value.version, previous };
     }

@@ -21,6 +21,8 @@ import {
   CLI_PACKAGE_NAME,
   declaredChangesetReleases,
   derivedChangeset,
+  derivedChangesetName,
+  isDerivedChangeset,
 } from "./derived-changeset";
 import { rpcFingerprint } from "./rpc-fingerprint";
 import { readPublicBaseline } from "./public-baseline";
@@ -42,7 +44,7 @@ export const releasePlanPath = resolve(
   root,
   "packages/release/release-plan.json"
 );
-const generatedChangeset = resolve(root, ".changeset/rpc-plugins.md");
+const changesetDirectory = resolve(root, ".changeset");
 const markerPath = resolve(root, "packages/release/rpc-breaks");
 const pluginDirectory = resolve(root, "integrations/pi");
 const JsonObject = Schema.Record({
@@ -223,29 +225,31 @@ export const prepareRelease = (mode: "detect" | "allocate" | "verify") =>
       );
       const candidate = yield* planPlugin(metadata, previousPlugin);
       if (mode === "detect") {
+        // The only derived release is a new RPC contract: the CLI and the plugins must follow it.
+        // Anything else ships only through a human changeset.
         const rpcChanged = canonical(existing.rpc) !== canonical(rpc);
-        const declared = yield* declaredChangesetReleases(
-          resolve(root, ".changeset"),
-          generatedChangeset
-        );
-        const changeset = derivedChangeset({
-          rpcChanged,
-          releases: [
-            ...(rpcChanged && !declared.has(CLI_PACKAGE_NAME)
-              ? [CLI_PACKAGE_NAME]
-              : []),
-            ...(candidate.publish && !declared.has(metadata.name)
-              ? [metadata.name]
-              : []),
-          ],
-        });
-        if (changeset !== undefined) yield* write(generatedChangeset, changeset);
-        else if (yield* fs.exists(generatedChangeset))
-          yield* fs.remove(generatedChangeset);
+        const declared = yield* declaredChangesetReleases(changesetDirectory);
+        const changeset = rpcChanged
+          ? derivedChangeset({
+              rpcVersion: rpc.version,
+              releases: [CLI_PACKAGE_NAME, metadata.name].filter(
+                (name) => !declared.has(name)
+              ),
+            })
+          : undefined;
+        const generated = derivedChangesetName(rpc.version);
+        for (const name of yield* fs.readDirectory(changesetDirectory)) {
+          if (isDerivedChangeset(name) && (changeset === undefined || name !== generated))
+            yield* fs.remove(`${changesetDirectory}/${name}`);
+        }
+        if (changeset !== undefined)
+          yield* write(`${changesetDirectory}/${generated}`, changeset);
         yield* Console.log(
           changeset !== undefined
-            ? "Prepared derived RPC/plugin changeset."
-            : "RPC and shipped plugin changes are already declared."
+            ? `Prepared derived changeset for RPC v${rpc.version}.`
+            : rpcChanged
+              ? `RPC v${rpc.version} is already declared by human changesets.`
+              : "RPC contract unchanged; nothing derived."
         );
         return { pending: false };
       }
@@ -261,10 +265,25 @@ export const prepareRelease = (mode: "detect" | "allocate" | "verify") =>
           selected.artifact.name !== metadata.name ||
           selected.artifact.version !== metadata.version ||
           selected.artifact.rpcVersion !== metadata.rpcVersion ||
-          selected.artifact.contentFingerprint !== metadata.contentFingerprint
+          (selected.publish &&
+            selected.artifact.contentFingerprint !== metadata.contentFingerprint)
         ) {
           return yield* new ReleasePreparationFailed({
             message: "Bundled plugin contents differ from the prepared release",
+          });
+        }
+        // A reused plugin ships its published bytes. The rebuild only proves the contract
+        // still matches; the bytes are proven against the registry.
+        if (
+          !selected.publish &&
+          (yield* publishedPluginIntegrity(
+            selected.artifact.name,
+            selected.artifact.version,
+            root
+          )) !== selected.artifact.integrity
+        ) {
+          return yield* new ReleasePreparationFailed({
+            message: `${selected.artifact.name}@${selected.artifact.version} on npm is not the artifact the release plan reuses`,
           });
         }
         yield* Console.log(
