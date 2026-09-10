@@ -1,0 +1,8 @@
+{
+  "source_archive_sha256": "7ae0fba6c63dae80b3c9c5c11a70bb8d7165794994f290f36e2fe87bfb143cfc",
+  "original_codegen_sha256": "8b129db6dd160a2f45df3405520e2044c1e37a121aaa123d1daaee9a887298da",
+  "patch_sha256": "018d4b29c35d424f307ab6c749bfbb058c6708ae712280dce18b32260c0ac302",
+  "original_binary_sha256": "aa6b196e0bba55c23ed7e7c45a264fbb29d4a9c1733458c2eb8e2614e7e7b38e",
+  "installed_binary_sha256": "aa74aa443df63347bf5cd23c3bc7e697fc1afe2ac8d951c017a65c603e71714a",
+  "scope": "Development runtime compiler replacement only. Original wheel and other installed runtime libraries unchanged. Full wheel packaging outstanding."
+}
