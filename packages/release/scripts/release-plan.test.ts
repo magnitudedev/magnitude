@@ -129,9 +129,9 @@ describe("public-baseline release allocation", () => {
       (await Effect.runPromise(Effect.either(allocateRpcVersion(exhausted, "b".repeat(64), []))))._tag
     ).toBe("Left");
   });
-  it("retains an unchanged published artifact, ignoring an incidental package bump", async () => {
+  it("reuses the published artifact when only the bundled content drifted", async () => {
     const plan = await Effect.runPromise(
-      planPlugin({ ...metadata, version: "1.2.4" }, published)
+      planPlugin({ ...metadata, contentFingerprint: "b".repeat(64) }, published)
     );
     expect(plan.publish).toBe(false);
     expect(plan.version).toBe("1.2.3");
@@ -141,17 +141,19 @@ describe("public-baseline release allocation", () => {
     expect(plan.publish).toBe(true);
     expect(plan.version).toBe("1.2.3");
   });
-  it("bumps for shipped code, dependency or protocol changes and respects a larger human bump", async () => {
-    for (const changed of [
-      { contentFingerprint: "b".repeat(64) },
-      { rpcVersion: 9 },
-    ]) {
-      const plan = await Effect.runPromise(
-        planPlugin({ ...metadata, ...changed }, published)
-      );
-      expect(plan.publish).toBe(true);
-      expect(plan.version).toBe("1.2.4");
-    }
+  it("publishes a changeset-driven version bump", async () => {
+    const plan = await Effect.runPromise(
+      planPlugin({ ...metadata, version: "1.2.4" }, published)
+    );
+    expect(plan.publish).toBe(true);
+    expect(plan.version).toBe("1.2.4");
+  });
+  it("publishes a new RPC contract, allocating a patch when no changeset bumped the package", async () => {
+    const plan = await Effect.runPromise(
+      planPlugin({ ...metadata, rpcVersion: 9 }, published)
+    );
+    expect(plan.publish).toBe(true);
+    expect(plan.version).toBe("1.2.4");
     expect(
       (
         await Effect.runPromise(
