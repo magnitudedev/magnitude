@@ -15,6 +15,7 @@ import type {
   StreamStartFailure,
 } from "@magnitudedev/ai"
 import type { MagnitudeProviderInstance } from "./magnitude/provider"
+import type { MiniMaxProviderInstance } from "./minimax/provider"
 import { inspectProviderCatalogs, makeAggregatedCatalog, type ProviderCatalogOutcome } from "./catalog-aggregator"
 
 export type AuthStatus =
@@ -77,6 +78,7 @@ export class ProviderRegistry extends Context.Tag("ProviderRegistry")<
  */
 export function makeProviderRegistry<TPreparation = never>(config: {
   readonly magnitude: MagnitudeProviderInstance<TPreparation> | null
+  readonly minimax?: MiniMaxProviderInstance<TPreparation> | null
   readonly discoverableProviders?: readonly DiscoverableProviderInstance<TPreparation>[]
 }): ProviderRegistryService<TPreparation> {
   const providers = new Map<ProviderId, Pick<Provider<ProviderModel, TPreparation>, "id" | "bindModel" | "catalog" | "discoverModelProperties">>()
@@ -91,6 +93,18 @@ export function makeProviderRegistry<TPreparation = never>(config: {
       authStatus: config.magnitude.authentication._tag === "Configured"
         ? { _tag: "authenticated" }
         : { _tag: "not_configured", reason: "Magnitude authentication is not configured" },
+    })
+  }
+
+  if (config.minimax) {
+    providers.set(config.minimax.provider.id, config.minimax.provider)
+    providerInfos.push({
+      id: config.minimax.provider.id,
+      displayName: config.minimax.provider.displayName,
+      kind: "Hosted",
+      authStatus: config.minimax.authentication._tag === "Configured"
+        ? { _tag: "authenticated" }
+        : { _tag: "not_configured", reason: "MiniMax authentication is not configured" },
     })
   }
 
@@ -143,5 +157,6 @@ export function makeProviderRegistry<TPreparation = never>(config: {
 
 export const ProviderRegistryLive = (config: {
   readonly magnitude: MagnitudeProviderInstance | null
+  readonly minimax?: MiniMaxProviderInstance | null
   readonly discoverableProviders?: readonly DiscoverableProviderInstance[]
 }) => Layer.succeed(ProviderRegistry, makeProviderRegistry(config))

@@ -22,6 +22,7 @@ import type { ModelCatalog } from "@magnitudedev/ai"
 import { makeFileBackedModelCatalog } from "@magnitudedev/ai"
 import {
   createMagnitudeProvider,
+  createMiniMaxProvider,
   createExaWebSearch,
   makeProviderRegistry,
   WebSearchNotConfigured,
@@ -33,6 +34,8 @@ import {
   type MagnitudeAdditionalOptions,
   type MagnitudeClientError,
   type MagnitudeModelInfo,
+  type MiniMaxClientConfig,
+  type MiniMaxProviderInstance,
   type WebSearchError,
   type FetchUsageOptions,
   type CloudUsageResponse,
@@ -87,6 +90,7 @@ export type { ProviderCatalogOutcome } from "@magnitudedev/providers"
 
 export interface ProviderClientConfig<TPreparation = IcnModelPreparation> extends MagnitudeClientConfig {
   readonly discoverableProviders?: readonly DiscoverableProviderInstance<TPreparation>[]
+  readonly miniMax?: MiniMaxClientConfig
   readonly exaApiKey?: string
   readonly exaEndpoint?: string
 }
@@ -193,6 +197,7 @@ export class ProviderClient extends Context.Tag("ProviderClient")<
 
 export function createProviderClient<TPreparation = IcnModelPreparation>(config?: ProviderClientConfig<TPreparation>): ProviderClientShape<TPreparation> {
   const magnitudeInstance: MagnitudeProviderInstance<TPreparation> = createMagnitudeProvider<TPreparation>(config)
+  const miniMaxInstance: MiniMaxProviderInstance<TPreparation> = createMiniMaxProvider<TPreparation>(config?.miniMax)
   const exaInstance = createExaWebSearch({
     ...(config?.exaApiKey === undefined ? {} : { apiKey: config.exaApiKey }),
     ...(config?.exaEndpoint === undefined ? {} : { endpoint: config.exaEndpoint }),
@@ -214,6 +219,7 @@ export function createProviderClient<TPreparation = IcnModelPreparation>(config?
   const registry = makeProviderRegistry<TPreparation>({
     // magnitude: magnitudeInstance,
     magnitude: null,
+    minimax: miniMaxInstance,
     discoverableProviders: config?.discoverableProviders ?? [],
   })
 

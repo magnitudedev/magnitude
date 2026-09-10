@@ -112,6 +112,25 @@ export type {
 export type { ToolChoice } from "@magnitudedev/ai"
 export type { CloudUsageResponse, UsagePeriod } from "./magnitude/usage"
 
+// MiniMax provider
+export {
+  createMiniMaxProvider,
+  MINIMAX_ENDPOINTS,
+  MINIMAX_MODELS,
+  MINIMAX_PROVIDER_ID,
+  createMiniMaxCatalog,
+  createMiniMaxCompatibleSpec,
+  classifyMiniMaxRejectedResponse,
+  type MiniMaxAuthentication,
+  type MiniMaxCallOptions,
+  type MiniMaxClientConfig,
+  type MiniMaxCompatibleSpecConfig,
+  type MiniMaxEndpointConfig,
+  type MiniMaxModelInfo,
+  type MiniMaxProviderInstance,
+  type MiniMaxRegion,
+} from "./minimax/index"
+
 // Custom OpenAI-compatible endpoints
 export {
   createCustomEndpointProvider,
