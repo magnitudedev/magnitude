@@ -1,0 +1,7 @@
+{
+  "base_patch": "metal-bfloat-types.patch",
+  "patch_sha256": "c40f52234a5f6a88feac1f2b7be2ad88e6e28752d2f64b591c1cb6d2450cbc38",
+  "original_binary_sha256": "aa74aa443df63347bf5cd23c3bc7e697fc1afe2ac8d951c017a65c603e71714a",
+  "installed_binary_sha256": "d23e58c453ba7c814d0aaafc50a871e38b8d60d5118cdd1561b46506ec51cf84",
+  "scope": "Development runtime compiler extension; per-lane get/set for Metal SIMD-group matrix elements. Numerical equations remain TileLang IR. Reproducible wheel packaging remains outstanding."
+}
