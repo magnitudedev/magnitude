@@ -18,7 +18,7 @@
   <a href="https://www.npmjs.com/package/@magnitudedev/cli"><img src="https://img.shields.io/npm/v/%40magnitudedev%2Fcli" alt="npm version"></a>
 </p>
 
-Magnitude is an open source inference server for the hardware you already have. It profiles your machine, recommends the right models for it, then downloads, tunes, and runs them. Plug it into Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, or Cline, or use the built-in harness.
+Magnitude is an open source inference server for the hardware you already have. It profiles your machine, recommends the right models for it, then downloads, tunes, and runs them. Plug it into Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline, or use the built-in harness.
 
 ⭐ Help us reach more developers and grow the Magnitude community. Star this repo!
 
