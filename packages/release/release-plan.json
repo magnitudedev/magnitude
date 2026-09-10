@@ -9,8 +9,8 @@
       "fingerprint": "dfba86a156b5dd9647f66bead4d1ed2b22809fb7003955caa94adf6690f5b66f"
     }
   },
-  "cliVersion": "0.0.15-alpha.0",
-  "revision": 37,
+  "cliVersion": "0.0.15-alpha.1",
+  "revision": 38,
   "rpc": {
     "version": 1,
     "fingerprint": "dfba86a156b5dd9647f66bead4d1ed2b22809fb7003955caa94adf6690f5b66f"
@@ -27,7 +27,7 @@
         "filename": "magnitudedev-pi-extension-0.0.3-alpha.0.tgz",
         "integrity": "sha512-blUtTbaNf8K9LerI2Tl9Zy6uSZEJcAyqF4pqng6LJXsYDCctVr9gAXD2VTRGEVgzHdw/rpGQp9truglvdZ1RHg=="
       },
-      "publish": true
+      "publish": false
     }
   ]
 }
