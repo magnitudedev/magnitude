@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.15-alpha.0
+
+### Patch Changes
+
+- [`1cbaafc`](https://github.com/magnitudedev/magnitude/commit/1cbaafc04ad38393c7c54b1ae4ea70dc5ab4c32f) Thanks [@anerli](https://github.com/anerli)! - Apple signing
+
 ## 0.0.14
 
 ### Patch Changes

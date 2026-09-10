@@ -1,5 +1,11 @@
 # @magnitudedev/pi-extension
 
+## 0.0.3-alpha.0
+
+### Patch Changes
+
+- [`cb0f909`](https://github.com/magnitudedev/magnitude/commit/cb0f909f61fc1cfe93cec7068807c87f00a9ff5d) Thanks [@anerli](https://github.com/anerli)! - Activate the selected model in Pi before restoring the terminal after onboarding, so the session already holds it when Pi redraws.
+
 ## 0.0.2
 
 ### Patch Changes
