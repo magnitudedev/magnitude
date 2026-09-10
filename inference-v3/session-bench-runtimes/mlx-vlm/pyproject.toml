@@ -1,0 +1,14 @@
+[project]
+name = "session-bench-mlx-vlm-runtime"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "mlx==0.32.2",
+  "mlx-lm==0.31.3",
+  "mlx-vlm==0.6.17",
+  "transformers==5.16.1",
+  "torch>=2.7,<3",
+  "torchvision>=0.22,<1",
+  "httpx==0.28.1",
+  "psutil>=7",
+]

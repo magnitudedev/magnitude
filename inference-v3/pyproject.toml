@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "magnitude-engine-v3"
+version = "0.1.0"
+description = "TileLang-native Magnitude inference engine"
+requires-python = ">=3.12"
+dependencies = [
+  "pydantic==2.13.5",
+  "numpy>=2.5.3",
+  "tilelang==0.1.14",
+  "torch>=2.14.0",
+  "httpx==0.28.1",
+  "psutil>=7",
+  "tokenizers==0.23.2",
+  "fastapi==0.141.1",
+  "uvicorn==0.52.4",
+  "jinja2==3.1.6",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=9.1.1",
+  "pytest-asyncio>=1",
+  "hypothesis>=6",
+  "ruff>=0.16.6",
+  "pyright",
+  "gguf==0.19.0",
+  "huggingface-hub>=1.27,<2",
+  "transformers==5.16.1",
+]
+
+[project.scripts]
+session-bench = "session_bench.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/magnitude_engine", "src/session_bench", "src/benchmark_fixtures"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+addopts = "-q"
+asyncio_mode = "auto"
+markers = [
+  "model: requires the pinned local model artifact",
+  "device: requires a qualified execution endpoint",
+  "performance: exclusive measured performance qualification",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pyright]
+include = ["src/magnitude_engine"]
+typeCheckingMode = "basic"
+# TileLang parses kernel annotations, scalar constructors and intrinsics as its
+# own typed DSL. Python's checker cannot interpret those three expression forms;
+# the compiler/reference suite checks them. Host operation contracts remain checked.
+executionEnvironments = [
+  { root = "src/magnitude_engine/numerics", reportInvalidTypeForm = false, reportCallIssue = false, reportAttributeAccessIssue = false },
+  { root = "src/magnitude_engine" },
+]
