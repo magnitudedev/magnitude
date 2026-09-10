@@ -198,8 +198,8 @@ describe('decoded patch pipeline — smoke', () => {
 // Production schema test — DisplayViewSnapshot
 // ---------------------------------------------------------------------------
 
-import { DisplayViewSnapshot } from '../../../../protocol/src/schemas/display'
-import type { DisplayViewSnapshot as DVS } from '../../../../protocol/src/schemas/display'
+import { DisplayViewSnapshot } from '../../../../acn-protocol/src/schemas/display'
+import type { DisplayViewSnapshot as DVS } from '../../../../acn-protocol/src/schemas/display'
 
 describe('decoded patch pipeline — production DisplayViewSnapshot', () => {
   const compiled = compilePatchMap(DisplayViewSnapshot)
