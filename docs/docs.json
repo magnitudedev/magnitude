@@ -2,7 +2,7 @@
     "$schema": "https://mintlify.com/docs.json",
     "name": "Magnitude",
     "theme": "linden",
-    "description": "The best way to run local models on your machine",
+    "description": "Run the best local models for your machine",
     "logo": {
         "light": "/wordmark-black.svg",
         "dark": "/wordmark-white.svg"

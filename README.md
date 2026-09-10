@@ -8,7 +8,7 @@
 
 <h1 align="center">Magnitude</h1>
 
-<p align="center"><strong>The best way to run local models on your machine</strong></p>
+<p align="center"><strong>Run the best local models for your machine</strong></p>
 
 <p align="center">
   <a href="https://docs.magnitude.dev"><img src="https://img.shields.io/badge/%F0%9F%93%95-Docs-0369a1?style=flat-square&labelColor=0369a1&color=gray" alt="Documentation"></a>
@@ -18,7 +18,7 @@
   <a href="https://www.npmjs.com/package/@magnitudedev/cli"><img src="https://img.shields.io/npm/v/%40magnitudedev%2Fcli" alt="npm version"></a>
 </p>
 
-Magnitude is an open source inference server for the hardware you already have. It profiles your machine, recommends the right models for it, then downloads, tunes, and runs them. Plug it into Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline, or use the built-in harness.
+Magnitude is an open source local inference engine. It runs on the hardware you already have, whether that's a Mac, an NVIDIA or AMD GPU, or just a CPU. It profiles your machine, recommends the right models for it, then downloads, tunes, and runs them. Plug it into Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline.
 
 ⭐ Help us reach more developers and grow the Magnitude community. Star this repo!
 
@@ -45,7 +45,7 @@ Your agent will profile your hardware, walk you through the best local models fo
 
 ## Why Magnitude?
 
-- **Knows your machine:** profiles your hardware to assess fit and estimate tok/s per model
+- **Knows your machine:** profiles your hardware to assess fit and estimate tok/s
 - **Recommends the best models:** ranked by speed, accuracy, intelligence, and memory
 - **Tuned end to end:** speculative decoding and more, all set for your hardware
 - **Easy setup:** one command and your agent is running local models
@@ -74,7 +74,7 @@ macOS, Linux, and Windows through WSL. Metal, CUDA, and Vulkan on the GPU side, 
 
 ### Which harnesses work with it?
 
-Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline. During setup, your agent connects your harness to the model you pick. Or use Magnitude's built-in harness.
+Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline. During setup, your agent connects your harness to the model you pick.
 
 ### Do I need to manage it after setup?
 
