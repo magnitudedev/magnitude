@@ -96,9 +96,16 @@ export const verifyAppleDeploymentTarget = async (
       "-show-build",
       file,
     ])
+    // Modern linkers emit LC_BUILD_VERSION (platform + minos); older x86_64 toolchains, including
+    // the upstream Intel ripgrep, still emit LC_VERSION_MIN_MACOSX (version only). Both declare
+    // a macOS deployment target.
     const platform = report.match(/^\s*platform\s+(\S+)\s*$/m)?.[1]
-    const minimum = report.match(/^\s*minos\s+(\d+(?:\.\d+){1,2})\s*$/m)?.[1]
-    if (platform !== "MACOS" || minimum === undefined) {
+    const minimum = platform === "MACOS"
+      ? report.match(/^\s*minos\s+(\d+(?:\.\d+){1,2})\s*$/m)?.[1]
+      : /^\s*cmd LC_VERSION_MIN_MACOSX\s*$/m.test(report)
+        ? report.match(/^\s*version\s+(\d+(?:\.\d+){1,2})\s*$/m)?.[1]
+        : undefined
+    if (minimum === undefined) {
       throw new Error(`${basename(file)} has no macOS deployment target`)
     }
     if (compareVersions(minimum, MACOS_DEPLOYMENT_TARGET) > 0) {
