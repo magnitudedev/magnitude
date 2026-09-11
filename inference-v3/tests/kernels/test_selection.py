@@ -1,7 +1,7 @@
 """Each table picks the kernel the engine's former if-chains picked.
 
 These are the inputs the engine actually sees: decode at one row, prefill at 8,
-64, 256 and 4096 rows; K-quant, repacked and MLX weights; each precision preset;
+64, 256 and 4096 rows; K-quant and MLX weights; each precision preset;
 a 32-lane subgroup endpoint and the host. Nothing is compiled — a candidate's
 choice is a fact about the four axes, so it can be read without a device.
 """
@@ -41,12 +41,14 @@ from magnitude_engine.kernels.semantics import HeadMapping
 from magnitude_engine.operations.candidates import NoCandidate, Selection, select
 from magnitude_engine.platform.execution import DType
 from magnitude_engine.weights.representation import (
-    BlockCodec,
+    Affine,
+    Code,
+    Codebook,
+    CodeInterpretation,
     Dense,
-    EncodedBlocks,
-    HierarchicalAffine,
-    HierarchyPacking,
-    PlanarAffine,
+    DirectCoefficients,
+    HierarchicalCoefficients,
+    WeightLayout,
 )
 
 METAL = Capability(
@@ -54,39 +56,56 @@ METAL = Capability(
 )
 UNBOUNDED = 1 << 60
 
-Q4_K = HierarchicalAffine(4, 0, 32, 256, 6, False, True, HierarchyPacking.SCALE_MIN_I6)
-Q6_K = HierarchicalAffine(4, 2, 16, 256, 8, True, False, HierarchyPacking.SIGNED_SCALE_I8)
-IQ4_XS = EncodedBlocks(BlockCodec.CODEBOOK_I4, 256, 136)
+SCALE_MIN = HierarchicalCoefficients(
+    256,
+    6,
+    CodeInterpretation.UNSIGNED,
+    DType.F16,
+    local_bias_bits=6,
+    super_bias_dtype=DType.F16,
+    bias_sign=-1,
+)
+Q4_K = Affine(Code(4), 32, SCALE_MIN)
+Q6_K = Affine(
+    Code(4, 2, CodeInterpretation.OFFSET_BINARY, 32),
+    16,
+    HierarchicalCoefficients(256, 8, CodeInterpretation.TWOS_COMPLEMENT, DType.F16),
+)
+IQ4_XS = Codebook(
+    4,
+    tuple(range(16)),
+    32,
+    HierarchicalCoefficients(
+        256,
+        6,
+        CodeInterpretation.OFFSET_BINARY,
+        DType.F16,
+        local_scale_zero_point=32,
+    ),
+)
 F32 = Dense(DType.F32)
-REPACKED_Q4_K = PlanarAffine(
-    bits=4, high_bits=0, group=32, coefficient_dtype=DType.F32, signed=False, has_bias=True
-)
-REPACKED_Q6_K = PlanarAffine(
-    bits=4, high_bits=2, group=16, coefficient_dtype=DType.F32, signed=True, has_bias=False
-)
-MLX_Q4 = PlanarAffine(
-    bits=4, high_bits=0, group=64, coefficient_dtype=DType.BF16, signed=False, has_bias=True
-)
+MLX_Q4 = Affine(Code(4), 64, DirectCoefficients(DType.BF16, DType.BF16))
 
 
-def chosen(name, table, shape, precision, capability, representation=None, budget=UNBOUNDED):
+def chosen(name, table, shape, precision, capability, layout=None, budget=UNBOUNDED):
     candidate, _ = select(
         name,
         table,
-        Selection(shape, precision, capability, representation),
+        Selection(shape, precision, capability, layout),
         available_bytes=budget,
     )
     return candidate.name
 
 
 def projection(rows, representation, inputs=2048, widths=(2048,), capability=METAL, **kwargs):
+    layout = WeightLayout(representation, sum(widths), inputs)
     return chosen(
         "projection",
         PROJECTION,
         ProjectionShape(rows, widths, inputs, DType.BF16, DType.BF16),
         kwargs.pop("precision", NATIVE_BF16),
         capability,
-        representation,
+        layout,
         **kwargs,
     )
 
@@ -96,21 +115,18 @@ def projection(rows, representation, inputs=2048, widths=(2048,), capability=MET
     "rows,representation,expected",
     [
         # Decode reduces one row across a subgroup.
-        (1, Q4_K, "projection.hierarchical_scale_min"),
-        (1, Q6_K, "projection.groupwise_blocks"),
-        (1, IQ4_XS, "projection.groupwise_blocks"),
-        (1, REPACKED_Q4_K, "projection.planar_affine.vector"),
-        (1, REPACKED_Q6_K, "projection.planar_affine.vector"),
-        (1, MLX_Q4, "projection.planar_affine.vector"),
+        (1, Q4_K, "projection.hierarchical"),
+        (1, Q6_K, "projection.groupwise"),
+        (1, IQ4_XS, "projection.groupwise"),
+        (1, MLX_Q4, "projection.direct_affine.vector"),
         (1, F32, "projection.subgroup"),
         # From eight rows the contraction fills matrix tiles.
         (8, Q4_K, "projection.matrix"),
-        (8, REPACKED_Q4_K, "projection.matrix"),
-        (8, MLX_Q4, "projection.planar_affine.matrix"),
+        (8, MLX_Q4, "projection.direct_affine.matrix"),
         (64, Q6_K, "projection.matrix"),
-        (256, MLX_Q4, "projection.planar_affine.matrix"),
+        (256, MLX_Q4, "projection.direct_affine.matrix"),
         (4096, Q4_K, "projection.matrix"),
-        (4096, MLX_Q4, "projection.planar_affine.matrix"),
+        (4096, MLX_Q4, "projection.direct_affine.matrix"),
     ],
 )
 def test_projection_selects_the_same_schedule_as_before(rows, representation, expected, precision):
@@ -120,17 +136,19 @@ def test_projection_selects_the_same_schedule_as_before(rows, representation, ex
 def test_projection_falls_back_to_the_host_where_there_are_no_groups():
     assert projection(1, Q4_K, capability=HOST) == "projection.serial"
     assert projection(64, Q4_K, capability=HOST) == "projection.serial"
-    assert projection(1, MLX_Q4, capability=HOST) == "projection.planar_affine.serial"
+    assert projection(1, MLX_Q4, capability=HOST) == "projection.serial"
 
 
-def test_projection_needs_whole_folds_before_it_reads_a_flat_plane():
+def test_projection_uses_the_canonical_direct_schedule_for_narrow_inputs():
     narrow = Capability(
         subgroup_width=32,
         threads_per_group=1024,
         shared_memory_bytes=32768,
         matrix_instructions=False,
     )
-    assert projection(1, REPACKED_Q4_K, inputs=768, capability=narrow) == "projection.subgroup"
+    assert projection(1, MLX_Q4, inputs=768, capability=narrow) == (
+        "projection.direct_affine.vector"
+    )
 
 
 def test_projection_uses_a_threadgroup_where_lanes_cannot_exchange():
@@ -216,29 +234,29 @@ def test_norm_uses_the_subgroup_chain_only_for_native_rounding(precision, capabi
 @pytest.mark.parametrize(
     "representation,expected",
     [
-        (MLX_Q4, "embedding.planar_rows"),
-        (REPACKED_Q4_K, "embedding.gather"),
+        (MLX_Q4, "embedding.gather"),
         (Q4_K, "embedding.gather"),
         (F32, "embedding.gather"),
     ],
 )
 def test_embedding_gathers_from_whatever_the_table_is_resident_in(representation, expected):
     shape = EmbeddingShape(3, 1024, 2048, DType.BF16)
-    assert chosen("embedding", EMBEDDING, shape, NATIVE_BF16, METAL, representation) == expected
+    layout = WeightLayout(representation, shape.vocabulary, shape.width)
+    assert chosen("embedding", EMBEDDING, shape, NATIVE_BF16, METAL, layout) == expected
 
 
 def gated(rows, representation, precision=NATIVE_BF16, capability=METAL):
     shape = GatedShape(rows, 4096, 2048, DType.BF16, DType.BF16)
-    return chosen("gated", GATED_TABLE, shape, precision, capability, representation)
+    layout = WeightLayout(representation, 2 * shape.width, shape.inputs)
+    return chosen("gated", GATED_TABLE, shape, precision, capability, layout)
 
 
 @pytest.mark.parametrize(
     "rows,representation,precision,expected",
     [
-        (1, MLX_Q4, NATIVE_BF16, "gated.fused_vector"),
+        (1, MLX_Q4, NATIVE_BF16, "gated.direct_affine_fused_vector"),
         (1, MLX_Q4, MIXED_BF16, "gated.projected"),
         (8, MLX_Q4, NATIVE_BF16, "gated.projected"),
-        (1, REPACKED_Q4_K, NATIVE_BF16, "gated.projected"),
         (1, Q4_K, NATIVE_BF16, "gated.hierarchical_fused_vector"),
     ],
 )

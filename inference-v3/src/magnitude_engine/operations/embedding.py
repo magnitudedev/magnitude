@@ -46,16 +46,12 @@ class ResidentEmbedding(Embedding):
         if key not in self._plans:
             from magnitude_engine.kernels.embedding.select import TABLE, EmbeddingShape
 
-            shape = EmbeddingShape(
-                rows, self._parameters.vocabulary, self._parameters.width, dtype
-            )
+            shape = EmbeddingShape(rows, self._parameters.vocabulary, self._parameters.width, dtype)
             self._plans[key] = realize(
                 "embedding",
                 TABLE,
                 self.context,
-                Selection(
-                    shape, self.precision, self.context.capability, self.weight.representation
-                ),
+                Selection(shape, self.precision, self.context.capability, self.weight.layout),
             )
         return self._plans[key]
 

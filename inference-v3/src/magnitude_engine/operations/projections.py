@@ -104,7 +104,7 @@ class ResidentProjections(Projections):
                 "projection",
                 TABLE,
                 self.context,
-                Selection(shape, self.precision, self.context.capability, self.representation),
+                Selection(shape, self.precision, self.context.capability, self.weight.layout),
             )
         return self._plans[key]
 

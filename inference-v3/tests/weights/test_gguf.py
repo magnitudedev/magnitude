@@ -2,7 +2,20 @@ import struct
 
 import pytest
 
-from magnitude_engine.weights.formats.gguf import ByteOrder, Encoding, InvalidGGUF, read_directory
+from magnitude_engine.platform.execution import DType
+from magnitude_engine.weights.formats.gguf import (
+    ByteOrder,
+    Encoding,
+    InvalidGGUF,
+    quantization,
+    read_directory,
+)
+from magnitude_engine.weights.representation import (
+    Affine,
+    Code,
+    DirectCoefficients,
+    canonical_layout,
+)
 
 
 class Source:
@@ -15,6 +28,28 @@ class Source:
 
     def read(self, offset: int, length: int):
         return self.content[offset : offset + length]
+
+
+def test_canonical_quantized_sizes_preserve_every_source_bit():
+    for encoding in (
+        Encoding.Q4_K,
+        Encoding.Q5_K,
+        Encoding.Q6_K,
+        Encoding.Q8_0,
+        Encoding.IQ4_XS,
+    ):
+        representation, _ = quantization(encoding)
+        layout = canonical_layout(representation, encoding.block_elements)
+        assert layout.nbytes == layout.tile_bytes == encoding.block_bytes
+        assert layout.low == 0
+        assert layout.scales > layout.low
+        if layout.high is not None:
+            assert layout.low < layout.high < layout.scales
+
+    mlx = Affine(Code(4), 64, DirectCoefficients(DType.BF16, DType.BF16))
+    layout = canonical_layout(mlx, 64)
+    assert layout.nbytes == 36
+    assert (layout.low, layout.high, layout.scales, layout.biases) == (0, None, 32, 34)
 
 
 def container(*, order="<", entries=None, metadata=(), alignment=32):

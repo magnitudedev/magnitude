@@ -1,31 +1,49 @@
-"""Gate and up over one compact scale/min hierarchy, sharing every input load."""
+"""Fused gate/up contraction over the canonical Q4/Q5 hierarchy."""
 
 import tilelang.language as T
 
 from magnitude_engine.kernels.capabilities import Capability
 from magnitude_engine.kernels.precision import Precision, Rounding, native_sigmoid
-from magnitude_engine.kernels.projection.packed_k import scale_min
-from magnitude_engine.weights.representation import HierarchicalAffine, HierarchyPacking
+from magnitude_engine.kernels.projection.packed_k import _byte, _half, _packed
+from magnitude_engine.weights.representation import (
+    HierarchicalCoefficients,
+    WeightLayout,
+    canonical_layout,
+    is_scale_min_hierarchy,
+)
 
 
 def gated_vector(
     M: int,
     N: int,
     K: int,
-    representation: HierarchicalAffine,
+    layout: WeightLayout,
     *,
     capability: Capability,
     precision: Precision,
 ):
+    representation = layout.representation
     if capability.subgroup_width != 32:
         raise ValueError("the hierarchical gate reduces across a 32-lane subgroup")
     if precision.rounding != Rounding.NATIVE_BF16:
         raise ValueError("the hierarchical gate rounds the way NATIVE_BF16 does")
-    if representation.packing != HierarchyPacking.SCALE_MIN_I6 or K % 256:
-        raise ValueError("the hierarchical gate requires complete scale/min superblocks")
-    block_words = representation.block_bytes // 4
-    payload_words = 4 + representation.high_bits * 8
-    words = 2 * N * K // 256 * block_words
+    if (
+        not is_scale_min_hierarchy(representation)
+        or layout.logical_rows != 2 * N
+        or layout.first_row
+        or layout.columns != K
+        or K % 256
+        or layout.nbytes % 4
+    ):
+        raise ValueError("the hierarchical gate requires canonical Q4_K or Q5_K")
+    coefficients = representation.coefficients
+    assert isinstance(coefficients, HierarchicalCoefficients)
+
+    resident = canonical_layout(representation, layout.elements)
+    assert resident.biases is not None
+    assert resident.super_scale is not None
+    assert resident.super_bias is not None
+    words = layout.nbytes // 4
 
     @T.prim_func
     def main(
@@ -35,49 +53,37 @@ def gated_vector(
     ):
         with T.Kernel(N, M, threads=32) as (out, row):
             lane = T.get_thread_binding()
+            group = lane // 4
             partial = T.alloc_local((2,), "float32")
-            dot = T.alloc_local((2, 2), "float32")
-            sums = T.alloc_local((2,), "float32")
-            input0 = T.alloc_local((4,), "float32")
-            input1 = T.alloc_local((4,), "float32")
-            half_bits = T.alloc_local((2,), "uint16")
-            high = T.alloc_local((1,), "uint32")
+            dot = T.alloc_local((2,), "float32")
+            sums = T.alloc_local((1,), "float32")
+            values = T.alloc_local((8,), "float32")
             T.clear(partial)
             for chunk in T.serial(K // 256):
-                group = lane // 8 * 2
-                T.clear(sums)
-                for j in T.unroll(4, explicit=True):
-                    k = chunk * 256 + lane // 8 * 64 + lane % 8 * 4 + j
-                    input0[j] = A[row, k].astype("float32")
-                    input1[j] = A[row, k + 32].astype("float32")
-                    sums[0] += input0[j]
-                    sums[1] += input1[j]
+                sums[0] = 0
+                for j in T.unroll(8, explicit=True):
+                    values[j] = A[row, chunk * 256 + lane * 8 + j].astype("float32")
+                    sums[0] += values[j]
                 for branch in T.unroll(2, explicit=True):
-                    base = ((branch * N + out) * (K // 256) + chunk) * block_words
-                    header = B[base]
-                    half_bits[0] = (header & T.uint32(65535)).astype("uint16")
-                    half_bits[1] = (header >> 16).astype("uint16")
-                    d = T.reinterpret(half_bits[0], "float16").astype("float32")
-                    minimum = T.reinterpret(half_bits[1], "float16").astype("float32")
-                    scale0, bias0 = scale_min(B[base + 1], B[base + 2], B[base + 3], group)
-                    scale1, bias1 = scale_min(B[base + 1], B[base + 2], B[base + 3], group + 1)
-                    word = B[base + payload_words + lane]
-                    high[0] = 0
-                    if representation.high_bits:
-                        high[0] = B[base + 4 + lane % 8]
-                    T.clear(dot)
-                    for j in T.unroll(4, explicit=True):
-                        q0 = ((word >> (j * 8)) & T.uint32(15)) | (
-                            ((high[0] >> (j * 8 + group)) & T.uint32(1)) << 4
-                        )
-                        q1 = ((word >> (j * 8 + 4)) & T.uint32(15)) | (
-                            ((high[0] >> (j * 8 + group + 1)) & T.uint32(1)) << 4
-                        )
-                        dot[branch, 0] += input0[j] * q0.astype("float32")
-                        dot[branch, 1] += input1[j] * q1.astype("float32")
-                    partial[branch] += d * (
-                        scale0 * dot[branch, 0] + scale1 * dot[branch, 1]
-                    ) - minimum * (bias0 * sums[0] + bias1 * sums[1])
+                    element = (branch * N + out) * K + chunk * 256
+                    base = (element // 256) * resident.tile_bytes
+                    low = B[(base + resident.low) // 4 + lane]
+                    high = T.uint32(0)
+                    if representation.code.high_bits:
+                        high = _byte(B, base + resident.high + lane)
+                    scale = _packed(B, base + resident.scales, 6, group)
+                    bias = _packed(B, base + resident.biases, 6, group)
+                    super_scale = _half(B, base + resident.super_scale)
+                    super_bias = _half(B, base + resident.super_bias)
+                    dot[branch] = 0
+                    for j in T.unroll(8, explicit=True):
+                        code = (low >> (j * 4)) & T.uint32(15)
+                        if representation.code.high_bits:
+                            code = code | (((high >> j) & T.uint32(1)) << 4)
+                        dot[branch] += values[j] * code.astype("float32")
+                    partial[branch] += (
+                        super_scale * scale * dot[branch] - super_bias * bias * sums[0]
+                    )
             gate = T.warp_reduce_sum(partial[0]).astype("bfloat16").astype("float32")
             up = T.warp_reduce_sum(partial[1]).astype("bfloat16").astype("float32")
             if lane == 0:
