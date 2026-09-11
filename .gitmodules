@@ -1,3 +1,7 @@
 [submodule "inference/native/llama-cpp-rs"]
 	path = inference/native/llama-cpp-rs
 	url = https://github.com/magnitudedev/llama-cpp-rs.git
+[submodule "inference-v3/tilelang"]
+	path = inference-v3/tilelang
+	url = https://github.com/magnitudedev/tilelang.git
+	branch = magnitude

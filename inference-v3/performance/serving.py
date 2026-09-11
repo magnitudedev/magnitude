@@ -112,13 +112,6 @@ async def run(
                 store.path / "engine-build.json",
                 dict(source_digest=source, compiler=compiler.model_dump(mode="json")),
             )
-            # The copied snapshot covers Python. Preserve native sources and
-            # compiler patches too, since they materially define v3 execution.
-            for original in (root / "src/magnitude_engine/platform").rglob("*"):
-                if original.suffix in (".mm", ".patch") and original.is_file():
-                    destination = store.path / "source" / target.id / original.relative_to(root)
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    destination.write_bytes(original.read_bytes())
             atomic_json(store.path / f"{target.id}-artifact.json", artifact.model_dump(mode="json"))
             atomic_json(store.path / f"{target.id}-runtime.json", adapter.identity)
             text, provenance = await prose.prepare()
