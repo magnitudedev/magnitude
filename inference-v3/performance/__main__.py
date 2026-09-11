@@ -27,8 +27,6 @@ def source_identity(root: Path) -> str:
     for path in sorted(
         (
             *root.joinpath("src/magnitude_engine").rglob("*.py"),
-            *root.joinpath("src/magnitude_engine").rglob("*.mm"),
-            *root.joinpath("src/magnitude_engine/platform/compiler_patches").glob("*.patch"),
             *root.joinpath("performance").rglob("*.py"),
             root / "pyproject.toml",
             root / "uv.lock",

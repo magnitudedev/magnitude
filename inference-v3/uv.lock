@@ -575,7 +575,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.5.3" },
     { name = "psutil", specifier = ">=7" },
     { name = "pydantic", specifier = "==2.13.5" },
-    { name = "tilelang", specifier = "==0.1.14" },
+    { name = "tilelang", editable = "tilelang" },
     { name = "tokenizers", specifier = "==0.23.2" },
     { name = "torch", specifier = ">=2.14.0" },
     { name = "uvicorn", specifier = "==0.52.4" },
@@ -1438,8 +1438,7 @@ wheels = [
 
 [[package]]
 name = "tilelang"
-version = "0.1.14"
-source = { registry = "https://pypi.org/simple" }
+source = { editable = "tilelang" }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "cloudpickle" },
@@ -1453,13 +1452,31 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "z3-solver" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/98/b6/b2a79ca220c63f0ec43ece86c0a37f92af9e22261b13951e58700b008a2b/tilelang-0.1.14.tar.gz", hash = "sha256:7ae0fba6c63dae80b3c9c5c11a70bb8d7165794994f290f36e2fe87bfb143cfc", size = 91668408, upload-time = "2026-09-02T06:23:14.202Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/91/13/aa13f149ea8c83c1115f715c2e611cec9a09dfdec1d0871551dda3979c16/tilelang-0.1.14-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:a78003b810b63092de380accc1e73c0139a1f11b0377e1335774b72845ba0571", size = 32731973, upload-time = "2026-09-02T06:23:01.02Z" },
-    { url = "https://files.pythonhosted.org/packages/40/69/e69a18eaf239efaa1718922a26d0a4605a0525a2263d3224f506354c02ae/tilelang-0.1.14-cp39-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:fcc5d47ac1baeb7a8555ff5384af9ce9f3efef46dd926bc23d2c1cd425f68600", size = 45387334, upload-time = "2026-09-02T06:23:04.013Z" },
-    { url = "https://files.pythonhosted.org/packages/6a/ea/1463c3c736f7ace24169caeaa14189fa4aa486206179d92a47283339883a/tilelang-0.1.14-cp39-abi3-manylinux_2_34_aarch64.whl", hash = "sha256:99308791d356732aa30525d28ce686e32c9b3961852ab380be0d688fff448e74", size = 41034991, upload-time = "2026-09-02T06:23:07.405Z" },
-    { url = "https://files.pythonhosted.org/packages/aa/1d/97fb5b21437a9fae43f16523b7eae5f98f27a87e56c6026c6e5d2ae03f6d/tilelang-0.1.14-cp39-abi3-win_amd64.whl", hash = "sha256:3eff7e03e8e86d69ba2afd6b9a7df00c5d44323b0323e8cb06cb489601ecd52c", size = 28537602, upload-time = "2026-09-02T06:23:10.779Z" },
+
+[package.metadata]
+requires-dist = [
+    { name = "apache-tvm-ffi", specifier = ">=0.1.11,<0.1.13" },
+    { name = "cloudpickle" },
+    { name = "matplotlib", marker = "extra == 'vis'" },
+    { name = "ml-dtypes" },
+    { name = "ml-dtypes", marker = "extra == 'fp4'", specifier = ">=0.5.1" },
+    { name = "numpy", specifier = ">=1.23.5" },
+    { name = "nvidia-cuda-cccl", marker = "extra == 'nvcc'", specifier = ">=13.0.50" },
+    { name = "nvidia-cuda-nvcc", marker = "extra == 'nvcc'", specifier = ">=13.0.48" },
+    { name = "nvidia-cuda-nvrtc", marker = "sys_platform == 'win32' and extra == 'nvcc'", specifier = ">=13" },
+    { name = "nvidia-curand", marker = "sys_platform == 'win32' and extra == 'nvcc'", specifier = ">=10.4" },
+    { name = "psutil" },
+    { name = "setuptools", marker = "sys_platform == 'darwin'" },
+    { name = "torch" },
+    { name = "torch", marker = "sys_platform == 'darwin'", specifier = ">=2.4" },
+    { name = "torch", marker = "sys_platform == 'win32' and extra == 'nvcc'", index = "https://download.pytorch.org/whl/cu130", conflict = { package = "tilelang", extra = "nvcc" } },
+    { name = "torch", marker = "sys_platform != 'win32' and extra == 'nvcc'" },
+    { name = "torch-c-dlpack-ext", marker = "python_full_version < '3.14'" },
+    { name = "tqdm", specifier = ">=4.62.3" },
+    { name = "typing-extensions", specifier = ">=4.10.0" },
+    { name = "z3-solver", specifier = ">=4.13.0,<4.15.5" },
 ]
+provides-extras = ["fp4", "vis", "nvcc"]
 
 [[package]]
 name = "tokenizers"

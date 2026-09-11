@@ -107,15 +107,18 @@ def open_context(backend: Backend, budget_bytes: int, ordinal: int):
             "; ".join(endpoint.unavailable) if endpoint is not None else "endpoint not discovered"
         )
         raise RuntimeError(f"cannot open {backend.value}:{ordinal}: {detail}")
-    if backend == Backend.METAL:
-        from magnitude_engine.platform.metal import MetalDriver
+    from magnitude_engine.platform.torch_runtime import MetalSelection, TorchDriver
 
+    selection = None
+    if backend == Backend.METAL:
         device = next(device for device in inventory.devices if device.id == endpoint.device)
         if device.registry_id is None:
             raise RuntimeError("Metal endpoint has no native registry identity")
-        driver = MetalDriver(device.registry_id)
-    else:
-        from magnitude_engine.platform.torch_runtime import TorchDriver
-
-        driver = TorchDriver(backend, ordinal)
+        working_set = next(
+            budget
+            for budget in inventory.budgets
+            if budget.id == BudgetId(f"metal:working-set:{device.registry_id}")
+        )
+        selection = MetalSelection(name=device.name, working_set_bytes=working_set.limit_bytes)
+    driver = TorchDriver(backend, ordinal, metal=selection)
     return DeviceContext(driver, budget_bytes)
