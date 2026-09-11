@@ -2,7 +2,7 @@
 
 import tilelang.language as T
 
-from magnitude_engine.kernels.projection.planar_affine.layout import output_index
+from magnitude_engine.kernels.projection.layout import output_index
 from magnitude_engine.platform.execution import DType
 
 

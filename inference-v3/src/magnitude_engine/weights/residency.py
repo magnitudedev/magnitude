@@ -31,15 +31,13 @@ from magnitude_engine.weights.descriptor import (
 )
 from magnitude_engine.weights.identity import ArtifactIdentity
 from magnitude_engine.weights.representation import (
+    EncodedBlocks,
+    HierarchicalAffine,
     PlanarAffine,
     Representation,
     plane_offsets,
     resident_bytes,
 )
-
-# Final backing plus at most this many original superblocks and an offset.
-# Chunk offsets are runtime operands, not distinct compiled kernels.
-_REPACK_BLOCKS = 4096
 
 
 class WeightFormat(Protocol):
@@ -71,7 +69,11 @@ class ResidentWeight:
         self._storage = storage
         self._elements = math.prod(descriptor.shape) if elements is None else elements
         self._row_offset, self._rows = row_offset, rows
-        self.nbytes = storage.spec.nbytes
+        self.nbytes = (
+            storage.spec.nbytes
+            if rows is None
+            else resident_bytes(representation, rows * descriptor.shape[-1])
+        )
 
     @property
     def context(self) -> DeviceContext:
@@ -82,7 +84,14 @@ class ResidentWeight:
         if len(specs) == 1:
             if specs[0].nbytes != self.nbytes:
                 raise ValueError("consumer representation differs from resident weight size")
-            return (self._storage.view(specs[0]),)
+            start = 0
+            if self._rows is not None and isinstance(
+                self.representation, (EncodedBlocks, HierarchicalAffine)
+            ):
+                start = resident_bytes(
+                    self.representation, self._row_offset * self.descriptor.shape[-1]
+                )
+            return (self._storage.view(specs[0], start),)
         representation = self.representation
         if not isinstance(representation, PlanarAffine) or len(specs) != 3:
             raise ValueError("only planar affine weights bind separate plane operands")
@@ -175,17 +184,28 @@ class Weights:
         if len({d.shape[1] for d in descriptors}) != 1:
             raise ValueError("a projection group shares one input width")
         stored = tuple(self.format.stored(descriptor) for descriptor in descriptors)
-        if not all(isinstance(entry, StoredAffinePlanes) for entry in stored):
-            return None
         if any(descriptor.name in self._resident for descriptor in descriptors):
             raise ValueError("projection groups must be declared before individual residency")
         widths = tuple(descriptor.shape[0] for descriptor in descriptors)
         inputs = descriptors[0].shape[1]
         packed = WeightDescriptor(name="+".join(key), shape=(sum(widths), inputs))
-        representation = resident_representation(stored[0], packed.shape, self.capability)
-        assert isinstance(representation, PlanarAffine)
         elements = sum(widths) * inputs
-        storage = self._affine_planes(stored, representation, elements, widths, inputs)
+        if all(isinstance(entry, StoredAffinePlanes) for entry in stored):
+            affine = tuple(entry for entry in stored if isinstance(entry, StoredAffinePlanes))
+            representation = resident_representation(affine[0], packed.shape, self.capability)
+            assert isinstance(representation, PlanarAffine)
+            storage = self._affine_planes(affine, representation, elements, widths, inputs)
+        elif all(isinstance(entry, StoredBlocks) for entry in stored):
+            blocks = tuple(entry for entry in stored if isinstance(entry, StoredBlocks))
+            if len({entry.layout for entry in blocks}) != 1 or any(
+                descriptor.transform != WeightTransform.IDENTITY for descriptor in descriptors
+            ):
+                return None
+            representation = resident_representation(blocks[0], packed.shape, self.capability)
+            assert isinstance(representation, (EncodedBlocks, HierarchicalAffine))
+            storage = self._block_rows(blocks, representation, widths, inputs)
+        else:
+            return None
         weight = ResidentWeight(packed, representation, storage, stored[0], elements=elements)
         self._cleanup.callback(weight.close)
         start = 0
@@ -206,6 +226,23 @@ class Weights:
 
     # ------------------------------------------------------------ materializing
 
+    def _block_rows(
+        self,
+        stored: tuple[StoredBlocks, ...],
+        representation: EncodedBlocks | HierarchicalAffine,
+        widths: tuple[int, ...],
+        inputs: int,
+    ) -> Tensor:
+        """Concatenate compatible row-major compact weights without changing their layout."""
+        from magnitude_engine.platform.storage import ConcatenatedSource
+
+        pieces = []
+        for entry, width in zip(stored, widths, strict=True):
+            nbytes = resident_bytes(representation, width * inputs)
+            pieces.append((entry.source, entry.offset, nbytes))
+        source = ConcatenatedSource(tuple(pieces))
+        return self.context.upload_source(TensorSpec((source.size,), DType.U8), source, 0)
+
     def _materialize(
         self,
         descriptor: WeightDescriptor,
@@ -222,22 +259,22 @@ class Weights:
             return self._convert(descriptor, stored, elements)
         assert isinstance(stored, StoredBlocks)
         nbytes = resident_bytes(representation, elements)
-        if isinstance(representation, PlanarAffine):
-            return self._repack(stored, representation, elements, nbytes)
         if descriptor.transform != WeightTransform.IDENTITY:
             raise ValueError("a container's blocked weights carry no declared transform")
         return self.context.upload_source(
             TensorSpec((nbytes,), DType.U8), stored.source, stored.offset
         )
 
-    def _convert(
-        self, descriptor: WeightDescriptor, stored: StoredDense, elements: int
-    ) -> Tensor:
+    def _convert(self, descriptor: WeightDescriptor, stored: StoredDense, elements: int) -> Tensor:
         """Widen a stored floating parameter and apply its declared transform."""
         from magnitude_engine.kernels.copy.convert import convert
 
         if stored.dtype not in (DType.BF16, DType.F32):
             raise ValueError("a stored floating parameter must be BF16 or F32")
+        if stored.dtype == DType.F32 and descriptor.transform == WeightTransform.IDENTITY:
+            return self.context.upload_source(
+                TensorSpec((elements,), DType.F32), stored.source, stored.offset
+            )
         with ExitStack() as cleanup:
             source = self.context.upload_source(
                 TensorSpec((elements,), stored.dtype), stored.source, stored.offset
@@ -254,33 +291,6 @@ class Weights:
             cleanup.callback(target.close)
             self.context.submit((Prepared(self.context, kernel, (source, target)),)).wait()
             owned = target.view(target.spec)
-        return owned
-
-    def _repack(
-        self, stored: StoredBlocks, representation: PlanarAffine, elements: int, nbytes: int
-    ) -> Tensor:
-        from magnitude_engine.kernels.projection.planar_affine.pack import pack
-
-        context = self.context
-        with ExitStack() as cleanup:
-            target = context.allocate(TensorSpec((nbytes // 4,), DType.U32))
-            cleanup.callback(target.close)
-            for first in range(0, elements // 256, _REPACK_BLOCKS):
-                count = min(_REPACK_BLOCKS, elements // 256 - first)
-                kernel = context.specialize(
-                    pack, count, elements, stored.encoding, representation
-                )
-                with ExitStack() as chunk:
-                    source = context.upload_source(
-                        kernel.signature[0],
-                        stored.source,
-                        stored.offset + first * stored.encoding.block_bytes,
-                    )
-                    chunk.callback(source.close)
-                    offset = context.indices((first * 256,))
-                    chunk.callback(offset.close)
-                    context.submit((Prepared(context, kernel, (source, target, offset)),)).wait()
-            owned = target.view(TensorSpec((nbytes,), DType.U8))
         return owned
 
     def _affine_planes(

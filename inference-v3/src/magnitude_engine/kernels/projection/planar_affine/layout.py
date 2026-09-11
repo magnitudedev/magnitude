@@ -10,8 +10,6 @@ only definition of where a plane starts.
 
 from __future__ import annotations
 
-import tilelang.language as T
-
 from magnitude_engine.platform.execution import DType, TensorSpec
 from magnitude_engine.weights.representation import PlanarAffine, plane_offsets
 
@@ -53,18 +51,6 @@ def plane_byte_offsets(representation: PlanarAffine, elements: int) -> tuple[int
         return (0,)
     assert offsets.biases is not None
     return (offsets.low * 4, offsets.scales * 4, offsets.biases * 4)
-
-
-def output_index(rows, widths):
-    def index(row, col):
-        result = row * widths[0] + col
-        start = widths[0]
-        for width in widths[1:]:
-            result = T.if_then_else(col >= start, rows * start + row * width + col - start, result)
-            start += width
-        return result
-
-    return index
 
 
 def partitions(m, n, k):

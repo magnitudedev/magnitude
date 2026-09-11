@@ -1,8 +1,8 @@
 """What a kernel reads. Containers are forgotten once a weight is resident.
 
-A Q4_K matrix repacked into planes and an MLX affine matrix uploaded from three
-tensors are both ``PlanarAffine``; they differ only in the parameters below, and
-one kernel family covers both by specializing on them.
+Flat affine planes and compact hierarchical affine blocks are distinct resident
+meanings. A container may already store either one; kernels specialize on the
+representation parameters and never on that container's wire names.
 
 Planar storage is one allocation: the low plane, then the scale plane, then the
 bias plane if present, then the high plane if present. ``plane_offsets`` is the
@@ -14,14 +14,16 @@ that reads them.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 
 from magnitude_engine.platform.execution import DType
-from magnitude_engine.weights.formats.gguf import Encoding
 
 __all__ = [
-    "Blocked",
+    "BlockCodec",
+    "EncodedBlocks",
     "Dense",
-    "Encoding",
+    "HierarchicalAffine",
+    "HierarchyPacking",
     "PlanarAffine",
     "PlaneOffsets",
     "Representation",
@@ -35,9 +37,78 @@ class Dense:
     dtype: DType
 
 
+class BlockCodec(StrEnum):
+    """Container-neutral byte interpretations without affine hierarchy."""
+
+    F16 = "f16"
+    GROUPED_I8 = "grouped_i8"
+    CODEBOOK_I4 = "codebook_i4"
+
+
 @dataclass(frozen=True)
-class Blocked:
-    encoding: Encoding
+class EncodedBlocks:
+    codec: BlockCodec
+    block_elements: int
+    block_bytes: int
+
+    def __post_init__(self):
+        if self.block_elements <= 0 or self.block_bytes <= 0:
+            raise ValueError("encoded block geometry must be positive")
+
+    @property
+    def bits_per_value(self) -> float:
+        return self.block_bytes * 8 / self.block_elements
+
+
+class HierarchyPacking(StrEnum):
+    """Physical organizations of hierarchical affine coefficients and codes."""
+
+    SCALE_MIN_I6 = "scale_min_i6"
+    SIGNED_SCALE_I8 = "signed_scale_i8"
+
+
+@dataclass(frozen=True)
+class HierarchicalAffine:
+    """Compact two-level affine blocks consumed without persistent expansion."""
+
+    bits: int
+    high_bits: int
+    group: int
+    supergroup: int
+    local_bits: int
+    signed: bool
+    has_bias: bool
+    packing: HierarchyPacking
+
+    def __post_init__(self):
+        if self.bits != 4 or self.high_bits not in (0, 1, 2):
+            raise ValueError("hierarchical affine storage carries a 4-bit low code")
+        if self.group <= 0 or self.supergroup <= 0 or self.supergroup % self.group:
+            raise ValueError("hierarchical affine groups must tile their supergroup")
+        if self.local_bits not in (6, 8):
+            raise ValueError("hierarchical affine coefficients are six or eight bit")
+        if self.packing == HierarchyPacking.SCALE_MIN_I6:
+            if self.local_bits != 6 or self.signed or not self.has_bias or self.group != 32:
+                raise ValueError("scale/min packing requires unsigned 32-value groups")
+        elif self.packing == HierarchyPacking.SIGNED_SCALE_I8:
+            if self.local_bits != 8 or not self.signed or self.has_bias or self.group != 16:
+                raise ValueError("signed-scale packing requires signed 16-value groups")
+
+    @property
+    def block_elements(self) -> int:
+        return self.supergroup
+
+    @property
+    def block_bytes(self) -> int:
+        payload = self.supergroup * (self.bits + self.high_bits) // 8
+        groups = self.supergroup // self.group
+        local = groups * self.local_bits * (2 if self.has_bias else 1) // 8
+        super_coefficients = 2 * (2 if self.has_bias else 1)
+        return payload + local + super_coefficients
+
+    @property
+    def bits_per_value(self) -> float:
+        return self.block_bytes * 8 / self.block_elements
 
 
 @dataclass(frozen=True)
@@ -81,7 +152,7 @@ class PlanarAffine:
         return self.bits + self.high_bits + coefficients // self.group
 
 
-type Representation = Dense | Blocked | PlanarAffine
+type Representation = Dense | EncodedBlocks | HierarchicalAffine | PlanarAffine
 
 
 @dataclass(frozen=True)
@@ -117,7 +188,8 @@ def resident_bytes(representation: Representation, elements: int) -> int:
         return plane_offsets(representation, elements).words * 4
     if isinstance(representation, Dense):
         return elements * representation.dtype.itemsize
-    encoding = representation.encoding
-    if elements % encoding.block_elements:
+    if not isinstance(representation, (EncodedBlocks, HierarchicalAffine)):
+        raise TypeError("unknown resident weight representation")
+    if elements % representation.block_elements:
         raise ValueError("blocked storage requires complete container blocks")
-    return elements // encoding.block_elements * encoding.block_bytes
+    return elements // representation.block_elements * representation.block_bytes

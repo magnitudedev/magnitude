@@ -4,13 +4,14 @@ import tilelang.language as T
 
 from magnitude_engine.kernels.capabilities import Capability
 from magnitude_engine.kernels.projection.decode import decoder
+from magnitude_engine.kernels.projection.layout import output_index, widths_and_outputs
 from magnitude_engine.platform.execution import DType
 from magnitude_engine.weights.representation import Representation, resident_bytes
 
 
 def projection(
     rows: int,
-    outputs: int,
+    widths: int | tuple[int, ...],
     inputs: int,
     representation: Representation,
     *,
@@ -22,8 +23,10 @@ def projection(
     output_dtype: DType = DType.F32,
 ):
     """One lane reduces a strided slice of a row; the subgroup sums it."""
+    logical_widths, outputs = widths_and_outputs(widths)
+    output_at = output_index(rows, logical_widths)
     subgroup_width = capability.subgroup_width
-    if min(rows, outputs, inputs, subgroup_width, output_tile, pack, row_tile) <= 0:
+    if min(rows, inputs, subgroup_width, output_tile, pack, row_tile) <= 0:
         raise ValueError("projection extents must be positive")
     if subgroup_width <= 1:
         raise ValueError("this schedule requires a subgroup wider than one lane")
@@ -59,6 +62,7 @@ def projection(
                 total = T.warp_reduce_sum(partial[r])
                 row = row_group * row_tile + r
                 if lane == 0 and out < outputs and row < rows:
-                    C[row, out] = total
+                    index = output_at(row, out)
+                    C[index // outputs, index % outputs] = total
 
     return main

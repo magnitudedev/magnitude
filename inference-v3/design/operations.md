@@ -58,6 +58,7 @@ component.
 
 ```text
 GatedLinear:  fused single pass            applies: planes, native rounding, few rows
+              fused hierarchical pass      applies: compatible compact hierarchy, native rounding, few rows
               two projections + gate       applies: always; declares the packed buffer
 ```
 
@@ -82,5 +83,6 @@ One binding builds every weight-backed operation for any container. What a
 resident weight is in decides what its operations can be; the binding does not
 know which container produced it. Projections that share an input are a grouping
 opportunity: whether they become one contraction is residency's decision, made
-before either is asked for alone, so that a group is one allocation rather than a
-copy.
+before either is asked for alone, so that a compatible row-concatenated group is
+one allocation rather than a copy. Grouping eligibility follows from the resident
+representation, never from the container class.

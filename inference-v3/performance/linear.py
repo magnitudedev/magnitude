@@ -8,7 +8,10 @@ from pydantic import Field
 
 from magnitude_engine.operations.linear import ResidentLinear
 from magnitude_engine.platform.execution import DType, TensorSpec, Ticket
-from magnitude_engine.weights.representation import Blocked, resident_bytes
+from magnitude_engine.weights.descriptor import StoredBlocks
+from magnitude_engine.weights.formats.gguf import encoding_for_layout
+from magnitude_engine.weights.representation import resident_bytes
+from magnitude_engine.weights.residency import ResidentWeight
 from performance.metrics import (
     Latency,
     LinearMetrics,
@@ -45,13 +48,16 @@ class LinearCase:
         parameters = component.parameters
         # Read the container independently of residency: the resident weight
         # kept what it was made from, so the oracle never guesses a layout.
-        stored = component.weight.stored
+        weight = component.projection.weight
+        if not isinstance(weight, ResidentWeight) or not isinstance(weight.stored, StoredBlocks):
+            raise TypeError("encoded-linear benchmark requires one block-resident weight")
+        self.weight_nbytes = weight.nbytes
+        stored = weight.stored
         elements = parameters.output_width * parameters.input_width
-        raw = stored.source.read(
-            stored.offset, resident_bytes(Blocked(stored.encoding), elements)
-        )
+        raw = stored.source.read(stored.offset, resident_bytes(stored.layout, elements))
         encoded = np.frombuffer(raw, np.uint8).reshape(parameters.output_width, -1)
-        weights = gguf.dequantize(encoded, gguf.GGMLQuantizationType(stored.encoding))
+        wire_encoding = encoding_for_layout(stored.layout)
+        weights = gguf.dequantize(encoded, gguf.GGMLQuantizationType(wire_encoding))
         inputs = (
             np.random.default_rng(workload.seed)
             .normal(size=(workload.rows, parameters.input_width))
@@ -138,7 +144,7 @@ class LinearCase:
                 else ("separate device timestamps unavailable",),
             ),
             reads=ReadTraffic(
-                minimum_bytes=self.component.encoded.resident_bytes + self.inputs.spec.nbytes,
+                minimum_bytes=self.weight_nbytes + self.inputs.spec.nbytes,
                 interface=TrafficInterface.LOGICAL_OPERANDS,
                 formula="encoded weight payload bytes + rows * input_width * input_item_bytes",
                 assumptions=(

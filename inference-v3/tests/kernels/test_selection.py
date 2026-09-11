@@ -40,16 +40,23 @@ from magnitude_engine.kernels.recurrence.select import RecurrenceShape
 from magnitude_engine.kernels.semantics import HeadMapping
 from magnitude_engine.operations.candidates import NoCandidate, Selection, select
 from magnitude_engine.platform.execution import DType
-from magnitude_engine.weights.representation import Blocked, Dense, Encoding, PlanarAffine
+from magnitude_engine.weights.representation import (
+    BlockCodec,
+    Dense,
+    EncodedBlocks,
+    HierarchicalAffine,
+    HierarchyPacking,
+    PlanarAffine,
+)
 
 METAL = Capability(
     subgroup_width=32, threads_per_group=1024, shared_memory_bytes=32768, matrix_instructions=True
 )
 UNBOUNDED = 1 << 60
 
-Q4_K = Blocked(Encoding.Q4_K)
-Q6_K = Blocked(Encoding.Q6_K)
-IQ4_XS = Blocked(Encoding.IQ4_XS)
+Q4_K = HierarchicalAffine(4, 0, 32, 256, 6, False, True, HierarchyPacking.SCALE_MIN_I6)
+Q6_K = HierarchicalAffine(4, 2, 16, 256, 8, True, False, HierarchyPacking.SIGNED_SCALE_I8)
+IQ4_XS = EncodedBlocks(BlockCodec.CODEBOOK_I4, 256, 136)
 F32 = Dense(DType.F32)
 REPACKED_Q4_K = PlanarAffine(
     bits=4, high_bits=0, group=32, coefficient_dtype=DType.F32, signed=False, has_bias=True
@@ -89,9 +96,9 @@ def projection(rows, representation, inputs=2048, widths=(2048,), capability=MET
     "rows,representation,expected",
     [
         # Decode reduces one row across a subgroup.
-        (1, Q4_K, "projection.packed_k"),
-        (1, Q6_K, "projection.blocks"),
-        (1, IQ4_XS, "projection.blocks"),
+        (1, Q4_K, "projection.hierarchical_scale_min"),
+        (1, Q6_K, "projection.groupwise_blocks"),
+        (1, IQ4_XS, "projection.groupwise_blocks"),
         (1, REPACKED_Q4_K, "projection.planar_affine.vector"),
         (1, REPACKED_Q6_K, "projection.planar_affine.vector"),
         (1, MLX_Q4, "projection.planar_affine.vector"),
@@ -118,7 +125,9 @@ def test_projection_falls_back_to_the_host_where_there_are_no_groups():
 
 def test_projection_needs_whole_folds_before_it_reads_a_flat_plane():
     narrow = Capability(
-        subgroup_width=32, threads_per_group=1024, shared_memory_bytes=32768,
+        subgroup_width=32,
+        threads_per_group=1024,
+        shared_memory_bytes=32768,
         matrix_instructions=False,
     )
     assert projection(1, REPACKED_Q4_K, inputs=768, capability=narrow) == "projection.subgroup"
@@ -126,16 +135,16 @@ def test_projection_needs_whole_folds_before_it_reads_a_flat_plane():
 
 def test_projection_uses_a_threadgroup_where_lanes_cannot_exchange():
     no_subgroup = Capability(
-        subgroup_width=1, threads_per_group=256, shared_memory_bytes=16384,
+        subgroup_width=1,
+        threads_per_group=256,
+        shared_memory_bytes=16384,
         matrix_instructions=False,
     )
     assert projection(1, Q4_K, capability=no_subgroup) == "projection.threadgroup"
 
 
 def attention(rows, capacity, capability=METAL, dtype=DType.BF16, width=256, budget=UNBOUNDED):
-    shape = AttentionShape(
-        rows, 32, 4, width, dtype, (HistoryShape(capacity, capacity, 1),)
-    )
+    shape = AttentionShape(rows, 32, 4, width, dtype, (HistoryShape(capacity, capacity, 1),))
     return chosen("attention", ATTENTION, shape, NATIVE_BF16, capability, budget=budget)
 
 
@@ -168,7 +177,9 @@ def test_attention_falls_back_to_the_host_and_to_portable_matrix_hardware():
     assert attention(1, 65536, capability=HOST) == "attention.serial"
     assert attention(256, 4096, capability=HOST) == "attention.serial"
     no_subgroup = Capability(
-        subgroup_width=1, threads_per_group=1024, shared_memory_bytes=65536,
+        subgroup_width=1,
+        threads_per_group=1024,
+        shared_memory_bytes=65536,
         matrix_instructions=True,
     )
     assert attention(1, 65536, capability=no_subgroup) == "attention.portable"
@@ -228,7 +239,7 @@ def gated(rows, representation, precision=NATIVE_BF16, capability=METAL):
         (1, MLX_Q4, MIXED_BF16, "gated.projected"),
         (8, MLX_Q4, NATIVE_BF16, "gated.projected"),
         (1, REPACKED_Q4_K, NATIVE_BF16, "gated.projected"),
-        (1, Q4_K, NATIVE_BF16, "gated.projected"),
+        (1, Q4_K, NATIVE_BF16, "gated.hierarchical_fused_vector"),
     ],
 )
 def test_gated_fusion_is_a_candidate_of_the_composite(rows, representation, precision, expected):

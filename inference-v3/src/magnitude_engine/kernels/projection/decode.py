@@ -10,27 +10,29 @@ import tilelang.language as T
 
 from magnitude_engine.platform.execution import DType
 from magnitude_engine.weights.representation import (
-    Blocked,
+    BlockCodec,
     Dense,
-    Encoding,
+    EncodedBlocks,
+    HierarchicalAffine,
+    HierarchyPacking,
     PlanarAffine,
     Representation,
     plane_offsets,
 )
 
 
-def _blocks(representation: Representation) -> Encoding | None:
-    """The container encoding a blocked schedule reads, or None for planes.
+def _blocks(representation: Representation) -> Dense | EncodedBlocks | HierarchicalAffine | None:
+    """The compact representation a blocked schedule reads, or None for planes.
 
     A dense FP32 weight is read by the same path as an FP32 container block:
     one reinterpretation of four bytes, with no group parameters.
     """
-    if isinstance(representation, Blocked):
-        return representation.encoding
+    if isinstance(representation, (EncodedBlocks, HierarchicalAffine)):
+        return representation
     if isinstance(representation, Dense):
         if representation.dtype != DType.F32:
             raise ValueError("dense resident weights are read as FP32")
-        return Encoding.F32
+        return representation
     if not isinstance(representation, PlanarAffine):
         raise TypeError("unknown resident weight representation")
     return None
@@ -47,10 +49,10 @@ def half(data, offset):
 
 def decoder(representation: Representation, elements: int = 0):
     """Scalar access to one coordinate of a resident weight."""
-    encoding = _blocks(representation)
+    blocks = _blocks(representation)
     planes = None
     group_elements, high_bits, zero_point = 32, 0, 0
-    if encoding is None:
+    if blocks is None:
         assert isinstance(representation, PlanarAffine)
         if representation.coefficient_dtype != DType.F32:
             raise ValueError("scalar plane access requires FP32 group coefficients")
@@ -85,7 +87,7 @@ def decoder(representation: Representation, elements: int = 0):
             result[0] = T.reinterpret(bits[0], "float32") * (
                 quant[0].astype("int32") - zero_point
             ).astype("float32") + T.reinterpret(bits[1], "float32")
-        elif encoding == Encoding.F32:
+        elif isinstance(blocks, Dense):
             offset = index * 4
             bits = (
                 data[offset].astype("uint32")
@@ -94,15 +96,18 @@ def decoder(representation: Representation, elements: int = 0):
                 | (data[offset + 3].astype("uint32") << 24)
             )
             result[0] = T.reinterpret(bits, "float32")
-        elif encoding == Encoding.F16:
+        elif isinstance(blocks, EncodedBlocks) and blocks.codec == BlockCodec.F16:
             result[0] = half(data, index * 2)
-        elif encoding == Encoding.Q8_0:
+        elif isinstance(blocks, EncodedBlocks) and blocks.codec == BlockCodec.GROUPED_I8:
             base = index // 32 * 34
             result[0] = half(data, base) * data[base + 2 + index % 32].astype("int8").astype(
                 "float32"
             )
-        elif encoding == Encoding.Q4_K or encoding == Encoding.Q5_K:
-            base = index // 256 * encoding.block_bytes
+        elif (
+            isinstance(blocks, HierarchicalAffine)
+            and blocks.packing == HierarchyPacking.SCALE_MIN_I6
+        ):
+            base = index // blocks.supergroup * blocks.block_bytes
             k = index % 256
             group = k // 32
             low = data[base + 4 + group % 4].astype("int32")
@@ -110,19 +115,22 @@ def decoder(representation: Representation, elements: int = 0):
             high = data[base + 12 + group % 4].astype("int32")
             scale = T.if_then_else(group < 4, low & 63, (high & 15) | ((low >> 6) << 4))
             bias = T.if_then_else(group < 4, minimum & 63, (high >> 4) | ((minimum >> 6) << 4))
-            payload = 16 if encoding == Encoding.Q4_K else 48
+            payload = 16 + blocks.high_bits * 32
             low_code = (
                 data[base + payload + k // 64 * 32 + k % 32].astype("int32") >> (k % 64 // 32 * 4)
             ) & 15
             code = T.alloc_local((1,), "int32")
             code[0] = low_code
-            if encoding == Encoding.Q5_K:
+            if blocks.high_bits:
                 code[0] |= ((data[base + 16 + k % 32].astype("int32") >> group) & 1) << 4
             result[0] = half(data, base) * scale.astype("float32") * code[0].astype(
                 "float32"
             ) - half(data, base + 2) * bias.astype("float32")
-        elif encoding == Encoding.Q6_K:
-            base = index // 256 * 210
+        elif (
+            isinstance(blocks, HierarchicalAffine)
+            and blocks.packing == HierarchyPacking.SIGNED_SCALE_I8
+        ):
+            base = index // blocks.supergroup * blocks.block_bytes
             k = index % 256
             low = (data[base + k // 128 * 64 + k % 64].astype("int32") >> (k % 128 // 64 * 4)) & 15
             high = (
@@ -132,7 +140,7 @@ def decoder(representation: Representation, elements: int = 0):
             result[0] = (
                 half(data, base + 208) * scale * ((low | (high << 4)) - 32).astype("float32")
             )
-        elif encoding == Encoding.IQ4_XS:
+        elif isinstance(blocks, EncodedBlocks) and blocks.codec == BlockCodec.CODEBOOK_I4:
             base = index // 256 * 136
             k = index % 256
             group = k // 32
@@ -228,10 +236,10 @@ def word32(words, index):
 
 def interpretation(representation: Representation, elements: int = 0):
     """Cooperative access: one worker owns an aligned group of eight values."""
-    encoding = _blocks(representation)
+    blocks = _blocks(representation)
     planes = None
     group_elements, high_bits, zero_point = 32, 0, 0
-    if encoding is None:
+    if blocks is None:
         assert isinstance(representation, PlanarAffine)
         if representation.coefficient_dtype != DType.F32:
             raise ValueError("cooperative plane access requires FP32 group coefficients")
@@ -255,8 +263,11 @@ def interpretation(representation: Representation, elements: int = 0):
                     word32(words, planes.biases + index // group_elements),
                     "float32",
                 )
-        elif encoding == Encoding.Q4_K or encoding == Encoding.Q5_K:
-            base = index // 256 * encoding.block_bytes
+        elif (
+            isinstance(blocks, HierarchicalAffine)
+            and blocks.packing == HierarchyPacking.SCALE_MIN_I6
+        ):
+            base = index // blocks.supergroup * blocks.block_bytes
             group = index % 256 // 32
             lo = byte(words, base + 4 + group % 4)
             minimum = byte(words, base + 8 + group % 4)
@@ -269,12 +280,15 @@ def interpretation(representation: Representation, elements: int = 0):
             bias[0] = -T.reinterpret(words[base // 2 + 1], "float16").astype("float32") * m.astype(
                 "float32"
             )
-        elif encoding == Encoding.Q6_K:
-            base = index // 256 * 210
+        elif (
+            isinstance(blocks, HierarchicalAffine)
+            and blocks.packing == HierarchyPacking.SIGNED_SCALE_I8
+        ):
+            base = index // blocks.supergroup * blocks.block_bytes
             scale[0] = T.reinterpret(words[base // 2 + 104], "float16").astype("float32") * byte(
                 words, base + 192 + index % 256 // 16
             ).astype("int8").astype("float32")
-        elif encoding == Encoding.IQ4_XS:
+        elif isinstance(blocks, EncodedBlocks) and blocks.codec == BlockCodec.CODEBOOK_I4:
             base = index // 256 * 136
             group = index % 256 // 32
             lo = (byte(words, base + 4 + group // 2) >> ((group % 2) * 4)) & 15
@@ -282,7 +296,7 @@ def interpretation(representation: Representation, elements: int = 0):
             scale[0] = T.reinterpret(words[base // 2], "float16").astype("float32") * (
                 (lo | (hi << 4)).astype("int32") - 32
             ).astype("float32")
-        elif encoding == Encoding.Q8_0:
+        elif isinstance(blocks, EncodedBlocks) and blocks.codec == BlockCodec.GROUPED_I8:
             scale[0] = T.reinterpret(words[index // 32 * 17], "float16").astype("float32")
         return scale[0], bias[0]
 
@@ -299,32 +313,38 @@ def interpretation(representation: Representation, elements: int = 0):
                 ) & ((1 << high_bits) - 1)
                 quant[0] |= high << 4
             result[0] = (quant[0].astype("int32") - zero_point).astype("float32")
-        elif encoding == Encoding.Q4_K or encoding == Encoding.Q5_K:
-            base = index // 256 * encoding.block_bytes
+        elif (
+            isinstance(blocks, HierarchicalAffine)
+            and blocks.packing == HierarchyPacking.SCALE_MIN_I6
+        ):
+            base = index // blocks.supergroup * blocks.block_bytes
             k = index % 256
-            payload = 16 if encoding == Encoding.Q4_K else 48
+            payload = 16 + blocks.high_bits * 32
             lo = (byte(words, base + payload + k // 64 * 32 + k % 32) >> (k % 64 // 32 * 4)) & 15
             high = T.alloc_local((1,), "uint32")
             high[0] = 0
-            if encoding == Encoding.Q5_K:
+            if blocks.high_bits:
                 high[0] = ((byte(words, base + 16 + k % 32) >> (k // 32)) & 1) << 4
             result[0] = (lo | high[0]).astype("float32")
-        elif encoding == Encoding.Q6_K:
-            base = index // 256 * 210
+        elif (
+            isinstance(blocks, HierarchicalAffine)
+            and blocks.packing == HierarchyPacking.SIGNED_SCALE_I8
+        ):
+            base = index // blocks.supergroup * blocks.block_bytes
             k = index % 256
             lo = (byte(words, base + k // 128 * 64 + k % 64) >> (k % 128 // 64 * 4)) & 15
             hi = (byte(words, base + 128 + k // 128 * 32 + k % 32) >> (k % 128 // 32 * 2)) & 3
             result[0] = ((lo | (hi << 4)).astype("int32") - 32).astype("float32")
-        elif encoding == Encoding.IQ4_XS:
+        elif isinstance(blocks, EncodedBlocks) and blocks.codec == BlockCodec.CODEBOOK_I4:
             base = index // 256 * 136
             k = index % 256
             packed = byte(words, base + 8 + k // 32 * 16 + k % 16)
             result[0] = iq_value((packed >> (k % 32 // 16 * 4)) & 15)
-        elif encoding == Encoding.Q8_0:
+        elif isinstance(blocks, EncodedBlocks) and blocks.codec == BlockCodec.GROUPED_I8:
             result[0] = (
                 byte(words, index // 32 * 34 + 2 + index % 32).astype("int8").astype("float32")
             )
-        elif encoding == Encoding.F16:
+        elif isinstance(blocks, EncodedBlocks) and blocks.codec == BlockCodec.F16:
             result[0] = T.reinterpret(words[index], "float16").astype("float32")
         else:
             bits = words[index * 2].astype("uint32") | (words[index * 2 + 1].astype("uint32") << 16)
