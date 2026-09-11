@@ -32,6 +32,9 @@ dev = [
   "transformers==5.16.1",
 ]
 
+[tool.uv.sources]
+tilelang = { path = "tilelang", editable = true }
+
 [project.scripts]
 session-bench = "session_bench.cli:main"
 
