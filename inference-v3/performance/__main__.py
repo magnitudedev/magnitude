@@ -9,10 +9,10 @@ from pathlib import Path
 from magnitude_engine.composition import build, digest, loads
 from magnitude_engine.models.qwen35.runtime import DenseRuntime
 from magnitude_engine.operations.attention import CausalAttention
-from magnitude_engine.operations.linear import EncodedLinear
+from magnitude_engine.operations.linear import ResidentLinear
 from magnitude_engine.operations.recurrent import DeltaRecurrence
-from magnitude_engine.platform.machine import discover
-from magnitude_engine.platform.measurement import exclusive_measurement
+from magnitude_engine.platform.host.machine import discover
+from magnitude_engine.platform.host.measurement import exclusive_measurement
 from performance import benchmarks
 from performance.attention import AttentionWorkload
 from performance.linear import LinearWorkload
@@ -57,14 +57,14 @@ def main():
     with exclusive_measurement(), ThermalRecorder(evidence) as thermal, build(recipe) as component:
         machine = discover()
         policy = Policy(repetitions=args.repetitions, host_profile=args.host_profile)
-        if isinstance(component, EncodedLinear):
+        if isinstance(component, ResidentLinear):
             workload = LinearWorkload.model_validate_json(workload_json)
             result = benchmarks.run(component, workload, policy=policy)
-            artifact_identity = component.encoded.artifact_identity
+            artifact_identity = None
         elif isinstance(component, DenseRuntime):
             workload = ModelWorkload.model_validate_json(workload_json)
             result = benchmarks.run(component, workload, policy=policy)
-            artifact_identity = component.artifact_identity
+            artifact_identity = None
         elif isinstance(component, DeltaRecurrence):
             workload = RecurrentWorkload.model_validate_json(workload_json)
             result = benchmarks.run(component, workload, policy=policy)

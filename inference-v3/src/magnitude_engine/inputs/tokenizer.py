@@ -8,8 +8,8 @@ from enum import IntEnum, StrEnum
 
 from pydantic import model_validator
 
-from magnitude_engine.artifacts.identity import ArtifactIdentity
 from magnitude_engine.data import Record, TokenId
+from magnitude_engine.weights.identity import ArtifactIdentity
 
 
 class PieceKind(IntEnum):

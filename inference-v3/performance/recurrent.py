@@ -5,11 +5,19 @@ from contextlib import ExitStack
 import numpy as np
 from pydantic import Field
 
-from magnitude_engine.numerics.semantics import HeadMapping
+from magnitude_engine.kernels.semantics import HeadMapping
 from magnitude_engine.operations.recurrent import DeltaRecurrence
-from magnitude_engine.platform.backend import Backend
 from magnitude_engine.platform.execution import DType, TensorSpec, Ticket
-from performance.metrics import Latency, Record, Sample, TimingBoundary, TimingPass, Validation
+from performance.metrics import (
+    Latency,
+    Realized,
+    Record,
+    Sample,
+    TimingBoundary,
+    TimingPass,
+    Validation,
+)
+from performance.selection import realized
 
 
 class RecurrentWorkload(Record):
@@ -21,6 +29,7 @@ class RecurrentWorkload(Record):
 class RecurrentMetrics(Record):
     completed_latency: Latency
     device_latency: Latency
+    selection: tuple[Realized, ...] = ()
 
 
 class RecurrentCase:
@@ -79,7 +88,7 @@ class RecurrentCase:
     def observation_passes(self) -> tuple[TimingPass, ...]:
         return (
             (TimingPass.COMPLETED,)
-            if self.component.context.backend == Backend.LLVM
+            if self.component.context.capability.threads_per_group == 1
             else (
                 TimingPass.COMPLETED,
                 TimingPass.DEVICE_EVENTS,
@@ -117,6 +126,7 @@ class RecurrentCase:
 
     def assess(self, samples: tuple[Sample, ...]) -> RecurrentMetrics:
         return RecurrentMetrics(
+            selection=realized(self.component),
             completed_latency=Latency(
                 samples_seconds=tuple(
                     s.completed_seconds for s in samples if s.pass_kind == TimingPass.COMPLETED

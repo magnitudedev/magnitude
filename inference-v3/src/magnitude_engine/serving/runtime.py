@@ -9,16 +9,16 @@ from typing import Literal
 
 from pydantic import Field
 
-from magnitude_engine.artifacts.identity import ArtifactIdentity
-from magnitude_engine.artifacts.tokenizer import TokenizerArtifact
 from magnitude_engine.data import Record, TokenId
 from magnitude_engine.generation.plain import Options, OutputToken
+from magnitude_engine.inputs.formats.gguf_tokenizer import TokenizerArtifact
 from magnitude_engine.models.qwen35.inputs import InputPlan
 from magnitude_engine.models.qwen35.runtime import DenseRuntime
 from magnitude_engine.platform.backend import Backend
 from magnitude_engine.platform.execution import Ticket
 from magnitude_engine.service.engine import Engine, Snapshot, Submission
 from magnitude_engine.service.policy import RequestId
+from magnitude_engine.weights.identity import ArtifactIdentity
 
 
 class Config(Record):
@@ -146,15 +146,15 @@ class Runtime:
 @contextmanager
 def open_runtime(config: Config) -> Iterator[Runtime]:
     from magnitude_engine.blueprints import (
-        artifacts,
         execution,
         models,
         operations,
         service,
         serving,
     )
+    from magnitude_engine.blueprints import weights as containers
     from magnitude_engine.composition import build, digest, dumps
-    from magnitude_engine.platform.machine import choose_endpoint
+    from magnitude_engine.platform.host.machine import choose_endpoint
 
     endpoint = choose_endpoint(config.backend, config.ordinal)
     if endpoint.ordinal is None:
@@ -163,16 +163,18 @@ def open_runtime(config: Config) -> Iterator[Runtime]:
         backend=endpoint.backend, budget_bytes=config.memory_bytes, ordinal=endpoint.ordinal
     )
     if Path(config.target).is_dir():
-        mlx = artifacts.MLX(path=config.target)
-        description = models.Qwen35MLXDescription(artifact=mlx)
-        weights = operations.MLXOperations(artifact=mlx, context=context)
-        metadata = serving.MLXChatMetadata(artifact=mlx)
+        container = containers.MLX(path=config.target)
+        description = models.Qwen35MLXDescription(format=container)
+        metadata = serving.MLXChatMetadata(artifact=container)
     else:
-        gguf = artifacts.GGUF(path=config.target)
-        description = models.Qwen35DenseDescription(artifact=gguf)
-        weights = operations.ResidentOperations(artifact=gguf, context=context)
-        metadata = serving.ChatMetadata(artifact=gguf)
-    model = models.Qwen35Dense(description=description, operations=weights)
+        container = containers.GGUF(path=config.target)
+        description = models.Qwen35DenseDescription(format=container)
+        metadata = serving.ChatMetadata(artifact=container)
+    arena = operations.Arena(context=context)
+    binding = operations.Operations(
+        weights=containers.Weights(format=container, context=context), arena=arena
+    )
+    model = models.Qwen35Dense(description=description, operations=binding)
     recipe = serving.ChatComponents(
         engine=service.Continuous(
             model=model,

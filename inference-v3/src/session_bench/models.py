@@ -23,7 +23,21 @@ class Target(Record):
 
     @property
     def kind(self) -> Literal["mlx", "gguf"]:
-        return "gguf" if self.engine == "llama.cpp" else "mlx"
+        """The container this reference names, within what the engine accepts.
+
+        Only ``magnitude`` reads both, so only it is decided by the reference:
+        a ``.gguf`` file (or a ``#file.gguf`` Hub reference) is GGUF, and a
+        model directory or snapshot is MLX.
+        """
+        if self.engine == "llama.cpp":
+            return "gguf"
+        if self.engine != "magnitude":
+            return "mlx"
+        if self.reference.startswith("hf:"):
+            return "gguf" if "#" in self.reference else "mlx"
+        # The same rule the engine itself applies: a directory is a snapshot,
+        # anything else is a single container file.
+        return "mlx" if Path(self.reference).is_dir() else "gguf"
 
     @property
     def id(self) -> str:

@@ -6,9 +6,9 @@ import gguf
 import numpy as np
 from pydantic import Field
 
-from magnitude_engine.operations.linear import EncodedLinear
-from magnitude_engine.platform.backend import Backend
+from magnitude_engine.operations.linear import ResidentLinear
 from magnitude_engine.platform.execution import DType, TensorSpec, Ticket
+from magnitude_engine.weights.representation import Blocked, resident_bytes
 from performance.metrics import (
     Latency,
     LinearMetrics,
@@ -21,6 +21,7 @@ from performance.metrics import (
     Validation,
 )
 from performance.precision import decode, encode, rounded
+from performance.selection import realized
 
 
 class LinearWorkload(Record):
@@ -35,20 +36,22 @@ class LinearCase:
     def observation_passes(self) -> tuple[TimingPass, ...]:
         return (
             (TimingPass.COMPLETED,)
-            if self.component.context.backend == Backend.LLVM
+            if self.component.context.capability.threads_per_group == 1
             else (TimingPass.COMPLETED, TimingPass.DEVICE_EVENTS)
         )
 
-    def __init__(self, component: EncodedLinear, workload: LinearWorkload):
+    def __init__(self, component: ResidentLinear, workload: LinearWorkload):
         self.component, self.workload = component, workload
         parameters = component.parameters
-        artifact = component.weight.artifact
-        descriptor = artifact.directory.tensor(component.encoded.tensor_name)
-        raw = artifact.source.read(
-            artifact.directory.data_offset + descriptor.offset, descriptor.nbytes
+        # Read the container independently of residency: the resident weight
+        # kept what it was made from, so the oracle never guesses a layout.
+        stored = component.weight.stored
+        elements = parameters.output_width * parameters.input_width
+        raw = stored.source.read(
+            stored.offset, resident_bytes(Blocked(stored.encoding), elements)
         )
         encoded = np.frombuffer(raw, np.uint8).reshape(parameters.output_width, -1)
-        weights = gguf.dequantize(encoded, gguf.GGMLQuantizationType(descriptor.encoding))
+        weights = gguf.dequantize(encoded, gguf.GGMLQuantizationType(stored.encoding))
         inputs = (
             np.random.default_rng(workload.seed)
             .normal(size=(workload.rows, parameters.input_width))
@@ -117,6 +120,7 @@ class LinearCase:
             sample.device_seconds for sample in samples if sample.device_seconds is not None
         )
         return LinearMetrics(
+            selection=realized(self.component),
             completed_latency=Latency(
                 samples_seconds=tuple(
                     s.completed_seconds for s in samples if s.pass_kind == TimingPass.COMPLETED
@@ -150,5 +154,5 @@ class LinearCase:
 
 
 class LinearProcedure:
-    def prepare(self, component: EncodedLinear, workload: LinearWorkload) -> LinearCase:
+    def prepare(self, component: ResidentLinear, workload: LinearWorkload) -> LinearCase:
         return LinearCase(component, workload)

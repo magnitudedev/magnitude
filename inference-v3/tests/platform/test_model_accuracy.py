@@ -8,10 +8,10 @@ from typing import cast
 import numpy as np
 import pytest
 
-from magnitude_engine.artifacts.identity import ArtifactIdentity
+from magnitude_engine.kernels import precision
 from magnitude_engine.models.qwen35.runtime import DenseRuntime
-from magnitude_engine.numerics.policy import NumericalFamily
-from magnitude_engine.platform.measurement import exclusive_measurement
+from magnitude_engine.platform.host.measurement import exclusive_measurement
+from magnitude_engine.weights.identity import ArtifactIdentity
 from performance.model import LogitsReference, ModelCase, ModelWorkload, ReferenceIdentity
 from performance.model_accuracy import compare
 
@@ -55,12 +55,12 @@ def test_model_rejects_missing_or_mismatched_precision_anchor_before_execution(t
         DenseRuntime,
         SimpleNamespace(
             artifact_identity=artifact,
-            numerics=NumericalFamily.MIXED_BF16,
+            precision=precision.MIXED_BF16,
             geometry=SimpleNamespace(context_limit=64, vocabulary=4),
         ),
     )
 
-    def reference(name: str, tokens: tuple[int, ...], family: NumericalFamily):
+    def reference(name: str, tokens: tuple[int, ...], family: str):
         path: Path = tmp_path / name
         content = (
             np.array([len(tokens), 4, *tokens], dtype="<i4").tobytes()
@@ -71,14 +71,14 @@ def test_model_rejects_missing_or_mismatched_precision_anchor_before_execution(t
             path=path,
             identity=ReferenceIdentity(hashlib.sha256(content).hexdigest()),
             artifact=artifact,
-            numerics=family,
+            precision=family,
         )
 
     with exclusive_measurement():
-        control = reference("control.bin", (1, 2), NumericalFamily.MIXED_BF16)
+        control = reference("control.bin", (1, 2), "mixed_bf16")
         with pytest.raises(ValueError, match="explicit paired FP32"):
             ModelCase(model, ModelWorkload(reference=control))
-        wrong_tokens = reference("anchor.bin", (1, 3), NumericalFamily.REFERENCE_F32)
+        wrong_tokens = reference("anchor.bin", (1, 3), "reference_f32")
         with pytest.raises(ValueError, match="tokens or geometry"):
             ModelCase(model, ModelWorkload(reference=control, accuracy_anchor=wrong_tokens))
         with pytest.raises(ValueError, match="FP32 interpretation"):

@@ -14,10 +14,10 @@ from pathlib import Path
 
 from benchmark_fixtures import prose
 from benchmark_fixtures.prose_history import Prose
-from magnitude_engine.artifacts.model import GGUFArtifact
-from magnitude_engine.models.qwen35.artifact import inspect_dense
+from magnitude_engine.models.qwen35.description import inspect_dense
 from magnitude_engine.platform.compiler import compiler_build
-from magnitude_engine.platform.measurement import exclusive_measurement
+from magnitude_engine.platform.host.measurement import exclusive_measurement
+from magnitude_engine.weights.formats.gguf import GGUFFormat
 from performance.__main__ import source_identity
 from performance.thermals import ThermalRecorder
 from session_bench import report
@@ -32,7 +32,7 @@ from session_bench.suites import SECTIONS, compile_plan
 def gguf_artifact(path: Path) -> Artifact:
     path = path.expanduser().resolve(strict=True)
     before = path.stat()
-    artifact = GGUFArtifact(str(path))
+    artifact = GGUFFormat(str(path))
     try:
         description = inspect_dense(artifact.directory, artifact.identity)
         after = path.stat()

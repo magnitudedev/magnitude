@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from magnitude_engine.artifacts.tokenizer import TokenizerArtifact
+from magnitude_engine.inputs.formats.gguf_tokenizer import TokenizerArtifact
 from magnitude_engine.service.engine import Engine
 
 

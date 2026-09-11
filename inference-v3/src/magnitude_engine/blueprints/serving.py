@@ -1,16 +1,16 @@
-from magnitude_engine.artifacts.mlx import MLXArtifact
-from magnitude_engine.artifacts.model import GGUFArtifact
-from magnitude_engine.artifacts.tokenizer import TokenizerArtifact
 from magnitude_engine.composition import Blueprint, blueprint
+from magnitude_engine.inputs.formats.gguf_tokenizer import TokenizerArtifact
 from magnitude_engine.service.engine import Engine
 from magnitude_engine.serving.binding import Components
+from magnitude_engine.weights.formats.gguf import GGUFFormat
+from magnitude_engine.weights.formats.mlx_safetensors import MLXFormat
 
 __all__ = ["ChatMetadata", "MLXChatMetadata", "ChatComponents"]
 
 
 @blueprint
 class ChatMetadata(Blueprint[TokenizerArtifact]):
-    artifact: Blueprint[GGUFArtifact]
+    artifact: Blueprint[GGUFFormat]
 
     @staticmethod
     def implementation():
@@ -29,10 +29,10 @@ class ChatComponents(Blueprint[Components]):
 
 @blueprint
 class MLXChatMetadata(Blueprint[TokenizerArtifact]):
-    artifact: Blueprint[MLXArtifact]
+    artifact: Blueprint[MLXFormat]
 
     @staticmethod
     def implementation():
-        from magnitude_engine.artifacts.tokenizer import mlx_tokenizer
+        from magnitude_engine.inputs.formats.gguf_tokenizer import mlx_tokenizer
 
         return mlx_tokenizer

@@ -14,7 +14,6 @@ from pydantic import Field
 
 from magnitude_engine.data import Record, TokenId
 from magnitude_engine.operations.preparation import Preparation
-from magnitude_engine.platform.backend import Backend
 from magnitude_engine.platform.execution import (
     DeviceContext,
     DType,
@@ -92,11 +91,16 @@ class SampleSelector:
         key = rows, vocabulary
         tiles = math.ceil(vocabulary / self.tile)
         if key not in self._plans:
-            from magnitude_engine.numerics.sampling import finish_selection, select_tiles
+            from magnitude_engine.kernels.sampling.finish import finish_selection
+            from magnitude_engine.kernels.sampling.select_tiles import select_tiles
 
-            cpu = self.context.backend == Backend.LLVM
-            first = self.context.specialize(select_tiles, rows, vocabulary, cpu=cpu, tile=self.tile)
-            second = self.context.specialize(finish_selection, rows, tiles, cpu=cpu)
+            capability = self.context.capability
+            first = self.context.specialize(
+                select_tiles, rows, vocabulary, capability=capability, tile=self.tile
+            )
+            second = self.context.specialize(
+                finish_selection, rows, tiles, capability=capability
+            )
             self._plans[key] = first, second
         with Preparation(self.context) as p:
             words = tuple(word for draw in draws for word in draw.words())

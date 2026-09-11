@@ -14,7 +14,9 @@ one implementation for every backend and passes no per-target configuration.
 
 The fork has two kinds of branches: `magnitude`, which Magnitude uses and which
 evolves freely, and `pr/<name>` branches based on upstream `main`, one per
-change we want upstreamed. The TileLang suites relevant to a change are the
+change we want upstreamed. The fork's `3rdparty/tvm` points at
+`magnitudedev/tvm`, our fork of `TileLang/tvm`, run the same way (its
+upstream branch is `tilelang_main`). The TileLang suites relevant to a change are the
 ones for the backends it touches (`testing/python/<backend>`, plus the shared
 transform and language tests for cross-backend changes). The workflow:
 

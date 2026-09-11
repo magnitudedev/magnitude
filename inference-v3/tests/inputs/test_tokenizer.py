@@ -5,11 +5,12 @@ from pathlib import Path
 import pytest
 from tokenizers import Tokenizer as ReferenceTokenizer
 
-from magnitude_engine.artifacts.identity import ArtifactIdentity
-from magnitude_engine.blueprints import artifacts, inputs
+from magnitude_engine.blueprints import inputs
+from magnitude_engine.blueprints import weights as containers
 from magnitude_engine.composition import build, dumps, loads
 from magnitude_engine.data import TokenId
 from magnitude_engine.inputs.tokenizer import BPEConfig, ByteBPETokenizer, PieceKind, SpecialTokens
+from magnitude_engine.weights.identity import ArtifactIdentity
 
 
 def byte_tokenizer():
@@ -65,7 +66,7 @@ def test_pinned_gguf_tokenization_matches_published_qwen_reference():
     reference_path = os.environ.get("MAGNITUDE_TEST_TOKENIZER_REFERENCE")
     if source is None or reference_path is None:
         pytest.skip("set MAGNITUDE_TEST_GGUF and MAGNITUDE_TEST_TOKENIZER_REFERENCE")
-    recipe = inputs.ByteBPE(config=inputs.Qwen35Tokenization(artifact=artifacts.GGUF(path=source)))
+    recipe = inputs.ByteBPE(config=inputs.Qwen35Tokenization(artifact=containers.GGUF(path=source)))
     with build(loads(dumps(recipe))) as tokenizer:
         pass
     reference = ReferenceTokenizer.from_file(str(Path(reference_path)))

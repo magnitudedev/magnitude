@@ -7,7 +7,7 @@ from functools import partial
 
 from magnitude_engine.generation.plain import FinishReason, Options
 from magnitude_engine.operations.sampling import SamplingSeed, SelectionKind
-from magnitude_engine.platform.worker import Worker
+from magnitude_engine.platform.host.worker import Worker
 from magnitude_engine.service.engine import Snapshot
 from magnitude_engine.serving.parsing import OutputParser, TextDelta, ToolCall
 from magnitude_engine.serving.requests import ChatRequest

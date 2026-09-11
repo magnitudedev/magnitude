@@ -16,8 +16,9 @@ from threading import get_ident
 from typing import TYPE_CHECKING, Protocol
 
 from magnitude_engine.data import Record
+from magnitude_engine.kernels.capabilities import Capability
 from magnitude_engine.platform.backend import Backend
-from magnitude_engine.platform.measurement import clock_ns
+from magnitude_engine.platform.host.measurement import clock_ns
 from magnitude_engine.platform.specialization import Specialization
 from magnitude_engine.platform.storage import ByteSource, ZeroSource
 
@@ -126,9 +127,7 @@ class InputReference:
 
 class Driver(Protocol):
     backend: Backend
-
-    @property
-    def subgroup_width(self) -> int | None: ...
+    capability: Capability
 
     def compile(self, program: PrimFunc) -> Executable: ...
     def bind_sequence(
@@ -506,11 +505,13 @@ class DeviceContext:
 
     @property
     def backend(self) -> Backend:
+        """The endpoint family. Only ``platform`` and composition may test this."""
         return self.driver.backend
 
     @property
-    def subgroup_width(self) -> int | None:
-        return self.driver.subgroup_width
+    def capability(self) -> Capability:
+        """The endpoint facts kernels and candidate predicates are allowed to read."""
+        return self.driver.capability
 
     @property
     def specialization_statistics(self) -> SpecializationStatistics:
@@ -623,6 +624,32 @@ class DeviceContext:
         except BaseException:
             tensor.close()
             raise
+
+    def write_source(
+        self,
+        tensor: Tensor,
+        source: ByteSource,
+        offset: int = 0,
+        *,
+        chunk_bytes: int = 8 * 1024**2,
+    ) -> None:
+        """Stage an artifact range into storage that is still private to loading.
+
+        Like ``upload_source``, but into an already allocated destination, so a
+        weight whose planes come from several ranges still occupies one
+        allocation. The caller owns the destination for the duration.
+        """
+        self.check()
+        if tensor.context is not self:
+            raise ValueError("destination belongs to another device context")
+        if offset < 0 or offset + tensor.spec.nbytes > source.size or chunk_bytes <= 0:
+            raise ValueError("invalid artifact upload range or staging size")
+        for start in range(0, tensor.spec.nbytes, chunk_bytes):
+            length = min(chunk_bytes, tensor.spec.nbytes - start)
+            content = source.read(offset + start, length)
+            if len(content) != length:
+                raise ValueError("artifact source returned a short read")
+            self.driver.write(tensor._lease._allocation.native, tensor.offset + start, content)
 
     def submit(
         self, commands: Sequence[Prepared], *, after: Sequence[Ticket] = (), timing: bool = False
