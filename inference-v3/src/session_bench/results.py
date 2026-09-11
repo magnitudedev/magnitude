@@ -73,7 +73,7 @@ def public_command(
 
 class RunStore:
     def __init__(self, root: Path, command: str, selection: dict):
-        from magnitude_engine.host_info import capture_hardware
+        from magnitude_engine.platform.host.host_info import capture_hardware
 
         identifier = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex[:8]
         self.path = root / "runs" / "session-bench" / identifier

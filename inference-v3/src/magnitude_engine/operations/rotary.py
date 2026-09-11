@@ -1,9 +1,8 @@
 """Query/key preparation keeps its physical schedule out of model equations."""
 
-from magnitude_engine.numerics.policy import floating
+from magnitude_engine.kernels.precision import Precision, floating
 from magnitude_engine.operations.parameters import Parameter
 from magnitude_engine.operations.preparation import Preparation
-from magnitude_engine.platform.backend import Backend
 from magnitude_engine.platform.execution import DeviceContext, DType, Executable, Prepared, Tensor
 
 
@@ -20,10 +19,9 @@ class AttentionPreparation:
         base: float,
         sections: tuple[int, int, int, int],
         epsilon: float,
-        *,
-        native_rounding: bool = False,
+        precision: Precision,
     ):
-        self.native_rounding = native_rounding
+        self.precision = precision
         self.context, self.query_norm, self.key_norm = context, query_norm, key_norm
         self.query_heads, self.kv_heads, self.width = query_heads, kv_heads, width
         self.rotary_width, self.base, self.sections, self.epsilon = (
@@ -47,7 +45,7 @@ class AttentionPreparation:
         rows = query_gate.spec.shape[0]
         key = rows, query_gate.spec.dtype
         if key not in self._plans:
-            from magnitude_engine.numerics.rotary import prepare_attention
+            from magnitude_engine.kernels.rotary.portable import prepare_attention
 
             self._plans[key] = self.context.specialize(
                 prepare_attention,
@@ -59,9 +57,9 @@ class AttentionPreparation:
                 self.base,
                 self.sections,
                 self.epsilon,
-                cpu=self.context.backend == Backend.LLVM,
+                capability=self.context.capability,
+                precision=self.precision,
                 dtype=query_gate.spec.dtype,
-                native_rounding=self.native_rounding,
             )
         with Preparation(self.context) as p:
             p.add(

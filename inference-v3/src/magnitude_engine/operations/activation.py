@@ -1,12 +1,14 @@
-"""Portable activation contracts and their workload-specific executable plans."""
+"""Portable activation contracts and the executables their shapes resolve to."""
+
+from __future__ import annotations
 
 import math
 
-from magnitude_engine.numerics.policy import floating
-from magnitude_engine.numerics.semantics import Pointwise
+from magnitude_engine.kernels.precision import Precision, floating
+from magnitude_engine.kernels.semantics import Pointwise
+from magnitude_engine.operations.candidates import Plan, Selection, realize
 from magnitude_engine.operations.parameters import Parameter
 from magnitude_engine.operations.preparation import Preparation
-from magnitude_engine.platform.backend import Backend
 from magnitude_engine.platform.execution import (
     DeviceContext,
     DType,
@@ -18,9 +20,8 @@ from magnitude_engine.platform.execution import (
 
 
 class Elementwise:
-    def __init__(self, context: DeviceContext, kind: Pointwise, *, native_rounding: bool = False):
-        self.native_rounding = native_rounding
-        self.context, self.kind = context, kind
+    def __init__(self, context: DeviceContext, kind: Pointwise, precision: Precision):
+        self.context, self.kind, self.precision = context, kind, precision
         self._plans: dict[tuple[int, DType, DType, DType], Executable] = {}
 
     def prepare(self, first: Tensor, second: Tensor, output: Tensor) -> tuple[Prepared, ...]:
@@ -31,17 +32,17 @@ class Elementwise:
         size = math.prod(first.spec.shape)
         key = size, first.spec.dtype, second.spec.dtype, output.spec.dtype
         if key not in self._plans:
-            from magnitude_engine.numerics.vector import pointwise
+            from magnitude_engine.kernels.pointwise.portable import pointwise
 
             self._plans[key] = self.context.specialize(
                 pointwise,
                 size,
                 self.kind,
-                cpu=self.context.backend == Backend.LLVM,
+                capability=self.context.capability,
+                precision=self.precision,
                 dtype=first.spec.dtype,
                 second_dtype=second.spec.dtype,
                 output_dtype=output.spec.dtype,
-                native_rounding=self.native_rounding,
             )
         with Preparation(self.context) as p:
             views = [
@@ -57,18 +58,27 @@ class Elementwise:
 
 class RMSNorm:
     def __init__(
-        self,
-        context: DeviceContext,
-        weight: Parameter,
-        epsilon: float,
-        *,
-        native_rounding: bool = False,
+        self, context: DeviceContext, weight: Parameter, epsilon: float, precision: Precision
     ):
-        self.native_rounding = native_rounding
         if len(weight.spec.shape) != 1:
             raise ValueError("normalization weight must be a vector")
         self.context, self.weight, self.epsilon = context, weight, epsilon
-        self._plans: dict[tuple[int, DType, DType], Executable] = {}
+        self.precision = precision
+        self._plans: dict[tuple[int, DType, DType], Plan] = {}
+
+    def plan(self, rows: int, dtype: DType, output_dtype: DType) -> Plan:
+        key = rows, dtype, output_dtype
+        if key not in self._plans:
+            from magnitude_engine.kernels.norm.select import TABLE, NormShape
+
+            shape = NormShape(rows, self.weight.spec.shape[0], self.epsilon, dtype, output_dtype)
+            self._plans[key] = realize(
+                "norm",
+                TABLE,
+                self.context,
+                Selection(shape, self.precision, self.context.capability),
+            )
+        return self._plans[key]
 
     def prepare(self, inputs: Tensor, outputs: Tensor) -> tuple[Prepared, ...]:
         width = self.weight.spec.shape[0]
@@ -77,37 +87,16 @@ class RMSNorm:
         floating(inputs.spec.dtype)
         floating(outputs.spec.dtype)
         rows = math.prod(inputs.spec.shape) // width
-        key = rows, inputs.spec.dtype, outputs.spec.dtype
-        if key not in self._plans:
-            from magnitude_engine.numerics.vector import rms_norm
-
-            if self.native_rounding and self.context.backend == Backend.METAL:
-                from magnitude_engine.numerics.native_bf16 import norm
-
-                self._plans[key] = self.context.specialize(
-                    norm, 1, width, ROWS=rows, epsilon=self.epsilon
-                )
-            else:
-                self._plans[key] = self.context.specialize(
-                    rms_norm,
-                    rows,
-                    width,
-                    self.epsilon,
-                    cpu=self.context.backend == Backend.LLVM,
-                    dtype=inputs.spec.dtype,
-                    output_dtype=outputs.spec.dtype,
-                    native_rounding=self.native_rounding,
-                )
-        spec = TensorSpec((rows, width), inputs.spec.dtype)
+        executable = self.plan(rows, inputs.spec.dtype, outputs.spec.dtype).executables[0]
         with Preparation(self.context) as p:
             p.add(
                 Prepared(
                     self.context,
-                    self._plans[key],
+                    executable,
                     [
-                        p.view(inputs, spec),
+                        p.view(inputs, executable.signature[0]),
                         p.parameter(self.weight),
-                        p.view(outputs, self._plans[key].signature[-1]),
+                        p.view(outputs, executable.signature[-1]),
                     ],
                 )
             )

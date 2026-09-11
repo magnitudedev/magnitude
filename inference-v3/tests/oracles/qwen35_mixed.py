@@ -242,8 +242,11 @@ def main():
                 tokens_sha256=sha(args.tokens),
                 oracle_source_sha256=sha(__file__),
                 reference_sha256=sha(args.output),
-                numerical_family="mixed_bf16",
-                reference="Independent NumPy equations; gguf-0.19 decode; BF16 storage, permitted BF16 matrix operands, FP32 recurrent state/logits",
+                precision="mixed_bf16",
+                reference=(
+                    "Independent NumPy equations; gguf-0.19 decode; BF16 storage, permitted "
+                    "BF16 matrix operands, FP32 recurrent state/logits"
+                ),
                 history_tokens=args.history,
                 history_chunk=args.chunk,
                 vocabulary=oracle.vocabulary,

@@ -1,29 +1,61 @@
-from magnitude_engine.artifacts.mlx import MLXArtifact
-from magnitude_engine.artifacts.model import GGUFArtifact
+"""Logical operations over one residency. Kernel selection is not exposed here.
+
+Two runs with the same composition digest on different hardware may realize
+different candidates; run records name which, so the difference is visible.
+"""
+
 from magnitude_engine.composition import Blueprint, blueprint
-from magnitude_engine.numerics.encoded_layout import EncodedLayout
-from magnitude_engine.numerics.semantics import HeadMapping
+from magnitude_engine.kernels.semantics import HeadMapping
+from magnitude_engine.models.qwen35.arena import Arena as ScratchArena
 from magnitude_engine.operations.attention import CausalAttention as Attention
-from magnitude_engine.operations.embedding import Embedding
-from magnitude_engine.operations.factory import WeightOperations
-from magnitude_engine.operations.linear import Linear, ProjectionSchedule
-from magnitude_engine.operations.parameters import Parameter
+from magnitude_engine.operations.binding import Operations as Binding
+from magnitude_engine.operations.linear import ResidentLinear
 from magnitude_engine.operations.recurrent import DeltaRecurrence as Recurrence
 from magnitude_engine.operations.sampling import SampleSelector as Selector
-from magnitude_engine.operations.weights import ResidentWeight as Weight
 from magnitude_engine.platform.execution import DeviceContext
+from magnitude_engine.weights.residency import ResidentWeight as Weight
+from magnitude_engine.weights.residency import Weights
 
 __all__ = [
-    "EncodedLinear",
-    "EncodedEmbedding",
-    "ResidentWeight",
-    "DenseParameter",
-    "ResidentOperations",
-    "MLXOperations",
-    "SampleSelector",
-    "DeltaRecurrence",
+    "Arena",
     "CausalAttention",
+    "DeltaRecurrence",
+    "Linear",
+    "Operations",
+    "ResidentWeight",
+    "SampleSelector",
 ]
+
+
+@blueprint
+class Arena(Blueprint[ScratchArena]):
+    context: Blueprint[DeviceContext]
+    precision: str = "native_bf16"
+
+    @staticmethod
+    def implementation():
+        def build(context: DeviceContext, precision: str) -> ScratchArena:
+            from magnitude_engine.kernels.precision import preset
+
+            return ScratchArena(context, preset(precision))
+
+        return build
+
+
+@blueprint
+class Operations(Blueprint[Binding]):
+    weights: Blueprint[Weights]
+    arena: Blueprint[ScratchArena]
+    precision: str = "native_bf16"
+
+    @staticmethod
+    def implementation():
+        def build(weights: Weights, arena: ScratchArena, precision: str) -> Binding:
+            from magnitude_engine.kernels.precision import preset
+
+            return Binding(weights, preset(precision), arena)
+
+        return build
 
 
 @blueprint
@@ -32,10 +64,24 @@ class CausalAttention(Blueprint[Attention]):
     heads: int
     kv_heads: int
     width: int
+    arena: Blueprint[ScratchArena]
+    precision: str = "native_bf16"
 
     @staticmethod
     def implementation():
-        return Attention
+        def build(
+            context: DeviceContext,
+            heads: int,
+            kv_heads: int,
+            width: int,
+            arena: ScratchArena,
+            precision: str,
+        ) -> Attention:
+            from magnitude_engine.kernels.precision import preset
+
+            return Attention(context, heads, kv_heads, width, preset(precision), arena)
+
+        return build
 
 
 @blueprint
@@ -45,10 +91,23 @@ class DeltaRecurrence(Blueprint[Recurrence]):
     value_heads: int
     width: int
     mapping: HeadMapping
+    precision: str = "native_bf16"
 
     @staticmethod
     def implementation():
-        return Recurrence
+        def build(
+            context: DeviceContext,
+            key_heads: int,
+            value_heads: int,
+            width: int,
+            mapping: HeadMapping,
+            precision: str,
+        ) -> Recurrence:
+            from magnitude_engine.kernels.precision import preset
+
+            return Recurrence(context, key_heads, value_heads, width, mapping, preset(precision))
+
+        return build
 
 
 @blueprint
@@ -63,74 +122,34 @@ class SampleSelector(Blueprint[Selector]):
 
 @blueprint
 class ResidentWeight(Blueprint[Weight]):
-    artifact: Blueprint[GGUFArtifact]
-    context: Blueprint[DeviceContext]
+    """One weight made resident on its own, for measuring a single operation."""
+
+    weights: Blueprint[Weights]
     tensor_name: str
-    layout: EncodedLayout | None = None
+    shape: tuple[int, ...]
 
     @staticmethod
     def implementation():
-        return Weight
+        def build(weights: Weights, tensor_name: str, shape: tuple[int, ...]) -> Weight:
+            from magnitude_engine.weights.descriptor import WeightDescriptor
+
+            return weights.resident(WeightDescriptor(name=tensor_name, shape=shape))
+
+        return build
 
 
 @blueprint
-class ResidentOperations(Blueprint[WeightOperations]):
-    artifact: Blueprint[GGUFArtifact]
-    context: Blueprint[DeviceContext]
-    vector_rows: int = 1
-
-    @staticmethod
-    def implementation():
-        from magnitude_engine.operations.factory import ResidentOperations
-
-        return ResidentOperations
-
-
-@blueprint
-class EncodedLinear(Blueprint[Linear]):
+class Linear(Blueprint[ResidentLinear]):
     weight: Blueprint[Weight]
-    output_tile: int = 4
-    reduction_lanes: int = 32
-    schedule: ProjectionSchedule = ProjectionSchedule.PORTABLE
-    pack: int = 8
-    vector_rows: int = 1
+    arena: Blueprint[ScratchArena]
+    precision: str = "native_bf16"
 
     @staticmethod
     def implementation():
-        from magnitude_engine.operations.linear import EncodedLinear
+        def build(weight: Weight, arena: ScratchArena, precision: str) -> ResidentLinear:
+            from magnitude_engine.kernels.precision import preset
+            from magnitude_engine.operations.projections import ResidentProjections
 
-        return EncodedLinear
+            return ResidentLinear(ResidentProjections(weight, preset(precision), arena))
 
-
-@blueprint
-class EncodedEmbedding(Blueprint[Embedding]):
-    weight: Blueprint[Weight]
-
-    @staticmethod
-    def implementation():
-        from magnitude_engine.operations.embedding import EncodedEmbedding
-
-        return EncodedEmbedding
-
-
-@blueprint
-class DenseParameter(Blueprint[Parameter]):
-    weight: Blueprint[Weight]
-
-    @staticmethod
-    def implementation():
-        from magnitude_engine.operations.parameters import DenseParameter
-
-        return DenseParameter
-
-
-@blueprint
-class MLXOperations(Blueprint[WeightOperations]):
-    artifact: Blueprint[MLXArtifact]
-    context: Blueprint[DeviceContext]
-
-    @staticmethod
-    def implementation():
-        from magnitude_engine.operations.mlx import MLXOperations
-
-        return MLXOperations
+        return build

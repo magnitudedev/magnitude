@@ -1,12 +1,14 @@
 """Logical token lookup with representation owned below the operation boundary."""
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from magnitude_engine.numerics.policy import floating
-from magnitude_engine.operations.weights import ResidentWeight
-from magnitude_engine.platform.backend import Backend
-from magnitude_engine.platform.execution import DType, Executable, Prepared, Tensor
+from magnitude_engine.kernels.precision import Precision, floating
+from magnitude_engine.operations.candidates import Plan, Selection, realize
+from magnitude_engine.platform.execution import DType, Prepared, Tensor
+from magnitude_engine.weights.residency import ResidentWeight
 
 
 @dataclass(frozen=True)
@@ -27,43 +29,59 @@ class Embedding(ABC):
     def close(self) -> None: ...
 
 
-class EncodedEmbedding(Embedding):
-    def __init__(self, weight: ResidentWeight):
+class ResidentEmbedding(Embedding):
+    def __init__(self, weight: ResidentWeight, precision: Precision):
         if len(weight.descriptor.shape) != 2:
             raise ValueError("embedding requires matrix weights")
-        self.weight, self.context = weight, weight.context
+        self.weight, self.context, self.precision = weight, weight.context, precision
         self._parameters = EmbeddingParameters(*weight.descriptor.shape)
-        self._plans: dict[tuple[int, DType], Executable] = {}
+        self._plans: dict[tuple[int, DType], Plan] = {}
 
     @property
     def parameters(self) -> EmbeddingParameters:
         return self._parameters
 
-    def prepare(self, tokens: Tensor, output: Tensor) -> tuple[Prepared, ...]:
-        from magnitude_engine.numerics.encoded import gather
+    def plan(self, rows: int, dtype: DType) -> Plan:
+        key = rows, dtype
+        if key not in self._plans:
+            from magnitude_engine.kernels.embedding.select import TABLE, EmbeddingShape
 
+            shape = EmbeddingShape(
+                rows, self._parameters.vocabulary, self._parameters.width, dtype
+            )
+            self._plans[key] = realize(
+                "embedding",
+                TABLE,
+                self.context,
+                Selection(
+                    shape, self.precision, self.context.capability, self.weight.representation
+                ),
+            )
+        return self._plans[key]
+
+    def prepare(self, tokens: Tensor, output: Tensor) -> tuple[Prepared, ...]:
         if len(tokens.spec.shape) != 1:
             raise ValueError("embedding input must be a vector of token IDs")
         floating(output.spec.dtype)
-        rows = tokens.spec.shape[0]
-        key = rows, output.spec.dtype
-        if key not in self._plans:
-            self._plans[key] = self.context.specialize(
-                gather,
-                rows,
-                self.parameters.vocabulary,
-                self.parameters.width,
-                self.weight.descriptor.encoding,
-                cpu=self.context.backend == Backend.LLVM,
-                dtype=output.spec.dtype,
-                layout=self.weight.layout,
-            )
-        plan = self._plans[key]
-        weight = self.weight.acquire(plan.signature[1])
+        executable = self.plan(tokens.spec.shape[0], output.spec.dtype).executables[0]
+        # A row-addressed gather binds its planes first; a flat one takes the
+        # token vector first. Both end with the selected rows.
+        weights = self.weight.acquire(
+            tuple(spec for spec in executable.signature[:-1] if spec.dtype != DType.I32)
+        )
         try:
-            return (Prepared(self.context, plan, (tokens, weight, output)),)
+            operands = []
+            index = 0
+            for spec in executable.signature[:-1]:
+                if spec.dtype == DType.I32:
+                    operands.append(tokens)
+                else:
+                    operands.append(weights[index])
+                    index += 1
+            return (Prepared(self.context, executable, (*operands, output)),)
         finally:
-            weight.close()
+            for tensor in weights:
+                tensor.close()
 
     def close(self) -> None:
         self._plans.clear()

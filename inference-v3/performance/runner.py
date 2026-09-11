@@ -5,7 +5,7 @@ from typing import Protocol
 from pydantic import Field
 
 from magnitude_engine.platform.execution import Ticket
-from magnitude_engine.platform.measurement import clock_ns, exclusive_measurement
+from magnitude_engine.platform.host.measurement import clock_ns, exclusive_measurement
 from performance.metrics import Record, Sample, TimingPass, Validation
 from performance.profiling import HostProfile
 

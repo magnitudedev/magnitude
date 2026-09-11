@@ -10,7 +10,8 @@ from __future__ import annotations
 from contextlib import ExitStack
 from dataclasses import dataclass
 
-from magnitude_engine.models.qwen35.artifact import DenseArtifact
+from magnitude_engine.kernels.precision import NATIVE_BF16, Precision
+from magnitude_engine.models.qwen35.description import DenseDescription
 from magnitude_engine.models.qwen35.inputs import Feature, InputPlan, Inputs, InputState
 from magnitude_engine.models.qwen35.program import DenseProgram
 from magnitude_engine.models.qwen35.sequence import (
@@ -26,9 +27,8 @@ from magnitude_engine.models.sequence import (
     ModelRequest,
     ModelSequence,
 )
-from magnitude_engine.numerics.policy import NumericalFamily
+from magnitude_engine.operations.binding import Operations
 from magnitude_engine.operations.copy import Copy
-from magnitude_engine.operations.factory import WeightOperations
 from magnitude_engine.operations.preparation import Preparation
 from magnitude_engine.platform.execution import DType, Prepared, Tensor, TensorSpec, Ticket
 
@@ -116,14 +116,14 @@ class Forward:
 class DenseRuntime(ModelExecutor):
     def __init__(
         self,
-        description: DenseArtifact,
-        operations: WeightOperations,
-        numerics: NumericalFamily = NumericalFamily.NATIVE_BF16,
+        description: DenseDescription,
+        operations: Operations,
+        precision: Precision = NATIVE_BF16,
     ):
-        self.context, self.geometry, self.numerics = (
+        self.context, self.geometry, self.precision = (
             operations.context,
             description.geometry,
-            numerics,
+            precision,
         )
         self.artifact_identity = operations.artifact_identity
         self._forwards: set[Forward] = set()
@@ -133,9 +133,9 @@ class DenseRuntime(ModelExecutor):
         with ExitStack() as cleanup:
             self.copy = Copy(self.context)
             cleanup.callback(self.copy.close)
-            self.program = DenseProgram(description, operations, numerics)
+            self.program = DenseProgram(description, operations, precision)
             cleanup.callback(self.program.close)
-            self.states = QwenStateStore(self.context, self.geometry, numerics)
+            self.states = QwenStateStore(self.context, self.geometry, precision)
             cleanup.callback(self.states.close)
             self._cleanup = cleanup.pop_all()
 
@@ -143,7 +143,7 @@ class DenseRuntime(ModelExecutor):
         self.context.check()
         before = self.context.allocated_bytes
         self.program.release_binding()
-        self.program.workspace.close()
+        self.program.arena.close()
         self.states.release_idle()
         return before - self.context.allocated_bytes
 
@@ -312,10 +312,10 @@ class DenseRuntime(ModelExecutor):
                     source = p.view(feature.values, spec, feature.source * stride)
                     destination = p.view(
                         embeddings,
-                        TensorSpec(spec.shape, self.numerics.activation),
+                        TensorSpec(spec.shape, self.precision.activation),
                         (start + feature.destination)
                         * self.geometry.hidden
-                        * self.numerics.activation.itemsize,
+                        * self.precision.activation.itemsize,
                     )
                     p.add(*self.copy.prepare(source, destination))
                 start += len(request.inputs.tokens)

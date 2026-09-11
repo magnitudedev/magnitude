@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from magnitude_engine.platform.measurement import exclusive_measurement
+from magnitude_engine.platform.host.measurement import exclusive_measurement
 
 
 def claim():
@@ -16,7 +16,7 @@ def claim():
 
 def test_measurement_nested_owner_does_not_admit_peer_threads_or_processes():
     source = (
-        "from magnitude_engine.platform.measurement import exclusive_measurement\n"
+        "from magnitude_engine.platform.host.measurement import exclusive_measurement\n"
         "with exclusive_measurement(): pass"
     )
     with exclusive_measurement():

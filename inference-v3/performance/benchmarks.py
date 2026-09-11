@@ -4,7 +4,7 @@ from typing import overload
 
 from magnitude_engine.models.qwen35.runtime import DenseRuntime
 from magnitude_engine.operations.attention import CausalAttention
-from magnitude_engine.operations.linear import EncodedLinear
+from magnitude_engine.operations.linear import ResidentLinear
 from magnitude_engine.operations.recurrent import DeltaRecurrence
 from performance.attention import AttentionMetrics, AttentionProcedure, AttentionWorkload
 from performance.linear import LinearProcedure, LinearWorkload
@@ -30,7 +30,7 @@ def run(
 
 @overload
 def run(
-    component: EncodedLinear, workload: LinearWorkload, *, policy: Policy = _DEFAULT_POLICY
+    component: ResidentLinear, workload: LinearWorkload, *, policy: Policy = _DEFAULT_POLICY
 ) -> Result[LinearMetrics]: ...
 
 
@@ -41,7 +41,7 @@ def run(
 
 
 def run(
-    component: EncodedLinear | DenseRuntime | DeltaRecurrence | CausalAttention,
+    component: ResidentLinear | DenseRuntime | DeltaRecurrence | CausalAttention,
     workload: LinearWorkload | ModelWorkload | RecurrentWorkload | AttentionWorkload,
     *,
     policy: Policy = _DEFAULT_POLICY,
@@ -55,7 +55,7 @@ def run(
         return collect(AttentionProcedure(), component, workload, policy)
     if isinstance(component, DeltaRecurrence) and isinstance(workload, RecurrentWorkload):
         return collect(RecurrentProcedure(), component, workload, policy)
-    if isinstance(component, EncodedLinear) and isinstance(workload, LinearWorkload):
+    if isinstance(component, ResidentLinear) and isinstance(workload, LinearWorkload):
         return collect(LinearProcedure(), component, workload, policy)
     if isinstance(component, DenseRuntime) and isinstance(workload, ModelWorkload):
         return collect(ModelProcedure(), component, workload, policy)

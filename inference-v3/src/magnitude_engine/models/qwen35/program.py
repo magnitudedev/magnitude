@@ -8,19 +8,19 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from itertools import pairwise
 
-from magnitude_engine.models.qwen35.artifact import (
+from magnitude_engine.kernels.precision import NATIVE_BF16, Precision, Rounding
+from magnitude_engine.kernels.semantics import Pointwise
+from magnitude_engine.models.qwen35.arena import Slot
+from magnitude_engine.models.qwen35.description import (
     AttentionWeights,
-    DenseArtifact,
+    DenseDescription,
     RecurrentWeights,
 )
 from magnitude_engine.models.qwen35.state import QwenAdvance
-from magnitude_engine.models.qwen35.workspace import Slot, Workspace
-from magnitude_engine.numerics.policy import NumericalFamily
-from magnitude_engine.numerics.semantics import Pointwise
 from magnitude_engine.operations.activation import Elementwise, RMSNorm
 from magnitude_engine.operations.attention import CausalAttention, KVAppend
+from magnitude_engine.operations.binding import Operations
 from magnitude_engine.operations.copy import Copy
-from magnitude_engine.operations.factory import WeightOperations
 from magnitude_engine.operations.kv_binding import (
     KVBinding,
     ReadBinding,
@@ -81,9 +81,9 @@ class Block:
 class DenseProgram:
     def __init__(
         self,
-        description: DenseArtifact,
-        operations: WeightOperations,
-        numerics: NumericalFamily = NumericalFamily.NATIVE_BF16,
+        description: DenseDescription,
+        operations: Operations,
+        precision: Precision = NATIVE_BF16,
     ):
         if description.artifact_identity != operations.artifact_identity:
             raise ValueError("model description and weight operations refer to different artifacts")
@@ -92,18 +92,24 @@ class DenseProgram:
             description.geometry,
             operations,
         )
-        self.context, self.numerics = operations.context, numerics
+        self.context, self.precision = operations.context, precision
         self._binding: BoundSequence | None = None
         self._binding_geometry: InvocationGeometry | None = None
         g = self.geometry
         with ExitStack() as cleanup:
-            self.workspace = Workspace(self.context, numerics)
-            cleanup.callback(self.workspace.close)
+            self.arena = operations.arena
             self.copy = Copy(self.context)
-            self.add = Elementwise(self.context, Pointwise.ADD)
-            self.silu_product = Elementwise(self.context, Pointwise.SILU_PRODUCT)
+            reference = Precision(
+                activation=precision.activation,
+                residual=precision.residual,
+                recurrent=precision.recurrent,
+                kv=precision.kv,
+                rounding=Rounding.FP32_INTERNAL,
+            )
+            self.add = Elementwise(self.context, Pointwise.ADD, reference)
+            self.silu_product = Elementwise(self.context, Pointwise.SILU_PRODUCT, reference)
             self.sigmoid_product = Elementwise(
-                self.context, Pointwise.SIGMOID_PRODUCT, native_rounding=numerics.native_rounding
+                self.context, Pointwise.SIGMOID_PRODUCT, precision
             )
             self.delta = DeltaRecurrence(
                 self.context,
@@ -111,9 +117,15 @@ class DenseProgram:
                 g.recurrent_value_heads,
                 g.recurrent_width,
                 g.recurrent_head_mapping,
+                precision,
             )
             self.attention = CausalAttention(
-                self.context, g.attention_heads, g.kv_heads, g.attention_width
+                self.context,
+                g.attention_heads,
+                g.kv_heads,
+                g.attention_width,
+                precision,
+                self.arena,
             )
             self.append = KVAppend(self.context, g.kv_heads, g.attention_width)
             for operation in (
@@ -128,12 +140,7 @@ class DenseProgram:
                 cleanup.callback(operation.close)
 
             def norm(weight):
-                value = RMSNorm(
-                    self.context,
-                    operations.parameter(weight),
-                    g.epsilon,
-                    native_rounding=numerics.native_rounding,
-                )
+                value = RMSNorm(self.context, operations.parameter(weight), g.epsilon, precision)
                 cleanup.callback(value.close)
                 return value
 
@@ -153,7 +160,7 @@ class DenseProgram:
                         g.rotary_base,
                         g.rotary_sections,
                         g.epsilon,
-                        native_rounding=numerics.native_rounding,
+                        precision,
                     )
                     cleanup.callback(preparation.close)
                     mixer = AttentionMixer(
@@ -176,7 +183,7 @@ class DenseProgram:
                         g.recurrent_width,
                         g.convolution_width,
                         g.epsilon,
-                        native_rounding=numerics.native_rounding,
+                        precision,
                     )
                     cleanup.callback(preparation.close)
                     mixer = RecurrentMixer(
@@ -191,9 +198,7 @@ class DenseProgram:
                         mixer,
                         norm(weights.feedforward_norm),
                         operations.gated_linear(
-                            weights.feedforward_gate,
-                            weights.feedforward_up,
-                            native_rounding=numerics.native_rounding,
+                            weights.feedforward_gate, weights.feedforward_up
                         ),
                         operations.linear(weights.feedforward_down),
                     )
@@ -212,10 +217,9 @@ class DenseProgram:
             self._binding_geometry = None
 
     def release_binding(self) -> None:
-        """Evict the plan and numerical scratch; outstanding consumers retain claims."""
+        """Evict the plan and its scratch; outstanding consumers retain claims."""
         self._release_plan()
-        self.attention.release_workspace()
-        self.operations.release_workspace()
+        self.arena.release_scratch()
 
     def reserve(self, rows: int) -> None:
         if rows <= 0:
@@ -224,8 +228,8 @@ class DenseProgram:
         hidden = rows * g.hidden
         attention = rows * g.attention_heads * g.attention_width
         recurrent = rows * g.recurrent_value_heads * g.recurrent_width
-        generation = self.workspace.generation
-        self.workspace.reserve(
+        generation = self.arena.generation
+        self.arena.reserve_slots(
             {
                 Slot.INPUT: hidden,
                 Slot.HIDDEN: hidden,
@@ -255,13 +259,13 @@ class DenseProgram:
                 Slot.FEEDFORWARD_ACTIVATED: rows * g.intermediate,
             }
         )
-        if generation != self.workspace.generation:
+        self.operations.reserve(rows, self.precision.activation)
+        if generation != self.arena.generation:
             self.release_binding()
-        self.operations.reserve_workspace(rows, self.numerics.activation)
 
     def input_buffer(self, rows: int) -> Tensor:
         self.reserve(rows)
-        return self.workspace.acquire(Slot.INPUT, (rows, self.geometry.hidden))
+        return self.arena.acquire(Slot.INPUT, (rows, self.geometry.hidden))
 
     def prepare(
         self,
@@ -289,7 +293,7 @@ class DenseProgram:
             ranges.append((rows, advance))
             rows += advance.count
         if (
-            embeddings.spec != TensorSpec((rows, g.hidden), self.numerics.activation)
+            embeddings.spec != TensorSpec((rows, g.hidden), self.precision.activation)
             or coordinates.spec != TensorSpec((rows, 3), DType.I32)
             or positions.spec != TensorSpec((rows,), DType.I32)
         ):
@@ -352,7 +356,6 @@ class DenseProgram:
                 return (self._binding.prepare(inputs),)
             self._release_plan()
             with ExitStack() as cleanup:
-                cleanup.callback(self.attention.release_workspace)
                 commands = self._commands(
                     embeddings,
                     coordinates,
@@ -384,7 +387,7 @@ class DenseProgram:
         with Preparation(self.context) as p:
 
             def view(slot, *shape, offset=0):
-                return self.workspace.view(p, slot, shape, offset)
+                return self.arena.view(p, slot, shape, offset)
 
             def sequence_view(tensor: Tensor, start: int, count: int) -> Tensor:
                 spec = TensorSpec((count, *tensor.spec.shape[1:]), tensor.spec.dtype)
@@ -506,7 +509,7 @@ class DenseProgram:
                     flat = p.view(
                         gated,
                         TensorSpec(
-                            (rows, g.attention_heads * g.attention_width), self.numerics.activation
+                            (rows, g.attention_heads * g.attention_width), self.precision.activation
                         ),
                     )
 

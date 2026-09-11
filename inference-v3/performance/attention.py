@@ -7,10 +7,18 @@ from pydantic import Field
 
 from magnitude_engine.operations.attention import CausalAttention
 from magnitude_engine.operations.kv_binding import ReadBinding, ReadGeometry
-from magnitude_engine.platform.backend import Backend
 from magnitude_engine.platform.execution import DType, TensorSpec, Ticket
-from performance.metrics import Latency, Record, Sample, TimingBoundary, TimingPass, Validation
+from performance.metrics import (
+    Latency,
+    Realized,
+    Record,
+    Sample,
+    TimingBoundary,
+    TimingPass,
+    Validation,
+)
 from performance.precision import decode, encode, rounded
+from performance.selection import realized
 
 
 class AttentionWorkload(Record):
@@ -44,6 +52,7 @@ def attention_error_bound(
 class AttentionMetrics(Record):
     completed_latency: Latency
     device_latency: Latency
+    selection: tuple[Realized, ...] = ()
 
 
 class AttentionCase:
@@ -107,7 +116,7 @@ class AttentionCase:
     def observation_passes(self) -> tuple[TimingPass, ...]:
         return (
             (TimingPass.COMPLETED,)
-            if self.component.context.backend == Backend.LLVM
+            if self.component.context.capability.threads_per_group == 1
             else (
                 TimingPass.COMPLETED,
                 TimingPass.DEVICE_EVENTS,
@@ -144,6 +153,7 @@ class AttentionCase:
 
     def assess(self, samples: tuple[Sample, ...]) -> AttentionMetrics:
         return AttentionMetrics(
+            selection=realized(self.component),
             completed_latency=Latency(
                 samples_seconds=tuple(
                     s.completed_seconds for s in samples if s.pass_kind == TimingPass.COMPLETED

@@ -67,10 +67,26 @@ class ReadTraffic(Record):
     unavailable: tuple[str, ...] = ()
 
 
+class Realized(Record):
+    """Which kernel a measured operation's table actually chose, and on what.
+
+    Two runs with the same composition digest on different hardware may realize
+    different candidates. Recording the name and the resident representation is
+    what lets a regression be attributed to a selection change rather than to a
+    kernel change.
+    """
+
+    operation: str
+    candidate: str
+    representation: str | None = None
+    detail: tuple[tuple[str, int], ...] = ()
+
+
 class LinearMetrics(Record):
     completed_latency: Latency
     device_latency: Latency
     reads: ReadTraffic
+    selection: tuple[Realized, ...] = ()
 
 
 class Validation(Record):

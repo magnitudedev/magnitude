@@ -8,7 +8,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from jinja2 import TemplateError
 
-from magnitude_engine.platform.worker import WorkerUnavailable
+from magnitude_engine.platform.host.worker import WorkerUnavailable
 from magnitude_engine.serving.requests import ChatRequest
 from magnitude_engine.serving.responses import ChatResponse, sse
 from magnitude_engine.serving.runtime import Config

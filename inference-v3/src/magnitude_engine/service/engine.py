@@ -21,7 +21,7 @@ from magnitude_engine.generation.plain import (
 from magnitude_engine.models.sequence import ModelExecutor, ModelInput
 from magnitude_engine.operations.sampling import SampleSelector
 from magnitude_engine.platform.execution import CapacityError, Ticket
-from magnitude_engine.platform.measurement import clock_ns
+from magnitude_engine.platform.host.measurement import clock_ns
 from magnitude_engine.service.policy import (
     Candidate,
     Limits,
