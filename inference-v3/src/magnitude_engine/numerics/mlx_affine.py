@@ -76,7 +76,7 @@ def vector(M, widths: tuple[int, ...], K, output_dtype: DType = DType.BF16):
                     partial[0] += dot[0] * C[row, base // 64].astype("float32") + bias_sum[0] * D[
                         row, base // 64
                     ].astype("float32")
-            total = T.call_extern("float32", "simd_sum", partial[0])
+            total = T.warp_reduce_sum(partial[0])
             if lane == 0:
                 E[output_at(token, row)] = total.astype("bfloat16")
 
@@ -186,7 +186,7 @@ def finish(M, widths: tuple[int, ...], PARTS, output_dtype: DType = DType.BF16):
                                 .astype("bfloat16")
                                 .astype("float32")
                             )
-                    total = T.call_extern("float32", "simd_sum", value[0])
+                    total = T.warp_reduce_sum(value[0])
                     if lane == 0:
                         B[output_at(idx // N, idx % N)] = total.astype("bfloat16")
 
@@ -326,16 +326,8 @@ def gated_vector(M, N, K):
                         partial[branch] += dot[branch] * C[branch * N + row, base // 64].astype(
                             "float32"
                         ) + bias_sum[0] * D[branch * N + row, base // 64].astype("float32")
-            gate = (
-                T.call_extern("float32", "simd_sum", partial[0])
-                .astype("bfloat16")
-                .astype("float32")
-            )
-            up = (
-                T.call_extern("float32", "simd_sum", partial[1])
-                .astype("bfloat16")
-                .astype("float32")
-            )
+            gate = T.warp_reduce_sum(partial[0]).astype("bfloat16").astype("float32")
+            up = T.warp_reduce_sum(partial[1]).astype("bfloat16").astype("float32")
             if lane == 0:
                 activated = (
                     (gate * native_sigmoid(gate).astype("float32"))
