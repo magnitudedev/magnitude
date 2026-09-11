@@ -8,8 +8,8 @@ from jinja2 import TemplateError
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from pydantic import TypeAdapter
 
-from magnitude_engine.artifacts.tokenizer import TokenizerArtifact
 from magnitude_engine.data import TokenId
+from magnitude_engine.inputs.formats.gguf_tokenizer import TokenizerArtifact
 from magnitude_engine.inputs.tokenizer import ByteBPETokenizer
 from magnitude_engine.serving.formats import ChatFormat
 from magnitude_engine.serving.requests import Message, NamedChoice, TemplateOptions, Tool

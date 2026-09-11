@@ -8,7 +8,7 @@ from typing import cast
 import pytest
 
 from magnitude_engine.platform.execution import Ticket
-from magnitude_engine.platform.worker import Worker, WorkerUnavailable
+from magnitude_engine.platform.host.worker import Worker, WorkerUnavailable
 
 
 class Completion:

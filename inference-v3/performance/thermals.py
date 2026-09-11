@@ -8,7 +8,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from magnitude_engine.platform.temperature import AppleSMC, sensor_group
+from magnitude_engine.platform.host.temperature import AppleSMC, sensor_group
 from performance.store import atomic
 
 

@@ -13,6 +13,6 @@ class Device(Blueprint[DeviceContext]):
 
     @staticmethod
     def implementation():
-        from magnitude_engine.platform.machine import open_context
+        from magnitude_engine.platform.host.machine import open_context
 
         return open_context

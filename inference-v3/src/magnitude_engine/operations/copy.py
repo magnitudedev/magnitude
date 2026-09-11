@@ -2,9 +2,8 @@
 
 import math
 
-from magnitude_engine.numerics.policy import floating
+from magnitude_engine.kernels.precision import floating
 from magnitude_engine.operations.preparation import Preparation
-from magnitude_engine.platform.backend import Backend
 from magnitude_engine.platform.execution import (
     DeviceContext,
     DType,
@@ -30,12 +29,12 @@ class Copy:
         size = math.prod(source.spec.shape)
         key = size, source.spec.dtype, destination.spec.dtype
         if key not in self._plans:
-            from magnitude_engine.numerics.copy import copy
+            from magnitude_engine.kernels.copy.copy import copy
 
             self._plans[key] = self.context.specialize(
                 copy,
                 size,
-                cpu=self.context.backend == Backend.LLVM,
+                capability=self.context.capability,
                 dtype=source.spec.dtype,
                 output_dtype=destination.spec.dtype,
             )

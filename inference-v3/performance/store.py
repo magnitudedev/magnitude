@@ -6,7 +6,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, JsonValue
 
-from magnitude_engine.platform.publication import publish
+from magnitude_engine.platform.host.publication import publish
 
 
 def atomic(path: Path, value: JsonValue) -> None:

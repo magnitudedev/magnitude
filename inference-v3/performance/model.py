@@ -16,23 +16,38 @@ from typing import NewType
 import numpy as np
 from pydantic import Field
 
-from magnitude_engine.artifacts.identity import ArtifactIdentity
 from magnitude_engine.data import TokenId
+from magnitude_engine.kernels.precision import PRESETS, Precision
 from magnitude_engine.models.qwen35.inputs import InputPlan
 from magnitude_engine.models.qwen35.runtime import DenseRuntime
 from magnitude_engine.models.sequence import LogitsSelection, ModelBatch, ModelRequest
-from magnitude_engine.numerics.policy import NumericalFamily
-from magnitude_engine.platform.backend import Backend
 from magnitude_engine.platform.execution import Ticket
-from performance.metrics import Latency, Record, Sample, TimingBoundary, TimingPass, Validation
+from magnitude_engine.weights.identity import ArtifactIdentity
+from performance.metrics import (
+    Latency,
+    Realized,
+    Record,
+    Sample,
+    TimingBoundary,
+    TimingPass,
+    Validation,
+)
 from performance.model_accuracy import (
     FP32_MAX_ERROR,
     FP32_RELATIVE_RMS,
     PrecisionComparison,
     compare,
 )
+from performance.selection import realized
 
 ReferenceIdentity = NewType("ReferenceIdentity", str)
+
+
+def _named(precision: Precision) -> str:
+    for name, preset in PRESETS.items():
+        if preset == precision:
+            return name
+    raise ValueError("model observations require a named precision preset")
 
 
 class ReferenceRows(StrEnum):
@@ -45,7 +60,7 @@ class LogitsReference(Record):
     identity: ReferenceIdentity = Field(pattern=r"^[0-9a-f]{64}$")
     artifact: ArtifactIdentity = Field(pattern=r"^[0-9a-f]{64}$")
     rows: ReferenceRows = ReferenceRows.ALL
-    numerics: NumericalFamily = NumericalFamily.REFERENCE_F32
+    precision: str = "reference_f32"
 
 
 class ModelWorkload(Record):
@@ -64,6 +79,7 @@ class ModelMetrics(Record):
     processed_tokens: int = Field(gt=0)
     commands_per_invocation: int = Field(gt=0)
     precision_comparison: PrecisionComparison | None = None
+    selection: tuple[Realized, ...] = ()
 
     @property
     def tokens_per_second(self) -> float | None:
@@ -76,14 +92,14 @@ class ModelCase:
         reference = workload.reference
         if reference.artifact != component.artifact_identity:
             raise ValueError("model benchmark reference belongs to another artifact")
-        control_family = (
-            NumericalFamily.MIXED_BF16
-            if component.numerics == NumericalFamily.MIXED_BF16_F32_RESIDUAL
-            else component.numerics
-        )
-        if reference.numerics != control_family:
-            raise ValueError("model benchmark reference belongs to another numerical family")
-        mixed = reference.numerics == NumericalFamily.MIXED_BF16
+        control = _named(component.precision)
+        if control == "mixed_bf16_f32_residual":
+            # The residual width is an accumulation choice, not a different
+            # arithmetic trajectory; both share one BF16 control.
+            control = "mixed_bf16"
+        if reference.precision != control:
+            raise ValueError("model benchmark reference belongs to another precision")
+        mixed = reference.precision == "mixed_bf16"
         if mixed != (workload.accuracy_anchor is not None):
             raise ValueError(
                 "mixed model observations require an explicit paired FP32 accuracy anchor"
@@ -113,7 +129,7 @@ class ModelCase:
         anchor = workload.accuracy_anchor
         if anchor is not None:
             if (
-                anchor.numerics != NumericalFamily.REFERENCE_F32
+                anchor.precision != "reference_f32"
                 or anchor.artifact != component.artifact_identity
             ):
                 raise ValueError(
@@ -169,7 +185,7 @@ class ModelCase:
     def observation_passes(self) -> tuple[TimingPass, ...]:
         return (
             (TimingPass.COMPLETED,)
-            if self.component.context.backend == Backend.LLVM
+            if self.component.context.capability.threads_per_group == 1
             else (TimingPass.COMPLETED, TimingPass.DEVICE_EVENTS)
         )
 
@@ -248,6 +264,7 @@ class ModelCase:
     def assess(self, samples: tuple[Sample, ...]) -> ModelMetrics:
         device = tuple(s.device_seconds for s in samples if s.device_seconds is not None)
         return ModelMetrics(
+            selection=realized(self.component),
             completed_latency=Latency(
                 samples_seconds=tuple(
                     s.completed_seconds for s in samples if s.pass_kind == TimingPass.COMPLETED

@@ -3,14 +3,11 @@ from pathlib import Path
 
 import pytest
 
-from magnitude_engine.artifacts.gguf import Metadata, read_directory
-from magnitude_engine.artifacts.identity import ArtifactIdentity
-from magnitude_engine.models.qwen35.artifact import (
-    AttentionWeights,
-    RecurrentWeights,
-    inspect_dense,
-)
+from magnitude_engine.models.qwen35.description import AttentionWeights, RecurrentWeights
+from magnitude_engine.models.qwen35.formats.gguf import inspect_dense
 from magnitude_engine.platform.storage import FileSource
+from magnitude_engine.weights.formats.gguf import Metadata, read_directory
+from magnitude_engine.weights.identity import ArtifactIdentity
 
 IDENTITY = ArtifactIdentity("b252c5610a42ca82d20fe2a12813e9d069eed89292907e26c783eeb0bc961bc7")
 

@@ -17,7 +17,7 @@ class ExternalComponent:
 
 def component[T](identity: str) -> Callable[[T], T]:
     def annotate(value: T) -> T:
-        setattr(value, "__external_component__", ExternalComponent(identity))
+        value.__external_component__ = ExternalComponent(identity)
         return value
 
     return annotate

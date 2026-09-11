@@ -3,7 +3,7 @@
 import inspect
 import struct
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
 from functools import cache
 from typing import TYPE_CHECKING
@@ -23,7 +23,15 @@ def parameter_key(value: object) -> tuple:
         return type(value), value
     if isinstance(value, tuple):
         return tuple, tuple(parameter_key(item) for item in value)
-    raise TypeError("kernel specialization requires immutable scalar, enum or tuple parameters")
+    # Value objects (Capability, Precision, a Representation) are compile-time
+    # arguments like any other: identity is their type and their fields.
+    if is_dataclass(value) and not isinstance(value, type) and value.__dataclass_params__.frozen:
+        return type(value), tuple(
+            parameter_key(getattr(value, field.name)) for field in fields(value)
+        )
+    raise TypeError(
+        "kernel specialization requires immutable scalar, enum, tuple or frozen value parameters"
+    )
 
 
 @cache

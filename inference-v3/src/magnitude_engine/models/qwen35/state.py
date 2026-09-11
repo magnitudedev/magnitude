@@ -9,8 +9,8 @@ from __future__ import annotations
 from contextlib import ExitStack
 from dataclasses import dataclass
 
-from magnitude_engine.models.qwen35.artifact import Geometry, MixerKind
-from magnitude_engine.numerics.policy import NumericalFamily
+from magnitude_engine.kernels.precision import NATIVE_BF16, Precision
+from magnitude_engine.models.qwen35.description import Geometry, MixerKind
 from magnitude_engine.platform.execution import (
     DeviceContext,
     DType,
@@ -256,9 +256,9 @@ class QwenStateStore:
         self,
         context: DeviceContext,
         geometry: Geometry,
-        numerics: NumericalFamily = NumericalFamily.NATIVE_BF16,
+        precision: Precision = NATIVE_BF16,
     ):
-        self.context, self.geometry, self.numerics = context, geometry, numerics
+        self.context, self.geometry, self.precision = context, geometry, precision
         attention_layers = sum(kind == MixerKind.ATTENTION for kind in geometry.layers)
         self.pool = (
             KVPool(
@@ -267,7 +267,7 @@ class QwenStateStore:
                     attention_layers,
                     geometry.kv_heads,
                     geometry.attention_width,
-                    numerics.activation,
+                    precision.kv,
                 ),
             )
             if attention_layers
@@ -290,7 +290,7 @@ class QwenStateStore:
         with ExitStack() as cleanup:
             convolution = allocate(
                 TensorSpec(
-                    (1, g.recurrent_channels, g.convolution_width - 1), self.numerics.activation
+                    (1, g.recurrent_channels, g.convolution_width - 1), self.precision.activation
                 )
             )
             cleanup.callback(convolution.close)
