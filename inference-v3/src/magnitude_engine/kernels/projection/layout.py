@@ -7,6 +7,8 @@ logical result without copying it.
 
 import tilelang.language as T
 
+from magnitude_engine.weights.representation import WeightLayout
+
 
 def widths_and_outputs(widths: int | tuple[int, ...]) -> tuple[tuple[int, ...], int]:
     logical = (widths,) if isinstance(widths, int) else widths
@@ -25,5 +27,14 @@ def output_index(rows: int, widths: tuple[int, ...]):
             result = T.if_then_else(col >= start, rows * start + row * width + col - start, result)
             start += width
         return result
+
+    return index
+
+
+def weight_index(layout: WeightLayout):
+    """Map a logical matrix coordinate to its row in the shared backing."""
+
+    def index(row, column):
+        return (layout.first_row + row) * layout.columns + column
 
     return index

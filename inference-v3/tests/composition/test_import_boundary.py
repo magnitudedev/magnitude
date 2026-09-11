@@ -102,11 +102,13 @@ def test_only_the_platform_and_composition_name_a_backend():
     assert offenders == []
 
 
-# Residency compiles dense conversion; a capability decides a representation.
+# Residency compiles dense conversion and canonical quantized import; a
+# capability decides a representation.
 # Nothing else in `weights/` reaches a schedule.
 WEIGHT_KERNELS = {
     "magnitude_engine.kernels.capabilities",
     "magnitude_engine.kernels.copy.convert",
+    "magnitude_engine.kernels.copy.relayout",
 }
 
 

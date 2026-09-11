@@ -1,46 +1,58 @@
-"""Gate and up projections plus their activation, in one pass over the input."""
+"""Fused gate/up projection over one canonical direct-affine allocation."""
 
 import tilelang.language as T
 
 from magnitude_engine.kernels.capabilities import Capability
 from magnitude_engine.kernels.precision import Precision, Rounding, native_sigmoid
-from magnitude_engine.kernels.projection.planar_affine.layout import check
+from magnitude_engine.kernels.projection.direct_affine.layout import check
+from magnitude_engine.kernels.projection.direct_affine.vector import _bf16
 from magnitude_engine.platform.execution import DType
-from magnitude_engine.weights.representation import PlanarAffine
+from magnitude_engine.weights.representation import (
+    CodeInterpretation,
+    WeightLayout,
+    canonical_layout,
+)
 
 
 def gated_vector(
-    M,
-    N,
-    K,
-    representation: PlanarAffine,
+    M: int,
+    N: int,
+    K: int,
+    layout: WeightLayout,
     *,
     capability: Capability,
     precision: Precision,
 ):
-    """One pass over the input computes both branches and the gate product.
-
-    A fusion is a candidate of the composite operation, never a special case
-    inside one of its components.
-    """
-    check(representation)
+    representation, coefficients = check(layout)
     if capability.subgroup_width != 32:
         raise ValueError("the fused gate reduces across a 32-lane subgroup")
     if precision.rounding != Rounding.NATIVE_BF16:
         raise ValueError("the fused gate rounds the way NATIVE_BF16 does")
-    if representation.coefficient_dtype != DType.BF16 or representation.high_bits:
-        raise ValueError("this fusion reads row-addressed BF16 coefficient planes")
+    if (
+        representation.code.low_bits != 4
+        or representation.code.high_bits
+        or representation.code.interpretation != CodeInterpretation.UNSIGNED
+        or coefficients.bias_dtype != DType.BF16
+        or layout.logical_rows != 2 * N
+        or layout.first_row
+        or layout.columns != K
+        or K % representation.group
+        or layout.nbytes % 4
+    ):
+        raise ValueError("invalid direct-affine gated geometry")
+
+    resident = canonical_layout(representation, layout.elements)
+    assert resident.biases is not None
+    words = layout.nbytes // 4
     group = representation.group
 
     @T.prim_func
     def main(
         A: T.Tensor((M, K), "bfloat16"),
-        B: T.Tensor((2 * N, K // 8), "uint32"),
-        C: T.Tensor((2 * N, K // group), "bfloat16"),
-        D: T.Tensor((2 * N, K // group), "bfloat16"),
-        E: T.Tensor((M, N), "bfloat16"),
+        B: T.Tensor((words,), "uint32"),
+        C: T.Tensor((M, N), "bfloat16"),
     ):
-        with T.Kernel(N, M, threads=32) as (row, token):
+        with T.Kernel(N, M, threads=32) as (out, token):
             lane = T.get_thread_binding()
             partial = T.alloc_local((2,), "float32")
             dot = T.alloc_local((2,), "float32")
@@ -63,9 +75,10 @@ def gated_vector(
                         xs2 = (xs + x2).astype("bfloat16").astype("float32")
                         bias_sum[0] += (xs2 + x3).astype("bfloat16").astype("float32")
                         for branch in T.unroll(2, explicit=True):
-                            word = (
-                                B[branch * N + row, column // 8] >> ((column % 8) * 4)
-                            ) & T.uint32(65535)
+                            backing_row = branch * N + out
+                            element = backing_row * K + column
+                            packed = B[(resident.low + element // 2) // 4]
+                            word = (packed >> ((element % 8) * 4)) & T.uint32(65535)
                             dot[branch] += (
                                 x0 * (word & T.uint32(15)).astype("float32")
                                 + x1 * ((word >> 4) & T.uint32(15)).astype("float32")
@@ -74,11 +87,11 @@ def gated_vector(
                             )
                 if base < K:
                     for branch in T.unroll(2, explicit=True):
-                        partial[branch] += dot[branch] * C[
-                            branch * N + row, base // group
-                        ].astype("float32") + bias_sum[0] * D[
-                            branch * N + row, base // group
-                        ].astype("float32")
+                        backing_row = branch * N + out
+                        coefficient = (backing_row * (K // group) + base // group) * 2
+                        scale = _bf16(B, resident.scales + coefficient)
+                        bias = _bf16(B, resident.biases + coefficient)
+                        partial[branch] += dot[branch] * scale + bias_sum[0] * bias
             gate = T.warp_reduce_sum(partial[0]).astype("bfloat16").astype("float32")
             up = T.warp_reduce_sum(partial[1]).astype("bfloat16").astype("float32")
             if lane == 0:
@@ -87,6 +100,6 @@ def gated_vector(
                     .astype("bfloat16")
                     .astype("float32")
                 )
-                E[token, row] = activated * up
+                C[token, out] = activated * up
 
     return main

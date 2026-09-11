@@ -4,16 +4,20 @@ import tilelang.language as T
 
 from magnitude_engine.kernels.capabilities import Capability
 from magnitude_engine.kernels.projection.decode import decoder
-from magnitude_engine.kernels.projection.layout import output_index, widths_and_outputs
+from magnitude_engine.kernels.projection.layout import (
+    output_index,
+    weight_index,
+    widths_and_outputs,
+)
 from magnitude_engine.platform.execution import DType
-from magnitude_engine.weights.representation import Representation, resident_bytes
+from magnitude_engine.weights.representation import WeightLayout
 
 
 def projection(
     rows: int,
     widths: int | tuple[int, ...],
     inputs: int,
-    representation: Representation,
+    layout: WeightLayout,
     *,
     capability: Capability,
     output_tile: int = 4,
@@ -30,8 +34,11 @@ def projection(
         raise ValueError("projection extents must be positive")
     if subgroup_width <= 1:
         raise ValueError("this schedule requires a subgroup wider than one lane")
-    size = resident_bytes(representation, outputs * inputs)
-    decode = decoder(representation, outputs * inputs)
+    if outputs != layout.logical_rows or inputs != layout.columns:
+        raise ValueError("projection and resident layout differ")
+    size = layout.nbytes
+    at = weight_index(layout)
+    decode = decoder(layout.representation, layout.elements)
 
     @T.prim_func
     def main(
@@ -53,7 +60,7 @@ def projection(
                 for j in T.unroll(pack, explicit=True):
                     k = (chunk * pack + j) * subgroup_width + lane
                     if out < outputs and k < inputs:
-                        weight = decode(B, out * inputs + k)
+                        weight = decode(B, at(out, k))
                         for r in T.unroll(row_tile, explicit=True):
                             row = row_group * row_tile + r
                             if row < rows:

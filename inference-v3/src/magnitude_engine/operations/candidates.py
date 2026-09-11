@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Protocol
 from magnitude_engine.kernels.capabilities import Capability
 from magnitude_engine.kernels.precision import Precision
 from magnitude_engine.platform.execution import DeviceContext, Executable, TensorSpec
-from magnitude_engine.weights.representation import Representation
+from magnitude_engine.weights.representation import Representation, WeightLayout
 
 if TYPE_CHECKING:
     from magnitude_engine.operations.preparation import Preparation
@@ -74,7 +74,11 @@ class Selection[S]:
     shape: S
     precision: Precision
     capability: Capability
-    representation: Representation | None = None
+    layout: WeightLayout | None = None
+
+    @property
+    def representation(self) -> Representation | None:
+        return None if self.layout is None else self.layout.representation
 
 
 @dataclass(frozen=True)
@@ -83,9 +87,7 @@ class Candidate[S]:
     applies: Callable[[Selection[S]], bool]
     build: Callable[[DeviceContext, Selection[S]], Plan]
     rank: int = 0
-    scratch: Callable[[Selection[S]], tuple[Scratch, ...]] = field(
-        default=lambda selection: ()
-    )
+    scratch: Callable[[Selection[S]], tuple[Scratch, ...]] = field(default=lambda selection: ())
     """Declared before anything is allocated, so a plan that cannot fit is skipped."""
 
 
@@ -148,7 +150,6 @@ def _named(representation: Representation | None) -> str | None:
     if representation is None:
         return None
     fields = ", ".join(
-        f"{key}={getattr(value, 'name', value)}"
-        for key, value in vars(representation).items()
+        f"{key}={getattr(value, 'name', value)}" for key, value in vars(representation).items()
     )
     return f"{type(representation).__name__}({fields})"

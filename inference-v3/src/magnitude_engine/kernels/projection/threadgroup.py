@@ -10,16 +10,20 @@ import math
 import tilelang.language as T
 
 from magnitude_engine.kernels.projection.decode import decoder
-from magnitude_engine.kernels.projection.layout import output_index, widths_and_outputs
+from magnitude_engine.kernels.projection.layout import (
+    output_index,
+    weight_index,
+    widths_and_outputs,
+)
 from magnitude_engine.platform.execution import DType
-from magnitude_engine.weights.representation import Representation, resident_bytes
+from magnitude_engine.weights.representation import WeightLayout
 
 
 def projection(
     rows: int,
     widths: int | tuple[int, ...],
     inputs: int,
-    representation: Representation,
+    layout: WeightLayout,
     *,
     output_tile: int = 4,
     reduction_lanes: int = 32,
@@ -38,8 +42,11 @@ def projection(
         raise ValueError("projection extents and tile sizes must be positive")
     if reduction_lanes & (reduction_lanes - 1):
         raise ValueError("reduction lane count must be a power of two")
-    decode = decoder(representation, outputs * inputs)
-    size = resident_bytes(representation, outputs * inputs)
+    if outputs != layout.logical_rows or inputs != layout.columns:
+        raise ValueError("projection and resident layout differ")
+    at = weight_index(layout)
+    decode = decoder(layout.representation, layout.elements)
+    size = layout.nbytes
 
     @T.prim_func
     def main(
@@ -60,7 +67,7 @@ def projection(
                     out = block * output_tile + i
                     k = chunk * reduction_lanes + j
                     if out < outputs and k < inputs:
-                        weight = decode(B, out * inputs + k)
+                        weight = decode(B, at(out, k))
                         for r in T.unroll(row_tile, explicit=True):
                             row = row_group * row_tile + r
                             if row < rows:

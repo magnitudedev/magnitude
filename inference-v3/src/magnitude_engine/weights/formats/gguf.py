@@ -1,15 +1,15 @@
-"""The GGUF container: its directory, wire encodings, and neutral stored layouts.
+"""The GGUF container and its residency-only source codecs.
 
 Encoding geometry follows ggml block layouts. A directory is validated before
 any tensor storage is uploaded. Logical shapes use outermost-first ordering.
-GGUF's numeric encoding enumeration stops here; ``block_layout`` maps it to the
-container-neutral representation understood by residency and kernels.
+GGUF's numeric encoding enumeration and physical field arrangements stop here.
 """
 
 from __future__ import annotations
 
 import math
 import struct
+from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 from pathlib import Path
 
@@ -18,13 +18,21 @@ from pydantic import Field
 from magnitude_engine.data import Record
 from magnitude_engine.platform.execution import DType
 from magnitude_engine.platform.storage import ByteSource, FileSource
-from magnitude_engine.weights.descriptor import StoredBlocks, StoredDense, WeightDescriptor
+from magnitude_engine.weights.descriptor import (
+    StoredDense,
+    StoredQuantized,
+    TraceBuffer,
+    TraceValue,
+    WeightDescriptor,
+)
 from magnitude_engine.weights.identity import ArtifactIdentity
 from magnitude_engine.weights.representation import (
-    BlockCodec,
-    EncodedBlocks,
-    HierarchicalAffine,
-    HierarchyPacking,
+    Affine,
+    Code,
+    Codebook,
+    CodeInterpretation,
+    DirectCoefficients,
+    HierarchicalCoefficients,
 )
 
 
@@ -54,33 +62,137 @@ class Encoding(IntEnum):
         }[self]
 
 
-_BLOCK_LAYOUTS = {
-    Encoding.F16: EncodedBlocks(BlockCodec.F16, 1, 2),
-    Encoding.Q8_0: EncodedBlocks(BlockCodec.GROUPED_I8, 32, 34),
-    Encoding.Q4_K: HierarchicalAffine(4, 0, 32, 256, 6, False, True, HierarchyPacking.SCALE_MIN_I6),
-    Encoding.Q5_K: HierarchicalAffine(4, 1, 32, 256, 6, False, True, HierarchyPacking.SCALE_MIN_I6),
-    Encoding.Q6_K: HierarchicalAffine(
-        4, 2, 16, 256, 8, True, False, HierarchyPacking.SIGNED_SCALE_I8
+_SCALE_MIN = HierarchicalCoefficients(
+    supergroup=256,
+    local_scale_bits=6,
+    local_scale_interpretation=CodeInterpretation.UNSIGNED,
+    super_scale_dtype=DType.F16,
+    local_bias_bits=6,
+    super_bias_dtype=DType.F16,
+    bias_sign=-1,
+)
+_SIGNED_SCALE = HierarchicalCoefficients(
+    supergroup=256,
+    local_scale_bits=8,
+    local_scale_interpretation=CodeInterpretation.TWOS_COMPLEMENT,
+    super_scale_dtype=DType.F16,
+)
+_IQ_SCALE = HierarchicalCoefficients(
+    supergroup=256,
+    local_scale_bits=6,
+    local_scale_interpretation=CodeInterpretation.OFFSET_BINARY,
+    local_scale_zero_point=32,
+    super_scale_dtype=DType.F16,
+)
+_IQ_TABLE = (-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113)
+
+_REPRESENTATIONS = {
+    Encoding.Q8_0: Affine(
+        Code(8, interpretation=CodeInterpretation.TWOS_COMPLEMENT),
+        32,
+        DirectCoefficients(DType.F16),
     ),
-    Encoding.IQ4_XS: EncodedBlocks(BlockCodec.CODEBOOK_I4, 256, 136),
+    Encoding.Q4_K: Affine(Code(4), 32, _SCALE_MIN),
+    Encoding.Q5_K: Affine(Code(4, 1), 32, _SCALE_MIN),
+    Encoding.Q6_K: Affine(Code(4, 2, CodeInterpretation.OFFSET_BINARY, 32), 16, _SIGNED_SCALE),
+    Encoding.IQ4_XS: Codebook(4, _IQ_TABLE, 32, _IQ_SCALE),
 }
 
 
-def block_layout(encoding: Encoding):
-    """Map one GGUF wire encoding to its container-neutral resident meaning."""
-    if encoding == Encoding.F32:
-        from magnitude_engine.weights.representation import Dense
+@dataclass(frozen=True)
+class GGUFCodec:
+    """Logical reads from one ggml block, used only by quantized import."""
 
-        return Dense(DType.F32)
-    return _BLOCK_LAYOUTS[encoding]
+    encoding: Encoding
+
+    @property
+    def block_elements(self) -> int:
+        return self.encoding.block_elements
+
+    @property
+    def block_bytes(self) -> int:
+        return self.encoding.block_bytes
+
+    def code(
+        self, data: TraceBuffer, base: int | TraceValue, index: int | TraceValue
+    ) -> TraceValue:
+        if self.encoding in (Encoding.Q4_K, Encoding.Q5_K):
+            payload = 16 + (32 if self.encoding == Encoding.Q5_K else 0)
+            low = (
+                data[base + payload + index // 64 * 32 + index % 32].astype("uint32")
+                >> (index % 64 // 32 * 4)
+            ) & 15
+            if self.encoding == Encoding.Q5_K:
+                low |= ((data[base + 16 + index % 32].astype("uint32") >> (index // 32)) & 1) << 4
+            return low
+        if self.encoding == Encoding.Q6_K:
+            low = (
+                data[base + index // 128 * 64 + index % 64].astype("uint32")
+                >> (index % 128 // 64 * 4)
+            ) & 15
+            high = (
+                data[base + 128 + index // 128 * 32 + index % 32].astype("uint32")
+                >> (index % 128 // 32 * 2)
+            ) & 3
+            return low | (high << 4)
+        if self.encoding == Encoding.Q8_0:
+            return data[base + 2 + index].astype("uint32")
+        if self.encoding == Encoding.IQ4_XS:
+            group = index // 32
+            return (
+                data[base + 8 + group * 16 + index % 16].astype("uint32") >> (index % 32 // 16 * 4)
+            ) & 15
+        raise ValueError(f"{self.encoding.name} has no quantized code reader")
+
+    def local_scale(
+        self, data: TraceBuffer, base: int | TraceValue, group: int | TraceValue
+    ) -> TraceValue:
+        import tilelang.language as T
+
+        if self.encoding in (Encoding.Q4_K, Encoding.Q5_K):
+            low = data[base + 4 + group % 4].astype("uint32")
+            high = data[base + 12 + group % 4].astype("uint32")
+            return T.if_then_else(group < 4, low & 63, (high & 15) | ((low >> 6) << 4))
+        if self.encoding == Encoding.Q6_K:
+            return data[base + 192 + group].astype("uint32")
+        if self.encoding == Encoding.IQ4_XS:
+            high = data[base + 2].astype("uint32") | (data[base + 3].astype("uint32") << 8)
+            low = (data[base + 4 + group // 2].astype("uint32") >> (group % 2 * 4)) & 15
+            return low | (((high >> (2 * group)) & 3) << 4)
+        raise ValueError(f"{self.encoding.name} has no local scale")
+
+    def local_bias(
+        self, data: TraceBuffer, base: int | TraceValue, group: int | TraceValue
+    ) -> TraceValue:
+        import tilelang.language as T
+
+        if self.encoding in (Encoding.Q4_K, Encoding.Q5_K):
+            low = data[base + 8 + group % 4].astype("uint32")
+            high = data[base + 12 + group % 4].astype("uint32")
+            return T.if_then_else(group < 4, low & 63, (high >> 4) | ((low >> 6) << 4))
+        raise ValueError(f"{self.encoding.name} has no local bias")
+
+    def scale_byte(
+        self, data: TraceBuffer, base: int | TraceValue, byte_index: int | TraceValue
+    ) -> TraceValue:
+        offset = 208 if self.encoding == Encoding.Q6_K else 0
+        return data[base + offset + byte_index]
+
+    def bias_byte(
+        self, data: TraceBuffer, base: int | TraceValue, byte_index: int | TraceValue
+    ) -> TraceValue:
+        return data[base + 2 + byte_index]
 
 
-def encoding_for_layout(layout: EncodedBlocks | HierarchicalAffine) -> Encoding:
-    """Return the GGUF wire type whose bytes have this neutral block layout."""
-    for encoding, candidate in _BLOCK_LAYOUTS.items():
-        if candidate == layout:
-            return encoding
-    raise ValueError("resident block layout did not originate as a supported GGUF encoding")
+_CODECS = {encoding: GGUFCodec(encoding) for encoding in _REPRESENTATIONS}
+
+
+def quantization(encoding: Encoding) -> tuple[Affine | Codebook, GGUFCodec]:
+    """The numerical meaning and import codec for a quantized wire encoding."""
+    try:
+        return _REPRESENTATIONS[encoding], _CODECS[encoding]
+    except KeyError as error:
+        raise ValueError(f"{encoding.name} is not a quantized GGUF encoding") from error
 
 
 class ByteOrder(StrEnum):
@@ -262,15 +374,18 @@ class GGUFFormat:
             self.source.close()
             raise
 
-    def stored(self, descriptor: WeightDescriptor) -> StoredBlocks | StoredDense:
+    def stored(self, descriptor: WeightDescriptor) -> StoredQuantized | StoredDense:
         entry = self.directory.tensor(descriptor.name)
         if entry.shape != descriptor.shape:
             raise ValueError(f"GGUF weight {descriptor.name}: shape differs from its model role")
         offset = self.directory.data_offset + entry.offset
-        if entry.encoding == Encoding.F32:
-            return StoredDense(DType.F32, self.source, offset, entry.nbytes)
-        return StoredBlocks(
-            layout=_BLOCK_LAYOUTS[entry.encoding],
+        if entry.encoding in (Encoding.F32, Encoding.F16):
+            dtype = DType.F32 if entry.encoding == Encoding.F32 else DType.F16
+            return StoredDense(dtype, self.source, offset, entry.nbytes)
+        representation, codec = quantization(entry.encoding)
+        return StoredQuantized(
+            representation=representation,
+            codec=codec,
             source=self.source,
             offset=offset,
         )

@@ -51,8 +51,8 @@ class GatedLinear(Linear):
                 dtype,
                 output_dtype,
             )
-            representation = (
-                self.projections.representation
+            layout = (
+                self.projections.weight.layout
                 if isinstance(self.projections, ResidentProjections)
                 else None
             )
@@ -60,7 +60,7 @@ class GatedLinear(Linear):
                 "gated",
                 GATED_TABLE,
                 self.context,
-                Selection(shape, self.precision, self.context.capability, representation),
+                Selection(shape, self.precision, self.context.capability, layout),
             )
         return self._plans[key]
 

@@ -9,23 +9,20 @@ import tilelang.language as T
 
 from magnitude_engine.kernels.capabilities import Capability
 from magnitude_engine.kernels.projection.decode import interpretation
-from magnitude_engine.kernels.projection.layout import output_index, widths_and_outputs
-from magnitude_engine.platform.execution import DType
-from magnitude_engine.weights.representation import (
-    BlockCodec,
-    EncodedBlocks,
-    HierarchicalAffine,
-    HierarchyPacking,
-    Representation,
-    resident_bytes,
+from magnitude_engine.kernels.projection.layout import (
+    output_index,
+    weight_index,
+    widths_and_outputs,
 )
+from magnitude_engine.platform.execution import DType
+from magnitude_engine.weights.representation import Affine, Codebook, WeightLayout
 
 
 def projection(
     rows,
     widths: int | tuple[int, ...],
     inputs,
-    representation: Representation,
+    layout: WeightLayout,
     *,
     capability: Capability,
     row_tile=1,
@@ -37,21 +34,19 @@ def projection(
     output_at = output_index(rows, logical_widths)
     if capability.subgroup_width != 32:
         raise ValueError("the group contraction consumes 256 weights per 32-lane subgroup")
-    supported = (
-        isinstance(representation, HierarchicalAffine)
-        and representation.packing == HierarchyPacking.SIGNED_SCALE_I8
-    ) or (
-        isinstance(representation, EncodedBlocks)
-        and representation.codec in (BlockCodec.CODEBOOK_I4, BlockCodec.GROUPED_I8, BlockCodec.F16)
-    )
-    if not supported:
-        raise ValueError("group contraction requires a supported symmetric or dense encoding")
-    if min(rows, inputs, row_tile, output_tile) <= 0 or inputs % representation.block_elements:
+    representation = layout.representation
+    if not isinstance(representation, (Affine, Codebook)):
+        raise ValueError("group contraction requires quantized weights")
+    if outputs != layout.logical_rows or inputs != layout.columns or layout.nbytes % 2:
+        raise ValueError("group contraction and resident layout differ")
+    tile = representation.supergroup or representation.group
+    if min(rows, inputs, row_tile, output_tile) <= 0 or inputs % tile:
         raise ValueError("invalid group contraction geometry")
     if output_tile % 2:
         raise ValueError("group contraction tiles output rows in pairs")
-    parameters, payload = interpretation(representation, outputs * inputs)
-    size = resident_bytes(representation, outputs * inputs) // 2
+    at = weight_index(layout)
+    parameters, payload = interpretation(representation, layout.elements)
+    size = layout.nbytes // 2
 
     @T.prim_func
     def main(
@@ -85,11 +80,12 @@ def projection(
                         out = first_out + owned
                         T.clear(dot)
                         if out < outputs:
-                            scale, _ = parameters(B, out * inputs + first)
+                            storage_first = at(out, first)
+                            scale, _ = parameters(B, storage_first)
                             for j in T.unroll(8, explicit=True):
                                 k = first + j
                                 if k < inputs:
-                                    code = payload(B, out * inputs + k)
+                                    code = payload(B, at(out, k))
                                     for r in T.unroll(row_tile, explicit=True):
                                         row = row_group * row_tile + r
                                         if row < rows:
