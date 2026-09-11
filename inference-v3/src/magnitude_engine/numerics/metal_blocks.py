@@ -61,7 +61,7 @@ def projection(
                     for r in T.unroll(row_tile, explicit=True):
                         accum[r] += dot[r] * scale
             for r in T.unroll(row_tile, explicit=True):
-                total = T.call_extern("float32", "simd_sum", accum[r])
+                total = T.warp_reduce_sum(accum[r])
                 row = row_group * row_tile + r
                 if lane == 0 and out < outputs and row < rows:
                     C[row, out] = total

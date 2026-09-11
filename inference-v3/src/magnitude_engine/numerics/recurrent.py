@@ -159,10 +159,8 @@ def prepare_sequence(
                     values[j] = convolve(X, Weight, Previous, Next, row, h, d)
                     if h < 2 * key_heads:
                         squares[0] += values[j] * values[j]
-                total = T.call_extern("float32", "simd_sum", squares[0])
-                inverse = T.call_pure_extern(
-                    "float32", "metal::precise::rsqrt", total / width + epsilon
-                )
+                total = T.warp_reduce_sum(squares[0])
+                inverse = T.rsqrt(total / width + epsilon)
                 for j in T.unroll(width // simd_width, explicit=True):
                     d = lane * (width // simd_width) + j
                     store(Q, K, V, row, h, d, values[j], inverse)

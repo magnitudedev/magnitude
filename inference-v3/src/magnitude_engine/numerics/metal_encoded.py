@@ -53,7 +53,7 @@ def projection(
                             if row < rows:
                                 partial[r] += A[row, k].astype("float32") * weight
             for r in T.unroll(row_tile, explicit=True):
-                total = T.call_extern("float32", "simd_sum", partial[r])
+                total = T.warp_reduce_sum(partial[r])
                 row = row_group * row_tile + r
                 if lane == 0 and out < outputs and row < rows:
                     C[row, out] = total
@@ -161,7 +161,7 @@ def k_projection(
                             bias0 * sums[r, 0] + bias1 * sums[r, 1]
                         )
             for r in T.unroll(row_tile, explicit=True):
-                total = T.call_extern("float32", "simd_sum", partial[r])
+                total = T.warp_reduce_sum(partial[r])
                 row = row_group * row_tile + r
                 if lane == 0 and out < outputs and row < rows:
                     C[row, out] = total

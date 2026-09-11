@@ -142,7 +142,7 @@ def run_attention(
                                 value[0] = scores[i, token] * (1 / math.sqrt(width))
                         scores[i, token] = value[0]
                         maximum[0] = T.max(maximum[0], value[0])
-                m = T.call_extern("float32", "simd_max", maximum[0])
+                m = T.warp_reduce_max(maximum[0])
                 total[0] = 0
                 for step in T.unroll(T.ceildiv(span, 32), explicit=True):
                     token = step * 32 + lane
@@ -152,7 +152,7 @@ def run_attention(
                         )
                         scores[i, token] = p
                         total[0] += p
-                mass = T.call_extern("float32", "simd_sum", total[0])
+                mass = T.warp_reduce_sum(total[0])
                 for step in T.unroll(T.ceildiv(span, 32), explicit=True):
                     token = step * 32 + lane
                     if token < span:
