@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.15-alpha.1
+
+### Patch Changes
+
+- [`a5a5711`](https://github.com/magnitudedev/magnitude/commit/a5a5711a7d7c0deee96f3c476df4711bc1df409c) Thanks [@anerli](https://github.com/anerli)! - Add AssociatedBundleIdentifiers to launchd plist for macOS so login item shows correct icon and name
+
 ## 0.0.15-alpha.0
 
 ### Patch Changes
