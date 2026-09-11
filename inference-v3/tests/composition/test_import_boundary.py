@@ -65,9 +65,7 @@ def test_kernels_import_only_the_language_dtypes_and_representations():
     for path in sources("kernels"):
         allowed = SELECT_ALLOWED if path.name == "select.py" else KERNEL_ALLOWED
         offenders += [
-            (relative(path), module)
-            for module in imports(path)
-            if not permitted(module, allowed)
+            (relative(path), module) for module in imports(path) if not permitted(module, allowed)
         ]
     assert offenders == []
 
@@ -99,18 +97,16 @@ def test_only_the_platform_and_composition_name_a_backend():
         for path in sources(
             "kernels", "weights", "operations", "models", "inputs", "state", "generation"
         )
-        if "Backend" in names(path)
-        or "magnitude_engine.platform.backend" in imports(path)
+        if "Backend" in names(path) or "magnitude_engine.platform.backend" in imports(path)
     ]
     assert offenders == []
 
 
-# Residency compiles the repack and the conversion; a capability decides a
-# representation. Nothing else in `weights/` reaches a schedule.
+# Residency compiles dense conversion; a capability decides a representation.
+# Nothing else in `weights/` reaches a schedule.
 WEIGHT_KERNELS = {
     "magnitude_engine.kernels.capabilities",
     "magnitude_engine.kernels.copy.convert",
-    "magnitude_engine.kernels.projection.planar_affine.pack",
 }
 
 

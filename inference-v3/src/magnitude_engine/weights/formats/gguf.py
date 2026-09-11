@@ -1,9 +1,9 @@
-"""The GGUF container: its directory, its encodings, and what it stores.
+"""The GGUF container: its directory, wire encodings, and neutral stored layouts.
 
 Encoding geometry follows ggml block layouts. A directory is validated before
 any tensor storage is uploaded. Logical shapes use outermost-first ordering.
-``Encoding`` is ggml's enumeration and is defined here; kernels reach it through
-``weights.representation``, which is the only weight module they may import.
+GGUF's numeric encoding enumeration stops here; ``block_layout`` maps it to the
+container-neutral representation understood by residency and kernels.
 """
 
 from __future__ import annotations
@@ -16,9 +16,16 @@ from pathlib import Path
 from pydantic import Field
 
 from magnitude_engine.data import Record
+from magnitude_engine.platform.execution import DType
 from magnitude_engine.platform.storage import ByteSource, FileSource
-from magnitude_engine.weights.descriptor import StoredBlocks, WeightDescriptor
+from magnitude_engine.weights.descriptor import StoredBlocks, StoredDense, WeightDescriptor
 from magnitude_engine.weights.identity import ArtifactIdentity
+from magnitude_engine.weights.representation import (
+    BlockCodec,
+    EncodedBlocks,
+    HierarchicalAffine,
+    HierarchyPacking,
+)
 
 
 class Encoding(IntEnum):
@@ -45,6 +52,35 @@ class Encoding(IntEnum):
             Encoding.Q6_K: 210,
             Encoding.IQ4_XS: 136,
         }[self]
+
+
+_BLOCK_LAYOUTS = {
+    Encoding.F16: EncodedBlocks(BlockCodec.F16, 1, 2),
+    Encoding.Q8_0: EncodedBlocks(BlockCodec.GROUPED_I8, 32, 34),
+    Encoding.Q4_K: HierarchicalAffine(4, 0, 32, 256, 6, False, True, HierarchyPacking.SCALE_MIN_I6),
+    Encoding.Q5_K: HierarchicalAffine(4, 1, 32, 256, 6, False, True, HierarchyPacking.SCALE_MIN_I6),
+    Encoding.Q6_K: HierarchicalAffine(
+        4, 2, 16, 256, 8, True, False, HierarchyPacking.SIGNED_SCALE_I8
+    ),
+    Encoding.IQ4_XS: EncodedBlocks(BlockCodec.CODEBOOK_I4, 256, 136),
+}
+
+
+def block_layout(encoding: Encoding):
+    """Map one GGUF wire encoding to its container-neutral resident meaning."""
+    if encoding == Encoding.F32:
+        from magnitude_engine.weights.representation import Dense
+
+        return Dense(DType.F32)
+    return _BLOCK_LAYOUTS[encoding]
+
+
+def encoding_for_layout(layout: EncodedBlocks | HierarchicalAffine) -> Encoding:
+    """Return the GGUF wire type whose bytes have this neutral block layout."""
+    for encoding, candidate in _BLOCK_LAYOUTS.items():
+        if candidate == layout:
+            return encoding
+    raise ValueError("resident block layout did not originate as a supported GGUF encoding")
 
 
 class ByteOrder(StrEnum):
@@ -226,14 +262,17 @@ class GGUFFormat:
             self.source.close()
             raise
 
-    def stored(self, descriptor: WeightDescriptor) -> StoredBlocks:
+    def stored(self, descriptor: WeightDescriptor) -> StoredBlocks | StoredDense:
         entry = self.directory.tensor(descriptor.name)
         if entry.shape != descriptor.shape:
             raise ValueError(f"GGUF weight {descriptor.name}: shape differs from its model role")
+        offset = self.directory.data_offset + entry.offset
+        if entry.encoding == Encoding.F32:
+            return StoredDense(DType.F32, self.source, offset, entry.nbytes)
         return StoredBlocks(
-            encoding=entry.encoding,
+            layout=_BLOCK_LAYOUTS[entry.encoding],
             source=self.source,
-            offset=self.directory.data_offset + entry.offset,
+            offset=offset,
         )
 
     def close(self) -> None:

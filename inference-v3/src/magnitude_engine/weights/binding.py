@@ -1,13 +1,12 @@
 """The one decision that turns a stored weight into a resident representation.
 
-Nothing else in the engine chooses a layout. The inputs are the stored layout,
-the logical shape, and the endpoint capability; the result is recorded on the
-resident weight and appears in run records.
+Nothing else in the engine chooses a layout. Compact hierarchical and encoded
+blocks remain compact; affine planes keep their coefficient width; dense values
+are converted according to their declared transform. The result is recorded on
+the resident weight and appears in run records.
 """
 
 from __future__ import annotations
-
-import math
 
 from magnitude_engine.kernels.capabilities import Capability
 from magnitude_engine.platform.execution import DType
@@ -17,28 +16,7 @@ from magnitude_engine.weights.descriptor import (
     StoredBlocks,
     StoredDense,
 )
-from magnitude_engine.weights.representation import (
-    Blocked,
-    Dense,
-    Encoding,
-    PlanarAffine,
-    Representation,
-)
-
-# Repacking a K-quant matrix into planes pays for itself only where a subgroup
-# can consume a whole 512-coordinate fold; below that the container layout is
-# read in place.
-_REPACKED = {
-    Encoding.Q4_K: PlanarAffine(
-        bits=4, high_bits=0, group=32, coefficient_dtype=DType.F32, signed=False, has_bias=True
-    ),
-    Encoding.Q5_K: PlanarAffine(
-        bits=4, high_bits=1, group=32, coefficient_dtype=DType.F32, signed=False, has_bias=True
-    ),
-    Encoding.Q6_K: PlanarAffine(
-        bits=4, high_bits=2, group=16, coefficient_dtype=DType.F32, signed=True, has_bias=False
-    ),
-}
+from magnitude_engine.weights.representation import Dense, PlanarAffine, Representation
 
 
 def resident_representation(
@@ -61,15 +39,4 @@ def resident_representation(
         return Dense(DType.F32)
     if not isinstance(stored, StoredBlocks):
         raise TypeError("unknown stored weight layout")
-    if stored.encoding == Encoding.F32:
-        return Dense(DType.F32)
-    repacked = _REPACKED.get(stored.encoding)
-    if (
-        repacked is not None
-        and capability.subgroup_width == 32
-        and len(shape) == 2
-        and shape[1] % 512 == 0
-        and math.prod(shape) % repacked.group == 0
-    ):
-        return repacked
-    return Blocked(stored.encoding)
+    return stored.layout

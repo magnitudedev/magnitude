@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from magnitude_engine.kernels.precision import Rounding
 from magnitude_engine.kernels.projection import (
     blocks,
+    hierarchical_fused,
     matrix,
     packed_k,
     serial,
@@ -34,7 +35,14 @@ from magnitude_engine.kernels.projection.planar_affine import (
 from magnitude_engine.kernels.projection.planar_affine.layout import partitions
 from magnitude_engine.operations.candidates import Candidate, Plan, Scratch, Selection
 from magnitude_engine.platform.execution import DType, TensorSpec
-from magnitude_engine.weights.representation import Blocked, Dense, Encoding, PlanarAffine
+from magnitude_engine.weights.representation import (
+    BlockCodec,
+    Dense,
+    EncodedBlocks,
+    HierarchicalAffine,
+    HierarchyPacking,
+    PlanarAffine,
+)
 
 
 @dataclass(frozen=True)
@@ -65,12 +73,33 @@ def _flat(selection: Selection[ProjectionShape]) -> bool:
     representation = selection.representation
     if isinstance(representation, PlanarAffine):
         return representation.coefficient_dtype == DType.F32
-    return isinstance(representation, (Blocked, Dense)) and len(selection.shape.widths) == 1
+    return isinstance(representation, (Dense, EncodedBlocks, HierarchicalAffine))
 
 
-def _blocked(selection: Selection[ProjectionShape]) -> Encoding | None:
+def _blocked(selection: Selection[ProjectionShape]) -> EncodedBlocks | HierarchicalAffine | None:
     representation = selection.representation
-    return representation.encoding if isinstance(representation, Blocked) else None
+    return (
+        representation if isinstance(representation, (EncodedBlocks, HierarchicalAffine)) else None
+    )
+
+
+def _scale_min_hierarchy(selection: Selection[ProjectionShape]) -> bool:
+    representation = _blocked(selection)
+    return (
+        isinstance(representation, HierarchicalAffine)
+        and representation.packing == HierarchyPacking.SCALE_MIN_I6
+    )
+
+
+def _groupwise_blocks(selection: Selection[ProjectionShape]) -> bool:
+    representation = _blocked(selection)
+    return (
+        isinstance(representation, HierarchicalAffine)
+        and representation.packing == HierarchyPacking.SIGNED_SCALE_I8
+    ) or (
+        isinstance(representation, EncodedBlocks)
+        and representation.codec in (BlockCodec.CODEBOOK_I4, BlockCodec.GROUPED_I8, BlockCodec.F16)
+    )
 
 
 # ---------------------------------------------------------------- planar rows
@@ -214,7 +243,7 @@ def _matrix(context, selection: Selection[ProjectionShape]) -> Plan:
         context.specialize(
             matrix.projection,
             shape.rows,
-            shape.outputs,
+            shape.widths,
             shape.inputs,
             selection.representation,
             capability=selection.capability,
@@ -228,7 +257,7 @@ def _matrix(context, selection: Selection[ProjectionShape]) -> Plan:
             context.specialize(
                 matrix.merge_partitions,
                 shape.rows,
-                shape.outputs,
+                shape.widths,
                 parts,
                 output_dtype=shape.output_dtype,
             ),
@@ -247,7 +276,7 @@ def _single(factory, name: str, **extra):
                 context.specialize(
                     factory,
                     shape.rows,
-                    shape.outputs,
+                    shape.widths,
                     shape.inputs,
                     selection.representation,
                     capability=selection.capability,
@@ -270,7 +299,7 @@ def _threadgroup(context, selection: Selection[ProjectionShape]) -> Plan:
             context.specialize(
                 threadgroup.projection,
                 shape.rows,
-                shape.outputs,
+                shape.widths,
                 shape.inputs,
                 selection.representation,
                 output_tile=4,
@@ -291,7 +320,7 @@ def _serial(context, selection: Selection[ProjectionShape]) -> Plan:
             context.specialize(
                 serial.projection,
                 shape.rows,
-                shape.outputs,
+                shape.widths,
                 shape.inputs,
                 selection.representation,
                 row_tile=1,
@@ -324,24 +353,20 @@ TABLE: tuple[Candidate[ProjectionShape], ...] = (
         scratch=_matrix_scratch,
     ),
     Candidate(
-        "projection.packed_k",
+        "projection.hierarchical_scale_min",
         lambda s: (
             _flat(s)
-            and _blocked(s) in (Encoding.Q4_K, Encoding.Q5_K)
+            and _scale_min_hierarchy(s)
             and s.capability.subgroup_width == 32
             and s.shape.inputs % 256 == 0
         ),
-        _single(packed_k.projection, "projection.packed_k", output_tile=4),
+        _single(packed_k.projection, "projection.hierarchical_scale_min", output_tile=4),
         rank=40,
     ),
     Candidate(
-        "projection.blocks",
-        lambda s: (
-            _flat(s)
-            and _blocked(s) in (Encoding.Q6_K, Encoding.IQ4_XS, Encoding.Q8_0, Encoding.F16)
-            and s.capability.subgroup_width == 32
-        ),
-        _single(blocks.projection, "projection.blocks", output_tile=4),
+        "projection.groupwise_blocks",
+        lambda s: _flat(s) and _groupwise_blocks(s) and s.capability.subgroup_width == 32,
+        _single(blocks.projection, "projection.groupwise_blocks", output_tile=4),
         rank=40,
     ),
     Candidate(
@@ -399,6 +424,37 @@ def _fused_applies(selection: Selection[GatedShape]) -> bool:
     )
 
 
+def _hierarchical_fused_applies(selection: Selection[GatedShape]) -> bool:
+    representation = selection.representation
+    shape = selection.shape
+    return (
+        isinstance(representation, HierarchicalAffine)
+        and representation.packing == HierarchyPacking.SCALE_MIN_I6
+        and selection.precision.rounding == Rounding.NATIVE_BF16
+        and selection.capability.subgroup_width == 32
+        and shape.rows < 8
+        and shape.inputs % representation.supergroup == 0
+    )
+
+
+def _hierarchical_fused(context, selection: Selection[GatedShape]) -> Plan:
+    shape = selection.shape
+    return Plan(
+        "gated.hierarchical_fused_vector",
+        (
+            context.specialize(
+                hierarchical_fused.gated_vector,
+                shape.rows,
+                shape.width,
+                shape.inputs,
+                selection.representation,
+                capability=selection.capability,
+                precision=selection.precision,
+            ),
+        ),
+    )
+
+
 def _fused(context, selection: Selection[GatedShape]) -> Plan:
     shape = selection.shape
     return Plan(
@@ -434,8 +490,12 @@ def _projected(context, selection: Selection[GatedShape]) -> Plan:
 
 
 GATED_TABLE: tuple[Candidate[GatedShape], ...] = (
-    Candidate("gated.fused_vector", _fused_applies, _fused, rank=60),
     Candidate(
-        "gated.projected", lambda s: True, _projected, rank=10, scratch=_projected_scratch
+        "gated.hierarchical_fused_vector",
+        _hierarchical_fused_applies,
+        _hierarchical_fused,
+        rank=60,
     ),
+    Candidate("gated.fused_vector", _fused_applies, _fused, rank=60),
+    Candidate("gated.projected", lambda s: True, _projected, rank=10, scratch=_projected_scratch),
 )
