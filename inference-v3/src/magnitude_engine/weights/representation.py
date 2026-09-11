@@ -1,34 +1,32 @@
-"""What a kernel reads. Containers are forgotten once a weight is resident.
+"""Numerical weight representations and their canonical engine layouts.
 
-Flat affine planes and compact hierarchical affine blocks are distinct resident
-meanings. A container may already store either one; kernels specialize on the
-representation parameters and never on that container's wire names.
-
-Planar storage is one allocation: the low plane, then the scale plane, then the
-bias plane if present, then the high plane if present. ``plane_offsets`` is the
-single definition of where those start, shared by the repack kernel that writes
-them, the upload that places MLX tensors at the same offsets, and every kernel
-that reads them.
+Containers stop at residency. Quantized representations describe values; the
+layout below is the sole definition of the bytes inference kernels read.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import TypeGuard
 
 from magnitude_engine.platform.execution import DType
 
 __all__ = [
-    "BlockCodec",
-    "EncodedBlocks",
+    "Affine",
+    "CanonicalLayout",
+    "Code",
+    "CodeInterpretation",
+    "Codebook",
+    "CoefficientScheme",
     "Dense",
-    "HierarchicalAffine",
-    "HierarchyPacking",
-    "PlanarAffine",
-    "PlaneOffsets",
+    "DirectCoefficients",
+    "HierarchicalCoefficients",
     "Representation",
-    "plane_offsets",
+    "WeightLayout",
+    "canonical_layout",
     "resident_bytes",
+    "is_scale_min_hierarchy",
 ]
 
 
@@ -37,159 +35,287 @@ class Dense:
     dtype: DType
 
 
-class BlockCodec(StrEnum):
-    """Container-neutral byte interpretations without affine hierarchy."""
-
-    F16 = "f16"
-    GROUPED_I8 = "grouped_i8"
-    CODEBOOK_I4 = "codebook_i4"
+class CodeInterpretation(StrEnum):
+    UNSIGNED = "unsigned"
+    OFFSET_BINARY = "offset_binary"
+    TWOS_COMPLEMENT = "twos_complement"
 
 
 @dataclass(frozen=True)
-class EncodedBlocks:
-    codec: BlockCodec
-    block_elements: int
-    block_bytes: int
+class Code:
+    low_bits: int
+    high_bits: int = 0
+    interpretation: CodeInterpretation = CodeInterpretation.UNSIGNED
+    zero_point: int = 0
 
     def __post_init__(self):
-        if self.block_elements <= 0 or self.block_bytes <= 0:
-            raise ValueError("encoded block geometry must be positive")
+        if self.low_bits not in (4, 8) or self.high_bits not in (0, 1, 2):
+            raise ValueError("unsupported canonical code planes")
+        if self.low_bits == 8 and self.high_bits:
+            raise ValueError("eight-bit codes have no high plane")
+        if self.interpretation == CodeInterpretation.OFFSET_BINARY:
+            if not 0 < self.zero_point < 1 << self.bits:
+                raise ValueError("offset-binary codes require an in-range zero point")
+        elif self.zero_point:
+            raise ValueError("only offset-binary codes carry a zero point")
+        if self.interpretation == CodeInterpretation.TWOS_COMPLEMENT and self.bits != 8:
+            raise ValueError("canonical two's-complement codes are eight bit")
 
     @property
-    def bits_per_value(self) -> float:
-        return self.block_bytes * 8 / self.block_elements
-
-
-class HierarchyPacking(StrEnum):
-    """Physical organizations of hierarchical affine coefficients and codes."""
-
-    SCALE_MIN_I6 = "scale_min_i6"
-    SIGNED_SCALE_I8 = "signed_scale_i8"
+    def bits(self) -> int:
+        return self.low_bits + self.high_bits
 
 
 @dataclass(frozen=True)
-class HierarchicalAffine:
-    """Compact two-level affine blocks consumed without persistent expansion."""
+class DirectCoefficients:
+    scale_dtype: DType
+    bias_dtype: DType | None = None
 
-    bits: int
-    high_bits: int
-    group: int
+    def __post_init__(self):
+        if self.scale_dtype not in (DType.F16, DType.BF16, DType.F32):
+            raise ValueError("direct affine scales must be floating point")
+        if self.bias_dtype not in (None, DType.F16, DType.BF16, DType.F32):
+            raise ValueError("direct affine biases must be floating point")
+
+    @property
+    def has_bias(self) -> bool:
+        return self.bias_dtype is not None
+
+
+@dataclass(frozen=True)
+class HierarchicalCoefficients:
     supergroup: int
-    local_bits: int
-    signed: bool
-    has_bias: bool
-    packing: HierarchyPacking
+    local_scale_bits: int
+    local_scale_interpretation: CodeInterpretation
+    super_scale_dtype: DType
+    local_scale_zero_point: int = 0
+    local_bias_bits: int | None = None
+    super_bias_dtype: DType | None = None
+    bias_sign: int = 0
 
     def __post_init__(self):
-        if self.bits != 4 or self.high_bits not in (0, 1, 2):
-            raise ValueError("hierarchical affine storage carries a 4-bit low code")
-        if self.group <= 0 or self.supergroup <= 0 or self.supergroup % self.group:
-            raise ValueError("hierarchical affine groups must tile their supergroup")
-        if self.local_bits not in (6, 8):
-            raise ValueError("hierarchical affine coefficients are six or eight bit")
-        if self.packing == HierarchyPacking.SCALE_MIN_I6:
-            if self.local_bits != 6 or self.signed or not self.has_bias or self.group != 32:
-                raise ValueError("scale/min packing requires unsigned 32-value groups")
-        elif self.packing == HierarchyPacking.SIGNED_SCALE_I8:
-            if self.local_bits != 8 or not self.signed or self.has_bias or self.group != 16:
-                raise ValueError("signed-scale packing requires signed 16-value groups")
+        if self.supergroup <= 0 or self.local_scale_bits not in (6, 8):
+            raise ValueError("invalid hierarchical coefficient geometry")
+        if self.super_scale_dtype not in (DType.F16, DType.BF16, DType.F32):
+            raise ValueError("hierarchical super scale must be floating point")
+        if self.local_scale_interpretation == CodeInterpretation.OFFSET_BINARY:
+            if not 0 < self.local_scale_zero_point < 1 << self.local_scale_bits:
+                raise ValueError("offset-binary local scales require a zero point")
+        elif self.local_scale_zero_point:
+            raise ValueError("only offset-binary local scales carry a zero point")
+        bias = self.local_bias_bits is not None
+        if bias != (self.super_bias_dtype is not None):
+            raise ValueError("local and super bias must be present together")
+        if bias:
+            if self.local_bias_bits not in (6, 8):
+                raise ValueError("invalid hierarchical local bias width")
+            if self.super_bias_dtype not in (DType.F16, DType.BF16, DType.F32):
+                raise ValueError("hierarchical super bias must be floating point")
+            if self.bias_sign not in (-1, 1):
+                raise ValueError("hierarchical bias requires an explicit sign")
+        elif self.bias_sign:
+            raise ValueError("a bias sign requires bias coefficients")
 
     @property
-    def block_elements(self) -> int:
-        return self.supergroup
+    def has_bias(self) -> bool:
+        return self.local_bias_bits is not None
 
-    @property
-    def block_bytes(self) -> int:
-        payload = self.supergroup * (self.bits + self.high_bits) // 8
-        groups = self.supergroup // self.group
-        local = groups * self.local_bits * (2 if self.has_bias else 1) // 8
-        super_coefficients = 2 * (2 if self.has_bias else 1)
-        return payload + local + super_coefficients
 
-    @property
-    def bits_per_value(self) -> float:
-        return self.block_bytes * 8 / self.block_elements
+type CoefficientScheme = DirectCoefficients | HierarchicalCoefficients
 
 
 @dataclass(frozen=True)
-class PlanarAffine:
-    bits: int
-    """Low-plane bits per value."""
-
-    high_bits: int
-    """Extra plane bits per value: 0, 1 or 2."""
-
+class Affine:
+    code: Code
     group: int
-    """Values sharing one scale."""
-
-    coefficient_dtype: DType
-    """F32 for repacked K-quants, BF16 for MLX."""
-
-    signed: bool
-    """The zero point is ``2 ** (bits + high_bits - 1)`` rather than zero."""
-
-    has_bias: bool
-    """A bias plane follows the scales."""
+    coefficients: CoefficientScheme
 
     def __post_init__(self):
-        if self.bits != 4 or self.high_bits not in (0, 1, 2):
-            raise ValueError("planar affine storage carries a 4-bit low plane")
-        if self.group <= 0 or self.group % 8:
-            raise ValueError("an affine group must cover whole low-plane words")
-        if self.coefficient_dtype not in (DType.F32, DType.BF16):
-            raise ValueError("affine coefficients are stored as F32 or BF16")
-        if self.signed and self.has_bias:
-            raise ValueError("a signed affine representation has no bias plane")
+        if self.group <= 0:
+            raise ValueError("an affine group must be positive")
+        coefficients = self.coefficients
+        if isinstance(coefficients, HierarchicalCoefficients):
+            if coefficients.supergroup % self.group:
+                raise ValueError("affine groups must tile their supergroup")
 
     @property
-    def zero_point(self) -> int:
-        return (1 << (self.bits + self.high_bits - 1)) if self.signed else 0
+    def has_bias(self) -> bool:
+        return self.coefficients.has_bias
 
     @property
-    def bits_per_value(self) -> int:
-        """Payload and coefficient bits amortized over one value."""
-        coefficients = self.coefficient_dtype.itemsize * 8 * (2 if self.has_bias else 1)
-        return self.bits + self.high_bits + coefficients // self.group
-
-
-type Representation = Dense | EncodedBlocks | HierarchicalAffine | PlanarAffine
+    def supergroup(self) -> int | None:
+        coefficients = self.coefficients
+        return (
+            coefficients.supergroup if isinstance(coefficients, HierarchicalCoefficients) else None
+        )
 
 
 @dataclass(frozen=True)
-class PlaneOffsets:
-    """Word offsets of each plane within one ``uint32`` allocation."""
+class Codebook:
+    code_bits: int
+    table: tuple[int, ...]
+    group: int
+    coefficients: CoefficientScheme
 
+    def __post_init__(self):
+        if self.code_bits not in (2, 4, 8) or len(self.table) != 1 << self.code_bits:
+            raise ValueError("a codebook must define every packed code")
+        if any(value < -128 or value > 127 for value in self.table):
+            raise ValueError("canonical codebook entries are signed bytes")
+        if self.group <= 0:
+            raise ValueError("a codebook group must be positive")
+        coefficients = self.coefficients
+        if isinstance(coefficients, HierarchicalCoefficients):
+            if coefficients.supergroup % self.group:
+                raise ValueError("codebook groups must tile their supergroup")
+
+    @property
+    def supergroup(self) -> int | None:
+        coefficients = self.coefficients
+        return (
+            coefficients.supergroup if isinstance(coefficients, HierarchicalCoefficients) else None
+        )
+
+
+type Representation = Dense | Affine | Codebook
+
+
+def is_scale_min_hierarchy(representation: Representation) -> TypeGuard[Affine]:
+    """Whether the representation matches the grouped Q4/Q5 scale/min family."""
+    coefficients = representation.coefficients if isinstance(representation, Affine) else None
+    return (
+        isinstance(representation, Affine)
+        and isinstance(coefficients, HierarchicalCoefficients)
+        and representation.code.low_bits == 4
+        and representation.code.high_bits in (0, 1)
+        and representation.code.interpretation == CodeInterpretation.UNSIGNED
+        and representation.group == 32
+        and coefficients.supergroup == 256
+        and coefficients.local_scale_bits == 6
+        and coefficients.local_scale_interpretation == CodeInterpretation.UNSIGNED
+        and coefficients.local_bias_bits == 6
+        and coefficients.bias_sign == -1
+        and coefficients.super_scale_dtype == DType.F16
+        and coefficients.super_bias_dtype == DType.F16
+    )
+
+
+@dataclass(frozen=True)
+class WeightLayout:
+    """One logical row range over a complete resident allocation."""
+
+    representation: Representation
+    rows: int
+    columns: int
+    first_row: int = 0
+    row_count: int | None = None
+
+    def __post_init__(self):
+        count = self.rows if self.row_count is None else self.row_count
+        if min(self.rows, self.columns, count) <= 0 or not 0 <= self.first_row <= self.rows - count:
+            raise ValueError("invalid resident weight row range")
+
+    @property
+    def logical_rows(self) -> int:
+        return self.rows if self.row_count is None else self.row_count
+
+    @property
+    def elements(self) -> int:
+        return self.rows * self.columns
+
+    @property
+    def nbytes(self) -> int:
+        return resident_bytes(self.representation, self.elements)
+
+
+@dataclass(frozen=True)
+class CanonicalLayout:
+    """Byte offsets in one canonical allocation.
+
+    Hierarchical fields repeat once per supergroup. Direct fields are planes
+    spanning the complete allocation. Offsets are relative to a tile for the
+    former and absolute for the latter.
+    """
+
+    elements: int
+    tile_elements: int
+    tile_bytes: int
     low: int
+    high: int | None
     scales: int
     biases: int | None
-    high: int | None
-    words: int
+    super_scale: int | None
+    super_bias: int | None
+    nbytes: int
+    hierarchical: bool
 
 
-def plane_offsets(representation: PlanarAffine, elements: int) -> PlaneOffsets:
+def _bytes(bits: int) -> int:
+    if bits < 0 or bits % 8:
+        raise ValueError("canonical fields must occupy whole bytes")
+    return bits // 8
+
+
+def canonical_layout(representation: Affine | Codebook, elements: int) -> CanonicalLayout:
     if elements <= 0 or elements % representation.group:
-        raise ValueError("planar affine storage requires complete groups")
-    groups = elements // representation.group
-    coefficient_words = groups * representation.coefficient_dtype.itemsize // 4
-    if groups * representation.coefficient_dtype.itemsize % 4:
-        raise ValueError("affine coefficient planes must fill whole words")
+        raise ValueError("quantized storage requires complete groups")
+    coefficients = representation.coefficients
+    code_bits = (
+        representation.code.low_bits
+        if isinstance(representation, Affine)
+        else representation.code_bits
+    )
+    high_bits = representation.code.high_bits if isinstance(representation, Affine) else 0
+
+    if isinstance(coefficients, DirectCoefficients):
+        groups = elements // representation.group
+        low = 0
+        high = _bytes(elements * code_bits) if high_bits else None
+        scales = _bytes(elements * (code_bits + high_bits))
+        biases = (
+            scales + groups * coefficients.scale_dtype.itemsize if coefficients.has_bias else None
+        )
+        end = scales + groups * coefficients.scale_dtype.itemsize
+        if coefficients.bias_dtype is not None:
+            end += groups * coefficients.bias_dtype.itemsize
+        return CanonicalLayout(
+            elements, elements, end, low, high, scales, biases, None, None, end, False
+        )
+
+    tile_elements = coefficients.supergroup
+    if elements % tile_elements:
+        raise ValueError("hierarchical storage requires complete supergroups")
+    groups = tile_elements // representation.group
     low = 0
-    scales = elements * representation.bits // 32
-    biases = scales + coefficient_words if representation.has_bias else None
-    end = scales + coefficient_words * (2 if representation.has_bias else 1)
-    high = end if representation.high_bits else None
-    if representation.high_bits:
-        end += elements * representation.high_bits // 32
-    return PlaneOffsets(low=low, scales=scales, biases=biases, high=high, words=end)
+    high = _bytes(tile_elements * code_bits) if high_bits else None
+    scales = _bytes(tile_elements * (code_bits + high_bits))
+    local_scale_bytes = _bytes(groups * coefficients.local_scale_bits)
+    biases = scales + local_scale_bytes if coefficients.has_bias else None
+    end = scales + local_scale_bytes
+    if coefficients.local_bias_bits is not None:
+        end += _bytes(groups * coefficients.local_bias_bits)
+    super_scale = end
+    end += coefficients.super_scale_dtype.itemsize
+    super_bias = end if coefficients.super_bias_dtype is not None else None
+    if coefficients.super_bias_dtype is not None:
+        end += coefficients.super_bias_dtype.itemsize
+    tiles = elements // tile_elements
+    return CanonicalLayout(
+        elements,
+        tile_elements,
+        end,
+        low,
+        high,
+        scales,
+        biases,
+        super_scale,
+        super_bias,
+        tiles * end,
+        True,
+    )
 
 
 def resident_bytes(representation: Representation, elements: int) -> int:
-    if isinstance(representation, PlanarAffine):
-        return plane_offsets(representation, elements).words * 4
     if isinstance(representation, Dense):
         return elements * representation.dtype.itemsize
-    if not isinstance(representation, (EncodedBlocks, HierarchicalAffine)):
-        raise TypeError("unknown resident weight representation")
-    if elements % representation.block_elements:
-        raise ValueError("blocked storage requires complete container blocks")
-    return elements // representation.block_elements * representation.block_bytes
+    return canonical_layout(representation, elements).nbytes

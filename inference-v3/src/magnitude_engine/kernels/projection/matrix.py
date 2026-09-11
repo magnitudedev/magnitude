@@ -4,16 +4,20 @@ import tilelang.language as T
 
 from magnitude_engine.kernels.capabilities import Capability
 from magnitude_engine.kernels.projection.decode import interpretation
-from magnitude_engine.kernels.projection.layout import output_index, widths_and_outputs
+from magnitude_engine.kernels.projection.layout import (
+    output_index,
+    weight_index,
+    widths_and_outputs,
+)
 from magnitude_engine.platform.execution import DType
-from magnitude_engine.weights.representation import Representation, resident_bytes
+from magnitude_engine.weights.representation import WeightLayout
 
 
 def projection(
     rows: int,
     widths: int | tuple[int, ...],
     inputs: int,
-    representation: Representation,
+    layout: WeightLayout,
     *,
     capability: Capability,
     row_tile: int = 64,
@@ -32,8 +36,11 @@ def projection(
         raise ValueError("matrix projection geometry must be positive")
     if any(n % 8 for n in (row_tile, output_tile, reduction_tile)):
         raise ValueError("invalid encoded matrix tile")
-    parameters, payload = interpretation(representation, outputs * inputs)
-    size = resident_bytes(representation, outputs * inputs) // 2
+    if outputs != layout.logical_rows or inputs != layout.columns or layout.nbytes % 2:
+        raise ValueError("matrix projection and resident layout differ")
+    at = weight_index(layout)
+    parameters, payload = interpretation(layout.representation, layout.elements)
+    size = layout.nbytes // 2
     blocks_per_partition = (inputs + reduction_tile * partitions - 1) // (
         reduction_tile * partitions
     )
@@ -68,7 +75,7 @@ def projection(
                     j, k0 = index // reduction_tile, index % reduction_tile
                     if j < output_tile:
                         if bx * output_tile + j < outputs and block * reduction_tile + k0 < inputs:
-                            first = (bx * output_tile + j) * inputs + block * reduction_tile + k0
+                            first = at(bx * output_tile + j, block * reduction_tile + k0)
                             scale, bias = parameters(B, first)
                             for offset in T.unroll(8, explicit=True):
                                 # Publish once. A clear followed by an overwrite

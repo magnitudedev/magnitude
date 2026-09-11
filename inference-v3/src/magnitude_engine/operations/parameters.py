@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 from contextlib import ExitStack
 
 from magnitude_engine.platform.execution import DType, Prepared, Tensor, TensorSpec
-from magnitude_engine.weights.representation import Dense
+from magnitude_engine.weights.representation import Dense, WeightLayout
 from magnitude_engine.weights.residency import ResidentWeight
 
 
@@ -49,7 +49,7 @@ class ResidentParameter(Parameter):
             1,
             1,
             count,
-            weight.representation,
+            WeightLayout(weight.representation, 1, count),
             capability=self.context.capability,
         )
         with ExitStack() as cleanup:

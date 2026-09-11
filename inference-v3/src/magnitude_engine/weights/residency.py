@@ -17,27 +17,31 @@ from magnitude_engine.platform.execution import (
     DeviceContext,
     DType,
     Prepared,
+    SubmissionError,
     Tensor,
     TensorSpec,
+    Ticket,
 )
 from magnitude_engine.weights.binding import resident_representation
 from magnitude_engine.weights.descriptor import (
     Stored,
     StoredAffinePlanes,
-    StoredBlocks,
     StoredDense,
+    StoredQuantized,
     WeightDescriptor,
     WeightTransform,
 )
 from magnitude_engine.weights.identity import ArtifactIdentity
 from magnitude_engine.weights.representation import (
-    EncodedBlocks,
-    HierarchicalAffine,
-    PlanarAffine,
+    Affine,
+    Codebook,
     Representation,
-    plane_offsets,
+    WeightLayout,
+    canonical_layout,
     resident_bytes,
 )
+
+IMPORT_CHUNK_BYTES = 8 * 1024**2
 
 
 class WeightFormat(Protocol):
@@ -55,59 +59,36 @@ class ResidentWeight:
         descriptor: WeightDescriptor,
         representation: Representation,
         storage: Tensor,
-        stored: Stored,
         *,
-        elements: int | None = None,
+        full_rows: int | None = None,
         row_offset: int = 0,
         rows: int | None = None,
     ):
         self.descriptor = descriptor
         self.representation = representation
-        self.stored = stored
-        """What the container held. Retained so an independent reader can check
-        this weight against its source without reopening the container."""
         self._storage = storage
-        self._elements = math.prod(descriptor.shape) if elements is None else elements
-        self._row_offset, self._rows = row_offset, rows
-        self.nbytes = (
-            storage.spec.nbytes
-            if rows is None
-            else resident_bytes(representation, rows * descriptor.shape[-1])
+        matrix = len(descriptor.shape) > 1
+        logical_rows = (descriptor.shape[0] if matrix else 1) if rows is None else rows
+        backing_rows = logical_rows if full_rows is None else full_rows
+        columns = descriptor.shape[-1] if matrix else descriptor.shape[0]
+        self.layout = WeightLayout(
+            representation,
+            backing_rows,
+            columns,
+            first_row=row_offset,
+            row_count=logical_rows,
         )
+        self.nbytes = resident_bytes(representation, logical_rows * columns)
 
     @property
     def context(self) -> DeviceContext:
         return self._storage.context
 
     def acquire(self, specs: tuple[TensorSpec, ...]) -> tuple[Tensor, ...]:
-        """Views of this weight's storage matching a schedule's weight operands."""
-        if len(specs) == 1:
-            if specs[0].nbytes != self.nbytes:
-                raise ValueError("consumer representation differs from resident weight size")
-            start = 0
-            if self._rows is not None and isinstance(
-                self.representation, (EncodedBlocks, HierarchicalAffine)
-            ):
-                start = resident_bytes(
-                    self.representation, self._row_offset * self.descriptor.shape[-1]
-                )
-            return (self._storage.view(specs[0], start),)
-        representation = self.representation
-        if not isinstance(representation, PlanarAffine) or len(specs) != 3:
-            raise ValueError("only planar affine weights bind separate plane operands")
-        offsets = plane_offsets(representation, self._elements)
-        assert offsets.biases is not None
-        starts = (offsets.low * 4, offsets.scales * 4, offsets.biases * 4)
-        views: list[Tensor] = []
-        try:
-            for spec, start in zip(specs, starts, strict=True):
-                stride = spec.nbytes // spec.shape[0]
-                views.append(self._storage.view(spec, start + self._row_offset * stride))
-            return tuple(views)
-        except BaseException:
-            for view in views:
-                view.close()
-            raise
+        """The one backing operand read through this weight's logical layout."""
+        if len(specs) != 1 or specs[0].nbytes != self._storage.spec.nbytes:
+            raise ValueError("a resident weight binds exactly one complete backing allocation")
+        return (self._storage.view(specs[0]),)
 
     def single(self, spec: TensorSpec) -> Tensor:
         return self.acquire((spec,))[0]
@@ -125,6 +106,10 @@ class ResidentGroup:
     @property
     def representation(self) -> Representation:
         return self.packed.representation
+
+    @property
+    def layout(self) -> WeightLayout:
+        return self.packed.layout
 
     @property
     def context(self) -> DeviceContext:
@@ -166,7 +151,7 @@ class Weights:
         elements = math.prod(descriptor.shape)
         representation = resident_representation(stored, descriptor.shape, self.capability)
         storage = self._materialize(descriptor, stored, representation, elements)
-        weight = ResidentWeight(descriptor, representation, storage, stored, elements=elements)
+        weight = ResidentWeight(descriptor, representation, storage)
         self._cleanup.callback(weight.close)
         self._resident[descriptor.name] = weight
         return weight
@@ -193,29 +178,28 @@ class Weights:
         if all(isinstance(entry, StoredAffinePlanes) for entry in stored):
             affine = tuple(entry for entry in stored if isinstance(entry, StoredAffinePlanes))
             representation = resident_representation(affine[0], packed.shape, self.capability)
-            assert isinstance(representation, PlanarAffine)
+            assert isinstance(representation, Affine)
             storage = self._affine_planes(affine, representation, elements, widths, inputs)
-        elif all(isinstance(entry, StoredBlocks) for entry in stored):
-            blocks = tuple(entry for entry in stored if isinstance(entry, StoredBlocks))
-            if len({entry.layout for entry in blocks}) != 1 or any(
+        elif all(isinstance(entry, StoredQuantized) for entry in stored):
+            quantized = tuple(entry for entry in stored if isinstance(entry, StoredQuantized))
+            if len({entry.representation for entry in quantized}) != 1 or any(
                 descriptor.transform != WeightTransform.IDENTITY for descriptor in descriptors
             ):
                 return None
-            representation = resident_representation(blocks[0], packed.shape, self.capability)
-            assert isinstance(representation, (EncodedBlocks, HierarchicalAffine))
-            storage = self._block_rows(blocks, representation, widths, inputs)
+            representation = resident_representation(quantized[0], packed.shape, self.capability)
+            assert isinstance(representation, (Affine, Codebook))
+            storage = self._quantized_rows(quantized, representation, widths, inputs)
         else:
             return None
-        weight = ResidentWeight(packed, representation, storage, stored[0], elements=elements)
+        weight = ResidentWeight(packed, representation, storage)
         self._cleanup.callback(weight.close)
         start = 0
-        for descriptor, width, entry in zip(descriptors, widths, stored, strict=True):
+        for descriptor, width in zip(descriptors, widths, strict=True):
             self._resident[descriptor.name] = ResidentWeight(
                 descriptor,
                 representation,
                 storage,
-                entry,
-                elements=elements,
+                full_rows=sum(widths),
                 row_offset=start,
                 rows=width,
             )
@@ -226,22 +210,34 @@ class Weights:
 
     # ------------------------------------------------------------ materializing
 
-    def _block_rows(
+    def _quantized_rows(
         self,
-        stored: tuple[StoredBlocks, ...],
-        representation: EncodedBlocks | HierarchicalAffine,
+        stored: tuple[StoredQuantized, ...],
+        representation: Affine | Codebook,
         widths: tuple[int, ...],
         inputs: int,
     ) -> Tensor:
-        """Concatenate compatible row-major compact weights without changing their layout."""
-        from magnitude_engine.platform.storage import ConcatenatedSource
-
-        pieces = []
-        for entry, width in zip(stored, widths, strict=True):
-            nbytes = resident_bytes(representation, width * inputs)
-            pieces.append((entry.source, entry.offset, nbytes))
-        source = ConcatenatedSource(tuple(pieces))
-        return self.context.upload_source(TensorSpec((source.size,), DType.U8), source, 0)
+        """Import each source directly into its final canonical row range."""
+        elements = sum(widths) * inputs
+        target = self.context.allocate(
+            TensorSpec((resident_bytes(representation, elements),), DType.U8)
+        )
+        try:
+            first_row = 0
+            for entry, width in zip(stored, widths, strict=True):
+                self._relayout(
+                    entry,
+                    target,
+                    representation,
+                    elements,
+                    first_row * inputs,
+                    width * inputs,
+                )
+                first_row += width
+            return target
+        except BaseException:
+            target.close()
+            raise
 
     def _materialize(
         self,
@@ -251,26 +247,95 @@ class Weights:
         elements: int,
     ) -> Tensor:
         if isinstance(stored, StoredAffinePlanes):
-            assert isinstance(representation, PlanarAffine)
+            assert isinstance(representation, Affine)
             return self._affine_planes(
                 (stored,), representation, elements, (descriptor.shape[0],), descriptor.shape[1]
             )
         if isinstance(stored, StoredDense):
             return self._convert(descriptor, stored, elements)
-        assert isinstance(stored, StoredBlocks)
-        nbytes = resident_bytes(representation, elements)
+        assert isinstance(stored, StoredQuantized)
+        assert isinstance(representation, (Affine, Codebook))
         if descriptor.transform != WeightTransform.IDENTITY:
-            raise ValueError("a container's blocked weights carry no declared transform")
-        return self.context.upload_source(
-            TensorSpec((nbytes,), DType.U8), stored.source, stored.offset
+            raise ValueError("a container's quantized weights carry no declared transform")
+        return self._quantized_rows(
+            (stored,), representation, (descriptor.shape[0],), descriptor.shape[-1]
         )
+
+    def _relayout(
+        self,
+        stored: StoredQuantized,
+        target: Tensor,
+        representation: Affine | Codebook,
+        total_elements: int,
+        target_element: int,
+        source_elements: int,
+    ) -> None:
+        """Transform bounded source chunks directly into canonical residency."""
+        from magnitude_engine.kernels.copy.relayout import relayout
+
+        codec = stored.codec
+        if source_elements % codec.block_elements or target_element % codec.block_elements:
+            raise ValueError("quantized rows must contain complete source blocks")
+        total_tiles = source_elements // codec.block_elements
+        staged_tiles = min(total_tiles, max(1, IMPORT_CHUNK_BYTES // codec.block_bytes))
+        stage_bytes = staged_tiles * codec.block_bytes
+        kernel = self.context.specialize(
+            relayout,
+            total_elements,
+            representation,
+            codec,
+            staged_tiles,
+            capability=self.capability,
+        )
+        pending: list[Ticket] = []
+        try:
+            for first in range(0, total_tiles, staged_tiles):
+                # Bound staging to two slots. Retiring the older slot leaves the
+                # immediately preceding kernel running while this source read occurs.
+                if len(pending) == 2:
+                    pending.pop(0).wait()
+                valid = min(staged_tiles, total_tiles - first)
+                source_offset = stored.offset + first * codec.block_bytes
+                content = stored.source.read(source_offset, valid * codec.block_bytes)
+                if len(content) != valid * codec.block_bytes:
+                    raise ValueError("artifact source returned a short quantized read")
+                content += bytes(stage_bytes - len(content))
+                with ExitStack() as cleanup:
+                    stage = self.context.upload(kernel.signature[0], content)
+                    cleanup.callback(stage.close)
+                    extent = self.context.indices(
+                        (valid, target_element // codec.block_elements + first)
+                    )
+                    cleanup.callback(extent.close)
+                    command = Prepared(self.context, kernel, (stage, target, extent))
+                    cleanup.callback(command.close)
+                    try:
+                        pending.append(self.context.submit((command,)))
+                    except SubmissionError as error:
+                        pending.append(error.ticket)
+                        raise
+            for ticket in pending:
+                ticket.wait()
+        except BaseException as primary:
+            cleanup_errors: list[BaseException] = []
+            for ticket in pending:
+                if not ticket.done:
+                    try:
+                        ticket.wait()
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+            if cleanup_errors:
+                raise BaseExceptionGroup(
+                    "quantized import and in-flight cleanup failed", (primary, *cleanup_errors)
+                ) from primary
+            raise
 
     def _convert(self, descriptor: WeightDescriptor, stored: StoredDense, elements: int) -> Tensor:
         """Widen a stored floating parameter and apply its declared transform."""
         from magnitude_engine.kernels.copy.convert import convert
 
-        if stored.dtype not in (DType.BF16, DType.F32):
-            raise ValueError("a stored floating parameter must be BF16 or F32")
+        if stored.dtype not in (DType.F16, DType.BF16, DType.F32):
+            raise ValueError("a stored floating parameter must be F16, BF16 or F32")
         if stored.dtype == DType.F32 and descriptor.transform == WeightTransform.IDENTITY:
             return self.context.upload_source(
                 TensorSpec((elements,), DType.F32), stored.source, stored.offset
@@ -296,7 +361,7 @@ class Weights:
     def _affine_planes(
         self,
         stored: tuple[StoredAffinePlanes, ...],
-        representation: PlanarAffine,
+        representation: Affine,
         elements: int,
         widths: tuple[int, ...],
         inputs: int,
@@ -304,23 +369,23 @@ class Weights:
         """Place every stored plane into the one allocation its readers address."""
         from magnitude_engine.platform.storage import ConcatenatedSource
 
-        offsets = plane_offsets(representation, elements)
-        assert offsets.biases is not None
-        nbytes = offsets.words * 4
+        layout = canonical_layout(representation, elements)
+        assert layout.biases is not None
+        nbytes = layout.nbytes
         rows = sum(widths)
         plan = (
-            (offsets.low * 4, tuple(entry.codes for entry in stored), inputs // 8, DType.U32),
+            (layout.low, tuple(entry.codes for entry in stored), inputs // 8, DType.U32),
             (
-                offsets.scales * 4,
+                layout.scales,
                 tuple(entry.scales for entry in stored),
                 inputs // representation.group,
-                representation.coefficient_dtype,
+                stored[0].scales.dtype,
             ),
             (
-                offsets.biases * 4,
+                layout.biases,
                 tuple(entry.biases for entry in stored),
                 inputs // representation.group,
-                representation.coefficient_dtype,
+                stored[0].biases.dtype,
             ),
         )
         with ExitStack() as cleanup:

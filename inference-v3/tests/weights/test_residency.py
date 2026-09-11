@@ -10,11 +10,17 @@ import pytest
 from magnitude_engine.kernels.precision import NATIVE_BF16, REFERENCE_F32
 from magnitude_engine.operations.parameters import ResidentParameter
 from magnitude_engine.platform.backend import Backend
-from magnitude_engine.platform.execution import DType, TensorSpec
+from magnitude_engine.platform.execution import DType, TensorSpec, Ticket
 from magnitude_engine.platform.host.machine import open_context
-from magnitude_engine.weights.descriptor import WeightDescriptor
-from magnitude_engine.weights.formats.gguf import Encoding, GGUFFormat
-from magnitude_engine.weights.representation import HierarchicalAffine, resident_bytes
+from magnitude_engine.weights.descriptor import StoredQuantized, WeightDescriptor
+from magnitude_engine.weights.formats.gguf import Encoding, GGUFFormat, quantization
+from magnitude_engine.weights.identity import ArtifactIdentity
+from magnitude_engine.weights.representation import (
+    Affine,
+    HierarchicalCoefficients,
+    resident_bytes,
+)
+from magnitude_engine.weights.residency import Weights
 from performance.precision import decode, encode, rounded
 from tests.kernels.test_encoded import packed
 from tests.support import bind
@@ -39,6 +45,55 @@ def write_many(path, tensors, encoding):
     writer.close()
 
 
+def test_chunked_import_failure_does_not_publish_partial_residency(monkeypatch):
+    from magnitude_engine.weights import residency as residency_module
+
+    raw = packed(Encoding.Q4_K, 4, 512)
+    events = []
+
+    original_wait = Ticket.wait
+
+    def tracked_wait(ticket):
+        events.append("wait")
+        return original_wait(ticket)
+
+    monkeypatch.setattr(Ticket, "wait", tracked_wait)
+
+    class FailingSource:
+        size = raw.nbytes
+        reads = 0
+
+        def read(self, offset, length):
+            events.append("read")
+            self.reads += 1
+            if self.reads == 2:
+                raise OSError("deliberate source failure")
+            return raw.tobytes()[offset : offset + length]
+
+    class Format:
+        identity = ArtifactIdentity("failing-import")
+        source = FailingSource()
+
+        def stored(self, descriptor):
+            representation, codec = quantization(Encoding.Q4_K)
+            return StoredQuantized(representation, codec, self.source, 0)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(residency_module, "IMPORT_CHUNK_BYTES", 2 * Encoding.Q4_K.block_bytes)
+    context = open_context(Backend.LLVM, 1024**2, 0)
+    weights = Weights(Format(), context)
+    with pytest.raises(OSError, match="deliberate source failure"):
+        weights.resident(WeightDescriptor(name="weight", shape=(4, 512)))
+    assert weights.existing(WeightDescriptor(name="weight", shape=(4, 512))) is None
+    assert context.allocated_bytes == 0
+    assert events[:2] == ["read", "read"]
+    assert "wait" in events[2:]
+    weights.close()
+    context.close()
+
+
 @pytest.mark.device
 @pytest.mark.parametrize("encoding", (Encoding.Q4_K, Encoding.Q5_K, Encoding.Q6_K))
 @pytest.mark.parametrize("dtype", (DType.F32, DType.BF16))
@@ -57,7 +112,8 @@ def test_compact_hierarchy_serves_every_consumer_and_survives_retirement(tmp_pat
         cleanup.callback(binding.close)
         descriptor = WeightDescriptor(name="weight", shape=(n, k))
         resident = binding.weights.resident(descriptor)
-        assert isinstance(resident.representation, HierarchicalAffine)
+        assert isinstance(resident.representation, Affine)
+        assert isinstance(resident.representation.coefficients, HierarchicalCoefficients)
         assert (
             context.allocated_bytes
             == resident.nbytes
@@ -125,7 +181,8 @@ def test_blocked_representation_when_a_row_cannot_fill_a_fold(tmp_path):
         binding = bind(artifact, context, REFERENCE_F32)
         cleanup.callback(binding.close)
         resident = binding.weights.resident(WeightDescriptor(name="weight", shape=(n, k)))
-        assert isinstance(resident.representation, HierarchicalAffine)
+        assert isinstance(resident.representation, Affine)
+        assert isinstance(resident.representation.coefficients, HierarchicalCoefficients)
         assert resident.nbytes == raw.nbytes
 
 
@@ -149,19 +206,20 @@ def test_compact_hierarchies_group_by_rows_without_changing_bytes(tmp_path):
         )
         group = binding.weights.group(descriptors)
         assert group is not None
-        assert isinstance(group.representation, HierarchicalAffine)
+        assert isinstance(group.representation, Affine)
+        assert isinstance(group.representation.coefficients, HierarchicalCoefficients)
         assert context.allocated_bytes == gate.nbytes + up.nbytes
         operation = binding.operations.gated_linear(*descriptors)
         assert operation.plan(1, DType.BF16, DType.BF16).candidate == (
             "gated.hierarchical_fused_vector"
         )
-        for start, descriptor, expected in zip(
-            (0, gate.nbytes), descriptors, (gate, up), strict=True
-        ):
+        for first_row, descriptor in zip((0, n), descriptors, strict=True):
             resident = binding.weights.existing(descriptor)
             assert resident is not None
-            view = resident.acquire((TensorSpec((expected.nbytes,), DType.U8),))[0]
+            assert resident.layout.first_row == first_row
+            assert resident.layout.logical_rows == n
+            view = resident.acquire((TensorSpec((gate.nbytes + up.nbytes,), DType.U8),))[0]
             try:
-                assert view.offset == start
+                assert view.offset == 0
             finally:
                 view.close()

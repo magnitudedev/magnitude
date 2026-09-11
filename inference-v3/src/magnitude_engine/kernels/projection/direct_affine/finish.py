@@ -1,4 +1,4 @@
-"""Reconcile the partial sums a partitioned affine contraction produced."""
+"""Reconcile the partial sums a partitioned direct-affine contraction produced."""
 
 import tilelang.language as T
 

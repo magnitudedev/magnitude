@@ -1,71 +1,99 @@
 # Weights
 
-**A container is forgotten at residency. Kernels read representations; one owner
-holds every resident weight; the layout decision is made once, from the stored
-layout, the shape and the endpoint.**
+**A container is forgotten at residency. Every execution kernel reads an
+engine-defined layout whose parameters express numerical meaning, not a source
+format or packing name.**
 
 ## From container to kernel
 
 ```text
-container ──► stored weight ──► decision ──► resident representation ──► views ──► commands
-  format        blocks, dense,    stored ×       dense / blocked /        every         retain the
-  parses and    affine planes     shape ×        planar affine             consumer      allocation
-  validates                       capability                               shares one    past the owner
+container ──► stored weight ──► residency ──► resident weight ──► command
+ parser          source spans      bounded       representation      retains the
+ and codec       and codec         import        layout + rows       allocation
 ```
 
 | Stage | Owns | Never knows |
 |---|---|---|
-| Format | Parsing, validation, content identity, what is stored for a role | Devices, layouts kernels want |
-| Decision | Which resident layout a stored layout becomes here | Which model asked, which operation will read |
-| Residency | Upload, repack, conversion, the one allocation, views, groups | Container identity |
-| Kernel | Reading one representation | Where it came from |
+| Format | Parsing, validation, artifact identity, wire geometry, source codec | Execution schedules |
+| Residency | Representation choice, bounded relayout or conversion, one allocation | Model semantics |
+| Resident weight | Numerical representation, canonical layout, backing extent, logical rows | Source codec or container metadata |
+| Kernel | Canonical addresses and numerical interpretation | Where bytes came from |
 
-## Representations
+## Numerical representations
 
-A representation is parameters, not a name. Two containers that yield the same
-parameters share every kernel that reads them.
+A representation is a parameter value. Containers with equal parameters share
+the same readers and schedules.
 
-| Representation | Parameters | Read cost | Bits per value |
-|---|---|---|---|
-| Dense | dtype | none | the dtype |
-| Encoded blocks | codec and block geometry | codec-specific decode | the declared block geometry |
-| Planar affine | bits, high bits, group, coefficient width, sign, bias | word loads of one plane set; one affine correction per group | bits + coefficient bits over the group |
-| Hierarchical affine | code bits, group and supergroup geometry, local coefficient width, sign, bias, packing | packed code dot; local coefficients interpreted in registers; one correction per group | the compact block geometry |
-
-Planar affine storage is one allocation with a fixed plane order, and the offsets
-of those planes have one definition shared by the kernel that writes them, the
-upload that places a container's planes at the same offsets, and every kernel
-that reads them. Hierarchical affine storage preserves compact local and superblock
-coefficients; its packing is part of the execution representation, not the name of
-the container that supplied it.
-
-## The decision
-
-| Stored | Becomes | Because |
+| Meaning | Parameters | Examples |
 |---|---|---|
-| Affine planes | Planar affine, coefficients as stored | The container already is the resident layout |
-| Hierarchical affine blocks | Hierarchical affine, coefficients as stored | Decode applies compact local and superblock coefficients inside the contraction; no persistent expansion is paid on every token |
-| Other encoded blocks | Encoded blocks | The codec is an execution fact even when no affine hierarchy describes it |
-| Dense floats | Dense FP32 | Parameters are read by every layer in FP32; the declared transform is applied here, once |
+| Dense | dtype | resident FP32 parameters |
+| Affine | code planes and interpretation, group, coefficient scheme | MLX Q4, Q4_K, Q5_K, Q6_K, Q8_0 |
+| Codebook | code width and table, group, coefficient scheme | IQ4_XS |
 
-The decision reads capability, never a backend. A resident weight records its
-representation, and run records report it, so a layout change is visible as such.
+Codes distinguish unsigned, offset-binary, and two's-complement
+interpretations. Coefficients are either direct floating scale/bias values or a
+compact local/supergroup hierarchy. Bias presence and sign belong to the
+coefficient scheme; they are not independent packing flags.
 
-## Ownership
+Codebook is a separate representation because table lookup changes numerical
+meaning. Its immutable table is folded into a specialization and consumes no
+resident bytes.
+
+## Canonical layout
+
+`canonical_layout` is the only authority for field offsets and allocation
+size. Hierarchical tiles contain, in order:
+
+```text
+low codes · high codes · local scales · local biases · super scale · super bias
+```
+
+Absent fields consume no space. Codes and local coefficients are bit-contiguous
+and little-endian within their fields. A direct affine matrix uses the same
+order as matrix-wide planes, which lets MLX codes, scales, and biases copy
+directly into their final ranges.
+
+Canonical relayout is a permutation, not dequantization. It cannot widen codes
+or coefficients, add per-tile padding, precompute products, or create a second
+resident copy. Current compact sizes therefore remain 36 bytes per 64 MLX Q4
+values and 144/176/210/34/136 bytes for Q4_K/Q5_K/Q6_K/Q8_0/IQ4_XS blocks.
+
+## Import
+
+A quantized format supplies one stable source codec per wire encoding. The
+codec declares source tile geometry and reads logical codes and coefficients.
+Residency specializes one generic relayout writer with that codec, processes
+complete tiles through bounded two-slot staging, and writes directly into the
+final canonical allocation. Reading and uploading the next slot overlaps the
+preceding relayout submission. Codec and wire-enum knowledge never enter
+inference. The codec boundary is typed as trace buffers and scalar expressions;
+it does not expose schedules or an untyped kernel API.
+
+Dense conversion is separate. Stored F16 and BF16 values widen to resident
+FP32, with any declared transform applied once. MLX affine planes already have
+canonical logical order and are copied without a relayout kernel.
+
+A failed import closes the unpublished target and all staging. A successful
+import publishes only the final allocation.
+
+## Ownership and grouping
 
 | Rule | Reason |
 |---|---|
-| One allocation per weight or compatible row-concatenated group | Every consumer views the same bytes; there is no second copy to keep coherent |
-| A group is declared before any member is asked for alone | Grouping after individual residency would mean a copy; declared first, a member is a row-offset view |
-| Commands retain the allocation | The container and the owner may retire while work that reads the weight is still submitted |
-| Residency checks the artifact identity the description came from | A description and a container from different artifacts fail at binding, never as wrong numbers |
-| Tokenizer metadata never reaches residency | It travels in the same files but is an input concern |
+| One allocation per weight or compatible row-concatenated group | Every consumer sees the same bytes |
+| A group is declared before any member becomes resident | Grouping later would require a copy |
+| A group member carries a logical row range over the complete layout | Canonical fields need not form one byte-contiguous member slice |
+| Every kernel binds the complete allocation once | No format-specific multi-plane binding contract leaks upward |
+| Commands retain allocation views | Sources and residency owners may retire after submission |
+
+Grouping preserves bytes exactly. Quantized members must have equal numerical
+representations and complete source tiles per row; declared transforms prevent
+grouping.
 
 ## Extension
 
-A format brings a parser that yields stored weights and, per model, a mapping
-from its names to the model's roles. Wire type numbers and recipe labels stop at
-that parser. If its stored layout is one a representation already covers, no
-kernel changes. A representation is new only when no parameterization of an
-existing one describes its numerical meaning and physical bytes, and it brings
-the kernels that read it.
+A new container implements parsing and source codecs. If its values match an
+existing representation, it needs no inference change. A representation is new
+only when its numerical meaning cannot be expressed by `Dense`, `Affine`, or
+`Codebook`; a new source packing alone never creates a representation or fast
+path.
