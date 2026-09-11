@@ -10,13 +10,14 @@ import math
 import tilelang.language as T
 
 from magnitude_engine.kernels.projection.decode import decoder
+from magnitude_engine.kernels.projection.layout import output_index, widths_and_outputs
 from magnitude_engine.platform.execution import DType
 from magnitude_engine.weights.representation import Representation, resident_bytes
 
 
 def projection(
     rows: int,
-    outputs: int,
+    widths: int | tuple[int, ...],
     inputs: int,
     representation: Representation,
     *,
@@ -31,7 +32,9 @@ def projection(
     Prefill matrix-tiled candidates will share the decoder and operation contract.
     Reduction lanes and output tile are candidate parameters, not device facts.
     """
-    if min(rows, outputs, inputs, output_tile, reduction_lanes, row_tile) <= 0:
+    logical_widths, outputs = widths_and_outputs(widths)
+    output_at = output_index(rows, logical_widths)
+    if min(rows, inputs, output_tile, reduction_lanes, row_tile) <= 0:
         raise ValueError("projection extents and tile sizes must be positive")
     if reduction_lanes & (reduction_lanes - 1):
         raise ValueError("reduction lane count must be a power of two")
@@ -73,6 +76,8 @@ def projection(
             for r, i in T.Parallel(row_tile, output_tile):
                 row = row_group * row_tile + r
                 if block * output_tile + i < outputs and row < rows:
-                    C[row, block * output_tile + i] = shared[r, i, 0]
+                    out = block * output_tile + i
+                    index = output_at(row, out)
+                    C[index // outputs, index % outputs] = shared[r, i, 0]
 
     return main

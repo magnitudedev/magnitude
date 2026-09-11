@@ -49,11 +49,22 @@ def _reachable(value: object, seen: set[int]):
         for item in value.values():
             yield from _reachable(item, seen)
         return
-    attributes = getattr(value, "__dict__", None)
+    try:
+        attributes = getattr(value, "__dict__", None)
+    except (AttributeError, RuntimeError, TypeError):
+        # Compiled runtime handles are deliberately opaque and some reject
+        # Python state introspection instead of returning no ``__dict__``.
+        return
     if attributes is None:
         return
     yield value
     for name, item in tuple(attributes.items()):
-        if name.startswith("__") or name in ("context", "driver", "weights", "format"):
+        if name.startswith("__") or name in (
+            "context",
+            "driver",
+            "weights",
+            "format",
+            "_plans",
+        ):
             continue
         yield from _reachable(item, seen)

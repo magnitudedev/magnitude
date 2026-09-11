@@ -5,10 +5,8 @@ import tilelang.language as T
 from magnitude_engine.kernels.capabilities import Capability
 from magnitude_engine.kernels.launch import serial
 from magnitude_engine.kernels.projection.decode import decoder
-from magnitude_engine.kernels.projection.planar_affine.layout import (
-    check,
-    output_index,
-)
+from magnitude_engine.kernels.projection.layout import output_index, widths_and_outputs
+from magnitude_engine.kernels.projection.planar_affine.layout import check
 from magnitude_engine.platform.execution import DType
 from magnitude_engine.weights.representation import (
     PlanarAffine,
@@ -19,7 +17,7 @@ from magnitude_engine.weights.representation import (
 
 def projection(
     rows: int,
-    outputs: int,
+    widths: int | tuple[int, ...],
     inputs: int,
     representation: Representation,
     *,
@@ -28,8 +26,10 @@ def projection(
     output_dtype: DType = DType.F32,
 ):
     """The same contraction where the endpoint has no threadgroups."""
-    if min(rows, outputs, inputs, row_tile) <= 0:
+    logical_widths, outputs = widths_and_outputs(widths)
+    if min(rows, inputs, row_tile) <= 0:
         raise ValueError("invalid encoded projection geometry")
+    output_at = output_index(rows, logical_widths)
     decode = decoder(representation, outputs * inputs)
     size = resident_bytes(representation, outputs * inputs)
 
@@ -52,7 +52,8 @@ def projection(
             for r in T.unroll(row_tile, explicit=True):
                 row = row_group * row_tile + r
                 if row < rows:
-                    C[row, out] = total[r]
+                    index = output_at(row, out)
+                    C[index // outputs, index % outputs] = total[r]
 
     return main
 

@@ -7,18 +7,19 @@ import gguf
 import numpy as np
 import pytest
 
+from magnitude_engine.kernels.precision import NATIVE_BF16
 from magnitude_engine.kernels.projection.serial import projection as projection_cpu
 from magnitude_engine.kernels.projection.threadgroup import projection
 from magnitude_engine.platform.backend import Backend
 from magnitude_engine.platform.execution import DType, Prepared, TensorSpec
 from magnitude_engine.platform.host.machine import open_context
 from magnitude_engine.platform.storage import FileSource
-from magnitude_engine.weights.formats.gguf import Encoding, read_directory
-from magnitude_engine.weights.representation import Blocked
+from magnitude_engine.weights.formats.gguf import Encoding, block_layout, read_directory
+from performance.precision import decode, encode, rounded
 
 
-def packed(encoding: Encoding, outputs: int, inputs: int) -> np.ndarray:
-    rng = np.random.default_rng(284)
+def packed(encoding: Encoding, outputs: int, inputs: int, *, seed: int = 284) -> np.ndarray:
+    rng = np.random.default_rng(seed)
     blocks = outputs * inputs // encoding.block_elements
     data = rng.integers(0, 256, (blocks, encoding.block_bytes), dtype=np.uint8)
     if encoding == Encoding.F32:
@@ -65,13 +66,11 @@ def check_projection(
     # A test that wants one schedule names its factory; the candidate table is
     # exercised separately, by tests/kernels/test_selection.py.
     capability = context.capability
-    representation = Blocked(encoding)
+    representation = block_layout(encoding)
     if matrix:
         from magnitude_engine.kernels.projection.matrix import projection as matrix_projection
 
-        program = matrix_projection(
-            rows, outputs, inputs, representation, capability=capability
-        )
+        program = matrix_projection(rows, outputs, inputs, representation, capability=capability)
     elif subgroup:
         from magnitude_engine.kernels.projection.subgroup import projection as subgroup_projection
 
@@ -161,6 +160,86 @@ def test_metal_packed_k_projection(encoding, row_tile):
     check_projection(
         packed(encoding, 5, 768), encoding, 5, 768, 3, packed_k=True, row_tile=row_tile
     )
+
+
+@pytest.mark.device
+@pytest.mark.parametrize("matrix", [False, True])
+def test_grouped_compact_projection_layout(matrix):
+    if os.environ.get("MAGNITUDE_TEST_BACKEND", "metal") != "metal":
+        pytest.skip("Metal compact projection schedules")
+    from magnitude_engine.kernels.projection.matrix import projection as matrix_projection
+    from magnitude_engine.kernels.projection.packed_k import projection as vector_projection
+
+    encoding = Encoding.Q4_K
+    rows, widths, inputs = (9 if matrix else 3), (5, 7), 512
+    outputs = sum(widths)
+    data = packed(encoding, outputs, inputs)
+    weights = gguf.dequantize(data.reshape(outputs, -1), gguf.GGMLQuantizationType(encoding))
+    values = np.random.default_rng(765).normal(size=(rows, inputs)).astype(np.float32)
+    logical = values.astype(np.float64) @ weights.astype(np.float64).T
+    expected = np.concatenate((logical[:, : widths[0]].ravel(), logical[:, widths[0] :].ravel()))
+    context = open_context(Backend.METAL, data.nbytes + values.nbytes + 2 * 1024**2, 0)
+    a = context.upload(TensorSpec(values.shape, DType.F32), values.tobytes())
+    b = context.upload(TensorSpec((data.size,), DType.U8), data.tobytes())
+    c = context.allocate(TensorSpec((rows, outputs), DType.F32))
+    factory = matrix_projection if matrix else vector_projection
+    kernel = context.compile(
+        factory(rows, widths, inputs, block_layout(encoding), capability=context.capability)
+    )
+    weight_view = b.view(kernel.signature[1])
+    ticket = context.submit((Prepared(context, kernel, (a, weight_view, c)),))
+    weight_view.close()
+    a.close()
+    b.close()
+    actual = np.frombuffer(context.read(c, after=ticket), np.float32)
+    c.close()
+    context.close()
+    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.device
+@pytest.mark.parametrize("encoding", (Encoding.Q4_K, Encoding.Q5_K))
+def test_hierarchical_fused_gate(encoding):
+    if os.environ.get("MAGNITUDE_TEST_BACKEND", "metal") != "metal":
+        pytest.skip("Metal hierarchical fused schedule")
+    from magnitude_engine.kernels.projection.hierarchical_fused import gated_vector
+
+    rows, outputs, inputs = 2, 5, 512
+    gate = packed(encoding, outputs, inputs)
+    up = packed(encoding, outputs, inputs, seed=285)
+    raw = np.concatenate((gate, up))
+    wire = gguf.GGMLQuantizationType(encoding)
+    gate_weights = gguf.dequantize(gate.reshape(outputs, -1), wire)
+    up_weights = gguf.dequantize(up.reshape(outputs, -1), wire)
+    values = rounded(
+        np.random.default_rng(765).normal(0, 0.1, size=(rows, inputs)).astype(np.float32),
+        DType.BF16,
+    )
+    gate_result = rounded(values @ gate_weights.T, DType.BF16)
+    up_result = rounded(values @ up_weights.T, DType.BF16)
+    activated = rounded(gate_result / (1 + np.exp(-gate_result)), DType.BF16)
+    expected = rounded(activated * up_result, DType.BF16)
+    context = open_context(Backend.METAL, raw.nbytes + 2 * 1024**2, 0)
+    a = context.upload(TensorSpec(values.shape, DType.BF16), encode(values, DType.BF16))
+    b = context.upload(TensorSpec((raw.nbytes // 4,), DType.U32), raw.tobytes())
+    c = context.allocate(TensorSpec((rows, outputs), DType.BF16))
+    kernel = context.compile(
+        gated_vector(
+            rows,
+            outputs,
+            inputs,
+            block_layout(encoding),
+            capability=context.capability,
+            precision=NATIVE_BF16,
+        )
+    )
+    ticket = context.submit((Prepared(context, kernel, (a, b, c)),))
+    a.close()
+    b.close()
+    actual = decode(context.read(c, after=ticket), DType.BF16).reshape(rows, outputs)
+    c.close()
+    context.close()
+    np.testing.assert_allclose(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.model

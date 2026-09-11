@@ -1,18 +1,21 @@
-"""Group-wise contractions: payload dot products precede the shared scales.
+"""Group-wise contractions: payload dot products precede shared coefficients.
 
 A subgroup consumes 256 adjacent logical weights per iteration. Each lane owns
 eight coordinates within one quantization group, so it loads that group's scale
-once. Resident storage stays in its container's block layout.
+once. Resident storage stays in its declared compact representation.
 """
 
 import tilelang.language as T
 
 from magnitude_engine.kernels.capabilities import Capability
 from magnitude_engine.kernels.projection.decode import interpretation
+from magnitude_engine.kernels.projection.layout import output_index, widths_and_outputs
 from magnitude_engine.platform.execution import DType
 from magnitude_engine.weights.representation import (
-    Blocked,
-    Encoding,
+    BlockCodec,
+    EncodedBlocks,
+    HierarchicalAffine,
+    HierarchyPacking,
     Representation,
     resident_bytes,
 )
@@ -20,7 +23,7 @@ from magnitude_engine.weights.representation import (
 
 def projection(
     rows,
-    outputs,
+    widths: int | tuple[int, ...],
     inputs,
     representation: Representation,
     *,
@@ -30,13 +33,23 @@ def projection(
     dtype: DType = DType.F32,
     output_dtype: DType = DType.F32,
 ):
+    logical_widths, outputs = widths_and_outputs(widths)
+    output_at = output_index(rows, logical_widths)
     if capability.subgroup_width != 32:
         raise ValueError("the group contraction consumes 256 weights per 32-lane subgroup")
-    encoding = representation.encoding if isinstance(representation, Blocked) else None
-    if encoding not in (Encoding.Q6_K, Encoding.IQ4_XS, Encoding.Q8_0, Encoding.F16):
+    supported = (
+        isinstance(representation, HierarchicalAffine)
+        and representation.packing == HierarchyPacking.SIGNED_SCALE_I8
+    ) or (
+        isinstance(representation, EncodedBlocks)
+        and representation.codec in (BlockCodec.CODEBOOK_I4, BlockCodec.GROUPED_I8, BlockCodec.F16)
+    )
+    if not supported:
         raise ValueError("group contraction requires a supported symmetric or dense encoding")
-    if min(rows, outputs, inputs, row_tile, output_tile) <= 0 or inputs % encoding.block_elements:
+    if min(rows, inputs, row_tile, output_tile) <= 0 or inputs % representation.block_elements:
         raise ValueError("invalid group contraction geometry")
+    if output_tile % 2:
+        raise ValueError("group contraction tiles output rows in pairs")
     parameters, payload = interpretation(representation, outputs * inputs)
     size = resident_bytes(representation, outputs * inputs) // 2
 
@@ -47,33 +60,49 @@ def projection(
         C: T.Tensor((rows, outputs), output_dtype.value),
     ):
         with T.Kernel(
-            T.ceildiv(outputs, output_tile), T.ceildiv(rows, row_tile), threads=32 * output_tile
+            T.ceildiv(outputs, output_tile),
+            T.ceildiv(rows, row_tile),
+            threads=32 * (output_tile // 2),
         ) as (block, row_group):
             tid = T.get_thread_binding()
             lane = tid % 32
-            out = block * output_tile + tid // 32
-            accum = T.alloc_local((row_tile,), "float32")
+            first_out = block * output_tile + (tid // 32) * 2
+            accum = T.alloc_local((row_tile, 2), "float32")
             dot = T.alloc_local((row_tile,), "float32")
+            values = T.alloc_local((row_tile, 8), "float32")
             T.clear(accum)
             for chunk in T.serial(T.ceildiv(inputs, 256)):
                 first = chunk * 256 + lane * 8
-                T.clear(dot)
-                if out < outputs and first < inputs:
-                    scale, _ = parameters(B, out * inputs + first)
+                if first < inputs:
                     for j in T.unroll(8, explicit=True):
                         k = first + j
                         if k < inputs:
-                            code = payload(B, out * inputs + k)
                             for r in T.unroll(row_tile, explicit=True):
                                 row = row_group * row_tile + r
                                 if row < rows:
-                                    dot[r] += A[row, k].astype("float32") * code
-                    for r in T.unroll(row_tile, explicit=True):
-                        accum[r] += dot[r] * scale
+                                    values[r, j] = A[row, k].astype("float32")
+                    for owned in T.unroll(2, explicit=True):
+                        out = first_out + owned
+                        T.clear(dot)
+                        if out < outputs:
+                            scale, _ = parameters(B, out * inputs + first)
+                            for j in T.unroll(8, explicit=True):
+                                k = first + j
+                                if k < inputs:
+                                    code = payload(B, out * inputs + k)
+                                    for r in T.unroll(row_tile, explicit=True):
+                                        row = row_group * row_tile + r
+                                        if row < rows:
+                                            dot[r] += values[r, j] * code
+                            for r in T.unroll(row_tile, explicit=True):
+                                accum[r, owned] += dot[r] * scale
             for r in T.unroll(row_tile, explicit=True):
-                total = T.warp_reduce_sum(accum[r])
-                row = row_group * row_tile + r
-                if lane == 0 and out < outputs and row < rows:
-                    C[row, out] = total
+                for owned in T.unroll(2, explicit=True):
+                    total = T.warp_reduce_sum(accum[r, owned])
+                    row = row_group * row_tile + r
+                    out = first_out + owned
+                    if lane == 0 and out < outputs and row < rows:
+                        index = output_at(row, out)
+                        C[index // outputs, index % outputs] = total
 
     return main

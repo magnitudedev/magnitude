@@ -12,7 +12,8 @@ apply the affine correction once per group.
 import tilelang.language as T
 
 from magnitude_engine.kernels.capabilities import Capability
-from magnitude_engine.kernels.projection.planar_affine.layout import check, output_index
+from magnitude_engine.kernels.projection.layout import output_index
+from magnitude_engine.kernels.projection.planar_affine.layout import check
 from magnitude_engine.platform.execution import DType
 from magnitude_engine.weights.representation import PlanarAffine, plane_offsets
 

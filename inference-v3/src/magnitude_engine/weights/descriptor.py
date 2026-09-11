@@ -10,16 +10,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING
 
 from pydantic import PositiveInt
 
 from magnitude_engine.data import Record
 from magnitude_engine.platform.execution import DType
 from magnitude_engine.platform.storage import ByteSource
-
-if TYPE_CHECKING:
-    from magnitude_engine.weights.formats.gguf import Encoding
+from magnitude_engine.weights.representation import EncodedBlocks, HierarchicalAffine
 
 
 class WeightTransform(StrEnum):
@@ -35,9 +32,9 @@ class WeightDescriptor(Record):
 
 @dataclass(frozen=True)
 class StoredBlocks:
-    """ggml block layout, exactly as the container holds it."""
+    """A neutral block layout, exactly as the container holds it."""
 
-    encoding: Encoding
+    layout: EncodedBlocks | HierarchicalAffine
     source: ByteSource
     offset: int
 

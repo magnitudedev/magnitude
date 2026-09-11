@@ -19,7 +19,7 @@ program ──► compiler fork ──► target source ──► executable(ope
 | Extents, dtypes, tile shapes | Positions and coordinates |
 | Rounding mode and per-role storage dtypes | Visibility metadata: which segments may be read |
 | Capability: lanes, group width, matrix hardware | Write offsets and run capacities within a class |
-| Representation parameters: bits, group, coefficient width, sign | Every tensor |
+| Representation parameters: bits, group and supergroup geometry, coefficient width, sign, packing | Every tensor |
 
 Folding buys straight-line code; every folded value multiplies the specializations.
 Geometry that varies continuously is bounded into classes (a history capacity is a
@@ -68,7 +68,7 @@ is a branch at trace time with one shared body.
 | Operation | Strategy | Wins when | Needs |
 |---|---|---|---|
 | Projection | Subgroup fold over encoded blocks | One or few rows; weights stream once | Lanes that reduce |
-| | Packed word decode of superblocks | K-quant blocks whose layout admits word loads | 32 lanes |
+| | Packed hierarchical-affine fold | Compact codes and coefficients whose layout admits word loads; input values are reused across output rows | 32 lanes |
 | | Vector fold over planar affine planes | Few rows; repacked or affine weights; whole 512-folds | 32 lanes |
 | | Matrix tiles with partitioned contraction | Eight rows or more; narrow outputs cannot fill the device alone | Matrix hardware |
 | Attention | Streaming over history spans | Prefill; scores never materialize | Matrix hardware, 32 lanes |
@@ -80,6 +80,11 @@ is a branch at trace time with one shared body.
 A schedule is admitted by its conditions and ranked among those that apply. The
 conditions are stated in shape, precision, capability and representation, and the
 table that holds them belongs to the operation, not to the kernel.
+
+Compact hierarchical schedules interpret local coefficients in registers and
+apply the superblock correction around the accumulated code dot product. They do
+not materialize dequantized weights or expanded coefficient planes. Matrix
+schedules decode only the tile reused by the matrix contraction.
 
 ## Portability
 

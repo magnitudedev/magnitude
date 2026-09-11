@@ -4,13 +4,14 @@ import tilelang.language as T
 
 from magnitude_engine.kernels.capabilities import Capability
 from magnitude_engine.kernels.projection.decode import interpretation
+from magnitude_engine.kernels.projection.layout import output_index, widths_and_outputs
 from magnitude_engine.platform.execution import DType
 from magnitude_engine.weights.representation import Representation, resident_bytes
 
 
 def projection(
     rows: int,
-    outputs: int,
+    widths: int | tuple[int, ...],
     inputs: int,
     representation: Representation,
     *,
@@ -23,6 +24,8 @@ def projection(
     dtype: DType = DType.F32,
     output_dtype: DType = DType.F32,
 ):
+    logical_widths, outputs = widths_and_outputs(widths)
+    output_at = output_index(rows, logical_widths)
     if not capability.matrix_instructions:
         raise ValueError("the tiled contraction requires matrix hardware for T.gemm")
     if min(rows, outputs, inputs, row_tile, output_tile, reduction_tile, threads, partitions) <= 0:
@@ -85,12 +88,26 @@ def projection(
             T.sync_threads()
             for i, j in T.Parallel(row_tile, output_tile):
                 if by * row_tile + i < rows and bx * output_tile + j < outputs:
-                    C[part * rows + by * row_tile + i, bx * output_tile + j] = result[i, j]
+                    row = by * row_tile + i
+                    out = bx * output_tile + j
+                    if partitions == 1:
+                        index = output_at(row, out)
+                        C[index // outputs, index % outputs] = result[i, j]
+                    else:
+                        C[part * rows + row, out] = result[i, j]
 
     return main
 
 
-def merge_partitions(rows: int, outputs: int, partitions: int, output_dtype: DType = DType.F32):
+def merge_partitions(
+    rows: int,
+    widths: int | tuple[int, ...],
+    partitions: int,
+    output_dtype: DType = DType.F32,
+):
+    logical_widths, outputs = widths_and_outputs(widths)
+    output_at = output_index(rows, logical_widths)
+
     @T.prim_func
     def main(
         A: T.Tensor((partitions * rows, outputs), "float32"),
@@ -103,6 +120,7 @@ def merge_partitions(rows: int, outputs: int, partitions: int, output_dtype: DTy
             if index < rows * outputs:
                 for part in T.serial(partitions):
                     total[0] += A[part * rows + index // outputs, index % outputs]
-                B[index // outputs, index % outputs] = total[0]
+                target = output_at(index // outputs, index % outputs)
+                B[target // outputs, target % outputs] = total[0]
 
     return main
