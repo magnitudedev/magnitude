@@ -78,7 +78,7 @@ def delta_sequence(
                         query[j] = Q[row, key_head, k]
                     state[j] *= Decay[row, head]
                     partial[0] += state[j] * key[j]
-                remembered = T.call_extern("float32", "simd_sum", partial[0])
+                remembered = T.warp_reduce_sum(partial[0])
                 residual[0] = 0
                 if channel < value_width:
                     residual[0] = (V[row, head, channel] - remembered) * Beta[row, head]
@@ -86,7 +86,7 @@ def delta_sequence(
                 for j in T.unroll(elements, explicit=True):
                     state[j] += residual[0] * key[j]
                     partial[0] += state[j] * query[j]
-                answer = T.call_extern("float32", "simd_sum", partial[0])
+                answer = T.warp_reduce_sum(partial[0])
                 if lane == 0 and channel < value_width:
                     Output[row, head, channel] = answer
             for j in T.unroll(elements, explicit=True):

@@ -59,7 +59,7 @@ def run_attention(
             dot = T.alloc_local((1,), "float32")
             scratch = T.alloc_shared((NC, HG, 258), "float32")
             for h in T.unroll(HG, explicit=True):
-                peak[h] = T.call_pure_extern("float32", "as_type<float>", T.uint32(0xFF800000))
+                peak[h] = T.reinterpret(T.uint32(0xFF800000), "float32")
                 total[h] = 0
                 for i in T.unroll(8, explicit=True):
                     query[h, i] = A[row, head * HG + h, lane * 8 + i].astype("float32")
@@ -81,10 +81,10 @@ def run_attention(
                     dot[0] = 0
                     for i in T.unroll(8, explicit=True):
                         dot[0] += query[h, i] * key[i]
-                    score = T.call_extern("float32", "simd_sum", dot[0]) * T.float32(1 / 16)
+                    score = T.warp_reduce_sum(dot[0]) * T.float32(1 / 16)
                     maximum = T.max(peak[h], score)
-                    previous = T.call_pure_extern("float32", "metal::fast::exp", peak[h] - maximum)
-                    weight = T.call_pure_extern("float32", "metal::fast::exp", score - maximum)
+                    previous = T.__exp(peak[h] - maximum)
+                    weight = T.__exp(score - maximum)
                     total[h] = total[h] * previous + weight
                     for i in T.unroll(8, explicit=True):
                         acc[h, i] = acc[h, i] * previous + weight * value[i]
@@ -98,7 +98,7 @@ def run_attention(
             T.sync_threads()
             if chunk == 0:
                 for h in T.unroll(HG, explicit=True):
-                    peak[h] = T.call_pure_extern("float32", "as_type<float>", T.uint32(0xFF800000))
+                    peak[h] = T.reinterpret(T.uint32(0xFF800000), "float32")
                     total[h] = 0
                     for c in T.serial(NC):
                         peak[h] = T.max(peak[h], scratch[c, h, 256])
@@ -107,9 +107,7 @@ def run_attention(
                     for c in T.serial(NC):
                         weight = T.if_then_else(
                             scratch[c, h, 257] > 0,
-                            T.call_pure_extern(
-                                "float32", "metal::fast::exp", scratch[c, h, 256] - peak[h]
-                            ),
+                            T.__exp(scratch[c, h, 256] - peak[h]),
                             T.float32(0),
                         )
                         total[h] += weight * scratch[c, h, 257]

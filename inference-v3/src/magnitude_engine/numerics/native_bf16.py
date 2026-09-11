@@ -8,13 +8,7 @@ import tilelang.language as T
 @T.macro
 def native_sigmoid(x, precise=True):
     exponential = (
-        (
-            T.exp(T.abs(x))
-            if precise
-            else T.call_pure_extern("float32", "metal::fast::exp", T.abs(x))
-        )
-        .astype("bfloat16")
-        .astype("float32")
+        (T.exp(T.abs(x)) if precise else T.__exp(T.abs(x))).astype("bfloat16").astype("float32")
     )
     denominator = (1 + exponential).astype("bfloat16").astype("float32")
     reciprocal = (1 / denominator).astype("bfloat16").astype("float32")
@@ -59,18 +53,16 @@ def norm(H, D, gain=1.0, ROWS=1, STRIDE=None, OFFSET=0, epsilon=1e-6):
             if lane < 32:
                 partial[lane] = 0
             T.sync_threads()
-            subtotal = T.call_extern("float32", "simd_sum", squares[0])
+            subtotal = T.warp_reduce_sum(squares[0])
             if lane % 32 == 0:
                 partial[lane // 32] = subtotal
             T.sync_threads()
             if lane < 32:
-                total = T.call_extern("float32", "simd_sum", partial[lane])
+                total = T.warp_reduce_sum(partial[lane])
                 if lane == 0:
                     partial[0] = total
             T.sync_threads()
-            inverse = T.call_pure_extern(
-                "float32", "metal::precise::rsqrt", partial[0] / D + epsilon
-            )
+            inverse = T.rsqrt(partial[0] / D + epsilon)
             for chunk in T.serial(T.ceildiv(D, threads * 4)):
                 for j in T.serial(4):
                     d = chunk * threads * 4 + lane * 4 + j
@@ -83,8 +75,6 @@ def norm(H, D, gain=1.0, ROWS=1, STRIDE=None, OFFSET=0, epsilon=1e-6):
                         weighted = (
                             (scaled * B[d].astype("float32")).astype("bfloat16").astype("float32")
                         )
-                        C[row, h, d] = weighted * T.call_pure_extern(
-                            "float32", "as_type<float>", T.uint32(gain_bits)
-                        )
+                        C[row, h, d] = weighted * T.reinterpret(T.uint32(gain_bits), "float32")
 
     return main

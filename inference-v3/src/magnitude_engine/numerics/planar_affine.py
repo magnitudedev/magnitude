@@ -137,7 +137,7 @@ def vector(
                             bias = T.reinterpret(B[elements // 8 + groups + g], "float32")
                             accum[out] += scale * dot[0] + bias * total[0]
             for out in T.unroll(4, explicit=True):
-                result = T.call_extern("float32", "simd_sum", accum[out])
+                result = T.warp_reduce_sum(accum[out])
                 if lane == 0 and first + out < outputs:
                     C[row, first + out] = result
 

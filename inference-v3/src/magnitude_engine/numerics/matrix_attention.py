@@ -266,29 +266,29 @@ def normalize_bf16(rows, heads, segments, length):
             for block in T.serial(T.ceildiv(count, 4096)):
                 offset = block * 4096 + tid * 4
                 for j in T.unroll(4, explicit=True):
-                    vals[j] = T.call_pure_extern("float32", "as_type<float>", T.uint32(0xFF800000))
+                    vals[j] = T.reinterpret(T.uint32(0xFF800000), "float32")
                     if offset + j < count:
                         vals[j] = Scores[segment, head, row, offset + j].astype("float32")
                 previous[0] = peak[0]
                 for j in T.unroll(4, explicit=True):
                     peak[0] = T.max(peak[0], vals[j])
-                total[0] *= T.call_pure_extern("float32", "metal::fast::exp", previous[0] - peak[0])
+                total[0] *= T.__exp(previous[0] - peak[0])
                 for j in T.unroll(4, explicit=True):
-                    total[0] += T.call_pure_extern("float32", "metal::fast::exp", vals[j] - peak[0])
+                    total[0] += T.__exp(vals[j] - peak[0])
             previous[0] = peak[0]
-            peak[0] = T.call_extern("float32", "simd_max", peak[0])
-            total[0] *= T.call_pure_extern("float32", "metal::fast::exp", previous[0] - peak[0])
-            total[0] = T.call_extern("float32", "simd_sum", total[0])
+            peak[0] = T.warp_reduce_max(peak[0])
+            total[0] *= T.__exp(previous[0] - peak[0])
+            total[0] = T.warp_reduce_sum(total[0])
             previous[0] = peak[0]
             if tid % 32 == 0:
                 peaks[tid // 32] = peak[0]
             T.sync_threads()
-            peak[0] = T.call_extern("float32", "simd_max", peaks[tid % 32])
-            total[0] *= T.call_pure_extern("float32", "metal::fast::exp", previous[0] - peak[0])
+            peak[0] = T.warp_reduce_max(peaks[tid % 32])
+            total[0] *= T.__exp(previous[0] - peak[0])
             if tid % 32 == 0:
                 sums[tid // 32] = total[0]
             T.sync_threads()
-            total[0] = T.call_extern("float32", "simd_sum", sums[tid % 32])
+            total[0] = T.warp_reduce_sum(sums[tid % 32])
             if tid == 0:
                 Statistics[segment, row, head, 0] = peak[0]
                 Statistics[segment, row, head, 1] = total[0]
@@ -298,11 +298,7 @@ def normalize_bf16(rows, heads, segments, length):
                     if index < Run[segment, 2]:
                         Scores[segment, head, row, index] = T.if_then_else(
                             index < count and total[0] > 0,
-                            T.call_pure_extern(
-                                "float32",
-                                "metal::fast::exp",
-                                Scores[segment, head, row, index].astype("float32") - peak[0],
-                            )
+                            T.__exp(Scores[segment, head, row, index].astype("float32") - peak[0])
                             / total[0],
                             T.float32(0),
                         )
