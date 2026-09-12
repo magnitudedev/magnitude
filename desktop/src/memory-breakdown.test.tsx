@@ -1,26 +1,29 @@
 import { renderToStaticMarkup } from "react-dom/server"
 import { expect, it } from "vitest"
-import { LocalInferenceMemoryDomainIdSchema } from "@magnitudedev/sdk"
-import type { HardwareMemoryDomainView } from "@magnitudedev/client-common"
-import { MemoryDomain } from "./memory-breakdown"
+import { Option, Schema } from "effect"
+import { ModelInstanceAllocationSchema } from "@magnitudedev/sdk"
+import { MemoryFigures } from "./memory-breakdown"
 
-const domain: HardwareMemoryDomainView = {
-  id: LocalInferenceMemoryDomainIdSchema.make("system"), label: "Unified memory", kind: "UnifiedMemory",
-  totalBytes: 16 * 1024 ** 3, usedBytes: 8 * 1024 ** 3,
-  modelBytes: 3 * 1024 ** 3, overheadBytes: 1024 ** 3, fixedBytes: 4 * 1024 ** 3,
-  kvCacheBytes: 2 * 1024 ** 3, systemAndAppsBytes: 2 * 1024 ** 3, freeBytes: 8 * 1024 ** 3,
-  status: "complete", notice: null, participatesInModelServing: true,
-}
-it("renders separate accessible memory categories with exact byte evidence", () => {
-  const html = renderToStaticMarkup(<MemoryDomain domain={domain} />)
-  for (const label of ["Model weights", "KV cache", "Engine overhead", "System &amp; apps", "Free"]) expect(html).toContain(`data-memory-category="${label}"`)
-  expect(html).toContain('data-memory-category="Model weights" data-bytes="3221225472"')
-  expect(html).not.toContain("Unavailable")
+const GiB = 1024 ** 3
+const allocation = Schema.decodeUnknownSync(ModelInstanceAllocationSchema)({
+  contextWindowTokens: 4096, parallelSequences: 1, physicalContextTokens: 4096,
+  memoryDomains: [
+    { memoryDomainId: "system", modelBytes: GiB, contextBytes: 0, computeBytes: GiB / 4, auxiliaryBytes: GiB / 4 },
+    { memoryDomainId: "gpu", modelBytes: 2 * GiB, contextBytes: 2 * GiB, computeBytes: GiB / 4, auxiliaryBytes: GiB / 4 },
+  ],
 })
-it("shows unknown measurements without a zero-valued or partial stacked chart", () => {
-  const html = renderToStaticMarkup(<MemoryDomain domain={{ ...domain, modelBytes: null, overheadBytes: null, fixedBytes: null, kvCacheBytes: null, systemAndAppsBytes: null, status: "inconsistent", notice: "Allocation and resident usage could not be reconciled." }} />)
-  expect(html.match(/Unavailable/g)).toHaveLength(4)
-  expect(html).not.toContain('style="width:')
-  expect(html).toContain("could not be reconciled")
-  expect(html).not.toContain('data-bytes="0"')
+it("sums the three native allocation categories across memory domains", () => {
+  const html = renderToStaticMarkup(<MemoryFigures allocation={Option.some(allocation)} />)
+  expect(html).toContain(`data-memory-bytes="${6 * GiB}"`)
+  for (const [label, bytes] of [["Model weights", 3 * GiB], ["KV cache", 2 * GiB], ["Overhead", GiB]]) {
+    expect(html).toContain(`data-memory-category="${label}" data-bytes="${bytes}"`)
+  }
+  expect(html.match(/data-memory-category=/g)).toHaveLength(3)
+})
+it("shows zero total and zero categories with no loaded model", () => {
+  const html = renderToStaticMarkup(<MemoryFigures allocation={Option.none()} />)
+  expect(html).toContain('data-memory-bytes="0">0 MB</p>')
+  expect(html.match(/data-bytes="0"/g)).toHaveLength(3)
+  expect(html).not.toContain('NaN')
+  for (const text of ['<details', 'System &amp; apps', 'Model buffers', 'processes', 'How memory']) expect(html).not.toContain(text)
 })

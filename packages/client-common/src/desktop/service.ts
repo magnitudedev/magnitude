@@ -9,7 +9,7 @@ import { LOCAL_MODEL_RANKING_SCALE_VALUES } from "../local-models/options"
 import { formatLocalModelDisplayName } from "../utils/model-presentation"
 import type { DesktopUpdateState } from "./update"
 
-export const DesktopPage = Schema.Literal("discover", "catalog", "models", "connections", "status", "settings")
+export const DesktopPage = Schema.Literal("discover", "catalog", "models", "connections", "usage", "status", "settings")
 export type DesktopPage = typeof DesktopPage.Type
 export const DesktopAction = Schema.Union(Schema.TaggedStruct("Navigate", { page: DesktopPage }), Schema.TaggedStruct("StopModel", {}))
 export const ModelTrayPresentation = Schema.Struct({ label: Schema.String, canStop: Schema.Boolean })
