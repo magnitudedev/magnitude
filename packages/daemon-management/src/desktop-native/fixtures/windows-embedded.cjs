@@ -21,7 +21,6 @@ try {
   observed = native.observeProcess(process.pid);
   assert.ok(observed);
   assert.equal(native.observedProcessExited(observed), false);
-  assert.equal(native.observedProcessDetails(observed).pid, process.pid);
   console.log('PASS embedded Windows native known-folder, ownership and process observation');
 } finally {
   if (observed) native.releaseObservedProcess(observed);

@@ -21,7 +21,7 @@ artifacts. The release graph is product configuration, not a plugin system.
 | Artifact | Published for | Contents |
 | --- | --- | --- |
 | CLI | every host | one `bin/magnitude-cli` executable |
-| Desktop | supported graphical hosts | Electron application with its matched service and native ownership addon and transient command helper; macOS uses an explicit DMG installation |
+| Desktop | supported graphical hosts | Electron application with its matched service and native ownership addon and, on Unix, transient command helper; macOS uses an explicit DMG installation |
 | ACN | Apple hosts | signed, notarized, stapled `Magnitude.app` whose main executable is `magnitude-service` with embedded ripgrep, plus metadata and icon |
 | ACN | other hosts | one `bin/magnitude-service` executable with embedded ripgrep |
 | ICN base | every host | one `bin/magnitude-inference` executable, planner inputs, common runtime libraries, and CPU modules |
@@ -49,6 +49,10 @@ The desktop bundle owns the window, tray, and service lifecycle. Inference artif
 remain outside the app. Its installer preserves the sealed native bundle, including framework
 symlinks; runtime archive extraction never installs or interprets a desktop artifact. Signing and
 notarization precede final installer checksums. Ad-hoc local builds never imply publisher trust.
+Initial desktop installation uses direct platform downloads, with a DMG on macOS and no curl/shell
+installer. The transition from standalone daemon installations requires users to stop and disable
+their previous installation before opening the new app. No old-service migration helper ships;
+user models and settings remain outside the installed bundle.
 Each Apple host also produces an update ZIP from the same signed and stapled desktop bundle as
 its DMG. The ZIP is a separate desktop artifact covered by the release manifest and acceptance
 receipts. It is not an inference/runtime acquisition archive. Producing it does not establish

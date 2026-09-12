@@ -5,7 +5,6 @@ import { describe, expect, it } from "vitest";
 const repositoryRoot = resolve(import.meta.dirname, "../../../..");
 
 const boundaryFiles = [
-  "packages/daemon-management/src/desktop-native/legacy-owner.ts",
   "packages/daemon-management/src/desktop-native/owned-service.ts",
   "packages/acn/src/server.ts",
   "packages/acn/src/session-runtime-options.ts",
@@ -31,7 +30,6 @@ describe("external-data boundary architecture", () => {
 
   it("keeps the removed JSON lock protocol out of production coordination", async () => {
     for (const relativePath of [
-      "packages/daemon-management/src/desktop-native/legacy-owner.ts",
       "packages/daemon-management/src/desktop-native/owned-service.ts",
       "packages/acn/src/server.ts",
     ]) {

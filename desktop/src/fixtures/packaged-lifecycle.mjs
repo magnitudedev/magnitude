@@ -1,7 +1,7 @@
 import { _electron as electron } from 'playwright';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, readFile, writeFile, chmod } from 'node:fs/promises';
-import { fileURLToPath } from 'node:url';
+import { mkdtemp, rm, readFile, writeFile, chmod, mkdir } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
@@ -43,8 +43,7 @@ const invoke = args => new Promise((resolve, reject) => {
 });
 let application;
 let probeOwner;
-let legacy;
-let legacyEngine;
+let incumbent;
 try {
   const invalidStateDirectory = join(profile, 'not-a-directory');
   await writeFile(invalidStateDirectory, 'deliberately invalid isolated ownership location');
@@ -105,20 +104,12 @@ try {
   assert.equal(failedOwner.exitCode, 0);
   console.log('Missing inference engine: bounded startup failures retain safe detail and tray, Retry repeats cleanly, native Quit exits0');
 
-  legacy = spawn(process.env.MAGNITUDE_TEST_BUN ?? 'bun', [fileURLToPath(new URL('./legacy-service.ts', import.meta.url)), profile], { detached: true, stdio: ['ignore', 'pipe', 'inherit'] });
-  const legacyInfo = await new Promise((resolve, reject) => {
-    let output = '';
-    const timeout = setTimeout(() => reject(new Error('Legacy fixture did not become ready')), 10000);
-    legacy.once('error', error => { clearTimeout(timeout); reject(error); });
-    legacy.stdout.on('data', chunk => {
-      output += chunk;
-      if (!output.includes('\n')) return;
-      clearTimeout(timeout);
-      try { resolve(JSON.parse(output.trim())); } catch (error) { reject(error); }
-    });
-  });
-  legacyEngine = legacyInfo.enginePid;
-  await writeFile(join(profile, 'migration-preserved.txt'), 'preserve user data');
+  await mkdir(join(profile, 'acn'), { recursive: true });
+  const oldState = join(profile, 'acn/coordination.sqlite');
+  await writeFile(oldState, 'old coordination state: deliberately not a database');
+  await writeFile(join(profile, 'preserved.txt'), 'preserve user data');
+  incumbent = createServer((_request, response) => response.end('unrelated service'));
+  await new Promise((resolve, reject) => { incumbent.once('error', reject); incumbent.listen(11109, '127.0.0.1', resolve); });
   application = await electron.launch({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 30000 });
   const app = application;
   const visibility = () => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().map(window => ({ visible: window.isVisible(), minimized: window.isMinimized() })));
@@ -126,18 +117,31 @@ try {
   await eventually(visibility, [{ visible: false, minimized: false }], 2000);
   await eventually(() => readFile(probePids, 'utf8').then(text => text.trim().split('\n').map(Number).some(alive)).catch(() => false), true, 2000);
   console.log('Slow shell probe: owner and hidden window available while shell is still running');
+  assert.equal(await invoke([]), 0);
+  const conflictWindow = await app.firstWindow();
+  await conflictWindow.getByRole('button', { name: 'Status', exact: true }).click();
+  await conflictWindow.getByText('Failed', { exact: true }).waitFor();
+  await conflictWindow.getByText('Port 11109 is already in use.', { exact: false }).waitFor();
+  await conflictWindow.getByText(/^Registered with your desktop\./).waitFor();
+  assert.equal(await (await fetch('http://127.0.0.1:11109')).text(), 'unrelated service');
+  await conflictWindow.getByRole('button', { name: 'Retry service', exact: true }).click();
+  await conflictWindow.getByText('Failed', { exact: true }).waitFor();
+  assert.equal(await (await fetch('http://127.0.0.1:11109')).text(), 'unrelated service');
+  await new Promise(resolve => incumbent.close(resolve));
+  incumbent = undefined;
+  await conflictWindow.getByRole('button', { name: 'Retry service', exact: true }).click();
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].close());
+  console.log('Port conflict: actionable failure, tray and control stay available, incumbent survives retries');
   await eventually(async () => (await health())?.state?._tag, 'Ready', 60000);
   await eventually(visibility, [{ visible: false, minimized: false }]);
   const service = await health();
   if (process.env.MAGNITUDE_TEST_EXPECT_VERSION) assert.equal(service.version, process.env.MAGNITUDE_TEST_EXPECT_VERSION);
   if (process.env.MAGNITUDE_TEST_EXPECT_REVISION) assert.equal(service.revision, Number(process.env.MAGNITUDE_TEST_EXPECT_REVISION));
   if (process.env.MAGNITUDE_TEST_EXPECT_RPC_VERSION) assert.equal(service.rpcVersion, Number(process.env.MAGNITUDE_TEST_EXPECT_RPC_VERSION));
-  assert.notEqual(service.pid, legacyInfo.pid);
-  await eventually(() => Promise.resolve([legacyInfo.pid, legacyEngine].some(alive)), false);
-  assert.equal(JSON.parse(await readFile(join(profile, 'desktop/legacy-migration.json'), 'utf8'))._tag, 'Complete');
-  await assert.rejects(readFile(join(profile, 'acn/coordination.sqlite')), { code: 'ENOENT' });
-  assert.equal(await readFile(join(profile, 'migration-preserved.txt'), 'utf8'), 'preserve user data');
-  console.log('Legacy migration: old service and detached inference retired, checkpoint complete, user data preserved');
+  await assert.rejects(readFile(join(profile, 'desktop/legacy-migration.json')), { code: 'ENOENT' });
+  assert.equal(await readFile(oldState, 'utf8'), 'old coordination state: deliberately not a database');
+  assert.equal(await readFile(join(profile, 'preserved.txt'), 'utf8'), 'preserve user data');
+  console.log('Clean cutover: old coordination files untouched, no migration checkpoint, Retry reaches Ready');
   console.log('Cold background launch: service Ready, window hidden');
 
   assert.deepEqual(await Promise.all(Array.from({ length: 4 }, () => invoke(['--background']))), [0, 0, 0, 0]);
@@ -351,8 +355,6 @@ try {
     try { await application.close(); }
     finally { clearTimeout(timeout); }
   }
-  for (const pid of [legacyEngine, legacy?.pid]) if (pid && alive(pid)) {
-    try { process.kill(-pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
-  }
+  if (incumbent) await new Promise(resolve => incumbent.close(resolve));
   await Promise.all([profile, failedProfile].map(path => rm(path, { recursive: true, force: true })));
 }

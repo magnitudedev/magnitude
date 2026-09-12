@@ -133,16 +133,6 @@ const readExactly = async (pipe, size) => {
       const observation = native.observeProcess(identity.pid);
       assert.notEqual(observation, null); observers.add(observation);
       assert.equal(native.observedProcessExited(observation), false);
-      const observed = native.observedProcessDetails(observation);
-      assert.equal(observed.pid, identity.pid);
-      assert.equal(observed.creationTime, identity.creationTime);
-      assert.equal(observed.executable.toLowerCase(), process.execPath.toLowerCase());
-      assert.match(observed.userSid, /^S-1-/);
-      const parentSnapshot = native.snapshotProcessParents();
-      assert.equal(new Set(parentSnapshot.map(row => row.pid)).size, parentSnapshot.length);
-      assert.deepEqual(parentSnapshot.find(row => row.pid === identity.pid), { pid: identity.pid, parentPid: process.pid });
-      assert.throws(() => native.observedProcessDetails(owned), { win32Code: 6 });
-      assert.throws(() => native.observedProcessDetails(Object.create(observation)), { win32Code: 6 });
       assert.throws(() => native.terminateOwnedProcess(observation), /owned Windows process/);
       assert.equal(native.ownedProcessExit(owned), null);
       assert.ok(native.ownedProcessActiveCount(owned) >= 1);
@@ -150,21 +140,7 @@ const readExactly = async (pipe, size) => {
       let text = '';
       while (!text.includes('\n')) text += (await native.readPrivatePipe(output.pipe)).toString();
       assert.deepEqual(JSON.parse(text), { pid: identity.pid, argument, empty: "", unicode: "模型🙂" });
-      assert.throws(() => native.startMigrationProcessRetirement(observation), { win32Code: 6 });
-      assert.throws(() => native.acquireMigrationProcess(identity.pid, '0000000000000000', observed.executable, observed.userSid), { win32Code: 13 });
-      assert.throws(() => native.acquireMigrationProcess(identity.pid, identity.creationTime, observed.executable + '\0suffix', observed.userSid), { win32Code: 87 });
-      const migration = native.acquireMigrationProcess(identity.pid, identity.creationTime, observed.executable, observed.userSid);
-      try {
-        assert.throws(() => native.startMigrationProcessRetirement(Object.create(migration)), { win32Code: 6 });
-        assert.equal(native.migrationProcessExited(migration), false);
-        native.startMigrationProcessRetirement(migration);
-        while (!native.migrationProcessExited(migration)) await new Promise(resolve => setTimeout(resolve, 10));
-        native.startMigrationProcessRetirement(migration);
-      } finally { native.releaseMigrationProcess(migration); }
-      native.releaseMigrationProcess(migration);
-      assert.throws(() => native.startMigrationProcessRetirement(migration), { win32Code: 6 });
-      console.log('PASS exact migration capability, identity mismatch, retained exit and terminal close');
-
+      native.terminateOwnedProcess(owned);
       while (native.ownedProcessActiveCount(owned) !== 0) await new Promise(resolve => setTimeout(resolve, 10));
       assert.equal(native.ownedProcessExit(owned), 1);
       assert.deepEqual(native.ownedProcessIdentity(owned), identity);
@@ -172,7 +148,6 @@ const readExactly = async (pipe, size) => {
       native.releaseObservedProcess(observation); native.releaseObservedProcess(observation);
       observers.delete(observation);
       assert.throws(() => native.observedProcessExited(observation), { win32Code: 6 });
-      assert.throws(() => native.observedProcessDetails(observation), { win32Code: 6 });
     } finally {
       native.closeOwnedProcess(owned);
       native.closeOwnedProcess(owned);
@@ -209,39 +184,6 @@ const readExactly = async (pipe, size) => {
       await Promise.all([inputStream, outputStream, errorStream].map(async stream => { await native.closePrivatePipe(stream.pipe); pipes.delete(stream.pipe); }));
     }
     console.log('PASS separate inherited stdin/stdout/stderr, parent EOF and job retirement');
-
-    const taskOutput = create();
-    const queryPath = path.join(path.dirname(process.argv.at(-1)), 'magnitude-task-query.exe');
-    const queryAccepted = native.acceptPrivatePipe(taskOutput.pipe);
-    const queryJob = native.spawnOwnedProcess(queryPath, quoted(queryPath), environment, taskOutput.name);
-    let queryDeadline;
-    try {
-      await Promise.race([(async () => {
-        assert.equal(await queryAccepted, process.pid, 'Only the parent opens the inherited output handle');
-        const chunks = []; let size = 0;
-        for (;;) {
-          const chunk = await native.readPrivatePipe(taskOutput.pipe);
-          if (!chunk.length) break;
-          size += chunk.length; assert.ok(size <= 512 * 1024, 'Task query output is bounded');
-          chunks.push(chunk);
-        }
-        const result = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-        assert.ok(['Missing', 'Registered'].includes(result._tag), JSON.stringify(result));
-        if (result._tag === 'Registered') {
-          assert.match(result.currentUserSid, /^S-1-/);
-          assert.ok(result.xml.includes('<Task'));
-        }
-        while (native.ownedProcessExit(queryJob) === null || native.ownedProcessActiveCount(queryJob) !== 0)
-          await new Promise(resolve => setTimeout(resolve, 10));
-        assert.equal(native.ownedProcessExit(queryJob), 0);
-      })(), new Promise((_, reject) => { queryDeadline = setTimeout(() => reject(new Error('Task query deadline')), 5000); })]);
-    } finally {
-      clearTimeout(queryDeadline);
-      native.terminateOwnedProcess(queryJob);
-      native.closeOwnedProcess(queryJob);
-      await native.closePrivatePipe(taskOutput.pipe); pipes.delete(taskOutput.pipe);
-    }
-    console.log('PASS contained read-only Task Scheduler inspection');
 
     // More idle reads than Node's default worker pool must not starve write/close work.
     const peers = await Promise.all(Array.from({ length: 24 }, connected));

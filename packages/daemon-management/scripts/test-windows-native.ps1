@@ -24,12 +24,6 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'Native Windows pipe compilation failed.' }
   & (Join-Path $testRoot 'windows-pipe-test.exe')
   if ($LASTEXITCODE -ne 0) { throw 'Native Windows pipe acceptance failed.' }
-  & cl.exe /nologo /W4 /WX /O2 /std:c11 /D_WIN32_WINNT=0x0A00 /D_CRT_SECURE_NO_WARNINGS `
-    (Join-Path $packageRoot 'native\windows-process-retirement.c') (Join-Path $packageRoot 'native\windows-process-retirement-test.c') `
-    (Join-Path $packageRoot 'native\windows-job.c') /Fe:windows-process-retirement-test.exe /link advapi32.lib
-  if ($LASTEXITCODE -ne 0) { throw 'Native Windows migration process compilation failed.' }
-  & (Join-Path $testRoot 'windows-process-retirement-test.exe')
-  if ($LASTEXITCODE -ne 0) { throw 'Native Windows migration process acceptance failed.' }
   $addon = Join-Path $testRoot 'desktop-host.node'
   & (Join-Path $PSScriptRoot 'build-windows-native.ps1') -Headers $Headers -NodeLibrary $NodeLibrary -Output $addon
   $embeddedFixture = Join-Path $testRoot 'windows-embedded.cjs'
@@ -66,7 +60,6 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Missing acknowledgement prevented bounded service exit.' }
   } finally { Pop-Location }
 
-  & (Join-Path $PSScriptRoot 'test-windows-task.ps1') -Addon $addon -Helper (Join-Path $testRoot 'magnitude-task-query.exe') -FixtureRoot $testRoot
 
 } finally {
   Pop-Location
