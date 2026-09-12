@@ -2,7 +2,7 @@ import { FetchHttpClient } from "@effect/platform"
 import { Effect, Either, Option, Schema } from "effect"
 import { generateKeyPairSync } from "node:crypto"
 import { describe, expect, it } from "vitest"
-import { checkHostedUpdate, UpdateClientMetadata } from "./client"
+import { checkHostedUpdate, resolveHostedDownload, UpdateClientMetadata } from "./client"
 import { signUpdateRequest, verifyUpdateRequest, installationId } from "./request-auth"
 import { PublisherKeyId, signUpdateManifest, UpdateManifest } from "./manifest"
 
@@ -17,6 +17,25 @@ const check = (fetch: (...args: Parameters<typeof globalThis.fetch>) => Promise<
 }).pipe(Effect.provide(FetchHttpClient.layer), Effect.provideService(FetchHttpClient.Fetch, Object.assign(fetch, { preconnect: () => {} })))
 
 describe("hosted update client", () => {
+  it("signs the download selector and resolves only the exact trusted storage path without following it", async () => {
+    const expected = `https://storage.example/${manifest.artifact.path}`
+    for (const location of [expected, "https://untrusted.example/file.zip", `${expected}?changed=1`]) {
+      let calls = 0
+      const result = await Effect.runPromise(resolveHostedDownload({ origin: "https://magnitude.dev", metadata,
+        sign: url => signUpdateRequest(installation.privateKey, url), userAgent: "Magnitude/1.0.0", manifest, storageOrigin: "https://storage.example",
+      }).pipe(Effect.provide(FetchHttpClient.layer), Effect.provideService(FetchHttpClient.Fetch, Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
+        calls++
+        const request = new Request(input, init), url = new URL(request.url)
+        expect(init?.redirect).toBe("manual")
+        expect(url.pathname).toBe(`/api/download/${manifest.artifact.id}`)
+        expect(url.searchParams.get("release")).toBe(manifest.version)
+        expect(await Effect.runPromise(verifyUpdateRequest(request.headers.get("authorization")!, url))).toBe(await Effect.runPromise(installationId(installation.publicKey)))
+        return new Response(null, { status: 302, headers: { location } })
+      }, { preconnect: () => {} })), Effect.either))
+      expect(calls).toBe(1)
+      expect(Either.isRight(result)).toBe(location === expected)
+    }
+  })
   it("sends a verifiable complete request and accepts 204 without a body", async () => {
     let calls = 0
     const result = await Effect.runPromise(check(async (input, init) => {

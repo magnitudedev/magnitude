@@ -4,6 +4,12 @@ applies_to:
   - packages/release/resources/distribution/**
   - packages/release/scripts/build-distribution-server.ts
   - desktop/src/update-identity*
+  - desktop/src/update-preferences*
+  - desktop/src/update-schedule*
+  - desktop/src/update-config.ts
+  - desktop/src/application-update*
+  - desktop/src/mac-update-source*
+  - packages/client-common/src/desktop/update.ts
 ---
 
 # Hosted application update protocol
@@ -13,6 +19,14 @@ An installation owns an Ed25519 private key outside its application bundle. The 
 it by SHA-256 of its raw public key. That identity proves possession, not a person's identity or
 truthful platform reports. Publisher keys are a separate trust set supplied by application builds;
 a server response never expands that trust set.
+
+The desktop owner checks after startup and hourly, with bounded jitter and coalesced resume
+wakeups. Manual checks reset the deadline. Check admission is independent of a download or prepared
+update; a later check cannot replace an active transfer. Automatic downloads default on, with an
+atomically persisted preference independent of ACN. Corrupt preferences pause automatic downloads
+without replacing the file or suppressing checks. Turning the preference off cancels only automatic
+transfers before native staging. Cancellation retains transfer admission until scoped cleanup ends.
+Neither renderer disconnection nor window closure owns or cancels this work.
 
 ## Signed checks
 

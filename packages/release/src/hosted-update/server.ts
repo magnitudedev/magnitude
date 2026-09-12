@@ -2,13 +2,14 @@ import { Pool } from "pg"
 import { Effect, Option, Runtime, Schema } from "effect"
 import { decodePublisherPublicKey } from "./manifest"
 import { handleUpdateCheck, DistributionStore } from "./service"
-import { postgresDistributionStore } from "./postgres-store"
+import { postgresDistributionStore, DistributionNamespace } from "./postgres-store"
 import { handleArtifactDownload } from "./download"
 
 export const DistributionServerConfig = Schema.Struct({
   origin: Schema.String,
   databaseUrl: Schema.String,
   databaseCa: Schema.String,
+  databaseNamespace: DistributionNamespace,
   storageOrigin: Schema.String,
   publishers: Schema.Record({ key: Schema.String, value: Schema.String }),
 })
@@ -32,7 +33,7 @@ export const makeDistributionServer = (config: DistributionServerConfig) => Effe
   // Idle pool errors have no pending query to receive them. Never log connection strings or SQL details.
   const runtime = yield* Effect.runtime<never>()
   pool.on("error", () => { Runtime.runSync(runtime)(Effect.logWarning("Distribution database connection closed")) })
-  const store = postgresDistributionStore(pool)
+  const store = postgresDistributionStore(pool, config.databaseNamespace)
   return {
     pool,
     check: (request: Request, country: string | undefined) => handleUpdateCheck(request, {

@@ -13,6 +13,7 @@ export const InferenceHostRpcs = RpcGroup.make(
   Rpc.make("MachineIdentity", { payload: Unit, success: MachineIdentityObservation, error: HostError }).pipe(replaySafe),
   Rpc.make("Memory", { payload: Unit, success: ApplicationMemoryObservation, error: HostError, stream: true }),
   Rpc.make("Updates", { payload: Unit, success: DesktopUpdateState, error: HostError, stream: true }),
+  Rpc.make("SetAutoDownload", { payload: Schema.Struct({ enabled: Schema.Boolean }), success: Unit, error: HostError }).pipe(atMostOnce),
   Rpc.make("CheckUpdate", { payload: Unit, success: Unit, error: HostError }).pipe(atMostOnce),
   Rpc.make("DownloadUpdate", { payload: Unit, success: Unit, error: HostError }).pipe(atMostOnce),
   Rpc.make("RestartUpdate", { payload: Unit, success: Unit, error: HostError }).pipe(atMostOnce),
@@ -34,6 +35,7 @@ export interface DesktopApi {
   readonly memory: (value: (state: ApplicationMemoryObservation) => void, error: (message: string) => void) => () => void
   readonly applicationInfo: () => Promise<typeof DesktopApplicationInfo.Type>
   readonly updates: (value: (state: typeof DesktopUpdateState.Type) => void, error: (message: string) => void) => () => void
+  readonly setAutoDownload: (enabled: boolean) => Promise<void>
   readonly checkUpdate: () => Promise<void>
   readonly downloadUpdate: () => Promise<void>
   readonly restartUpdate: () => Promise<void>

@@ -7,7 +7,11 @@ import { ApplicationUpdateSource, makeApplicationUpdate, unavailableApplicationU
 import { macUpdateSource } from "./mac-update-source"
 import { NativeMacUpdate, nativeMacUpdate } from "./mac-update-stage"
 import { ApplicationUpdateHandoff, makeUpdateHandoff } from "./update-handoff"
-import { releaseBaseUrl } from "@magnitudedev/release"
+import { UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
+import { makeUpdateIdentity } from "./update-identity"
+import { makeUpdatePreferences, UpdatePreferences } from "./update-preferences"
+import { makeUpdateSchedule } from "./update-schedule"
+import { readUpdateConfiguration } from "./update-config"
 import { NativeTrayFactory, NativeTrayFailed, TrayOwner, TrayOwnerLive } from "./tray-owner"
 import { CommandExecutor, FetchHttpClient } from "@effect/platform"
 import { NodeContext } from "@effect/platform-node"
@@ -94,14 +98,29 @@ const program = Effect.scoped(Effect.gen(function* () {
   const run = (effect: Effect.Effect<unknown>) => { Runtime.runFork(runtime)(effect) }
   requestQuit = () => run(Queue.offer(quit, "Quit"))
   if (earlyQuitRequested) yield* Queue.offer(quit, "Quit")
-  const updates = isolatedProfile ? unavailableApplicationUpdate("Application updates are available in the installed Magnitude app.")
+  const updateConfiguration = yield* readUpdateConfiguration.pipe(Effect.option)
+  const updates = Option.isNone(updateConfiguration) ? unavailableApplicationUpdate("Application update configuration is invalid.")
+    : isolatedProfile && !updateConfiguration.value.acceptance ? unavailableApplicationUpdate("Application updates are available in the installed Magnitude app.")
     : process.platform !== "darwin" ? unavailableApplicationUpdate(process.platform === "linux"
       ? "Update Magnitude through your Linux package manager." : "Application updates are not available in this Windows build.")
     : !handoff ? unavailableApplicationUpdate("Application update recovery is unavailable in this build.")
-    : yield* macUpdateSource({ currentVersion: app.getVersion(), host: process.arch === "arm64" ? "darwin-arm64" : "darwin-x64",
-      releaseBaseUrl: releaseBaseUrl(), cacheDirectory: join(app.getPath("userData"), "updates"),
-    }).pipe(Effect.provideService(NativeMacUpdate, nativeMacUpdate(autoUpdater)), Effect.provideService(ApplicationUpdateHandoff, handoff),
-      Effect.flatMap(source => makeApplicationUpdate(updateAdmission?._tag === "Failed" ? Option.some(updateAdmission.message) : Option.none()).pipe(Effect.provideService(ApplicationUpdateSource, source))))
+    : yield* Effect.gen(function* () {
+      const identity = yield* makeUpdateIdentity(dataDir).pipe(Effect.provide(NodeContext.layer))
+      const preferences = yield* makeUpdatePreferences(dataDir).pipe(Effect.provide(NodeContext.layer))
+      const { trustedPublishers, origin, storageOrigin } = updateConfiguration.value
+      const metadata = yield* Schema.decodeUnknown(UpdateClientMetadata)({ version: app.getVersion(), os: "darwin",
+        os_version: process.getSystemVersion(), arch: process.arch, package: "mac-zip" })
+      const source = yield* macUpdateSource({ origin, storageOrigin, metadata,
+        sign: identity.sign, trustedPublishers, userAgent: `Magnitude/${app.getVersion()} ${process.arch} Electron/${process.versions.electron} macOS/${process.getSystemVersion()}`,
+        cacheDirectory: join(app.getPath("userData"), "updates"),
+      }).pipe(Effect.provideService(NativeMacUpdate, nativeMacUpdate(autoUpdater)), Effect.provideService(ApplicationUpdateHandoff, handoff))
+      return yield* makeApplicationUpdate(updateAdmission?._tag === "Failed" ? Option.some(updateAdmission.message) : Option.none()).pipe(
+        Effect.provideService(ApplicationUpdateSource, source), Effect.provideService(UpdatePreferences, preferences))
+    }).pipe(Effect.catchAll(() => Effect.succeed(unavailableApplicationUpdate("Application update setup could not be read."))))
+  const updateSchedule = yield* makeUpdateSchedule(updates.check)
+  const resumeUpdates = () => run(updateSchedule.resume)
+  powerMonitor.on("resume", resumeUpdates)
+  yield* Effect.addFinalizer(() => Effect.sync(() => powerMonitor.removeListener("resume", resumeUpdates)))
 
   const nativeTray = Layer.succeed(NativeTrayFactory, { create: Effect.acquireRelease(Effect.try({ try: () => {
     // A monochrome template works in either macOS menu-bar appearance.
@@ -141,13 +160,17 @@ const program = Effect.scoped(Effect.gen(function* () {
   const refreshTray = Effect.gen(function* () {
     const current = yield* Ref.get(state)
     const presentation = yield* Ref.get(model)
-    yield* tray.setMenu(buildTrayMenu({ service: current?._tag ?? "Unknown", model: presentation }, {
+    const update = yield* updates.state
+    yield* tray.setMenu(buildTrayMenu({ service: current?._tag ?? "Unknown", model: presentation, updateReady: update.transfer._tag === "Ready" }, {
       open: page => run(show(page)),
       stopModel: () => run(PubSub.publish(actions, { _tag: "StopModel" })),
       quit: requestQuit,
+      restartUpdate: () => run(updates.requireReady.pipe(Effect.zipRight(Queue.offer(quit, "RestartUpdate")), Effect.catchAll(() => Effect.void))),
     }))
   })
   yield* refreshTray
+  yield* updates.changes.pipe(Stream.map(value => value.transfer._tag === "Ready"), Stream.changes,
+    Stream.runForEach(() => refreshTray), Effect.forkScoped)
   if (process.platform === "linux") {
     const trayHost = Context.get(yield* Layer.build(linuxTrayHostLayer()), LinuxTrayHost)
     yield* trayHost.changes.pipe(Stream.runForEach(tray.observeHost), Effect.forkScoped)
@@ -190,7 +213,8 @@ const program = Effect.scoped(Effect.gen(function* () {
     Memory: () => observeApplicationMemory(memory, () => !!window && !window.isDestroyed() && window.isVisible()),
     ApplicationInfo: () => Effect.sync(() => ({ version: app.getVersion() })),
     Updates: () => updates.changes,
-    CheckUpdate: () => updates.check.pipe(Effect.mapError(connectionError), Effect.as({})),
+    SetAutoDownload: ({ enabled }) => updates.setAutoDownload(enabled).pipe(Effect.mapError(connectionError), Effect.as({})),
+    CheckUpdate: () => updateSchedule.check.pipe(Effect.mapError(connectionError), Effect.as({})),
     DownloadUpdate: () => updates.download.pipe(Effect.mapError(connectionError), Effect.as({})),
     RestartUpdate: () => updates.requireReady.pipe(Effect.mapError(connectionError), Effect.zipRight(Effect.gen(function* () {
       if (!window || window.isDestroyed() || !window.isVisible() || window.isMinimized() || systemShutdownRequested) {

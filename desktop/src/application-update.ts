@@ -1,12 +1,12 @@
-import { Context, Effect, ExecutionStrategy, Exit, Option, Schema, Scope, Stream, SubscriptionRef } from "effect"
-import { FSM } from "@magnitudedev/utils"
-import { DesktopUpdateCandidate } from "@magnitudedev/release"
+import { Clock, Context, Effect, ExecutionStrategy, Exit, Fiber, Option, Schema, Scope, Stream, SubscriptionRef } from "effect"
+import { UpdateManifest } from "@magnitudedev/release/hosted-update"
 import type { DesktopUpdateState } from "@magnitudedev/client-common"
+import { UpdatePreferences } from "./update-preferences"
 
 export class ApplicationUpdateFailed extends Schema.TaggedError<ApplicationUpdateFailed>()("ApplicationUpdateFailed", {
   message: Schema.String,
 }) {}
-type Candidate = typeof DesktopUpdateCandidate.Type
+type Candidate = typeof UpdateManifest.Type
 export interface ApplicationUpdateSource {
   readonly check: Effect.Effect<Option.Option<Candidate>, ApplicationUpdateFailed>
   readonly download: (candidate: Candidate, progress: (completed: number) => Effect.Effect<void>) => Effect.Effect<string, ApplicationUpdateFailed, Scope.Scope>
@@ -14,28 +14,26 @@ export interface ApplicationUpdateSource {
 }
 export const ApplicationUpdateSource = Context.GenericTag<ApplicationUpdateSource>("desktop/ApplicationUpdateSource")
 
-class Idle extends Schema.TaggedClass<Idle>()("Idle", {}) {}
-class Checking extends Schema.TaggedClass<Checking>()("Checking", {}) {}
-class Current extends Schema.TaggedClass<Current>()("Current", {}) {}
-class Available extends Schema.TaggedClass<Available>()("Available", { candidate: DesktopUpdateCandidate }) {}
-class Downloading extends Schema.TaggedClass<Downloading>()("Downloading", { candidate: DesktopUpdateCandidate, completed: Schema.Number }) {}
-class Staging extends Schema.TaggedClass<Staging>()("Staging", { candidate: DesktopUpdateCandidate }) {}
-class Ready extends Schema.TaggedClass<Ready>()("Ready", { version: Schema.String }) {}
-class Failed extends Schema.TaggedClass<Failed>()("Failed", { message: Schema.String }) {}
-class Closed extends Schema.TaggedClass<Closed>()("Closed", {}) {}
-type State = Idle | Checking | Current | Available | Downloading | Staging | Ready | Failed | Closed
-const machine = FSM.defineFSM({ Idle, Checking, Current, Available, Downloading, Staging, Ready, Failed, Closed }, {
-  Idle: ["Checking", "Closed"], Checking: ["Current", "Available", "Failed", "Closed"],
-  Current: ["Checking", "Closed"], Available: ["Checking", "Downloading", "Closed"],
-  Downloading: ["Staging", "Failed", "Closed"], Staging: ["Ready", "Failed", "Closed"],
-  Ready: ["Closed"], Failed: ["Checking", "Closed"], Closed: [],
-} as const)
+const Transfer = Schema.Union(
+  Schema.TaggedStruct("Idle", {}),
+  Schema.TaggedStruct("Available", { candidate: UpdateManifest }),
+  Schema.TaggedStruct("Downloading", { candidate: UpdateManifest, completed: Schema.Number, automatic: Schema.Boolean }),
+  Schema.TaggedStruct("Cancelling", { candidate: UpdateManifest }),
+  Schema.TaggedStruct("Staging", { candidate: UpdateManifest }),
+  Schema.TaggedStruct("Ready", { version: Schema.String }),
+  Schema.TaggedStruct("Failed", { message: Schema.String }),
+  Schema.TaggedStruct("Closed", {}),
+)
+type Transfer = typeof Transfer.Type
+type State = { readonly transfer: Transfer; readonly check: DesktopUpdateState["check"]; readonly preference: DesktopUpdateState["preference"] }
 const present = (state: State): DesktopUpdateState => {
-  switch (state._tag) {
-    case "Available": return { _tag: "Available", version: state.candidate.version, bytes: state.candidate.artifact.bytes }
-    case "Downloading": return { _tag: "Downloading", version: state.candidate.version, completed: state.completed, total: state.candidate.artifact.bytes }
-    case "Staging": return { _tag: "Staging", version: state.candidate.version }
-    default: return state
+  const transfer = state.transfer
+  switch (transfer._tag) {
+    case "Available": return { ...state, transfer: { _tag: "Available", version: transfer.candidate.version, bytes: transfer.candidate.artifact.bytes } }
+    case "Downloading": return { ...state, transfer: { _tag: "Downloading", version: transfer.candidate.version, completed: transfer.completed, total: transfer.candidate.artifact.bytes } }
+    case "Cancelling": return { ...state, transfer: { _tag: "Cancelling" } }
+    case "Staging": return { ...state, transfer: { _tag: "Staging", version: transfer.candidate.version } }
+    default: return { ...state, transfer }
   }
 }
 export interface ApplicationUpdate {
@@ -43,61 +41,113 @@ export interface ApplicationUpdate {
   readonly changes: Stream.Stream<DesktopUpdateState>
   readonly check: Effect.Effect<void, ApplicationUpdateFailed>
   readonly download: Effect.Effect<void, ApplicationUpdateFailed>
+  readonly setAutoDownload: (enabled: boolean) => Effect.Effect<void, ApplicationUpdateFailed>
   readonly requireReady: Effect.Effect<void, ApplicationUpdateFailed>
   readonly close: Effect.Effect<void>
 }
 export const ApplicationUpdate = Context.GenericTag<ApplicationUpdate>("desktop/ApplicationUpdate")
 
-/** Admission is finite. Its worker belongs to the application, never the requesting renderer. */
+/** Checks and transfers have independent admission; workers belong to the desktop owner. */
 export const makeApplicationUpdate = (initialFailure: Option.Option<string> = Option.none()) => Effect.gen(function* () {
   const source = yield* ApplicationUpdateSource
+  const preferences = yield* UpdatePreferences
+  const preference = yield* preferences.read.pipe(Effect.match({
+    onSuccess: autoDownload => ({ _tag: "Known", autoDownload }) as const,
+    onFailure: error => ({ _tag: "Unavailable", message: error.message }) as const,
+  }))
   const owner = yield* Scope.fork(yield* Scope.Scope, ExecutionStrategy.sequential)
-  const state = yield* SubscriptionRef.make<State>(Option.isSome(initialFailure) ? new Failed({ message: initialFailure.value }) : new Idle({}))
+  const state = yield* SubscriptionRef.make<State>({ preference, check: { _tag: "Idle" },
+    transfer: Option.isSome(initialFailure) ? { _tag: "Failed", message: initialFailure.value } : { _tag: "Idle" } })
   const gate = yield* Effect.makeSemaphore(1)
-  const failed = (error: ApplicationUpdateFailed) => SubscriptionRef.update(state, current =>
-    current._tag === "Checking" || current._tag === "Downloading" || current._tag === "Staging"
-      ? machine.transition(current, "Failed", { message: error.message }) : current)
-  const work = (effect: Effect.Effect<void, ApplicationUpdateFailed>) => effect.pipe(
-    Effect.catchAll(failed),
-    Effect.catchAllDefect(cause => Effect.logError(cause).pipe(Effect.zipRight(failed(new ApplicationUpdateFailed({ message: "The application update could not finish. Try checking again." }))))),
-    Effect.interruptible, Effect.forkIn(owner), Effect.asVoid,
-  )
-  const close = gate.withPermits(1)(Effect.gen(function* () {
-    yield* SubscriptionRef.update(state, current => current._tag === "Closed" ? current : machine.transition(current, "Closed", {}))
+  let transferWorker: Option.Option<Fiber.RuntimeFiber<void, never>> = Option.none()
+  const closed = new ApplicationUpdateFailed({ message: "Magnitude is quitting." })
+  const autoEnabled = (current: State) => current.preference._tag === "Known" && current.preference.autoDownload
+  const failTransfer = (error: ApplicationUpdateFailed) => gate.withPermits(1)(SubscriptionRef.update(state, (current): State =>
+    current.transfer._tag === "Downloading" || current.transfer._tag === "Staging"
+      ? { ...current, transfer: { _tag: "Failed", message: error.message } } : current))
+
+  // Caller owns the gate. Cancelling retains admission until scoped file cleanup has finished.
+  const startDownload = (candidate: Candidate, automatic: boolean): Effect.Effect<void> => Effect.gen(function* () {
+    yield* SubscriptionRef.update(state, (current): State => ({ ...current, transfer: { _tag: "Downloading", candidate, completed: 0, automatic } }))
+    transferWorker = Option.some(yield* Effect.scoped(Effect.gen(function* () {
+      const archive = yield* source.download(candidate, completed => SubscriptionRef.update(state, (current): State => current.transfer._tag === "Downloading"
+        ? { ...current, transfer: { ...current.transfer, completed } } : current))
+      const admitted = yield* gate.withPermits(1)(Effect.gen(function* () {
+        const current = yield* SubscriptionRef.get(state)
+        if (current.transfer._tag !== "Downloading") return false
+        yield* SubscriptionRef.set(state, { ...current, transfer: { _tag: "Staging", candidate } })
+        return true
+      }))
+      if (!admitted) return
+      yield* source.stage(archive, candidate)
+      yield* gate.withPermits(1)(SubscriptionRef.update(state, (current): State => current.transfer._tag === "Staging"
+        ? { ...current, transfer: { _tag: "Ready", version: candidate.version } } : current))
+    })).pipe(
+      Effect.catchAll(failTransfer),
+      Effect.catchAllDefect(() => failTransfer(new ApplicationUpdateFailed({ message: "The application update could not finish. Check again to retry." }))),
+      Effect.ensuring(gate.withPermits(1)(Effect.gen(function* () {
+        const current = yield* SubscriptionRef.get(state)
+        if (current.transfer._tag !== "Cancelling") return
+        yield* SubscriptionRef.set(state, { ...current, transfer: { _tag: "Available", candidate: current.transfer.candidate } })
+        if (autoEnabled(current)) yield* startDownload(current.transfer.candidate, true)
+      }))),
+      Effect.interruptible, Effect.forkIn(owner),
+    ))
+  })
+  const close = Effect.gen(function* () {
+    yield* gate.withPermits(1)(SubscriptionRef.update(state, (current): State => ({ ...current, transfer: { _tag: "Closed" } })))
+    // Finalizers can acquire the gate; never await them while holding it.
     yield* Scope.close(owner, Exit.void)
-  })).pipe(Effect.uninterruptible)
+  }).pipe(Effect.uninterruptible)
   yield* Effect.addFinalizer(() => close)
+  const check = gate.withPermits(1)(Effect.gen(function* () {
+    const current = yield* SubscriptionRef.get(state)
+    if (current.transfer._tag === "Closed") return yield* closed
+    if (current.check._tag === "Checking") return
+    yield* SubscriptionRef.set(state, { ...current, check: { _tag: "Checking" } })
+    yield* source.check.pipe(
+      Effect.flatMap(candidate => gate.withPermits(1)(Effect.gen(function* () {
+        const current = yield* SubscriptionRef.get(state)
+        if (current.transfer._tag === "Closed") return
+        const replaceable = ["Idle", "Available", "Failed"].includes(current.transfer._tag)
+        const next: State = { ...current, check: { _tag: "Succeeded", at: yield* Clock.currentTimeMillis },
+          transfer: replaceable ? Option.isSome(candidate) ? { _tag: "Available", candidate: candidate.value } : { _tag: "Idle" } : current.transfer }
+        yield* SubscriptionRef.set(state, next)
+        if (replaceable && Option.isSome(candidate) && autoEnabled(next)) yield* startDownload(candidate.value, true)
+      }))),
+      Effect.catchAll(error => gate.withPermits(1)(SubscriptionRef.update(state, (current): State => current.transfer._tag === "Closed" ? current
+        : { ...current, check: { _tag: "Failed", message: error.message } }))),
+      Effect.catchAllDefect(() => gate.withPermits(1)(SubscriptionRef.update(state, (current): State => current.transfer._tag === "Closed" ? current
+        : { ...current, check: { _tag: "Failed", message: "Could not check for updates." } }))),
+      Effect.interruptible, Effect.forkIn(owner),
+    )
+  })).pipe(Effect.uninterruptible)
   return ApplicationUpdate.of({
-    state: SubscriptionRef.get(state).pipe(Effect.map(present)), changes: state.changes.pipe(Stream.map(present)), close,
-    requireReady: SubscriptionRef.get(state).pipe(Effect.flatMap(current => current._tag === "Ready" ? Effect.void
+    state: SubscriptionRef.get(state).pipe(Effect.map(present)), changes: state.changes.pipe(Stream.map(present)), close, check,
+    requireReady: SubscriptionRef.get(state).pipe(Effect.flatMap(current => current.transfer._tag === "Ready" ? Effect.void
       : new ApplicationUpdateFailed({ message: "Download the application update before restarting." }))),
-    check: gate.withPermits(1)(Effect.gen(function* () {
-      const current = yield* SubscriptionRef.get(state)
-      if (current._tag !== "Idle" && current._tag !== "Current" && current._tag !== "Available" && current._tag !== "Failed") {
-        return yield* new ApplicationUpdateFailed({ message: "An update is already in progress or Magnitude is quitting." })
-      }
-      yield* SubscriptionRef.set(state, machine.transition(current, "Checking", {}))
-      yield* work(source.check.pipe(Effect.flatMap(candidate => SubscriptionRef.update(state, current => current._tag !== "Checking" ? current
-        : Option.isSome(candidate) ? machine.transition(current, "Available", { candidate: candidate.value }) : machine.transition(current, "Current", {})))))
-    })).pipe(Effect.uninterruptible),
     download: gate.withPermits(1)(Effect.gen(function* () {
       const current = yield* SubscriptionRef.get(state)
-      if (current._tag !== "Available") return yield* new ApplicationUpdateFailed({ message: "Check for an available update before downloading." })
-      const candidate = current.candidate
-      yield* SubscriptionRef.set(state, machine.transition(current, "Downloading", { candidate, completed: 0 }))
-      yield* work(Effect.scoped(Effect.gen(function* () {
-        const archive = yield* source.download(candidate, completed => SubscriptionRef.update(state, current => current._tag === "Downloading"
-          ? machine.hold(current, { completed }) : current))
-        yield* SubscriptionRef.update(state, current => current._tag === "Downloading" ? machine.transition(current, "Staging", { candidate }) : current)
-        yield* source.stage(archive, candidate)
-        yield* SubscriptionRef.update(state, current => current._tag === "Staging" ? machine.transition(current, "Ready", { version: candidate.version }) : current)
-      })))
+      if (current.transfer._tag !== "Available") return yield* new ApplicationUpdateFailed({ message: "Check for an available update before downloading." })
+      yield* startDownload(current.transfer.candidate, false)
+    })).pipe(Effect.uninterruptible),
+    setAutoDownload: enabled => gate.withPermits(1)(Effect.gen(function* () {
+      if ((yield* SubscriptionRef.get(state)).transfer._tag === "Closed") return yield* closed
+      yield* preferences.write(enabled).pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })))
+      yield* SubscriptionRef.update(state, (current): State => ({ ...current, preference: { _tag: "Known", autoDownload: enabled } }))
+      const current = yield* SubscriptionRef.get(state)
+      if (enabled && current.transfer._tag === "Available") yield* startDownload(current.transfer.candidate, true)
+      if (!enabled && current.transfer._tag === "Downloading" && current.transfer.automatic) {
+        yield* SubscriptionRef.set(state, { ...current, transfer: { _tag: "Cancelling", candidate: current.transfer.candidate } })
+        if (Option.isSome(transferWorker)) yield* Fiber.interruptFork(transferWorker.value)
+      }
     })).pipe(Effect.uninterruptible),
   })
 })
 
-export const unavailableApplicationUpdate = (message: string): ApplicationUpdate => ({
-  state: Effect.succeed({ _tag: "Unavailable", message }), changes: Stream.succeed({ _tag: "Unavailable", message }),
-  check: new ApplicationUpdateFailed({ message }), download: new ApplicationUpdateFailed({ message }),
-  requireReady: new ApplicationUpdateFailed({ message }), close: Effect.void,
-})
+export const unavailableApplicationUpdate = (message: string): ApplicationUpdate => {
+  const state: DesktopUpdateState = { transfer: { _tag: "Unavailable", message }, check: { _tag: "Idle" }, preference: { _tag: "Unavailable", message } }
+  return { state: Effect.succeed(state), changes: Stream.succeed(state), check: new ApplicationUpdateFailed({ message }),
+    download: new ApplicationUpdateFailed({ message }), setAutoDownload: () => new ApplicationUpdateFailed({ message }),
+    requireReady: new ApplicationUpdateFailed({ message }), close: Effect.void }
+}
