@@ -1,0 +1,541 @@
+[
+  {
+    "id": "book16",
+    "file": "macbook-pro-16.jpg",
+    "subject": "16-inch MacBook Pro",
+    "source": "https://commons.wikimedia.org/wiki/File:MacBook_Pro_%2816-inch%2C_M4_Pro%2C_Silver%29.jpg",
+    "author": "AzureSaturn",
+    "license": "CC0",
+    "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Mac16,5",
+        "Mac16,7",
+        "Mac15,7",
+        "Mac15,9",
+        "Mac15,11",
+        "Mac17,6",
+        "Mac17,8"
+      ]
+    }
+  },
+  {
+    "id": "book14",
+    "file": "macbook-pro-14.jpg",
+    "subject": "14-inch MacBook Pro",
+    "source": "https://commons.wikimedia.org/wiki/File:MacBook_Pro_%2814-inch%2C_M5%2C_Space_Black%29.jpg",
+    "author": "AzureSaturn",
+    "license": "CC0",
+    "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Mac16,1",
+        "Mac16,6",
+        "Mac16,8",
+        "Mac15,3",
+        "Mac15,6",
+        "Mac15,8",
+        "Mac15,10",
+        "Mac14,5",
+        "Mac14,9",
+        "MacBookPro18,3",
+        "MacBookPro18,4",
+        "Mac17,2",
+        "Mac17,7",
+        "Mac17,9"
+      ]
+    }
+  },
+  {
+    "id": "air13",
+    "file": "macbook-air-13.jpg",
+    "subject": "13-inch MacBook Air",
+    "source": "https://commons.wikimedia.org/wiki/File:MacBook_Air_%2813-inch%2C_M4%2C_Silver%29.jpg",
+    "author": "AzureSaturn",
+    "license": "CC0",
+    "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Mac16,12",
+        "Mac17,3"
+      ]
+    }
+  },
+  {
+    "id": "studio",
+    "file": "mac-studio.jpg",
+    "subject": "Mac Studio",
+    "source": "https://commons.wikimedia.org/wiki/File:Mac_Studio_%282022%29_front.jpg",
+    "author": "Yasu",
+    "license": "CC BY-SA 3.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Mac13,1",
+        "Mac13,2",
+        "Mac14,13",
+        "Mac14,14",
+        "Mac15,14",
+        "Mac16,9"
+      ]
+    }
+  },
+  {
+    "id": "mini",
+    "file": "mac-mini-2024.jpg",
+    "subject": "Mac mini (2024)",
+    "source": "https://commons.wikimedia.org/wiki/File:Mac_mini_2024_M4.jpg",
+    "author": "Seasider53",
+    "license": "CC BY 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by/4.0/",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Mac16,10",
+        "Mac16,11"
+      ]
+    }
+  },
+  {
+    "id": "rtx5090",
+    "file": "rtx-5090.png",
+    "subject": "GeForce RTX 5090 Founders Edition",
+    "source": "https://commons.wikimedia.org/wiki/File:RTX_5090_-_du%C5%BCa_wydajno%C5%9B%C4%87_du%C5%BCym_kosztem_%282160p_30fps_VP9_LQ-96kbit_AAC%29-00.05.24.568.png",
+    "author": "ZMASLO",
+    "license": "CC BY 3.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by/3.0/",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "RTX 5090",
+        "RTX 5090 Founders Edition"
+      ]
+    }
+  },
+  {
+    "id": "air15-m4",
+    "file": "air15-m4.jpg",
+    "author": "AzureSaturn",
+    "license": "CC0",
+    "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/deed.en",
+    "source": "https://commons.wikimedia.org/wiki/File:MacBook_Air_(15-inch,_M4,_Silver).jpg",
+    "subject": "15-inch MacBook Air",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Mac16,13",
+        "Mac17,4"
+      ]
+    }
+  },
+  {
+    "id": "air13-m2",
+    "file": "air13-m2.jpg",
+    "author": "メイド理世",
+    "license": "CC BY-SA 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:MacBook_Air_(A2681)_front.jpg",
+    "subject": "13-inch MacBook Air (M2 / M3)",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Mac14,2",
+        "Mac15,12"
+      ]
+    }
+  },
+  {
+    "id": "air15-m2",
+    "file": "air15-m2.jpg",
+    "author": "KKPCW（Kyu3）",
+    "license": "CC BY-SA 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:Macbook_Air_15_inch_-_1.jpg",
+    "subject": "15-inch MacBook Air (M2 / M3)",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Mac14,15",
+        "Mac15,13"
+      ]
+    }
+  },
+  {
+    "id": "air13-m1",
+    "file": "air13-m1.jpg",
+    "author": "Jelican9",
+    "license": "CC BY-SA 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:Macbook_Air_2020_(M1).jpg",
+    "subject": "MacBook Air (M1)",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "MacBookAir10,1"
+      ]
+    }
+  },
+  {
+    "id": "pro13-m1",
+    "file": "pro13-m1.jpg",
+    "author": "Yagya Parihar",
+    "license": "CC BY-SA 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:MacBook_Pro_13_(M1,_2020).jpg",
+    "subject": "13-inch MacBook Pro (M1 / M2)",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "MacBookPro17,1",
+        "Mac14,7"
+      ]
+    }
+  },
+  {
+    "id": "pro16-m1",
+    "file": "pro16-m1.jpg",
+    "author": "Premeditated",
+    "license": "CC BY-SA 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:MacBook_Pro_16_(M1_Pro,_2021)_-_Wikipedia_(cropped).jpg",
+    "subject": "16-inch MacBook Pro (2021)",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "MacBookPro18,1",
+        "MacBookPro18,2"
+      ]
+    }
+  },
+  {
+    "id": "pro16-m2",
+    "file": "pro16-m2.jpg",
+    "author": "SimonWaldherr",
+    "license": "CC BY-SA 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:Apple_MacBook_Pro_16%22_M2_Max.jpg",
+    "subject": "16-inch MacBook Pro (early 2023)",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Mac14,6",
+        "Mac14,10"
+      ]
+    }
+  },
+  {
+    "id": "mini-m1",
+    "file": "mini-m1.jpg",
+    "author": "Gerd Fahrenhorst",
+    "license": "CC BY 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:Mac_mini_2020_(M1)_Anschl%C3%BCsse.jpg",
+    "subject": "Mac mini (M1 / M2)",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Macmini9,1",
+        "Mac14,3"
+      ]
+    }
+  },
+  {
+    "id": "rtx3060",
+    "file": "rtx3060.jpg",
+    "author": "Qurren",
+    "license": "CC BY-SA 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:Zotac_GeForce_RTX_3060_12GB_VRAM_LHR_video_card.jpg",
+    "subject": "RTX 3060",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "RTX 3060"
+      ]
+    }
+  },
+  {
+    "id": "rtx3070",
+    "file": "rtx3070.jpg",
+    "author": "TheStriker",
+    "license": "CC BY 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:MSI_GeForce_RTX_3070_VENTUS_3X_OC.jpg",
+    "subject": "RTX 3070",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "RTX 3070"
+      ]
+    }
+  },
+  {
+    "id": "rtx3090",
+    "file": "rtx3090.jpg",
+    "author": "Adam Kapetanakis",
+    "license": "CC BY-SA 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:RTX_3090_Founders_Edition.jpg",
+    "subject": "RTX 3090",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "RTX 3090"
+      ]
+    }
+  },
+  {
+    "id": "rtx4070super",
+    "file": "rtx4070super.png",
+    "author": "极客湾Geekerwan",
+    "license": "CC BY 3.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by/3.0",
+    "source": "https://commons.wikimedia.org/wiki/File:Video_%C3%BCber_die_RTX_4070_Super_und_Vergleichskarten_(%E6%9E%81%E5%AE%A2%E6%B9%BEGeekerwan)_01.png",
+    "subject": "RTX 4070 SUPER",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "RTX 4070 SUPER"
+      ]
+    }
+  },
+  {
+    "id": "rtx4090",
+    "file": "rtx4090.jpg",
+    "author": "Benlisquare",
+    "license": "CC BY-SA 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:Asus_Strix_RTX_4090.jpg",
+    "subject": "RTX 4090",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "RTX 4090"
+      ]
+    }
+  },
+  {
+    "id": "rtx5060",
+    "file": "rtx5060.jpg",
+    "author": "4300streetcar",
+    "license": "CC BY 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:PNY_short_RTX_5060_at_Computex_2025.jpg",
+    "subject": "RTX 5060",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "RTX 5060"
+      ]
+    }
+  },
+  {
+    "id": "rx6800xt",
+    "file": "rx6800xt.jpg",
+    "author": "Vitaly Zdanevich",
+    "license": "CC BY-SA 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:Amd-radeon-rx6800xt-from2020year-angle.jpg",
+    "subject": "RX 6800 XT",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "RX 6800 XT"
+      ]
+    }
+  },
+  {
+    "id": "rx6900xt",
+    "file": "rx6900xt.jpg",
+    "author": "Verte95",
+    "license": "CC BY-SA 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:AMD_RX_6900XT_.jpg",
+    "subject": "RX 6900 XT",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "RX 6900 XT"
+      ]
+    }
+  },
+  {
+    "id": "rx7900xt",
+    "file": "rx7900xt.jpg",
+    "author": "Shinobara",
+    "license": "CC BY 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:RX7900XT_crop.jpg",
+    "subject": "RX 7900 XT",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "RX 7900 XT"
+      ]
+    }
+  },
+  {
+    "id": "rx7900xtx",
+    "file": "rx7900xtx.jpg",
+    "author": "Geni",
+    "license": "CC BY-SA 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:Sapphire_AMD_Radeon_RX_7900_XTX.jpg",
+    "subject": "RX 7900 XTX",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "RX 7900 XTX"
+      ]
+    }
+  },
+  {
+    "id": "rx9060xt",
+    "file": "rx9060xt.png",
+    "author": "Padgriffin",
+    "license": "CC BY 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:AMD_Radeon_RX9060XT.png",
+    "subject": "RX 9060 XT",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "RX 9060 XT"
+      ]
+    }
+  },
+  {
+    "id": "imac-m1",
+    "file": "imac-m1.jpg",
+    "author": "Jelican9",
+    "license": "CC BY-SA 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:M1_iMac_blue_model.jpg",
+    "subject": "24-inch iMac (M1 / M3)",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "iMac21,1",
+        "iMac21,2",
+        "Mac15,4",
+        "Mac15,5"
+      ]
+    }
+  },
+  {
+    "id": "imac-m4",
+    "file": "imac-m4.jpg",
+    "author": "Seasider53",
+    "license": "CC BY 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:IMac_M4_2024_2_(cropped).jpg",
+    "subject": "24-inch iMac (M4)",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Mac16,2",
+        "Mac16,3"
+      ]
+    }
+  },
+  {
+    "id": "surface-studio",
+    "file": "surface-studio.jpg",
+    "author": "KKPCW",
+    "license": "CC BY-SA 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:Surface_Laptop_Studio_-_1.jpg",
+    "subject": "Surface Laptop Studio",
+    "match": {
+      "_tag": "Pc",
+      "manufacturers": [
+        "Microsoft Corporation"
+      ],
+      "models": [
+        "Surface Laptop Studio"
+      ]
+    }
+  },
+  {
+    "id": "surface-go",
+    "file": "surface-go.jpg",
+    "author": "Ckazemi",
+    "license": "CC BY-SA 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:A_platinum_Microsoft_Surface_Laptop_Go.jpg",
+    "subject": "Surface Laptop Go",
+    "match": {
+      "_tag": "Pc",
+      "manufacturers": [
+        "Microsoft Corporation"
+      ],
+      "models": [
+        "Surface Laptop Go"
+      ]
+    }
+  },
+  {
+    "id": "arc-a770",
+    "file": "arc-a770.jpg",
+    "author": "Telaneo",
+    "license": "CC0",
+    "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/deed.en",
+    "source": "https://commons.wikimedia.org/wiki/File:Intel_Arc_A770_front.jpg",
+    "subject": "Arc A770",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "Arc A770"
+      ]
+    }
+  },
+  {
+    "id": "arc-b580",
+    "file": "arc-b580.jpg",
+    "author": "Jiahwang",
+    "license": "CC0",
+    "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/deed.en",
+    "source": "https://commons.wikimedia.org/wiki/File:Intel_Arc_Battlemage_B580_Limited_Edition.jpg",
+    "subject": "Arc B580",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "Arc B580"
+      ]
+    }
+  },
+  {
+    "id": "rtx5070ti",
+    "file": "rtx5070ti.jpg",
+    "author": "4300streetcar",
+    "license": "CC BY 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:PNY_RTX_5070_Ti_at_Computex_2025.jpg",
+    "subject": "RTX 5070 Ti",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "RTX 5070 Ti"
+      ]
+    }
+  },
+  {
+    "id": "rx580",
+    "file": "rx580.jpg",
+    "author": "Verte95",
+    "license": "CC BY-SA 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:Sapphire_RX_580_Nitro%2B.jpg",
+    "subject": "RX 580",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "RX 580"
+      ]
+    }
+  }
+]
