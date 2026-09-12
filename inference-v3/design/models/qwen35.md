@@ -1,82 +1,95 @@
-# Qwen 3.5 dense
+# Qwen 3.5
 
-**The architecture names its geometry and weight roles; a container supplies them;
-the program composes operations and is captured once per invocation geometry.**
+**Qwen defines geometry, weight roles, mixer topology, feedforward topology and
+finite-precision equations as ordinary Magnitensor composition; it owns no
+kernel, candidate table, scratch arena or compiler path.**
 
-## Assembly
+## Model composition
 
 ```text
-Qwen 3.5 dense
-├── Embedding
-├── Repeated block (mixer kind per layer from the description)
-│   ├── Input norm
+Qwen 3.5
+├── Optional prepared media
+│   └── vision encoder + projector ──► decoder-width conditioned spans
+├── Token embedding with conditioned-span replacement
+├── Repeated block, mixer kind from the description
+│   ├── Input normalization
 │   ├── Attention mixer
-│   │   ├── Grouped q/gate, k, v projections
-│   │   ├── Rotary coordinates and q/k norms
-│   │   ├── KV append ── State: KV pool
-│   │   ├── Causal attention over visible history
-│   │   ├── Sigmoid gate
-│   │   └── Output projection
+│   │   ├── grouped Q/gate, K and V projection
+│   │   ├── Q/K normalization and rotary
+│   │   ├── versioned KV append and causal attention
+│   │   └── output gate and projection
 │   ├── Recurrent mixer
-│   │   ├── Grouped qkv, gate, beta, alpha projections
-│   │   ├── Convolution, norms, decay and gates ── State: recurrent banks
-│   │   ├── Gated delta update
-│   │   ├── Norm, SiLU gate
-│   │   └── Output projection
-│   ├── Residual add
-│   └── Feedforward norm → Gated feedforward → Down projection → Residual add
-└── Selected rows → Output norm → Readout
-
-Description: geometry + weight roles     ◄── formats: GGUF, MLX (one inspector each)
+│   │   ├── grouped QKV, gate, beta and alpha projection
+│   │   ├── convolution, decay and delta-state transition
+│   │   └── gated normalization and output projection
+│   ├── Residual transition
+│   └── Feedforward
+│       ├── dense gated feedforward, or
+│       └── router + selected experts + shared expert
+└── Selected rows ──► output normalization ──► readout
 ```
 
-| Boundary | Rule |
-|---|---|
-| Description ↔ container | The description names roles and geometry with no container in view; a format maps its own names to those roles. This is the one place model meets format, one file per format |
-| Description ↔ weights | The description carries the artifact identity; a binding from another artifact fails before any work |
-| Program ↔ kernels | The program asks operations; it names no schedule and imports none |
+The description names these roles and their geometry independently of a
+container. GGUF and other formats map their names and stored tensors to those
+roles. Artifact identity is checked before the model function is compiled.
 
-## Rounding points
+## Magnitensor boundary
 
-The program carries one precision. Where the reference implementation rounds
-natively, so does the program; where it does not, FP32 is kept across the
-expression regardless of preset:
+The model uses semantically strong operations for quantized projections,
+attention, recurrence, routing, selected experts, shared experts, state access
+and normalization. Those operations preserve the information required for
+specialized prefill and decode lowering.
 
-| Boundary | Follows the preset | Always FP32 internal |
-|---|---|---|
-| Norms, rotary and q/k norms, attention gate, feedforward gate | ● | |
-| Residual adds, recurrent SiLU gate | | ● |
-| Reductions, delta state, decay, statistics, logits | | ● |
+The block itself remains ordinary model composition. Magnitensor may match a
+complete attention, recurrence or expert producer-consumer region and emit one
+authored fused TileLang schedule. Such a lowering is described by its
+mathematics, geometry, representation and effects, never by the Qwen name.
 
-## Invocation geometry
+Dense and routed variants use the same tensor system. MoE is not a second model
+executor: routing, grouping, expert projection, weighted reduction and shared
+expert combination are tensor operations within the same graph, resource plan
+and completion.
 
-A forward is prepared once for a geometry and replayed for every step that shares
-it:
+## Precision
 
-```text
-geometry = changing-operand layout · packed counts · requested output rows ·
-           KV read and write geometry of the first attention layer
-same geometry ──► rebind and launch     different ──► release plan, rebuild, capture
-```
+The model declares its observable finite-precision contract. Norms, rotary,
+projection boundaries, gates, residuals, recurrent state, reductions and logits
+retain their required accumulation and storage boundaries through fusion. A
+lowering that changes an observable rounding point is not a substitute for the
+same model contract.
 
-Decode at a fixed batch size is one geometry for as long as histories stay in
-their capacity classes; a prefill chunk of a new length is another. Layer-by-layer
-Python work exists only when the geometry changes.
+## Specialization
 
-The arena holds every intermediate: the program's slots sized by row count, and
-the regions operations declared, merged by name. A slot survives a plan change;
-operation scratch is released with the plan. Growth of either is a geometry change.
+Prefill, decode and verification compile as different tensor specializations
+because their optimal algorithms and geometries differ. Packed counts, requested
+readout rows, causal read/write geometry and representation constraints are
+explicit graph inputs or static specialization facts.
+
+History lengths remain dynamic within bounded capacity classes. A growing
+history changes resource metadata, not model topology. A state-only invocation
+omits the stateless suffix whose result has no consumer.
 
 ## State
 
-| Rule | Reason |
-|---|---|
-| The KV pool is laid out for the attention layers only | Recurrent layers keep no history; they keep a state |
-| Recurrent state lives in reusable banks | A new state needs banks; an idle bank is reused rather than reallocated |
-| An advance extends a private KV tail in place, otherwise claims new runs | Sharing with a checkpoint forbids the in-place write |
-| An advance anticipates the input horizon | The pool sizes new slabs toward the known prompt length without claiming ahead |
-| A state-only prefill chunk stops after the last mixer | Its output has no consumer; the recurrent state is already complete |
+Attention layers receive logical KV views backed by Magnitensor resources;
+recurrent layers receive versioned recurrent banks. The tensor graph orders
+writes and subsequent reads. The Qwen sequence owner decides whether each
+tentative advance commits, aborts, forks or becomes a checkpoint.
 
-Packing is the runtime's: several sequences' tokens, positions and coordinates
-become one forward; conditioning features overwrite the embedding rows they
-replace; each sequence's advance accepts or aborts on its own.
+Packing combines several sequences into one tensor invocation while preserving
+row-local positions, visibility, routing, reductions and acceptance. Padding or
+peer rows never enter another row's arithmetic.
+
+## Vision
+
+The Qwen input adapter interprets its processor contract, expands media
+placeholders and constructs the required coordinates and spans. The vision tower
+and projector are stateless Magnitensor tensor functions whose outputs are
+decoder-width features. Their resources and batching are independent of decoder
+state and decoder batching.
+
+The language function consumes prepared feature slices through the model input
+contract; it does not inspect raw images or placeholder token identities. A
+partial legal continuation retains the coordinates and remaining feature slice
+needed to resume. Fully consumed media does not remain an operand of ordinary
+text decode. See [inputs.md](inputs.md).

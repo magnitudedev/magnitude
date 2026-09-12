@@ -1,99 +1,87 @@
 # Weights
 
-**A container is forgotten at residency. Every execution kernel reads an
-engine-defined layout whose parameters express numerical meaning, not a source
-format or packing name.**
+**Magnitude interprets artifacts and model roles; Magnitensor owns numerical
+representations and physical tensor resources. Container identity and packing
+never enter operation lowering or portable kernels.**
 
-## From container to kernel
-
-```text
-container ──► stored weight ──► residency ──► resident weight ──► command
- parser          source spans      bounded       representation      retains the
- and codec       and codec         import        layout + rows       allocation
-```
-
-| Stage | Owns | Never knows |
-|---|---|---|
-| Format | Parsing, validation, artifact identity, wire geometry, source codec | Execution schedules |
-| Residency | Representation choice, bounded relayout or conversion, one allocation | Model semantics |
-| Resident weight | Numerical representation, canonical layout, backing extent, logical rows | Source codec or container metadata |
-| Kernel | Canonical addresses and numerical interpretation | Where bytes came from |
-
-## Numerical representations
-
-A representation is a parameter value. Containers with equal parameters share
-the same readers and schedules.
-
-| Meaning | Parameters | Examples |
-|---|---|---|
-| Dense | dtype | resident FP32 parameters |
-| Affine | code planes and interpretation, group, coefficient scheme | MLX Q4, Q4_K, Q5_K, Q6_K, Q8_0 |
-| Codebook | code width and table, group, coefficient scheme | IQ4_XS |
-
-Codes distinguish unsigned, offset-binary, and two's-complement
-interpretations. Coefficients are either direct floating scale/bias values or a
-compact local/supergroup hierarchy. Bias presence and sign belong to the
-coefficient scheme; they are not independent packing flags.
-
-Codebook is a separate representation because table lookup changes numerical
-meaning. Its immutable table is folded into a specialization and consumes no
-resident bytes.
-
-## Canonical layout
-
-`canonical_layout` is the only authority for field offsets and allocation
-size. Hierarchical tiles contain, in order:
+## Boundary
 
 ```text
-low codes · high codes · local scales · local biases · super scale · super bias
+artifact container
+    │ Magnitude parses names, geometry, codec and numerical meaning
+    ▼
+model-role tensors with residency constraints
+    │ Magnitensor imports into typed physical resources
+    ▼
+representation and layout visible to graph lowering
+    │ selected portable TileLang kernel
+    ▼
+numerical use
 ```
 
-Absent fields consume no space. Codes and local coefficients are bit-contiguous
-and little-endian within their fields. A direct affine matrix uses the same
-order as matrix-wide planes, which lets MLX codes, scales, and biases copy
-directly into their final ranges.
+| Owner | Responsibility | Must not decide |
+|---|---|---|
+| Format adapter | Parsing, validation, artifact identity, source geometry and codec | Execution strategy or target layout |
+| Model description | Weight roles, transforms and architecture geometry | Container byte layout or kernels |
+| Magnitude residency policy | Which weights may be resident, streamed or grouped under the memory policy | Backend-specific numerical implementation |
+| Magnitensor | Numerical representation, selected physical layout, import computation, resources and views | Container names, model topology or eviction policy |
+| Portable kernel | Decode and consume the selected representation | Source format or vendor identity |
 
-Canonical relayout is a permutation, not dequantization. It cannot widen codes
-or coefficients, add per-tile padding, precompute products, or create a second
-resident copy. Current compact sizes therefore remain 36 bytes per 64 MLX Q4
-values and 144/176/210/34/136 bytes for Q4_K/Q5_K/Q6_K/Q8_0/IQ4_XS blocks.
+## Numerical representation
+
+A representation describes mathematical interpretation, not provenance. Dense,
+affine and codebook representations state their dtypes, code interpretation,
+groups, coefficients and lookup values. Containers with equal numerical
+parameters use the same operations and candidate families.
+
+A new wire packing does not create a representation. A representation is new
+only when existing descriptions cannot express the stored values' mathematical
+meaning. Source codecs disappear after import.
+
+## Layout selection
+
+Logical representation and physical layout are different facts. A representation
+may have several lossless layouts suitable for different algorithms. Magnitensor
+selects layout together with graph regions and kernel candidates, charging any
+conversion and additional residency explicitly.
+
+```text
+representation: what values the bytes mean
+layout:         where those bytes are for a selected implementation
+codec:          how the source container stored them before import
+```
+
+One canonical compact layout is always available for supported encoded weights.
+Additional execution layouts exist only when their enclosing performance benefit
+justifies their memory cost. They are not selected by container or backend name,
+and they never silently create an uncharged dequantized copy.
 
 ## Import
 
-A quantized format supplies one stable source codec per wire encoding. The
-codec declares source tile geometry and reads logical codes and coefficients.
-Residency specializes one generic relayout writer with that codec, processes
-complete tiles through bounded two-slot staging, and writes directly into the
-final canonical allocation. Reading and uploading the next slot overlaps the
-preceding relayout submission. Codec and wire-enum knowledge never enter
-inference. The codec boundary is typed as trace buffers and scalar expressions;
-it does not expose schedules or an untyped kernel API.
+The format adapter presents bounded source tiles and a typed decoding contract.
+Magnitensor performs required permutation or conversion as ordinary tensor work,
+compiled through TileLang. Import publishes only complete target resources; a
+failure releases staging and unpublished allocations.
 
-Dense conversion is separate. Stored F16 and BF16 values widen to resident
-FP32, with any declared transform applied once. MLX affine planes already have
-canonical logical order and are copied without a relayout kernel.
+Lossless relayout preserves encoded numerical meaning. Widening, dequantization
+or coefficient precomputation changes representation and must be declared as
+such. Import and execution may overlap only through explicit completion and
+resource ownership.
 
-A failed import closes the unpublished target and all staging. A successful
-import publishes only the final allocation.
+## Identity, grouping and sharing
 
-## Ownership and grouping
+Artifact identity remains attached to every bound role so weights from different
+artifacts cannot be combined accidentally. Compatible projections may share or
+group physical storage when declared before import and when representation,
+layout, transforms and row boundaries permit it.
 
-| Rule | Reason |
-|---|---|
-| One allocation per weight or compatible row-concatenated group | Every consumer sees the same bytes |
-| A group is declared before any member becomes resident | Grouping later would require a copy |
-| A group member carries a logical row range over the complete layout | Canonical fields need not form one byte-contiguous member slice |
-| Every kernel binds the complete allocation once | No format-specific multi-plane binding contract leaks upward |
-| Commands retain allocation views | Sources and residency owners may retire after submission |
-
-Grouping preserves bytes exactly. Quantized members must have equal numerical
-representations and complete source tiles per row; declared transforms prevent
-grouping.
+Grouping is a compiler-visible tensor relationship, not an operation object. It
+may enable one projection or fused region without requiring a later copy.
+Equal-shaped weights share compiled code but remain distinct resources.
 
 ## Extension
 
-A new container implements parsing and source codecs. If its values match an
-existing representation, it needs no inference change. A representation is new
-only when its numerical meaning cannot be expressed by `Dense`, `Affine`, or
-`Codebook`; a new source packing alone never creates a representation or fast
-path.
+A new container adds a Magnitude format adapter and source codec. A new numerical
+representation adds its Magnitensor contract, reference interpretation, import
+path and portable lowering support. A new fast layout or kernel candidate changes
+neither container parsing nor model equations.

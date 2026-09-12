@@ -1,19 +1,21 @@
 # Serving
 
-**The host owns transport, rendering and parsing; a worker thread owns the engine.
-Tokens, options and snapshots cross between them, and nothing else does.**
+**The host owns transport, rendering, media preparation and parsing; a worker
+thread owns the engine. Tokens, prepared input tensors, options and snapshots
+cross between them, and nothing else does.**
 
 ## Process
 
 ```text
 HTTP ──► app ──► chat service ──► worker (one thread) ──► runtime ──► engine + model + device
              template · parser · stop text            │
-             per request, on the host                 └── built from one composition; reported with its digest
+             bounded media preparation                └── built from one composition; reported with its digest
+             per request, on the host
 ```
 
 | Crosses the worker boundary | Never crosses |
 |---|---|
-| Rendered tokens and generation options, in | A tokenizer, a template, a parser |
+| Rendered tokens, prepared media tensors and generation options, in | A tokenizer, template, parser or media processor |
 | Published tokens and a snapshot, out | A sequence, a tensor, a ticket, a device object |
 | Stop and release, in | A chat format or an input plan's meaning |
 
@@ -24,7 +26,8 @@ completion delivery is reserved so a saturated control queue cannot block it.
 
 ```text
 validate wire body ── reject unsupported policies before admission
-render with the artifact's own template ── tools, choice, parallelism ── must fit the context
+resolve and prepare bounded media with the artifact's processor
+render with the artifact's own template ── tools, media spans, choice, parallelism ── must fit the context
 admit ──► id
 receive ──► future ◄── publication of one token, or a finish, per delivery
 decode text incrementally ──► content / reasoning / tool-call events ──► SSE chunks

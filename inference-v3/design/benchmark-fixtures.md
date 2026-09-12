@@ -1,8 +1,8 @@
 # Benchmark context fixtures
 
-`benchmark_fixtures` owns source acquisition, deterministic content construction and
-prepared inputs. Model benchmarks and session-bench consume it; execution, scheduling
-and result storage stay with their respective runners.
+**Benchmark fixtures own source acquisition, deterministic content construction
+and prepared inputs. Model benchmarks and session bench consume them; execution,
+scheduling and result storage remain with their respective runners.**
 
 ## Content
 
