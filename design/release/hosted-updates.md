@@ -1,0 +1,100 @@
+---
+applies_to:
+  - packages/release/src/hosted-update/**
+  - packages/release/resources/distribution/**
+  - packages/release/scripts/build-distribution-server.ts
+  - desktop/src/update-identity*
+---
+
+# Hosted application update protocol
+
+The hosted distribution boundary separates installation authentication from publisher authenticity.
+An installation owns an Ed25519 private key outside its application bundle. The server identifies
+it by SHA-256 of its raw public key. That identity proves possession, not a person's identity or
+truthful platform reports. Publisher keys are a separate trust set supplied by application builds;
+a server response never expands that trust set.
+
+## Signed checks
+
+The request signature matches Ollama: `GET,` followed by the exact request path and query, signed
+with Ed25519. Authorization contains the base64 SSH Ed25519 public-key blob and base64 raw signature,
+separated by a colon. Query encoding matches Go's sorted form encoding. Request metadata is bounded,
+validated and covered by the signature; duplicate or unknown fields are invalid. The HTTP host
+admits only its fixed origin, update route and GET method.
+
+Timestamps are admitted within five minutes of server time. Nonces are admitted atomically and
+retained beyond the timestamp acceptance window so a concurrent replay cannot record activity
+again. Invalid authentication and expired requests return 401; replay returns 409; malformed input
+returns 400. Storage or publisher-verification failures return 503, never “up to date.”
+
+An admitted check returns 204 without a body when no qualifying release exists. A 200 response
+contains a signed manifest envelope. Checks are private and uncacheable; deployment must not apply
+ISR or shared response caching to them.
+
+The deployment edge limits only update/download endpoints before they reach the database. Its
+short-lived rate counter is separate from installation analytics; requests rejected at the edge
+are not installation observations. Ordinary website pages do not share this endpoint limit.
+
+## Release authenticity
+
+The envelope signs a versioned, domain-separated payload with a trusted publisher Ed25519 key.
+The payload binds release version, source commit, target OS/architecture/package, immutable artifact
+path, byte count and SHA-256. Paths cannot escape the release object prefix. The client admits only
+newer versions compatible with its target and existing stable/beta/alpha channel policy. Candidate
+selection chooses the newest compatible version independently of storage enumeration order.
+
+Cryptographic verification does not replace checksum verification after transfer or native
+publisher verification before installation. Installation lifecycle belongs to desktop main.
+
+Artifact paths belong to their signed version directory. Immutable storage publication verifies
+the local file, refuses overwrites, and verifies the complete remotely downloaded byte count and
+digest before an artifact is eligible for promotion. An existing object requires the same remote
+verification; existence alone is not an accepted publication.
+
+The desktop owner creates its installation key only after native ownership is acquired. The key
+survives application replacement, remains outside the bundle, and is private to the user. Corrupt
+key material causes an explicit failure rather than silently resetting the installation identity.
+
+## Database ownership
+
+Distribution records belong to a private schema, separate from provider customer and billing data.
+Public API roles receive no schema/table access. Runtime credentials receive only their necessary
+privileges. Release promotion is a publication operation; an ordinary check cannot publish.
+
+Nonce admission precedes release selection and telemetry. A verified check records installation
+identity and daily platform/version/country activity, using server time for observation dates.
+Country comes only from trusted host composition. Raw IPs, request signatures and private keys are
+not telemetry fields. Nonces exist only in the expiring replay table. Daily observations use
+atomic upserts so concurrent distinct checks preserve their count. A telemetry-only write failure
+may lose an observation but must not suppress an otherwise valid update response.
+
+Authenticated download requests use the same signature and replay admission, including the release
+selector. They resolve only a matching signed artifact and record download intent before returning
+an uncached redirect. Authorization is not forwarded to object storage. CDN range requests do not
+create additional download records. Request counts do not claim completed transfers or installs.
+
+Detailed installation observations are retained for 90 days, then rolled up without installation
+identifiers. Global daily active counts deduplicate across version and country changes; subgroup
+distinct counts must not be summed into a global total. Installation identities expire after 180
+inactive days. A database-owned scheduled function removes expired replay nonces and performs
+retention. The request runtime cannot execute retention or modify release/channel records.
+
+## Website deployment
+
+The website consumes a private, content-addressed bundle of this server implementation. The bundle
+contains the same request, manifest and database contracts; the website does not maintain a second
+verifier. Native Vercel API routes adapt HTTP requests and trusted edge country metadata, with one
+small pooled database connection set per function instance. Database credentials stay server-side,
+use a restricted role, and validate the Supabase certificate chain and hostname.
+
+## Acceptance
+
+Tests must reject signature/payload changes, malformed key encodings, expired or duplicate requests,
+wrong publishers, incompatible targets and downgrades. Concurrent duplicate requests yield one
+admission. Real PostgreSQL checks must verify daily-count upserts and replay uniqueness, not just
+an in-memory substitute. Deployments separately validate uncached routes, trusted country metadata
+and absence of sensitive request fields from logs.
+
+Native platform protocol probes establish crypto, networking and OS metadata behavior only. Full
+platform acceptance additionally requires actual application download, publisher verification,
+native replacement, relaunch and preserved service/installation ownership.
