@@ -2,6 +2,8 @@ import { decodePublisherPublicKey } from "@magnitudedev/release/hosted-update"
 import { Effect, Schema } from "effect"
 
 declare const __MAGNITUDE_UPDATE_CONFIGURATION__: unknown
+declare const __MAGNITUDE_UPDATE_ACCEPTANCE__: boolean
+export const isUpdateAcceptanceBuild = __MAGNITUDE_UPDATE_ACCEPTANCE__
 
 const Configuration = Schema.Struct({
   origin: Schema.String,

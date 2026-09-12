@@ -11,7 +11,7 @@ import { UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
 import { makeUpdateIdentity } from "./update-identity"
 import { makeUpdatePreferences, UpdatePreferences } from "./update-preferences"
 import { makeUpdateSchedule } from "./update-schedule"
-import { readUpdateConfiguration } from "./update-config"
+import { readUpdateConfiguration, isUpdateAcceptanceBuild } from "./update-config"
 import { NativeTrayFactory, NativeTrayFailed, TrayOwner, TrayOwnerLive } from "./tray-owner"
 import { CommandExecutor, FetchHttpClient } from "@effect/platform"
 import { NodeContext } from "@effect/platform-node"
@@ -44,12 +44,13 @@ if (process.platform === "win32") app.setAppUserModelId(WINDOWS_APPLICATION_ID)
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, "../../..")
 const background = process.argv.includes("--background") || (process.platform === "darwin" && app.isPackaged && app.getLoginItemSettings({ type: "mainAppService" }).wasOpenedAtLogin)
-const isolatedProfile = !app.isPackaged || process.env.MAGNITUDE_DEV_DATA_DIR !== undefined
-const dataDir = process.env.MAGNITUDE_DEV_DATA_DIR ?? (app.isPackaged ? join(homedir(), ".magnitude") : join(homedir(), ".magnitude-desktop-dev"))
+const isolatedProfile = isUpdateAcceptanceBuild || !app.isPackaged || process.env.MAGNITUDE_DEV_DATA_DIR !== undefined
+const dataDir = process.env.MAGNITUDE_DEV_DATA_DIR ?? join(homedir(), isUpdateAcceptanceBuild ? ".magnitude-update-acceptance" : app.isPackaged ? ".magnitude" : ".magnitude-desktop-dev")
+const stateOverride = process.env.MAGNITUDE_DESKTOP_STATE_DIR ?? (isUpdateAcceptanceBuild ? join(dataDir, "desktop") : undefined)
 // Chromium can create its profile before native ownership is acquired. Keep it outside the
 // protected Windows ownership leaf, which only native acquisition may create.
-if (isolatedProfile) app.setPath("userData", process.platform === "win32" ? join(dataDir, "electron") : join(process.env.MAGNITUDE_DESKTOP_STATE_DIR ?? join(dataDir, "desktop"), "electron"))
-const port = isolatedProfile ? Number(process.env.MAGNITUDE_DEV_PORT ?? 11101) : 10100
+if (isolatedProfile) app.setPath("userData", process.platform === "win32" ? join(dataDir, "electron") : join(stateOverride ?? join(dataDir, "desktop"), "electron"))
+const port = isolatedProfile ? Number(process.env.MAGNITUDE_DEV_PORT ?? (isUpdateAcceptanceBuild ? 11143 : 11101)) : 10100
 const endpoint = `http://127.0.0.1:${port}`
 const addonPath = app.isPackaged ? join(process.resourcesPath, "desktop-host.node") : join(root, `packages/daemon-management/dist/native/${process.platform}-${process.arch}/desktop-host.node`)
 let exiting = false
@@ -71,7 +72,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     yield* native.requireInteractiveDesktop
     canPresentErrors = true
   }
-  const stateDir = yield* applicationStateDirectory({ platform: process.platform, dataDirectory: dataDir, development: !app.isPackaged, override: Option.fromNullable(process.env.MAGNITUDE_DESKTOP_STATE_DIR), localAppDataDirectory: native.localAppDataDirectory })
+  const stateDir = yield* applicationStateDirectory({ platform: process.platform, dataDirectory: dataDir, development: !app.isPackaged, override: Option.fromNullable(stateOverride), localAppDataDirectory: native.localAppDataDirectory })
   const owner = yield* acquireApplicationOwner(stateDir, background ? "EnsureRunning" : "ShowWindow")
   if (owner._tag === "Forwarded") { exiting = true; app.quit(); return }
   const handoff = process.platform === "darwin" && app.isPackaged
