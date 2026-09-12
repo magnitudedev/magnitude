@@ -553,6 +553,7 @@ pub enum ModelReleaseReason {
     IdleTimeout,
     Replacement,
     MemoryPressure,
+    Failure,
 }
 
 #[cfg(test)]
@@ -566,6 +567,7 @@ mod model_release_reason_tests {
             (ModelReleaseReason::IdleTimeout, "\"idle_timeout\""),
             (ModelReleaseReason::Replacement, "\"replacement\""),
             (ModelReleaseReason::MemoryPressure, "\"memory_pressure\""),
+            (ModelReleaseReason::Failure, "\"failure\""),
         ];
 
         for (reason, expected) in cases {

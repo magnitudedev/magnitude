@@ -22,10 +22,34 @@ factory, observes termination, and performs bounded shutdown. ACN consumes that 
 directly; a second semantic facade is forbidden unless it owns a new invariant rather than merely
 renaming generated operations.
 
-The ICN child remains in its ACN's dedicated OS process-tree termination unit. Cooperative ICN
-shutdown is private to ACN, but external ACN retirement may signal that whole unit and must prove it
-absent even when the ACN root has already exited. No separate ICN discovery or durable identity is
-needed for that fallback.
+ICN remains inside ACN's owned process tree. On Unix, the process executor places ICN in a separate
+process group: its native parent-channel watchdog therefore terminates that entire group on ACN
+loss. Each native worker also installs protection before telemetry or backend initialization,
+preserving the spawning parent's identity across exec. Leader exit alone never proves group cleanup.
+Windows uses nested job containment. Each worker also observes the exact spawning ICN occurrence
+through a retained query/synchronization process handle. The launcher supplies PID and creation time;
+the worker verifies both before initialization, rejects an already exited parent, and waits on that
+same handle in a native thread. Parent exit or observation failure terminates the worker. This grants
+no termination rights over ICN and does not replace job containment of descendants. Job handles use
+owned native resources, with close-on-drop cleanup across threads and initialization failures.
+Native Windows child acquisition supplies the private job and explicit standard-I/O handle list
+as process-creation attributes. Containment must exist before child code executes. Retirement
+observes both root exit and zero job members through retained handles; a deadline failure retains
+those handles and does not authorize a replacement. Environment blocks use Windows ordinal name
+comparison, reject duplicate names, preserve inherited per-drive current-directory entries,
+and preserve UTF-16 arguments without shell interpretation.
+Both planning and inference workers use this acquisition boundary. Planning pipes are transferred
+through owned Windows handles into Tokio's standard child-stream adapters; dropping the planning
+owner closes its job before disposing of the adapters, so pending pipe reads can finish on child
+exit. Inference-worker ownership begins immediately after spawn, before any fallible handshake or
+IPC initialization. Its writer holds a weak client reference and terminates on Shutdown; an idle
+writer cannot keep its own command sender alive after the client is dropped.
+No independent ICN discovery or durable owner store exists.
+Platform child acquisition is a scoped capability supplied by ACN's host composition. It owns exact
+process identity, separate standard streams, exit observation and single-flight tree retirement.
+ICN's protocol lifecycle consumes that capability without Unix group or Windows job assumptions;
+it alone validates bootstrap records and readiness. Child acquisition installs retirement before
+becoming interruptible, and readiness failure or scope cancellation retires the acquired child.
 
 The child supervisor exposes one `defineFSM` lifecycle:
 
@@ -37,9 +61,10 @@ Starting -> Ready -> Stopping -> Exited
 
 The exact exit observer commits `Exited(code, expected)` before releasing exit waiters. Shutdown is
 single-flight and caller interruption cannot abandon it: the winner starts one daemon-owned
-terminalization Effect, while all callers await the same result. It sends TERM, waits for the
-configured deadline, sends KILL, waits for the force deadline, and reports failure if exact exit is
-still unobserved.
+terminalization Effect, while all callers await the same result. It sends TERM, waits for the configured deadline, sends KILL, waits for the force deadline, and
+reports failure if the owned process group is not proven absent. An already-exited leader does
+not bypass that proof. Generic process identity/group inspection lives in shared host utilities,
+not in the ACN wire protocol.
 
 ICN is not a separately discovered daemon. Clients never connect to it directly, and ACN does not
 adopt an ICN started by another process. A model is not a public process resource: the one ICN
@@ -121,8 +146,8 @@ emits:
 - generated client service/tag and construction APIs; and
 - a manifest binding every emitted artifact and operation to the source protocol.
 
-The ICN bootstrap protocol comprises four non-HTTP records: binary identity, backend eligibility,
-installation declaration, and process readiness. These records are canonical serializable Rust
+The ICN bootstrap protocol comprises non-HTTP records for binary identity, backend eligibility,
+installation declaration, process readiness and preparation, plus private parent commands. These are canonical serializable Rust
 types whose OpenAPI components generate the Effect Schemas consumed by Bun lifecycle, development,
 and release tooling. Producers construct the canonical Rust types and TypeScript consumers decode
 or encode only through the generated schemas; independently authored wire shapes, compatibility
@@ -299,7 +324,7 @@ without awaiting either. Startup retry applies only to
 transient connection/unready outcomes. Authentication failure, instance mismatch, incompatible
 identity, malformed response, and child exit fail immediately.
 
-Before this acquisition begins, the exact ACN has atomically entered `Assigned`. Its startup health
+Before this acquisition begins, the desktop owner has authorized the exact ACN child to start. Its startup health
 reports authoritative base download, accelerator download, installation, and launch activity; byte
 progress is present only while artifact bytes are being accepted. It rejects application RPC until
 acquisition succeeds. ACN reports `Ready` and admits RPC only after `IcnProcess` and the complete
@@ -346,10 +371,17 @@ bounded. Cleanup errors are logged and classified; they never leave an unobserve
 
 Signals enter ACN's authoritative lifecycle; they do not call `process.exit` before cleanup. For
 managed launch, ICN watches its private stdin pipe from process entry. Orderly ACN shutdown signals
-and reaps ICN before closing scope; abrupt ACN loss closes the pipe and ICN exits immediately,
+and reaps ICN before closing scope; abrupt ACN loss closes the pipe and ICN terminates its owned group immediately,
 including during synchronous native initialization. The EOF wait runs on a detached OS thread, not
 Tokio's blocking pool. This is a private child-lifetime channel, not admission, discovery, adoption,
 or sharing.
+On Windows, orderly shutdown sends the canonical newline-delimited Shutdown command over retained
+stdin and waits the configured grace interval before forced job retirement. The same shutdown path
+closes listener admission as an OS signal. The lifetime thread keeps watching after Shutdown;
+EOF, invalid framing or malformed commands still terminate immediately independently of Tokio.
+Frames are bounded to 256 bytes. Repeated valid Shutdown commands are idempotent, and a request
+received during initialization remains pending for orderly shutdown. The parent always proves the
+complete nested job retired, even when the root exits successfully within the grace period.
 
 ## Model instance lifecycle
 
@@ -382,6 +414,10 @@ hardware calibration and readiness. One pool actor owns the actual initialized p
 processes; unused capacity is numeric and additional workers are activated one at a time on demand.
 Only warm workers execute concurrently. A canceled waiter cannot return a still-running worker to
 the pool, and a failed worker is retired before replacement capacity is admitted.
+If planning-worker retirement fails or reaches its deadline, the pool retains that exact worker
+and continues counting it against capacity. Healthy workers remain usable and queued requests
+retain their own deadlines. Pool shutdown retries retained retirements; a failed retirement task
+cannot silently become an available worker slot.
 Each resident load creates one private `inference-worker` child; that child initializes its own process-lifetime
 native-backend capability, prepares and loads exactly one topology, and owns the executor until it
 exits. Persistent ICN exposes the loaded backend through a bounded framed-IPC proxy. Template
@@ -396,7 +432,7 @@ native allocation locations independently.
 
 Inference-worker lifetime is subordinate to ICN even on abrupt failure. Unix children disable
 core dumps and run a dedicated parent-liveness watchdog; Linux additionally requests
-`PR_SET_PDEATHSIG`. Windows workers are assigned to a kill-on-close Job Object. The retained child
+`PR_SET_PDEATHSIG`. Windows workers enter a kill-on-close Job Object during process creation. The retained child
 or Job handle, rather than a later PID lookup, performs forced termination and reaping.
 
 An ordinary inference request names only the canonical model ID. ICN validates installation, joins

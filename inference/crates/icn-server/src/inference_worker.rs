@@ -1,6 +1,9 @@
+#[cfg(windows)]
+use icn_utils::windows_process::OwnedWindowsChild as Child;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::process::{Child, ChildStderr, Command, Stdio};
+#[cfg(unix)]
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -16,7 +19,9 @@ use icn_engine::{ModelLoadObserver, ModelLoadPhase, NativeBackend};
 use icn_hardware::CapacityPolicy;
 use serde::{Deserialize, Serialize};
 
-use crate::worker_process::{NativeWorkerLauncher, NativeWorkerRole};
+use crate::worker_process::NativeWorkerLauncher;
+#[cfg(unix)]
+use crate::worker_process::NativeWorkerRole;
 
 const PROTOCOL_VERSION: u32 = 4;
 const MAX_FRAME_BYTES: usize = 48 * 1024 * 1024;
@@ -277,6 +282,7 @@ impl ClientInner {
         if self.failed.swap(true, Ordering::AcqRel) {
             return;
         }
+        let _ = self.commands.try_send(HostMessage::Shutdown);
         let reason = reason.into();
         let _ = self.load_events.try_send(LoadEvent::Lost {
             code: code.to_owned(),
@@ -295,6 +301,7 @@ impl ClientInner {
         if self.failed.swap(true, Ordering::AcqRel) {
             return;
         }
+        let _ = self.commands.try_send(HostMessage::Shutdown);
         let _ = self.load_events.try_send(LoadEvent::Lost {
             code: "model_instance_stopped".to_owned(),
             message: "model instance was stopped".to_owned(),
@@ -500,53 +507,105 @@ impl CompletionBackend for RemoteBackend {
     }
 }
 
+/// Own cleanup from the instant spawn succeeds, including every handshake/IPC setup error.
+struct WorkerChild(Child);
+impl std::ops::Deref for WorkerChild {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for WorkerChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+impl WorkerChild {
+    fn observe_exit(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        #[cfg(unix)]
+        {
+            self.0.try_wait()
+        }
+        #[cfg(windows)]
+        {
+            self.0.try_retirement()
+        }
+    }
+    fn stop(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        #[cfg(unix)]
+        {
+            if self.0.try_wait()?.is_none() {
+                self.0.kill()?;
+            }
+            self.0.wait()
+        }
+        #[cfg(windows)]
+        {
+            self.0.retire(std::time::Duration::from_secs(2))
+        }
+    }
+}
+impl Drop for WorkerChild {
+    fn drop(&mut self) {
+        if let Err(error) = self.stop() {
+            tracing::error!(%error, "inference worker cleanup could not prove retirement");
+        }
+    }
+}
+
+enum WorkerProcessState {
+    Owned(WorkerChild),
+    Retired(std::process::ExitStatus),
+}
+
 struct ProcessControl {
-    child: Mutex<Option<Child>>,
-    #[cfg(windows)]
-    job: WindowsJob,
+    child: Mutex<WorkerProcessState>,
 }
 
 impl ProcessControl {
     fn pid(&self) -> Option<u32> {
-        self.child
-            .lock()
-            .ok()
-            .and_then(|child| child.as_ref().map(Child::id))
+        self.child.lock().ok().and_then(|state| match &*state {
+            WorkerProcessState::Owned(child) => Some(child.id()),
+            WorkerProcessState::Retired(_) => None,
+        })
     }
 
     fn try_wait(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        let mut child = self
+        let mut state = self
             .child
             .lock()
             .map_err(|_| std::io::Error::other("worker process lock poisoned"))?;
-        match child.as_mut() {
-            Some(child) => child.try_wait(),
-            None => Ok(None),
+        match &mut *state {
+            WorkerProcessState::Retired(status) => Ok(Some(*status)),
+            WorkerProcessState::Owned(child) => {
+                let status = child.observe_exit()?;
+                if let Some(status) = status {
+                    *state = WorkerProcessState::Retired(status);
+                }
+                Ok(status)
+            }
+        }
+    }
+
+    fn retire(&self) -> std::io::Result<std::process::ExitStatus> {
+        let mut state = self
+            .child
+            .lock()
+            .map_err(|_| std::io::Error::other("worker process lock poisoned"))?;
+        match &mut *state {
+            WorkerProcessState::Retired(status) => Ok(*status),
+            WorkerProcessState::Owned(child) => {
+                // An error leaves the exact owner in place. Only proof of retirement replaces it.
+                let status = child.stop()?;
+                *state = WorkerProcessState::Retired(status);
+                Ok(status)
+            }
         }
     }
 
     fn terminate(&self) {
-        #[cfg(windows)]
-        self.job.terminate();
-        let Ok(mut slot) = self.child.lock() else {
-            return;
-        };
-        let Some(mut child) = slot.take() else {
-            return;
-        };
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-}
-
-impl Drop for ProcessControl {
-    fn drop(&mut self) {
-        let Ok(slot) = self.child.get_mut() else {
-            return;
-        };
-        if let Some(child) = slot.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Err(error) = self.retire() {
+            tracing::error!(%error, "inference worker retirement failed; retaining its owner");
         }
     }
 }
@@ -563,22 +622,18 @@ impl InferenceWorker {
         expected_build: String,
         worker_launcher: &NativeWorkerLauncher,
     ) -> anyhow::Result<(Self, tokio::sync::mpsc::Receiver<LoadEvent>)> {
-        let mut command = worker_launcher.command(NativeWorkerRole::Inference)?;
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        configure_child(&mut command);
-        let mut child = command.spawn()?;
-        #[cfg(windows)]
-        let job = match WindowsJob::assign(&child) {
-            Ok(job) => job,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error.into());
-            }
+        #[cfg(unix)]
+        let child = {
+            let mut command = worker_launcher.command(NativeWorkerRole::Inference)?;
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            command.spawn()?
         };
+        #[cfg(windows)]
+        let child = worker_launcher.spawn_inference()?;
+        let mut child = WorkerChild(child);
         let mut stdin = child
             .stdin
             .take()
@@ -604,21 +659,18 @@ impl InferenceWorker {
             match hello_receiver.recv_timeout(std::time::Duration::from_secs(10 * 60)) {
                 Ok((hello, stdout)) => (hello?, stdout),
                 Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    let _ = child.stop();
                     anyhow::bail!("inference worker handshake timed out");
                 }
             };
         match hello.message {
             WorkerMessage::Hello { build } if build == expected_build => {}
             WorkerMessage::Hello { build } => {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = child.stop();
                 anyhow::bail!("worker build mismatch: got {build:?}, expected {expected_build:?}");
             }
             _ => {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = child.stop();
                 anyhow::bail!("worker did not begin with a hello frame");
             }
         }
@@ -641,25 +693,13 @@ impl InferenceWorker {
             inner: Arc::clone(&inner),
         };
         let process = Arc::new(ProcessControl {
-            child: Mutex::new(Some(child)),
-            #[cfg(windows)]
-            job,
+            child: Mutex::new(WorkerProcessState::Owned(child)),
         });
 
-        let writer_inner = Arc::clone(&inner);
+        let writer_inner = Arc::downgrade(&inner);
         thread::Builder::new()
             .name(format!("icn-worker-writer-{generation}"))
-            .spawn(move || {
-                while let Ok(message) = command_receiver.recv() {
-                    if let Err(error) = write_frame(&mut stdin, generation, message) {
-                        writer_inner.fail_all(
-                            "worker_protocol_error",
-                            format!("worker IPC write failed: {error:#}"),
-                        );
-                        break;
-                    }
-                }
-            })?;
+            .spawn(move || run_worker_writer(stdin, command_receiver, writer_inner, generation))?;
 
         let reader_inner = Arc::clone(&inner);
         thread::Builder::new()
@@ -749,101 +789,6 @@ impl InferenceWorker {
     }
 }
 
-#[cfg(unix)]
-fn configure_child(command: &mut Command) {
-    use std::os::unix::process::CommandExt as _;
-
-    let expected_parent = std::process::id() as libc::pid_t;
-    // SAFETY: this closure performs only async-signal-safe libc calls between fork and exec.
-    unsafe {
-        command.pre_exec(move || {
-            let core_limit = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            if libc::setrlimit(libc::RLIMIT_CORE, &core_limit) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            #[cfg(target_os = "linux")]
-            {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            if libc::getppid() != expected_parent {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "ICN parent exited while the inference worker was spawning",
-                ));
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(windows)]
-fn configure_child(_command: &mut Command) {}
-
-#[cfg(windows)]
-struct WindowsJob(windows_sys::Win32::Foundation::HANDLE);
-
-#[cfg(windows)]
-impl WindowsJob {
-    fn assign(child: &Child) -> std::io::Result<Self> {
-        use std::mem::{size_of, zeroed};
-        use std::os::windows::io::AsRawHandle as _;
-        use windows_sys::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject,
-        };
-
-        // SAFETY: all handles and structure sizes follow the Win32 Job Object API contract.
-        unsafe {
-            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if job.is_null() {
-                return Err(std::io::Error::last_os_error());
-            }
-            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
-            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            if SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                &limits as *const _ as *const _,
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            ) == 0
-            {
-                let error = std::io::Error::last_os_error();
-                windows_sys::Win32::Foundation::CloseHandle(job);
-                return Err(error);
-            }
-            if AssignProcessToJobObject(job, child.as_raw_handle() as _) == 0 {
-                let error = std::io::Error::last_os_error();
-                windows_sys::Win32::Foundation::CloseHandle(job);
-                return Err(error);
-            }
-            Ok(Self(job))
-        }
-    }
-
-    fn terminate(&self) {
-        // SAFETY: the handle remains owned by this object until Drop.
-        unsafe {
-            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1);
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for WindowsJob {
-    fn drop(&mut self) {
-        // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE terminates any surviving worker descendants.
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.0);
-        }
-    }
-}
-
 fn dispatch_worker_message(inner: &Arc<ClientInner>, message: WorkerMessage) {
     match message {
         WorkerMessage::Prepared {
@@ -929,7 +874,30 @@ fn send_request_reply(
     }
 }
 
-fn drain_stderr(mut stderr: ChildStderr, generation: u64) {
+fn run_worker_writer(
+    mut stdin: impl Write,
+    command_receiver: mpsc::Receiver<HostMessage>,
+    writer_inner: std::sync::Weak<ClientInner>,
+    generation: u64,
+) {
+    while let Ok(message) = command_receiver.recv() {
+        let stopping = matches!(&message, HostMessage::Shutdown);
+        if let Err(error) = write_frame(&mut stdin, generation, message) {
+            if let Some(inner) = writer_inner.upgrade() {
+                inner.fail_all(
+                    "worker_protocol_error",
+                    format!("worker IPC write failed: {error:#}"),
+                );
+            }
+            break;
+        }
+        if stopping {
+            break;
+        }
+    }
+}
+
+fn drain_stderr(mut stderr: impl Read + Send + 'static, generation: u64) {
     let _ = thread::Builder::new()
         .name(format!("icn-worker-stderr-{generation}"))
         .spawn(move || {
@@ -967,7 +935,6 @@ impl ModelLoadObserver for IpcLoadObserver {
 }
 
 pub(crate) fn run_worker(build: String, native: NativeBackend) -> anyhow::Result<()> {
-    start_parent_watchdog();
     let generation = Arc::new(AtomicU64::new(0));
     let (responses, response_receiver) = mpsc::sync_channel(RESPONSE_QUEUE_CAPACITY);
     let writer_generation = Arc::clone(&generation);
@@ -1214,30 +1181,31 @@ pub(crate) fn run_worker(build: String, native: NativeBackend) -> anyhow::Result
     Ok(())
 }
 
-#[cfg(unix)]
-fn start_parent_watchdog() {
-    // Linux also has PR_SET_PDEATHSIG. Polling covers platforms such as macOS, which do not expose
-    // an equivalent inherited kill-on-parent-death primitive.
-    let parent = unsafe { libc::getppid() };
-    let _ = thread::Builder::new()
-        .name("icn-inference-worker-parent-watchdog".to_owned())
-        .spawn(move || {
-            loop {
-                thread::sleep(std::time::Duration::from_millis(100));
-                if unsafe { libc::getppid() } != parent {
-                    std::process::exit(1);
-                }
-            }
-        });
-}
-
-#[cfg(windows)]
-fn start_parent_watchdog() {
-    // The worker is assigned to a kill-on-close Job Object before the host completes handshake.
-}
-
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn startup_error_retires_and_reaps_the_acquired_worker() {
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let fail_startup = || -> anyhow::Result<()> {
+            let _owned = super::WorkerChild(child);
+            anyhow::bail!("simulated handshake failure")
+        };
+        assert!(fail_startup().is_err());
+        // SAFETY: this only observes whether the exact spawned child still needs reaping.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
     use super::*;
 
     fn test_client() -> (ClientHandle, mpsc::Receiver<HostMessage>) {
@@ -1251,6 +1219,98 @@ mod tests {
             failed: AtomicBool::new(false),
         });
         (ClientHandle { inner }, command_receiver)
+    }
+
+    #[test]
+    fn writer_exits_when_client_drops_or_retained_client_stops() {
+        for explicit_stop in [false, true] {
+            let (client, commands) = test_client();
+            let inner = Arc::downgrade(&client.inner);
+            let (finished, observed) = mpsc::channel();
+            let writer = thread::spawn(move || {
+                run_worker_writer(std::io::sink(), commands, inner, 1);
+                finished.send(()).unwrap();
+            });
+            if explicit_stop {
+                client.inner.stop_all_executions();
+                observed
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                // The retained handle cannot keep an idle writer alive after terminal shutdown.
+                assert!(client.inner.failed.load(Ordering::Acquire));
+            } else {
+                drop(client);
+                observed
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+            }
+            writer.join().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_control_preserves_retirement_proof_and_clears_live_pid() {
+        for forced in [true, false] {
+            let child = if forced {
+                std::process::Command::new("/bin/sleep")
+                    .arg("60")
+                    .spawn()
+                    .unwrap()
+            } else {
+                std::process::Command::new("/bin/sh")
+                    .args(["-c", "exit 7"])
+                    .spawn()
+                    .unwrap()
+            };
+            let pid = child.id();
+            let process = ProcessControl {
+                child: Mutex::new(WorkerProcessState::Owned(WorkerChild(child))),
+            };
+            assert_eq!(process.pid(), Some(pid));
+            let status = if forced {
+                assert!(process.try_wait().unwrap().is_none());
+                process.retire().unwrap()
+            } else {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    if let Some(status) = process.try_wait().unwrap() {
+                        break status;
+                    }
+                    assert!(std::time::Instant::now() < deadline, "child did not exit");
+                    thread::sleep(std::time::Duration::from_millis(5));
+                }
+            };
+            assert_eq!(process.pid(), None);
+            assert_eq!(process.try_wait().unwrap(), Some(status));
+            assert_eq!(process.retire().unwrap(), status);
+            if !forced {
+                assert_eq!(status.code(), Some(7));
+            }
+            assert_eq!(
+                unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_failure_and_explicit_stop_wake_an_idle_writer_once() {
+        for explicit_stop in [false, true] {
+            let (client, commands) = test_client();
+            if explicit_stop {
+                client.inner.stop_all_executions();
+            } else {
+                client.inner.fail_all("worker_lost", "test failure");
+            }
+            assert!(matches!(commands.try_recv(), Ok(HostMessage::Shutdown)));
+            client.inner.fail_all("worker_lost", "repeated failure");
+            assert!(commands.try_recv().is_err());
+        }
     }
 
     #[test]

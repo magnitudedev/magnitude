@@ -1563,6 +1563,7 @@ dependencies = [
  "icn-models",
  "icn-reasoning",
  "icn-speculative",
+ "icn-utils",
  "libc",
  "libloading",
  "llama-cpp-2",
@@ -1602,6 +1603,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
