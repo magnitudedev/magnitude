@@ -4,15 +4,22 @@
     "file": "book16.png",
     "subject": "16-inch MacBook Pro",
     "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/108052",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-pro/macbook-pro-16in-2024-colors.png",
+    "source": "https://www.apple.com/shop/refurbished/mac",
+    "imageUrl": "https://store.storeimages.cdn-apple.com/1/as-images.apple.com/is/refurb-mbp16-m4-silver-202502?wid=1200&hei=1200&fmt=png-alpha",
     "match": {
       "_tag": "Apple",
       "models": [
         "Mac16,5",
         "Mac16,7",
         "Mac17,6",
-        "Mac17,8"
+        "Mac17,8",
+        "MacBookPro18,1",
+        "MacBookPro18,2",
+        "Mac14,6",
+        "Mac14,10",
+        "Mac15,7",
+        "Mac15,9",
+        "Mac15,11"
       ]
     }
   },
@@ -21,8 +28,8 @@
     "file": "book14.png",
     "subject": "14-inch MacBook Pro",
     "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/108052",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-pro/macbook-pro-14in-2024-m4-pro-m4-max-colors.png",
+    "source": "https://www.apple.com/shop/refurbished/mac",
+    "imageUrl": "https://store.storeimages.cdn-apple.com/1/as-images.apple.com/is/refurb-mbp14-m4-silver-202502?wid=1200&hei=1200&fmt=png-alpha",
     "match": {
       "_tag": "Apple",
       "models": [
@@ -31,7 +38,15 @@
         "Mac16,8",
         "Mac17,2",
         "Mac17,7",
-        "Mac17,9"
+        "Mac17,9",
+        "MacBookPro18,3",
+        "MacBookPro18,4",
+        "Mac14,5",
+        "Mac14,9",
+        "Mac15,3",
+        "Mac15,6",
+        "Mac15,8",
+        "Mac15,10"
       ]
     }
   },
@@ -40,13 +55,15 @@
     "file": "air13.png",
     "subject": "13-inch MacBook Air",
     "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/102869",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-air/2025-macbook-air-13in-colors.png",
+    "source": "https://www.apple.com/shop/refurbished/mac",
+    "imageUrl": "https://store.storeimages.cdn-apple.com/1/as-images.apple.com/is/refurb-mba13-m5-silver-202606?wid=1200&hei=1200&fmt=png-alpha",
     "match": {
       "_tag": "Apple",
       "models": [
         "Mac16,12",
-        "Mac17,3"
+        "Mac17,3",
+        "Mac14,2",
+        "Mac15,12"
       ]
     }
   },
@@ -55,41 +72,13 @@
     "file": "air15-m4.png",
     "subject": "15-inch MacBook Air",
     "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/102869",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-air/2025-macbook-air-15in-colors.png",
+    "source": "https://www.apple.com/shop/refurbished/mac",
+    "imageUrl": "https://store.storeimages.cdn-apple.com/4982/as-images.apple.com/is/refurb-mba15-m4-silver-202503?wid=1200&hei=1200&fmt=png-alpha",
     "match": {
       "_tag": "Apple",
       "models": [
         "Mac16,13",
-        "Mac17,4"
-      ]
-    }
-  },
-  {
-    "id": "air13-m2",
-    "file": "air13-m2.png",
-    "subject": "13-inch MacBook Air (M2 / M3)",
-    "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/102869",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-air/2022-macbook-air-m2-colors.png",
-    "match": {
-      "_tag": "Apple",
-      "models": [
-        "Mac14,2",
-        "Mac15,12"
-      ]
-    }
-  },
-  {
-    "id": "air15-m2",
-    "file": "air15-m2.png",
-    "subject": "15-inch MacBook Air (M2 / M3)",
-    "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/102869",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-air/2023-macbook-air-15in-m2-colors.png",
-    "match": {
-      "_tag": "Apple",
-      "models": [
+        "Mac17,4",
         "Mac14,15",
         "Mac15,13"
       ]
@@ -97,11 +86,11 @@
   },
   {
     "id": "air13-m1",
-    "file": "air13-m1.jpg",
+    "file": "air13-m1.png",
     "subject": "MacBook Air (M1)",
     "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/102869",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-air/macbook-air-2020-late-device.jpg",
+    "source": "https://www.apple.com/shop/refurbished/mac",
+    "imageUrl": "https://store.storeimages.cdn-apple.com/4982/as-images.apple.com/is/refurb-macbook-air-silver-m1-202010?wid=1200&hei=1200&fmt=png-alpha",
     "match": {
       "_tag": "Apple",
       "models": [
@@ -114,8 +103,8 @@
     "file": "pro13-m1.png",
     "subject": "13-inch MacBook Pro (M1 / M2)",
     "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/108052",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-pro/macbook-pro-13-in-M2-2022.png",
+    "source": "https://www.apple.com/shop/refurbished/mac",
+    "imageUrl": "https://store.storeimages.cdn-apple.com/4982/as-images.apple.com/is/refurb-mbp13-silver-m1-2020?wid=1200&hei=1200&fmt=png-alpha",
     "match": {
       "_tag": "Apple",
       "models": [
@@ -125,42 +114,12 @@
     }
   },
   {
-    "id": "pro16-m1",
-    "file": "pro16-m1.png",
-    "subject": "16-inch MacBook Pro (2021)",
-    "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/108052",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-pro/macbook-pro-2021-16in.png",
-    "match": {
-      "_tag": "Apple",
-      "models": [
-        "MacBookPro18,1",
-        "MacBookPro18,2"
-      ]
-    }
-  },
-  {
-    "id": "pro16-m2",
-    "file": "pro16-m2.png",
-    "subject": "16-inch MacBook Pro (early 2023)",
-    "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/108052",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-pro/macbook-pro-16in-2023.png",
-    "match": {
-      "_tag": "Apple",
-      "models": [
-        "Mac14,6",
-        "Mac14,10"
-      ]
-    }
-  },
-  {
     "id": "studio",
     "file": "studio.png",
     "subject": "Mac Studio",
     "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/102231",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/mac-studio/mac-studio-2025-m4-max.png",
+    "source": "https://www.apple.com/shop/buy-mac/mac-studio",
+    "imageUrl": "https://store.storeimages.cdn-apple.com/4982/as-images.apple.com/is/mac-studio-select-202503?wid=1200&hei=1200&fmt=png-alpha",
     "match": {
       "_tag": "Apple",
       "models": [
@@ -178,8 +137,8 @@
     "file": "mini.png",
     "subject": "Mac mini (2024)",
     "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/102852",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/mac-mini/mac-mini-2024.png",
+    "source": "https://www.apple.com/shop/buy-mac/mac-mini",
+    "imageUrl": "https://store.storeimages.cdn-apple.com/4982/as-images.apple.com/is/mac-mini-select-202410?wid=1200&hei=1200&fmt=png-alpha",
     "match": {
       "_tag": "Apple",
       "models": [
@@ -193,27 +152,14 @@
     "file": "mini-m1.png",
     "subject": "Mac mini (M1 / M2)",
     "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/102852",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/mac-mini/mac-mini-2020-m1.png",
+    "source": "https://www.apple.com/shop/refurbished/mac",
+    "imageUrl": "https://store.storeimages.cdn-apple.com/4982/as-images.apple.com/is/refurb-mac-mini-2020?wid=1200&hei=1200&fmt=png-alpha",
     "match": {
       "_tag": "Apple",
       "models": [
-        "Macmini9,1"
-      ]
-    }
-  },
-  {
-    "id": "imac-m1",
-    "file": "imac-m1.png",
-    "subject": "24-inch iMac (M1 / M3)",
-    "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/108054",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/imac/id-imac-24-2021.png",
-    "match": {
-      "_tag": "Apple",
-      "models": [
-        "iMac21,1",
-        "iMac21,2"
+        "Macmini9,1",
+        "Mac14,3",
+        "Mac14,12"
       ]
     }
   },
@@ -222,104 +168,15 @@
     "file": "imac-m4.png",
     "subject": "24-inch iMac (M4)",
     "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/108054",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/imac/imac-24in-2024-four-ports-colors.png",
+    "source": "https://www.apple.com/shop/refurbished/mac",
+    "imageUrl": "https://store.storeimages.cdn-apple.com/1/as-images.apple.com/is/refurb-imac-silver-202502?wid=1200&hei=1200&fmt=png-alpha",
     "match": {
       "_tag": "Apple",
       "models": [
         "Mac16,2",
-        "Mac16,3"
-      ]
-    }
-  },
-  {
-    "id": "pro14-m1",
-    "file": "pro14-m1.png",
-    "subject": "14-inch MacBook Pro",
-    "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/108052",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-pro/macbook-pro-2021-14in.png",
-    "match": {
-      "_tag": "Apple",
-      "models": [
-        "MacBookPro18,3",
-        "MacBookPro18,4"
-      ]
-    }
-  },
-  {
-    "id": "pro14-m2",
-    "file": "pro14-m2.png",
-    "subject": "14-inch MacBook Pro",
-    "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/108052",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-pro/macbook-pro-14in-2023.png",
-    "match": {
-      "_tag": "Apple",
-      "models": [
-        "Mac14,5",
-        "Mac14,9"
-      ]
-    }
-  },
-  {
-    "id": "pro14-m3",
-    "file": "pro14-m3.png",
-    "subject": "14-inch MacBook Pro",
-    "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/108052",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-pro/macbook-pro-14in-m3-pro-m3-max-nov-2023-silver-space-black.png",
-    "match": {
-      "_tag": "Apple",
-      "models": [
-        "Mac15,3",
-        "Mac15,6",
-        "Mac15,8",
-        "Mac15,10"
-      ]
-    }
-  },
-  {
-    "id": "pro16-m3",
-    "file": "pro16-m3.png",
-    "subject": "16-inch MacBook Pro",
-    "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/108052",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-pro/macbook-pro-16in-m3-pro-m3-max-nov-2023-silver-space-black.png",
-    "match": {
-      "_tag": "Apple",
-      "models": [
-        "Mac15,7",
-        "Mac15,9",
-        "Mac15,11"
-      ]
-    }
-  },
-  {
-    "id": "mini-m2",
-    "file": "mini-m2.png",
-    "subject": "Mac mini",
-    "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/102852",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/mac-mini/mac-mini-2023-m2-pro.png",
-    "match": {
-      "_tag": "Apple",
-      "models": [
-        "Mac14,3",
-        "Mac14,12"
-      ]
-    }
-  },
-  {
-    "id": "imac-m3",
-    "file": "imac-m3.png",
-    "subject": "24-inch iMac",
-    "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/108054",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/imac/imac-24in-2023-four-ports-colors.png",
-    "match": {
-      "_tag": "Apple",
-      "models": [
+        "Mac16,3",
+        "iMac21,1",
+        "iMac21,2",
         "Mac15,4",
         "Mac15,5"
       ]
