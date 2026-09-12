@@ -10,7 +10,8 @@ const usage: Extract<ServingUsageSnapshot, { _tag: "Available" }> = {
 }
 it("renders all token categories and measurements without counting cache twice", () => {
   const html = renderToStaticMarkup(<UsageFigures usage={usage} />)
-  expect(html).toContain('data-usage="total">120</p>')
+  expect(html).not.toContain('data-usage="total"')
+  expect(html).not.toContain("total tokens ·")
   for (const [label, count] of [["Input tokens",100],["Cached input",40],["Output tokens",20]]) expect(html).toContain(`data-usage="${label}">${count}</p>`)
   expect(html).toContain("80 tokens/s"); expect(html).toContain("125 ms")
 })

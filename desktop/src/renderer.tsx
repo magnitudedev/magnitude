@@ -1,10 +1,11 @@
+import { ModelPreferenceSlider } from "./model-preference-slider"
 import { ServingUsage } from "./serving-usage"
 import { initializeAppearance, setAppearancePreference, useAppearancePreference, subscribeAppearance, getAppearancePreference } from "../../web/src/stores/appearance-store"
 import { Button } from "../../web/src/components/ui/button"
 import { Input } from "../../web/src/components/ui/input"
 import { Progress } from "../../web/src/components/ui/progress"
 import { MagnitudeMark } from "../../web/src/components/magnitude-mark"
-import { Layers3, Library, HardDrive, MemoryStick, Plug, Activity, Check, Settings2, Download, Play, Square, Trash2, X, Monitor, Sun, Moon } from "lucide-react"
+import { Layers3, Library, HardDrive, Plug, Activity, BarChart3, Check, Settings2, Download, Play, Square, Trash2, X, Monitor, Sun, Moon } from "lucide-react"
 import { createRoot } from "react-dom/client"
 import { useMemo, useState } from "react"
 import { Atom, RegistryProvider, Result, useAtomValue, useAtomSet } from "@effect-atom/atom-react"
@@ -48,8 +49,8 @@ const observation = Stream.asyncPush<typeof ApplicationSnapshot.Type, DesktopHos
   }, message => emit.fail(new DesktopHostFailed({ message })))), unsubscribe => Effect.sync(unsubscribe),
 ).pipe(Effect.asVoid))
 const hostState = Atom.keepAlive(Atom.make(observation))
-const pageNames: Record<Page, string> = { discover: "Discover", catalog: "Catalog", models: "My Models", connections: "Connections", status: "Status", settings: "Settings" }
-const pageIcons = { discover: Layers3, catalog: Library, models: HardDrive, connections: Plug, status: Activity, settings: Settings2 }
+const pageNames: Record<Page, string> = { discover: "Discover", catalog: "Catalog", models: "My Models", connections: "Connections", usage: "Usage", status: "Status", settings: "Settings" }
+const pageIcons = { discover: Layers3, catalog: Library, models: HardDrive, connections: Plug, usage: BarChart3, status: Activity, settings: Settings2 }
 
 function ModelFit({ model }: { model: CatalogLocalModel }) {
   const serving = model.servingState
@@ -150,7 +151,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
     <p className="mt-2 text-slate-500">{installedOnly ? "Your downloads and installed models, in one place." : discover ? "Your best local models, matched to your machine." : "Explore every model in the curated catalog."}</p>
     {discover && <HardwareOverview /> }
     {Option.isSome(stopResult.failure) && <p role="alert" className="mt-5 text-sm">{stopResult.failure.value}</p>}
-    {discover && <section aria-label="Recommendation preference" className="my-6"><div className="flex items-end justify-between gap-4"><div><h2 className="font-heading text-xl">Find your balance</h2><p className="mt-2 text-sm text-slate-500">Quick responses or deeper thinking. Choose what matters to you.</p></div><span className="rounded-full bg-blue-50 px-4 py-2 text-sm font-medium text-blue-700 dark:bg-slate-800 dark:text-blue-400">{LOCAL_MODEL_RANKING_SCALE_LABELS[preference]}</span></div><input type="range" min="0" max="4" step="1" aria-label="Model preference" aria-valuetext={LOCAL_MODEL_RANKING_SCALE_LABELS[preference]} value={preference} onChange={event=>setPreference(Number(event.target.value))} className="mt-5 h-1.5 w-full cursor-pointer appearance-none rounded-full bg-slate-200 accent-blue-600 dark:bg-slate-700 [&::-webkit-slider-thumb]:size-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-blue-500 [&::-webkit-slider-thumb]:shadow-sm" /><div className="mt-3 flex justify-between text-sm font-medium"><span>Fast <span className="font-normal text-slate-500">· lower latency</span></span><span><span className="font-normal text-slate-500">more intelligence · </span>Smart</span></div></section>}
+    {discover && <section aria-label="Recommendation preference" className="my-6"><div className="flex items-end justify-between gap-4"><div><h2 className="font-heading text-xl">Find your balance</h2><p className="mt-2 text-sm text-slate-500">Quick responses or deeper thinking. Choose what matters to you.</p></div><span className="rounded-full bg-blue-50 px-4 py-2 text-sm font-medium text-blue-700 dark:bg-slate-800 dark:text-blue-400">{LOCAL_MODEL_RANKING_SCALE_LABELS[preference]}</span></div><ModelPreferenceSlider value={preference} onChange={setPreference} /></section>}
     {!catalog.value.preparation.assessment.complete && <p className="mb-4 text-sm text-slate-500">Assessing models · {catalog.value.preparation.assessment.settledModels} of {catalog.value.preparation.assessment.totalModels}</p>}
     {discover && <section aria-label="Top recommendations" className="mb-10"><div className="mb-5 flex items-baseline justify-between"><h2 className="font-heading text-xl">Your top picks</h2><span className="text-xs text-slate-500">Best configuration for each model</span></div><div className="flex flex-col gap-6">{featuredCatalogModels(ranked).map((model,index)=><ModelCard key={model.modelId} model={model} visual recommended={index===0} {...(active&&active.model.modelId!==model.modelId?{replacing:formatLocalModelDisplayName(active.model)}:{})} />)}</div><p className="mt-4 text-xs text-slate-500">Profiles use catalog scores and your machine’s assessment. Speed is estimated; memory shows footprint, not free memory.</p></section>}
     {!discover && <>
@@ -221,26 +222,6 @@ function DownloadActivity() {
     {!Result.isSuccess(models) ? <p className="mt-3 text-sm text-slate-500">{Result.isFailure(models) ? "Download activity unavailable" : "Reading download activity…"}</p> : active.length === 0 ? <p className="mt-3 text-sm text-slate-500">No downloads in progress.</p> : <ul className="mt-4 space-y-5">{active.map(model => <li key={model.modelId}><div className="flex items-center gap-3"><ModelLogo model={model} className="size-6" /><p className="text-sm">{formatLocalModelDisplayName(model)} · {model.acquisitionState._tag === "Removing" ? "Removing files…" : model.acquisitionState._tag === "Updating" ? "Updating" : "Downloading"}</p></div><DownloadProgress acquisition={model.acquisitionState} /></li>)}</ul>}
   </section>
 }
-function MemoryStatus() {
-  const client = useAgentClient()
-  const session = useAtomValue(useMemo(() => client.runtime.atom(DesktopSession), [client]))
-  return Result.isSuccess(session) ? <MemoryStatusView service={session.value} /> : null
-}
-function MemoryStatusView({ service }: { service: DesktopSession }) {
-  const observation = useAtomValue(service.memory)
-  const sample = Result.isSuccess(observation) ? observation.value : null
-  const measured = sample?._tag === "Measured" ? sample : null
-  const metric = measured?.metric === "PhysicalFootprint" ? "macOS memory footprint" : measured?.metric === "ProportionalResident" ? "Proportional resident memory" : "Private working set"
-  return <section aria-label="Memory usage" className="rounded-2xl border border-slate-200 bg-white p-6 dark:border-slate-750 dark:bg-slate-850">
-    <div className="flex items-center gap-3"><MemoryStick className="size-5 text-blue-600 dark:text-blue-400" /><h2 className="font-heading text-lg">Memory in use</h2></div>
-    {measured ? <>
-      <p className="mt-4 font-heading text-3xl" data-memory-bytes={measured.bytes} data-measured-at={measured.measuredAt}>{formatMemorySize(measured.bytes)}</p>
-      <p className="mt-2 text-sm text-slate-500">Across Magnitude and its background processes.</p>
-      <details className="mt-3 text-xs text-slate-500"><summary className="cursor-pointer">How memory is measured</summary><p className="mt-2">{metric} across {measured.processCount} processes. {measured.metric === "ProportionalResident" ? "Shared pages are counted proportionally." : "Shared and file-backed pages may be excluded."} Updated {new Date(measured.measuredAt).toLocaleTimeString()}.</p></details>
-    </> : <p className="mt-4 text-sm text-slate-500">{sample?._tag === "Unavailable" ? sample.message : Result.isFailure(observation) ? "Memory reading unavailable." : "Measuring memory…"}</p>}
-    <MemoryBreakdown />
-  </section>
-}
 function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null }) {
   const service = snapshot?.service
   const ready=service?._tag === "Ready"
@@ -250,8 +231,7 @@ function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null
       {service && "message" in service && <p role="alert" className="mt-5 text-sm">{service.message}</p>}
       {service?._tag === "Failed" && <Button className="mt-5" variant="outline" onClick={() => host.retry()}>Retry service</Button>}
     </section>
-    <ServingUsage />
-    <MemoryStatus />
+    <MemoryBreakdown />
     <div className="grid items-start gap-5 lg:grid-cols-2">
       {ready ? <ModelStatus /> : <section className="rounded-2xl border border-slate-200 bg-white p-6 dark:border-slate-750 dark:bg-slate-850"><h2 className="font-heading text-lg">Model activity</h2><p className="mt-4 text-sm text-slate-500">Model status will return when the service is ready.</p></section>}
       {ready && <DownloadActivity />}
@@ -344,6 +324,7 @@ function App() {
     <aside className="flex w-56 shrink-0 flex-col border-r border-slate-200 px-4 py-8 dark:border-slate-750"><div className="mb-10 flex items-center gap-3 px-3 font-heading text-base font-semibold"><MagnitudeMark className="h-8 w-8" />Magnitude</div><nav className="flex min-h-0 flex-1 flex-col gap-2">{(Object.keys(pageNames) as Page[]).map(key => <Button variant="ghost" key={key} onClick={() => navigate(key)} aria-current={page === key ? "page" : undefined} className={`h-10 justify-start gap-3 rounded-lg px-3 text-left text-sm font-medium ${key === "status" ? "mt-auto" : ""} ${page === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>{(() => { const Icon = pageIcons[key]; return <Icon className="size-4" /> })()}{pageNames[key]}</Button>)}</nav></aside>
     <main key={page} className="min-w-0 flex-1 overflow-y-auto px-10 py-9"><h1 className="font-heading text-[28px] font-semibold tracking-tight">{pageNames[page]}</h1>
       {page === "status" ? <Status snapshot={Result.isSuccess(state) ? state.value : null} />
+      : page === "usage" ? <ServingUsage />
       : page === "settings" ? <><AppearanceSettings /><LoginSettings /><ApplicationSettings /></>
       : page === "connections" ? <Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} />
       : service?._tag !== "Ready" ? <p className="mt-8">{service?._tag === "Failed" ? "The service needs attention. Open Status for details." : "Starting the Magnitude service…"}</p>

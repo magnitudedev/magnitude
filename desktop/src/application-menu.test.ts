@@ -27,7 +27,7 @@ describe("application menu", () => {
       if (!item.click) throw new Error("Navigation action missing")
       Reflect.apply(item.click, undefined, [])
     }
-    expect(actions.open.mock.calls).toEqual([["discover"], ["catalog"], ["models"], ["connections"], ["status"], ["settings"]])
+    expect(actions.open.mock.calls).toEqual([["discover"], ["catalog"], ["models"], ["connections"], ["usage"], ["status"], ["settings"]])
     expect(actions.quit).not.toHaveBeenCalled()
   })
 })
