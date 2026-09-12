@@ -22,7 +22,7 @@ import {
 } from "@magnitudedev/client-common"
 import { HardwareOverview, ModelRadar } from "./discovery-visuals"
 import { MemoryBreakdown } from "./memory-breakdown"
-import { HarnessLogo } from "./harness-logo"
+import { HarnessConnections } from "./harness-connections"
 import { ModelLogo } from "./model-logo"
 import type { DesktopApi, Page } from "./desktop-rpc"
 import "@web-styles/tailwind.css"
@@ -189,14 +189,8 @@ function ConnectionsView({ service, serviceReady, selectedModel }: { service: De
     {Result.isFailure(rows) ? <p role="alert" className="mt-5">Could not check connections. {hostFailureMessage(rows.cause)}</p>
       : !Result.isSuccess(rows) ? <p className="mt-5">Checking harness configuration…</p>
       : rows.value._tag === "Unavailable" ? <p role="alert" className="mt-5">Could not check connections. {rows.value.message}</p>
-      : <div className="mt-7 grid items-start gap-5 xl:grid-cols-2">{rows.value.connections.map(row => <article key={row.id} className="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-750 dark:bg-slate-850">
-        <div className="flex flex-wrap items-center justify-between gap-5"><div className="flex items-center gap-4"><HarnessLogo id={row.id} name={row.name} /><div><h2 className="text-lg font-semibold">{row.name}</h2><p className="mt-1 text-sm text-slate-500">{row.inspection._tag === "Connected" ? "Connected" : row.inspection._tag === "Unavailable" ? "Could not verify" : "Disconnected"}{!row.installed ? " · Harness not installed" : ""}</p></div></div>
-          <div className="flex gap-2"><Button disabled={busy || !row.installed || !canConnect} onClick={() => connect({ harness: row.id, model: selectedModel })}>{row.inspection._tag === "Connected" ? "Reconnect" : row.managed ? "Repair connection" : "Connect"}</Button>{row.managed && <Button variant="outline" disabled={busy} onClick={() => disconnect(row.id)}>Disconnect</Button>}</div>
-        </div>
-        {row.inspection._tag !== "Connected" && <p className="mt-3 text-sm text-slate-500">{row.inspection.reason}</p>}
-        {row.plugin._tag === "Some" && <p className="mt-3 text-sm text-slate-500">Includes {row.plugin.value.name}.</p>}
-        <details className="mt-4 text-sm text-slate-500"><summary className="cursor-pointer">Configuration files</summary><ul className="mt-2 space-y-1">{row.configurationFiles.map(file => <li key={file} className="break-all font-mono text-xs">{file}</li>)}</ul></details>
-      </article>)}</div>}
+      : <HarnessConnections connections={rows.value.connections} busy={busy} canConnect={canConnect}
+          onConnect={harness => connect({ harness, model: selectedModel })} onDisconnect={harness => disconnect(harness)} />}
   </>
 }
 function ModelStatus() {
