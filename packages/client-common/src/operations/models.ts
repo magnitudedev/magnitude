@@ -1,8 +1,13 @@
+import { Schedule } from "effect";
 import { Models as Rpcs } from "@magnitudedev/sdk";
 import { Group, Mutation, QueryClient } from "@magnitudedev/effect-query";
 import { type SlotId } from "@magnitudedev/sdk";
 import { turnAdmissionScope } from "./configuration";
 import { mutation, query } from "./bind";
+
+const GetServingUsage = query(Rpcs.getServingUsage, client => client.models.getServingUsage, {
+  staleTime: 0, refresh: Schedule.spaced("5 seconds"),
+});
 
 const GetCatalog = query(
   Rpcs.getCatalog,
@@ -136,6 +141,7 @@ const PreviewSlotLoad = query(
 );
 
 export const Models = Group.make({
+  GetServingUsage,
   GetCatalog,
   GetSlots,
   GetLocalEnvironment,

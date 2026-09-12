@@ -210,8 +210,7 @@ OpenAI-hosted state. Upstream traffic never enters ICN, and local aliases never 
 
 The harness gateways are deliberately routing shims rather than protocol adapters. They recognize
 only gateway-owned paths and the one top-level model discriminator needed to choose a target. They
-do not define provider request DTOs, validate message or tool content, parse response bodies or
-SSE events, or normalize evolving vendor fields. Classification is size-bounded. A local request is
+do not define provider request DTOs, validate message or tool content, normalize evolving vendor fields, or adapt response content. A separate local-only usage observer may consume terminal usage and timing evidence without changing forwarded bytes; its contract is defined in [local serving usage](../acn/local-serving-usage.md). Classification is size-bounded. A local request is
 changed mechanically only at the model string; every other JSON field remains opaque. An upstream
 request retains its original bytes, query, public headers, response status, headers, and body
 stream. Except when removing ICN-owned history references, Codex zstd request compression is

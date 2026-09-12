@@ -1,3 +1,4 @@
+import { ServingUsage } from "../serving-usage";
 import {
   AcnRpcGroup, Configuration,
   Models,
@@ -59,6 +60,7 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
     const providerModelCatalog = yield* ProviderModelCatalog;
     const modelSlots = yield* ModelSlotController;
     const cloudUsage = yield* MagnitudeCloudUsage;
+    const servingUsage = yield* ServingUsage;
     const activeSessionStatuses = yield* ActiveSessionStatusesService;
     const displayStreams = yield* DisplayViewStreams;
     const changes = yield* AcnChanges;
@@ -310,6 +312,7 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       GetModelCatalog: () =>
         observeRpcDefects("GetModelCatalog", modelCatalog.state),
 
+      GetServingUsage: request => servingUsage.read(request),
       GetLocalInferenceEnvironment: () =>
         observeRpcDefects("GetLocalInferenceEnvironment", localInferenceHardware.state),
 
