@@ -29,12 +29,12 @@ def _encoded(shape):
 @pytest.mark.parametrize(
     "name,mode,rows,expected",
     (
-        ("encoded-linear", "decode", 1, "linear.direct-encoded"),
-        ("parallel-linear", "decode", 1, "linear.parallel-direct"),
-        ("dense-swiglu", "prefill", 8, "dense_swiglu.matrix"),
+        ("encoded-linear", "decode", 1, "linear.packet-vector"),
+        ("parallel-linear", "decode", 1, "linear.parallel-packet"),
+        ("dense-swiglu", "prefill", 8, "dense_swiglu.packet-prefill"),
         ("attention", "decode", 1, "causal_attention.online"),
         ("recurrent-prepare", "prefill", 8, "recurrent_prepare.channel-parallel"),
-        ("gated-recurrence", "prefill", 8, "gated_delta_recurrence.portable"),
+        ("gated-recurrence", "prefill", 8, "gated_delta.register-state"),
         ("grouped-experts", "prefill", 8, "routed_experts.grouped"),
     ),
 )
@@ -53,8 +53,8 @@ def test_kernel_benchmark_case_has_a_valid_compile_free_plan(name, mode, rows, e
 
 
 def test_small_parallel_projections_form_one_lowering_region():
-    source = mt.TensorSpec((1, 64), mt.DType.F16)
-    weight = _encoded((32, 64))
+    source = mt.TensorSpec((1, 512), mt.DType.F16)
+    weight = _encoded((32, 512))
 
     def project(value, first, second, third):
         return (
@@ -79,7 +79,7 @@ def test_small_parallel_projections_form_one_lowering_region():
     )
 
     assert [candidate.name.split("@", 1)[0] for candidate in plan.cover.candidates] == [
-        "linear.parallel-direct"
+        "linear.parallel-packet"
     ]
     assert plan.diagnostics.dispatches == 1
     assert len(plan.submissions) == 1

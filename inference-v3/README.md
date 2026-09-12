@@ -80,10 +80,20 @@ uv run magnitude-qualify --target /path/to/model \
 
 The standard matrix covers state-only prefill, logits prefill, long prefill,
 single-sequence decode and maximum-batch decode. The command exits unsuccessfully
-if it finds a scalar contraction fallback, a non-maximal submission, a missing
-online attention or recurrent preparation schedule, or an inappropriate dense or
-MoE schedule. Its JSON reports graph fingerprints, selected schedule counts,
-kernel counts, submission counts and temporary bytes.
+if it finds any production fallback, a non-maximal submission, an expanded
+hierarchical weight representation, a missing stateful fusion, or an
+inappropriate dense or MoE schedule. Its JSON reports graph fingerprints,
+selected schedule counts, kernel counts, submission counts and temporary bytes.
+It also reports resident bytes by physical representation, the largest selected
+region, and bound versus per-invocation native parameters so ABI growth is
+visible before compiling a kernel.
+
+Production lowering is intentionally fail-closed. Generic primitive lowering is
+an allowlist for indexing, pointwise work, import, and sampling; it is not a
+fallback for contractions or transformer regions. A packed representation with
+no qualified packet schedule is therefore a compile error. Reference evaluators
+remain available for correctness checks but are never candidates in a production
+cover.
 
 Once selection is structurally correct, compile and time only the affected
 region:
@@ -116,15 +126,53 @@ change. Full model startup and long session workloads are acceptance checks, not
 debugging loops.
 
 For shape-sensitive schedules, compare the real model geometry rather than the
-small defaults. Independent single-row projections must select
-`linear.direct-encoded` (or `linear.direct-dense` for unpacked weights),
-adjacent attention and recurrent projections sharing an activation must select
-`linear.parallel-direct`, and dense prefill blocks must select
-`dense_swiglu.matrix`. Prefill attention must select
-`causal_attention.matrix-streaming`, and long decode attention must select
-`causal_attention.partitioned`. Partitioned decode processes every query-head
-group sharing a KV head in one workgroup so K/V traffic and reduction barriers
-are not repeated per query head.
+small defaults. Decode projections select `linear.packet-vector`; adjacent
+attention and recurrent projections sharing an activation select
+`linear.parallel-packet`; prefill projections select `linear.packet-gemm`; and
+dense feed-forward regions select `dense_swiglu.packet-decode` or
+`dense_swiglu.packet-prefill`. Prefill attention selects the
+`attention.matrix-streaming-gated-output` region, fusing matrix-streaming
+attention with query gating, flattening, and packed output projection. Long
+decode attention selects the
+`attention.partitioned-gated-output` region, which processes all query heads
+sharing a KV head together and fuses partition merge, query gating, and output
+projection. Recurrent output selects `recurrent.output-decode`. MoE single-row
+decode selects `route_topk.fused-router` and
+`routed_experts.packet-shared`, avoiding a materialized router-logit tensor.
+The routed/shared expert region uses two launches: one combined packed gate/up
+activation for selected and shared experts (including the shared coefficient),
+then one combined weighted down projection. It never materializes a selected
+expert output before adding the shared expert. Prefill groups routes in one
+workgroup launch, fuses grouped gate/up GEMMs with SwiGLU, and completes grouped
+down projection plus unpermutation in four launches total.
+Prefill and wider decode batches instead use matrix-instruction router GEMM
+followed by `route_topk.subgroup`: preserving matrix throughput is faster there
+than assigning one serial dot product to each expert lane. Both paths remain in
+the same native multi-kernel program; neither adds a Python launch boundary.
+
+## Physical kernel architecture
+
+Weights keep one compact resident representation from import through execution:
+
+- MLX Q4 group-64 uses packed nibbles with BF16 scale and bias planes.
+- GGUF Q8_0 uses packed signed-byte groups with one FP16 scale per 32 values.
+- GGUF Q4_K, Q5_K, and Q6_K use interleaved 256-value superblocks. Local
+  coefficients and FP16 super-coefficients stay beside their payload. Q4/Q5
+  use six-bit scale/min pairs; Q6 uses signed eight-bit scales. These are
+  never expanded to FP32 planes.
+
+Decode work is packet-native: a 32-lane subgroup consumes a 256- or 512-value
+reduction tile, loads each coefficient once, produces paired output rows, and
+reduces in FP32. Prefill decodes those same packets directly into shared-memory
+weight tiles and immediately reuses them with `T.gemm`; no full dequantized
+matrix exists. Full tiles have a structurally unpredicated path, while only the
+boundary tile pays validity checks.
+
+One decoder specialization is assembled as one maximal multi-kernel TileLang
+`PrimFunc` and submitted through one pre-bound native entrypoint. Immutable
+weights and compiler-owned temporary storage are bound once. Python supplies
+only invocation data and mutable model state; it does not loop over layers or
+launch numerical kernels itself.
 
 ## Measure
 

@@ -1,39 +1,45 @@
 """Portable TileLang schedules and capability-selected lowering rules."""
 
-from .attention import OnlineAttentionRule
-from .experts import DenseSwiGLURule, DirectExpertsRule, MatrixDenseSwiGLURule
+from .attention import AttentionOutputRule, OnlineAttentionRule
+from .attention_fusion import AttentionPrepareAppendRule
+from .experts import DenseSwiGLURule, RoutedSharedExpertsRule, SelectedExpertsRule
 from .fusion import PointwiseFusionRule
 from .grouped_experts import GroupedExpertsRule
+from .indexing import PackedEmbeddingRule
 from .matrix import (
     DenseMatrixRule,
-    DirectDenseMatrixRule,
-    DirectEncodedMatrixRule,
-    EncodedMatrixRule,
-    PacketAffineMatrixRule,
-    ParallelDirectMatrixRule,
+    PackedMatrixRule,
+    ParallelPackedMatrixRule,
 )
-from .normalization import ResidualRMSRule
+from .normalization import RMSRule, ResidualRMSRule, RowDotRule
 from .portable import PrimitiveLoweringRule
-from .recurrent import RecurrentPrepareRule
+from .recurrent import GatedDeltaRule, RecurrentOutputRule, RecurrentPrepareRule
+from .routing import RouterTopKRule, RoutingRule
 
 
 def register_builtin_lowerings(registry) -> None:
     names = {rule.name for rule in registry.rules}
     for rule in (
         DenseMatrixRule(),
-        ParallelDirectMatrixRule(),
-        PacketAffineMatrixRule(),
-        DirectDenseMatrixRule(),
-        DirectEncodedMatrixRule(),
-        EncodedMatrixRule(),
+        ParallelPackedMatrixRule(),
+        PackedMatrixRule(),
+        PackedEmbeddingRule(),
         DenseSwiGLURule(),
-        MatrixDenseSwiGLURule(),
-        DirectExpertsRule(),
+        SelectedExpertsRule(),
+        RoutedSharedExpertsRule(),
         GroupedExpertsRule(),
         OnlineAttentionRule(),
+        AttentionOutputRule(),
+        AttentionPrepareAppendRule(),
         ResidualRMSRule(),
+        RMSRule(),
+        RowDotRule(),
         PointwiseFusionRule(),
         RecurrentPrepareRule(),
+        GatedDeltaRule(),
+        RecurrentOutputRule(),
+        RoutingRule(),
+        RouterTopKRule(),
         PrimitiveLoweringRule(),
     ):
         if rule.name not in names:
@@ -42,19 +48,25 @@ def register_builtin_lowerings(registry) -> None:
 
 __all__ = [
     "DenseMatrixRule",
-    "DirectDenseMatrixRule",
-    "DirectEncodedMatrixRule",
-    "EncodedMatrixRule",
+    "PackedMatrixRule",
     "DenseSwiGLURule",
-    "DirectExpertsRule",
+    "SelectedExpertsRule",
+    "RoutedSharedExpertsRule",
     "GroupedExpertsRule",
-    "MatrixDenseSwiGLURule",
-    "ParallelDirectMatrixRule",
-    "PacketAffineMatrixRule",
+    "GatedDeltaRule",
+    "PackedEmbeddingRule",
+    "ParallelPackedMatrixRule",
     "OnlineAttentionRule",
+    "AttentionOutputRule",
+    "AttentionPrepareAppendRule",
     "PointwiseFusionRule",
     "PrimitiveLoweringRule",
     "RecurrentPrepareRule",
+    "RecurrentOutputRule",
+    "RoutingRule",
+    "RouterTopKRule",
     "ResidualRMSRule",
+    "RMSRule",
+    "RowDotRule",
     "register_builtin_lowerings",
 ]

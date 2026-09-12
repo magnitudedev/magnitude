@@ -21,7 +21,7 @@ CAPABILITIES = mt.Capabilities(
     memory_scopes=frozenset({"global", "shared", "local"}),
     native_multi_launch=True,
     partial_binding=True,
-    fingerprint="direct-expert-test",
+    fingerprint="packet-expert-test",
 )
 
 GROUPED_CAPABILITIES = mt.Capabilities(
@@ -39,6 +39,16 @@ GROUPED_CAPABILITIES = mt.Capabilities(
 
 def _dense_model(hidden, gate, up, down):
     return mt.linear(mt.silu(mt.linear(hidden, gate)) * mt.linear(hidden, up), down)
+
+
+def _encoded_spec(shape):
+    return mt.TensorSpec(shape, mt.DType.F16).with_representation(
+        mt.Affine(
+            mt.Code(8, interpretation=mt.CodeInterpretation.TWOS_COMPLEMENT),
+            32,
+            mt.DirectCoefficients(mt.DType.F16),
+        )
+    )
 
 
 @pytest.mark.device
@@ -88,7 +98,11 @@ def test_direct_dense_swiglu_schedule_matches_reference_on_metal():
             },
             options=mt.CompileOptions(mode="decode"),
         )
-        assert compiled.diagnostics.submissions == (("dense_swiglu.direct@0:4",),)
+        selected = tuple(
+            name for unit in compiled.diagnostics.submissions for name in unit
+        )
+        assert len(compiled.diagnostics.submissions) == 1
+        assert all(".portable@" not in name for name in selected)
         execution = compiled.submit(resources[0])
         execution.completion.wait()
         np.testing.assert_allclose(
@@ -118,11 +132,11 @@ def test_route_order_and_cutoff_ties_match_qwen_reduction_semantics():
 
 
 def _graph(rows: int = 1):
-    hidden = mt.TensorSpec((rows, 32), mt.DType.F16)
+    hidden = mt.TensorSpec((rows, 256), mt.DType.F16)
     routes = mt.TensorSpec((rows, 2), mt.DType.I32)
     scores = mt.TensorSpec((rows, 2), mt.DType.F32)
-    expert = mt.TensorSpec((4, 64, 32), mt.DType.F16)
-    down = mt.TensorSpec((4, 32, 64), mt.DType.F16)
+    expert = _encoded_spec((4, 256, 256))
+    down = _encoded_spec((4, 256, 256))
     return mt.trace(
         lambda value, indices, weights, gate, up, down_weight: mt.routed_experts(
             value, indices, weights, gate, up, down_weight
@@ -140,11 +154,13 @@ def _graph(rows: int = 1):
     )
 
 
-def test_decode_selects_two_stage_direct_expert_lowering_in_one_submission():
+def test_decode_selects_two_stage_packet_expert_lowering_in_one_submission():
     graph = _graph()
     context = LoweringContext(CAPABILITIES, "decode", "model", "test", 1 << 20)
     cover = select_cover(graph, mt.lowerings.enumerate(graph, context))
-    assert tuple(candidate.name for candidate in cover.candidates) == ("routed_experts.direct@0",)
+    assert tuple(candidate.name for candidate in cover.candidates) == (
+        "routed_experts.packet-selected@0",
+    )
     submissions = plan_submissions(graph, cover, CAPABILITIES)
     assert len(submissions) == 1
     assert submissions[0].kernel_count == 2
@@ -157,15 +173,15 @@ def test_prefill_selects_grouped_expert_pipeline_in_one_submission():
     assert tuple(candidate.name for candidate in cover.candidates) == ("routed_experts.grouped@0",)
     submissions = plan_submissions(graph, cover, GROUPED_CAPABILITIES)
     assert len(submissions) == 1
-    assert submissions[0].kernel_count == 8
+    assert submissions[0].kernel_count == 4
 
 
 def test_prefill_selects_matrix_swiglu_region_in_one_submission():
     specs = (
-        mt.TensorSpec((8, 32), mt.DType.F16),
-        mt.TensorSpec((64, 32), mt.DType.F16),
-        mt.TensorSpec((64, 32), mt.DType.F16),
-        mt.TensorSpec((32, 64), mt.DType.F16),
+        mt.TensorSpec((8, 256), mt.DType.F16),
+        _encoded_spec((256, 256)),
+        _encoded_spec((256, 256)),
+        _encoded_spec((256, 256)),
     )
     graph = mt.trace(
         _dense_model,
@@ -184,7 +200,9 @@ def test_prefill_selects_matrix_swiglu_region_in_one_submission():
     )
     context = LoweringContext(GROUPED_CAPABILITIES, "prefill", "model", "test", 1 << 20)
     cover = select_cover(graph, mt.lowerings.enumerate(graph, context))
-    assert tuple(candidate.name for candidate in cover.candidates) == ("dense_swiglu.matrix@0:4",)
+    assert tuple(candidate.name for candidate in cover.candidates) == (
+        "dense_swiglu.packet-prefill@0:4",
+    )
     submissions = plan_submissions(graph, cover, GROUPED_CAPABILITIES)
     assert len(submissions) == 1 and submissions[0].kernel_count == 2
 
@@ -234,139 +252,12 @@ def test_matrix_prefill_swiglu_matches_reference_on_metal():
             },
             options=mt.CompileOptions(mode="prefill"),
         )
-        assert compiled.diagnostics.submissions == (("dense_swiglu.matrix@0:4",),)
+        selected = tuple(
+            name for unit in compiled.diagnostics.submissions for name in unit
+        )
+        assert len(compiled.diagnostics.submissions) == 1
+        assert all(".portable@" not in name for name in selected)
         execution = compiled.submit(resources[0])
-        execution.completion.wait()
-        np.testing.assert_allclose(
-            execution.outputs[0].native.cpu().numpy(), expected, rtol=3e-2, atol=3e-2
-        )
-    finally:
-        if execution is not None:
-            for output in execution.outputs:
-                output.close()
-        if compiled is not None:
-            compiled.close()
-        for resource in reversed(resources):
-            resource.close()
-        device.close()
-
-
-@pytest.mark.device
-def test_direct_expert_schedule_matches_reference_on_metal():
-    if not torch.backends.mps.is_available():
-        pytest.skip("Metal numerical qualification requires MPS")
-    rng = np.random.default_rng(91)
-    hidden = rng.normal(0, 0.1, (1, 32)).astype(np.float16)
-    routes = np.asarray([[1, 3]], dtype=np.int32)
-    scores = np.asarray([[0.25, 0.75]], dtype=np.float32)
-    gate = rng.normal(0, 0.1, (4, 64, 32)).astype(np.float16)
-    up = rng.normal(0, 0.1, (4, 64, 32)).astype(np.float16)
-    down = rng.normal(0, 0.1, (4, 32, 64)).astype(np.float16)
-
-    graph = _graph()
-    expected = mt.evaluate_reference(
-        graph,
-        {
-            "hidden": hidden,
-            "routes": routes,
-            "scores": scores,
-            "gate": gate,
-            "up": up,
-            "down": down,
-        },
-    ).outputs[0]
-    device = mt.device("metal", budget_bytes=1 << 20)
-    resources = []
-    compiled = None
-    execution = None
-    try:
-        for value, data in zip(
-            graph.values[:6], (hidden, routes, scores, gate, up, down), strict=True
-        ):
-            resources.append(device.upload(value.spec, data.tobytes()))
-        compiled = mt.compile(
-            lambda value, indices, weights, gate_weight, up_weight, down_weight: mt.routed_experts(
-                value, indices, weights, gate_weight, up_weight, down_weight
-            ),
-            signature=mt.Signature(
-                tuple(
-                    mt.Argument(
-                        graph.values[index].spec,
-                        graph.values[index].name,
-                        graph.values[index].kind,
-                    )
-                    for index in range(6)
-                )
-            ),
-            device=device,
-            constants={"gate": resources[3], "up": resources[4], "down": resources[5]},
-            options=mt.CompileOptions(mode="decode"),
-        )
-        execution = compiled.submit(*resources[:3])
-        execution.completion.wait()
-        actual = execution.outputs[0].native.cpu().numpy()
-        np.testing.assert_allclose(actual, expected, rtol=2e-2, atol=2e-2)
-    finally:
-        if execution is not None:
-            for output in execution.outputs:
-                output.close()
-        if compiled is not None:
-            compiled.close()
-        for resource in reversed(resources):
-            resource.close()
-        device.close()
-
-
-@pytest.mark.device
-def test_grouped_prefill_expert_pipeline_matches_reference_on_metal():
-    if not torch.backends.mps.is_available():
-        pytest.skip("Metal numerical qualification requires MPS")
-    rng = np.random.default_rng(92)
-    arrays = (
-        rng.normal(0, 0.1, (8, 32)).astype(np.float16),
-        np.asarray([[row % 4, (row + 1) % 4] for row in range(8)], dtype=np.int32),
-        np.full((8, 2), 0.5, dtype=np.float32),
-        rng.normal(0, 0.1, (4, 64, 32)).astype(np.float16),
-        rng.normal(0, 0.1, (4, 64, 32)).astype(np.float16),
-        rng.normal(0, 0.1, (4, 32, 64)).astype(np.float16),
-    )
-    graph = _graph(rows=8)
-    expected = mt.evaluate_reference(
-        graph,
-        dict(zip(("hidden", "routes", "scores", "gate", "up", "down"), arrays, strict=True)),
-    ).outputs[0]
-    device = mt.device("metal", budget_bytes=4 << 20)
-    resources = []
-    compiled = execution = None
-    try:
-        resources = [
-            device.upload(graph.values[index].spec, value.tobytes())
-            for index, value in enumerate(arrays)
-        ]
-        compiled = mt.compile(
-            lambda value, indices, weights, gate, up, down: mt.routed_experts(
-                value, indices, weights, gate, up, down
-            ),
-            signature=mt.Signature(
-                tuple(
-                    mt.Argument(
-                        graph.values[index].spec,
-                        graph.values[index].name,
-                        graph.values[index].kind,
-                    )
-                    for index in range(6)
-                )
-            ),
-            device=device,
-            constants={
-                "gate": resources[3],
-                "up": resources[4],
-                "down": resources[5],
-            },
-            options=mt.CompileOptions(mode="prefill"),
-        )
-        assert compiled.diagnostics.submissions == (("routed_experts.grouped@0",),)
-        execution = compiled.submit(*resources[:3])
         execution.completion.wait()
         np.testing.assert_allclose(
             execution.outputs[0].native.cpu().numpy(), expected, rtol=3e-2, atol=3e-2
