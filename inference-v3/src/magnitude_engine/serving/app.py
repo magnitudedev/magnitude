@@ -1,6 +1,7 @@
 """HTTP routes adapt validated chat work; the worker owns all model execution."""
 
 import asyncio
+import logging
 from contextlib import aclosing, asynccontextmanager
 
 from fastapi import FastAPI
@@ -13,6 +14,8 @@ from magnitude_engine.serving.requests import ChatRequest
 from magnitude_engine.serving.responses import ChatResponse, sse
 from magnitude_engine.serving.runtime import Config
 from magnitude_engine.serving.session import ChatFinished, ChatService
+
+logger = logging.getLogger(__name__)
 
 
 def error_payload(message: str, kind="invalid_request_error") -> dict:
@@ -79,6 +82,7 @@ def create_app(config: Config) -> FastAPI:
                         else:
                             yield sse(response.semantic(event, retain=False))
             except (ValueError, TypeError, RuntimeError) as error:
+                logger.exception("streaming generation failed")
                 yield sse(error_payload(str(error), "server_error"))
                 yield sse("[DONE]")
 

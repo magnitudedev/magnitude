@@ -4,6 +4,9 @@
 or fused region. Magnitensor chooses the strategy; TileLang owns its compiler
 meaning and target-specific realization.**
 
+[Kernel optimization](development/kernel-optimization.md) defines how schedules
+are pushed to their limits without weakening this boundary.
+
 ## Boundary
 
 ```text
@@ -100,6 +103,20 @@ than permission to split the graph into Python calls.
 Representation decoding happens where its values are consumed. A quantized
 matrix schedule decodes only the tile it reuses; it does not require a resident
 dequantized copy unless that representation is selected and charged explicitly.
+
+Small-row projection is selected by shape rather than by the enclosing prefill
+or decode label. An exact-row direct schedule avoids executing masked matrix
+instruction rows. Consecutive attention or recurrent projections that consume
+the same activation form one lowering region and one `T.Kernel`; their separate
+semantic outputs remain visible to downstream operations without requiring
+separate launches.
+
+Long-context decode attention groups every query head sharing one KV head into
+the same partition workgroup. Each K/V channel is loaded once and one reduction
+barrier tree advances all members of the group. Partition statistics and partial
+values are merged by the second ordered `T.Kernel` in the same native
+submission. Prefill instead uses the matrix-streaming schedule because query-row
+reuse makes fragment products appropriate there.
 
 ## Qualification
 

@@ -16,7 +16,7 @@ from pathlib import Path
 
 from pydantic import TypeAdapter
 
-from magnitude_engine.platform.execution import DType, TensorSpec
+import magnitensor as mt
 from magnitude_engine.platform.storage import FileSource
 from magnitude_engine.weights.descriptor import (
     StoredAffinePlanes,
@@ -30,7 +30,7 @@ from magnitude_engine.weights.identity import ArtifactIdentity
 class StoredTensor:
     source: FileSource
     offset: int
-    spec: TensorSpec
+    spec: mt.TensorSpec
 
     def read(self) -> bytes:
         return self.source.read(self.offset, self.spec.nbytes)
@@ -66,7 +66,11 @@ class MLXFormat:
                         continue
                     if name in self.tensors:
                         raise ValueError(f"duplicate Safetensors tensor {name}")
-                    dtype = {"U32": DType.U32, "BF16": DType.BF16, "F32": DType.F32}.get(
+                    dtype = {
+                        "U32": mt.DType.U32,
+                        "BF16": mt.DType.BF16,
+                        "F32": mt.DType.F32,
+                    }.get(
                         entry["dtype"]
                     )
                     if dtype is None:
@@ -76,7 +80,7 @@ class MLXFormat:
                     shape = tuple(entry["shape"])
                     if any(type(n) is not int or n <= 0 for n in shape):
                         raise ValueError(f"invalid Safetensors shape for {name}")
-                    spec = TensorSpec(shape, dtype)
+                    spec = mt.TensorSpec(shape, dtype)
                     start, end = entry["data_offsets"]
                     if (
                         type(start) is not int
@@ -98,25 +102,25 @@ class MLXFormat:
 
     def descriptor(self, name: str, shape: tuple[int, ...]) -> WeightDescriptor:
         stored = self.tensors[name]
-        if stored.spec.dtype == DType.U32:
+        if stored.spec.dtype == mt.DType.U32:
             if len(shape) != 2 or shape[1] % self.group:
                 raise ValueError(f"invalid affine geometry: {name}")
             n, k = shape
             if stored.spec.shape != (n, k * self.bits // 32) or not name.endswith(".weight"):
                 raise ValueError(f"affine code shape differs: {name}")
             for suffix in ("scales", "biases"):
-                if self.tensors[name.removesuffix("weight") + suffix].spec != TensorSpec(
-                    (n, k // self.group), DType.BF16
+                if self.tensors[name.removesuffix("weight") + suffix].spec != mt.TensorSpec(
+                    (n, k // self.group), mt.DType.BF16
                 ):
                     raise ValueError(f"affine parameter shape/dtype differs: {name}")
-        elif math.prod(stored.spec.shape) != math.prod(shape):
+        elif not stored.spec.static or stored.spec.elements != math.prod(shape):
             raise ValueError(f"floating parameter shape differs: {name}")
         return WeightDescriptor(name=name, shape=shape)
 
     def stored(self, descriptor: WeightDescriptor) -> StoredAffinePlanes | StoredDense:
         self.descriptor(descriptor.name, descriptor.shape)
         entry = self.tensors[descriptor.name]
-        if entry.spec.dtype != DType.U32:
+        if entry.spec.dtype != mt.DType.U32:
             return self._dense(descriptor.name)
         return StoredAffinePlanes(
             bits=self.bits,

@@ -7,13 +7,13 @@ pending input and output credit; it never inspects a model's state storage.
 from __future__ import annotations
 
 from collections import deque
-from contextlib import ExitStack
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated
 
 from pydantic import Field
 
+import magnitensor as mt
 from magnitude_engine.data import Record, TokenId
 from magnitude_engine.models.sequence import (
     LogitsSelection,
@@ -23,16 +23,13 @@ from magnitude_engine.models.sequence import (
     ModelRequest,
     ModelSequence,
 )
-from magnitude_engine.operations.preparation import Preparation
 from magnitude_engine.operations.sampling import (
     Draw,
     SamplePosition,
-    SampleSelector,
     SamplingSeed,
+    SelectionFailure,
     SelectionKind,
-    UnselectableDistribution,
 )
-from magnitude_engine.platform.execution import DType, Prepared, Tensor, TensorSpec, Ticket
 
 
 class FinishReason(StrEnum):
@@ -98,15 +95,10 @@ class Ready:
 
 
 class GenerationWork:
-    def __init__(
-        self,
-        ready: Ready,
-        advance: ModelAdvance,
-        sample: Tensor | None,
-    ):
+    def __init__(self, ready: Ready, advance: ModelAdvance):
         self.generation, self.kind, self.count = ready.generation, ready.kind, len(ready.tokens)
-        self.advance, self.sample = advance, sample
-        self.completion: Ticket | None = None
+        self.advance = advance
+        self.completion: mt.Completion | None = None
         self.closed = False
 
     def finish(self) -> None:
@@ -118,13 +110,19 @@ class GenerationWork:
         try:
             self.completion.wait()
             selected = None
-            if self.sample is not None:
-                selected = generation.selector.read(self.sample, after=self.completion)[0]
-                if isinstance(selected, UnselectableDistribution):
-                    raise ValueError(f"distribution cannot be selected: {selected.reason.name}")
+            sampled = self.advance.read_sample()
+            if sampled is not None:
+                token, status = sampled
+                if status:
+                    try:
+                        reason = SelectionFailure(status)
+                    except ValueError as error:
+                        raise RuntimeError(f"sampling returned unknown status {status}") from error
+                    raise ValueError(f"distribution cannot be selected: {reason.name}")
+                selected = token
             self.advance.commit()
             if selected is not None:
-                generation._accept(selected.token)
+                generation._accept(TokenId(selected))
         except BaseException:
             generation.finish_reason = FinishReason.FAILED
             raise
@@ -134,92 +132,55 @@ class GenerationWork:
     def close(self) -> None:
         if not self.closed:
             self.advance.close()
-            if self.sample is not None:
-                self.sample.close()
             if self.generation.pending is self:
                 self.generation.pending = None
             self.closed = True
 
 
 class GenerationBatch:
-    def __init__(
-        self,
-        execution: ModelBatch,
-        works: tuple[GenerationWork, ...],
-        commands: tuple[Prepared, ...],
-        ownership: ExitStack,
-    ):
+    def __init__(self, execution: ModelBatch, works: tuple[GenerationWork, ...]):
         self.execution, self.works = execution, works
-        self._commands, self._ownership = commands, ownership
-        self.completion: Ticket | None = None
+        self.completion = execution.completion
         self.closed = False
+        for work in works:
+            work.completion = self.completion
 
     @classmethod
     def prepare(cls, ready: tuple[Ready, ...]) -> GenerationBatch:
         if not ready or len({id(item.generation) for item in ready}) != len(ready):
             raise ValueError("a generation batch requires distinct ready requests")
         first = ready[0].generation
-        model, selector = first.sequence.model, first.selector
+        model = first.sequence.model
         for item in ready:
             generation = item.generation
-            if generation.sequence.model is not model or generation.selector is not selector:
-                raise ValueError("ready requests do not share model and selector bindings")
+            if generation.sequence.model is not model:
+                raise ValueError("ready requests do not share a model binding")
             if generation.ready(len(item.tokens)) != item:
                 raise ValueError("generation proposal is no longer ready")
-        with ExitStack() as ownership, Preparation(first.sequence.context) as p:
-            execution = model.prepare(
-                tuple(
-                    ModelRequest(item.generation.sequence, item.tokens, item.selection)
-                    for item in ready
-                )
-            )
-            ownership.callback(execution.close)
-            p.add(*execution.commands)
-            draws = tuple(
-                Draw(
-                    kind=item.generation.options.selection,
-                    seed=item.generation.options.seed,
-                    position=item.sample_position,
+        execution = model.prepare(
+            tuple(
+                ModelRequest(
+                    item.generation.sequence,
+                    item.tokens,
+                    item.selection,
+                    None
+                    if item.selection == LogitsSelection.NONE
+                    else Draw(
+                        kind=item.generation.options.selection,
+                        seed=item.generation.options.seed,
+                        position=item.sample_position,
+                    ).words(),
                 )
                 for item in ready
-                if item.selection != LogitsSelection.NONE
             )
-            samples = None
-            if draws:
-                if execution.logits is None or execution.logits.spec.shape[0] != len(draws):
-                    raise RuntimeError("model batch omitted requested logits")
-                samples = p.allocate(TensorSpec((len(draws), 2), DType.I32))
-                p.add(*selector.prepare(execution.logits, draws, samples))
-            works: list[GenerationWork] = []
-            selected = 0
-            for item, advance in zip(ready, execution.advances, strict=True):
-                sample = None
-                if item.selection != LogitsSelection.NONE:
-                    assert samples is not None
-                    sample = samples.view(TensorSpec((1, 2), DType.I32), selected * 8)
-                    selected += 1
-                work = GenerationWork(item, advance, sample)
-                ownership.callback(work.close)
-                item.generation.pending = work
-                works.append(work)
-            return cls(execution, tuple(works), p.finish(), ownership.pop_all())
-
-    @property
-    def commands(self) -> tuple[Prepared, ...]:
-        if self.closed or self.completion is not None:
-            raise RuntimeError("generation batch is not awaiting submission")
-        return self._commands
-
-    def submitted(self, completion: Ticket) -> None:
-        if self.closed or self.completion is not None:
-            raise RuntimeError("generation batch is not awaiting submission")
-        if any(command.submission is not completion for command in self._commands):
-            raise ValueError("completion does not cover all generation work")
-        self.execution.submitted(completion)
-        for work in self.works:
-            if not work.closed:
-                work.completion = completion
-        self.completion = completion
+        )
+        works = tuple(
+            GenerationWork(item, advance)
+            for item, advance in zip(ready, execution.advances, strict=True)
+        )
+        for item, work in zip(ready, works, strict=True):
+            item.generation.pending = work
+        return cls(execution, works)
 
     def finish(self) -> None:
         if self.closed or self.completion is None or not self.completion.done:
@@ -241,10 +202,9 @@ class GenerationBatch:
 
     def close(self) -> None:
         if not self.closed:
-            for command in reversed(self._commands):
-                command.close()
-            self._commands = ()
-            self._ownership.close()
+            for work in self.works:
+                work.close()
+            self.execution.close()
             self.closed = True
 
 
@@ -253,7 +213,6 @@ class Generation:
         self,
         sequence: ModelSequence,
         prompt: tuple[TokenId, ...],
-        selector: SampleSelector,
         options: Options,
         *,
         continuation: Continuation | None = None,
@@ -265,8 +224,6 @@ class Generation:
             continuation = recovery.continuation
         continuation = Continuation() if continuation is None else continuation
         accepted_position = sequence.position if recovery is None else recovery.processed
-        if sequence.context is not selector.context:
-            raise ValueError("model and selector must use the same execution owner")
         if (
             len(prompt) != sequence.layout.count
             or not prompt
@@ -287,12 +244,7 @@ class Generation:
             )
         ):
             raise ValueError("generation continuation and processed/publication boundaries differ")
-        self.sequence, self.prompt, self.selector, self.options = (
-            sequence,
-            prompt,
-            selector,
-            options,
-        )
+        self.sequence, self.prompt, self.options = sequence, prompt, options
         self.sampled = list(continuation.sampled)
         self.output = deque(continuation.output)
         self.published = continuation.published
@@ -390,9 +342,7 @@ class Generation:
             published=self.published,
             finish=self.finish_reason,
         )
-        return Checkpoint(
-            self.sequence.checkpoint(), self.prompt, self.selector, self.options, state
-        )
+        return Checkpoint(self.sequence.checkpoint(), self.prompt, self.options, state)
 
     @property
     def rebuilding(self) -> bool:
@@ -428,7 +378,6 @@ class Generation:
             raise RuntimeError("only an evicted live generation may restore state")
         if (
             sequence.model is not self.sequence.model
-            or sequence.context is not self.selector.context
             or sequence.layout != self.sequence.layout
             or sequence.position != 0
         ):
@@ -478,11 +427,10 @@ class Checkpoint:
         self,
         model: ModelCheckpoint,
         prompt: tuple[TokenId, ...],
-        selector: SampleSelector,
         options: Options,
         continuation: Continuation,
     ):
-        self.model, self.prompt, self.selector = model, prompt, selector
+        self.model, self.prompt = model, prompt
         self.options, self.continuation, self.closed = options, continuation, False
 
     def fork(self) -> Generation:
@@ -494,7 +442,6 @@ class Checkpoint:
             return Generation(
                 sequence,
                 self.prompt,
-                self.selector,
                 self.options,
                 continuation=self.continuation,
             )

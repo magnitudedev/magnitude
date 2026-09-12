@@ -2,7 +2,6 @@
 
 from magnitude_engine.composition import Blueprint, blueprint
 from magnitude_engine.models.sequence import ModelExecutor
-from magnitude_engine.operations.sampling import SampleSelector
 from magnitude_engine.service.engine import Engine
 from magnitude_engine.service.policy import Limits
 
@@ -25,7 +24,6 @@ class ServiceLimits(Blueprint[Limits]):
 @blueprint
 class Continuous(Blueprint[Engine]):
     model: Blueprint[ModelExecutor]
-    selector: Blueprint[SampleSelector]
     limits: Blueprint[Limits] = ServiceLimits()
 
     @staticmethod

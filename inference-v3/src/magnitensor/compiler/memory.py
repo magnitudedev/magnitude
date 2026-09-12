@@ -1,4 +1,4 @@
-"""Graph-derived materialization and temporary arena planning."""
+"""Graph-derived materialization and reusable temporary-slot planning."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ class StorageClass(StrEnum):
     CONSTANT = "constant"
     RESOURCE = "resource"
     OUTPUT = "output"
-    ARENA = "arena"
+    TEMPORARY = "temporary"
     ALIAS = "alias"
 
 
@@ -25,7 +25,7 @@ class StorageClass(StrEnum):
 class Placement:
     storage: StorageClass
     spec: TensorSpec
-    offset: int = 0
+    slot: int | None = None
     source: int | None = None
 
 
@@ -34,14 +34,14 @@ class WorkspacePlacement:
     candidate: str
     index: int
     spec: TensorSpec
-    offset: int
+    slot: int
 
 
 @dataclass(frozen=True, slots=True)
 class MemoryPlan:
     values: Mapping[int, Placement]
     workspace: tuple[WorkspacePlacement, ...]
-    arena_bytes: int
+    temporary_bytes: int
     alignment: int
 
     def __post_init__(self) -> None:
@@ -130,13 +130,15 @@ def plan_memory(graph: Graph, cover: Cover, capabilities: Capabilities) -> Memor
                 )
             )
 
-    offsets, arena_bytes = _assign(tuple(intervals))
+    slots, temporary_bytes = _assign_slots(
+        tuple(intervals), max((item.alignment for item in intervals), default=1)
+    )
     workspaces = []
     for interval in intervals:
-        offset = offsets[interval.identity]
+        slot = slots[interval.identity]
         if interval.identity[0] == "value":
             value_id = interval.identity[1]
-            placements[value_id] = Placement(StorageClass.ARENA, interval.spec, offset)
+            placements[value_id] = Placement(StorageClass.TEMPORARY, interval.spec, slot)
         else:
             candidate_index_value, workspace_index = interval.identity[1:]
             workspaces.append(
@@ -144,18 +146,26 @@ def plan_memory(graph: Graph, cover: Cover, capabilities: Capabilities) -> Memor
                     cover.candidates[candidate_index_value].name,
                     workspace_index,
                     interval.spec,
-                    offset,
+                    slot,
                 )
             )
     alignment = max((item.alignment for item in intervals), default=1)
-    return MemoryPlan(placements, tuple(workspaces), arena_bytes, alignment)
+    return MemoryPlan(placements, tuple(workspaces), temporary_bytes, alignment)
 
 
 def _alignment(spec: TensorSpec, capabilities: Capabilities) -> int:
     return max(spec.dtype.itemsize, capabilities.alignments.get(spec.dtype, spec.dtype.itemsize))
 
 
-def _assign(intervals: tuple[_Interval, ...]) -> tuple[dict[tuple[str, int, int], int], int]:
+def _assign_slots(
+    intervals: tuple[_Interval, ...], alignment: int
+) -> tuple[dict[tuple[str, int, int], int], int]:
+    """Plan byte ranges, then use each distinct range start as an ABI slot.
+
+    Range planning retains best-fit lifetime reuse. Physical realization maps
+    every distinct start to a zero-offset allocation because packed TileLang
+    tensor arguments cannot carry a nonzero storage offset.
+    """
     ordered = sorted(intervals, key=lambda item: (item.start, -item.size, item.identity))
     active: list[tuple[int, int, int]] = []  # end, offset, size
     free: list[tuple[int, int]] = []
@@ -190,7 +200,7 @@ def _assign(intervals: tuple[_Interval, ...]) -> tuple[dict[tuple[str, int, int]
                 free.append((offset + interval.size, after))
         offsets[interval.identity] = offset
         active.append((interval.end, offset, interval.size))
-    return offsets, extent
+    return offsets, _align(extent, alignment)
 
 
 def _align(value: int, alignment: int) -> int:

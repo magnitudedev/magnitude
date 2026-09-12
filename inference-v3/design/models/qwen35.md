@@ -52,7 +52,9 @@ and completion.
 
 ## Precision
 
-The model declares its observable finite-precision contract. Norms, rotary,
+The model declares its observable finite-precision contract. Production Qwen
+descriptions currently select FP16 activation and KV storage with FP32 reduction
+and recurrent state where declared. Norms, rotary,
 projection boundaries, gates, residuals, recurrent state, reductions and logits
 retain their required accumulation and storage boundaries through fusion. A
 lowering that changes an observable rounding point is not a substitute for the

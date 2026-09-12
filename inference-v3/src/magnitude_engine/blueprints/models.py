@@ -1,11 +1,12 @@
 """Container interpretation and numerical runtime construction dependencies."""
 
+import magnitensor as mt
 from magnitude_engine.composition import Blueprint, blueprint
 from magnitude_engine.models.qwen35.description import DenseDescription
 from magnitude_engine.models.qwen35.runtime import DenseRuntime
-from magnitude_engine.operations.binding import Operations
 from magnitude_engine.weights.formats.gguf import GGUFFormat
 from magnitude_engine.weights.formats.mlx_safetensors import MLXFormat
+from magnitude_engine.weights.tensor_residency import TensorWeights
 
 __all__ = ["Qwen35DenseDescription", "Qwen35MLXDescription", "Qwen35Dense"]
 
@@ -41,16 +42,29 @@ class Qwen35MLXDescription(Blueprint[DenseDescription]):
 @blueprint
 class Qwen35Dense(Blueprint[DenseRuntime]):
     description: Blueprint[DenseDescription]
-    operations: Blueprint[Operations]
-    precision: str = "native_bf16"
+    device: Blueprint[mt.Device]
+    weights: Blueprint[TensorWeights]
+    max_sequences: int = 8
+    prefill_rows: int | None = None
+    context_capacity: int | None = None
 
     @staticmethod
     def implementation():
         def build(
-            description: DenseDescription, operations: Operations, precision: str
+            description,
+            device,
+            weights,
+            max_sequences,
+            prefill_rows,
+            context_capacity,
         ) -> DenseRuntime:
-            from magnitude_engine.kernels.precision import preset
-
-            return DenseRuntime(description, operations, preset(precision))
+            return DenseRuntime(
+                description,
+                device,
+                weights,
+                max_sequences=max_sequences,
+                prefill_rows=prefill_rows,
+                context_capacity=context_capacity,
+            )
 
         return build

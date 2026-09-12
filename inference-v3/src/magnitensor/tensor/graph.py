@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any
@@ -99,6 +99,59 @@ class Graph:
 
     def value(self, value_id: int) -> Value:
         return self.values[value_id]
+
+
+def prune_dead_nodes(graph: Graph) -> Graph:
+    """Remove pure computations that cannot affect an output or observable resource."""
+    live_values = set(graph.outputs)
+    live_nodes: set[int] = set()
+    for node in reversed(graph.nodes):
+        observable = bool(node.effects.writes) or node.effects.host_observation
+        if observable or any(output in live_values for output in node.outputs):
+            live_nodes.add(node.id)
+            live_values.update(node.outputs)
+            live_values.update(node.inputs)
+
+    declared = set((*graph.inputs, *graph.constants, *graph.resources))
+    retained_values = declared | live_values
+    value_ids = {
+        value.id: index
+        for index, value in enumerate(
+            value for value in graph.values if value.id in retained_values
+        )
+    }
+    node_ids = {
+        node.id: index
+        for index, node in enumerate(node for node in graph.nodes if node.id in live_nodes)
+    }
+    values = tuple(
+        replace(
+            value,
+            id=value_ids[value.id],
+            producer=None if value.producer is None else node_ids[value.producer],
+        )
+        for value in graph.values
+        if value.id in retained_values
+    )
+    nodes = tuple(
+        replace(
+            node,
+            id=node_ids[node.id],
+            inputs=tuple(value_ids[value] for value in node.inputs),
+            outputs=tuple(value_ids[value] for value in node.outputs),
+        )
+        for node in graph.nodes
+        if node.id in live_nodes
+    )
+    return Graph(
+        graph.name,
+        values,
+        nodes,
+        tuple(value_ids[value] for value in graph.inputs),
+        tuple(value_ids[value] for value in graph.constants),
+        tuple(value_ids[value] for value in graph.resources),
+        tuple(value_ids[value] for value in graph.outputs),
+    )
 
     def node(self, node_id: int) -> Node:
         return self.nodes[node_id]

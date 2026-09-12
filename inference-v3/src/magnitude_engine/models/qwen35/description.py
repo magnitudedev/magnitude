@@ -10,8 +10,8 @@ from enum import StrEnum
 
 from pydantic import Field, PositiveFloat, PositiveInt, model_validator
 
+import magnitensor as mt
 from magnitude_engine.data import Record
-from magnitude_engine.kernels.semantics import HeadMapping
 from magnitude_engine.weights.descriptor import WeightDescriptor
 from magnitude_engine.weights.identity import ArtifactIdentity
 
@@ -21,7 +21,27 @@ class MixerKind(StrEnum):
     RECURRENT = "recurrent"
 
 
+class HeadMapping(StrEnum):
+    GROUPED = "grouped"
+    TILED = "tiled"
+
+
+class ExpertGeometry(Record):
+    count: PositiveInt
+    selected: PositiveInt
+    intermediate: PositiveInt
+    shared_intermediate: PositiveInt
+    normalize_selected: bool = True
+
+    @model_validator(mode="after")
+    def validate_experts(self):
+        if self.selected > self.count:
+            raise ValueError("selected expert count exceeds the expert collection")
+        return self
+
+
 class Geometry(Record):
+    activation_dtype: mt.DType
     hidden: PositiveInt
     intermediate: PositiveInt
     vocabulary: PositiveInt
@@ -39,9 +59,12 @@ class Geometry(Record):
     recurrent_value_heads: PositiveInt
     recurrent_width: PositiveInt
     recurrent_head_mapping: HeadMapping = HeadMapping.TILED
+    experts: ExpertGeometry | None = None
 
     @model_validator(mode="after")
     def validate_geometry(self):
+        if self.activation_dtype not in (mt.DType.F16, mt.DType.BF16):
+            raise ValueError("Qwen activations require a qualified 16-bit floating dtype")
         if not math.isfinite(self.epsilon) or not math.isfinite(self.rotary_base):
             raise ValueError("Qwen numerical parameters must be finite")
         if not self.layers or self.attention_heads % self.kv_heads:
@@ -87,13 +110,28 @@ class RecurrentWeights(Record):
     output: WeightDescriptor
 
 
+class DenseFeedForwardWeights(Record):
+    gate: WeightDescriptor
+    up: WeightDescriptor
+    down: WeightDescriptor
+
+
+class RoutedFeedForwardWeights(Record):
+    router: WeightDescriptor
+    shared_router: WeightDescriptor
+    expert_gate: WeightDescriptor
+    expert_up: WeightDescriptor
+    expert_down: WeightDescriptor
+    shared_gate: WeightDescriptor
+    shared_up: WeightDescriptor
+    shared_down: WeightDescriptor
+
+
 class BlockWeights(Record):
     input_norm: WeightDescriptor
     mixer: AttentionWeights | RecurrentWeights
     feedforward_norm: WeightDescriptor
-    feedforward_gate: WeightDescriptor
-    feedforward_up: WeightDescriptor
-    feedforward_down: WeightDescriptor
+    feedforward: DenseFeedForwardWeights | RoutedFeedForwardWeights
 
 
 class DenseDescription(Record):

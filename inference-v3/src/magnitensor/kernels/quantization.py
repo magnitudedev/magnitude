@@ -129,10 +129,14 @@ def _interpret_bits(raw: Any, bits: int, interpretation: Any, zero_point: int) -
 
 def _float_at(storage: Any, base: int, index: Any, dtype: DType) -> Any:
     offset = base + index * dtype.itemsize
-    if dtype in (DType.F16, DType.BF16):
+    if dtype == DType.F16:
         bits = T.cast(storage[offset], "uint16")
         bits |= T.cast(storage[offset + 1], "uint16") << 8
         return T.reinterpret(T.cast(bits, "uint16"), dtype.value)
+    if dtype == DType.BF16:
+        bits = T.cast(storage[offset], "uint32")
+        bits |= T.cast(storage[offset + 1], "uint32") << 8
+        return T.reinterpret(T.cast(bits << 16, "uint32"), "float32")
     if dtype == DType.F32:
         bits = T.cast(storage[offset], "uint32")
         bits |= T.cast(storage[offset + 1], "uint32") << 8

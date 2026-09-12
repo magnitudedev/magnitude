@@ -8,16 +8,16 @@ that is a ``Representation``, decided at residency.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Any, Protocol
 
 from pydantic import PositiveInt
 
+import magnitensor as mt
 from magnitude_engine.data import Record
-from magnitude_engine.platform.execution import DType
 from magnitude_engine.platform.storage import ByteSource
-from magnitude_engine.weights.representation import Affine, Codebook
 
 
 class WeightTransform(StrEnum):
@@ -45,6 +45,7 @@ class TraceValue(Protocol):
     def __rshift__(self, other: int | TraceValue) -> TraceValue: ...
     def __and__(self, other: int | TraceValue) -> TraceValue: ...
     def __or__(self, other: int | TraceValue) -> TraceValue: ...
+    def __neg__(self) -> TraceValue: ...
     def __lt__(self, other: int | TraceValue) -> TraceValue: ...
 
 
@@ -67,10 +68,18 @@ class SourceCodec(Protocol):
         self, data: TraceBuffer, base: int | TraceValue, index: int | TraceValue
     ) -> TraceValue: ...
     def local_scale(
-        self, data: TraceBuffer, base: int | TraceValue, group: int | TraceValue
+        self,
+        data: TraceBuffer,
+        base: int | TraceValue,
+        group: int | TraceValue,
+        select: Callable[[Any, Any, Any], Any],
     ) -> TraceValue: ...
     def local_bias(
-        self, data: TraceBuffer, base: int | TraceValue, group: int | TraceValue
+        self,
+        data: TraceBuffer,
+        base: int | TraceValue,
+        group: int | TraceValue,
+        select: Callable[[Any, Any, Any], Any],
     ) -> TraceValue: ...
     def scale_byte(
         self, data: TraceBuffer, base: int | TraceValue, byte_index: int | TraceValue
@@ -78,13 +87,29 @@ class SourceCodec(Protocol):
     def bias_byte(
         self, data: TraceBuffer, base: int | TraceValue, byte_index: int | TraceValue
     ) -> TraceValue: ...
+    def direct_scale(
+        self,
+        data: TraceBuffer,
+        base: int | TraceValue,
+        group: int | TraceValue,
+        select: Callable[[Any, Any, Any], Any],
+        reinterpret: Callable[[Any, str], Any],
+    ) -> TraceValue: ...
+    def direct_bias(
+        self,
+        data: TraceBuffer,
+        base: int | TraceValue,
+        group: int | TraceValue,
+        select: Callable[[Any, Any, Any], Any],
+        reinterpret: Callable[[Any, str], Any],
+    ) -> TraceValue: ...
 
 
 @dataclass(frozen=True)
 class StoredQuantized:
     """Container bytes plus their one import-only logical reader."""
 
-    representation: Affine | Codebook
+    representation: mt.Affine | mt.Codebook
     codec: SourceCodec
     source: ByteSource
     offset: int
@@ -92,7 +117,7 @@ class StoredQuantized:
 
 @dataclass(frozen=True)
 class StoredDense:
-    dtype: DType
+    dtype: mt.DType
     source: ByteSource
     offset: int
     nbytes: int

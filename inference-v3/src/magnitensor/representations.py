@@ -133,38 +133,106 @@ class TensorRepresentation:
     physical_layout: Layout = Layout(tag="canonical")
 
 
+@dataclass(frozen=True, slots=True)
+class CanonicalLayout:
+    """Byte geometry of one canonical encoded allocation.
+
+    Direct coefficients occupy allocation-wide planes. Hierarchical
+    coefficients remain interleaved with each supergroup so a consuming
+    subgroup can fetch one complete quantization tile locally.
+    """
+
+    elements: int
+    tile_elements: int
+    tile_bytes: int
+    low: int
+    high: int | None
+    scales: int
+    biases: int | None
+    super_scale: int | None
+    super_bias: int | None
+    nbytes: int
+    hierarchical: bool
+
+
+def _whole_bytes(bits: int) -> int:
+    if bits < 0 or bits % 8:
+        raise ValueError("canonical encoded fields must occupy whole bytes")
+    return bits // 8
+
+
+def canonical_layout(
+    representation: Affine | Codebook, elements: int
+) -> CanonicalLayout:
+    """Return the sole physical layout consumed by Magnitensor schedules."""
+    if elements <= 0 or elements % representation.group:
+        raise ValueError("encoded storage requires complete quantization groups")
+    coefficients = representation.coefficients
+    low_bits = (
+        representation.code.low_bits
+        if isinstance(representation, Affine)
+        else representation.code_bits
+    )
+    high_bits = representation.code.high_bits if isinstance(representation, Affine) else 0
+
+    if isinstance(coefficients, DirectCoefficients):
+        groups = elements // representation.group
+        low = 0
+        high = _whole_bytes(elements * low_bits) if high_bits else None
+        scales = _whole_bytes(elements * (low_bits + high_bits))
+        biases = scales + groups * coefficients.scale_dtype.itemsize if coefficients.has_bias else None
+        end = scales + groups * coefficients.scale_dtype.itemsize
+        if coefficients.bias_dtype is not None:
+            end += groups * coefficients.bias_dtype.itemsize
+        return CanonicalLayout(
+            elements,
+            elements,
+            end,
+            low,
+            high,
+            scales,
+            biases,
+            None,
+            None,
+            end,
+            False,
+        )
+
+    tile_elements = coefficients.supergroup
+    if elements % tile_elements:
+        raise ValueError("hierarchical storage requires complete supergroups")
+    tile_groups = tile_elements // representation.group
+    low = 0
+    high = _whole_bytes(tile_elements * low_bits) if high_bits else None
+    scales = _whole_bytes(tile_elements * (low_bits + high_bits))
+    local_scale_bytes = _whole_bytes(tile_groups * coefficients.local_scale_bits)
+    biases = scales + local_scale_bytes if coefficients.has_bias else None
+    end = scales + local_scale_bytes
+    if coefficients.local_bias_bits is not None:
+        end += _whole_bytes(tile_groups * coefficients.local_bias_bits)
+    super_scale = end
+    end += coefficients.super_scale_dtype.itemsize
+    super_bias = end if coefficients.super_bias_dtype is not None else None
+    if coefficients.super_bias_dtype is not None:
+        end += coefficients.super_bias_dtype.itemsize
+    return CanonicalLayout(
+        elements,
+        tile_elements,
+        end,
+        low,
+        high,
+        scales,
+        biases,
+        super_scale,
+        super_bias,
+        elements // tile_elements * end,
+        True,
+    )
+
+
 def represented_nbytes(representation: Representation, elements: int) -> int:
     if elements <= 0:
         raise ValueError("element count must be positive")
     if isinstance(representation, Dense):
         return elements * representation.dtype.itemsize
-    if isinstance(representation, Affine):
-        # Affine codes use independently packed low and high planes.
-        code_bytes = math.ceil(elements * representation.code.low_bits / 8)
-        code_bytes += math.ceil(elements * representation.code.high_bits / 8)
-    else:
-        code_bytes = math.ceil(elements * representation.code_bits / 8)
-    groups = math.ceil(elements / representation.group)
-    coefficients = representation.coefficients
-    if isinstance(coefficients, DirectCoefficients):
-        return code_bytes + groups * (
-            coefficients.scale_dtype.itemsize
-            + (0 if coefficients.bias_dtype is None else coefficients.bias_dtype.itemsize)
-        )
-    supergroups = math.ceil(elements / coefficients.supergroup)
-    local_bytes = math.ceil(groups * coefficients.local_scale_bits / 8)
-    if coefficients.local_bias_bits is not None:
-        local_bytes += math.ceil(groups * coefficients.local_bias_bits / 8)
-    return (
-        code_bytes
-        + local_bytes
-        + supergroups
-        * (
-            coefficients.super_scale_dtype.itemsize
-            + (
-                0
-                if coefficients.super_bias_dtype is None
-                else coefficients.super_bias_dtype.itemsize
-            )
-        )
-    )
+    return canonical_layout(representation, elements).nbytes

@@ -8,6 +8,7 @@ their typed contracts and actual construction/binding relationships.
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any, cast
 
 
 @dataclass(frozen=True)
@@ -17,7 +18,7 @@ class ExternalComponent:
 
 def component[T](identity: str) -> Callable[[T], T]:
     def annotate(value: T) -> T:
-        value.__external_component__ = ExternalComponent(identity)
+        cast(Any, value).__external_component__ = ExternalComponent(identity)
         return value
 
     return annotate

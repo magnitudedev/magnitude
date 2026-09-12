@@ -119,6 +119,29 @@ def cast(value: Tensor, dtype: DType) -> Tensor:
     return _emit("cast", value, dtype=dtype)
 
 
+def _decode_bfloat16_reference(inputs, attrs):
+    np = _np()
+    bits = inputs[0].astype(np.uint32) << 16
+    return (bits.view(np.float32).astype(attrs["dtype"].value),)
+
+
+@operation(
+    "decode_bfloat16",
+    reference=_decode_bfloat16_reference,
+    tags=frozenset({"cheap", "representation"}),
+)
+def _decode_bfloat16(inputs, attrs):
+    _one(inputs, 1, "decode_bfloat16")
+    dtype = attrs["dtype"]
+    if inputs[0].dtype != DType.U16 or dtype not in (DType.F16, DType.F32):
+        raise ValueError("bfloat16 decoding requires uint16 storage and an F16/F32 result")
+    return (TensorSpec(inputs[0].shape, dtype, inputs[0].layout),)
+
+
+def decode_bfloat16(value: Tensor, dtype: DType) -> Tensor:
+    return _emit("decode_bfloat16", value, dtype=dtype)
+
+
 @operation(
     "reshape",
     reference=lambda inputs, attrs: (_np().reshape(inputs[0], attrs["shape"]),),
@@ -179,6 +202,167 @@ def _concatenate(inputs, attrs):
 
 def concatenate(values: Sequence[Tensor], axis: int = 0) -> Tensor:
     return _emit("concatenate", *tuple(values), axis=axis)
+
+
+@operation(
+    "take_rows",
+    reference=lambda inputs, _attrs: (inputs[0][inputs[1]],),
+    tags=frozenset({"indexing"}),
+)
+def _take_rows(inputs, _attrs):
+    _one(inputs, 2, "take_rows")
+    value, indices = inputs
+    if value.rank < 1 or indices.rank != 1 or not indices.dtype.integer:
+        raise ValueError("take_rows expects a tensor and one-dimensional integer indices")
+    return (TensorSpec((indices.shape[0], *value.shape[1:]), value.dtype),)
+
+
+def take_rows(value: Tensor, indices: Tensor) -> Tensor:
+    return _emit("take_rows", value, indices)
+
+
+@operation(
+    "overlay_rows",
+    reference=lambda inputs, _attrs: (_overlay_rows_reference(inputs),),
+    tags=frozenset({"indexing"}),
+)
+def _overlay_rows(inputs, _attrs):
+    _one(inputs, 3, "overlay_rows")
+    value, replacement, indices = inputs
+    if (
+        value.rank < 1
+        or replacement.shape != (indices.shape[0], *value.shape[1:])
+        or replacement.dtype != value.dtype
+        or indices.rank != 1
+        or not indices.dtype.integer
+    ):
+        raise ValueError("overlay_rows replacement geometry differs from its destination")
+    return (value,)
+
+
+def _overlay_rows_reference(inputs):
+    result = inputs[0].copy()
+    result[inputs[2]] = inputs[1]
+    return result
+
+
+def overlay_rows(value: Tensor, replacement: Tensor, indices: Tensor) -> Tensor:
+    return _emit("overlay_rows", value, replacement, indices)
+
+
+@operation(
+    "quantized_import",
+    resource_writes=(1,),
+    aliases=((0, 1),),
+    tags=frozenset({"residency"}),
+)
+def _quantized_import(inputs, attrs):
+    _one(inputs, 3, "quantized_import")
+    source, target, extent = inputs
+    if (
+        source.rank != 1
+        or source.dtype != DType.U8
+        or target.representation is None
+        or extent != TensorSpec((2,), DType.I32)
+        or attrs["staged_tiles"] <= 0
+    ):
+        raise ValueError("invalid quantized residency import geometry")
+    return (target,)
+
+
+def quantized_import(
+    source: Tensor,
+    target: Tensor,
+    extent: Tensor,
+    *,
+    codec: object,
+    staged_tiles: int,
+) -> Tensor:
+    """Relayout format bytes into a canonical encoded resource."""
+
+    return _emit(
+        "quantized_import",
+        source,
+        target,
+        extent,
+        codec=codec,
+        staged_tiles=staged_tiles,
+    )
+
+
+@operation(
+    "sample",
+    reference=lambda inputs, _attrs: (_sample_reference(inputs[0], inputs[1]),),
+    tags=frozenset({"sampling", "host-output"}),
+    host_observation=True,
+)
+def _sample(inputs, _attrs):
+    _one(inputs, 2, "sample")
+    logits, draws = inputs
+    if (
+        logits.rank != 2
+        or logits.dtype != DType.F32
+        or draws != TensorSpec((logits.shape[0], 6), DType.U32)
+    ):
+        raise ValueError("sampling expects FP32 logits and six uint32 draw words per row")
+    return (TensorSpec((logits.shape[0], 2), DType.I32),)
+
+
+def sample(logits: Tensor, draws: Tensor) -> Tensor:
+    """Select token/status rows using position-addressed deterministic draws."""
+
+    return _emit("sample", logits, draws)
+
+
+def _sample_reference(logits, draws):
+    np = _np()
+    output = np.empty((logits.shape[0], 2), dtype=np.int32)
+    for row in range(logits.shape[0]):
+        values = logits[row].astype(np.float32)
+        invalid = bool(np.isnan(values).any() or np.isposinf(values).any())
+        finite = ~np.isneginf(values)
+        if invalid:
+            output[row] = (-1, 2)
+            continue
+        if not finite.any():
+            output[row] = (-1, 1)
+            continue
+        scores = values.copy()
+        if int(draws[row, 0]) == 1:
+            for token in np.flatnonzero(finite):
+                word = _philox_reference(
+                    int(token),
+                    int(draws[row, 3]),
+                    int(draws[row, 4]),
+                    int(draws[row, 5]),
+                    int(draws[row, 1]),
+                    int(draws[row, 2]),
+                )
+                uniform = ((word >> 9) + 0.5) * (2**-23)
+                scores[token] -= np.log(-np.log(uniform))
+        scores[~finite] = -np.inf
+        output[row] = (int(np.argmax(scores)), 0)
+    return output
+
+
+def _philox_reference(c0, c1, c2, c3, k0, k1):
+    mask = 0xFFFFFFFF
+    counter = [c0 & mask, c1 & mask, c2 & mask, c3 & mask]
+    key = [k0 & mask, k1 & mask]
+    for _ in range(10):
+        product0 = 0xD2511F53 * counter[0]
+        product1 = 0xCD9E8D57 * counter[2]
+        hi0, lo0 = (product0 >> 32) & mask, product0 & mask
+        hi1, lo1 = (product1 >> 32) & mask, product1 & mask
+        counter = [
+            (hi1 ^ counter[1] ^ key[0]) & mask,
+            lo1,
+            (hi0 ^ counter[3] ^ key[1]) & mask,
+            lo0,
+        ]
+        key[0] = (key[0] + 0x9E3779B9) & mask
+        key[1] = (key[1] + 0xBB67AE85) & mask
+    return counter[0]
 
 
 @operation(
@@ -313,6 +497,42 @@ def linear(
 
 
 @operation(
+    "row_dot",
+    reference=lambda inputs, attrs: (_row_dot_reference(inputs, attrs),),
+    numerical=NumericalContract(DType.F32),
+    tags=frozenset({"projection"}),
+)
+def _row_dot(inputs, attrs):
+    _one(inputs, 2, "row_dot")
+    value, weight = inputs
+    if (
+        value.rank != 2
+        or weight.rank != 1
+        or value.shape[-1] != weight.shape[0]
+        or not value.dtype.floating
+        or not weight.dtype.floating
+    ):
+        raise ValueError("row_dot expects floating rows and one matching vector")
+    output_dtype = attrs.get("output_dtype") or value.dtype
+    return (TensorSpec((*value.shape[:-1], 1), output_dtype),)
+
+
+def _row_dot_reference(inputs, attrs):
+    np = _np()
+    output_dtype = attrs.get("output_dtype") or inputs[0].dtype
+    result = np.sum(
+        inputs[0].astype(np.float32) * inputs[1].astype(np.float32),
+        axis=-1,
+        keepdims=True,
+    )
+    return result.astype(output_dtype.value)
+
+
+def row_dot(value: Tensor, weight: Tensor, *, output_dtype: DType | None = None) -> Tensor:
+    return _emit("row_dot", value, weight, output_dtype=output_dtype)
+
+
+@operation(
     "embedding",
     reference=lambda inputs, _attrs: (inputs[1][inputs[0]],),
     tags=frozenset({"embedding"}),
@@ -385,6 +605,125 @@ def rotary(
 
 
 @operation(
+    "attention_prepare",
+    reference=lambda inputs, attrs: _attention_prepare_reference(inputs, attrs),
+    numerical=NumericalContract(DType.F32),
+    tags=frozenset({"attention", "normalization", "position"}),
+)
+def _attention_prepare(inputs, attrs):
+    _one(inputs, 5, "attention_prepare")
+    query_gate, keys, query_norm, key_norm, coordinates = inputs
+    rows = query_gate.shape[0] if query_gate.rank == 2 else None
+    query_heads = attrs["query_heads"]
+    kv_heads = attrs["kv_heads"]
+    width = attrs["width"]
+    rotary_width = attrs["rotary_width"]
+    sections = attrs["sections"]
+    if (
+        rows is None
+        or query_gate.shape != (rows, query_heads * 2 * width)
+        or keys.shape != (rows, kv_heads * width)
+        or query_norm.shape != (width,)
+        or key_norm.shape != (width,)
+        or coordinates.shape != (rows, 3)
+        or coordinates.dtype != DType.I32
+        or len({query_gate.dtype, keys.dtype}) != 1
+        or not query_gate.dtype.floating
+        or query_norm.dtype != DType.F32
+        or key_norm.dtype != DType.F32
+        or rotary_width <= 0
+        or rotary_width > width
+        or rotary_width % 2
+        or len(sections) != 4
+        or any(type(value) is not int or value < 0 for value in sections)
+        or sum(sections) * 2 != rotary_width
+        or attrs["base"] <= 0
+        or attrs["epsilon"] <= 0
+    ):
+        raise ValueError("invalid normalized rotary attention geometry")
+    dtype = query_gate.dtype
+    return (
+        TensorSpec((rows, query_heads, width), dtype),
+        TensorSpec((rows, kv_heads, width), dtype),
+        TensorSpec((rows, query_heads, width), dtype),
+    )
+
+
+def _attention_prepare_reference(inputs, attrs):
+    np = _np()
+    query_gate, keys, query_norm, key_norm, coordinates = inputs
+    rows = query_gate.shape[0]
+    query_heads = attrs["query_heads"]
+    kv_heads = attrs["kv_heads"]
+    width = attrs["width"]
+    rotary_width = attrs["rotary_width"]
+    half = rotary_width // 2
+    sections = attrs["sections"]
+
+    def normalize(value, weight):
+        inverse = 1 / np.sqrt(
+            np.mean(value.astype(np.float32) ** 2, axis=-1, keepdims=True) + attrs["epsilon"]
+        )
+        return value.astype(np.float32) * inverse * weight.astype(np.float32)
+
+    query_gate = query_gate.reshape(rows, query_heads, 2, width)
+    query = normalize(query_gate[:, :, 0], query_norm)
+    key = normalize(keys.reshape(rows, kv_heads, width), key_norm)
+    frequency = attrs["base"] ** (-np.arange(0, rotary_width, 2, dtype=np.float32) / half)
+    index = np.arange(half)
+    axis = np.where(
+        (index % 3 == 1) & (index < sections[1] * 3),
+        1,
+        np.where((index % 3 == 2) & (index < sections[2] * 3), 2, 0),
+    )
+    angles = coordinates[:, axis].astype(np.float32) * frequency
+
+    def rotate(value):
+        result = value.copy()
+        first = value[..., :half]
+        second = value[..., half:rotary_width]
+        cosine = np.cos(angles)[:, None, :]
+        sine = np.sin(angles)[:, None, :]
+        result[..., :half] = first * cosine - second * sine
+        result[..., half:rotary_width] = second * cosine + first * sine
+        return result.astype(query_gate.dtype)
+
+    return rotate(query), rotate(key), query_gate[:, :, 1].astype(query_gate.dtype)
+
+
+def attention_prepare(
+    query_gate: Tensor,
+    keys: Tensor,
+    query_norm: Tensor,
+    key_norm: Tensor,
+    coordinates: Tensor,
+    *,
+    query_heads: int,
+    kv_heads: int,
+    width: int,
+    rotary_width: int,
+    base: float,
+    sections: tuple[int, int, int, int],
+    epsilon: float,
+):
+    return _emit(
+        "attention_prepare",
+        query_gate,
+        keys,
+        query_norm,
+        key_norm,
+        coordinates,
+        query_heads=query_heads,
+        kv_heads=kv_heads,
+        width=width,
+        rotary_width=rotary_width,
+        base=base,
+        sections=sections,
+        epsilon=epsilon,
+    )
+
+
+@operation(
     "kv_append",
     reference=lambda inputs, attrs: (_kv_append_reference(inputs, attrs),),
     resource_reads=(0,),
@@ -408,13 +747,40 @@ def _kv_append(inputs, attrs):
 def _kv_append_reference(inputs, attrs):
     resource = inputs[0].copy()
     destinations = inputs[3]
-    resource[0, destinations] = inputs[1]
-    resource[1, destinations] = inputs[2]
+    valid = destinations >= 0
+    resource[0, destinations[valid]] = inputs[1][valid]
+    resource[1, destinations[valid]] = inputs[2][valid]
     return resource
 
 
 def kv_append(resource: Tensor, keys: Tensor, values: Tensor, destinations: Tensor) -> Tensor:
     return _emit("kv_append", resource, keys, values, destinations)
+
+
+@operation(
+    "kv_copy",
+    resource_reads=(0,),
+    resource_writes=(0,),
+    aliases=((0, 0),),
+    tags=frozenset({"state"}),
+)
+def _kv_copy(inputs, attrs):
+    _one(inputs, 2, "kv_copy")
+    resource, ranges = inputs
+    if (
+        resource.rank != 4
+        or resource.shape[0] != 2
+        or ranges.rank != 2
+        or ranges.shape[1] != 3
+        or ranges.dtype != DType.I32
+        or attrs["max_count"] <= 0
+    ):
+        raise ValueError("invalid KV copy geometry")
+    return (resource,)
+
+
+def kv_copy(resource: Tensor, ranges: Tensor, *, max_count: int) -> Tensor:
+    return _emit("kv_copy", resource, ranges, max_count=max_count)
 
 
 @operation(
@@ -435,8 +801,15 @@ def _causal_attention(inputs, attrs):
         raise ValueError("attention history uses [2, capacity, head, channel] geometry")
     if queries.shape[-2] % history.shape[-2]:
         raise ValueError("query heads must be grouped over KV heads")
-    if len(inputs) == 3 and inputs[2].shape != queries.shape[:-2]:
-        raise ValueError("attention visibility must match token geometry")
+    if len(inputs) == 3 and inputs[2].shape not in (
+        queries.shape[:-2],
+        (*queries.shape[:-2], 2),
+    ):
+        raise ValueError("attention visibility must provide counts or start/count ranges")
+    if attrs["sequence_count"] is not None and (
+        type(attrs["sequence_count"]) is not int or attrs["sequence_count"] <= 0
+    ):
+        raise ValueError("attention sequence count must be positive")
     return (queries,)
 
 
@@ -449,19 +822,29 @@ def _attention_reference(inputs, attrs):
     group = queries.shape[-2] // kv_heads
     for token in range(queries.shape[0]):
         for head in range(queries.shape[1]):
-            count = int(visible[token])
+            if visible.ndim == 2:
+                start, count = map(int, visible[token])
+            else:
+                start, count = 0, int(visible[token])
             kv_head = head // group
             logits = (
                 queries[token, head].astype(np.float32)
-                @ history[0, :count, kv_head].astype(np.float32).T
+                @ history[0, start : start + count, kv_head].astype(np.float32).T
             )
             probabilities = _softmax_reference(logits * attrs["scale"], -1)
-            result[token, head] = probabilities @ history[1, :count, kv_head].astype(np.float32)
+            result[token, head] = probabilities @ history[
+                1, start : start + count, kv_head
+            ].astype(np.float32)
     return result
 
 
 def causal_attention(
-    queries: Tensor, history: Tensor, reads: Tensor | None = None, *, scale: float | None = None
+    queries: Tensor,
+    history: Tensor,
+    reads: Tensor | None = None,
+    *,
+    scale: float | None = None,
+    sequence_count: int | None = None,
 ) -> Tensor:
     inputs = (queries, history) if reads is None else (queries, history, reads)
     if scale is None:
@@ -469,7 +852,12 @@ def causal_attention(
         if not isinstance(width, int):
             raise ValueError("attention width must be specialized")
         scale = width**-0.5
-    return _emit("causal_attention", *inputs, scale=scale)
+    return _emit(
+        "causal_attention",
+        *inputs,
+        scale=scale,
+        sequence_count=sequence_count,
+    )
 
 
 @operation(
@@ -510,6 +898,212 @@ def delta_recurrence(values: Tensor, state: Tensor, *parameters: Tensor, **attri
 
 
 @operation(
+    "gated_delta_recurrence",
+    reference=lambda inputs, attrs: _gated_delta_reference(inputs, attrs),
+    numerical=NumericalContract(DType.F32),
+    tags=frozenset({"recurrence", "state"}),
+)
+def _gated_delta_recurrence(inputs, attrs):
+    _one(inputs, 7, "gated_delta_recurrence")
+    query, key, value, decay, beta, previous, offsets = inputs
+    if (
+        query.rank != 3
+        or key.shape != query.shape
+        or value.rank != 3
+        or value.shape[0] != query.shape[0]
+        or decay.shape != value.shape[:2]
+        or beta.shape != value.shape[:2]
+        or previous.rank != 4
+        or previous.shape[1:] != (value.shape[1], value.shape[2], query.shape[2])
+        or query.shape[1] > value.shape[1]
+        or value.shape[1] % query.shape[1]
+        or attrs["mapping"] not in {"tiled", "grouped"}
+        or len({query.dtype, key.dtype, value.dtype, beta.dtype}) != 1
+        or decay.dtype != DType.F32
+        or previous.dtype != DType.F32
+        or offsets.shape != (previous.shape[0] + 1,)
+        or offsets.dtype != DType.I32
+    ):
+        raise ValueError("invalid gated delta recurrence geometry")
+    return value, previous
+
+
+def _gated_delta_reference(inputs, attrs):
+    np = _np()
+    query, key, value, decay, beta, previous, offsets = inputs
+    batch, value_heads, value_width, key_width = previous.shape
+    key_heads = query.shape[1]
+    state = previous.astype(np.float32).copy()
+    output = np.empty_like(value)
+    for sequence in range(batch):
+        for head in range(value_heads):
+            key_head = (
+                head % key_heads
+                if attrs["mapping"] == "tiled"
+                else head // (value_heads // key_heads)
+            )
+            for row in range(int(offsets[sequence]), int(offsets[sequence + 1])):
+                state[sequence, head] *= decay[row, head]
+                remembered = state[sequence, head] @ key[row, key_head].astype(np.float32)
+                residual = (value[row, head].astype(np.float32) - remembered) * beta[row, head]
+                state[sequence, head] += (
+                    residual[:, None] * key[row, key_head].astype(np.float32)[None, :]
+                )
+                output[row, head] = (
+                    state[sequence, head] @ query[row, key_head].astype(np.float32)
+                ).astype(value.dtype)
+    return output, state
+
+
+def gated_delta_recurrence(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    decay: Tensor,
+    beta: Tensor,
+    previous: Tensor,
+    offsets: Tensor,
+    *,
+    mapping: str = "tiled",
+):
+    return _emit(
+        "gated_delta_recurrence",
+        query,
+        key,
+        value,
+        decay,
+        beta,
+        previous,
+        offsets,
+        mapping=mapping,
+    )
+
+
+@operation(
+    "recurrent_prepare",
+    reference=lambda inputs, attrs: _recurrent_prepare_reference(inputs, attrs),
+    numerical=NumericalContract(DType.F32),
+    tags=frozenset({"recurrence", "normalization", "state"}),
+)
+def _recurrent_prepare(inputs, attrs):
+    _one(inputs, 8, "recurrent_prepare")
+    projected, convolution, previous, alpha, beta_input, rate, bias, offsets = inputs
+    batch = previous.shape[0] if previous.rank == 3 else None
+    rows = projected.shape[0] if projected.rank == 2 else None
+    key_heads = attrs["key_heads"]
+    value_heads = attrs["value_heads"]
+    width = attrs["width"]
+    channels = (2 * key_heads + value_heads) * width
+    history = attrs["convolution_width"] - 1
+    if (
+        batch is None
+        or rows is None
+        or projected.shape != (rows, channels)
+        or convolution.shape != (channels, history + 1)
+        or previous.shape != (batch, channels, history)
+        or alpha.shape != (rows, value_heads)
+        or beta_input.shape != alpha.shape
+        or rate.shape != (value_heads,)
+        or bias.shape != (value_heads,)
+        or not projected.dtype.floating
+        or convolution.dtype != DType.F32
+        or previous.dtype != projected.dtype
+        or alpha.dtype != projected.dtype
+        or beta_input.dtype != projected.dtype
+        or rate.dtype != DType.F32
+        or bias.dtype != DType.F32
+        or offsets.shape != (batch + 1,)
+        or offsets.dtype != DType.I32
+        or attrs["epsilon"] <= 0
+    ):
+        raise ValueError("invalid recurrent preparation geometry")
+    dtype = projected.dtype
+    return (
+        TensorSpec((rows, key_heads, width), dtype),
+        TensorSpec((rows, key_heads, width), dtype),
+        TensorSpec((rows, value_heads, width), dtype),
+        TensorSpec((rows, value_heads), dtype),
+        TensorSpec((rows, value_heads), DType.F32),
+        previous,
+    )
+
+
+def _recurrent_prepare_reference(inputs, attrs):
+    np = _np()
+    projected, convolution, previous, alpha, beta_input, rate, bias, offsets = inputs
+    batch, channels, history = previous.shape
+    rows = projected.shape[0]
+    key_heads = attrs["key_heads"]
+    value_heads = attrs["value_heads"]
+    width = attrs["width"]
+    convolved = np.empty((rows, channels), dtype=np.float32)
+    following = np.empty_like(previous)
+    for sequence in range(batch):
+        start, end = int(offsets[sequence]), int(offsets[sequence + 1])
+        joined = np.concatenate(
+            (
+                previous[sequence].astype(np.float32),
+                projected[start:end].T.astype(np.float32),
+            ),
+            axis=1,
+        )
+        for step, row in enumerate(range(start, end)):
+            convolved[row] = np.sum(
+                joined[:, step : step + history + 1] * convolution, axis=1
+            )
+        following[sequence] = joined[:, -history:]
+    convolved = convolved / (1 + np.exp(-convolved))
+    heads = convolved.reshape(rows, 2 * key_heads + value_heads, width)
+
+    def normalized(value, gain):
+        inverse = 1 / np.sqrt(np.sum(value * value, axis=-1, keepdims=True) + attrs["epsilon"])
+        return (value * inverse * gain).astype(projected.dtype)
+
+    query = normalized(heads[:, :key_heads], 1 / math.sqrt(width))
+    key = normalized(heads[:, key_heads : 2 * key_heads], 1)
+    value = heads[:, 2 * key_heads :].astype(projected.dtype)
+    beta = (1 / (1 + np.exp(-beta_input.astype(np.float32)))).astype(projected.dtype)
+    shifted = alpha.astype(np.float32) + bias
+    softplus = np.maximum(shifted, 0) + np.log1p(np.exp(-np.abs(shifted)))
+    decay = np.exp(rate * softplus).astype(np.float32)
+    return query, key, value, beta, decay, following
+
+
+def recurrent_prepare(
+    projected: Tensor,
+    convolution: Tensor,
+    previous: Tensor,
+    alpha: Tensor,
+    beta_input: Tensor,
+    rate: Tensor,
+    bias: Tensor,
+    offsets: Tensor,
+    *,
+    key_heads: int,
+    value_heads: int,
+    width: int,
+    convolution_width: int,
+    epsilon: float,
+):
+    return _emit(
+        "recurrent_prepare",
+        projected,
+        convolution,
+        previous,
+        alpha,
+        beta_input,
+        rate,
+        bias,
+        offsets,
+        key_heads=key_heads,
+        value_heads=value_heads,
+        width=width,
+        convolution_width=convolution_width,
+        epsilon=epsilon,
+    )
+
+
+@operation(
     "route_topk",
     reference=lambda inputs, attrs: _route_reference(inputs[0], attrs),
     numerical=NumericalContract(DType.F32),
@@ -518,7 +1112,12 @@ def delta_recurrence(values: Tensor, state: Tensor, *parameters: Tensor, **attri
 def _route_topk(inputs, attrs):
     _one(inputs, 1, "route_topk")
     logits = inputs[0]
-    if logits.rank != 2 or not 0 < attrs["k"] <= logits.shape[1]:
+    if (
+        logits.rank != 2
+        or not logits.dtype.floating
+        or attrs["scoring"] not in {"softmax", "sigmoid"}
+        or not 0 < attrs["k"] <= logits.shape[1]
+    ):
         raise ValueError("invalid routed expert count")
     shape = (logits.shape[0], attrs["k"])
     return TensorSpec(shape, DType.I32), TensorSpec(shape, DType.F32)
@@ -531,7 +1130,10 @@ def _route_reference(logits, attrs):
         if attrs["scoring"] == "sigmoid"
         else _softmax_reference(logits, -1)
     )
-    indices = np.argsort(scores, axis=-1, kind="stable")[:, -attrs["k"] :][:, ::-1]
+    # The architecture observes selected routes in ascending probability/index
+    # order. Stable ascending sorting also makes the larger expert ID win an
+    # exact-score tie at the cutoff.
+    indices = np.argsort(scores, axis=-1, kind="stable")[:, -attrs["k"] :]
     selected = np.take_along_axis(scores, indices, axis=-1)
     if attrs["normalize"]:
         selected = selected / np.sum(selected, axis=-1, keepdims=True)
@@ -552,10 +1154,24 @@ def _routed_experts(inputs, attrs):
     if len(inputs) < 6:
         raise ValueError("routed_experts expects hidden, routes, scores and expert weights")
     hidden, routes, scores = inputs[:3]
-    if hidden.rank != 2 or routes.shape != scores.shape or routes.shape[0] != hidden.shape[0]:
+    if (
+        hidden.rank != 2
+        or not hidden.dtype.floating
+        or routes.shape != scores.shape
+        or routes.shape[0] != hidden.shape[0]
+        or not routes.dtype.integer
+        or scores.dtype != DType.F32
+    ):
         raise ValueError("invalid routed expert geometry")
     gate, up, down = inputs[3:6]
-    if gate.rank != 3 or up.shape != gate.shape or down.rank != 3:
+    if (
+        gate.rank != 3
+        or up.shape != gate.shape
+        or down.rank != 3
+        or not gate.dtype.floating
+        or not up.dtype.floating
+        or not down.dtype.floating
+    ):
         raise ValueError("expert weights require [expert, output, input] geometry")
     if gate.shape[0] != down.shape[0] or gate.shape[2] != hidden.shape[1]:
         raise ValueError("expert input geometry differs from hidden state")

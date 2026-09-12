@@ -2,12 +2,14 @@
 
 from pydantic import BaseModel, ConfigDict, PositiveFloat, PositiveInt
 
-from magnitude_engine.kernels.semantics import HeadMapping
+import magnitensor as mt
 from magnitude_engine.models.qwen35.description import (
     AttentionWeights,
     BlockWeights,
     DenseDescription,
+    DenseFeedForwardWeights,
     Geometry,
+    HeadMapping,
     MixerKind,
     RecurrentWeights,
 )
@@ -67,6 +69,7 @@ def describe(artifact: MLXFormat) -> DenseDescription:
     ):
         raise ValueError("invalid Qwen layer order")
     g = Geometry(
+        activation_dtype=mt.DType.F16,
         hidden=text.hidden_size,
         intermediate=text.intermediate_size,
         vocabulary=text.vocab_size,
@@ -134,9 +137,11 @@ def describe(artifact: MLXFormat) -> DenseDescription:
                 input_norm=weight(p + "input_layernorm.weight", (g.hidden,)),
                 mixer=mixer,
                 feedforward_norm=weight(p + "post_attention_layernorm.weight", (g.hidden,)),
-                feedforward_gate=weight(p + "mlp.gate_proj.weight", (g.intermediate, g.hidden)),
-                feedforward_up=weight(p + "mlp.up_proj.weight", (g.intermediate, g.hidden)),
-                feedforward_down=weight(p + "mlp.down_proj.weight", (g.hidden, g.intermediate)),
+                feedforward=DenseFeedForwardWeights(
+                    gate=weight(p + "mlp.gate_proj.weight", (g.intermediate, g.hidden)),
+                    up=weight(p + "mlp.up_proj.weight", (g.intermediate, g.hidden)),
+                    down=weight(p + "mlp.down_proj.weight", (g.hidden, g.intermediate)),
+                ),
             )
         )
     return DenseDescription(
