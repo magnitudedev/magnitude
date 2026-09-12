@@ -25,7 +25,7 @@ import {
   acquireApplicationOwner, applicationStateDirectory, makeOwnedService, makeUnixOwnedChildSpawner, makeWindowsOwnedChildSpawner, requireServicePort, NativeHost, nativeHostLayer,
   OwnedChildSpawner, serveApplicationControl, serveWindowsApplicationControl, type ApplicationControlOptions,
   LinuxTrayHost, linuxTrayHostLayer, guardedCommandLayer,
-  NativeMacApplicationInstallation, ApplicationMemory, nativeApplicationMemoryLayer, observeApplicationMemory,
+  NativeMacApplicationInstallation, nativeMachineIdentity, ApplicationMemory, nativeApplicationMemoryLayer, observeApplicationMemory,
 } from "@magnitudedev/daemon-management/desktop-native"
 import { ProcessGroupController } from "@magnitudedev/utils/process-groups"
 import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native"
@@ -184,7 +184,9 @@ const program = Effect.scoped(Effect.gen(function* () {
   const connectionChanges = yield* PubSub.sliding<void>(1)
   const connectionError = (error: { readonly message: string }) => new HostError({ message: error.message })
   const memory = Context.get(yield* Layer.build(nativeApplicationMemoryLayer(addonPath)), ApplicationMemory)
+  const machineIdentity = yield* Effect.cached(nativeMachineIdentity(addonPath))
   const handlers = InferenceHostRpcs.toLayer({
+    MachineIdentity: () => machineIdentity,
     Memory: () => observeApplicationMemory(memory, () => !!window && !window.isDestroyed() && window.isVisible()),
     ApplicationInfo: () => Effect.sync(() => ({ version: app.getVersion() })),
     Updates: () => updates.changes,

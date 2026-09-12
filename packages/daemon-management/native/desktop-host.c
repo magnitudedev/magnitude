@@ -23,6 +23,7 @@ void magnitude_register_windows_observers(napi_env env, napi_value exports);
 #endif
 
 void magnitude_register_application_memory(napi_env env, napi_value exports);
+void magnitude_register_machine_identity(napi_env env, napi_value exports);
 
 typedef struct {
 #ifdef _WIN32
@@ -299,6 +300,7 @@ static napi_value init(napi_env env, napi_value exports) {
   magnitude_register_windows_observers(env, exports);
   #endif
   magnitude_register_application_memory(env, exports);
+  magnitude_register_machine_identity(env, exports);
   return exports;
 }
 NAPI_MODULE(NODE_GYP_MODULE_NAME, init)

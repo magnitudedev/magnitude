@@ -366,6 +366,7 @@ const boot = Effect.gen(function* () {
       else emit.fail(new DesktopHostFailed({ message: String(decoded.left) }))
     }, message => emit.fail(new DesktopHostFailed({ message })))), unsubscribe => Effect.sync(unsubscribe)).pipe(Effect.asVoid)),
     memory: Stream.asyncPush(emit => Effect.acquireRelease(Effect.sync(() => host.memory(value => emit.single(value), message => emit.fail(new DesktopHostFailed({ message })))), unsubscribe => Effect.sync(unsubscribe)).pipe(Effect.asVoid)),
+    machineIdentity: Effect.tryPromise(() => host.machineIdentity()),
     applicationInfo: Effect.tryPromise(() => host.applicationInfo()).pipe(Effect.flatMap(Schema.decodeUnknown(DesktopApplicationInfo))),
     updates: Stream.asyncPush(emit => Effect.acquireRelease(Effect.sync(() => host.updates(state => {
       const decoded = Schema.decodeUnknownEither(DesktopUpdateState)(state)

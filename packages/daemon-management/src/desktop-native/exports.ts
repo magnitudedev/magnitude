@@ -17,3 +17,4 @@ export { GuardedCommand, GuardedCommandFailed, guardedCommandLayer } from "./gua
 export { makeWindowsOwnedChildSpawner } from "./windows-owned-child"
 export { requireServicePort } from "./service-port"
 export { ApplicationMemory, nativeApplicationMemoryLayer, observeApplicationMemory } from "./application-memory"
+export { nativeMachineIdentity } from "./machine-identity"

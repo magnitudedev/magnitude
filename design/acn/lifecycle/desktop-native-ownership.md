@@ -183,3 +183,5 @@ recreating tray objects. Scope closure releases the connection, match rules, rea
 Host availability proves protocol support, not pixel visibility or user pinning.
 
 Application memory observation is read-only and rooted at the current desktop process. Native sampling runs outside the Electron thread, bounds process and input sizes, and checks creation identity and ancestry across memory reads. A failed member read invalidates the sample. Observation grants no termination authority and cannot create or restart a service. The host serializes sampling; releasing a subscription stops future work after any in-flight native read completes. Acceptance covers real child allocation and retirement, exclusion of unrelated processes, native failure recovery, and visibility-scoped refresh.
+
+Client device identification exposes only manufacturer and product/model from native OS metadata. It requires no elevated privileges or shell processes and does not export serial numbers or UUIDs. Firmware parsing bounds both input and string lengths. Missing or invalid metadata yields unavailable without delaying service readiness or replacing inference-owned hardware facts.

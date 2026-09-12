@@ -55,3 +55,14 @@ export const ApplicationMemoryObservation = Schema.Union(
   Schema.TaggedStruct("Unavailable", { message: Schema.String }),
 )
 export type ApplicationMemoryObservation = typeof ApplicationMemoryObservation.Type
+
+/** Host enclosure identity supplements, but never determines, inference capabilities. */
+export const MachineIdentity = Schema.Struct({
+  manufacturer: Schema.Trimmed.pipe(Schema.minLength(1), Schema.maxLength(255)),
+  model: Schema.Trimmed.pipe(Schema.minLength(1), Schema.maxLength(255)),
+})
+export const MachineIdentityObservation = Schema.Union(
+  Schema.TaggedStruct("Identified", MachineIdentity.fields),
+  Schema.TaggedStruct("Unavailable", {}),
+)
+export type MachineIdentityObservation = typeof MachineIdentityObservation.Type

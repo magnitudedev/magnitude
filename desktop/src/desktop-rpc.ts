@@ -1,6 +1,6 @@
 import { Rpc, RpcGroup, type RpcClient, type RpcClientError } from "@effect/rpc"
 import { atMostOnce, replaySafe } from "@magnitudedev/sdk"
-import { ApplicationSnapshot, LoginStartupState, ApplicationMemoryObservation } from "@magnitudedev/sdk/desktop-host"
+import { ApplicationSnapshot, LoginStartupState, ApplicationMemoryObservation, MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
 import { DesktopApplicationInfo, DesktopConnectRequest, DesktopConnectionsSnapshot, DesktopUpdateState, HarnessIdSchema } from "@magnitudedev/client-common"
 import { Schema } from "effect"
 
@@ -10,6 +10,7 @@ export class HostError extends Schema.TaggedError<HostError>()("HostError", { me
 const Unit = Schema.Struct({})
 export const InferenceHostRpcs = RpcGroup.make(
   Rpc.make("ApplicationInfo", { payload: Unit, success: DesktopApplicationInfo, error: HostError }).pipe(replaySafe),
+  Rpc.make("MachineIdentity", { payload: Unit, success: MachineIdentityObservation, error: HostError }).pipe(replaySafe),
   Rpc.make("Memory", { payload: Unit, success: ApplicationMemoryObservation, error: HostError, stream: true }),
   Rpc.make("Updates", { payload: Unit, success: DesktopUpdateState, error: HostError, stream: true }),
   Rpc.make("CheckUpdate", { payload: Unit, success: Unit, error: HostError }).pipe(atMostOnce),
@@ -29,6 +30,7 @@ export const InferenceHostRpcs = RpcGroup.make(
 )
 export type InferenceHostClient = RpcClient.FromGroup<typeof InferenceHostRpcs, RpcClientError.RpcClientError>
 export interface DesktopApi {
+  readonly machineIdentity: () => Promise<MachineIdentityObservation>
   readonly memory: (value: (state: ApplicationMemoryObservation) => void, error: (message: string) => void) => () => void
   readonly applicationInfo: () => Promise<typeof DesktopApplicationInfo.Type>
   readonly updates: (value: (state: typeof DesktopUpdateState.Type) => void, error: (message: string) => void) => () => void
