@@ -1,13 +1,14 @@
 import { ModelPreferenceSlider } from "./model-preference-slider"
 import { ServingUsage } from "./serving-usage"
 import { initializeAppearance, setAppearancePreference, useAppearancePreference, subscribeAppearance, getAppearancePreference } from "../../web/src/stores/appearance-store"
+import { ActionTooltip, TooltipProvider } from "../../web/src/components/ui/tooltip"
 import { Button } from "../../web/src/components/ui/button"
 import { Input } from "../../web/src/components/ui/input"
 import { Progress } from "../../web/src/components/ui/progress"
 import { MagnitudeMark } from "../../web/src/components/magnitude-mark"
-import { Layers3, Library, HardDrive, Plug, Activity, BarChart3, Check, Settings2, Download, Play, Square, Trash2, X, Monitor, Sun, Moon } from "lucide-react"
+import { ChevronDown, Eye, ArrowUpRight, Layers3, Library, HardDrive, Plug, Activity, BarChart3, Check, Settings2, Download, Play, Square, Trash2, X, Monitor, Sun, Moon } from "lucide-react"
 import { createRoot } from "react-dom/client"
-import { useMemo, useState } from "react"
+import { useId, useMemo, useState, type ReactNode } from "react"
 import { Atom, RegistryProvider, Result, useAtomValue, useAtomSet } from "@effect-atom/atom-react"
 import { Cause, Effect, Exit, Layer, Option, Runtime, Schema, Scope, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
@@ -61,34 +62,45 @@ function ModelFit({ model }: { model: CatalogLocalModel }) {
   if (assessment._tag === "DoesNotFit") return <p className="mt-3 text-sm text-slate-500">Doesn’t fit this machine · short by {formatMemorySize(assessment.deficitBytes, { rounding: "up" })} of memory.</p>
   return <p className="mt-3 text-sm text-blue-700 dark:text-blue-400">Fits your machine · {formatMemorySize(assessment.memory.totalRequiredBytes)} estimated memory</p>
 }
-function ModelDetails({ model, radar = false }: { model: CatalogLocalModel; radar?: boolean }) {
+function ModelDetails({ model, radar = false, open, contentId, compact = false }: { model: CatalogLocalModel; radar?: boolean; open?: boolean; contentId?: string; compact?: boolean }) {
   const serving = model.servingState
-  return <details className="mt-4 text-sm">
-    <summary className="cursor-pointer rounded py-1 text-slate-600 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-300">Model details</summary>
-    <div className="mt-3 space-y-3 border-t border-slate-200 pt-4 dark:border-slate-750">
-      {radar && <div className="max-w-sm"><ModelRadar model={model} /></div>}
-      <p>License: {Option.getOrElse(model.presentation.license, () => "Not supplied by the catalog")}</p>
-      {serving._tag === "Assessed" && <>
-        <p>Context: {serving.assessment.profile.contextLength.toLocaleString()} tokens</p>
-        <p>Capabilities: {[
-          serving.capabilities.tools && "Tool use", serving.capabilities.vision && "Vision",
-          serving.capabilities.structuredOutput && "Structured output", serving.capabilities.reasoning.supported && "Reasoning",
-        ].filter(Boolean).join(" · ") || "Text generation"}</p>
-        {serving.assessment._tag === "Fits" && serving.assessment.performance.length > 0 && <div>
-          <p className="font-medium">Estimated generation speed</p>
-          <ul className="mt-1 space-y-1 text-slate-500">{serving.assessment.performance.map(sample => <li key={sample.contextTokens}>{Math.round(sample.estimatedTokensPerSecond)} tokens/s at {sample.contextTokens.toLocaleString()} context tokens</li>)}</ul>
-          <p className="mt-2 text-xs text-slate-500">Estimates from your machine’s assessment; actual speed varies with workload.</p>
-        </div>}
-      </>}
-      {model.presentation.sourceUrls.length > 0 && <div className="flex flex-col items-start gap-2"><p className="font-medium">Sources</p>{model.presentation.sourceUrls.map(url => <a className="break-all text-blue-700 underline underline-offset-2 dark:text-blue-400" key={url} href={url} target="_blank" rel="noreferrer">{url}</a>)}</div>}
+  const content = (
+    <div className={compact ? "grid gap-5 text-sm" : "mt-3 grid items-start gap-8 border-t border-slate-200 pt-5 dark:border-slate-750 lg:grid-cols-2"}>
+      <div className={radar ? "space-y-5" : "contents"}>
+      <div className="min-w-0 space-y-5">
+        <dl className="flex flex-wrap gap-x-8 gap-y-3">
+          <div><dt className="text-xs text-slate-500">License</dt><dd className="mt-1">{Option.getOrElse(model.presentation.license, () => "Not specified")}</dd></div>
+          {serving._tag === "Assessed" && <div><dt className="text-xs text-slate-500">Context window</dt><dd className="mt-1">{serving.assessment.profile.contextLength.toLocaleString()} tokens</dd></div>}
+          {serving._tag === "Assessed" && serving.capabilities.vision && <div className="self-end"><TooltipProvider><ActionTooltip label="Supports vision" trigger={<button type="button" aria-label="Supports vision" className="rounded p-1 text-slate-500 hover:text-slate-800 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-200"><Eye aria-hidden="true" className="size-4" /></button>} /></TooltipProvider></div>}
+        </dl>
+        {model.presentation.sourceUrls.length > 0 && <div><p className="mb-2 text-xs text-slate-500">Sources</p><div className="flex flex-wrap gap-x-4 gap-y-2">{model.presentation.sourceUrls.map(url => {
+          const source = new URL(url)
+          const label = source.hostname === "huggingface.co" ? `Hugging Face · ${source.pathname.split("/")[1]}` : source.hostname.replace(/^www\./, "")
+          return <a className="inline-flex items-center gap-1 text-sm text-slate-600 hover:underline dark:text-slate-300" key={url} href={url} title={url} target="_blank" rel="noreferrer">{label}<ArrowUpRight aria-hidden="true" className="size-3.5" /></a>
+        })}</div></div>}
+      </div>
+      {serving._tag === "Assessed" && serving.assessment._tag === "Fits" && serving.assessment.performance.length > 0 && <div className="min-w-0">
+        <table className="w-full text-left text-sm tabular-nums">
+          <caption className="mb-3 text-left font-medium">Estimated speed on your machine</caption>
+          <thead className="text-xs text-slate-500"><tr><th className="pb-2 font-normal">Context tokens</th><th className="pb-2 text-right font-normal">Tokens / sec</th></tr></thead>
+          <tbody>{serving.assessment.performance.map(sample => <tr key={sample.contextTokens} className="border-t border-slate-200 dark:border-slate-750"><td className="py-2">{sample.contextTokens.toLocaleString()}</td><td className="py-2 text-right">{Math.round(sample.estimatedTokensPerSecond)}</td></tr>)}</tbody>
+        </table>
+      </div>}
+      </div>
+      {radar && <ModelRadar model={model} />}
     </div>
+  )
+  if (open !== undefined) return open ? <div id={contentId}>{content}</div> : null
+  return <details className="group mt-4 text-sm">
+    <summary className="flex cursor-pointer list-none items-center justify-end gap-1 rounded py-1 text-slate-600 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-300 [&::-webkit-details-marker]:hidden">Model details<ChevronDown aria-hidden="true" className="size-4 group-open:rotate-180" /></summary>
+    {content}
   </details>
 }
 function DownloadProgress({ acquisition }: { acquisition: CatalogLocalModel["acquisitionState"] }) {
   if (acquisition._tag !== "Installing" && acquisition._tag !== "Updating") return null
   return <div className="mt-4"><p className="mb-2 text-sm">{acquisition.progress.stage === "downloading" ? `${formatStorageSize(acquisition.progress.completedBytes)} of ${formatStorageSize(acquisition.progress.totalBytes)}` : acquisition.progress.stage.replaceAll("_", " ")}</p><Progress aria-label="Download progress" indicatorClassName="bg-blue-700 dark:bg-blue-500" value={acquisition.progress.totalBytes ? acquisition.progress.completedBytes / acquisition.progress.totalBytes * 100 : null} /></div>
 }
-function ModelCard({ model, recommended = false, visual = false, replacing }: { model: CatalogLocalModel; visual?: boolean; recommended?: boolean; replacing?: string }) {
+function ModelControls({ model, replacing, children }: { model: CatalogLocalModel; replacing?: string; children?: ReactNode }) {
   const { install, load, stop, cancel, remove, dismissFailure: dismiss } = useLocalModelMutations()
   const command = useLocalModelCommandStatus(model.modelId)
   const stopping = useLocalModelStopStatus()
@@ -96,33 +108,72 @@ function ModelCard({ model, recommended = false, visual = false, replacing }: { 
   const acquisition = model.acquisitionState
   const installed = "residencyState" in acquisition
   const residency = installed ? acquisition.residencyState : undefined
+  const canStop = residency !== undefined && ["Ready", "Loading", "Requested", "Stopping"].includes(residency._tag)
   const transferring = acquisition._tag === "Installing" || acquisition._tag === "Updating"
-  return <article className={`relative rounded-2xl border bg-white p-7 dark:bg-slate-850 ${recommended ? "border-blue-300 shadow-sm dark:border-blue-700" : "border-slate-200 dark:border-slate-750"}`}>
-    <div className={visual ? "grid items-center gap-8 lg:grid-cols-[minmax(0,1fr)_16rem]" : ""}>
-    <div>
-    {visual && <p className="mb-3 text-xs font-medium uppercase tracking-wider text-blue-700 dark:text-blue-400">{recommended ? "Best match" : "Also worth a look"}</p>}
-    <div className="flex items-start justify-between gap-4"><div className="flex min-w-0 items-center gap-4"><ModelLogo model={model} /><div><h2 className="text-lg font-semibold">{formatLocalModelDisplayName(model)}</h2><p className="mt-1 text-sm text-slate-500">Download size: {formatStorageSize(model.storageBytes)}</p></div></div><span className="text-sm text-slate-500">{acquisition._tag === "Removing" ? "Removing…" : acquisition._tag === "RemoveFailed" ? "Removal failed" : residency?._tag === "Ready" ? "Loaded" : acquisition._tag === "NotInstalled" ? "" : residency?._tag === "Unloaded" ? "Downloaded" : residency?._tag ?? acquisition._tag}</span></div>
-    <p className="mt-4 max-w-xl text-sm leading-6 text-slate-500">{model.presentation.description}</p>
-    <ModelFit model={model} />
+  return <div>
+    <div className="flex flex-wrap items-center gap-2">{children}
+      {transferring ? <Button variant="outline" onClick={() => cancel(model.modelId)}><X />Cancel download</Button> : !installed ? <Button disabled={pending || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><Download />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <>
+        {canStop ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><Square />Stop model</Button> : <Button className="min-w-28" disabled={pending} onClick={() => { if (!replacing || window.confirm(`Loading ${formatLocalModelDisplayName(model)} will stop ${replacing}. Continue?`)) load(model.modelId) }}><Play />Load model</Button>}
+        <Button variant="ghost" size="icon" aria-label={`Remove ${formatLocalModelDisplayName(model)}`} title="Remove download" disabled={pending} onClick={() => { if (window.confirm(`Remove the downloaded files for ${formatLocalModelDisplayName(model)}?`)) remove(model.modelId) }}><Trash2 /></Button>
+        {(acquisition._tag === "UpdateAvailable" || acquisition._tag === "UpdateFailed") && <Button variant="outline" disabled={pending} onClick={() => install(model.modelId)}>Update</Button>}
+      </>}
+      {(acquisition._tag === "InstallFailed" || acquisition._tag === "UpdateFailed") && <Button variant="outline" onClick={() => dismiss(model.modelId)}>Dismiss error</Button>}
+    </div>
+    {(model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits") && <ModelFit model={model} />}
     <DownloadProgress acquisition={acquisition} />
     {"failure" in acquisition && <p role="alert" className="mt-3 text-sm">{acquisition._tag === "InstallFailed" || acquisition._tag === "UpdateFailed" ? modelDownloadFailureMessage(acquisition.failure) : acquisition.failure.message}</p>}
     {residency?._tag === "Failed" && <p role="alert" className="mt-3 text-sm">{residency.failure.message}</p>}
     {command.failures.map(message => <p key={message} role="alert" className="mt-3 text-sm">{message}</p>)}
     {residency?._tag === "Stopping" && Option.isSome(stopping.failure) && <p role="alert" className="mt-3 text-sm">{stopping.failure.value}</p>}
-    <div className="mt-5 flex flex-wrap gap-2">
-      {transferring ? <Button variant="outline" onClick={() => cancel(model.modelId)}><X />Cancel download</Button> : !installed ? <Button disabled={pending || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><Download />Download</Button> : <>
-        <Button disabled={pending || residency?._tag === "Ready" || residency?._tag === "Loading" || residency?._tag === "Requested" || residency?._tag === "Stopping"} onClick={() => { if (!replacing || window.confirm(`Loading ${formatLocalModelDisplayName(model)} will stop ${replacing}. Continue?`)) { load(model.modelId) } }}><Play />Load model</Button>
-        <Button variant="outline" disabled={stopping.pending || residency?._tag === "Unloaded" || residency?._tag === "Failed"} onClick={() => stop()}><Square />Stop model</Button>
-        <Button variant="outline" disabled={pending} onClick={() => { if (window.confirm(`Remove the downloaded files for ${formatLocalModelDisplayName(model)}?`)) remove(model.modelId) }}><Trash2 />Remove</Button>
-        {(acquisition._tag === "UpdateAvailable" || acquisition._tag === "UpdateFailed") && <Button variant="outline" disabled={pending} onClick={() => install(model.modelId)}>Update</Button>}
-      </>}
-      {(acquisition._tag === "InstallFailed" || acquisition._tag === "UpdateFailed") && <Button variant="outline" onClick={() => dismiss(model.modelId)}>Dismiss error</Button>}
+  </div>
+}
+function ModelCard({ model, showMemory = false, replacing }: { model: CatalogLocalModel; showMemory?: boolean; replacing?: string }) {
+  const [detailsOpen, setDetailsOpen] = useState(false)
+  const detailsId = useId()
+  const acquisition = model.acquisitionState
+  const residency = "residencyState" in acquisition ? acquisition.residencyState : undefined
+  const statusLabel = acquisition._tag === "Removing" ? "Removing…" : acquisition._tag === "RemoveFailed" ? "Removal failed" : residency?._tag === "Ready" ? "Loaded" : residency?._tag === "Unloaded" ? "Downloaded" : residency?._tag ?? (acquisition._tag === "NotInstalled" ? "" : acquisition._tag)
+  const status = (statusLabel || showMemory) && <div className="mt-1 flex flex-wrap items-center gap-x-3 text-sm text-slate-500">{statusLabel && <span className={residency?._tag === "Ready" ? "text-green-600 dark:text-green-400" : ""}>{statusLabel}</span>}{showMemory && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits" && <><span aria-hidden="true">·</span><span>{formatMemorySize(model.servingState.assessment.memory.totalRequiredBytes)} memory</span></>}</div>
+  return <article className="rounded-2xl border border-slate-200 bg-white p-5 dark:border-slate-750 dark:bg-slate-850">
+    <div className="grid items-center gap-4 lg:grid-cols-[minmax(0,1fr)_auto]">
+      <div className="flex min-w-0 items-center gap-4"><ModelLogo model={model} /><div className="min-w-0"><h2 className="text-lg font-semibold">{formatLocalModelDisplayName(model)}</h2>{status}</div></div>
+      <ModelControls model={model} {...(replacing ? { replacing } : {})}>
+        <Button variant="ghost" aria-expanded={detailsOpen} aria-controls={detailsId} onClick={() => setDetailsOpen(value => !value)}>Details<ChevronDown aria-hidden="true" className={`size-4 ${detailsOpen ? "rotate-180" : ""}`} /></Button>
+      </ModelControls>
     </div>
-    </div>
-    {visual && <ModelRadar model={model} />}
-    </div>
-    <ModelDetails model={model} radar={!visual} />
+    <ModelDetails model={model} radar open={detailsOpen} contentId={detailsId} />
   </article>
+}
+function SelectedRecommendation({ model, active }: { model: CatalogLocalModel; active: ReturnType<typeof activeLocalModel> }) {
+  const [view, setView] = useState<"profile" | "details">("profile")
+  return <div className="min-w-0 border-t border-slate-200 p-5 dark:border-slate-750 lg:border-l lg:border-t-0" aria-label="Selected model profile">
+    <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+    <div className="flex items-center gap-1" aria-label="Model information">
+      <Button variant={view === "profile" ? "secondary" : "ghost"} aria-pressed={view === "profile"} onClick={() => setView("profile")}>Profile</Button>
+      <Button variant={view === "details" ? "secondary" : "ghost"} aria-pressed={view === "details"} onClick={() => setView("details")}>Details</Button>
+    </div>
+      <ModelControls model={model} {...(Option.isSome(active) && active.value.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.value.model) } : {})} />
+    </div>
+    <div className="grid min-h-72">
+      <div className={`col-start-1 row-start-1 min-w-0 ${view === "profile" ? "" : "invisible"}`} aria-hidden={view !== "profile"}><ModelRadar model={model} /></div>
+      <div className={`col-start-1 row-start-1 min-w-0 ${view === "details" ? "" : "invisible"}`} aria-hidden={view !== "details"}><ModelDetails model={model} compact open /></div>
+    </div>
+  </div>
+}
+function Recommendations({ models, active }: { models: readonly CatalogLocalModel[]; active: ReturnType<typeof activeLocalModel> }) {
+  const [selectedId, setSelectedId] = useState<CatalogLocalModel["modelId"] | null>(null)
+  const selected = models.find(model => model.modelId === selectedId) ?? models[0]
+  if (!selected) return null
+  return <section aria-label="Top recommendations" className="mb-8">
+    <div className="grid overflow-hidden rounded-2xl border border-slate-200 bg-white dark:border-slate-750 dark:bg-slate-850 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+      <div className="space-y-2 p-3" aria-label="Recommended models">{models.map((model, rank) => <button key={model.modelId} type="button" aria-pressed={model.modelId === selected.modelId} onClick={() => setSelectedId(model.modelId)} className={`flex min-h-16 w-full items-center gap-3 rounded-xl border px-3 py-4 text-left transition-colors focus-visible:outline-2 focus-visible:outline-blue-500 ${model.modelId === selected.modelId ? "border-blue-300 bg-blue-50 dark:border-blue-700 dark:bg-slate-800" : "border-transparent hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
+        <span className="w-4 shrink-0 text-sm tabular-nums text-slate-500">{rank + 1}</span>
+        <ModelLogo model={model} className="size-7" />
+        <span className="min-w-0 text-sm font-medium">{formatLocalModelDisplayName(model)}</span>
+      </button>)}</div>
+      <SelectedRecommendation key={selected.modelId} model={selected} active={active} />
+    </div>
+  </section>
 }
 function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const installedOnly = page === "models"
@@ -153,11 +204,11 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
     {Option.isSome(stopResult.failure) && <p role="alert" className="mt-5 text-sm">{stopResult.failure.value}</p>}
     {discover && <section aria-label="Recommendation preference" className="my-6"><div className="flex items-end justify-between gap-4"><div><h2 className="font-heading text-xl">Find your balance</h2><p className="mt-2 text-sm text-slate-500">Quick responses or deeper thinking. Choose what matters to you.</p></div><span className="rounded-full bg-blue-50 px-4 py-2 text-sm font-medium text-blue-700 dark:bg-slate-800 dark:text-blue-400">{LOCAL_MODEL_RANKING_SCALE_LABELS[preference]}</span></div><ModelPreferenceSlider value={preference} onChange={setPreference} /></section>}
     {!catalog.value.preparation.assessment.complete && <p className="mb-4 text-sm text-slate-500">Assessing models · {catalog.value.preparation.assessment.settledModels} of {catalog.value.preparation.assessment.totalModels}</p>}
-    {discover && <section aria-label="Top recommendations" className="mb-10"><div className="mb-5 flex items-baseline justify-between"><h2 className="font-heading text-xl">Your top picks</h2><span className="text-xs text-slate-500">Best configuration for each model</span></div><div className="flex flex-col gap-6">{featuredCatalogModels(ranked).map((model,index)=><ModelCard key={model.modelId} model={model} visual recommended={index===0} {...(active&&active.model.modelId!==model.modelId?{replacing:formatLocalModelDisplayName(active.model)}:{})} />)}</div><p className="mt-4 text-xs text-slate-500">Profiles use catalog scores and your machine’s assessment. Speed is estimated; memory shows footprint, not free memory.</p></section>}
+    {discover && <Recommendations key={preference} models={featuredCatalogModels(ranked, 5)} active={Option.fromNullable(active)} />}
     {!discover && <>
     <div className="mb-5 mt-8 flex flex-wrap items-center justify-between gap-4"><h2 className="font-heading text-xl">{installedOnly?"Your library":"Explore the catalog"}</h2><Input aria-label="Search models" placeholder="Find a model…" className="max-w-sm" value={search} onChange={event=>setSearch(event.target.value)} /></div>
     {!installedOnly && <div className="mb-5 flex items-center justify-between text-sm text-slate-500"><label className="flex items-center gap-2"><input type="checkbox" checked={fitOnly} onChange={event => setFitOnly(event.target.checked)} className="accent-blue-600" />Fits my machine</label><span>{visible.length} configurations</span></div>}
-    <div className="grid items-start gap-5 xl:grid-cols-2">{visible.map(model => <ModelCard key={model.modelId} model={model} {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})} />)}</div>
+    <div className="grid items-start gap-5">{visible.map(model => <ModelCard key={model.modelId} model={model} showMemory={installedOnly} {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})} />)}</div>
     {visible.length === 0 && <p className="py-8 text-slate-500">{search ? "No matching models." : installedOnly ? "No models downloaded yet. Find one in Discover." : "No models match this filter."}</p>}
     </>}
     {discover && ranked.length === 0 && catalog.value.preparation.assessment.complete && <p className="py-8 text-slate-500">No fitting recommendations right now. Explore Catalog for compatibility details.</p>}
@@ -199,37 +250,33 @@ function ModelStatus() {
   const stopping = useLocalModelStopStatus()
   const presentation = Result.isSuccess(models) ? modelTrayPresentation(models.value) : null
   const active = Result.isSuccess(models) ? Option.getOrUndefined(activeLocalModel(models.value)) : undefined
-  return <section className="rounded-xl border border-slate-200 bg-white p-6 dark:border-slate-750 dark:bg-slate-850">
-    <h2 className="font-heading text-lg">Model activity</h2>
-    <div className="mt-3 flex items-center gap-3">{active && <ModelLogo model={active.model} className="size-7" />}<p>{presentation?.label ?? (Result.isFailure(models) ? "Model status unavailable" : "Reading model status…")}</p></div>
+  return <div className="mt-3">
+    <div className="flex items-center gap-3">{active && <ModelLogo model={active.model} className="size-7" />}<p>{presentation?.label ?? (Result.isFailure(models) ? "Model status unavailable" : "Reading model status…")}</p></div>
     {active?.residency._tag === "Loading" && <div className="mt-4"><Progress aria-label="Model loading progress" indicatorClassName="bg-blue-700 dark:bg-blue-500" value={Option.match(active.residency.progress, { onNone: () => null, onSome: fraction => fraction * 100 })} /></div>}
     {Result.isFailure(models) && <p role="alert" className="mt-2 text-sm text-slate-500">{localModelFailureMessage(models.cause, "Could not read model status. Check Status and try again.")}</p>}
     {presentation?.canStop && <Button className="mt-4" variant="outline" disabled={stopping.pending} onClick={() => stop()}><Square />Stop model</Button>}
     {Option.isSome(stopping.failure) && <p role="alert" className="mt-2 text-sm">{stopping.failure.value}</p>}
-  </section>
+  </div>
 }
 function DownloadActivity() {
   const models = useLocalModels()
   const active = Result.isSuccess(models) ? models.value.models.filter((model): model is CatalogLocalModel => model._tag === "Catalog" && (model.acquisitionState._tag === "Installing" || model.acquisitionState._tag === "Updating" || model.acquisitionState._tag === "Removing")) : []
-  return <section className="rounded-xl border border-slate-200 bg-white p-6 dark:border-slate-750 dark:bg-slate-850">
-    <h2 className="font-heading text-lg">Downloads</h2>
-    {!Result.isSuccess(models) ? <p className="mt-3 text-sm text-slate-500">{Result.isFailure(models) ? "Download activity unavailable" : "Reading download activity…"}</p> : active.length === 0 ? <p className="mt-3 text-sm text-slate-500">No downloads in progress.</p> : <ul className="mt-4 space-y-5">{active.map(model => <li key={model.modelId}><div className="flex items-center gap-3"><ModelLogo model={model} className="size-6" /><p className="text-sm">{formatLocalModelDisplayName(model)} · {model.acquisitionState._tag === "Removing" ? "Removing files…" : model.acquisitionState._tag === "Updating" ? "Updating" : "Downloading"}</p></div><DownloadProgress acquisition={model.acquisitionState} /></li>)}</ul>}
-  </section>
+  if (Result.isSuccess(models) && active.length === 0) return null
+  return <div className="mt-5 border-t border-slate-200 pt-5 dark:border-slate-700">
+    {!Result.isSuccess(models) ? <p className="mt-3 text-sm text-slate-500">{Result.isFailure(models) ? "Download activity unavailable" : "Reading download activity…"}</p> : <ul className="space-y-5">{active.map(model => <li key={model.modelId}><div className="flex items-center gap-3"><ModelLogo model={model} className="size-6" /><p className="text-sm">{formatLocalModelDisplayName(model)} · {model.acquisitionState._tag === "Removing" ? "Removing files…" : model.acquisitionState._tag === "Updating" ? "Updating" : "Downloading"}</p></div><DownloadProgress acquisition={model.acquisitionState} /></li>)}</ul>}
+  </div>
 }
 function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null }) {
   const service = snapshot?.service
   const ready=service?._tag === "Ready"
   return <div className="mt-7 space-y-6">
     <section className="relative overflow-hidden rounded-2xl border border-blue-200 bg-gradient-to-br from-blue-50 to-white p-7 dark:border-slate-700 dark:from-slate-800 dark:to-slate-900">
-      <div className="flex items-center gap-5"><div className={`flex size-16 items-center justify-center rounded-full border bg-white dark:bg-slate-900 ${ready ? "border-green-300 text-green-600 dark:border-green-800 dark:text-green-400" : "border-blue-300 text-blue-600 dark:border-blue-800 dark:text-blue-400"}`}>{ready ? <Check aria-label="Service ready" className="size-7 text-green-600 dark:text-green-400" /> : <Activity className="size-7" />}</div><div><p className="text-xs font-medium uppercase tracking-widest text-slate-500">Magnitude service</p><h2 className="mt-2 font-heading text-2xl">{ready ? "Ready when you are" : service?._tag === "CleanupFailed" ? "Cleanup needs attention" : service?._tag === "Failed" ? "Let’s get you running" : "Starting your local engine"}</h2><p className="mt-2 text-sm text-slate-500">{ready ? "Your service is running. Model activity is shown separately below." : service?._tag ?? "Connecting"}</p></div></div>
+      <div className="flex items-center gap-5"><div className={`flex size-16 shrink-0 items-center justify-center rounded-full border bg-white dark:bg-slate-900 ${ready ? "border-green-300 text-green-600 dark:border-green-800 dark:text-green-400" : "border-blue-300 text-blue-600 dark:border-blue-800 dark:text-blue-400"}`}>{ready ? <Check aria-label="Service ready" className="size-7 text-green-600 dark:text-green-400" /> : <Activity className="size-7" />}</div><div><p className="text-xs font-medium uppercase tracking-widest text-slate-500">Magnitude service</p><h2 className="mt-2 font-heading text-2xl">{ready ? "Ready when you are" : service?._tag === "CleanupFailed" ? "Cleanup needs attention" : service?._tag === "Failed" ? "Let’s get you running" : "Starting your local engine"}</h2>{ready ? <ModelStatus /> : <p className="mt-2 text-sm text-slate-500">{service?._tag ?? "Connecting"}</p>}</div></div>
+      {ready && <DownloadActivity />}
       {service && "message" in service && <p role="alert" className="mt-5 text-sm">{service.message}</p>}
       {service?._tag === "Failed" && <Button className="mt-5" variant="outline" onClick={() => host.retry()}>Retry service</Button>}
     </section>
     <MemoryBreakdown />
-    <div className="grid items-start gap-5 lg:grid-cols-2">
-      {ready ? <ModelStatus /> : <section className="rounded-2xl border border-slate-200 bg-white p-6 dark:border-slate-750 dark:bg-slate-850"><h2 className="font-heading text-lg">Model activity</h2><p className="mt-4 text-sm text-slate-500">Model status will return when the service is ready.</p></section>}
-      {ready && <DownloadActivity />}
-    </div>
     <section className="rounded-2xl border border-slate-200 bg-white p-6 dark:border-slate-750 dark:bg-slate-850"><div className="flex items-center gap-3"><Plug className="size-5 text-blue-600 dark:text-blue-400" /><h2 className="font-heading text-lg">Local connection</h2></div><p className="mt-2 text-sm text-slate-500">Your tools connect to Magnitude on this machine.</p><p className="mt-4 break-all rounded-lg bg-slate-50 p-4 font-mono text-sm dark:bg-slate-900">{snapshot?.endpoint ?? "Endpoint unavailable"}</p><div className="mt-5 flex items-start gap-3"><span className={`mt-1 size-2 shrink-0 rounded-full ${snapshot?.tray._tag === "Registered" ? "bg-blue-500" : "bg-slate-400"}`} /><div><p className="text-sm font-medium">Background activity</p><p className="mt-1 text-sm text-slate-500">{snapshot?.tray._tag === "Registered" ? "Magnitude keeps running when you close the window." : snapshot?.tray._tag === "Unavailable" ? snapshot.tray.message : snapshot?.tray._tag === "Closed" ? "Magnitude is quitting." : "Checking tray availability…"}</p></div></div></section>
   </div>
 }
