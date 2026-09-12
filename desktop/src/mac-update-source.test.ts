@@ -1,9 +1,11 @@
-import { createHash } from "node:crypto"
+import { FetchHttpClient } from "@effect/platform"
+import { createHash, generateKeyPairSync } from "node:crypto"
 import { mkdtemp, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, Option, Schema, Stream } from "effect"
-import { DesktopUpdateCandidate } from "@magnitudedev/release"
+import { UpdateManifest, UpdateClientMetadata, signUpdateRequest } from "@magnitudedev/release/hosted-update"
+import { UpdatePreferences } from "./update-preferences"
 import { describe, expect, it } from "vitest"
 import { ApplicationUpdateSource, makeApplicationUpdate } from "./application-update"
 import { NativeMacUpdate } from "./mac-update-stage"
@@ -13,18 +15,29 @@ import { ApplicationUpdateHandoff } from "./update-handoff"
 describe("Mac update acquisition and native handoff", () => {
   it.each([false, true])("verifies downloaded bytes before native staging (corrupt=%s)", async corrupt => {
     const bytes = Buffer.from("verified ZIP fixture")
-    const candidate = Schema.decodeUnknownSync(DesktopUpdateCandidate)({ version: "2.0.0", artifact: {
-      id: "desktop-update-darwin-arm64", kind: "desktop", host: "darwin-arm64",
-      filename: "magnitude-desktop-darwin-arm64.zip", bytes: bytes.length,
+    const candidate = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, version: "2.0.0", commit: "a".repeat(40), artifact: {
+      id: "desktop-update-darwin-arm64", target: { os: "darwin", arch: "arm64", package: "mac-zip" },
+      path: "releases/2.0.0/magnitude-desktop-darwin-arm64.zip", bytes: bytes.length,
       sha256: createHash("sha256").update(bytes).digest("hex"),
     } })
     const root = await mkdtemp(join(tmpdir(), "mac-update-source-"))
-    const server = Bun.serve({ port: 0, fetch: () => new Response(corrupt ? Buffer.alloc(bytes.length, 0) : bytes) })
+    const identity = generateKeyPairSync("ed25519")
+    const metadata = Schema.decodeUnknownSync(UpdateClientMetadata)({ version: "1.0.0", os: "darwin", os_version: "26", arch: "arm64", package: "mac-zip" })
+    const fetchArtifact = Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init)
+      if (new URL(request.url).pathname.startsWith("/api/download/")) {
+        expect(request.headers.has("authorization")).toBe(true)
+        return new Response(null, { status: 302, headers: { location: `https://storage.example/${candidate.artifact.path}` } })
+      }
+      expect(request.url).toBe(`https://storage.example/${candidate.artifact.path}`)
+      expect(request.headers.has("authorization")).toBe(false)
+      return new Response(corrupt ? Buffer.alloc(bytes.length, 0) : bytes, { headers: { "content-length": String(bytes.length) } })
+    }, { preconnect: () => {} })
     let staged = false
     let recorded = false
     try {
       await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-        const source = yield* macUpdateSource({ currentVersion: "1.0.0", host: "darwin-arm64", releaseBaseUrl: String(server.url), cacheDirectory: root }).pipe(
+        const source = yield* macUpdateSource({ origin: "https://magnitude.dev", storageOrigin: "https://storage.example", metadata, sign: url => signUpdateRequest(identity.privateKey, url), trustedPublishers: new Map(), userAgent: "Magnitude/1.0.0", cacheDirectory: root }).pipe(
           Effect.provideService(ApplicationUpdateHandoff, { record: version => Effect.sync(() => { expect(version).toBe(candidate.version); recorded = true }), inspect: () => Effect.succeed({ _tag: "Continue" as const }) }),
           Effect.provideService(NativeMacUpdate, {
             stage: feed => Effect.promise(async () => {
@@ -37,14 +50,14 @@ describe("Mac update acquisition and native handoff", () => {
         )
         const owner = yield* makeApplicationUpdate().pipe(Effect.provideService(ApplicationUpdateSource, { ...source, check: Effect.succeed(Option.some(candidate)) }))
         yield* owner.check
-        yield* owner.changes.pipe(Stream.filter(state => state._tag === "Available"), Stream.take(1), Stream.runDrain)
+        yield* owner.changes.pipe(Stream.filter(state => state.transfer._tag === "Available"), Stream.take(1), Stream.runDrain)
         yield* owner.download
-        yield* owner.changes.pipe(Stream.filter(state => state._tag === (corrupt ? "Failed" : "Ready")), Stream.take(1), Stream.runDrain)
+        yield* owner.changes.pipe(Stream.filter(state => state.transfer._tag === (corrupt ? "Failed" : "Ready")), Stream.take(1), Stream.runDrain)
         yield* owner.close
-      })).pipe(Effect.timeout("5 seconds")))
+      })).pipe(Effect.provideService(UpdatePreferences, { read: Effect.succeed(false), write: () => Effect.void }), Effect.provideService(FetchHttpClient.Fetch, fetchArtifact), Effect.timeout("5 seconds")))
       expect(staged).toBe(!corrupt)
       expect(recorded).toBe(!corrupt)
       expect(await readdir(root)).toEqual([])
-    } finally { server.stop(true); await rm(root, { recursive: true, force: true }) }
+    } finally { await rm(root, { recursive: true, force: true }) }
   })
 })

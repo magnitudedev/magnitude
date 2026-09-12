@@ -3,6 +3,8 @@ import type { Pool } from "pg"
 import { DistributionStore, DistributionStoreUnavailable, type CheckObservation } from "./service"
 import { SignedUpdateManifest } from "./manifest"
 
+export const DistributionNamespace = Schema.Literal("magnitude_distribution", "magnitude_distribution_acceptance")
+
 const installationUpsert = `
   INSERT INTO magnitude_distribution.installations (installation_id, version, os, os_version, arch, package, distro, distro_version, country)
   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
@@ -16,9 +18,9 @@ const installationParameters = ({ installation, request, country }: Pick<typeof 
     Option.getOrElse(request.distro, () => ""), Option.getOrElse(request.distro_version, () => ""), Option.getOrElse(country, () => "")]
 
 /** pg is the single intentional Promise boundary. Queries never include credentials or raw request data in errors. */
-export const postgresDistributionStore = (pool: Pool): DistributionStore => {
+export const postgresDistributionStore = (pool: Pool, namespace: typeof DistributionNamespace.Type = "magnitude_distribution"): DistributionStore => {
   const query = (text: string, values: readonly unknown[]) => Effect.tryPromise({
-    try: () => pool.query(text, [...values]),
+    try: () => pool.query(text.replaceAll("magnitude_distribution.", `${namespace}.`), [...values]),
     catch: () => new DistributionStoreUnavailable(),
   })
   return DistributionStore.of({

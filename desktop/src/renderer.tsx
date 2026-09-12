@@ -296,30 +296,43 @@ function UpdateSettingsView({ service }: { service: DesktopSession }) {
   const check = useAtomSet(service.checkUpdate)
   const download = useAtomSet(service.downloadUpdate)
   const restart = useAtomSet(service.restartUpdate)
+  const setAutoDownload = useAtomSet(service.setAutoDownload)
   const checking = useAtomValue(service.checkUpdate)
   const downloading = useAtomValue(service.downloadUpdate)
   const restarting = useAtomValue(service.restartUpdate)
-  const current = Result.isSuccess(observation) ? observation.value : null
-  const pending = checking.waiting || downloading.waiting || restarting.waiting
+  const saving = useAtomValue(service.setAutoDownload)
+  const snapshot = Result.isSuccess(observation) ? observation.value : null
+  const current = snapshot?.transfer
+  const pending = downloading.waiting || restarting.waiting
   const message = !current ? Result.isFailure(observation) ? "Update status unavailable." : "Reading update status…"
-    : current._tag === "Idle" ? "Check for a new version of Magnitude."
-    : current._tag === "Checking" ? "Checking for updates…"
-    : current._tag === "Current" ? "You’re up to date."
+    : current._tag === "Idle" ? snapshot?.check._tag === "Succeeded" ? "You’re up to date." : "Magnitude checks for updates automatically."
     : current._tag === "Available" ? `Version ${current.version} is available · ${formatStorageSize(current.bytes)}`
     : current._tag === "Downloading" ? `Downloading version ${current.version} · ${formatStorageSize(current.completed)} of ${formatStorageSize(current.total)}`
+    : current._tag === "Cancelling" ? "Stopping automatic download…"
     : current._tag === "Staging" ? `Preparing version ${current.version}…`
     : current._tag === "Ready" ? `Version ${current.version} is ready. Restart now, or it will be applied when you quit Magnitude.`
     : current._tag === "Closed" ? "Magnitude is quitting…" : current.message
   return <div className="mt-5 border-t border-slate-200 pt-5 dark:border-slate-750">
     <h3 className="font-medium">Application updates</h3>
-    <p className="mt-2 text-sm text-slate-500" role="status">{message}</p>
+    {snapshot?.preference._tag === "Known" && <label className="mt-3 flex items-center gap-3 text-sm">
+      <input type="checkbox" className="size-4 accent-sky-500" checked={snapshot.preference.autoDownload} disabled={saving.waiting || current?._tag === "Closed"} onChange={event => setAutoDownload(event.target.checked)} />
+      Auto-download updates
+    </label>}
+    {snapshot?.preference._tag === "Known" && <p className="mt-1 text-sm text-slate-500">Checks continue every hour when automatic downloads are off.</p>}
+    {snapshot?.preference._tag === "Unavailable" && current?._tag !== "Unavailable" && <div className="mt-2">
+      <p role="alert" className="text-sm">{snapshot.preference.message}</p>
+      <div className="mt-2 flex gap-2"><Button variant="outline" disabled={saving.waiting} onClick={() => setAutoDownload(true)}>Enable automatic downloads</Button>
+        <Button variant="outline" disabled={saving.waiting} onClick={() => setAutoDownload(false)}>Use manual downloads</Button></div>
+    </div>}
+    <p className="mt-3 text-sm text-slate-500" role="status">{message}</p>
+    {snapshot?.check._tag === "Failed" && <p className="mt-2 text-sm" role="alert">{snapshot.check.message}</p>}
     <div className="mt-3 flex flex-wrap gap-2">
-      {current && ["Idle", "Current", "Available", "Failed"].includes(current._tag) && <Button variant="outline" disabled={pending} onClick={() => check()}>Check for updates</Button>}
+      {current && !["Unavailable", "Closed"].includes(current._tag) && <Button variant="outline" disabled={checking.waiting || snapshot?.check._tag === "Checking"} onClick={() => check()}>{snapshot?.check._tag === "Checking" ? "Checking…" : "Check for updates"}</Button>}
       {current?._tag === "Available" && <Button disabled={pending} onClick={() => download()}>Download update</Button>}
       {current?._tag === "Ready" && <Button disabled={pending} onClick={() => restart()}>Restart to update</Button>}
     </div>
     {current?._tag === "Ready" && <p className="mt-2 text-sm text-slate-500">Restarting stops the running model and service.</p>}
-    {[checking, downloading, restarting].map((result, index) => Result.isFailure(result) ? <p key={index} role="alert" className="mt-2 text-sm">{hostFailureMessage(result.cause)}</p> : null)}
+    {[checking, downloading, restarting, saving].map((result, index) => Result.isFailure(result) ? <p key={index} role="alert" className="mt-2 text-sm">{hostFailureMessage(result.cause)}</p> : null)}
   </div>
 }
 function AppearanceSettings() {
@@ -399,6 +412,7 @@ const boot = Effect.gen(function* () {
       if (decoded._tag === "Right") emit.single(decoded.right)
       else emit.fail(new DesktopHostFailed({ message: String(decoded.left) }))
     }, message => emit.fail(new DesktopHostFailed({ message })))), unsubscribe => Effect.sync(unsubscribe)).pipe(Effect.asVoid)),
+    setAutoDownload: enabled => hostCommand(() => host.setAutoDownload(enabled)),
     checkUpdate: hostCommand(() => host.checkUpdate()),
     downloadUpdate: hostCommand(() => host.downloadUpdate()),
     restartUpdate: hostCommand(() => host.restartUpdate()),

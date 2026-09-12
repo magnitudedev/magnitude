@@ -28,6 +28,7 @@ const api: DesktopApi = {
   machineIdentity: () => runtime.runPromise(Effect.flatMap(HostClient, client => client.MachineIdentity({}))),
   applicationInfo: () => runtime.runPromise(Effect.flatMap(HostClient, client => client.ApplicationInfo({}))),
   updates: (value, error) => observe(client => client.Updates({}), value, error),
+  setAutoDownload: enabled => command(client => client.SetAutoDownload({ enabled })),
   checkUpdate: () => command(client => client.CheckUpdate({})),
   downloadUpdate: () => command(client => client.DownloadUpdate({})),
   restartUpdate: () => command(client => client.RestartUpdate({})),

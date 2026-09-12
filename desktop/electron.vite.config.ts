@@ -4,8 +4,22 @@ import tailwindcss from "@tailwindcss/vite";
 import { resolve } from "node:path";
 import { readFileSync } from "node:fs";
 
+const acceptanceConfig = process.env.MAGNITUDE_UPDATE_ACCEPTANCE_CONFIG;
+const updateConfiguration = acceptanceConfig ? {
+  ...JSON.parse(readFileSync(acceptanceConfig, "utf8")), acceptance: true,
+} : {
+  origin: "https://magnitude.dev",
+  storageOrigin: "https://5r3lqtpag4uzvtxd.public.blob.vercel-storage.com",
+  keyId: "magnitude-2026-01",
+  publicKey: readFileSync(resolve(__dirname, "../packages/release/resources/distribution/magnitude-2026-01.pub.pem"), "utf8"),
+  acceptance: false,
+};
+
 export default defineConfig({
   main: {
+    define: {
+      __MAGNITUDE_UPDATE_CONFIGURATION__: JSON.stringify(updateConfiguration),
+    },
     plugins: [{ name: "harness-skill-text", load(id) { if (id.endsWith(".md")) return `export default ${JSON.stringify(readFileSync(id, "utf8"))}` } }],
     build: {
       // Workspace packages publish TypeScript source for Bun. Bundle them for

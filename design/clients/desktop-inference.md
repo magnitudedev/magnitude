@@ -40,12 +40,12 @@ curated ACN catalog, hardware observations, and the shared ranking algorithm; no
 catalog, hardware inference, or independent recommendation source exists.
 Settings reads the running application's version from the privileged host independently of service
 readiness; it never substitutes a hardcoded version or the service protocol version.
-Application update checks and downloads are explicit Settings actions. Main owns their work and
-observation independently of the renderer and service readiness. Window Close and observer loss
-cannot cancel admitted work. Mac updates use shared release-channel selection, verify the selected
-archive's size and digest, and stage it through the native updater before reporting Ready. The local
+Main owns scheduled Magnitude-hosted update checks, automatic downloads and explicit Settings actions
+independently of the renderer and service readiness. The automatic-download preference does not
+disable checks. Window Close and observer loss cannot cancel admitted work. Mac updates verify the
+publisher-signed manifest and selected archive's size and digest, and stage it through the native updater before reporting Ready. The local
 staging endpoint exposes only that archive and closes on success, failure, or owner interruption.
-Restart requires a visible window and a staged update at admission. Quit closes update admission and
+Restart requires a staged update and an explicit Settings or tray action. Quit closes update admission and
 cancels unfinished transfers before retiring the service; native installation/relaunch is invoked only
 after owned-child cleanup and application-scope release. Ordinary Quit applies a staged update without
 relaunch. Development profiles disable native update actions. Platform builds without an implemented
