@@ -1,9 +1,11 @@
-"""TileLang-backed realization of Magnitensor's runtime contract."""
+"""TileLang realization of Magnitensor's physical runtime contract."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, cast
+
+import torch
 
 from ..compiler.lowering import Capabilities, MatrixInstruction
 from ..compiler.unit import TileCompilationUnit
@@ -13,26 +15,63 @@ from .resources import NativeAllocation, NativeBoundEntrypoint, NativeCompletion
 
 
 class _Allocation(NativeAllocation):
-    def __init__(self, native):
-        self._native = native
+    def __init__(self, tensor: torch.Tensor):
+        self._tensor: torch.Tensor | None = tensor
+
+    def _require_tensor(self) -> torch.Tensor:
+        if self._tensor is None:
+            raise RuntimeError("allocation is closed")
+        return self._tensor
 
     @property
     def allocated_bytes(self) -> int:
-        return self._native.allocated_bytes
+        return self._require_tensor().untyped_storage().nbytes()
 
-    def view(self, spec: TensorSpec, offset: int = 0) -> Any:
+    def view(self, spec: TensorSpec, offset: int = 0) -> torch.Tensor:
+        tensor = self._require_tensor()
         representation = spec.representation
         if representation is not None and not isinstance(representation, Dense):
-            return self._native.view((spec.storage_nbytes,), DType.U8.value, offset)
-        dtype = spec.dtype if not isinstance(representation, Dense) else representation.dtype
-        return self._native.view(spec.shape, dtype.value, offset)
+            shape, dtype = (spec.storage_nbytes,), DType.U8
+        else:
+            shape = cast(tuple[int, ...], spec.shape)
+            dtype = spec.dtype if not isinstance(representation, Dense) else representation.dtype
+        torch_dtype = getattr(torch, dtype.value)
+        width = torch.empty((), dtype=torch_dtype).element_size()
+        if offset % width:
+            raise ValueError("view offset is not aligned to its element type")
+        count = 1
+        for extent in shape:
+            count *= extent
+        return tensor[offset : offset + count * width].view(torch_dtype).view(shape)
 
     def close(self) -> None:
-        self._native.close()
+        self._tensor = None
 
 
 class _Completion(NativeCompletion):
-    def __init__(self, completions: tuple[Any, ...]):
+    def __init__(self, event=None, synchronize: Callable[[], None] | None = None):
+        self._event = event
+        self._synchronize = synchronize
+        self._done = event is None and synchronize is None
+
+    def ready(self) -> bool:
+        if self._done:
+            return True
+        if self._event is None:
+            return False
+        self._done = bool(self._event.query())
+        return self._done
+
+    def wait(self) -> None:
+        if self._event is not None:
+            self._event.synchronize()
+        elif self._synchronize is not None:
+            self._synchronize()
+        self._done = True
+
+
+class _JoinedCompletion(NativeCompletion):
+    def __init__(self, completions: tuple[NativeCompletion, ...]):
         self._completions = completions
 
     def ready(self) -> bool:
@@ -44,37 +83,60 @@ class _Completion(NativeCompletion):
 
 
 class _BoundEntrypoint(NativeBoundEntrypoint):
-    def __init__(self, native):
-        self._native = native
+    def __init__(self, bound, completion: Callable[[], NativeCompletion]):
+        self._bound = bound
+        self._completion = completion
 
     def submit(self, dynamic: tuple[Any, ...]) -> NativeCompletion:
-        return _Completion((self._native.submit(dynamic),))
+        if self._bound is None:
+            raise RuntimeError("bound entrypoint is closed")
+        self._bound(*dynamic)
+        return self._completion()
 
     def close(self) -> None:
-        self._native.close()
+        self._bound = None
 
 
 class _Executable(NativeExecutable):
-    def __init__(self, native):
-        self._native = native
+    def __init__(self, kernel, completion: Callable[[], NativeCompletion]):
+        self._kernel = kernel
+        self._completion = completion
 
     def bind(
         self, static: Mapping[int, Any], dynamic_indices: tuple[int, ...]
     ) -> NativeBoundEntrypoint:
-        return _BoundEntrypoint(self._native.bind(static, dynamic_indices))
+        if self._kernel is None:
+            raise RuntimeError("executable is closed")
+        return _BoundEntrypoint(self._kernel.bind(dict(static), dynamic_indices), self._completion)
 
     def close(self) -> None:
-        self._native.close()
+        self._kernel = None
 
 
 class TileLangRuntime:
-    """Opaque TileLang endpoint implementing Magnitensor's physical contract."""
+    """Magnitensor-owned storage and submission over a resolved TileLang backend."""
 
     def __init__(self, target: Any = "auto"):
-        from tilelang.runtime import open_device
+        from tilelang.backend.module import create_backend_context
 
-        self._device: Any = open_device(target)
-        self._capabilities = _capabilities(self._device.capabilities)
+        self._context = create_backend_context(target, execution_backend="tvm_ffi")
+        kind = self._context.target.kind.name
+        if kind == "metal":
+            self._device = torch.device("mps")
+            self._completion = lambda: _Completion(synchronize=torch.mps.synchronize)
+        elif kind in ("cuda", "hip"):
+            self._device = torch.device("cuda")
+
+            def completion() -> NativeCompletion:
+                event = torch.cuda.Event()
+                event.record()
+                return _Completion(event=event)
+
+            self._completion = completion
+        else:
+            self._device = torch.device("cpu")
+            self._completion = _Completion
+        self._capabilities = _capabilities(self._context.capabilities)
 
     @property
     def capabilities(self) -> Capabilities:
@@ -82,31 +144,41 @@ class TileLangRuntime:
 
     @property
     def compiler_identity(self) -> str:
-        return self._device.compiler_identity
+        import tilelang
+
+        context = self._context
+        return f"tilelang-{tilelang.__version__}:{context.target}:{context.execution_backend.name}"
 
     def allocate(self, size: int, alignment: int) -> NativeAllocation:
-        return _Allocation(self._device.allocate(size, alignment))
+        if size <= 0 or alignment <= 0:
+            raise ValueError("allocation size and alignment must be positive")
+        return _Allocation(torch.empty(size, dtype=torch.uint8, device=self._device))
 
     def upload(self, spec: TensorSpec, content: bytes) -> NativeAllocation:
         del spec
-        return _Allocation(self._device.upload(content))
+        host = torch.frombuffer(bytearray(content), dtype=torch.uint8)
+        return _Allocation(host.to(self._device))
 
     def compile(self, program: object, signature: tuple[TensorSpec, ...]) -> NativeExecutable:
+        import tilelang
+
         del signature
         unit = cast(TileCompilationUnit, program)
-        return _Executable(self._device.compile(_build_prim_func(unit)))
+        context = self._context
+        kernel = tilelang.compile(
+            _build_prim_func(unit),
+            out_idx=[],
+            execution_backend="tvm_ffi",
+            target=context.target,
+            target_host=context.target_host,
+        )
+        return _Executable(kernel, self._completion)
 
     def join(self, completions: tuple[NativeCompletion, ...]) -> NativeCompletion:
-        flattened = []
-        for completion in completions:
-            if isinstance(completion, _Completion):
-                flattened.extend(completion._completions)
-            else:
-                flattened.append(completion)
-        return _Completion(tuple(flattened))
+        return _JoinedCompletion(completions)
 
     def close(self) -> None:
-        self._device.close()
+        self._device = None
 
 
 def _annotation(T, spec: TensorSpec):
@@ -137,9 +209,13 @@ def _build_prim_func(unit: TileCompilationUnit):
 
 
 def _capabilities(value) -> Capabilities:
+    shared = value.shared_memory_bytes > 0
+    atomics = frozenset(
+        dtype for dtype in DType if value.supports(f"atomic.add.{dtype.value}")
+    )
     return Capabilities(
         subgroup_width=value.subgroup_width,
-        threads_per_group=value.threads_per_group,
+        threads_per_group=value.max_threads_per_group,
         shared_memory_bytes=value.shared_memory_bytes,
         matrix_instructions=tuple(
             MatrixInstruction(
@@ -148,15 +224,19 @@ def _capabilities(value) -> Capabilities:
             for item in value.matrix_instructions
         ),
         supported_dtypes=frozenset(DType(item) for item in value.supported_dtypes),
-        memory_scopes=value.memory_scopes,
-        barrier_scopes=value.barrier_scopes,
-        asynchronous_copy=value.asynchronous_copy,
-        subgroup_exchange=value.subgroup_exchange,
-        vector_bytes=value.vector_bytes,
-        atomics=frozenset(DType(item) for item in value.atomics),
-        alignments={DType(dtype): alignment for dtype, alignment in value.alignments},
+        memory_scopes=(
+            frozenset({"global", "shared", "local"})
+            if shared
+            else frozenset({"global", "local"})
+        ),
+        barrier_scopes=frozenset({"workgroup"}) if shared else frozenset(),
+        asynchronous_copy=value.supports("async_copy"),
+        subgroup_exchange=value.supports("subgroup_exchange"),
+        vector_bytes=(1, 2, 4, 8, 16),
+        atomics=atomics,
+        alignments={dtype: dtype.itemsize for dtype in DType},
         native_multi_launch=value.native_multi_launch,
-        partial_binding=value.partial_binding,
+        partial_binding=value.native_argument_binding,
         max_kernels_per_program=value.max_kernels_per_program,
         fingerprint=value.fingerprint,
     )
