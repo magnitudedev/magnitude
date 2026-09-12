@@ -1,0 +1,10 @@
+{
+  "action": "rules.insert",
+  "value": {
+    "name": "Magnitude update endpoints",
+    "description": "Bound update and artifact checks before they reach application code",
+    "active": true,
+    "conditionGroup": [{"conditions": [{"type": "path", "op": "re", "value": "^/api/(update$|download/)"}]}],
+    "action": {"mitigate": {"action": "rate_limit", "rateLimit": {"algo": "fixed_window", "window": 60, "limit": 300, "keys": ["ip"]}}}
+  }
+}
