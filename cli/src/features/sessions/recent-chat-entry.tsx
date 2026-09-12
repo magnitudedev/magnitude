@@ -5,6 +5,7 @@ import { Button } from '../../components/button'
 import { formatRelativeTime, type RecentChat } from '@magnitudedev/client-common'
 
 interface RecentChatEntryProps {
+  id?: string
   chat: RecentChat
   isSelected: boolean
   onSelect: (chat: RecentChat) => void
@@ -12,6 +13,7 @@ interface RecentChatEntryProps {
 }
 
 export const RecentChatEntry = memo(function RecentChatEntry({
+  id,
   chat,
   isSelected,
   onSelect,
@@ -29,6 +31,7 @@ export const RecentChatEntry = memo(function RecentChatEntry({
 
   return (
     <Button
+      id={id}
       onClick={() => onSelect(chat)}
       onMouseOver={onHover}
       style={{
