@@ -27,7 +27,6 @@ jobs:
     env:
       MAGNITUDE_APPLE_DISTRIBUTION: developer-id
       MAGNITUDE_ACCEPTANCE_VERSION: ${{ matrix.version }}
-      MAGNITUDE_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/magnitude-update-acceptance
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -49,6 +48,8 @@ jobs:
           APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
       - name: Build matched application and service without rebuilding inference
         run: bun packages/release/scripts/acceptance/build-desktop.ts
+        env:
+          MAGNITUDE_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/magnitude-update-acceptance
       - name: Retain signed installers and notarization evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -61,3 +62,33 @@ jobs:
       - name: Remove signing credentials
         if: always()
         run: bash packages/release/scripts/apple/cleanup-credentials.sh
+
+  native-checks:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-22.04, ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - name: Exercise signed requests and update ownership on the native runtime
+        working-directory: desktop
+        run: bunx --bun vitest run src/update-identity.test.ts src/update-preferences.test.ts src/update-schedule.test.ts src/application-update.test.ts
+      - name: Send a real signed check to the isolated hosted endpoint
+        run: bun packages/release/scripts/acceptance/check.ts
+        env:
+          MAGNITUDE_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/update-check.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: update-check-${{ matrix.os }}
+          path: ${{ runner.temp }}/update-check.json
+          if-no-files-found: error
+          retention-days: 14
