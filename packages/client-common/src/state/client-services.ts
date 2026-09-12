@@ -1,13 +1,8 @@
-import { DesktopOnboarding, DesktopOnboardingLive } from "../desktop/onboarding"
 import { DesktopBridge, DesktopSession, DesktopSessionLive } from "../desktop/service"
 import { Context, Layer, Option } from "effect"
 import { Files, FilesLive } from "../files/service"
 import { LocalModels, LocalModelsLive } from "../local-models/service"
 import { ModelSlots, ModelSlotsLive } from "../model-slots/service"
-import {
-  OnboardingPersistence,
-  OnboardingPersistenceLive,
-} from "../onboarding/persistence"
 import { ProjectFiles, ProjectFilesLive } from "../project-files/service"
 import { ChangesLive } from "./changes"
 import { ClientEffectQuery } from "./client-effect-query"
@@ -17,13 +12,11 @@ import {
 } from "../harness-connections/service"
 
 export type ClientServices =
-  | DesktopOnboarding
   | DesktopSession
   | ClientEffectQuery
   | Files
   | LocalModels
   | ModelSlots
-  | OnboardingPersistence
   | ProjectFiles
   | HarnessConnection
 
@@ -51,14 +44,13 @@ export const clientServicesLayer = (
     FilesLive,
     LocalModelsLive,
     ModelSlotsLive,
-    OnboardingPersistenceLive,
     ProjectFilesLive,
     harnessConnection,
   ).pipe(
     Layer.provideMerge(observedInfrastructure),
   )
 
-  return Layer.merge(DesktopSessionLive, DesktopOnboardingLive).pipe(
+  return DesktopSessionLive.pipe(
     Layer.provideMerge(domains),
     Layer.provide(Layer.succeed(DesktopBridge, Option.fromNullable(options.desktopBridge))),
   )

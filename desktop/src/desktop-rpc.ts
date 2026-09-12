@@ -1,7 +1,7 @@
 import { Rpc, RpcGroup, type RpcClient, type RpcClientError } from "@effect/rpc"
 import { atMostOnce, replaySafe } from "@magnitudedev/sdk"
 import { ApplicationSnapshot, LoginStartupState } from "@magnitudedev/sdk/desktop-host"
-import { DesktopApplicationInfo, DesktopConnectRequest, DesktopConnectionsSnapshot, DesktopUpdateState, HarnessIdSchema, SetupStatus } from "@magnitudedev/client-common"
+import { DesktopApplicationInfo, DesktopConnectRequest, DesktopConnectionsSnapshot, DesktopUpdateState, HarnessIdSchema } from "@magnitudedev/client-common"
 import { Schema } from "effect"
 
 export { DesktopPage as Page, ModelTrayPresentation, DesktopAction as ApplicationAction } from "@magnitudedev/client-common"
@@ -16,7 +16,6 @@ export const InferenceHostRpcs = RpcGroup.make(
   Rpc.make("RestartUpdate", { payload: Unit, success: Unit, error: HostError }).pipe(atMostOnce),
   Rpc.make("Observe", { payload: Unit, success: ApplicationSnapshot, error: HostError, stream: true }),
   Rpc.make("Actions", { payload: Unit, success: ApplicationAction, error: HostError, stream: true }),
-  Rpc.make("PresentSetup", { payload: Schema.Struct({ status: SetupStatus }), success: Unit, error: HostError }).pipe(atMostOnce),
   Rpc.make("PresentModel", { payload: ModelTrayPresentation, success: Unit, error: HostError }).pipe(atMostOnce),
   Rpc.make("Appearance", { payload: Schema.Struct({ preference: Schema.Literal("system", "light", "dark") }), success: Unit, error: HostError }).pipe(atMostOnce),
   Rpc.make("LoginStartup", { payload: Unit, success: LoginStartupState, error: HostError, stream: true }),
@@ -37,7 +36,6 @@ export interface DesktopApi {
   readonly platform: string
   readonly observe: (value: (snapshot: typeof ApplicationSnapshot.Encoded) => void, error: (message: string) => void) => () => void
   readonly actions: (value: (action: typeof ApplicationAction.Type) => void) => () => void
-  readonly presentSetup: (status: typeof SetupStatus.Type) => Promise<void>
   readonly presentModel: (value: typeof ModelTrayPresentation.Type) => Promise<void>
   readonly appearance: (preference: "system" | "light" | "dark") => Promise<void>
   readonly loginStartup: (value: (state: typeof LoginStartupState.Type) => void, error: (message: string) => void) => () => void

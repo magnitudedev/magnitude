@@ -75,7 +75,6 @@ import { LocalProviderOfferingsLive } from "./local-provider-offerings"
 import type { AcnOwnerControl } from "./owned-control"
 import { LocalProviderResolverLive } from "./local-provider-resolver"
 import { LocalInferenceHardwareLive } from "./local-inference-hardware"
-import { OnboardingLive } from "./onboarding"
 import { CustomEndpointsLive } from "./custom-endpoints"
 import { CustomEndpointReconcilerLive } from "./custom-endpoint-reconciler"
 import { FileMentionSearcherLive } from "./file-mention-searcher"
@@ -358,10 +357,9 @@ const addLocalInferenceServices = <A, E, R>(
   const withCatalogAdapter = Layer.provideMerge(LocalModelSourcesLive, withHardware)
   const withLocalModels = Layer.provideMerge(LocalModelsLive, withCatalogAdapter)
   const withOfferings = Layer.provideMerge(LocalProviderOfferingsLive, withLocalModels)
-  const withOnboarding = Layer.provideMerge(OnboardingLive, withOfferings)
   const withResolver = Layer.provideMerge(
     LocalProviderResolverLive,
-    withOnboarding
+    withOfferings
   )
   const withIcnProvider = Layer.provideMerge(makeIcnProvider(), withResolver)
   const withProviderClients = Layer.provideMerge(

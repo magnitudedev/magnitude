@@ -15,7 +15,7 @@ export const LoginStartup = Context.GenericTag<LoginStartup>("desktop/LoginStart
 /** The OS is the preference authority; this adapter retains no settings receipt. */
 export const makeLoginStartup = (isolatedProfile: boolean) => Effect.gen(function* () {
   if (isolatedProfile || !app.isPackaged) {
-    const message = "Launch at login is available in the installed Magnitude app."
+    const message = "Launch at login is disabled in this development or test build. Install Magnitude to enable it."
     return LoginStartup.of({ read: Effect.succeed({ _tag: "Unavailable", message }), set: () => Effect.fail(new LoginStartupFailed({ message })) })
   }
   if (process.platform === "linux") return yield* makeXdgLoginStartup({ executable: LINUX_DESKTOP_EXECUTABLE_PATH })

@@ -89,7 +89,6 @@ const program = Effect.scoped(Effect.gen(function* () {
   const actions = yield* PubSub.unbounded<typeof ApplicationAction.Type>()
   const quit = yield* Queue.sliding<"Quit" | "RestartUpdate">(1)
   const state = yield* Ref.make<OwnedServiceState | null>(null)
-  const setupStatus = yield* Ref.make<"Required" | "Complete" | "Unavailable">("Unavailable")
   const model = yield* Ref.make({ label: "Model status unavailable", canStop: false })
   const runtime = yield* Effect.runtime<never>()
   const run = (effect: Effect.Effect<unknown>) => { Runtime.runFork(runtime)(effect) }
@@ -142,8 +141,7 @@ const program = Effect.scoped(Effect.gen(function* () {
   const refreshTray = Effect.gen(function* () {
     const current = yield* Ref.get(state)
     const presentation = yield* Ref.get(model)
-    const setup = yield* Ref.get(setupStatus)
-    yield* tray.setMenu(buildTrayMenu({ service: current?._tag ?? "Unknown", model: presentation, setup }, {
+    yield* tray.setMenu(buildTrayMenu({ service: current?._tag ?? "Unknown", model: presentation }, {
       open: page => run(show(page)),
       stopModel: () => run(PubSub.publish(actions, { _tag: "StopModel" })),
       quit: requestQuit,
@@ -199,7 +197,6 @@ const program = Effect.scoped(Effect.gen(function* () {
     }))),
     Observe: () => snapshots,
     Actions: () => Stream.concat(Stream.succeed({ _tag: "Navigate" as const, page: pendingPage }), Stream.fromPubSub(actions)),
-    PresentSetup: ({ status }) => Ref.set(setupStatus, status).pipe(Effect.zipRight(refreshTray), Effect.as({})),
     PresentModel: value => Ref.set(model, value).pipe(Effect.zipRight(refreshTray), Effect.as({})),
     Appearance: ({ preference }) => Effect.sync(() => { nativeTheme.themeSource = preference; window?.setBackgroundColor(nativeTheme.shouldUseDarkColors ? slate[925] : slate[50]); return {} }),
     LoginStartup: () => Stream.repeatEffectWithSchedule(loginStartup.read.pipe(Effect.catchAll(error => Effect.succeed({ _tag: "Unavailable" as const, message: error.message }))), Schedule.spaced("2 seconds")).pipe(Stream.mapError(connectionError)),
@@ -216,7 +213,6 @@ const program = Effect.scoped(Effect.gen(function* () {
     value.on("close", event => { if (!exiting) { event.preventDefault(); value.hide() } })
     value.webContents.on("render-process-gone", () => run(Effect.gen(function* () {
       yield* Ref.set(model, { label: "Model status unavailable", canStop: false })
-      yield* Ref.set(setupStatus, "Unavailable")
       const current = yield* Ref.get(state)
       if (exiting || current?._tag === "Stopping" || current?._tag === "Stopped") return
       const retry = yield* rendererRecovery.crashed
@@ -228,7 +224,7 @@ const program = Effect.scoped(Effect.gen(function* () {
       if (!isMainFrame || code === -3 || exiting) return
       run(rendererRecovery.loadFailed.pipe(
         Effect.zipRight(Ref.set(model, { label: "Window unavailable · Open Magnitude to retry", canStop: false })),
-        Effect.zipRight(Ref.set(setupStatus, "Unavailable")), Effect.zipRight(refreshTray),
+        Effect.zipRight(refreshTray),
       ))
     })
     value.webContents.session.webRequest.onHeadersReceived((details, callback) => callback({ responseHeaders: {

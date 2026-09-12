@@ -208,23 +208,9 @@ next operation. Authoritative long-running progress is awaited through lower ser
 using the exact admitted identity. No step infers causality from the latest mutation, a matching
 resource discovered later, or timing.
 
-```text
-choose canonical catalog model
-          |
-          v
-install(modelId) -> admission(providerModelId, modelDownloadId)
-          |                              |
-          | await exact download         +---- cancellation addresses exact modelDownloadId
-          v
-assign(exact providerModelId) -> exact selection
-          |
-          v
-load(exact selection) -> instanceId
-          |
-          | await exact instanceId
-          v
-complete onboarding
-```
+Desktop downloads and model loads are separate explicit actions. There is no first-use chain that
+automatically loads a downloaded model or persists setup completion. Composition must reflect an
+actual product command, not invent a hidden onboarding workflow.
 
 ### Hook
 

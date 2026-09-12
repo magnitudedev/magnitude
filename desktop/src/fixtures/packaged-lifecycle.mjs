@@ -78,13 +78,13 @@ try {
     try { await window.__magnitudeDesktop.setLoginStartup(true); return null; }
     catch (error) { return { message: error.message }; }
   });
-  assert.deepEqual(rejectedLogin, { message: 'Launch at login is available in the installed Magnitude app.' });
+  assert.deepEqual(rejectedLogin, { message: 'Launch at login is disabled in this development or test build. Install Magnitude to enable it.' });
   console.log('Host action failure preserves actionable message across real contextBridge');
   await failedWindow.getByRole('button', { name: 'Status', exact: true }).click();
   for (let attempt = 0; attempt < 2; attempt++) {
     await failedWindow.getByText('Failed', { exact: true }).waitFor({ timeout: 20000 });
     await failedWindow.getByText(`The inference server binary was not found at ${join(failedProfile, 'bin/magnitude-inference')}`, { exact: true }).waitFor();
-    await failedWindow.getByText(/^Registered with your desktop\./).waitFor();
+    await failedWindow.getByText(/^Magnitude keeps running when you close the window\./).waitFor();
     assert.equal(await failedWindow.getByText('Cleanup needs attention', { exact: false }).count(), 0);
     assert.equal(alive(failedOwner.pid), true);
     if (attempt === 0) {
@@ -122,7 +122,7 @@ try {
   await conflictWindow.getByRole('button', { name: 'Status', exact: true }).click();
   await conflictWindow.getByText('Failed', { exact: true }).waitFor();
   await conflictWindow.getByText('Port 11109 is already in use.', { exact: false }).waitFor();
-  await conflictWindow.getByText(/^Registered with your desktop\./).waitFor();
+  await conflictWindow.getByText(/^Magnitude keeps running when you close the window\./).waitFor();
   assert.equal(await (await fetch('http://127.0.0.1:11109')).text(), 'unrelated service');
   await conflictWindow.getByRole('button', { name: 'Retry service', exact: true }).click();
   await conflictWindow.getByText('Failed', { exact: true }).waitFor();
@@ -153,9 +153,9 @@ try {
   await eventually(visibility, [{ visible: true, minimized: false }]);
   const window = await app.firstWindow();
   window.setDefaultTimeout(10000);
-  await window.getByRole('button', { name: 'Skip setup', exact: true }).click();
+  assert.equal(await window.getByRole('button', { name: 'Skip setup', exact: true }).count(), 0);
   await window.getByRole('region', { name: 'Get started', exact: true }).waitFor({ state: 'hidden' });
-  console.log('Fresh profile: explicit Skip completes onboarding without a model');
+  console.log('Fresh profile: ordinary model actions without a setup flow');
   await window.getByRole('button', { name: 'Connections', exact: true }).click();
   await window.getByRole('heading', { name: 'Connections', exact: true }).waitFor();
   await eventually(() => window.getByRole('button', { name: 'Connect', exact: true }).count(), 8);
@@ -205,7 +205,7 @@ try {
   console.log('Packaged appearance: Light/Dark/System, native theme, persisted reload, distinct backgrounds, and loaded Inter/Martian Mono fonts pass');
   await window.getByRole('button', { name: 'Status', exact: true }).click();
   await window.getByText('No downloads in progress.', { exact: true }).waitFor();
-  await window.getByText(/^Registered with your desktop\./).waitFor();
+  await window.getByText(/^Magnitude keeps running when you close the window\./).waitFor();
   await window.getByRole('button', { name: 'Discover', exact: true }).click();
   await eventually(() => window.locator('main').evaluate(element => element.scrollHeight > element.clientHeight + 100), true);
   await window.locator('main').evaluate(element => { element.scrollTop = 100; });
@@ -301,7 +301,7 @@ try {
   await reopened.getByRole('button', { name: 'Download', exact: true }).first().waitFor();
   assert.equal(await reopened.getByRole('button', { name: 'Skip setup', exact: true }).count(), 0);
   assert.deepEqual(await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().map(window => window.isVisible())), [false]);
-  console.log('Completed onboarding persists after full Quit and hidden relaunch');
+  console.log('No setup flow after full Quit and hidden relaunch');
   const replacement = await health();
   const descendants = execFileSync('/bin/ps', ['-axo', 'pid=,ppid='], { encoding: 'utf8' }).trim().split('\n')
     .map(line => line.trim().split(/\s+/).map(Number)).filter(([, parent]) => parent === replacement.pid).map(([pid]) => pid);

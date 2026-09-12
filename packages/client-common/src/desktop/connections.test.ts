@@ -12,7 +12,7 @@ describe("desktop connection boundary", () => {
     expect(Schema.decodeUnknownSync(DesktopConnectRequest)(encoded)).toEqual(input)
   })
 
-  it("preserves the exact onboarding selection across the structured-clone boundary", () => {
+  it("preserves the exact model selection across the structured-clone boundary", () => {
     const input = { harness: HarnessIdSchema.make("opencode"), model: Option.some(ProviderModelIdSchema.make("catalog/model-Q8")) }
     const encoded = structuredClone(Schema.encodeSync(DesktopConnectRequest)(input))
     expect(encoded).toEqual({ harness: "opencode", model: "catalog/model-Q8" })

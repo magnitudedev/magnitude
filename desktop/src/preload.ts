@@ -32,7 +32,6 @@ const api: DesktopApi = {
   platform: process.platform,
   observe: (value, error) => observe(client => client.Observe({}), state => value(Schema.encodeSync(ApplicationSnapshot)(state)), error),
   actions: value => observe(client => client.Actions({}), value, message => console.error(message)),
-  presentSetup: status => command(client => client.PresentSetup({ status })),
   presentModel: value => command(client => client.PresentModel(value)),
   appearance: preference => command(client => client.Appearance({ preference })),
   loginStartup: (value, error) => observe(client => client.LoginStartup({}), value, error),

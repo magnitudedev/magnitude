@@ -24,7 +24,7 @@ a shutdown-error dialog. The OS may allow less time than normal Quit; native lif
 remains the fallback. Windows confirmed session end can terminate Electron synchronously, so an
 asynchronous event handler is not a graceful-shutdown guarantee; owned jobs must contain that exit.
 Main permits three automatic renderer-crash retries. After exhaustion or a failed main-document load,
-model/setup observations become unavailable and the tray retains Open and Quit. Explicit Open retries
+model observations become unavailable and the tray retains Open and Quit. Explicit Open retries
 the renderer with a renewed budget. Background demand never renews it or shows a window. Renderer
 failure cannot terminate or restart the service, and teardown never starts renderer recovery.
 The privileged IPC transport identifies each preload/runtime occurrence independently of its retained
@@ -79,8 +79,7 @@ stops serving, destroys the window, or requests activation. Menu updates and rep
 application shutdown terminalizes tray ownership so late observations cannot recreate an icon.
 Status and application control expose tray registration separately from service/model state. Registered
 means native registration was requested successfully, not guaranteed pixel visibility or user pinning.
-The tray shows setup guidance only from an observed incomplete onboarding flag while the service is
-ready. Unavailable onboarding evidence does not imply completion and never opens the window.
+The tray shows service and model state without a setup-completion state. First use follows the ordinary Discover, model and connection actions.
 
 A background launch starts the owner and tray without showing or focusing a window. Explicit Show
 Window or navigation intent opens it. Dock activation reopens a hidden window and explicit Open
@@ -103,7 +102,7 @@ Harness environment discovery is bounded asynchronous work, independent of tray 
 It never mutates the application environment. Connections use the resolved search path, configuration
 roots, and child-command environment; explicit command overrides remain authoritative. Failure falls
 back to the inherited environment. Quit cancels the probe and retires its child process group.
-Onboarding passes the exact model selected during setup; ordinary Connect preserves the harness's
+Connect preserves the harness's
 current model. A saved receipt exposes repair and removal even when configuration has been overwritten.
 Intact configuration without a receipt can be Connected but is not claimed as removable owned state.
 Connections remain observable while the inference service is unavailable: configuration integrity
@@ -148,3 +147,5 @@ autostart entry, honors desktop exclusions and disablement, and writes a Hidden 
 so a lower-priority system entry cannot re-enable startup. No login adapter requests automatic OS
 restart after Quit. Native platform acceptance includes signed macOS login and Windows startup approval;
 filesystem simulation does not establish those guarantees.
+
+Status uses a green check for a ready service and keeps model residency separate. Hardware recommendation artwork belongs to Discover, not Status. Normal background behavior is explained in user terms; native tray registration terminology stays out of the healthy-state UI. Development/test login-startup restrictions explicitly identify the build as such.
