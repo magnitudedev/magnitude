@@ -20,7 +20,7 @@ const harness = async (overrides: Partial<DistributionStore> = {}) => {
   const store: DistributionStore = {
     admit: (_, nonce) => Effect.sync(() => { if (seen.has(nonce)) return false; seen.add(nonce); return true }),
     artifact: (version, id) => Effect.succeed(version === manifest.version && id === manifest.artifact.id ? Option.some(envelope) : Option.none()),
-    recordDownload: () => Effect.sync(() => { recorded++ }),
+    recordDownload: () => Effect.sync(() => { recorded++ }), recordInstallerDownload: () => Effect.void,
     candidates: () => Effect.succeed([]), recordCheck: () => Effect.void, ...overrides,
   }
   return { count: () => recorded, run: (req: Request) => Effect.runPromise(handleArtifactDownload(req, options).pipe(Effect.provideService(DistributionStore, store))) }

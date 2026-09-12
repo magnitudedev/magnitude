@@ -9,8 +9,8 @@ const Digest = Schema.String.pipe(Schema.pattern(/^[a-f0-9]{64}$/))
 export const ArtifactId = Schema.String.pipe(Schema.pattern(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/), Schema.brand("UpdateArtifactId"))
 export type ArtifactId = typeof ArtifactId.Type
 const ArtifactPath = Schema.String.pipe(Schema.maxLength(512), Schema.pattern(/^releases\/[a-zA-Z0-9][a-zA-Z0-9._-]*\/[a-zA-Z0-9][a-zA-Z0-9._-]*$/))
-const target = Schema.Union(
-  Schema.Struct({ os: Schema.Literal("darwin"), arch: Schema.Literal("arm64", "x64"), package: Schema.Literal("mac-zip") }),
+export const ArtifactTarget = Schema.Union(
+  Schema.Struct({ os: Schema.Literal("darwin"), arch: Schema.Literal("arm64", "x64"), package: Schema.Literal("mac-zip", "dmg") }),
   Schema.Struct({ os: Schema.Literal("windows"), arch: Schema.Literal("x64"), package: Schema.Literal("windows-exe") }),
   Schema.Struct({ os: Schema.Literal("linux"), arch: Schema.Literal("arm64", "x64"), package: Schema.Literal("deb", "rpm") }),
 )
@@ -20,7 +20,7 @@ export const UpdateManifest = Schema.Struct({
   commit: Schema.String.pipe(Schema.pattern(/^[a-f0-9]{40}$/)),
   artifact: Schema.Struct({
     id: ArtifactId,
-    target,
+    target: ArtifactTarget,
     path: ArtifactPath,
     bytes: Schema.Number.pipe(Schema.int(), Schema.positive(), Schema.filter(Number.isSafeInteger)),
     sha256: Digest,

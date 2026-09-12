@@ -24,6 +24,12 @@ export const postgresDistributionStore = (pool: Pool, namespace: typeof Distribu
     catch: () => new DistributionStoreUnavailable(),
   })
   return DistributionStore.of({
+    recordInstallerDownload: observation => query(`
+      INSERT INTO magnitude_distribution.installer_daily(release_version,artifact_id,os,arch,package,country)
+      VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(day,release_version,artifact_id,country)
+      DO UPDATE SET requests=magnitude_distribution.installer_daily.requests+1
+    `, [observation.release, observation.artifact, observation.target.os, observation.target.arch, observation.target.package,
+      Option.getOrElse(observation.country, () => "")]).pipe(Effect.asVoid),
     admit: (installation, nonce, expiresAt) => query(`
       INSERT INTO magnitude_distribution.request_nonces (installation_id, nonce, expires_at)
       VALUES ($1, $2, to_timestamp($3)) ON CONFLICT DO NOTHING RETURNING installation_id

@@ -16,6 +16,6 @@ const run = Effect.gen(function* () {
   }, catch: () => new DistributionBuildFailed() })
   const digest = createHash("sha256").update(yield* fs.readFile(join(output, "server.js"))).digest("hex")
   yield* fs.writeFileString(join(output, "package.json"), `{"name":"@magnitudedev/distribution-server","version":"0.0.0-${digest.slice(0, 12)}","private":true,"type":"module","exports":{".":{"types":"./server.d.ts","import":"./server.js"}},"dependencies":{"pg":"8.20.0"}}\n`)
-  yield* fs.writeFileString(join(output, "server.d.ts"), 'import type { Pool } from "pg";\nexport declare function createDistributionServer(input: unknown): Promise<{pool: Pool; check(request: Request, country?: string): Promise<Response>; download(request: Request, country?: string): Promise<Response>}>;\n')
+  yield* fs.writeFileString(join(output, "server.d.ts"), 'import type { Pool } from "pg";\nexport declare function createDistributionServer(input: unknown): Promise<{pool: Pool; check(request: Request, country?: string): Promise<Response>; download(request: Request, country?: string): Promise<Response>; installer(request: Request, country?: string): Promise<Response>}>;\n')
 })
 BunRuntime.runMain(run.pipe(Effect.provide(BunContext.layer)))
