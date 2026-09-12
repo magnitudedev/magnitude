@@ -17,7 +17,7 @@ const harness = (candidates: readonly SignedUpdateManifest[] = [], overrides: Pa
   const store: DistributionStore = {
     admit: (id, nonce) => Effect.sync(() => { const key = `${id}:${nonce}`; if (nonces.has(key)) return false; nonces.add(key); return true }),
     candidates: () => Effect.succeed(candidates), recordCheck: value => Effect.sync(() => { records.push(value) }),
-    artifact: () => Effect.succeed(Option.none()), recordDownload: () => Effect.void, ...overrides,
+    artifact: () => Effect.succeed(Option.none()), recordDownload: () => Effect.void, recordInstallerDownload: () => Effect.void, ...overrides,
   }
   return { records, store, run: (req: Request) => Effect.runPromise(handleUpdateCheck(req, options).pipe(Effect.provideService(DistributionStore, store))) }
 }

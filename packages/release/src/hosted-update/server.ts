@@ -4,6 +4,7 @@ import { decodePublisherPublicKey } from "./manifest"
 import { handleUpdateCheck, DistributionStore } from "./service"
 import { postgresDistributionStore, DistributionNamespace } from "./postgres-store"
 import { handleArtifactDownload } from "./download"
+import { handleInstallerDownload } from "./installer"
 
 export const DistributionServerConfig = Schema.Struct({
   origin: Schema.String,
@@ -36,6 +37,9 @@ export const makeDistributionServer = (config: DistributionServerConfig) => Effe
   const store = postgresDistributionStore(pool, config.databaseNamespace)
   return {
     pool,
+    installer: (request: Request, country: string | undefined) => handleInstallerDownload(request, {
+      origin: config.origin, storageOrigin: config.storageOrigin, country: Option.fromNullable(country), trustedPublishers: new Map(keys),
+    }).pipe(Effect.provideService(DistributionStore, store)),
     check: (request: Request, country: string | undefined) => handleUpdateCheck(request, {
       origin: config.origin, country: Option.fromNullable(country), trustedPublishers: new Map(keys),
     }).pipe(Effect.provideService(DistributionStore, store)),
@@ -50,6 +54,7 @@ export const createDistributionServer = async (input: unknown) => {
   const server = await Effect.runPromise(Schema.decodeUnknown(DistributionServerConfig)(input).pipe(Effect.flatMap(makeDistributionServer)))
   return {
     pool: server.pool,
+    installer: (request: Request, country?: string) => Effect.runPromise(server.installer(request, country)),
     check: (request: Request, country?: string) => Effect.runPromise(server.check(request, country)),
     download: (request: Request, country?: string) => Effect.runPromise(server.download(request, country)),
   }

@@ -3,7 +3,7 @@ import type { KeyObject } from "node:crypto"
 import { decodeUpdateRequest, UpdateRequest } from "./request"
 import { verifyUpdateRequest, InstallationId, type RequestNonce } from "./request-auth"
 import { isNewerVersion } from "../client-update/release-channels"
-import { acceptsUpdateManifest, verifyUpdateManifest, SignedUpdateManifest, ArtifactId } from "./manifest"
+import { acceptsUpdateManifest, verifyUpdateManifest, SignedUpdateManifest, ArtifactId, ArtifactTarget } from "./manifest"
 
 export class DistributionStoreUnavailable extends Schema.TaggedError<DistributionStoreUnavailable>()("DistributionStoreUnavailable", {}) {}
 export const Country = Schema.String.pipe(Schema.pattern(/^[A-Z]{2}$/))
@@ -20,13 +20,20 @@ export const DownloadObservation = Schema.Struct({
   release: Schema.String,
   artifact: ArtifactId,
 })
+export const InstallerDownloadObservation = Schema.Struct({
+  target: ArtifactTarget,
+  country: Schema.optionalWith(Country, { as: "Option", exact: true }),
+  release: Schema.String,
+  artifact: ArtifactId,
+})
 export interface DistributionStore {
   /** Atomic unique admission; expiry is server time, not an untrusted client TTL. */
   readonly admit: (installation: InstallationId, nonce: RequestNonce, expiresAt: number) => Effect.Effect<boolean, DistributionStoreUnavailable>
-  readonly candidates: (request: UpdateRequest) => Effect.Effect<readonly SignedUpdateManifest[], DistributionStoreUnavailable>
+  readonly candidates: (target: Pick<UpdateRequest, "os" | "arch"> & { readonly package: UpdateRequest["package"] | "dmg" }) => Effect.Effect<readonly SignedUpdateManifest[], DistributionStoreUnavailable>
   readonly recordCheck: (observation: typeof CheckObservation.Type) => Effect.Effect<void, DistributionStoreUnavailable>
   readonly artifact: (release: string, id: ArtifactId) => Effect.Effect<Option.Option<SignedUpdateManifest>, DistributionStoreUnavailable>
   readonly recordDownload: (observation: typeof DownloadObservation.Type) => Effect.Effect<void, DistributionStoreUnavailable>
+  readonly recordInstallerDownload: (observation: typeof InstallerDownloadObservation.Type) => Effect.Effect<void, DistributionStoreUnavailable>
 }
 export const DistributionStore = Context.GenericTag<DistributionStore>("release/DistributionStore")
 

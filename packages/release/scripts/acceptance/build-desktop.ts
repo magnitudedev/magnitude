@@ -33,7 +33,7 @@ const run = Effect.gen(function* () {
     const service = yield* Effect.tryPromise({ try: () => buildAcnBinary("bun-darwin-arm64"), catch: () => new AcceptanceBuildFailed({ message: "Service compilation failed" }) })
     const release = yield* Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ revision: Schema.Number })))(yield* fs.readFileString(join(root, "packages/release/release-plan.json")))
     const apps = yield* buildDesktopApplication({ service, version, revision: release.revision, outputDirectory: join(output, "application") })
-    const app = apps[0]!
+    const app = join(apps[0]!, "Magnitude.app")
     const serviceVersion = yield* Command.make(join(app, "Contents/Resources", ACN_EXECUTABLE_NAME), "version").pipe(Command.string)
     if (serviceVersion.trim() !== version) return yield* new AcceptanceBuildFailed({ message: "Application and bundled service versions differ" })
     // Separate Launch Services identity; the executable, service and native installation path are real.

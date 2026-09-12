@@ -87,6 +87,11 @@ selector. They resolve only a matching signed artifact and record download inten
 an uncached redirect. Authorization is not forwarded to object storage. CDN range requests do not
 create additional download records. Request counts do not claim completed transfers or installs.
 
+First installation uses a public installer endpoint with an explicit OS, architecture and package.
+It selects only a verified stable installer and records anonymous daily download intent by artifact
+and country. A browser download has no installation key and must not be counted as an identified
+user. macOS DMGs serve first installation; ZIP archives remain the native update transport.
+
 Detailed installation observations are retained for 90 days, then rolled up without installation
 identifiers. Global daily active counts deduplicate across version and country changes; subgroup
 distinct counts must not be summed into a global total. Installation identities expire after 180
