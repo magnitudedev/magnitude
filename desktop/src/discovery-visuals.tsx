@@ -12,18 +12,23 @@ export function ModelRadar({ model }: { model: CatalogLocalModel }) {
   if (Option.isNone(axes)) return <p className="py-12 text-center text-sm text-slate-500">{model.servingState._tag === "Assessing" ? "Waiting for model assessment" : "No performance profile is available for this configuration."}</p>
   const point = (index: number, radius: number) => {
     const angle = -Math.PI / 2 + index * Math.PI * 2 / 5
-    return [150 + Math.cos(angle) * radius, 118 + Math.sin(angle) * radius]
+    return [180 + Math.cos(angle) * radius, 138 + Math.sin(angle) * radius]
   }
   const polygon = (radius: number) => axes.value.map((_, index) => point(index, radius).join(",")).join(" ")
   return <div className="my-3">
-    <svg viewBox="0 0 300 235" role="img" aria-label={`${model.presentation.displayName} capability profile`} className="mx-auto w-full max-w-60 text-blue-600 dark:text-blue-400">
+    <svg viewBox="0 0 360 270" role="img" aria-label={`${model.presentation.displayName} capability profile`} className="mx-auto w-full text-blue-600 dark:text-blue-400">
       <title>{axes.value.map(axis => `${axis.label}: ${axis.detail}`).join("; ")}</title>
       {[20,40,60,80].map(radius => <polygon key={radius} points={polygon(radius)} fill="none" className="stroke-slate-200 dark:stroke-slate-700" strokeWidth="0.8" />)}
-      {axes.value.map((axis,index) => <line key={axis.label} x1="150" y1="118" x2={point(index,80)[0]} y2={point(index,80)[1]} className="stroke-slate-200 dark:stroke-slate-700" strokeWidth="0.8" />)}
+      {axes.value.map((axis,index) => <line key={axis.label} x1="180" y1="138" x2={point(index,80)[0]} y2={point(index,80)[1]} className="stroke-slate-200 dark:stroke-slate-700" strokeWidth="0.8" />)}
       <polygon points={axes.value.map((axis,index) => point(index,Option.getOrElse(axis.value,()=>0)*80).join(",")).join(" ")} fill="currentColor" fillOpacity="0.13" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
-      {axes.value.map((axis,index) => {const p=point(index,103);return <text key={axis.label} x={p[0]} y={p[1]} textAnchor="middle" dominantBaseline="middle" className="fill-slate-500 dark:fill-slate-400" fontSize="9" letterSpacing="0.5">{axis.label}</text>})}
+      {axes.value.map((axis,index) => {
+        const [x,y] = [[180,20],[290,83],[258,238],[102,238],[70,83]][index]!
+        return <text key={axis.label} x={x} y={y} textAnchor="middle">
+          <tspan x={x} className="fill-slate-500 dark:fill-slate-400" fontSize="11">{axis.label.charAt(0)+axis.label.slice(1).toLowerCase()}</tspan>
+          <tspan x={x} dy="18" className="fill-slate-800 dark:fill-slate-200" fontSize="13" fontWeight="500">{axis.detail}</tspan>
+        </text>
+      })}
     </svg>
-    <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs">{axes.value.map(axis => <div key={axis.label} className="flex flex-col gap-1"><dt className="text-slate-500">{axis.label.charAt(0)+axis.label.slice(1).toLowerCase()}</dt><dd className="font-medium">{axis.detail}</dd></div>)}</dl>
   </div>
 }
 
