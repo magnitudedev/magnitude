@@ -120,22 +120,6 @@ requesting shutdown. It waits on that same handle rather than repeatedly resolvi
 that the reply identifies the observed application. Observation grants no termination or job rights.
 Permission failures are not process absence; cancellation releases observation without killing the
 application or its service. Only the desktop owner retires its service tree.
-Read-only process observations can inspect creation time, executable path and token user SID through
-the same retained handle. Details must identify the requested PID; failed metadata access is not
-absence. A bounded native process-parent snapshot rejects duplicate identities but proves only
-reported current ancestry. It does not establish ownership of orphaned historical descendants or
-grant termination rights. Descendant capture retains each selected process handle, verifies the
-expected root and same-user identity, rejects children older than their reported retained parent,
-and rechecks ancestry and retained liveness before returning. Later verification invalidates that
-evidence on exit or topology change. This is current-descendant evidence, not proof that historical
-orphans are absent. Migration must separately prove the complete retirement boundary.
-Migration termination uses a separate scoped native capability, acquired only for a captured process
-whose creation time, executable, and user SID match; the SID must also match the current user.
-A read-only observer cannot be promoted into it. Termination and exit observation use that same
-non-inheritable handle. Initiating termination is not retirement proof; deadline or observation
-failure retains authority for retry within its scope. Closing the capability does not terminate a
-process. This proves only the identified process's exit and cannot authorize tree-wide cleanup or
-new-service admission without the complete migration boundary.
 The service validates kill-on-close containment without breakaway in its immediate Windows job
 before connecting its private owner pipe. The desktop checks the pipe client's native PID against
 the retained child identity before consuming Booted. Windows commands invoke the known executable
@@ -176,69 +160,19 @@ stacks and stderr remain in logs instead of becoming the ordinary Status label.
 Failed child attempts retain bounded diagnostics in logs even when control-channel closure is
 observed before process exit; diagnostic visibility cannot depend on which failure wins that race.
 
-Legacy migration reads the old singleton record through a frozen, bounded, read-only contract.
-Missing records do not create a database; malformed, unreadable, or unsafe files are failures,
-never absence. Reading does not claim ownership, repair a database, or establish process liveness.
-Retirement separately requires exact process identity and full-tree cleanup evidence.
-Windows migration converts the historical `windows:<UTC DateTime ticks>` identity to native
-FILETIME using exact integer arithmetic and the 1601 epoch offset. Invalid timestamps and PIDs
-outside the native DWORD range fail admission. Conversion preserves the original frozen record;
-it does not establish liveness or grant retirement authority. Native observation must still compare
-the converted identity against a retained process handle before acting.
-Windows Task Scheduler inspection runs in a bounded, parent-contained native helper so scheduler
-RPC waits cannot block the tray. It queries the exact historical task through the native API;
-localized command output is not a registration contract. Only explicit task-not-found is absence.
-Permission, service, malformed-output and timeout failures remain migration failures. The complete
-registration XML is one snapshot, including enablement; it is input to validation, not authorization
-to retire a task or process. Helper root exit and output completion still require job retirement.
-Registration retirement passes the recognized XML digest and original current-user SID to the
-contained native helper. It rereads the exact historical task, verifies both values, deletes that
-registration, and requires explicit task absence before acknowledgement. Already-absent replay
-succeeds. A changed definition, user mismatch, scheduler failure or reappearing task is a failure.
-Task Scheduler provides separate inspection and deletion calls, not an atomic compare-and-delete;
-the digest check fences the inspected definition immediately before deletion. Registration removal
-does not prove that its running service or descendants exited. Migration must complete that separate
-retirement boundary before admitting a new service.
-Fresh Windows admission requires independent absence of both the legacy owner record and scheduled
-task. Inspection failure is never absence. Existing installations require completed migration before
-child creation; query helpers and the service use distinct application-scoped jobs.
-Registration recognition requires one direct Magnitude service execution, one logon trigger and
-the current user's unelevated principal. Ambiguous XML, additional actions, unknown settings and
-external entities fail recognition. The exact XML digest fences later retirement against registration
-changes; disabled registration remains present with disabled login intent. Historical schtasks exports
-may omit the default least-privilege level and use either scheduling engine. A generated logon start
-boundary must match the registration's creation minute; custom delayed starts remain unsupported.
-Native exported-task acceptance must reproduce historical creation and restart-policy commands,
-rather than substitute a task-construction API with different defaults.
-Live Unix migration captures separately grouped descendants through verified ancestry, checking
-owner and group-leader identities around the native snapshot. An unrelated group member, changing
-group topology, or reused PID invalidates the capture. The captured groups retain their distinct
-identities after the root exits; root absence alone does not retire separately grouped inference.
-Legacy macOS registration and process state are independent: an unloaded launch agent may still
-be enabled for login while a separately started daemon serves requests. Migration preserves the
-effective launchctl/plist preference before unregistration. It verifies source path and file digest,
-disables restart before unloading, proves the job unloaded, and removes only the unchanged source
-file. Unregistration may terminate the root, so captured process identities must survive that step.
-Migration persists its original input before the first external change. A private schema-validated
-checkpoint advances only after unregistration, process retirement, login transfer, and legacy-file
-cleanup succeed, in that order. Atomic flushed writes finish before cancellation releases ownership.
-Restart resumes the last checkpoint without recomputing the original preference or losing captured
-groups. External actions tolerate replay when they succeeded before a checkpoint write failed.
-A corrupt checkpoint fails migration instead of resetting it. No legacy registration means no
-inferred change to the desktop's current login preference.
-Migration gates child creation inside the service supervisor, after application ownership and tray
-creation. Failure remains visible and retryable without losing the tray or control endpoint; Quit
-cancels admission and cannot start a child afterward. Isolated profiles use a separate legacy startup
-namespace and cannot retire the installed application's login job.
-Linux migration recognizes the old generated systemd user unit separately from process ownership.
-It verifies the current user manager, fragment path, unchanged unit contents, absence of drop-ins,
-and matching main process before disable/stop. Persistent enablement transfers to desktop login;
-runtime-only enablement does not become a persistent preference. A missing manager is not absence
-when a legacy unit file exists. On systems without a user manager or legacy unit, registration
-migration is empty while any recorded manual daemon still requires exact process retirement.
-Removal reloads the user manager and proves the unit absent; a crash between unlink and reload
-resumes reload without recreating the unit. Unknown/custom registration states remain explicit
-failures. Native Linux acceptance must verify the manager behavior independently of simulations.
+The desktop is a clean cutover from independently installed daemon versions. Users download the
+new application and stop and disable any previous daemon installation themselves. The application
+does not read old coordination databases, inspect or unregister old startup jobs, retire old
+processes, transfer login preferences, or persist migration checkpoints. Existing models, settings,
+and unrelated files remain untouched by cutover. Only this application's owned children may be stopped.
+
+Before each service spawn, a loopback port check reports an occupied port as an actionable, retryable
+failure inside the supervisor. The tray and application control remain available, including Quit.
+The check never contacts or adopts the incumbent, and is diagnostic rather than an ownership lock;
+the service's own bind remains authoritative if another process races startup. Once the user removes
+the conflict, Retry may start a fresh owned service. Acceptance verifies that retries leave an
+incumbent alive, stale or malformed coordination files do not gate startup, and no migration state
+is created.
 
 Linux tray-host observation belongs to the application scope, independently of service and renderer
 lifetime. Subscribe to watcher ownership, host registration, and property changes before the initial

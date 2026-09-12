@@ -68,14 +68,14 @@ jobs:
           bun install --frozen-lockfile --ignore-scripts
           bun packages/version/scripts/generate-version.ts
           bun packages/daemon-management/scripts/build-native.ts
-      - name: Exercise native ownership, systemd migration and GLib background launch
+      - name: Exercise native ownership and GLib background launch
         working-directory: packages/daemon-management
         env:
           MAGNITUDE_TEST_SYSTEMD: "1"
           MAGNITUDE_TEST_XDG: "1"
         run: |
           systemctl --user show-environment > /dev/null
-          bunx --bun vitest run src/desktop-native/native.test.ts src/desktop-native/owned-child.test.ts src/desktop-native/login-startup.test.ts src/desktop-native/legacy-startup-linux.test.ts src/desktop-native/legacy-startup-linux-native.test.ts
+          bunx --bun vitest run src/desktop-native/native.test.ts src/desktop-native/owned-child.test.ts src/desktop-native/login-startup.test.ts
       - name: Exercise Linux process identity and exit races
         working-directory: packages/utils
         run: bunx --bun vitest run src/process-groups/exact-process.test.ts src/process-groups/exact-process-linux.test.ts

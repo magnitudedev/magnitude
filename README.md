@@ -24,11 +24,20 @@ Magnitude is an open source local inference engine. It runs on the hardware you 
 
 ## Get started
 
-Install the Magnitude desktop application from the [release downloads](https://github.com/magnitudedev/magnitude/releases), using an installer available for your platform. Open the app to browse **Discover**, compare curated recommendations for your machine, and download a model.
+Install the Magnitude desktop application from the [release downloads](https://github.com/magnitudedev/magnitude/releases), using the DMG on macOS or an installer available for your platform. On macOS, open the DMG, drag Magnitude into Applications, and launch it from there. Open the app to browse **Discover**, compare curated recommendations for your machine, and download a model.
 
 Use **My Models** to load or stop models, **Connections** to configure an external harness, **Status** to inspect service and model state, and **Settings** for appearance and launch at login. Connect writes the harness configuration and supported integration files; open the harness yourself when it is ready.
 
 Closing the window keeps Magnitude running in the background. **Quit Magnitude** stops the service and its inference processes. On Linux desktops without a supported tray host, reopen the app from your applications menu.
+
+### Moving from the previous application
+
+Quit the old application and stop and disable its standalone service before installing the new
+desktop. Download the new installer directly; there is no automatic migration or shell installer.
+Keep your Magnitude data directory to retain downloaded models and settings. Update your CLI if you
+use it, then reconnect your external harnesses from **Connections**. Set **Launch at login** in the
+new app if desired. If Status reports an occupied port, stop the process using it and select
+**Retry service**.
 
 ### Headless CLI
 

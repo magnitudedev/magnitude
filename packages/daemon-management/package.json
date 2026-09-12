@@ -17,7 +17,6 @@
     "@magnitudedev/acn-protocol": "workspace:*",
     "@magnitudedev/sdk": "workspace:*",
     "@magnitudedev/utils": "workspace:*",
-    "@xmldom/xmldom": "0.9.12",
     "dbus-native": "0.15.2",
     "effect": "3.21.2"
   },

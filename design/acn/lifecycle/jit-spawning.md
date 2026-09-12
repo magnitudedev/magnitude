@@ -47,13 +47,13 @@ Unix lifetime guards remain independent of JavaScript; separately grouped childr
 own protection. Windows uses job containment assigned at process creation. Native platform testing
 is required in addition to unit tests.
 
-## Compatibility and migration
+## Compatibility and installation
 
 Exact SDK RPC-version and instance fencing remain. Application updates own replacement of their
-matched bundled service; an older CLI cannot downgrade a live app's child. Legacy SQLite records
-and daemon jobs are consulted only by isolated one-time migration, which validates exact identity,
-retires the old tree, preserves data/login preference, and removes obsolete supervision. They are
-never normal runtime ownership authority.
+matched bundled service; an older CLI cannot downgrade a live app's child. Users install the new
+desktop explicitly and stop and disable any previous standalone service. The application does not
+inspect old coordination records or migrate OS registrations. An occupied service port is a
+retryable conflict, never authority to adopt or terminate its current listener.
 
 Existing SDK connections reconnect only to an existing owner. Full Quit cannot be undone by stale
 subscriptions or background retries. Fresh explicit demand may launch a new application lifetime.

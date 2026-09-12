@@ -22,11 +22,8 @@ import { fileURLToPath } from "node:url"
 import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, PubSub, Queue, Ref, Runtime, Schema, Schedule, Scope, Stream } from "effect"
 import { RpcServer } from "@effect/rpc"
 import {
-  acquireApplicationOwner, applicationStateDirectory, makeOwnedService, makeUnixOwnedChildSpawner, makeWindowsOwnedChildSpawner, makeWindowsLegacyTaskControl, makeWindowsLegacyStartup, requireFreshWindowsInstallation, readLegacyOwner, NativeHost, nativeHostLayer,
+  acquireApplicationOwner, applicationStateDirectory, makeOwnedService, makeUnixOwnedChildSpawner, makeWindowsOwnedChildSpawner, requireServicePort, NativeHost, nativeHostLayer,
   OwnedChildSpawner, serveApplicationControl, serveWindowsApplicationControl, type ApplicationControlOptions,
-  makeUnixLegacyMigrationActions, makeLegacyMigration, LegacyMigrationActions, LegacyMigrationFailed,
-  fileLegacyMigrationJournal, UnixLegacyProcessTable, NativeLegacyStartupCommands, migrateBeforeSpawn,
-  macLegacyStartupLayer, linuxLegacyStartupLayer,
   LinuxTrayHost, linuxTrayHostLayer, guardedCommandLayer,
   NativeMacApplicationInstallation,
 } from "@magnitudedev/daemon-management/desktop-native"
@@ -158,44 +155,12 @@ const program = Effect.scoped(Effect.gen(function* () {
     yield* trayHost.changes.pipe(Stream.runForEach(tray.observeHost), Effect.forkScoped)
   }
   const harnessEnvironment = yield* resolveHarnessEnvironment().pipe(Effect.provide(guardedCommandLayer(join(dirname(addonPath), "magnitude-command"))), Effect.forkScoped)
-  const windows = process.platform === "win32" ? yield* Effect.gen(function* () {
+  const spawner = process.platform === "win32" ? yield* Effect.gen(function* () {
     const pipes = yield* Layer.build(nativeWindowsPrivatePipesLayer(addonPath))
-    // Separate application-scoped jobs: a task-query helper cannot replace the service job.
-    const serviceJobs = yield* Layer.build(nativeWindowsJobOwnerLayer(addonPath))
-    const queryJobs = yield* Layer.build(nativeWindowsJobOwnerLayer(addonPath))
-    const spawner = yield* makeWindowsOwnedChildSpawner.pipe(Effect.provide(pipes), Effect.provide(serviceJobs))
-    const query = yield* makeWindowsLegacyTaskControl({
-      executable: join(dirname(addonPath), "magnitude-task-query.exe"), environment: process.env,
-    }).pipe(Effect.provide(pipes), Effect.provide(queryJobs))
-    const startup = yield* makeWindowsLegacyStartup(query)
-    const admission = requireFreshWindowsInstallation({
-      owner: readLegacyOwner(dataDir).pipe(Effect.provide(NodeSqliteDriverLayer)),
-      // Isolated profiles never inspect the installed task namespace.
-      task: isolatedProfile ? Effect.succeed(Option.none()) : startup.inspect,
-    })
-    return { spawner, admission }
-  }) : undefined
-  const spawner = windows ? windows.spawner : yield* makeUnixOwnedChildSpawner
-  const admittedSpawner = windows ? yield* migrateBeforeSpawn(windows.admission).pipe(Effect.provideService(OwnedChildSpawner, spawner)) : yield* Effect.gen(function* () {
-    // Isolated profiles cannot observe or mutate the installed legacy startup namespace.
-    const legacyHome = isolatedProfile ? join(dataDir, "legacy-home") : homedir()
-    const startup = process.platform === "darwin"
-      ? macLegacyStartupLayer(legacyHome, isolatedProfile ? "dev.magnitude.isolated-legacy" : undefined)
-      : linuxLegacyStartupLayer({ home: legacyHome, ...(isolatedProfile ? {
-        runtimeDirectory: join(dataDir, "legacy-runtime"), unit: "magnitude-isolated-legacy.service",
-      } : {}) })
-    const migrationActions = yield* makeUnixLegacyMigrationActions({
-      dataDirectory: dataDir,
-      transferLogin: enabled => loginStartup.set(enabled).pipe(Effect.asVoid,
-        Effect.mapError(error => new LegacyMigrationFailed({ message: error.message }))),
-    }).pipe(Effect.provide(startup))
-    const migration = yield* makeLegacyMigration.pipe(
-      Effect.provideService(LegacyMigrationActions, migrationActions),
-      Effect.provide(fileLegacyMigrationJournal(stateDir)),
-    )
-    return yield* migrateBeforeSpawn(migration.run).pipe(Effect.provideService(OwnedChildSpawner, spawner))
-  }).pipe(Effect.provide([NodeSqliteDriverLayer, FetchHttpClient.layer, NativeLegacyStartupCommands,
-    UnixLegacyProcessTable.pipe(Layer.provide(NodeContext.layer))]))
+    const jobs = yield* Layer.build(nativeWindowsJobOwnerLayer(addonPath))
+    return yield* makeWindowsOwnedChildSpawner.pipe(Effect.provide(pipes), Effect.provide(jobs))
+  }) : yield* makeUnixOwnedChildSpawner
+  const admittedSpawner = yield* requireServicePort(port).pipe(Effect.provideService(OwnedChildSpawner, spawner))
   const service = yield* makeOwnedService({
     executable: app.isPackaged ? join(process.resourcesPath, process.platform === "win32" ? "magnitude-service.exe" : "magnitude-service") : process.env.MAGNITUDE_BUN_PATH ?? "bun",
     arguments: [...(app.isPackaged ? [] : [join(root, "packages/acn/src/binary.ts")]), "serve", "--data-dir", dataDir, "--port", String(port)],

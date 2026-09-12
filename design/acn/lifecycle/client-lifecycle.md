@@ -43,8 +43,8 @@ Missing executable, failed command, unavailable service, malformed health, and p
 remain distinguishable failures.
 
 Privileged first-party hosts can supply a direct starter backed by private daemon-management.
-That package owns native desktop discovery/control, exact child supervision, login registration,
-and read-only legacy migration. The installed desktop bundles its matched service. The SDK receives progress or failure, never owner rows or launch
+That package owns native desktop discovery/control, exact child supervision,
+and login registration. The installed desktop bundles its matched service. The SDK receives progress or failure, never owner rows or launch
 targets. Desktop and web host bridges carry the same startup-only stream; application RPC remains
 on the existing daemon endpoint.
 

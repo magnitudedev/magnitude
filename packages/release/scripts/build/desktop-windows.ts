@@ -90,7 +90,7 @@ export const buildWindowsDesktopInstaller = (options: {
     }
   })
   yield* inspect("")
-  for (const required of ["Magnitude.exe", "resources/app.asar", "resources/magnitude-service.exe", "resources/desktop-host.node", "resources/magnitude-task-query.exe", "resources/Magnitude-LICENSE.txt"]) {
+  for (const required of ["Magnitude.exe", "resources/app.asar", "resources/magnitude-service.exe", "resources/desktop-host.node", "resources/Magnitude-LICENSE.txt"]) {
     if (!files.includes(required)) return yield* new DesktopBuildFailed({ message: `Windows application is missing ${required}` })
   }
   const guard = yield* fs.readFile(resolve(options.guard))

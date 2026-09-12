@@ -40,15 +40,17 @@ export const buildDesktopApplication = (options: {
   const tray = join(resources, "trayTemplate@2x.png")
   const icon = join(resources, "application-icon.png")
   const license = join(resources, "Magnitude-LICENSE.txt")
-  const command = join(resources, platform === "win32" ? "magnitude-task-query.exe" : "magnitude-command")
+  const command = join(resources, "magnitude-command")
   yield* fs.copyFile(options.service, service)
   yield* fs.chmod(service, 0o755)
   yield* fs.copyFile(join(root, `packages/daemon-management/dist/native/${platform}-${arch}/desktop-host.node`), addon)
   yield* fs.copyFile(join(root, "assets/brand/trayTemplate@2x.png"), tray)
   yield* fs.copyFile(join(root, "assets/brand/application-icon.png"), icon)
   yield* fs.copyFile(join(root, "LICENSE"), license)
-  yield* fs.copyFile(join(root, `packages/daemon-management/dist/native/${platform}-${arch}/${platform === "win32" ? "magnitude-task-query.exe" : "magnitude-command"}`), command)
-  if (platform !== "win32") yield* fs.chmod(command, 0o755)
+  if (platform !== "win32") {
+    yield* fs.copyFile(join(root, `packages/daemon-management/dist/native/${platform}-${arch}/magnitude-command`), command)
+    yield* fs.chmod(command, 0o755)
+  }
   const electron = yield* fs.readFileString(join(root, "node_modules/electron/package.json")).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(PackageVersion))))
   return yield* Effect.tryPromise({ try: () => packager({
     dir: app, out: options.outputDirectory, name: "Magnitude", executableName: platform === "linux" ? "magnitude" : "Magnitude",
@@ -57,6 +59,6 @@ export const buildDesktopApplication = (options: {
     ...(platform === "win32" ? { icon: join(root, "packages/release/resources/windows/Magnitude.ico"), win32metadata: { CompanyName: "Magnitude" } } : {}),
     ...(platform === "darwin" ? { icon: join(root, "packages/release/resources/macos/Magnitude.icns"), extendInfo: { LSMinimumSystemVersion: MACOS_DEPLOYMENT_TARGET } } : {}),
     asar: true, prune: false, overwrite: true,
-    extraResource: [service, addon, tray, icon, command, license],
+    extraResource: [service, addon, tray, icon, license, ...(platform === "win32" ? [] : [command])],
   }), catch: error => new DesktopBuildFailed({ message: `Could not assemble desktop: ${String(error)}` }) })
 })).pipe(Effect.mapError(error => error instanceof DesktopBuildFailed ? error : new DesktopBuildFailed({ message: String(error) })))
