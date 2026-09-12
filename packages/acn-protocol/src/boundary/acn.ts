@@ -4,7 +4,6 @@ import { Agent } from "./agent"
 import { Connection } from "./connection"
 import { Display } from "./display"
 import { Shell } from "./shell"
-import { Onboarding } from "./onboarding"
 import { ProjectFiles } from "./project-files"
 import { Skills } from "./skills"
 import { Models } from "./models"
@@ -20,7 +19,6 @@ export const MagnitudeRpcs = {
   connection: Connection,
   display: Display,
   shell: Shell,
-  onboarding: Onboarding,
   projectFiles: ProjectFiles,
   skills: Skills,
   models: Models,

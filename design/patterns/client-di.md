@@ -84,32 +84,9 @@ Each implementation is a Layer. Its requirements are its complete direct depende
 composed service obtains lower services by yielding their Tags; it does not call constructors,
 accept an aggregate client object, or look services up by object identity.
 
-```text
-ACN RPC + QueryClient + AtomRegistry
-             |
-       +-----+----------------+
-       |                      |
-       v                      v
- LocalModels Layer       ModelSlots Layer       OnboardingPersistence Layer
-       |                      |                           |
-       +----------------------+---------------------------+
-                              |
-                              v
-                  OnboardingModelSetup Layer
-```
-
-```ts
-const OnboardingModelSetupLive = Layer.effect(
-  OnboardingModelSetup,
-  Effect.gen(function* () {
-    const localModels = yield* LocalModels
-    const modelSlots = yield* ModelSlots
-    const onboarding = yield* OnboardingPersistence
-
-    return makeOnboardingModelSetup({ localModels, modelSlots, onboarding })
-  }),
-)
-```
+For example, DesktopSession depends on LocalModels and the optional DesktopBridge. It observes
+model state and forwards presentation to the tray, while platform operations stay behind the
+bridge. The Layer declares both dependencies and owns its subscriptions for the connection scope.
 
 The renderer composition root assembles the complete Layer graph into the connection's existing
 Effect Atom runtime. `createAgentClient(sdk)` provides that same `MagnitudeClient` to the
@@ -184,21 +161,11 @@ boundary operation, materialized, at its group name (`client.Sessions.GetSession
 group the client is made for — not domain services attached to a client object. Domain services
 remain Tags acquired through the client's runtime (`client.runtime.atom(Tag)`).
 
-## Onboarding model setup
+## Observational construction
 
-The onboarding model setup capability is the proof case for this pattern:
-
-- local models and onboarding persistence are separate ACN-backed service Tags;
-- each service privately owns its Effect Query materialization; the connection owns the change
-  subscription and invalidation;
-- desktop onboarding is a Layer requiring those semantic services;
-- its client-owned execution state is retained in keep-alive Atoms in the connection registry;
-- each command is one Effect program passing exact outputs to dependent operations; and
-- the onboarding hook observes and invokes the composed service without receiving lower Query or
-  Mutation machinery.
-
-Construction does not change product behavior. Acquiring, reading, mounting, or remounting any of
-these services is observational and cannot install, assign, load, stop, or complete onboarding.
+Acquiring, reading, mounting or remounting a client service is observational. It cannot install,
+assign, load or stop a model. These mutations require explicit user actions. Desktop first use
+uses ordinary model and connection actions without a composed setup worker or completion state.
 
 ## Conformance
 

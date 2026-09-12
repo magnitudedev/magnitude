@@ -124,5 +124,3 @@ export * from "./desktop/service"
 export * from "./desktop/update"
 
 export { DesktopConnectRequest, ConnectionInspection, DesktopHarnessConnection, DesktopConnectionsSnapshot } from "./desktop/connections"
-
-export * from "./desktop/onboarding"

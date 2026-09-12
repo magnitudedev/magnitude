@@ -9,11 +9,9 @@ interface TrayActions {
 export const buildTrayMenu = (state: {
   readonly service: OwnedServiceState["_tag"] | "Unknown"
   readonly model: { readonly label: string; readonly canStop: boolean }
-  readonly setup: "Required" | "Complete" | "Unavailable"
 }, actions: TrayActions) => [
   { label: state.service === "Ready" ? "Service running" : state.service === "Failed" || state.service === "CleanupFailed" ? "Service needs attention" : (state.service === "Stopping" || state.service === "Stopped") ? "Stopping Magnitude…" : "Service starting…", enabled: false },
   { label: state.service === "Ready" ? state.model.label : "Model status unavailable", enabled: false },
-  ...(state.service === "Ready" && state.setup === "Required" ? [{ label: "Setup needed · Open Discover to begin", enabled: false }] : []),
   { type: "separator" as const },
   { label: "Open Magnitude", click: () => actions.open() },
   { label: "Discover Models", click: () => actions.open("discover") },

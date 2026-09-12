@@ -7,7 +7,6 @@ import { Display } from "./display";
 import { Files } from "./files";
 import { Git } from "./git";
 import { Models } from "./models";
-import { Onboarding } from "./onboarding";
 import { ProjectFiles } from "./project-files";
 import { Projects } from "./projects";
 import { Sessions } from "./sessions";
@@ -20,7 +19,6 @@ export const AcnQueries = Group.make({
   Connection,
   Display,
   Shell,
-  Onboarding,
   ProjectFiles,
   Skills,
   Models,
@@ -39,7 +37,6 @@ export {
   Files,
   Git,
   Models,
-  Onboarding,
   ProjectFiles,
   Projects,
   Sessions,

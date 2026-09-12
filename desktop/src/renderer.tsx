@@ -3,7 +3,7 @@ import { Button } from "../../web/src/components/ui/button"
 import { Input } from "../../web/src/components/ui/input"
 import { Progress } from "../../web/src/components/ui/progress"
 import { MagnitudeMark } from "../../web/src/components/magnitude-mark"
-import { Layers3, Library, HardDrive, Plug, Activity, Settings2, Download, Play, Square, Trash2, X, Monitor, Sun, Moon } from "lucide-react"
+import { Layers3, Library, HardDrive, Plug, Activity, Check, Settings2, Download, Play, Square, Trash2, X, Monitor, Sun, Moon } from "lucide-react"
 import { createRoot } from "react-dom/client"
 import { useMemo, useState } from "react"
 import { Atom, RegistryProvider, Result, useAtomValue, useAtomSet } from "@effect-atom/atom-react"
@@ -12,7 +12,7 @@ import { FetchHttpClient } from "@effect/platform"
 import { MagnitudeClient, ProviderModelIdSchema, type ProviderModelId, type CatalogLocalModel } from "@magnitudedev/sdk"
 import { ApplicationSnapshot, LoginStartupState } from "@magnitudedev/sdk/desktop-host"
 import {
-  DesktopApplicationInfo, DesktopUpdateState, DesktopConnectRequest, DesktopHostUnavailable, DesktopOnboarding, DesktopSession, DesktopConnectionsSnapshot, activeLocalModel, modelDownloadFailureMessage,
+  DesktopApplicationInfo, DesktopUpdateState, DesktopConnectRequest, DesktopHostUnavailable, DesktopSession, DesktopConnectionsSnapshot, activeLocalModel, modelDownloadFailureMessage,
   createAgentClient, AgentClientProvider, useAgentClient, makeFirstPartyConnection,
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, localModelFailureMessage, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
   formatStorageSize, formatMemorySize, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes,
@@ -81,16 +81,15 @@ function ModelDetails({ model, radar = false }: { model: CatalogLocalModel; rada
     </div>
   </details>
 }
-interface SetupActions { readonly busy: boolean; readonly select: (modelId: CatalogLocalModel["modelId"]) => void }
 function DownloadProgress({ acquisition }: { acquisition: CatalogLocalModel["acquisitionState"] }) {
   if (acquisition._tag !== "Installing" && acquisition._tag !== "Updating") return null
   return <div className="mt-4"><p className="mb-2 text-sm">{acquisition.progress.stage === "downloading" ? `${formatStorageSize(acquisition.progress.completedBytes)} of ${formatStorageSize(acquisition.progress.totalBytes)}` : acquisition.progress.stage.replaceAll("_", " ")}</p><Progress aria-label="Download progress" indicatorClassName="bg-blue-700 dark:bg-blue-500" value={acquisition.progress.totalBytes ? acquisition.progress.completedBytes / acquisition.progress.totalBytes * 100 : null} /></div>
 }
-function ModelCard({ model, recommended = false, visual = false, replacing, setup }: { model: CatalogLocalModel; visual?: boolean; recommended?: boolean; replacing?: string; setup?: SetupActions }) {
+function ModelCard({ model, recommended = false, visual = false, replacing }: { model: CatalogLocalModel; visual?: boolean; recommended?: boolean; replacing?: string }) {
   const { install, load, stop, cancel, remove, dismissFailure: dismiss } = useLocalModelMutations()
   const command = useLocalModelCommandStatus(model.modelId)
   const stopping = useLocalModelStopStatus()
-  const pending = setup?.busy || command.pending || stopping.pending || model.acquisitionState._tag === "Removing"
+  const pending = command.pending || stopping.pending || model.acquisitionState._tag === "Removing"
   const acquisition = model.acquisitionState
   const installed = "residencyState" in acquisition
   const residency = installed ? acquisition.residencyState : undefined
@@ -108,8 +107,8 @@ function ModelCard({ model, recommended = false, visual = false, replacing, setu
     {command.failures.map(message => <p key={message} role="alert" className="mt-3 text-sm">{message}</p>)}
     {residency?._tag === "Stopping" && Option.isSome(stopping.failure) && <p role="alert" className="mt-3 text-sm">{stopping.failure.value}</p>}
     <div className="mt-5 flex flex-wrap gap-2">
-      {transferring ? <Button variant="outline" onClick={() => cancel(model.modelId)}><X />Cancel download</Button> : !installed ? <Button disabled={pending || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { if (!setup || !replacing || window.confirm(`Setting up this model will stop ${replacing}. Continue?`)) { if (setup) setup.select(model.modelId); else install(model.modelId) } }}><Download />{setup ? "Download and load" : "Download"}</Button> : <>
-        <Button disabled={pending || residency?._tag === "Ready" || residency?._tag === "Loading" || residency?._tag === "Requested" || residency?._tag === "Stopping"} onClick={() => { if (!replacing || window.confirm(`Loading ${formatLocalModelDisplayName(model)} will stop ${replacing}. Continue?`)) { if (setup) setup.select(model.modelId); else load(model.modelId) } }}><Play />Load model</Button>
+      {transferring ? <Button variant="outline" onClick={() => cancel(model.modelId)}><X />Cancel download</Button> : !installed ? <Button disabled={pending || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><Download />Download</Button> : <>
+        <Button disabled={pending || residency?._tag === "Ready" || residency?._tag === "Loading" || residency?._tag === "Requested" || residency?._tag === "Stopping"} onClick={() => { if (!replacing || window.confirm(`Loading ${formatLocalModelDisplayName(model)} will stop ${replacing}. Continue?`)) { load(model.modelId) } }}><Play />Load model</Button>
         <Button variant="outline" disabled={stopping.pending || residency?._tag === "Unloaded" || residency?._tag === "Failed"} onClick={() => stop()}><Square />Stop model</Button>
         <Button variant="outline" disabled={pending} onClick={() => { if (window.confirm(`Remove the downloaded files for ${formatLocalModelDisplayName(model)}?`)) remove(model.modelId) }}><Trash2 />Remove</Button>
         {(acquisition._tag === "UpdateAvailable" || acquisition._tag === "UpdateFailed") && <Button variant="outline" disabled={pending} onClick={() => install(model.modelId)}>Update</Button>}
@@ -122,7 +121,7 @@ function ModelCard({ model, recommended = false, visual = false, replacing, setu
     <ModelDetails model={model} radar={!visual} />
   </article>
 }
-function Models({ page, setup }: { page: "discover" | "catalog" | "models"; setup?: SetupActions }) {
+function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const installedOnly = page === "models"
   const discover = page === "discover"
   const catalog = useCatalogModels()
@@ -151,11 +150,11 @@ function Models({ page, setup }: { page: "discover" | "catalog" | "models"; setu
     {Option.isSome(stopResult.failure) && <p role="alert" className="mt-5 text-sm">{stopResult.failure.value}</p>}
     {discover && <section aria-label="Recommendation preference" className="my-6"><div className="flex items-end justify-between gap-4"><div><h2 className="font-heading text-xl">Find your balance</h2><p className="mt-2 text-sm text-slate-500">Quick responses or deeper thinking. Choose what matters to you.</p></div><span className="rounded-full bg-blue-50 px-4 py-2 text-sm font-medium text-blue-700 dark:bg-slate-800 dark:text-blue-400">{LOCAL_MODEL_RANKING_SCALE_LABELS[preference]}</span></div><input type="range" min="0" max="4" step="1" aria-label="Model preference" aria-valuetext={LOCAL_MODEL_RANKING_SCALE_LABELS[preference]} value={preference} onChange={event=>setPreference(Number(event.target.value))} className="mt-5 h-1.5 w-full cursor-pointer appearance-none rounded-full bg-slate-200 accent-blue-600 dark:bg-slate-700 [&::-webkit-slider-thumb]:size-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-blue-500 [&::-webkit-slider-thumb]:shadow-sm" /><div className="mt-3 flex justify-between text-sm font-medium"><span>Fast <span className="font-normal text-slate-500">· lower latency</span></span><span><span className="font-normal text-slate-500">more intelligence · </span>Smart</span></div></section>}
     {!catalog.value.preparation.assessment.complete && <p className="mb-4 text-sm text-slate-500">Assessing models · {catalog.value.preparation.assessment.settledModels} of {catalog.value.preparation.assessment.totalModels}</p>}
-    {discover && <section aria-label="Top recommendations" className="mb-10"><div className="mb-5 flex items-baseline justify-between"><h2 className="font-heading text-xl">Your top picks</h2><span className="text-xs text-slate-500">Best configuration for each model</span></div><div className="flex flex-col gap-6">{featuredCatalogModels(ranked).map((model,index)=><ModelCard key={model.modelId} model={model} visual recommended={index===0} {...(setup?{setup}:{})} {...(active&&active.model.modelId!==model.modelId?{replacing:formatLocalModelDisplayName(active.model)}:{})} />)}</div><p className="mt-4 text-xs text-slate-500">Profiles use catalog scores and your machine’s assessment. Speed is estimated; memory shows footprint, not free memory.</p></section>}
+    {discover && <section aria-label="Top recommendations" className="mb-10"><div className="mb-5 flex items-baseline justify-between"><h2 className="font-heading text-xl">Your top picks</h2><span className="text-xs text-slate-500">Best configuration for each model</span></div><div className="flex flex-col gap-6">{featuredCatalogModels(ranked).map((model,index)=><ModelCard key={model.modelId} model={model} visual recommended={index===0} {...(active&&active.model.modelId!==model.modelId?{replacing:formatLocalModelDisplayName(active.model)}:{})} />)}</div><p className="mt-4 text-xs text-slate-500">Profiles use catalog scores and your machine’s assessment. Speed is estimated; memory shows footprint, not free memory.</p></section>}
     {!discover && <>
     <div className="mb-5 mt-8 flex flex-wrap items-center justify-between gap-4"><h2 className="font-heading text-xl">{installedOnly?"Your library":"Explore the catalog"}</h2><Input aria-label="Search models" placeholder="Find a model…" className="max-w-sm" value={search} onChange={event=>setSearch(event.target.value)} /></div>
     {!installedOnly && <div className="mb-5 flex items-center justify-between text-sm text-slate-500"><label className="flex items-center gap-2"><input type="checkbox" checked={fitOnly} onChange={event => setFitOnly(event.target.checked)} className="accent-blue-600" />Fits my machine</label><span>{visible.length} configurations</span></div>}
-    <div className="grid items-start gap-5 xl:grid-cols-2">{visible.map(model => <ModelCard key={model.modelId} model={model} {...(setup ? { setup } : {})} {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})} />)}</div>
+    <div className="grid items-start gap-5 xl:grid-cols-2">{visible.map(model => <ModelCard key={model.modelId} model={model} {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})} />)}</div>
     {visible.length === 0 && <p className="py-8 text-slate-500">{search ? "No matching models." : installedOnly ? "No models downloaded yet. Find one in Discover." : "No models match this filter."}</p>}
     </>}
     {discover && ranked.length === 0 && catalog.value.preparation.assessment.complete && <p className="py-8 text-slate-500">No fitting recommendations right now. Explore Catalog for compatibility details.</p>}
@@ -225,7 +224,7 @@ function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null
   const ready=service?._tag === "Ready"
   return <div className="mt-7 space-y-6">
     <section className="relative overflow-hidden rounded-2xl border border-blue-200 bg-gradient-to-br from-blue-50 to-white p-7 dark:border-slate-700 dark:from-slate-800 dark:to-slate-900">
-      <div className="flex items-center gap-5"><div className="flex size-16 items-center justify-center rounded-full border border-blue-300 bg-white text-blue-600 dark:border-blue-800 dark:bg-slate-900 dark:text-blue-400"><Activity className="size-7" /></div><div><p className="text-xs font-medium uppercase tracking-widest text-slate-500">Magnitude service</p><h2 className="mt-2 font-heading text-2xl">{ready ? "Ready when you are" : service?._tag === "CleanupFailed" ? "Cleanup needs attention" : service?._tag === "Failed" ? "Let’s get you running" : "Starting your local engine"}</h2><p className="mt-2 text-sm text-slate-500">{ready ? "Your service is running. Model activity is shown separately below." : service?._tag ?? "Connecting"}</p></div></div>
+      <div className="flex items-center gap-5"><div className={`flex size-16 items-center justify-center rounded-full border bg-white dark:bg-slate-900 ${ready ? "border-green-300 text-green-600 dark:border-green-800 dark:text-green-400" : "border-blue-300 text-blue-600 dark:border-blue-800 dark:text-blue-400"}`}>{ready ? <Check aria-label="Service ready" className="size-7 text-green-600 dark:text-green-400" /> : <Activity className="size-7" />}</div><div><p className="text-xs font-medium uppercase tracking-widest text-slate-500">Magnitude service</p><h2 className="mt-2 font-heading text-2xl">{ready ? "Ready when you are" : service?._tag === "CleanupFailed" ? "Cleanup needs attention" : service?._tag === "Failed" ? "Let’s get you running" : "Starting your local engine"}</h2><p className="mt-2 text-sm text-slate-500">{ready ? "Your service is running. Model activity is shown separately below." : service?._tag ?? "Connecting"}</p></div></div>
       {service && "message" in service && <p role="alert" className="mt-5 text-sm">{service.message}</p>}
       {service?._tag === "Failed" && <Button className="mt-5" variant="outline" onClick={() => host.retry()}>Retry service</Button>}
     </section>
@@ -233,8 +232,7 @@ function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null
       {ready ? <ModelStatus /> : <section className="rounded-2xl border border-slate-200 bg-white p-6 dark:border-slate-750 dark:bg-slate-850"><h2 className="font-heading text-lg">Model activity</h2><p className="mt-4 text-sm text-slate-500">Model status will return when the service is ready.</p></section>}
       {ready && <DownloadActivity />}
     </div>
-    <section className="rounded-2xl border border-slate-200 bg-white p-6 dark:border-slate-750 dark:bg-slate-850"><div className="flex items-center gap-3"><Plug className="size-5 text-blue-600 dark:text-blue-400" /><h2 className="font-heading text-lg">Local connection</h2></div><p className="mt-2 text-sm text-slate-500">Your tools connect to Magnitude on this machine.</p><p className="mt-4 break-all rounded-lg bg-slate-50 p-4 font-mono text-sm dark:bg-slate-900">{snapshot?.endpoint ?? "Endpoint unavailable"}</p><div className="mt-5 flex items-start gap-3"><span className={`mt-1 size-2 shrink-0 rounded-full ${snapshot?.tray._tag === "Registered" ? "bg-blue-500" : "bg-slate-400"}`} /><div><p className="text-sm font-medium">Tray icon</p><p className="mt-1 text-sm text-slate-500">{snapshot?.tray._tag === "Registered" ? "Registered with your desktop. Magnitude keeps running when you close the window." : snapshot?.tray._tag === "Unavailable" ? snapshot.tray.message : snapshot?.tray._tag === "Closed" ? "Magnitude is quitting." : "Checking tray availability…"}</p></div></div></section>
-    <HardwareOverview />
+    <section className="rounded-2xl border border-slate-200 bg-white p-6 dark:border-slate-750 dark:bg-slate-850"><div className="flex items-center gap-3"><Plug className="size-5 text-blue-600 dark:text-blue-400" /><h2 className="font-heading text-lg">Local connection</h2></div><p className="mt-2 text-sm text-slate-500">Your tools connect to Magnitude on this machine.</p><p className="mt-4 break-all rounded-lg bg-slate-50 p-4 font-mono text-sm dark:bg-slate-900">{snapshot?.endpoint ?? "Endpoint unavailable"}</p><div className="mt-5 flex items-start gap-3"><span className={`mt-1 size-2 shrink-0 rounded-full ${snapshot?.tray._tag === "Registered" ? "bg-blue-500" : "bg-slate-400"}`} /><div><p className="text-sm font-medium">Background activity</p><p className="mt-1 text-sm text-slate-500">{snapshot?.tray._tag === "Registered" ? "Magnitude keeps running when you close the window." : snapshot?.tray._tag === "Unavailable" ? snapshot.tray.message : snapshot?.tray._tag === "Closed" ? "Magnitude is quitting." : "Checking tray availability…"}</p></div></div></section>
   </div>
 }
 function ApplicationSettings() {
@@ -309,21 +307,7 @@ function LoginSettingsView({ service }: { service: DesktopSession }) {
     {Result.isFailure(change) && <p role="alert" className="mt-3 text-sm">{hostFailureMessage(change.cause)}</p>}
   </section>
 }
-function useDesktopSetup() {
-  const client = useAgentClient()
-  const service = useMemo(() => client.runtime.atom(DesktopOnboarding), [client])
-  const view = useAtomValue(useMemo(() => Atom.make(get => Result.flatMap(get(service), setup => Result.map(get(setup.completion), completion => ({ completed: completion.completed, state: get(setup.state) })))), [service]))
-  const select = useAtomSet(useMemo(() => client.runtime.fn((modelId: CatalogLocalModel["modelId"]) => Effect.flatMap(DesktopOnboarding, setup => setup.select(modelId))), [client]))
-  const finishAtom = useMemo(() => client.runtime.fn(() => Effect.flatMap(DesktopOnboarding, setup => setup.finish)), [client])
-  const finish = useAtomSet(finishAtom)
-  const finishing = useAtomValue(finishAtom)
-  const retry = useAtomSet(useMemo(() => client.runtime.fn(() => Effect.flatMap(DesktopOnboarding, setup => setup.retry)), [client]))
-  const busy = Result.isSuccess(view) && (view.value.state._tag === "Installing" || view.value.state._tag === "Loading")
-  return { view, select, finish, finishing, retry, busy }
-}
 function App() {
-  const setup = useDesktopSetup()
-  const firstUse = Result.isSuccess(setup.view) && !setup.view.value.completed
   const state = useAtomValue(hostState)
   const client = useAgentClient()
   const session = useMemo(() => client.runtime.atom(DesktopSession), [client])
@@ -335,23 +319,11 @@ function App() {
   return <div className="flex h-screen bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200">
     <aside className="flex w-56 shrink-0 flex-col border-r border-slate-200 px-4 py-8 dark:border-slate-750"><div className="mb-10 flex items-center gap-3 px-3 font-heading text-base font-semibold"><MagnitudeMark className="h-8 w-8" />Magnitude</div><nav className="flex min-h-0 flex-1 flex-col gap-2">{(Object.keys(pageNames) as Page[]).map(key => <Button variant="ghost" key={key} onClick={() => navigate(key)} aria-current={page === key ? "page" : undefined} className={`h-10 justify-start gap-3 rounded-lg px-3 text-left text-sm font-medium ${key === "status" ? "mt-auto" : ""} ${page === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>{(() => { const Icon = pageIcons[key]; return <Icon className="size-4" /> })()}{pageNames[key]}</Button>)}</nav></aside>
     <main key={page} className="min-w-0 flex-1 overflow-y-auto px-10 py-9"><h1 className="font-heading text-[28px] font-semibold tracking-tight">{pageNames[page]}</h1>
-      {service?._tag === "Ready" && (page === "discover" || page === "connections") && <>
-        {Result.isFailure(setup.view) ? <div role="alert" className="mt-6 text-sm">Could not read setup status. <Button variant="outline" onClick={() => setup.retry()}>Retry</Button></div>
-        : firstUse && Result.isSuccess(setup.view) ? <section aria-label="Get started" className="my-5 rounded-xl border border-blue-200 bg-blue-50 p-4 dark:border-slate-700 dark:bg-slate-850">
-          <div className="flex flex-wrap items-center justify-between gap-x-5 gap-y-3">
-          <div className="min-w-0 flex-1 basis-80"><h2 className="text-sm font-semibold">{setup.view.value.state._tag === "Ready" ? "Model setup complete" : "Get started with local models"}</h2>
-          <p className="mt-1 text-sm leading-5 text-slate-600 dark:text-slate-300">{setup.busy ? setup.view.value.state._tag === "Installing" ? "Downloading your model. It will load when the download finishes." : "Loading your model…" : setup.view.value.state._tag === "Ready" ? "Connect a tool, or finish setup and explore." : page === "discover" ? "Choose a model below. Connect your tools next." : "Choose a model in Discover, then connect your tools here."}</p></div>
-          <div className="flex flex-wrap gap-3">{setup.view.value.state._tag === "Ready" && page !== "connections" && <Button onClick={() => navigate("connections")}>Connect a tool</Button>}<Button variant="outline" disabled={setup.busy || setup.finishing.waiting} onClick={() => setup.finish()}>{setup.view.value.state._tag === "Ready" ? "Finish setup" : "Skip setup"}</Button></div>
-          </div>
-          {setup.view.value.state._tag === "Failed" && <p role="alert" className="mt-3 text-sm">{setup.view.value.state.message}</p>}
-          {Result.isFailure(setup.finishing) && <p role="alert" className="mt-3 text-sm">Could not save setup completion. Try again.</p>}
-        </section> : null}
-      </>}
       {page === "status" ? <Status snapshot={Result.isSuccess(state) ? state.value : null} />
       : page === "settings" ? <><AppearanceSettings /><LoginSettings /><ApplicationSettings /></>
-      : page === "connections" ? <Connections serviceReady={service?._tag === "Ready"} selectedModel={firstUse && Result.isSuccess(setup.view) && setup.view.value.state._tag === "Ready" ? Option.some(ProviderModelIdSchema.make(setup.view.value.state.modelId)) : Option.none()} />
+      : page === "connections" ? <Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} />
       : service?._tag !== "Ready" ? <p className="mt-8">{service?._tag === "Failed" ? "The service needs attention. Open Status for details." : "Starting the Magnitude service…"}</p>
-      : page === "discover" || page === "catalog" || page === "models" ? <Models page={page} {...(firstUse ? { setup: { busy: setup.busy, select: setup.select } } : {})} />
+      : page === "discover" || page === "catalog" || page === "models" ? <Models page={page} />
       : null}
     </main>
   </div>
@@ -391,7 +363,6 @@ const boot = Effect.gen(function* () {
     connect: input => hostCommand(() => host.connect(Schema.encodeSync(DesktopConnectRequest)(input))),
     disconnect: harness => hostCommand(() => host.disconnect(harness)),
     actions: Stream.asyncPush(emit => Effect.acquireRelease(Effect.sync(() => host.actions(action => emit.single(action))), unsubscribe => Effect.sync(unsubscribe)).pipe(Effect.asVoid)),
-    presentSetup: status => Effect.tryPromise(() => host.presentSetup(status)),
     presentModel: value => Effect.tryPromise(() => host.presentModel(value)),
   } })
   root.render(<RegistryProvider><AgentClientProvider tag={client}><App /></AgentClientProvider></RegistryProvider>)

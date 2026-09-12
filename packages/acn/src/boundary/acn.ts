@@ -22,7 +22,6 @@ import { uploadAttachment } from "../attachment-upload";
 import { getSkill, listSkills, runBash } from "../skill-shell-ops";
 import { UserBashCommandId, type AppEvent } from "@magnitudedev/agent";
 import { createId } from "@magnitudedev/generate-id";
-import { Onboarding } from "../onboarding";
 import { AcnChanges } from "../changes";
 import { ModelCatalog } from "../model-catalog";
 import { ModelCommands } from "../model-commands";
@@ -62,7 +61,6 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
     const cloudUsage = yield* MagnitudeCloudUsage;
     const activeSessionStatuses = yield* ActiveSessionStatusesService;
     const displayStreams = yield* DisplayViewStreams;
-    const onboarding = yield* Onboarding;
     const changes = yield* AcnChanges;
     const modelCatalog = yield* ModelCatalog;
     const modelCommands = yield* ModelCommands;
@@ -368,18 +366,6 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
             ...(payload.days !== undefined ? { days: payload.days } : {}),
             ...(payload.tz !== undefined ? { tz: payload.tz } : {}),
           })
-        ),
-
-      GetOnboardingState: () =>
-        observeRpcDefects(
-          "GetOnboardingState",
-          onboarding.state,
-        ),
-
-      CompleteOnboarding: () =>
-        observeRpcDefects(
-          "CompleteOnboarding",
-          onboarding.complete.pipe(Effect.as({})),
         ),
 
       // Server-side operations

@@ -15,12 +15,9 @@ import type { SessionStorageShape } from './sessions/contracts'
 import { GlobalStorage } from './services'
 import {
   EMPTY_MODEL_STATE,
-  EMPTY_ONBOARDING_STATE,
   ModelStateSchema,
-  OnboardingStateSchema,
   ProjectStateSchema,
   type ModelState,
-  type OnboardingState,
   type ProjectState,
 } from './types'
 import { makeStateDocument, type StateDocumentError, type StateHandle } from './state'
@@ -32,7 +29,6 @@ export interface MagnitudeStorageShape {
   readonly memory: MemoryStorageShape
   readonly logs: LogStorageShape
   readonly models: StateHandle<ModelState, StateDocumentError>
-  readonly onboarding: StateHandle<OnboardingState, StateDocumentError>
   readonly projects: StateHandle<ProjectState, StateDocumentError>
 }
 
@@ -52,12 +48,6 @@ export const StorageLive = Layer.effect(
       initial: () => EMPTY_MODEL_STATE,
       equivalence: Schema.equivalence(ModelStateSchema),
     })
-    const onboarding = yield* makeStateDocument({
-      path: global.paths.onboardingFile,
-      schema: OnboardingStateSchema,
-      initial: () => EMPTY_ONBOARDING_STATE,
-      equivalence: Schema.equivalence(OnboardingStateSchema),
-    })
     const projects = yield* makeStateDocument({
       path: global.paths.projectsFile,
       schema: ProjectStateSchema,
@@ -71,7 +61,6 @@ export const StorageLive = Layer.effect(
       memory: yield* makeMemoryStorage(),
       logs: yield* makeLogStorage(),
       models,
-      onboarding,
       projects,
     })
   })

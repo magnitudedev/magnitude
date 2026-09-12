@@ -1,4 +1,3 @@
-import { OnboardingPersistence } from "../onboarding/persistence"
 import { Atom, Registry, Result } from "@effect-atom/atom-react"
 import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import type { LoginStartupState } from "@magnitudedev/sdk/desktop-host"
@@ -13,7 +12,6 @@ import type { DesktopUpdateState } from "./update"
 export const DesktopPage = Schema.Literal("discover", "catalog", "models", "connections", "status", "settings")
 export type DesktopPage = typeof DesktopPage.Type
 export const DesktopAction = Schema.Union(Schema.TaggedStruct("Navigate", { page: DesktopPage }), Schema.TaggedStruct("StopModel", {}))
-export const SetupStatus = Schema.Literal("Required", "Complete", "Unavailable")
 export const ModelTrayPresentation = Schema.Struct({ label: Schema.String, canStop: Schema.Boolean })
 export const DesktopApplicationInfo = Schema.Struct({ version: Schema.String })
 export class DesktopHostUnavailable extends Schema.TaggedError<DesktopHostUnavailable>()("DesktopHostUnavailable", {}) {
@@ -31,7 +29,6 @@ export interface DesktopBridge {
   readonly connect: (input: DesktopConnectRequest) => Effect.Effect<void, unknown>
   readonly disconnect: (harness: HarnessId) => Effect.Effect<void, unknown>
   readonly actions: Stream.Stream<typeof DesktopAction.Type>
-  readonly presentSetup: (status: typeof SetupStatus.Type) => Effect.Effect<void, unknown>
   readonly presentModel: (value: typeof ModelTrayPresentation.Type) => Effect.Effect<void, unknown>
 }
 export const DesktopBridge = Context.GenericTag<Option.Option<DesktopBridge>>("client/DesktopBridge")
@@ -63,11 +60,6 @@ const makeDesktopSession = Effect.gen(function* () {
   const navigate = (value: DesktopPage) => Effect.sync(() => registry.set(page, value))
   if (Option.isSome(bridge)) {
     const host = bridge.value
-    const onboarding = yield* OnboardingPersistence
-    yield* Registry.toStream(registry, onboarding.state).pipe(
-      Stream.map(result => Result.isSuccess(result) ? result.value.completed ? "Complete" as const : "Required" as const : "Unavailable" as const),
-      Stream.changes, Stream.runForEach(status => host.presentSetup(status).pipe(Effect.catchAll(Effect.logError))), Effect.forkScoped,
-    )
     const models = yield* LocalModels
     yield* host.actions.pipe(Stream.runForEach(action => action._tag === "Navigate" ? navigate(action.page) : models.stop.pipe(Effect.asVoid, Effect.catchAll(Effect.logError))), Effect.forkScoped)
     yield* Registry.toStream(registry, models.state).pipe(
