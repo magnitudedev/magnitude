@@ -19,6 +19,7 @@ export default defineConfig({
   main: {
     define: {
       __MAGNITUDE_UPDATE_CONFIGURATION__: JSON.stringify(updateConfiguration),
+      __MAGNITUDE_UPDATE_ACCEPTANCE__: JSON.stringify(Boolean(acceptanceConfig)),
     },
     plugins: [{ name: "harness-skill-text", load(id) { if (id.endsWith(".md")) return `export default ${JSON.stringify(readFileSync(id, "utf8"))}` } }],
     build: {

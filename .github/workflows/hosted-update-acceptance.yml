@@ -1,0 +1,63 @@
+name: Hosted update acceptance
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [app]
+    paths:
+      - .github/workflows/hosted-update-acceptance.yml
+      - packages/release/scripts/acceptance/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-update-acceptance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  signed-mac-apps:
+    environment: apple-release
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["0.0.14", "0.0.15"]
+    env:
+      MAGNITUDE_APPLE_DISTRIBUTION: developer-id
+      MAGNITUDE_ACCEPTANCE_VERSION: ${{ matrix.version }}
+      MAGNITUDE_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/magnitude-update-acceptance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - name: Import Apple signing credentials
+        run: bash packages/release/scripts/apple/credentials.sh
+        env:
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_NOTARY_API_KEY_P8: ${{ secrets.APPLE_NOTARY_API_KEY_P8 }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+      - name: Build matched application and service without rebuilding inference
+        run: bun packages/release/scripts/acceptance/build-desktop.ts
+      - name: Retain signed installers and notarization evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: update-acceptance-mac-${{ matrix.version }}
+          path: ${{ runner.temp }}/magnitude-update-acceptance/artifacts
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Remove signing credentials
+        if: always()
+        run: bash packages/release/scripts/apple/cleanup-credentials.sh
