@@ -24,6 +24,7 @@ from magnitude_engine.models.qwen35.tensor_program import (
 from magnitude_engine.weights.formats.gguf import GGUFFormat
 from magnitude_engine.weights.formats.mlx_safetensors import MLXFormat
 from magnitude_engine.weights.tensor_residency import TensorWeights
+from magnitensor.compiler.unit import ParameterKind, build_unit
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +45,10 @@ class QualificationResult:
     kernels: int
     submissions: int
     temporary_bytes: int
+    bound_parameters: int
+    dynamic_parameters: int
+    largest_region_nodes: int
+    representation_bytes: dict[str, int]
     selected: dict[str, int]
     failures: tuple[str, ...]
 
@@ -118,7 +123,26 @@ def qualify(
         for item in plan.diagnostics.candidates
         if item.selected
     )
-    failures = _failures(description, case, selected, len(plan.submissions))
+    units = tuple(build_unit(plan.graph, plan.memory, unit) for unit in plan.submissions)
+    bound_parameters = sum(
+        parameter.kind in (ParameterKind.CONSTANT, ParameterKind.TEMPORARY)
+        for unit in units for parameter in unit.parameters
+    )
+    dynamic_parameters = sum(
+        parameter.kind not in (ParameterKind.CONSTANT, ParameterKind.TEMPORARY)
+        for unit in units for parameter in unit.parameters
+    )
+    representation_bytes = Counter()
+    for spec in weight_specs.values():
+        representation_bytes[_representation_name(spec)] += spec.storage_nbytes
+    failures = _failures(
+        description,
+        case,
+        selected,
+        len(plan.submissions),
+        weight_specs,
+        plan.cover.candidates,
+    )
     return QualificationResult(
         case,
         plan.graph.fingerprint,
@@ -126,6 +150,10 @@ def qualify(
         plan.diagnostics.dispatches,
         len(plan.submissions),
         plan.memory.temporary_bytes,
+        bound_parameters,
+        dynamic_parameters,
+        max((len(candidate.nodes) for candidate in plan.cover.candidates), default=0),
+        dict(sorted(representation_bytes.items())),
         dict(sorted(selected.items())),
         tuple(failures),
     )
@@ -136,25 +164,82 @@ def _failures(
     case: QualificationCase,
     selected: Counter[str],
     submissions: int,
+    weight_specs: dict[str, mt.TensorSpec],
+    candidates: tuple[mt.Candidate, ...],
 ) -> list[str]:
     failures = []
-    for operation in ("linear.portable", "matmul.portable"):
+    forbidden_primitives = {
+        "linear.portable",
+        "matmul.portable",
+        "embedding.portable",
+        "route_topk.portable",
+        "routed_experts.portable",
+        "causal_attention.portable",
+        "attention_prepare.portable",
+        "kv_append.portable",
+        "recurrent_prepare.portable",
+        "gated_delta_recurrence.portable",
+        "rms_norm.portable",
+        "row_dot.portable",
+        "reshape.portable",
+    }
+    for operation in sorted(forbidden_primitives):
         if selected[operation]:
-            failures.append(f"selected forbidden scalar contraction {operation}")
+            failures.append(f"selected forbidden production fallback {operation}")
+    for name in selected:
+        if any(marker in name for marker in ("direct-encoded", "fragment-encoded", "scalar")):
+            failures.append(f"selected obsolete implementation {name}")
+    expected_region_kernels = {
+        "routed_experts.grouped": 4,
+        "routed_experts.packet-shared": 2,
+        "dense_swiglu.packet-prefill": 2,
+        "dense_swiglu.packet-decode": 2,
+        "attention.matrix-streaming-gated-output": 2,
+        "attention.partitioned-gated-output": 3,
+        "recurrent.output-prefill": 2,
+        "recurrent.output-decode": 2,
+    }
+    for candidate in candidates:
+        family = candidate.name.split("@", 1)[0]
+        expected_kernels = expected_region_kernels.get(family)
+        if expected_kernels is not None and candidate.kernel_count != expected_kernels:
+            failures.append(
+                f"{family} uses {candidate.kernel_count} kernels; expected {expected_kernels}"
+            )
     if submissions != 1:
         failures.append(f"expected one maximal submission, selected {submissions}")
+    for name, spec in weight_specs.items():
+        representation = spec.representation
+        if (
+            isinstance(representation, mt.Affine)
+            and representation.code.low_bits == 4
+            and representation.group == 32
+            and isinstance(representation.coefficients, mt.DirectCoefficients)
+            and representation.coefficients.scale_dtype == mt.DType.F32
+        ):
+            failures.append(f"hierarchical quantization was expanded for {name}")
     attention = sum(isinstance(block.mixer, AttentionWeights) for block in description.blocks)
     recurrent = len(description.blocks) - attention
-    selected_attention = sum(
-        count for name, count in selected.items() if name.startswith("causal_attention.")
-    )
-    if case.logits and selected_attention != attention:
-        failures.append("not every attention layer selected an attention schedule")
-    if case.logits and selected["recurrent_prepare.channel-parallel"] != recurrent:
+    if selected["attention.prepare-append"] != attention:
+        failures.append(
+            f"expected {attention} fused attention prepare/append regions, "
+            f"selected {selected['attention.prepare-append']}"
+        )
+    if selected["recurrent_prepare.channel-parallel"] != recurrent:
         failures.append("not every recurrent layer selected channel-parallel preparation")
+    if selected["gated_delta.register-state"] != recurrent:
+        failures.append("not every recurrent layer selected register-resident recurrence")
+    if (
+        case.mode == "prefill"
+        and case.logits
+        and selected["attention.matrix-streaming-gated-output"] != attention
+    ):
+        failures.append(
+            "not every attention layer fused matrix-streaming attention, gate, and output"
+        )
     if case.name == "decode-b1":
         expected = len(description.blocks)
-        actual = selected["linear.parallel-direct"]
+        actual = selected["linear.parallel-packet"]
         if actual != expected:
             failures.append(
                 f"expected {expected} fused parallel projection regions, selected {actual}"
@@ -168,18 +253,52 @@ def _failures(
         for block in description.blocks
     )
     if routed and case.logits:
-        expected = "routed_experts.grouped" if case.mode == "prefill" else "routed_experts.direct"
+        if case.name == "decode-b1":
+            if selected["route_topk.fused-router"] != routed:
+                failures.append(
+                    f"expected {routed} fused router/top-k regions, "
+                    f"selected {selected['route_topk.fused-router']}"
+                )
+        elif selected["route_topk.subgroup"] != routed:
+            failures.append(
+                f"expected {routed} subgroup top-k regions after matrix router projection, "
+                f"selected {selected['route_topk.subgroup']}"
+            )
+        expected = (
+            "routed_experts.grouped"
+            if case.mode == "prefill"
+            else "routed_experts.packet-shared"
+        )
         if selected[expected] != routed:
             failures.append(f"expected {routed} {expected} regions, selected {selected[expected]}")
-        if selected["routed_experts.portable"]:
-            failures.append("selected portable routed experts")
-    if dense and case.logits and case.mode == "prefill" and case.rows > 4:
-        if selected["dense_swiglu.matrix"] != dense:
-            actual = selected["dense_swiglu.matrix"]
+    if case.logits:
+        expected_dense = dense + (routed if case.mode == "prefill" else 0)
+        dense_name = f"dense_swiglu.packet-{case.mode}"
+        if selected[dense_name] != expected_dense:
             failures.append(
-                f"expected {dense} matrix SwiGLU regions, selected {actual}"
+                f"expected {expected_dense} {dense_name} regions, selected {selected[dense_name]}"
             )
+    if case.mode == "decode" and case.logits:
+        if selected["attention.partitioned-gated-output"] != attention:
+            failures.append("not every attention layer fused partition merge, gate, and output")
+        if selected["recurrent.output-decode"] != recurrent:
+            failures.append("not every recurrent layer fused normalization, gate, and output")
     return failures
+
+
+def _representation_name(spec: mt.TensorSpec) -> str:
+    representation = spec.representation
+    if representation is None or isinstance(representation, mt.Dense):
+        return f"dense-{spec.dtype.value}"
+    if isinstance(representation, mt.Affine):
+        coefficients = representation.coefficients
+        family = "hierarchical" if isinstance(
+            coefficients, mt.HierarchicalCoefficients
+        ) else "direct"
+        return f"affine-{representation.code.bits}bit-g{representation.group}-{family}"
+    if isinstance(representation, mt.Codebook):
+        return f"codebook-{representation.code_bits}bit-g{representation.group}"
+    raise TypeError(f"unknown representation {representation!r}")
 
 
 def standard_cases(contexts: tuple[int, int], max_batch: int) -> tuple[QualificationCase, ...]:

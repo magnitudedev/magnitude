@@ -95,6 +95,9 @@ class ResidualRMSRule:
         norm = graph.nodes[norm_ids[0]]
         if len(norm.inputs) != 2 or norm.inputs[0] != residual:
             return ()
+        nodes = frozenset({add.id, norm.id})
+        if nodes != frozenset(range(add.id, norm.id + 1)):
+            return ()
         specs = tuple(graph.values[value].spec for value in (*add.inputs, norm.inputs[1]))
         if (
             any(not spec.static for spec in specs)
@@ -134,3 +137,125 @@ class ResidualRMSRule:
                 priority=40,
             ),
         )
+
+
+@T.macro
+def _rms(source, weight, output, rows, width, epsilon, threads, dtype, weighted):
+    with T.Kernel(rows, threads=threads) as row:
+        lane = T.get_thread_binding()
+        squares = T.alloc_shared((threads,), "float32")
+        partial = T.alloc_local((1,), "float32")
+        partial[0] = 0.0
+        for chunk in T.serial(T.ceildiv(width, threads)):
+            channel = chunk * threads + lane
+            if channel < width:
+                value = T.cast(source[row, channel], "float32")
+                partial[0] += value * value
+        squares[lane] = partial[0]
+        T.sync_threads()
+        for step in T.unroll(threads.bit_length() - 1):
+            distance = threads >> (step + 1)
+            if lane < distance:
+                squares[lane] += squares[lane + distance]
+            T.sync_threads()
+        inverse = T.rsqrt(squares[0] / width + epsilon)
+        for chunk in T.serial(T.ceildiv(width, threads)):
+            channel = chunk * threads + lane
+            if channel < width:
+                if weighted:
+                    output[row, channel] = T.cast(
+                        T.cast(source[row, channel], "float32")
+                        * inverse
+                        * T.cast(weight[channel], "float32"),
+                        dtype,
+                    )
+                else:
+                    output[row, channel] = T.cast(
+                        T.cast(source[row, channel], "float32") * inverse,
+                        dtype,
+                    )
+
+
+class _RMSEmitter:
+    def __init__(self, spec, epsilon, threads, weighted):
+        self.spec, self.epsilon, self.threads, self.weighted = spec, epsilon, threads, weighted
+
+    def __call__(self, operands: tuple[Any, ...]) -> None:
+        rows = self.spec.elements // cast(int, self.spec.shape[-1])
+        width = cast(int, self.spec.shape[-1])
+        weight = operands[1] if self.weighted else operands[0]
+        output = operands[2] if self.weighted else operands[1]
+        _rms(
+            operands[0], weight, output, rows, width, self.epsilon, self.threads,
+            self.spec.dtype.value, self.weighted,
+        )
+
+
+class RMSRule:
+    name = "parallel-rms"
+
+    def enumerate(self, graph: Graph, root: int, context: LoweringContext):
+        node = graph.nodes[root]
+        if node.operation != "rms_norm" or "shared" not in context.capabilities.memory_scopes:
+            return ()
+        specs = tuple(graph.values[value].spec for value in (*node.inputs, *node.outputs))
+        source = specs[0]
+        if any(not spec.static for spec in specs) or source.rank < 2:
+            return ()
+        width = cast(int, source.shape[-1])
+        threads = min(1 << (width - 1).bit_length(), context.capabilities.threads_per_group)
+        if threads & (threads - 1):
+            return ()
+        moved = sum(spec.storage_nbytes for spec in specs)
+        return (Candidate(
+            f"rms_norm.parallel@{root}", frozenset({root}), node.inputs, node.outputs,
+            _RMSEmitter(source, node.attributes["epsilon"], threads, len(node.inputs) == 2),
+            3e-7 + moved / 180e9, priority=40,
+        ),)
+
+
+@T.macro
+def _row_dot(source, weight, output, rows, width, threads, dtype):
+    with T.Kernel(rows, threads=threads) as row:
+        lane = T.get_thread_binding()
+        partial = T.alloc_local((1,), "float32")
+        partial[0] = 0.0
+        for chunk in T.serial(T.ceildiv(width, threads)):
+            channel = chunk * threads + lane
+            if channel < width:
+                partial[0] += T.cast(source[row, channel], "float32") * T.cast(
+                    weight[channel], "float32"
+                )
+        total = T.warp_reduce_sum(partial[0])
+        if lane == 0:
+            output[row, 0] = T.cast(total, dtype)
+
+
+class _RowDotEmitter:
+    def __init__(self, rows, width, threads, dtype):
+        self.args = rows, width, threads, dtype
+
+    def __call__(self, operands: tuple[Any, ...]) -> None:
+        _row_dot(operands[0], operands[1], operands[2], *self.args)
+
+
+class RowDotRule:
+    name = "subgroup-row-dot"
+
+    def enumerate(self, graph: Graph, root: int, context: LoweringContext):
+        node = graph.nodes[root]
+        if node.operation != "row_dot" or context.capabilities.subgroup_width != 32:
+            return ()
+        source = graph.values[node.inputs[0]].spec
+        if not source.static or source.rank != 2:
+            return ()
+        rows, width = cast(tuple[int, int], source.shape)
+        output = graph.values[node.outputs[0]].spec
+        return (Candidate(
+            f"row_dot.subgroup@{root}", frozenset({root}), node.inputs, node.outputs,
+            _RowDotEmitter(rows, width, 32, output.dtype.value),
+            2e-7 + source.storage_nbytes / 200e9, priority=40,
+        ),)
+
+
+__all__ = ["RMSRule", "ResidualRMSRule", "RowDotRule"]

@@ -25,7 +25,6 @@ from .representations import (
     Dense,
     DirectCoefficients,
     HierarchicalCoefficients,
-    TensorRepresentation,
 )
 from .runtime.resources import CapacityError, Completion, Device, Execution, Resource
 from .runtime.tilelang import TileLangRuntime
@@ -115,7 +114,6 @@ __all__ = [
     "Resource",
     "Signature",
     "Tensor",
-    "TensorRepresentation",
     "TensorSpec",
     "TileLangRuntime",
     "TuningDatabase",

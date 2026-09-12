@@ -7,10 +7,9 @@ from typing import Any, cast
 import tilelang.language as T
 
 from ..compiler.lowering import Candidate, LoweringContext
-from ..representations import Dense
 from ..tensor.graph import Graph
 from ..tensor.types import DType, TensorSpec
-from .quantization import represented_load
+from .packed import decode_packet, packet_format
 
 
 def _aligned_capacity(rows: int, selected: int, experts: int, tile: int) -> int:
@@ -19,9 +18,11 @@ def _aligned_capacity(rows: int, selected: int, experts: int, tile: int) -> int:
 
 
 @T.macro
-def _group_count(
-    routes, order, inverse, block_experts, counts, rows, selected, experts, capacity, tile
+def _group_routes(
+    routes, order, inverse, block_experts, counts, cursors,
+    rows, selected, experts, capacity, tile,
 ):
+    """Build the complete expert permutation in one workgroup launch."""
     count = rows * selected
     blocks = capacity // tile
     with T.Kernel(1, threads=256):
@@ -47,25 +48,16 @@ def _group_count(
                 expert = routes[route // selected, route % selected]
                 if 0 <= expert and expert < experts:
                     T.atomic_add(counts[expert], 1)
-
-
-@T.macro
-def _group_prefix(counts, cursors, block_experts, experts, tile):
-    with T.Kernel(1, threads=1):
-        cursor = T.alloc_local((1,), "int32")
-        cursor[0] = 0
-        for expert in T.serial(experts):
-            cursors[expert] = cursor[0]
-            for block in T.serial(T.ceildiv(counts[expert], tile)):
-                block_experts[cursor[0] // tile + block] = expert
-            cursor[0] += T.ceildiv(counts[expert], tile) * tile
-
-
-@T.macro
-def _group_scatter(routes, order, inverse, cursors, rows, selected, experts):
-    count = rows * selected
-    with T.Kernel(1, threads=256):
-        lane = T.get_thread_binding(0)
+        T.sync_threads()
+        if lane == 0:
+            cursor = T.alloc_local((1,), "int32")
+            cursor[0] = 0
+            for expert in T.serial(experts):
+                cursors[expert] = cursor[0]
+                for block in T.serial(T.ceildiv(counts[expert], tile)):
+                    block_experts[cursor[0] // tile + block] = expert
+                cursor[0] += T.ceildiv(counts[expert], tile) * tile
+        T.sync_threads()
         for chunk in T.serial(T.ceildiv(count, 256)):
             route = chunk * 256 + lane
             if route < count:
@@ -76,13 +68,88 @@ def _group_scatter(routes, order, inverse, cursors, rows, selected, experts):
                     inverse[route] = position
 
 
-def _weight(storage, spec: TensorSpec, expert, output, reduction):
-    experts, rows, columns = cast(tuple[int, int, int], spec.shape)
-    del experts
-    if spec.representation is None or isinstance(spec.representation, Dense):
-        return T.cast(storage[expert, output, reduction], spec.dtype.value)
-    index = (expert * rows + output) * columns + reduction
-    return T.cast(represented_load(storage, spec, index), spec.dtype.value)
+@T.macro
+def _grouped_gated_projection(
+    source,
+    order,
+    block_experts,
+    gate,
+    up,
+    output,
+    gate_spec,
+    up_spec,
+    blocks,
+    source_width,
+    output_width,
+    selected,
+    source_grouped,
+    bm,
+    bn,
+    bk,
+    threads,
+):
+    packet = packet_format(gate_spec)
+    assert packet is not None and packet_format(up_spec) == packet
+    with T.Kernel(T.ceildiv(output_width, bn), blocks, threads=threads) as (bx, by):
+        x = T.alloc_shared((bm, bk), gate_spec.dtype.value)
+        gate_tile = T.alloc_shared((bn, bk), gate_spec.dtype.value)
+        up_tile = T.alloc_shared((bn, bk), gate_spec.dtype.value)
+        gate_accum = T.alloc_fragment((bm, bn), "float32")
+        up_accum = T.alloc_fragment((bm, bn), "float32")
+        T.clear(gate_accum)
+        T.clear(up_accum)
+        expert = block_experts[by]
+        for reduction_block in T.serial(T.ceildiv(source_width, bk)):
+            for i, reduction_lane in T.Parallel(bm, bk):
+                route = order[by * bm + i]
+                reduction = reduction_block * bk + reduction_lane
+                x[i, reduction_lane] = T.if_then_else(
+                    route >= 0 and reduction < source_width,
+                    source[
+                        T.if_then_else(source_grouped, by * bm + i, route // selected),
+                        reduction,
+                    ],
+                    0,
+                )
+            packets = bn * bk // packet.packet
+            for iteration in T.serial(T.ceildiv(packets, threads)):
+                linear = iteration * threads + T.get_thread_binding()
+                j = linear // (bk // packet.packet)
+                packet_column = linear % (bk // packet.packet) * packet.packet
+                channel = bx * bn + j
+                reduction = reduction_block * bk + packet_column
+                if j < bn:
+                    if expert >= 0 and channel < output_width and reduction < source_width:
+                        flattened_row = expert * output_width + channel
+                        decode_packet(
+                            gate_tile, j, packet_column, gate, gate_spec,
+                            flattened_row, reduction,
+                        )
+                        decode_packet(
+                            up_tile, j, packet_column, up, up_spec,
+                            flattened_row, reduction,
+                        )
+                    else:
+                        for item in T.unroll(packet.packet, explicit=True):
+                            gate_tile[j, packet_column + item] = 0
+                            up_tile[j, packet_column + item] = 0
+            T.sync_threads()
+            T.gemm(x, gate_tile, gate_accum, transpose_B=True)
+            T.gemm(x, up_tile, up_accum, transpose_B=True)
+            T.sync_threads()
+        for i, j in T.Parallel(bm, bn):
+            route = order[by * bm + i]
+            channel = bx * bn + j
+            if route >= 0 and channel < output_width:
+                gate_value = T.cast(
+                    T.cast(gate_accum[i, j], gate_spec.dtype.value), "float32"
+                )
+                output[by * bm + i, channel] = T.cast(
+                    gate_value
+                    * T.sigmoid(gate_value)
+                    * T.cast(T.cast(up_accum[i, j], up_spec.dtype.value), "float32"),
+                    gate_spec.dtype.value,
+                )
 
 
 @T.macro
@@ -103,6 +170,8 @@ def _grouped_projection(
     bk,
     threads,
 ):
+    packet = packet_format(weight_spec)
+    assert packet is not None
     with T.Kernel(T.ceildiv(output_width, bn), blocks, threads=threads) as (bx, by):
         x = T.alloc_shared((bm, bk), weight_spec.dtype.value)
         w = T.alloc_shared((bn, bk), weight_spec.dtype.value)
@@ -110,10 +179,10 @@ def _grouped_projection(
         T.clear(accum)
         expert = block_experts[by]
         for reduction_block in T.serial(T.ceildiv(source_width, bk)):
-            for i, k in T.Parallel(bm, bk):
+            for i, reduction_lane in T.Parallel(bm, bk):
                 route = order[by * bm + i]
-                reduction = reduction_block * bk + k
-                x[i, k] = T.if_then_else(
+                reduction = reduction_block * bk + reduction_lane
+                x[i, reduction_lane] = T.if_then_else(
                     route >= 0 and reduction < source_width,
                     source[
                         T.if_then_else(source_grouped, by * bm + i, route // selected),
@@ -121,13 +190,27 @@ def _grouped_projection(
                     ],
                     0,
                 )
-            for j, k in T.Parallel(bn, bk):
+            packets = bn * bk // packet.packet
+            for iteration in T.serial(T.ceildiv(packets, threads)):
+                linear = iteration * threads + T.get_thread_binding()
+                j = linear // (bk // packet.packet)
+                packet_column = linear % (bk // packet.packet) * packet.packet
                 channel = bx * bn + j
-                reduction = reduction_block * bk + k
-                if expert >= 0 and channel < output_width and reduction < source_width:
-                    w[j, k] = _weight(weight, weight_spec, expert, channel, reduction)
-                else:
-                    w[j, k] = 0
+                reduction = reduction_block * bk + packet_column
+                if j < bn:
+                    if expert >= 0 and channel < output_width and reduction < source_width:
+                        decode_packet(
+                            w,
+                            j,
+                            packet_column,
+                            weight,
+                            weight_spec,
+                            expert * output_width + channel,
+                            reduction,
+                        )
+                    else:
+                        for item in T.unroll(packet.packet, explicit=True):
+                            w[j, packet_column + item] = 0
             T.sync_threads()
             T.gemm(x, w, accum, transpose_B=True)
             T.sync_threads()
@@ -137,20 +220,6 @@ def _grouped_projection(
             if route >= 0 and channel < output_width:
                 output[by * bm + i, channel] = T.cast(
                     accum[i, j], weight_spec.dtype.value
-                )
-
-
-@T.macro
-def _activate(gate, up, output, capacity, width, dtype, threads):
-    with T.Kernel(T.ceildiv(capacity * width, threads), threads=threads) as block:
-        for lane in T.Parallel(threads):
-            flat = block * threads + lane
-            if flat < capacity * width:
-                row, column = flat // width, flat % width
-                value = T.cast(gate[row, column], "float32")
-                output[row, column] = T.cast(
-                    value * T.sigmoid(value) * T.cast(up[row, column], "float32"),
-                    dtype,
                 )
 
 
@@ -185,8 +254,6 @@ class _GroupedExpertsEmitter:
             block_experts,
             counts,
             cursors,
-            gate_result,
-            up_result,
             activation,
             projected,
         ) = operands[7:]
@@ -195,43 +262,27 @@ class _GroupedExpertsEmitter:
         experts, intermediate, _ = cast(tuple[int, int, int], self.specs[3].shape)
         instruction = self.tile
         bm, bn, bk, threads = instruction
-        _group_count(
+        _group_routes(
             routes,
             order,
             inverse,
             block_experts,
             counts,
+            cursors,
             rows,
             selected,
             experts,
             self.capacity,
             bm,
         )
-        _group_prefix(counts, cursors, block_experts, experts, bm)
-        _group_scatter(routes, order, inverse, cursors, rows, selected, experts)
-        _grouped_projection(
+        _grouped_gated_projection(
             hidden,
             order,
             block_experts,
             gate,
-            gate_result,
-            self.specs[3],
-            self.blocks,
-            width,
-            intermediate,
-            selected,
-            False,
-            bm,
-            bn,
-            bk,
-            threads,
-        )
-        _grouped_projection(
-            hidden,
-            order,
-            block_experts,
             up,
-            up_result,
+            activation,
+            self.specs[3],
             self.specs[4],
             self.blocks,
             width,
@@ -241,15 +292,6 @@ class _GroupedExpertsEmitter:
             bm,
             bn,
             bk,
-            threads,
-        )
-        _activate(
-            gate_result,
-            up_result,
-            activation,
-            self.capacity,
-            intermediate,
-            self.specs[0].dtype.value,
             threads,
         )
         _grouped_projection(
@@ -302,6 +344,9 @@ class GroupedExpertsRule:
         rows, width = cast(tuple[int, int], hidden.shape)
         selected = cast(int, routes.shape[1])
         experts, intermediate, input_width = cast(tuple[int, int, int], gate.shape)
+        gate_packet, up_packet, down_packet = (
+            packet_format(spec) for spec in (gate, up, down)
+        )
         instruction = next(
             (
                 value
@@ -319,16 +364,26 @@ class GroupedExpertsRule:
             or scores.shape != routes.shape
             or output.shape != hidden.shape
             or experts > 256
+            or gate_packet is None
+            or up_packet is None
+            or down_packet is None
+            or gate_packet != up_packet
+            or width % gate_packet.tile
+            or intermediate % down_packet.tile
         ):
             return ()
         bm = instruction.m * 2
         bn = instruction.n * 2
-        bk = instruction.k
+        packet_width = max(
+            gate_packet.packet, up_packet.packet, down_packet.packet
+        )
+        bk = max(instruction.k, packet_width)
+        bk = ((bk + packet_width - 1) // packet_width) * packet_width
         threads = min(
             context.capabilities.threads_per_group,
             context.capabilities.subgroup_width * 4,
         )
-        shared = (bm * bk + bn * bk) * hidden.dtype.itemsize
+        shared = (bm * bk + 2 * bn * bk) * hidden.dtype.itemsize
         if shared > context.capabilities.shared_memory_bytes:
             return ()
         capacity = _aligned_capacity(rows, selected, experts, bm)
@@ -339,8 +394,6 @@ class GroupedExpertsRule:
             TensorSpec((blocks,), DType.I32),
             TensorSpec((experts,), DType.I32),
             TensorSpec((experts,), DType.I32),
-            TensorSpec((capacity, intermediate), hidden.dtype),
-            TensorSpec((capacity, intermediate), hidden.dtype),
             TensorSpec((capacity, intermediate), hidden.dtype),
             TensorSpec((capacity, width), hidden.dtype),
         )
@@ -358,7 +411,7 @@ class GroupedExpertsRule:
                 ),
                 1e-7 + operations / 5e12,
                 workspace=workspace,
-                kernel_count=8,
+                kernel_count=4,
                 priority=40,
             ),
         )

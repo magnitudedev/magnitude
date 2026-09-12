@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass
 from enum import StrEnum
 
-from .tensor.types import DType, Layout
+from .tensor.types import DType
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,12 +125,6 @@ class Codebook:
 
 
 type Representation = Dense | Affine | Codebook
-
-
-@dataclass(frozen=True, slots=True)
-class TensorRepresentation:
-    numerical: Representation
-    physical_layout: Layout = Layout(tag="canonical")
 
 
 @dataclass(frozen=True, slots=True)

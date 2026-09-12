@@ -76,9 +76,7 @@ class TensorWeights:
             return cached
         stored = self.format.stored(descriptor)
         if isinstance(stored, StoredQuantized):
-            representation = _representation(
-                stored.representation, descriptor.shape, self.device.capabilities
-            )
+            representation = stored.representation
             result = mt.TensorSpec(descriptor.shape, dtype, representation=representation)
         elif isinstance(stored, StoredAffinePlanes):
             result = mt.TensorSpec(
@@ -179,9 +177,7 @@ class TensorWeights:
     ) -> mt.Resource:
         if descriptor.transform != WeightTransform.IDENTITY:
             raise ValueError("quantized weights cannot carry a post-import transform")
-        representation = _representation(
-            stored.representation, descriptor.shape, self.device.capabilities
-        )
+        representation = stored.representation
         target_spec = mt.TensorSpec(descriptor.shape, dtype, representation=representation)
         target = self.device.allocate(target_spec)
         codec = stored.codec
@@ -263,37 +259,3 @@ class TensorWeights:
             self._resident.clear()
             self._specs.clear()
             self._closed = True
-
-
-def _representation(
-    value: mt.Affine | mt.Codebook,
-    shape: tuple[int, ...],
-    capabilities: mt.Capabilities,
-):
-    if (
-        isinstance(value, mt.Affine)
-        and len(shape) == 3
-        and capabilities.matrix_instructions
-        and _scale_min_hierarchy(value)
-    ):
-        return mt.Affine(
-            value.code,
-            value.group,
-            mt.DirectCoefficients(mt.DType.F32, mt.DType.F32),
-        )
-    return value
-
-
-def _scale_min_hierarchy(value: mt.Affine | mt.Codebook) -> bool:
-    coefficients = value.coefficients if isinstance(value, mt.Affine) else None
-    return (
-        isinstance(value, mt.Affine)
-        and isinstance(coefficients, mt.HierarchicalCoefficients)
-        and value.code.low_bits == 4
-        and value.code.high_bits in (0, 1)
-        and value.group == 32
-        and coefficients.supergroup == 256
-        and coefficients.local_scale_bits == 6
-        and coefficients.local_bias_bits == 6
-        and coefficients.bias_sign == -1
-    )

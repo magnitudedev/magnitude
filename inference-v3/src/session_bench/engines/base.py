@@ -58,12 +58,9 @@ async def stop(process: asyncio.subprocess.Process):
             await asyncio.wait_for(asyncio.shield(process.wait()), deadline)
         except TimeoutError:
             continue
-        if sig == signal.SIGTERM:
-            # Kill any remaining orphan in this owned process group.
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        # The supervisor exits only after reaping the server it owns. Once it
+        # has exited successfully, the process group is retired; signalling
+        # that numeric group again can race PID/group reuse on Darwin.
         break
     await asyncio.wait_for(process.wait(), 5)
 

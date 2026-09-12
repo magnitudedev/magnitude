@@ -10,6 +10,8 @@ import tilelang.language as T
 from ..compiler.lowering import Candidate, LoweringContext
 from ..tensor.graph import Graph
 from ..tensor.types import DType, TensorSpec
+from .matrix import _packed_matrix, _packed_vector
+from .packed import packet_format
 
 
 @T.macro
@@ -17,6 +19,7 @@ def _matrix_streaming_attention(
     query,
     history,
     visible,
+    gate,
     output,
     tokens,
     heads,
@@ -27,6 +30,7 @@ def _matrix_streaming_attention(
     key_tile,
     threads,
     dtype,
+    fuse_gate,
 ):
     """Stream one packed sequence through tiled QK and PV matrix products."""
     group = heads // kv_heads
@@ -112,10 +116,19 @@ def _matrix_streaming_attention(
         for row, channel in T.Parallel(query_tile, width):
             token = first_row + row
             if token < tokens:
-                output[token, head, channel] = T.cast(
-                    output_fragment[row, channel] / T.max(denominator[row], 1e-30),
-                    dtype,
-                )
+                if fuse_gate:
+                    output[token, head * width + channel] = T.cast(
+                        output_fragment[row, channel]
+                        / T.max(denominator[row], 1e-30)
+                        * T.sigmoid(T.cast(gate[token, head, channel], "float32")),
+                        dtype,
+                    )
+                else:
+                    output[token, head, channel] = T.cast(
+                        output_fragment[row, channel]
+                        / T.max(denominator[row], 1e-30),
+                        dtype,
+                    )
 
 
 @T.macro
@@ -363,6 +376,7 @@ class _MatrixAttentionEmitter:
             operands[0],
             operands[1],
             operands[2],
+            operands[0],
             operands[3],
             tokens,
             heads,
@@ -373,6 +387,7 @@ class _MatrixAttentionEmitter:
             key_tile,
             threads,
             self.specs[0].dtype.value,
+            False,
         )
 
 
@@ -519,3 +534,190 @@ class OnlineAttentionRule:
                     )
                 )
         return tuple(candidates)
+
+
+@T.macro
+def _merge_attention_gate(
+    partials, statistics, gate, output, tokens, heads, width, partitions, threads, dtype,
+):
+    with T.Kernel(heads, tokens, threads=threads) as (head, token):
+        lane = T.get_thread_binding()
+        maximum = T.alloc_local((1,), "float32")
+        denominator = T.alloc_local((1,), "float32")
+        answer = T.alloc_local((1,), "float32")
+        maximum[0] = -3.402823466e38
+        denominator[0] = 0.0
+        answer[0] = 0.0
+        for partition in T.serial(partitions):
+            if statistics[partition, token, head, 1] > 0:
+                maximum[0] = T.max(maximum[0], statistics[partition, token, head, 0])
+        if lane < width:
+            for partition in T.serial(partitions):
+                if statistics[partition, token, head, 1] > 0:
+                    weight = T.exp(
+                        statistics[partition, token, head, 0] - maximum[0]
+                    ) * statistics[partition, token, head, 1]
+                    denominator[0] += weight
+                    answer[0] += weight * partials[partition, token, head, lane]
+            gate_value = T.cast(gate[token, head, lane], "float32")
+            output[token, head * width + lane] = T.cast(
+                answer[0] / T.max(denominator[0], 1e-30) * T.sigmoid(gate_value), dtype
+            )
+
+
+def _attention_output_region(graph: Graph, root: int):
+    if root + 4 >= len(graph.nodes):
+        return None
+    attention, sigmoid, multiply, reshape, linear = graph.nodes[root : root + 5]
+    if (
+        attention.operation != "causal_attention"
+        or sigmoid.operation != "sigmoid"
+        or multiply.operation != "multiply"
+        or attention.outputs[0] not in multiply.inputs
+        or sigmoid.outputs[0] not in multiply.inputs
+        or reshape.operation != "reshape" or reshape.inputs != multiply.outputs
+        or linear.operation != "linear" or linear.inputs[0] != reshape.outputs[0]
+        or len(attention.inputs) != 3
+    ):
+        return None
+    gate = sigmoid.inputs[0]
+    inputs = (*attention.inputs, gate, linear.inputs[1])
+    outputs = linear.outputs
+    specs = tuple(graph.values[value].spec for value in (*inputs, *outputs))
+    if any(not spec.static for spec in specs) or packet_format(specs[4]) is None:
+        return None
+    return frozenset(range(root, root + 5)), inputs, outputs, specs, attention.attributes["scale"]
+
+
+class _AttentionOutputEmitter:
+    def __init__(self, specs, scale, partitions, span, threads):
+        self.specs, self.scale = specs, scale
+        self.partitions, self.span, self.threads = partitions, span, threads
+
+    def __call__(self, operands: tuple[Any, ...]) -> None:
+        query, history, visible, gate, weight, output, partials, statistics, activation = operands
+        tokens, heads, width = cast(tuple[int, int, int], self.specs[0].shape)
+        kv_heads = cast(int, self.specs[1].shape[2])
+        _partition_attention(
+            query, history, visible, partials, statistics, tokens, heads, kv_heads,
+            width, self.partitions, self.span, self.scale, self.threads,
+        )
+        _merge_attention_gate(
+            partials, statistics, gate, activation, tokens, heads, width,
+            self.partitions, self.threads, self.specs[0].dtype.value,
+        )
+        _packed_vector(
+            activation, weight, activation, output, self.specs[4], tokens,
+            cast(int, self.specs[4].shape[0]), heads * width,
+            self.specs[5].dtype.value, False,
+        )
+
+
+class _PrefillAttentionOutputEmitter:
+    def __init__(self, specs, scale, attention_tile, projection_tile):
+        self.specs, self.scale = specs, scale
+        self.attention_tile, self.projection_tile = attention_tile, projection_tile
+
+    def __call__(self, operands: tuple[Any, ...]) -> None:
+        query, history, visible, gate, weight, output, activation = operands
+        tokens, heads, width = cast(tuple[int, int, int], self.specs[0].shape)
+        kv_heads = cast(int, self.specs[1].shape[2])
+        query_tile, key_tile, attention_threads = self.attention_tile
+        _matrix_streaming_attention(
+            query, history, visible, gate, activation, tokens, heads, kv_heads,
+            width, self.scale, query_tile, key_tile, attention_threads,
+            self.specs[0].dtype.value, True,
+        )
+        projection_threads, bm, bn, bk = self.projection_tile
+        _packed_matrix(
+            activation, weight, activation, output, self.specs[4], tokens,
+            cast(int, self.specs[4].shape[0]), heads * width,
+            self.specs[0].dtype.value, self.specs[5].dtype.value,
+            projection_threads, bm, bn, bk, False,
+        )
+
+
+class AttentionOutputRule:
+    """Matrix attention, query gating, flattening, and packed output projection."""
+
+    name = "attention-output"
+
+    def enumerate(self, graph: Graph, root: int, context: LoweringContext):
+        region = _attention_output_region(graph, root)
+        if region is None:
+            return ()
+        nodes, inputs, outputs, specs, scale = region
+        tokens, heads, width = cast(tuple[int, int, int], specs[0].shape)
+        capacity = cast(int, specs[1].shape[1])
+        packet = packet_format(specs[4])
+        if (
+            packet is None or heads * width % packet.tile
+            or context.capabilities.subgroup_width != 32
+        ):
+            return ()
+        if context.mode == "prefill":
+            attention = next(
+                (
+                    item for item in context.capabilities.matrix_instructions
+                    if item.input_dtype == specs[0].dtype
+                ),
+                None,
+            )
+            if (
+                attention is None
+                or graph.nodes[root].attributes["sequence_count"] != 1
+                or width < attention.k
+                or width % attention.k
+            ):
+                return ()
+            query_tile, key_tile = attention.m * 4, attention.n * 4
+            attention_threads = min(
+                context.capabilities.threads_per_group,
+                context.capabilities.subgroup_width * 4,
+            )
+            projection_threads = attention_threads
+            bm, bn = attention.m * 4, attention.n * 4
+            bk = max(attention.k * 2, packet.packet)
+            bk = math.ceil(bk / packet.packet) * packet.packet
+            attention_shared = key_tile * width * specs[0].dtype.itemsize
+            projection_shared = (bm + bn) * bk * specs[0].dtype.itemsize
+            if max(attention_shared, projection_shared) > context.capabilities.shared_memory_bytes:
+                return ()
+            activation = TensorSpec((tokens, heads * width), specs[0].dtype)
+            if activation.storage_nbytes > context.workspace_limit:
+                return ()
+            return (Candidate(
+                f"attention.matrix-streaming-gated-output@{root}:{max(nodes)}",
+                nodes, inputs, outputs,
+                _PrefillAttentionOutputEmitter(
+                    specs, scale,
+                    (query_tile, key_tile, attention_threads),
+                    (projection_threads, bm, bn, bk),
+                ),
+                8e-7 + tokens * heads * capacity * width / 5e12
+                + specs[4].storage_nbytes / 5e12,
+                workspace=(activation,), kernel_count=2, priority=110,
+            ),)
+        if context.mode != "decode" or capacity <= 512:
+            return ()
+        threads = 1 << (width - 1).bit_length()
+        if threads > context.capabilities.threads_per_group:
+            return ()
+        span = 128
+        partitions = math.ceil(capacity / span)
+        partials = TensorSpec((partitions, tokens, heads, width), DType.F32)
+        statistics = TensorSpec((partitions, tokens, heads, 2), DType.F32)
+        activation = TensorSpec((tokens, heads * width), specs[0].dtype)
+        workspace = (partials, statistics, activation)
+        if sum(value.storage_nbytes for value in workspace) > context.workspace_limit:
+            return ()
+        return (Candidate(
+            f"attention.partitioned-gated-output@{root}:{max(nodes)}", nodes, inputs, outputs,
+            _AttentionOutputEmitter(specs, scale, partitions, span, threads),
+            8e-7 + tokens * heads * capacity * width / 2e12
+            + specs[4].storage_nbytes / 4e12,
+            workspace=workspace, kernel_count=3, priority=100,
+        ),)
+
+
+__all__ = ["AttentionOutputRule", "OnlineAttentionRule"]
