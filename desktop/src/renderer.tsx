@@ -19,6 +19,7 @@ import {
   LOCAL_MODEL_RANKING_SCALE_LABELS, LOCAL_MODEL_RANKING_SCALE_VALUES,
 } from "@magnitudedev/client-common"
 import { HardwareOverview, ModelRadar } from "./discovery-visuals"
+import { MemoryBreakdown } from "./memory-breakdown"
 import { HarnessLogo } from "./harness-logo"
 import { ModelLogo } from "./model-logo"
 import type { DesktopApi, Page } from "./desktop-rpc"
@@ -236,6 +237,7 @@ function MemoryStatusView({ service }: { service: DesktopSession }) {
       <p className="mt-2 text-sm text-slate-500">Across Magnitude and its background processes.</p>
       <details className="mt-3 text-xs text-slate-500"><summary className="cursor-pointer">How memory is measured</summary><p className="mt-2">{metric} across {measured.processCount} processes. {measured.metric === "ProportionalResident" ? "Shared pages are counted proportionally." : "Shared and file-backed pages may be excluded."} Updated {new Date(measured.measuredAt).toLocaleTimeString()}.</p></details>
     </> : <p className="mt-4 text-sm text-slate-500">{sample?._tag === "Unavailable" ? sample.message : Result.isFailure(observation) ? "Memory reading unavailable." : "Measuring memory…"}</p>}
+    <MemoryBreakdown />
   </section>
 }
 function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null }) {

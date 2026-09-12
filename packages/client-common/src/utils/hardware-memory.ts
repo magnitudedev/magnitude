@@ -17,6 +17,8 @@ export interface HardwareMemoryDomainView {
   readonly kind: LocalInferenceHardware["memoryDomains"][number]["kind"]
   readonly totalBytes: number
   readonly usedBytes: number | null
+  readonly modelBytes: number | null
+  readonly overheadBytes: number | null
   readonly fixedBytes: number | null
   readonly kvCacheBytes: number | null
   readonly systemAndAppsBytes: number | null
@@ -83,10 +85,15 @@ export const deriveHardwareMemoryView = (
     const freeBytes = Option.getOrNull(Option.map(domain.availableBytes, (available) =>
       Math.min(domain.totalBytes, Math.max(0, available))))
     const usedBytes = freeBytes === null ? null : domain.totalBytes - freeBytes
-    const fixedBytes = Option.match(allocation, {
+    const modelBytes = Option.match(allocation, {
       onNone: () => 0,
-      onSome: (resident) => resident.modelBytes + resident.computeBytes + resident.auxiliaryBytes,
+      onSome: (resident) => resident.modelBytes,
     })
+    const overheadBytes = Option.match(allocation, {
+      onNone: () => 0,
+      onSome: (resident) => resident.computeBytes + resident.auxiliaryBytes,
+    })
+    const fixedBytes = modelBytes + overheadBytes
     const kvCacheBytes = Option.match(allocation, {
       onNone: () => 0,
       onSome: (resident) => resident.contextBytes,
@@ -101,6 +108,8 @@ export const deriveHardwareMemoryView = (
     if (freeBytes === null || usedBytes === null) return {
       ...base,
       usedBytes: null,
+      modelBytes,
+      overheadBytes,
       fixedBytes,
       kvCacheBytes,
       systemAndAppsBytes: null,
@@ -114,6 +123,8 @@ export const deriveHardwareMemoryView = (
     if (excessBytes > toleranceBytes) return {
       ...base,
       usedBytes,
+      modelBytes: null,
+      overheadBytes: null,
       fixedBytes: null,
       kvCacheBytes: null,
       systemAndAppsBytes: null,
@@ -126,6 +137,8 @@ export const deriveHardwareMemoryView = (
     return {
       ...base,
       usedBytes: displayedUsedBytes,
+      modelBytes,
+      overheadBytes,
       fixedBytes,
       kvCacheBytes,
       systemAndAppsBytes: Math.max(0, displayedUsedBytes - ownedBytes),
