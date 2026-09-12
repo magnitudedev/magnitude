@@ -16,7 +16,7 @@ use axum::{Json, Router};
 use futures_util::{future::BoxFuture, stream::BoxStream};
 use icn_contracts::bootstrap_protocol::{
     BackendEligibilityReport, CudaEligibility, IcnBinaryIdentity, IcnInstallationBackend,
-    IcnInstallationDeclaration, IcnStartupBackend, IcnStartupProgressRecord,
+    IcnInstallationDeclaration, IcnParentCommand, IcnParentCommandType, IcnStartupBackend, IcnStartupProgressRecord,
     IcnStartupProgressRecordType, IcnStartupRecord, IcnStartupRecordType, MetalEligibility,
     VulkanEligibility,
 };
@@ -2168,6 +2168,8 @@ fn domain_error(error: domain::InferenceRequestError) -> ApiError {
         IcnStartupRecord,
         IcnStartupRecordType,
         IcnStartupProgressRecord,
+        IcnParentCommand,
+        IcnParentCommandType,
         IcnStartupProgressRecordType,
         IcnStartupBackend,
         IcnInstallationDeclaration,

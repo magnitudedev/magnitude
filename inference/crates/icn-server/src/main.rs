@@ -1,6 +1,5 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -35,8 +34,7 @@ use icn_contracts::{
     HardwareAssessment, HardwareProvider, HardwareSnapshot, InventoryError,
     ModelExecutionAssessment, ModelPreviewProfile, ReasoningProfile, ResolvedModel,
     ResolvedModelAssessor, SpeculativeDecodingConfig, SpeculativeDecodingSelection,
-    SpeculativeDraftSource,
-    SpeculativeMethodConfig, TemplateCapabilities,
+    SpeculativeDraftSource, SpeculativeMethodConfig, TemplateCapabilities,
 };
 use icn_engine::{
     ModelLoadObserver, ModelPlanDefaults, NativeBackend, execution_intent, model_plan_defaults,
@@ -61,6 +59,7 @@ mod inference_worker;
 mod installation;
 mod load_progress;
 mod memory_supervisor;
+mod parent_control;
 mod telemetry;
 mod worker_process;
 
@@ -68,8 +67,9 @@ use inference_worker::{InferenceWorker, LoadEvent, RemoteBackend};
 use load_progress::{LoadProgressEstimator, LoadProgressTracker};
 use memory_supervisor::{IDLE_POLL_INTERVAL, RECOVERY_STABLE_TIME};
 use memory_supervisor::{MONITOR_LOSS_DEADLINE, POLL_INTERVAL, SystemMemoryObserver};
-use worker_process::NativeWorkerRole;
-use worker_process::{NativeRuntimeAuthority, NativeWorkerArgs, NativeWorkerLauncher};
+use worker_process::{
+    NativeRuntimeAuthority, NativeWorkerArgs, NativeWorkerLauncher, PlanningWorkerChild,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -175,6 +175,22 @@ trait ResidencyWorker: Send + Sync {
     fn shutdown(&self);
 }
 
+fn verify_worker_retirement(worker: &dyn ResidencyWorker) -> Result<(), ModelOperationFailure> {
+    match worker.try_wait() {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(ModelOperationFailure::new(
+            "worker_retirement_failed",
+            "inference worker retirement remains unproven",
+            true,
+        )),
+        Err(error) => Err(ModelOperationFailure::new(
+            "worker_retirement_failed",
+            format!("cannot verify inference worker retirement: {error}"),
+            true,
+        )),
+    }
+}
+
 impl ResidencyWorker for InferenceWorker {
     fn pid(&self) -> Option<u32> {
         self.pid()
@@ -266,6 +282,7 @@ struct ResidentResources {
 #[derive(Clone)]
 struct ReleaseControl {
     interrupt: tokio::sync::watch::Sender<bool>,
+    worker: Arc<dyn ResidencyWorker>,
 }
 
 impl ReleaseControl {
@@ -277,6 +294,7 @@ impl ReleaseControl {
 enum ReleaseOperation {
     StoppingLoad {
         operation: tokio::task::JoinHandle<()>,
+        worker: Option<Arc<dyn ResidencyWorker>>,
     },
     Draining {
         resources: Option<ResidentResources>,
@@ -284,11 +302,16 @@ enum ReleaseOperation {
     Stopping {
         control: ReleaseControl,
     },
+    RetirementFailed {
+        worker: Arc<dyn ResidencyWorker>,
+        failure: ModelOperationFailure,
+    },
 }
 
 struct ReleasingResidency {
     instance: ModelInstance,
     reason: ModelReleaseReason,
+    terminal_failure: Option<ModelOperationFailure>,
     operation: ReleaseOperation,
     stop_replies: Vec<tokio::sync::oneshot::Sender<Result<(), InventoryError>>>,
 }
@@ -657,9 +680,14 @@ struct PendingPlanningJob {
 }
 
 struct PlanningWorkerProcess {
-    child: tokio::process::Child,
+    child: PlanningWorkerChild,
     stderr_tail: Arc<std::sync::Mutex<Vec<u8>>>,
     stderr_reader: tokio::task::JoinHandle<()>,
+}
+
+struct PlanningRetirementFailure {
+    process: PlanningWorkerProcess,
+    error: std::io::Error,
 }
 
 impl PlanningWorkerProcess {
@@ -670,11 +698,29 @@ impl PlanningWorkerProcess {
             .unwrap_or_else(|_| "planning worker diagnostic buffer was poisoned".to_owned())
     }
 
-    async fn retire(mut self) {
-        let _ = self.child.start_kill();
-        let _ = tokio::time::timeout(PLANNING_WORKER_REAP_TIMEOUT, self.child.wait()).await;
+    async fn retire(mut self) -> Result<(), PlanningRetirementFailure> {
+        let result = async {
+            self.child.start_kill()?;
+            tokio::time::timeout(PLANNING_WORKER_REAP_TIMEOUT, self.child.wait())
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "planning worker retirement remains unproven",
+                    )
+                })?
+                .map(|_| ())
+        }
+        .await;
+        if let Err(error) = result {
+            return Err(PlanningRetirementFailure {
+                process: self,
+                error,
+            });
+        }
         self.stderr_reader.abort();
         let _ = self.stderr_reader.await;
+        Ok(())
     }
 }
 
@@ -701,7 +747,7 @@ enum PlanningPoolTask {
         queue_microseconds: u64,
         worker_microseconds: u64,
     },
-    Retired,
+    RetirementFinished(Result<(), PlanningRetirementFailure>),
 }
 
 struct PlanningWorkerPoolOwner {
@@ -712,6 +758,7 @@ struct PlanningWorkerPoolOwner {
     pending: std::collections::VecDeque<PendingPlanningJob>,
     active_workers: usize,
     retiring_workers: usize,
+    unretired_workers: Vec<PlanningWorkerProcess>,
     expansion: PlanningExpansionState,
     tasks: tokio::task::JoinSet<PlanningPoolTask>,
 }
@@ -730,16 +777,23 @@ impl PersistentPlanningWorkerPool {
         hardware_calibration: Option<NativeHardwareCalibration>,
     ) -> Result<(Self, NativeHardwareCalibration), InventoryError> {
         let deadline = tokio::time::Instant::now() + MODEL_ASSESSMENT_TIMEOUT;
-        let (worker, hardware_calibration) =
-            match activate_planning_worker(&launcher, hardware_calibration, deadline).await {
-                Ok(activated) => activated,
-                Err(failure) => {
-                    if let Some(process) = failure.process {
-                        process.retire().await;
+        let (worker, hardware_calibration) = match activate_planning_worker(
+            &launcher,
+            hardware_calibration,
+            deadline,
+        )
+        .await
+        {
+            Ok(activated) => activated,
+            Err(failure) => {
+                if let Some(process) = failure.process {
+                    if let Err(failure) = process.retire().await {
+                        tracing::error!(error = %failure.error, "planning startup cleanup remains unproven; startup rejected");
                     }
-                    return Err(failure.error);
                 }
-            };
+                return Err(failure.error);
+            }
+        };
         let (commands, receiver) = tokio::sync::mpsc::channel(32);
         tokio::spawn(run_planning_worker_pool(
             PlanningWorkerPoolOwner {
@@ -750,6 +804,7 @@ impl PersistentPlanningWorkerPool {
                 pending: std::collections::VecDeque::new(),
                 active_workers: 0,
                 retiring_workers: 0,
+                unretired_workers: Vec::new(),
                 expansion: PlanningExpansionState::Ready,
                 tasks: tokio::task::JoinSet::new(),
             },
@@ -3254,6 +3309,7 @@ impl PlanningWorkerPoolOwner {
         self.idle.len()
             + self.active_workers
             + self.retiring_workers
+            + self.unretired_workers.len()
             + usize::from(self.expansion == PlanningExpansionState::Activating)
     }
 
@@ -3339,10 +3395,8 @@ impl PlanningWorkerPoolOwner {
 
     fn retire(&mut self, process: PlanningWorkerProcess) {
         self.retiring_workers += 1;
-        self.tasks.spawn(async move {
-            process.retire().await;
-            PlanningPoolTask::Retired
-        });
+        self.tasks
+            .spawn(async move { PlanningPoolTask::RetirementFinished(process.retire().await) });
     }
 
     fn fail_one_pending(&mut self, error: InventoryError) {
@@ -3428,11 +3482,15 @@ impl PlanningWorkerPoolOwner {
                 }
                 let _ = response.send(result);
             }
-            PlanningPoolTask::Retired => {
+            PlanningPoolTask::RetirementFinished(result) => {
                 self.retiring_workers = self
                     .retiring_workers
                     .checked_sub(1)
                     .expect("completed retirement must have a retiring worker");
+                if let Err(failure) = result {
+                    tracing::error!(error = %failure.error, "planning worker retirement failed; retaining ownership and capacity");
+                    self.unretired_workers.push(failure.process);
+                }
             }
         }
     }
@@ -3446,12 +3504,16 @@ impl PlanningWorkerPoolOwner {
         }
         self.tasks.abort_all();
         while self.tasks.join_next().await.is_some() {}
-        let retirements = self.idle.drain(..).map(PlanningWorkerProcess::retire);
-        let _ = tokio::time::timeout(
-            PLANNING_WORKER_REAP_TIMEOUT,
-            futures_util::future::join_all(retirements),
-        )
-        .await;
+        let retirements = self
+            .idle
+            .drain(..)
+            .chain(self.unretired_workers.drain(..))
+            .map(PlanningWorkerProcess::retire);
+        for result in futures_util::future::join_all(retirements).await {
+            if let Err(failure) = result {
+                tracing::error!(error = %failure.error, "planning pool shutdown cleanup remains unproven");
+            }
+        }
     }
 }
 
@@ -3490,22 +3552,12 @@ async fn run_planning_worker_pool(
 fn spawn_planning_worker(
     launcher: &NativeWorkerLauncher,
 ) -> Result<PlanningWorkerProcess, InventoryError> {
-    let command = launcher
-        .command(NativeWorkerRole::Planning)
-        .map_err(|error| InventoryError::Internal(error.to_string()))?;
-    let mut command = tokio::process::Command::from(command);
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| {
-            planning_worker_failure(
-                "planner_spawn_failed",
-                &format!("failed to start planning worker: {error}"),
-            )
-        })?;
+    let mut child = launcher.spawn_planning().map_err(|error| {
+        planning_worker_failure(
+            "planner_spawn_failed",
+            &format!("failed to start planning worker: {error}"),
+        )
+    })?;
     let stderr = child.stderr.take().ok_or_else(|| {
         planning_worker_failure("planner_protocol", "planning worker stderr is unavailable")
     })?;
@@ -3576,7 +3628,7 @@ fn planning_failure_with_diagnostics(error: InventoryError, diagnostics: &str) -
 }
 
 async fn exchange_planning_frame(
-    child: &mut tokio::process::Child,
+    child: &mut PlanningWorkerChild,
     command: &PlanningWorkerCommand,
     deadline: tokio::time::Instant,
 ) -> Result<PlanningWorkerReply, InventoryError> {
@@ -4064,6 +4116,15 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                     && loading.instance.id == instance_id
                 {
                     loading.worker = Some(worker);
+                } else if let ResidencyState::Releasing(releasing) = &mut self.state
+                    && releasing.instance.id == instance_id
+                    && let ReleaseOperation::StoppingLoad {
+                        worker: retained, ..
+                    } = &mut releasing.operation
+                {
+                    // The start notification may already be queued when cancellation is admitted.
+                    worker.stop_all_executions();
+                    *retained = Some(worker);
                 }
             }
             ResidencyCommand::LoadProgress {
@@ -4077,15 +4138,18 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 result,
             } => self.load_finished(instance_id, result),
             ResidencyCommand::LoadingStopCompleted { instance_id } => {
-                if matches!(
-                    &self.state,
-                    ResidencyState::Releasing(ReleasingResidency {
-                        instance,
-                        operation: ReleaseOperation::StoppingLoad { .. },
-                        ..
-                    }) if instance.id == instance_id
-                ) {
-                    self.finish_stopped(instance_id);
+                if let ResidencyState::Releasing(releasing) = &mut self.state
+                    && releasing.instance.id == instance_id
+                    && let ReleaseOperation::StoppingLoad { worker, .. } = &mut releasing.operation
+                {
+                    if let Some(worker) = worker.take() {
+                        let control =
+                            self.controller
+                                .start_worker_release(instance_id, worker, true);
+                        releasing.operation = ReleaseOperation::Stopping { control };
+                    } else {
+                        self.finish_stopped(instance_id);
+                    }
                 }
             }
             ResidencyCommand::LeaseReleased { instance_id, token } => {
@@ -4107,6 +4171,10 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
     }
 
     fn acquire(&mut self, waiter: AcquisitionWaiter) {
+        if let Some(failure) = self.retirement_failure() {
+            let _ = waiter.reply.send(Err(Self::inventory_failure(failure)));
+            return;
+        }
         if self.package_removal_active || !self.package_removals.is_empty() {
             self.queue.push_back(waiter);
             return;
@@ -4137,6 +4205,17 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
     }
 
     fn admit_package_removal(&mut self) {
+        if let Some(failure) = self.retirement_failure() {
+            let errors = self
+                .package_removals
+                .iter()
+                .map(|_| Self::inventory_failure(failure))
+                .collect::<Vec<_>>();
+            for ((_, reply), error) in self.package_removals.drain(..).zip(errors) {
+                let _ = reply.send(Err(error));
+            }
+            return;
+        }
         if self.package_removal_active
             || matches!(
                 self.state,
@@ -4327,7 +4406,8 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 &ModelReleaseReason::UserStop,
             )));
         }
-        if let Some(worker) = loading.worker.take() {
+        let worker = loading.worker.take();
+        if let Some(worker) = &worker {
             worker.stop_all_executions();
         }
         loading.operation.abort();
@@ -4356,8 +4436,10 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         self.state = ResidencyState::Releasing(ReleasingResidency {
             instance: stopping,
             reason: ModelReleaseReason::UserStop,
+            terminal_failure: None,
             operation: ReleaseOperation::StoppingLoad {
                 operation: completion,
+                worker,
             },
             stop_replies: vec![reply],
         });
@@ -4388,6 +4470,14 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 releasing.operation = ReleaseOperation::Stopping { control };
             }
             ReleaseOperation::Stopping { control } => control.interrupt(),
+            ReleaseOperation::RetirementFailed { worker, .. } => {
+                let control = self.controller.start_worker_release(
+                    releasing.instance.id.clone(),
+                    Arc::clone(worker),
+                    true,
+                );
+                releasing.operation = ReleaseOperation::Stopping { control };
+            }
         }
         releasing.instance.lifecycle = ModelInstanceLifecycle::Stopping {
             reason: ModelReleaseReason::UserStop,
@@ -4492,7 +4582,11 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 for waiter in loading.waiters.drain(..) {
                     let _ = waiter.reply.send(Err(Self::inventory_failure(&failure)));
                 }
-                self.finish_failed(instance_id, loading.instance.model_id, failure);
+                if let Some(worker) = loading.worker {
+                    self.begin_failed_release(loading.instance, worker, failure);
+                } else {
+                    self.finish_failed(instance_id, loading.instance.model_id, failure);
+                }
             }
         }
     }
@@ -4529,6 +4623,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             self.state = ResidencyState::Releasing(ReleasingResidency {
                 instance: stopping,
                 reason,
+                terminal_failure: None,
                 operation: ReleaseOperation::Stopping { control },
                 stop_replies,
             });
@@ -4536,6 +4631,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             self.state = ResidencyState::Releasing(ReleasingResidency {
                 instance: stopping,
                 reason,
+                terminal_failure: None,
                 operation: ReleaseOperation::Draining {
                     resources: Some(ready.resources),
                 },
@@ -4606,12 +4702,38 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         if releasing.instance.id != instance_id {
             return;
         }
+        let ReleaseOperation::Stopping { control } = &releasing.operation else {
+            return;
+        };
+        let worker = Arc::clone(&control.worker);
+        // Release completion is a notification, not evidence that native resources are gone.
+        let result = result.and_then(|()| verify_worker_retirement(worker.as_ref()));
         match result {
             Ok(()) => self.finish_stopped(instance_id),
             Err(failure) => {
-                let model_id = releasing.instance.model_id.clone();
-                self.finish_failed(instance_id, model_id, failure);
+                let ResidencyState::Releasing(releasing) = &mut self.state else {
+                    unreachable!();
+                };
+                for reply in releasing.stop_replies.drain(..) {
+                    let _ = reply.send(Err(Self::inventory_failure(&failure)));
+                }
+                for waiter in self.queue.drain(..) {
+                    let _ = waiter.reply.send(Err(Self::inventory_failure(&failure)));
+                }
+                releasing.operation = ReleaseOperation::RetirementFailed { worker, failure };
+                self.admit_package_removal();
+                self.publish_current();
             }
+        }
+    }
+
+    fn retirement_failure(&self) -> Option<&ModelOperationFailure> {
+        match &self.state {
+            ResidencyState::Releasing(ReleasingResidency {
+                operation: ReleaseOperation::RetirementFailed { failure, .. },
+                ..
+            }) => Some(failure),
+            _ => None,
         }
     }
 
@@ -4622,8 +4744,46 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         if ready.instance.id != instance_id {
             return;
         }
-        let model_id = ready.instance.model_id.clone();
-        self.finish_failed(instance_id, model_id, failure);
+        let ResidencyState::Ready(ready) =
+            std::mem::replace(&mut self.state, ResidencyState::Vacant)
+        else {
+            unreachable!()
+        };
+        self.begin_failed_release(ready.instance, ready.resources.worker, failure);
+    }
+
+    fn begin_failed_release(
+        &mut self,
+        mut instance: ModelInstance,
+        worker: Arc<dyn ResidencyWorker>,
+        failure: ModelOperationFailure,
+    ) {
+        let allocation = match instance.lifecycle {
+            ModelInstanceLifecycle::Loading {
+                planned_allocation, ..
+            } => ModelStoppingAllocation::Planned {
+                allocation: planned_allocation,
+            },
+            ModelInstanceLifecycle::Ready { allocation } => {
+                ModelStoppingAllocation::Resident { allocation }
+            }
+            _ => unreachable!("only a loading or ready worker can fail"),
+        };
+        instance.lifecycle = ModelInstanceLifecycle::Stopping {
+            reason: ModelReleaseReason::Failure,
+            allocation,
+        };
+        let control = self
+            .controller
+            .start_worker_release(instance.id.clone(), worker, true);
+        self.state = ResidencyState::Releasing(ReleasingResidency {
+            instance,
+            reason: ModelReleaseReason::Failure,
+            terminal_failure: Some(failure),
+            operation: ReleaseOperation::Stopping { control },
+            stop_replies: Vec::new(),
+        });
+        self.publish_current();
     }
 
     fn release_requested(&mut self, instance_id: ModelInstanceId, reason: ModelReleaseReason) {
@@ -4669,8 +4829,13 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         let terminal = ModelInstance {
             id: releasing.instance.id,
             model_id: releasing.instance.model_id,
-            lifecycle: ModelInstanceLifecycle::Stopped {
-                reason: releasing.reason,
+            lifecycle: match releasing.terminal_failure {
+                Some(failure) => ModelInstanceLifecycle::Failed {
+                    failure: failure.into_instance_failure(),
+                },
+                None => ModelInstanceLifecycle::Stopped {
+                    reason: releasing.reason,
+                },
             },
         };
         self.publish_terminal(terminal);
@@ -4889,9 +5054,18 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 ..
             }) => control.interrupt(),
             ResidencyState::Releasing(ReleasingResidency {
-                operation: ReleaseOperation::StoppingLoad { operation },
+                operation: ReleaseOperation::StoppingLoad { operation, worker },
                 ..
-            }) => operation.abort(),
+            }) => {
+                operation.abort();
+                if let Some(worker) = worker {
+                    worker.stop_all_executions();
+                }
+            }
+            ResidencyState::Releasing(ReleasingResidency {
+                operation: ReleaseOperation::RetirementFailed { worker, .. },
+                ..
+            }) => worker.stop_all_executions(),
             ResidencyState::Vacant => {}
         }
     }
@@ -5762,6 +5936,10 @@ impl NativeModelInstanceController {
         interrupt_immediately: bool,
     ) -> ReleaseControl {
         let (interrupt, mut interruption) = tokio::sync::watch::channel(interrupt_immediately);
+        let control = ReleaseControl {
+            interrupt,
+            worker: Arc::clone(&worker),
+        };
         let commands = self.residency.commands.clone();
         tokio::spawn(async move {
             let result = if interrupt_immediately {
@@ -5817,7 +5995,7 @@ impl NativeModelInstanceController {
                 result,
             });
         });
-        ReleaseControl { interrupt }
+        control
     }
 }
 
@@ -6131,14 +6309,22 @@ fn validate_registered_backend(installation: &installation::Installation) -> any
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    if matches!(
+    let mut parent_shutdown = if matches!(
         &cli.command,
         Command::Serve {
             exit_on_stdin_eof: true,
             ..
         }
     ) {
-        install_parent_stdin_guard();
+        Some(parent_control::install()?)
+    } else {
+        None
+    };
+    if matches!(
+        &cli.command,
+        Command::PlanningWorker { .. } | Command::InferenceWorker { .. }
+    ) {
+        worker_process::install_parent_watchdog()?;
     }
     let _telemetry = telemetry::init(matches!(&cli.command, Command::Serve { .. }))?;
     // Native planner diagnostics are extremely verbose and can dominate metadata-only assessment.
@@ -6389,7 +6575,15 @@ async fn main() -> anyhow::Result<()> {
                     .on_response(DefaultOnResponse::new().level(tracing::Level::INFO)),
             );
             let serve_result = axum::serve(listener, app)
-                .with_graceful_shutdown(interrupt_signal())
+                .with_graceful_shutdown(async move {
+                    match parent_shutdown.as_mut() {
+                        Some(receiver) => tokio::select! {
+                            _ = interrupt_signal() => {},
+                            _ = receiver.wait_for(|shutdown| *shutdown) => {},
+                        },
+                        None => interrupt_signal().await,
+                    }
+                })
                 .await;
             serve_result?;
             tracing::info!("ICN server stopped");
@@ -6418,24 +6612,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-fn install_parent_stdin_guard() {
-    // This thread starts before telemetry or native initialization. An ordinary
-    // ACN shutdown signals ICN first; abrupt owner loss closes the private pipe
-    // and must terminate ICN even if synchronous native initialization is busy.
-    std::thread::spawn(move || {
-        use std::io::Read as _;
-
-        let mut stdin = std::io::stdin().lock();
-        let mut buffer = [0_u8; 1];
-        loop {
-            match stdin.read(&mut buffer) {
-                Ok(0) | Err(_) => std::process::exit(0),
-                Ok(_) => {}
-            }
-        }
-    });
 }
 
 #[cfg(unix)]
@@ -6901,6 +7077,7 @@ mod tests {
             pending: std::collections::VecDeque::new(),
             active_workers: 0,
             retiring_workers: 0,
+            unretired_workers: Vec::new(),
             expansion: PlanningExpansionState::Ready,
             tasks: tokio::task::JoinSet::new(),
         };
@@ -6925,6 +7102,7 @@ mod tests {
             pending: std::collections::VecDeque::new(),
             active_workers: 1,
             retiring_workers: 0,
+            unretired_workers: Vec::new(),
             expansion: PlanningExpansionState::DeferredWhileWarm,
             tasks: tokio::task::JoinSet::new(),
         };
@@ -6936,6 +7114,85 @@ mod tests {
         owner.recover_deferred_expansion_after_capacity_loss();
 
         assert_eq!(owner.expansion, PlanningExpansionState::Ready);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planning_retirement_failure_retains_capacity_and_pending_deadlines() {
+        let child = tokio::process::Command::new("/bin/sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap() as libc::pid_t;
+        let process = PlanningWorkerProcess {
+            child,
+            stderr_tail: Arc::new(std::sync::Mutex::new(Vec::new())),
+            stderr_reader: tokio::spawn(std::future::pending()),
+        };
+        let mut owner = PlanningWorkerPoolOwner {
+            launcher: NativeWorkerLauncher::development(),
+            hardware_calibration: fixture_hardware_calibration(),
+            maximum_workers: 1,
+            idle: Vec::new(),
+            pending: std::collections::VecDeque::new(),
+            active_workers: 0,
+            retiring_workers: 1,
+            unretired_workers: Vec::new(),
+            expansion: PlanningExpansionState::Ready,
+            tasks: tokio::task::JoinSet::new(),
+        };
+        owner.handle_task(PlanningPoolTask::RetirementFinished(Err(
+            PlanningRetirementFailure {
+                process,
+                error: std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "injected retirement deadline",
+                ),
+            },
+        )));
+        let (response, reply) = tokio::sync::oneshot::channel();
+        owner.pending.push_back(PendingPlanningJob {
+            request: PlanningWorkerRequest {
+                deadline_at_ms: None,
+                hardware: calibration_test_snapshot(),
+                primary: "must-not-open.gguf".into(),
+                projector: None,
+                speculative: SpeculativeDecodingConfig::Disabled {
+                    reason: "test".into(),
+                },
+                defaults: Vec::new(),
+                performance_context_tokens: Vec::new(),
+                hardware_calibration: None,
+                assessed_capabilities: None,
+            },
+            class: PlanningAdmissionClass::Foreground,
+            enqueued_at: std::time::Instant::now(),
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            response,
+        });
+        owner.schedule();
+        assert_eq!(owner.live_workers(), 1);
+        assert!(
+            owner.tasks.is_empty(),
+            "unproven cleanup must not start a replacement"
+        );
+        assert_eq!(owner.pending.len(), 1);
+        owner.pending.front_mut().unwrap().deadline = tokio::time::Instant::now();
+        owner.schedule();
+        assert!(
+            matches!(reply.await.unwrap(), Err(InventoryError::ModelOperation { code, .. }) if code == "planning_deadline")
+        );
+        owner.shutdown().await;
+        // Shutdown retries the retained exact child and reaps it, rather than losing its handle.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 
     #[derive(Clone)]
@@ -6952,6 +7209,8 @@ mod tests {
     struct TestResidencyWorker {
         interrupted: AtomicU64,
         shutdown: AtomicU64,
+        retired: std::sync::atomic::AtomicBool,
+        fail_retirement: std::sync::atomic::AtomicBool,
     }
 
     impl ResidencyWorker for TestResidencyWorker {
@@ -6960,19 +7219,38 @@ mod tests {
         }
 
         fn try_wait(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
-            Ok(None)
+            #[cfg(unix)]
+            use std::os::unix::process::ExitStatusExt;
+            #[cfg(windows)]
+            use std::os::windows::process::ExitStatusExt;
+            Ok(self
+                .retired
+                .load(Ordering::Acquire)
+                .then(|| std::process::ExitStatus::from_raw(0)))
         }
 
         fn terminate(&self, _code: &str, _reason: &str) {
             self.interrupted.fetch_add(1, Ordering::AcqRel);
+            self.retired.store(
+                !self.fail_retirement.load(Ordering::Acquire),
+                Ordering::Release,
+            );
         }
 
         fn stop_all_executions(&self) {
             self.interrupted.fetch_add(1, Ordering::AcqRel);
+            self.retired.store(
+                !self.fail_retirement.load(Ordering::Acquire),
+                Ordering::Release,
+            );
         }
 
         fn shutdown(&self) {
             self.shutdown.fetch_add(1, Ordering::AcqRel);
+            self.retired.store(
+                !self.fail_retirement.load(Ordering::Acquire),
+                Ordering::Release,
+            );
         }
     }
 
@@ -7053,7 +7331,7 @@ mod tests {
                     result: Ok(()),
                 });
             });
-            ReleaseControl { interrupt }
+            ReleaseControl { interrupt, worker }
         }
 
         fn supervise_worker(
@@ -7361,6 +7639,134 @@ mod tests {
         drop(second_lease);
         client.stop(second_id).await.expect("second stop");
         actor.abort();
+    }
+
+    #[tokio::test]
+    async fn canceled_load_retains_worker_before_or_after_stop_notification() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for start_after_stop in [false, true] {
+                let (client, mut loads, _, actor) = test_residency(false);
+                let loading = tokio::spawn({ let client = client.clone(); async move {
+                    client.acquire(test_target("model-a"), ResidencyAcquisition::Warm).await
+                }});
+                let (instance_id, _) = loads.recv().await.unwrap();
+                let worker = Arc::new(TestResidencyWorker::default());
+                worker.fail_retirement.store(true, Ordering::Release);
+                let started = ResidencyCommand::LoadWorkerStarted { instance_id: instance_id.clone(), worker: worker.clone() };
+                let (reply, stopped) = tokio::sync::oneshot::channel();
+                let stop = ResidencyCommand::Stop { instance_id: instance_id.clone(), reply };
+                let commands = if start_after_stop { [stop, started] } else { [started, stop] };
+                for command in commands { client.commands.send(command).unwrap(); }
+                assert!(matches!(stopped.await.unwrap(), Err(InventoryError::ModelOperation { code, .. }) if code == "worker_retirement_failed"));
+                assert_explicit_stop(loading.await.unwrap());
+                let snapshot = client.snapshot().await;
+                assert_eq!(snapshot.instances[0].id, instance_id);
+                assert!(matches!(snapshot.instances[0].lifecycle, ModelInstanceLifecycle::Stopping { .. }));
+                assert!(client.acquire(test_target("model-b"), ResidencyAcquisition::Warm).await.is_err());
+                assert!(client.acquire_package_removal(ModelPackageId("test-package".into())).await.is_err());
+                assert!(loads.try_recv().is_err());
+                worker.fail_retirement.store(false, Ordering::Release);
+                client.stop(instance_id).await.expect("retry retires canceled load worker");
+                let next = tokio::spawn({ let client = client.clone(); async move {
+                    client.acquire(test_target("model-b"), ResidencyAcquisition::Warm).await
+                }});
+                let (next_id, _) = loads.recv().await.unwrap();
+                client.stop(next_id).await.unwrap();
+                assert_explicit_stop(next.await.unwrap());
+                actor.abort();
+            }
+        }).await.expect("cancellation lost worker ownership or a reply");
+    }
+
+    #[tokio::test]
+    async fn failed_load_and_ready_worker_retain_ownership_until_cleanup_succeeds() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for ready in [false, true] {
+                let (client, mut loads, workers, actor) = test_residency(ready);
+                let mut acquisition = Some(tokio::spawn({ let client = client.clone(); async move {
+                    client.acquire(test_target("model-a"), ResidencyAcquisition::Warm).await
+                }}));
+                let (instance_id, _) = loads.recv().await.unwrap();
+                let worker = if ready {
+                    acquisition.take().unwrap().await.unwrap().unwrap();
+                    Arc::clone(&workers.lock().unwrap()[0])
+                } else {
+                    let worker = Arc::new(TestResidencyWorker::default());
+                    client.commands.send(ResidencyCommand::LoadWorkerStarted {
+                        instance_id: instance_id.clone(), worker: worker.clone(),
+                    }).unwrap();
+                    worker
+                };
+                worker.fail_retirement.store(true, Ordering::Release);
+                let failure = ModelOperationFailure::new("fixture_failure", "original worker failure", false);
+                let command = if ready {
+                    ResidencyCommand::WorkerFailed { instance_id: instance_id.clone(), failure }
+                } else {
+                    ResidencyCommand::LoadFinished { instance_id: instance_id.clone(), result: Err(failure) }
+                };
+                client.commands.send(command).unwrap();
+                if let Some(acquisition) = acquisition {
+                    assert!(matches!(acquisition.await.unwrap(),
+                        Err(InventoryError::ModelOperation { code, .. }) if code == "fixture_failure"));
+                }
+                // The next admission waits on cleanup and must receive its failure, not start a successor.
+                assert!(matches!(client.acquire(test_target("model-b"), ResidencyAcquisition::Warm).await,
+                    Err(InventoryError::ModelOperation { code, .. }) if code == "worker_retirement_failed"));
+                let snapshot = client.snapshot().await;
+                assert_eq!(snapshot.instances.len(), 1);
+                assert_eq!(snapshot.instances[0].id, instance_id);
+                assert!(matches!(snapshot.instances[0].lifecycle,
+                    ModelInstanceLifecycle::Stopping { reason: ModelReleaseReason::Failure, .. }));
+                assert!(client.acquire_package_removal(ModelPackageId("test-package".into())).await.is_err());
+                assert!(loads.try_recv().is_err());
+                worker.fail_retirement.store(false, Ordering::Release);
+                client.stop(instance_id.clone()).await.expect("cleanup retry retires failed worker");
+                let snapshot = client.snapshot().await;
+                let terminal = snapshot.instances.iter().find(|instance| instance.id == instance_id).unwrap();
+                assert!(matches!(&terminal.lifecycle, ModelInstanceLifecycle::Failed { failure }
+                    if serde_json::to_string(failure).unwrap().contains("fixture_failure")));
+                let next = tokio::spawn({ let client = client.clone(); async move {
+                    client.acquire(test_target("model-b"), ResidencyAcquisition::Warm).await
+                }});
+                let (next_id, _) = loads.recv().await.unwrap();
+                client.stop(next_id).await.unwrap();
+                let _ = next.await.unwrap();
+                actor.abort();
+            }
+        }).await.expect("failure cleanup lost ownership or admission reply");
+    }
+
+    #[tokio::test]
+    async fn unproven_ready_release_blocks_loads_and_removal_until_exact_stop_retry() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for explicit_stop in [true, false] {
+                let (client, mut loads, workers, actor) = test_residency(true);
+                client.acquire(test_target("model-a"), ResidencyAcquisition::Warm).await.unwrap();
+                let (first_id, _) = loads.recv().await.unwrap();
+                let worker = Arc::clone(&workers.lock().unwrap()[0]);
+                worker.fail_retirement.store(true, Ordering::Release);
+                let failed = if explicit_stop {
+                    client.stop(first_id.clone()).await
+                } else {
+                    client.acquire(test_target("model-b"), ResidencyAcquisition::Warm).await.map(|_| ())
+                };
+                assert!(matches!(failed, Err(InventoryError::ModelOperation { code, .. }) if code == "worker_retirement_failed"));
+                let snapshot = client.snapshot().await;
+                assert_eq!(snapshot.instances.len(), 1);
+                assert_eq!(snapshot.instances[0].id, first_id);
+                assert!(matches!(snapshot.instances[0].lifecycle, ModelInstanceLifecycle::Stopping { .. }));
+                assert!(client.acquire(test_target("model-b"), ResidencyAcquisition::Warm).await.is_err());
+                assert!(client.acquire_package_removal(ModelPackageId("test-package".into())).await.is_err());
+                assert!(loads.try_recv().is_err(), "unproven retirement admitted a new load");
+                worker.fail_retirement.store(false, Ordering::Release);
+                client.stop(first_id.clone()).await.expect("retry retires the same worker");
+                client.acquire(test_target("model-b"), ResidencyAcquisition::Warm).await.unwrap();
+                let (next_id, _) = loads.recv().await.unwrap();
+                assert_ne!(first_id, next_id);
+                client.stop(next_id).await.unwrap();
+                actor.abort();
+            }
+        }).await.expect("retirement failure or retry lost a reply");
     }
 
     #[tokio::test]

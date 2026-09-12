@@ -67,6 +67,15 @@ explicit Stop closes admission, terminates active execution, and reports the can
 non-retryable `model_instance_stopped` result to every affected stream. Graceful replacement and
 idle release, rather than explicit Stop, drain active leases.
 
+Completion of a worker's release operation is not itself retirement evidence. Canceled loads,
+failed loads, and failed Ready workers retain their worker through cleanup. The actor verifies the
+exact worker's retained exit result before publishing a resource-free terminal state or admitting a
+successor. Failure cleanup uses `Stopping(Failure)` and preserves the original failure for its
+eventual Failed tombstone, including when an explicit Stop retries cleanup.
+An unproven release remains Stopping with its worker owned: Stop and queued demand receive a typed
+failure, new loads and package removal are rejected, and a later exact-instance Stop retries that
+same worker. Native exit evidence persists after reaping; absence of a live PID is not used as proof.
+
 ## Inference acquisition
 
 Chat Completions, Responses, and explicit Instance admission use one residency coordinator.

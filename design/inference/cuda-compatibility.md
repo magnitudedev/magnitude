@@ -5,7 +5,6 @@ applies_to:
   - packages/icn-protocol/**
   - packages/acn-protocol/src/schemas/acn-health.ts
   - packages/acn/src/icn/**
-  - packages/daemon-management/src/acn-jit/**
   - inference/crates/icn-server/**
   - inference/crates/icn-contracts/**
   - inference/scripts/**
@@ -108,7 +107,7 @@ ACN projects this operation through startup state without owning it:
 }
 ```
 
-The TUI remains responsive and shows the phase under `Starting Magnitude`. It does not fabricate a
+The desktop remains responsive and shows the phase in service startup status. It does not fabricate a
 percentage for opaque driver JIT work. The NVIDIA driver may reuse its disk JIT cache, but Magnitude
 does not depend on or manage that cache. Worker initialization runs on every CUDA ICN startup;
 calibration measurement runs only on a cache miss.
