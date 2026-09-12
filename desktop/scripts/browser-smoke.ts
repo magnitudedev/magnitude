@@ -297,7 +297,7 @@ try {
   const context = browser.contexts()[0]!
   const qaArtifacts = process.env["MAGNITUDE_BROWSER_QA_ARTIFACTS"]
   if (qaArtifacts !== undefined) await mkdir(qaArtifacts, { recursive: true })
-  const page = await waitForPage(context, (candidate) => candidate.url().includes("/renderer/index.html"))
+  const page = await waitForPage(context, (candidate) => candidate.url() === "magnitude://app/index.html")
   page.setDefaultTimeout(30_000)
   const consoleErrors: string[] = []
   page.on("console", (message) => {
@@ -901,7 +901,7 @@ try {
   await activeFixtureGuest.locator("#popup").click()
   await page.getByRole("tab", { name: "Fixture Next" }).last().waitFor()
   assert.equal(await browserTabs.count(), 4)
-  const magnitudeWindowCount = context.pages().filter((candidate) => candidate.url().includes("/renderer/index.html")).length
+  const magnitudeWindowCount = context.pages().filter((candidate) => candidate.url().startsWith("magnitude://app/")).length
   assert.equal(magnitudeWindowCount, 1, "target=_blank must not create another Magnitude window")
 
   await navigate(page, "file:///etc/passwd")

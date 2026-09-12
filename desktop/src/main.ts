@@ -1,5 +1,5 @@
 import { makeServiceStarter } from "@magnitudedev/daemon-management"
-import { ServiceStartFailed } from "@magnitudedev/sdk"
+import { MAGNITUDE_APP_ORIGIN, ServiceStartFailed } from "@magnitudedev/sdk"
 /**
  * Electron main entry — spec §5.1
  *
@@ -13,10 +13,10 @@ import { ServiceStartFailed } from "@magnitudedev/sdk"
  * the renderer SDK opens the ACN RPC connection directly to the endpoint
  * returned by that service.
  */
-import { app, BrowserWindow, dialog, ipcMain, Menu, Notification, type MenuItemConstructorOptions } from "electron"
+import { app, BrowserWindow, dialog, ipcMain, Menu, net, Notification, protocol, type MenuItemConstructorOptions } from "electron"
 import * as nodePath from "node:path"
 import * as nodeFs from "node:fs"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import { spawn } from "node:child_process"
 import { Array as Arr, Cause, Effect, Exit, Layer, ManagedRuntime, Option, PubSub, Scope, Stream } from "effect"
 import { RpcServer } from "@effect/rpc"
@@ -37,9 +37,20 @@ import {
 import { makeLocalAcnInstanceManager, ChildProcessSpawner, scopeAcnCandidate, AcnCandidateBootstrapProcessExitUnproven, AcnCandidateBootstrapProcessStopFailed, AcnCandidateParentChannelReleaseFailed, AcnCandidateSpawnFailed, DAEMON_TARGET, type AcnInstanceManager as AcnInstanceManagerService } from "@magnitudedev/daemon-management"
 // SDK imports — these run in the main process (Node)
 import { ACN_EXECUTABLE_NAME } from "@magnitudedev/daemon-management"
+import { MAGNITUDE_APP_SCHEME, resolveMagnitudeAppAssetPath } from "./app-protocol"
 
 // ESM doesn't have __dirname — polyfill it
 const __dirname = nodePath.dirname(fileURLToPath(import.meta.url))
+
+protocol.registerSchemesAsPrivileged([{
+  scheme: MAGNITUDE_APP_SCHEME,
+  privileges: {
+    standard: true,
+    secure: true,
+    supportFetchAPI: true,
+    corsEnabled: true,
+  },
+}])
 
 let mainWindow: BrowserWindow | null = null
 let embeddedBrowserRuntime: ManagedRuntime.ManagedRuntime<EmbeddedBrowser, never> | null = null
@@ -396,8 +407,8 @@ function createWindow(): void {
     // Dev mode — electron-vite serves the renderer
     mainWindow.loadURL(process.env["ELECTRON_RENDERER_URL"])
   } else {
-    // Production — load the built renderer
-    mainWindow.loadFile(nodePath.join(__dirname, "../renderer/index.html"))
+    // Production — load the built renderer from its explicit app origin.
+    mainWindow.loadURL(`${MAGNITUDE_APP_ORIGIN}/index.html`)
   }
 
   mainWindow.on("close", () => {
@@ -577,7 +588,16 @@ function startDesktopRpcServer(): void {
   )
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  if (process.env["ELECTRON_RENDERER_URL"] === undefined) {
+    const rendererRoot = nodePath.join(__dirname, "../renderer")
+    await protocol.handle(MAGNITUDE_APP_SCHEME, (request) => {
+      const assetPath = resolveMagnitudeAppAssetPath(rendererRoot, request.url)
+      if (assetPath === null) return new Response("Not found", { status: 404 })
+      return net.fetch(pathToFileURL(assetPath).toString())
+    })
+  }
+
   // 1. Resolve the login shell environment before any lazy ACN launch.
   inheritLoginShellEnv()
 
