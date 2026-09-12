@@ -1,7 +1,10 @@
 import { Option } from "effect"
-import { Result } from "@effect-atom/atom-react"
-import { Cpu, MemoryStick, CircuitBoard } from "lucide-react"
-import { localModelRadarAxes, useLocalInferenceHardware, formatMemorySize } from "@magnitudedev/client-common"
+import { useMemo } from "react"
+import { Result, useAtomValue } from "@effect-atom/atom-react"
+import { MemoryStick, CircuitBoard } from "lucide-react"
+import { DesktopSession, useAgentClient, localModelRadarAxes, useLocalInferenceHardware, formatMemorySize } from "@magnitudedev/client-common"
+import { hardwarePresentation, type HardwarePhoto } from "./hardware-photos"
+import type { MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
 import type { CatalogLocalModel } from "@magnitudedev/sdk"
 
 export function ModelRadar({ model }: { model: CatalogLocalModel }) {
@@ -25,11 +28,41 @@ export function ModelRadar({ model }: { model: CatalogLocalModel }) {
 }
 
 export function HardwareOverview() {
-  const hardware=useLocalInferenceHardware()
-  if(!Result.isSuccess(hardware))return <div className="my-6 rounded-2xl border border-slate-200 p-6 text-sm text-slate-500 dark:border-slate-750">{Result.isFailure(hardware)?"Hardware observation unavailable. Recommendations will return when it recovers.":"Getting to know your machine…"}</div>
-  const value=hardware.value
+  const client = useAgentClient()
+  const session = useAtomValue(useMemo(() => client.runtime.atom(DesktopSession), [client]))
+  return Result.isSuccess(session) ? <ObservedHardware service={session.value} /> : <HardwareCard identity={null} />
+}
+function ObservedHardware({ service }: { service: DesktopSession }) {
+  const identity = useAtomValue(service.machineIdentity)
+  return <HardwareCard identity={Result.isSuccess(identity) ? identity.value : null} />
+}
+function HardwarePhotograph({ photo }: { photo: HardwarePhoto }) {
+  return <figure className="min-w-0 overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900">
+    <img src={photo.src} alt={photo.subject} className="aspect-[4/3] w-full object-cover" />
+    <figcaption className="px-3 py-2 text-[10px] leading-relaxed text-slate-500 dark:text-slate-400">
+      <p>{photo.kind === "Component" ? "Reference graphics card · designs vary" : "Device family photo · finish may vary"}</p>
+      <a href={photo.source} target="_blank" rel="noreferrer" className="underline underline-offset-2">{photo.author}</a>
+      {" · "}<a href={photo.licenseUrl} target="_blank" rel="noreferrer" className="underline underline-offset-2">{photo.license}</a>
+    </figcaption>
+  </figure>
+}
+function HardwareCard({ identity }: { identity: MachineIdentityObservation | null }) {
+  const hardware = useLocalInferenceHardware()
+  if (!Result.isSuccess(hardware)) return <div className="my-6 rounded-2xl border border-slate-200 p-6 text-sm text-slate-500 dark:border-slate-750">{Result.isFailure(hardware) ? "Hardware observation unavailable. Recommendations will return when it recovers." : "Getting to know your machine…"}</div>
+  const value = hardware.value
+  const presentation = hardwarePresentation(identity, value.accelerators.map(accelerator => accelerator.name))
   return <section aria-label="Your hardware" className="relative my-6 overflow-hidden rounded-2xl border border-blue-200 bg-gradient-to-br from-blue-50 via-white to-slate-100 p-6 dark:border-slate-700 dark:from-slate-800 dark:via-slate-850 dark:to-slate-900">
-    <div className="flex flex-wrap items-center gap-4"><div className="rounded-2xl border border-blue-200 bg-white/70 p-3 text-blue-700 dark:border-slate-650 dark:bg-slate-900 dark:text-blue-400"><Cpu className="size-7" /></div><div><p className="text-xs font-medium uppercase tracking-widest text-slate-500">Made for your machine</p><h2 className="mt-1 font-heading text-xl">{Option.getOrElse(value.processor,()=>value.platform)}</h2></div>
-    <div className="ml-auto flex flex-wrap gap-x-8 gap-y-4"><div className="flex items-center gap-3"><MemoryStick className="size-5 text-blue-600 dark:text-blue-400" /><div><p className="text-lg font-semibold">{formatMemorySize(value.totalSystemMemoryBytes)}</p><p className="text-xs text-slate-500">System memory</p></div></div>{value.accelerators.map(accelerator=><div key={accelerator.name} className="flex items-center gap-3"><CircuitBoard className="size-5 text-blue-600 dark:text-blue-400" /><div><p className="text-sm font-medium">{accelerator.name}</p><p className="text-xs text-slate-500">Local acceleration</p></div></div>)}</div></div>
+    <div className={`grid items-center gap-6 ${Option.isSome(presentation.photo) ? "grid-cols-[140px_minmax(0,1fr)] min-[1000px]:grid-cols-[220px_minmax(0,1fr)]" : ""}`}>
+      {Option.isSome(presentation.photo) && <div className="w-full max-w-[260px]"><HardwarePhotograph photo={presentation.photo.value} /></div>}
+      <div className="min-w-0">
+        <p className="text-xs font-medium uppercase tracking-widest text-slate-500">Your machine</p>
+        <h2 className="mt-2 break-words font-heading text-xl">{Option.getOrElse(presentation.name, () => Option.getOrElse(value.processor, () => value.platform))}</h2>
+        {Option.isSome(presentation.name) && <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">{Option.getOrElse(value.processor, () => value.platform)}</p>}
+        <div className="mt-5 flex flex-wrap gap-x-7 gap-y-4">
+          <div className="flex items-center gap-3"><MemoryStick className="size-5 shrink-0 text-blue-600 dark:text-blue-400" /><div><p className="text-lg font-semibold">{formatMemorySize(value.totalSystemMemoryBytes)}</p><p className="text-xs text-slate-500">System memory</p></div></div>
+          {value.accelerators.map(accelerator => <div key={accelerator.name} className="flex min-w-0 items-center gap-3"><CircuitBoard className="size-5 shrink-0 text-blue-600 dark:text-blue-400" /><div className="min-w-0"><p className="break-words text-sm font-medium">{accelerator.name}</p><p className="text-xs text-slate-500">Local acceleration</p></div></div>)}
+        </div>
+      </div>
+    </div>
   </section>
 }

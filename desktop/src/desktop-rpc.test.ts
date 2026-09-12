@@ -9,7 +9,7 @@ describe("desktop host recovery contract", () => {
     for (const rpc of InferenceHostRpcs.requests.values()) {
       if (RpcSchema.isStreamSchema(rpc.successSchema)) continue
       expect(Context.getOption(rpc.annotations, AcnRpcRecoveryPolicyTag), rpc._tag)
-        .toEqual(Option.some(rpc._tag === "ApplicationInfo" ? "ReplaySafe" : "AtMostOnce"))
+        .toEqual(Option.some(["ApplicationInfo", "MachineIdentity"].includes(rpc._tag) ? "ReplaySafe" : "AtMostOnce"))
     }
   })
 })
