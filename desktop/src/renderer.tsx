@@ -1,3 +1,4 @@
+import { ServingUsage } from "./serving-usage"
 import { initializeAppearance, setAppearancePreference, useAppearancePreference, subscribeAppearance, getAppearancePreference } from "../../web/src/stores/appearance-store"
 import { Button } from "../../web/src/components/ui/button"
 import { Input } from "../../web/src/components/ui/input"
@@ -249,6 +250,7 @@ function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null
       {service && "message" in service && <p role="alert" className="mt-5 text-sm">{service.message}</p>}
       {service?._tag === "Failed" && <Button className="mt-5" variant="outline" onClick={() => host.retry()}>Retry service</Button>}
     </section>
+    <ServingUsage />
     <MemoryStatus />
     <div className="grid items-start gap-5 lg:grid-cols-2">
       {ready ? <ModelStatus /> : <section className="rounded-2xl border border-slate-200 bg-white p-6 dark:border-slate-750 dark:bg-slate-850"><h2 className="font-heading text-lg">Model activity</h2><p className="mt-4 text-sm text-slate-500">Model status will return when the service is ready.</p></section>}

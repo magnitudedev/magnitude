@@ -19,3 +19,5 @@ export * from "./changes"
 export * from "./model-slot-visibility"
 export * from "./local-model-projection"
 export * from "./inference-projection"
+
+export * from "./serving-usage"

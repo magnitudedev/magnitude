@@ -1,3 +1,4 @@
+import { ServingUsageRequest, ServingUsageSnapshot } from "../schemas/serving-usage"
 import { Rpc } from "@effect/rpc"
 import { replaySafe, atMostOnce } from "../transport/recovery"
 import { Option, Schema } from "effect"
@@ -18,6 +19,8 @@ import {
   SlotIdSchema,
   SlotSelectionSchema,
 } from "../schemas/model-state"
+
+const GetServingUsage = Rpc.make("GetServingUsage", { payload: ServingUsageRequest, success: ServingUsageSnapshot }).pipe(replaySafe)
 
 const GetCatalog = Rpc.make("GetModelCatalog", {
   payload: Schema.Struct({}),
@@ -118,6 +121,7 @@ const PreviewSlotLoad = Rpc.make("PreviewModelSlotLoad", {
 }).pipe(replaySafe)
 
 export const Models = {
+  getServingUsage: GetServingUsage,
   getCatalog: GetCatalog,
   getSlots: GetSlots,
   getLocalEnvironment: GetLocalEnvironment,

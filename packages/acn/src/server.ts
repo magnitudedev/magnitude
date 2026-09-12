@@ -47,6 +47,9 @@ import { ProviderModelCatalogLive } from "./provider-model-catalog"
 import { ProviderCredentialsLive } from "./provider-credentials"
 import { ModelSlotControllerLive } from "./model-slot-controller"
 import { MagnitudeCloudUsageLive } from "./magnitude-cloud-usage"
+import { ServingUsage, ServingUsageLive } from "./serving-usage"
+import { makeUsageFetch, makeUsageWebSocket } from "./serving-usage-observer"
+import type { InferenceFetch } from "./inference-gateway"
 import {
   ProviderClientRegistryLive,
   SharedProviderClientLive,
@@ -309,7 +312,8 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
     ProviderModelCatalogLive,
     withSharedClient
   )
-  const withModelCatalog = Layer.provideMerge(ModelCatalogLive, withCatalog)
+  const withUsage = Layer.provideMerge(ServingUsageLive, withCatalog)
+  const withModelCatalog = Layer.provideMerge(ModelCatalogLive, withUsage)
   const withCredentials = Layer.provideMerge(
     ProviderCredentialsLive,
     withModelCatalog
@@ -430,7 +434,7 @@ const makeAcnInfrastructure = (
 export const proxyInferenceWebRequest = async (
   source: Request,
   icn: InferenceProxyTarget,
-  fetchTarget: typeof fetch = fetch,
+  fetchTarget: InferenceFetch = fetch,
   signal: AbortSignal = source.signal,
 ): Promise<Response> => {
   return proxyOpenAiInferenceRequest(source, icn, fetchTarget, signal)
@@ -440,6 +444,7 @@ const makeCodexWebSocketProxy = (
   request: HttpServerRequest.HttpServerRequest,
   source: Request,
   icn: InferenceProxyTarget,
+  usage: ServingUsage | undefined,
 ) => Effect.scoped(Effect.gen(function* () {
   const incoming = yield* request.upgrade
   type ClientEvent =
@@ -457,6 +462,7 @@ const makeCodexWebSocketProxy = (
   ) => WebSocket
   let active: {
     readonly key: string
+    readonly observer: ReturnType<typeof makeUsageWebSocket> | undefined
     readonly scope: Scope.CloseableScope
     readonly writer: (
       chunk: Uint8Array | string | PlatformSocket.CloseEvent,
@@ -482,7 +488,11 @@ const makeCodexWebSocketProxy = (
         (socket) => Effect.sync(() => socket.close(1000)),
       )).pipe(Scope.extend(outgoingScope))
       const writer = yield* outgoing.writer
-      yield* outgoing.runRaw((message) => incomingWriter(message)).pipe(
+      const observer = target.route === "local" && usage ? makeUsageWebSocket(usage) : undefined
+      if (observer) yield* Scope.addFinalizer(outgoingScope, observer.close())
+      yield* outgoing.runRaw((message) => (observer?.received(message) ?? Effect.void).pipe(
+        Effect.zipRight(incomingWriter(message)),
+      )).pipe(
         Effect.onExit((exit) => Exit.isInterrupted(exit)
           ? Effect.void
           : incomingWriter(new PlatformSocket.CloseEvent(
@@ -491,8 +501,9 @@ const makeCodexWebSocketProxy = (
           )).pipe(Effect.ignore)),
         Effect.forkIn(outgoingScope),
       )
-      active = { key, scope: outgoingScope, writer }
+      active = { key, scope: outgoingScope, writer, observer }
     }
+    yield* (active.observer?.sent(target.firstMessage) ?? Effect.void)
     const sent = yield* active.writer(target.firstMessage).pipe(Effect.either)
     if (sent._tag === "Left") {
       yield* incomingWriter(new PlatformSocket.CloseEvent(
@@ -513,11 +524,13 @@ const makeCodexWebSocketProxy = (
 const makeInferenceProxy = (
   icn: InferenceProxyTarget,
   protocol: "openai" | "anthropic" | "codex" | "claude-code",
+  fetchTarget: InferenceFetch = fetch,
+  usage?: ServingUsage,
 ) => {
   const anthropicGateway = protocol === "claude-code"
-    ? makeAnthropicGateway(icn)
+    ? makeAnthropicGateway(icn, fetchTarget)
     : undefined
-  const codexGateway = protocol === "codex" ? makeCodexGateway(icn) : undefined
+  const codexGateway = protocol === "codex" ? makeCodexGateway(icn, fetchTarget) : undefined
   return (request: HttpServerRequest.HttpServerRequest) => Effect.gen(function* () {
     // The wildcard proxy route is also the most specific OPTIONS route. Handle
     // browser preflight locally instead of forwarding it to an ICN operation.
@@ -527,7 +540,7 @@ const makeInferenceProxy = (
       return HttpServerResponse.text("Unsupported request transport", { status: 500 })
     }
     if (protocol === "codex" && source.headers.get("upgrade")?.toLowerCase() === "websocket") {
-      return yield* makeCodexWebSocketProxy(request, source, icn)
+      return yield* makeCodexWebSocketProxy(request, source, icn, usage)
     }
     const response = anthropicGateway !== undefined
       ? yield* anthropicGateway.route(source).pipe(Effect.either)
@@ -535,8 +548,8 @@ const makeInferenceProxy = (
         ? yield* codexGateway.route(source).pipe(Effect.either)
         : yield* Effect.tryPromise({
           try: (signal) => protocol === "openai"
-            ? proxyInferenceWebRequest(source, icn, fetch, signal)
-            : proxyLocalAnthropicInferenceRequest(source, icn, fetch, signal),
+            ? proxyInferenceWebRequest(source, icn, fetchTarget, signal)
+            : proxyLocalAnthropicInferenceRequest(source, icn, fetchTarget, signal),
           catch: (cause) => new InferenceProxyFailed({ cause }),
         }).pipe(Effect.either)
     if (response._tag === "Right") {
@@ -595,6 +608,8 @@ export const installAcnPublicRoutes = (
   router: HttpLayerRouter.HttpRouter,
   lifecycle: AcnServiceLifecycleApi,
   icn: InferenceProxyTarget,
+  fetchTarget: InferenceFetch = fetch,
+  usage?: ServingUsage,
 ) => Effect.gen(function* () {
   yield* router.add("POST", "/rpc", Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest
@@ -603,16 +618,16 @@ export const installAcnPublicRoutes = (
       : HttpServerResponse.empty({ status: 409 })
   }))
   yield* router.prefixed("/inference/v1/proxies/codex").add(
-    "*", "/*", makeInferenceProxy(icn, "codex"),
+    "*", "/*", makeInferenceProxy(icn, "codex", fetchTarget, usage),
   )
   yield* router.prefixed("/inference/v1").add(
-    "*", "/*", makeInferenceProxy(icn, "openai"),
+    "*", "/*", makeInferenceProxy(icn, "openai", fetchTarget),
   )
   yield* router.prefixed("/inference/anthropic/proxies/claude-code").add(
-    "*", "/*", makeInferenceProxy(icn, "claude-code"),
+    "*", "/*", makeInferenceProxy(icn, "claude-code", fetchTarget),
   )
   yield* router.prefixed("/inference/anthropic").add(
-    "*", "/*", makeInferenceProxy(icn, "anthropic"),
+    "*", "/*", makeInferenceProxy(icn, "anthropic", fetchTarget),
   )
 })
 
@@ -698,7 +713,8 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
         yield* installAcnIntrospectionRoutes(router, builtServices.introspector.value)
       }
       const icn = Context.get(applicationContext, IcnProcess)
-      yield* installAcnPublicRoutes(router, lifecycle, icn)
+      const usage = Context.get(applicationContext, ServingUsage)
+      yield* installAcnPublicRoutes(router, lifecycle, icn, makeUsageFetch(icn.origin, usage), usage)
       yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie))
       return {
         subscriptions: Context.get(applicationContext, AcnSubscriptions),

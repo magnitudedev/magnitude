@@ -3,15 +3,14 @@ import type { MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
 import inventory from "../../assets/hardware/inventory.json"
 
 export const HardwarePhoto = Schema.Struct({
-  src: Schema.String, subject: Schema.String, author: Schema.String,
-  source: Schema.String, license: Schema.String, licenseUrl: Schema.String,
+  src: Schema.String, subject: Schema.String,
   kind: Schema.Literal("Device", "Component"),
 })
 export type HardwarePhoto = typeof HardwarePhoto.Type
 const HardwarePhotoEntry = Schema.Struct({
   id: Schema.NonEmptyString.pipe(Schema.brand("HardwarePhotoId")), file: Schema.NonEmptyString,
-  subject: Schema.NonEmptyString, author: Schema.NonEmptyString,
-  source: Schema.NonEmptyString, license: Schema.NonEmptyString, licenseUrl: Schema.NonEmptyString,
+  subject: Schema.NonEmptyString, manufacturer: Schema.NonEmptyString,
+  source: Schema.NonEmptyString, imageUrl: Schema.NonEmptyString,
   match: Schema.Union(
     Schema.TaggedStruct("Apple", { models: Schema.NonEmptyArray(Schema.NonEmptyString) }),
     Schema.TaggedStruct("Pc", { manufacturers: Schema.NonEmptyArray(Schema.NonEmptyString), models: Schema.NonEmptyArray(Schema.NonEmptyString) }),

@@ -39,11 +39,6 @@ function ObservedHardware({ service }: { service: DesktopSession }) {
 function HardwarePhotograph({ photo }: { photo: HardwarePhoto }) {
   return <figure className="min-w-0 overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900">
     <img src={photo.src} alt={photo.subject} className="aspect-[4/3] w-full object-contain" />
-    <figcaption className="px-3 py-2 text-[10px] leading-relaxed text-slate-500 dark:text-slate-400">
-      <p>{photo.kind === "Component" ? "Reference graphics card · designs vary" : "Device family photo · finish may vary"}</p>
-      <a href={photo.source} target="_blank" rel="noreferrer" className="underline underline-offset-2">{photo.author}</a>
-      {" · "}<a href={photo.licenseUrl} target="_blank" rel="noreferrer" className="underline underline-offset-2">{photo.license}</a>
-    </figcaption>
   </figure>
 }
 function HardwareCard({ identity }: { identity: MachineIdentityObservation | null }) {

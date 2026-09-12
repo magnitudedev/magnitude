@@ -1,20 +1,16 @@
 [
   {
     "id": "book16",
-    "file": "macbook-pro-16.jpg",
+    "file": "book16.png",
     "subject": "16-inch MacBook Pro",
-    "source": "https://commons.wikimedia.org/wiki/File:MacBook_Pro_%2816-inch%2C_M4_Pro%2C_Silver%29.jpg",
-    "author": "AzureSaturn",
-    "license": "CC0",
-    "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/108052",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-pro/macbook-pro-16in-2024-colors.png",
     "match": {
       "_tag": "Apple",
       "models": [
         "Mac16,5",
         "Mac16,7",
-        "Mac15,7",
-        "Mac15,9",
-        "Mac15,11",
         "Mac17,6",
         "Mac17,8"
       ]
@@ -22,26 +18,17 @@
   },
   {
     "id": "book14",
-    "file": "macbook-pro-14.jpg",
+    "file": "book14.png",
     "subject": "14-inch MacBook Pro",
-    "source": "https://commons.wikimedia.org/wiki/File:MacBook_Pro_%2814-inch%2C_M5%2C_Space_Black%29.jpg",
-    "author": "AzureSaturn",
-    "license": "CC0",
-    "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/108052",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-pro/macbook-pro-14in-2024-m4-pro-m4-max-colors.png",
     "match": {
       "_tag": "Apple",
       "models": [
         "Mac16,1",
         "Mac16,6",
         "Mac16,8",
-        "Mac15,3",
-        "Mac15,6",
-        "Mac15,8",
-        "Mac15,10",
-        "Mac14,5",
-        "Mac14,9",
-        "MacBookPro18,3",
-        "MacBookPro18,4",
         "Mac17,2",
         "Mac17,7",
         "Mac17,9"
@@ -50,12 +37,11 @@
   },
   {
     "id": "air13",
-    "file": "macbook-air-13.jpg",
+    "file": "air13.png",
     "subject": "13-inch MacBook Air",
-    "source": "https://commons.wikimedia.org/wiki/File:MacBook_Air_%2813-inch%2C_M4%2C_Silver%29.jpg",
-    "author": "AzureSaturn",
-    "license": "CC0",
-    "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/102869",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-air/2025-macbook-air-13in-colors.png",
     "match": {
       "_tag": "Apple",
       "models": [
@@ -65,13 +51,116 @@
     }
   },
   {
+    "id": "air15-m4",
+    "file": "air15-m4.png",
+    "subject": "15-inch MacBook Air",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/102869",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-air/2025-macbook-air-15in-colors.png",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Mac16,13",
+        "Mac17,4"
+      ]
+    }
+  },
+  {
+    "id": "air13-m2",
+    "file": "air13-m2.png",
+    "subject": "13-inch MacBook Air (M2 / M3)",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/102869",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-air/2022-macbook-air-m2-colors.png",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Mac14,2",
+        "Mac15,12"
+      ]
+    }
+  },
+  {
+    "id": "air15-m2",
+    "file": "air15-m2.png",
+    "subject": "15-inch MacBook Air (M2 / M3)",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/102869",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-air/2023-macbook-air-15in-m2-colors.png",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Mac14,15",
+        "Mac15,13"
+      ]
+    }
+  },
+  {
+    "id": "air13-m1",
+    "file": "air13-m1.jpg",
+    "subject": "MacBook Air (M1)",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/102869",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-air/macbook-air-2020-late-device.jpg",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "MacBookAir10,1"
+      ]
+    }
+  },
+  {
+    "id": "pro13-m1",
+    "file": "pro13-m1.png",
+    "subject": "13-inch MacBook Pro (M1 / M2)",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/108052",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-pro/macbook-pro-13-in-M2-2022.png",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "MacBookPro17,1",
+        "Mac14,7"
+      ]
+    }
+  },
+  {
+    "id": "pro16-m1",
+    "file": "pro16-m1.png",
+    "subject": "16-inch MacBook Pro (2021)",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/108052",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-pro/macbook-pro-2021-16in.png",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "MacBookPro18,1",
+        "MacBookPro18,2"
+      ]
+    }
+  },
+  {
+    "id": "pro16-m2",
+    "file": "pro16-m2.png",
+    "subject": "16-inch MacBook Pro (early 2023)",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/108052",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-pro/macbook-pro-16in-2023.png",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Mac14,6",
+        "Mac14,10"
+      ]
+    }
+  },
+  {
     "id": "studio",
-    "file": "mac-studio.jpg",
+    "file": "studio.png",
     "subject": "Mac Studio",
-    "source": "https://commons.wikimedia.org/wiki/File:Mac_Studio_%282022%29_front.jpg",
-    "author": "Yasu",
-    "license": "CC BY-SA 3.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/102231",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/mac-studio/mac-studio-2025-m4-max.png",
     "match": {
       "_tag": "Apple",
       "models": [
@@ -86,12 +175,11 @@
   },
   {
     "id": "mini",
-    "file": "mac-mini-2024.jpg",
+    "file": "mini.png",
     "subject": "Mac mini (2024)",
-    "source": "https://commons.wikimedia.org/wiki/File:Mac_mini_2024_M4.jpg",
-    "author": "Seasider53",
-    "license": "CC BY 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by/4.0/",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/102852",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/mac-mini/mac-mini-2024.png",
     "match": {
       "_tag": "Apple",
       "models": [
@@ -101,13 +189,163 @@
     }
   },
   {
+    "id": "mini-m1",
+    "file": "mini-m1.png",
+    "subject": "Mac mini (M1 / M2)",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/102852",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/mac-mini/mac-mini-2020-m1.png",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Macmini9,1"
+      ]
+    }
+  },
+  {
+    "id": "imac-m1",
+    "file": "imac-m1.png",
+    "subject": "24-inch iMac (M1 / M3)",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/108054",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/imac/id-imac-24-2021.png",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "iMac21,1",
+        "iMac21,2"
+      ]
+    }
+  },
+  {
+    "id": "imac-m4",
+    "file": "imac-m4.png",
+    "subject": "24-inch iMac (M4)",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/108054",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/imac/imac-24in-2024-four-ports-colors.png",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Mac16,2",
+        "Mac16,3"
+      ]
+    }
+  },
+  {
+    "id": "pro14-m1",
+    "file": "pro14-m1.png",
+    "subject": "14-inch MacBook Pro",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/108052",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-pro/macbook-pro-2021-14in.png",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "MacBookPro18,3",
+        "MacBookPro18,4"
+      ]
+    }
+  },
+  {
+    "id": "pro14-m2",
+    "file": "pro14-m2.png",
+    "subject": "14-inch MacBook Pro",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/108052",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-pro/macbook-pro-14in-2023.png",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Mac14,5",
+        "Mac14,9"
+      ]
+    }
+  },
+  {
+    "id": "pro14-m3",
+    "file": "pro14-m3.png",
+    "subject": "14-inch MacBook Pro",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/108052",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-pro/macbook-pro-14in-m3-pro-m3-max-nov-2023-silver-space-black.png",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Mac15,3",
+        "Mac15,6",
+        "Mac15,8",
+        "Mac15,10"
+      ]
+    }
+  },
+  {
+    "id": "pro16-m3",
+    "file": "pro16-m3.png",
+    "subject": "16-inch MacBook Pro",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/108052",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/macbook-pro/macbook-pro-16in-m3-pro-m3-max-nov-2023-silver-space-black.png",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Mac15,7",
+        "Mac15,9",
+        "Mac15,11"
+      ]
+    }
+  },
+  {
+    "id": "mini-m2",
+    "file": "mini-m2.png",
+    "subject": "Mac mini",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/102852",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/mac-mini/mac-mini-2023-m2-pro.png",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Mac14,3",
+        "Mac14,12"
+      ]
+    }
+  },
+  {
+    "id": "imac-m3",
+    "file": "imac-m3.png",
+    "subject": "24-inch iMac",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/108054",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/imac/imac-24in-2023-four-ports-colors.png",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "Mac15,4",
+        "Mac15,5"
+      ]
+    }
+  },
+  {
+    "id": "mac-pro-2013",
+    "file": "mac-pro-2013.jpg",
+    "subject": "Mac Pro",
+    "manufacturer": "Apple",
+    "source": "https://support.apple.com/en-us/102887",
+    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/mac-pro/id-mac-pro-2013.jpg",
+    "match": {
+      "_tag": "Apple",
+      "models": [
+        "MacPro6,1"
+      ]
+    }
+  },
+  {
     "id": "rtx5090",
-    "file": "rtx-5090.png",
+    "file": "rtx5090.png",
     "subject": "GeForce RTX 5090 Founders Edition",
-    "source": "https://commons.wikimedia.org/wiki/File:RTX_5090_-_du%C5%BCa_wydajno%C5%9B%C4%87_du%C5%BCym_kosztem_%282160p_30fps_VP9_LQ-96kbit_AAC%29-00.05.24.568.png",
-    "author": "ZMASLO",
-    "license": "CC BY 3.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by/3.0/",
+    "manufacturer": "PNY",
+    "source": "https://www.pny.com/geforce-rtx-5090-models?sku=VCG509032TFXPB1",
+    "imageUrl": "https://d2vfia6k6wrouk.cloudfront.net/productimages/74e8f739-cf99-4cad-bccd-b25f00affcce/images/2-pny-rtx-5090-std-triple-fan-ra.png",
     "match": {
       "_tag": "Gpu",
       "names": [
@@ -117,215 +355,56 @@
     }
   },
   {
-    "id": "air15-m4",
-    "file": "air15-m4.jpg",
-    "author": "AzureSaturn",
-    "license": "CC0",
-    "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/deed.en",
-    "source": "https://commons.wikimedia.org/wiki/File:MacBook_Air_(15-inch,_M4,_Silver).jpg",
-    "subject": "15-inch MacBook Air",
-    "match": {
-      "_tag": "Apple",
-      "models": [
-        "Mac16,13",
-        "Mac17,4"
-      ]
-    }
-  },
-  {
-    "id": "air13-m2",
-    "file": "air13-m2.jpg",
-    "author": "メイド理世",
-    "license": "CC BY-SA 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:MacBook_Air_(A2681)_front.jpg",
-    "subject": "13-inch MacBook Air (M2 / M3)",
-    "match": {
-      "_tag": "Apple",
-      "models": [
-        "Mac14,2",
-        "Mac15,12"
-      ]
-    }
-  },
-  {
-    "id": "air15-m2",
-    "file": "air15-m2.jpg",
-    "author": "KKPCW（Kyu3）",
-    "license": "CC BY-SA 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:Macbook_Air_15_inch_-_1.jpg",
-    "subject": "15-inch MacBook Air (M2 / M3)",
-    "match": {
-      "_tag": "Apple",
-      "models": [
-        "Mac14,15",
-        "Mac15,13"
-      ]
-    }
-  },
-  {
-    "id": "air13-m1",
-    "file": "air13-m1.jpg",
-    "author": "Jelican9",
-    "license": "CC BY-SA 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:Macbook_Air_2020_(M1).jpg",
-    "subject": "MacBook Air (M1)",
-    "match": {
-      "_tag": "Apple",
-      "models": [
-        "MacBookAir10,1"
-      ]
-    }
-  },
-  {
-    "id": "pro13-m1",
-    "file": "pro13-m1.jpg",
-    "author": "Yagya Parihar",
-    "license": "CC BY-SA 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:MacBook_Pro_13_(M1,_2020).jpg",
-    "subject": "13-inch MacBook Pro (M1 / M2)",
-    "match": {
-      "_tag": "Apple",
-      "models": [
-        "MacBookPro17,1",
-        "Mac14,7"
-      ]
-    }
-  },
-  {
-    "id": "pro16-m1",
-    "file": "pro16-m1.jpg",
-    "author": "Premeditated",
-    "license": "CC BY-SA 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:MacBook_Pro_16_(M1_Pro,_2021)_-_Wikipedia_(cropped).jpg",
-    "subject": "16-inch MacBook Pro (2021)",
-    "match": {
-      "_tag": "Apple",
-      "models": [
-        "MacBookPro18,1",
-        "MacBookPro18,2"
-      ]
-    }
-  },
-  {
-    "id": "pro16-m2",
-    "file": "pro16-m2.jpg",
-    "author": "SimonWaldherr",
-    "license": "CC BY-SA 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:Apple_MacBook_Pro_16%22_M2_Max.jpg",
-    "subject": "16-inch MacBook Pro (early 2023)",
-    "match": {
-      "_tag": "Apple",
-      "models": [
-        "Mac14,6",
-        "Mac14,10"
-      ]
-    }
-  },
-  {
-    "id": "mini-m1",
-    "file": "mini-m1.jpg",
-    "author": "Gerd Fahrenhorst",
-    "license": "CC BY 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:Mac_mini_2020_(M1)_Anschl%C3%BCsse.jpg",
-    "subject": "Mac mini (M1 / M2)",
-    "match": {
-      "_tag": "Apple",
-      "models": [
-        "Macmini9,1",
-        "Mac14,3"
-      ]
-    }
-  },
-  {
-    "id": "rtx3060",
-    "file": "rtx3060.jpg",
-    "author": "Qurren",
-    "license": "CC BY-SA 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:Zotac_GeForce_RTX_3060_12GB_VRAM_LHR_video_card.jpg",
-    "subject": "RTX 3060",
+    "id": "rtx5080",
+    "file": "rtx5080.png",
+    "subject": "NVIDIA GeForce RTX 5080",
+    "manufacturer": "PNY",
+    "source": "https://www.pny.com/geforce-rtx-5080-models",
+    "imageUrl": "https://d2vfia6k6wrouk.cloudfront.net/productimages/261d17b4-064c-424d-8d3e-b25f00dc49b3/images/2-pny-rtx-5080-argb-oc-epic-x-triple-fan-ra.png",
     "match": {
       "_tag": "Gpu",
       "names": [
-        "RTX 3060"
+        "RTX 5080",
+        "NVIDIA GeForce RTX 5080"
       ]
     }
   },
   {
-    "id": "rtx3070",
-    "file": "rtx3070.jpg",
-    "author": "TheStriker",
-    "license": "CC BY 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:MSI_GeForce_RTX_3070_VENTUS_3X_OC.jpg",
-    "subject": "RTX 3070",
+    "id": "rtx5070ti",
+    "file": "rtx5070ti.png",
+    "subject": "RTX 5070 Ti",
+    "manufacturer": "PNY",
+    "source": "https://www.pny.com/geforce-rtx-5070-ti-models",
+    "imageUrl": "https://d2vfia6k6wrouk.cloudfront.net/productimages/a63a730f-6141-4b90-9c4a-b25f00f56a7d/images/2-pny-rtx-5070-ti-argb-oc-epic-x-triple-fan-ra.png",
     "match": {
       "_tag": "Gpu",
       "names": [
-        "RTX 3070"
+        "RTX 5070 Ti"
       ]
     }
   },
   {
-    "id": "rtx3090",
-    "file": "rtx3090.jpg",
-    "author": "Adam Kapetanakis",
-    "license": "CC BY-SA 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:RTX_3090_Founders_Edition.jpg",
-    "subject": "RTX 3090",
+    "id": "rtx5070",
+    "file": "rtx5070.png",
+    "subject": "NVIDIA GeForce RTX 5070",
+    "manufacturer": "PNY",
+    "source": "https://www.pny.com/geforce-rtx-5070-models",
+    "imageUrl": "https://d2vfia6k6wrouk.cloudfront.net/productimages/d3266c6f-d466-41a0-b948-b25f00b01415/images/2-pny-rtx-5070-argb-oc-epic-x-triple-fan-ra.png",
     "match": {
       "_tag": "Gpu",
       "names": [
-        "RTX 3090"
-      ]
-    }
-  },
-  {
-    "id": "rtx4070super",
-    "file": "rtx4070super.png",
-    "author": "极客湾Geekerwan",
-    "license": "CC BY 3.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by/3.0",
-    "source": "https://commons.wikimedia.org/wiki/File:Video_%C3%BCber_die_RTX_4070_Super_und_Vergleichskarten_(%E6%9E%81%E5%AE%A2%E6%B9%BEGeekerwan)_01.png",
-    "subject": "RTX 4070 SUPER",
-    "match": {
-      "_tag": "Gpu",
-      "names": [
-        "RTX 4070 SUPER"
-      ]
-    }
-  },
-  {
-    "id": "rtx4090",
-    "file": "rtx4090.jpg",
-    "author": "Benlisquare",
-    "license": "CC BY-SA 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:Asus_Strix_RTX_4090.jpg",
-    "subject": "RTX 4090",
-    "match": {
-      "_tag": "Gpu",
-      "names": [
-        "RTX 4090"
+        "RTX 5070",
+        "NVIDIA GeForce RTX 5070"
       ]
     }
   },
   {
     "id": "rtx5060",
-    "file": "rtx5060.jpg",
-    "author": "4300streetcar",
-    "license": "CC BY 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:PNY_short_RTX_5060_at_Computex_2025.jpg",
+    "file": "rtx5060.png",
     "subject": "RTX 5060",
+    "manufacturer": "PNY",
+    "source": "https://www.pny.com/geforce-rtx-5060-8gb-models?sku=VCG50608DFXPB1",
+    "imageUrl": "https://d2vfia6k6wrouk.cloudfront.net/productimages/026769ef-e581-4b5f-bc57-b2c0009c7bee/images/1-pny-rtx-5060-std-dual-fan-ra.png",
     "match": {
       "_tag": "Gpu",
       "names": [
@@ -334,13 +413,82 @@
     }
   },
   {
+    "id": "rtx4090",
+    "file": "rtx4090.png",
+    "subject": "RTX 4090",
+    "manufacturer": "PNY",
+    "source": "https://www.pny.com/pny-geforce-rtx-4090-24gb-verto-triple-fan-led",
+    "imageUrl": "https://d2vfia6k6wrouk.cloudfront.net/productimages/d21d252f-4186-47e9-bfab-af380099ba5a/images/pny-rtx-4090-verto-triple-fan-ra.png",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "RTX 4090"
+      ]
+    }
+  },
+  {
+    "id": "rtx4070super",
+    "file": "rtx4070super.png",
+    "subject": "RTX 4070 SUPER",
+    "manufacturer": "PNY",
+    "source": "https://www.pny.com/pny-geforce-rtx-4070-super-12-gb-verto-oc-edition-dual-fan",
+    "imageUrl": "https://d2vfia6k6wrouk.cloudfront.net/productimages/e7c5ce6d-d8fd-43e1-b3f1-b0f100cbb986/images/pny-rtx-4070-super-12gb-verto-dual-fan-oc-ra.png",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "RTX 4070 SUPER"
+      ]
+    }
+  },
+  {
+    "id": "rtx3070",
+    "file": "rtx3070.png",
+    "subject": "RTX 3070",
+    "manufacturer": "PNY",
+    "source": "https://www.pny.com/geforc-rtx-3070-uprising-lhr",
+    "imageUrl": "https://d2vfia6k6wrouk.cloudfront.net/productimages/80d2de3b-d4af-4c4f-9131-ad2c00a37fee/images/2-pny-geforce-rtx-3070-df-m-ra-no-logo.png",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "RTX 3070"
+      ]
+    }
+  },
+  {
+    "id": "rtx3060",
+    "file": "rtx3060.png",
+    "subject": "RTX 3060",
+    "manufacturer": "PNY",
+    "source": "https://www.pny.com/geforce-rtx-3060-12gb-xlr8-gaming-revel-epic-x-rgb-df",
+    "imageUrl": "https://d2vfia6k6wrouk.cloudfront.net/productimages/b09cdb7e-fa34-4aa1-9fd0-acae00e18691/images/3_pny-geforce-rtx-3060-led-blue-top-2.png",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "RTX 3060"
+      ]
+    }
+  },
+  {
+    "id": "rtx3090",
+    "file": "rtx3090.jpg",
+    "subject": "RTX 3090",
+    "manufacturer": "NVIDIA",
+    "source": "https://www.nvidia.com/en-us/geforce/graphics-cards/30-series/rtx-3090-3090ti/",
+    "imageUrl": "https://www.nvidia.com/content/dam/en-zz/Solutions/geforce/ampere/rtx-3090/geforce-rtx-3090-product-gallery-full-screen-3840-2.jpg",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "RTX 3090"
+      ]
+    }
+  },
+  {
     "id": "rx6800xt",
     "file": "rx6800xt.jpg",
-    "author": "Vitaly Zdanevich",
-    "license": "CC BY-SA 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:Amd-radeon-rx6800xt-from2020year-angle.jpg",
     "subject": "RX 6800 XT",
+    "manufacturer": "AMD",
+    "source": "https://www.amd.com/en/products/graphics/desktops.html",
+    "imageUrl": "https://www.amd.com/content/dam/amd/en/images/products/graphics/2648997-amd-radeon-6800xt.jpg",
     "match": {
       "_tag": "Gpu",
       "names": [
@@ -351,11 +499,10 @@
   {
     "id": "rx6900xt",
     "file": "rx6900xt.jpg",
-    "author": "Verte95",
-    "license": "CC BY-SA 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:AMD_RX_6900XT_.jpg",
     "subject": "RX 6900 XT",
+    "manufacturer": "AMD",
+    "source": "https://www.amd.com/en/products/graphics/desktops.html",
+    "imageUrl": "https://www.amd.com/content/dam/amd/en/images/products/graphics/2648997-amd-radeon-6900xt.jpg",
     "match": {
       "_tag": "Gpu",
       "names": [
@@ -366,11 +513,10 @@
   {
     "id": "rx7900xt",
     "file": "rx7900xt.jpg",
-    "author": "Shinobara",
-    "license": "CC BY 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:RX7900XT_crop.jpg",
     "subject": "RX 7900 XT",
+    "manufacturer": "AMD",
+    "source": "https://www.amd.com/en/products/graphics/desktops.html",
+    "imageUrl": "https://www.amd.com/content/dam/amd/en/images/products/graphics/2648997-amd-radeon-7900xt.jpg",
     "match": {
       "_tag": "Gpu",
       "names": [
@@ -381,11 +527,10 @@
   {
     "id": "rx7900xtx",
     "file": "rx7900xtx.jpg",
-    "author": "Geni",
-    "license": "CC BY-SA 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:Sapphire_AMD_Radeon_RX_7900_XTX.jpg",
     "subject": "RX 7900 XTX",
+    "manufacturer": "AMD",
+    "source": "https://www.amd.com/en/products/graphics/desktops.html",
+    "imageUrl": "https://www.amd.com/content/dam/amd/en/images/products/graphics/2648997-amd-radeon-7900xtx.jpg",
     "match": {
       "_tag": "Gpu",
       "names": [
@@ -394,13 +539,40 @@
     }
   },
   {
+    "id": "arc-b580",
+    "file": "arc-b580.png",
+    "subject": "Arc B580",
+    "manufacturer": "SPARKLE",
+    "source": "https://www.sparkle.com.tw/tw/products/view/6893fe373180",
+    "imageUrl": "https://www.sparkle.com.tw/files/20241203220302595.png",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "Arc B580"
+      ]
+    }
+  },
+  {
+    "id": "rx580",
+    "file": "rx580.png",
+    "subject": "RX 580",
+    "manufacturer": "SAPPHIRE",
+    "source": "https://www.sapphiretech.com/en/consumer/pulse-rx-580-8g-g5",
+    "imageUrl": "https://cdn.sapphiretech.global/assets/consumer/11265_20G_PULSE_RX_580_8gb/11265_05_RX580_Pulse_8GB_800x500_02.png",
+    "match": {
+      "_tag": "Gpu",
+      "names": [
+        "RX 580"
+      ]
+    }
+  },
+  {
     "id": "rx9060xt",
-    "file": "rx9060xt.png",
-    "author": "Padgriffin",
-    "license": "CC BY 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:AMD_Radeon_RX9060XT.png",
+    "file": "rx9060xt.jpg",
     "subject": "RX 9060 XT",
+    "manufacturer": "SAPPHIRE",
+    "source": "https://www.sapphiretech.com/en/consumer/pulse-radeon-rx-9060-xt-16g-gddr6",
+    "imageUrl": "https://media.cdn.sapphiretech.com.cn/-/media/sites/sapphire/pim/product-images/11350_03_rx9060xt_pulse_16ggddr6/rx9060xt_pulse_16gb_photo_c01_800x500.ashx?v=a513c6c1e3224d2f9d27eb34c56e355d",
     "match": {
       "_tag": "Gpu",
       "names": [
@@ -409,65 +581,44 @@
     }
   },
   {
-    "id": "imac-m1",
-    "file": "imac-m1.jpg",
-    "author": "Jelican9",
-    "license": "CC BY-SA 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:M1_iMac_blue_model.jpg",
-    "subject": "24-inch iMac (M1 / M3)",
+    "id": "arc-a770",
+    "file": "arc-a770.png",
+    "subject": "Arc A770",
+    "manufacturer": "SPARKLE",
+    "source": "https://www.sparkle.com.tw/en/products/view/6A1A31428cBE",
+    "imageUrl": "https://www.sparkle.com.tw/files/20240126151517623.png",
     "match": {
-      "_tag": "Apple",
-      "models": [
-        "iMac21,1",
-        "iMac21,2",
-        "Mac15,4",
-        "Mac15,5"
+      "_tag": "Gpu",
+      "names": [
+        "Arc A770"
       ]
     }
   },
   {
-    "id": "imac-m4",
-    "file": "imac-m4.jpg",
-    "author": "Seasider53",
-    "license": "CC BY 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:IMac_M4_2024_2_(cropped).jpg",
-    "subject": "24-inch iMac (M4)",
-    "match": {
-      "_tag": "Apple",
-      "models": [
-        "Mac16,2",
-        "Mac16,3"
-      ]
-    }
-  },
-  {
-    "id": "surface-studio",
-    "file": "surface-studio.jpg",
-    "author": "KKPCW",
-    "license": "CC BY-SA 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:Surface_Laptop_Studio_-_1.jpg",
-    "subject": "Surface Laptop Studio",
+    "id": "dgx-a100",
+    "file": "dgx-a100.png",
+    "subject": "NVIDIA DGX A100",
+    "manufacturer": "NVIDIA",
+    "source": "https://docs.nvidia.com/dgx/dgxa100-user-guide/introduction-to-dgxa100.html",
+    "imageUrl": "https://docs.nvidia.com/dgx/dgxa100-user-guide/_images/dgxa100-front.png",
     "match": {
       "_tag": "Pc",
       "manufacturers": [
-        "Microsoft Corporation"
+        "NVIDIA",
+        "NVIDIA Corporation"
       ],
       "models": [
-        "Surface Laptop Studio"
+        "DGXA100 920-23687-2530-000"
       ]
     }
   },
   {
     "id": "surface-go",
     "file": "surface-go.jpg",
-    "author": "Ckazemi",
-    "license": "CC BY-SA 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:A_platinum_Microsoft_Surface_Laptop_Go.jpg",
     "subject": "Surface Laptop Go",
+    "manufacturer": "Microsoft",
+    "source": "https://www.domayne.com.au/microsoft-surface-laptop-go-12-4-inch-i5-8gb-256gb-ssd-laptop-platinum.html",
+    "imageUrl": "https://dmau.imgix.net/media/catalog/product/f/e/feature_01-platinum_2_2.jpg",
     "match": {
       "_tag": "Pc",
       "manufacturers": [
@@ -479,62 +630,19 @@
     }
   },
   {
-    "id": "arc-a770",
-    "file": "arc-a770.jpg",
-    "author": "Telaneo",
-    "license": "CC0",
-    "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/deed.en",
-    "source": "https://commons.wikimedia.org/wiki/File:Intel_Arc_A770_front.jpg",
-    "subject": "Arc A770",
+    "id": "surface-studio",
+    "file": "surface-studio.jpg",
+    "subject": "Surface Laptop Studio",
+    "manufacturer": "Microsoft",
+    "source": "https://www.walmart.com/ip/799143780",
+    "imageUrl": "https://i5.walmartimages.com/seo/Microsoft-Surface-Laptop-Studio-14-4-Pixel-Sense-Flow-Display-10-Point-Multi-touch-Intel-Core-H35-i5-11300H-16GB-RAM-512GB-SSD-Platinum-Windows-11-9W_b283a552-4a85-44aa-bc6d-041f134a6815.ea6ab6cc3b6d6b8e54c8af0858167b44.jpeg",
     "match": {
-      "_tag": "Gpu",
-      "names": [
-        "Arc A770"
-      ]
-    }
-  },
-  {
-    "id": "arc-b580",
-    "file": "arc-b580.jpg",
-    "author": "Jiahwang",
-    "license": "CC0",
-    "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/deed.en",
-    "source": "https://commons.wikimedia.org/wiki/File:Intel_Arc_Battlemage_B580_Limited_Edition.jpg",
-    "subject": "Arc B580",
-    "match": {
-      "_tag": "Gpu",
-      "names": [
-        "Arc B580"
-      ]
-    }
-  },
-  {
-    "id": "rtx5070ti",
-    "file": "rtx5070ti.jpg",
-    "author": "4300streetcar",
-    "license": "CC BY 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:PNY_RTX_5070_Ti_at_Computex_2025.jpg",
-    "subject": "RTX 5070 Ti",
-    "match": {
-      "_tag": "Gpu",
-      "names": [
-        "RTX 5070 Ti"
-      ]
-    }
-  },
-  {
-    "id": "rx580",
-    "file": "rx580.jpg",
-    "author": "Verte95",
-    "license": "CC BY-SA 4.0",
-    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0",
-    "source": "https://commons.wikimedia.org/wiki/File:Sapphire_RX_580_Nitro%2B.jpg",
-    "subject": "RX 580",
-    "match": {
-      "_tag": "Gpu",
-      "names": [
-        "RX 580"
+      "_tag": "Pc",
+      "manufacturers": [
+        "Microsoft Corporation"
+      ],
+      "models": [
+        "Surface Laptop Studio"
       ]
     }
   }

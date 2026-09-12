@@ -43,15 +43,17 @@ it.each(hardwarePhotoInventory)("matches the verified identity for $id", entry =
     }
   }
 })
-it("contains distinct attributed local photographs and unambiguous matches", () => {
+it("contains distinct professional product photographs and unambiguous matches", () => {
   expect(hardwarePhotoInventory.length).toBeGreaterThanOrEqual(30)
   expect(new Set(hardwarePhotoInventory.map(entry => entry.file)).size).toBe(hardwarePhotoInventory.length)
   expect(new Set(hardwarePhotoInventory.map(entry => entry.id)).size).toBe(hardwarePhotoInventory.length)
   const identities = hardwarePhotoInventory.flatMap(({ match }) => match._tag === "Gpu" ? match.names : match.models)
   expect(new Set(identities).size).toBe(identities.length)
   for (const entry of hardwarePhotoInventory) {
-    expect(entry.source).toMatch(/^https:\/\/commons.wikimedia.org\/wiki\/File:/)
-    expect(entry.licenseUrl).toMatch(/^https:\/\/creativecommons.org\//)
+    expect(entry.source).toMatch(/^https:\/\//)
+    expect(entry.source).not.toContain("wikimedia")
+    expect(entry.imageUrl).toMatch(/^https:\/\//)
+    expect(entry.manufacturer).toBeTruthy()
     expect(entry.src).toBeTruthy()
     expect(entry.kind).toBe(entry.match._tag === "Gpu" ? "Component" : "Device")
   }
