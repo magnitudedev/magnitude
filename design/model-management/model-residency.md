@@ -3,7 +3,6 @@ applies_to:
   - inference/crates/icn-api/**
   - inference/crates/icn-server/**
   - packages/icn-protocol/**
-  - packages/daemon-management/src/acn-jit/**
   - packages/acn/src/service-lifecycle.ts
   - packages/acn/src/server.ts
   - cli/src/**
@@ -15,8 +14,9 @@ applies_to:
 
 ACN process lifetime, ICN child lifetime, client lifetime, session-runtime lifetime, and model
 residency are independent concerns. Clients have no heartbeat, lease, connected count, or presence
-state. Closing a client releases only client-owned selection and transport resources; it never
-mutates ACN, ICN, or model lifetime.
+state. Closing an ordinary client releases only client-owned selection and transport resources. Closing
+the desktop window hides it and preserves serving. Full desktop application Quit is owner shutdown
+and terminates ACN, ICN, and residency.
 
 ACN remains alive until explicit administrative stop, replacement, ownership loss, signal,
 startup failure, mandatory ICN loss, or fatal process failure. ICN remains ACN's private mandatory
@@ -48,6 +48,6 @@ operations such as downloads outlive initiating callers according to their domai
 - First-party and external inference requests protect residency through the same exact lease.
 - A Ready instance with an active lease cannot idle-release.
 - Final lease release and equivalent warm demand each start a full one-hour interval.
-- Closing any or all clients cannot stop ACN or ICN and cannot change a model deadline.
+- Closing ordinary clients or the desktop window cannot change a model deadline; full owner Quit stops the tree.
 - Unrelated activity cannot retain or prematurely release a model.
 - Idle expiration cannot affect a replacement instance.

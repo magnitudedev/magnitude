@@ -34,7 +34,7 @@ model is best for every workload.
   it with a percent sign, but it is an index score—not a probability or the percentage of questions
   the model answers correctly. Quantized variants of the same source model generally share this
   model-level score.
-- **Accuracy** describes how faithfully the local artifact is expected to preserve the source model
+- **Fidelity** describes how faithfully the local artifact is expected to preserve the source model
   after quantization. It does not mean factual accuracy and is separate from Intelligence.
 - **Acceleration** identifies the speculative-decoding method Magnitude has prepared for that
   configuration. See `magnitude docs speculative-methods` for what `None`, `MTP`, `DFlash`, and
@@ -47,7 +47,7 @@ model is best for every workload.
 
 Use these signals together. A faster model may feel better for quick iteration, while a more
 intelligent model may be worth waiting for on difficult coding or reasoning tasks. Memory and
-context determine whether the model is practical on this computer, artifact accuracy indicates how
+context determine whether the model is practical on this computer, artifact fidelity indicates how
 much quality the local format may give up, and capabilities determine whether it can do the job at
 all.
 

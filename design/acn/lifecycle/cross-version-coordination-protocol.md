@@ -1,26 +1,23 @@
 ---
 applies_to:
-  - packages/acn-protocol/src/coordination/**
+  - packages/daemon-management/src/desktop-native/legacy-owner.ts
   - packages/acn-protocol/src/schemas/acn-health.ts
-  - packages/daemon-management/src/acn-jit/acn-owner-observer.ts
-  - packages/daemon-management/src/acn-jit/acn-daemon-shutdown-supervisor.ts
-  - packages/daemon-management/src/acn-jit/acn-candidate-launch-supervisor.ts
-  - packages/daemon-management/src/acn-jit/acn-ensurance-coordinator.ts
-  - packages/daemon-management/src/acn-jit/local-acn-instance-manager.ts
   - packages/acn/src/server.ts
-  - packages/acn/src/ownership-monitor.ts
   - packages/acn/src/binary.ts
   - packages/acn/src/version.ts
   - packages/sdk/src/version.ts
   - packages/version/scripts/generate-version.ts
 ---
 
-# ACN cross-version coordination protocol
+# Legacy ACN coordination migration
 
-This document is the complete required surface shared by ACN and client versions. No path, field,
-encoding, SQL operation, HTTP behavior, or process expectation in this document may change, and no
-additional behavior may become required for coordination or convergence, without explicit approval.
-Nothing outside this document is a cross-version coordination prerequisite.
+This records the old installed-daemon surface solely for one-time migration to desktop ownership.
+Normal desktop-owned ACN serving does not open this database, bind this endpoint, perform election,
+or run an owner monitor. The historical rules below describe old binaries; they do not authorize
+new runtime convergence. Preserve the record/identity encoding only to identify and retire an old
+installation safely. The desktop-owned contract is defined in service-lifecycle and jit-spawning.
+The migration reader opens existing databases in SQLite read-only mode and bounds the singleton
+query. It never initializes a missing database or runs the historical replacement operation.
 
 ## Filesystem and database surface
 

@@ -29,6 +29,16 @@ const makeArchive = async (entries: readonly { name: string; type?: "file" | "sy
 }
 
 describe("Magnitude app distribution", () => {
+  it("does not treat a desktop installer as a runtime archive", async () => {
+    const desktop = Schema.decodeUnknownSync(ReleaseArtifactSchema)({ id: "desktop-darwin-arm64", kind: "desktop", host: "darwin-arm64", filename: "Magnitude.dmg", bytes: 1, sha256: "a".repeat(64) })
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const extractor = yield* ArchiveExtractor
+      return yield* extractor.extract(join(root, "not-opened.dmg"), join(root, "not-created"), desktop, Option.none()).pipe(Effect.either)
+    }).pipe(Effect.provide(NodeArchiveExtractor)))
+    expect(result._tag).toBe("Left")
+    if (result._tag === "Left") expect(result.left.message).toContain("platform installer")
+    expect(await stat(join(root, "not-created")).then(() => true, () => false)).toBe(false)
+  })
   it("preserves every sealed resource, ticket file, and executable mode through the production extractor", async () => {
     const names = [...MACOS_REQUIRED_FILES.map((name) => `Magnitude.app/${name}`), "Magnitude.app/Contents/CodeResources"]
     await makeArchive(names.map((name) => ({ name })))

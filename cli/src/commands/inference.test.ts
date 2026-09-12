@@ -1,20 +1,27 @@
 import { Command } from "@commander-js/extra-typings"
 import { Option } from "effect"
 import { CatalogFormModelIdSchema, type ModelCatalogState } from "@magnitudedev/sdk"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import {
   makeAcquiringModel,
   makeCatalogModel,
   makeHardware,
   makeInstalledCatalogModel,
-} from "../features/local-inference/test-fixtures"
+} from "./fixtures/inference"
 import { registerInferenceCommands } from "./inference"
 import {
+  showRecommendations, showCatalogModel, pullModel, cancelDownload, removeModel, showModelsStatus, loadInstance,
   renderCatalog,
   renderCatalogStatus,
   renderModelsStatus,
   renderRecommendations,
 } from "./inference-runtime"
+
+const startupProbe = vi.hoisted(() => vi.fn(() => { throw new Error("Unexpected service startup") }))
+vi.mock("../server/acn-connection", async () => {
+  const { Effect } = await import("effect")
+  return { headlessAcnConnection: Effect.sync(startupProbe) }
+})
 
 type CatalogSnapshotState = Exclude<ModelCatalogState, { readonly _tag: "Initializing" }>
 
@@ -30,6 +37,32 @@ const catalogState = (...models: ReturnType<typeof makeCatalogModel>[]): Catalog
 })
 
 describe("inference command surface", () => {
+  it.each([
+    [() => showRecommendations("unknown", "10"), "Preference must be one of: fastest, faster, balanced, smarter, smartest"],
+    [() => showRecommendations("balanced", "0"), "Limit must be a positive integer"],
+    [() => showCatalogModel(""), "Invalid catalog model ID: "],
+    [() => pullModel(""), "Invalid catalog model ID: "],
+    [() => cancelDownload(""), "Invalid catalog model ID: "],
+    [() => removeModel(""), "Invalid catalog model ID: "],
+    [() => showModelsStatus(""), "Invalid catalog model ID: "],
+    [() => loadInstance(""), "Invalid catalog model ID: "],
+    [() => loadInstance("hf:test/model/model.gguf"), "Invalid catalog model ID: hf:test/model/model.gguf"],
+    [() => showModelsStatus("hf:test/model/model.gguf"), "Invalid catalog model ID: hf:test/model/model.gguf"],
+  ])("validates model arguments before acquiring a service", async (command, message) => {
+    const exitCode = process.exitCode
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
+    startupProbe.mockClear()
+    try {
+      await command()
+      expect(stderr).toHaveBeenCalledWith(`${message}\n`)
+      expect(process.exitCode).toBe(1)
+      expect(startupProbe).not.toHaveBeenCalled()
+    } finally {
+      stderr.mockRestore()
+      process.exitCode = exitCode
+    }
+  })
+
   it("exposes acquisition under catalog and residency under models", () => {
     const program = new Command().name("magnitude")
     registerInferenceCommands(program)
@@ -73,7 +106,7 @@ describe("inference command surface", () => {
     await expect(program.parseAsync(args, { from: "user" })).rejects.toMatchObject({ code: "commander.unknownOption" })
   })
 
-  it("renders authoritative discovery and assessment completion independently", () => {
+  it("renders assessment progress without arbitrary-model discovery", () => {
     const active: ModelCatalogState = {
       ...catalogState(),
       localModelPreparation: {
@@ -83,7 +116,6 @@ describe("inference command surface", () => {
     }
     expect(renderCatalogStatus(active)).toBe([
       "Model catalog preparation",
-      "Discovery: Complete - 4 models found",
       "Assessment: In progress - 3 of 4 models assessed",
       "",
     ].join("\n"))
@@ -97,10 +129,9 @@ describe("inference command surface", () => {
     })).toContain("Assessment: Complete - 4 of 4 models assessed")
   })
 
-  it("reports both preparation phases as active while the catalog initializes", () => {
+  it("reports assessment as pending while the catalog initializes", () => {
     expect(renderCatalogStatus({ _tag: "Initializing" })).toBe([
       "Model catalog preparation",
-      "Discovery: In progress",
       "Assessment: In progress",
       "",
     ].join("\n"))

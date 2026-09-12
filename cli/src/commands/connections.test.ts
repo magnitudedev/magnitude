@@ -1,12 +1,37 @@
 import { Command } from "@commander-js/extra-typings"
 import { HarnessIdSchema } from "@magnitudedev/client-common"
 import { ProviderModelIdSchema } from "@magnitudedev/sdk"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { Option } from "effect"
 import { registerConnectionsCommand } from "./connections"
-import { renderAddedConnection, renderConnections, renderLaunchPlan } from "./connections-runtime"
+import { addConnection, syncConnections, renderAddedConnection, renderConnections } from "./connections-runtime"
+
+const startupProbe = vi.hoisted(() => vi.fn(() => { throw new Error("Unexpected service startup") }))
+vi.mock("../server/acn-connection", async () => {
+  const { Effect } = await import("effect")
+  return { headlessAcnConnection: Effect.sync(startupProbe) }
+})
 
 describe("connections command contract", () => {
+  it.each([
+    [() => addConnection("magnitude", undefined, false), "Unsupported harness: magnitude"],
+    [() => syncConnections("magnitude"), "Unsupported harness: magnitude"],
+    [() => addConnection("pi", "", false), "Invalid model ID: "],
+  ])("rejects invalid arguments before service startup", async (command, message) => {
+    const exitCode = process.exitCode
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
+    startupProbe.mockClear()
+    try {
+      await command()
+      expect(stderr).toHaveBeenCalledWith(`${message}\n`)
+      expect(process.exitCode).toBe(1)
+      expect(startupProbe).not.toHaveBeenCalled()
+    } finally {
+      stderr.mockRestore()
+      process.exitCode = exitCode
+    }
+  })
+
   it("connects all models and optionally selects a harness model", () => {
     const program = new Command()
     registerConnectionsCommand(program)
@@ -19,32 +44,34 @@ describe("connections command contract", () => {
     expect(add?.description()).toBe("Connect installed Magnitude models to a harness")
   })
 
-  it("distinguishes durable connections from installed harnesses", () => {
+  it("distinguishes configuration integrity from installation", () => {
+    const common = { configurationFiles: [], plugin: Option.none(), managed: false }
     const output = renderConnections([
-      { id: HarnessIdSchema.make("magnitude"), name: "Magnitude Harness", availability: "Installed", selectable: true, connected: false },
-      { id: HarnessIdSchema.make("codex"), name: "Codex", availability: "Installed", selectable: true, connected: true },
-      { id: HarnessIdSchema.make("claude-code"), name: "Claude Code", availability: "Installed", selectable: true, connected: false },
-      { id: HarnessIdSchema.make("cline"), name: "Cline", availability: "Not installed", selectable: false, connected: false },
+      { ...common, id: HarnessIdSchema.make("codex"), name: "Codex", installed: true, inspection: { _tag: "Connected" } },
+      { ...common, id: HarnessIdSchema.make("claude-code"), name: "Claude Code", installed: true, inspection: { _tag: "Disconnected", reason: "Settings changed" } },
+      { ...common, id: HarnessIdSchema.make("cline"), name: "Cline", installed: false, inspection: { _tag: "Disconnected", reason: "No configuration" } },
+      { ...common, id: HarnessIdSchema.make("pi"), name: "Pi", installed: true, inspection: { _tag: "Unavailable", reason: "Permission denied" } },
     ])
-    expect(output).toContain("Built in")
     expect(output).toContain("Connected")
-    expect(output).toContain("Available")
+    expect(output).toContain("Disconnected")
     expect(output).toContain("Not installed")
+    expect(output).toContain("Unable to check")
+    expect(output).toContain("Settings changed")
+    expect(output).not.toContain("Built in")
   })
 
-  it("renders handoff with the ambient command instead of the detected executable path", () => {
-    const detectedExecutable = "/Applications/Codex.app/Contents/MacOS/codex"
-    const output = renderLaunchPlan({
-      harness: HarnessIdSchema.make("codex"),
-      command: "codex",
-      executable: detectedExecutable,
-      args: ["--model", "magnitude-local/example"],
-      environment: {},
-      modelId: ProviderModelIdSchema.make("example"),
-    })
-
-    expect(output).toContain("codex")
-    expect(output).not.toContain(detectedExecutable)
+  it.each([
+    [{ _tag: "Connected" } as const, "Connected"],
+    [{ _tag: "Disconnected", reason: "Settings changed" } as const, "Disconnected"],
+    [{ _tag: "Unavailable", reason: "Permission denied" } as const, "Unable to check"],
+  ])("preserves configuration status when the executable is missing: %s", (inspection, status) => {
+    const output = renderConnections([{
+      id: HarnessIdSchema.make("claude-code"), name: "Claude Code", installed: false,
+      configurationFiles: [], plugin: Option.none(), managed: false, inspection,
+    }])
+    expect(output).toContain("Not installed")
+    expect(output).toContain(status)
+    if (inspection._tag !== "Connected") expect(output).toContain(inspection.reason)
   })
 
   it("reports automatic Pi package and skill installation in the headless flow", () => {
@@ -64,20 +91,12 @@ describe("connections command contract", () => {
         skillInstalled: true,
         startupInstalled: false,
       },
-      launchPlan: Option.some({
-        harness: pi,
-        command: "pi",
-        executable: "/installed/pi",
-        args: ["--model", `magnitude/${model}`],
-        environment: {},
-        modelId: model,
-      }),
     })
 
     expect(output).toContain("Connected pi to Magnitude.")
     expect(output).toContain("Magnitude for Pi  Installed")
     expect(output).toContain("Skill             Installed")
-    expect(output).toContain("pi --model magnitude/local/model")
+    expect(output).not.toContain("pi --model")
     expect(output).toContain("run /reload to activate the extension")
   })
 })

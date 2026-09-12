@@ -1,95 +1,53 @@
-/**
- * Login shell env resolution — spec §13.2
- *
- * The VS Code pattern with two-phase probe, sentinel var, UUID markers,
- * env -0 parsing, 10s timeout. Resolves the login shell environment in
- * the Electron main process BEFORE spawning the daemon so the ACN
- * subprocess inherits the correct PATH and environment variables.
- */
-import { spawnSync } from "node:child_process"
-import * as os from "node:os"
+import { Command, CommandExecutor } from "@effect/platform"
+import { GuardedCommand } from "@magnitudedev/daemon-management/desktop-native"
+import { Effect, HashMap, Option, Schema } from "effect"
+import { randomUUID } from "node:crypto"
+import { userInfo } from "node:os"
 
-/**
- * Inherit the login shell environment into process.env.
- * Skips on Windows (env is in registry) and if launched from CLI
- * (env already correct — check for sentinel env var).
- */
-export function inheritLoginShellEnv(): void {
-  if (process.platform === "win32") return
-  if (process.env.MAGNITUDE_LAUNCHED_FROM_CLI) return
+const Environment = Schema.Record({ key: Schema.String, value: Schema.String })
+type Environment = typeof Environment.Type
+class ShellEnvironmentFailed extends Schema.TaggedError<ShellEnvironmentFailed>()("ShellEnvironmentFailed", {}) {}
 
-  const shell = getUserShell()
-  if (!shell) return
+const probe = (shell: string, flags: string, environment: Environment, timeout: number) => Effect.gen(function* () {
+  const runner = yield* GuardedCommand
+  const marker = `__MAGNITUDE_ENV_${randomUUID()}__`
+  const { code, stdout: output } = yield* runner.run(shell, [flags, `printf '${marker}\\n'; /usr/bin/env -0; printf '${marker}\\n'`], {
+    ...environment, ELECTRON_RUN_AS_NODE: "1", MAGNITUDE_RESOLVING_ENV: "1",
+  }).pipe(Effect.timeout(timeout))
+  const start = output.indexOf(`${marker}\n`)
+  const end = output.lastIndexOf(marker)
+  if (code !== 0 || start < 0 || end <= start) return yield* new ShellEnvironmentFailed()
+  const entries = output.slice(start + marker.length + 1, end).split("\0").filter(Boolean).map(entry => {
+    const separator = entry.indexOf("=")
+    return [entry.slice(0, separator), entry.slice(separator + 1)] as const
+  })
+  if (entries.some(([key]) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key))) return yield* new ShellEnvironmentFailed()
+  return yield* Schema.decodeUnknown(Environment)(Object.fromEntries(entries.filter(([key]) => !key.startsWith("ELECTRON_") && key !== "MAGNITUDE_RESOLVING_ENV")))
+})
 
-  const env = loadShellEnv(shell)
-  if (env) {
-    // Shell env as base, app env overrides (so explicit app vars take precedence)
-    const merged = { ...env, ...process.env }
-    Object.assign(process.env, merged)
-  }
-}
+/** A bounded, application-scoped observation for harnesses; never mutates process.env. */
+export const resolveHarnessEnvironment = (options: {
+  readonly environment?: Readonly<Record<string, string | undefined>>
+  readonly platform?: NodeJS.Platform
+  readonly timeoutMilliseconds?: number
+} = {}) => Effect.gen(function* () {
+  const environment = Object.fromEntries(Object.entries(options.environment ?? process.env).filter((entry): entry is [string, string] => entry[1] !== undefined))
+  const platform = options.platform ?? process.platform
+  if (platform === "win32" || environment.MAGNITUDE_SHELL_ENV_INHERITED) return environment
+  const shell = environment.SHELL ?? (yield* Effect.try(() => userInfo().shell).pipe(Effect.option, Effect.map(Option.getOrUndefined))) ?? (platform === "darwin" ? "/bin/zsh" : "/bin/bash")
+  if (/[/\\]nu(?:\.exe)?$/.test(shell)) return environment
+  const found = yield* probe(shell, "-ilc", environment, options.timeoutMilliseconds ?? 2500).pipe(
+    Effect.orElse(() => probe(shell, "-lc", environment, options.timeoutMilliseconds ?? 2500)), Effect.option,
+  )
+  if (Option.isNone(found)) return environment
+  // Preserve explicit launch overrides; login PATH supplies tools absent from GUI-launch PATH.
+  return { ...found.value, ...environment, PATH: found.value.PATH ?? environment.PATH ?? "" }
+})
 
-function getUserShell(): string | null {
-  if (process.env.SHELL) return process.env.SHELL
-  try {
-    const info = os.userInfo()
-    if (info.shell) return info.shell
-  } catch {}
-  if (process.platform === "darwin") return "/bin/zsh"
-  if (process.platform === "linux") return "/bin/bash"
-  return null
-}
-
-function loadShellEnv(shell: string): Record<string, string> | null {
-  const name = shell.split("/").pop()?.toLowerCase() ?? ""
-  // Nushell doesn't support POSIX -il flags — skip, fall back to process.env
-  if (name === "nu" || name === "nu.exe") return null
-
-  // Try interactive login first (most complete — sources both .zprofile AND .zshrc)
-  const interactive = probeShellEnv(shell, ["-ilc"])
-  if (interactive) return interactive
-
-  // Fall back to login only (sources .zprofile) if interactive timed out
-  return probeShellEnv(shell, ["-lc"])
-}
-
-function probeShellEnv(shell: string, flags: string[]): Record<string, string> | null {
-  const marker = `__MAGNITUDE_ENV_${Date.now()}__`
-  const command = `echo '${marker}'; env -0; echo '${marker}'`
-
-  try {
-    const result = spawnSync(shell, [...flags, command], {
-      encoding: "utf8",
-      timeout: 10_000,
-      env: {
-        ...process.env,
-        ELECTRON_RUN_AS_NODE: "1",
-        ELECTRON_NO_ATTACH_CONSOLE: "1",
-        MAGNITUDE_RESOLVING_ENV: "1",
-      },
-    })
-
-    if (result.error || result.status !== 0) return null
-
-    const start = result.stdout.indexOf(marker)
-    const end = result.stdout.lastIndexOf(marker)
-    if (start === -1 || end === -1 || start === end) return null
-
-    const envPart = result.stdout.slice(start + marker.length, end).trim()
-    const env: Record<string, string> = {}
-
-    for (const entry of envPart.split("\0")) {
-      const idx = entry.indexOf("=")
-      if (idx > 0) {
-        const key = entry.slice(0, idx)
-        if (!key.startsWith("MAGNITUDE_RESOLVING") && !key.startsWith("ELECTRON_")) {
-          env[key] = entry.slice(idx + 1)
-        }
-      }
-    }
-
-    return env
-  } catch {
-    return null
-  }
-}
+/** Child commands inherit the resolved harness environment; command-specific overrides win. */
+export const harnessCommandExecutor = (environment: Environment) => Effect.map(CommandExecutor.CommandExecutor, executor => {
+  const apply = (command: Command.Command): Command.Command => command._tag === "PipedCommand"
+    ? Command.pipeTo(apply(command.left), apply(command.right))
+    : Command.env(command, { ...environment, ...Object.fromEntries(HashMap.toEntries(command.env)) })
+  return CommandExecutor.makeExecutor(command => executor.start(apply(command)))
+})

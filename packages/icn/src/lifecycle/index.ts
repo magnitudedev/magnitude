@@ -1,3 +1,5 @@
+import { IcnChildSpawner, IcnChildLaunch } from "./child.js";
+export * from "./child.js";
 import * as Command from "@effect/platform/Command";
 import * as CommandExecutor from "@effect/platform/CommandExecutor";
 import * as FileSystem from "@effect/platform/FileSystem";
@@ -23,7 +25,6 @@ import {
   Ref,
   Schedule,
   Schema,
-  Scope,
   Stream,
   SubscriptionRef,
 } from "effect";
@@ -40,7 +41,6 @@ import {
   IcnNativeBuildIncompatible,
   IcnReadinessCommitRejected,
   IcnReadinessTimedOut,
-  IcnShutdownTimedOut,
   IcnStartupIdentityMismatch,
   IcnStartupOriginInvalid,
   IcnStartupOriginNotLoopback,
@@ -376,6 +376,7 @@ export const renderIcnArguments = (
 const acquireIcn = (input: IcnLifecycleConfig) =>
   Effect.gen(function* () {
     const config = yield* Schema.validate(IcnLifecycleConfig)(input);
+    const children = yield* IcnChildSpawner;
     const resolver = yield* IcnBinaryResolver;
     const reporter = yield* IcnPreparationReporter;
     const binary = yield* resolver.resolve(config.binary);
@@ -386,49 +387,16 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
       new IcnProcessStarting({}),
     );
     const lifecycleLock = yield* Effect.makeSemaphore(1);
-    const shutdownCompletion = yield* Deferred.make<void, IcnLifecycleError>();
     const { process, terminateProcess } = yield* Effect.uninterruptibleMask(() =>
       Effect.gen(function* () {
-        const process = yield* Command.start(
-          Command.make(
-            binary.path,
-            ...renderIcnArguments(
-              config,
-              instanceId,
-              binary.installation,
-            )
-          ).pipe(
-            Command.env({
-              ...binary.environment,
-              MAGNITUDE_ICN_AUTH_TOKEN: authorization,
-              HF_HUB_DISABLE_IMPLICIT_TOKEN: "1",
-            }),
-            Command.stdin(Stream.never),
-          )
-        );
-        const waitForProcessExit = process.exitCode;
-        const isProcessRunning = process.isRunning;
-        const stopAndProve = Effect.gen(function* () {
-          if (!(yield* isProcessRunning)) return;
-          yield* process.kill("SIGTERM");
-          const graceful = yield* waitForProcessExit.pipe(
-            Effect.timeoutOption(config.gracefulShutdownTimeout),
-          );
-          if (Option.isSome(graceful)) return;
-          if (yield* isProcessRunning) {
-            yield* process.kill("SIGKILL");
-          }
-          yield* waitForProcessExit.pipe(
-            Effect.timeoutFail({
-              duration: config.forceShutdownTimeout,
-              onTimeout: () => new IcnShutdownTimedOut({
-                pid: Number(process.pid),
-                timeout: config.forceShutdownTimeout,
-              }),
-            }),
-          );
-        });
-        const terminateProcess = yield* Effect.cached(stopAndProve);
+        const process = yield* children.spawn(new IcnChildLaunch({
+          executable: binary.path,
+          arguments: renderIcnArguments(config, instanceId, binary.installation),
+          environment: { ...binary.environment, MAGNITUDE_ICN_AUTH_TOKEN: authorization, HF_HUB_DISABLE_IMPLICIT_TOKEN: "1" },
+          gracefulShutdownTimeout: config.gracefulShutdownTimeout,
+          forceShutdownTimeout: config.forceShutdownTimeout,
+        }));
+        const terminateProcess = process.terminate;
         yield* Effect.addFinalizer(() =>
           lifecycleLock.withPermits(1)(
             SubscriptionRef.update(lifecycle, (current) =>
@@ -436,15 +404,11 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
                 ? IcnProcessLifecycleFsm.transition(current, "Stopping", {})
                 : current,
             ),
-          ).pipe(
-            Effect.zipRight(terminateProcess),
-            Effect.ignore,
           ),
         );
         return { process, terminateProcess } as const;
       })
     );
-    const waitForProcessExit = process.exitCode;
     const output = yield* Ref.make("");
     const startupRecord = yield* Deferred.make<
       IcnStartupRecord,
@@ -636,33 +600,15 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
       Effect.zipRight(Deferred.await(exited)),
       Effect.asVoid,
     )
-    const shutdown = Effect.uninterruptibleMask((restore) =>
-      Effect.gen(function* () {
-        const shouldStart = yield* lifecycleLock.withPermits(1)(
-          Effect.gen(function* () {
-            const current = yield* SubscriptionRef.get(lifecycle)
-            if (current._tag === "Exited") {
-              yield* Deferred.succeed(shutdownCompletion, undefined)
-              return false
-            }
-            if (current._tag === "Stopping") return false
-            yield* SubscriptionRef.set(
-              lifecycle,
-              IcnProcessLifecycleFsm.transition(current, "Stopping", {}),
-            )
-            return true
-          }),
-        );
-        if (shouldStart) {
-          yield* performShutdown.pipe(
-            Effect.exit,
-            Effect.flatMap((result) => Deferred.done(shutdownCompletion, result)),
-            Effect.forkDaemon,
-          );
-        }
-        return yield* restore(Deferred.await(shutdownCompletion));
-      }),
-    );
+    const shutdown = yield* Effect.cached(Effect.gen(function* () {
+      yield* lifecycleLock.withPermits(1)(SubscriptionRef.update(lifecycle, current =>
+        current._tag === "Starting" || current._tag === "Ready"
+          ? IcnProcessLifecycleFsm.transition(current, "Stopping", {})
+          : current,
+      ));
+      // Exited describes the leader; terminalization must still prove the owned group absent.
+      yield* performShutdown;
+    }).pipe(Effect.uninterruptible));
     const exit = Deferred.await(exited);
     return {
       process: IcnProcess.of({
@@ -710,6 +656,7 @@ export const makeIcnProcess = (
   | HttpClient.HttpClient
   | Path.Path
   | IcnPreparationReporterService
+  | IcnChildSpawner
 > =>
   Layer.scoped(
     IcnProcess,

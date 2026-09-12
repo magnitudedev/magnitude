@@ -1,11 +1,8 @@
-import { Context, Layer } from "effect"
+import { DesktopOnboarding, DesktopOnboardingLive } from "../desktop/onboarding"
+import { DesktopBridge, DesktopSession, DesktopSessionLive } from "../desktop/service"
+import { Context, Layer, Option } from "effect"
 import { Files, FilesLive } from "../files/service"
 import { LocalModels, LocalModelsLive } from "../local-models/service"
-import {
-  OnboardingModelSetup,
-  OnboardingModelSetupConfig,
-  OnboardingModelSetupLive,
-} from "../local-models/setup"
 import { ModelSlots, ModelSlotsLive } from "../model-slots/service"
 import {
   OnboardingPersistence,
@@ -20,18 +17,18 @@ import {
 } from "../harness-connections/service"
 
 export type ClientServices =
+  | DesktopOnboarding
+  | DesktopSession
   | ClientEffectQuery
   | Files
   | LocalModels
   | ModelSlots
   | OnboardingPersistence
-  | OnboardingModelSetup
   | ProjectFiles
   | HarnessConnection
 
 export interface ClientServicesOptions {
-  readonly onboardingSetupInitiallyOpen?: boolean
-  readonly onboardingSetupHost?: OnboardingModelSetupConfig["host"]
+  readonly desktopBridge?: DesktopBridge
   readonly harnessConnection?: HarnessConnection
 }
 
@@ -61,11 +58,8 @@ export const clientServicesLayer = (
     Layer.provideMerge(observedInfrastructure),
   )
 
-  return OnboardingModelSetupLive.pipe(
+  return Layer.merge(DesktopSessionLive, DesktopOnboardingLive).pipe(
     Layer.provideMerge(domains),
-    Layer.provide(Layer.succeed(OnboardingModelSetupConfig, {
-      initiallyOpen: options.onboardingSetupInitiallyOpen ?? false,
-      host: options.onboardingSetupHost,
-    })),
+    Layer.provide(Layer.succeed(DesktopBridge, Option.fromNullable(options.desktopBridge))),
   )
 }

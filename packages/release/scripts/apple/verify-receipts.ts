@@ -28,7 +28,7 @@ export const verifyAppleReceipts = (root: string, candidate?: string) => Effect.
     if (receipt.sourceCommit !== expectedCommit || receipt.team !== team) return yield* fail("Apple receipt does not match the selected commit and publisher")
     const units = receipt.notarizations.map((value) => value.unit)
     const requiredUnits = receipt.artifacts.some((value) => value.id.startsWith("acn-"))
-      ? ["cli", "inference", "app"]
+      ? ["cli", "inference", "app", "desktop"]
       : receipt.artifacts.map((value) => value.id.replace(/^icn-backend-/, ""))
     if (units.length !== requiredUnits.length || requiredUnits.some((unit) => !units.includes(unit))) return yield* fail("Apple receipt is missing a native software submission")
     for (const artifact of receipt.artifacts) {
@@ -36,12 +36,12 @@ export const verifyAppleReceipts = (root: string, candidate?: string) => Effect.
       const descriptor = resolve(dirname(file), `${artifact.id}.artifact.json`)
       const metadata = yield* fs.readFileString(descriptor).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(ReleaseArtifactSchema))))
       if (metadata.id !== artifact.id || metadata.sha256 !== artifact.sha256 || (yield* sha256File(resolve(dirname(file), metadata.filename))) !== artifact.sha256) return yield* fail(`Apple accepted bytes changed for ${artifact.id}`)
-      if (metadata.kind === "acn" && !receipt.stapledApp) return yield* fail("Magnitude.app has no validated stapled ticket")
+      if ((metadata.kind === "acn" || metadata.kind === "desktop") && !receipt.stapledApp) return yield* fail("Magnitude.app has no validated stapled ticket")
       accepted.set(artifact.id, artifact.sha256)
     }
   }
   const expected = [
-    ...releaseHosts.filter((host) => host.id.startsWith("darwin-")).flatMap((host) => [`cli-${host.id}`, `acn-${host.id}`, `icn-base-${host.id}`]),
+    ...releaseHosts.filter((host) => host.id.startsWith("darwin-")).flatMap((host) => [`cli-${host.id}`, `acn-${host.id}`, `icn-base-${host.id}`, `desktop-${host.id}`, `desktop-update-${host.id}`]),
     ...backendPacks.filter((pack) => pack.host.startsWith("darwin-")).map((pack) => `icn-backend-${pack.id}`),
   ]
   if (expected.some((id) => !accepted.has(id)) || accepted.size !== expected.length) return yield* fail("Publication requires the complete Developer ID and notarization receipt graph")

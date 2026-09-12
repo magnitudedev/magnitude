@@ -10,7 +10,9 @@ import {
   writeFile,
 } from "node:fs/promises"
 import { basename, resolve } from "node:path"
-import { Option, Schema } from "effect"
+import { Effect, Option, Schema } from "effect"
+import { BunContext } from "@effect/platform-bun"
+import { validateLinuxDesktopInstaller } from "./build/desktop-linux"
 import {
   releaseTag,
   ReleaseArtifactSchema,
@@ -24,6 +26,9 @@ import {
   backendArchive,
   backendPacks,
   cliArchive,
+  desktopInstaller,
+  desktopUpdateArchive,
+  linuxDesktopInstaller,
   icnBaseArchive,
   releaseHosts,
 } from "../src/targets"
@@ -73,11 +78,21 @@ const required = (name: string, fallback?: string): string => {
   return value
 }
 
+const packageJson = Schema.decodeUnknownSync(Schema.parseJson(Schema.Struct({ version: Schema.NonEmptyString })))(
+  await readFile(resolve(PROJECT_ROOT, "packages/launcher/package.json"), "utf8"),
+)
+const version = required("MAGNITUDE_RELEASE_VERSION", packageJson.version)
+if (packageJson.version !== version) throw new Error("package version differs from the release version")
+
 const expectedArtifacts = new Map<string, string>([
   ...candidateHosts.flatMap((host) => [
     [`cli-${host.id}`, cliArchive(host.id)] as const,
     [`acn-${host.id}`, acnArchive(host.id)] as const,
     [`icn-base-${host.id}`, icnBaseArchive(host.id)] as const,
+    ...(host.id === "darwin-arm64" || host.id === "darwin-x64" ? [[`desktop-${host.id}`, desktopInstaller(host.id)] as const, [`desktop-update-${host.id}`, desktopUpdateArchive(host.id)] as const] : []),
+    ...(host.id === "linux-arm64-gnu" || host.id === "linux-x64-gnu"
+      ? (["deb", "rpm"] as const).map(format => [`desktop-${host.id}-${format}`, linuxDesktopInstaller(host.id as "linux-arm64-gnu" | "linux-x64-gnu", format, version, ACN_COORDINATION_REVISION)] as const)
+      : []),
   ]),
   ...candidateBackendPacks.map((pack) =>
     [`icn-backend-${pack.id}`, backendArchive(pack)] as const
@@ -94,6 +109,29 @@ const validateLayout = async (
   artifact: ReleaseArtifact,
   archive: string,
 ): Promise<void> => {
+  if (artifact.kind === "desktop") {
+    const host = Option.getOrThrow(artifact.host)
+    if (host === "linux-arm64-gnu" || host === "linux-x64-gnu") {
+      const format = artifact.id === `desktop-${host}-deb` ? "deb" : artifact.id === `desktop-${host}-rpm` ? "rpm" : undefined
+      if (format === undefined) throw new Error(`Unexpected Linux desktop artifact ${artifact.id}`)
+      await Effect.runPromise(validateLinuxDesktopInstaller({
+        file: archive, format, arch: host === "linux-arm64-gnu" ? "arm64" : "x64", version, revision: ACN_COORDINATION_REVISION,
+      }).pipe(Effect.provide(BunContext.layer)))
+      return
+    }
+    if (host !== "darwin-arm64" && host !== "darwin-x64") throw new Error(`Unsupported desktop artifact host ${host}`)
+    if (artifact.id === `desktop-update-${host}`) {
+      // Native Apple consumers extract and verify the sealed app and execute its lifecycle.
+      const signature = new Uint8Array(await Bun.file(archive).slice(0, 4).arrayBuffer())
+      if (signature.length !== 4 || ![0x50, 0x4b, 0x03, 0x04].every((byte, index) => signature[index] === byte)) throw new Error(`${artifact.id} is not a ZIP archive`)
+      return
+    }
+    // DMG contents are mounted and executed by the Apple producer and independent consumer.
+    // This cross-platform assembly host verifies the immutable image bytes, not a tar layout.
+    const file = Bun.file(archive)
+    if (file.size < 512 || await file.slice(file.size - 512, file.size - 508).text() !== "koly") throw new Error(`${artifact.id} is not a UDIF disk image`)
+    return
+  }
   const listing = await archiveListing(archive)
   const host = Option.getOrThrow(artifact.host)
   const extension = host === "windows-x64-msvc" ? ".exe" : ""
@@ -259,13 +297,6 @@ for (const host of candidateHosts.filter((candidate) => candidate.id.startsWith(
   ])
 }
 
-const packageJson = JSON.parse(
-  await readFile(resolve(PROJECT_ROOT, "packages/launcher/package.json"), "utf8"),
-) as { readonly version?: string }
-const version = required("MAGNITUDE_RELEASE_VERSION", packageJson.version)
-if (packageJson.version !== version) {
-  throw new Error("package version differs from the release version")
-}
 const sourceCommit = required("MAGNITUDE_SOURCE_COMMIT")
 if (!/^[a-f0-9]{40}$/.test(sourceCommit)) {
   throw new Error("MAGNITUDE_SOURCE_COMMIT must be a full lowercase commit SHA")

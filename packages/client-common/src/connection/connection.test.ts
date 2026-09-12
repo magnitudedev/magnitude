@@ -93,6 +93,10 @@ const fixture = () => {
     stop: () => {
       running = false;
     },
+    restart: () => {
+      running = true;
+      id = "replacement";
+    },
   };
 };
 
@@ -136,6 +140,8 @@ describe("first-party SDK presentation", () => {
             Stream.runHead
           );
           f.stop();
+          // The desktop owner, not this established SDK connection, restarts the service.
+          f.restart();
           // Health is replay-safe; StopActiveLocalModel is deliberately not.
           yield* client.connection.health({});
           yield* connection.startup.recovery.changes.pipe(
@@ -144,9 +150,19 @@ describe("first-party SDK presentation", () => {
           );
           expect(connection.client).toBe(client);
           expect((yield* connection.startup.state.get)._tag).toBe("Ready");
-          expect(f.starts()).toBe(1);
+          expect(f.starts()).toBe(0);
         })
       )
     );
+  });
+  it("does not undo explicit Quit through an established connection", async () => {
+    const f = fixture();
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const connection = yield* makeFirstPartyConnection(f.layer);
+      yield* connection.startup.awaitReady;
+      f.stop();
+      expect((yield* Effect.either(connection.client.connection.health({})))._tag).toBe("Left");
+      expect(f.starts()).toBe(0);
+    })));
   });
 });

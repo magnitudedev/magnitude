@@ -41,6 +41,7 @@ export function modelReleaseReasonLabel(reason: ModelReleaseReason): string {
     case "idle_timeout": return "Idle timeout"
     case "replacement": return "Model replacement"
     case "memory_pressure": return "Low memory"
+    case "failure": return "Model failure"
   }
 }
 

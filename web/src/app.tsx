@@ -37,7 +37,6 @@ import {
   useComposerState,
   useSessionPreload,
   useSessionActions,
-  useOnboardingModelSetup,
   useServiceLifecycle,
   useLocalModels,
   useModelSlots,
@@ -64,7 +63,6 @@ import { WorkspacePanel } from "./components/workspace-panel"
 import { WorkerDetailPanel } from "./components/worker-detail-panel"
 import { ContextUsageIndicator } from "./components/context-usage-indicator"
 import { SettingsCenter } from "./components/settings-center"
-import { LocalModelOnboarding } from "./components/local-model-onboarding"
 import { ChatColumnPage } from "./components/chat-column-page"
 import {
   selectedCwdAtom,
@@ -343,7 +341,6 @@ function ComposerContainer({
   const { startNewSession } = useSessionActions()
   const sendRef = useRef<(text: string) => void>(() => {})
   const slotsResult = useModelSlots()
-  const onboarding = useOnboardingModelSetup()
   const slots = Option.getOrNull(Result.value(slotsResult))
   const currentModel = slots === null
     ? null
@@ -382,7 +379,6 @@ function ComposerContainer({
         )
       },
       openSettings: () => setSettingsTab("general"),
-      openSetup: onboarding.open,
       openModelMenu: (menu) => {
         if (menu === "models" || menu === "catalog" || menu === "hardware") {
           setSettingsTab(menu)
@@ -399,7 +395,6 @@ function ComposerContainer({
       setSidebarVisible,
       setBashMode,
       setSettingsTab,
-      onboarding.open,
     ]
   )
   const composer = useComposerState(commandContext)
@@ -806,7 +801,6 @@ function AppInner({
   useInterruptAllListener()
   const platform = usePlatform()
   const acnLifecycle = useServiceLifecycle(initialAcnLifecycle)
-  const onboarding = useOnboardingModelSetup()
   if (acnLifecycle.state._tag !== "Ready") {
     return (
       <AcnBootstrapScreen
@@ -815,59 +809,6 @@ function AppInner({
         {...(platform.quit === undefined ? {} : { onQuit: platform.quit })}
       />
     )
-  }
-  const onboardingState = Option.getOrNull(Result.value(onboarding.view))
-  if (Result.isFailure(onboarding.view)) {
-    const failureDescription = Option.match(
-      Cause.failureOption(onboarding.view.cause),
-      {
-        onNone: () => "Local model settings are temporarily unavailable.",
-        onSome: (failure) => {
-          if (failure._tag !== "OnboardingModelSetupObservationFailed") {
-            return "Local model settings are temporarily unavailable."
-          }
-          switch (failure.source) {
-            case "onboarding":
-              return "Magnitude couldn’t read onboarding status from the daemon."
-            case "local-models":
-              return "Magnitude couldn’t load the local model catalog."
-            case "model-slots":
-              return "Magnitude couldn’t read the configured local model."
-          }
-        },
-      }
-    )
-    return (
-      <div className="min-h-screen flex flex-col items-center justify-center gap-2.5 p-8 text-center bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-200 [&_h1]:mt-1 [&_h1]:text-[22px] [&_p]:mb-2 [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
-        <AlertTriangleIcon />
-        <h1>Couldn’t load local setup</h1>
-        <p>{failureDescription}</p>
-        <Button variant="unstyled" size="unstyled"
-          className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 bg-blue-700 text-slate-50 hover:bg-blue-800 dark:bg-blue-500 dark:text-slate-925 dark:hover:bg-blue-400"
-          type="button"
-          onClick={onboarding.retry}
-        >
-          Retry
-        </Button>
-      </div>
-    )
-  }
-  if (onboardingState === null) {
-    return (
-      <div className="flex min-h-screen flex-col items-center justify-center bg-slate-50 p-8 text-center text-slate-900 dark:bg-slate-900 dark:text-slate-200">
-        <MagnitudeMark className="mb-6 h-auto w-[82px]" />
-        <h1 className="text-[30px] font-semibold leading-tight tracking-[-0.025em]">
-          Opening Magnitude
-        </h1>
-        <div className="mt-5 flex items-center gap-2.5 text-[16px] leading-7 text-slate-600 dark:text-slate-300">
-          <Spinner className="size-[17px] text-blue-700 motion-reduce:animate-none dark:text-blue-500" />
-          <p>Loading local model settings…</p>
-        </div>
-      </div>
-    )
-  }
-  if (onboardingState._tag === "Open") {
-    return <LocalModelOnboarding setup={onboarding} />
   }
   return <AuthenticatedAppContent isNarrow={isNarrow} />
 }

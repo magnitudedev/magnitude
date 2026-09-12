@@ -34,7 +34,7 @@ const icnExecutable = executable(`(?:${ICN_EXECUTABLE_NAME}|icn-server)`)
 const acnExecutable = executable(ACN_EXECUTABLE_NAME)
 const cliExecutable = executable("magnitude-cli")
 const acnSource = scriptInvocation("packages/acn/src/binary\\.ts")
-const cliSource = scriptInvocation("cli/src/index\\.tsx")
+const cliSource = scriptInvocation("cli/src/index\\.ts")
 const npmCliSource = scriptInvocation("packages/launcher/bin/magnitude\\.js")
 
 export const classifyMagnitudeProcess = (

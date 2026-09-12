@@ -1,0 +1,175 @@
+name: Desktop native ownership
+
+on:
+  pull_request:
+    paths:
+      - "packages/daemon-management/native/**"
+      - "packages/daemon-management/src/**"
+      - "packages/utils/src/process-groups/**"
+      - "packages/utils/src/windows-native/**"
+      - "packages/utils/src/json-line-channel.ts"
+      - "packages/acn/src/**"
+      - "packages/acn-protocol/src/desktop-control.ts"
+      - "packages/release/scripts/build/acn.ts"
+      - "inference/crates/icn-utils/**"
+      - "inference/crates/icn-server/src/worker_process.rs"
+      - "inference/crates/icn-server/src/inference_worker.rs"
+      - "inference/crates/icn-server/src/main.rs"
+      - "inference/crates/icn-server/Cargo.toml"
+      - "inference/Cargo.lock"
+      - "inference/rust-toolchain.toml"
+      - "cli/**"
+      - "desktop/**"
+      - "assets/brand/**"
+      - "packages/client-common/src/desktop/**"
+      - "packages/sdk/src/desktop-host.ts"
+      - "bun.lock"
+      - "packages/release/scripts/build/cli.ts"
+      - "packages/release/scripts/build/desktop*.ts"
+      - "packages/release/resources/linux/**"
+      - "packages/release/src/executables.ts"
+      - "packages/release/package.json"
+      - "packages/daemon-management/scripts/*.ps1"
+      - "packages/daemon-management/src/desktop-native/fixtures/windows-*"
+      - ".github/workflows/desktop-native.yml"
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-native-ownership:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+      - name: Prepare native build tools and real user manager
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential dbus-user-session desktop-file-utils libglib2.0-bin
+          test_uid=$(id -u)
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@$test_uid.service"
+          echo "XDG_RUNTIME_DIR=/run/user/$test_uid" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$test_uid/bus" >> "$GITHUB_ENV"
+      - name: Build native ownership adapter
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          bun packages/version/scripts/generate-version.ts
+          bun packages/daemon-management/scripts/build-native.ts
+      - name: Exercise native ownership, systemd migration and GLib background launch
+        working-directory: packages/daemon-management
+        env:
+          MAGNITUDE_TEST_SYSTEMD: "1"
+          MAGNITUDE_TEST_XDG: "1"
+        run: |
+          systemctl --user show-environment > /dev/null
+          bunx --bun vitest run src/desktop-native/native.test.ts src/desktop-native/owned-child.test.ts src/desktop-native/login-startup.test.ts src/desktop-native/legacy-startup-linux.test.ts src/desktop-native/legacy-startup-linux-native.test.ts
+      - name: Exercise Linux process identity and exit races
+        working-directory: packages/utils
+        run: bunx --bun vitest run src/process-groups/exact-process.test.ts src/process-groups/exact-process-linux.test.ts
+      - name: Build the matched desktop, service, CLI and DEB
+        run: |
+          bun run --cwd desktop build
+          bun -e '
+            import { Effect } from "effect";
+            import { NodeContext } from "@effect/platform-node";
+            import { MAGNITUDE_VERSION, ACN_COORDINATION_REVISION } from "./packages/version/src";
+            import { buildAcnBinary } from "./packages/release/scripts/build/acn";
+            import { buildCliBinary } from "./packages/release/scripts/build/cli";
+            import { buildDesktopApplication } from "./packages/release/scripts/build/desktop";
+            import { buildLinuxDesktopInstaller } from "./packages/release/scripts/build/desktop-linux";
+            await Effect.runPromise(Effect.gen(function* () {
+              const service = yield* Effect.tryPromise(() => buildAcnBinary("bun-linux-x64"));
+              yield* Effect.tryPromise(() => buildCliBinary("bun-linux-x64"));
+              const options = { version: MAGNITUDE_VERSION, revision: ACN_COORDINATION_REVISION };
+              const apps = yield* buildDesktopApplication({ ...options, service, outputDirectory: "/tmp/magnitude-desktop-ci/app" });
+              yield* buildLinuxDesktopInstaller({ ...options, app: apps[0]!, format: "deb", arch: "x64", output: "/tmp/magnitude-desktop-ci/installers" });
+            }).pipe(Effect.provide(NodeContext.layer)));
+          '
+      - name: Install and exercise the real desktop package
+        env:
+          MAGNITUDE_TEST_INSTALLED_LINUX: "1"
+          MAGNITUDE_TEST_CLI_EXECUTABLE: ${{ github.workspace }}/bin/magnitude-cli
+          MAGNITUDE_TEST_ASSEMBLED_DESKTOP: /tmp/magnitude-desktop-ci/app/Magnitude-linux-x64
+        run: |
+          sudo apt-get install -y --no-install-recommends /tmp/magnitude-desktop-ci/installers/*.deb
+          sudo apt-get install -y --no-install-recommends xvfb dbus-x11 xfwm4 x11-utils xauth
+          export MAGNITUDE_TEST_NODE="$(command -v node)"
+          xvfb-run -a dbus-run-session -- bunx --bun vitest run --config desktop/vitest.config.ts desktop/src/linux-installed-lifecycle.test.ts
+
+  windows-job-containment:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+      - name: Acquire verified Node import library and pinned Node-API headers
+        shell: pwsh
+        run: |
+          $dependencyRoot = Join-Path $env:RUNNER_TEMP 'magnitude-native-dependencies'
+          New-Item -ItemType Directory -Force $dependencyRoot | Out-Null
+          npm install --prefix $dependencyRoot --ignore-scripts --no-audit --no-fund node-api-headers@1.9.0
+          if ($LASTEXITCODE -ne 0) { throw 'Could not acquire Node-API headers.' }
+          $version = (node -p process.versions.node).Trim()
+          $base = "https://nodejs.org/download/release/v$version"
+          $library = Join-Path $dependencyRoot 'node.lib'
+          Invoke-WebRequest "$base/win-x64/node.lib" -OutFile $library
+          $checksums = (Invoke-WebRequest "$base/SHASUMS256.txt").Content
+          $match = [regex]::Match($checksums, '(?m)^([a-f0-9]{64})\s+win-x64/node\.lib\r?$')
+          if (-not $match.Success -or (Get-FileHash $library -Algorithm SHA256).Hash.ToLowerInvariant() -ne $match.Groups[1].Value) { throw 'Node import library integrity check failed.' }
+          "MAGNITUDE_NODE_LIBRARY=$library" >> $env:GITHUB_ENV
+          "MAGNITUDE_NODE_HEADERS=$(Join-Path $dependencyRoot 'node_modules/node-api-headers/include')" >> $env:GITHUB_ENV
+      - name: Install workspace dependencies for native and compiled CLI acceptance
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Compile and exercise native ownership and Node/Bun pipe interoperability
+        shell: pwsh
+        run: ./packages/daemon-management/scripts/test-windows-native.ps1 -Headers $env:MAGNITUDE_NODE_HEADERS -NodeLibrary $env:MAGNITUDE_NODE_LIBRARY
+
+      - name: Exercise Rust atomic child creation and descendant retirement
+        working-directory: inference
+        run: cargo test --locked -p icn-utils windows_process::tests -- --test-threads=1
+      - name: Compile native x86 installer helper and verify configuration preservation
+        shell: pwsh
+        run: |
+          ./packages/release/scripts/test-windows-installer.ps1
+      - name: Compile CLI and verify passive native bootstrap
+        shell: pwsh
+        run: |
+          bun -e 'import {buildCliBinary} from "./packages/release/scripts/build/cli"; await buildCliBinary("bun-windows-x64")'
+          if ($LASTEXITCODE -ne 0) { throw 'Windows CLI compilation failed.' }
+          $cli = Join-Path $PWD 'bin/magnitude-cli.exe'
+          $env:MAGNITUDE_DESKTOP_STATE_DIR = Join-Path $env:RUNNER_TEMP ('Magnitude CLI smoke ' + [Guid]::NewGuid() + '\ownership')
+          $env:LOCALAPPDATA = '\\invalid\environment-profile'
+          & $cli --version
+          if ($LASTEXITCODE -ne 0) { throw 'Windows CLI version failed.' }
+          & $cli --help
+          if ($LASTEXITCODE -ne 0) { throw 'Windows CLI help failed.' }
+          $status = & $cli service status
+          if ($LASTEXITCODE -ne 0 -or ($status -join "`n") -notmatch 'Runtime\s+Stopped') { throw 'Passive Windows CLI status failed.' }
+          & $cli service stop
+          if ($LASTEXITCODE -ne 0) { throw 'Already-stopped Windows CLI stop failed.' }
+          if (Test-Path $env:MAGNITUDE_DESKTOP_STATE_DIR) { throw 'Passive commands created application ownership state.' }
+          $PSNativeCommandUseErrorActionPreference = $false
+          $start = & $cli service start 2>&1
+          if ($LASTEXITCODE -eq 0) { throw 'Missing desktop unexpectedly started.' }
+          $failure = $start -join "`n"
+          if ($failure -notmatch 'Magnitude desktop is not installed at' -or $failure -match 'invalid\\environment-profile') { throw 'CLI did not resolve the missing desktop through the native known folder.' }
+          if (Test-Path $env:MAGNITUDE_DESKTOP_STATE_DIR) { throw 'Missing installation created ownership state.' }
+          exit 0

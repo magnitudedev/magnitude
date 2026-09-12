@@ -4,6 +4,7 @@ export default [
   'packages/acn-protocol',
   'packages/sdk',
   'packages/daemon-management',
+  'packages/harness-connections',
   'packages/release',
   'packages/storage',
   'packages/client-common',

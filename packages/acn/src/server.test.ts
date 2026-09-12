@@ -1,12 +1,56 @@
-import { BunHttpServer } from "@effect/platform-bun"
+import { BunContext, BunHttpServer } from "@effect/platform-bun"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import type { MagnitudeHealthResponse } from "@magnitudedev/acn-protocol"
 import { FetchHttpClient, HttpBody, HttpClient, HttpClientRequest, HttpServer, HttpServerRequest, HttpServerResponse } from "@effect/platform"
 import * as HttpLayerRouter from "@effect/platform/HttpLayerRouter"
 import { Rpc, RpcGroup, RpcSerialization, RpcServer } from "@effect/rpc"
-import { Context, Effect, Layer, Schema, Stream } from "effect"
-import { describe, expect, it } from "vitest"
+import { Cause, Context, Effect, Layer, Schema, Stream } from "effect"
+import { IcnBinaryNotFound } from "@magnitudedev/icn"
+import { describe, expect, it, vi } from "vitest"
 import { ACN_INSTANCE_ID } from "./identity"
 import { makeAcnServiceLifecycle } from "./service-lifecycle"
-import { ACN_PUBLIC_PORT, installAcnControlRoutes, installAcnPublicRoutes } from "./server"
+import { ACN_PUBLIC_PORT, acnStartupFailureDetail, installAcnHealthRoutes, installAcnPublicRoutes, launchAcnServer } from "./server"
+
+describe("ACN startup failure presentation", () => {
+  it("finishes a delayed stopping report after application acquisition fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "magnitude-health-failure-"))
+    const delivered: MagnitudeHealthResponse[] = []
+    vi.stubEnv("MAGNITUDE_ICN_PATH", join(root, "absent-installation.json"))
+    try {
+      const result = await Effect.runPromise(launchAcnServer({ dataDir: root, port: 0 }, {
+        awaitStart: Effect.void, awaitShutdown: Effect.never,
+        reportHealth: health => Effect.sleep(health.state._tag === "Stopping" ? "25 millis" : "0 millis").pipe(
+          Effect.zipRight(Effect.sync(() => { delivered.push(health) })),
+        ),
+      }).pipe(Effect.exit, Effect.provide([BunContext.layer, FetchHttpClient.layer])))
+      expect(result._tag).toBe("Failure")
+      const terminal = delivered.at(-1)?.state
+      expect(terminal?._tag).toBe("Stopping")
+      if (terminal?._tag === "Stopping") {
+        expect(terminal.reason).toBe("startup-failed")
+        expect(terminal.safeDetail._tag).toBe("Some")
+        if (terminal.safeDetail._tag === "Some") {
+          expect(terminal.safeDetail.value).toContain("not found")
+          expect(terminal.safeDetail.value).not.toContain("\n")
+        }
+      }
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+  it("preserves the actionable native error without its stack", () => {
+    const error = new IcnBinaryNotFound({ path: "/isolated/bin/magnitude-inference" })
+    expect(acnStartupFailureDetail(Cause.fail(error))).toBe(error.message)
+  })
+  it("bounds multiline messages and keeps defects in diagnostics", () => {
+    expect(acnStartupFailureDetail(Cause.fail(new Error("Engine unavailable\nprivate diagnostic stack")))).toBe("Engine unavailable")
+    expect(acnStartupFailureDetail(Cause.fail(new Error("x".repeat(2000))))).toHaveLength(500)
+    expect(acnStartupFailureDetail(Cause.die(new Error("private defect")))).toBe("Magnitude service could not start. See diagnostics for details.")
+  })
+})
 
 const TestRpcs = RpcGroup.make(
   Rpc.make("Ping", { success: Schema.String }),
@@ -23,15 +67,11 @@ const listen = (router: HttpLayerRouter.HttpRouter, port: number) => Effect.gen(
   return `http://127.0.0.1:${server.address.port}`
 })
 
-describe("ACN public and control HTTP listeners", () => {
-  it("serves fenced RPC only on 10100, alongside inference, with shared lifecycle health", async () => {
+describe("ACN public HTTP listener", () => {
+  it("serves fenced RPC and inference with shared lifecycle health, without a shutdown listener", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const http = yield* HttpClient.HttpClient
       const lifecycle = yield* makeAcnServiceLifecycle()
-      const control = yield* HttpLayerRouter.make
-      yield* installAcnControlRoutes(control, lifecycle)
-      const controlOrigin = yield* listen(control, 0)
-
       const icn = yield* HttpLayerRouter.make
       yield* icn.add("GET", "/v1/models", Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest
@@ -40,13 +80,13 @@ describe("ACN public and control HTTP listeners", () => {
       }))
       const icnOrigin = yield* listen(icn, 0)
       const publicRouter = yield* HttpLayerRouter.make
+      yield* installAcnHealthRoutes(publicRouter, lifecycle)
       yield* installAcnPublicRoutes(publicRouter, lifecycle, {
         origin: new URL(icnOrigin),
         clientOptions: { headers: { authorization: "Bearer private-icn" } },
       })
-      const origin = yield* listen(publicRouter, ACN_PUBLIC_PORT)
-      expect(origin).toBe("http://127.0.0.1:10100")
-      expect(controlOrigin).not.toBe(origin)
+      const origin = yield* listen(publicRouter, 0)
+      expect(ACN_PUBLIC_PORT).toBe(10100)
 
       const rpc = (base: string, id: string | undefined, tag = "Ping") => http.execute(
         HttpClientRequest.post(`${base}/rpc`, {
@@ -56,10 +96,8 @@ describe("ACN public and control HTTP listeners", () => {
           })}\n`, "application/ndjson"),
         }),
       )
-      expect((yield* http.get(`${controlOrigin}/health`)).status).toBe(503)
       expect((yield* http.get(`${origin}/health`)).status).toBe(503)
       expect((yield* rpc(origin, ACN_INSTANCE_ID)).status).toBe(503)
-      expect((yield* rpc(controlOrigin, ACN_INSTANCE_ID)).status).toBe(404)
 
       let dispatched = 0
       const rpcRouter = yield* HttpLayerRouter.make
@@ -77,9 +115,7 @@ describe("ACN public and control HTTP listeners", () => {
       )
       yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie))
 
-      expect((yield* http.get(`${controlOrigin}/health`)).status).toBe(200)
       expect((yield* http.get(`${origin}/health`)).status).toBe(200)
-      expect((yield* rpc(controlOrigin, ACN_INSTANCE_ID)).status).toBe(404)
       expect((yield* rpc(origin, undefined)).status).toBe(409)
       expect((yield* rpc(origin, "previous-instance")).status).toBe(409)
       expect(dispatched).toBe(0)
@@ -98,9 +134,8 @@ describe("ACN public and control HTTP listeners", () => {
       expect((yield* http.get(`${origin}/inference/api/v1/models`)).status).toBe(404)
 
       expect((yield* http.post(`${origin}/shutdown`)).status).toBe(404)
-      expect((yield* http.post(`${controlOrigin}/shutdown`)).status).toBe(202)
+      yield* lifecycle.beginStopping({ reason: "administrative" })
       expect((yield* http.get(`${origin}/health`)).status).toBe(503)
-      expect((yield* http.get(`${controlOrigin}/health`)).status).toBe(503)
       expect((yield* rpc(origin, ACN_INSTANCE_ID)).status).toBe(503)
       expect(dispatched).toBe(1)
     })).pipe(Effect.provide(FetchHttpClient.layer)))

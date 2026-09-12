@@ -5,30 +5,23 @@ import * as BunContext from "@effect/platform-bun/BunContext"
 import * as BunRuntime from "@effect/platform-bun/BunRuntime"
 import { ProviderModelIdSchema, localModelIsInstalled, type ModelCatalogState, type LocalModel, formatConnectionError } from "@magnitudedev/sdk"
 import { HarnessIdSchema } from "@magnitudedev/client-common"
-import { harnessExecutableSearchPath, makeHarnessConnectionService, piDevelopmentConnectionOptions } from "../cli/src/harness-connections/service"
+import { harnessExecutableSearchPath, makeHarnessConnectionService } from "@magnitudedev/harness-connections"
+import { piDevelopmentConnectionOptions } from "../cli/src/server/harness-connections"
 import {
   interactiveProcessExitCode,
   runInteractiveProcess,
   type InteractiveProcessTermination,
 } from "@magnitudedev/utils/process"
-import { Cause, Console, Effect, Exit, Fiber, Option, Schema, Stream } from "effect"
+import { Console, Effect, Option, Schema } from "effect"
 import { dirname, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { buildLocalIcn } from "../inference/scripts/build-local"
-import { makeAcnConnectionWithInstanceManager } from "../cli/src/server/acn-connection"
-import {
-  makeBootstrappingAcnInstanceManager,
-  stopLocalAcn,
-} from "../cli/src/server/acn-instance-manager"
-import {
-  serviceStatus,
-  startInstalledService,
-  stopService,
-} from "../cli/src/server/service"
+import { headlessAcnConnection } from "../cli/src/server/acn-connection"
+import { desktopServiceOrigin } from "../cli/src/server/application"
+import { BunSqliteDriverLayer } from "@magnitudedev/daemon-management/bun"
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..")
-const cliEntrypoint = resolve(projectRoot, "cli/src/index.tsx")
-const acnEntrypoint = resolve(projectRoot, "packages/acn/src/binary.ts")
+const cliEntrypoint = resolve(projectRoot, "cli/src/index.ts")
 const piPackageSource = resolve(projectRoot, "integrations/pi")
 const encodeJsonString = Schema.encodeSync(Schema.parseJson(Schema.String))
 
@@ -114,30 +107,10 @@ const program = Effect.scoped(Effect.gen(function* () {
   }))
   process.env.MAGNITUDE_ICN_PATH = localIcn.installationPath
 
-  const previousService = yield* serviceStatus
-  if (previousService.running && !previousService.managed) {
-    return yield* new PiDevelopmentFailed({
-      message: "A Magnitude service not owned by the installed service manager is already running; stop it before launching Pi development",
-    })
-  }
-  yield* Effect.addFinalizer(() => Effect.gen(function* () {
-    const stopped = yield* stopLocalAcn.pipe(Effect.interruptible, Effect.fork, Effect.flatMap(Fiber.await))
-    if (previousIcnPath === undefined) delete process.env.MAGNITUDE_ICN_PATH
-    else process.env.MAGNITUDE_ICN_PATH = previousIcnPath
-    const restored = yield* (previousService.running && previousService.managed ? startInstalledService : Effect.void).pipe(Effect.interruptible, Effect.fork, Effect.flatMap(Fiber.await))
-    const failures: string[] = []
-    if (Exit.isFailure(stopped)) failures.push(Cause.pretty(stopped.cause))
-    if (Exit.isFailure(restored)) failures.push(Cause.pretty(restored.cause))
-    if (failures.length) return yield* Effect.die(new PiDevelopmentFailed({ message: `Could not restore the installed service: ${failures.join("; ")}` }))
-  }))
-  yield* stopService
-
-  yield* Console.log(`Starting the ${localIcn.backend} development runtime...`)
-  const manager = yield* makeBootstrappingAcnInstanceManager({
-    launchCommand: Option.some(["bun", acnEntrypoint, "serve"]),
-    debug: false,
-  })
-  const acnConnection = yield* makeAcnConnectionWithInstanceManager(manager)
+  yield* Command.make("bun", "run", "build").pipe(Command.workingDirectory(resolve(projectRoot, "desktop")), Command.exitCode,
+    Effect.flatMap(code => code === 0 ? Effect.void : Effect.fail(new PiDevelopmentFailed({ message: "Could not build the development desktop" }))))
+  yield* Console.log("Ensuring the Magnitude development app is running in the background...")
+  const acnConnection = yield* headlessAcnConnection
   yield* acnConnection.startup.awaitReady.pipe(
     Effect.mapError((error) => new PiDevelopmentFailed({
       message: `Could not start the development Magnitude service: ${formatConnectionError(error)}`,
@@ -172,6 +145,7 @@ const program = Effect.scoped(Effect.gen(function* () {
       MAGNITUDE_CLI: magnitudeExecutable,
       PI_CODING_AGENT_DIR: piDirectory,
       MAGNITUDE_PI_DEVELOPMENT_ROOT: temporaryDirectory,
+      MAGNITUDE_PI_DEVELOPMENT_ORIGIN: desktopServiceOrigin,
     },
   })
   yield* requireSuccess("Pi", pi)
@@ -181,5 +155,6 @@ if (import.meta.main) {
   BunRuntime.runMain(program.pipe(Effect.provide([
     BunContext.layer,
     FetchHttpClient.layer,
+    BunSqliteDriverLayer,
   ])))
 }

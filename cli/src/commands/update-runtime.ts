@@ -1,11 +1,12 @@
 import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import { updateActionFor } from "@magnitudedev/release"
-import { makeCliUpdater } from "../features/update/updater"
+import { makeCliUpdater } from "../update/updater"
 import { Effect, Either, Option } from "effect"
-import { executeUpdate } from "../features/update/execute"
+import { executeUpdate } from "../update/execute"
 import { isDevelopmentBuild } from "../runtime/environment"
 import { CLI_VERSION } from "../version"
+import { desktopDataDirectory } from "../server/application"
 
 const runExplicitUpdate = Effect.gen(function* () {
   if (isDevelopmentBuild()) {
@@ -17,7 +18,7 @@ const runExplicitUpdate = Effect.gen(function* () {
 
   const updater = yield* makeCliUpdater({
     currentVersion: CLI_VERSION,
-    developmentBuild: false,
+    dataDir: desktopDataDirectory,
   })
   if (Option.isNone(updater.packageManager)) {
     yield* Effect.sync(() => {
@@ -27,9 +28,6 @@ const runExplicitUpdate = Effect.gen(function* () {
     })
     return 1
   }
-  // The explicit command resolves its target the same way the prompt does —
-  // channel-selected and readiness-verified — but ignores dismissals: asking
-  // to update overrides having dismissed.
   const checked = yield* Effect.either(updater.updateTarget)
   if (Either.isLeft(checked)) {
     yield* Effect.sync(() => {
@@ -39,7 +37,7 @@ const runExplicitUpdate = Effect.gen(function* () {
   }
   if (Option.isNone(checked.right)) {
     yield* Effect.sync(() => {
-      process.stdout.write("Magnitude is already up to date.\n")
+      process.stdout.write("Magnitude CLI is already up to date.\n")
     })
     return 0
   }

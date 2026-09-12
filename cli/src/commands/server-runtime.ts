@@ -1,32 +1,14 @@
+import { desktopApplication, desktopServiceOrigin, startDesktopApplication, stopDesktopApplication, readDesktopLoginStartup, setDesktopLoginStartup } from "../server/application"
 import { FetchHttpClient } from "@effect/platform"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as CommandExecutor from "@effect/platform/CommandExecutor"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as Path from "@effect/platform/Path"
-import * as Terminal from "@effect/platform/Terminal"
 import { BunContext } from "@effect/platform-bun"
 import { formatLocalModelDisplayName } from "@magnitudedev/client-common"
-import {
-  MAGNITUDE_SERVICE_ORIGIN,
-} from "@magnitudedev/sdk"
-import { Effect, Layer, Option } from "effect"
-import {
-  confirmServicePublicReady,
-  installService,
-  serviceStatus,
-  startServiceManager,
-  stopService,
-  uninstallService,
-} from "../server/service"
-import { probeTerminalAppearance } from "../platform/terminal-appearance"
-import {
-  makeInlineServiceStartupPresenter,
-} from "../startup/inline-service-lifecycle"
-import { resolveCliTheme } from "../utils/theme"
-import { makeCliUpdater, updateReleaseNotesUrl } from "../features/update/updater"
-import { CLI_VERSION } from "../version"
-import { isDevelopmentBuild } from "../runtime/environment"
-import { existingAcnConnection, startingAcnConnection } from "../server/acn-connection"
+import type { TrayRegistration } from "@magnitudedev/sdk/desktop-host"
+import { Effect, Option } from "effect"
+import { existingAcnConnection } from "../server/acn-connection"
 import { explainServiceStartupFailure } from "../startup/service-startup-error"
 import { runCommand } from "./output"
 
@@ -36,56 +18,26 @@ interface ActiveModel {
 }
 
 interface ServiceStatusPresentation {
-  readonly status: "Stopped" | "Starting" | "Ready" | "Stopping"
+  readonly status: "Stopped" | "Starting" | "Ready" | "Stopping" | "Failed" | "CleanupFailed"
   readonly address: string
   readonly version: Option.Option<string>
-  readonly startsAutomaticallyOnLogin: boolean
-  readonly activeModel: Option.Option<ActiveModel>
+  readonly startsAutomaticallyOnLogin: Option.Option<boolean>
+  readonly activeModel: { readonly _tag: "Unavailable" } | { readonly _tag: "Observed"; readonly model: Option.Option<ActiveModel> }
+  readonly tray: Option.Option<TrayRegistration>
 }
 
-const serviceAddress = new URL(MAGNITUDE_SERVICE_ORIGIN).host
+const serviceAddress = new URL(desktopServiceOrigin).host
 
-const runServiceStartEffect = Effect.scoped(Effect.gen(function* () {
-  const appearance = yield* probeTerminalAppearance()
-  const theme = resolveCliTheme(appearance)
-  const startup = yield* makeInlineServiceStartupPresenter(theme, {
-    showReadyWhenNoWork: true,
-  })
-  const updater = yield* makeCliUpdater({
-    currentVersion: CLI_VERSION,
-    developmentBuild: isDevelopmentBuild(),
-  })
-  const discovery = yield* updater.discover
-
-  const started = yield* Effect.exit(startServiceManager(Option.some(startup.acquisitionObserver)))
-  if (started._tag === "Failure") {
-    return yield* Effect.failCause(started.cause)
-  }
-  yield* startup.acquisitionSucceeded
-
-  const connection = yield* startingAcnConnection
-  yield* startup.run(connection.startup)
-  yield* confirmServicePublicReady
-
-  const latest = yield* discovery.fresh
-  if (Option.isSome(latest)) {
-    yield* Effect.sync(() => {
-      process.stdout.write([
-        `Update available! ${CLI_VERSION} → ${latest.value}`,
-        `Release notes: ${updateReleaseNotesUrl(latest.value)}`,
-        "Run `magnitude update` to install it.",
-        "",
-      ].join("\n"))
-    })
-  }
-}))
+const runServiceStartEffect = startDesktopApplication.pipe(
+  Effect.tap(() => Effect.sync(() => process.stdout.write("Magnitude service is running.\n"))),
+  Effect.asVoid,
+)
 
 type ServiceRequirements =
   | FileSystem.FileSystem
   | CommandExecutor.CommandExecutor
   | Path.Path
   | HttpClient.HttpClient
-  | Terminal.Terminal
 
 const run = (
   effect: Effect.Effect<void, unknown, ServiceRequirements>,
@@ -98,34 +50,27 @@ const run = (
   })),
 ))
 
-type ServiceActionRequirements =
-  | FileSystem.FileSystem
-  | CommandExecutor.CommandExecutor
-  | Path.Path
-  | HttpClient.HttpClient
-
-const live = <A, E>(effect: Effect.Effect<A, E, ServiceActionRequirements>) => effect.pipe(
-  Effect.provide([BunContext.layer, FetchHttpClient.layer]),
-)
-
 export const runServiceInstall = () => runCommand({
-  effect: live(installService),
-  render: () => "Magnitude will start automatically when you log in.\n",
+  effect: setDesktopLoginStartup(true),
+  render: state => state._tag === "RequiresApproval"
+    ? "Allow Magnitude in your system login settings to finish enabling launch at login.\n"
+    : state._tag === "Enabled" ? "Magnitude will start in the background when you log in.\n"
+    : "Login startup could not be enabled. Check the installed desktop app's Settings.\n",
 })
 export const runServiceUninstall = () => runCommand({
-  effect: live(uninstallService),
-  render: () => "Magnitude service stopped and was removed from login startup.\nModels, settings, and sessions were kept.\n",
+  effect: setDesktopLoginStartup(false).pipe(Effect.zipRight(stopDesktopApplication)),
+  render: () => "Magnitude was removed from login startup and quit.\nModels and settings were kept.\n",
 })
 export const runServiceStart = () => run(runServiceStartEffect, explainServiceStartupFailure)
 export const runServiceStop = () => runCommand({
-  effect: live(stopService),
+  effect: stopDesktopApplication,
   render: () => "Magnitude service stopped.\n",
 })
 
 const readActiveModel = Effect.scoped(Effect.gen(function* () {
   const connection = yield* existingAcnConnection
   const catalog = yield* connection.client.models.getCatalog({})
-  if (catalog._tag === "Initializing") return Option.none<ActiveModel>()
+  if (catalog._tag === "Initializing") return { _tag: "Unavailable" } as const
   for (const entry of catalog.models) {
     if (entry._tag !== "Local") continue
     const model = entry.product
@@ -139,29 +84,28 @@ const readActiveModel = Effect.scoped(Effect.gen(function* () {
       && residency._tag !== "Loading"
       && residency._tag !== "Ready"
       && residency._tag !== "Stopping") continue
-    return Option.some({
+    return { _tag: "Observed", model: Option.some({
       displayName: formatLocalModelDisplayName(model),
       status: residency._tag === "Requested" ? "Loading" as const : residency._tag,
-    })
+    }) } as const
   }
-  return Option.none<ActiveModel>()
+  return { _tag: "Observed", model: Option.none<ActiveModel>() } as const
 }))
 
-const publicServiceStatus = live(serviceStatus).pipe(
-  Effect.flatMap((status) => {
-    const activeModel = status.running && status.state === "Ready"
-      ? readActiveModel.pipe(
-          Effect.timeoutOption("2 seconds"),
-          Effect.map(Option.flatten),
-          Effect.orElseSucceed(() => Option.none<ActiveModel>()),
-        )
-      : Effect.succeed(Option.none<ActiveModel>())
-    return activeModel.pipe(Effect.map((model) => ({
-      status: status.state,
-      address: serviceAddress,
-      version: status.running ? Option.some(String(status.version)) : Option.none<string>(),
-      startsAutomaticallyOnLogin: status.enabled,
-      activeModel: model,
+const publicServiceStatus = desktopApplication.observe.pipe(
+  Effect.map(Option.some),
+  Effect.catchTag("ApplicationControlUnavailable", () => Effect.succeed(Option.none())),
+  Effect.flatMap((snapshot) => {
+    const state = Option.isSome(snapshot) ? snapshot.value.service : undefined
+    const activeModel = state?._tag === "Ready" ? readActiveModel.pipe(
+      Effect.timeout("2 seconds"),
+      Effect.orElseSucceed(() => ({ _tag: "Unavailable" } as const)),
+    ) : Effect.succeed({ _tag: "Unavailable" } as const)
+    return Effect.all({ model: activeModel, login: readDesktopLoginStartup.pipe(Effect.map(state => state._tag === "Enabled" ? Option.some(true) : state._tag === "Disabled" ? Option.some(false) : Option.none<boolean>()), Effect.orElseSucceed(() => Option.none<boolean>())) }, { concurrency: "unbounded" }).pipe(Effect.map(({ model, login }): ServiceStatusPresentation => ({
+      status: state?._tag ?? "Stopped", address: serviceAddress,
+      version: state?._tag === "Ready" ? Option.some(String(state.health.version)) : Option.none(),
+      startsAutomaticallyOnLogin: login, activeModel: model,
+      tray: Option.map(snapshot, value => value.tray),
     })))
   }),
 )
@@ -169,12 +113,13 @@ const publicServiceStatus = live(serviceStatus).pipe(
 export const renderServiceStatus = (status: ServiceStatusPresentation): string => [
   "Magnitude service",
   `  Runtime         ${status.status}`,
-  `  Starts at login ${status.startsAutomaticallyOnLogin ? "Yes" : "No"}`,
+  `  Tray            ${Option.match(status.tray, { onNone: () => "Not running", onSome: tray => tray._tag === "Unavailable" ? `Unavailable · ${tray.message}` : tray._tag })}`,
+  `  Starts at login ${Option.match(status.startsAutomaticallyOnLogin, { onNone: () => "Unavailable", onSome: value => value ? "Yes" : "No" })}`,
   ...(Option.isSome(status.version) ? [
     `  Version         ${status.version.value}`,
     `  Address         ${status.address}`,
   ] : []),
-  ...(status.status === "Ready" ? [`  Active model    ${Option.match(status.activeModel, {
+  ...(status.status === "Ready" ? [`  Active model    ${status.activeModel._tag === "Unavailable" ? "Unavailable" : Option.match(status.activeModel.model, {
     onNone: () => "None",
     onSome: (model) => model.status === "Ready"
       ? model.displayName

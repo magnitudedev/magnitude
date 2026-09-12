@@ -27,11 +27,7 @@ describe("web local-model commands", () => {
     expect(routeSlashCommand("/usage", context)._tag).toBe("Unhandled")
   })
 
-  test("reopens the shared local-model onboarding flow", () => {
-    const openSetup = vi.fn()
-    const context = { openSetup } as unknown as CommandContext
-
-    expect(routeSlashCommand("/setup", context)._tag).toBe("Handled")
-    expect(openSetup).toHaveBeenCalledOnce()
+  test("does not expose desktop onboarding in the web command surface", () => {
+    expect(routeSlashCommand("/setup", {} as CommandContext)._tag).toBe("Unhandled")
   })
 })

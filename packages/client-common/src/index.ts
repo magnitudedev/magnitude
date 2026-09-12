@@ -61,8 +61,6 @@ export * from './utils/model-slots'
 export * from './local-models/projection'
 export * from './local-models/options'
 export * from './local-models/failure-messages'
-export * from './local-models/setup'
-export * from './local-models/setup-view'
 export * from './local-models/service'
 export * from './files/service'
 export * from './project-files/service'
@@ -118,7 +116,13 @@ export * from './hooks/use-composer-state'
 export * from './hooks/use-file-panel-state'
 export * from './hooks/use-menu-actions-core'
 export * from './hooks/use-local-inference-state'
-export * from './hooks/use-onboarding-model-setup'
 export * from './display-view-controller/timeline-scroll-controller'
 
 export * from './tracing'
+
+export * from "./desktop/service"
+export * from "./desktop/update"
+
+export { DesktopConnectRequest, ConnectionInspection, DesktopHarnessConnection, DesktopConnectionsSnapshot } from "./desktop/connections"
+
+export * from "./desktop/onboarding"

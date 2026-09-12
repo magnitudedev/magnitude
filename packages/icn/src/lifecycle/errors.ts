@@ -1,7 +1,8 @@
+import type { ExactProcessIdentityObservationFailed, ProcessGroupStopError } from "@magnitudedev/utils/process-groups";
 import type { PlatformError } from "@effect/platform/Error";
 import type { IcnStartupRecord } from "@magnitudedev/icn-protocol";
 import type { GeneratedClientError } from "@magnitudedev/openapi-effect/client-runtime";
-import { Data, Duration, type ParseResult } from "effect";
+import { Data, Duration, Schema, type ParseResult } from "effect";
 import type { ReleaseIcnInstallationError } from "./release-installation.js";
 
 export class IcnBinaryNotFound extends Data.TaggedError("IcnBinaryNotFound")<{
@@ -62,6 +63,14 @@ export class IcnCapabilityMissing extends Data.TaggedError("IcnCapabilityMissing
     return `The inference server binary does not provide required capability ${this.capability}`;
   }
 }
+
+export class IcnProcessIdentityUnavailable extends Data.TaggedError("IcnProcessIdentityUnavailable")<{
+  readonly pid: number;
+}> { override get message(): string { return `Cannot establish owned inference process identity for ${this.pid}`; } }
+
+export class IcnProcessGroupReplaced extends Data.TaggedError("IcnProcessGroupReplaced")<{
+  readonly pid: number;
+}> { override get message(): string { return `Inference process group ${this.pid} was replaced; refusing to signal it`; } }
 
 export class IcnShutdownTimedOut extends Data.TaggedError("IcnShutdownTimedOut")<{
   readonly pid: number;
@@ -179,6 +188,13 @@ export type IcnBinaryResolutionError =
   | IcnCapabilityMissing;
 
 export type IcnLifecycleError =
+  | IcnChildAcquisitionFailed
+  | IcnChildObservationFailed
+  | IcnChildRetirementFailed
+  | ExactProcessIdentityObservationFailed
+  | ProcessGroupStopError
+  | IcnProcessIdentityUnavailable
+  | IcnProcessGroupReplaced
   | IcnBinaryResolutionError
   | GeneratedClientError<never>
   | IcnShutdownTimedOut
@@ -191,3 +207,13 @@ export type IcnLifecycleError =
   | IcnReadinessTimedOut
   | IcnReadinessCommitRejected
   | IcnUnexpectedExit;
+
+export class IcnChildAcquisitionFailed extends Schema.TaggedError<IcnChildAcquisitionFailed>()("IcnChildAcquisitionFailed", {
+  executable: Schema.String, message: Schema.String,
+}) {}
+export class IcnChildObservationFailed extends Schema.TaggedError<IcnChildObservationFailed>()("IcnChildObservationFailed", {
+  pid: Schema.Int, message: Schema.String,
+}) {}
+export class IcnChildRetirementFailed extends Schema.TaggedError<IcnChildRetirementFailed>()("IcnChildRetirementFailed", {
+  pid: Schema.Int, message: Schema.String,
+}) {}

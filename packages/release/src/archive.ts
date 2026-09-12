@@ -127,6 +127,7 @@ const extractWithNodeStreams = (
   >,
 ): Effect.Effect<void, ReleaseAcquisitionError> =>
   Effect.gen(function* () {
+    if (artifact.kind === "desktop") return yield* archiveError("Install the desktop application with its platform installer; it is not a runtime archive")
     const runtime = yield* Effect.runtime<never>()
     return yield* Effect.async<void, ReleaseAcquisitionError>((resume) => {
       const reader = extract()

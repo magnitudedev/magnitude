@@ -1,12 +1,7 @@
 ---
 title: Embedded browser
-status: implemented
+status: historical
 applies_to:
-  - desktop/src/embedded-browser*.ts
-  - desktop/src/desktop-rpc.ts
-  - desktop/src/main.ts
-  - desktop/src/platform.ts
-  - desktop/src/preload.ts
   - packages/client-common/src/platform/embedded-browser.ts
   - packages/client-common/src/platform/types.ts
   - web/src/components/browser-panel.tsx
@@ -15,7 +10,11 @@ applies_to:
   - web/src/lib/workspace-panel-layout.ts
 ---
 
-# Embedded browser
+# Retired desktop browser
+
+This document is historical context for the retained agent browser interfaces. The inference
+desktop implements no embedded browser. The rules below describe the retired agent desktop and
+do not govern the inference application.
 
 ## Authority and boundary
 

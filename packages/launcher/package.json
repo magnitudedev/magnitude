@@ -1,7 +1,7 @@
 {
   "name": "@magnitudedev/cli",
   "version": "0.0.14",
-  "description": "Magnitude AI coding agent",
+  "description": "Headless CLI for Magnitude local inference",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -14,8 +14,8 @@
   },
   "keywords": [
     "ai",
-    "coding",
-    "agent",
+    "inference",
+    "local-models",
     "cli",
     "magnitude"
   ],

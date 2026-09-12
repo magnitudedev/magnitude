@@ -1,27 +1,15 @@
+import { desktopServiceOrigin, startDesktopApplication } from "./application"
 import { FetchHttpClient } from "@effect/platform"
-import { type AcnInstanceManager, makeServiceStarter } from "@magnitudedev/daemon-management"
-import { MagnitudeClient, MagnitudeServiceStarter } from "@magnitudedev/sdk"
-import { makeFirstPartyConnection, type FirstPartyConnection } from "@magnitudedev/client-common"
-import { Effect, Layer, Scope, Stream } from "effect"
-
-export const makeAcnConnectionWithInstanceManager = (
-  manager: AcnInstanceManager,
-): Effect.Effect<FirstPartyConnection, never, Scope.Scope> => makeFirstPartyConnection(
-  MagnitudeClient.layer().pipe(Layer.provide([
-    FetchHttpClient.layer,
-    Layer.succeed(MagnitudeServiceStarter, makeServiceStarter(manager)),
-  ])),
-)
+import { MagnitudeClient } from "@magnitudedev/sdk"
+import { makeFirstPartyConnection } from "@magnitudedev/client-common"
+import { Effect, Layer } from "effect"
 
 /** Connection whose startup requires an already-usable service. */
 export const existingAcnConnection = makeFirstPartyConnection(
-  MagnitudeClient.layer({ autoStart: false }).pipe(Layer.provide(FetchHttpClient.layer)),
+  MagnitudeClient.layer({ origin: desktopServiceOrigin, autoStart: false }).pipe(Layer.provide(FetchHttpClient.layer)),
 )
 
-/** Connection that follows the persistent service launched by `magnitude service start`. */
-export const startingAcnConnection = makeFirstPartyConnection(MagnitudeClient.layer().pipe(
-  Layer.provide([
-    FetchHttpClient.layer,
-    Layer.succeed(MagnitudeServiceStarter, { start: Stream.empty }),
-  ]),
+/** A headless request may initially start the desktop in the background, never a separate daemon. */
+export const headlessAcnConnection = Effect.flatMap(startDesktopApplication, () => makeFirstPartyConnection(
+  MagnitudeClient.layer({ origin: desktopServiceOrigin, autoStart: false }).pipe(Layer.provide(FetchHttpClient.layer)),
 ))

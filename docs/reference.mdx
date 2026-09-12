@@ -10,12 +10,16 @@ Magnitude normally configures and manages these interfaces automatically. This r
 
 | Command | Purpose |
 |---|---|
-| `magnitude setup` | Open interactive model browsing and setup |
-| `magnitude service install` | Install and enable the per-user service without starting it |
-| `magnitude service start` | Install or refresh, start, and await the user service |
-| `magnitude service status` | Show installation, startup, runtime, and active-model status |
-| `magnitude service stop` | Stop the service without uninstalling it |
-| `magnitude service uninstall` | Stop and remove the service definition while preserving user data |
+| `magnitude app open` | Explicitly open the desktop window |
+| `magnitude hardware` | Inspect hardware and available inference memory |
+| `magnitude catalog status` | Inspect catalog preparation |
+| `magnitude catalog show <model-id>` | Inspect one catalog model |
+| `magnitude catalog recommendations [--preference <value>] [--limit <count>]` | Rank compatible catalog models |
+| `magnitude service install` | Enable login startup and start the desktop in the background |
+| `magnitude service start` | Start the desktop in the background and await its service |
+| `magnitude service status` | Show service, tray, login-startup, and active-model status |
+| `magnitude service stop` | Quit the desktop and service while preserving login startup |
+| `magnitude service uninstall` | Disable login startup and quit while preserving models and settings |
 | `magnitude catalog list` | Show catalog, assessment, acquisition, and residency state |
 | `magnitude catalog pull <model-id>` | Install or update a catalog model |
 | `magnitude catalog remove <model-id>` | Remove an installed catalog model |
@@ -28,12 +32,9 @@ Magnitude normally configures and manages these interfaces automatically. This r
 | `magnitude connections sync [harness]` | Refresh connected harness configuration |
 | `magnitude connections remove <harness>` | Remove a harness connection |
 | `magnitude docs [topic-id]` | List or read bundled documentation for agents |
-| `magnitude docs onboarding` | Read the complete agent-guided setup workflow |
-| `magnitude update` | Update Magnitude |
+| `magnitude update` | Update the headless CLI |
 
-Run `magnitude --help` or append `--help` to a command for its complete options. Every
-non-interactive observation command supports `--json`; agents should begin with
-`magnitude docs onboarding` for the complete CLI-only setup and model-selection workflow.
+Run `magnitude --help` or append `--help` to a command for its complete options. Read `magnitude docs cli` for the non-interactive workflow. CLI output is text; structured integrations use the SDK. Onboarding and harness selection live in the desktop application. Connection commands configure external harnesses without launching them.
 
 ## Inference APIs
 
@@ -50,7 +51,6 @@ The OpenAI-compatible API supports model listing, Chat Completions, and Response
 
 | Variable | Purpose |
 |---|---|
-| `EXA_API_KEY` | Enable web search in Magnitude Harness |
 | `HF_HUB_CACHE` | Set the Hugging Face Hub cache directory |
 | `HUGGINGFACE_HUB_CACHE` | Legacy Hugging Face Hub cache override |
 | `HF_HOME` | Set the Hugging Face data directory |
@@ -64,8 +64,6 @@ Hugging Face cache settings are checked in the order shown. If none is set, Magn
 |---|---|
 | `~/.magnitude/models/` | Magnitude-managed local models |
 | `~/.magnitude/cache/` | Model metadata, hardware profiles, and disposable caches |
-| `~/.magnitude/sessions/` | Magnitude Harness conversations and session logs |
-| `~/.magnitude/logs/` | CLI logs and macOS service logs |
 | `~/.magnitude/traces/` | Local trace data when tracing is enabled |
 | `~/.magnitude/config.json` | User settings and model selections |
 | `~/.magnitude/harness-connections.json` | Managed harness connections |

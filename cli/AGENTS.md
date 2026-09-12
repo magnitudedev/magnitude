@@ -1,24 +1,19 @@
 # CLI Architecture
 
-The CLI is a React client rendered with OpenTUI (`@opentui/core` and `@opentui/react`). It handles terminal input and owns CLI-only presentation state. Shared server state and domain behavior belong in [`packages/client-common`](../packages/client-common/).
+The CLI is entirely headless. It exposes finite commands for agents and terminal users; onboarding and visual interaction belong to the desktop application. Do not add a TUI, chat harness, terminal renderer, or interactive onboarding.
 
-## Required Client-State Guidance
+## Client-State Guidance
 
-Before changing CLI state, hooks, RPC usage, subscriptions, or async lifecycle code, read [`packages/client-common/AGENTS.md`](../packages/client-common/AGENTS.md). Its rules govern:
-
-- choosing server, shared-client, or presentation state ownership;
-- Effect Query queries, mutations, subscriptions, and `Result`;
-- Effect Atom derivation and event-source actions;
-- `useAtomMount` lifecycle and stream-to-query invalidation bridges;
-- prohibited React state mirroring and imperative synchronization patterns.
+Before changing CLI state, RPC usage, subscriptions, or async lifecycle code, read [`packages/client-common/AGENTS.md`](../packages/client-common/AGENTS.md). Preserve its state ownership and Effect-scoped resource rules. Component hooks and React mounting patterns apply to renderers, not this headless package.
 
 ## CLI Boundaries
 
 - Import product APIs and wire types only from `@magnitudedev/client-common` and `@magnitudedev/sdk`. Never import ACN, protocol, agent, AI, provider, storage, or inference-engine packages directly.
-- Privileged bootstrap and service-command composition may import private `daemon-management`; ordinary UI and product commands do not own process coordination.
-- Use OpenTUI components and hooks for terminal rendering and interaction. Renderer and event types come from `@opentui/core`; React bindings such as `createRoot`, `useRenderer`, and `useKeyboard` come from `@opentui/react`.
-- Put reusable domain atoms, hooks, actions, and RPC subscription bridges in client-common. Keep CLI modules focused on OpenTUI rendering, terminal interaction, CLI routes, and genuinely CLI-only presentation atoms.
-- Compose independent domains in a pure CLI view model when a screen needs them together. Do not merge their state systems or request a screen-shaped RPC.
-- Use `useAgentClient` with client-common's `AcnQueries` members for ordinary query, mutation, and subscription work. Those policies call the SDK. Do not add promise wrappers plus `useState` for loading, errors, progress, or server snapshots.
-- Long-running operation UI reads progress from an authoritative query. A mounted stream may invalidate that query; it must not become a second state store.
-- `useEffect`, ref-diff synchronization, async IIFEs for server state, and callback-ref dependency effects are not accepted. Follow the declarative/event-source/`useAtomMount` decision in the client-common guidance.
+- Privileged bootstrap and service-command composition may import private `daemon-management`; ordinary product commands do not own process coordination. Privileged connection composition may import the private harness-connections package.
+- Reuse client-common's product derivations, recommendation policy, and shared capabilities. Keep CLI modules focused on command registration, finite output, and headless orchestration.
+- Acquire the shared first-party connection in an Effect scope. Finite SDK reads and commands consume their results directly; do not construct a renderer, React hooks, a second request cache, or a separate onboarding workflow to run them.
+- Compose independent observations in pure output functions. Do not add a combined server RPC or retained state merely because one command prints several domains.
+- A command acknowledgement is distinct from download or load completion. Print the relevant observation command when admitted work continues; progress and terminal state come from the authoritative product resource.
+- Validate command syntax before acquiring runtime capabilities. Help, version, documentation, and rejected syntax must not start the application or mutate user configuration.
+- Keep runtime imports behind command execution so passive commands remain usable without native application adapters or an installed desktop.
+- External connection commands configure and inspect supported harnesses; they never launch one. Keep reusable connector implementation in the host package rather than adding a CLI-specific path.

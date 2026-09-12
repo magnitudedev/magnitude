@@ -1,5 +1,6 @@
 import type { ReactNode } from "react"
-import magnitudeMarkUrl from "../../../assets/brand/icon-light.svg"
+import lightMarkUrl from "../../../assets/brand/icon-light.svg"
+import darkMarkUrl from "../../../assets/brand/icon-dark.svg"
 
 export function MagnitudeMark({
   className,
@@ -7,11 +8,9 @@ export function MagnitudeMark({
   readonly className?: string
 }): ReactNode {
   return (
-    <img
-      src={magnitudeMarkUrl}
-      alt=""
-      aria-hidden="true"
-      className={className}
-    />
+    <span aria-hidden="true" className={className}>
+      <img src={lightMarkUrl} alt="" className="h-full w-full object-contain dark:hidden" />
+      <img src={darkMarkUrl} alt="" className="hidden h-full w-full object-contain dark:block" />
+    </span>
   )
 }

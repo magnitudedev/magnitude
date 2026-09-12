@@ -1,5 +1,9 @@
+import { ProcessGroupController } from "@magnitudedev/utils/process-groups";
+import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { nativeWindowsJobOwnerLayer, nativeWindowsPrivatePipesLayer } from "@magnitudedev/utils/windows-native";
+import { WindowsIcnChildSpawner } from "./windows-child";
 import { Duration, Effect, Layer, Option, Ref } from "effect";
 import {
   type AcnInstallationPlan,
@@ -16,6 +20,7 @@ import {
   makeIcnModelAssessments,
   makeIcnClient,
   makeIcnProcess,
+  UnixIcnChildSpawner,
   makeIcnHardware,
   makeIcnEvents,
   IcnInstancesLive,
@@ -105,7 +110,12 @@ const makeProcess = (dataDir: string) =>
       forceShutdownTimeout: Duration.millis(500),
       outputLimitBytes: 256 * 1024,
     })
-  ).pipe(Layer.orDie);
+  ).pipe(Layer.provide(process.platform === "win32"
+    ? WindowsIcnChildSpawner.pipe(Layer.provide(Layer.merge(
+      nativeWindowsJobOwnerLayer(process.env.MAGNITUDE_NATIVE_HOST ?? join(dirname(process.execPath), "desktop-host.node")),
+      nativeWindowsPrivatePipesLayer(process.env.MAGNITUDE_NATIVE_HOST ?? join(dirname(process.execPath), "desktop-host.node")),
+    )))
+    : UnixIcnChildSpawner.pipe(Layer.provide(Layer.succeed(ProcessGroupController, ProcessGroupControllerLive)))));
 
 const makeSupervision = () =>
   Layer.scopedDiscard(
@@ -219,5 +229,5 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
   const withModels = Layer.provideMerge(makeIcnDiscovery(), withCatalog);
   const withAssessments = Layer.provideMerge(makeIcnModelAssessments(), withModels);
   const withInstallations = Layer.provideMerge(makeIcnCatalogInstallations(), withAssessments);
-  return Layer.provideMerge(IcnInstancesLive, withInstallations).pipe(Layer.orDie);
+  return Layer.provideMerge(IcnInstancesLive, withInstallations);
 };

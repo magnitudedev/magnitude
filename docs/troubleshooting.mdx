@@ -1,40 +1,40 @@
 ---
 title: Troubleshooting
-description: "Resolve setup, connection, model, memory, and performance problems"
+description: "Resolve service, connection, download, and model problems"
 icon: wrench
 ---
 
-If your harness is available, ask the agent to inspect Magnitude and fix the problem. It can run `magnitude docs onboarding` for the current agent-guided workflow and use the headless CLI to inspect the service, models, and connections.
-
-<Warning>
-  Do not delete `~/.magnitude`. It contains downloaded models, settings, harness connections, and Magnitude Harness sessions.
-</Warning>
+Start with **Status** in the desktop app. It reports the service, model, downloads, and tray separately. Agents can inspect the same system with `magnitude service status`, `magnitude models status`, and `magnitude connections list`; `magnitude docs cli` describes the headless commands.
 
 ## Setup did not finish
 
-Ask your agent to resume setup and follow `magnitude docs onboarding` again. Completed hardware profiling and model downloads are reused when possible.
+Reopen Magnitude and continue in Discover. Completed downloads remain available in My Models. Onboarding lives in the desktop application.
 
-If the CLI does not start, check `magnitude --version`, then update or reinstall it. On Windows, run Magnitude inside WSL. If you were using interactive setup, you can run `magnitude setup` again.
+If the CLI reports that the desktop is missing, install the desktop application for your platform. Reinstalling the npm CLI alone does not install the desktop or its service.
+
+## Service is unavailable
+
+Open Status and read the failure. Use **Retry service** when offered. A service failure does not imply that a downloaded model was deleted.
+
+```sh
+magnitude service status
+magnitude service start
+```
+
+Start requests run the desktop in the background. Use `magnitude app open` to show its window. If Status reports **Cleanup needs attention**, resolve that failure before attempting replacement processes; do not start a separate daemon manually.
 
 ## Harness cannot use Magnitude
 
-Ask the agent to check that the Magnitude service is running and resync the harness connection. For manual recovery:
+Check Connections. Its status reflects the managed configuration on disk; external edits can disconnect an integration. Connect again to repair it, or use:
 
 ```sh
-magnitude service start
+magnitude connections list
 magnitude connections sync
 ```
 
-If the harness is not connected, ask your agent to resume onboarding. For manual recovery, rerun `magnitude setup` or add the connection from the CLI reference.
+Connect writes the configuration and supported integration files without launching the harness. Restart or reload the harness yourself when its configuration requires it.
 
-Codex and Claude Code keep using Magnitude's local gateway while their connection is installed. If
-the service was stopped, start it again:
-
-```sh
-magnitude service start
-```
-
-To stop using the Magnitude connection instead, remove it and restart the harness:
+Codex and Claude Code use Magnitude's local gateway while connected, including for hosted models. Keep Magnitude running, or remove the connection and restart the harness:
 
 ```sh
 magnitude connections remove codex
@@ -44,41 +44,22 @@ magnitude connections remove claude-code
 
 ## Model download failed
 
-Magnitude retries temporary network and server failures. If retries are exhausted, retry after checking network access and disk space. Partial downloads can resume instead of starting again.
+Check network access and free disk space, then retry from Discover or My Models. Magnitude can resume partial downloads when the source permits. Use the curated catalog in the app to select another model.
 
-A GGUF model downloaded outside Magnitude must be complete and stored in a recognized Hugging Face Hub cache. Restart Magnitude after the download finishes.
+## Model will not load or was stopped
 
-## Model will not load
+A downloaded model occupies disk space; a loaded model also needs inference memory. Check the model's failure in My Models and the current state in Status. Other applications can reduce available memory after the fit assessment. Free memory or choose a smaller recommendation and try again.
 
-| Message | Meaning | Action |
-|---|---|---|
-| **Too large** | The configuration cannot fit while preserving system memory | Choose a smaller model, quantization, or context |
-| **Not enough memory available** | The model normally fits, but other applications are using too much memory | Close memory-intensive applications and try again |
-| **Model stopped · Low memory** | Available memory became unsafe while the model was running | Free memory; the next request can load the model again |
+Stopping a model preserves its downloaded files and keeps the service available. A later inference request can load the selected model again. Full **Quit Magnitude** stops the service and its inference processes.
 
-A downloaded model does not use inference memory until Magnitude loads it for a request.
+## Tray or login startup is unavailable
 
-## Model was unloaded
+Some Linux desktop environments do not expose a supported tray host. Status reports this explicitly. Reopen Magnitude through your applications menu or `magnitude app open`; quit through the application menu or `magnitude service stop`.
 
-This is normally expected. Magnitude unloads inactive models and can stop a model when the machine needs memory. The model remains downloaded and selected. The next agent request loads it again.
+Use Settings to enable launch at login. The CLI equivalents are `magnitude service install` to enable it and start the background app, and `magnitude service uninstall` to disable it and quit. `magnitude service stop` preserves the login setting.
 
-## Inference is slow or queued
+## Report a problem
 
-The first request may wait for the model to load. Long prompts also require prefill before generation begins. Concurrent requests wait when the machine has no free inference capacity.
+Include the app version, operating system, service/model status, and the steps that failed. On Linux, include your desktop environment and whether the session uses X11 or Wayland. Remove prompts, project contents, private paths, and credentials from any logs you share.
 
-Actual generation speed varies with prompt length, concurrent work, other applications, and model revision. Ask the agent to compare the active configuration with faster recommendations if sustained generation is slower than expected.
-
-## Logs and recovery
-
-On macOS, service logs are in `~/.magnitude/logs/acn-service.log`. On Linux, use `journalctl --user -u magnitude.service`. Magnitude Harness session logs are stored with each session under `~/.magnitude/sessions`.
-
-Use the least disruptive recovery:
-
-1. Retry the request.
-2. Restart the harness.
-3. Start or restart the Magnitude service.
-4. Ask your agent to resume onboarding, or run `magnitude setup` again for interactive setup.
-5. Clear only `~/.magnitude/cache` when derived hardware or catalog data is the problem.
-6. Reinstall the CLI if bundled inference files are missing.
-
-Before sharing logs, remove prompts, project contents, private paths, and credentials. Open a [GitHub issue](https://github.com/magnitudedev/magnitude/issues) or ask in [Discord](https://discord.gg/EHt48pPWdC).
+Do not delete the complete `~/.magnitude` directory as a troubleshooting step; it contains models and configuration. Open a [GitHub issue](https://github.com/magnitudedev/magnitude/issues) or ask in [Discord](https://discord.gg/EHt48pPWdC).

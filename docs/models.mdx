@@ -14,7 +14,7 @@ Magnitude caches this profile and recalibrates when needed.
 
 ## Recommendations
 
-During agent-first setup, Magnitude ranks up to ten configurations using:
+Discover ranks curated configurations using:
 
 - Model intelligence
 - Estimated generation speed
@@ -22,9 +22,9 @@ During agent-first setup, Magnitude ranks up to ten configurations using:
 - Configured context size
 - Physical memory
 
-Your agent asks whether you prefer faster, balanced, or smarter output, then walks you through the strongest options. In interactive setup, move **Fast to Smart** toward Fast to favor generation speed or toward Smart to favor intelligence.
+Choose Fastest, Faster, Balanced, Smarter, or Smartest in Discover. The CLI recommendation command uses the same shared ranking over the service catalog and hardware assessments.
 
-Speed is shown as a range such as `~36–48 tok/s`. Actual performance varies with prompt length, concurrent work, available memory, and model revision.
+Model details show estimated generation speed at assessed context sizes. Actual performance varies with prompt length, concurrent work, available memory, and model revision.
 
 ## Model catalog
 
@@ -44,8 +44,6 @@ Choose another installed model from your harness model dropdown. You can also as
 
 The agent can use the Magnitude CLI to inspect the hardware and catalog and install the model. Select it from your harness when it is ready.
 
-## Download a model outside the catalog
+## Curated discovery
 
-Magnitude also discovers compatible GGUF packages outside its catalog when they are stored in the Hugging Face Hub cache. Ask your agent to download the model and quantization with the Hugging Face CLI. Restart Magnitude after the download completes to refresh the inventory.
-
-Magnitude checks `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HOME`, and `XDG_CACHE_HOME`, then falls back to `~/.cache/huggingface/hub`.
+The desktop app downloads models from the curated catalog. Model details explain the assessed context, capabilities, license, and memory requirements. A fit estimate is not a guarantee of free memory when you load the model.

@@ -17,7 +17,7 @@ describe("classifyMagnitudeProcess", () => {
     [`/Users/me/.magnitude/bin/${ACN_EXECUTABLE_NAME} serve --parent-bound`, "ACN"],
     ["bun run packages/acn/src/binary.ts serve --debug", "ACN"],
     ["/tmp/bin/magnitude-cli --debug", "CLI"],
-    ["bun run cli/src/index.tsx --debug", "CLI"],
+    ["bun run cli/src/index.ts --debug", "CLI"],
     ["node packages/launcher/bin/magnitude.js", "CLI"],
   ] as const)("classifies %s as %s", (command, expected) => {
     expect(classifyMagnitudeProcess(command)).toBe(expected)

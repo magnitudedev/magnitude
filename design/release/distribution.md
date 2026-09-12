@@ -5,6 +5,9 @@ applies_to:
   - packages/release/src/targets.ts
   - packages/release/scripts/assemble.ts
   - packages/release/scripts/build/**
+  - packages/release/native/windows-installer.*
+  - packages/release/resources/windows/desktop.nsi
+  - packages/release/scripts/apple/desktop.ts
   - packages/launcher/package.json
 ---
 
@@ -18,6 +21,7 @@ artifacts. The release graph is product configuration, not a plugin system.
 | Artifact | Published for | Contents |
 | --- | --- | --- |
 | CLI | every host | one `bin/magnitude-cli` executable |
+| Desktop | supported graphical hosts | Electron application with its matched service and native ownership addon and transient command helper; macOS uses an explicit DMG installation |
 | ACN | Apple hosts | signed, notarized, stapled `Magnitude.app` whose main executable is `magnitude-service` with embedded ripgrep, plus metadata and icon |
 | ACN | other hosts | one `bin/magnitude-service` executable with embedded ripgrep |
 | ICN base | every host | one `bin/magnitude-inference` executable, planner inputs, common runtime libraries, and CPU modules |
@@ -41,9 +45,39 @@ native-build identity and backend-module ABI.
 The manifest does not describe build provenance or duplicate platform policy. Platform support is
 a property of the release target and is enforced while building and accepting the candidate.
 
-The app bundle exists so the macOS service can be notarized and stapled; it adds no process,
-window, or menu item, and the per-user LaunchAgent runs the executable inside it. The CLI,
-inference artifacts, and models remain outside the app.
+The desktop bundle owns the window, tray, and service lifecycle. Inference artifacts and models
+remain outside the app. Its installer preserves the sealed native bundle, including framework
+symlinks; runtime archive extraction never installs or interprets a desktop artifact. Signing and
+notarization precede final installer checksums. Ad-hoc local builds never imply publisher trust.
+Each Apple host also produces an update ZIP from the same signed and stapled desktop bundle as
+its DMG. The ZIP is a separate desktop artifact covered by the release manifest and acceptance
+receipts. It is not an inference/runtime acquisition archive. Producing it does not establish
+successful application replacement or relaunch; those remain updater acceptance requirements.
+
+Linux desktop packages use the name `magnitude-desktop` and place the matched application at
+`/usr/lib/magnitude-desktop/magnitude`. The application-menu launcher and headless CLI resolve
+that same installation through `/usr/bin/magnitude-desktop`, including login startup. This guarded
+entry acquires shared installation admission before executing Electron and retains it until exit.
+The package manager obtains exclusive admission before replacement/removal and rejects while any
+participating user app remains alive. A root-owned installation gate spans the separate maintainer
+script lifetimes; launches fail with repair guidance until configuration succeeds. Interrupted
+installation never becomes an independently running service. The lock inode survives reinstall.
+Package abort hooks must preserve a healthy old installation after a rejected upgrade.
+`/usr/bin/magnitude-desktop` is the graphical launch entry; it does not
+replace the npm CLI's `magnitude` command. Login registration remains a user preference controlled
+by the running application. Package installation does not register an independent daemon or
+automatically open a window. Native DEB/RPM consumption and upgrade acceptance precede inclusion
+in the published artifact graph.
+
+Windows installer candidates use the desktop's existing application lease and never start or adopt
+an independent service. Fresh installation publishes a complete staged payload by same-volume rename.
+A private installer-owned scratch container permits recovery after interrupted extraction; cleanup
+is relative to retained handles and cannot follow directory redirections. Existing unsafe scratch
+permissions are rejected without repair. The installed uninstaller is the sole removal record and
+must match its executing self-copy before mutation. Payload removal rejects redirected paths,
+preserves unrelated installed files, and retains the exact removal record until required cleanup
+succeeds. Interrupted removal can be retried. Candidate packaging does not authorize replacement,
+updates, signing claims, or publication before their separate acceptance gates pass.
 
 ## Distribution contract
 

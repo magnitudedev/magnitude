@@ -1,10 +1,4 @@
-import type {
-  OnboardingModelSetupFailure,
-  OnboardingModelSetupNotice,
-  OnboardingModelSetupExecution,
-} from "./setup-state"
 import type { ModelAcquisitionFailure } from "@magnitudedev/sdk"
-import { formatLocalModelDisplayName } from "../utils/model-presentation"
 import { formatStorageSize } from "../utils/format-bytes"
 
 export const modelDownloadFailureMessage = (failure: ModelAcquisitionFailure): string => {
@@ -22,58 +16,4 @@ export const modelDownloadFailureMessage = (failure: ModelAcquisitionFailure): s
       return "Magnitude couldn’t write the model to disk. Check disk access and try again."
     case "Internal": return failure.message
   }
-}
-
-const onboardingModelSetupFailureDetail = (
-  failure: OnboardingModelSetupFailure,
-): string => {
-  if (typeof failure !== "object" || failure === null) {
-    return "The onboarding model setup could not be completed."
-  }
-  if (!("_tag" in failure)) {
-    const message = "message" in failure ? failure.message : undefined
-    return typeof message === "string" ? message : "The onboarding model setup could not be completed."
-  }
-  switch (failure._tag) {
-    case "OnboardingModelChoiceRejected":
-      return "That model is no longer available for setup."
-    case "OnboardingModelResourceChanged":
-      return "The selected model changed before setup completed. Choose it again to retry."
-    case "Interrupted":
-    case "InsufficientDiskSpace":
-    case "SourceUnavailable":
-    case "NetworkUnavailable":
-    case "CorruptDownload":
-    case "LocalStorageFailure":
-      return modelDownloadFailureMessage(failure)
-    case "Internal": return failure.message
-    default: {
-      const message = "message" in failure ? failure.message : undefined
-      return typeof message === "string" && message.length > 0
-        ? message
-        : "The onboarding model setup could not be completed."
-    }
-  }
-}
-
-const modelOperationVerb = (
-  operation: OnboardingModelSetupExecution["_tag"],
-): string => {
-  switch (operation) {
-    case "Preparing": return "preparing"
-    case "Installing": return "downloading"
-    case "Configuring": return "configuring"
-    case "Loading": return "loading"
-    case "Completing": return "finishing setup for"
-  }
-}
-
-export const onboardingModelSetupNoticeMessage = (
-  notice: OnboardingModelSetupNotice,
-): string => {
-  const detail = onboardingModelSetupFailureDetail(notice.failure)
-  if (notice.subject._tag === "Setup") return `Unexpected setup error · ${detail}`
-  return `Unexpected error ${modelOperationVerb(notice.subject.operation)} ${
-    formatLocalModelDisplayName(notice.subject.model)
-  } · ${detail}`
 }

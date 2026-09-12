@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { Option, Schema } from "effect"
-import releasePlan from "../../release-plan.json"
+import releasePlan from "../../../release/release-plan.json"
 import { ReleaseManifestSchema } from "@magnitudedev/release"
 import type { ReleaseArtifact, ReleaseManifest } from "@magnitudedev/release"
 import { selectCudaArtifact } from "./cuda-compatibility"

@@ -4,10 +4,10 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts",
     "./bun": "./src/bun.ts",
     "./sqlite-driver": "./src/sqlite-driver.ts",
-    "./service": "./src/service.ts"
+    "./desktop-native": "./src/desktop-native/exports.ts",
+    "./node": "./src/node-sqlite-driver.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
@@ -15,14 +15,16 @@
   "dependencies": {
     "@effect/platform": "^0.96.0",
     "@magnitudedev/acn-protocol": "workspace:*",
-    "@magnitudedev/release": "workspace:*",
+    "@magnitudedev/sdk": "workspace:*",
     "@magnitudedev/utils": "workspace:*",
-    "@magnitudedev/version": "workspace:*",
-    "effect": "3.21.2",
-    "@magnitudedev/sdk": "workspace:*"
+    "@xmldom/xmldom": "0.9.12",
+    "dbus-native": "0.15.2",
+    "effect": "3.21.2"
   },
   "devDependencies": {
     "@effect/platform-bun": "^0.90.0",
+    "@types/node": "^24",
+    "node-api-headers": "1.9.0",
     "vitest": "^3.2.4"
   }
 }

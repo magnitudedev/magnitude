@@ -1,180 +1,83 @@
 ---
 applies_to:
-  - cli/src/index.tsx
-  - cli/src/commands/interactive.ts
-  - cli/src/commands/interactive-runtime.ts
-  - cli/src/commands/server.ts
-  - cli/src/commands/server-runtime.ts
+  - cli/src/index.ts
+  - cli/src/commands/**
+  - cli/src/server/**
   - cli/src/runtime/**
   - cli/src/startup/**
-  - cli/src/features/update/**
-  - cli/src/platform/terminal.ts
-  - cli/src/server/acn-connection.ts
-  - cli/src/server/acn-instance-manager.ts
-  - cli/src/platform/process-exit.ts
-  - cli/src/platform/terminal-appearance.ts
+  - cli/src/update/**
   - packages/sdk/src/client.ts
-  - packages/daemon-management/src/service-starter.ts
+  - packages/daemon-management/src/desktop-native/application-client.ts
+  - packages/daemon-management/src/desktop-native/application-host.ts
 ---
 
-# CLI startup sequence
+# Headless CLI startup
 
-Service startup and update choice are inline terminal work owned by the command runtime. OpenTUI is
-not a bootstrap surface. The interactive command creates its renderer only after the update choice,
-exact service readiness, and onboarding preflight have completed. Consequently, a warm launch makes
-no terminal writes before the application's first frame.
+The CLI is a finite, noninteractive command surface. Bare invocation prints help. Help, version,
+documentation, connection inspection, and service status are observational and never start the
+application. There is no terminal renderer, onboarding preflight, update prompt, or agent harness.
 
-User-facing copy always says **service**. `ACN`, `daemon`, `server`, JIT, ownership, and endpoint
-selection remain implementation terms.
+## Application ownership
 
-## Service acquisition
+Commands validate argument syntax and supported identifiers before requesting startup.
+Service-backed commands ask the installed desktop application to run in the background and await
+its exact Ready service and compatible RPC version. The same request applies to cold and warm
+startup. It never shows, restores, or focuses a window. Only explicit `magnitude app open` sends
+ShowWindow; this does not wait for inference readiness and can open a failed application's Status.
 
-Every service-backed command explicitly constructs the mechanism appropriate to its operation:
+The privileged application client owns installation discovery, launch intent, and local control.
+Only an absent application control endpoint permits a launch attempt. A timeout, permission error,
+unresponsive owner, or explicit application failure is not absence and must not create another
+owner. Concurrent launches coalesce through the desktop native lifetime lock. A cancelled CLI
+request does not cancel an application that has already started. Cold startup observes launcher
+failure until application control responds. Nonzero launcher exit fails promptly; the Linux
+installation guard reports package-manager repair guidance. A successful platform dispatcher may
+exit before application admission and is not treated as failure. This short-lived observation
+never supervises or terminates the desktop process.
 
-| Commands | Acquisition mechanism | Service absent |
-| --- | --- | --- |
-| Bare `magnitude` interactive launch | Bootstrapping `AcnInstanceManager` followed by an `AcnConnection` | Install, launch, and await exact readiness inline |
-| `magnitude service start` | Explicit platform-service installation/start followed by an observing `AcnConnection` | Install/register/start and await exact readiness inline |
-| Catalog, model, and connection operations | Existing-service observer followed by an `AcnConnection` | Fail with `Magnitude service is not running. Run \`magnitude service start\`.` |
+The CLI does not install or download ACN, elect a daemon owner, kill a predecessor, or register an
+independent OS daemon. Missing installation and missing graphical session produce actionable errors.
+Windows cold launch checks the native assigned desktop; a noninteractive caller may control an
+existing desktop owner but cannot create an invisible owner in its own session.
+Development uses its isolated desktop, service endpoint, data, and harness configuration.
+An explicitly isolated profile also applies to packaged CLI runs: application control, service
+requests, and harness configuration use that profile together. Choosing a private profile does
+not change whether startup launches a source checkout or an installed application.
 
-When an exact live service cannot produce valid health in either bounded attempt, commands report
-the observed private endpoint and process ID plus both ordered attempt diagnostics. They do not
-expose SDK error class names.
+## Service administration
 
-The terminal adapter contains only terminal and OS operations. It never selects a service-acquisition
-mechanism and contains no RPC transport, startup lifecycle, recovery lifecycle, or connection close.
-Noninteractive commands do not construct it.
+`service start` ensures the desktop in the background, awaits compatible Ready, acknowledges, and
+exits. It does not enable login startup. `service stop` asks the application to Quit and awaits
+that exact process occurrence's exit. The desktop proves owned-child cleanup; the CLI never stops
+ACN independently. An already absent application is a successful stop.
 
-`magnitude update` updates the package and, under a compatible launcher, asks the newly installed
-CLI to run `magnitude service start`. Without the launcher protocol, success prints the explicit
-service-start command as the degradation floor.
+`service status` observes application lifecycle without starting it. Model observations are separate
+from service readiness, and unavailable model evidence must not be presented as no loaded model.
+Login installation registers the desktop's graphical-session startup; uninstallation unregisters
+it and requests full application shutdown while preserving model files and settings.
 
-## Interactive launch
+## Recovery and updates
 
-```text
-shell launcher
-  -> resolve native CLI (silent when cached; inline artifact progress when needed)
-  -> probe terminal appearance and begin update discovery
-  -> resolve an available update inline, if any
-  -> construct the bootstrapping instance manager and ACN connection
-  -> await exact Ready service occurrence inline
-  -> run onboarding preflight
-  -> create OpenTUI renderer
-  -> first frame is Application
-```
+An established SDK connection may reconnect to an available service, but cannot invoke its starter
+again. A stale request or subscription therefore cannot undo explicit Quit. A fresh command may
+explicitly ensure the application again. Startup waits remain bound to the admitted application
+occurrence and fail if it is replaced.
 
-The ready check itself is silent. If the service is already warm, no lifecycle phase is printed and
-the renderer opens directly into chat. If work is necessary, lifecycle observations drive an inline
-active region. Completed phases remain as stable lines; the current phase is replaced in place.
-Redirected output uses durable milestone lines and no cursor control codes.
+CLI package updates remain explicit and separate from desktop application/service updates. A
+post-update launcher request uses the same public background service-start path. RPC mismatch gives
+an update action rather than replacing or downgrading the running service.
+Before a cold installed macOS launch, the host waits for an active native update job targeting that
+exact application bundle to finish. An inactive retained job is not an active installation. Observation
+failure or a bounded wait expiring fails the command without starting the old application. The CLI
+does not stop, replace, or supervise the installer, and warm control requests retain their existing
+application semantics.
 
-`Checking` never renders. There is no synthetic generic startup phase before an authoritative
-observation. A critical startup failure freezes the current progress as a durable transcript,
-prints `Magnitude service failed to start:` followed immediately by the underlying error, and exits
-nonzero. There is no retry/quit prompt; such a failure is treated as a product error.
+## Acceptance
 
-## Inline update choice
-
-The prompt uses the detected Magnitude theme and plain terminal input. Numbers are labels, not
-shortcuts. Up/down changes the selected row, Enter confirms, Escape skips this launch, and Ctrl-C is
-a normal process interruption. There are no j/k or direct-number controls.
-
-```text
-Update available! 1.3.0 → 1.4.0
-
-Release notes: https://github.com/magnitudedev/magnitude/releases/tag/@magnitudedev/cli@1.4.0
-
-› 1. Update now (runs `npm install -g @magnitudedev/cli@1.4.0`)
-  2. Skip
-  3. Skip until next version
-
-Press enter to continue
-```
-
-The selector and selected number are theme-accent-colored and bold. The URL uses the theme link
-color. Completed checks use the same sea-foam token as Markdown inline code. The URL stays on the label's line and
-has no arrow glyph. Confirming erases the active prompt and leaves a short durable summary before
-continuing or handing off to the updater.
-
-## Inline service progress
-
-The presenter projects the existing typed lifecycle as one nested service-start operation; it does
-not own service decisions. The parent uses a static theme-blue `○` while active and `●` when ready.
-Only the current child uses the animated Braille spinner.
-
-| Lifecycle observation | Inline copy |
-| --- | --- |
-| `Checking` | Nothing |
-| `Installing / DownloadingDaemon` | `Downloading Magnitude service... 63% (24.8 MB / 39.4 MB)` when exact bytes are known |
-| `Installing / DownloadingInferenceEngine` | `Downloading inference engine... 63% (3.1 GB / 4.9 GB)` when exact bytes are known |
-| `Installing / StartingMagnitude` | Child `Starting inference engine` |
-| `Starting / WaitingForOwner` | `Waiting for previous Magnitude service` |
-| `Starting / ResolvingLocalInference` | No child; absorbed into the parent operation |
-| `Starting / LaunchingLocalInference` | Child `Starting inference engine` |
-| `Starting / PreparingBackend` | Child `Preparing <backend> backend for <hardware>` |
-| `Ready` | Complete the active child and change the parent `○` to `●` |
-| `Failed` | Preserve the current progress; outer boundary prints the actual error and exits nonzero |
-
-Service-binary acquisition feeds the same parent presenter before the lifecycle is observable. TTY
-output rewrites the nested block with no progress bar; redirected output emits coarse percentage
-milestones without ANSI animation.
-
-```text
-○ Starting Magnitude service
-  ✓ Magnitude service downloaded 100% (39.4 MB / 39.4 MB)
-  ✓ Inference engine downloaded 100% (4.9 GB / 4.9 GB)
-  ✓ Inference engine started
-  ⠹ Preparing CUDA backend for NVIDIA RTX 4090
-```
-
-At readiness:
-
-```text
-● Magnitude service is ready at 127.0.0.1:10100
-  ✓ Magnitude service downloaded 100% (39.4 MB / 39.4 MB)
-  ✓ Inference engine downloaded 100% (4.9 GB / 4.9 GB)
-  ✓ Inference engine started
-  ✓ CUDA backend ready for NVIDIA RTX 4090
-```
-
-The launcher uses the same one-line Braille grammar but shows measurements only for the transfer:
-
-```text
-⠹ Downloading Magnitude CLI... 63% (24.8 MB / 39.4 MB)
-⠹ Verifying Magnitude CLI...
-⠹ Installing Magnitude CLI...
-✓ Magnitude CLI installed
-```
-
-## `magnitude service start`
-
-This command is noninteractive. It installs or refreshes the per-user service definition, starts it,
-uses the same lifecycle and inline presenter as interactive startup, and waits for the same exact
-readiness guarantee. It then prints:
-
-```text
-Magnitude service is ready at 127.0.0.1:10100
-```
-
-Update discovery runs concurrently. If an update is available, the command reports the same version
-transition and full release-notes URL without prompting:
-
-```text
-Update available! 1.3.0 → 1.4.0
-Release notes: https://github.com/magnitudedev/magnitude/releases/tag/@magnitudedev/cli@1.4.0
-Run `magnitude update` to install it.
-```
-
-## Post-start recovery
-
-After the application starts, transport recovery retains the existing single-flight selection and
-request retry semantics. Each recovery occurrence uses a fresh lifecycle projection, but it never
-re-enters startup UI and never unmounts chat. Active recovery is projected into the shared
-notification area; success publishes the ephemeral notice `Reconnected to Magnitude service`.
-
-## Exit and ownership
-
-All startup work is one scoped Effect program. Signals and fatal events use the typed process-exit
-path. Package-manager execution begins only after startup terminal resources are restored. The outer
-command owns the exit code; nested startup logic does not mutate it. The launcher may honor one
-post-update relaunch request, re-inspecting the installation before resolving the new binary.
+- Every retained command terminates without terminal UI or prompts.
+- Passive commands neither create a desktop process nor alter login registration.
+- Background cold and concurrent launches preserve window visibility and focus.
+- Service readiness uses the exact application's compatible service, independent of model loading.
+- Cancelling startup leaves an already admitted desktop alive.
+- Quit stops the application and its owned tree; established clients cannot resurrect it.
+- Installation and login startup never register a standalone daemon.

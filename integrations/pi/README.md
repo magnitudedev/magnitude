@@ -13,12 +13,13 @@ Install the extension:
 pi install npm:@magnitudedev/pi-extension
 ```
 
-Open Pi and accept the setup offer. Magnitude walks you through the best models for your machine,
-downloads your selection, and connects it to Pi. You don't need Magnitude installed beforehand.
+Install the Magnitude desktop app and its CLI. Open Pi and accept the offer to open Magnitude.
+Discover and download a model in the desktop app, then connect Pi from Connections. Return to Pi
+and run `/reload` to use the new configuration.
 
 You can also start setup anytime with `/magnitude-setup`.
 
-Requires Pi 0.83.0 or newer. Magnitude supports macOS and Linux, and Windows through WSL.
+Requires Pi 0.83.0 or newer. Use a supported Magnitude desktop installation in the same graphical user session as Pi.
 An internet connection is needed for installation and model downloads; after that, you can work offline.
 
 ## Why Magnitude?
@@ -42,7 +43,7 @@ ask your agent:
 Use Magnitude to recommend the best local models for my hardware and help me install one.
 ```
 
-Use `/magnitude-setup` to run guided setup again, or `/stop-model` to unload the active model and
+Use `/magnitude-setup` to open the desktop again, or `/stop-model` to unload the active model and
 free its memory.
 
 ### Already using Magnitude?

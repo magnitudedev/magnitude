@@ -1,7 +1,3 @@
-import {
-  AcnEnsuranceError,
-  formatAcnEnsuranceError,
-} from "@magnitudedev/daemon-management"
 import { Schema } from "effect"
 import { ConnectionErrorSchema, formatConnectionError } from "@magnitudedev/sdk"
 
@@ -16,12 +12,5 @@ export const explainError = (error: unknown): string => Schema.is(ConnectionErro
     ? error.message
     : String(error)
 
-export const explainInteractiveFailure = (error: unknown): string =>
-  Schema.is(AcnEnsuranceError)(error)
-    ? `Magnitude service failed to start:\n${formatAcnEnsuranceError(error)}`
-    : explainError(error)
-
 export const explainServiceStartupFailure = (error: unknown): string =>
-  `Magnitude service failed to start:\n${Schema.is(AcnEnsuranceError)(error)
-    ? formatAcnEnsuranceError(error)
-    : explainError(error)}`
+  `Magnitude service failed to start:\n${explainError(error)}`

@@ -5,10 +5,21 @@
     "jsxImportSource": "react",
     "noEmit": true,
     "paths": {
-      "@magnitudedev/web": ["../web/src/index.tsx"],
-      "@magnitudedev/sdk": ["../packages/sdk/src"],
-      "@magnitudedev/sdk/*": ["../packages/sdk/src/*"]
+      "@magnitudedev/web": [
+        "../web/src/index.tsx"
+      ],
+      "@magnitudedev/sdk": [
+        "../packages/sdk/src"
+      ],
+      "@magnitudedev/sdk/*": [
+        "../packages/sdk/src/*"
+      ],
+      "@/*": [
+        "../web/src/*"
+      ]
     }
   },
-  "include": ["src"]
+  "include": [
+    "src"
+  ]
 }
