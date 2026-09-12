@@ -149,3 +149,5 @@ restart after Quit. Native platform acceptance includes signed macOS login and W
 filesystem simulation does not establish those guarantees.
 
 Status uses a green check for a ready service and keeps model residency separate. Hardware recommendation artwork belongs to Discover, not Status. Normal background behavior is explained in user terms; native tray registration terminology stays out of the healthy-state UI. Development/test login-startup restrictions explicitly identify the build as such.
+
+Status observes live application memory through the privileged desktop host, independently of service readiness. The total covers the application process and its descendants, including service and inference children. It is a timestamped platform measurement, never a model estimate or system capacity. macOS uses physical footprint, Linux proportional resident memory, and Windows private working set; the UI explains their scope. Failed or unsupported observations show unavailable rather than zero or a retained successful total. Sampling belongs to the observed Status view and pauses while the window is hidden.

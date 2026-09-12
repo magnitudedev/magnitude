@@ -181,3 +181,5 @@ retired-owner replies cannot become current availability. Signals are coalesced 
 truth. Missing hosts remain observable, and session-bus loss reconnects without periodically
 recreating tray objects. Scope closure releases the connection, match rules, reads, and retries.
 Host availability proves protocol support, not pixel visibility or user pinning.
+
+Application memory observation is read-only and rooted at the current desktop process. Native sampling runs outside the Electron thread, bounds process and input sizes, and checks creation identity and ancestry across memory reads. A failed member read invalidates the sample. Observation grants no termination authority and cannot create or restart a service. The host serializes sampling; releasing a subscription stops future work after any in-flight native read completes. Acceptance covers real child allocation and retirement, exclusion of unrelated processes, native failure recovery, and visibility-scoped refresh.
