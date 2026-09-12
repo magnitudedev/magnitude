@@ -10,7 +10,7 @@ request ──ready(allowance)──► proposal: kind, tokens, logits wanted   
                                    │
 batch.prepare(proposals) ──► one packed model execution + one selection over its logits
                                    │
-                              submit ──► ticket
+                              submit ──► completion
                                    │
 batch.finish() ──► per request: read its selected token, commit its advance, accept
                                    │
@@ -34,7 +34,7 @@ batch is prepared, and a batch is prepared as a whole or unwound as a whole.
 | A sample depends on the request's seed and position, never on the batch | The same request produces the same tokens whoever it shares a batch with |
 | Output credit is bounded | A transport that does not drain stops the request from generating, not the batch from finishing |
 | A stop, the length limit or the context limit is decided at acceptance | The finish is part of the logical record, so it survives eviction |
-| Cancellation drops unsubmitted work only | Submitted shared work completes; its resources are released when the ticket is done |
+| Cancellation drops unsubmitted work only | Submitted shared work completes; its resources are released when completion is proven |
 | Failure retains accepted output | What was published stays published; only future work is refused |
 
 ## Eviction and reconstruction

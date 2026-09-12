@@ -16,8 +16,8 @@ Queued ── selected ──► Runnable ──► Completion (batch in flight)
 ```
 
 Status is derived from facts, never stored; a request is in exactly one of these
-states at any time. The transport drives `step`, waits on the returned ticket, and
-drains output. Idle service does nothing until something changes.
+states at any time. The transport drives `step`, waits on the returned
+completion, and drains output. Idle service does nothing until something changes.
 
 ## Selecting a phase
 
@@ -41,12 +41,14 @@ service, so a resident request is not pushed out by a newcomer of equal age.
 
 ## Capacity
 
-Preparation claims state and scratch; when it cannot, the service negotiates in a
-fixed order, each step cheaper than the next in lost work:
+Preparation asks the model boundary to claim the logical and physical capacity
+needed by one tentative batch. When it cannot, the service negotiates in a fixed
+order, each step cheaper than the next in lost work. It reasons about prices and
+releasable bytes, never tensor layouts or allocation kinds:
 
 | Step | What it costs |
 |---|---|
-| Reclaim: retire unborrowed scratch and idle caches | Nothing already paid for |
+| Reclaim: ask owners to retire unclaimed temporary capacity and idle caches | Nothing already paid for |
 | Drop the last selected request from the batch | That request waits a step |
 | Halve the prefill allowance | Smaller chunks repeat execution overhead |
 | Evict victims priced by the model | Their prompts are replayed |
