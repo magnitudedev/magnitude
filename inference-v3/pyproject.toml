@@ -37,9 +37,11 @@ tilelang = { path = "tilelang", editable = true }
 
 [project.scripts]
 session-bench = "session_bench.cli:main"
+magnitude-qualify = "magnitude_engine.qualification:main"
+magnitude-kernel-bench = "magnitude_engine.kernel_bench:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/magnitude_engine", "src/session_bench", "src/benchmark_fixtures"]
+packages = ["src/magnitude_engine", "src/magnitensor", "src/session_bench", "src/benchmark_fixtures"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -60,7 +62,7 @@ target-version = "py312"
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.pyright]
-include = ["src/magnitude_engine"]
+include = ["src/magnitude_engine", "src/magnitensor"]
 typeCheckingMode = "basic"
 # TileLang parses kernel annotations, scalar constructors and intrinsics as its
 # own typed DSL. Python's checker cannot interpret those three expression forms;

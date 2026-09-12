@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -32,7 +33,7 @@ class CompilationDiagnostics:
     precision: str
     candidates: tuple[CandidateDiagnostic, ...]
     materializations: Mapping[int, str]
-    arena_bytes: int
+    temporary_bytes: int
     submissions: tuple[tuple[str, ...], ...]
     submission_reasons: tuple[str, ...]
     dispatches: int
@@ -46,7 +47,7 @@ class CompilationDiagnostics:
             f"mode={self.mode} precision={self.precision}",
             f"compiler={self.compiler_identity}",
             f"capability={self.capability_fingerprint}",
-            f"arena={self.arena_bytes} bytes units={len(self.submissions)} "
+            f"temporaries={self.temporary_bytes} bytes units={len(self.submissions)} "
             f"kernels={self.dispatches}",
         ]
         for index, (names, reason) in enumerate(
@@ -57,6 +58,19 @@ class CompilationDiagnostics:
             status = "selected" if item.selected else f"rejected: {item.reason}"
             lines.append(f"candidate {item.name} nodes={item.nodes} {status}")
         return "\n".join(lines)
+
+    def render_summary(self) -> str:
+        """Render the selected lowering cover without dumping every rejected candidate."""
+        selected = Counter(
+            item.name.split("@", 1)[0] for item in self.candidates if item.selected
+        )
+        cover = ", ".join(f"{name}={count}" for name, count in sorted(selected.items()))
+        return (
+            f"graph={self.graph_name} mode={self.mode} nodes="
+            f"{sum(len(item.nodes) for item in self.candidates if item.selected)} "
+            f"units={len(self.submissions)} kernels={self.dispatches} "
+            f"temporaries={self.temporary_bytes} cover=[{cover}]"
+        )
 
 
 def build_diagnostics(
@@ -93,7 +107,7 @@ def build_diagnostics(
         precision,
         items,
         {value: placement.storage.value for value, placement in memory.values.items()},
-        memory.arena_bytes,
+        memory.temporary_bytes,
         tuple(tuple(candidate.name for candidate in unit.candidates) for unit in submissions),
         tuple(unit.reason for unit in submissions),
         sum(unit.kernel_count for unit in submissions),

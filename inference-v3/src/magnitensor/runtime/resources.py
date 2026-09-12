@@ -60,6 +60,8 @@ class NativeRuntime(Protocol):
 
     def upload(self, spec: TensorSpec, content: bytes) -> NativeAllocation: ...
 
+    def download(self, value: Any) -> bytes: ...
+
     def compile(
         self,
         program: object,
@@ -160,7 +162,14 @@ class Resource:
 
 
 class Completion:
-    def __init__(self, native: NativeCompletion, retained: tuple[object, ...], on_release=None):
+    def __init__(
+        self,
+        device: Device,
+        native: NativeCompletion,
+        retained: tuple[object, ...],
+        on_release=None,
+    ):
+        self.device = device
         self._native = native
         self._retained = retained
         self._on_release = on_release
@@ -172,9 +181,21 @@ class Completion:
             self._release()
         return ready
 
+    @property
+    def done(self) -> bool:
+        return self.ready()
+
     def wait(self) -> None:
         self._native.wait()
         self._release()
+
+    def completion_waiter(self):
+        """Return a thread-safe native wait for an external owner loop.
+
+        Resource release remains on the device owner thread when ``wait`` is
+        subsequently called there.
+        """
+        return self._native.wait
 
     def _release(self) -> None:
         if self._released:
@@ -231,14 +252,18 @@ class Device:
         if self._closed:
             raise RuntimeError("device is closed")
 
+    def check(self) -> None:
+        self._check()
+
+    def check_thread(self) -> None:
+        self._check_thread()
+
     def allocate(self, spec: TensorSpec, *, alignment: int | None = None) -> Resource:
         self._check()
         native = self._allocate(spec.storage_nbytes, max(spec.dtype.itemsize, alignment or 1))
         return Resource(native.acquire(), spec)
 
-    def allocate_arena(self, size: int, alignment: int) -> Resource | None:
-        if size == 0:
-            return None
+    def allocate_temporary(self, size: int, alignment: int) -> Resource:
         allocation = self._allocate(size, alignment)
         return Resource(allocation.acquire(), TensorSpec((size,), DType.U8))
 
@@ -267,6 +292,14 @@ class Device:
             raise CapacityError(allocation.charged_bytes, self.available_bytes)
         self._allocated += allocation.charged_bytes
         return Resource(allocation.acquire(), spec)
+
+    def read(self, resource: Resource, *, after: Completion | None = None) -> bytes:
+        self._check()
+        if resource.device is not self or (after is not None and after.device is not self):
+            raise ValueError("read operands belong to another device")
+        if after is not None:
+            after.wait()
+        return self.runtime.download(resource.native)
 
     def close(self) -> None:
         self._check()

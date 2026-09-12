@@ -103,6 +103,7 @@ async def test_preparation_failure_still_has_report(tmp_path, fake_runtime):
 async def test_cancel_keeps_completed_result_and_retires_child(
     tmp_path, artifact_path, fake_runtime, monkeypatch
 ):
+    existing_children = {child.pid for child in psutil.Process().children(recursive=True)}
     entered = asyncio.Event()
     original = runner.measure
 
@@ -127,7 +128,12 @@ async def test_cancel_keeps_completed_result_and_retires_child(
         )
     )
     await asyncio.wait_for(entered.wait(), 10)
-    children = psutil.Process().children(recursive=True)
+    children = [
+        child
+        for child in psutil.Process().children(recursive=True)
+        if child.pid not in existing_children
+    ]
+    assert children
     task.cancel()
     result = await task
     assert result["status"] == "cancelled"

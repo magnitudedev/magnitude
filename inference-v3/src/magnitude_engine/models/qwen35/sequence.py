@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
 
 from magnitude_engine.models.qwen35.inputs import Feature, InputPlan, InputState
 from magnitude_engine.models.qwen35.state import QwenCheckpoint, QwenState
-from magnitude_engine.platform.execution import Ticket
 
 if TYPE_CHECKING:
     from magnitude_engine.models.qwen35.runtime import DenseRuntime, Forward, ForwardOutput
@@ -32,6 +31,9 @@ class SequenceAdvance:
         self.committed = True
         previous.close()
 
+    def read_sample(self):
+        return self.forward.read_sample()
+
     def close(self) -> None:
         if not self.closed:
             self.forward.close()
@@ -54,15 +56,10 @@ class SequenceBatch:
         return self.execution.logits
 
     @property
-    def commands(self):
+    def completion(self):
         if self.closed:
             raise RuntimeError("model batch is closed")
-        return self.execution.commands
-
-    def submitted(self, completion: Ticket) -> None:
-        if self.closed:
-            raise RuntimeError("model batch is closed")
-        self.execution.submitted(completion)
+        return self.execution.completion
 
     def close(self) -> None:
         if not self.closed:
@@ -96,7 +93,7 @@ class Sequence:
 
     @property
     def context_limit(self):
-        return self.runtime.geometry.context_limit
+        return self.runtime.context_capacity
 
     def check(self) -> None:
         self.state.check()
@@ -169,11 +166,11 @@ class Source:
             raise RuntimeError("model runtime is closed")
         if (
             not plan.tokens
-            or len(plan.tokens) > model.geometry.context_limit
+            or len(plan.tokens) > model.context_capacity
             or any(token >= model.geometry.vocabulary for token in plan.tokens)
         ):
             raise ValueError("input plan exceeds the bound model's vocabulary or context")
-        if any(feature.values.context is not model.context for feature in features):
+        if any(feature.values.device is not model.context for feature in features):
             raise ValueError("input features belong to another execution owner")
         self.model = model
         self.inputs = InputState(plan, 0, features, model.geometry.hidden)

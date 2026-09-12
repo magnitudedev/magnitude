@@ -81,6 +81,14 @@ Continuously changing quantities remain operands or are grouped into bounded
 geometry classes. Compilation identity follows graph structure and declared
 static facts, never a model name, request, benchmark or machine hostname.
 
+Planning and physical realization are separate public compiler phases.
+`analyze` traces and prunes the graph, enumerates and selects lowerings, plans
+memory and submissions, and returns diagnostics without allocating, generating
+code or executing work. `materialize` realizes that immutable plan on a device;
+`compile` is their production composition. Qualification tools must use analysis
+when the question is structural so model loading and backend compilation cannot
+pollute the iteration loop.
+
 ## Region selection
 
 An implementation candidate covers one semantic operation or a bounded connected
@@ -103,8 +111,9 @@ all relevant paths and externally used results are represented by the region.
 
 Fusion means one device kernel and no globally materialized interior value.
 Materialization and temporary allocation happen only after the selected cover is
-known. Live intervals and legal aliases share an aligned arena; persistent weights
-and state resources remain externally owned.
+known. Disjoint live intervals reuse aligned planned ranges. Physical realization
+maps each distinct range start to a zero-offset ABI slot; persistent weights and
+state resources remain externally owned.
 
 ## Submission planning
 
@@ -169,8 +178,8 @@ ordinary TileLang macro calls into a valid `PrimFunc`.
 
 ## Compiled execution
 
-A compiled callable retains immutable bindings, maximal compiled units, one
-planned temporary arena, dynamic binding descriptions and compilation
+A compiled callable retains immutable bindings, maximal compiled units, planned
+zero-offset temporary slots, dynamic binding descriptions and compilation
 provenance. Magnitensor decides which operands are static; TileLang realizes
 their partial binding against the compiled ABI. Submission binds only dynamic
 inputs, invokes each native entrypoint once, and returns output tensors with one

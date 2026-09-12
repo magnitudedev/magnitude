@@ -15,8 +15,16 @@ from pathlib import Path
 
 from pydantic import Field
 
+from magnitensor import (
+    Affine,
+    Code,
+    Codebook,
+    CodeInterpretation,
+    DirectCoefficients,
+    DType,
+    HierarchicalCoefficients,
+)
 from magnitude_engine.data import Record
-from magnitude_engine.platform.execution import DType
 from magnitude_engine.platform.storage import ByteSource, FileSource
 from magnitude_engine.weights.descriptor import (
     StoredDense,
@@ -26,14 +34,6 @@ from magnitude_engine.weights.descriptor import (
     WeightDescriptor,
 )
 from magnitude_engine.weights.identity import ArtifactIdentity
-from magnitude_engine.weights.representation import (
-    Affine,
-    Code,
-    Codebook,
-    CodeInterpretation,
-    DirectCoefficients,
-    HierarchicalCoefficients,
-)
 
 
 class Encoding(IntEnum):
@@ -145,14 +145,12 @@ class GGUFCodec:
         raise ValueError(f"{self.encoding.name} has no quantized code reader")
 
     def local_scale(
-        self, data: TraceBuffer, base: int | TraceValue, group: int | TraceValue
+        self, data: TraceBuffer, base: int | TraceValue, group: int | TraceValue, select
     ) -> TraceValue:
-        import tilelang.language as T
-
         if self.encoding in (Encoding.Q4_K, Encoding.Q5_K):
             low = data[base + 4 + group % 4].astype("uint32")
             high = data[base + 12 + group % 4].astype("uint32")
-            return T.if_then_else(group < 4, low & 63, (high & 15) | ((low >> 6) << 4))
+            return select(group < 4, low & 63, (high & 15) | ((low >> 6) << 4))
         if self.encoding == Encoding.Q6_K:
             return data[base + 192 + group].astype("uint32")
         if self.encoding == Encoding.IQ4_XS:
@@ -162,14 +160,12 @@ class GGUFCodec:
         raise ValueError(f"{self.encoding.name} has no local scale")
 
     def local_bias(
-        self, data: TraceBuffer, base: int | TraceValue, group: int | TraceValue
+        self, data: TraceBuffer, base: int | TraceValue, group: int | TraceValue, select
     ) -> TraceValue:
-        import tilelang.language as T
-
         if self.encoding in (Encoding.Q4_K, Encoding.Q5_K):
             low = data[base + 8 + group % 4].astype("uint32")
             high = data[base + 12 + group % 4].astype("uint32")
-            return T.if_then_else(group < 4, low & 63, (high >> 4) | ((low >> 6) << 4))
+            return select(group < 4, low & 63, (high >> 4) | ((low >> 6) << 4))
         raise ValueError(f"{self.encoding.name} has no local bias")
 
     def scale_byte(
@@ -182,6 +178,36 @@ class GGUFCodec:
         self, data: TraceBuffer, base: int | TraceValue, byte_index: int | TraceValue
     ) -> TraceValue:
         return data[base + 2 + byte_index]
+
+    def direct_scale(
+        self,
+        data: TraceBuffer,
+        base: int | TraceValue,
+        group: int | TraceValue,
+        select,
+        reinterpret,
+    ) -> TraceValue:
+        """Expand one K-quant group coefficient during private residency."""
+        if self.encoding not in (Encoding.Q4_K, Encoding.Q5_K):
+            raise ValueError(f"{self.encoding.name} has no derived direct scale")
+        bits = data[base].astype("uint32") | (data[base + 1].astype("uint32") << 8)
+        super_scale = reinterpret(bits.astype("uint16"), "float16").astype("float32")
+        return super_scale * self.local_scale(data, base, group, select).astype("float32")
+
+    def direct_bias(
+        self,
+        data: TraceBuffer,
+        base: int | TraceValue,
+        group: int | TraceValue,
+        select,
+        reinterpret,
+    ) -> TraceValue:
+        """Expand the signed K-quant minimum into an affine bias."""
+        if self.encoding not in (Encoding.Q4_K, Encoding.Q5_K):
+            raise ValueError(f"{self.encoding.name} has no derived direct bias")
+        bits = data[base + 2].astype("uint32") | (data[base + 3].astype("uint32") << 8)
+        super_bias = reinterpret(bits.astype("uint16"), "float16").astype("float32")
+        return -super_bias * self.local_bias(data, base, group, select).astype("float32")
 
 
 _CODECS = {encoding: GGUFCodec(encoding) for encoding in _REPRESENTATIONS}

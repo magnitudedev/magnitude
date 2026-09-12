@@ -45,11 +45,18 @@ transform and language tests for cross-backend changes). The workflow:
    belongs there, which defect or missing contract it addresses, and what tests
    were run. Do not commit or push the fork changes until the user explicitly
    approves them.
-4. **Land on the fork's `magnitude` branch.** After approval, split the work into
-   coherent commits on `magnitude` and push them to `magnitudedev/tilelang`.
-   Bump Magnitude's submodule pointer only after the relevant TileLang suites and
-   `tests/numerics` pass against those exact commits.
-5. **Prepare contained PR branches.** For every distinct upstreamable change,
+4. **Reconcile upstream before pushing.** Fetch `upstream/main` and check every
+   local fork change against upstream before committing or pushing `magnitude`.
+   If upstream already resolves any carried change, merge `upstream/main` into
+   `magnitude` and resolve the resulting conflicts instead of pushing a duplicate
+   implementation. Rebuild and revalidate the remaining fork delta after the
+   merge.
+5. **Land on the fork's `magnitude` branch.** After approval and upstream
+   reconciliation, split the work into coherent commits on `magnitude` and push
+   them to `magnitudedev/tilelang`. Bump Magnitude's submodule pointer only after
+   the relevant TileLang suites and `tests/numerics` pass against those exact
+   commits.
+6. **Prepare contained PR branches.** For every distinct upstreamable change,
    cut a separate `pr/<name>` from `upstream/main` and apply only that change
    (`git diff upstream/main...magnitude -- <paths>` is the source of truth for
    what we carry). Rebuild the C++ library on each checkout before testing (a
@@ -67,7 +74,7 @@ transform and language tests for cross-backend changes). The workflow:
      Tests, Validation (hardware, exact commands, pass/skip counts), Related
      (overlapping upstream PRs and how they reconcile). Tell the user what the
      description will say; it is not a file anywhere.
-6. **Open upstream PRs only after final approval.** Present each tested PR branch
+7. **Open upstream PRs only after final approval.** Present each tested PR branch
    and its proposed description to the user. Creating a PR against
    `tile-ai/tilelang` is a separate step requiring the user's explicit final
    approval; never open an upstream PR on your own. CI for first-time
@@ -80,7 +87,7 @@ transform and language tests for cross-backend changes). The workflow:
    the existing commit and force-pushed with `--force-with-lease`; the user
    answers reviewers. Fixes that land on the `pr/` branch are merged back into
    `magnitude`.
-7. **Pull upstream in.** When a PR of ours merges, or upstream has something we
+8. **Pull upstream in.** When a PR of ours merges, or upstream has something we
    want: in the submodule, `git fetch upstream && git merge upstream/main`
    (merge, never rebase, so older Magnitude commits keep buildable pointers),
    resolve conflicts, rebuild, run the suites, push `magnitude`, bump the

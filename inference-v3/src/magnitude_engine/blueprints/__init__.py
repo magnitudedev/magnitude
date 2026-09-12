@@ -4,10 +4,9 @@ from magnitude_engine.blueprints import (
     execution,
     inputs,
     models,
-    operations,
     service,
     serving,
     weights,
 )
 
-__all__ = ["execution", "inputs", "models", "operations", "service", "serving", "weights"]
+__all__ = ["execution", "inputs", "models", "service", "serving", "weights"]

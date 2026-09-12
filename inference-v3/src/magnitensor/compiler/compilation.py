@@ -2,20 +2,34 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from sys import maxsize
 from types import MappingProxyType
 from typing import Any
 
 from ..runtime.resources import Completion, Device, Execution, Resource
-from ..tensor.graph import Graph
+from ..tensor.graph import Graph, prune_dead_nodes
 from ..tensor.tracing import Signature, trace
 from ..tensor.types import TensorSpec
 from .diagnostics import CompilationDiagnostics, build_diagnostics
-from .lowering import LoweringContext, LoweringRegistry, lowerings, plan_submissions, select_cover
+from .lowering import (
+    Candidate,
+    Capabilities,
+    Cover,
+    LoweringContext,
+    LoweringRegistry,
+    SubmissionUnit,
+    lowerings,
+    plan_submissions,
+    select_cover,
+)
 from .memory import MemoryPlan, StorageClass, plan_memory
 from .tuning import EMPTY_TUNING, TuningDatabase
 from .unit import BindingKey, ParameterKind, TileCompilationUnit, build_unit
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +46,18 @@ class CompileOptions:
         if self.workspace_limit is not None and self.workspace_limit < 0:
             raise ValueError("workspace limit must not be negative")
         object.__setattr__(self, "dimensions", MappingProxyType(dict(self.dimensions)))
+
+
+@dataclass(frozen=True, slots=True)
+class CompilationPlan:
+    """Pure whole-graph plan produced before allocation or backend compilation."""
+
+    graph: Graph
+    candidates: tuple[Candidate, ...]
+    cover: Cover
+    memory: MemoryPlan
+    submissions: tuple[SubmissionUnit, ...]
+    diagnostics: CompilationDiagnostics
 
 
 @dataclass(slots=True)
@@ -132,7 +158,10 @@ class CompiledFunction:
             for resource in allocated_outputs:
                 resource.close()
             self._active = True
-            return Execution(outputs, Completion(native, tuple(retained), self._release_invocation))
+            return Execution(
+                outputs,
+                Completion(self.device, native, tuple(retained), self._release_invocation),
+            )
         except BaseException:
             for resource in reversed(retained):
                 resource.close()
@@ -167,25 +196,71 @@ def compile(
     options: CompileOptions,
     registry: LoweringRegistry = lowerings,
 ) -> CompiledFunction:
-    graph = trace(function, _specialize_signature(signature, options.dimensions))
-    bound_constants = _bind_constants(graph, constants, device)
-    workspace_limit = (
-        device.available_bytes if options.workspace_limit is None else options.workspace_limit
+    plan = analyze(
+        function,
+        signature=signature,
+        capabilities=device.capabilities,
+        compiler_identity=device.compiler_identity,
+        available_bytes=device.available_bytes,
+        options=options,
+        registry=registry,
     )
+    return materialize(plan, device=device, constants=constants)
+
+
+def analyze(
+    function,
+    *,
+    signature: Signature,
+    capabilities: Capabilities,
+    options: CompileOptions,
+    compiler_identity: str = "analysis",
+    available_bytes: int | None = None,
+    registry: LoweringRegistry = lowerings,
+) -> CompilationPlan:
+    """Plan a function without allocation, code generation, or native execution."""
+    graph = prune_dead_nodes(trace(function, _specialize_signature(signature, options.dimensions)))
+    workspace_limit = options.workspace_limit
+    if workspace_limit is None:
+        workspace_limit = maxsize if available_bytes is None else available_bytes
     context = LoweringContext(
-        device.capabilities,
+        capabilities,
         options.mode,
         options.precision,
-        device.compiler_identity,
+        compiler_identity,
         workspace_limit,
         options.tuning,
     )
     candidates = registry.enumerate(graph, context)
     cover = select_cover(graph, candidates)
-    memory = plan_memory(graph, cover, device.capabilities)
-    submissions = plan_submissions(graph, cover, device.capabilities)
+    memory = plan_memory(graph, cover, capabilities)
+    submissions = plan_submissions(graph, cover, capabilities)
+    diagnostics = build_diagnostics(
+        graph,
+        candidates,
+        cover,
+        memory,
+        submissions,
+        compiler_identity=compiler_identity,
+        capability_fingerprint=capabilities.fingerprint,
+        mode=options.mode,
+        precision=options.precision,
+    )
+    logger.info("Magnitensor lowering: %s", diagnostics.render_summary())
+    return CompilationPlan(graph, candidates, cover, memory, submissions, diagnostics)
+
+
+def materialize(
+    plan: CompilationPlan,
+    *,
+    device: Device,
+    constants: Mapping[int | str, Resource],
+) -> CompiledFunction:
+    """Allocate and compile one previously analyzed plan."""
+    graph, memory, submissions = plan.graph, plan.memory, plan.submissions
+    bound_constants = _bind_constants(graph, constants, device)
     units = []
-    owned_storage, static_values, static_workspace = _allocate_static_arena(device, memory)
+    owned_storage, static_values, static_workspace = _allocate_temporary_slots(device, memory)
     try:
         for submission in submissions:
             compilation_unit = build_unit(graph, memory, submission)
@@ -193,7 +268,7 @@ def compile(
             for parameter in compilation_unit.parameters:
                 if parameter.kind == ParameterKind.CONSTANT:
                     static[parameter.index] = bound_constants[parameter.key[1]].native
-                elif parameter.kind == ParameterKind.ARENA:
+                elif parameter.kind == ParameterKind.TEMPORARY:
                     if parameter.key[0] == "value":
                         static[parameter.index] = static_values[parameter.key[1]].native
                     else:
@@ -208,7 +283,7 @@ def compile(
             dynamic_indices = tuple(
                 parameter.index
                 for parameter in compilation_unit.parameters
-                if parameter.kind not in (ParameterKind.CONSTANT, ParameterKind.ARENA)
+                if parameter.kind not in (ParameterKind.CONSTANT, ParameterKind.TEMPORARY)
             )
             executable = device.runtime.compile(compilation_unit, compilation_unit.signature)
             try:
@@ -219,7 +294,7 @@ def compile(
             dynamic = tuple(
                 parameter.key
                 for parameter in compilation_unit.parameters
-                if parameter.kind not in (ParameterKind.CONSTANT, ParameterKind.ARENA)
+                if parameter.kind not in (ParameterKind.CONSTANT, ParameterKind.TEMPORARY)
             )
             units.append(_CompiledUnit(compilation_unit, executable, entrypoint, dynamic))
     except BaseException:
@@ -228,17 +303,6 @@ def compile(
         for resource in reversed(owned_storage):
             resource.close()
         raise
-    diagnostics = build_diagnostics(
-        graph,
-        candidates,
-        cover,
-        memory,
-        submissions,
-        compiler_identity=device.compiler_identity,
-        capability_fingerprint=device.capabilities.fingerprint,
-        mode=options.mode,
-        precision=options.precision,
-    )
     return CompiledFunction(
         device,
         graph,
@@ -248,26 +312,46 @@ def compile(
         owned_storage,
         static_values,
         static_workspace,
-        diagnostics,
+        plan.diagnostics,
     )
 
 
-def _allocate_static_arena(device: Device, memory: MemoryPlan):
-    arena = device.allocate_arena(memory.arena_bytes, memory.alignment)
-    if arena is None:
+def _allocate_temporary_slots(device: Device, memory: MemoryPlan):
+    placements = [
+        ("value", value_id, placement.slot, placement.spec)
+        for value_id, placement in memory.values.items()
+        if placement.storage == StorageClass.TEMPORARY
+    ]
+    placements.extend(
+        ("workspace", index, placement.slot, placement.spec)
+        for index, placement in enumerate(memory.workspace)
+    )
+    if not placements:
         return (), {}, {}
-    owned = [arena]
+    # Every ABI tensor starts at byte offset zero. The memory plan has already
+    # colored disjoint live intervals into reusable whole-allocation slots.
+    slot_sizes: dict[int, int] = {}
+    for _, _, slot, spec in placements:
+        assert slot is not None
+        slot_sizes[slot] = max(slot_sizes.get(slot, 0), spec.storage_nbytes)
+    owned = []
+    slots = {}
     values = {}
     workspaces = {}
     try:
-        for value_id, placement in memory.values.items():
-            if placement.storage == StorageClass.ARENA:
-                view = arena.view(placement.spec, placement.offset)
+        for slot_id, size in sorted(slot_sizes.items()):
+            allocation = device.allocate_temporary(size, memory.alignment)
+            slots[slot_id] = allocation
+            owned.append(allocation)
+        for kind, index, slot, spec in placements:
+            assert slot is not None
+            view = slots[slot].view(spec)
+            if kind == "value":
+                value_id = index
                 values[value_id] = view
-                owned.append(view)
-        for placement in memory.workspace:
-            view = arena.view(placement.spec, placement.offset)
-            workspaces[(placement.candidate, placement.index)] = view
+            else:
+                placement = memory.workspace[index]
+                workspaces[(placement.candidate, placement.index)] = view
             owned.append(view)
         return tuple(owned), values, workspaces
     except BaseException:

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
+from threading import Lock
 from typing import Any, cast
 
 import torch
@@ -12,6 +15,8 @@ from ..compiler.unit import TileCompilationUnit
 from ..representations import Dense
 from ..tensor.types import DType, TensorSpec
 from .resources import NativeAllocation, NativeBoundEntrypoint, NativeCompletion, NativeExecutable
+
+_COMPILER_RECURSION_LOCK = Lock()
 
 
 class _Allocation(NativeAllocation):
@@ -116,16 +121,20 @@ class _Executable(NativeExecutable):
 class TileLangRuntime:
     """Magnitensor-owned storage and submission over a resolved TileLang backend."""
 
-    def __init__(self, target: Any = "auto"):
+    def __init__(self, target: Any = "auto", *, ordinal: int = 0):
+        if type(ordinal) is not int or ordinal < 0:
+            raise ValueError("device ordinal must be a nonnegative integer")
         from tilelang.backend.module import create_backend_context
 
         self._context = create_backend_context(target, execution_backend="tvm_ffi")
         kind = self._context.target.kind.name
         if kind == "metal":
+            if ordinal:
+                raise ValueError("Metal exposes only process device ordinal zero")
             self._device = torch.device("mps")
             self._completion = lambda: _Completion(synchronize=torch.mps.synchronize)
         elif kind in ("cuda", "hip"):
-            self._device = torch.device("cuda")
+            self._device = torch.device("cuda", ordinal)
 
             def completion() -> NativeCompletion:
                 event = torch.cuda.Event()
@@ -134,6 +143,8 @@ class TileLangRuntime:
 
             self._completion = completion
         else:
+            if ordinal:
+                raise ValueError("CPU execution exposes only process device ordinal zero")
             self._device = torch.device("cpu")
             self._completion = _Completion
         self._capabilities = _capabilities(self._context.capabilities)
@@ -159,19 +170,25 @@ class TileLangRuntime:
         host = torch.frombuffer(bytearray(content), dtype=torch.uint8)
         return _Allocation(host.to(self._device))
 
+    def download(self, value: torch.Tensor) -> bytes:
+        # Host transfer is an ABI operation. Numerical work remains in the
+        # compiled TileLang program.
+        return value.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes()
+
     def compile(self, program: object, signature: tuple[TensorSpec, ...]) -> NativeExecutable:
         import tilelang
 
         del signature
         unit = cast(TileCompilationUnit, program)
         context = self._context
-        kernel = tilelang.compile(
-            _build_prim_func(unit),
-            out_idx=[],
-            execution_backend="tvm_ffi",
-            target=context.target,
-            target_host=context.target_host,
-        )
+        with _compiler_recursion_budget(unit):
+            kernel = tilelang.compile(
+                _build_prim_func(unit),
+                out_idx=[],
+                execution_backend="tvm_ffi",
+                target=context.target,
+                target_host=context.target_host,
+            )
         return _Executable(kernel, self._completion)
 
     def join(self, completions: tuple[NativeCompletion, ...]) -> NativeCompletion:
@@ -189,6 +206,19 @@ def _annotation(T, spec: TensorSpec):
     return T.Tensor(spec.shape, dtype.value)
 
 
+@contextmanager
+def _compiler_recursion_budget(unit: TileCompilationUnit):
+    """Give recursive TIR visitors enough stack for a maximal multi-kernel function."""
+    required = 2_000 + 8 * sum(call.candidate.kernel_count for call in unit.calls)
+    with _COMPILER_RECURSION_LOCK:
+        previous = sys.getrecursionlimit()
+        sys.setrecursionlimit(max(previous, required))
+        try:
+            yield
+        finally:
+            sys.setrecursionlimit(previous)
+
+
 def _build_prim_func(unit: TileCompilationUnit):
     import tilelang.language as T
 
@@ -200,19 +230,26 @@ def _build_prim_func(unit: TileCompilationUnit):
         by_name = {
             parameter.name: value for parameter, value in zip(unit.parameters, bound, strict=True)
         }
+        specs_by_name = {parameter.name: parameter.spec for parameter in unit.parameters}
         for call in unit.calls:
             operands = tuple(by_name[binding.parameter] for binding in call.bindings)
             operands += tuple(bound[index] for index in call.workspace)
-            call.candidate.emitter(operands)
+            try:
+                call.candidate.emitter(operands)
+            except BaseException as error:
+                bindings = ", ".join(
+                    f"{binding.parameter}:{specs_by_name[binding.parameter]!r}"
+                    for binding in call.bindings
+                )
+                error.add_note(f"while emitting {call.candidate.name} with {bindings}")
+                raise
 
     return T.build_prim_func(unit.name, parameters, body)
 
 
 def _capabilities(value) -> Capabilities:
     shared = value.shared_memory_bytes > 0
-    atomics = frozenset(
-        dtype for dtype in DType if value.supports(f"atomic.add.{dtype.value}")
-    )
+    atomics = frozenset(dtype for dtype in DType if value.supports(f"atomic.add.{dtype.value}"))
     return Capabilities(
         subgroup_width=value.subgroup_width,
         threads_per_group=value.max_threads_per_group,
@@ -225,15 +262,14 @@ def _capabilities(value) -> Capabilities:
         ),
         supported_dtypes=frozenset(DType(item) for item in value.supported_dtypes),
         memory_scopes=(
-            frozenset({"global", "shared", "local"})
-            if shared
-            else frozenset({"global", "local"})
+            frozenset({"global", "shared", "local"}) if shared else frozenset({"global", "local"})
         ),
         barrier_scopes=frozenset({"workgroup"}) if shared else frozenset(),
         asynchronous_copy=value.supports("async_copy"),
         subgroup_exchange=value.supports("subgroup_exchange"),
         vector_bytes=(1, 2, 4, 8, 16),
         atomics=atomics,
+        features=frozenset(value.features),
         alignments={dtype: dtype.itemsize for dtype in DType},
         native_multi_launch=value.native_multi_launch,
         partial_binding=value.native_argument_binding,

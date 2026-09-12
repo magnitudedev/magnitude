@@ -1,6 +1,13 @@
 """Magnitensor: composable inference tensors compiled through TileLang."""
 
-from .compiler.compilation import CompiledFunction, CompileOptions, compile
+from .compiler.compilation import (
+    CompilationPlan,
+    CompiledFunction,
+    CompileOptions,
+    analyze,
+    compile,
+    materialize,
+)
 from .compiler.lowering import (
     Candidate,
     Capabilities,
@@ -32,27 +39,37 @@ from .tensor.operation import (
 )
 from .tensor.ops import (
     add,
+    attention_prepare,
     cast,
     causal_attention,
     concatenate,
+    decode_bfloat16,
     delta_recurrence,
     divide,
     embedding,
     exp,
+    gated_delta_recurrence,
     kv_append,
+    kv_copy,
     linear,
     matmul,
     multiply,
+    overlay_rows,
+    quantized_import,
+    recurrent_prepare,
     reshape,
     rms_norm,
     rotary,
     route_topk,
     routed_experts,
+    row_dot,
+    sample,
     scalar,
     sigmoid,
     silu,
     softmax,
     subtract,
+    take_rows,
     tanh,
     transpose,
 )
@@ -62,8 +79,8 @@ from .tensor.types import DENSE, Dim, DType, Layout, TensorSpec
 register_builtin_lowerings(lowerings)
 
 
-def device(target="auto", *, budget_bytes: int) -> Device:
-    return Device(TileLangRuntime(target), budget_bytes=budget_bytes)
+def device(target="auto", *, budget_bytes: int, ordinal: int = 0) -> Device:
+    return Device(TileLangRuntime(target, ordinal=ordinal), budget_bytes=budget_bytes)
 
 
 __all__ = [
@@ -76,6 +93,7 @@ __all__ = [
     "CodeInterpretation",
     "Codebook",
     "CompileOptions",
+    "CompilationPlan",
     "CompiledFunction",
     "Completion",
     "DENSE",
@@ -106,25 +124,36 @@ __all__ = [
     "Value",
     "ValueKind",
     "add",
+    "analyze",
+    "attention_prepare",
     "cast",
     "causal_attention",
     "compile",
     "concatenate",
+    "decode_bfloat16",
     "delta_recurrence",
     "device",
     "divide",
     "embedding",
     "evaluate_reference",
     "exp",
+    "gated_delta_recurrence",
     "kv_append",
+    "kv_copy",
     "linear",
     "lowerings",
     "matmul",
+    "materialize",
     "multiply",
+    "overlay_rows",
+    "quantized_import",
     "operation",
     "operations",
     "reshape",
+    "recurrent_prepare",
     "rms_norm",
+    "sample",
+    "row_dot",
     "rotary",
     "route_topk",
     "routed_experts",
@@ -133,6 +162,7 @@ __all__ = [
     "silu",
     "softmax",
     "subtract",
+    "take_rows",
     "tanh",
     "trace",
     "transpose",

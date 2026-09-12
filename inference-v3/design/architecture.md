@@ -103,6 +103,7 @@ not permission to cross a boundary.
 | Magnitensor | [tensor-system.md](tensor-system.md) |
 | Inference operations | [operations.md](operations.md) |
 | Portable schedules | [kernels.md](kernels.md) |
+| Kernel optimization | [development/kernel-optimization.md](development/kernel-optimization.md) |
 | Physical execution | [platform.md](platform.md) |
 | Weight sources and representations | [weights.md](weights.md) |
 | Logical KV state | [state.md](state.md) |

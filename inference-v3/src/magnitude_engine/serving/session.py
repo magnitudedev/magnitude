@@ -88,7 +88,13 @@ class ChatService:
                 publication = await asyncio.wrap_future(receiver)
                 state = publication.state
                 for item in publication.tokens:
-                    for event in parser.feed(stops.feed(decoder.push(item.token))):
+                    try:
+                        decoded = decoder.push(item.token)
+                    except IndexError as error:
+                        raise RuntimeError(
+                            f"tokenizer cannot decode model token {int(item.token)}"
+                        ) from error
+                    for event in parser.feed(stops.feed(decoded)):
                         yield event
                 if stops.matched is not None:
                     state = await asyncio.wrap_future(

@@ -14,11 +14,11 @@ from queue import Empty, SimpleQueue
 from threading import Lock, Thread
 from typing import Protocol
 
-from magnitude_engine.platform.execution import Ticket
+import magnitensor as mt
 
 
 class Driven(Protocol):
-    def advance(self) -> Ticket | None: ...
+    def advance(self) -> mt.Completion | None: ...
     def failed(self, error: Exception) -> None: ...
 
 
@@ -52,7 +52,7 @@ class _Call[Owner, Result](_Job[Owner]):
 
 @dataclass(frozen=True)
 class _Completed:
-    ticket: Ticket
+    completion: mt.Completion
 
 
 @dataclass(frozen=True)
@@ -99,7 +99,7 @@ class Worker[Owner: Driven]:
     def _run(self, factory: Callable[[], AbstractContextManager[Owner]]) -> None:
         try:
             with factory() as owner, ThreadPoolExecutor(max_workers=1) as waiter:
-                waiting: Ticket | None = None
+                waiting: mt.Completion | None = None
                 self.ready.set_result(None)
                 try:
                     while True:
@@ -107,10 +107,10 @@ class Worker[Owner: Driven]:
                         if isinstance(event, _Stop):
                             break
                         if isinstance(event, _Completed):
-                            if event.ticket is not waiting:
+                            if event.completion is not waiting:
                                 raise RuntimeError("completion does not match pending execution")
                             try:
-                                event.ticket.wait()
+                                event.completion.wait()
                             except Exception as error:
                                 owner.failed(error)
                             waiting = None
@@ -125,10 +125,12 @@ class Worker[Owner: Driven]:
                             waiting = completion
                             native = waiter.submit(completion.completion_waiter())
 
-                            def finished(future: Future[None], ticket: Ticket = completion):
+                            def finished(
+                                future: Future[None], completed: mt.Completion = completion
+                            ):
                                 # Native failures are reconciled on the execution owner.
                                 future.exception()
-                                self._queue.put(_Completed(ticket))
+                                self._queue.put(_Completed(completed))
 
                             native.add_done_callback(finished)
                 except Exception as error:

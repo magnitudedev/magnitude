@@ -12,9 +12,9 @@ from typing import Annotated
 
 from pydantic import Field, model_validator
 
+import magnitensor as mt
 from magnitude_engine.data import Record, TokenId
 from magnitude_engine.inputs.layout import BoundaryRule, ConditioningIdentity, InputLayout
-from magnitude_engine.platform.execution import DType, Tensor, TensorSpec
 
 type Coordinate = Annotated[int, Field(ge=0, le=0x7FFFFFFF)]
 type RotaryCoordinates = tuple[Coordinate, Coordinate, Coordinate]
@@ -68,12 +68,12 @@ class InputPlan(Record):
 @dataclass(frozen=True)
 class Feature:
     identity: ConditioningIdentity
-    values: Tensor
+    values: mt.Resource
 
 
 @dataclass(frozen=True)
 class FeatureSlice:
-    values: Tensor
+    values: mt.Resource
     source: int
     destination: int
     count: int
@@ -93,6 +93,11 @@ class Inputs:
         )
 
 
+@dataclass(frozen=True)
+class _AssembledInputs(Inputs):
+    """InputState-proven semantic operands; not a public numerical boundary."""
+
+
 class InputState:
     """Immutable semantic continuation with independently owned feature views.
 
@@ -108,8 +113,8 @@ class InputState:
         if len(supplied) != len(features) or set(supplied) != required:
             raise ValueError("conditioning features must exactly cover the unconsumed input")
         for span in plan.layout.spans:
-            if span.end > position and supplied[span.identity].spec != TensorSpec(
-                (span.end - span.start, width), DType.F32
+            if span.end > position and supplied[span.identity].spec != mt.TensorSpec(
+                (span.end - span.start, width), mt.DType.F32
             ):
                 raise ValueError("projected feature geometry differs from its input span")
         with ExitStack() as cleanup:
@@ -153,7 +158,7 @@ class InputState:
             for span in self.plan.layout.spans
             if span.start < end and span.end > position
         )
-        return Inputs(tokens, self.plan.rotary(position, len(tokens)), slices)
+        return _AssembledInputs(tokens, self.plan.rotary(position, len(tokens)), slices)
 
     def check(self) -> None:
         if self.closed:

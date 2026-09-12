@@ -7,9 +7,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
+import magnitensor as mt
 from magnitude_engine.data import TokenId
 from magnitude_engine.inputs.layout import InputLayout
-from magnitude_engine.platform.execution import DeviceContext, Prepared, Tensor, Ticket
 
 
 class LogitsSelection(StrEnum):
@@ -20,8 +20,9 @@ class LogitsSelection(StrEnum):
 
 class ModelAdvance(Protocol):
     @property
-    def logits(self) -> Tensor | None: ...
+    def logits(self) -> mt.Resource | None: ...
     def commit(self) -> None: ...
+    def read_sample(self) -> tuple[int, int] | None: ...
     def close(self) -> None: ...
 
 
@@ -30,24 +31,29 @@ class ModelRequest:
     sequence: ModelSequence
     tokens: tuple[TokenId, ...]
     selection: LogitsSelection = LogitsSelection.LAST
+    draw_words: tuple[int, int, int, int, int, int] | None = None
 
 
 class ModelBatch(Protocol):
     @property
-    def logits(self) -> Tensor | None:
+    def logits(self) -> mt.Resource | None:
         """Requested logit rows packed in request order."""
         ...
 
     @property
-    def commands(self) -> tuple[Prepared, ...]: ...
+    def completion(self) -> mt.Completion: ...
     @property
     def advances(self) -> tuple[ModelAdvance, ...]: ...
-    def submitted(self, completion: Ticket) -> None: ...
     def close(self) -> None: ...
 
 
 class ModelExecutor(ABC):
-    context: DeviceContext
+    context: mt.Device
+
+    @abstractmethod
+    def prime(self, rows: int, horizon: int) -> None:
+        """Construct canonical execution forms for a prefill quantum and horizon."""
+        ...
 
     @abstractmethod
     def reclaim(self) -> int:
@@ -72,7 +78,7 @@ class ModelCheckpoint(Protocol):
 
 class ModelSequence(Protocol):
     @property
-    def context(self) -> DeviceContext: ...
+    def context(self) -> mt.Device: ...
     @property
     def position(self) -> int: ...
     @property

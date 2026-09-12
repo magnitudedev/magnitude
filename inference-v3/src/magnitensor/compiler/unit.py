@@ -16,7 +16,7 @@ class ParameterKind(StrEnum):
     CONSTANT = "constant"
     RESOURCE = "resource"
     OUTPUT = "output"
-    ARENA = "arena"
+    TEMPORARY = "temporary"
 
 
 type BindingKey = tuple[str, int, int]
@@ -62,8 +62,6 @@ def build_unit(graph: Graph, memory: MemoryPlan, unit: SubmissionUnit) -> TileCo
             add_value(placement.source)
             return
         kind = ParameterKind(placement.storage.value)
-        if kind == ParameterKind.ARENA:
-            kind = ParameterKind.ARENA
         value = graph.values[value_id]
         keys[("value", value_id, 0)] = (f"v{value_id}", value.spec, kind)
 
@@ -76,7 +74,7 @@ def build_unit(graph: Graph, memory: MemoryPlan, unit: SubmissionUnit) -> TileCo
             keys[("workspace", min(candidate.nodes), index)] = (
                 f"w{min(candidate.nodes)}_{index}",
                 spec,
-                ParameterKind.ARENA,
+                ParameterKind.TEMPORARY,
             )
 
     ordered = sorted(

@@ -88,37 +88,3 @@ def choose_endpoint(backend: Backend | None = None, ordinal: int = 0) -> Endpoin
     # Prefer a discovered accelerator to the CPU fallback. Performance/profile
     # qualification is separate; this does not invent undiscovered GPU backends.
     return min(candidates, key=lambda endpoint: endpoint.backend == Backend.LLVM)
-
-
-def open_context(backend: Backend, budget_bytes: int, ordinal: int):
-    from magnitude_engine.platform.execution import DeviceContext
-
-    inventory = discover()
-    endpoint = next(
-        (
-            endpoint
-            for endpoint in inventory.endpoints
-            if endpoint.backend == backend and endpoint.ordinal == ordinal
-        ),
-        None,
-    )
-    if endpoint is None or endpoint.unavailable:
-        detail = (
-            "; ".join(endpoint.unavailable) if endpoint is not None else "endpoint not discovered"
-        )
-        raise RuntimeError(f"cannot open {backend.value}:{ordinal}: {detail}")
-    from magnitude_engine.platform.driver import MetalSelection, TorchDriver
-
-    selection = None
-    if backend == Backend.METAL:
-        device = next(device for device in inventory.devices if device.id == endpoint.device)
-        if device.registry_id is None:
-            raise RuntimeError("Metal endpoint has no native registry identity")
-        working_set = next(
-            budget
-            for budget in inventory.budgets
-            if budget.id == BudgetId(f"metal:working-set:{device.registry_id}")
-        )
-        selection = MetalSelection(name=device.name, working_set_bytes=working_set.limit_bytes)
-    driver = TorchDriver(backend, ordinal, metal=selection)
-    return DeviceContext(driver, budget_bytes)

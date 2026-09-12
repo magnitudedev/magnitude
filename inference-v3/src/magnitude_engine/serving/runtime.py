@@ -9,13 +9,13 @@ from typing import Literal
 
 from pydantic import Field
 
+import magnitensor as mt
 from magnitude_engine.data import Record, TokenId
 from magnitude_engine.generation.plain import Options, OutputToken
 from magnitude_engine.inputs.formats.gguf_tokenizer import TokenizerArtifact
 from magnitude_engine.models.qwen35.inputs import InputPlan
 from magnitude_engine.models.qwen35.runtime import DenseRuntime
 from magnitude_engine.platform.backend import Backend
-from magnitude_engine.platform.execution import Ticket
 from magnitude_engine.service.engine import Engine, Snapshot, Submission
 from magnitude_engine.service.policy import RequestId
 from magnitude_engine.weights.identity import ArtifactIdentity
@@ -107,7 +107,7 @@ class Runtime:
     def failed(self, error: Exception) -> None:
         self.engine.fail(error)
 
-    def advance(self) -> Ticket | None:
+    def advance(self) -> mt.Completion | None:
         while True:
             action = self.engine.step()
             delivered = False
@@ -145,13 +145,7 @@ class Runtime:
 
 @contextmanager
 def open_runtime(config: Config) -> Iterator[Runtime]:
-    from magnitude_engine.blueprints import (
-        execution,
-        models,
-        operations,
-        service,
-        serving,
-    )
+    from magnitude_engine.blueprints import execution, models, service, serving
     from magnitude_engine.blueprints import weights as containers
     from magnitude_engine.composition import build, digest, dumps
     from magnitude_engine.platform.host.machine import choose_endpoint
@@ -170,15 +164,18 @@ def open_runtime(config: Config) -> Iterator[Runtime]:
         container = containers.GGUF(path=config.target)
         description = models.Qwen35DenseDescription(format=container)
         metadata = serving.ChatMetadata(artifact=container)
-    arena = operations.Arena(context=context)
-    binding = operations.Operations(
-        weights=containers.Weights(format=container, context=context), arena=arena
+    residency = containers.Weights(format=container, context=context)
+    model = models.Qwen35Dense(
+        description=description,
+        device=context,
+        weights=residency,
+        max_sequences=config.parallel_sequences,
+        prefill_rows=config.prefill_tokens,
+        context_capacity=config.context_tokens,
     )
-    model = models.Qwen35Dense(description=description, operations=binding)
     recipe = serving.ChatComponents(
         engine=service.Continuous(
             model=model,
-            selector=operations.SampleSelector(context=context),
             limits=service.ServiceLimits(
                 max_requests=config.max_queued + config.parallel_sequences,
                 max_batch=config.parallel_sequences,
@@ -189,10 +186,8 @@ def open_runtime(config: Config) -> Iterator[Runtime]:
     )
     with build(recipe) as bound:
         assert isinstance(bound.engine.model, DenseRuntime)
-        maximum = bound.engine.model.geometry.context_limit
-        context_tokens = maximum if config.context_tokens is None else config.context_tokens
-        if context_tokens > maximum:
-            raise ValueError("configured context exceeds the model's declared limit")
+        context_tokens = bound.engine.model.context_capacity
+        bound.engine.model.prime(min(config.prefill_tokens, context_tokens), context_tokens)
         ready = Ready(
             ServerProperties(
                 status="ready",

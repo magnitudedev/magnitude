@@ -1,18 +1,19 @@
+import magnitensor as mt
 from magnitude_engine.composition import Blueprint, blueprint
 from magnitude_engine.platform.backend import Backend
-from magnitude_engine.platform.execution import DeviceContext
 
 __all__ = ["Device"]
 
 
 @blueprint
-class Device(Blueprint[DeviceContext]):
+class Device(Blueprint[mt.Device]):
     backend: Backend
     budget_bytes: int
     ordinal: int = 0
 
     @staticmethod
     def implementation():
-        from magnitude_engine.platform.host.machine import open_context
+        def build(backend: Backend, budget_bytes: int, ordinal: int) -> mt.Device:
+            return mt.device(backend.value, budget_bytes=budget_bytes, ordinal=ordinal)
 
-        return open_context
+        return build

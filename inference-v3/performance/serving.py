@@ -14,11 +14,11 @@ from pathlib import Path
 
 from benchmark_fixtures import prose
 from benchmark_fixtures.prose_history import Prose
-from magnitude_engine.models.qwen35.description import inspect_dense
+from magnitude_engine.models.qwen35.formats.gguf import describe
 from magnitude_engine.platform.compiler import compiler_build
 from magnitude_engine.platform.host.measurement import exclusive_measurement
 from magnitude_engine.weights.formats.gguf import GGUFFormat
-from performance.__main__ import source_identity
+from performance import source_identity
 from performance.thermals import ThermalRecorder
 from session_bench import report
 from session_bench.engines.magnitude import Magnitude
@@ -34,7 +34,7 @@ def gguf_artifact(path: Path) -> Artifact:
     before = path.stat()
     artifact = GGUFFormat(str(path))
     try:
-        description = inspect_dense(artifact.directory, artifact.identity)
+        description = describe(artifact)
         after = path.stat()
         if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
             raise ValueError("GGUF changed during benchmark preparation")

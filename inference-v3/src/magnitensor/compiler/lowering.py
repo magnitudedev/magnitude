@@ -38,6 +38,7 @@ class Capabilities:
     subgroup_exchange: bool = False
     vector_bytes: tuple[int, ...] = (1,)
     atomics: frozenset[DType] = frozenset()
+    features: frozenset[str] = frozenset()
     alignments: Mapping[DType, int] = field(default_factory=dict)
     native_multi_launch: bool = False
     partial_binding: bool = False
@@ -49,7 +50,11 @@ class Capabilities:
             raise ValueError("invalid target capability geometry")
         if self.max_kernels_per_program is not None and self.max_kernels_per_program <= 0:
             raise ValueError("kernel program limit must be positive")
-        if not self.supported_dtypes or any(value <= 0 for value in self.vector_bytes):
+        if (
+            not self.supported_dtypes
+            or any(value <= 0 for value in self.vector_bytes)
+            or any(not value for value in self.features)
+        ):
             raise ValueError("target capability sets must not be empty or invalid")
         if not self.fingerprint:
             raise ValueError("capability fingerprint must not be empty")
@@ -178,53 +183,52 @@ class Cover:
 
 
 def select_cover(graph: Graph, candidates: tuple[Candidate, ...]) -> Cover:
-    by_node: dict[int, list[Candidate]] = defaultdict(list)
+    by_start: dict[int, list[Candidate]] = defaultdict(list)
     for candidate in candidates:
-        for node in candidate.nodes:
-            by_node[node].append(candidate)
-    missing = [node for node in range(len(graph.nodes)) if not by_node[node]]
+        by_start[min(candidate.nodes)].append(candidate)
+    covered = {node for candidate in candidates for node in candidate.nodes}
+    missing = [node for node in range(len(graph.nodes)) if node not in covered]
     if missing:
         raise ValueError(f"no legal lowering covers graph nodes {missing}")
-
-    all_nodes = frozenset(range(len(graph.nodes)))
-    memo: dict[frozenset[int], tuple[float, tuple[Candidate, ...]] | None] = {}
-
-    def solve(remaining: frozenset[int]):
-        if not remaining:
-            return 0.0, ()
-        if remaining in memo:
-            return memo[remaining]
-        root = min(remaining, key=lambda node: len(by_node[node]))
-        best = None
-        for candidate in by_node[root]:
-            if not candidate.nodes <= remaining:
-                continue
-            suffix = solve(remaining - candidate.nodes)
+    # Lowering regions are contiguous trace intervals. This turns exact cover
+    # selection into a bounded shortest path over node positions instead of an
+    # exponential subset search over the full graph.
+    best: list[tuple[float, int, tuple[Candidate, ...]] | None] = [
+        None for _ in range(len(graph.nodes) + 1)
+    ]
+    best[-1] = (0.0, 0, ())
+    for start in reversed(range(len(graph.nodes))):
+        choice = None
+        for candidate in by_start[start]:
+            end = max(candidate.nodes) + 1
+            suffix = best[end]
             if suffix is None:
                 continue
-            cost = candidate.estimated_seconds + suffix[0]
-            selected = (candidate, *suffix[1])
+            selected = (candidate, *suffix[2])
+            proposal = (
+                candidate.estimated_seconds + suffix[0],
+                candidate.priority + suffix[1],
+                selected,
+            )
             identity = tuple(item.name for item in selected)
-            if best is None or (cost, -sum(item.priority for item in selected), identity) < (
-                best[0],
-                -sum(item.priority for item in best[1]),
-                tuple(item.name for item in best[1]),
+            if choice is None or (proposal[0], -proposal[1], identity) < (
+                choice[0],
+                -choice[1],
+                tuple(item.name for item in choice[2]),
             ):
-                best = cost, selected
-        memo[remaining] = best
-        return best
+                choice = proposal
+        best[start] = choice
 
-    result = solve(all_nodes)
+    result = best[0]
     if result is None:
         raise ValueError("lowering candidates do not form a complete non-overlapping graph cover")
-    selected_names = {candidate.name for candidate in result[1]}
+    selected_names = {candidate.name for candidate in result[2]}
     rejected = {
         candidate.name: "overlapped or costlier than selected cover"
         for candidate in candidates
         if candidate.name not in selected_names
     }
-    ordered = tuple(sorted(result[1], key=lambda candidate: min(candidate.nodes)))
-    return Cover(ordered, result[0], MappingProxyType(rejected))
+    return Cover(result[2], result[0], MappingProxyType(rejected))
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +297,8 @@ def _validate_candidate(graph: Graph, candidate: Candidate, max_nodes: int) -> N
         raise ValueError(f"candidate {candidate.name} has an invalid region")
     if not _connected(graph, candidate.nodes):
         raise ValueError(f"candidate {candidate.name} region is disconnected")
+    if candidate.nodes != frozenset(range(min(candidate.nodes), max(candidate.nodes) + 1)):
+        raise ValueError(f"candidate {candidate.name} region is not a contiguous trace interval")
     internal_outputs = {value for node in candidate.nodes for value in graph.nodes[node].outputs}
     expected_inputs = {
         value
@@ -304,28 +310,39 @@ def _validate_candidate(graph: Graph, candidate: Candidate, max_nodes: int) -> N
         value
         for value in internal_outputs
         if value in graph.outputs
-        or any(consumer not in candidate.nodes for consumer in _consumers(graph, value))
+        or any(consumer not in candidate.nodes for consumer in graph.users[value])
     }
-    if set(candidate.inputs) != expected_inputs or set(candidate.outputs) != expected_outputs:
+    declared_outputs = set(candidate.outputs)
+    if (
+        set(candidate.inputs) != expected_inputs
+        or not expected_outputs <= declared_outputs
+        or not declared_outputs <= internal_outputs
+    ):
         raise ValueError(f"candidate {candidate.name} declares incorrect region boundaries")
-    if not _convex(graph, candidate.nodes):
-        raise ValueError(f"candidate {candidate.name} region is not convex")
-
-
-def _consumers(graph: Graph, value: int) -> tuple[int, ...]:
-    return tuple(node.id for node in graph.nodes if value in node.inputs)
+    # Node ids are topological and the region is a complete id interval, so a
+    # dependency path cannot leave the interval and later re-enter it.
 
 
 def _connected(graph: Graph, nodes: frozenset[int]) -> bool:
     if len(nodes) == 1:
         return True
     adjacency: dict[int, set[int]] = {node: set() for node in nodes}
+    consumers: dict[int, list[int]] = defaultdict(list)
     for node in nodes:
         for value in graph.nodes[node].inputs:
+            consumers[value].append(node)
             producer = graph.values[value].producer
             if producer in nodes:
                 adjacency[node].add(producer)
                 adjacency[producer].add(node)
+    # Values are hyperedges: sibling operations consuming the same external
+    # activation are connected even when neither produces the other.
+    for related in consumers.values():
+        if len(related) > 1:
+            anchor = related[0]
+            for node in related[1:]:
+                adjacency[anchor].add(node)
+                adjacency[node].add(anchor)
     seen = {next(iter(nodes))}
     stack = list(seen)
     while stack:
@@ -335,25 +352,3 @@ def _connected(graph: Graph, nodes: frozenset[int]) -> bool:
                 seen.add(neighbor)
                 stack.append(neighbor)
     return seen == set(nodes)
-
-
-def _convex(graph: Graph, nodes: frozenset[int]) -> bool:
-    # A dependency path may not leave the region and later re-enter it.
-    frontier = []
-    seen_outside = set()
-    for source in nodes:
-        for value in graph.nodes[source].outputs:
-            for consumer in _consumers(graph, value):
-                if consumer not in nodes and consumer not in seen_outside:
-                    seen_outside.add(consumer)
-                    frontier.append(consumer)
-    while frontier:
-        outside = frontier.pop()
-        for value in graph.nodes[outside].outputs:
-            for consumer in _consumers(graph, value):
-                if consumer in nodes:
-                    return False
-                if consumer not in seen_outside:
-                    seen_outside.add(consumer)
-                    frontier.append(consumer)
-    return True

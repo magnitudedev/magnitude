@@ -115,7 +115,7 @@ def select(root: Path, models: list[str], engines: list[str], targets: list[str]
             }))
     else:
         if not models:
-            raise ValueError("--model is required (aliases live in inference-v2/models.local.json)")
+            raise ValueError("--model is required (aliases live in inference-v3/models.local.json)")
         local = aliases(root)
         for model in models:
             for engine in engines or ["magnitude"]:
@@ -186,6 +186,8 @@ def prepare(target: Target) -> Artifact:
         }
     else:
         if not path.is_file():
+            if target.engine == "magnitude":
+                raise ValueError(f"Magnitude model must be a model directory or GGUF file: {path}")
             raise ValueError(f"llama.cpp requires a GGUF file: {path}")
         from gguf import GGUFReader
 

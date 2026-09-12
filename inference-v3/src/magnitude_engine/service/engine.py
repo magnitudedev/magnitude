@@ -4,9 +4,11 @@ Transport drives step, waits on its concrete ticket, and drains output. Pressure
 uses model-owned reclamation facts; this layer knows no numerical state layout.
 """
 
+import logging
 from dataclasses import dataclass
 from enum import StrEnum
 
+import magnitensor as mt
 from magnitude_engine.data import Record
 from magnitude_engine.generation.plain import (
     FinishReason,
@@ -19,8 +21,6 @@ from magnitude_engine.generation.plain import (
     WorkKind,
 )
 from magnitude_engine.models.sequence import ModelExecutor, ModelInput
-from magnitude_engine.operations.sampling import SampleSelector
-from magnitude_engine.platform.execution import CapacityError, Ticket
 from magnitude_engine.platform.host.measurement import clock_ns
 from magnitude_engine.service.policy import (
     Candidate,
@@ -30,6 +30,8 @@ from magnitude_engine.service.policy import (
     Scheduler,
     Selection,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class Status(StrEnum):
@@ -74,8 +76,13 @@ class Snapshot(Record):
     service_ns: int
     preemptions: int
     generated_tokens: int
+    preparation_ns: int
+    prefill_preparation_ns: int
+    decode_preparation_ns: int
     prefill_ns: int
     decode_ns: int
+    first_decode_preparation_ns: int
+    first_decode_ns: int
     replay_ns: int
     capacity_wait: CapacityWait | None
 
@@ -90,8 +97,13 @@ class Request:
     finish: FinishReason | None = None
     failure: Failure | None = None
     service_ns: int = 0
+    preparation_ns: int = 0
+    prefill_preparation_ns: int = 0
+    decode_preparation_ns: int = 0
     prefill_ns: int = 0
     decode_ns: int = 0
+    first_decode_preparation_ns: int = 0
+    first_decode_ns: int = 0
     replay_ns: int = 0
     preemptions: int = 0
     preemption_debt: int = 0
@@ -108,7 +120,7 @@ class Request:
 
 @dataclass(frozen=True)
 class Submission:
-    completion: Ticket
+    completion: mt.Completion
     requests: tuple[RequestId, ...]
     phase: Phase
     tokens: int
@@ -132,12 +144,8 @@ class _NotPrepared(Exception):
 
 
 class Engine:
-    def __init__(
-        self, model: ModelExecutor, selector: SampleSelector, limits: Limits | None = None
-    ):
-        if model.context is not selector.context:
-            raise ValueError("service model and selector must share an execution owner")
-        self.model, self.selector, self.context = model, selector, model.context
+    def __init__(self, model: ModelExecutor, limits: Limits | None = None):
+        self.model, self.context = model, model.context
         self.scheduler = Scheduler(Limits() if limits is None else limits)
         self.requests: dict[RequestId, Request] = {}
         self.pending: Pending | None = None
@@ -199,8 +207,13 @@ class Engine:
             service_ns=r.service_ns,
             preemptions=r.preemptions,
             generated_tokens=0 if g is None else len(g.sampled),
+            preparation_ns=r.preparation_ns,
+            prefill_preparation_ns=r.prefill_preparation_ns,
+            decode_preparation_ns=r.decode_preparation_ns,
             prefill_ns=r.prefill_ns,
             decode_ns=r.decode_ns,
+            first_decode_preparation_ns=r.first_decode_preparation_ns,
+            first_decode_ns=r.first_decode_ns,
             replay_ns=r.replay_ns,
             capacity_wait=r.capacity_wait if status == Status.CAPACITY else None,
         )
@@ -269,7 +282,7 @@ class Engine:
             sequence = r.source.open()
             try:
                 if r.generation is None:
-                    r.generation = Generation(sequence, r.source.prompt, self.selector, r.options)
+                    r.generation = Generation(sequence, r.source.prompt, r.options)
                 else:
                     r.generation.restore(sequence)
             except BaseException:
@@ -286,13 +299,13 @@ class Engine:
         r.failure = Failure(
             kind=kind,
             message=str(error),
-            required_bytes=error.required if isinstance(error, CapacityError) else None,
-            available_bytes=error.available if isinstance(error, CapacityError) else None,
+            required_bytes=error.required if isinstance(error, mt.CapacityError) else None,
+            available_bytes=error.available if isinstance(error, mt.CapacityError) else None,
         )
         r.retire_source()
         self._epoch += 1
 
-    def _evict(self, selected: set[RequestId], error: CapacityError) -> bool:
+    def _evict(self, selected: set[RequestId], error: mt.CapacityError) -> bool:
         candidates = []
         for r in self.requests.values():
             g = r.generation
@@ -346,7 +359,7 @@ class Engine:
         allowance = 1 if selection.phase == Phase.DECODE else self.scheduler.limits.prefill_tokens
         reclaimed = False
         last_shape = None
-        capacity: CapacityError | None = None
+        capacity: mt.CapacityError | None = None
         while True:
             ready = []
             remaining = allowance
@@ -370,7 +383,7 @@ class Engine:
                 batch = GenerationBatch.prepare(tuple(ready))
                 served = tuple(identities[: len(ready)])
                 return batch, Selection(selection.phase, served, selection.contended), sum(shape)
-            except CapacityError as error:
+            except mt.CapacityError as error:
                 capacity = error
                 if not reclaimed:
                     self.model.reclaim()
@@ -409,6 +422,7 @@ class Engine:
                     self._fail(r, FailureKind.CAPACITY, error)
                 raise _NotPrepared from error
             except Exception as error:
+                logger.exception("model batch preparation failed")
                 self._fail(self.requests[current], FailureKind.PREPARATION, error)
                 raise _NotPrepared from error
 
@@ -419,6 +433,7 @@ class Engine:
         try:
             pending.batch.finish()
         except Exception as error:
+            logger.exception("model batch completion failed")
             for identity in pending.submission.requests:
                 r = self.requests[identity]
                 if r.generation is not None and r.generation.finish_reason == FinishReason.FAILED:
@@ -437,6 +452,8 @@ class Engine:
             if kind == WorkKind.PREFILL:
                 r.prefill_ns += attributed
             elif kind == WorkKind.DECODE:
+                if r.decode_ns == 0:
+                    r.first_decode_ns = attributed
                 r.decode_ns += attributed
             else:
                 r.replay_ns += attributed
@@ -483,13 +500,14 @@ class Engine:
             if selection is None:
                 return Idle(tuple(self.snapshot(identity) for identity in self.requests))
             try:
+                preparation_started = clock_ns()
                 batch, selected, tokens = self._prepare(selection)
+                preparation_elapsed = max(0, clock_ns() - preparation_started)
             except _NotPrepared:
                 continue
             started = clock_ns()
             try:
-                ticket = self.context.submit(batch.commands)
-                batch.submitted(ticket)
+                ticket = batch.completion
             except Exception as error:
                 batch.close()
                 for identity in selected.requests:
@@ -503,6 +521,17 @@ class Engine:
                     return Idle(tuple(self.snapshot(identity) for identity in self.requests))
                 continue
             submission = Submission(ticket, selected.requests, selected.phase, tokens)
+            share, extra = divmod(preparation_elapsed, len(selected.requests))
+            for index, identity in enumerate(selected.requests):
+                r = self.requests[identity]
+                attributed = share + (index < extra)
+                r.preparation_ns += attributed
+                if selected.phase == Phase.PREFILL:
+                    r.prefill_preparation_ns += attributed
+                else:
+                    r.decode_preparation_ns += attributed
+                    if r.decode_ns == 0:
+                        r.first_decode_preparation_ns = attributed
             self.pending = Pending(batch, selected, started, submission)
             return submission
         return Idle(tuple(self.snapshot(identity) for identity in self.requests))

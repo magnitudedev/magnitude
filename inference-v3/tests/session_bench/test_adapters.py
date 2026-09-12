@@ -6,6 +6,7 @@ import pytest
 from session_bench.engines import ADAPTERS
 from session_bench.engines.omlx_native import instrumentation
 from session_bench.models import Target, prepare
+from session_bench.policy import PREFILL_TOKENS
 from session_bench.results import RunStore
 
 
@@ -24,7 +25,7 @@ def test_readiness_requires_matching_loaded_capacity(engine, artifact_path, tmp_
             "parallel_sequences": 4,
             "speculative_backend": "none",
             "retained_prefixes": 0,
-            "prefill_tokens": 512,
+            "prefill_tokens": PREFILL_TOKENS,
             "output_capacity": 64,
             "memory_bytes": adapter.memory_limit,
             "composition_json": "{}",
