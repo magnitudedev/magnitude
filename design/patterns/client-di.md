@@ -188,10 +188,10 @@ remain Tags acquired through the client's runtime (`client.runtime.atom(Tag)`).
 
 The onboarding model setup capability is the proof case for this pattern:
 
-- local models, model slots, and onboarding persistence are separate ACN-backed service Tags;
+- local models and onboarding persistence are separate ACN-backed service Tags;
 - each service privately owns its Effect Query materialization; the connection owns the change
   subscription and invalidation;
-- onboarding model setup is a Layer requiring those three Tags;
+- desktop onboarding is a Layer requiring those semantic services;
 - its client-owned execution state is retained in keep-alive Atoms in the connection registry;
 - each command is one Effect program passing exact outputs to dependent operations; and
 - the onboarding hook observes and invokes the composed service without receiving lower Query or

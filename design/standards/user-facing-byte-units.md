@@ -29,8 +29,9 @@ unit without changing the underlying byte value or scaling policy. Explicitly te
 diagnostic output uses binary scaling with IEC `KiB`, `MiB`, `GiB`, or `TiB` labels. A binary-scaled
 file quantity or technical value cannot carry a decimal-unit label.
 
-Model-selection actions do not show artifact size alongside predicted memory. Download byte counts
-remain visible when operationally relevant: active transfer progress and storage-capacity failures.
+Compact model-selection menu actions do not show artifact size alongside predicted memory. Desktop
+catalog cards label download size separately from assessed memory so users can distinguish disk and
+RAM requirements. Download byte counts also remain visible in transfer progress and storage failures.
 
 ## Conformance
 

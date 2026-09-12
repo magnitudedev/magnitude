@@ -344,7 +344,7 @@ Ownership chain:
 
 ```text
 client SDK --observes--> ACN
-client holding fenced JIT replacement claim --removes--> ACN
+desktop application --owns/removes--> ACN
 ACN --owns/removes--> ICN
 ICN --owns/removes--> native worker
 ```
@@ -493,7 +493,7 @@ agent accepted shape + projections --> display events --> client
 
 ```text
 client SDK --query/watch--> ACN lifecycle
-client holding fenced JIT replacement claim --stop/remove--> exact ACN
+desktop owner holding retained child authority --stop/remove--> exact ACN
 
 ACN --query/watch--> ICN lifecycle
 ACN --stop/remove--> exact ICN child

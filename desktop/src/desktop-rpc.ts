@@ -1,244 +1,55 @@
-import { Rpc, RpcClient, RpcClientError, RpcGroup } from "@effect/rpc"
+import { Rpc, RpcGroup, type RpcClient, type RpcClientError } from "@effect/rpc"
+import { atMostOnce, replaySafe } from "@magnitudedev/sdk"
+import { ApplicationSnapshot, LoginStartupState } from "@magnitudedev/sdk/desktop-host"
+import { DesktopApplicationInfo, DesktopConnectRequest, DesktopConnectionsSnapshot, DesktopUpdateState, HarnessIdSchema, SetupStatus } from "@magnitudedev/client-common"
 import { Schema } from "effect"
-import {
-  MenuActionSchema,
-  type MenuAction,
-} from "@magnitudedev/client-common/types/menu-action"
-import {
-  BrowserDownloadIdSchema,
-  BrowserPermissionRequestIdSchema,
-  BrowserTabIdSchema,
-  BrowserViewportRectSchema,
-  BrowserWorkspaceStateSchema,
-  type BrowserDownloadId,
-  type BrowserPermissionRequestId,
-  type BrowserTabId,
-  type BrowserViewportRect,
-} from "@magnitudedev/client-common/platform/embedded-browser"
-import { ServiceStartProgressSchema, ServiceStartErrorSchema } from "@magnitudedev/sdk"
 
-export type { MenuAction }
-
-export const DesktopRpcChannel = {
-  request: "__magnitude:desktop-rpc:request",
-  response: "__magnitude:desktop-rpc:response",
-} as const
-
+export { DesktopPage as Page, ModelTrayPresentation, DesktopAction as ApplicationAction } from "@magnitudedev/client-common"
+import { DesktopPage as Page, ModelTrayPresentation, DesktopAction as ApplicationAction } from "@magnitudedev/client-common"
+export class HostError extends Schema.TaggedError<HostError>()("HostError", { message: Schema.String }) {}
 const Unit = Schema.Struct({})
-
-export class DesktopRpcError extends Schema.TaggedError<DesktopRpcError>()(
-  "DesktopRpcError",
-  { message: Schema.String },
-) {}
-
-export const OpenFileOptionsPayload = Schema.Struct({
-  multiple: Schema.optionalWith(Schema.Boolean, { default: () => false }),
-})
-
-export interface OpenFileOptions {
-  readonly multiple?: boolean
-}
-
-export const DesktopRpcs = RpcGroup.make(
-  Rpc.make("ServiceStart", {
-    payload: {},
-    success: ServiceStartProgressSchema,
-    error: ServiceStartErrorSchema,
-    stream: true,
-  }),
-  Rpc.make("StorageGet", {
-    payload: Schema.Struct({ key: Schema.String }),
-    success: Schema.NullOr(Schema.String),
-    error: DesktopRpcError,
-  }),
-  Rpc.make("StorageSet", {
-    payload: Schema.Struct({ key: Schema.String, value: Schema.String }),
-    success: Unit,
-    error: DesktopRpcError,
-  }),
-  Rpc.make("StorageRemove", {
-    payload: Schema.Struct({ key: Schema.String }),
-    success: Unit,
-    error: DesktopRpcError,
-  }),
-  Rpc.make("DialogOpenDirectory", {
-    payload: Unit,
-    success: Schema.NullOr(Schema.String),
-    error: DesktopRpcError,
-  }),
-  Rpc.make("DialogOpenFile", {
-    payload: OpenFileOptionsPayload,
-    success: Schema.NullOr(Schema.Array(Schema.String)),
-    error: DesktopRpcError,
-  }),
-  Rpc.make("NotificationShow", {
-    payload: Schema.Struct({ title: Schema.String, body: Schema.String }),
-    success: Unit,
-    error: DesktopRpcError,
-  }),
-  Rpc.make("Quit", {
-    payload: Unit,
-    success: Unit,
-    error: DesktopRpcError,
-  }),
-  Rpc.make("InterruptStream", {
-    payload: Unit,
-    success: Unit,
-    error: DesktopRpcError,
-  }),
-  Rpc.make("StreamMenuActions", {
-    payload: Unit,
-    success: MenuActionSchema,
-    error: DesktopRpcError,
-    stream: true,
-  }),
-  Rpc.make("BrowserObserve", {
-    payload: Unit,
-    success: BrowserWorkspaceStateSchema,
-    error: DesktopRpcError,
-    stream: true,
-  }),
-  Rpc.make("BrowserCreateTab", {
-    payload: Schema.Struct({ url: Schema.NullOr(Schema.String) }),
-    success: BrowserTabIdSchema,
-    error: DesktopRpcError,
-  }),
-  Rpc.make("BrowserActivateTab", {
-    payload: Schema.Struct({ tabId: BrowserTabIdSchema }),
-    success: Unit,
-    error: DesktopRpcError,
-  }),
-  Rpc.make("BrowserCloseTab", {
-    payload: Schema.Struct({ tabId: BrowserTabIdSchema }),
-    success: Unit,
-    error: DesktopRpcError,
-  }),
-  Rpc.make("BrowserNavigate", {
-    payload: Schema.Struct({ input: Schema.String }),
-    success: Unit,
-    error: DesktopRpcError,
-  }),
-  Rpc.make("BrowserGoBack", { payload: Unit, success: Unit, error: DesktopRpcError }),
-  Rpc.make("BrowserGoForward", { payload: Unit, success: Unit, error: DesktopRpcError }),
-  Rpc.make("BrowserReload", { payload: Unit, success: Unit, error: DesktopRpcError }),
-  Rpc.make("BrowserStop", { payload: Unit, success: Unit, error: DesktopRpcError }),
-  Rpc.make("BrowserContinueInsecureNavigation", {
-    payload: Unit,
-    success: Unit,
-    error: DesktopRpcError,
-  }),
-  Rpc.make("BrowserCancelInsecureNavigation", {
-    payload: Unit,
-    success: Unit,
-    error: DesktopRpcError,
-  }),
-  Rpc.make("BrowserSetViewport", {
-    payload: Schema.Struct({ bounds: Schema.NullOr(BrowserViewportRectSchema) }),
-    success: Unit,
-    error: DesktopRpcError,
-  }),
-  Rpc.make("BrowserOpenExternal", { payload: Unit, success: Unit, error: DesktopRpcError }),
-  Rpc.make("BrowserRespondToPermission", {
-    payload: Schema.Struct({
-      requestId: BrowserPermissionRequestIdSchema,
-      allow: Schema.Boolean,
-    }),
-    success: Unit,
-    error: DesktopRpcError,
-  }),
-  Rpc.make("BrowserCancelDownload", {
-    payload: Schema.Struct({ downloadId: BrowserDownloadIdSchema }),
-    success: Unit,
-    error: DesktopRpcError,
-  }),
-  Rpc.make("BrowserRevealDownload", {
-    payload: Schema.Struct({ downloadId: BrowserDownloadIdSchema }),
-    success: Unit,
-    error: DesktopRpcError,
-  }),
+export const InferenceHostRpcs = RpcGroup.make(
+  Rpc.make("ApplicationInfo", { payload: Unit, success: DesktopApplicationInfo, error: HostError }).pipe(replaySafe),
+  Rpc.make("Updates", { payload: Unit, success: DesktopUpdateState, error: HostError, stream: true }),
+  Rpc.make("CheckUpdate", { payload: Unit, success: Unit, error: HostError }).pipe(atMostOnce),
+  Rpc.make("DownloadUpdate", { payload: Unit, success: Unit, error: HostError }).pipe(atMostOnce),
+  Rpc.make("RestartUpdate", { payload: Unit, success: Unit, error: HostError }).pipe(atMostOnce),
+  Rpc.make("Observe", { payload: Unit, success: ApplicationSnapshot, error: HostError, stream: true }),
+  Rpc.make("Actions", { payload: Unit, success: ApplicationAction, error: HostError, stream: true }),
+  Rpc.make("PresentSetup", { payload: Schema.Struct({ status: SetupStatus }), success: Unit, error: HostError }).pipe(atMostOnce),
+  Rpc.make("PresentModel", { payload: ModelTrayPresentation, success: Unit, error: HostError }).pipe(atMostOnce),
+  Rpc.make("Appearance", { payload: Schema.Struct({ preference: Schema.Literal("system", "light", "dark") }), success: Unit, error: HostError }).pipe(atMostOnce),
+  Rpc.make("LoginStartup", { payload: Unit, success: LoginStartupState, error: HostError, stream: true }),
+  Rpc.make("SetLoginStartup", { payload: Schema.Struct({ enabled: Schema.Boolean }), success: Unit, error: HostError }).pipe(atMostOnce),
+  Rpc.make("Connections", { payload: Unit, success: DesktopConnectionsSnapshot, error: HostError, stream: true }),
+  Rpc.make("Connect", { payload: DesktopConnectRequest, success: Unit, error: HostError }).pipe(atMostOnce),
+  Rpc.make("Disconnect", { payload: Schema.Struct({ harness: HarnessIdSchema }), success: Unit, error: HostError }).pipe(atMostOnce),
+  Rpc.make("Retry", { payload: Unit, success: Unit, error: HostError }).pipe(atMostOnce),
+  Rpc.make("Quit", { payload: Unit, success: Unit, error: HostError }).pipe(atMostOnce),
 )
-
-export type DesktopRpcClient = RpcClient.FromGroup<
-  typeof DesktopRpcs,
-  RpcClientError.RpcClientError
->
-
-/**
- * Values exposed through contextBridge are structured-cloned, so Effect data
- * types (notably Option) must cross that boundary in their encoded form.
- */
-export type DesktopServiceStartProgress = Schema.Schema.Encoded<
-  typeof ServiceStartProgressSchema
->
-export const encodeDesktopServiceStartProgress =
-  Schema.encodeSync(ServiceStartProgressSchema)
-export const decodeDesktopServiceStartProgress =
-  Schema.decodeUnknownSync(ServiceStartProgressSchema)
-
-export type DesktopBrowserWorkspaceState = Schema.Schema.Encoded<
-  typeof BrowserWorkspaceStateSchema
->
-export const encodeDesktopBrowserWorkspaceState =
-  Schema.encodeSync(BrowserWorkspaceStateSchema)
-export const decodeDesktopBrowserWorkspaceState =
-  Schema.decodeUnknownSync(BrowserWorkspaceStateSchema)
-
-export type DesktopPlatform = "darwin" | "win32" | "linux"
-
+export type InferenceHostClient = RpcClient.FromGroup<typeof InferenceHostRpcs, RpcClientError.RpcClientError>
 export interface DesktopApi {
-  readonly platform: DesktopPlatform
-  readonly serviceStarter: {
-    start(
-      onEvent: (event: DesktopServiceStartProgress) => void,
-      onError: (error: unknown) => void,
-      onEnd: () => void,
-    ): () => void
-  }
-  readonly onMenuAction: (cb: (action: MenuAction) => void) => () => void
-  readonly quit: () => void
-  readonly interruptStream: () => void
-  readonly openPath: (path: string) => Promise<void>
-  readonly openExternal: (url: string) => Promise<void>
-  readonly showItemInFolder?: (path: string) => void
-  readonly storage: {
-    getItem(key: string): Promise<string | null>
-    setItem(key: string, value: string): Promise<void>
-    removeItem(key: string): Promise<void>
-  }
-  readonly clipboard: {
-    readText(): Promise<string>
-    writeText(text: string): Promise<void>
-  }
-  readonly dialogs: {
-    openDirectory(): Promise<string | null>
-    openFile(options?: OpenFileOptions): Promise<string[] | null>
-  }
-  readonly notifications: {
-    show(title: string, body: string): void
-  }
-  readonly browser: {
-    observe(
-      onState: (state: DesktopBrowserWorkspaceState) => void,
-      onError: (error: unknown) => void,
-      onEnd: () => void,
-    ): () => void
-    createTab(url?: string): Promise<BrowserTabId>
-    activateTab(tabId: BrowserTabId): Promise<void>
-    closeTab(tabId: BrowserTabId): Promise<void>
-    navigate(input: string): Promise<void>
-    goBack(): Promise<void>
-    goForward(): Promise<void>
-    reload(): Promise<void>
-    stop(): Promise<void>
-    continueInsecureNavigation(): Promise<void>
-    cancelInsecureNavigation(): Promise<void>
-    setViewport(bounds: BrowserViewportRect | null): Promise<void>
-    openExternal(): Promise<void>
-    respondToPermission(
-      requestId: BrowserPermissionRequestId,
-      allow: boolean,
-    ): Promise<void>
-    cancelDownload(downloadId: BrowserDownloadId): Promise<void>
-    revealDownload(downloadId: BrowserDownloadId): Promise<void>
-  }
+  readonly applicationInfo: () => Promise<typeof DesktopApplicationInfo.Type>
+  readonly updates: (value: (state: typeof DesktopUpdateState.Type) => void, error: (message: string) => void) => () => void
+  readonly checkUpdate: () => Promise<void>
+  readonly downloadUpdate: () => Promise<void>
+  readonly restartUpdate: () => Promise<void>
+  readonly platform: string
+  readonly observe: (value: (snapshot: typeof ApplicationSnapshot.Encoded) => void, error: (message: string) => void) => () => void
+  readonly actions: (value: (action: typeof ApplicationAction.Type) => void) => () => void
+  readonly presentSetup: (status: typeof SetupStatus.Type) => Promise<void>
+  readonly presentModel: (value: typeof ModelTrayPresentation.Type) => Promise<void>
+  readonly appearance: (preference: "system" | "light" | "dark") => Promise<void>
+  readonly loginStartup: (value: (state: typeof LoginStartupState.Type) => void, error: (message: string) => void) => () => void
+  readonly setLoginStartup: (enabled: boolean) => Promise<void>
+  readonly connections: (value: (rows: typeof DesktopConnectionsSnapshot.Encoded) => void, error: (message: string) => void) => () => void
+  readonly connect: (input: typeof DesktopConnectRequest.Encoded) => Promise<void>
+  readonly disconnect: (harness: typeof HarnessIdSchema.Type) => Promise<void>
+  readonly retry: () => Promise<void>
+  readonly quit: () => Promise<void>
 }
+
+export const DesktopRpcChannel = { request: "__magnitude:desktop-rpc:request", response: "__magnitude:desktop-rpc:response" } as const
+export const DesktopRendererSession = Schema.UUID.pipe(Schema.brand("DesktopRendererSession"))
+/** The nested message remains owned by Effect RPC's protocol and operation schemas. */
+export const DesktopRpcEnvelope = Schema.Struct({ session: DesktopRendererSession, message: Schema.Unknown })

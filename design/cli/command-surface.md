@@ -1,11 +1,11 @@
 ---
 applies_to:
   - cli/src/commands/**
-  - cli/src/index.tsx
+  - cli/src/index.ts
   - cli/src/server/service.ts
   - cli/src/agent-docs/**
   - packages/client-common/src/harness-connections/**
-  - cli/src/harness-connections/**
+  - packages/harness-connections/**
   - packages/sdk/**
 ---
 
@@ -14,16 +14,16 @@ applies_to:
 ## Scope
 
 The non-interactive CLI is a human-readable, agent-usable projection of Magnitude product state.
-It does not expose transport documents or internal state graphs. Bare `magnitude` and `magnitude
-setup` remain interactive entrypoints and are outside this presentation contract.
-
-Pi invokes `setup --host pi` through a private `--host` option hidden from public help.
-The option accepts only `pi` and is not part of the human or agent command vocabulary.
+It does not expose transport documents or internal state graphs. Bare `magnitude` prints help and
+exits. Help, version, and documentation do not start the desktop or service. There is no terminal
+onboarding, chat harness, setup command, or hidden hosted-setup mode. All onboarding lives in the
+desktop application.
 
 The public command vocabulary is:
 
 ```text
 update
+app open
 service install | uninstall | start | stop | status
 hardware
 catalog status | list | show <model-id> | recommendations [--preference <value>] [--limit <count>]
@@ -40,12 +40,12 @@ plugins call the SDK over RPC instead.
 
 ## Domain ownership
 
-- `service` reports runtime readiness and login-startup intent.
+- `service` reports runtime readiness, tray registration, and login-startup intent independently.
 - `hardware` reports the local inference topology, current memory use, and current allocation.
-- `catalog` reports model discovery and assessment progress, reviewed model choices,
+- `catalog` reports catalog assessment progress, reviewed model choices,
   machine-specific assessment evidence, recommendations, and download operations.
 - `models` reports models present or undergoing local operations and controls runtime residency.
-- `connections` reports harness installation and durable Magnitude connection intent.
+- `connections` reports harness installation and observed configuration integrity.
 
 Catalog output never includes acquisition or residency state. Model-status output never includes
 catalog ranking or provenance. The focused `models status <model-id>` view is the observation point
@@ -82,9 +82,9 @@ operations. Command output remains human text and is not scraped or parsed as an
 
 ## Catalog and recommendation behavior
 
-`catalog status` reports the authoritative discovery and assessment completion flags and their
-progress counts independently. It does not infer completion from catalog rows or recommendation
-availability and does not wait for either phase to finish.
+`catalog status` reports authoritative assessment completion and progress counts. It does not infer
+completion from catalog rows or recommendation availability and does not wait for assessment to
+finish. Arbitrary-model discovery is outside the catalog-only product and is not presented.
 
 `catalog list` displays only assessed catalog configurations that fit the current machine. It shows
 friendly identity, predicted memory, baseline speed, configured context, speculative acceleration,
@@ -92,7 +92,7 @@ and canonical ID. Outstanding or failed assessments are summarized after the use
 
 `catalog recommendations` reuses the shared onboarding eligibility and ranking policy. Preference
 is one of Fastest, Faster, Balanced, Smarter, or Smartest and defaults to Balanced; limit defaults
-to ten. Recommendation evidence includes speed, memory, context, intelligence, artifact accuracy,
+to ten. Recommendation evidence includes speed, memory, context, intelligence, artifact fidelity,
 acceleration, capabilities, and canonical ID. Raw ranking scores and aggregate utility remain
 private. The command is a client projection over existing catalog and hardware authorities, not a
 second server recommendation authority. Successful nonempty output ends with the exact local
@@ -109,34 +109,35 @@ and `service start` completion are likewise independent of background assessment
 download or update work and directs the caller to focused model status. Pull, cancel, and removal
 validate only model-ID syntax before delegating directly to their authoritative mutations.
 
-`models status` lists catalog-attributed and externally discovered models together when they are on
-the computer or have relevant acquisition/removal work. One status field applies product priority:
+`models status` lists curated catalog models when they are on the computer or have relevant
+acquisition/removal work. Addressed model commands accept catalog IDs only. One status field applies product priority:
 removal, transfer, failures, load/stop, ready, update availability, then unloaded. The addressed
 form reports installation, transfer progress, runtime, memory, context, and actionable failure
 details without historical or internal operation state.
 
-Load and stop delegate directly to their authoritative mutations. Magnitude has one active local
+Load acknowledges admission and prints the focused status command; it never claims readiness from
+the load acknowledgement. Load and stop delegate directly to their authoritative mutations. Magnitude has one active local
 residency slot, so stop remains unaddressed.
 
 ## Connections
 
-Connection observation distinguishes `Built in`, `Connected`, `Available`, and `Not installed`.
-`Connected` comes from the durable connection manifest, not from executable detection. Connection
-mutations delegate directly to the existing service operations. Handoff output is copyable shell
-text rather than raw argv or environment structures. It uses the harness's ordinary ambient command
-name rather than the exact detected executable path, and Magnitude does not launch it from a
-non-interactive command.
+Connection observation reports executable installation and configuration integrity separately;
+a missing executable cannot hide intact or unreadable configuration.
+`Connected` comes from actual configuration and required artifacts, not the durable receipt or executable detection. Connection
+mutations delegate directly to the shared connector service. Success reports configuration and
+artifact installation. There is no launch-plan or handoff output and no Magnitude harness destination.
+Users launch their external harness themselves.
 
 ## Conformance
 
 - Every public command and option has useful help.
 - Collection ordering is deterministic and every collection has an explicit empty state.
 - Addressable rows preserve exact canonical IDs at every terminal width.
-- Catalog status preserves the authoritative discovery and assessment completion states.
+- Catalog status preserves the authoritative assessment completion state.
 - Recommendations match shared onboarding ranking and memory eligibility.
 - No observation command waits for assessment or residency completion.
 - Mutation commands acknowledge authoritative completion without adding preflight state
   interpretations.
-- Agent documentation completes onboarding using only the human command surface.
+- Agent documentation directs onboarding to the desktop and documents headless model/configuration commands.
 - Tests cover collection, detail, narrow-width, empty, partial, failure, and redirected forms.
 - Model commands reject the removed `--json` option before performing any operation.

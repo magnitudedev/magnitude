@@ -5,7 +5,7 @@ import { Effect, Exit, Scope } from "effect"
 import { fileURLToPath } from "node:url"
 import { registerMagnitudeSetup } from "./setup"
 
-export const SETUP_QUESTION = "Set up local models with Magnitude now?"
+export const SETUP_QUESTION = "Open Magnitude desktop to set up local models?"
 export const SETUP_REMINDER = "You can set up local models anytime with `/magnitude-setup`."
 
 /** An exclusive, profile-owned receipt: concurrent Pi launches can offer setup only once. */
@@ -32,8 +32,7 @@ export const offerSetup = (pi: ExtensionAPI, ctx: ExtensionContext, agentDir: st
   const accepted = yield* Effect.tryPromise(() => ctx.ui.confirm(SETUP_QUESTION, "", { signal }))
   if (signal.aborted) return
   if (accepted && ctx.isIdle() && !ctx.hasPendingMessages()) {
-    // Startup has an event context, not a command context. The loaded extension
-    // and bundled skill are already active; only model activation is needed.
+    // This opens the desktop only; connection and model choice happen there.
     yield* Effect.tryPromise(() => runSetup(ctx))
   }
   else pi.sendMessage({ customType: "magnitude-setup", content: SETUP_REMINDER, display: true })

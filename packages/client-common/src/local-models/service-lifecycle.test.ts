@@ -2,16 +2,18 @@ import { createElement } from "react"
 import { act, create, type ReactTestRenderer } from "react-test-renderer"
 import { RegistryContext } from "@effect-atom/atom-react"
 import * as Registry from "@effect-atom/atom/Registry"
-import { Effect, Layer } from "effect"
+import { Deferred, Effect, Layer, Option } from "effect"
 import { Client as EffectQueryClient } from "@magnitudedev/effect-query"
 import { describe, expect, it } from "vitest"
 import {
   AgentClientProvider,
   useLocalModelActions,
+  useLocalModelMutations,
+  useLocalModelStopStatus,
   useLocalModelsSelector,
   type AgentClient,
 } from "../index"
-import { type Change, type LocalModelsState } from "@magnitudedev/sdk"
+import { CatalogFormModelIdSchema, type Change, type LocalModelsState } from "@magnitudedev/sdk"
 import { Queue, Stream } from "effect"
 import { clientServicesLayer, type ClientServices } from "../state/client-services"
 import type { AcnClientRequirements } from "../state/agent-client"
@@ -33,9 +35,10 @@ const makeFakeAgentClient = (
   onGetModelCatalog: () => void,
   options?: {
     readonly getLocalModels?: () => Effect.Effect<unknown, unknown>
+    readonly command?: (tag: string, payload: unknown) => Effect.Effect<unknown, unknown>
   },
 ) => {
-  const request = (tag: string): Effect.Effect<unknown, unknown> => {
+  const request = (tag: string, payload: unknown): Effect.Effect<unknown, unknown> => {
     if (tag === "GetModelCatalog") {
       onGetModelCatalog()
       return options?.getLocalModels?.() ?? Effect.succeed({
@@ -50,6 +53,7 @@ const makeFakeAgentClient = (
         localModelPreparation: localModelsState.preparation,
       })
     }
+    if (options?.command) return options.command(tag, payload)
     return Effect.dieMessage(`Unexpected RPC in local-model lifecycle test: ${tag}`)
   }
   const changes = Effect.runSync(Queue.unbounded<Change>())
@@ -161,5 +165,61 @@ describe("local model query lifecycle", () => {
 
     await act(async () => renderer.unmount())
     registry.dispose()
+  })
+})
+
+
+describe("shared local-model command hooks", () => {
+  it("keeps different model commands concurrent and shares Stop failure across consumers", async () => {
+    const release = Effect.runSync(Deferred.make<void>())
+    const started: unknown[] = []
+    let completed = 0
+    const { client } = makeFakeAgentClient(() => {}, { command: (tag, payload) => {
+      if (tag === "SyncLocalModel") return Effect.sync(() => started.push(payload)).pipe(
+        Effect.zipRight(Deferred.await(release)), Effect.tap(() => Effect.sync(() => completed++)),
+      )
+      if (tag === "StopActiveLocalModel") return Effect.fail({ message: "Cleanup is incomplete. Try Stop again." })
+      return Effect.dieMessage(`Unexpected command: ${tag}`)
+    } })
+    const registry = Registry.make({ defaultIdleTTL: 5_000 })
+    let actions!: ReturnType<typeof useLocalModelMutations>
+    const statuses = new Map<number, ReturnType<typeof useLocalModelStopStatus>>()
+    const Probe = ({ id }: { id: number }) => {
+      const currentActions = useLocalModelMutations()
+      const status = useLocalModelStopStatus()
+      if (id === 0) actions = currentActions
+      statuses.set(id, status)
+      return null
+    }
+    let renderer!: ReactTestRenderer
+    try {
+      await act(async () => {
+        renderer = create(createElement(RegistryContext.Provider, { value: registry },
+          createElement(AgentClientProvider, { tag: client, children: [0, 1].map(id => createElement(Probe, { key: id, id })) })))
+        await Effect.runPromise(Effect.sleep("20 millis"))
+      })
+      const first = CatalogFormModelIdSchema.make("first:gguf:q4")
+      const second = CatalogFormModelIdSchema.make("second:gguf:q4")
+      await act(async () => {
+        actions.install(first)
+        actions.install(second)
+        await Effect.runPromise(Effect.sleep("20 millis"))
+      })
+      expect(started).toEqual([{ modelId: first }, { modelId: second }])
+      expect(completed).toBe(0)
+      await act(async () => {
+        await Effect.runPromise(Deferred.succeed(release, undefined))
+        await Effect.runPromise(Effect.sleep("20 millis"))
+      })
+      expect(completed).toBe(2)
+      await act(async () => {
+        actions.stop()
+        await Effect.runPromise(Effect.sleep("20 millis"))
+      })
+      for (const id of [0, 1]) expect(statuses.get(id)).toEqual({ pending: false, failure: Option.some("Cleanup is incomplete. Try Stop again.") })
+    } finally {
+      if (renderer) await act(async () => renderer.unmount())
+      registry.dispose()
+    }
   })
 })

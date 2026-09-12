@@ -1,4 +1,4 @@
-import { isDevelopmentVersion } from "../features/update/updater"
+import { isDevelopmentVersion } from "../update/updater"
 import { CLI_VERSION } from "../version"
 
 export const isDevelopmentBuild = (): boolean =>

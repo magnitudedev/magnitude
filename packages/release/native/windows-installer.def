@@ -1,0 +1,12 @@
+EXPORTS
+  HoldOwnership=_HoldOwnership@0
+  CreateStage=_CreateStage@8
+  CleanupStage=_CleanupStage@0
+  RequireAbsentPath=_RequireAbsentPath@4
+  RequireUnusedRegistration=_RequireUnusedRegistration@8
+  PrepareInstallationDirectory=_PrepareInstallationDirectory@4
+  AcquireRemovalExecutable=_AcquireRemovalExecutable@4
+  RemovePayload=_RemovePayload@8
+  RemoveOwnedStartup=_RemoveOwnedStartup@4
+  RemoveRegistration=_RemoveRegistration@4
+  RemoveRemovalExecutable=_RemoveRemovalExecutable@0

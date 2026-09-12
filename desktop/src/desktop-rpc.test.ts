@@ -1,38 +1,15 @@
-import { describe, expect, test } from "vitest"
-import { Option } from "effect"
-import {
-  decodeDesktopServiceStartProgress,
-  encodeDesktopServiceStartProgress,
-} from "./desktop-rpc"
+import { describe, expect, it } from "vitest"
+import { RpcSchema } from "@effect/rpc"
+import { Context, Option } from "effect"
+import { AcnRpcRecoveryPolicyTag } from "@magnitudedev/sdk"
+import { InferenceHostRpcs } from "./desktop-rpc"
 
-describe("desktop ACN ensure bridge", () => {
-  test("restores Effect options after Electron structured cloning", () => {
-    const encoded = encodeDesktopServiceStartProgress({
-        _tag: "Installing",
-        phase: "DownloadingInferenceEngine",
-        plan: {
-          daemonBytes: 1,
-          inferenceEngineBytes: 100,
-          inferenceEngineBytesExact: true,
-        },
-        progress: Option.some({
-          completed: 50,
-          totalBytes: 100,
-          unit: "Bytes",
-          attempt: Option.some(1),
-        }),
-    })
-
-    const decoded = decodeDesktopServiceStartProgress(structuredClone(encoded))
-    expect(decoded._tag).toBe("Installing")
-    if (decoded._tag !== "Installing") {
-      throw new Error("expected an installing observation")
+describe("desktop host recovery contract", () => {
+  it("declares every finite call and never allows host actions to be replayed", () => {
+    for (const rpc of InferenceHostRpcs.requests.values()) {
+      if (RpcSchema.isStreamSchema(rpc.successSchema)) continue
+      expect(Context.getOption(rpc.annotations, AcnRpcRecoveryPolicyTag), rpc._tag)
+        .toEqual(Option.some(rpc._tag === "ApplicationInfo" ? "ReplaySafe" : "AtMostOnce"))
     }
-    expect(Option.getOrThrow(decoded.progress)).toEqual({
-      completed: 50,
-      totalBytes: 100,
-      unit: "Bytes",
-      attempt: Option.some(1),
-    })
   })
 })

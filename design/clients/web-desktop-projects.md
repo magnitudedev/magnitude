@@ -6,12 +6,10 @@ applies_to:
   - packages/acn/src/session-*.ts
   - packages/acn/src/agent-*.ts
   - packages/client-common/src/**
-  - cli/src/**
   - web/src/**
-  - desktop/src/**
 ---
 
-# Web and desktop Projects
+# Web Projects
 
 ## Product model
 
@@ -24,7 +22,7 @@ Sessions do not carry a Project ID at any boundary. A session is associated with
 when `session.cwd === project.cwd`; both sides are the shared branded `DirectoryPath`, the
 relationship is derived on demand, and it has no lifecycle of its own. Consequences:
 
-- CLI and TUI sessions appear under an existing Project registered for the same cwd with zero
+- Agent sessions appear under an existing Project registered for the same cwd with zero
   write-path work.
 - Changing a Project's cwd changes which sessions associate with it without rewriting sessions.
 - Removing a Project never mutates sessions; sessions whose cwd has no active Project remain valid,
@@ -34,7 +32,7 @@ relationship is derived on demand, and it has no lifecycle of its own. Consequen
 
 No service creates or mutates a Project because a session was created or read. Project
 registration is always an explicit Project command. The CLI has no Project navigation or commands
-and continues to create sessions from cwd.
+and does not create agent sessions.
 
 ## Lifecycle and presentation
 
@@ -109,6 +107,5 @@ continuations are all reactive query atoms keyed by the complete request identit
 stable ID, and reset by identity change; loading later pages never uses a mutation path. Server
 truth never lands in component `useState` and is never synchronized with `useEffect`.
 
-Electron and browser render the same React components. Electron supplies a native directory picker;
-a browser file-system handle name is never submitted as cwd. Revealing a Project folder is an
-agent-host operation through ACN; Electron never passes a Project path to a client-host shell API.
+A browser file-system handle name is never submitted as cwd. Revealing a Project folder is an
+agent-host operation through ACN. The inference desktop has no Projects or agent-session interface.

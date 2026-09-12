@@ -422,6 +422,7 @@ export const ModelReleaseReasonSchema = Schema.Literal(
   "idle_timeout",
   "replacement",
   "memory_pressure",
+  "failure",
 )
 export type ModelReleaseReason = typeof ModelReleaseReasonSchema.Type
 

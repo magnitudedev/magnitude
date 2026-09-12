@@ -17,19 +17,17 @@ import {
 import {
   CatalogFormModelIdSchema,
   type MagnitudeClient,
-  ModelIdSchema,
   type CatalogLocalModel,
   type LocalInferenceHardware,
-  type LocalModel,
   type ModelCatalogState,
   type ModelId,
 } from "@magnitudedev/sdk"
 import { Data, Effect, Option, Schema } from "effect"
-import { existingAcnConnection } from "../server/acn-connection"
+import { headlessAcnConnection } from "../server/acn-connection"
 import {
   describeLocalHardware,
   formatContext,
-} from "../features/local-inference/view-model"
+} from "./inference-format"
 import {
   ensureTrailingNewline,
   renderFields,
@@ -45,32 +43,30 @@ class ModelCommandError extends Data.TaggedError("ModelCommandError")<{
 
 const withClient = <A>(use: (client: CliModelsClient) => Effect.Effect<A, unknown>) =>
   Effect.scoped(Effect.gen(function* () {
-    const connection = yield* existingAcnConnection
+    const connection = yield* headlessAcnConnection
     return yield* use(connection.client)
   }))
 
 const readCatalog = (client: CliModelsClient) => client.models.getCatalog({})
 const readHardware = (client: CliModelsClient) => client.models.getLocalEnvironment({})
 
-const modelsForStatus = (models: readonly LocalModel[]): LocalModel[] => models
-  .filter(model => model._tag === "Discovered" || model.acquisitionState._tag !== "NotInstalled")
+const modelsForStatus = (models: readonly CatalogLocalModel[]): CatalogLocalModel[] => models
+  .filter(model => model.acquisitionState._tag !== "NotInstalled")
   .sort((a,b) => formatLocalModelDisplayName(a).localeCompare(formatLocalModelDisplayName(b)) || a.modelId.localeCompare(b.modelId))
 
-const localModels = (catalog: ModelCatalogState): readonly LocalModel[] =>
+const localModels = (catalog: ModelCatalogState): readonly CatalogLocalModel[] =>
   catalog._tag === "Initializing" ? [] : catalog.models.flatMap((entry) =>
-    entry._tag === "Local" ? [entry.product] : [])
+    entry._tag === "Local" && entry.product._tag === "Catalog" ? [entry.product] : [])
 
 export const renderCatalogStatus = (catalog: ModelCatalogState): string => {
   if (catalog._tag === "Initializing") return ensureTrailingNewline([
     "Model catalog preparation",
-    "Discovery: In progress",
     "Assessment: In progress",
   ].join("\n"))
 
-  const { discovery, assessment } = catalog.localModelPreparation
+  const { assessment } = catalog.localModelPreparation
   return ensureTrailingNewline([
     "Model catalog preparation",
-    `Discovery: ${discovery.complete ? "Complete" : "In progress"} - ${discovery.modelsFound} model${discovery.modelsFound === 1 ? "" : "s"} found`,
     `Assessment: ${assessment.complete ? "Complete" : "In progress"} - ${assessment.settledModels} of ${assessment.totalModels} model${assessment.totalModels === 1 ? "" : "s"} assessed`,
   ].join("\n"))
 }
@@ -80,7 +76,7 @@ export const showCatalogStatus = () => runCommand({
   render: renderCatalogStatus,
 })
 
-const requireLocalModels = (catalog: ModelCatalogState): Effect.Effect<readonly LocalModel[], ModelCommandError> =>
+const requireLocalModels = (catalog: ModelCatalogState): Effect.Effect<readonly CatalogLocalModel[], ModelCommandError> =>
   catalog._tag === "Initializing"
     ? Effect.fail(new ModelCommandError({ message: "Local models are initializing. Try again shortly." }))
     : Effect.succeed(localModels(catalog))
@@ -89,11 +85,7 @@ const decodeCatalogId = (input: string) => Schema.decodeUnknown(CatalogFormModel
   Effect.mapError(() => new ModelCommandError({ message: `Invalid catalog model ID: ${input}` })),
 )
 
-const decodeModelId = (input: string) => Schema.decodeUnknown(ModelIdSchema)(input).pipe(
-  Effect.mapError(() => new ModelCommandError({ message: `Invalid model ID: ${input}` })),
-)
-
-const findModel = <M extends LocalModel>(
+const findModel = <M extends CatalogLocalModel>(
   models: readonly M[],
   modelId: string,
   kind = "model",
@@ -104,18 +96,16 @@ const findModel = <M extends LocalModel>(
     : Effect.succeed(model)
 }
 
-const servingState = (model: LocalModel) => Option.getOrUndefined(localModelServingState(model))
+const servingState = (model: CatalogLocalModel) => Option.getOrUndefined(localModelServingState(model))
 
-const residencyState = (model: LocalModel) => model._tag === "Discovered"
-  ? model.state._tag === "Ready" ? model.state.residencyState : undefined
-  : "residencyState" in model.acquisitionState ? model.acquisitionState.residencyState : undefined
+const residencyState = (model: CatalogLocalModel) => "residencyState" in model.acquisitionState ? model.acquisitionState.residencyState : undefined
 
-const modelContext = (model: LocalModel): string => Option.match(localModelServingProfile(model), {
+const modelContext = (model: CatalogLocalModel): string => Option.match(localModelServingProfile(model), {
   onNone: () => "—",
   onSome: ({ contextLength }) => formatContext(contextLength),
 })
 
-const modelMemoryBytes = (model: LocalModel): number | undefined => {
+const modelMemoryBytes = (model: CatalogLocalModel): number | undefined => {
   const serving = servingState(model)
   if (serving?._tag !== "Assessed") return undefined
   return serving.assessment._tag === "Fits"
@@ -123,18 +113,18 @@ const modelMemoryBytes = (model: LocalModel): number | undefined => {
     : serving.assessment._tag === "DoesNotFit" ? serving.assessment.totalRequiredBytes : undefined
 }
 
-const modelMemory = (model: LocalModel): string => {
+const modelMemory = (model: CatalogLocalModel): string => {
   const bytes = modelMemoryBytes(model)
   return bytes === undefined ? "—" : formatMemorySize(bytes)
 }
 
-const assessmentSummary = (models: readonly LocalModel[]): { assessing: number; failed: number } => ({
+const assessmentSummary = (models: readonly CatalogLocalModel[]): { assessing: number; failed: number } => ({
   assessing: models.filter((model) => model._tag === "Catalog" && model.servingState._tag === "Assessing").length,
   failed: models.filter((model) => model._tag === "Catalog" && model.servingState._tag === "Failed").length,
 })
 
 const assessmentNotice = (
-  models: readonly LocalModel[],
+  models: readonly CatalogLocalModel[],
   subject: "list" | "recommendations",
 ): string[] => {
   const { assessing, failed } = assessmentSummary(models)
@@ -151,15 +141,14 @@ const catalogWarnings = (catalog: ModelCatalogState): string[] => catalog._tag =
   : [...new Set(catalog.failures.map(({ message }) => message.trim()).filter(Boolean))]
     .map((message) => `Catalog warning: ${message}`)
 
-const fittingCatalogModels = (models: readonly LocalModel[]): CatalogLocalModel[] => models
-  .filter((model): model is CatalogLocalModel => model._tag === "Catalog"
-    && model.servingState._tag === "Assessed"
+const fittingCatalogModels = (models: readonly CatalogLocalModel[]): CatalogLocalModel[] => models
+  .filter(model => model.servingState._tag === "Assessed"
     && model.servingState.assessment._tag === "Fits")
   .sort((left, right) => left.presentation.displayName.localeCompare(right.presentation.displayName)
     || String(left.presentation.variantLabel).localeCompare(String(right.presentation.variantLabel))
     || left.modelId.localeCompare(right.modelId))
 
-const radarDetail = (model: LocalModel, label: string): string =>
+const radarDetail = (model: CatalogLocalModel, label: string): string =>
   Option.getOrUndefined(localModelRadarAxes(model))?.find((axis) => axis.label === label)?.detail ?? "—"
 
 const speedLabel = (model: CatalogLocalModel): string => radarDetail(model, "SPEED")
@@ -242,30 +231,27 @@ const renderRecommendation = (model: CatalogLocalModel, index: number): string =
     `${index + 1}. ${formatLocalModelDisplayName(model)}`,
     `   ID: ${model.modelId}`,
     `   ${speedLabel(model)} - ${modelMemory(model)} memory - ${modelContext(model)} context`,
-    `   Intelligence ${Math.round(model.catalogData.intelligence.score)}% - Accuracy ${radarDetail(model, "ACCURACY")} - Acceleration ${accelerationLabel(model)}`,
+    `   Intelligence ${Math.round(model.catalogData.intelligence.score)}% - Fidelity ${radarDetail(model, "FIDELITY")} - Acceleration ${accelerationLabel(model)}`,
     ...(capabilities.length > 0 ? [`   ${capabilities.join(", ")}`] : []),
   ].join("\n")
 }
 
 export const showRecommendations = (preferenceInput: string, limitInput: string) => runCommand({
-  effect: withClient((client) => Effect.gen(function* () {
-    const [catalog, hardware, preference, limit] = yield* Effect.all([
-      readCatalog(client),
-      readHardware(client),
-      parsePreference(preferenceInput),
-      parseLimit(limitInput),
-    ])
-    const models = localModels(catalog)
-    const ranked = rankedLocalModelOptions(models.map((model) => ({
-      id: String(model.modelId),
-      kind: localModelIsInstalled(model) ? "stored" as const : "downloadable" as const,
-      model,
-    })), {
-      fastToSmart: preference.value,
-      memoryBudgetBytes: targetPhysicalMemoryBytes(hardware),
-    }, limit).flatMap(({ model }) => model._tag === "Catalog" ? [model] : [])
-    return { catalog, models, hardware, preference, ranked }
-  })),
+  effect: Effect.all([parsePreference(preferenceInput), parseLimit(limitInput)]).pipe(
+    Effect.flatMap(([preference, limit]) => withClient((client) => Effect.gen(function* () {
+      const [catalog, hardware] = yield* Effect.all([readCatalog(client), readHardware(client)])
+      const models = localModels(catalog)
+      const ranked = rankedLocalModelOptions(models.map((model) => ({
+        id: String(model.modelId),
+        kind: localModelIsInstalled(model) ? "stored" as const : "downloadable" as const,
+        model,
+      })), {
+        fastToSmart: preference.value,
+        memoryBudgetBytes: targetPhysicalMemoryBytes(hardware),
+      }, limit).flatMap(({ model }) => model._tag === "Catalog" ? [model] : [])
+      return { catalog, models, hardware, preference, ranked }
+    }))),
+  ),
   render: renderRecommendations,
 })
 
@@ -277,7 +263,7 @@ export function renderRecommendations({
   ranked,
 }: {
   readonly catalog: ModelCatalogState
-  readonly models: readonly LocalModel[]
+  readonly models: readonly CatalogLocalModel[]
   readonly hardware: LocalInferenceHardware
   readonly preference: { readonly label: string }
   readonly ranked: readonly CatalogLocalModel[]
@@ -346,7 +332,7 @@ const renderCatalogDetail = (model: CatalogLocalModel): string => {
       ["Speed", speedLabel(model)],
       ["Memory", radarDetail(model, "MEMORY")],
       ["Intelligence", `${Math.round(model.catalogData.intelligence.score)}%`],
-      ["Accuracy", radarDetail(model, "ACCURACY")],
+      ["Fidelity", radarDetail(model, "FIDELITY")],
       ["Acceleration", accelerationLabel(model)],
     ])]
   })()
@@ -365,21 +351,19 @@ const renderCatalogDetail = (model: CatalogLocalModel): string => {
 }
 
 export const showCatalogModel = (modelInput: string) => runCommand({
-  effect: withClient((client) => Effect.gen(function* () {
-    const modelId = yield* decodeCatalogId(modelInput)
-    const models = (yield* requireLocalModels(yield* readCatalog(client)))
-      .filter((model): model is CatalogLocalModel => model._tag === "Catalog")
+  effect: decodeCatalogId(modelInput).pipe(Effect.flatMap(modelId => withClient((client) => Effect.gen(function* () {
+    const models = yield* requireLocalModels(yield* readCatalog(client))
     return yield* findModel(models, modelId, "catalog model")
-  })),
+  })))),
   render: renderCatalogDetail,
 })
 
 export const pullModel = (modelInput: string) => runCommand({
-  effect: withClient((client) => decodeCatalogId(modelInput).pipe(
-    Effect.flatMap((modelId) => client.models.syncLocalModel({ modelId }).pipe(
+  effect: decodeCatalogId(modelInput).pipe(
+    Effect.flatMap((modelId) => withClient(client => client.models.syncLocalModel({ modelId }).pipe(
       Effect.map(({ outcome }) => ({ modelId, outcome })),
-    )),
-  )),
+    ))),
+  ),
   render: ({ modelId, outcome }) => outcome === "AlreadyCurrent"
     ? `${modelId} is already installed and up to date.\n`
     : `Downloading or updating ${modelId}.\nCheck progress: magnitude models status ${modelId}\n`,
@@ -391,11 +375,9 @@ const modelMutation = <Id extends ModelId>(
   execute: (client: CliModelsClient, modelId: Id) => Effect.Effect<unknown, unknown>,
   render: (modelId: Id) => string,
 ) => runCommand({
-  effect: withClient((client) => decode(modelInput).pipe(
-    Effect.flatMap((modelId) => execute(client, modelId).pipe(
-      Effect.as(modelId),
-    )),
-  )),
+  effect: decode(modelInput).pipe(
+    Effect.flatMap((modelId) => withClient(client => execute(client, modelId).pipe(Effect.as(modelId)))),
+  ),
   render,
 })
 
@@ -413,7 +395,7 @@ export const removeModel = (modelInput: string) => modelMutation(
   (modelId) => `Removed ${modelId} from this computer.\nThe model remains available in the catalog.\n`,
 )
 
-const residencyLabel = (model: LocalModel): string => {
+const residencyLabel = (model: CatalogLocalModel): string => {
   const residency = residencyState(model)
   if (residency === undefined) return "Unloaded"
   switch (residency._tag) {
@@ -430,10 +412,7 @@ const residencyLabel = (model: LocalModel): string => {
 const percent = (completed: number, total: number): string =>
   `${total === 0 ? 0 : Math.round((completed / total) * 100)}%`
 
-const modelStatus = (model: LocalModel): string => {
-  if (model._tag === "Discovered") {
-    return model.state._tag === "Unavailable" ? `Failed - ${model.state.failure.message}` : residencyLabel(model)
-  }
+const modelStatus = (model: CatalogLocalModel): string => {
   const acquisition = model.acquisitionState
   switch (acquisition._tag) {
     case "Removing": return "Removing"
@@ -451,7 +430,7 @@ const modelStatus = (model: LocalModel): string => {
   }
 }
 
-export const renderModelsStatus = (models: readonly LocalModel[]): string => {
+export const renderModelsStatus = (models: readonly CatalogLocalModel[]): string => {
   const visible = modelsForStatus(models)
   if (visible.length === 0) return "No local models are on this computer.\n"
   return ensureTrailingNewline([
@@ -467,8 +446,7 @@ export const renderModelsStatus = (models: readonly LocalModel[]): string => {
   ].join("\n"))
 }
 
-const installationFields = (model: LocalModel): readonly (readonly [string, string])[] => {
-  if (model._tag === "Discovered") return [["Installation", model.state._tag === "Ready" ? "Installed" : "Unavailable"]]
+const installationFields = (model: CatalogLocalModel): readonly (readonly [string, string])[] => {
   const state = model.acquisitionState
   if (state._tag === "Installing" || state._tag === "Updating") return [
     ["Installation", state._tag === "Installing" ? "Downloading" : "Updating"],
@@ -485,7 +463,7 @@ const installationFields = (model: LocalModel): readonly (readonly [string, stri
   ]
 }
 
-const renderModelDetail = (model: LocalModel): string => ensureTrailingNewline([
+const renderModelDetail = (model: CatalogLocalModel): string => ensureTrailingNewline([
   formatLocalModelDisplayName(model),
   renderFields([
     ["Model ID", model.modelId],
@@ -497,14 +475,15 @@ const renderModelDetail = (model: LocalModel): string => ensureTrailingNewline([
 ].join("\n"))
 
 export const showModelsStatus = (modelInput?: string) => runCommand({
-  effect: withClient((client) => Effect.gen(function* () {
-    const catalog = yield* readCatalog(client)
-    if (catalog._tag === "Initializing") return { _tag: "Initializing" as const }
-    const models = localModels(catalog)
-    if (modelInput === undefined) return { _tag: "List" as const, models }
-    const modelId = yield* decodeModelId(modelInput)
-    return { _tag: "Detail" as const, model: yield* findModel(models, modelId) }
-  })),
+  effect: (modelInput === undefined ? Effect.succeed(Option.none<typeof CatalogFormModelIdSchema.Type>()) : decodeCatalogId(modelInput).pipe(Effect.map(Option.some))).pipe(
+    Effect.flatMap(modelId => withClient((client) => Effect.gen(function* () {
+      const catalog = yield* readCatalog(client)
+      if (catalog._tag === "Initializing") return { _tag: "Initializing" as const }
+      const models = localModels(catalog)
+      if (Option.isNone(modelId)) return { _tag: "List" as const, models }
+      return { _tag: "Detail" as const, model: yield* findModel(models, modelId.value) }
+    }))),
+  ),
   render: (result) => result._tag === "Initializing"
     ? "Local models are initializing.\n"
     : result._tag === "List" ? renderModelsStatus(result.models) : renderModelDetail(result.model),
@@ -512,9 +491,9 @@ export const showModelsStatus = (modelInput?: string) => runCommand({
 
 export const loadInstance = (modelInput: string) => modelMutation(
   modelInput,
-  decodeModelId,
+  decodeCatalogId,
   (client, modelId) => client.models.load({ modelId }),
-  (modelId) => `Loaded ${modelId}.\n`,
+  (modelId) => `Load requested for ${modelId}.\nCheck progress: magnitude models status ${modelId}\n`,
 )
 
 export const stopInstance = () => runCommand({
@@ -522,7 +501,7 @@ export const stopInstance = () => runCommand({
   render: () => "Stopped the active local model.\n",
 })
 
-const residentAllocation = (model: LocalModel) => {
+const residentAllocation = (model: CatalogLocalModel) => {
   const residency = residencyState(model)
   if (residency?._tag === "Ready") return Option.some(residency.allocation)
   if (residency?._tag === "Stopping" && residency.allocation._tag === "Resident") {
@@ -531,7 +510,7 @@ const residentAllocation = (model: LocalModel) => {
   return Option.none()
 }
 
-const activePlan = (model: LocalModel) => {
+const activePlan = (model: CatalogLocalModel) => {
   const residency = residencyState(model)
   if (residency?._tag === "Loading") return residency.plannedAllocation
   if (residency?._tag === "Stopping" && residency.allocation._tag === "Planned") {
@@ -540,7 +519,7 @@ const activePlan = (model: LocalModel) => {
   return Option.none()
 }
 
-const renderHardware = (hardware: LocalInferenceHardware, models: readonly LocalModel[]): string => {
+const renderHardware = (hardware: LocalInferenceHardware, models: readonly CatalogLocalModel[]): string => {
   const presentation = describeLocalHardware(hardware)
   const current = models.find((model) => {
     const state = residencyState(model)?._tag

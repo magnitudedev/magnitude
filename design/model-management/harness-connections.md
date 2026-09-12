@@ -1,12 +1,10 @@
 ---
 applies_to:
   - packages/client-common/src/harness-connections/**
-  - cli/src/harness-connections/**
+  - packages/harness-connections/**
   - cli/src/commands/connections.ts
   - cli/src/commands/connections-runtime.ts
-  - cli/src/server/service.ts
-  - cli/src/runtime/interactive.tsx
-  - cli/src/features/model-setup/harness.tsx
+  - cli/src/server/harness-connections.ts
   - integrations/pi/**
   - scripts/dev-pi.ts
   - package.json
@@ -19,16 +17,20 @@ public CLI noun; there is no separate connection-manager domain.
 
 ## Observation
 
-Harnesses have one canonical order:
+The shared identifier schema, registry and unavailable-host fallback expose only external harnesses.
+An unavailable host supplies no destinations and rejects configuration mutations. Harnesses have one canonical order:
 
 ```text
-Magnitude, Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, Cline
+Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, Cline
 ```
 
-Detection proves that an external executable is launchable from the user's ambient `PATH`, excluding
-dependency-local binaries. Magnitude is always `Built in`. A manifest-owned external connection is
-`Connected`, an installed unconnected harness is `Available`, and an absent harness is `Not
-installed`. Installation alone does not imply connection.
+Detection proves that an external executable is launchable from the host-supplied user `PATH`, excluding
+dependency-local binaries. Desktop hosts may resolve a login environment asynchronously; its configuration
+roots and command environment are scoped to the connection service, never global process mutations. Installation and connection are independent observations. Connected means
+that required Magnitude provider fields, skill contents, and plugin files/activation still exist and
+match the connector contract. Receipts alone never imply Connected. Missing or overwritten fields
+are Disconnected; filesystem access failures are Unavailable. Unrelated user fields do not invalidate
+a connection. The desktop refreshes this observation after mutations and while the page is observed.
 
 ## Ownership
 
@@ -49,7 +51,7 @@ Each harness has one connector. A connector owns that harness's:
 - reasoning-control projection;
 - inference protocol and endpoint;
 - skill installation target; and
-- launch plan.
+- read-only configuration inspection.
 
 The shared service owns manifest persistence, installation observation, transactional compensation,
 connector dispatch, skill installation, and startup orchestration. It contains no
@@ -103,17 +105,12 @@ Manifest recovery preserves the nearest valid boundary: invalid properties are r
 defaulted, an invalid connection removes only that connection, and an invalid root is preserved for
 diagnosis before resetting to no connections. Valid siblings survive.
 
-## Configuration and launch
+## Configuration without launch
 
-Configuration and launch are independent. Configuration publishes the complete model projection
-and optional persisted selection. Launch receives an exact model ID directly and must not depend on
-manifest selection state. A launch plan contains the exact detected executable for programmatic
-launch, the stable ambient command name for user-facing handoff, arguments, environment additions,
-and model identity; it never invokes a shell.
-
-The interactive runtime releases its inference client and terminal renderer before running the
-child with inherited standard I/O and working directory. Magnitude and the child TUI never own the
-terminal concurrently.
+Connecting publishes the complete installed-model projection and optional persisted selection.
+Desktop onboarding and headless connection commands share this implementation. Neither starts an
+external harness, produces a launch plan, or takes ownership of an external terminal. A completed
+connection reports any reload or restart the user must perform in an already-running harness.
 
 Connectors preserve canonical model IDs as opaque keys. Claude-facing identities add only the
 reserved `anthropic-local/` routing prefix. Provider-local registrations expose every installed
@@ -146,7 +143,6 @@ Projection completeness is normative:
 
 | Harness | Projection | Reason |
 | --- | --- | --- |
-| Magnitude | Complete | A slot persists model and effort together and normalizes them against the catalog. |
 | Pi | Complete | Per-model thinking maps govern initial selection, session restoration, and model changes. |
 | Oh My Pi | Complete | Native per-model thinking profiles govern selection and model changes. |
 | OpenCode | Complete | Reasoning variants are model-relative; an unavailable variant is not serialized. |
@@ -184,30 +180,30 @@ not own this wire-compatibility behavior.
   boundary.
 - **Claude Code:** persist the Magnitude gateway settings and selected `anthropic-local/` model, but
   no effort default. Its discovery schema limitation requires the Anthropic boundary.
-- **OpenClaw:** use a dedicated Magnitude agent and a fresh agent-scoped session for handoff so stale
-  session model overrides cannot replace the selected model. Explicit connection selection also
-  updates the ordinary global primary with conditional restoration.
+- **OpenClaw:** publish a dedicated Magnitude agent. Explicit connection selection also updates
+  the ordinary global primary with conditional restoration; the user owns session creation.
 
 ## Skills and startup
 
-Magnitude, Pi, OpenCode, OpenClaw, Codex, and Oh My Pi share the `~/.agents/skills` target. Hermes,
+Pi, OpenCode, OpenClaw, Codex, and Oh My Pi share the `~/.agents/skills` target. Hermes,
 Claude Code, and Cline use harness-specific user targets. Installation atomically replaces the
 selected target's Magnitude skill with the bundled version; shared targets receive one physical
 copy.
 
-Startup means idempotently registering Magnitude's per-user operating-system service. Startup and
-skill installation finish before connector configuration and handoff. Codex and Claude Code's
-persistent proxy configuration require this service; disconnect removes those settings only while
-they retain Magnitude's installed values.
+Startup is an explicit preference to register the desktop owner at login. Connecting a harness does
+not implicitly enable login startup or launch the harness. The desktop service supplies the proxy
+endpoints; disconnect removes owned settings only while they retain Magnitude's installed values.
+An injected service origin governs both generated configuration and read-only inspection; development
+profiles use an isolated origin and filesystem root.
 
 The Magnitude skill remains independently installable from a harness companion package. It remains optional for ordinary
 connectors, but is required for Pi because catalog discovery, recommendation, acquisition, and
 removal are agent-guided rather than duplicated as Pi extension commands. Connecting Pi always
 installs or enables the desired Magnitude Pi package through Pi's package command and installs the
 skill into Pi's shared agent-skill target. Both the
-non-interactive `connections add pi` flow and interactive onboarding submit the same connection
+non-interactive `connections add pi` flow and desktop onboarding submit the same connection
 request to the shared service; neither presentation surface owns a second installation path.
-Interactive onboarding discloses the exact package source and that Pi extensions execute with the
+Desktop onboarding discloses the exact package source and that Pi extensions execute with the
 user's authority. A successful connection reports whether an already-running harness must reload
 or restart.
 
@@ -215,25 +211,22 @@ Native Pi package installation also bundles the canonical Magnitude usage skill,
 no skill of that name is already loaded and automatic skills have not been disabled. Loading the
 extension does not require the CLI or contact the service. The first eligible fresh interactive
 startup offers local-model setup with a Yes/No dialog. Acceptance directly invokes the same setup
-action as `/magnitude-setup`, temporarily handing the terminal to the shared graphical CLI setup;
-it never routes command text through the agent. Rejection or cancellation retains a conversation-area reminder for
-`/magnitude-setup`. An exclusive profile-local receipt prevents repeat offers across processes,
-reloads, and package updates. Existing Magnitude configurations, conversations, pending work, editor
-input, and command-line prompts suppress the offer without consuming it; headless modes do likewise.
-Manual setup remains available independently of the receipt. Accepting setup installs an absent
-ambient CLI through Magnitude's public npm distribution before opening graphical setup; no separate
-Magnitude installation is a first-run prerequisite. Installation and executable checks run in the
-background while Pi retains the terminal and shows its native cancellable spinner. Success hides
-installer output; failures show bounded diagnostics and permit an explicit retry. Cancellation or
-disposal terminates scoped subprocess work and closes the spinner. Only the graphical model setup
-releases Pi's terminal ownership.
+action as `/magnitude-setup`: the headless `magnitude app open` command. The desktop owns all
+model discovery, installation, and connection steps. Opening it does not certify setup completion,
+change Pi's selected model, reload Pi, or suspend its terminal. Pi tells the user to connect Pi in
+Magnitude and return to `/reload`. Missing application or CLI installation produces an actionable
+error; no terminal onboarding or automatic package installation is retained here.
+
+An exclusive profile-local receipt prevents repeat offers. Existing Magnitude configurations,
+conversations, pending work, editor input, command-line prompts, and headless modes suppress the
+offer. The explicit command remains available. The development launcher uses the isolated desktop
+endpoint and temporary harness profile; finishing the Pi process does not stop the desktop owner.
+
 Existing incompatible or broken CLIs and explicit executable overrides are reported, never silently
 replaced. Loading the extension, declining setup, and headless operation do not install software.
-The package does not install a private CLI dependency or alter executable lookup. Hosted setup
-uses the same connection transaction as headless and ordinary interactive setup, then selects the
-current local primary model, read once through the SDK after a successful child exit, in the existing
-Pi session before returning terminal ownership and redrawing Pi, so the footer reflects the selection
-without waiting for keyboard input. Failed or cancelled setup does not query or change Pi's model. Manual commands then reload resources. First-run
+The package does not install a private CLI dependency or alter executable lookup. Desktop setup
+does not transfer terminal ownership or select a model in the existing Pi session. The user reloads
+Pi after connection and selects an installed model through Pi's native model selector. First-run
 events retain the already-loaded extension and usage skill; they do not require command-only reload
 authority or newer chat-message dispatch APIs.
 
@@ -302,17 +295,19 @@ including after reload. Changing Pi's agent directory alone does not isolate sha
 It builds the extension and runs the checkout's inference runtime and suppresses successful
 native-build diagnostics while preserving complete failure diagnostics. It inherits the caller's
 environment but does not start a telemetry collector or enable tracing itself.
-It borrows the fixed service endpoint only from a stopped state or the installed service manager:
-after Pi exits, it stops the development daemon and restores whether the installed service was
-running. An already-running unmanaged daemon is rejected because its launch state cannot be safely
-reconstructed.
+The development launcher uses the same background desktop admission as the headless CLI. The
+desktop owns its service and inference tree independently of the Pi session. Exiting Pi closes
+Pi's scoped process and temporary connection resources; it does not stop or replace a separately
+owned installed daemon or reconstruct a previous daemon state.
 
-`dev:pi --setup` instead installs only the local package into a fresh temporary Pi profile and
-exercises first-run onboarding without preconfiguring a model. Hosted CLI commands inherit the
-development connection root, local package source, and isolated configuration/skill paths. This
-source-only override never installs a temporary executable as an OS login service; the launcher
-already owns that service's lifetime. Both modes share the real model store, so acquisition and
-residency have real disk and memory effects.
+`dev:pi --setup` instead installs only the local package into a fresh temporary Pi profile.
+Pi's setup command opens the desktop; it never hosts terminal onboarding. Desktop onboarding
+and Connections remain the canonical model-setup and configuration surfaces. The temporary Pi
+profile is not implicitly selected by an already-running desktop: connecting that profile must
+use its explicit development connection configuration. Source CLI commands inherit the development
+connection root, local package source, and isolated configuration/skill paths. This override
+never installs a temporary executable as an OS login service. Both modes use the development
+app's model store, so acquisition and residency have real disk and memory effects.
 
 ## Conformance
 

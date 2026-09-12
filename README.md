@@ -22,33 +22,32 @@ Magnitude is an open source local inference engine. It runs on the hardware you 
 
 ⭐ Help us reach more developers and grow the Magnitude community. Star this repo!
 
-![Magnitude demo: run local models on your machine](assets/readme/demo9-9.gif)
-
 ## Get started
 
-See what your machine can run:
+Install the Magnitude desktop application from the [release downloads](https://github.com/magnitudedev/magnitude/releases), using an installer available for your platform. Open the app to browse **Discover**, compare curated recommendations for your machine, and download a model.
+
+Use **My Models** to load or stop models, **Connections** to configure an external harness, **Status** to inspect service and model state, and **Settings** for appearance and launch at login. Connect writes the harness configuration and supported integration files; open the harness yourself when it is ready.
+
+Closing the window keeps Magnitude running in the background. **Quit Magnitude** stops the service and its inference processes. On Linux desktops without a supported tray host, reopen the app from your applications menu.
+
+### Headless CLI
+
+Install the CLI for agents, scripts, and terminal use after installing the desktop application:
 
 ```sh
 npm i -g @magnitudedev/cli
-magnitude setup
+magnitude docs cli
+magnitude service status
 ```
 
-Setup profiles your hardware, ranks models by speed, accuracy, intelligence, and memory, and connects your harness to the one you pick.
-
-Or let your agent handle it. Send this to Pi, Claude Code, OpenCode, or whatever you use:
-
-```text
-Set up local models for me with the Magnitude CLI. Install it with `npm i -g @magnitudedev/cli` (or my package manager), then run `magnitude docs onboarding` and follow the instructions.
-```
-
-Your agent will profile your hardware, walk you through the best local models for it, download the ones you pick, and switch itself over to them.
+The CLI controls the same desktop-owned service. Background startup does not open a window. Use `magnitude app open` when you explicitly want to show the app. Onboarding lives in the desktop application.
 
 ## Why Magnitude?
 
 - **Knows your machine:** profiles your hardware to assess fit and estimate tok/s
 - **Recommends the best models:** ranked by speed, accuracy, intelligence, and memory
 - **Tuned end to end:** speculative decoding and more, all set for your hardware
-- **Easy setup:** one command and your agent is running local models
+- **Easy setup:** discover a model and connect your harness in the desktop app
 - **Free to run:** no token costs, API keys, or rate limits
 - **Fully private and offline:** models, prompts, and files stay on your machine
 - **Models on demand:** loaded on request, unloaded when idle or memory fills
@@ -70,11 +69,11 @@ There's no fixed minimum. Magnitude profiles your machine and recommends what ru
 
 ### What systems does Magnitude support?
 
-Magnitude runs on macOS, Linux, and Windows through WSL. It supports Apple Silicon, NVIDIA GPUs, AMD GPUs, and CPU-only setups. It profiles your hardware and recommends models that fit.
+Installer availability is listed with each release. Hardware support depends on the inference backend available for that platform. Magnitude profiles your machine and recommends compatible catalog models; Linux tray support also depends on your desktop environment.
 
 ### Which harnesses work with it?
 
-Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline. During setup, your agent connects your harness to the model you pick.
+Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline. Use Connections in the desktop app to configure your harness without launching it.
 
 ### Do I need to manage it after setup?
 

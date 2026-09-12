@@ -3,17 +3,14 @@ applies_to:
   - packages/release/src/client-update/**
   - packages/launcher/src/**
   - packages/launcher/scripts/build-launcher.ts
-  - packages/storage/src/types/config.ts
-  - cli/src/index.tsx
+  - cli/src/index.ts
   - cli/src/commands/update.ts
   - cli/src/commands/update-runtime.ts
-  - cli/src/features/update/**
+  - cli/src/update/**
   - cli/src/runtime/**
-  - cli/src/platform/process-exit.ts
-  - cli/src/platform/terminal.ts
 ---
 
-# CLI updates
+# Client release updates
 
 Magnitude delegates installation updates to the package manager that launched its npm wrapper. The
 supported methods are npm, Bun, and pnpm. The launcher detects its manager and passes that context
@@ -27,6 +24,14 @@ or modify a package-manager installation directly.
 ## Discovery
 
 ### Channels
+
+The release package owns channel interpretation and bounded dist-tag discovery for both CLI and
+desktop consumers. Each caller verifies its required native artifacts and receives the exact
+verified result from the selected candidate. Selection performs no installation or lifecycle action.
+The CLI contains only its installation context, CLI-artifact verification and package-manager execution.
+Mac desktop selection requires the exact update ZIP identity and filename for the running architecture.
+A CLI-only release, installer-only release or archive for another architecture cannot qualify. The
+selected value retains the manifest's version, size and digest for subsequent integrity verification.
 
 A release channel is derived from a version's prerelease identifier: none → stable, `alpha` →
 alpha, `beta` → beta. The client's channel comes from its own running version, and it admits
@@ -46,67 +51,19 @@ function: among admissible candidates newer than the running version, the highes
 Semver's prerelease ordering (`alpha < beta < stable` within a base) makes cross-channel
 supersession fall out naturally.
 
-### Checks and the cache
+### Explicit checks
 
-Every interactive launch fires one discovery check, concurrently with startup, supervised by the
-startup scope. There is no check interval or cache expiry. A candidate is an available update
-only when it is newer than the running version, admissible for this client's channel, and its
-public release manifest contains exactly one CLI artifact for the current host — the readiness
-check. The check walks the admissible upgrades newest-first and stops at the first that passes
-readiness, so the normal case verifies exactly one manifest; a candidate published before its
-release assets is skipped, not fatal. Readiness exists because the launcher acquires the native
-CLI from the corresponding GitHub release; an update must never be offered before its binary is
-downloadable.
+Only `magnitude update` checks for CLI updates. Ordinary commands perform no update discovery,
+prompts, notifications, or dismissal tracking. There is no CLI startup-update preference or offer
+cache. Desktop application updates are a separate distribution concern.
+The privileged CLI host supplies the update cache directory; the updater does not depend on
+agent storage or independently choose an application profile.
 
-The cache (`state/version.json`) stores the selected, readiness-verified candidate of the last
-completed check — including the empty result, which erases the cache. A completed check is
-authoritative: its selection stands even when it retracts a cached offer (registry rollback);
-the cached answer stands in only when the check itself failed. Check failures are silent, leave
-the prior answer intact, and never delay or prevent startup. Admissibility, newness, and the
-dismissal floor are re-applied when the cache is read: the running binary — and so its channel —
-may have changed since the write.
-
-The check result is consumed before OpenTUI is created:
-
-- Known from cache → the inline update prompt precedes all service work.
-- No installed service build (fresh machine, wiped cache) → startup awaits this launch's check
-  result before the install sequence begins: an offer always prompts before any download, and a
-  multi-minute install of a version about to be replaced never starts. The wait is bounded by the
-  check's own ceiling and costs nothing real — installation needs the network regardless.
-- Fresh result arrives while service startup work is still running (cold spawn — the check
-  usually outruns it) → the inline presentation is interrupted to show the prompt. The shared
-  startup occurrence remains supervised; declining resumes its current presentation, while
-  accepting closes the startup scope before package-manager execution.
-- Fresh result arrives from daemon readiness on (typical warm start) → one in-session
-  notification line, and the now-cached answer prompts first thing next launch. Startup latency
-  is never added to wait for the network.
-
-Dismissal state is user-owned and stored separately from the discovery answer
-(`state/version-dismissal.json`). A dismissal is a floor: it suppresses the prompt and the
-notification for every candidate at or below the dismissed version — the user declined the best
-available option, so a strictly older one is never surfaced in its place — and anything strictly
-newer re-engages. The floor is monotonic (only ever-higher versions can be dismissed, since only
-offers above the floor are shown) and self-healing: a completed check whose best candidate falls
-below the floor clears it, because the registry retreated past what was dismissed. The explicit
-update command ignores dismissals entirely. Source and development builds do not check.
-
-## Startup interaction
-
-When a cached update is offered, the prompt renders inline before service work. A fresh offer may
-interrupt an in-progress inline startup, but always renders before OpenTUI is created. The prompt
-has three choices: update now, skip this launch, skip until the next version.
-Noninteractive launches and launches with an initial prompt never show it.
-Pi-hosted setup also suppresses update interaction: its child must preserve setup exit-status
-semantics and must not replace itself through the update/relaunch flow. An unsupported private setup
-command reports install/update guidance in Pi. Ordinary discovery may still refresh its cache.
-
-Accepting an update completes the inline terminal scope before invoking the package manager; no
-React root or OpenTUI renderer exists yet.
-A failed update reports the command failure and exits nonzero.
-
-The global `checkForUpdateOnStartup` configuration value defaults behaviorally to true when absent.
-Setting it to false disables discovery, prompts, and notifications, but not the explicit update
-command.
+A bounded dist-tags request selects admissible upgrades newest-first. A candidate qualifies only
+when its public release manifest contains exactly one CLI artifact for the current host. Candidates
+published before their native artifacts are skipped. Registry failure reports an actionable error
+and exits nonzero; no qualifying candidate means the CLI is already up to date. Development builds
+and unknown installation methods reject the update command before checking.
 
 ## Relaunch protocol
 
@@ -118,9 +75,9 @@ manual restart as the guaranteed floor:
   when the environment's protocol version matches its own. On mismatch or absence it prints the
   manual-restart message instead: version skew degrades by definition, never by accident.
 - The launcher honors a relaunch request **at most once per process**: it re-runs its own pipeline —
-  locate the installation fresh, resolve the now-installed version's binary, and spawn it. An
-  interactive prompt update repeats the original arguments; an explicit `magnitude update` runs the
-  new binary as `magnitude service start`. Any failure prints the matching manual command and exits.
+  locate the installation fresh, resolve the now-installed version's binary, and spawn it. An explicit `magnitude update` runs the
+  new binary as `magnitude service start`, starting the desktop in the background without opening
+  its window. Any failure prints the matching manual command and exits.
   A second relaunch request passes through as an ordinary exit.
 
 The degraded outcome of every relaunch failure — incompatible new release, broken binary, unchanged
@@ -137,23 +94,14 @@ clients on their own channel, where an unpinned install would resolve `latest`:
 - pnpm runs `pnpm add -g @magnitudedev/cli@<version>`.
 
 The visible command and executed command come from the same structured action. Arguments are passed
-directly to the executable rather than through a shell. `magnitude update` resolves its target the
-same way the prompt does — one fresh check, channel-selected, readiness-verified — but ignores
-dismissals: asking to update overrides having dismissed. No target means "already up to date"; a
-failed check reports itself and exits nonzero. The command is unavailable to development builds or
-unknown installation methods.
+directly to the executable rather than through a shell. Each explicit command performs a fresh,
+channel-selected, readiness-verified check before running the pinned installation command.
 
 ## Required guarantees
 
-- Startup never waits for update network access, with one deliberate exception: a launch with no
-  installed daemon build awaits the version check before downloading.
-- Discovery failure never prevents startup or discards the previous known answer.
-- An offered version has a matching native CLI artifact for the current host.
-- Package-manager execution occurs only after an explicit user choice or `magnitude update`.
-- Cached offers and fresh-install offers are resolved before service work begins; a later fresh
-  offer may interrupt an already-supervised startup occurrence.
-- The package-manager command is run only after terminal restoration.
-- The launcher relaunches at most once per process; every relaunch failure degrades to the
-  manual-restart message.
-- The CLI emits the relaunch exit code only on an exact launch-protocol-version match.
-- Discovery and terminal resources cannot outlive the interactive startup scope.
+- Ordinary CLI startup makes no update network request and presents no interaction.
+- Every selected version has a matching native CLI artifact for the current host.
+- Package-manager execution occurs only through explicit `magnitude update`.
+- The launcher handles a post-update request at most once per process; failures provide the
+  manual background service-start command.
+- The CLI requests launcher follow-up only on an exact launch-protocol-version match.

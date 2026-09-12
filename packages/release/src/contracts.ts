@@ -42,7 +42,7 @@ const Compatibility = Schema.Union(
 
 export const ReleaseArtifactSchema = Schema.Struct({
   id: NonEmpty,
-  kind: Schema.Literal("cli", "acn", "icn-base", "icn-backend"),
+  kind: Schema.Literal("cli", "acn", "desktop", "icn-base", "icn-backend"),
   host: Schema.optionalWith(Host, { as: "Option", exact: true }),
   backend: Schema.optionalWith(BackendSchema, { as: "Option", exact: true }),
   filename: NonEmpty,

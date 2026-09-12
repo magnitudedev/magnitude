@@ -9,16 +9,15 @@ applies_to:
   - web/src/styles/**
   - desktop/src/renderer.tsx
   - packages/client-common/src/hooks/use-local-inference-state.ts
-  - packages/client-common/src/hooks/use-onboarding-model-setup.ts
   - packages/client-common/src/local-models/**
   - packages/client-common/src/model-slots/**
 ---
 
 # Web local inference and appearance
 
-The browser product and Electron renderer expose one local-only model experience. Electron hosts
-the browser renderer and supplies desktop capabilities and daemon bootstrap; it does not own a
-separate model-management or appearance interface.
+The retained browser client consumes local model services. The inference-focused desktop has its
+own shell, specified in `desktop-inference.md`, and shares the established appearance system and UI
+primitives. Onboarding belongs exclusively to that desktop shell.
 
 ## Authority and boundaries
 
@@ -31,7 +30,7 @@ client-visible. `ModelSlotsState` owns durable selection, favorites, and recency
 server-side to truthful Slot states including residency.
 
 Web consumes those domains through one connection-scoped Effect Query runtime containing ACN RPC
-operations, plus the composed `LocalModels`, `ModelSlots`, and `OnboardingModelSetup`
+operations, plus the composed `LocalModels` and `ModelSlots`
 client-common services. React hooks are adapters to those services. DOM components may derive
 labels and layout, but do not construct services, cache server snapshots, or infer compatibility,
 availability, readiness, progress, or command completion.
@@ -42,30 +41,9 @@ and cloud-model surfaces are absent.
 
 ## Product flow
 
-Startup presents daemon lifecycle, the shared onboarding setup view, or the ordinary application
-shell as mutually exclusive states. Required onboarding prevents session preload and chat entry.
-The shared setup service sequences install, assignment, load, cancellation, and onboarding
-completion and publishes one server-derived presentation state. Web renders that state directly and
-does not maintain a second workflow or correlate operations itself.
-
-Before the model chooser is ready, the existing onboarding screen renders one fixed preparation
-body with `Discovering existing models · N found` and `Assessing models · X of Y`. Both rows remain visually
-active and only their numbers update; the discovery row omits its `· N found` suffix while nothing
-has been discovered, and the assessment row omits its `· X of Y` suffix while it has no targets. The slider and model choices remain absent until the projected
-ICN discovery and assessment states are both complete, at which point the same screen replaces the
-preparation body with the chooser. There is no completed-row presentation, client-owned denominator,
-or client-visible discovery revision.
-
-Browser and Electron bootstrap presentation observes the SDK's client ACN lifecycle before treating
-the application connection as ready. Starting phases display their latest authoritative activity;
-installation displays the lifecycle's monotonic overall progress and exact transfer size only when
-the lifecycle marks that detail exact. Indeterminate work never receives a fabricated percentage.
-Typed startup failure replaces activity with its diagnostic and available recovery actions. The
-onboarding observation may begin while startup is visible so the transition to setup or the ordinary
-shell does not introduce a redundant connection screen. Any remaining post-connection observation
-gap is identified as loading local model settings, not as connecting to inference.
-Startup surfaces use the canonical transparent Magnitude mark from shared product assets without
-placing it inside a card, badge, or manufactured background.
+Browser startup presents the SDK daemon lifecycle before the ordinary application shell. The
+browser has no onboarding gate or `/setup` command. Desktop onboarding and process ownership are
+specified by their dedicated contracts. Neither surface fabricates startup progress or readiness.
 
 The ordinary shell contains a dedicated Settings surface for local inference:
 
@@ -108,13 +86,12 @@ CLI and web share the pure five-axis local-model comparison profile: intelligenc
 speculation, memory efficiency, and accuracy. Each client owns its renderer, so terminal cells and
 browser SVG remain separate presentations of the same model evidence.
 
-Install and update use the canonical model ID. Cancellation and failure dismissal use
-the exact ICN-issued Download ID. Selection assigns that same model ID to a slot. Warm load uses the
-model ID and exact stop uses the ICN Instance ID; neither operation is routed through Slot state.
-Long-running progress is rendered from refreshed service queries. During the gap between local
-command acceptance and ACN's first authoritative snapshot, client-common projects the mutation's
-queued admission into the same local-model view; it never fabricates progress beyond that queued
-state.
+Install, update, cancellation, failure dismissal, removal, and warm load use the canonical model
+ID. Selection assigns that same model ID to a slot. Active Stop asks ACN to resolve and retire the
+current native instance; slot Stop addresses the slot. Native download and instance IDs remain
+private. Long-running progress comes from canonical service queries. Mutation pending and failure
+describe the command separately; command acknowledgement does not fabricate acquisition or residency
+progress. Mutation synchronization refreshes the already-committed catalog snapshot.
 
 Chat submission requires a selected local model. When no model is selected, the composer routes the
 user to Models in Settings instead of discarding the attempt. A selected model does not need to be
@@ -182,14 +159,13 @@ ordinary monospace stack remains reserved for code and technical data rather tha
 
 Static presentation uses Tailwind utilities. Inline styles are reserved for values derived from
 runtime data, such as measured dimensions, progress values, and SVG geometry, or for third-party
-renderer output that cannot consume classes. The terminal appearance detector and `CliTheme` remain
-CLI-owned because terminal palette discovery and transparent terminal backgrounds are not browser
-semantics.
+renderer output that cannot consume classes. The headless CLI has no terminal appearance detector,
+interactive theme, or parallel onboarding presentation.
 
 ## Conformance
 
-- Browser and Electron render the same React application and recover by refetching service state.
-- Browser and Electron render the same authoritative daemon phases before entering application gates.
+- Browser and desktop use canonical shared model observations and recover by refetching service state.
+- Browser startup observes SDK lifecycle; desktop observes its owned application lifecycle.
 - No web model-management component reconstructs the deprecated candidate/offering/download model.
 - Non-local catalog entries are never rendered, selected, assigned, or counted as ready.
 - Every long-running lifecycle is rendered from server state; mutations cover command admission.

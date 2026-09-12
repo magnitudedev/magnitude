@@ -1,10 +1,14 @@
 import { FetchHttpClient } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
-import { MagnitudeClient, MagnitudeServiceStarter } from "@magnitudedev/sdk"
-import { makeServiceStarter } from "@magnitudedev/daemon-management"
-import { BunDetachedChildProcessSpawner, ChildProcessSpawner, makeLocalAcnInstanceManager } from "@magnitudedev/daemon-management"
-import { BunSqliteDriverLayer } from "@magnitudedev/daemon-management/bun"
-import { Duration, Effect, Exit, Layer, Schema, Scope, Stream } from "effect"
+import { Effect, Option, Schema, Stream } from "effect"
+import * as Command from "@effect/platform/Command"
+import * as FileSystem from "@effect/platform/FileSystem"
+import { IcnInstallationDeclaration } from "@magnitudedev/icn-protocol"
+import { NodeArchiveExtractor } from "../packages/release/src/archive"
+import { currentHost } from "@magnitudedev/release/targets"
+import { sha256File } from "@magnitudedev/release/macos-app"
+import { validateDesktopDistribution } from "../packages/release/scripts/apple/desktop"
+import { validateLinuxDesktopInstaller } from "../packages/release/scripts/build/desktop-linux"
 import {
   mkdir,
   mkdtemp,
@@ -14,11 +18,10 @@ import {
 } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { resolve } from "node:path"
-import { releaseUrl } from "@magnitudedev/release/acquisition"
-import { ReleaseManifestSchema } from "@magnitudedev/release/contracts"
+import { releaseUrl, installArtifact, selectArtifact } from "@magnitudedev/release/acquisition"
+import { ReleaseManifestSchema, validateReleaseManifest } from "@magnitudedev/release/contracts"
 
-const BOOTSTRAP_TIMEOUT_MS = 2 * 60_000
-const SHUTDOWN_TIMEOUT_MS = 20_000
+class CandidateAcceptanceFailed extends Schema.TaggedError<CandidateAcceptanceFailed>()("CandidateAcceptanceFailed", { message: Schema.String }) {}
 
 const candidate = resolve(process.argv[2] ?? "release-candidate")
 const tarballArgument = process.argv[3]
@@ -27,36 +30,31 @@ if (!tarballArgument) {
 }
 const tarball = resolve(tarballArgument)
 
-const run = async (
+// Script entry points use Promises; subprocess lifetime and output bounds remain Effect-owned.
+const run = (
   command: readonly string[],
   options: {
     readonly cwd?: string
     readonly env?: Readonly<Record<string, string | undefined>>
   } = {},
-): Promise<string> => {
-  const child = Bun.spawn([...command], {
-    cwd: options.cwd,
-    env: options.env,
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-  })
-  const [code, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ])
-  if (code !== 0) {
-    throw new Error(
-      `${command[0]} failed with exit ${code}: ${(stderr || stdout).trim()}`,
-    )
-  }
+): Promise<string> => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+  const executable = command[0]
+  if (!executable) return yield* new CandidateAcceptanceFailed({ message: "Empty acceptance command" })
+  const environment = Object.fromEntries(Object.entries(options.env ?? {}).filter((entry): entry is [string, string] => entry[1] !== undefined))
+  const child = yield* Command.make(executable, ...command.slice(1)).pipe(
+    Command.workingDirectory(options.cwd ?? process.cwd()), Command.env(environment), Command.start,
+  )
+  const read = (stream: typeof child.stdout) => stream.pipe(Stream.decodeText(), Stream.runFoldEffect("", (previous, chunk) =>
+    previous.length + chunk.length <= 1024 * 1024 ? Effect.succeed(previous + chunk)
+      : Effect.fail(new CandidateAcceptanceFailed({ message: `${executable} exceeded its output limit` }))))
+  const [code, stdout, stderr] = yield* Effect.all([child.exitCode, read(child.stdout), read(child.stderr)], { concurrency: "unbounded" })
+  if (code !== 0) return yield* new CandidateAcceptanceFailed({ message: `${executable} failed with exit ${code}: ${(stderr || stdout).trim()}` })
   return stdout
-}
+})).pipe(Effect.timeout("5 minutes"), Effect.provide(BunContext.layer)))
 
-const manifest = Schema.decodeUnknownSync(
-  Schema.parseJson(ReleaseManifestSchema),
-)(await readFile(resolve(candidate, "magnitude-release.json"), "utf8"))
+const manifest = await Effect.runPromise(Schema.decodeUnknown(Schema.parseJson(ReleaseManifestSchema))(
+  await readFile(resolve(candidate, "magnitude-release.json"), "utf8"),
+).pipe(Effect.flatMap(validateReleaseManifest)))
 
 const routes = new Map(
   [
@@ -69,6 +67,7 @@ const routes = new Map(
 )
 const server = Bun.serve({
   port: 0,
+  hostname: "127.0.0.1",
   async fetch(request) {
     const name = routes.get(new URL(request.url).pathname)
     if (!name) return new Response("missing", { status: 404 })
@@ -82,20 +81,6 @@ const server = Bun.serve({
 const baseUrl = `http://127.0.0.1:${server.port}`
 const root = await mkdtemp(resolve(tmpdir(), "magnitude-candidate-"))
 const dataDir = resolve(root, "home-bootstrap", ".magnitude")
-const ensurerScope = await Effect.runPromise(Scope.make())
-
-const manager = await Effect.runPromise(
-  makeLocalAcnInstanceManager({ dataDir }).pipe(
-    Effect.provideService(ChildProcessSpawner, BunDetachedChildProcessSpawner),
-    Effect.provideService(Scope.Scope, ensurerScope),
-    Effect.provide([
-      BunContext.layer,
-      FetchHttpClient.layer,
-      BunSqliteDriverLayer,
-    ]),
-  ),
-)
-
 const environment = (home: string) => ({
   ...process.env,
   HOME: home,
@@ -104,145 +89,58 @@ const environment = (home: string) => ({
   MAGNITUDE_RELEASE_BASE_URL: baseUrl,
 })
 
-const processIsAlive = (pid: number): boolean => {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (cause) {
-    return cause instanceof Error &&
-      "code" in cause &&
-      cause.code === "EPERM"
+/** Candidate acceptance launches the sealed desktop; it never owns a standalone daemon. */
+const acceptBootstrap = Effect.scoped(Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const host = currentHost()
+  const linux = host === "linux-arm64-gnu" || host === "linux-x64-gnu"
+  if (!linux && host !== "darwin-arm64" && host !== "darwin-x64") return yield* new CandidateAcceptanceFailed({
+    message: "Candidate desktop installer acceptance is not implemented for this host yet",
+  })
+  const desktops = manifest.artifacts.filter(value => value.kind === "desktop" && Option.getOrUndefined(value.host) === host &&
+    (value.id === (linux ? `desktop-${host}-deb` : `desktop-${host}`)))
+  if (desktops.length !== 1) return yield* new CandidateAcceptanceFailed({ message: "Candidate must contain exactly one selected desktop installer" })
+  const desktop = desktops[0]!
+  const image = resolve(candidate, desktop.filename)
+  const info = yield* fs.stat(image)
+  if (Number(info.size) !== desktop.bytes || (yield* sha256File(image)) !== desktop.sha256) {
+    return yield* new CandidateAcceptanceFailed({ message: "Desktop installer differs from the candidate manifest" })
   }
-}
-
-const processTree = async (): Promise<ReadonlyMap<number, readonly number[]>> => {
-  const output = await run(["ps", "-axo", "pid=,ppid="])
-  const children = new Map<number, number[]>()
-  for (const line of output.split("\n")) {
-    const [pidText, parentText] = line.trim().split(/\s+/)
-    const pid = Number(pidText)
-    const parent = Number(parentText)
-    if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(parent)) continue
-    const existing = children.get(parent)
-    if (existing) existing.push(pid)
-    else children.set(parent, [pid])
-  }
-  return children
-}
-
-const descendantsOf = (
-  rootPid: number,
-  tree: ReadonlyMap<number, readonly number[]>,
-): readonly number[] => {
-  const descendants: number[] = []
-  const pending = [...(tree.get(rootPid) ?? [])]
-  while (pending.length > 0) {
-    const pid = pending.pop()
-    if (pid === undefined) continue
-    descendants.push(pid)
-    pending.push(...(tree.get(pid) ?? []))
-  }
-  return descendants
-}
-
-const registeredProcess = async (pid: number): Promise<{
-  readonly pid: number
-  readonly descendants: readonly number[]
-}> => {
-  if (!processIsAlive(pid)) {
-    throw new Error(`release bootstrap ACN ${pid} exited before teardown`)
-  }
-  return {
-    pid,
-    descendants: descendantsOf(pid, await processTree()),
-  }
-}
-
-const terminateBootstrap = async (pid?: number): Promise<void> => {
-  const registered = pid === undefined ? undefined : await registeredProcess(pid)
-  let terminationFailure: unknown
-  try {
-    await Effect.runPromise(manager.stop)
-  } catch (cause) {
-    terminationFailure = cause
-  }
-  if (registered === undefined) {
-    if (terminationFailure !== undefined) throw terminationFailure
-    return
-  }
-  const ownedProcesses = [registered.pid, ...registered.descendants]
-  const deadline = Date.now() + SHUTDOWN_TIMEOUT_MS
-  while (
-    ownedProcesses.some(processIsAlive) &&
-    Date.now() < deadline
-  ) {
-    await Bun.sleep(100)
-  }
-  const survivors = ownedProcesses.filter(processIsAlive)
-  if (survivors.length === 0) {
-    if (terminationFailure !== undefined) throw terminationFailure
-    return
-  }
-  for (const pid of survivors) {
-    try {
-      process.kill(pid, "SIGKILL")
-    } catch {
-      // The process exited between observation and cleanup.
+  const base = yield* selectArtifact(manifest, "icn-base", host)
+  const installation = yield* installArtifact(baseUrl, manifest.version, base, resolve(dataDir, "inference"))
+  const declaration = resolve(installation, "installation.json")
+  yield* fs.writeFileString(declaration, yield* Schema.encode(Schema.parseJson(IcnInstallationDeclaration))({
+    schemaVersion: 1, backend: "cpu", nativeBuild: Option.getOrThrow(base.nativeBuild),
+    backendModuleAbi: Option.getOrThrow(base.backendModuleAbi),
+  }))
+  if (linux) {
+    yield* validateLinuxDesktopInstaller({ file: image, format: "deb", arch: host === "linux-arm64-gnu" ? "arm64" : "x64",
+      version: manifest.version, revision: manifest.acnRevision })
+    // Linux candidate acceptance runs on a disposable consumer with native package installation.
+    const installed = yield* Command.make("sudo", "apt-get", "install", "-y", "--reinstall", "--no-install-recommends", image).pipe(
+      Command.stdout("inherit"), Command.stderr("inherit"), Command.exitCode,
+    )
+    if (installed !== 0) return yield* new CandidateAcceptanceFailed({ message: "Candidate DEB installation failed" })
+    const cli = yield* selectArtifact(manifest, "cli", host)
+    const cliRoot = yield* installArtifact(baseUrl, manifest.version, cli, resolve(dataDir, "cli"))
+    const code = yield* Command.make("xvfb-run", "-a", "dbus-run-session", "--", process.env.MAGNITUDE_TEST_NODE ?? "node",
+      resolve(import.meta.dir, "../desktop/src/fixtures/linux-installed-lifecycle.mjs")).pipe(
+      Command.env({ MAGNITUDE_TEST_CLI_EXECUTABLE: resolve(cliRoot, "bin/magnitude-cli"), MAGNITUDE_TEST_INFERENCE_INSTALLATION: declaration }),
+      Command.stdout("inherit"), Command.stderr("inherit"), Command.exitCode, Effect.timeout("3 minutes"),
+    )
+    if (code !== 0) return yield* new CandidateAcceptanceFailed({ message: "Candidate Linux desktop lifecycle failed" })
+  } else {
+    const updates = manifest.artifacts.filter(value => value.kind === "desktop" && Option.getOrUndefined(value.host) === host && value.id === `desktop-update-${host}`)
+    if (updates.length !== 1) return yield* new CandidateAcceptanceFailed({ message: "Candidate must contain exactly one Mac update archive" })
+    const update = updates[0]!
+    const updateArchive = resolve(candidate, update.filename)
+    if (Number((yield* fs.stat(updateArchive)).size) !== update.bytes || (yield* sha256File(updateArchive)) !== update.sha256) {
+      return yield* new CandidateAcceptanceFailed({ message: "Desktop update archive differs from the candidate manifest" })
     }
+    yield* validateDesktopDistribution({ image, updateArchive, version: manifest.version, revision: manifest.acnRevision,
+      rpcVersion: manifest.rpc.version, inferenceInstallation: declaration })
   }
-  throw new Error(
-    `release bootstrap left processes alive after shutdown: ${survivors.join(", ")}`,
-  )
-}
-
-
-let candidateStarted = false
-const candidateStarter = MagnitudeServiceStarter.of({
-  start: makeServiceStarter(manager).start.pipe(Stream.concat(Stream.execute(Effect.sync(() => { candidateStarted = true })))),
-})
-const probeBootstrap = Effect.gen(function* () {
-  const client = yield* MagnitudeClient
-  return yield* client.connection.health({})
-}).pipe(
-  Effect.provide(MagnitudeClient.layer().pipe(Layer.provide([
-    FetchHttpClient.layer,
-    Layer.succeed(MagnitudeServiceStarter, candidateStarter),
-  ]))),
-  Effect.scoped,
-  Effect.timeout(Duration.millis(BOOTSTRAP_TIMEOUT_MS)),
-)
-
-const acceptBootstrap = async (): Promise<void> => {
-  let accepted = false
-  let healthPid: number | undefined
-  try {
-    const health = await Effect.runPromise(probeBootstrap)
-    // Never accept or stop a pre-existing service on the fixed application port.
-    if (!candidateStarted) throw new Error("Port 10100 already serves a daemon outside this candidate; run acceptance with that port free")
-    if (
-      health.service !== "magnitude-acn" ||
-      health.version !== manifest.version ||
-      health.revision !== manifest.acnRevision ||
-      health.rpcVersion !== manifest.rpc.version ||
-      health.state._tag !== "Ready"
-    ) {
-      throw new Error(
-        `release bootstrap returned incompatible health: ${JSON.stringify(health)}`,
-      )
-    }
-    healthPid = health.pid
-    await registeredProcess(health.pid)
-    const plugins = process.argv[4]
-    if (plugins) await run(["bun", resolve(import.meta.dir, "accept-integrations.ts"), resolve(plugins)])
-    accepted = true
-  } finally {
-    try {
-      await terminateBootstrap(healthPid)
-    } catch (cause) {
-      if (accepted) throw cause
-    }
-  }
-}
+})).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, NodeArchiveExtractor]))
 
 const invoke = async (
   command: readonly string[],
@@ -257,9 +155,6 @@ const invoke = async (
     throw new Error(`${command[0]} returned ${output}; expected ${manifest.version}`)
   }
 }
-
-process.env.MAGNITUDE_ACN_VERSION = manifest.version
-process.env.MAGNITUDE_RELEASE_BASE_URL = baseUrl
 
 try {
   const npmRoot = resolve(root, "npm")
@@ -281,9 +176,14 @@ try {
     resolve(root, "home-bunx"),
   )
 
-  await acceptBootstrap()
+  await Effect.runPromise(acceptBootstrap)
+  server.stop(true)
+  await invoke(["npx", "--no-install", "magnitude", "--version"], npmRoot, resolve(root, "home-npx"))
+  await invoke(["bunx", "--bun", "magnitude", "--version"], bunRoot, resolve(root, "home-bunx"))
+  console.log("Cached Node and Bun CLI launchers work with the candidate artifact endpoint stopped")
+  const plugins = process.argv[4]
+  if (plugins) await run(["bun", resolve(import.meta.dir, "accept-integrations.ts"), resolve(plugins)])
 } finally {
-  await Effect.runPromise(Scope.close(ensurerScope, Exit.void))
   server.stop(true)
   await rm(root, { recursive: true, force: true })
 }

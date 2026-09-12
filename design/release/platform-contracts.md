@@ -3,7 +3,6 @@ applies_to:
   - packages/release/**
   - packages/icn/src/lifecycle/release-installation.ts
   - packages/icn/src/lifecycle/installation-environment.ts
-  - packages/daemon-management/src/binary.ts
   - inference/**
   - .github/workflows/release-build.yml
 ---
@@ -77,6 +76,17 @@ toolkit libraries required at runtime are artifact-owned and shipped in the CUDA
 Linux executables resolve owned libraries from `../runtime`; libraries and backend modules resolve
 from their own directory or `../runtime`. Allowed loader paths are therefore `$ORIGIN` and
 `$ORIGIN/../runtime`. Releases must not require `LD_LIBRARY_PATH`.
+
+### Linux graphical desktop
+
+The Electron application additionally requires the distribution's graphical userspace: GLib/GIO,
+GTK3, NSS/NSPR, ATK/AT-SPI, D-Bus, Cairo/Pango, CUPS, X11/XCB, xkbcommon, GBM/DRM, expat, udev,
+and ALSA libraries, plus util-linux for installation admission. These are package-manager dependencies, including when the application uses
+Wayland. They do not become requirements of the headless CLI or inference artifacts. FFmpeg,
+Electron, and the bundled rendering libraries are artifact-owned. Package metadata must resolve
+the graphical dependencies on each supported distribution without relying on optional recommends
+for directly linked libraries. Native consumer checks validate the final installed application's
+loader closure and sandbox permissions; a build-host launch is insufficient.
 
 ## Apple contract
 

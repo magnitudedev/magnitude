@@ -5,28 +5,31 @@
   "main": "out/main/main.js",
   "scripts": {
     "setup": "install-electron --no",
-    "dev": "electron-vite dev",
-    "build": "electron-vite build",
+    "dev": "bun run build:native && electron-vite dev",
+    "build": "bun run build:native && electron-vite build",
     "test": "bunx --bun vitest run",
-    "test:browser": "bun run build && node --no-warnings --experimental-strip-types scripts/browser-smoke.ts"
+    "build:native": "bun ../packages/daemon-management/scripts/build-native.ts"
   },
   "dependencies": {
     "@effect/platform": "^0.96.1",
-    "@effect/platform-node-shared": "^0.60.0",
+    "@effect/platform-node": "^0.107.0",
     "@effect/rpc": "0.75.1",
     "@magnitudedev/client-common": "workspace:*",
+    "@magnitudedev/daemon-management": "workspace:*",
+    "@magnitudedev/harness-connections": "workspace:*",
+    "@magnitudedev/release": "workspace:*",
     "@magnitudedev/sdk": "workspace:*",
     "@magnitudedev/web": "workspace:*",
     "effect": "^3.21.2",
-    "sqlite3": "5.1.7",
-    "@magnitudedev/daemon-management": "workspace:*"
+    "lucide-react": "^0.460.0",
+    "@magnitudedev/utils": "workspace:*"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.4",
-    "electron": "^43.4.1",
+    "electron": "^43.7.0",
     "electron-vite": "^5.0.0",
     "playwright": "^1.62.1",
     "tailwindcss": "^4.3.3",

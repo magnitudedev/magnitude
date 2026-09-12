@@ -1,7 +1,7 @@
 {
   "name": "magnitude",
   "private": true,
-  "packageManager": "bun@1.3.14",
+  "packageManager": "bun@1.4.2",
   "workspaces": [
     "cli",
     "desktop",
@@ -15,8 +15,8 @@
     "dev": "bun run scripts/dev.ts",
     "devl": "bun run dev:version && bun run dev:client:local",
     "dev:version": "bun run packages/version/scripts/generate-version.ts --dev",
-    "dev:client": "bun run cli/src/index.tsx",
-    "dev:client:local": "MAGNITUDE_USE_LOCAL=1 bun run cli/src/index.tsx",
+    "dev:client": "bun run cli/src/index.ts",
+    "dev:client:local": "MAGNITUDE_USE_LOCAL=1 bun run cli/src/index.ts",
     "dev:pi": "bun run scripts/dev-pi.ts",
     "acn:dash": "bun run --cwd packages/acn-dashboard dashboard",
     "build": "bun run packages/version/scripts/generate-version.ts && turbo build",

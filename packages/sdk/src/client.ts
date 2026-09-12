@@ -262,7 +262,7 @@ const makeClient = (
     // unusable one (absent, undecodable, or the wrong protocol). The starter, when
     // the host injected one, gets exactly one chance to make an unusable service
     // usable; after it has run, only a transient absence is tolerated.
-    const acquire = Effect.gen(function* () {
+    const acquire = (allowStart: boolean) => Effect.gen(function* () {
       let started = false;
       while (true) {
         const observed = yield* Effect.either(
@@ -282,7 +282,7 @@ const makeClient = (
         } else if (started) {
           if (observed.left._tag !== "ServiceUnavailable")
             return yield* observed.left;
-        } else if (Option.isSome(starter)) {
+        } else if (allowStart && Option.isSome(starter)) {
           started = true;
           yield* startService(starter.value.start);
           continue;
@@ -335,7 +335,7 @@ const makeClient = (
                   activity: Option.none(),
                 })
               );
-              yield* acquire.pipe(
+              yield* acquire(!connectedBefore).pipe(
                 Effect.exit,
                 Effect.flatMap((result) =>
                   admission.withPermits(1)(

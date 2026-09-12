@@ -31,8 +31,7 @@ Every probe observes a usable service, ready or still starting, or an unusable o
 undecodable, or the wrong protocol. An unusable service may invoke an injected
 `MagnitudeServiceStarter`. The SDK invokes it at most once per admission occurrence, observes
 progress, then verifies public readiness; after it has run, only a transient absence is tolerated
-and any other answer is final. The host decides what the starter does: the CLI's replaces an older
-daemon, the plugin's asks the installed CLI. An already-starting service is observed without
+and any other answer is final. The host starter ensures the desktop application in the background; it never replaces a daemon independently. The plugin asks the installed CLI. An already-starting service is observed without
 invoking another starter. Connect-only clients omit that capability and fail with the typed error.
 The default absolute admission deadline is ten minutes, including starter execution and health
 waiting. Each health request has a two-second bound.
@@ -44,8 +43,8 @@ Missing executable, failed command, unavailable service, malformed health, and p
 remain distinguishable failures.
 
 Privileged first-party hosts can supply a direct starter backed by private daemon-management.
-That package alone owns SQLite coordination, exact-process supervision, binary acquisition, and
-OS service administration. The SDK receives progress or failure, never owner rows or launch
+That package owns native desktop discovery/control, exact child supervision, login registration,
+and read-only legacy migration. The installed desktop bundles its matched service. The SDK receives progress or failure, never owner rows or launch
 targets. Desktop and web host bridges carry the same startup-only stream; application RPC remains
 on the existing daemon endpoint.
 
@@ -56,7 +55,7 @@ Cancelling a waiter does not cancel that shared attempt. Closing the SDK cancels
 terminalizes all waiters. Admission publication and close share one serialized boundary.
 
 Every RPC carries the selected instance ID; a successor at the same address rejects stale
-dispatch. Confirmed transport loss re-enters admission. Domain errors and caller cancellation
+dispatch. Confirmed transport loss re-enters admission without startup authority. Once this SDK has admitted a service, recovery and later reconnects never invoke the starter; a user quitting the desktop cannot be undone by an old connection. A fresh explicit application launch is independent of SDK recovery. Domain errors and caller cancellation
 do not. Finite operations follow their declaration's replay policy: replay-safe reads may retry;
 ambiguous at-most-once mutations report an unknown outcome rather than duplicate side effects.
 Finite declarations must apply `replaySafe` or `atMostOnce` before entering the RPC tree. The type
@@ -90,9 +89,8 @@ timers are switched with the current presentation and need no per-recovery fiber
 The lifecycle module declares whether a model's rendering depends on time; connection composition
 does not inspect installation phases to decide when to tick.
 
-CLI update discovery and the update-before-download gate remain before bootstrap. Renderer
-construction remains after readiness. Logging, appearance probing, and shutdown ordering retain
-their existing ownership.
+CLI updates are explicit headless commands. Desktop renderer construction is independent of service
+readiness, so startup and failure remain visible. Logging and appearance retain their host ownership.
 
 Electron progress and errors are schema-encoded before structured cloning and decoded afterward.
 Live Effect Option values and class instances never cross the bridge. Cancellation closes the

@@ -97,7 +97,7 @@ if (manifest.sourceCommit !== sourceCommit) {
   throw new Error("candidate source commit differs from the workflow commit")
 }
 const prerelease = semverPrerelease(manifest.version) !== null
-if (!prerelease) await Effect.runPromise(verifyPublishedPlugins(manifest.plugins, resolve(import.meta.dir, "../../..")).pipe(Effect.provide(BunContext.layer)))
+await Effect.runPromise(verifyPublishedPlugins(manifest.plugins, resolve(import.meta.dir, "../../..")).pipe(Effect.provide(BunContext.layer)))
 const expectedNames = new Set([
   "magnitude-release.json",
   ...manifest.artifacts.map((artifact) => artifact.filename),

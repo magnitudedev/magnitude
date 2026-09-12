@@ -61,7 +61,7 @@ const speculationValue = (model: LocalModel): number => {
   })
 }
 
-const accuracyLabel = (rank: number): string =>
+const fidelityLabel = (rank: number): string =>
   rank >= 70 ? "Very high" : rank >= 45 ? "High" : rank >= 30 ? "Medium" : "Reduced"
 
 const shortVariantLabel = (model: LocalModel): string =>
@@ -82,7 +82,7 @@ const quantizationBits = (model: LocalModel): Option.Option<number> => {
   return Option.none()
 }
 
-const discoveredAccuracyLabel = (bits: Option.Option<number>): string =>
+const discoveredFidelityLabel = (bits: Option.Option<number>): string =>
   Option.match(bits, {
     onNone: () => "Not assessed",
     onSome: (value) =>
@@ -182,11 +182,11 @@ export const localModelRadarAxes = (
         onNone: () => Option.map(bits, (value) => clamp01(value / 8)),
         onSome: ({ fidelityRank }) => Option.some(clamp01(fidelityRank / 100)),
       }),
-      label: "ACCURACY",
+      label: "FIDELITY",
       detail: Option.match(catalog, {
-        onNone: () => `${discoveredAccuracyLabel(bits)} (${quantization})`,
+        onNone: () => `${discoveredFidelityLabel(bits)} (${quantization})`,
         onSome: ({ fidelityRank }) =>
-          `${accuracyLabel(fidelityRank)} (${shortVariantLabel(model)})`,
+          `${fidelityLabel(fidelityRank)} (${shortVariantLabel(model)})`,
       }),
     },
   ]

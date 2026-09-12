@@ -7,7 +7,6 @@ applies_to:
   - packages/release/src/launcher*.ts
   - packages/launcher/src/wrapper.ts
   - packages/launcher/scripts/build-launcher.ts
-  - packages/daemon-management/src/binary.ts
   - packages/icn/src/lifecycle/release-installation.ts
 ---
 
@@ -18,8 +17,9 @@ Runtime acquisition installs only artifacts selected from the version's release 
 ## Ownership
 
 - The npm launcher acquires CLI.
-- The private daemon-management package acquires ACN. On macOS it verifies the acquired
-  `Magnitude.app` signature and publisher before executing the service inside it.
+- The installed desktop application bundles and owns its matching ACN executable. CLI and harness
+  demand locate that application; they do not acquire a standalone daemon. Desktop distribution
+  validates the application signature and publisher before installation.
 - The ICN lifecycle acquires the ICN base and optional backend pack and composes their installation.
 
 These responsibilities do not overlap.

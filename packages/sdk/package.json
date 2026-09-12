@@ -9,7 +9,8 @@
     ".": {
       "types": "./src/index.ts",
       "import": "./src/index.ts"
-    }
+    },
+    "./desktop-host": "./src/desktop-host.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"

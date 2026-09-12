@@ -27,7 +27,7 @@ const commandsLayer = Layer.effect(ModelCommands, Effect.gen(function* () {
 }))
 
 const magnitudeExecutable = () => process.env.MAGNITUDE_CLI?.trim() || "magnitude"
-const clientLayer = () => MagnitudeClient.layer().pipe(Layer.provide([
+const clientLayer = () => MagnitudeClient.layer(process.env.MAGNITUDE_PI_DEVELOPMENT_ORIGIN ? { origin: process.env.MAGNITUDE_PI_DEVELOPMENT_ORIGIN } : {}).pipe(Layer.provide([
   FetchHttpClient.layer,
   MagnitudeServiceStarter.cliLayer({ executable: magnitudeExecutable() }).pipe(
     Layer.provide(NodeCommandExecutor.layer.pipe(Layer.provide(NodeFileSystem.layer))),

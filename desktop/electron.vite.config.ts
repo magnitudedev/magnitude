@@ -2,31 +2,17 @@ import { defineConfig } from "electron-vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { resolve } from "node:path";
+import { readFileSync } from "node:fs";
 
 export default defineConfig({
   main: {
-    resolve: {
-      alias: {
-        "@magnitudedev/client-common/platform/embedded-browser": resolve(__dirname, "../packages/client-common/src/platform/embedded-browser.ts"),
-        "@magnitudedev/client-common/types/menu-action": resolve(__dirname, "../packages/client-common/src/types/menu-action.ts"),
-      },
-    },
+    plugins: [{ name: "harness-skill-text", load(id) { if (id.endsWith(".md")) return `export default ${JSON.stringify(readFileSync(id, "utf8"))}` } }],
     build: {
       // Workspace packages publish TypeScript source for Bun. Bundle them for
       // Electron's Node runtime so production does not depend on repository
       // source files or Node's TypeScript resolution behavior.
-      externalizeDeps: {
-        exclude: [
-          "@magnitudedev/client-common",
-          "@magnitudedev/client-common/platform/embedded-browser",
-          "@magnitudedev/client-common/types/menu-action",
-          "@magnitudedev/sdk",
-        ],
-      },
+      externalizeDeps: false,
       rollupOptions: {
-        // sqlite3 is a native CommonJS addon. It must remain a runtime Node
-        // dependency; bundling its tracing helper into ESM erases __filename.
-        external: ["sqlite3"],
         input: {
           main: resolve(__dirname, "src/main.ts"),
         },
@@ -34,21 +20,8 @@ export default defineConfig({
     },
   },
   preload: {
-    resolve: {
-      alias: {
-        "@magnitudedev/client-common/platform/embedded-browser": resolve(__dirname, "../packages/client-common/src/platform/embedded-browser.ts"),
-        "@magnitudedev/client-common/types/menu-action": resolve(__dirname, "../packages/client-common/src/types/menu-action.ts"),
-      },
-    },
     build: {
-      externalizeDeps: {
-        exclude: [
-          "@magnitudedev/client-common",
-          "@magnitudedev/client-common/platform/embedded-browser",
-          "@magnitudedev/client-common/types/menu-action",
-          "@magnitudedev/sdk",
-        ],
-      },
+      externalizeDeps: false,
       rollupOptions: {
         input: {
           preload: resolve(__dirname, "src/preload.ts"),
@@ -101,6 +74,14 @@ export default defineConfig({
     optimizeDeps: {
       exclude: [
         "@magnitudedev/sdk",
+          "@magnitudedev/sdk/desktop-host",
+          "@magnitudedev/daemon-management",
+          "@magnitudedev/daemon-management/desktop-native",
+          "@magnitudedev/utils",
+          "@magnitudedev/harness-connections",
+          "@magnitudedev/daemon-management/node",
+          "@magnitudedev/storage",
+          "@magnitudedev/release",
         "@magnitudedev/client-common",
         "@magnitudedev/generate-id",
         "@magnitudedev/web",

@@ -9,7 +9,7 @@ export const registerInferenceCommands = (program: Command): void => {
 
   const catalog = program.command("catalog").description("Find, compare, and download local models")
   catalog.command("status")
-    .description("Show cached Hugging Face discovery and hardware assessment progress")
+    .description("Show model catalog preparation and hardware assessment progress")
     .action(() => loadRuntime().then(({ showCatalogStatus }) => showCatalogStatus()))
   catalog.command("list")
     .description("List catalog models compatible with this computer")

@@ -4,8 +4,9 @@ applies_to:
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/client-common/src/local-models/options.ts
   - packages/client-common/src/local-models/setup*.ts
-  - cli/src/features/model-setup/chooser.tsx
-  - web/src/components/local-model-onboarding.tsx
+  - cli/src/commands/inference-runtime.ts
+  - packages/client-common/src/desktop/service.ts
+  - desktop/src/renderer.tsx
   - web/src/components/model-center.tsx
 ---
 
@@ -58,29 +59,27 @@ physical-memory capacity.
 
 The physical-memory maximum is the sum of the normalized, distinct hardware memory domains. The
 system-memory total is not added separately. The client filters every local model option with scores,
-sorts by descending utility, breaks ties by canonical model ID, and then returns at most ten rows.
-Installation state affects the row action, not ranking eligibility. Every installed model also
-remains available under `ON THIS COMPUTER`, including when it appears in the ranked group.
+sorts by descending utility, breaks ties by canonical model ID, and then applies the caller's result limit. Installation state affects the row action, not ranking eligibility. Every installed
+model remains available in My Models, including when it appears in Discover.
 
 ## Preference lifetime and rendering
 
-Fast-to-Smart is connection-scoped setup state and defaults to `0.5`. The setup service clamps updates
-to `[0, 1]`; the preference survives renderer remounts for the current connection but is not persisted.
+The desktop preference is connection-scoped state and defaults to Balanced. It survives page
+navigation and renderer component remounts within the connection but is not persisted. Discover
+observes canonical catalog and hardware data and applies the shared client-common ranking policy.
+Selectable recommendations require authoritative hardware and assessment evidence.
 
-CLI and web render the same controls and recompute results from current hardware, options, and
-control state. Selectable ranked models require an authoritative hardware result. Fast-to-Smart has
-five visually equidistant semantic positions: Fastest, Faster, Balanced, Smarter, and Smartest,
-corresponding to normalized weights `0.05`, `0.25`, `0.5`, `0.75`, and `0.95`. The softened endpoint
-weights ensure both speed and intelligence remain ranking factors at every position. The CLI
-calculates tick spacing from label widths so labels cannot overlap. Its track, unselected ticks, and
-unselected labels use the normal white text color; only the selected tick and its label use accent
-blue, with no separate marker glyph.
-The CLI renders the Left/Right preference instruction in the chooser's shared bottom control row
-alongside model navigation, selection, and exit controls. The scale is not focusable or
-pointer-selectable. CLI keyboard traversal contains only model rows;
-Left/Right and `h`/`l` adjust Fast-to-Smart regardless of the selected row. The cursor owns a visible
-row position, so re-ranking keeps it on the same rank while the model and details at that rank change.
-There is no memory control.
+The five semantic positions are Fastest, Faster, Balanced, Smarter, and Smartest, corresponding to
+normalized weights `0.05`, `0.25`, `0.5`, `0.75`, and `0.95`. The softened endpoints keep both speed
+and intelligence relevant at every position. Discover renders these positions as a Fast-to-Smart slider and orders the
+eligible catalog entries by the selected preference. Its featured set takes the first configuration
+for each distinct canonical model base, then the first three models in that order. The complete
+configuration ranking remains available in the catalog. Other catalog entries retain their assessment
+status and cannot be mistaken for compatible recommendations. There is no memory control.
+
+The headless CLI accepts `catalog recommendations --preference` and `--limit`. It uses the same
+shared ranking policy and authoritative data as desktop Discover, with Balanced and ten results
+as its defaults. It prints a finite result and does not render a chooser or keyboard controls.
 
 ## Conformance
 
@@ -92,8 +91,8 @@ There is no memory control.
   ranking dimension.
 - Missing required speed evidence fails ranking.
 - Fast-to-Smart preference and the physical-memory hard filter are client-common concerns.
-- Filtering and sorting happen before the ten-result limit.
+- Filtering and sorting happen before the requested result limit.
 - Equal utility is ordered by canonical model ID only.
 - Eligible installed choices are ranked by the same controls as downloadable choices.
-- Every installed choice remains available under `ON THIS COMPUTER`, including ranked choices.
+- Every installed choice remains available in My Models, including ranked choices.
 - Live native load admission remains authoritative after assessment and ranking.
