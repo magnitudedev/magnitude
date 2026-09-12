@@ -34,7 +34,7 @@ another occurrence. Same-document navigation preserves the current session. Only
 may access the host RPC transport. Finite host calls declare replay policy; state-changing host
 actions are at-most-once and lost replies are not replayed into a replacement renderer session.
 
-The main destinations are Discover, Catalog, My Models, Connections, Status, and Settings. Service health and
+The main destinations are Discover, Catalog, My Models, Connections, Usage, Status, and Settings. Service health and
 model residency are distinct facts. There is no permanent bottom status strip. Discover, Catalog, My Models, Connections, and Usage occupy the top of the sidebar; Status and Settings stay pinned at the bottom. Discover leads with observed hardware, a Fast-to-Smart slider with five visible stops and clickable labels, and three distinct model recommendations with assessment-derived radar profiles. Each featured model uses its highest-ranked configuration; recommendations are full-width, vertically arranged, with room for their profiles and actions. Discover contains no catalog search or full catalog list. The separate Catalog destination owns the full collection, search, compatibility filtering, and expandable details with radar charts. My Models shows only acquisition/library entries, never the undownloaded catalog. Connections show the supported harnesses’ own artwork. Discovery uses the
 curated ACN catalog, hardware observations, and the shared ranking algorithm; no renderer-owned
 catalog, hardware inference, or independent recommendation source exists.
@@ -94,7 +94,7 @@ foreground startup also presents the failure. Service-supervisor failures remain
 the running tray and window and do not use this fatal initialization path.
 
 Connections observe actual provider configuration, required skills, and plugin integrity through the
-privileged host. Saved connection receipts govern restoration and ownership, not the Connected label.
+privileged host. Detected installations appear first, with installation and Magnitude connection status shown separately. Within installed harnesses, connected entries appear first with a green dot and their configuration paths; disconnected entries use a neutral dot and do not present expected paths as existing configuration. Unverifiable configuration remains an explicit unknown state. Undetected harnesses appear below with their artwork, Not installed status, and an official installation link; configuration details and connection actions are hidden until installation is detected. Detection refreshes automatically and has no manual Detect action. Saved connection receipts govern restoration and ownership, not the Connected label.
 Filesystem access failures remain distinguishable from missing or overwritten configuration. Connect
 writes configuration and required artifacts without launching a harness. Login startup is a separate
 explicit preference. Headless commands and the desktop share one connector implementation.
@@ -103,7 +103,7 @@ It never mutates the application environment. Connections use the resolved searc
 roots, and child-command environment; explicit command overrides remain authoritative. Failure falls
 back to the inherited environment. Quit cancels the probe and retires its child process group.
 Connect preserves the harness's
-current model. A saved receipt exposes repair and removal even when configuration has been overwritten.
+current model. For an installed harness, Connect repairs configuration that has been overwritten; Disconnect removes an intact managed connection. Connection status sits beneath the harness title, with connection actions in the header. Only connected cards have a divided configuration-details section.
 Intact configuration without a receipt can be Connected but is not claimed as removable owned state.
 Connections remain observable while the inference service is unavailable: configuration integrity
 does not depend on whether a model or service is running. Status shows separate service and model
