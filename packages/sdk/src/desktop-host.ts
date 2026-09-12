@@ -40,3 +40,18 @@ export type LoginStartupAction = typeof LoginStartupAction.Type
 export class LoginStartupFailed extends Schema.TaggedError<LoginStartupFailed>()("LoginStartupFailed", { message: Schema.String }) {}
 export const ApplicationLoginRequest = Schema.Struct({ version: Schema.Literal(1), login: LoginStartupAction })
 export const ApplicationLoginReply = Schema.Union(Schema.TaggedStruct("LoginStartup", { state: LoginStartupState }), LoginStartupFailed)
+
+/** OS-attributed process memory, never catalog estimates or whole-machine used RAM. */
+export const ApplicationMemorySample = Schema.Struct({
+  bytes: Schema.Int.pipe(Schema.between(0, Number.MAX_SAFE_INTEGER)),
+  processCount: Schema.Int.pipe(Schema.between(1, 512)),
+  metric: Schema.Literal("PhysicalFootprint", "ProportionalResident", "PrivateWorkingSet"),
+})
+export const ApplicationMemoryObservation = Schema.Union(
+  Schema.TaggedStruct("Measured", {
+    ...ApplicationMemorySample.fields,
+    measuredAt: Schema.Int.pipe(Schema.between(0, Number.MAX_SAFE_INTEGER)),
+  }),
+  Schema.TaggedStruct("Unavailable", { message: Schema.String }),
+)
+export type ApplicationMemoryObservation = typeof ApplicationMemoryObservation.Type

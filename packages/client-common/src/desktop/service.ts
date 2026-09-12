@@ -1,6 +1,6 @@
 import { Atom, Registry, Result } from "@effect-atom/atom-react"
 import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
-import type { LoginStartupState } from "@magnitudedev/sdk/desktop-host"
+import type { LoginStartupState, ApplicationMemoryObservation } from "@magnitudedev/sdk/desktop-host"
 import type { LocalModelsState } from "@magnitudedev/sdk"
 import type { DesktopConnectRequest, DesktopConnectionsSnapshot } from "./connections"
 import type { HarnessId } from "../harness-connections/service"
@@ -18,6 +18,7 @@ export class DesktopHostUnavailable extends Schema.TaggedError<DesktopHostUnavai
   override get message() { return "Desktop host unavailable" }
 }
 export interface DesktopBridge {
+  readonly memory: Stream.Stream<ApplicationMemoryObservation, unknown>
   readonly applicationInfo: Effect.Effect<typeof DesktopApplicationInfo.Type, unknown>
   readonly updates: Stream.Stream<DesktopUpdateState, unknown>
   readonly checkUpdate: Effect.Effect<void, unknown>
@@ -69,6 +70,7 @@ const makeDesktopSession = Effect.gen(function* () {
     )
   }
   const loginStartup = Atom.make(Option.isSome(bridge) ? bridge.value.loginStartup : Stream.succeed({ _tag: "Unavailable" as const, message: "Desktop host unavailable" }))
+  const memory = Atom.make(Option.isSome(bridge) ? bridge.value.memory : Stream.succeed({ _tag: "Unavailable" as const, message: "Desktop host unavailable" }))
   const applicationInfo = Atom.make(Option.isSome(bridge) ? bridge.value.applicationInfo : Effect.fail(new DesktopHostUnavailable()))
   const updates = Atom.make(Option.isSome(bridge) ? bridge.value.updates : Stream.succeed({ _tag: "Unavailable" as const, message: "Desktop host unavailable" }))
   const checkUpdate = Atom.fn(() => Option.isSome(bridge) ? bridge.value.checkUpdate : Effect.fail(new DesktopHostUnavailable()))
@@ -78,7 +80,7 @@ const makeDesktopSession = Effect.gen(function* () {
   const connections = Atom.make(Option.isSome(bridge) ? bridge.value.connections : Stream.succeed({ _tag: "Ready" as const, connections: [] }))
   const connect = Atom.fn((input: DesktopConnectRequest) => Option.isSome(bridge) ? bridge.value.connect(input) : Effect.fail(new DesktopHostUnavailable()))
   const disconnect = Atom.fn((harness: HarnessId) => Option.isSome(bridge) ? bridge.value.disconnect(harness) : Effect.fail(new DesktopHostUnavailable()))
-  return { page: page as Atom.Atom<DesktopPage>, navigate, rankingPreference: rankingPreference as Atom.Atom<number>, setRankingPreference, applicationInfo, updates, checkUpdate, downloadUpdate, restartUpdate, loginStartup, setLoginStartup, connections, connect, disconnect }
+  return { memory, page: page as Atom.Atom<DesktopPage>, navigate, rankingPreference: rankingPreference as Atom.Atom<number>, setRankingPreference, applicationInfo, updates, checkUpdate, downloadUpdate, restartUpdate, loginStartup, setLoginStartup, connections, connect, disconnect }
 })
 export interface DesktopSession extends Effect.Effect.Success<typeof makeDesktopSession> {}
 export const DesktopSession = Context.GenericTag<DesktopSession>("client/DesktopSession")

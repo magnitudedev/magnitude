@@ -24,6 +24,7 @@ const command = (select: (client: InferenceHostClient) => Effect.Effect<unknown,
   },
 }))
 const api: DesktopApi = {
+  memory: (value, error) => observe(client => client.Memory({}), value, error),
   applicationInfo: () => runtime.runPromise(Effect.flatMap(HostClient, client => client.ApplicationInfo({}))),
   updates: (value, error) => observe(client => client.Updates({}), value, error),
   checkUpdate: () => command(client => client.CheckUpdate({})),

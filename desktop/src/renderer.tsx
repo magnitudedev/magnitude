@@ -3,7 +3,7 @@ import { Button } from "../../web/src/components/ui/button"
 import { Input } from "../../web/src/components/ui/input"
 import { Progress } from "../../web/src/components/ui/progress"
 import { MagnitudeMark } from "../../web/src/components/magnitude-mark"
-import { Layers3, Library, HardDrive, Plug, Activity, Check, Settings2, Download, Play, Square, Trash2, X, Monitor, Sun, Moon } from "lucide-react"
+import { Layers3, Library, HardDrive, MemoryStick, Plug, Activity, Check, Settings2, Download, Play, Square, Trash2, X, Monitor, Sun, Moon } from "lucide-react"
 import { createRoot } from "react-dom/client"
 import { useMemo, useState } from "react"
 import { Atom, RegistryProvider, Result, useAtomValue, useAtomSet } from "@effect-atom/atom-react"
@@ -219,6 +219,25 @@ function DownloadActivity() {
     {!Result.isSuccess(models) ? <p className="mt-3 text-sm text-slate-500">{Result.isFailure(models) ? "Download activity unavailable" : "Reading download activity…"}</p> : active.length === 0 ? <p className="mt-3 text-sm text-slate-500">No downloads in progress.</p> : <ul className="mt-4 space-y-5">{active.map(model => <li key={model.modelId}><div className="flex items-center gap-3"><ModelLogo model={model} className="size-6" /><p className="text-sm">{formatLocalModelDisplayName(model)} · {model.acquisitionState._tag === "Removing" ? "Removing files…" : model.acquisitionState._tag === "Updating" ? "Updating" : "Downloading"}</p></div><DownloadProgress acquisition={model.acquisitionState} /></li>)}</ul>}
   </section>
 }
+function MemoryStatus() {
+  const client = useAgentClient()
+  const session = useAtomValue(useMemo(() => client.runtime.atom(DesktopSession), [client]))
+  return Result.isSuccess(session) ? <MemoryStatusView service={session.value} /> : null
+}
+function MemoryStatusView({ service }: { service: DesktopSession }) {
+  const observation = useAtomValue(service.memory)
+  const sample = Result.isSuccess(observation) ? observation.value : null
+  const measured = sample?._tag === "Measured" ? sample : null
+  const metric = measured?.metric === "PhysicalFootprint" ? "macOS memory footprint" : measured?.metric === "ProportionalResident" ? "Proportional resident memory" : "Private working set"
+  return <section aria-label="Memory usage" className="rounded-2xl border border-slate-200 bg-white p-6 dark:border-slate-750 dark:bg-slate-850">
+    <div className="flex items-center gap-3"><MemoryStick className="size-5 text-blue-600 dark:text-blue-400" /><h2 className="font-heading text-lg">Memory in use</h2></div>
+    {measured ? <>
+      <p className="mt-4 font-heading text-3xl" data-memory-bytes={measured.bytes} data-measured-at={measured.measuredAt}>{formatMemorySize(measured.bytes)}</p>
+      <p className="mt-2 text-sm text-slate-500">Across Magnitude and its background processes.</p>
+      <details className="mt-3 text-xs text-slate-500"><summary className="cursor-pointer">How memory is measured</summary><p className="mt-2">{metric} across {measured.processCount} processes. {measured.metric === "ProportionalResident" ? "Shared pages are counted proportionally." : "Shared and file-backed pages may be excluded."} Updated {new Date(measured.measuredAt).toLocaleTimeString()}.</p></details>
+    </> : <p className="mt-4 text-sm text-slate-500">{sample?._tag === "Unavailable" ? sample.message : Result.isFailure(observation) ? "Memory reading unavailable." : "Measuring memory…"}</p>}
+  </section>
+}
 function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null }) {
   const service = snapshot?.service
   const ready=service?._tag === "Ready"
@@ -228,6 +247,7 @@ function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null
       {service && "message" in service && <p role="alert" className="mt-5 text-sm">{service.message}</p>}
       {service?._tag === "Failed" && <Button className="mt-5" variant="outline" onClick={() => host.retry()}>Retry service</Button>}
     </section>
+    <MemoryStatus />
     <div className="grid items-start gap-5 lg:grid-cols-2">
       {ready ? <ModelStatus /> : <section className="rounded-2xl border border-slate-200 bg-white p-6 dark:border-slate-750 dark:bg-slate-850"><h2 className="font-heading text-lg">Model activity</h2><p className="mt-4 text-sm text-slate-500">Model status will return when the service is ready.</p></section>}
       {ready && <DownloadActivity />}
@@ -345,6 +365,7 @@ const boot = Effect.gen(function* () {
       if (decoded._tag === "Right") emit.single(decoded.right)
       else emit.fail(new DesktopHostFailed({ message: String(decoded.left) }))
     }, message => emit.fail(new DesktopHostFailed({ message })))), unsubscribe => Effect.sync(unsubscribe)).pipe(Effect.asVoid)),
+    memory: Stream.asyncPush(emit => Effect.acquireRelease(Effect.sync(() => host.memory(value => emit.single(value), message => emit.fail(new DesktopHostFailed({ message })))), unsubscribe => Effect.sync(unsubscribe)).pipe(Effect.asVoid)),
     applicationInfo: Effect.tryPromise(() => host.applicationInfo()).pipe(Effect.flatMap(Schema.decodeUnknown(DesktopApplicationInfo))),
     updates: Stream.asyncPush(emit => Effect.acquireRelease(Effect.sync(() => host.updates(state => {
       const decoded = Schema.decodeUnknownEither(DesktopUpdateState)(state)
