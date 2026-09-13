@@ -4,6 +4,7 @@ import { lstat, unlink, chmod } from "node:fs/promises"
 import { Deferred, Effect, Option, Schema, Stream } from "effect"
 import { receiveJsonLines, sendJsonLine } from "@magnitudedev/utils/json-line-channel"
 import { ApplicationIntent, ApplicationRequest, ApplicationSnapshot, ApplicationLoginRequest, ApplicationLoginReply, LoginStartupFailed, type LoginStartupAction, type LoginStartupState } from "@magnitudedev/sdk/desktop-host"
+import { ApplicationUpdateRequest, ApplicationUpdateReply, type ApplicationUpdateAction, type ApplicationUpdateControlFailed, type DesktopUpdateState } from "@magnitudedev/sdk/desktop-host"
 export { ApplicationIntent, ApplicationRequest, ApplicationSnapshot } from "@magnitudedev/sdk/desktop-host"
 
 export class ApplicationControlFailed extends Schema.TaggedError<ApplicationControlFailed>()("ApplicationControlFailed", { message: Schema.String }) {}
@@ -24,6 +25,7 @@ export interface ApplicationControlOptions {
   readonly snapshot: Effect.Effect<ApplicationSnapshot>
   readonly dispatch: (intent: ApplicationIntent) => Effect.Effect<void>
   readonly login: (action: LoginStartupAction) => Effect.Effect<LoginStartupState, LoginStartupFailed>
+  readonly update: (action: ApplicationUpdateAction) => Effect.Effect<{ readonly state: DesktopUpdateState; readonly afterReply: Effect.Effect<void> }, ApplicationUpdateControlFailed>
 }
 
 export const serveApplicationControl = (path: string, options: ApplicationControlOptions) => Effect.gen(function* () {
@@ -46,7 +48,7 @@ export const serveApplicationControl = (path: string, options: ApplicationContro
         sockets.add(socket)
         socket.on("error", () => {})
         socket.once("close", () => sockets.delete(socket))
-        socket.setTimeout(5000, () => socket.destroy())
+        socket.setTimeout(20000, () => socket.destroy())
         void emit.single(socket)
       })
       server.on("error", error => { resume(Effect.fail(failure(error))); void emit.fail(failure(error)) })
@@ -68,8 +70,14 @@ export const serveApplicationControl = (path: string, options: ApplicationContro
 export const serveApplicationRequests = <E, R>(connections: Stream.Stream<Duplex, E, R>, options: ApplicationControlOptions) =>
   connections.pipe(Stream.mapEffect(socket => Effect.scoped(Effect.gen(function* () {
     yield* Effect.addFinalizer(() => Effect.sync(() => socket.destroy()))
-    const request = yield* receiveJsonLines(socket, Schema.Union(ApplicationRequest, ApplicationLoginRequest)).pipe(Stream.take(1), Stream.runHead)
+    const request = yield* receiveJsonLines(socket, Schema.Union(ApplicationRequest, ApplicationLoginRequest, ApplicationUpdateRequest)).pipe(Stream.take(1), Stream.runHead)
     if (Option.isNone(request)) return
+    if ("update" in request.value) {
+      const result = yield* options.update(request.value.update).pipe(Effect.either)
+      yield* sendJsonLine(socket, ApplicationUpdateReply, result._tag === "Left" ? result.left : { _tag: "Update", state: result.right.state })
+      if (result._tag === "Right") yield* result.right.afterReply
+      return
+    }
     if ("login" in request.value) {
       const reply = yield* options.login(request.value.login).pipe(Effect.map(state => ({ _tag: "LoginStartup" as const, state })), Effect.catchAll(Effect.succeed))
       yield* sendJsonLine(socket, ApplicationLoginReply, reply)
@@ -78,9 +86,9 @@ export const serveApplicationRequests = <E, R>(connections: Stream.Stream<Duplex
     // Reply before Quit tears down the server and before ShowWindow does any UI work.
     yield* sendJsonLine(socket, ApplicationSnapshot, yield* options.snapshot)
     yield* options.dispatch(request.value.intent)
-  })).pipe(Effect.timeout("5 seconds"), Effect.catchAll(() => Effect.void)), { concurrency: 16 }), Stream.runDrain, Effect.forkScoped)
+  })).pipe(Effect.timeout("20 seconds"), Effect.catchAll(() => Effect.void)), { concurrency: 16 }), Stream.runDrain, Effect.forkScoped)
 
-const exchange = <Q, QI, A, AI>(path: string, requestSchema: Schema.Schema<Q, QI>, request: Q, replySchema: Schema.Schema<A, AI>) => Effect.scoped(Effect.gen(function* () {
+const exchange = <Q, QI, A, AI>(path: string, requestSchema: Schema.Schema<Q, QI>, request: Q, replySchema: Schema.Schema<A, AI>, timeout = 5000) => Effect.scoped(Effect.gen(function* () {
   if (process.platform !== "win32") yield* validateUnixControlPath(path)
   const socket = yield* Effect.acquireRelease(
     Effect.async<Socket, ApplicationControlFailed | ApplicationControlUnavailable>(resume => {
@@ -98,9 +106,12 @@ const exchange = <Q, QI, A, AI>(path: string, requestSchema: Schema.Schema<Q, QI
   yield* sendJsonLine(socket, requestSchema, request)
   const value = yield* response.await.pipe(Effect.flatten)
   return yield* Option.match(value, { onNone: () => Effect.fail(new ApplicationControlFailed({ message: "Application closed without a response" })), onSome: Effect.succeed })
-})).pipe(Effect.catchTag("JsonLineChannelFailed", error => Effect.fail(new ApplicationControlFailed({ message: error.message }))), Effect.timeoutFail({ duration: "5 seconds", onTimeout: () => new ApplicationControlFailed({ message: "Application did not respond within five seconds" }) }))
+})).pipe(Effect.catchTag("JsonLineChannelFailed", error => Effect.fail(new ApplicationControlFailed({ message: error.message }))), Effect.timeoutFail({ duration: timeout, onTimeout: () => new ApplicationControlFailed({ message: "Application control request timed out" }) }))
 
 export const requestApplication = (path: string, intent: ApplicationIntent) => exchange(path, ApplicationRequest, { version: 1 as const, intent }, ApplicationSnapshot)
 export const requestLoginStartup = (path: string, login: LoginStartupAction) => exchange(path, ApplicationLoginRequest, { version: 1 as const, login }, ApplicationLoginReply).pipe(
   Effect.flatMap(reply => reply._tag === "LoginStartupFailed" ? Effect.fail(reply) : Effect.succeed(reply.state)),
+)
+export const requestApplicationUpdate = (path: string, update: ApplicationUpdateAction) => exchange(path, ApplicationUpdateRequest, { version: 1 as const, update }, ApplicationUpdateReply, 20000).pipe(
+  Effect.flatMap(reply => reply._tag === "ApplicationUpdateControlFailed" ? Effect.fail(reply) : Effect.succeed(reply.state)),
 )

@@ -35,6 +35,9 @@ archives, not only on intermediate build outputs.
   Electron distribution, executable names, native resources and platform metadata all follow
   that target; assembly requires prebuilt matching service and native inputs. Cross-assembly
   does not replace installed-consumer acceptance on the target operating system.
+- Desktop resources include the exact headless CLI and service built with the application version.
+  Apple signs both compiled runtimes with their required JIT entitlements before notarization.
+  Package acceptance executes both version commands; an application update cannot leave its CLI behind.
 
 ## Linux build baseline
 

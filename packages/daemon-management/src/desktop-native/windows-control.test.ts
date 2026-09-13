@@ -52,7 +52,7 @@ describe("Windows application control (simulated native transport)", () => {
       closePrivatePipe: async () => { throw new Error("No handle was acquired") },
     })
     const result = await Effect.runPromise(Effect.scoped(Effect.either(serveWindowsApplicationControl(name, {
-      snapshot: Effect.succeed(snapshot), login: () => Effect.succeed({ _tag: "Disabled" }), dispatch: () => Effect.void,
+      snapshot: Effect.succeed(snapshot), update: () => Effect.die("Unexpected update request"), login: () => Effect.succeed({ _tag: "Disabled" }), dispatch: () => Effect.void,
     }))).pipe(Effect.provide(layer), Effect.timeout("2 seconds")))
     expect(result._tag).toBe("Left")
     if (result._tag === "Left") expect(result.left._tag).toBe("WindowsPipeFailed")
@@ -62,7 +62,7 @@ describe("Windows application control (simulated native transport)", () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const done = yield* Deferred.make<void>()
       yield* serveWindowsApplicationControl(name, {
-        snapshot: Effect.succeed(snapshot), login: () => Effect.succeed({ _tag: "Disabled" }),
+        snapshot: Effect.succeed(snapshot), update: () => Effect.die("Unexpected update request"), login: () => Effect.succeed({ _tag: "Disabled" }),
         dispatch: received => Effect.sync(() => {
           expect(received).toBe(intent)
           expect(JSON.parse(Buffer.concat(test.instances[0]!.output).toString()).tray._tag).toBe("Registered")
@@ -81,7 +81,7 @@ describe("Windows application control (simulated native transport)", () => {
     const test = fixture()
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       yield* serveWindowsApplicationControl(name, {
-        snapshot: Effect.succeed(snapshot), dispatch: () => Effect.die("Login must not dispatch intent"),
+        snapshot: Effect.succeed(snapshot), update: () => Effect.die("Unexpected update request"), dispatch: () => Effect.die("Login must not dispatch intent"),
         login: action => action === "disable" ? Effect.fail(new LoginStartupFailed({ message: "OS refused change" })) : Effect.succeed({ _tag: action === "read" ? "Disabled" : "Enabled" }),
       })
       test.instances[0]!.input.resolve(Buffer.from(JSON.stringify({ version: 1, login }) + "\n"))
@@ -95,7 +95,7 @@ describe("Windows application control (simulated native transport)", () => {
   it("rejects malformed framing without dispatching or losing the listener", async () => {
     const test = fixture()
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      yield* serveWindowsApplicationControl(name, { snapshot: Effect.succeed(snapshot), login: () => Effect.die("Invalid request"), dispatch: () => Effect.die("Invalid request") })
+      yield* serveWindowsApplicationControl(name, { snapshot: Effect.succeed(snapshot), update: () => Effect.die("Unexpected update request"), login: () => Effect.die("Invalid request"), dispatch: () => Effect.die("Invalid request") })
       test.instances[0]!.input.resolve(Buffer.from('{"version":1,"intent":"ReplaceOwner"}\n'))
       test.instances[0]!.accept.resolve(42)
       yield* waitFor(() => test.instances[0]!.closed)
@@ -107,7 +107,7 @@ describe("Windows application control (simulated native transport)", () => {
   it("bounds admission to sixteen clients and retires idle channels on interruption", async () => {
     const test = fixture()
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const worker = yield* serveWindowsApplicationControl(name, { snapshot: Effect.succeed(snapshot), login: () => Effect.succeed({ _tag: "Disabled" }), dispatch: () => Effect.void })
+      const worker = yield* serveWindowsApplicationControl(name, { snapshot: Effect.succeed(snapshot), update: () => Effect.die("Unexpected update request"), login: () => Effect.succeed({ _tag: "Disabled" }), dispatch: () => Effect.void })
       for (let index = 0; index < 16; index++) {
         yield* waitFor(() => test.instances.length > index)
         test.instances[index]!.accept.resolve(42)

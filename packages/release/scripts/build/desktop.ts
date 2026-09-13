@@ -18,6 +18,7 @@ export const DesktopTarget = Schema.Union(
 /** Assemble the desktop and its exact service together. Signing/notarization follow assembly. */
 export const buildDesktopApplication = (options: {
   readonly service: string
+  readonly cli: string
   readonly outputDirectory: string
   readonly version: string
   readonly revision: number
@@ -36,6 +37,7 @@ export const buildDesktopApplication = (options: {
   }))
   const serviceName = `${ACN_EXECUTABLE_NAME}${platform === "win32" ? ".exe" : ""}`
   const service = join(resources, serviceName)
+  const cli = join(resources, platform === "win32" ? "magnitude.exe" : "magnitude")
   const addon = join(resources, "desktop-host.node")
   const tray = join(resources, "trayTemplate@2x.png")
   const icon = join(resources, "application-icon.png")
@@ -43,6 +45,8 @@ export const buildDesktopApplication = (options: {
   const command = join(resources, "magnitude-command")
   yield* fs.copyFile(options.service, service)
   yield* fs.chmod(service, 0o755)
+  yield* fs.copyFile(options.cli, cli)
+  yield* fs.chmod(cli, 0o755)
   yield* fs.copyFile(join(root, `packages/daemon-management/dist/native/${platform}-${arch}/desktop-host.node`), addon)
   yield* fs.copyFile(join(root, "assets/brand/trayTemplate@2x.png"), tray)
   yield* fs.copyFile(join(root, "assets/brand/application-icon.png"), icon)
@@ -59,6 +63,6 @@ export const buildDesktopApplication = (options: {
     ...(platform === "win32" ? { icon: join(root, "packages/release/resources/windows/Magnitude.ico"), win32metadata: { CompanyName: "Magnitude" } } : {}),
     ...(platform === "darwin" ? { icon: join(root, "packages/release/resources/macos/Magnitude.icns"), extendInfo: { LSMinimumSystemVersion: MACOS_DEPLOYMENT_TARGET } } : {}),
     asar: true, prune: false, overwrite: true,
-    extraResource: [service, addon, tray, icon, license, ...(platform === "win32" ? [] : [command])],
+    extraResource: [service, cli, addon, tray, icon, license, ...(platform === "win32" ? [] : [command])],
   }), catch: error => new DesktopBuildFailed({ message: `Could not assemble desktop: ${String(error)}` }) })
 })).pipe(Effect.mapError(error => error instanceof DesktopBuildFailed ? error : new DesktopBuildFailed({ message: String(error) })))

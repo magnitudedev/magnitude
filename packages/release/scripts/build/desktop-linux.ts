@@ -119,6 +119,15 @@ export const buildLinuxDesktopInstaller = (options: {
     return yield* new DesktopBuildFailed({ message: "Linux desktop installer filename does not match its release target" })
   }
   const candidate = join(destination, packages[0]!)
+  if (options.format === "deb") {
+    // Both public executables are package-owned; maintainer scripts never edit user PATHs.
+    const contents = join(stage, "debian-contents")
+    const extracted = yield* Command.make("dpkg-deb", "--raw-extract", candidate, contents).pipe(Command.exitCode)
+    if (extracted !== 0) return yield* new DesktopBuildFailed({ message: "Could not prepare the bundled CLI package entry" })
+    yield* fs.symlink(`../lib/${LINUX_DESKTOP_PACKAGE_NAME}/resources/magnitude`, join(contents, "usr/bin/magnitude"))
+    const rebuilt = yield* Command.make("dpkg-deb", "--root-owner-group", "--build", contents, candidate).pipe(Command.exitCode)
+    if (rebuilt !== 0) return yield* new DesktopBuildFailed({ message: "Could not package the bundled CLI entry" })
+  }
   yield* validateLinuxDesktopInstaller({ ...options, file: candidate })
   yield* fs.makeDirectory(options.output, { recursive: true })
   const output = resolve(options.output, packages[0]!)

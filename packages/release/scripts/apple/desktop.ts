@@ -75,7 +75,7 @@ export const signDesktopApplication = (app: string) => Effect.gen(function* () {
       optionsForFile: file => ({
         hardenedRuntime: signing.mode === "developer-id",
         ...(signing.mode === "adhoc" ? { timestamp: "none" } : {}),
-        entitlements: join(resources, file.endsWith(`/${ACN_EXECUTABLE_NAME}`)
+        entitlements: join(resources, file.endsWith(`/${ACN_EXECUTABLE_NAME}`) || file.endsWith("/resources/magnitude") || file.endsWith("/Resources/magnitude")
           ? "bun.entitlements.plist"
           : (/\.(node|dylib|framework)$/.test(file) || file.endsWith("/magnitude-command")) ? "library.entitlements.plist" : "electron.entitlements.plist"),
       }),

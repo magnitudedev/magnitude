@@ -1,5 +1,6 @@
-import { isDevelopmentVersion } from "../update/updater"
 import { CLI_VERSION } from "../version"
+
+const isDevelopmentVersion = (version: string): boolean => version.includes("+dev.") || version === "0.0.0"
 
 export const isDevelopmentBuild = (): boolean =>
   /\.tsx?$/.test(import.meta.url)

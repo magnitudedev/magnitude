@@ -10,6 +10,7 @@ applies_to:
   - desktop/src/application-update*
   - desktop/src/mac-update-source*
   - packages/client-common/src/desktop/update.ts
+  - packages/sdk/src/desktop-update.ts
 ---
 
 # Hosted application update protocol

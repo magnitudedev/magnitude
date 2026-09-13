@@ -63,9 +63,10 @@ again. A stale request or subscription therefore cannot undo explicit Quit. A fr
 explicitly ensure the application again. Startup waits remain bound to the admitted application
 occurrence and fail if it is replaced.
 
-CLI package updates remain explicit and separate from desktop application/service updates. A
-post-update launcher request uses the same public background service-start path. RPC mismatch gives
-an update action rather than replacing or downgrading the running service.
+CLI update commands delegate to the desktop update owner independently of service readiness.
+Status is passive; active commands may start the tray without opening the window. The CLI does not
+run a package manager or update itself separately. RPC mismatch gives an update action rather than
+replacing or downgrading the running service.
 Before a cold installed macOS launch, the host waits for an active native update job targeting that
 exact application bundle to finish. An inactive retained job is not an active installation. Observation
 failure or a bounded wait expiring fails the command without starting the old application. The CLI

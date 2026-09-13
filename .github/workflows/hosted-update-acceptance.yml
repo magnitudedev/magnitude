@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["0.0.14", "0.0.15"]
+        version: ["0.0.16", "0.0.17"]
     env:
       MAGNITUDE_APPLE_DISTRIBUTION: developer-id
       MAGNITUDE_ACCEPTANCE_VERSION: ${{ matrix.version }}
@@ -84,7 +84,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04-arm]
-        version: ["0.0.14", "0.0.15"]
+        version: ["0.0.16", "0.0.17"]
     runs-on: ${{ matrix.os }}
     container: ubuntu:22.04
     timeout-minutes: 30
