@@ -184,6 +184,10 @@ jobs:
       - name: Validate package permission regressions
         working-directory: packages/release
         run: bunx --bun vitest run scripts/build/desktop-linux.test.ts
+      - name: Validate Windows installation inventory and configuration ownership
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./packages/release/scripts/test-windows-installer.ps1
       - name: Verify Windows Authenticode with actual signed and tampered executables
         if: runner.os == 'Windows'
         shell: pwsh

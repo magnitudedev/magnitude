@@ -3,7 +3,7 @@ import { Cause, Effect, Exit, Schema } from "effect"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as NodeContext from "@effect/platform-node/NodeContext"
 import { join } from "node:path"
-import { WindowsInstallerInput, WindowsPayloadPath, buildWindowsDesktopInstaller, renderWindowsInstaller } from "./desktop-windows"
+import { WindowsInstallerInput, WindowsPayloadPath, buildWindowsDesktopInstaller, renderWindowsInstaller, renderWindowsInstallationInventory } from "./desktop-windows"
 const template = "@PAYLOAD_FILES@\n@REMOVE_FILES@\n@REMOVE_DIRECTORIES@"
 const input: typeof WindowsInstallerInput.Encoded = {
   version: "1.2.3-alpha.1", revision: 36, files: ["Magnitude.exe", "resources/app.asar"],
@@ -14,6 +14,7 @@ describe("Windows installer file contract", () => {
   })
   it.each([
     ["a", "A"], ["a", "a/b"], ["Resources/a", "resources/b"], ["Uninstall Magnitude.exe"], ["Uninstall Magnitude.exe/child"],
+    ["resources/installation-files.txt"], ["resources"],
   ])("rejects case/ownership collisions %j", async (...files) => {
     await expect(Effect.runPromise(renderWindowsInstaller(template, { ...input, files: files as [string, ...string[]] }))).rejects.toThrow()
   })
@@ -25,6 +26,14 @@ describe("Windows installer file contract", () => {
     expect(result).toContain('VIProductVersion "1.2.3.36"')
     expect(result).toContain('!define MAGNITUDE_VERSION "1.2.3-alpha.1"')
     expect(result).not.toContain('Delete "$INSTDIR')
+  })
+  it("records the exact owned payload and generated records with directories in removal order", async () => {
+    const inventory = await Effect.runPromise(renderWindowsInstallationInventory({ ...input, files: ["Magnitude.exe", "resources/nested/model.txt"] }))
+    expect(inventory.split("\n")).toEqual([
+      "magnitude-installation-v1", input.version,
+      "F\tMagnitude.exe", "F\tUninstall Magnitude.exe", "F\tresources\\installation-files.txt", "F\tresources\\nested\\model.txt",
+      "D\tresources\\nested", "D\tresources", "",
+    ])
   })
   it("escapes both NSIS quoting contexts and interpolation", async () => {
     const result = await Effect.runPromise(renderWindowsInstaller(template, { ...input, files: ["resources/O'Brien$.txt"] }))

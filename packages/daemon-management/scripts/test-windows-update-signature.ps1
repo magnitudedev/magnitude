@@ -13,12 +13,18 @@ try {
   $binary = Join-Path $fixture 'verify.exe'
   & $binary $binary 'Magnitude Update Acceptance'
   if ($LASTEXITCODE -eq 0) { throw 'Unsigned installer was accepted' }
+  Write-Output 'Creating isolated fixture publisher'
   $certificate = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Magnitude Update Acceptance, O=Magnitude Update Acceptance' `
     -CertStoreLocation Cert:\CurrentUser\My -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -NotAfter (Get-Date).AddDays(1)
   Export-Certificate -Cert $certificate -FilePath (Join-Path $fixture 'publisher.cer') | Out-Null
-  Import-Certificate -FilePath (Join-Path $fixture 'publisher.cer') -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
+  # CurrentUser Root displays an interactive trust prompt, even on a headless runner.
+  # The disposable CI machine is elevated; remove this exact test root in finally.
+  Write-Output 'Trusting isolated fixture publisher on the disposable runner'
+  Import-Certificate -FilePath (Join-Path $fixture 'publisher.cer') -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
+  Write-Output 'Signing the fixture executable'
   $signed = Set-AuthenticodeSignature -FilePath $binary -Certificate $certificate -HashAlgorithm SHA256
   if ($signed.Status -ne 'Valid') { throw "Fixture signing failed: $($signed.Status)" }
+  Write-Output 'Verifying the trusted fixture publisher'
   & $binary $binary 'Magnitude Update Acceptance'
   if ($LASTEXITCODE -ne 0) { throw 'Trusted fixture publisher was rejected' }
   & $binary $binary 'Different Publisher'
@@ -32,7 +38,7 @@ try {
   Write-Output 'PASS unsigned, trusted, wrong-publisher and tampered native installer checks'
 } finally {
   if ($certificate) {
-    Remove-Item -LiteralPath "Cert:\CurrentUser\Root\$($certificate.Thumbprint)" -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath "Cert:\LocalMachine\Root\$($certificate.Thumbprint)" -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath "Cert:\CurrentUser\My\$($certificate.Thumbprint)" -ErrorAction SilentlyContinue
   }
   Pop-Location

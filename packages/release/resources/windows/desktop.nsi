@@ -73,6 +73,9 @@ Section "Magnitude"
   SetOverwrite try
 @PAYLOAD_FILES@
   IfErrors stageFailed
+  SetOutPath "$Stage\resources"
+  File /oname=installation-files.txt "installation-files.txt"
+  IfErrors stageFailed
   WriteUninstaller "$Stage\Uninstall Magnitude.exe"
   IfErrors stageFailed
   SetOutPath "$PLUGINSDIR"
