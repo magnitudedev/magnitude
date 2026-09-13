@@ -10,7 +10,7 @@ const keys = generateKeyPairSync("ed25519"), publisher = generateKeyPairSync("ed
 const options = { origin: "https://magnitude.dev", storageOrigin: "https://downloads.magnitude.dev", country: Option.some("US"), trustedPublishers: new Map([[keyId, publisher.publicKey]]) }
 const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, version: "2.0.0", commit: "a".repeat(40), artifact: { id: "mac", target: { os: "darwin", arch: "arm64", package: "mac-zip" }, path: "releases/2.0.0/mac.zip", bytes: 42, sha256: "a".repeat(64) } })
 const request = async (fields: Record<string, string> = {}) => {
-  const url = new URL(options.origin + "/api/download/mac?" + updateQuery({ protocol: "1", product: "desktop", version: "1.0.0", os: "darwin", os_version: "26.0", arch: "arm64", package: "mac-zip", channel: "stable", ts: String(Math.floor(Date.now() / 1000)), nonce: await Effect.runPromise(newUpdateNonce), release: "2.0.0", ...fields }))
+  const url = new URL(options.origin + "/api/download?" + updateQuery({ artifact: "mac", protocol: "1", product: "desktop", version: "1.0.0", os: "darwin", os_version: "26.0", arch: "arm64", package: "mac-zip", channel: "stable", ts: String(Math.floor(Date.now() / 1000)), nonce: await Effect.runPromise(newUpdateNonce), release: "2.0.0", ...fields }))
   return new Request(url, { headers: { authorization: await Effect.runPromise(signUpdateRequest(keys.privateKey, url)) } })
 }
 const harness = async (overrides: Partial<DistributionStore> = {}) => {
@@ -48,5 +48,16 @@ describe("authenticated artifact downloads", () => {
   it("still offers the verified object when telemetry writing fails", async () => {
     const h = await harness({ recordDownload: () => new DistributionStoreUnavailable() })
     expect((await h.run(await request())).status).toBe(302)
+  })
+  it("binds the artifact in the signed query and rejects duplicate or unexpected fields", async () => {
+    const h = await harness(), signed = await request()
+    const changed = new URL(signed.url)
+    changed.searchParams.set("artifact", "other")
+    expect((await h.run(new Request(changed, { headers: signed.headers }))).status).toBe(401)
+    const duplicate = new URL(signed.url)
+    duplicate.searchParams.append("artifact", "mac")
+    expect((await h.run(new Request(duplicate, { headers: signed.headers }))).status).toBe(400)
+    expect((await h.run(await request({ unexpected: "value" }))).status).toBe(400)
+    expect(h.count()).toBe(0)
   })
 })

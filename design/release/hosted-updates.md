@@ -84,7 +84,8 @@ atomic upserts so concurrent distinct checks preserve their count. A telemetry-o
 may lose an observation but must not suppress an otherwise valid update response.
 
 Authenticated download requests use the same signature and replay admission, including the release
-selector. They resolve only a matching signed artifact and record download intent before returning
+and artifact selectors. Static HTTP endpoints preserve the exact signed path and query; routing
+parameters must never be appended to or overwrite signed fields. They resolve only a matching signed artifact and record download intent before returning
 an uncached redirect. Authorization is not forwarded to object storage. CDN range requests do not
 create additional download records. Request counts do not claim completed transfers or installs.
 

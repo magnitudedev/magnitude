@@ -27,7 +27,8 @@ describe("hosted update client", () => {
         calls++
         const request = new Request(input, init), url = new URL(request.url)
         expect(init?.redirect).toBe("manual")
-        expect(url.pathname).toBe(`/api/download/${manifest.artifact.id}`)
+        expect(url.pathname).toBe("/api/download")
+        expect(url.searchParams.get("artifact")).toBe(manifest.artifact.id)
         expect(url.searchParams.get("release")).toBe(manifest.version)
         expect(await Effect.runPromise(verifyUpdateRequest(request.headers.get("authorization")!, url))).toBe(await Effect.runPromise(installationId(installation.publicKey)))
         return new Response(null, { status: 302, headers: { location } })

@@ -25,7 +25,7 @@ describe("Mac update acquisition and native handoff", () => {
     const metadata = Schema.decodeUnknownSync(UpdateClientMetadata)({ version: "1.0.0", os: "darwin", os_version: "26", arch: "arm64", package: "mac-zip" })
     const fetchArtifact = Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init)
-      if (new URL(request.url).pathname.startsWith("/api/download/")) {
+      if (new URL(request.url).pathname === "/api/download") {
         expect(request.headers.has("authorization")).toBe(true)
         return new Response(null, { status: 302, headers: { location: `https://storage.example/${candidate.artifact.path}` } })
       }
