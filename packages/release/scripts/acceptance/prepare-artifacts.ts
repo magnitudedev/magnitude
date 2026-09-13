@@ -19,8 +19,10 @@ const run = Effect.gen(function* () {
     if (artifact.kind !== "desktop" || Option.isNone(artifact.host)) return yield* new AcceptancePreparationFailed()
     const host = artifact.host.value
     if (host.startsWith("darwin-") ? !/\.(dmg|zip)$/.test(artifact.filename)
+      : host === "windows-x64-msvc" ? !artifact.filename.endsWith(".exe")
       : !host.startsWith("linux-") || !/\.(deb|rpm)$/.test(artifact.filename)) return yield* new AcceptancePreparationFailed()
     const target = host.startsWith("darwin-") ? { os: "darwin", arch: host.endsWith("arm64") ? "arm64" : "x64", package: artifact.filename.endsWith(".dmg") ? "dmg" : "mac-zip" }
+      : host === "windows-x64-msvc" ? { os: "windows", arch: "x64", package: "windows-exe" }
       : { os: "linux", arch: host.includes("arm64") ? "arm64" : "x64", package: artifact.filename.endsWith(".deb") ? "deb" : "rpm" }
     const manifest = yield* Schema.decodeUnknown(UpdateManifest)({ protocol: 1, version, commit,
       artifact: { id: artifact.id, target, path: `releases/${version}/acceptance-${commit}-${artifact.filename}`, bytes: artifact.bytes, sha256: artifact.sha256 },

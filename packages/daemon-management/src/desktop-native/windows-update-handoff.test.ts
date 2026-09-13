@@ -38,6 +38,7 @@ describe("Windows update handoff", () => {
     expect(stdin.writableEnded).toBe(false)
     expect(Schema.decodeUnknownSync(Schema.parseJson(WindowsUpdateHandoffRequest))(Buffer.concat(chunks).toString())).toEqual(request)
     expect(vi.mocked(spawn).mock.calls[0]?.slice(0, 2)).toEqual([`${request.preparedDirectory}\\magnitude-update.exe`, ["_complete-windows-application-update"]])
+    expect(vi.mocked(spawn).mock.calls[0]?.[2]?.cwd).toBe(request.preparedDirectory)
     stdin.destroy(); stdout.destroy()
   })
   it("retires an unready helper on cancellation", async () => {

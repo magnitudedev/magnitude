@@ -11,6 +11,7 @@ const Configuration = Schema.Struct({
   keyId: Schema.String,
   publicKey: Schema.String,
   acceptance: Schema.Boolean,
+  windowsPublisher: Schema.optionalWith(Schema.NonEmptyString, { as: "Option", exact: true }),
 }).pipe(Schema.filter(config => !config.acceptance || config.origin !== "https://magnitude.dev"))
 
 /** Acceptance trust is an explicit build input, never a runtime environment override. */

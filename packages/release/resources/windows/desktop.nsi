@@ -133,8 +133,11 @@ Section "Magnitude"
   IfErrors stageFailed
   StrCpy $Stage ""
   ClearErrors
+  SetOutPath "$INSTDIR"
+  IfErrors registrationFailed
   CreateShortcut "$SMPROGRAMS\Magnitude.lnk" "$INSTDIR\Magnitude.exe"
   IfErrors registrationFailed
+  SetOutPath "$PLUGINSDIR"
   ClearErrors
   WriteRegStr HKCU "${REGKEY}" "DisplayName" "Magnitude"
   IfErrors registrationFailed
@@ -167,6 +170,7 @@ replacementRegistrationFailed:
   SetErrorLevel 1
   Abort "The update could not be registered. The previous installation was restored."
 registrationFailed:
+  SetOutPath "$PLUGINSDIR"
   SetErrorLevel 1
   Abort "Application registration is incomplete. Run $INSTDIR\Uninstall Magnitude.exe before reinstalling."
 stageFailed:

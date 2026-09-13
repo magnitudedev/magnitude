@@ -13,6 +13,7 @@ const updateConfiguration = acceptanceConfig ? {
   keyId: "magnitude-2026-01",
   publicKey: readFileSync(resolve(__dirname, "../packages/release/resources/distribution/magnitude-2026-01.pub.pem"), "utf8"),
   acceptance: false,
+  ...(process.env.MAGNITUDE_WINDOWS_PUBLISHER ? { windowsPublisher: process.env.MAGNITUDE_WINDOWS_PUBLISHER } : {}),
 };
 
 export default defineConfig({

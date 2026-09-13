@@ -30,7 +30,7 @@ const failed = () => new WindowsUpdateHandoffFailed({ message: "Could not start 
 export const startWindowsUpdateHandoff = (request: WindowsUpdateHandoffRequest) =>
   Schema.encode(Schema.parseJson(WindowsUpdateHandoffRequest))(request).pipe(Effect.mapError(failed), Effect.flatMap(payload => Effect.async<void, WindowsUpdateHandoffFailed>(resume => {
     const helper = spawn(win32.join(request.preparedDirectory, "magnitude-update.exe"), ["_complete-windows-application-update"], {
-      detached: true, windowsHide: true, stdio: ["pipe", "pipe", "ignore"],
+      cwd: request.preparedDirectory, detached: true, windowsHide: true, stdio: ["pipe", "pipe", "ignore"],
     })
     let admitted = false
     const fail = () => {
@@ -63,13 +63,14 @@ export const completeWindowsUpdateHandoff = (request: WindowsUpdateHandoffReques
   }
   const fs = yield* FileSystem.FileSystem
   const executor = yield* CommandExecutor.CommandExecutor
-  const result = yield* executor.exitCode(Command.make(win32.join(request.preparedDirectory, "magnitude-setup.exe"), "/S")).pipe(Effect.either)
+  const result = yield* executor.exitCode(Command.make(win32.join(request.preparedDirectory, "magnitude-setup.exe"), "/S")
+    .pipe(Command.workingDirectory(request.preparedDirectory))).pipe(Effect.either)
   const error = result._tag === "Left" ? Option.some("The application update installer could not be started.")
     : result.right === 0 ? Option.none<string>()
     : Option.some("The application update installer could not finish. Check for updates to retry.")
   const relaunch = Effect.async<void, WindowsUpdateHandoffFailed>(resume => {
     const application = spawn(request.applicationPath, request.showWindow ? [] : ["--background"], {
-      detached: true, windowsHide: true, stdio: "ignore",
+      cwd: win32.dirname(request.applicationPath), detached: true, windowsHide: true, stdio: "ignore",
     })
     application.once("error", () => resume(Effect.fail(failed())))
     application.once("spawn", () => { application.unref(); resume(Effect.void) })
