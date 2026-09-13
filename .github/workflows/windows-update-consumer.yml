@@ -18,8 +18,8 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     env:
-      MAGNITUDE_WINDOWS_ACCEPTANCE_FROM: '0.0.30'
-      MAGNITUDE_WINDOWS_ACCEPTANCE_TO: '0.0.31'
+      MAGNITUDE_WINDOWS_ACCEPTANCE_FROM: '0.0.32'
+      MAGNITUDE_WINDOWS_ACCEPTANCE_TO: '0.0.33'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -33,7 +33,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: prepared-windows-installers
-          run-id: 34750226856
+          run-id: 34751651548
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: ${{ runner.temp }}/magnitude-windows-update-acceptance
       - name: Exercise real downloads, Settings, native replacement and tray interaction
