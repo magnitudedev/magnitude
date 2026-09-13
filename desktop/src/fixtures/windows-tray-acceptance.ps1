@@ -8,10 +8,12 @@ Add-Type @'
 using System;
 using System.Runtime.InteropServices;
 public static class NativeTrayMouse {
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
 }
 '@
+[void][NativeTrayMouse]::SetProcessDPIAware()
 function Capture([string]$Name) {
   $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
   $image = New-Object Drawing.Bitmap($bounds.Width, $bounds.Height)
@@ -26,14 +28,21 @@ function Buttons {
   return [Windows.Automation.AutomationElement]::RootElement.FindAll([Windows.Automation.TreeScope]::Descendants, $condition)
 }
 function Click([Windows.Automation.AutomationElement]$Element, [bool]$Right = $false) {
-  $point = $Element.GetClickablePoint()
-  [void][NativeTrayMouse]::SetCursorPos([int]$point.X, [int]$point.Y)
+  try { $point = $Element.GetClickablePoint(); $x = $point.X; $y = $point.Y }
+  catch [Windows.Automation.NoClickablePointException] {
+    $bounds = $Element.Current.BoundingRectangle
+    if ($Element.Current.IsOffscreen -or $bounds.IsEmpty -or $bounds.Width -le 0 -or $bounds.Height -le 0) { throw }
+    $x = $bounds.X + $bounds.Width / 2
+    $y = $bounds.Y + $bounds.Height / 2
+  }
+  if (![System.Windows.Forms.SystemInformation]::VirtualScreen.Contains([int]$x, [int]$y)) { throw 'Native control is outside the visible desktop' }
+  [void][NativeTrayMouse]::SetCursorPos([int]$x, [int]$y)
   [NativeTrayMouse]::mouse_event($(if ($Right) {8} else {2}), 0, 0, 0, [UIntPtr]::Zero)
   [NativeTrayMouse]::mouse_event($(if ($Right) {16} else {4}), 0, 0, 0, [UIntPtr]::Zero)
 }
 Capture 'windows-desktop.png'
 $buttons = @(Buttons)
-$buttons | ForEach-Object { "$($_.Current.Name) | $($_.Current.ClassName) | $($_.Current.AutomationId)" } | Set-Content (Join-Path $Evidence 'native-buttons.txt')
+$buttons | ForEach-Object { "$($_.Current.Name) | $($_.Current.ClassName) | $($_.Current.AutomationId) | $($_.Current.BoundingRectangle) | offscreen=$($_.Current.IsOffscreen)" } | Set-Content (Join-Path $Evidence 'native-buttons.txt')
 $candidates = @($buttons | Where-Object { $_.Current.Name -eq 'Magnitude' -and !$_.Current.IsOffscreen })
 if ($candidates.Count -gt 1) { throw 'Multiple Magnitude buttons require native tray inspection' }
 $tray = $candidates | Select-Object -First 1
@@ -42,6 +51,7 @@ if (!$tray) {
   if ($overflow) {
     Click $overflow
     Start-Sleep -Milliseconds 500
+    Capture 'windows-tray-overflow.png'
     $candidates = @(@(Buttons) | Where-Object { $_.Current.Name -eq 'Magnitude' -and !$_.Current.IsOffscreen })
     if ($candidates.Count -gt 1) { throw 'Multiple Magnitude buttons require native tray inspection' }
     $tray = $candidates | Select-Object -First 1
