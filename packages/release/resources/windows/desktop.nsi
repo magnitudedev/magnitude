@@ -1,4 +1,4 @@
-; Per-user fresh installation. Updates require a separate accepted ownership policy.
+; Per-user installation and current-format replacement under the application lease.
 Unicode true
 RequestExecutionLevel user
 Name "Magnitude"
@@ -10,6 +10,7 @@ SetCompressor /SOLID lzma
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
 Var Stage
+Var PreviousVersion
 !define MUI_ABORTWARNING
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_INSTFILES
@@ -33,6 +34,35 @@ Function .onInit
   SetShellVarContext current
   StrCpy $INSTDIR "$LOCALAPPDATA\Programs\Magnitude"
   !insertmacro Lease
+  StrCpy $PreviousVersion ""
+  System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::ReadInstallationVersion(w "$INSTDIR", w "${REGKEY}", w .r8, i 1024) i .r0'
+  ${If} $0 == 0
+    StrCpy $PreviousVersion $8
+    System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::FlushInstallationRegistration(w "${REGKEY}") i .r0'
+    ${If} $0 != 0
+      SetErrorLevel 1
+      Abort "The application registration could not be saved. Existing files were preserved. Run setup again."
+    ${EndIf}
+  ${ElseIf} $0 != 2
+    MessageBox MB_OK|MB_ICONSTOP "The existing application registration could not be verified (code $0). It was preserved." /SD IDOK
+    SetErrorLevel 1
+    Abort
+  ${EndIf}
+  System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::RecoverReplacement(w "$INSTDIR", w "$PreviousVersion") i .r0'
+  ${If} $0 != 0
+    MessageBox MB_OK|MB_ICONSTOP "An interrupted installation could not be recovered (code $0). Its files were preserved. Close applications using those files and run setup again." /SD IDOK
+    SetErrorLevel 1
+    Abort
+  ${EndIf}
+  ${If} $PreviousVersion != ""
+    System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::ValidateOwnedInstallation(w "$INSTDIR", w "$PreviousVersion") i .r0'
+    ${If} $0 != 0
+      MessageBox MB_OK|MB_ICONSTOP "The installed files could not be verified (code $0). Setup preserved them. Remove the existing installation before installing this version." /SD IDOK
+      SetErrorLevel 1
+      Abort
+    ${EndIf}
+    Return
+  ${EndIf}
   System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::RequireUnusedRegistration(w "$SMPROGRAMS\Magnitude.lnk", w "${REGKEY}") i .r0'
   ${If} $0 != 0
     MessageBox MB_OK|MB_ICONSTOP "An existing shortcut or application registration could not be safely replaced (code $0). It was preserved." /SD IDOK
@@ -79,6 +109,26 @@ Section "Magnitude"
   WriteUninstaller "$Stage\Uninstall Magnitude.exe"
   IfErrors stageFailed
   SetOutPath "$PLUGINSDIR"
+  ${If} $PreviousVersion != ""
+    System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::BeginReplacement(w "$INSTDIR", w "$PreviousVersion", w "${MAGNITUDE_VERSION}") i .r0'
+    ${If} $0 != 0
+      Goto stageFailed
+    ${EndIf}
+    ClearErrors
+    WriteRegStr HKCU "${REGKEY}" "DisplayVersion" "${MAGNITUDE_VERSION}"
+    IfErrors replacementRegistrationFailed
+    System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::FlushInstallationRegistration(w "${REGKEY}") i .r0'
+    ${If} $0 != 0
+      SetErrorLevel 1
+      Abort "The update registration could not be saved. Installation files were retained for recovery. Run setup again."
+    ${EndIf}
+    System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::FinishReplacement(w "$PreviousVersion") i .r0'
+    ${If} $0 != 0
+      DetailPrint "The update is installed. Previous files were retained because cleanup could not complete (code $0). Setup will retry cleanup next time."
+    ${EndIf}
+    StrCpy $Stage ""
+    Goto installed
+  ${EndIf}
   Rename "$Stage" "$INSTDIR"
   IfErrors stageFailed
   StrCpy $Stage ""
@@ -107,13 +157,22 @@ Section "Magnitude"
   WriteRegDWORD HKCU "${REGKEY}" "NoRepair" 1
   IfErrors registrationFailed
   Goto installed
+replacementRegistrationFailed:
+  System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::RollbackReplacement() i .r0'
+  ${If} $0 != 0
+    SetErrorLevel 1
+    Abort "The update could not finish or restore the old installation. Files were retained for recovery. Run setup again."
+  ${EndIf}
+  Call CleanupStage
+  SetErrorLevel 1
+  Abort "The update could not be registered. The previous installation was restored."
 registrationFailed:
   SetErrorLevel 1
   Abort "Application registration is incomplete. Run $INSTDIR\Uninstall Magnitude.exe before reinstalling."
 stageFailed:
   Call CleanupStage
   SetErrorLevel 1
-  Abort "The application could not be staged. The installation path was not replaced."
+  Abort "Setup could not complete. Installation files were retained for recovery. Close applications using them and run setup again."
 installed:
 SectionEnd
 Function un.onInit

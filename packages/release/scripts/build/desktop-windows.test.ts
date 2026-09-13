@@ -20,7 +20,7 @@ describe("Windows installer file contract", () => {
   })
   it("uses one payload list for extraction and handle-relative removal", async () => {
     const result = await Effect.runPromise(renderWindowsInstaller(template, input))
-    expect(result).toContain('File "/oname=app.asar" "payload/000001.bin"')
+    expect(result).toContain('File "/oname=app.asar" "payload\\000001.bin"')
     expect(result).toContain('RemovePayload(w "resources\\app.asar", i 0)')
     expect(result).toContain('RemovePayload(w "resources", i 1)')
     expect(result).toContain('VIProductVersion "1.2.3.36"')

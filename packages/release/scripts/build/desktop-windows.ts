@@ -71,7 +71,7 @@ export const renderWindowsInstaller = (template: string, input: typeof WindowsIn
   const replacements: Record<string, string> = {
     "@PAYLOAD_FILES@": files.map((file, index) => {
       const parent = file.includes("/") ? "\\" + file.slice(0, file.lastIndexOf("/")).replaceAll("/", "\\") : ""
-      return `  SetOutPath "$Stage${quote(parent)}"\n  IfErrors stageFailed\n  File "/oname=${quote(file.split("/").at(-1)!)}" "payload/${String(index).padStart(6, "0")}.bin"\n  IfErrors stageFailed`
+      return `  SetOutPath "$Stage${quote(parent)}"\n  IfErrors stageFailed\n  File "/oname=${quote(file.split("/").at(-1)!)}" "payload\\${String(index).padStart(6, "0")}.bin"\n  IfErrors stageFailed`
     }).join("\n"),
     "@REMOVE_FILES@": [...files, "resources/installation-files.txt"].map(file => remove(file, false)).join("\n"),
     "@REMOVE_DIRECTORIES@": [...directories].sort((a, b) => b.split("/").length - a.split("/").length || a.localeCompare(b)).map(directory => remove(directory, true)).join("\n"),

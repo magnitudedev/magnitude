@@ -11,6 +11,9 @@
 static void require(BOOL condition, const char *message) {
   if (!condition) { fprintf(stderr, "%s (Windows error %lu)\n", message, GetLastError()); ExitProcess(1); }
 }
+static void require_success(DWORD error, const char *message) {
+  SetLastError(error); require(error == ERROR_SUCCESS, message);
+}
 static void set_value(HKEY root, LPCWSTR path, LPCWSTR name, LPCWSTR value) {
   HKEY key;
   require(RegCreateKeyExW(root, path, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL) == ERROR_SUCCESS, "create fixture key");
@@ -90,6 +93,15 @@ static void fill_installation(LPCWSTR root, LPCWSTR version) {
   swprintf(text, 1024, L"\xFEFFmagnitude-installation-v1\n%ls\nF\tMagnitude.exe\nF\tUninstall Magnitude.exe\nF\tresources\\installation-files.txt\nD\tresources\n", version);
   write_fixture(path, text);
 }
+static void remove_installation_fixture(LPCWSTR root) {
+  WCHAR path[32768];
+  LPCWSTR files[] = {L"Magnitude.exe", L"Uninstall Magnitude.exe", L"resources\\installation-files.txt"};
+  for (size_t index = 0; index < sizeof(files) / sizeof(files[0]); ++index) {
+    swprintf(path, 32768, L"%ls\\%ls", root, files[index]); require(DeleteFileW(path), "remove exact installation fixture file");
+  }
+  swprintf(path, 32768, L"%ls\\resources", root); require(RemoveDirectoryW(path), "remove empty fixture resources");
+  require(RemoveDirectoryW(root), "remove empty installation fixture");
+}
 #define RESOLVE_FUNCTION(library, variable, name) do { \
   FARPROC pointer = GetProcAddress(library, name); \
   require(pointer != NULL && sizeof(pointer) == sizeof(variable), "resolve " name); \
@@ -119,12 +131,12 @@ static void check_replacement(HMODULE library) {
   fill_installation(root, L"1.2.3"); fill_installation(payload, L"1.2.4");
   require(begin(root, L"1.2.2", L"1.2.4") != ERROR_SUCCESS, "wrong old version cannot replace installation");
   require(validate(root, L"1.2.3") == ERROR_SUCCESS, "rejected replacement preserves old payload");
-  require(begin(root, L"1.2.3", L"1.2.4") == ERROR_SUCCESS, "publish replacement by native directory handles");
-  require(rollback() == ERROR_SUCCESS, "roll back unpublished registration");
+  require_success(begin(root, L"1.2.3", L"1.2.4"), "publish replacement by native directory handles");
+  require_success(rollback(), "roll back unpublished registration");
   require(validate(root, L"1.2.3") == ERROR_SUCCESS, "rollback restores old version");
   require(validate(payload, L"1.2.4") == ERROR_SUCCESS, "rollback retains staged new version");
-  require(begin(root, L"1.2.3", L"1.2.4") == ERROR_SUCCESS, "retry replacement after rollback");
-  require(finish(L"1.2.3") == ERROR_SUCCESS, "retire exact old inventory after commit");
+  require_success(begin(root, L"1.2.3", L"1.2.4"), "retry replacement after rollback");
+  require_success(finish(L"1.2.3"), "retire exact old inventory after commit");
   require(validate(root, L"1.2.4") == ERROR_SUCCESS, "committed replacement has complete new inventory");
   swprintf(file, 32768, L"%ls\\Magnitude.exe", root); require(DeleteFileW(file), "remove new fixture executable");
   swprintf(file, 32768, L"%ls\\Uninstall Magnitude.exe", root); require(DeleteFileW(file), "remove new fixture uninstaller");
@@ -133,9 +145,56 @@ static void check_replacement(HMODULE library) {
   require(RemoveDirectoryW(root), "remove empty replacement fixture");
 }
 
+/* Separate invocations exit with native handles still held, reproducing an
+   installer interruption without a test-only production failure switch. */
+static void check_interrupted_replacement(HMODULE library, LPCWSTR mode) {
+  DWORD (WINAPI *hold)(void), (WINAPI *cleanup)(void);
+  DWORD (WINAPI *create_stage)(LPWSTR, DWORD);
+  DWORD (WINAPI *begin)(LPCWSTR, LPCWSTR, LPCWSTR);
+  DWORD (WINAPI *recover)(LPCWSTR, LPCWSTR);
+  DWORD (WINAPI *validate)(LPCWSTR, LPCWSTR);
+  RESOLVE_FUNCTION(library, hold, "HoldOwnership");
+  RESOLVE_FUNCTION(library, cleanup, "CleanupStage");
+  RESOLVE_FUNCTION(library, create_stage, "CreateStage");
+  RESOLVE_FUNCTION(library, begin, "BeginReplacement");
+  RESOLVE_FUNCTION(library, recover, "RecoverReplacement");
+  RESOLVE_FUNCTION(library, validate, "ValidateOwnedInstallation");
+  require_success(hold(), "acquire interrupted-installation lease");
+  WCHAR root[32768], payload[32768];
+  require(GetCurrentDirectoryW(32768, root) > 0 && wcslen(root) < 32000, "recovery fixture working directory");
+  wcscat(root, L"\\interrupted installation");
+  BOOL setup = !wcsncmp(mode, L"setup-", 6);
+  require(setup || !wcsncmp(mode, L"recover-", 8), "recognized interruption mode");
+  LPCWSTR scenario = setup ? mode + 6 : mode + 8;
+  require(!wcscmp(scenario, L"old-moved") || !wcscmp(scenario, L"uncommitted") || !wcscmp(scenario, L"committed"), "recognized interruption scenario");
+  if (setup) {
+    require_success(create_stage(payload, 32768), "create interrupted extraction stage");
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    require_success(magnitude_private_descriptor(TRUE, &descriptor), "private interrupted fixture descriptor");
+    SECURITY_ATTRIBUTES attributes = {sizeof(attributes), descriptor, FALSE};
+    require(CreateDirectoryW(root, &attributes), "create interrupted old installation"); LocalFree(descriptor);
+    fill_installation(root, L"1.2.3"); fill_installation(payload, L"1.2.4");
+    if (!wcscmp(scenario, L"old-moved")) {
+      WCHAR previous[32768]; wcscpy(previous, payload);
+      WCHAR *leaf = wcsrchr(previous, L'\\'); require(leaf != NULL, "stage has a parent"); wcscpy(leaf + 1, L"previous");
+      require(MoveFileExW(root, previous, 0), "interrupt after old directory moved");
+    } else require_success(begin(root, L"1.2.3", L"1.2.4"), "interrupt after new directory published");
+    ExitProcess(0);
+  }
+  LPCWSTR registered = !wcscmp(scenario, L"committed") ? L"1.2.4" : L"1.2.3";
+  require_success(recover(root, registered), "recover interrupted replacement using registered version");
+  require_success(validate(root, registered), "recovery publishes the registered complete version");
+  require_success(recover(root, registered), "recovery is repeatable");
+  remove_installation_fixture(root);
+  require_success(create_stage(payload, 32768), "previous installation is no longer treated as scratch");
+  require_success(cleanup(), "clean remaining extraction scratch");
+  puts("PASS interrupted installation recovery");
+}
+
 int wmain(int argc, wchar_t **argv) {
-  require(argc == 2, "expected absolute helper DLL path");
+  require(argc == 2 || argc == 3, "expected absolute helper DLL path and optional interruption mode");
   HMODULE library = LoadLibraryW(argv[1]); require(library != NULL, "load actual x86 helper DLL");
+  if (argc == 3) { check_interrupted_replacement(library, argv[2]); return 0; }
   check_inventory(library);
   check_replacement(library);
   typedef DWORD (WINAPI *RemoveStartup)(LPCWSTR);

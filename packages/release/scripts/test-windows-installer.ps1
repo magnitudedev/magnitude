@@ -15,7 +15,25 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'Native installer test compilation failed.' }
   & (Join-Path $testRoot 'windows-installer-test.exe') $helper
   if ($LASTEXITCODE -ne 0) { throw 'Native installer configuration preservation failed.' }
+  foreach ($scenario in @('old-moved', 'uncommitted', 'committed')) {
+    foreach ($phase in @('setup', 'recover')) {
+      & (Join-Path $testRoot 'windows-installer-test.exe') $helper "$phase-$scenario"
+      if ($LASTEXITCODE -ne 0) { throw "Native interrupted installation failed: $phase-$scenario" }
+    }
+  }
+  $nsis = Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'
+  if (!(Test-Path -LiteralPath $nsis)) {
+    & choco install nsis --yes --no-progress
+    if ($LASTEXITCODE -ne 0) { throw 'NSIS acquisition failed' }
+  }
+  $env:MAGNITUDE_INSTALLER_TEST_ROOT = $testRoot
+  $env:MAGNITUDE_INSTALLER_TEST_NSIS = $nsis
+  & bun (Join-Path $PSScriptRoot 'acceptance\build-windows-installer-fixture.ts')
+  if ($LASTEXITCODE -ne 0) { throw 'Production NSIS fixture compilation failed' }
+  & (Join-Path $PSScriptRoot 'acceptance\test-windows-installer-fixture.ps1') -Root $testRoot
 } finally {
+  Remove-Item Env:MAGNITUDE_INSTALLER_TEST_ROOT -ErrorAction SilentlyContinue
+  Remove-Item Env:MAGNITUDE_INSTALLER_TEST_NSIS -ErrorAction SilentlyContinue
   Pop-Location
   Remove-Item -Recurse -Force -LiteralPath $testRoot
 }
