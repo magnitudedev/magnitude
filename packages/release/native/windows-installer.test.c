@@ -80,10 +80,64 @@ static void check_inventory(HMODULE library) {
   require(RemoveDirectoryW(resources) && RemoveDirectoryW(root), "remove empty fixture directories");
 }
 
+static void fill_installation(LPCWSTR root, LPCWSTR version) {
+  WCHAR path[32768], text[1024];
+  swprintf(path, 32768, L"%ls\\resources", root);
+  require(CreateDirectoryW(path, NULL), "create replacement resources");
+  swprintf(path, 32768, L"%ls\\Magnitude.exe", root); write_fixture(path, version);
+  swprintf(path, 32768, L"%ls\\Uninstall Magnitude.exe", root); write_fixture(path, version);
+  swprintf(path, 32768, L"%ls\\resources\\installation-files.txt", root);
+  swprintf(text, 1024, L"\xFEFFmagnitude-installation-v1\n%ls\nF\tMagnitude.exe\nF\tUninstall Magnitude.exe\nF\tresources\\installation-files.txt\nD\tresources\n", version);
+  write_fixture(path, text);
+}
+#define RESOLVE_FUNCTION(library, variable, name) do { \
+  FARPROC pointer = GetProcAddress(library, name); \
+  require(pointer != NULL && sizeof(pointer) == sizeof(variable), "resolve " name); \
+  memcpy(&variable, &pointer, sizeof(variable)); \
+} while (0)
+static void check_replacement(HMODULE library) {
+  DWORD (WINAPI *hold)(void), (WINAPI *rollback)(void);
+  DWORD (WINAPI *create_stage)(LPWSTR, DWORD);
+  DWORD (WINAPI *begin)(LPCWSTR, LPCWSTR, LPCWSTR);
+  DWORD (WINAPI *finish)(LPCWSTR);
+  DWORD (WINAPI *validate)(LPCWSTR, LPCWSTR);
+  RESOLVE_FUNCTION(library, hold, "HoldOwnership");
+  RESOLVE_FUNCTION(library, create_stage, "CreateStage");
+  RESOLVE_FUNCTION(library, begin, "BeginReplacement");
+  RESOLVE_FUNCTION(library, rollback, "RollbackReplacement");
+  RESOLVE_FUNCTION(library, finish, "FinishReplacement");
+  RESOLVE_FUNCTION(library, validate, "ValidateOwnedInstallation");
+  require(hold() == ERROR_SUCCESS, "hold actual application lease");
+  WCHAR payload[32768], root[32768], file[32768];
+  require(create_stage(payload, 32768) == ERROR_SUCCESS, "prepare actual private installation stage");
+  require(GetCurrentDirectoryW(32768, root) > 0 && wcslen(root) < 32000, "replacement fixture working directory");
+  wcscat(root, L"\\replacement installation");
+  PSECURITY_DESCRIPTOR descriptor = NULL;
+  require(magnitude_private_descriptor(TRUE, &descriptor) == ERROR_SUCCESS, "replacement fixture descriptor");
+  SECURITY_ATTRIBUTES attributes = {sizeof(attributes), descriptor, FALSE};
+  require(CreateDirectoryW(root, &attributes), "create old private installation"); LocalFree(descriptor);
+  fill_installation(root, L"1.2.3"); fill_installation(payload, L"1.2.4");
+  require(begin(root, L"1.2.2", L"1.2.4") != ERROR_SUCCESS, "wrong old version cannot replace installation");
+  require(validate(root, L"1.2.3") == ERROR_SUCCESS, "rejected replacement preserves old payload");
+  require(begin(root, L"1.2.3", L"1.2.4") == ERROR_SUCCESS, "publish replacement by native directory handles");
+  require(rollback() == ERROR_SUCCESS, "roll back unpublished registration");
+  require(validate(root, L"1.2.3") == ERROR_SUCCESS, "rollback restores old version");
+  require(validate(payload, L"1.2.4") == ERROR_SUCCESS, "rollback retains staged new version");
+  require(begin(root, L"1.2.3", L"1.2.4") == ERROR_SUCCESS, "retry replacement after rollback");
+  require(finish(L"1.2.3") == ERROR_SUCCESS, "retire exact old inventory after commit");
+  require(validate(root, L"1.2.4") == ERROR_SUCCESS, "committed replacement has complete new inventory");
+  swprintf(file, 32768, L"%ls\\Magnitude.exe", root); require(DeleteFileW(file), "remove new fixture executable");
+  swprintf(file, 32768, L"%ls\\Uninstall Magnitude.exe", root); require(DeleteFileW(file), "remove new fixture uninstaller");
+  swprintf(file, 32768, L"%ls\\resources\\installation-files.txt", root); require(DeleteFileW(file), "remove new fixture inventory");
+  swprintf(file, 32768, L"%ls\\resources", root); require(RemoveDirectoryW(file), "remove new fixture resources");
+  require(RemoveDirectoryW(root), "remove empty replacement fixture");
+}
+
 int wmain(int argc, wchar_t **argv) {
   require(argc == 2, "expected absolute helper DLL path");
   HMODULE library = LoadLibraryW(argv[1]); require(library != NULL, "load actual x86 helper DLL");
   check_inventory(library);
+  check_replacement(library);
   typedef DWORD (WINAPI *RemoveStartup)(LPCWSTR);
   RemoveStartup remove_startup;
   FARPROC symbol = GetProcAddress(library, "RemoveOwnedStartup");

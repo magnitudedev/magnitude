@@ -12,6 +12,10 @@ static BOOL leaseHeld = FALSE;
 static HANDLE removalExecutable = INVALID_HANDLE_VALUE;
 static HANDLE removalDirectory = INVALID_HANDLE_VALUE;
 static HANDLE stageDirectory = INVALID_HANDLE_VALUE;
+static HANDLE replacementDirectory = INVALID_HANDLE_VALUE;
+static HANDLE previousDirectory = INVALID_HANDLE_VALUE;
+static HANDLE installationParent = INVALID_HANDLE_VALUE;
+static WCHAR installationLeaf[256];
 
 /* Name resolution must reject every reparse point, not only the final component.
    Deletion then acts on the opened object rather than resolving its path again. */
@@ -233,6 +237,137 @@ __declspec(dllexport) DWORD WINAPI ValidateOwnedInstallation(LPCWSTR path, LPCWS
   return error;
 }
 
+static DWORD rename_directory(HANDLE directory, HANDLE parent, LPCWSTR leaf) {
+  if (!safe_relative_path(leaf) || wcschr(leaf, L'\\')) return ERROR_BAD_PATHNAME;
+  size_t nameBytes = wcslen(leaf) * sizeof(WCHAR);
+  size_t size = sizeof(FILE_RENAME_INFO) + nameBytes;
+  FILE_RENAME_INFO *rename = calloc(1, size);
+  if (!rename) return ERROR_NOT_ENOUGH_MEMORY;
+  rename->RootDirectory = parent;
+  rename->FileNameLength = (DWORD)nameBytes;
+  memcpy(rename->FileName, leaf, nameBytes);
+  DWORD error = SetFileInformationByHandle(directory, FileRenameInfo, rename, (DWORD)size) ? ERROR_SUCCESS : GetLastError();
+  free(rename); return error;
+}
+static DWORD require_absent_child(HANDLE parent, LPCWSTR leaf) {
+  HANDLE child = INVALID_HANDLE_VALUE;
+  DWORD error = open_without_reparse(parent, leaf, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0, &child);
+  if (!error) { CloseHandle(child); return ERROR_ALREADY_EXISTS; }
+  return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? ERROR_SUCCESS : error;
+}
+static void close_replacement(void) {
+  if (replacementDirectory != INVALID_HANDLE_VALUE) CloseHandle(replacementDirectory);
+  if (previousDirectory != INVALID_HANDLE_VALUE) CloseHandle(previousDirectory);
+  if (installationParent != INVALID_HANDLE_VALUE) CloseHandle(installationParent);
+  replacementDirectory = previousDirectory = installationParent = INVALID_HANDLE_VALUE;
+  installationLeaf[0] = 0;
+}
+/* Both trees are validated before the first rename. Retained handles keep the
+   rollback targets stable until registration commits or rollback completes. */
+__declspec(dllexport) DWORD WINAPI BeginReplacement(LPCWSTR path, LPCWSTR oldVersion, LPCWSTR newVersion) {
+  if (!leaseHeld || stageDirectory == INVALID_HANDLE_VALUE || installationParent != INVALID_HANDLE_VALUE ||
+      !path || !oldVersion || !newVersion) return ERROR_INVALID_PARAMETER;
+  LPCWSTR leaf = wcsrchr(path, L'\\');
+  if (!leaf || leaf == path || wcslen(leaf + 1) >= 256 || !safe_relative_path(leaf + 1)) return ERROR_BAD_PATHNAME;
+  WCHAR *parent = calloc(32768, sizeof(WCHAR));
+  if (!parent) return ERROR_NOT_ENOUGH_MEMORY;
+  size_t length = (size_t)(leaf - path);
+  if (length > 32760 || path[1] != L':') { free(parent); return ERROR_BAD_PATHNAME; }
+  wcscpy(parent, L"\\??\\"); wmemcpy(parent + 4, path, length); parent[length + 4] = 0;
+  DWORD error = open_without_reparse(NULL, parent, FILE_LIST_DIRECTORY | FILE_ADD_SUBDIRECTORY,
+    FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_DIRECTORY_FILE, &installationParent);
+  free(parent);
+  if (!error) error = require_absent_child(stageDirectory, L"previous");
+  if (!error) error = open_installation_directory(path, &previousDirectory);
+  if (!error) error = open_without_reparse(stageDirectory, L"payload", READ_CONTROL | DELETE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+    FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_DIRECTORY_FILE, &replacementDirectory);
+  if (!error) error = magnitude_validate_private_directory(replacementDirectory);
+  installation_inventory oldInventory = {0}, newInventory = {0};
+  if (!error) error = read_inventory(previousDirectory, &oldInventory);
+  if (!error && wcscmp(oldInventory.version, oldVersion)) error = ERROR_INVALID_DATA;
+  if (!error) error = inspect_inventory(previousDirectory, &oldInventory, FALSE);
+  if (!error) error = read_inventory(replacementDirectory, &newInventory);
+  if (!error && wcscmp(newInventory.version, newVersion)) error = ERROR_INVALID_DATA;
+  if (!error) error = inspect_inventory(replacementDirectory, &newInventory, FALSE);
+  release_inventory(&oldInventory); release_inventory(&newInventory);
+  if (error) { close_replacement(); return error; }
+  wcscpy(installationLeaf, leaf + 1);
+  error = rename_directory(previousDirectory, stageDirectory, L"previous");
+  if (error) { close_replacement(); return error; }
+  error = rename_directory(replacementDirectory, installationParent, installationLeaf);
+  if (error) {
+    DWORD rollback = rename_directory(previousDirectory, installationParent, installationLeaf);
+    if (!rollback) close_replacement();
+    /* An incomplete rollback retains previous; scratch cleanup must refuse it. */
+    return rollback ? rollback : error;
+  }
+  return ERROR_SUCCESS;
+}
+__declspec(dllexport) DWORD WINAPI RollbackReplacement(void) {
+  if (!leaseHeld || installationParent == INVALID_HANDLE_VALUE || replacementDirectory == INVALID_HANDLE_VALUE ||
+      previousDirectory == INVALID_HANDLE_VALUE) return ERROR_INVALID_HANDLE;
+  DWORD error = rename_directory(replacementDirectory, stageDirectory, L"payload");
+  if (!error) error = rename_directory(previousDirectory, installationParent, installationLeaf);
+  if (!error) close_replacement();
+  return error;
+}
+
+static DWORD retire_entry(HANDLE directory, const inventory_entry *entry) {
+  HANDLE file = INVALID_HANDLE_VALUE;
+  DWORD error = open_without_reparse(directory, entry->path, DELETE | FILE_READ_ATTRIBUTES,
+    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    entry->directory ? FILE_DIRECTORY_FILE : FILE_NON_DIRECTORY_FILE, &file);
+  if (error) return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? ERROR_SUCCESS : error;
+  BY_HANDLE_FILE_INFORMATION info;
+  if (!GetFileInformationByHandle(file, &info)) error = GetLastError();
+  else if ((!entry->directory && info.nNumberOfLinks != 1) || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) error = ERROR_INVALID_DATA;
+  if (!error) {
+    FILE_DISPOSITION_INFO remove = {TRUE};
+    if (!SetFileInformationByHandle(file, FileDispositionInfo, &remove, sizeof(remove))) error = GetLastError();
+  }
+  CloseHandle(file); return error;
+}
+/* Never recursively clear the previous installation: the inventory authorizes
+   exact owned names, and unexpected files must survive even after commit. */
+static DWORD retire_inventory(HANDLE directory, LPCWSTR version) {
+  installation_inventory inventory;
+  DWORD error = read_inventory(directory, &inventory);
+  if (!error && wcscmp(inventory.version, version)) error = ERROR_INVALID_DATA;
+  if (!error) error = inspect_inventory(directory, &inventory, TRUE);
+  for (DWORD index = 0; !error && index < inventory.count; ++index) {
+    inventory_entry *entry = &inventory.entries[index];
+    if (!entry->directory && !same_name(entry->path, INVENTORY_FILE)) error = retire_entry(directory, entry);
+  }
+  for (int depth = 128; !error && depth >= 0; --depth) {
+    for (DWORD index = 0; !error && index < inventory.count; ++index) {
+      inventory_entry *entry = &inventory.entries[index];
+      if (!entry->directory || same_name(entry->path, L"resources")) continue;
+      int count = 0;
+      for (LPCWSTR cursor = entry->path; *cursor; ++cursor) if (*cursor == L'\\') ++count;
+      if (count == depth) error = retire_entry(directory, entry);
+    }
+  }
+  /* Retain the inventory until the rest has retired, so partial cleanup can retry. */
+  if (!error) error = inspect_inventory(directory, &inventory, TRUE);
+  inventory_entry record = {(WCHAR *)INVENTORY_FILE, FALSE, FALSE};
+  inventory_entry resources = {L"resources", TRUE, FALSE};
+  if (!error) error = retire_entry(directory, &record);
+  if (!error) error = retire_entry(directory, &resources);
+  if (!error) {
+    FILE_DISPOSITION_INFO remove = {TRUE};
+    if (!SetFileInformationByHandle(directory, FileDispositionInfo, &remove, sizeof(remove))) error = GetLastError();
+  }
+  release_inventory(&inventory); return error;
+}
+__declspec(dllexport) DWORD WINAPI FinishReplacement(LPCWSTR previousVersion) {
+  if (!leaseHeld || installationParent == INVALID_HANDLE_VALUE || previousDirectory == INVALID_HANDLE_VALUE ||
+      !previousVersion) return ERROR_INVALID_HANDLE;
+  DWORD error = retire_inventory(previousDirectory, previousVersion);
+  close_replacement();
+  return error;
+}
+
 #define STARTUP_NAME L"dev.magnitude.desktop"
 #define RUN_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 #define APPROVAL_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run"
@@ -386,6 +521,8 @@ static DWORD clear_scratch(HANDLE directory, unsigned depth) {
 }
 __declspec(dllexport) DWORD WINAPI CleanupStage(void) {
   if (!leaseHeld || stageDirectory == INVALID_HANDLE_VALUE) return ERROR_INVALID_HANDLE;
+  DWORD error = require_absent_child(stageDirectory, L"previous");
+  if (error) return error;
   return clear_scratch(stageDirectory, 0);
 }
 /* A fixed, private scratch container makes interrupted extraction recoverable.
@@ -411,12 +548,13 @@ __declspec(dllexport) DWORD WINAPI CreateStage(LPWSTR output, DWORD capacity) {
   SECURITY_ATTRIBUTES attributes = {sizeof(attributes), descriptor, FALSE};
   if (!CreateDirectoryW(container, &attributes) && GetLastError() != ERROR_ALREADY_EXISTS) error = GetLastError();
   if (!error) {
-    stageDirectory = CreateFileW(container, READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+    stageDirectory = CreateFileW(container, READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | FILE_ADD_SUBDIRECTORY,
       FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
       FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     if (stageDirectory == INVALID_HANDLE_VALUE) error = GetLastError();
     else error = magnitude_validate_private_directory(stageDirectory);
   }
+  if (!error) error = require_absent_child(stageDirectory, L"previous");
   if (!error) error = clear_scratch(stageDirectory, 0);
   if (!error && !CreateDirectoryW(payload, &attributes)) error = GetLastError();
   LocalFree(descriptor);
