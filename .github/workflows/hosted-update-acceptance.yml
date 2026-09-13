@@ -62,6 +62,9 @@ jobs:
       - name: Exercise the installed Windows application against the hosted update channel
         shell: pwsh
         run: ./packages/release/scripts/acceptance/test-windows-hosted-update.ps1
+        env:
+          MAGNITUDE_WINDOWS_ACCEPTANCE_FROM: '0.0.32'
+          MAGNITUDE_WINDOWS_ACCEPTANCE_TO: '0.0.33'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -71,14 +74,14 @@ jobs:
           retention-days: 14
 
   signed-mac-apps:
-    if: inputs.build_artifacts
+    if: github.event_name == 'push' || inputs.build_artifacts
     environment: apple-release
     runs-on: macos-15
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        version: ["0.0.28", "0.0.29"]
+        version: ["0.0.32", "0.0.33"]
     env:
       MAGNITUDE_APPLE_DISTRIBUTION: developer-id
       MAGNITUDE_ACCEPTANCE_VERSION: ${{ matrix.version }}
@@ -135,12 +138,12 @@ jobs:
         run: bash packages/release/scripts/apple/cleanup-credentials.sh
 
   linux-packages:
-    if: inputs.build_artifacts
+    if: github.event_name == 'push' || inputs.build_artifacts
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04-arm]
-        version: ["0.0.28", "0.0.29"]
+        version: ["0.0.32", "0.0.33"]
     runs-on: ${{ matrix.os }}
     container: ubuntu:22.04
     timeout-minutes: 30
@@ -215,6 +218,8 @@ jobs:
       - name: Exercise signed requests and update ownership on the native runtime
         working-directory: desktop
         run: bunx --bun vitest run src/update-identity.test.ts src/update-preferences.test.ts src/update-schedule.test.ts src/application-update.test.ts
+      - name: Verify bounded installer transfers and interrupted range recovery
+        run: bunx --bun vitest run packages/release/src/artifact-download.test.ts packages/release/src/hosted-update/installer-download.test.ts
       - name: Validate Windows private key permissions with native ACLs
         if: runner.os == 'Windows'
         shell: pwsh

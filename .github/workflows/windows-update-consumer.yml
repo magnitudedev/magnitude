@@ -5,6 +5,7 @@ on:
     paths:
       - '.github/workflows/windows-update-consumer.yml'
       - 'desktop/src/fixtures/windows-hosted-update.mjs'
+      - 'desktop/src/fixtures/windows-download-installer.ts'
       - 'desktop/src/fixtures/windows-tray-acceptance.ps1'
 permissions:
   contents: read
@@ -16,6 +17,9 @@ jobs:
   installed-application:
     runs-on: windows-latest
     timeout-minutes: 30
+    env:
+      MAGNITUDE_WINDOWS_ACCEPTANCE_FROM: '0.0.30'
+      MAGNITUDE_WINDOWS_ACCEPTANCE_TO: '0.0.31'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

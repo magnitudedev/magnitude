@@ -1,7 +1,6 @@
 import { FetchHttpClient, FileSystem } from "@effect/platform"
 import { NodeContext } from "@effect/platform-node"
-import { defaultArtifactDownloadPolicy, downloadArtifact } from "@magnitudedev/release"
-import { checkHostedUpdate, resolveHostedDownload, type HostedUpdateConnection } from "@magnitudedev/release/hosted-update"
+import { checkHostedUpdate, resolveHostedDownload, downloadUpdateArtifact, type HostedUpdateConnection } from "@magnitudedev/release/hosted-update"
 import { Effect, Option } from "effect"
 import type { KeyObject } from "node:crypto"
 import { basename, join } from "node:path"
@@ -23,14 +22,10 @@ export const hostedUpdateSource = (options: HostedUpdateSourceOptions, stage: Ap
     const fs = yield* FileSystem.FileSystem
     yield* fs.makeDirectory(options.cacheDirectory, { recursive: true, mode: 0o700 })
     const directory = yield* fs.makeTempDirectoryScoped({ directory: options.cacheDirectory, prefix: "desktop-update-" })
-    const downloaded = yield* downloadArtifact({
+    const downloaded = yield* downloadUpdateArtifact({
       url, destination: join(directory, basename(candidate.manifest.artifact.path)),
-      bytes: candidate.manifest.artifact.bytes, sha256: candidate.manifest.artifact.sha256,
-      strategy: { _tag: "Sequential" },
-      // Large installers can keep making progress on a slow connection for longer
-      // than the general acquisition attempt budget. The stall limit still applies.
-      policy: { ...defaultArtifactDownloadPolicy, attemptTimeout: "1 hour", totalTimeout: "185 minutes" },
-      onProgress: Option.some(value => progress(value.acceptedBytes)), onVerificationProgress: Option.none(),
+      manifest: candidate.manifest,
+      onProgress: Option.some(value => progress(value.acceptedBytes)),
     })
     return downloaded.destination
   }).pipe(Effect.mapError(() => new ApplicationUpdateFailed({ message: "Could not download and verify the application update." })), Effect.provide([NodeContext.layer, FetchHttpClient.layer])),
