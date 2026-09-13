@@ -135,3 +135,7 @@ HTTP failure, interrupted streams, byte-count mismatch and digest mismatch witho
 Installer downloads use bounded concurrent byte ranges so interrupted responses retry only their
 own part. Every range must describe the same artifact representation and the assembled file must
 match the signed byte count and digest. Endpoints without range support may use a sequential transfer.
+
+Range negotiation may retry a malformed probe within the same bounded attempt policy; no probe
+bytes are accepted as artifact data. A persistently invalid probe fails without publishing or
+falling back. Once negotiation succeeds, contradictory ranges or changed representations fail.

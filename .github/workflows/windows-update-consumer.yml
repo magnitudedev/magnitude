@@ -1,12 +1,22 @@
 name: Installed Windows update acceptance
 on:
-  push:
-    branches: [app]
-    paths:
-      - '.github/workflows/windows-update-consumer.yml'
-      - 'desktop/src/fixtures/windows-hosted-update.mjs'
-      - 'desktop/src/fixtures/windows-download-installer.ts'
-      - 'desktop/src/fixtures/windows-tray-acceptance.ps1'
+  workflow_dispatch:
+    inputs:
+      artifact_run:
+        description: Successful producer run containing prepared-windows-installers
+        required: true
+        default: '34751651548'
+        type: string
+      from_version:
+        description: Installer version to start from
+        required: true
+        default: '0.0.32'
+        type: string
+      to_version:
+        description: Hosted update version to accept
+        required: true
+        default: '0.0.33'
+        type: string
 permissions:
   contents: read
   actions: read
@@ -18,8 +28,8 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     env:
-      MAGNITUDE_WINDOWS_ACCEPTANCE_FROM: '0.0.32'
-      MAGNITUDE_WINDOWS_ACCEPTANCE_TO: '0.0.33'
+      MAGNITUDE_WINDOWS_ACCEPTANCE_FROM: ${{ inputs.from_version }}
+      MAGNITUDE_WINDOWS_ACCEPTANCE_TO: ${{ inputs.to_version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -33,7 +43,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: prepared-windows-installers
-          run-id: 34751651548
+          run-id: ${{ inputs.artifact_run }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: ${{ runner.temp }}/magnitude-windows-update-acceptance
       - name: Exercise real downloads, Settings, native replacement and tray interaction
