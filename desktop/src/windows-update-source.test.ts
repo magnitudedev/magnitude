@@ -41,7 +41,7 @@ describe.skipIf(process.platform !== "win32")("Windows installer staging", () =>
         }), Effect.provideService(WindowsInstallerVerifier, {
           verify: path => Effect.gen(function* () {
             signatures++
-            expect(yield* fs.readFile(path).pipe(Effect.orDie)).toEqual(new Uint8Array(bytes))
+            expect(Buffer.from(yield* fs.readFile(path).pipe(Effect.orDie))).toEqual(bytes)
             if (scenario === "unsigned") return yield* new WindowsInstallerSignatureFailed()
           }),
         }))

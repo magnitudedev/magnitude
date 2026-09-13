@@ -1,6 +1,16 @@
 $ErrorActionPreference = 'Stop'
 $root = Join-Path $env:RUNNER_TEMP 'magnitude-windows-update-acceptance'
 New-Item -ItemType Directory -Force $root | Out-Null
+$nodeVersion = (node -p process.versions.node).Trim()
+$nodeBase = "https://nodejs.org/download/release/v$nodeVersion"
+$nodeLibrary = Join-Path $root 'node.lib'
+Invoke-WebRequest "$nodeBase/win-x64/node.lib" -OutFile $nodeLibrary
+$checksums = (Invoke-WebRequest "$nodeBase/SHASUMS256.txt").Content
+$checksum = [regex]::Match($checksums, '(?m)^([a-f0-9]{64})\s+win-x64/node\.lib\r?$')
+if (!$checksum.Success -or (Get-FileHash $nodeLibrary -Algorithm SHA256).Hash.ToLowerInvariant() -ne $checksum.Groups[1].Value) {
+  throw 'Node import library integrity check failed'
+}
+$env:MAGNITUDE_NODE_LIBRARY = $nodeLibrary
 $certificate = $null
 try {
   $certificate = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Magnitude Update Acceptance, O=Magnitude Update Acceptance' `
