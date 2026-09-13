@@ -28,6 +28,37 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  windows-packages:
+    # App-branch checkpoints produce isolated candidates; publication still requires acceptance.
+    if: github.event_name == 'push' || inputs.build_artifacts
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - name: Build signed Windows applications and verify real hosted transfers
+        shell: pwsh
+        run: ./packages/release/scripts/acceptance/build-windows-cohort.ps1
+        env:
+          MAGNITUDE_ACCEPTANCE_COMMIT: ${{ github.sha }}
+          DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY: ${{ secrets.DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY }}
+          DISTRIBUTION_BLOB_READ_WRITE_TOKEN: ${{ secrets.DISTRIBUTION_BLOB_READ_WRITE_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prepared-windows-installers
+          path: |
+            ${{ runner.temp }}/magnitude-windows-update-acceptance/*/artifacts/*
+            ${{ runner.temp }}/magnitude-windows-update-acceptance/acceptance-publisher.cer
+          if-no-files-found: warn
+          retention-days: 14
+
   signed-mac-apps:
     if: inputs.build_artifacts
     environment: apple-release
@@ -207,6 +238,10 @@ jobs:
         if: runner.os == 'Windows'
         working-directory: packages/daemon-management
         run: bunx --bun vitest run src/desktop-native/windows-update-handoff.test.ts
+      - name: Verify Windows installer staging and rejection
+        if: runner.os == 'Windows'
+        working-directory: desktop
+        run: bunx --bun vitest run src/windows-update-source.test.ts
       - name: Verify Windows Authenticode with actual signed and tampered executables
         if: runner.os == 'Windows'
         shell: pwsh

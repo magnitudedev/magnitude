@@ -20,6 +20,8 @@ $old = Join-Path $Root '1.2.3\magnitude-desktop-windows-x64-1.2.3.exe'
 $next = Join-Path $Root '1.2.4\magnitude-desktop-windows-x64-1.2.4.exe'
 Invoke-Installer $old 0
 Assert-Version '1.2.3'
+$shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path ([Environment]::GetFolderPath('Programs')) 'Magnitude.lnk'))
+if ($shortcut.WorkingDirectory -ne $installation) { throw 'Application shortcut has an invalid working directory' }
 $unknown = Join-Path $installation 'unrelated user file.txt'
 [IO.File]::WriteAllText($unknown, 'preserve this file')
 Invoke-Installer $next 1
@@ -34,11 +36,14 @@ $state = Join-Path $Root 'update-state'
 $prepared = Join-Path $state ('application-updates\prepared-' + [Guid]::NewGuid())
 New-Item -ItemType Directory -Force $prepared | Out-Null
 $helper = Join-Path $prepared 'magnitude-update.exe'
+& bun (Join-Path $PSScriptRoot '..\..\..\version\scripts\generate-version.ts')
+if ($LASTEXITCODE -ne 0) { throw 'Update helper build identity generation failed' }
 & bun build (Join-Path $PSScriptRoot 'windows-update-handoff-entry.ts') --compile "--outfile=$helper"
 if ($LASTEXITCODE -ne 0) { throw 'Update handoff bootstrap compilation failed' }
 Copy-Item -LiteralPath $next -Destination (Join-Path $prepared 'magnitude-setup.exe')
 $request = @{ stateDirectory=$state; preparedDirectory=$prepared; applicationPath=(Join-Path $installation 'Magnitude.exe'); version='1.2.4'; showWindow=$false; envelope=@{keyId='fixture';payload='';signature=''} }
 $start = [Diagnostics.ProcessStartInfo]::new($helper)
+$start.WorkingDirectory = $prepared
 $start.UseShellExecute = $false
 $start.CreateNoWindow = $true
 $start.RedirectStandardInput = $true
