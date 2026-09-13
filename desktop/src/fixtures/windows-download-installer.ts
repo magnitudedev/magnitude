@@ -1,4 +1,4 @@
-import { FetchHttpClient, FileSystem } from "@effect/platform"
+import { FetchHttpClient, FileSystem, HttpClient } from "@effect/platform"
 import { NodeContext, NodeRuntime } from "@effect/platform-node"
 import { Config, Effect, Option, Schema } from "effect"
 import { createPublicKey } from "node:crypto"
@@ -15,9 +15,14 @@ NodeRuntime.runMain(Effect.gen(function* () {
   const trusted = new Map([["acceptance", createPublicKey(yield* fs.readFileString(fileURLToPath(new URL("../../../packages/release/resources/distribution/acceptance.pub.pem", import.meta.url))))]])
   const manifest = yield* verifyUpdateManifest(envelopes[0], trusted)
   if (manifest.version !== version || manifest.artifact.target.package !== "windows-exe") return yield* Effect.die("Wrong installer target")
+  const client = (yield* HttpClient.HttpClient).pipe(HttpClient.transformResponse(Effect.tap(response =>
+    response.request.headers.range === "bytes=0-0" ? Effect.logInfo("Installer range probe", {
+      encoding: response.request.headers["accept-encoding"], range: response.headers["content-range"],
+      expectedBytes: manifest.artifact.bytes, status: response.status,
+    }) : Effect.void)))
   const result = yield* downloadUpdateArtifact({ manifest,
     url: new URL(manifest.artifact.path, "https://5r3lqtpag4uzvtxd.public.blob.vercel-storage.com/").href,
     destination: join(root, "consumer/downloaded-installer.exe"), onProgress: Option.none(),
-  })
+  }).pipe(Effect.provideService(HttpClient.HttpClient, client))
   yield* Effect.logInfo("Verified hosted installer transfer", { version, bytes: result.bytes, strategy: result.strategy })
 }).pipe(Effect.provide([NodeContext.layer, FetchHttpClient.layer])))

@@ -256,6 +256,7 @@ describe("artifact downloader", () => {
         onVerificationProgress: Option.none(),
       }).pipe(Effect.flip))
       expect(error.phase).toBe("protocol")
+      expect(error.message).toContain(`0-0/${bytes.byteLength + 1}; expected 0-0/${bytes.byteLength}`)
       expect(requests).toBe(1)
       await expect(readFile(destination)).rejects.toMatchObject({ code: "ENOENT" })
     } finally {
