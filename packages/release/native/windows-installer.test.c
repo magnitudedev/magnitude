@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <wchar.h>
+#include "windows-security.h"
 
 #define RUN_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 #define APPROVAL_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run"
@@ -28,9 +29,61 @@ static void check_value(HKEY root, LPCWSTR path, LPCWSTR name, LPCWSTR expected)
   require(wcscmp(value, expected) == 0, "preserved value contents");
 }
 
+static void write_fixture(LPCWSTR path, LPCWSTR contents) {
+  HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+  require(file != INVALID_HANDLE_VALUE, "create fixture file");
+  DWORD bytes = (DWORD)(wcslen(contents) * sizeof(WCHAR)), written = 0;
+  require(WriteFile(file, contents, bytes, &written, NULL) && written == bytes, "write fixture file");
+  CloseHandle(file);
+}
+static void check_inventory(HMODULE library) {
+  typedef DWORD (WINAPI *ValidateInstallation)(LPCWSTR, LPCWSTR);
+  ValidateInstallation validate;
+  FARPROC symbol = GetProcAddress(library, "ValidateOwnedInstallation");
+  require(symbol != NULL && sizeof(symbol) == sizeof(validate), "resolve inventory validation export");
+  memcpy(&validate, &symbol, sizeof(validate));
+  WCHAR root[32768], resources[32768], inventory[32768], executable[32768], uninstaller[32768], unexpected[32768];
+  require(GetCurrentDirectoryW(32768, root) > 0, "fixture working directory");
+  require(wcslen(root) < 32000, "bounded fixture working directory");
+  wcscat(root, L"\\owned installation");
+  PSECURITY_DESCRIPTOR descriptor = NULL;
+  require(magnitude_private_descriptor(TRUE, &descriptor) == ERROR_SUCCESS, "private fixture descriptor");
+  SECURITY_ATTRIBUTES attributes = {sizeof(attributes), descriptor, FALSE};
+  require(CreateDirectoryW(root, &attributes), "create private installation fixture");
+  LocalFree(descriptor);
+  swprintf(resources, 32768, L"%ls\\resources", root);
+  swprintf(inventory, 32768, L"%ls\\installation-files.txt", resources);
+  swprintf(executable, 32768, L"%ls\\Magnitude.exe", root);
+  swprintf(uninstaller, 32768, L"%ls\\Uninstall Magnitude.exe", root);
+  swprintf(unexpected, 32768, L"%ls\\user notes.txt", root);
+  require(CreateDirectoryW(resources, NULL), "create resources fixture");
+  LPCWSTR valid = L"\xFEFFmagnitude-installation-v1\n1.2.3\nF\tMagnitude.exe\nF\tUninstall Magnitude.exe\nF\tresources\\installation-files.txt\nD\tresources\n";
+  write_fixture(inventory, valid); write_fixture(executable, L"application"); write_fixture(uninstaller, L"uninstaller");
+  require(validate(root, L"1.2.3") == ERROR_SUCCESS, "complete owned inventory accepted");
+  require(validate(root, L"1.2.4") != ERROR_SUCCESS, "wrong installed version rejected");
+  write_fixture(unexpected, L"preserve my notes");
+  require(validate(root, L"1.2.3") != ERROR_SUCCESS, "unknown files rejected");
+  require(GetFileAttributesW(unexpected) != INVALID_FILE_ATTRIBUTES, "unknown files preserved");
+  require(DeleteFileW(unexpected), "remove exact unknown fixture");
+  require(DeleteFileW(executable), "remove exact payload fixture");
+  require(validate(root, L"1.2.3") != ERROR_SUCCESS, "missing payload rejected");
+  require(CreateHardLinkW(executable, uninstaller, NULL), "create hard-link fixture");
+  require(validate(root, L"1.2.3") != ERROR_SUCCESS, "hard-linked payload rejected");
+  require(DeleteFileW(executable), "remove fixture hard link"); write_fixture(executable, L"application");
+  write_fixture(inventory, L"\xFEFFmagnitude-installation-v1\n1.2.3\nF\t..\\outside\n");
+  require(validate(root, L"1.2.3") != ERROR_SUCCESS, "path traversal rejected");
+  write_fixture(inventory, L"\xFEFFmagnitude-installation-v1\n1.2.3\nF\tMagnitude.exe\nF\tMAGNITUDE.EXE\nF\tUninstall Magnitude.exe\nF\tresources\\installation-files.txt\nD\tresources\n");
+  require(validate(root, L"1.2.3") != ERROR_SUCCESS, "case-insensitive duplicate rejected");
+  write_fixture(inventory, valid);
+  require(validate(root, L"1.2.3") == ERROR_SUCCESS, "valid inventory remains usable after rejection");
+  require(DeleteFileW(inventory) && DeleteFileW(executable) && DeleteFileW(uninstaller), "remove exact payload fixtures");
+  require(RemoveDirectoryW(resources) && RemoveDirectoryW(root), "remove empty fixture directories");
+}
+
 int wmain(int argc, wchar_t **argv) {
   require(argc == 2, "expected absolute helper DLL path");
   HMODULE library = LoadLibraryW(argv[1]); require(library != NULL, "load actual x86 helper DLL");
+  check_inventory(library);
   typedef DWORD (WINAPI *RemoveStartup)(LPCWSTR);
   RemoveStartup remove_startup;
   FARPROC symbol = GetProcAddress(library, "RemoveOwnedStartup");

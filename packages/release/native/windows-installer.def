@@ -5,6 +5,7 @@ EXPORTS
   RequireAbsentPath=_RequireAbsentPath@4
   RequireUnusedRegistration=_RequireUnusedRegistration@8
   PrepareInstallationDirectory=_PrepareInstallationDirectory@4
+  ValidateOwnedInstallation=_ValidateOwnedInstallation@8
   AcquireRemovalExecutable=_AcquireRemovalExecutable@4
   RemovePayload=_RemovePayload@8
   RemoveOwnedStartup=_RemoveOwnedStartup@4

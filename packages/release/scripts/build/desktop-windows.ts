@@ -27,15 +27,14 @@ const quote = (value: string) => value.replaceAll("$", () => "$$").replaceAll('"
 const remove = (path: string, directory: boolean) =>
   `  System::Call '$PLUGINSDIR\\MagnitudeInstallGuard.dll::RemovePayload(w "${quote(path.replaceAll("/", "\\"))}", i ${Number(directory)}) i .r0'\n  \${If} $0 != 0\n    Goto removalFailed\n  \${EndIf}`
 
-/** One validated file set governs both extraction and removal. */
-export const renderWindowsInstaller = (template: string, input: typeof WindowsInstallerInput.Encoded) => Effect.gen(function* () {
+const prepareWindowsInstallerInput = (input: typeof WindowsInstallerInput.Encoded) => Effect.gen(function* () {
   const options = yield* Schema.decodeUnknown(WindowsInstallerInput)(input)
   const files = [...options.files].sort()
   const names = new Set<string>()
-  const directories = new Set<string>()
+  const directories = new Set<string>(["resources"])
   for (const file of files) {
     const key = file.toUpperCase()
-    if (names.has(key) || key.split("/")[0] === "UNINSTALL MAGNITUDE.EXE") {
+    if (names.has(key) || key.split("/")[0] === "UNINSTALL MAGNITUDE.EXE" || key === "RESOURCES/INSTALLATION-FILES.TXT") {
       return yield* new DesktopBuildFailed({ message: `Conflicting Windows payload filename: ${file}` })
     }
     names.add(key)
@@ -52,13 +51,29 @@ export const renderWindowsInstaller = (template: string, input: typeof WindowsIn
   }
   const versionParts = options.version.split(/[+-]/)[0]!.split(".").map(Number)
   if (versionParts.some(part => part > 65535)) return yield* new DesktopBuildFailed({ message: "Windows installer version components exceed the native version range" })
+  return { options, files, directories, versionParts }
+})
+
+/** The inventory describes only files owned by this installer, including its generated records. */
+export const renderWindowsInstallationInventory = (input: typeof WindowsInstallerInput.Encoded) => prepareWindowsInstallerInput(input).pipe(
+  Effect.map(({ options, files, directories }) => [
+    "magnitude-installation-v1", options.version,
+    ...[...files, "resources/installation-files.txt", "Uninstall Magnitude.exe"].sort().map(file => `F\t${file.replaceAll("/", "\\")}`),
+    ...[...directories].sort((a, b) => b.split("/").length - a.split("/").length || a.localeCompare(b)).map(directory => `D\t${directory.replaceAll("/", "\\")}`),
+    "",
+  ].join("\n")),
+)
+
+/** One validated file set governs extraction, removal and the installed inventory. */
+export const renderWindowsInstaller = (template: string, input: typeof WindowsInstallerInput.Encoded) => Effect.gen(function* () {
+  const { options, files, directories, versionParts } = yield* prepareWindowsInstallerInput(input)
   const prefix = `!define MAGNITUDE_VERSION "${quote(options.version)}"`
   const replacements: Record<string, string> = {
     "@PAYLOAD_FILES@": files.map((file, index) => {
       const parent = file.includes("/") ? "\\" + file.slice(0, file.lastIndexOf("/")).replaceAll("/", "\\") : ""
       return `  SetOutPath "$Stage${quote(parent)}"\n  IfErrors stageFailed\n  File "/oname=${quote(file.split("/").at(-1)!)}" "payload/${String(index).padStart(6, "0")}.bin"\n  IfErrors stageFailed`
     }).join("\n"),
-    "@REMOVE_FILES@": files.map(file => remove(file, false)).join("\n"),
+    "@REMOVE_FILES@": [...files, "resources/installation-files.txt"].map(file => remove(file, false)).join("\n"),
     "@REMOVE_DIRECTORIES@": [...directories].sort((a, b) => b.split("/").length - a.split("/").length || a.localeCompare(b)).map(directory => remove(directory, true)).join("\n"),
   }
   for (const token of Object.keys(replacements)) {
@@ -114,6 +129,8 @@ export const buildWindowsDesktopInstaller = (options: {
   const template = yield* fs.readFileString(join(root, "packages/release/resources/windows/desktop.nsi"))
   yield* fs.copyFile(join(root, "packages/release/resources/windows/Magnitude.ico"), join(stage, "Magnitude.ico"))
   const script = yield* renderWindowsInstaller(template, { version: options.version, revision: options.revision, files: files as [string, ...string[]] })
+  const inventory = yield* renderWindowsInstallationInventory({ version: options.version, revision: options.revision, files: files as [string, ...string[]] })
+  yield* fs.writeFile(join(stage, "installation-files.txt"), Buffer.from(`\uFEFF${inventory}`, "utf16le"))
   const scriptPath = join(stage, "desktop.nsi")
   yield* fs.writeFileString(scriptPath, script)
   const code = yield* Command.make(options.makensis, scriptPath).pipe(Command.workingDirectory(stage), Command.stdout("inherit"), Command.stderr("inherit"), Command.exitCode)

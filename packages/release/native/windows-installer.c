@@ -3,6 +3,7 @@
 #include <winternl.h>
 #include <shlobj.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
 #include "windows-security.h"
@@ -34,7 +35,8 @@ static BOOL safe_relative_path(LPCWSTR path) {
   if (!path || !path[0]) return FALSE;
   LPCWSTR segment = path;
   for (LPCWSTR cursor = path;; ++cursor) {
-    if (*cursor == L':' || *cursor == L'/' || *cursor == L'*' || *cursor == L'?') return FALSE;
+    if ((*cursor && *cursor < 32) || *cursor == 127 || *cursor == L':' || *cursor == L'/' ||
+        *cursor == L'*' || *cursor == L'?' || *cursor == L'<' || *cursor == L'>' || *cursor == L'|' || *cursor == L'\"') return FALSE;
     if (*cursor == L'\\' || !*cursor) {
       size_t length = (size_t)(cursor - segment);
       if (!length || segment[length - 1] == L'.' || segment[length - 1] == L' ') return FALSE;
@@ -60,6 +62,175 @@ __declspec(dllexport) DWORD WINAPI RemovePayload(LPCWSTR relative, BOOL director
   }
   CloseHandle(file);
   return directory && error == ERROR_DIR_NOT_EMPTY ? ERROR_SUCCESS : error;
+}
+
+#define INVENTORY_LIMIT 4096
+#define INVENTORY_FILE L"resources\\installation-files.txt"
+typedef struct {
+  WCHAR *path;
+  BOOL directory;
+  BOOL seen;
+} inventory_entry;
+typedef struct {
+  WCHAR *text;
+  WCHAR *version;
+  inventory_entry *entries;
+  DWORD count;
+} installation_inventory;
+static void release_inventory(installation_inventory *inventory) {
+  free(inventory->entries); free(inventory->text); ZeroMemory(inventory, sizeof(*inventory));
+}
+static BOOL same_name(LPCWSTR left, LPCWSTR right) {
+  return CompareStringOrdinal(left, -1, right, -1, TRUE) == CSTR_EQUAL;
+}
+static DWORD read_inventory(HANDLE directory, installation_inventory *inventory) {
+  ZeroMemory(inventory, sizeof(*inventory));
+  HANDLE file = INVALID_HANDLE_VALUE;
+  DWORD error = open_without_reparse(directory, INVENTORY_FILE, GENERIC_READ,
+    FILE_SHARE_READ, FILE_NON_DIRECTORY_FILE, &file);
+  if (error) return error;
+  LARGE_INTEGER size; BY_HANDLE_FILE_INFORMATION info;
+  if (!GetFileSizeEx(file, &size) || !GetFileInformationByHandle(file, &info)) error = GetLastError();
+  else if (size.QuadPart < 64 || size.QuadPart > 1048576 || size.QuadPart % sizeof(WCHAR) ||
+      info.nNumberOfLinks != 1 || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) error = ERROR_INVALID_DATA;
+  if (!error) {
+    inventory->text = calloc((size_t)size.QuadPart / sizeof(WCHAR) + 1, sizeof(WCHAR));
+    inventory->entries = calloc(INVENTORY_LIMIT, sizeof(inventory_entry));
+    if (!inventory->text || !inventory->entries) error = ERROR_NOT_ENOUGH_MEMORY;
+  }
+  if (!error) {
+    DWORD read = 0;
+    if (!ReadFile(file, inventory->text, (DWORD)size.QuadPart, &read, NULL)) error = GetLastError();
+    else if (read != (DWORD)size.QuadPart) error = ERROR_INVALID_DATA;
+  }
+  CloseHandle(file);
+  if (!error) {
+    size_t characters = (size_t)size.QuadPart / sizeof(WCHAR);
+    if (inventory->text[0] != 0xFEFF || inventory->text[characters - 1] != L'\n') error = ERROR_INVALID_DATA;
+    for (size_t index = 1; index < characters && !error; ++index)
+      if (!inventory->text[index]) error = ERROR_INVALID_DATA;
+  }
+  WCHAR *line = !error ? inventory->text + 1 : NULL;
+  unsigned header = 0;
+  BOOL hasExecutable = FALSE, hasUninstaller = FALSE, hasInventory = FALSE;
+  while (!error && line && *line) {
+    WCHAR *next = wcschr(line, L'\n');
+    if (!next) { error = ERROR_INVALID_DATA; break; }
+    *next++ = 0;
+    if (header == 0) {
+      if (wcscmp(line, L"magnitude-installation-v1")) error = ERROR_INVALID_DATA;
+    } else if (header == 1) {
+      if (!line[0] || wcslen(line) > 255) error = ERROR_INVALID_DATA;
+      for (WCHAR *cursor = line; *cursor; ++cursor)
+        if (!((*cursor >= L'0' && *cursor <= L'9') || (*cursor >= L'A' && *cursor <= L'Z') ||
+            (*cursor >= L'a' && *cursor <= L'z') || *cursor == L'.' || *cursor == L'+' || *cursor == L'-')) error = ERROR_INVALID_DATA;
+      inventory->version = line;
+    } else {
+      if ((line[0] != L'F' && line[0] != L'D') || line[1] != L'\t' ||
+          !safe_relative_path(line + 2) || inventory->count == INVENTORY_LIMIT) { error = ERROR_INVALID_DATA; break; }
+      for (DWORD index = 0; index < inventory->count; ++index)
+        if (same_name(inventory->entries[index].path, line + 2)) error = ERROR_INVALID_DATA;
+      inventory_entry *entry = &inventory->entries[inventory->count++];
+      entry->path = line + 2; entry->directory = line[0] == L'D';
+      if (!entry->directory) {
+        if (same_name(entry->path, L"Magnitude.exe")) hasExecutable = TRUE;
+        if (same_name(entry->path, L"Uninstall Magnitude.exe")) hasUninstaller = TRUE;
+        if (same_name(entry->path, INVENTORY_FILE)) hasInventory = TRUE;
+      }
+    }
+    ++header; line = next;
+  }
+  if (!error && (!hasExecutable || !hasUninstaller || !hasInventory)) error = ERROR_INVALID_DATA;
+  if (error) release_inventory(inventory);
+  return error;
+}
+static DWORD inspect_inventory_directory(HANDLE directory, installation_inventory *inventory,
+    WCHAR *relative, size_t prefix, unsigned depth) {
+  if (depth > 128) return ERROR_DIRECTORY;
+  BYTE *buffer = malloc(65536);
+  if (!buffer) return ERROR_NOT_ENOUGH_MEMORY;
+  DWORD error = ERROR_SUCCESS;
+  FILE_INFO_BY_HANDLE_CLASS query = FileIdBothDirectoryRestartInfo;
+  for (;;) {
+    if (!GetFileInformationByHandleEx(directory, query, buffer, 65536)) {
+      error = GetLastError();
+      if (error == ERROR_NO_MORE_FILES) error = ERROR_SUCCESS;
+      break;
+    }
+    FILE_ID_BOTH_DIR_INFO *entry = (FILE_ID_BOTH_DIR_INFO *)buffer;
+    for (;;) {
+      size_t length = entry->FileNameLength / sizeof(WCHAR);
+      if (entry->FileNameLength % sizeof(WCHAR) || !length || prefix + length >= 32767) { error = ERROR_BAD_PATHNAME; break; }
+      BOOL dot = (length == 1 && entry->FileName[0] == L'.') ||
+        (length == 2 && entry->FileName[0] == L'.' && entry->FileName[1] == L'.');
+      if (!dot) {
+        wmemcpy(relative + prefix, entry->FileName, length); relative[prefix + length] = 0;
+        inventory_entry *known = NULL;
+        for (DWORD index = 0; index < inventory->count; ++index)
+          if (same_name(inventory->entries[index].path, relative)) { known = &inventory->entries[index]; break; }
+        BOOL isDirectory = (entry->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (!known || known->seen || known->directory != isDirectory || (entry->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+          error = ERROR_INVALID_DATA; break;
+        }
+        known->seen = TRUE;
+        HANDLE child = INVALID_HANDLE_VALUE;
+        error = open_without_reparse(directory, relative + prefix, FILE_READ_ATTRIBUTES | (isDirectory ? FILE_LIST_DIRECTORY : 0),
+          FILE_SHARE_READ | FILE_SHARE_WRITE, isDirectory ? FILE_DIRECTORY_FILE : FILE_NON_DIRECTORY_FILE, &child);
+        if (error) break;
+        BY_HANDLE_FILE_INFORMATION childInfo;
+        if (!GetFileInformationByHandle(child, &childInfo)) error = GetLastError();
+        else if ((!isDirectory && childInfo.nNumberOfLinks != 1) || (childInfo.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) error = ERROR_INVALID_DATA;
+        if (!error && isDirectory) {
+          relative[prefix + length] = L'\\'; relative[prefix + length + 1] = 0;
+          error = inspect_inventory_directory(child, inventory, relative, prefix + length + 1, depth + 1);
+        }
+        CloseHandle(child);
+        relative[prefix] = 0;
+        if (error) break;
+      }
+      if (!entry->NextEntryOffset) break;
+      entry = (FILE_ID_BOTH_DIR_INFO *)((BYTE *)entry + entry->NextEntryOffset);
+    }
+    if (error) break;
+    query = FileIdBothDirectoryInfo;
+  }
+  free(buffer); return error;
+}
+static DWORD inspect_inventory(HANDLE directory, installation_inventory *inventory, BOOL allowMissing) {
+  WCHAR *relative = calloc(32768, sizeof(WCHAR));
+  if (!relative) return ERROR_NOT_ENOUGH_MEMORY;
+  for (DWORD index = 0; index < inventory->count; ++index) inventory->entries[index].seen = FALSE;
+  DWORD error = inspect_inventory_directory(directory, inventory, relative, 0, 0);
+  free(relative);
+  if (!error && !allowMissing) for (DWORD index = 0; index < inventory->count; ++index)
+    if (!inventory->entries[index].seen) { error = ERROR_FILE_NOT_FOUND; break; }
+  return error;
+}
+
+static DWORD open_installation_directory(LPCWSTR path, HANDLE *directory) {
+  if (!path || wcslen(path) < 3 || wcslen(path) > 32760 || path[1] != L':' || path[2] != L'\\') return ERROR_BAD_PATHNAME;
+  WCHAR *absolute = calloc(32768, sizeof(WCHAR));
+  if (!absolute) return ERROR_NOT_ENOUGH_MEMORY;
+  wcscpy(absolute, L"\\??\\"); wcscat(absolute, path);
+  DWORD error = open_without_reparse(NULL, absolute, READ_CONTROL | DELETE | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+    FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_DIRECTORY_FILE, directory);
+  free(absolute);
+  if (!error) error = magnitude_validate_private_directory(*directory);
+  if (error && *directory != INVALID_HANDLE_VALUE) { CloseHandle(*directory); *directory = INVALID_HANDLE_VALUE; }
+  return error;
+}
+/* Inspection grants no replacement rights and never changes an existing installation. */
+__declspec(dllexport) DWORD WINAPI ValidateOwnedInstallation(LPCWSTR path, LPCWSTR version) {
+  if (!version || !version[0]) return ERROR_INVALID_PARAMETER;
+  HANDLE directory = INVALID_HANDLE_VALUE;
+  DWORD error = open_installation_directory(path, &directory);
+  if (error) return error;
+  installation_inventory inventory;
+  error = read_inventory(directory, &inventory);
+  if (!error && wcscmp(inventory.version, version)) error = ERROR_INVALID_DATA;
+  if (!error) error = inspect_inventory(directory, &inventory, FALSE);
+  release_inventory(&inventory); CloseHandle(directory);
+  return error;
 }
 
 #define STARTUP_NAME L"dev.magnitude.desktop"

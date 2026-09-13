@@ -82,6 +82,11 @@ must match its executing self-copy before mutation. Payload removal rejects redi
 preserves unrelated installed files, and retains the exact removal record until required cleanup
 succeeds. Interrupted removal can be retried. Candidate packaging does not authorize replacement,
 updates, signing claims, or publication before their separate acceptance gates pass.
+New Windows candidates include a versioned owned-file inventory generated from the extraction
+payload. Read-only native inspection requires a private installation root, exact version and
+complete file/directory membership; unknown files, duplicate names, redirected paths and
+hard-linked payloads fail inspection without mutation. This inventory prepares current-format
+replacement; it does not support pre-cutover installations or enable an unaccepted updater.
 
 ## Distribution contract
 
