@@ -4,11 +4,14 @@ EXPORTS
   CleanupStage=_CleanupStage@0
   RequireAbsentPath=_RequireAbsentPath@4
   RequireUnusedRegistration=_RequireUnusedRegistration@8
+  ReadInstallationVersion=_ReadInstallationVersion@16
+  FlushInstallationRegistration=_FlushInstallationRegistration@4
   PrepareInstallationDirectory=_PrepareInstallationDirectory@4
   ValidateOwnedInstallation=_ValidateOwnedInstallation@8
   BeginReplacement=_BeginReplacement@12
   RollbackReplacement=_RollbackReplacement@0
   FinishReplacement=_FinishReplacement@4
+  RecoverReplacement=_RecoverReplacement@8
   AcquireRemovalExecutable=_AcquireRemovalExecutable@4
   RemovePayload=_RemovePayload@8
   RemoveOwnedStartup=_RemoveOwnedStartup@4

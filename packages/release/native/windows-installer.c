@@ -246,7 +246,16 @@ static DWORD rename_directory(HANDLE directory, HANDLE parent, LPCWSTR leaf) {
   rename->RootDirectory = parent;
   rename->FileNameLength = (DWORD)nameBytes;
   memcpy(rename->FileName, leaf, nameBytes);
-  DWORD error = SetFileInformationByHandle(directory, FileRenameInfo, rename, (DWORD)size) ? ERROR_SUCCESS : GetLastError();
+  typedef NTSTATUS (NTAPI *SetInformationFile)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS);
+  HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+  FARPROC symbol = ntdll ? GetProcAddress(ntdll, "NtSetInformationFile") : NULL;
+  SetInformationFile setInformation;
+  if (!symbol || sizeof(symbol) != sizeof(setInformation)) { free(rename); return ERROR_PROC_NOT_FOUND; }
+  memcpy(&setInformation, &symbol, sizeof(setInformation));
+  IO_STATUS_BLOCK status;
+  /* FileRenameInformation (10) accepts a name relative to the retained target. */
+  NTSTATUS result = setInformation(directory, &status, rename, (ULONG)size, (FILE_INFORMATION_CLASS)10);
+  DWORD error = result < 0 ? RtlNtStatusToDosError(result) : ERROR_SUCCESS;
   free(rename); return error;
 }
 static DWORD require_absent_child(HANDLE parent, LPCWSTR leaf) {
@@ -263,11 +272,8 @@ static void close_replacement(void) {
   replacementDirectory = previousDirectory = installationParent = INVALID_HANDLE_VALUE;
   installationLeaf[0] = 0;
 }
-/* Both trees are validated before the first rename. Retained handles keep the
-   rollback targets stable until registration commits or rollback completes. */
-__declspec(dllexport) DWORD WINAPI BeginReplacement(LPCWSTR path, LPCWSTR oldVersion, LPCWSTR newVersion) {
-  if (!leaseHeld || stageDirectory == INVALID_HANDLE_VALUE || installationParent != INVALID_HANDLE_VALUE ||
-      !path || !oldVersion || !newVersion) return ERROR_INVALID_PARAMETER;
+static DWORD retain_installation_parent(LPCWSTR path) {
+  if (!path || installationParent != INVALID_HANDLE_VALUE) return ERROR_INVALID_PARAMETER;
   LPCWSTR leaf = wcsrchr(path, L'\\');
   if (!leaf || leaf == path || wcslen(leaf + 1) >= 256 || !safe_relative_path(leaf + 1)) return ERROR_BAD_PATHNAME;
   WCHAR *parent = calloc(32768, sizeof(WCHAR));
@@ -278,6 +284,15 @@ __declspec(dllexport) DWORD WINAPI BeginReplacement(LPCWSTR path, LPCWSTR oldVer
   DWORD error = open_without_reparse(NULL, parent, FILE_LIST_DIRECTORY | FILE_ADD_SUBDIRECTORY,
     FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_DIRECTORY_FILE, &installationParent);
   free(parent);
+  if (!error) wcscpy(installationLeaf, leaf + 1);
+  return error;
+}
+/* Both trees are validated before the first rename. Retained handles keep the
+   rollback targets stable until registration commits or rollback completes. */
+__declspec(dllexport) DWORD WINAPI BeginReplacement(LPCWSTR path, LPCWSTR oldVersion, LPCWSTR newVersion) {
+  if (!leaseHeld || stageDirectory == INVALID_HANDLE_VALUE || installationParent != INVALID_HANDLE_VALUE ||
+      !path || !oldVersion || !newVersion) return ERROR_INVALID_PARAMETER;
+  DWORD error = retain_installation_parent(path);
   if (!error) error = require_absent_child(stageDirectory, L"previous");
   if (!error) error = open_installation_directory(path, &previousDirectory);
   if (!error) error = open_without_reparse(stageDirectory, L"payload", READ_CONTROL | DELETE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
@@ -292,7 +307,6 @@ __declspec(dllexport) DWORD WINAPI BeginReplacement(LPCWSTR path, LPCWSTR oldVer
   if (!error) error = inspect_inventory(replacementDirectory, &newInventory, FALSE);
   release_inventory(&oldInventory); release_inventory(&newInventory);
   if (error) { close_replacement(); return error; }
-  wcscpy(installationLeaf, leaf + 1);
   error = rename_directory(previousDirectory, stageDirectory, L"previous");
   if (error) { close_replacement(); return error; }
   error = rename_directory(replacementDirectory, installationParent, installationLeaf);
@@ -525,6 +539,17 @@ __declspec(dllexport) DWORD WINAPI CleanupStage(void) {
   if (error) return error;
   return clear_scratch(stageDirectory, 0);
 }
+static DWORD stage_paths(WCHAR parent[32768], WCHAR container[32768], WCHAR payload[32768]) {
+  PWSTR local = NULL;
+  if (FAILED(SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, NULL, &local)) || !local)
+    return ERROR_PATH_NOT_FOUND;
+  int count = swprintf(parent, 32768, L"%ls\\Programs", local);
+  CoTaskMemFree(local);
+  if (count < 0 || swprintf(container, 32768, L"%ls\\Magnitude-installation-stage", parent) < 0 ||
+      swprintf(payload, 32768, L"%ls\\payload", container) < 0)
+    return ERROR_BAD_PATHNAME;
+  return ERROR_SUCCESS;
+}
 /* A fixed, private scratch container makes interrupted extraction recoverable.
    The application lease serializes callers; there is no second owner election. */
 __declspec(dllexport) DWORD WINAPI CreateStage(LPWSTR output, DWORD capacity) {
@@ -532,18 +557,13 @@ __declspec(dllexport) DWORD WINAPI CreateStage(LPWSTR output, DWORD capacity) {
   output[0] = 0;
   if (!leaseHeld) return ERROR_INVALID_HANDLE;
   if (stageDirectory != INVALID_HANDLE_VALUE) return ERROR_ALREADY_EXISTS;
-  PWSTR local = NULL;
-  if (FAILED(SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, NULL, &local)) || !local)
-    return ERROR_PATH_NOT_FOUND;
   WCHAR parent[32768], container[32768], payload[32768];
-  int count = swprintf(parent, 32768, L"%ls\\Programs", local);
-  CoTaskMemFree(local);
-  if (count < 0 || swprintf(container, 32768, L"%ls\\Magnitude-installation-stage", parent) < 0 ||
-      swprintf(payload, 32768, L"%ls\\payload", container) < 0 || wcslen(payload) >= capacity)
-    return ERROR_BAD_PATHNAME;
+  DWORD error = stage_paths(parent, container, payload);
+  if (error) return error;
+  if (wcslen(payload) >= capacity) return ERROR_BAD_PATHNAME;
   if (!CreateDirectoryW(parent, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) return GetLastError();
   PSECURITY_DESCRIPTOR descriptor = NULL;
-  DWORD error = magnitude_private_descriptor(TRUE, &descriptor);
+  error = magnitude_private_descriptor(TRUE, &descriptor);
   if (error) return error;
   SECURITY_ATTRIBUTES attributes = {sizeof(attributes), descriptor, FALSE};
   if (!CreateDirectoryW(container, &attributes) && GetLastError() != ERROR_ALREADY_EXISTS) error = GetLastError();
@@ -562,6 +582,59 @@ __declspec(dllexport) DWORD WINAPI CreateStage(LPWSTR output, DWORD capacity) {
     if (stageDirectory != INVALID_HANDLE_VALUE) CloseHandle(stageDirectory);
     stageDirectory = INVALID_HANDLE_VALUE;
   } else wcscpy(output, payload);
+  return error;
+}
+
+/* DisplayVersion is the commit point. A retained previous tree is either retired
+   after that commit or restored before it; it is never extraction scratch. */
+__declspec(dllexport) DWORD WINAPI RecoverReplacement(LPCWSTR path, LPCWSTR registeredVersion) {
+  if (!leaseHeld || stageDirectory != INVALID_HANDLE_VALUE || installationParent != INVALID_HANDLE_VALUE ||
+      !path || !registeredVersion) return ERROR_INVALID_PARAMETER;
+  WCHAR parent[32768], container[32768], payload[32768];
+  DWORD error = stage_paths(parent, container, payload);
+  if (error) return error;
+  error = open_installation_directory(container, &stageDirectory);
+  if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return ERROR_SUCCESS;
+  if (error) return error;
+  error = open_without_reparse(stageDirectory, L"previous", READ_CONTROL | DELETE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+    FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_DIRECTORY_FILE, &previousDirectory);
+  if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+    CloseHandle(stageDirectory); stageDirectory = INVALID_HANDLE_VALUE; return ERROR_SUCCESS;
+  }
+  if (!error && !registeredVersion[0]) error = ERROR_INVALID_DATA;
+  if (!error) error = magnitude_validate_private_directory(previousDirectory);
+  installation_inventory previous = {0}, current = {0};
+  DWORD previousRead = error ? error : read_inventory(previousDirectory, &previous);
+  BOOL currentMissing = FALSE;
+  if (!error) {
+    error = open_installation_directory(path, &replacementDirectory);
+    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) { currentMissing = TRUE; error = ERROR_SUCCESS; }
+  }
+  if (!error && !currentMissing) error = read_inventory(replacementDirectory, &current);
+  if (!error && !currentMissing) error = inspect_inventory(replacementDirectory, &current, FALSE);
+  if (!error && !currentMissing && !wcscmp(current.version, registeredVersion)) {
+    if (!previousRead) error = retire_inventory(previousDirectory, previous.version);
+    else if (previousRead == ERROR_FILE_NOT_FOUND || previousRead == ERROR_PATH_NOT_FOUND) {
+      /* A crash after deleting the inventory can leave only empty directories.
+         Kernel empty-directory removal preserves any unexpected remaining file. */
+      inventory_entry resources = {L"resources", TRUE, FALSE};
+      error = retire_entry(previousDirectory, &resources);
+      if (!error) {
+        FILE_DISPOSITION_INFO remove = {TRUE};
+        if (!SetFileInformationByHandle(previousDirectory, FileDispositionInfo, &remove, sizeof(remove))) error = GetLastError();
+      }
+    } else error = previousRead;
+  } else if (!error) {
+    error = previousRead;
+    if (!error && wcscmp(previous.version, registeredVersion)) error = ERROR_INVALID_DATA;
+    if (!error) error = inspect_inventory(previousDirectory, &previous, FALSE);
+    if (!error) error = retain_installation_parent(path);
+    if (!error && !currentMissing) error = require_absent_child(stageDirectory, L"payload");
+    if (!error && !currentMissing) error = rename_directory(replacementDirectory, stageDirectory, L"payload");
+    if (!error) error = rename_directory(previousDirectory, installationParent, installationLeaf);
+  }
+  release_inventory(&previous); release_inventory(&current); close_replacement();
+  CloseHandle(stageDirectory); stageDirectory = INVALID_HANDLE_VALUE;
   return error;
 }
 
@@ -610,6 +683,42 @@ __declspec(dllexport) DWORD WINAPI RequireUnusedRegistration(LPCWSTR shortcut, L
     if (result != ERROR_FILE_NOT_FOUND) return result;
   }
   return ERROR_SUCCESS;
+}
+
+static DWORD read_registration_string(HKEY key, LPCWSTR name, LPWSTR output, DWORD capacity) {
+  DWORD bytes = capacity * sizeof(WCHAR), type = 0;
+  DWORD error = (DWORD)RegQueryValueExW(key, name, NULL, &type, (BYTE *)output, &bytes);
+  if (error) return error;
+  if (type != REG_SZ || bytes < sizeof(WCHAR) || bytes % sizeof(WCHAR) || bytes > capacity * sizeof(WCHAR) ||
+      output[bytes / sizeof(WCHAR) - 1] || wcslen(output) + 1 != bytes / sizeof(WCHAR)) return ERROR_INVALID_DATA;
+  return ERROR_SUCCESS;
+}
+__declspec(dllexport) DWORD WINAPI ReadInstallationVersion(LPCWSTR path, LPCWSTR registration, LPWSTR output, DWORD capacity) {
+  if (!leaseHeld || !path || !registration || !output || !capacity || capacity > 32768) return ERROR_INVALID_PARAMETER;
+  output[0] = 0;
+  HKEY key;
+  DWORD error = (DWORD)RegOpenKeyExW(HKEY_CURRENT_USER, registration, 0, KEY_QUERY_VALUE | KEY_WOW64_32KEY, &key);
+  if (error) return error;
+  WCHAR *value = calloc(32768, sizeof(WCHAR)), *expected = calloc(32768, sizeof(WCHAR));
+  if (!value || !expected) error = ERROR_NOT_ENOUGH_MEMORY;
+  if (!error) error = read_registration_string(key, L"InstallLocation", value, 32768);
+  if (!error && !same_name(value, path)) error = ERROR_INVALID_DATA;
+  if (!error && swprintf(expected, 32768, L"\"%ls\\Uninstall Magnitude.exe\"", path) < 0) error = ERROR_BAD_PATHNAME;
+  if (!error) error = read_registration_string(key, L"UninstallString", value, 32768);
+  if (!error && !same_name(value, expected)) error = ERROR_INVALID_DATA;
+  if (!error) error = read_registration_string(key, L"DisplayVersion", value, 32768);
+  if (!error && (!value[0] || wcslen(value) >= capacity || wcslen(value) > 255)) error = ERROR_INVALID_DATA;
+  if (!error) wcscpy(output, value);
+  free(value); free(expected); RegCloseKey(key);
+  /* Only an absent registration admits a fresh install; missing fields do not. */
+  return error == ERROR_FILE_NOT_FOUND ? ERROR_INVALID_DATA : error;
+}
+__declspec(dllexport) DWORD WINAPI FlushInstallationRegistration(LPCWSTR registration) {
+  if (!leaseHeld || !registration) return ERROR_INVALID_PARAMETER;
+  HKEY key;
+  DWORD error = (DWORD)RegOpenKeyExW(HKEY_CURRENT_USER, registration, 0, KEY_QUERY_VALUE | KEY_WOW64_32KEY, &key);
+  if (error) return error;
+  error = (DWORD)RegFlushKey(key); RegCloseKey(key); return error;
 }
 
 /* A retry may follow failure before an uninstall key was created. */
