@@ -3,7 +3,7 @@ import { Context, Effect, Schema } from "effect"
 import { createPrivateKey, generateKeyPairSync } from "node:crypto"
 import { join } from "node:path"
 import { signUpdateRequest, type UpdateSigningFailed } from "@magnitudedev/release/hosted-update"
-import { PrivateFilePermissions } from "@magnitudedev/daemon-management/desktop-native"
+import { PrivateFilePermissions } from "@magnitudedev/daemon-management/private-files"
 
 export class UpdateIdentityFailed extends Schema.TaggedError<UpdateIdentityFailed>()("UpdateIdentityFailed", {}) {}
 export interface UpdateIdentity {

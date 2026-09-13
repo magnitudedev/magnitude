@@ -12,6 +12,7 @@
 void magnitude_register_windows_pipes(napi_env env, napi_value exports);
 void magnitude_register_windows_jobs(napi_env env, napi_value exports);
 void magnitude_register_windows_observers(napi_env env, napi_value exports);
+void magnitude_register_windows_updates(napi_env env, napi_value exports);
 #else
 #include <errno.h>
 #include <fcntl.h>
@@ -358,6 +359,7 @@ static napi_value init(napi_env env, napi_value exports) {
   magnitude_register_windows_pipes(env, exports);
   magnitude_register_windows_jobs(env, exports);
   magnitude_register_windows_observers(env, exports);
+  magnitude_register_windows_updates(env, exports);
   #endif
   magnitude_register_application_memory(env, exports);
   magnitude_register_machine_identity(env, exports);

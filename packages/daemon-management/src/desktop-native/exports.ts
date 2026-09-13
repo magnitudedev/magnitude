@@ -1,5 +1,6 @@
 export * from "./index"
 export { adoptLinuxInstallationLease } from "./linux-installation-lease"
+export { WindowsInstallerVerifier, nativeWindowsInstallerVerifier } from "./windows-update-signature"
 export { PrivateFilePermissions, unixPrivateFilePermissions, windowsPrivateFilePermissions } from "./private-files"
 export * from "./owned-service"
 export * from "./owned-child"
