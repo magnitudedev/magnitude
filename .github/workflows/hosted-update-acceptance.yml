@@ -50,6 +50,13 @@ jobs:
         run: bun packages/release/scripts/acceptance/build-desktop.ts
         env:
           MAGNITUDE_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/magnitude-update-acceptance
+      - name: Verify real storage transfers and prepare acceptance manifests
+        run: bun packages/release/scripts/acceptance/prepare-artifacts.ts
+        env:
+          MAGNITUDE_ACCEPTANCE_ARTIFACTS: ${{ runner.temp }}/magnitude-update-acceptance/artifacts
+          MAGNITUDE_ACCEPTANCE_COMMIT: ${{ github.sha }}
+          DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY: ${{ secrets.DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY }}
+          DISTRIBUTION_BLOB_READ_WRITE_TOKEN: ${{ secrets.DISTRIBUTION_BLOB_READ_WRITE_TOKEN }}
       - name: Retain signed installers and notarization evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -63,6 +70,11 @@ jobs:
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prepared-mac-${{ matrix.version }}
+          path: ${{ runner.temp }}/magnitude-update-acceptance/artifacts/prepared-manifests.json
+          if-no-files-found: error
       - name: Remove signing credentials
         if: always()
         run: bash packages/release/scripts/apple/cleanup-credentials.sh
@@ -92,12 +104,25 @@ jobs:
         env:
           MAGNITUDE_ACCEPTANCE_VERSION: ${{ matrix.version }}
           MAGNITUDE_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/magnitude-update-acceptance
+      - name: Verify real storage transfers and prepare acceptance manifests
+        run: bun packages/release/scripts/acceptance/prepare-artifacts.ts
+        env:
+          MAGNITUDE_ACCEPTANCE_VERSION: ${{ matrix.version }}
+          MAGNITUDE_ACCEPTANCE_ARTIFACTS: ${{ runner.temp }}/magnitude-update-acceptance/artifacts
+          MAGNITUDE_ACCEPTANCE_COMMIT: ${{ github.sha }}
+          DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY: ${{ secrets.DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY }}
+          DISTRIBUTION_BLOB_READ_WRITE_TOKEN: ${{ secrets.DISTRIBUTION_BLOB_READ_WRITE_TOKEN }}
       - uses: actions/upload-artifact@v4
         with:
           name: update-acceptance-linux-${{ matrix.os }}-${{ matrix.version }}
           path: ${{ runner.temp }}/magnitude-update-acceptance/artifacts
           if-no-files-found: error
           retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prepared-linux-${{ matrix.os }}-${{ matrix.version }}
+          path: ${{ runner.temp }}/magnitude-update-acceptance/artifacts/prepared-manifests.json
+          if-no-files-found: error
 
   native-checks:
     strategy:
