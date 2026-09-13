@@ -138,5 +138,5 @@ match the signed byte count and digest. Endpoints without range support may use 
 
 Range negotiation may retry a malformed probe within the same bounded attempt policy; no probe
 bytes are accepted as artifact data. A persistently invalid probe fails without publishing or
-falling back. A response with the requested bounds but an incorrect total size may also retry
-within that limit; its bytes are discarded. Incorrect bounds or changed representations fail.
+falling back. Inconsistent range bounds or totals may also retry within that limit; their bytes
+are discarded. Persistently inconsistent responses and changed representations fail.

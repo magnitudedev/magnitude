@@ -221,7 +221,7 @@ describe("artifact downloader", () => {
   it.each([
     { invalidProbe: true, shiftedBounds: false, expectedRequests: 3 },
     { invalidProbe: false, shiftedBounds: false, expectedRequests: 4 },
-    { invalidProbe: false, shiftedBounds: true, expectedRequests: 2 },
+    { invalidProbe: false, shiftedBounds: true, expectedRequests: 4 },
   ])("rejects inconsistent ranges without publishing ($invalidProbe, $shiftedBounds)", async ({ invalidProbe, shiftedBounds, expectedRequests }) => {
     const bytes = new TextEncoder().encode("inconsistent range")
     const root = await mkdtemp(join(tmpdir(), "artifact-download-test-"))

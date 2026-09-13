@@ -20,10 +20,11 @@ it.each([false, true])("recovers interrupted ranges and incorrect response total
     const start = Number(match[1]), end = Number(match[2])
     attempts.set(range, (attempts.get(range) ?? 0) + 1)
     const malformedPart = range === "bytes=0-4194303" && attempts.get(range) === 1
+    const malformedBounds = range === "bytes=8388608-9437183" && attempts.get(range) === 1
     const short = start === 4 * 1024 * 1024 && attempts.get(range) === 1
     const body = bytes.subarray(start, short ? start + 1024 : end + 1)
     return new Response(new ReadableStream({ start(controller) { controller.enqueue(body); controller.close() } }), {
-      status: 206, headers: { "content-range": `bytes ${start}-${end}/${malformedProbe && range === "bytes=0-0" && attempts.get(range) === 1 ? 1 : malformedPart ? end - start + 1 : bytes.length}`, etag: '"same-installer"' },
+      status: 206, headers: { "content-range": `bytes ${start}-${malformedBounds ? end - start : end}/${malformedProbe && range === "bytes=0-0" && attempts.get(range) === 1 ? 1 : malformedPart || malformedBounds ? end - start + 1 : bytes.length}`, etag: '"same-installer"' },
     })
   } })
   try {
@@ -39,7 +40,7 @@ it.each([false, true])("recovers interrupted ranges and incorrect response total
     expect(attempts.get("bytes=0-0")).toBe(malformedProbe ? 2 : 1)
     expect(attempts.get("bytes=4194304-8388607")).toBe(2)
     expect(attempts.get("bytes=0-4194303")).toBe(2)
-    expect(attempts.get("bytes=8388608-9437183")).toBe(1)
+    expect(attempts.get("bytes=8388608-9437183")).toBe(2)
     expect((await readFile(destination)).equals(bytes)).toBe(true)
   } finally { server.stop(true); await rm(directory, { recursive: true, force: true }) }
 })
