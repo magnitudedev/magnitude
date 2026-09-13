@@ -15,6 +15,7 @@
   "dependencies": {
     "@effect/platform": "^0.96.0",
     "@magnitudedev/acn-protocol": "workspace:*",
+    "@magnitudedev/release": "workspace:*",
     "@magnitudedev/sdk": "workspace:*",
     "@magnitudedev/utils": "workspace:*",
     "dbus-native": "0.15.2",

@@ -47,15 +47,24 @@ publisher-signed manifest and selected archive's size and digest, and stage it t
 staging endpoint exposes only that archive and closes on success, failure, or owner interruption.
 Restart requires a staged update and an explicit Settings, tray or headless update command. Quit closes update admission and
 cancels unfinished transfers before retiring the service; native installation/relaunch is invoked only
-after owned-child cleanup and application-scope release. Ordinary Quit applies a staged update without
-relaunch. Development profiles disable native update actions. Platform builds without an implemented
+after owned-child cleanup and application-scope release. On Mac, ordinary Quit applies a staged update without
+relaunch. Linux requires explicit installation and discards its prepared package on ordinary Quit.
+Development profiles disable native update actions. Platform builds without an implemented
 update transaction report that limitation rather than offering a nonfunctional restart action.
-Before native staging, the owner durably records the selected target version and application bundle.
+Before Mac native staging, the owner durably records the selected target version and application bundle.
 This is update intent, never a service lease or evidence of a live installer. On a later owner launch,
 an older app exits before creating its service/window while that exact native installation is active.
 The target version or a newer app admits normally and clears the receipt, including while its native
 relaunch helper is still exiting. If installation has stopped without applying the target, the app
 admits normally with a retryable update failure. Unknown native state cannot grant old-app startup.
+Linux retains the signed package for an explicit handoff to the system package manager. The user
+helper acknowledges readiness before owner exit, then waits on the inherited lifetime channel.
+Polkit authorizes only the privileged package operation. That operation verifies installed,
+root-owned publisher trust, target/version, copied package bytes and native package identity before
+invoking the package manager. Existing installation admission excludes another running app owner;
+an authorization or package-manager failure never means success. The helper relaunches as the
+original user, preserving whether the window was open, and records a retryable failure when needed.
+It is transient installation work, not an independent service owner or a login service.
 Recommendations order fitting assessed configurations using the shared preference. The remaining
 curated catalog stays discoverable with explicit pending, incompatible, or insufficient-memory
 explanations. Details expose catalog license/source links, capabilities, context, and labeled

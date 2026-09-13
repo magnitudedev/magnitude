@@ -21,7 +21,12 @@ export default defineConfig({
       __MAGNITUDE_UPDATE_CONFIGURATION__: JSON.stringify(updateConfiguration),
       __MAGNITUDE_UPDATE_ACCEPTANCE__: JSON.stringify(Boolean(acceptanceConfig)),
     },
-    plugins: [{ name: "harness-skill-text", load(id) { if (id.endsWith(".md")) return `export default ${JSON.stringify(readFileSync(id, "utf8"))}` } }],
+    plugins: [{ name: "harness-skill-text", load(id) { if (id.endsWith(".md")) return `export default ${JSON.stringify(readFileSync(id, "utf8"))}` } }, {
+      name: "installed-update-trust",
+      generateBundle() {
+        this.emitFile({ type: "asset", fileName: "update-trust.json", source: JSON.stringify({ keyId: updateConfiguration.keyId, publicKey: updateConfiguration.publicKey }) });
+      },
+    }],
     build: {
       // Workspace packages publish TypeScript source for Bun. Bundle them for
       // Electron's Node runtime so production does not depend on repository

@@ -69,6 +69,7 @@ export const buildLinuxDesktopInstaller = (options: {
   const config = join(stage, "options.json")
   const payload = join(stage, "application")
   yield* fs.copy(resolve(options.app), payload)
+  yield* fs.writeFileString(join(payload, "resources/update-package.json"), yield* Schema.encode(Schema.parseJson(Schema.Struct({ format: Schema.Literal("deb", "rpm") })))({ format: options.format }))
   yield* fs.copyFile(join(root, "packages/release/resources/linux/launch.sh"), join(payload, "launch"))
   yield* fs.chmod(join(payload, "launch"), 0o755)
   const begin = yield* fs.readFileString(join(root, "packages/release/resources/linux/installation-begin.sh"))
@@ -100,8 +101,8 @@ export const buildLinuxDesktopInstaller = (options: {
     version: options.version.replace("-", "~"),
   } as const
   yield* fs.writeFileString(config, options.format === "deb"
-    ? yield* Schema.encode(Schema.parseJson(DebianOptions))({ options: { ...metadata, depends: ["libc6 (>= 2.35)", "libasound2t64 | libasound2", "util-linux"], scripts } })
-    : yield* Schema.encode(Schema.parseJson(RpmOptions))({ options: { ...metadata, requires: ["glibc >= 2.35", "alsa-lib", "util-linux"], license: "Apache-2.0", specTemplate } }))
+    ? yield* Schema.encode(Schema.parseJson(DebianOptions))({ options: { ...metadata, depends: ["libc6 (>= 2.35)", "libasound2t64 | libasound2", "util-linux", "pkexec"], scripts } })
+    : yield* Schema.encode(Schema.parseJson(RpmOptions))({ options: { ...metadata, requires: ["glibc >= 2.35", "alsa-lib", "util-linux", "polkit"], license: "Apache-2.0", specTemplate } }))
   const destination = join(stage, "packages")
   const tool = options.format === "deb" ? "electron-installer-debian" : "electron-installer-redhat"
   const cli = join(dirname(fileURLToPath(import.meta.resolve(tool))), "cli.js")

@@ -54,7 +54,7 @@ describe("hosted update client", () => {
   it("accepts only a matching newer publisher-signed artifact", async () => {
     const envelope = await Effect.runPromise(signUpdateManifest(manifest, keyId, publisher.privateKey))
     const result = await Effect.runPromise(check(async () => Response.json(envelope)))
-    expect(Option.getOrThrow(result)).toEqual(manifest)
+    expect(Option.getOrThrow(result)).toEqual({ manifest, envelope })
     for (const rejected of [{ ...manifest, version: "0.9.0", artifact: { ...manifest.artifact, path: "releases/0.9.0/app.zip" } }, { ...manifest, artifact: { ...manifest.artifact, target: { ...manifest.artifact.target, arch: "x64" as const } } }]) {
       const offer = await Effect.runPromise(signUpdateManifest(rejected, keyId, publisher.privateKey))
       expect(Either.isLeft(await Effect.runPromise(Effect.either(check(async () => Response.json(offer)))))).toBe(true)

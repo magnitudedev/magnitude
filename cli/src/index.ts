@@ -16,6 +16,14 @@ registerInferenceCommands(program)
 registerConnectionsCommand(program)
 registerUpdateCommand(program)
 registerDocsCommand(program)
+program.command("_install-application-update", { hidden: true }).argument("<request>").action(async request => {
+  const { runLinuxUpdateInstallation } = await import("./startup/linux-update-installation")
+  await runLinuxUpdateInstallation(request)
+})
+program.command("_complete-application-update", { hidden: true }).action(async () => {
+  const { runLinuxUpdateHandoff } = await import("./startup/linux-update-installation")
+  await runLinuxUpdateHandoff()
+})
 program.action(async (options) => {
   if (options.version) {
     const { CLI_VERSION } = await import("./version")

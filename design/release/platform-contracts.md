@@ -81,7 +81,7 @@ from their own directory or `../runtime`. Allowed loader paths are therefore `$O
 
 The Electron application additionally requires the distribution's graphical userspace: GLib/GIO,
 GTK3, NSS/NSPR, ATK/AT-SPI, D-Bus, Cairo/Pango, CUPS, X11/XCB, xkbcommon, GBM/DRM, expat, udev,
-and ALSA libraries, plus util-linux for installation admission. These are package-manager dependencies, including when the application uses
+and ALSA libraries, plus util-linux for installation admission and Polkit/pkexec for update authorization. These are package-manager dependencies, including when the application uses
 Wayland. They do not become requirements of the headless CLI or inference artifacts. FFmpeg,
 Electron, and the bundled rendering libraries are artifact-owned. Package metadata must resolve
 the graphical dependencies on each supported distribution without relying on optional recommends

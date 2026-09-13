@@ -43,6 +43,8 @@ export const buildDesktopApplication = (options: {
   const icon = join(resources, "application-icon.png")
   const license = join(resources, "Magnitude-LICENSE.txt")
   const command = join(resources, "magnitude-command")
+  const updateTrust = join(resources, "update-trust.json")
+  yield* fs.copyFile(join(root, "desktop/out/main/update-trust.json"), updateTrust)
   yield* fs.copyFile(options.service, service)
   yield* fs.chmod(service, 0o755)
   yield* fs.copyFile(options.cli, cli)
@@ -63,6 +65,6 @@ export const buildDesktopApplication = (options: {
     ...(platform === "win32" ? { icon: join(root, "packages/release/resources/windows/Magnitude.ico"), win32metadata: { CompanyName: "Magnitude" } } : {}),
     ...(platform === "darwin" ? { icon: join(root, "packages/release/resources/macos/Magnitude.icns"), extendInfo: { LSMinimumSystemVersion: MACOS_DEPLOYMENT_TARGET } } : {}),
     asar: true, prune: false, overwrite: true,
-    extraResource: [service, cli, addon, tray, icon, license, ...(platform === "win32" ? [] : [command])],
+    extraResource: [service, cli, addon, tray, icon, license, updateTrust, ...(platform === "win32" ? [] : [command])],
   }), catch: error => new DesktopBuildFailed({ message: `Could not assemble desktop: ${String(error)}` }) })
 })).pipe(Effect.mapError(error => error instanceof DesktopBuildFailed ? error : new DesktopBuildFailed({ message: String(error) })))
