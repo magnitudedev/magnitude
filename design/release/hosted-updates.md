@@ -58,6 +58,11 @@ Cryptographic verification does not replace checksum verification after transfer
 publisher verification before installation. Installation lifecycle belongs to desktop main.
 The original signed envelope accompanies a verified candidate through any process handoff; a
 parsed manifest is not a substitute for publisher proof at a later privileged boundary.
+Windows additionally verifies the installer through WinVerifyTrust with whole-chain revocation
+checking and no verification UI. The verified signer's certificate must contain the publisher
+organization supplied by the installed build; a valid signature from another publisher is not enough.
+Native acceptance uses explicitly trusted, temporary test certificates to exercise valid signatures,
+unsigned files, payload tampering and publisher mismatch without weakening production trust.
 
 Artifact paths belong to their signed version directory. Immutable storage publication verifies
 the local file, refuses overwrites, and verifies the complete remotely downloaded byte count and

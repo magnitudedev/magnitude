@@ -5,7 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
 import { makeUpdateIdentity } from "./update-identity"
-import { unixPrivateFilePermissions } from "@magnitudedev/daemon-management/desktop-native"
+import { unixPrivateFilePermissions } from "@magnitudedev/daemon-management/private-files"
 
 describe("desktop installation identity", () => {
   it("persists one private identity across launches and refuses to reset a corrupt key", async () => {

@@ -2,11 +2,11 @@ name: Hosted update acceptance
 
 on:
   workflow_dispatch:
-  push:
-    branches: [app]
-    paths:
-      - .github/workflows/hosted-update-acceptance.yml
-      - packages/release/scripts/acceptance/**
+    inputs:
+      build_artifacts:
+        description: Build and upload a new installer cohort in addition to native checks
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -17,13 +17,14 @@ concurrency:
 
 jobs:
   signed-mac-apps:
+    if: inputs.build_artifacts
     environment: apple-release
     runs-on: macos-15
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        version: ["0.0.26", "0.0.27"]
+        version: ["0.0.28", "0.0.29"]
     env:
       MAGNITUDE_APPLE_DISTRIBUTION: developer-id
       MAGNITUDE_ACCEPTANCE_VERSION: ${{ matrix.version }}
@@ -80,11 +81,12 @@ jobs:
         run: bash packages/release/scripts/apple/cleanup-credentials.sh
 
   linux-packages:
+    if: inputs.build_artifacts
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04-arm]
-        version: ["0.0.26", "0.0.27"]
+        version: ["0.0.28", "0.0.29"]
     runs-on: ${{ matrix.os }}
     container: ubuntu:22.04
     timeout-minutes: 30
@@ -107,7 +109,7 @@ jobs:
       - name: Verify Linux installation lease does not escape into updater children
         shell: bash
         run: |
-          addon=$(find "${{ runner.temp }}/magnitude-update-acceptance/application" -name desktop-host.node -print -quit)
+          addon=$(find "$RUNNER_TEMP/magnitude-update-acceptance/application" -name desktop-host.node -print -quit)
           test -n "$addon"
           fixture="$GITHUB_WORKSPACE/packages/daemon-management/src/desktop-native/fixtures/linux-installation-lease.cjs"
           install -d -m 755 /var/lib/magnitude-desktop
@@ -172,7 +174,7 @@ jobs:
             npm install --prefix $fixture --ignore-scripts --no-audit --no-fund node-api-headers@1.9.0
             if ($LASTEXITCODE -ne 0) { throw 'Node-API header acquisition failed' }
             $headers = Join-Path $fixture 'node_modules/node-api-headers/include'
-            & cl.exe /nologo /c /W4 /WX /O2 /std:c11 /D_WIN32_WINNT=0x0A00 /DNAPI_VERSION=8 /D_CRT_SECURE_NO_WARNINGS "/I$headers" (Join-Path $source 'desktop-host.c')
+            & cl.exe /nologo /c /W4 /WX /O2 /std:c11 /D_WIN32_WINNT=0x0A00 /DNAPI_VERSION=8 /D_CRT_SECURE_NO_WARNINGS "/I$headers" (Join-Path $source 'desktop-host.c') (Join-Path $source 'windows-update-napi.c')
             if ($LASTEXITCODE -ne 0) { throw 'Windows update binding compilation failed' }
             & cl.exe /nologo /W4 /WX /O2 /std:c11 /D_WIN32_WINNT=0x0A00 /D_CRT_SECURE_NO_WARNINGS (Join-Path $source 'windows-security.c') (Join-Path $source 'windows-security-test.c') /Fe:security.exe /link advapi32.lib
             if ($LASTEXITCODE -ne 0) { throw 'Native permission compilation failed' }
@@ -182,6 +184,10 @@ jobs:
       - name: Validate package permission regressions
         working-directory: packages/release
         run: bunx --bun vitest run scripts/build/desktop-linux.test.ts
+      - name: Verify Windows Authenticode with actual signed and tampered executables
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./packages/daemon-management/scripts/test-windows-update-signature.ps1
       - name: Send a real signed check to the isolated hosted endpoint
         run: bun packages/release/scripts/acceptance/check.ts
         env:
