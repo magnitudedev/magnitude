@@ -8,6 +8,7 @@ import { LINUX_DESKTOP_PACKAGE_NAME } from "../../src/executables"
 import { ReleaseArtifactSchema } from "../../src/contracts"
 import { sha256File } from "../../src/macos-app"
 import { linuxDesktopInstaller } from "../../src/targets"
+import { renderLinuxMaintainerScripts } from "./linux-maintainer-scripts"
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..")
 const PackageFields = {
@@ -93,12 +94,7 @@ export const buildLinuxDesktopInstaller = (options: {
   const begin = yield* fs.readFileString(join(root, "packages/release/resources/linux/installation-begin.sh"))
   const end = yield* fs.readFileString(join(root, "packages/release/resources/linux/installation-end.sh"))
   const scripts: Record<string, string> = {}
-  for (const [name, body] of Object.entries({
-    preinst: `case "$1" in install|upgrade) ;; *) exit 0 ;; esac\n${begin}`,
-    postinst: `case "$1" in configure) ;; *) exit 0 ;; esac\n${end}`,
-    prerm: `case "$1" in remove) ;; *) exit 0 ;; esac\n${begin}`,
-    postrm: `case "$1" in remove|purge) ;; *) exit 0 ;; esac\n[ -f /var/lib/magnitude-desktop/installation.lock ] || exit 0\n${end}`,
-  })) {
+  for (const [name, body] of Object.entries(renderLinuxMaintainerScripts(begin, end))) {
     scripts[name] = join(stage, name)
     yield* fs.writeFileString(scripts[name]!, `#!/bin/sh\nset -eu\n${body}`)
     yield* fs.chmod(scripts[name]!, 0o755)
