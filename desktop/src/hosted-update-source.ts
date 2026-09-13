@@ -26,7 +26,10 @@ export const hostedUpdateSource = (options: HostedUpdateSourceOptions, stage: Ap
     const downloaded = yield* downloadArtifact({
       url, destination: join(directory, basename(candidate.manifest.artifact.path)),
       bytes: candidate.manifest.artifact.bytes, sha256: candidate.manifest.artifact.sha256,
-      strategy: { _tag: "Sequential" }, policy: defaultArtifactDownloadPolicy,
+      strategy: { _tag: "Sequential" },
+      // Large installers can keep making progress on a slow connection for longer
+      // than the general acquisition attempt budget. The stall limit still applies.
+      policy: { ...defaultArtifactDownloadPolicy, attemptTimeout: "1 hour", totalTimeout: "185 minutes" },
       onProgress: Option.some(value => progress(value.acceptedBytes)), onVerificationProgress: Option.none(),
     })
     return downloaded.destination
