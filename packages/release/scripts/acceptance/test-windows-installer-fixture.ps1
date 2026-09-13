@@ -30,7 +30,35 @@ $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $startup = '"' + (Join-Path $installation 'Magnitude.exe') + '" --background'
 New-Item -Path $run -Force | Out-Null
 New-ItemProperty -Path $run -Name 'dev.magnitude.desktop' -Value $startup -PropertyType String -Force | Out-Null
-Invoke-Installer $next 0
+$state = Join-Path $Root 'update-state'
+$prepared = Join-Path $state ('application-updates\prepared-' + [Guid]::NewGuid())
+New-Item -ItemType Directory -Force $prepared | Out-Null
+$helper = Join-Path $prepared 'magnitude-update.exe'
+& bun build (Join-Path $PSScriptRoot 'windows-update-handoff-entry.ts') --compile "--outfile=$helper"
+if ($LASTEXITCODE -ne 0) { throw 'Update handoff bootstrap compilation failed' }
+Copy-Item -LiteralPath $next -Destination (Join-Path $prepared 'magnitude-setup.exe')
+$request = @{ stateDirectory=$state; preparedDirectory=$prepared; applicationPath=(Join-Path $installation 'Magnitude.exe'); version='1.2.4'; showWindow=$false; envelope=@{keyId='fixture';payload='';signature=''} }
+$start = [Diagnostics.ProcessStartInfo]::new($helper)
+$start.UseShellExecute = $false
+$start.CreateNoWindow = $true
+$start.RedirectStandardInput = $true
+$start.RedirectStandardOutput = $true
+$process = [Diagnostics.Process]::Start($start)
+try {
+  $process.StandardInput.WriteLine(($request | ConvertTo-Json -Compress))
+  $ready = $process.StandardOutput.ReadLineAsync()
+  if (!$ready.Wait(10000) -or $ready.Result -ne 'ready') { throw 'Update helper did not acknowledge readiness' }
+  if ($process.WaitForExit(100)) { throw 'Update helper exited before its owner' }
+  Assert-Version '1.2.3'
+  $process.StandardInput.Close()
+  if (!$process.WaitForExit(60000)) { throw 'Update handoff did not finish installation' }
+  if ($process.ExitCode -ne 0) { throw 'Update helper failed' }
+  $result = Get-Content -Raw (Join-Path $state 'update-result.json') | ConvertFrom-Json
+  if ($result.request.version -ne '1.2.4' -or $result.error) { throw 'Update helper did not record installer success' }
+} finally {
+  if (!$process.HasExited) { $process.Kill(); $process.WaitForExit() }
+  $process.Dispose()
+}
 Assert-Version '1.2.4'
 if ((Get-ItemProperty $run).'dev.magnitude.desktop' -ne $startup) { throw 'Update changed startup preference' }
 Invoke-Installer (Join-Path $installation 'Uninstall Magnitude.exe') 0
@@ -38,5 +66,5 @@ $deadline = (Get-Date).AddSeconds(30)
 while ((Test-Path $installation) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
 if ((Test-Path $installation) -or (Test-Path $registration)) { throw 'Uninstaller did not finish' }
 if ((Get-ItemProperty $run -Name 'dev.magnitude.desktop' -ErrorAction SilentlyContinue)) { throw 'Uninstaller retained owned startup' }
-Write-Output 'PASS actual NSIS fresh install, unknown-file refusal, upgrade, startup preservation and uninstall'
+Write-Output 'PASS actual NSIS fresh install, unknown-file refusal, owner-exit handoff, upgrade, startup preservation and uninstall'
 $global:LASTEXITCODE = 0

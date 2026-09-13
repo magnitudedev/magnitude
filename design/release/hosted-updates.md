@@ -63,6 +63,11 @@ checking and no verification UI. The verified signer's certificate must contain 
 organization supplied by the installed build; a valid signature from another publisher is not enough.
 Native acceptance uses explicitly trusted, temporary test certificates to exercise valid signatures,
 unsigned files, payload tampering and publisher mismatch without weakening production trust.
+Windows stages the installer and a copy of the bundled CLI in a unique private directory outside
+the replaceable application. The temporary helper acknowledges readiness, waits for its desktop
+owner's lifetime pipe to close, then runs the per-user installer and records its actual exit result
+before relaunching. It owns no service and requests no elevation. The reopened desktop retires only
+that completed staging directory after the helper exits; installation identity remains in the profile.
 
 Artifact paths belong to their signed version directory. Immutable storage publication verifies
 the local file, refuses overwrites, and verifies the complete remotely downloaded byte count and
