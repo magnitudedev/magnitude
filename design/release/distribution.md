@@ -66,9 +66,11 @@ The package manager obtains exclusive admission before replacement/removal and r
 participating user app remains alive. A root-owned installation gate spans the separate maintainer
 script lifetimes; launches fail with repair guidance until configuration succeeds. Interrupted
 installation never becomes an independently running service. The lock inode survives reinstall.
-Package abort hooks must preserve a healthy old installation after a rejected upgrade.
-`/usr/bin/magnitude-desktop` is the graphical launch entry; it does not
-replace the npm CLI's `magnitude` command. Login registration remains a user preference controlled
+Package abort hooks must preserve a healthy old installation after a rejected upgrade. Debian's
+`postinst abort-upgrade` and `abort-remove` release the gate after the package manager restores the
+old installation; a refusal before gate acquisition does not acquire or clear another owner's gate.
+`/usr/bin/magnitude-desktop` is the graphical launch entry; `/usr/bin/magnitude` resolves the
+bundled headless CLI. Login registration remains a user preference controlled
 by the running application. Package installation does not register an independent daemon or
 automatically open a window. Native DEB/RPM consumption and upgrade acceptance precede inclusion
 in the published artifact graph.
