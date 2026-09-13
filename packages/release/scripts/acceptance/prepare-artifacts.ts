@@ -5,12 +5,13 @@ import { join } from "node:path"
 import { ReleaseArtifactSchema } from "../../src/contracts"
 import { decodePublisherPrivateKey, PublisherKeyId, SignedUpdateManifest, UpdateManifest } from "../../src/hosted-update/manifest"
 import { prepareHostedRelease } from "../../src/hosted-update/publication"
+import { isValidVersion } from "../../src/client-update/release-channels"
 
 class AcceptancePreparationFailed extends Schema.TaggedError<AcceptancePreparationFailed>()("AcceptancePreparationFailed", {}) {}
 const run = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const directory = yield* Config.string("MAGNITUDE_ACCEPTANCE_ARTIFACTS")
-  const version = yield* Config.literal("0.0.14", "0.0.15")("MAGNITUDE_ACCEPTANCE_VERSION")
+  const version = yield* Schema.decodeUnknown(Schema.String.pipe(Schema.filter(isValidVersion)))(yield* Config.string("MAGNITUDE_ACCEPTANCE_VERSION"))
   const commit = yield* Config.string("MAGNITUDE_ACCEPTANCE_COMMIT")
   const key = yield* decodePublisherPrivateKey(yield* Config.string("DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY"))
   const artifacts = yield* Effect.forEach((yield* fs.readDirectory(directory)).filter(name => name.endsWith(".artifact.json")), name => Effect.gen(function* () {

@@ -19,10 +19,12 @@ AutoReqProv: no
 %install
 mkdir -p %{buildroot}/usr/
 cp -a usr/. %{buildroot}/usr/
+ln -s ../lib/<%= name %>/resources/magnitude %{buildroot}/usr/bin/magnitude
 
 %files
 %defattr(-,root,root)
 /usr/bin/<%= name %>
+/usr/bin/magnitude
 /usr/lib/<%= name %>/
 /usr/share/applications/<%= name %>.desktop
 /usr/share/doc/<%= name %>/

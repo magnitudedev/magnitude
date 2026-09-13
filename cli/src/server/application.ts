@@ -8,7 +8,7 @@ import { isDevelopmentBuild } from "../runtime/environment"
 export const {
   desktopIsolatedProfile, desktopDataDirectory, desktopServiceOrigin, desktopApplication,
   startDesktopApplication, stopDesktopApplication,
-  readDesktopLoginStartup, setDesktopLoginStartup,
+  readDesktopLoginStartup, setDesktopLoginStartup, updateDesktopApplication,
 } = makeDesktopApplicationHost(isDevelopmentBuild()
   ? Option.some(resolve(dirname(fileURLToPath(import.meta.url)), "../../.."))
   : Option.none(), bundledWindowsNative)

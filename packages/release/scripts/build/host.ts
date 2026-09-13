@@ -408,7 +408,7 @@ export const buildHostArtifacts = async (
     }
     acnSources = (await runAppleBuild(regularAppleFiles(app))).map((file) => ({ ...file, path: `Magnitude.app/${file.path}` }))
     await run(["bun", "run", "build"], { cwd: resolve(PROJECT_ROOT, "desktop") })
-    const packages = await runAppleBuild(buildDesktopApplication({ service: acn, outputDirectory: resolve(output, ".desktop-build"), version, revision: ACN_COORDINATION_REVISION }))
+    const packages = await runAppleBuild(buildDesktopApplication({ service: acn, cli, outputDirectory: resolve(output, ".desktop-build"), version, revision: ACN_COORDINATION_REVISION }))
     if (packages.length !== 1) throw new Error("Desktop packaging did not produce exactly one host application")
     const desktop = await runAppleBuild(buildDesktopDmg({ app: resolve(packages[0]!, "Magnitude.app"), output, host: Schema.decodeUnknownSync(Schema.Literal("darwin-arm64", "darwin-x64"))(host.id) }))
     desktopArtifacts.push(desktop.artifact, desktop.updateArtifact)
@@ -418,7 +418,7 @@ export const buildHostArtifacts = async (
     const installers = await Effect.runPromise(Effect.gen(function* () {
       const arch = host.id === "linux-arm64-gnu" ? "arm64" : "x64"
       const applications = yield* buildDesktopApplication({
-        service: acn, outputDirectory: resolve(output, ".desktop-build"),
+        service: acn, cli, outputDirectory: resolve(output, ".desktop-build"),
         version, revision: ACN_COORDINATION_REVISION, target: { platform: "linux", arch },
       })
       if (applications.length !== 1) return yield* new DesktopBuildFailed({ message: "Desktop packaging did not produce exactly one Linux application" })

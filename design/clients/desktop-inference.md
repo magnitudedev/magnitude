@@ -45,7 +45,7 @@ independently of the renderer and service readiness. The automatic-download pref
 disable checks. Window Close and observer loss cannot cancel admitted work. Mac updates verify the
 publisher-signed manifest and selected archive's size and digest, and stage it through the native updater before reporting Ready. The local
 staging endpoint exposes only that archive and closes on success, failure, or owner interruption.
-Restart requires a staged update and an explicit Settings or tray action. Quit closes update admission and
+Restart requires a staged update and an explicit Settings, tray or headless update command. Quit closes update admission and
 cancels unfinished transfers before retiring the service; native installation/relaunch is invoked only
 after owned-child cleanup and application-scope release. Ordinary Quit applies a staged update without
 relaunch. Development profiles disable native update actions. Platform builds without an implemented

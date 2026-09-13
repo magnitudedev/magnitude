@@ -1,3 +1,4 @@
+import { ApplicationUpdateControlFailed } from "@magnitudedev/sdk/desktop-host"
 import { makeRendererRecovery } from "./renderer-recovery"
 import { resolveQuitFailure } from "./quit-failure"
 import { buildApplicationMenu } from "./application-menu"
@@ -191,7 +192,12 @@ const program = Effect.scoped(Effect.gen(function* () {
   const snapshot = Effect.all({ service: service.state, tray: tray.state }).pipe(Effect.map(value => ({ version: 1 as const, pid: process.pid, endpoint, ...value })))
   const snapshots = Stream.zipLatest(service.changes, tray.changes).pipe(Stream.map(([service, tray]) => ({ version: 1 as const, pid: process.pid, endpoint, service, tray })))
   yield* service.changes.pipe(Stream.runForEach(current => Ref.set(state, current).pipe(Effect.zipRight(refreshTray))), Effect.forkScoped)
-  const control: ApplicationControlOptions = { snapshot, login: action => action === "read" ? loginStartup.read : loginStartup.set(action === "enable"), dispatch: intent => intent === "Quit" ? Queue.offer(quit, "Quit").pipe(Effect.asVoid) : intent === "ShowWindow" ? show() : intent === "Retry" ? service.retry : Effect.void }
+  const control: ApplicationControlOptions = { snapshot, update: action => Effect.gen(function* () {
+    if (action === "check") yield* updateSchedule.check
+    if (action === "download") yield* updates.download
+    if (action === "install") yield* updates.requireReady
+    return { state: yield* updates.state, afterReply: action === "install" ? Queue.offer(quit, "RestartUpdate").pipe(Effect.asVoid) : Effect.void }
+  }).pipe(Effect.mapError(error => new ApplicationUpdateControlFailed({ message: error.message }))), login: action => action === "read" ? loginStartup.read : loginStartup.set(action === "enable"), dispatch: intent => intent === "Quit" ? Queue.offer(quit, "Quit").pipe(Effect.asVoid) : intent === "ShowWindow" ? show() : intent === "Retry" ? service.retry : Effect.void }
   if (process.platform === "win32") {
     const name = yield* Schema.decodeUnknown(WindowsPipeName)(owner.socketPath)
     yield* serveWindowsApplicationControl(name, control).pipe(Effect.provide(nativeWindowsPrivatePipesLayer(addonPath)))

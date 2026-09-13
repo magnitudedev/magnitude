@@ -1,4 +1,4 @@
-import { ApplicationControlFailed, ApplicationControlUnavailable, requestApplication, requestLoginStartup } from "./application-control"
+import { ApplicationControlFailed, ApplicationControlUnavailable, requestApplication, requestLoginStartup, requestApplicationUpdate } from "./application-control"
 import { access } from "node:fs/promises"
 import { join } from "node:path"
 import { homedir } from "node:os"
@@ -107,6 +107,10 @@ export const makeDesktopApplicationHost = (developmentRepository: Option.Option<
     Effect.zipRight(endpoint.pipe(Effect.flatMap(path => requestLoginStartup(path, enabled ? "enable" : "disable")))),
   )
 
-  return { desktopIsolatedProfile, desktopDataDirectory, desktopServiceOrigin, desktopApplication, startDesktopApplication, stopDesktopApplication, readDesktopLoginStartup, setDesktopLoginStartup }
+  const updateDesktopApplication = (action: import("@magnitudedev/sdk/desktop-host").ApplicationUpdateAction) => (action === "status" ? Effect.void : desktopApplication.ensure().pipe(Effect.asVoid)).pipe(
+    Effect.zipRight(endpoint.pipe(Effect.flatMap(path => requestApplicationUpdate(path, action)))),
+  )
+
+  return { updateDesktopApplication, desktopIsolatedProfile, desktopDataDirectory, desktopServiceOrigin, desktopApplication, startDesktopApplication, stopDesktopApplication, readDesktopLoginStartup, setDesktopLoginStartup }
 
 }

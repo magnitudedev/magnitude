@@ -3,6 +3,8 @@ import { BunContext, BunRuntime } from "@effect/platform-bun"
 import { Config, Effect, Schema } from "effect"
 import { join, resolve } from "node:path"
 import { buildAcnBinary } from "../build/acn"
+import { buildCliBinary } from "../build/cli"
+import { isValidVersion } from "../../src/client-update/release-channels"
 import { buildDesktopApplication } from "../build/desktop"
 import { buildDesktopDmg } from "../apple/desktop"
 import { buildLinuxDesktopInstaller } from "../build/desktop-linux"
@@ -13,7 +15,7 @@ const root = resolve(import.meta.dir, "../../../..")
 const Package = Schema.Record({ key: Schema.String, value: Schema.Unknown })
 const run = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
-  const version = yield* Config.literal("0.0.14", "0.0.15")("MAGNITUDE_ACCEPTANCE_VERSION")
+  const version = yield* Schema.decodeUnknown(Schema.String.pipe(Schema.filter(isValidVersion)))(yield* Config.string("MAGNITUDE_ACCEPTANCE_VERSION"))
   const target = yield* Schema.decodeUnknown(Schema.Union(
     Schema.Struct({ platform: Schema.Literal("darwin"), arch: Schema.Literal("arm64") }),
     Schema.Struct({ platform: Schema.Literal("linux"), arch: Schema.Literal("arm64", "x64") }),
@@ -35,11 +37,14 @@ const run = Effect.gen(function* () {
     yield* command([process.execPath, "packages/version/scripts/generate-version.ts"])
     yield* command([process.execPath, "run", "build"], join(root, "desktop"))
     const service = yield* Effect.tryPromise({ try: () => buildAcnBinary(`bun-${target.platform}-${target.arch}`), catch: () => new AcceptanceBuildFailed({ message: "Service compilation failed" }) })
+    const cli = yield* Effect.tryPromise({ try: () => buildCliBinary(`bun-${target.platform}-${target.arch}`), catch: () => new AcceptanceBuildFailed({ message: "CLI compilation failed" }) })
     const release = yield* Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ revision: Schema.Number })))(yield* fs.readFileString(join(root, "packages/release/release-plan.json")))
-    const apps = yield* buildDesktopApplication({ service, version, revision: release.revision, outputDirectory: join(output, "application") })
+    const apps = yield* buildDesktopApplication({ service, cli, version, revision: release.revision, outputDirectory: join(output, "application") })
     const app = target.platform === "darwin" ? join(apps[0]!, "Magnitude.app") : apps[0]!
     const serviceVersion = yield* Command.make(join(app, target.platform === "darwin" ? "Contents/Resources" : "resources", ACN_EXECUTABLE_NAME), "version").pipe(Command.string)
     if (serviceVersion.trim() !== version) return yield* new AcceptanceBuildFailed({ message: "Application and bundled service versions differ" })
+    const cliVersion = yield* Command.make(join(app, target.platform === "darwin" ? "Contents/Resources" : "resources", "magnitude"), "--version").pipe(Command.string)
+    if (cliVersion.trim() !== version) return yield* new AcceptanceBuildFailed({ message: "Application and bundled CLI versions differ" })
     if (target.platform === "darwin") {
       // Separate Launch Services identity; the executable, service and native installation path are real.
       yield* command(["/usr/libexec/PlistBuddy", "-c", "Set :CFBundleIdentifier dev.magnitude.desktop.update-acceptance", join(app, "Contents/Info.plist")])

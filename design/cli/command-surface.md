@@ -22,7 +22,7 @@ desktop application.
 The public command vocabulary is:
 
 ```text
-update
+update [check | status | download | install]
 app open
 service install | uninstall | start | stop | status
 hardware
