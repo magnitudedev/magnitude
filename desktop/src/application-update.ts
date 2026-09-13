@@ -1,12 +1,12 @@
 import { Clock, Context, Effect, ExecutionStrategy, Exit, Fiber, Option, Schema, Scope, Stream, SubscriptionRef } from "effect"
-import { UpdateManifest } from "@magnitudedev/release/hosted-update"
+import { UpdateCandidate } from "@magnitudedev/release/hosted-update"
 import type { DesktopUpdateState } from "@magnitudedev/client-common"
 import { UpdatePreferences } from "./update-preferences"
 
 export class ApplicationUpdateFailed extends Schema.TaggedError<ApplicationUpdateFailed>()("ApplicationUpdateFailed", {
   message: Schema.String,
 }) {}
-type Candidate = typeof UpdateManifest.Type
+type Candidate = typeof UpdateCandidate.Type
 export interface ApplicationUpdateSource {
   readonly check: Effect.Effect<Option.Option<Candidate>, ApplicationUpdateFailed>
   readonly download: (candidate: Candidate, progress: (completed: number) => Effect.Effect<void>) => Effect.Effect<string, ApplicationUpdateFailed, Scope.Scope>
@@ -16,10 +16,10 @@ export const ApplicationUpdateSource = Context.GenericTag<ApplicationUpdateSourc
 
 const Transfer = Schema.Union(
   Schema.TaggedStruct("Idle", {}),
-  Schema.TaggedStruct("Available", { candidate: UpdateManifest }),
-  Schema.TaggedStruct("Downloading", { candidate: UpdateManifest, completed: Schema.Number, automatic: Schema.Boolean }),
-  Schema.TaggedStruct("Cancelling", { candidate: UpdateManifest }),
-  Schema.TaggedStruct("Staging", { candidate: UpdateManifest }),
+  Schema.TaggedStruct("Available", { candidate: UpdateCandidate }),
+  Schema.TaggedStruct("Downloading", { candidate: UpdateCandidate, completed: Schema.Number, automatic: Schema.Boolean }),
+  Schema.TaggedStruct("Cancelling", { candidate: UpdateCandidate }),
+  Schema.TaggedStruct("Staging", { candidate: UpdateCandidate }),
   Schema.TaggedStruct("Ready", { version: Schema.String }),
   Schema.TaggedStruct("Failed", { message: Schema.String }),
   Schema.TaggedStruct("Closed", {}),
@@ -29,10 +29,10 @@ type State = { readonly transfer: Transfer; readonly check: DesktopUpdateState["
 const present = (state: State): DesktopUpdateState => {
   const transfer = state.transfer
   switch (transfer._tag) {
-    case "Available": return { ...state, transfer: { _tag: "Available", version: transfer.candidate.version, bytes: transfer.candidate.artifact.bytes } }
-    case "Downloading": return { ...state, transfer: { _tag: "Downloading", version: transfer.candidate.version, completed: transfer.completed, total: transfer.candidate.artifact.bytes } }
+    case "Available": return { ...state, transfer: { _tag: "Available", version: transfer.candidate.manifest.version, bytes: transfer.candidate.manifest.artifact.bytes } }
+    case "Downloading": return { ...state, transfer: { _tag: "Downloading", version: transfer.candidate.manifest.version, completed: transfer.completed, total: transfer.candidate.manifest.artifact.bytes } }
     case "Cancelling": return { ...state, transfer: { _tag: "Cancelling" } }
-    case "Staging": return { ...state, transfer: { _tag: "Staging", version: transfer.candidate.version } }
+    case "Staging": return { ...state, transfer: { _tag: "Staging", version: transfer.candidate.manifest.version } }
     default: return { ...state, transfer }
   }
 }
@@ -81,7 +81,7 @@ export const makeApplicationUpdate = (initialFailure: Option.Option<string> = Op
       if (!admitted) return
       yield* source.stage(archive, candidate)
       yield* gate.withPermits(1)(SubscriptionRef.update(state, (current): State => current.transfer._tag === "Staging"
-        ? { ...current, transfer: { _tag: "Ready", version: candidate.version } } : current))
+        ? { ...current, transfer: { _tag: "Ready", version: candidate.manifest.version } } : current))
     })).pipe(
       Effect.catchAll(failTransfer),
       Effect.catchAllDefect(() => failTransfer(new ApplicationUpdateFailed({ message: "The application update could not finish. Check again to retry." }))),

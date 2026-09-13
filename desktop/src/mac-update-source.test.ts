@@ -4,7 +4,8 @@ import { mkdtemp, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, Option, Schema, Stream } from "effect"
-import { UpdateManifest, UpdateClientMetadata, signUpdateRequest } from "@magnitudedev/release/hosted-update"
+import { UpdateClientMetadata, signUpdateRequest } from "@magnitudedev/release/hosted-update"
+import { UpdateManifest, PublisherKeyId, signUpdateManifest } from "../../packages/release/src/hosted-update/manifest"
 import { UpdatePreferences } from "./update-preferences"
 import { describe, expect, it } from "vitest"
 import { ApplicationUpdateSource, makeApplicationUpdate } from "./application-update"
@@ -20,6 +21,7 @@ describe("Mac update acquisition and native handoff", () => {
       path: "releases/2.0.0/magnitude-desktop-darwin-arm64.zip", bytes: bytes.length,
       sha256: createHash("sha256").update(bytes).digest("hex"),
     } })
+    const offer = { manifest: candidate, envelope: await Effect.runPromise(signUpdateManifest(candidate, PublisherKeyId.make("test"), generateKeyPairSync("ed25519").privateKey)) }
     const root = await mkdtemp(join(tmpdir(), "mac-update-source-"))
     const identity = generateKeyPairSync("ed25519")
     const metadata = Schema.decodeUnknownSync(UpdateClientMetadata)({ version: "1.0.0", os: "darwin", os_version: "26", arch: "arm64", package: "mac-zip" })
@@ -48,7 +50,7 @@ describe("Mac update acquisition and native handoff", () => {
             }),
           }),
         )
-        const owner = yield* makeApplicationUpdate().pipe(Effect.provideService(ApplicationUpdateSource, { ...source, check: Effect.succeed(Option.some(candidate)) }))
+        const owner = yield* makeApplicationUpdate().pipe(Effect.provideService(ApplicationUpdateSource, { ...source, check: Effect.succeed(Option.some(offer)) }))
         yield* owner.check
         yield* owner.changes.pipe(Stream.filter(state => state.transfer._tag === "Available"), Stream.take(1), Stream.runDrain)
         yield* owner.download

@@ -55,7 +55,7 @@ export const checkHostedUpdate = (options: HostedUpdateConnection & {
   const envelope = yield* Schema.decodeUnknown(Schema.parseJson(SignedUpdateManifest))(json, { onExcessProperty: "error" }).pipe(Effect.mapError(() => new HostedUpdateCheckFailed({ reason: "response" })))
   const manifest = yield* verifyUpdateManifest(envelope, options.trustedPublishers).pipe(Effect.mapError(() => new HostedUpdateCheckFailed({ reason: "publisher" })))
   if (!acceptsUpdateManifest(manifest, fields)) return yield* new HostedUpdateCheckFailed({ reason: "response" })
-  return Option.some(manifest)
+  return Option.some({ manifest, envelope })
 }).pipe(
   Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }),
   Effect.timeoutFail({ duration: "10 seconds", onTimeout: () => new HostedUpdateCheckFailed({ reason: "network" }) }),

@@ -4,8 +4,10 @@ import { resolveQuitFailure } from "./quit-failure"
 import { buildApplicationMenu } from "./application-menu"
 import { buildTrayMenu } from "./tray-menu"
 import { makeLoginStartup, WINDOWS_APPLICATION_ID } from "./login-startup"
-import { ApplicationUpdateSource, makeApplicationUpdate, unavailableApplicationUpdate } from "./application-update"
+import { ApplicationUpdateFailed, ApplicationUpdateSource, makeApplicationUpdate, unavailableApplicationUpdate } from "./application-update"
 import { macUpdateSource } from "./mac-update-source"
+import { makeLinuxUpdateSource } from "./linux-update-source"
+import { readLinuxUpdateMetadata } from "./update-metadata"
 import { NativeMacUpdate, nativeMacUpdate } from "./mac-update-stage"
 import { ApplicationUpdateHandoff, makeUpdateHandoff } from "./update-handoff"
 import { UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
@@ -58,6 +60,9 @@ let exiting = false
 let canPresentErrors = process.platform !== "win32"
 let systemShutdownRequested = false
 let earlyQuitRequested = false
+let restartLinuxUpdate: (() => Effect.Effect<void, ApplicationUpdateFailed>) | undefined
+let discardLinuxUpdate: Effect.Effect<void> = Effect.void
+let reopenAfterUpdate = false
 let requestQuit: () => void = () => { earlyQuitRequested = true }
 app.on("before-quit", event => { if (!exiting) { event.preventDefault(); requestQuit() } })
 // OS-requested termination must retire the owned service before Electron exits.
@@ -103,13 +108,23 @@ const program = Effect.scoped(Effect.gen(function* () {
   const updateConfiguration = yield* readUpdateConfiguration.pipe(Effect.option)
   const updates = Option.isNone(updateConfiguration) ? unavailableApplicationUpdate("Application update configuration is invalid.")
     : isolatedProfile && !updateConfiguration.value.acceptance ? unavailableApplicationUpdate("Application updates are available in the installed Magnitude app.")
-    : process.platform !== "darwin" ? unavailableApplicationUpdate(process.platform === "linux"
-      ? "Update Magnitude through your Linux package manager." : "Application updates are not available in this Windows build.")
-    : !handoff ? unavailableApplicationUpdate("Application update recovery is unavailable in this build.")
+    : process.platform === "win32" ? unavailableApplicationUpdate("Application updates are not available in this Windows build.")
+    : !app.isPackaged || (process.platform === "darwin" && !handoff) ? unavailableApplicationUpdate("Application update recovery is unavailable in this build.")
     : yield* Effect.gen(function* () {
       const identity = yield* makeUpdateIdentity(dataDir).pipe(Effect.provide(NodeContext.layer))
       const preferences = yield* makeUpdatePreferences(dataDir).pipe(Effect.provide(NodeContext.layer))
       const { trustedPublishers, origin, storageOrigin } = updateConfiguration.value
+      if (process.platform === "linux") {
+        const metadata = yield* readLinuxUpdateMetadata(process.resourcesPath, app.getVersion(), process.getSystemVersion()).pipe(Effect.provide(NodeContext.layer))
+        const linux = yield* makeLinuxUpdateSource({ origin, storageOrigin, metadata, sign: identity.sign, trustedPublishers,
+          userAgent: `Magnitude/${app.getVersion()} ${process.arch} Electron/${process.versions.electron} Linux/${process.getSystemVersion()}`,
+          cacheDirectory: join(app.getPath("userData"), "updates"), stateDirectory: stateDir,
+        }).pipe(Effect.provide(NodeContext.layer))
+        restartLinuxUpdate = () => linux.restart(reopenAfterUpdate)
+        discardLinuxUpdate = linux.discard
+        return yield* makeApplicationUpdate(linux.previousFailure).pipe(Effect.provideService(ApplicationUpdateSource, linux.source), Effect.provideService(UpdatePreferences, preferences))
+      }
+      if (!handoff) return unavailableApplicationUpdate("Application update recovery is unavailable in this build.")
       const metadata = yield* Schema.decodeUnknown(UpdateClientMetadata)({ version: app.getVersion(), os: "darwin",
         os_version: process.getSystemVersion(), arch: process.arch, package: "mac-zip" })
       const source = yield* macUpdateSource({ origin, storageOrigin, metadata,
@@ -289,6 +304,7 @@ const program = Effect.scoped(Effect.gen(function* () {
   if (wantsWindow) yield* show()
   for (;;) {
     const intent = yield* Queue.take(quit)
+    reopenAfterUpdate = BrowserWindow.getAllWindows().some(window => window.isVisible())
     yield* updates.close
     const stopped = yield* service.shutdown.pipe(Effect.either)
     if (stopped._tag === "Right") return systemShutdownRequested ? "Quit" as const : intent
@@ -305,7 +321,18 @@ const program = Effect.scoped(Effect.gen(function* () {
 Effect.runPromiseExit(program).then(Exit.match({
   onSuccess: intent => {
     exiting = true
-    if (intent !== "RestartUpdate") { app.quit(); return }
+    if (intent !== "RestartUpdate") {
+      if (process.platform === "linux" && !systemShutdownRequested) void Effect.runPromise(discardLinuxUpdate.pipe(Effect.timeoutOption("1 second"))).finally(() => app.quit())
+      else app.quit()
+      return
+    }
+    if (process.platform === "linux" && restartLinuxUpdate) {
+      void Effect.runPromise(restartLinuxUpdate()).then(() => app.quit(), error => {
+        dialog.showErrorBox("Magnitude could not restart for its update", String(error))
+        app.quit()
+      })
+      return
+    }
     try { autoUpdater.quitAndInstall() }
     catch (error) {
       dialog.showErrorBox("Magnitude could not restart for its update", String(error))

@@ -3,12 +3,8 @@ applies_to:
   - packages/release/src/hosted-update/**
   - packages/release/resources/distribution/**
   - packages/release/scripts/build-distribution-server.ts
-  - desktop/src/update-identity*
-  - desktop/src/update-preferences*
-  - desktop/src/update-schedule*
-  - desktop/src/update-config.ts
-  - desktop/src/application-update*
-  - desktop/src/mac-update-source*
+  - desktop/src/*update*
+  - packages/daemon-management/src/desktop-native/linux-update*
   - packages/client-common/src/desktop/update.ts
   - packages/sdk/src/desktop-update.ts
 ---
@@ -60,6 +56,8 @@ selection chooses the newest compatible version independently of storage enumera
 
 Cryptographic verification does not replace checksum verification after transfer or native
 publisher verification before installation. Installation lifecycle belongs to desktop main.
+The original signed envelope accompanies a verified candidate through any process handoff; a
+parsed manifest is not a substitute for publisher proof at a later privileged boundary.
 
 Artifact paths belong to their signed version directory. Immutable storage publication verifies
 the local file, refuses overwrites, and verifies the complete remotely downloaded byte count and

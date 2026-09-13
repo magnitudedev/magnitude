@@ -33,6 +33,9 @@ export const SignedUpdateManifest = Schema.Struct({
   signature: Schema.String.pipe(Schema.maxLength(128)),
 })
 export type SignedUpdateManifest = typeof SignedUpdateManifest.Type
+/** Retain publisher proof when a verified offer crosses an installation handoff. */
+export const UpdateCandidate = Schema.Struct({ manifest: UpdateManifest, envelope: SignedUpdateManifest })
+export type UpdateCandidate = typeof UpdateCandidate.Type
 export class InvalidUpdateManifest extends Schema.TaggedError<InvalidUpdateManifest>()("InvalidUpdateManifest", {}) {}
 export class ReleaseSigningFailed extends Schema.TaggedError<ReleaseSigningFailed>()("ReleaseSigningFailed", {}) {}
 const context = "magnitude-release-v1\n"
@@ -61,7 +64,7 @@ export const verifyUpdateManifest = (input: unknown, trustedKeys: ReadonlyMap<st
   return yield* Schema.decodeUnknown(Schema.parseJson(UpdateManifest))(json, { onExcessProperty: "error" }).pipe(Effect.mapError(() => new InvalidUpdateManifest()))
 })
 
-export const acceptsUpdateManifest = (manifest: UpdateManifest, request: UpdateRequest): boolean =>
+export const acceptsUpdateManifest = (manifest: UpdateManifest, request: Pick<UpdateRequest, "version" | "os" | "arch" | "package">): boolean =>
   isNewerVersion(manifest.version, request.version)
   && admittedChannels(releaseChannelOf(request.version)).has(releaseChannelOf(manifest.version))
   && manifest.artifact.target.os === request.os && manifest.artifact.target.arch === request.arch
