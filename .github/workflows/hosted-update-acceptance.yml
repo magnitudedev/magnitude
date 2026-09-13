@@ -65,8 +65,8 @@ jobs:
         shell: pwsh
         run: ./packages/release/scripts/acceptance/test-windows-hosted-update.ps1
         env:
-          MAGNITUDE_WINDOWS_ACCEPTANCE_FROM: '0.0.34'
-          MAGNITUDE_WINDOWS_ACCEPTANCE_TO: '0.0.35'
+          MAGNITUDE_WINDOWS_ACCEPTANCE_FROM: '0.0.36'
+          MAGNITUDE_WINDOWS_ACCEPTANCE_TO: '0.0.37'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -83,7 +83,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["0.0.34", "0.0.35"]
+        version: ["0.0.36", "0.0.37"]
     env:
       MAGNITUDE_APPLE_DISTRIBUTION: developer-id
       MAGNITUDE_ACCEPTANCE_VERSION: ${{ matrix.version }}
@@ -145,7 +145,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04-arm]
-        version: ["0.0.34", "0.0.35"]
+        version: ["0.0.36", "0.0.37"]
     runs-on: ${{ matrix.os }}
     container: ubuntu:22.04
     timeout-minutes: 30

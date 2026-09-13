@@ -391,6 +391,7 @@ const rangeRequest = (
       return yield* downloadError(
         "protocol",
         `range ${range.index} returned inconsistent Content-Range: ${contentRange.start}-${contentRange.end}/${contentRange.total}; expected ${range.start}-${range.end}/${input.bytes}`,
+        contentRange.start === range.start && contentRange.end === range.end,
       )
     }
     const expectedBytes = range.end - range.start + 1

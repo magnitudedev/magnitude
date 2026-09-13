@@ -43,6 +43,22 @@ const cli = args => execFileSync(join(installation, 'resources/magnitude.exe'), 
 let app
 try {
   app = await electron.launch({ executablePath, env, timeout: 30000 })
+  app.on('console', message => {
+    if (message.text().startsWith('UPDATE_RANGE ')) console.log(message.text())
+  })
+  await app.evaluate(() => {
+    const fetch = globalThis.fetch
+    globalThis.fetch = async (...args) => {
+      const response = await fetch(...args)
+      const range = new Headers(args[1]?.headers).get('range')
+      if (range) console.log('UPDATE_RANGE ' + JSON.stringify({
+        requested: range, status: response.status,
+        received: response.headers.get('content-range'),
+        cache: response.headers.get('x-vercel-cache'),
+      }))
+      return response
+    }
+  })
   let page = await app.firstWindow()
   await page.getByRole('button', { name: 'Settings', exact: true }).click()
   const automatic = page.getByRole('checkbox', { name: 'Auto-download updates' })
