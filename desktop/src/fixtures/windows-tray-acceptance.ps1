@@ -41,8 +41,12 @@ function Click([Windows.Automation.AutomationElement]$Element, [bool]$Right = $f
   [NativeTrayMouse]::mouse_event($(if ($Right) {16} else {4}), 0, 0, 0, [UIntPtr]::Zero)
 }
 function MagnitudeIcons {
-  $condition = New-Object Windows.Automation.PropertyCondition([Windows.Automation.AutomationElement]::NameProperty, 'Magnitude')
-  return @([Windows.Automation.AutomationElement]::RootElement.FindAll([Windows.Automation.TreeScope]::Descendants, $condition) | Where-Object { !$_.Current.IsOffscreen })
+  # Explorer prefixes the flyout's accessible tooltip with whitespace. The application window
+  # shares the name, so select only actual Explorer-owned notification buttons.
+  $explorerIds = @(Get-Process explorer | ForEach-Object { $_.Id })
+  return @(@(Buttons) | Where-Object {
+    !$_.Current.IsOffscreen -and $_.Current.Name.Trim() -eq 'Magnitude' -and $explorerIds -contains $_.Current.ProcessId
+  })
 }
 Capture 'windows-desktop.png'
 $buttons = @(Buttons)
