@@ -55,13 +55,49 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: update-acceptance-mac-${{ matrix.version }}
-          path: ${{ runner.temp }}/magnitude-update-acceptance/artifacts
+          path: |
+            ${{ runner.temp }}/magnitude-update-acceptance/artifacts/*.dmg
+            ${{ runner.temp }}/magnitude-update-acceptance/artifacts/*.zip
+            ${{ runner.temp }}/magnitude-update-acceptance/artifacts/*.json
+            ${{ runner.temp }}/magnitude-update-acceptance/artifacts/.apple/*.json
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
       - name: Remove signing credentials
         if: always()
         run: bash packages/release/scripts/apple/cleanup-credentials.sh
+
+  linux-packages:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04-arm]
+        version: ["0.0.14", "0.0.15"]
+    runs-on: ${{ matrix.os }}
+    container: ubuntu:22.04
+    timeout-minutes: 30
+    steps:
+      - name: Install packaging dependencies at the supported Linux baseline
+        run: apt-get update && apt-get install -y git ca-certificates curl unzip build-essential python3 fakeroot rpm libgtk-3-0 libnss3 libasound2 libgbm1 libxss1 libxtst6
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - name: Build matched Linux application and packages without rebuilding inference
+        run: bun packages/release/scripts/acceptance/build-desktop.ts
+        env:
+          MAGNITUDE_ACCEPTANCE_VERSION: ${{ matrix.version }}
+          MAGNITUDE_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/magnitude-update-acceptance
+      - uses: actions/upload-artifact@v4
+        with:
+          name: update-acceptance-linux-${{ matrix.os }}-${{ matrix.version }}
+          path: ${{ runner.temp }}/magnitude-update-acceptance/artifacts
+          if-no-files-found: error
+          retention-days: 14
 
   native-checks:
     strategy:
