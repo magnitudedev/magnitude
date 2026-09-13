@@ -612,7 +612,7 @@ const downloadSegmented = (
       }),
       Effect.retry({
         while: (error) =>
-          error._tag === "ArtifactDownloadError" && error.transient,
+          error._tag === "ArtifactDownloadError" && (error.transient || error.phase === "protocol"),
         schedule: retrySchedule(
           input.policy.retryCount,
           input.policy.retryDelay,

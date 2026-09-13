@@ -218,7 +218,7 @@ describe("artifact downloader", () => {
     }
   })
 
-  it("rejects an inconsistent range response without falling back or publishing", async () => {
+  it.each([true, false])("rejects inconsistent ranges without publishing (invalid probe=%s)", async invalidProbe => {
     const bytes = new TextEncoder().encode("inconsistent range")
     const root = await mkdtemp(join(tmpdir(), "artifact-download-test-"))
     const destination = join(root, "artifact")
@@ -233,7 +233,7 @@ describe("artifact downloader", () => {
         return new Response(part, {
           status: 206,
           headers: {
-            "content-range": `bytes ${start}-${end}/${bytes.byteLength + 1}`,
+            "content-range": `bytes ${start}-${end}/${!invalidProbe && start === 0 && end === 0 ? bytes.byteLength : bytes.byteLength + 1}`,
             "content-length": String(part.byteLength),
           },
         })
@@ -247,7 +247,7 @@ describe("artifact downloader", () => {
         sha256: sha256(bytes),
         strategy: {
           _tag: "Segmented",
-          concurrency: 4,
+          concurrency: 1,
           chunkBytes: 8,
           fallbackToSequential: true,
         },
@@ -256,8 +256,8 @@ describe("artifact downloader", () => {
         onVerificationProgress: Option.none(),
       }).pipe(Effect.flip))
       expect(error.phase).toBe("protocol")
-      expect(error.message).toContain(`0-0/${bytes.byteLength + 1}; expected 0-0/${bytes.byteLength}`)
-      expect(requests).toBe(1)
+      expect(error.message).toContain(`/${bytes.byteLength + 1}; expected `)
+      expect(requests).toBe(invalidProbe ? 3 : 2)
       await expect(readFile(destination)).rejects.toMatchObject({ code: "ENOENT" })
     } finally {
       server.stop(true)
