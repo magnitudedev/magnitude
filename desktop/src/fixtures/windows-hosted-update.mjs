@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { createHash, createPublicKey, verify } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
+import { once } from 'node:events'
 import { mkdir, readFile, writeFile, access, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -69,9 +70,14 @@ try {
   await page.getByRole('button', { name: 'Restart to update', exact: true }).waitFor({ timeout: 600000 })
   await page.screenshot({ path: join(evidence, 'ready.png'), fullPage: true })
   assert.ok(cli(['update', 'status']).includes(`${to} is ready to install`))
-  const closed = app.waitForEvent('close', { timeout: 60000 })
-  await page.getByRole('button', { name: 'Restart to update', exact: true }).click()
-  await closed
+  console.log('PASS application downloaded and verified the offered installer')
+  const original = app.process()
+  const exited = once(original, 'exit', { signal: AbortSignal.timeout(60000) })
+  await page.getByRole('button', { name: 'Restart to update', exact: true }).click({ noWaitAfter: true, timeout: 10000 }).catch(error => {
+    console.log('Restart closed the automation connection:', error.message)
+  })
+  await exited
+  console.log('PASS original application process exited for replacement', original.pid)
   app = undefined
   const restarted = Date.now() + 120000
   let status = ''
@@ -109,10 +115,16 @@ try {
   assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().some(window => window.isVisible())), true)
   await writeFile(join(evidence, 'accepted.json'), JSON.stringify({ installationId, from, to, at: new Date().toISOString(), status }, null, 2))
   console.log('PASS installed updated Settings, persisted auto-download preference and real up-to-date check')
+} catch (error) {
+  console.error(error)
+  await writeFile(join(evidence, 'failure.txt'), String(error.stack ?? error))
+  throw error
 } finally {
-  if (app) {
+  if (app && app.process().exitCode === null) {
     const visible = app.windows()[0]
-    if (visible) await visible.screenshot({ path: join(evidence, 'last-window.png'), fullPage: true }).catch(() => {})
-    await app.close()
+    if (visible) await visible.screenshot({ path: join(evidence, 'last-window.png'), fullPage: true, timeout: 5000 }).catch(() => {})
+    await Promise.race([app.close(), delay(10000).then(() => {
+      if (app.process().exitCode === null) app.process().kill()
+    })])
   }
 }
