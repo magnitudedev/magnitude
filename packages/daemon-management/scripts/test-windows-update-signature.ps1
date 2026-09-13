@@ -36,6 +36,7 @@ try {
   & $binary $tampered 'Magnitude Update Acceptance'
   if ($LASTEXITCODE -eq 0) { throw 'Tampered installer was accepted' }
   Write-Output 'PASS unsigned, trusted, wrong-publisher and tampered native installer checks'
+  $global:LASTEXITCODE = 0
 } finally {
   if ($certificate) {
     Remove-Item -LiteralPath "Cert:\LocalMachine\Root\$($certificate.Thumbprint)" -ErrorAction SilentlyContinue
