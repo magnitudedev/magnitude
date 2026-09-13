@@ -59,6 +59,17 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      - name: Exercise the installed Windows application against the hosted update channel
+        shell: pwsh
+        run: ./packages/release/scripts/acceptance/test-windows-hosted-update.ps1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-installed-update-evidence
+          path: ${{ runner.temp }}/magnitude-windows-update-acceptance/consumer
+          if-no-files-found: warn
+          retention-days: 14
+
   signed-mac-apps:
     if: inputs.build_artifacts
     environment: apple-release
