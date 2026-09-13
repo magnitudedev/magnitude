@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$Evidence)
+param([Parameter(Mandatory=$true)][string]$Evidence, [ValidateSet('Discover Models','Open Magnitude')][string]$MenuAction = 'Discover Models')
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
@@ -33,25 +33,29 @@ function Click([Windows.Automation.AutomationElement]$Element, [bool]$Right = $f
 }
 Capture 'windows-desktop.png'
 $buttons = @(Buttons)
-$buttons | ForEach-Object { $_.Current.Name } | Set-Content (Join-Path $Evidence 'native-buttons.txt')
-$tray = $buttons | Where-Object { $_.Current.Name -eq 'Magnitude' -and !$_.Current.IsOffscreen } | Select-Object -First 1
+$buttons | ForEach-Object { "$($_.Current.Name) | $($_.Current.ClassName) | $($_.Current.AutomationId)" } | Set-Content (Join-Path $Evidence 'native-buttons.txt')
+$candidates = @($buttons | Where-Object { $_.Current.Name -eq 'Magnitude' -and !$_.Current.IsOffscreen })
+if ($candidates.Count -gt 1) { throw 'Multiple Magnitude buttons require native tray inspection' }
+$tray = $candidates | Select-Object -First 1
 if (!$tray) {
   $overflow = $buttons | Where-Object { $_.Current.Name -match '^(Show hidden icons|Notification Chevron)$' } | Select-Object -First 1
   if ($overflow) {
     Click $overflow
     Start-Sleep -Milliseconds 500
-    $tray = @(Buttons) | Where-Object { $_.Current.Name -eq 'Magnitude' -and !$_.Current.IsOffscreen } | Select-Object -First 1
+    $candidates = @(@(Buttons) | Where-Object { $_.Current.Name -eq 'Magnitude' -and !$_.Current.IsOffscreen })
+    if ($candidates.Count -gt 1) { throw 'Multiple Magnitude buttons require native tray inspection' }
+    $tray = $candidates | Select-Object -First 1
   }
 }
 if (!$tray) { throw 'Magnitude native notification-area button is not visible' }
 Click $tray $true
 Start-Sleep -Milliseconds 500
-Capture 'windows-tray-menu.png'
+Capture ("windows-tray-menu-" + $MenuAction.Replace(' ','-') + '.png')
 $condition = New-Object Windows.Automation.PropertyCondition([Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::MenuItem)
 $items = @([Windows.Automation.AutomationElement]::RootElement.FindAll([Windows.Automation.TreeScope]::Descendants, $condition))
 $items | ForEach-Object { $_.Current.Name } | Set-Content (Join-Path $Evidence 'native-menu-items.txt')
 if (!($items | Where-Object { $_.Current.Name -eq 'Quit Magnitude' -and !$_.Current.IsOffscreen })) { throw 'Magnitude tray menu did not open' }
-$discover = $items | Where-Object { $_.Current.Name -eq 'Discover Models' -and !$_.Current.IsOffscreen } | Select-Object -First 1
-if (!$discover) { throw 'Discover action is missing from the native tray' }
-Click $discover
-Write-Output 'PASS actual Windows notification-area click, native menu and Discover action'
+$action = $items | Where-Object { $_.Current.Name -eq $MenuAction -and !$_.Current.IsOffscreen } | Select-Object -First 1
+if (!$action) { throw 'Requested action is missing from the native tray' }
+Click $action
+Write-Output "PASS actual Windows notification-area click, native menu and $MenuAction action"
