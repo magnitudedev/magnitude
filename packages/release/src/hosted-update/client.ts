@@ -66,7 +66,7 @@ export const resolveHostedDownload = (options: HostedUpdateConnection & {
   readonly manifest: UpdateManifest
   readonly storageOrigin: string
 }) => Effect.gen(function* () {
-  const { response, fields } = yield* signedRequest(options, `/api/download/${options.manifest.artifact.id}`, { release: options.manifest.version })
+  const { response, fields } = yield* signedRequest(options, "/api/download", { artifact: options.manifest.artifact.id, release: options.manifest.version })
   if (!acceptsUpdateManifest(options.manifest, fields) || response.status !== 302) return yield* new HostedUpdateCheckFailed({ reason: "response" })
   return yield* Effect.try({ try: () => {
     const storage = new URL(options.storageOrigin)

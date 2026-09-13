@@ -16,20 +16,22 @@ export const handleArtifactDownload = (request: Request, options: {
   readonly trustedPublishers: ReadonlyMap<string, KeyObject>
 }) => Effect.gen(function* () {
   const url = new URL(request.url)
-  const match = /^\/api\/download\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,127})$/.exec(url.pathname)
-  if (url.origin !== options.origin || !match) return response(404)
+  if (url.origin !== options.origin || url.pathname !== "/api/download") return response(404)
   if (request.method !== "GET") return response(405)
   const releases = url.searchParams.getAll("release")
   const release = releases[0]
   if (releases.length !== 1 || !release || release.length > 96 || !isValidVersion(release)) return response(400)
+  const artifacts = url.searchParams.getAll("artifact")
+  if (artifacts.length !== 1 || !Schema.is(ArtifactId)(artifacts[0])) return response(400)
+  const artifact = ArtifactId.make(artifacts[0])
   const fieldsUrl = new URL(url)
   fieldsUrl.searchParams.delete("release")
+  fieldsUrl.searchParams.delete("artifact")
   const now = Math.floor((yield* Clock.currentTimeMillis) / 1000)
   const fields = yield* decodeUpdateRequest(fieldsUrl, now)
   const installation = yield* verifyUpdateRequest(request.headers.get("authorization") ?? "", url)
   const store = yield* DistributionStore
   if (!(yield* store.admit(installation, fields.nonce, now + 600))) return response(409)
-  const artifact = ArtifactId.make(match[1]!)
   const envelope = yield* store.artifact(release, artifact)
   if (Option.isNone(envelope)) return response(404)
   const manifest = yield* verifyUpdateManifest(envelope.value, options.trustedPublishers)

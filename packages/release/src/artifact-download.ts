@@ -277,7 +277,7 @@ const sequentialAttempt = (
     yield* report(input, "Sequential", 0, attempt)
     const response = yield* client.execute(
       HttpClientRequest.get(input.url).pipe(
-        HttpClientRequest.setHeader("accept-encoding", "identity"),
+        HttpClientRequest.setHeader("accept-encoding", "identity;q=1, *;q=0"),
       ),
     ).pipe(
       Effect.mapError(() =>
@@ -356,7 +356,7 @@ const rangeRequest = (
     const request = HttpClientRequest.get(input.url).pipe(
       HttpClientRequest.setHeaders({
         range: `bytes=${range.start}-${range.end}`,
-        "accept-encoding": "identity",
+        "accept-encoding": "identity;q=1, *;q=0",
         "if-range": Option.getOrUndefined(representation),
       }),
     )

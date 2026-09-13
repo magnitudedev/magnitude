@@ -5,6 +5,9 @@ import { updateDesktopApplication } from "../server/application"
 import { runCommand } from "./output"
 
 export const renderApplicationUpdate = (state: DesktopUpdateState): string => {
+  if (state.check._tag === "Checking" && (state.transfer._tag === "Idle" || state.transfer._tag === "Failed")) {
+    return "Checking for application updates.\n"
+  }
   switch (state.transfer._tag) {
     case "Unavailable": case "Failed": return `${state.transfer.message}\n`
     case "Available": return `Magnitude ${state.transfer.version} is available (${formatStorageSize(state.transfer.bytes)}).\nDownload: magnitude update download\n`
