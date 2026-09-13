@@ -117,3 +117,8 @@ and absence of sensitive request fields from logs.
 Native platform protocol probes establish crypto, networking and OS metadata behavior only. Full
 platform acceptance additionally requires actual application download, publisher verification,
 native replacement, relaunch and preserved service/installation ownership.
+
+Desktop installer transfers allow a one-hour attempt and a bounded three-attempt total, with
+the independent sixty-second stall timeout retained. A slow but progressing installer transfer
+must not inherit the shorter general artifact-attempt budget. Publication diagnostics distinguish
+HTTP failure, interrupted streams, byte-count mismatch and digest mismatch without exposing credentials.
