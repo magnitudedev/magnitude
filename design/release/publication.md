@@ -114,7 +114,10 @@ whether a release is needed; tarball integrity proves which bytes were accepted 
 5. Recheck the public baseline and source at the commit point.
 6. Publish or verify selected plugins first, consuming the accepted tarballs without repacking.
 7. Publish the accepted native graph and manifest as the exact GitHub release.
-8. The accepted CLI npm tarball acquires and executes that public release, then is published
+8. Project the complete configured desktop graph into Magnitude-hosted signed manifests. Download
+   and verify the exact public native bytes, upload immutable objects, verify their full remote
+   transfers, then atomically promote their hosted channels. Desktop discovery never consults npm.
+9. The accepted CLI npm tarball acquires and executes that public release, then is published
    directly. Registry integrity must equal the accepted tarball integrity.
 
 The public manifest records RPC and plugin artifact metadata beside the native graph. Ordinary
@@ -135,6 +138,6 @@ publication succeeds only if the registry exposes the exact expected integrity. 
 before publication require refreshing preparation, never renumbering already-built candidates.
 
 GitHub-public/CLI-npm-absent recovery checks out the public tag, verifies the existing release,
-repeats acquisition acceptance, and publishes the accepted CLI tarball without rebuilding native
+completes or verifies hosted desktop publication, repeats acquisition acceptance, and publishes the accepted CLI tarball without rebuilding native
 assets. A plugin published before an interrupted main release is either reused byte-for-byte or
 superseded with a fresh plugin version during preparation.

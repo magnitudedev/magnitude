@@ -210,6 +210,15 @@ jobs:
           APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+      - name: Publish accepted desktop updates to Magnitude
+        run: bun packages/release/scripts/publish-hosted.ts
+        env:
+          MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+          DISTRIBUTION_PUBLISHER_PRIVATE_KEY: ${{ secrets.DISTRIBUTION_PUBLISHER_PRIVATE_KEY }}
+          DISTRIBUTION_PUBLISHER_DATABASE_URL: ${{ secrets.DISTRIBUTION_PUBLISHER_DATABASE_URL }}
+          DISTRIBUTION_DATABASE_CA: ${{ secrets.DISTRIBUTION_DATABASE_CA }}
+          DISTRIBUTION_BLOB_READ_WRITE_TOKEN: ${{ secrets.DISTRIBUTION_BLOB_READ_WRITE_TOKEN }}
       - name: Verify public CLI acquisition
         run: bun run packages/release/scripts/accept-public-cli.ts "${{ steps.npm-candidate.outputs.tarball }}"
         env:

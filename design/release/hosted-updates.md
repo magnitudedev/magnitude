@@ -3,6 +3,7 @@ applies_to:
   - packages/release/src/hosted-update/**
   - packages/release/resources/distribution/**
   - packages/release/scripts/build-distribution-server.ts
+  - packages/release/scripts/publish-hosted.ts
   - desktop/src/*update*
   - packages/daemon-management/src/desktop-native/linux-update*
   - packages/client-common/src/desktop/update.ts
@@ -73,6 +74,10 @@ Artifact paths belong to their signed version directory. Immutable storage publi
 the local file, refuses overwrites, and verifies the complete remotely downloaded byte count and
 digest before an artifact is eligible for promotion. An existing object requires the same remote
 verification; existence alone is not an accepted publication.
+Production publication consumes the complete desktop graph from the exact accepted public native
+release and verifies its source commit. Missing, duplicate, unexpected or mismatched desktop targets
+fail before any upload. Production signing credentials must match the application-embedded public
+key. Interrupted publication resumes from those same bytes without rebuilding or overwriting them.
 
 The desktop owner creates its installation key only after native ownership is acquired. The key
 survives application replacement, remains outside the bundle, and is private to the user. Corrupt
