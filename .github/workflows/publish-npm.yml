@@ -60,6 +60,15 @@ jobs:
         env:
           MAGNITUDE_RELEASE_VERSION: ${{ inputs.version }}
           MAGNITUDE_SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+      - name: Complete hosted desktop publication from the accepted public bytes
+        run: bun packages/release/scripts/publish-hosted.ts
+        env:
+          MAGNITUDE_RELEASE_VERSION: ${{ inputs.version }}
+          MAGNITUDE_SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+          DISTRIBUTION_PUBLISHER_PRIVATE_KEY: ${{ secrets.DISTRIBUTION_PUBLISHER_PRIVATE_KEY }}
+          DISTRIBUTION_PUBLISHER_DATABASE_URL: ${{ secrets.DISTRIBUTION_PUBLISHER_DATABASE_URL }}
+          DISTRIBUTION_DATABASE_CA: ${{ secrets.DISTRIBUTION_DATABASE_CA }}
+          DISTRIBUTION_BLOB_READ_WRITE_TOKEN: ${{ secrets.DISTRIBUTION_BLOB_READ_WRITE_TOKEN }}
       - id: npm-candidate
         run: bun run packages/release/scripts/prepare-npm.ts release/npm-candidate
       - name: Verify public CLI acquisition

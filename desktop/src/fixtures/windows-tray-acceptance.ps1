@@ -40,10 +40,14 @@ function Click([Windows.Automation.AutomationElement]$Element, [bool]$Right = $f
   [NativeTrayMouse]::mouse_event($(if ($Right) {8} else {2}), 0, 0, 0, [UIntPtr]::Zero)
   [NativeTrayMouse]::mouse_event($(if ($Right) {16} else {4}), 0, 0, 0, [UIntPtr]::Zero)
 }
+function MagnitudeIcons {
+  $condition = New-Object Windows.Automation.PropertyCondition([Windows.Automation.AutomationElement]::NameProperty, 'Magnitude')
+  return @([Windows.Automation.AutomationElement]::RootElement.FindAll([Windows.Automation.TreeScope]::Descendants, $condition) | Where-Object { !$_.Current.IsOffscreen })
+}
 Capture 'windows-desktop.png'
 $buttons = @(Buttons)
 $buttons | ForEach-Object { "$($_.Current.Name) | $($_.Current.ClassName) | $($_.Current.AutomationId) | $($_.Current.BoundingRectangle) | offscreen=$($_.Current.IsOffscreen)" } | Set-Content (Join-Path $Evidence 'native-buttons.txt')
-$candidates = @($buttons | Where-Object { $_.Current.Name -eq 'Magnitude' -and !$_.Current.IsOffscreen })
+$candidates = @(MagnitudeIcons)
 if ($candidates.Count -gt 1) { throw 'Multiple Magnitude buttons require native tray inspection' }
 $tray = $candidates | Select-Object -First 1
 if (!$tray) {
@@ -52,7 +56,15 @@ if (!$tray) {
     Click $overflow
     Start-Sleep -Milliseconds 500
     Capture 'windows-tray-overflow.png'
-    $candidates = @(@(Buttons) | Where-Object { $_.Current.Name -eq 'Magnitude' -and !$_.Current.IsOffscreen })
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    do {
+      $candidates = @(MagnitudeIcons)
+      if ($candidates.Count -eq 0) { Start-Sleep -Milliseconds 200 }
+    } while ($candidates.Count -eq 0 -and [DateTime]::UtcNow -lt $deadline)
+    [Windows.Automation.AutomationElement]::RootElement.FindAll([Windows.Automation.TreeScope]::Descendants, [Windows.Automation.Condition]::TrueCondition) |
+      Where-Object { !$_.Current.IsOffscreen -and $_.Current.Name } |
+      ForEach-Object { "$($_.Current.Name) | $($_.Current.ControlType.ProgrammaticName) | $($_.Current.ClassName) | $($_.Current.BoundingRectangle)" } |
+      Set-Content (Join-Path $Evidence 'native-overflow-controls.txt')
     if ($candidates.Count -gt 1) { throw 'Multiple Magnitude buttons require native tray inspection' }
     $tray = $candidates | Select-Object -First 1
   }

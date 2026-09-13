@@ -12,6 +12,7 @@ on:
       - 'packages/release/native/windows-installer*'
       - 'packages/release/src/artifact-download*'
       - 'packages/release/src/hosted-update/installer-download*'
+      - 'packages/release/src/hosted-update/release-candidate*'
       - 'packages/release/scripts/acceptance/*'
       - 'packages/release/scripts/build/desktop-*'
       - 'packages/release/scripts/build/linux-maintainer-scripts.ts'
@@ -221,7 +222,7 @@ jobs:
         working-directory: desktop
         run: bunx --bun vitest run src/update-identity.test.ts src/update-preferences.test.ts src/update-schedule.test.ts src/application-update.test.ts
       - name: Verify bounded installer transfers and interrupted range recovery
-        run: bunx --bun vitest run packages/release/src/artifact-download.test.ts packages/release/src/hosted-update/installer-download.test.ts
+        run: bunx --bun vitest run packages/release/src/artifact-download.test.ts packages/release/src/hosted-update/installer-download.test.ts packages/release/src/hosted-update/release-candidate.test.ts packages/release/src/hosted-update/publication.test.ts
       - name: Validate Windows private key permissions with native ACLs
         if: runner.os == 'Windows'
         shell: pwsh
