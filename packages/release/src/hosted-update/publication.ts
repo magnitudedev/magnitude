@@ -27,7 +27,7 @@ export const ReleasePublicationBatch = Schema.Array(Schema.Struct({ file: Schema
 )
 
 /** No channel moves until every local artifact and full remote transfer has been verified. */
-export const publishHostedRelease = (options: {
+export const prepareHostedRelease = (options: {
   readonly artifacts: typeof ReleasePublicationBatch.Type
   readonly keyId: typeof PublisherKeyId.Type
   readonly privateKey: KeyObject
@@ -35,11 +35,16 @@ export const publishHostedRelease = (options: {
   readonly storageOrigin: string
 }) => Effect.gen(function* () {
   const batch = yield* Schema.decodeUnknown(ReleasePublicationBatch)(options.artifacts).pipe(Effect.mapError(() => new ReleasePublicationFailed({ stage: "batch" })))
-  const store = yield* ReleasePublicationStore
   const envelopes = yield* Effect.forEach(batch, artifact => Effect.gen(function* () {
     yield* publishArtifactBytes({ ...artifact, token: options.token, storageOrigin: options.storageOrigin })
     return yield* signUpdateManifest(artifact.manifest, options.keyId, options.privateKey)
   }), { concurrency: 2 })
+  return envelopes
+})
+
+export const publishHostedRelease = (options: Parameters<typeof prepareHostedRelease>[0]) => Effect.gen(function* () {
+  const store = yield* ReleasePublicationStore
+  const envelopes = yield* prepareHostedRelease(options)
   yield* store.promote(envelopes)
   return envelopes
 })
