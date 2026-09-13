@@ -10,6 +10,8 @@ on:
       - 'packages/daemon-management/src/desktop-native/*update*'
       - 'packages/daemon-management/native/windows-update*'
       - 'packages/release/native/windows-installer*'
+      - 'packages/release/src/artifact-download*'
+      - 'packages/release/src/hosted-update/installer-download*'
       - 'packages/release/scripts/acceptance/*'
       - 'packages/release/scripts/build/desktop-*'
       - 'packages/release/scripts/build/linux-maintainer-scripts.ts'
@@ -29,8 +31,8 @@ concurrency:
 
 jobs:
   windows-packages:
-    # App-branch checkpoints produce isolated candidates; publication still requires acceptance.
-    if: github.event_name == 'push' || inputs.build_artifacts
+    # Reuse immutable cohorts while iterating consumer checks.
+    if: inputs.build_artifacts
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -74,7 +76,7 @@ jobs:
           retention-days: 14
 
   signed-mac-apps:
-    if: github.event_name == 'push' || inputs.build_artifacts
+    if: inputs.build_artifacts
     environment: apple-release
     runs-on: macos-15
     timeout-minutes: 60
@@ -138,7 +140,7 @@ jobs:
         run: bash packages/release/scripts/apple/cleanup-credentials.sh
 
   linux-packages:
-    if: github.event_name == 'push' || inputs.build_artifacts
+    if: inputs.build_artifacts
     strategy:
       fail-fast: false
       matrix:
