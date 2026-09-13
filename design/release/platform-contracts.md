@@ -116,3 +116,8 @@ expected architecture and deployment target of every executable and native libra
 - Base and accelerator artifacts for one host share the same platform contract.
 - Dynamic-loader failure remains distinct from protocol-decoding failure and retains bounded native
   diagnostics.
+
+Linux application packages must install their payload directories as root-owned mode0755 and
+remove group/other write permission from payload files while preserving executable and sandbox
+mode bits. Package validation rejects unprotected directories or files before publication; the
+privileged updater independently checks installed publisher-trust ancestry before authorizing an update.

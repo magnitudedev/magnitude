@@ -9,7 +9,7 @@ import { ReleaseArtifactSchema } from "../../src/contracts"
 import { sha256File } from "../../src/macos-app"
 import { linuxDesktopInstaller } from "../../src/targets"
 
-const root = resolve(import.meta.dir, "../../../..")
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..")
 const PackageFields = {
     name: Schema.Literal(LINUX_DESKTOP_PACKAGE_NAME),
     productName: Schema.Literal("Magnitude"),
@@ -28,6 +28,22 @@ const PackageFields = {
 const DebianOptions = Schema.Struct({ options: Schema.Struct({ ...PackageFields, depends: Schema.Array(Schema.String), scripts: Schema.Record({ key: Schema.String, value: Schema.String }) }) })
 const RpmOptions = Schema.Struct({ options: Schema.Struct({ ...PackageFields, requires: Schema.Array(Schema.String), license: Schema.String, specTemplate: Schema.String }) })
 
+export const validateLinuxPayloadPermissions = (format: "deb" | "rpm", listing: string) => Effect.gen(function* () {
+  const prefix = `/usr/lib/${LINUX_DESKTOP_PACKAGE_NAME}`
+  const rows = listing.split("\n").filter(line => format === "deb" ? line.includes(` .${prefix}/`)
+    : line.startsWith(`${prefix}/`) || line.startsWith(`${prefix} `))
+  if (rows.length === 0 || rows.some(line => {
+    if (format === "deb") {
+      const [mode, owner] = line.trim().split(/\s+/)
+      return owner !== "root/root" || !mode || (mode[0] !== "l" && (mode[5] === "w" || mode[8] === "w"))
+    }
+    const [, rawMode, owner, group] = line.split(" ")
+    const mode = Number.parseInt(rawMode ?? "", 8)
+    return owner !== "root" || group !== "root" || !Number.isFinite(mode)
+      || ((mode & 0o170000) !== 0o120000 && (mode & 0o022) !== 0)
+  })) return yield* new DesktopBuildFailed({ message: "Linux application payload must be root-owned without group or other write access" })
+})
+
 export const validateLinuxDesktopInstaller = (options: {
   readonly file: string
   readonly format: "deb" | "rpm"
@@ -43,12 +59,14 @@ export const validateLinuxDesktopInstaller = (options: {
   if (identity.trim() !== expected) return yield* new DesktopBuildFailed({ message: "Linux desktop package identity does not match its release target" })
   if (options.format === "deb") {
     const listing = yield* Command.make("dpkg-deb", "--contents", options.file).pipe(Command.env({ LC_ALL: "C" }), Command.string)
+    yield* validateLinuxPayloadPermissions("deb", listing)
     const sandbox = listing.split("\n").find(line => line.endsWith(` ./usr/lib/${LINUX_DESKTOP_PACKAGE_NAME}/chrome-sandbox`))
     if (sandbox === undefined || !/^-rwsr-xr-x\s+root\/root\s/.test(sandbox)) {
       return yield* new DesktopBuildFailed({ message: "Debian installer must contain a root-owned mode-04755 Chromium sandbox helper" })
     }
   } else {
     const listing = yield* Command.make("rpm", "-qp", "--qf", "[%{FILENAMES} %{FILEMODES:octal} %{FILEUSERNAME} %{FILEGROUPNAME}\n]", options.file).pipe(Command.string)
+    yield* validateLinuxPayloadPermissions("rpm", listing)
     if (!listing.split("\n").includes(`/usr/lib/${LINUX_DESKTOP_PACKAGE_NAME}/chrome-sandbox 104755 root root`)) {
       return yield* new DesktopBuildFailed({ message: "RPM installer must contain a root-owned mode-04755 Chromium sandbox helper" })
     }
@@ -126,6 +144,13 @@ export const buildLinuxDesktopInstaller = (options: {
     const extracted = yield* Command.make("dpkg-deb", "--raw-extract", candidate, contents).pipe(Command.exitCode)
     if (extracted !== 0) return yield* new DesktopBuildFailed({ message: "Could not prepare the bundled CLI package entry" })
     yield* fs.symlink(`../lib/${LINUX_DESKTOP_PACKAGE_NAME}/resources/magnitude`, join(contents, "usr/bin/magnitude"))
+    // Copied Electron directories can retain the builder's group-writable mode.
+    // Normalize the final package tree, including directories created by the installer.
+    const application = join(contents, "usr/lib", LINUX_DESKTOP_PACKAGE_NAME)
+    for (const [type, mode] of [["d", "0755"], ["f", "go-w"]] as const) {
+      const normalized = yield* Command.make("find", application, "-type", type, "-exec", "chmod", mode, "{}", "+").pipe(Command.exitCode)
+      if (normalized !== 0) return yield* new DesktopBuildFailed({ message: "Could not protect the Debian application payload" })
+    }
     const rebuilt = yield* Command.make("dpkg-deb", "--root-owner-group", "--build", contents, candidate).pipe(Command.exitCode)
     if (rebuilt !== 0) return yield* new DesktopBuildFailed({ message: "Could not package the bundled CLI entry" })
   }

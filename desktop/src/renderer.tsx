@@ -310,7 +310,7 @@ function UpdateSettingsView({ service }: { service: DesktopSession }) {
     : current._tag === "Downloading" ? `Downloading version ${current.version} · ${formatStorageSize(current.completed)} of ${formatStorageSize(current.total)}`
     : current._tag === "Cancelling" ? "Stopping automatic download…"
     : current._tag === "Staging" ? `Preparing version ${current.version}…`
-    : current._tag === "Ready" ? `Version ${current.version} is ready. Restart now, or it will be applied when you quit Magnitude.`
+    : current._tag === "Ready" ? `Version ${current.version} is ready to install. Restart Magnitude to update.`
     : current._tag === "Closed" ? "Magnitude is quitting…" : current.message
   return <div className="mt-5 border-t border-slate-200 pt-5 dark:border-slate-750">
     <h3 className="font-medium">Application updates</h3>

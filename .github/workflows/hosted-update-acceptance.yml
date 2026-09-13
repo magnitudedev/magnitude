@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["0.0.20", "0.0.21"]
+        version: ["0.0.22", "0.0.23"]
     env:
       MAGNITUDE_APPLE_DISTRIBUTION: developer-id
       MAGNITUDE_ACCEPTANCE_VERSION: ${{ matrix.version }}
@@ -84,7 +84,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04-arm]
-        version: ["0.0.20", "0.0.21"]
+        version: ["0.0.22", "0.0.23"]
     runs-on: ${{ matrix.os }}
     container: ubuntu:22.04
     timeout-minutes: 30
@@ -143,6 +143,9 @@ jobs:
       - name: Exercise signed requests and update ownership on the native runtime
         working-directory: desktop
         run: bunx --bun vitest run src/update-identity.test.ts src/update-preferences.test.ts src/update-schedule.test.ts src/application-update.test.ts
+      - name: Validate package permission regressions
+        working-directory: packages/release
+        run: bunx --bun vitest run scripts/build/desktop-linux.test.ts
       - name: Send a real signed check to the isolated hosted endpoint
         run: bun packages/release/scripts/acceptance/check.ts
         env:
