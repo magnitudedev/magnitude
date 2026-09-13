@@ -1,0 +1,44 @@
+name: Installed Windows update acceptance
+on:
+  push:
+    branches: [app]
+    paths:
+      - '.github/workflows/windows-update-consumer.yml'
+      - 'desktop/src/fixtures/windows-hosted-update.mjs'
+      - 'desktop/src/fixtures/windows-tray-acceptance.ps1'
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: windows-update-consumer-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  installed-application:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - name: Reuse the previously signed and transfer-verified installer cohort
+        uses: actions/download-artifact@v4
+        with:
+          name: prepared-windows-installers
+          run-id: 34750226856
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/magnitude-windows-update-acceptance
+      - name: Exercise real downloads, Settings, native replacement and tray interaction
+        shell: pwsh
+        run: ./packages/release/scripts/acceptance/test-windows-hosted-update.ps1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-installed-update-evidence
+          path: ${{ runner.temp }}/magnitude-windows-update-acceptance/consumer
+          if-no-files-found: warn
+          retention-days: 14

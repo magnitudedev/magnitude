@@ -3,6 +3,7 @@ import { createHash, createPublicKey, verify } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { mkdir, readFile, writeFile, access, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { setTimeout as delay } from 'node:timers/promises'
 import { _electron as electron } from 'playwright'
 
@@ -47,7 +48,7 @@ try {
   await page.getByRole('button', { name: 'Settings', exact: true }).click()
   const automatic = page.getByRole('checkbox', { name: 'Auto-download updates' })
   await automatic.uncheck()
-  const keyPath = join(state, 'updates/installation-key.pem')
+  const keyPath = join(data, 'updates/installation-key.pem')
   const identity = await readFile(keyPath)
   const publicBytes = createPublicKey(identity).export({ type: 'spki', format: 'der' }).subarray(-32)
   const installationId = createHash('sha256').update(publicBytes).digest('hex')
@@ -83,7 +84,7 @@ try {
   assert.match(status, /Tray\s+Registered/i, 'Updated app must relaunch with its native tray')
   assert.equal(cli(['--version']).trim(), '0.0.31')
   assert.deepEqual(await readFile(keyPath), identity, 'Update changed installation identity')
-  assert.equal(JSON.parse(await readFile(join(state, 'updates/preferences.json'), 'utf8')).autoDownload, false)
+  assert.equal(JSON.parse(await readFile(join(data, 'updates/preferences.json'), 'utf8')).autoDownload, false)
   await writeFile(join(evidence, 'after-relaunch.txt'), status)
   console.log('PASS real Settings download/restart, installed version 0.0.31, automatic owner/tray relaunch and identity preservation')
   cli(['service', 'stop'])
@@ -95,6 +96,8 @@ try {
   await page.getByRole('button', { name: 'Check for updates', exact: true }).click()
   await page.getByText('You’re up to date.', { exact: true }).waitFor({ timeout: 30000 })
   await page.screenshot({ path: join(evidence, 'updated-settings.png'), fullPage: true })
+  execFileSync('powershell', ['-NoProfile', '-File', fileURLToPath(new URL('./windows-tray-acceptance.ps1', import.meta.url)), '-Evidence', evidence], { stdio: 'inherit', timeout: 60000 })
+  await page.getByRole('heading', { name: 'Discover', exact: true }).waitFor({ timeout: 10000 })
   await writeFile(join(evidence, 'accepted.json'), JSON.stringify({ installationId, from: '0.0.30', to: '0.0.31', at: new Date().toISOString(), status }, null, 2))
   console.log('PASS installed updated Settings, persisted auto-download preference and real up-to-date check')
 } finally {
