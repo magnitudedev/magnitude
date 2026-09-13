@@ -1,6 +1,18 @@
 name: Hosted update acceptance
 
 on:
+  push:
+    branches: [app]
+    paths:
+      - '.github/workflows/hosted-update-acceptance.yml'
+      - 'desktop/src/*update*'
+      - 'cli/src/startup/*update*'
+      - 'packages/daemon-management/src/desktop-native/*update*'
+      - 'packages/daemon-management/native/windows-update*'
+      - 'packages/release/native/windows-installer*'
+      - 'packages/release/scripts/acceptance/*'
+      - 'packages/release/scripts/build/desktop-*'
+      - 'packages/release/scripts/build/linux-maintainer-scripts.ts'
   workflow_dispatch:
     inputs:
       build_artifacts:
@@ -191,6 +203,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./packages/release/scripts/test-windows-installer.ps1
+      - name: Verify Windows update handoff state and cancellation
+        if: runner.os == 'Windows'
+        working-directory: packages/daemon-management
+        run: bunx --bun vitest run src/desktop-native/windows-update-handoff.test.ts
       - name: Verify Windows Authenticode with actual signed and tampered executables
         if: runner.os == 'Windows'
         shell: pwsh
