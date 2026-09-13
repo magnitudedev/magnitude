@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["0.0.24", "0.0.25"]
+        version: ["0.0.26", "0.0.27"]
     env:
       MAGNITUDE_APPLE_DISTRIBUTION: developer-id
       MAGNITUDE_ACCEPTANCE_VERSION: ${{ matrix.version }}
@@ -84,7 +84,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04-arm]
-        version: ["0.0.24", "0.0.25"]
+        version: ["0.0.26", "0.0.27"]
     runs-on: ${{ matrix.os }}
     container: ubuntu:22.04
     timeout-minutes: 30
@@ -104,6 +104,21 @@ jobs:
         env:
           MAGNITUDE_ACCEPTANCE_VERSION: ${{ matrix.version }}
           MAGNITUDE_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/magnitude-update-acceptance
+      - name: Verify Linux installation lease does not escape into updater children
+        shell: bash
+        run: |
+          addon=$(find "${{ runner.temp }}/magnitude-update-acceptance/application" -name desktop-host.node -print -quit)
+          test -n "$addon"
+          fixture="$GITHUB_WORKSPACE/packages/daemon-management/src/desktop-native/fixtures/linux-installation-lease.cjs"
+          install -d -m 755 /var/lib/magnitude-desktop
+          touch /var/lib/magnitude-desktop/installation.lock
+          chmod 444 /var/lib/magnitude-desktop/installation.lock
+          node "$fixture" "$addon" invalid
+          node "$fixture" "$addon" invalid 9</dev/null
+          node "$fixture" "$addon" valid 9</var/lib/magnitude-desktop/installation.lock
+          touch /var/lib/magnitude-desktop/installing
+          node "$fixture" "$addon" invalid 9</var/lib/magnitude-desktop/installation.lock
+          rm /var/lib/magnitude-desktop/installing
       - name: Verify real storage transfers and prepare acceptance manifests
         run: bun packages/release/scripts/acceptance/prepare-artifacts.ts
         env:
@@ -144,6 +159,26 @@ jobs:
       - name: Exercise signed requests and update ownership on the native runtime
         working-directory: desktop
         run: bunx --bun vitest run src/update-identity.test.ts src/update-preferences.test.ts src/update-schedule.test.ts src/application-update.test.ts
+      - name: Validate Windows private key permissions with native ACLs
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          . ./packages/daemon-management/scripts/windows-toolchain.ps1
+          $source = Join-Path $env:GITHUB_WORKSPACE 'packages/daemon-management/native'
+          $fixture = Join-Path $env:RUNNER_TEMP 'update-key-permissions'
+          New-Item -ItemType Directory -Force $fixture | Out-Null
+          Push-Location $fixture
+          try {
+            npm install --prefix $fixture --ignore-scripts --no-audit --no-fund node-api-headers@1.9.0
+            if ($LASTEXITCODE -ne 0) { throw 'Node-API header acquisition failed' }
+            $headers = Join-Path $fixture 'node_modules/node-api-headers/include'
+            & cl.exe /nologo /c /W4 /WX /O2 /std:c11 /D_WIN32_WINNT=0x0A00 /DNAPI_VERSION=8 /D_CRT_SECURE_NO_WARNINGS "/I$headers" (Join-Path $source 'desktop-host.c')
+            if ($LASTEXITCODE -ne 0) { throw 'Windows update binding compilation failed' }
+            & cl.exe /nologo /W4 /WX /O2 /std:c11 /D_WIN32_WINNT=0x0A00 /D_CRT_SECURE_NO_WARNINGS (Join-Path $source 'windows-security.c') (Join-Path $source 'windows-security-test.c') /Fe:security.exe /link advapi32.lib
+            if ($LASTEXITCODE -ne 0) { throw 'Native permission compilation failed' }
+            & ./security.exe
+            if ($LASTEXITCODE -ne 0) { throw 'Native permission acceptance failed' }
+          } finally { Pop-Location }
       - name: Validate package permission regressions
         working-directory: packages/release
         run: bunx --bun vitest run scripts/build/desktop-linux.test.ts

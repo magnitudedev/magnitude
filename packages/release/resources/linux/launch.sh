@@ -7,5 +7,5 @@ unavailable() {
 exec 9</var/lib/magnitude-desktop/installation.lock || unavailable
 flock -s -n 9 || unavailable
 [ ! -e /var/lib/magnitude-desktop/installing ] || unavailable
-# exec retains the shared descriptor; no launcher supervisor remains alive.
+# Electron adopts this shared descriptor as close-on-exec before starting children.
 exec /usr/lib/magnitude-desktop/magnitude "$@"

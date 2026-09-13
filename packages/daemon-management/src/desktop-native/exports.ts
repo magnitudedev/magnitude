@@ -1,4 +1,6 @@
 export * from "./index"
+export { adoptLinuxInstallationLease } from "./linux-installation-lease"
+export { PrivateFilePermissions, unixPrivateFilePermissions, windowsPrivateFilePermissions } from "./private-files"
 export * from "./owned-service"
 export * from "./owned-child"
 export * from "./application-control"

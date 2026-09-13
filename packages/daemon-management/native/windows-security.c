@@ -60,6 +60,43 @@ DWORD magnitude_validate_private_directory(HANDLE directory) {
       !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) return ERROR_ACCESS_DENIED;
   return private_handle(directory, TRUE);
 }
+DWORD magnitude_prepare_private_directory(const WCHAR *path) {
+  PSECURITY_DESCRIPTOR descriptor = NULL;
+  DWORD error = magnitude_private_descriptor(TRUE, &descriptor);
+  if (error) return error;
+  SECURITY_ATTRIBUTES attributes = { (DWORD)sizeof(attributes), descriptor, FALSE };
+  if (!CreateDirectoryW(path, &attributes) && GetLastError() != ERROR_ALREADY_EXISTS) error = GetLastError();
+  LocalFree(descriptor);
+  if (error) return error;
+  HANDLE directory = CreateFileW(path, READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+  if (directory == INVALID_HANDLE_VALUE) return GetLastError();
+  error = magnitude_validate_private_directory(directory);
+  CloseHandle(directory);
+  return error;
+}
+DWORD magnitude_create_private_content(const WCHAR *path) {
+  PSECURITY_DESCRIPTOR descriptor = NULL;
+  DWORD error = magnitude_private_descriptor(FALSE, &descriptor);
+  if (error) return error;
+  SECURITY_ATTRIBUTES attributes = { (DWORD)sizeof(attributes), descriptor, FALSE };
+  HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, &attributes,
+    CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+  error = file == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+  if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+  LocalFree(descriptor); return error;
+}
+DWORD magnitude_validate_private_content(const WCHAR *path) {
+  HANDLE file = CreateFileW(path, GENERIC_READ | READ_CONTROL, FILE_SHARE_READ, NULL,
+    OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+  if (file == INVALID_HANDLE_VALUE) return GetLastError();
+  BY_HANDLE_FILE_INFORMATION info;
+  DWORD error = GetFileType(file) != FILE_TYPE_DISK || !GetFileInformationByHandle(file, &info) ||
+    info.nNumberOfLinks != 1 || (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))
+    ? ERROR_ACCESS_DENIED : private_handle(file, FALSE);
+  CloseHandle(file); return error;
+}
 DWORD magnitude_directory_endpoint(HANDLE directory, WCHAR endpoint[128]) {
   endpoint[0] = 0;
   DWORD error = magnitude_validate_private_directory(directory);

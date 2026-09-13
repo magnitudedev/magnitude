@@ -48,6 +48,28 @@ int wmain(void) {
   require(magnitude_private_descriptor(TRUE, &private_directory) == ERROR_SUCCESS, "private directory descriptor");
   require(ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;FA;;;WD)", SDDL_REVISION_1, &everyone, NULL), "broad fixture descriptor");
 
+  WCHAR update_directory[32768], update_file[32768], update_link[32768];
+  require(swprintf(update_directory, 32768, L"%ls\\updates", cwd) > 0, "update directory path");
+  require(swprintf(update_file, 32768, L"%ls\\key.pem", update_directory) > 0, "update key path");
+  require(swprintf(update_link, 32768, L"%ls\\key-link.pem", update_directory) > 0, "update link path");
+  require(magnitude_prepare_private_directory(update_directory) == ERROR_SUCCESS, "create private updates directory");
+  require(magnitude_prepare_private_directory(update_directory) == ERROR_SUCCESS, "reuse private updates directory");
+  require(magnitude_create_private_content(update_file) == ERROR_SUCCESS, "create private key before writing content");
+  require(magnitude_create_private_content(update_file) != ERROR_SUCCESS, "refuse to overwrite existing key");
+  require(magnitude_validate_private_content(update_file) == ERROR_SUCCESS, "accept explicit current-user-only key");
+  require(CreateHardLinkW(update_link, update_file, NULL), "create hard link fixture");
+  require(magnitude_validate_private_content(update_file) != ERROR_SUCCESS, "reject linked key");
+  require(DeleteFileW(update_link), "remove hard link fixture");
+  acl(update_file, everyone, TRUE);
+  require(magnitude_validate_private_content(update_file) != ERROR_SUCCESS, "reject broad key permissions");
+  acl(update_file, private_file, TRUE);
+  require(magnitude_validate_private_content(update_file) == ERROR_SUCCESS, "accept explicit private key");
+  require(magnitude_validate_private_content(update_directory) != ERROR_SUCCESS, "reject directory as key");
+  acl(update_directory, everyone, TRUE);
+  require(magnitude_prepare_private_directory(update_directory) != ERROR_SUCCESS, "refuse to repair broad updates directory");
+  acl(update_directory, private_directory, TRUE);
+  require(DeleteFileW(update_file) && RemoveDirectoryW(update_directory), "clean update permissions fixture");
+
   acl(lock_path, everyone, TRUE);
   rejects(lock_path, "reject broad file permissions");
   acl(lock_path, private_file, TRUE);

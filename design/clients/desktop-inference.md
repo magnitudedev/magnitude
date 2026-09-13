@@ -65,6 +65,9 @@ invoking the package manager. Existing installation admission excludes another r
 an authorization or package-manager failure never means success. The helper relaunches as the
 original user, preserving whether the window was open, and records a retryable failure when needed.
 It is transient installation work, not an independent service owner or a login service.
+The packaged Linux desktop adopts the launcher's shared installation descriptor before starting
+children and marks it close-on-exec. The desktop retains package admission until process exit;
+service and update-helper children cannot inherit the lease and block their own installation.
 Recommendations order fitting assessed configurations using the shared preference. The remaining
 curated catalog stays discoverable with explicit pending, incompatible, or insufficient-memory
 explanations. Details expose catalog license/source links, capabilities, context, and labeled
