@@ -101,6 +101,39 @@ static WCHAR *private_path(napi_env env, napi_value arg) {
   }
   return path;
 }
+static napi_value private_directory(napi_env env, napi_callback_info info) {
+  napi_value arg, result; size_t argc = 1;
+  if (napi_get_cb_info(env, info, &argc, &arg, NULL, NULL) != napi_ok || argc != 1)
+    return failure(env, "Expected a private directory path");
+  WCHAR *path = private_path(env, arg);
+  if (!path) return NULL;
+  DWORD error = magnitude_prepare_private_directory(path);
+  free(path);
+  if (error) return failure(env, "Unsafe or inaccessible private directory");
+  napi_get_undefined(env, &result); return result;
+}
+static napi_value private_content(napi_env env, napi_callback_info info) {
+  napi_value arg, result; size_t argc = 1;
+  if (napi_get_cb_info(env, info, &argc, &arg, NULL, NULL) != napi_ok || argc != 1)
+    return failure(env, "Expected a private file path");
+  WCHAR *path = private_path(env, arg);
+  if (!path) return NULL;
+  DWORD error = magnitude_validate_private_content(path);
+  free(path);
+  if (error) return failure(env, "Unsafe or inaccessible private file");
+  napi_get_undefined(env, &result); return result;
+}
+static napi_value create_private_content(napi_env env, napi_callback_info info) {
+  napi_value arg, result; size_t argc = 1;
+  if (napi_get_cb_info(env, info, &argc, &arg, NULL, NULL) != napi_ok || argc != 1)
+    return failure(env, "Expected a new private file path");
+  WCHAR *path = private_path(env, arg);
+  if (!path) return NULL;
+  DWORD error = magnitude_create_private_content(path);
+  free(path);
+  if (error) return failure(env, "Cannot create private file");
+  napi_get_undefined(env, &result); return result;
+}
 #endif
 
 static napi_value acquire(napi_env env, napi_callback_info info) {
@@ -281,15 +314,42 @@ static napi_value interactive_desktop(napi_env env, napi_callback_info info) {
 }
 #endif
 
+#ifdef __linux__
+static napi_value adopt_installation_lease(napi_env env, napi_callback_info info) {
+  (void)info;
+  struct stat inherited, installed;
+  const int descriptor = 9;
+  if (fstat(descriptor, &inherited) != 0 ||
+      lstat("/var/lib/magnitude-desktop/installation.lock", &installed) != 0 ||
+      !S_ISREG(inherited.st_mode) || inherited.st_uid != 0 || (inherited.st_mode & 0222) ||
+      inherited.st_dev != installed.st_dev || inherited.st_ino != installed.st_ino)
+    return failure(env, "Start Magnitude through its installed desktop launcher");
+  if (flock(descriptor, LOCK_SH | LOCK_NB) != 0 ||
+      lstat("/var/lib/magnitude-desktop/installing", &installed) == 0 || errno != ENOENT)
+    return failure(env, "Magnitude installation is in progress or needs package-manager repair");
+  int flags = fcntl(descriptor, F_GETFD);
+  if (flags < 0 || fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC) != 0)
+    return failure(env, "Cannot retain private installation admission");
+  napi_value result;
+  napi_get_undefined(env, &result); return result;
+}
+#endif
+
 static napi_value init(napi_env env, napi_value exports) {
   napi_property_descriptor methods[] = {
     {"acquireLock", NULL, acquire, NULL, NULL, NULL, napi_default, NULL},
     {"releaseLock", NULL, release, NULL, NULL, NULL, napi_default, NULL},
     {"guardParent", NULL, guard, NULL, NULL, NULL, napi_default, NULL},
+#ifdef __linux__
+    {"adoptInstallationLease", NULL, adopt_installation_lease, NULL, NULL, NULL, napi_default, NULL},
+#endif
 #ifdef _WIN32
     {"lockEndpoint", NULL, lock_endpoint, NULL, NULL, NULL, napi_default, NULL},
     {"inspectApplicationEndpoint", NULL, inspect_endpoint, NULL, NULL, NULL, napi_default, NULL},
     {"localAppDataDirectory", NULL, local_app_data, NULL, NULL, NULL, napi_default, NULL},
+    {"preparePrivateDirectory", NULL, private_directory, NULL, NULL, NULL, napi_default, NULL},
+    {"createPrivateContent", NULL, create_private_content, NULL, NULL, NULL, napi_default, NULL},
+    {"validatePrivateContent", NULL, private_content, NULL, NULL, NULL, napi_default, NULL},
     {"isInteractiveDesktop", NULL, interactive_desktop, NULL, NULL, NULL, napi_default, NULL},
 #endif
   };

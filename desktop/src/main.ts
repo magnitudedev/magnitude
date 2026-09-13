@@ -32,6 +32,8 @@ import {
   acquireApplicationOwner, applicationStateDirectory, makeOwnedService, makeUnixOwnedChildSpawner, makeWindowsOwnedChildSpawner, requireServicePort, NativeHost, nativeHostLayer,
   OwnedChildSpawner, serveApplicationControl, serveWindowsApplicationControl, type ApplicationControlOptions,
   LinuxTrayHost, linuxTrayHostLayer, guardedCommandLayer,
+  unixPrivateFilePermissions, windowsPrivateFilePermissions,
+  adoptLinuxInstallationLease,
   NativeMacApplicationInstallation, nativeMachineIdentity, ApplicationMemory, nativeApplicationMemoryLayer, observeApplicationMemory,
 } from "@magnitudedev/daemon-management/desktop-native"
 import { ProcessGroupController } from "@magnitudedev/utils/process-groups"
@@ -74,6 +76,7 @@ if (process.platform === "darwin") autoUpdater.on("error", error => console.erro
 
 const program = Effect.scoped(Effect.gen(function* () {
   const native = yield* NativeHost
+  if (process.platform === "linux" && app.isPackaged) yield* adoptLinuxInstallationLease(addonPath)
   if (process.platform === "win32") {
     yield* native.requireInteractiveDesktop
     canPresentErrors = true
@@ -111,7 +114,9 @@ const program = Effect.scoped(Effect.gen(function* () {
     : process.platform === "win32" ? unavailableApplicationUpdate("Application updates are not available in this Windows build.")
     : !app.isPackaged || (process.platform === "darwin" && !handoff) ? unavailableApplicationUpdate("Application update recovery is unavailable in this build.")
     : yield* Effect.gen(function* () {
-      const identity = yield* makeUpdateIdentity(dataDir).pipe(Effect.provide(NodeContext.layer))
+      const identity = yield* makeUpdateIdentity(dataDir).pipe(
+        Effect.provide((process.platform === "win32" ? windowsPrivateFilePermissions(addonPath) : unixPrivateFilePermissions).pipe(Layer.provideMerge(NodeContext.layer))),
+      )
       const preferences = yield* makeUpdatePreferences(dataDir).pipe(Effect.provide(NodeContext.layer))
       const { trustedPublishers, origin, storageOrigin } = updateConfiguration.value
       if (process.platform === "linux") {
