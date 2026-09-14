@@ -8,6 +8,7 @@ const Transfer = Schema.Union(
   Schema.TaggedStruct("Cancelling", {}),
   Schema.TaggedStruct("Staging", { version: Schema.String }),
   Schema.TaggedStruct("Ready", { version: Schema.String }),
+  Schema.TaggedStruct("InstallationFailed", { version: Schema.String, message: Schema.String }),
   Schema.TaggedStruct("Failed", { message: Schema.String }),
   Schema.TaggedStruct("Unavailable", { message: Schema.String }),
   Schema.TaggedStruct("Closed", {}),

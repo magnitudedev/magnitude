@@ -3,7 +3,7 @@ import { Clock, Effect, Option, Schema } from "effect"
 import type { KeyObject } from "node:crypto"
 import { decodeUpdateRequest } from "./request"
 import { verifyUpdateRequest } from "./request-auth"
-import { ArtifactId, verifyUpdateManifest } from "./manifest"
+import { ArtifactTarget, verifyUpdateManifest } from "./manifest"
 import { Country, DistributionStore } from "./service"
 import { isValidVersion } from "../client-update/release-channels"
 
@@ -21,28 +21,26 @@ export const handleArtifactDownload = (request: Request, options: {
   const releases = url.searchParams.getAll("release")
   const release = releases[0]
   if (releases.length !== 1 || !release || release.length > 96 || !isValidVersion(release)) return response(400)
-  const artifacts = url.searchParams.getAll("artifact")
-  if (artifacts.length !== 1 || !Schema.is(ArtifactId)(artifacts[0])) return response(400)
-  const artifact = ArtifactId.make(artifacts[0])
   const fieldsUrl = new URL(url)
   fieldsUrl.searchParams.delete("release")
-  fieldsUrl.searchParams.delete("artifact")
   const now = Math.floor((yield* Clock.currentTimeMillis) / 1000)
   const fields = yield* decodeUpdateRequest(fieldsUrl, now)
   const installation = yield* verifyUpdateRequest(request.headers.get("authorization") ?? "", url)
   const store = yield* DistributionStore
   if (!(yield* store.admit(installation, fields.nonce, now + 600))) return response(409)
-  const envelope = yield* store.artifact(release, artifact)
+  const target = yield* Schema.decodeUnknown(ArtifactTarget)({ os: fields.os, arch: fields.arch, package: fields.package })
+  const envelope = yield* store.artifact(release, target)
   if (Option.isNone(envelope)) return response(404)
   const manifest = yield* verifyUpdateManifest(envelope.value, options.trustedPublishers)
-  if (manifest.version !== release || manifest.artifact.id !== artifact || manifest.artifact.target.os !== fields.os
+  if (manifest.version !== release || manifest.artifact.target.os !== fields.os
     || manifest.artifact.target.arch !== fields.arch || manifest.artifact.target.package !== fields.package) return response(404)
-  yield* store.recordDownload({ installation, request: fields, country: Option.filter(options.country, Schema.is(Country)), release, artifact }).pipe(
+  yield* store.recordDownload({ installation, request: fields, country: Option.filter(options.country, Schema.is(Country)), release, artifact: manifest.artifact.id }).pipe(
     Effect.catchTag("DistributionStoreUnavailable", () => Effect.logWarning("Download telemetry write unavailable")),
   )
   const location = githubArtifactUrl(manifest)
   return new Response(null, { status: 302, headers: { "Cache-Control": "private, no-store", Location: location } })
 }).pipe(Effect.catchTags({
+  ParseError: () => Effect.succeed(response(400)),
   InvalidUpdateRequest: () => Effect.succeed(response(400)),
   ExpiredUpdateRequest: () => Effect.succeed(response(401)),
   InvalidUpdateSignature: () => Effect.succeed(response(401)),

@@ -42,23 +42,43 @@ Settings reads the running application's version from the privileged host indepe
 readiness; it never substitutes a hardcoded version or the service protocol version.
 Main owns scheduled Magnitude-hosted update checks, automatic downloads and explicit Settings actions
 independently of the renderer and service readiness. The automatic-download preference does not
-disable checks. Window Close and observer loss cannot cancel admitted work. Mac updates verify the
-publisher-signed manifest and selected archive's size and digest, and stage it through the native updater before reporting Ready. The local
-staging endpoint exposes only that archive and closes on success, failure, or owner interruption.
-Restart requires a staged update and an explicit Settings, tray or headless update command. Quit closes update admission and
-cancels unfinished transfers before retiring the service; native installation/relaunch is invoked only
-after owned-child cleanup and application-scope release. On Mac, ordinary Quit applies a staged update without
-relaunch. Linux requires explicit installation and discards its prepared package on ordinary Quit.
-Development profiles disable native update actions. Platform builds without an implemented
-update transaction report that limitation rather than offering a nonfunctional restart action.
-Before Mac native staging, the owner durably records the selected target version and application bundle.
-This is update intent, never a service lease or evidence of a live installer. On a later owner launch,
-an older app exits before creating its service/window while that exact native installation is active.
-The target version or a newer app admits normally and clears the receipt, including while its native
-relaunch helper is still exiting. If installation has stopped without applying the target, the app
-admits normally with a retryable update failure. Unknown native state cannot grant old-app startup.
+disable checks. Window Close and observer loss cannot cancel admitted work. Magnitude-owned user data
+lives under the shared `.magnitude` root: canonical config owns the automatic-download preference,
+root identity.pem owns request identity, electron/ owns Electron userData and sessionData configured
+before profile initialization, state/ owns application coordination, and updates/ owns one installer
+and one update.json. Isolated development/test roots preserve the same layout.
+
+A complete verified download publishes the exact public release and an installation union:
+Unattempted, Attempted, or Failed with a bounded reason. No persisted state claims readiness,
+installer liveness or success. Ordinary Quit cancels incomplete downloads and retains prepared
+updates. macOS does not stage Squirrel until installation is requested. The local staging endpoint
+exposes only that archive and closes on success, failure, or interruption.
+
+Before ACN starts, startup reconciles native exclusion and the installed version. Reaching or passing
+the saved release retires both files regardless of the saved outcome. Only Unattempted may install
+automatically; a background Linux launch defers interactive authorization without marking an attempt.
+Startup and explicit restart/retry use the same offline signature/size/hash verification and durable
+Attempted write before native invocation. Explicit restart first retires owned children while retaining
+application ownership. A failed attempt retains bytes and its actual reason; an unresolved Attempted
+record displays “The update did not complete” and requires explicit retry. Retry never redownloads
+valid retained bytes. Desktop settings and `magnitude update discard` can remove a retained download
+under the same owner admission; failed cleanup preserves the previous presentation so it can be
+retried. Discard does not change update preferences. Missing or invalid evidence cannot authorize installation.
+
+Platform helpers hold a native installation lease across owner exit, installer execution and
+same-release outcome recording, releasing it before relaunch. Competing bootstrap exits without
+waiting while holding application ownership. An older Mac app defers while its native installer is
+active; an installed target or newer version may reconcile successfully during native relaunch.
+Unknown native state cannot grant old-app startup. Foreground intent belongs to the live handoff,
+not another persisted update field. The Mac helper captures native job identity before staging,
+waits for Squirrel to finish replacement, and launches the app with the retiring environment and
+explicit window intent. Native automatic relaunch must not discard an isolated profile or show a
+window after background startup. Cleanup is recoverable and cannot race an active installer.
+Development profiles disable native update actions unless explicitly built for isolated acceptance.
 Linux retains the signed package for an explicit handoff to the system package manager. The user
 helper acknowledges readiness before owner exit, then waits on the inherited lifetime channel.
+An explicit update action may request authorization even while the window is hidden; background
+startup defers that prompt. Relaunch window intent is independent of authorization permission.
 Polkit authorizes only the privileged package operation. That operation verifies installed,
 root-owned publisher trust, target/version, copied package bytes and native package identity before
 invoking the package manager. Existing installation admission excludes another running app owner;

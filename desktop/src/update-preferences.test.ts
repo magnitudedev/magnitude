@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { expect, it } from "vitest"
-import { makeUpdatePreferences } from "./update-preferences"
+import { makeUpdatePreferences } from "@magnitudedev/daemon-management/desktop-native"
 
 it("defaults to automatic downloads, persists changes, and never silently resets corrupt preferences", async () => {
   const directory = await mkdtemp(join(tmpdir(), "magnitude-update-preferences-"))
@@ -14,7 +14,7 @@ it("defaults to automatic downloads, persists changes, and never silently resets
     expect(await Effect.runPromise(preferences.read)).toBe(true)
     await Effect.runPromise(preferences.write(false))
     expect(await Effect.runPromise((await make()).read)).toBe(false)
-    const path = join(directory, "updates", "preferences.json")
+    const path = join(directory, "config.json")
     await writeFile(path, "broken")
     expect((await Effect.runPromise(preferences.read.pipe(Effect.either)))._tag).toBe("Left")
     expect(await readFile(path, "utf8")).toBe("broken")

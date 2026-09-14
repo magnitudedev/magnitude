@@ -1,8 +1,10 @@
 import { BunContext } from "@effect/platform-bun"
-import { completeLinuxUpdateHandoff, installLinuxApplicationUpdate, LinuxUpdateHandoffRequest } from "@magnitudedev/daemon-management/desktop-native"
-import { Effect, Schema } from "effect"
+import { acquireUpdateInstallationLease, completeLinuxUpdateHandoff, installLinuxApplicationUpdate, LinuxUpdateHandoffRequest,
+  nativeHostLayer, relaunchLinuxAfterUpdate, unixPrivateFilePermissions } from "@magnitudedev/daemon-management/desktop-native"
+import { Effect } from "effect"
 import { CLI_VERSION } from "../version"
 import { writeSync } from "node:fs"
+import { readUpdateHandoff, UpdateHandoffChannelFailed } from "./update-handoff-channel"
 
 export const runLinuxUpdateInstallation = (request: string) => Effect.runPromise(
   installLinuxApplicationUpdate(request, CLI_VERSION).pipe(
@@ -12,22 +14,13 @@ export const runLinuxUpdateInstallation = (request: string) => Effect.runPromise
 )
 
 export const runLinuxUpdateHandoff = () => Effect.runPromise(Effect.gen(function* () {
-  // EOF is the retiring owner's lifetime signal, not a PID observation or timeout.
-  const request = yield* Effect.tryPromise(async () => {
-    let buffer = Buffer.alloc(0)
-    let decoded: typeof LinuxUpdateHandoffRequest.Type | undefined
-    for await (const chunk of process.stdin) {
-      buffer = Buffer.concat([buffer, Buffer.from(chunk)])
-      if (decoded || buffer.length > 32_768) throw new Error("Invalid update handoff")
-      const newline = buffer.indexOf(10)
-      if (newline >= 0) {
-        if (newline !== buffer.length - 1) throw new Error("Invalid update handoff")
-        decoded = Schema.decodeUnknownSync(Schema.parseJson(LinuxUpdateHandoffRequest))(buffer.subarray(0, newline).toString("utf8"))
-        writeSync(3, "ready\n")
-      }
-    }
-    if (!decoded) throw new Error("Missing update handoff")
-    return decoded
-  })
-  yield* completeLinuxUpdateHandoff(request)
+  const channel = yield* readUpdateHandoff(process.stdin, LinuxUpdateHandoffRequest)
+  const completed = yield* Effect.scoped(Effect.gen(function* () {
+    yield* acquireUpdateInstallationLease(channel.request.stateDirectory)
+    yield* Effect.try({ try: () => writeSync(3, "ready\n"), catch: () => new UpdateHandoffChannelFailed() })
+    yield* channel.awaitOwnerExit
+    return yield* completeLinuxUpdateHandoff(channel.request).pipe(Effect.exit)
+  })).pipe(Effect.provide([nativeHostLayer("/usr/lib/magnitude-desktop/resources/desktop-host.node"), unixPrivateFilePermissions]))
+  yield* relaunchLinuxAfterUpdate(channel.request)
+  yield* completed
 }).pipe(Effect.provide(BunContext.layer), Effect.catchAll(() => Effect.sync(() => { process.exitCode = 1 }))))

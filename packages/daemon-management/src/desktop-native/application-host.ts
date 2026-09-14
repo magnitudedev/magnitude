@@ -34,7 +34,7 @@ export const makeDesktopApplicationHost = (developmentRepository: Option.Option<
   const windowsExecutable = process.env.MAGNITUDE_DESKTOP_PATH ? Effect.succeed(process.env.MAGNITUDE_DESKTOP_PATH)
     : localAppDataDirectory.pipe(Effect.map(directory => join(directory, "Programs/Magnitude/Magnitude.exe")),
       Effect.mapError(error => new ApplicationLaunchFailed({ message: error.message })))
-  const stateDirectory = applicationStateDirectory({ platform: process.platform, dataDirectory: desktopDataDirectory, development, override: Option.fromNullable(process.env.MAGNITUDE_DESKTOP_STATE_DIR), localAppDataDirectory })
+  const stateDirectory = applicationStateDirectory({ platform: process.platform, dataDirectory: desktopDataDirectory, override: Option.fromNullable(process.env.MAGNITUDE_DESKTOP_STATE_DIR) })
   const endpoint = process.platform === "win32" ? stateDirectory.pipe(Effect.flatMap(directory => Effect.flatMap(NativeHost, native => native.inspectEndpoint(directory))),
     Effect.provide(hostNative),
     Effect.mapError(error => new ApplicationControlFailed({ message: error.message })),

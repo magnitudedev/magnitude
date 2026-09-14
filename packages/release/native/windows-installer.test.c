@@ -119,6 +119,12 @@ static void check_replacement(HMODULE library) {
   RESOLVE_FUNCTION(library, rollback, "RollbackReplacement");
   RESOLVE_FUNCTION(library, finish, "FinishReplacement");
   RESOLVE_FUNCTION(library, validate, "ValidateOwnedInstallation");
+  WCHAR originalState[32768];
+  DWORD stateLength = GetEnvironmentVariableW(L"MAGNITUDE_DESKTOP_STATE_DIR", originalState, 32768);
+  require(stateLength > 0 && stateLength < 32768, "isolated test state directory");
+  require(SetEnvironmentVariableW(L"MAGNITUDE_DESKTOP_STATE_DIR", L"\\\\server\\profile\\.magnitude\\state"), "set network state fixture");
+  require(hold() == ERROR_BAD_PATHNAME, "reject network coordination before opening a lock");
+  require(SetEnvironmentVariableW(L"MAGNITUDE_DESKTOP_STATE_DIR", originalState), "restore isolated test state");
   require(hold() == ERROR_SUCCESS, "hold actual application lease");
   WCHAR payload[32768], root[32768], file[32768];
   require(create_stage(payload, 32768) == ERROR_SUCCESS, "prepare actual private installation stage");

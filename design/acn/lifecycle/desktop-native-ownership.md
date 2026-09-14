@@ -47,12 +47,15 @@ version commands do not initialize native adapters. Cross-compilation requires t
 Native Windows acceptance executes the embedded addon and compiled CLI, with a deliberately invalid
 LOCALAPPDATA value, and verifies that passive commands create no ownership state. Missing application
 startup must report the native installation path without starting an independent service.
-Default Windows ownership state lives beneath the current user's native Local AppData known folder,
-with separate production and development namespaces. CLI and desktop share this resolution. A
-redirected home or caller-supplied LOCALAPPDATA value cannot redirect ownership. Native lookup failure
-does not select a guessed fallback. Explicit isolated state overrides still undergo native directory
-validation. Chromium profile creation must not pre-create the protected ownership leaf with inherited
-permissions; renderer profile data and the ownership directory have distinct creation authority.
+Application coordination lives in the shared user root's state/ directory on every platform.
+Windows resolves `%USERPROFILE%\.magnitude\state`; explicit isolated roots and state overrides
+remain supported. Native admission still requires a supported local volume and a private directory:
+redirected/network homes fail, without introducing a second lock location. Native Local AppData
+lookup remains authoritative only for OS-owned installed application locations. Chromium uses the
+sibling electron/ directory and must not pre-create the protected state leaf with inherited ACLs.
+Desktop, CLI and installer resolve the same application.lock. Update helpers use a separate kernel
+installation lease only to exclude app startup/cleanup during replacement, never to elect a service
+or infer liveness from file presence.
 Cold Windows application launch requires the caller's assigned interactive window station and its
 ordinary desktop. A noninteractive service or SSH session cannot create an unreachable tray owner.
 Native inspection failure is not permission to launch. This checks the assigned desktop rather than

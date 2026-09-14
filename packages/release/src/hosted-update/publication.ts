@@ -1,12 +1,12 @@
 import { Context, Effect, Schema } from "effect"
 import type { KeyObject } from "node:crypto"
-import { PublisherKeyId, SignedUpdateManifest, UpdateManifest, signUpdateManifest } from "./manifest"
+import { PublisherKeyId, PublishedUpdate, UpdateManifest, signUpdateManifest } from "./manifest"
 
 export class ReleasePublicationFailed extends Schema.TaggedError<ReleasePublicationFailed>()("ReleasePublicationFailed", {
   stage: Schema.Literal("batch", "database", "conflict"),
 }) {}
 export interface ReleasePublicationStore {
-  readonly promote: (envelopes: readonly SignedUpdateManifest[]) => Effect.Effect<void, ReleasePublicationFailed>
+  readonly promote: (envelopes: readonly PublishedUpdate[]) => Effect.Effect<void, ReleasePublicationFailed>
 }
 export const ReleasePublicationStore = Context.GenericTag<ReleasePublicationStore>("release/ReleasePublicationStore")
 
@@ -32,7 +32,7 @@ export const prepareHostedRelease = (options: {
   readonly privateKey: KeyObject
 }) => Effect.gen(function* () {
   const batch = yield* Schema.decodeUnknown(ReleasePublicationBatch)(options.artifacts).pipe(Effect.mapError(() => new ReleasePublicationFailed({ stage: "batch" })))
-  const envelopes = yield* Effect.forEach(batch, manifest => signUpdateManifest(manifest, options.keyId, options.privateKey))
+  const envelopes = yield* Effect.forEach(batch, manifest => signUpdateManifest(manifest, options.privateKey))
   return envelopes
 })
 

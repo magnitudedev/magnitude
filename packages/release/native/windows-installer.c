@@ -761,20 +761,43 @@ __declspec(dllexport) DWORD WINAPI RemoveOwnedStartup(LPCWSTR executable) {
 
 /* Process-scoped installation lease; never starts or adopts a service. */
 __declspec(dllexport) DWORD WINAPI HoldOwnership(void) {
-  PWSTR local = NULL;
-  HRESULT result = SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, NULL, &local);
-  if (FAILED(result) || !local) return ERROR_PATH_NOT_FOUND;
-  WCHAR parent[32768], path[32768];
-  if (local[1] != L':' ||
-      swprintf(parent, 32768, L"%ls\\Magnitude", local) < 0 ||
-      swprintf(path, 32768, L"%ls\\Magnitude\\desktop\\application.lock", local) < 0) {
-    CoTaskMemFree(local); return ERROR_BAD_PATHNAME;
+  WCHAR root[32768], state[32768], path[32768];
+  BOOL createRoot = FALSE;
+  DWORD length = GetEnvironmentVariableW(L"MAGNITUDE_DESKTOP_STATE_DIR", state, 32768);
+  if (length >= 32768) return ERROR_BAD_PATHNAME;
+  if (!length) {
+    length = GetEnvironmentVariableW(L"MAGNITUDE_DEV_DATA_DIR", root, 32768);
+    if (length >= 32768) return ERROR_BAD_PATHNAME;
+    if (!length) {
+      WCHAR profile[32768];
+      length = GetEnvironmentVariableW(L"USERPROFILE", profile, 32768);
+      if (length >= 32768) return ERROR_BAD_PATHNAME;
+      if (!length) {
+        PWSTR known = NULL;
+        if (FAILED(SHGetKnownFolderPath(&FOLDERID_Profile, 0, NULL, &known)) || !known) return ERROR_PATH_NOT_FOUND;
+        int copied = swprintf(profile, 32768, L"%ls", known);
+        CoTaskMemFree(known);
+        if (copied < 0) return ERROR_BAD_PATHNAME;
+      }
+      if (swprintf(root, 32768, L"%ls\\.magnitude", profile) < 0) return ERROR_BAD_PATHNAME;
+    }
+    if (swprintf(state, 32768, L"%ls\\state", root) < 0) return ERROR_BAD_PATHNAME;
+    createRoot = TRUE;
   }
-  CoTaskMemFree(local);
-  if (!CreateDirectoryW(parent, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) return GetLastError();
+  LPCWSTR drive = !wcsncmp(state, L"\\\\?\\", 4) ? state + 4 : state;
+  if (!((drive[0] >= L'A' && drive[0] <= L'Z') || (drive[0] >= L'a' && drive[0] <= L'z')) ||
+      drive[1] != L':' || (drive[2] != L'\\' && drive[2] != L'/') ||
+      swprintf(path, 32768, L"%ls\\application.lock", state) < 0) return ERROR_BAD_PATHNAME;
+  WCHAR volume[] = {drive[0], L':', L'\\', 0};
+  UINT type = GetDriveTypeW(volume);
+  if (type != DRIVE_FIXED && type != DRIVE_REMOVABLE && type != DRIVE_RAMDISK) return ERROR_NOT_SUPPORTED;
+  if (createRoot && !CreateDirectoryW(root, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) return GetLastError();
   HANDLE file, directory;
   DWORD error = magnitude_open_private_lock(path, &file, &directory);
   if (error) return error;
+  WCHAR endpoint[128];
+  error = magnitude_directory_endpoint(directory, endpoint);
+  if (error) { CloseHandle(file); CloseHandle(directory); return error; }
   OVERLAPPED offset = {0};
   if (!LockFileEx(file, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &offset)) {
     error = GetLastError(); CloseHandle(file); CloseHandle(directory); return error;

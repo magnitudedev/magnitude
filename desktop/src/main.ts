@@ -10,10 +10,11 @@ import { makeLinuxUpdateSource } from "./linux-update-source"
 import { makeWindowsUpdateSource } from "./windows-update-source"
 import { readLinuxUpdateMetadata } from "./update-metadata"
 import { NativeMacUpdate, nativeMacUpdate } from "./mac-update-stage"
-import { ApplicationUpdateHandoff, makeUpdateHandoff } from "./update-handoff"
-import { UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
+import { PreparedUpdateInstaller, reconcilePreparedUpdate, installPreparedUpdate, type UpdateInstallationIntent } from "./prepared-update-installation"
+import { isNewerVersion } from "@magnitudedev/release"
+import { ReleaseTarget, UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
 import { makeUpdateIdentity } from "./update-identity"
-import { makeUpdatePreferences, UpdatePreferences } from "./update-preferences"
+import { makeUpdatePreferences, UpdatePreferences } from "@magnitudedev/daemon-management/desktop-native"
 import { makeUpdateSchedule } from "./update-schedule"
 import { readUpdateConfiguration, isUpdateAcceptanceBuild } from "./update-config"
 import { NativeTrayFactory, NativeTrayFailed, TrayOwner, TrayOwnerLive } from "./tray-owner"
@@ -30,13 +31,13 @@ import { fileURLToPath } from "node:url"
 import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, PubSub, Queue, Ref, Runtime, Schema, Schedule, Scope, Stream } from "effect"
 import { RpcServer } from "@effect/rpc"
 import {
-  acquireApplicationOwner, applicationStateDirectory, makeOwnedService, makeUnixOwnedChildSpawner, makeWindowsOwnedChildSpawner, requireServicePort, NativeHost, nativeHostLayer,
+  acquireApplicationOwner, applicationStateDirectory, isUpdateInstallationActive, makeOwnedService, makeUnixOwnedChildSpawner, makeWindowsOwnedChildSpawner, requireServicePort, NativeHost, nativeHostLayer,
   OwnedChildSpawner, serveApplicationControl, serveWindowsApplicationControl, type ApplicationControlOptions,
   LinuxTrayHost, linuxTrayHostLayer, guardedCommandLayer,
   unixPrivateFilePermissions, windowsPrivateFilePermissions,
   nativeWindowsInstallerVerifier,
   adoptLinuxInstallationLease,
-  NativeMacApplicationInstallation, nativeMachineIdentity, ApplicationMemory, nativeApplicationMemoryLayer, observeApplicationMemory,
+  MacUpdateHandoff, startMacUpdateHandoff, MacApplicationInstallation, PreparedUpdateStore, makePreparedUpdateStore, NativeMacApplicationInstallation, nativeMachineIdentity, ApplicationMemory, nativeApplicationMemoryLayer, observeApplicationMemory,
 } from "@magnitudedev/daemon-management/desktop-native"
 import { ProcessGroupController } from "@magnitudedev/utils/process-groups"
 import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native"
@@ -53,10 +54,11 @@ const root = resolve(here, "../../..")
 const background = process.argv.includes("--background") || (process.platform === "darwin" && app.isPackaged && app.getLoginItemSettings({ type: "mainAppService" }).wasOpenedAtLogin)
 const isolatedProfile = isUpdateAcceptanceBuild || !app.isPackaged || process.env.MAGNITUDE_DEV_DATA_DIR !== undefined
 const dataDir = process.env.MAGNITUDE_DEV_DATA_DIR ?? join(homedir(), isUpdateAcceptanceBuild ? ".magnitude-update-acceptance" : app.isPackaged ? ".magnitude" : ".magnitude-desktop-dev")
-const stateOverride = process.env.MAGNITUDE_DESKTOP_STATE_DIR ?? (isUpdateAcceptanceBuild ? join(dataDir, "desktop") : undefined)
+const stateOverride = process.env.MAGNITUDE_DESKTOP_STATE_DIR
 // Chromium can create its profile before native ownership is acquired. Keep it outside the
 // protected Windows ownership leaf, which only native acquisition may create.
-if (isolatedProfile) app.setPath("userData", process.platform === "win32" ? join(dataDir, "electron") : join(stateOverride ?? join(dataDir, "desktop"), "electron"))
+app.setPath("userData", join(dataDir, "electron"))
+app.setPath("sessionData", join(dataDir, "electron"))
 const port = isolatedProfile ? Number(process.env.MAGNITUDE_DEV_PORT ?? (isUpdateAcceptanceBuild ? 11143 : 11101)) : 10100
 const endpoint = `http://127.0.0.1:${port}`
 const addonPath = app.isPackaged ? join(process.resourcesPath, "desktop-host.node") : join(root, `packages/daemon-management/dist/native/${process.platform}-${process.arch}/desktop-host.node`)
@@ -64,8 +66,9 @@ let exiting = false
 let canPresentErrors = process.platform !== "win32"
 let systemShutdownRequested = false
 let earlyQuitRequested = false
-let restartPackageUpdate: (() => Effect.Effect<void, ApplicationUpdateFailed>) | undefined
-let discardPackageUpdate: Effect.Effect<void> = Effect.void
+let restartPreparedUpdate: ((intent: UpdateInstallationIntent) => Effect.Effect<"Started" | "Deferred", ApplicationUpdateFailed>) | undefined
+let startupUpdateStarted = false
+let startupUpdateDeferred = false
 let reopenAfterUpdate = false
 let requestQuit: () => void = () => { earlyQuitRequested = true }
 app.on("before-quit", event => { if (!exiting) { event.preventDefault(); requestQuit() } })
@@ -83,15 +86,16 @@ const program = Effect.scoped(Effect.gen(function* () {
     yield* native.requireInteractiveDesktop
     canPresentErrors = true
   }
-  const stateDir = yield* applicationStateDirectory({ platform: process.platform, dataDirectory: dataDir, development: !app.isPackaged, override: Option.fromNullable(stateOverride), localAppDataDirectory: native.localAppDataDirectory })
+  const stateDir = yield* applicationStateDirectory({ platform: process.platform, dataDirectory: dataDir, override: Option.fromNullable(stateOverride) })
   const owner = yield* acquireApplicationOwner(stateDir, background ? "EnsureRunning" : "ShowWindow")
   if (owner._tag === "Forwarded") { exiting = true; app.quit(); return }
-  const handoff = process.platform === "darwin" && app.isPackaged
-    ? yield* makeUpdateHandoff(stateDir, dirname(dirname(dirname(process.execPath)))).pipe(Effect.provide(NativeMacApplicationInstallation)) : undefined
-  const updateAdmission = handoff ? yield* handoff.inspect(app.getVersion()) : undefined
-  // A direct old-bundle launch can race the native installer. Exit before creating any
-  // service or window; waiting inside this app would prevent ShipIt from installing it.
-  if (updateAdmission?._tag === "Defer") return "Quit" as const
+  if (yield* isUpdateInstallationActive(stateDir)) return "Quit" as const
+  if (process.platform === "darwin" && app.isPackaged) {
+    startupUpdateDeferred = yield* Effect.gen(function* () {
+      const installation = yield* MacApplicationInstallation
+      return yield* installation.isInstalling(dirname(dirname(dirname(process.execPath))))
+    }).pipe(Effect.provide(NativeMacApplicationInstallation))
+  }
   yield* Effect.promise(() => app.whenReady())
   // A system shutdown can end our process before asynchronous cleanup finishes.
   // Never veto it; native lifetime containment remains the hard fallback.
@@ -113,48 +117,51 @@ const program = Effect.scoped(Effect.gen(function* () {
   const updateConfiguration = yield* readUpdateConfiguration.pipe(Effect.option)
   const updates = Option.isNone(updateConfiguration) ? unavailableApplicationUpdate("Application update configuration is invalid.")
     : isolatedProfile && !updateConfiguration.value.acceptance ? unavailableApplicationUpdate("Application updates are available in the installed Magnitude app.")
-    : !app.isPackaged || (process.platform === "darwin" && !handoff) ? unavailableApplicationUpdate("Application update recovery is unavailable in this build.")
+    : !app.isPackaged ? unavailableApplicationUpdate("Application update recovery is unavailable in this build.")
     : yield* Effect.gen(function* () {
-      const identity = yield* makeUpdateIdentity(dataDir).pipe(
-        Effect.provide((process.platform === "win32" ? windowsPrivateFilePermissions(addonPath) : unixPrivateFilePermissions).pipe(Layer.provideMerge(NodeContext.layer))),
-      )
+      const privateFiles = (process.platform === "win32" ? windowsPrivateFilePermissions(addonPath) : unixPrivateFilePermissions).pipe(Layer.provideMerge(NodeContext.layer))
+      const identity = yield* makeUpdateIdentity(dataDir).pipe(Effect.provide(privateFiles))
       const preferences = yield* makeUpdatePreferences(dataDir).pipe(Effect.provide(NodeContext.layer))
       const { trustedPublishers, origin } = updateConfiguration.value
-      if (process.platform === "linux") {
-        const metadata = yield* readLinuxUpdateMetadata(process.resourcesPath, app.getVersion(), process.getSystemVersion()).pipe(Effect.provide(NodeContext.layer))
-        const linux = yield* makeLinuxUpdateSource({ origin, metadata, sign: identity.sign, trustedPublishers,
-          userAgent: `Magnitude/${app.getVersion()} ${process.arch} Electron/${process.versions.electron} Linux/${process.getSystemVersion()}`,
-          cacheDirectory: join(app.getPath("userData"), "updates"), stateDirectory: stateDir,
-        }).pipe(Effect.provide(NodeContext.layer))
-        restartPackageUpdate = () => linux.restart(reopenAfterUpdate)
-        discardPackageUpdate = linux.discard
-        return yield* makeApplicationUpdate(linux.previousFailure).pipe(Effect.provideService(ApplicationUpdateSource, linux.source), Effect.provideService(UpdatePreferences, preferences))
+      const metadata = process.platform === "linux"
+        ? yield* readLinuxUpdateMetadata(process.resourcesPath, app.getVersion(), process.getSystemVersion()).pipe(Effect.provide(NodeContext.layer))
+        : yield* Schema.decodeUnknown(UpdateClientMetadata)({ version: app.getVersion(), os: process.platform === "win32" ? "windows" : "darwin",
+            os_version: process.getSystemVersion(), arch: process.arch, package: process.platform === "win32" ? "windows-exe" : "mac-zip" })
+      const target = yield* Schema.decodeUnknown(ReleaseTarget)({ os: metadata.os, arch: metadata.arch, package: metadata.package })
+      const store = yield* makePreparedUpdateStore({ dataDirectory: dataDir, target, trustedPublishers }).pipe(Effect.provide(privateFiles))
+      const options = { origin, metadata, sign: identity.sign, trustedPublishers,
+        userAgent: `Magnitude/${app.getVersion()} ${process.arch} Electron/${process.versions.electron} ${metadata.os}/${process.getSystemVersion()}`,
+        cacheDirectory: join(dataDir, "updates"), dataDirectory: dataDir, stateDirectory: stateDir }
+      const platform = yield* Effect.gen(function* () {
+        if (process.platform === "linux") return yield* makeLinuxUpdateSource(options)
+        if (process.platform === "win32") {
+          const publisher = updateConfiguration.value.windowsPublisher
+          if (Option.isNone(publisher)) return yield* new ApplicationUpdateFailed({ message: "The Windows update publisher is missing." })
+          return yield* makeWindowsUpdateSource({ ...options, applicationPath: process.execPath,
+            cliPath: join(process.resourcesPath, "magnitude.exe"), addonPath }).pipe(
+              Effect.provide(nativeWindowsInstallerVerifier(addonPath, publisher.value)), Effect.provide(privateFiles))
+        }
+        return yield* macUpdateSource({ ...options, bundle: dirname(dirname(dirname(process.execPath))), cliPath: join(process.resourcesPath, "magnitude"), addonPath }).pipe(Effect.provideService(NativeMacUpdate, nativeMacUpdate(autoUpdater)), Effect.provideService(MacUpdateHandoff, { start: startMacUpdateHandoff }), Effect.provide(privateFiles))
+      }).pipe(Effect.provideService(PreparedUpdateStore, store))
+      restartPreparedUpdate = intent => installPreparedUpdate(intent).pipe(
+        Effect.provideService(PreparedUpdateStore, store), Effect.provideService(PreparedUpdateInstaller, platform.installer))
+      const saved = yield* store.read
+      if (startupUpdateDeferred) {
+        // ShipIt may still be finishing the relaunch of the successfully installed version.
+        if (Option.isSome(saved) && !isNewerVersion(saved.value.release.version, app.getVersion())) startupUpdateDeferred = false
+        else return unavailableApplicationUpdate("An application update is being installed.")
       }
-      if (process.platform === "win32") {
-        const publisher = updateConfiguration.value.windowsPublisher
-        if (Option.isNone(publisher)) return unavailableApplicationUpdate("Application update publisher configuration is missing from this Windows build.")
-        const metadata = yield* Schema.decodeUnknown(UpdateClientMetadata)({ version: app.getVersion(), os: "windows",
-          os_version: process.getSystemVersion(), arch: process.arch, package: "windows-exe" })
-        const windows = yield* makeWindowsUpdateSource({ origin, metadata, sign: identity.sign, trustedPublishers,
-          userAgent: `Magnitude/${app.getVersion()} ${process.arch} Electron/${process.versions.electron} Windows/${process.getSystemVersion()}`,
-          cacheDirectory: join(app.getPath("userData"), "updates"), stateDirectory: stateDir,
-          applicationPath: process.execPath, cliPath: join(process.resourcesPath, "magnitude.exe"),
-        }).pipe(Effect.provide([windowsPrivateFilePermissions(addonPath),
-          nativeWindowsInstallerVerifier(addonPath, publisher.value), NodeContext.layer]))
-        restartPackageUpdate = () => windows.restart(reopenAfterUpdate)
-        discardPackageUpdate = windows.discard
-        return yield* makeApplicationUpdate(windows.previousFailure).pipe(Effect.provideService(ApplicationUpdateSource, windows.source), Effect.provideService(UpdatePreferences, preferences))
+      let pending = yield* reconcilePreparedUpdate(app.getVersion()).pipe(Effect.provideService(PreparedUpdateStore, store))
+      if (Option.isSome(pending) && pending.value.installation._tag === "Unattempted" && !earlyQuitRequested) {
+        const attempted = yield* restartPreparedUpdate({ showWindow: !background, allowAuthorizationPrompt: !background }).pipe(Effect.either)
+        startupUpdateStarted = attempted._tag === "Right" && attempted.right === "Started"
+        pending = yield* store.read
       }
-      if (!handoff) return unavailableApplicationUpdate("Application update recovery is unavailable in this build.")
-      const metadata = yield* Schema.decodeUnknown(UpdateClientMetadata)({ version: app.getVersion(), os: "darwin",
-        os_version: process.getSystemVersion(), arch: process.arch, package: "mac-zip" })
-      const source = yield* macUpdateSource({ origin, metadata,
-        sign: identity.sign, trustedPublishers, userAgent: `Magnitude/${app.getVersion()} ${process.arch} Electron/${process.versions.electron} macOS/${process.getSystemVersion()}`,
-        cacheDirectory: join(app.getPath("userData"), "updates"),
-      }).pipe(Effect.provideService(NativeMacUpdate, nativeMacUpdate(autoUpdater)), Effect.provideService(ApplicationUpdateHandoff, handoff))
-      return yield* makeApplicationUpdate(updateAdmission?._tag === "Failed" ? Option.some(updateAdmission.message) : Option.none()).pipe(
-        Effect.provideService(ApplicationUpdateSource, source), Effect.provideService(UpdatePreferences, preferences))
+      return yield* makeApplicationUpdate(pending).pipe(
+        Effect.provideService(ApplicationUpdateSource, platform.source), Effect.provideService(PreparedUpdateStore, store), Effect.provideService(UpdatePreferences, preferences))
     }).pipe(Effect.catchAll(() => Effect.succeed(unavailableApplicationUpdate("Application update setup could not be read."))))
+  if (startupUpdateDeferred) return "Quit" as const
+  if (startupUpdateStarted) return "RestartUpdate" as const
   const updateSchedule = yield* makeUpdateSchedule(updates.check)
   const resumeUpdates = () => run(updateSchedule.resume)
   powerMonitor.on("resume", resumeUpdates)
@@ -199,7 +206,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     const current = yield* Ref.get(state)
     const presentation = yield* Ref.get(model)
     const update = yield* updates.state
-    yield* tray.setMenu(buildTrayMenu({ service: current?._tag ?? "Unknown", model: presentation, updateReady: update.transfer._tag === "Ready" }, {
+    yield* tray.setMenu(buildTrayMenu({ service: current?._tag ?? "Unknown", model: presentation, updateReady: (update.transfer._tag === "Ready" || update.transfer._tag === "InstallationFailed") }, {
       open: page => run(show(page)),
       stopModel: () => run(PubSub.publish(actions, { _tag: "StopModel" })),
       quit: requestQuit,
@@ -207,7 +214,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     }))
   })
   yield* refreshTray
-  yield* updates.changes.pipe(Stream.map(value => value.transfer._tag === "Ready"), Stream.changes,
+  yield* updates.changes.pipe(Stream.map(value => (value.transfer._tag === "Ready" || value.transfer._tag === "InstallationFailed")), Stream.changes,
     Stream.runForEach(() => refreshTray), Effect.forkScoped)
   if (process.platform === "linux") {
     const trayHost = Context.get(yield* Layer.build(linuxTrayHostLayer()), LinuxTrayHost)
@@ -231,6 +238,7 @@ const program = Effect.scoped(Effect.gen(function* () {
   const control: ApplicationControlOptions = { snapshot, update: action => Effect.gen(function* () {
     if (action === "check") yield* updateSchedule.check
     if (action === "download") yield* updates.download
+    if (action === "discard") yield* updates.discard
     if (action === "install") yield* updates.requireReady
     return { state: yield* updates.state, afterReply: action === "install" ? Queue.offer(quit, "RestartUpdate").pipe(Effect.asVoid) : Effect.void }
   }).pipe(Effect.mapError(error => new ApplicationUpdateControlFailed({ message: error.message }))), login: action => action === "read" ? loginStartup.read : loginStartup.set(action === "enable"), dispatch: intent => intent === "Quit" ? Queue.offer(quit, "Quit").pipe(Effect.asVoid) : intent === "ShowWindow" ? show() : intent === "Retry" ? service.retry : Effect.void }
@@ -259,6 +267,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     SetAutoDownload: ({ enabled }) => updates.setAutoDownload(enabled).pipe(Effect.mapError(connectionError), Effect.as({})),
     CheckUpdate: () => updateSchedule.check.pipe(Effect.mapError(connectionError), Effect.as({})),
     DownloadUpdate: () => updates.download.pipe(Effect.mapError(connectionError), Effect.as({})),
+    DiscardUpdate: () => updates.discard.pipe(Effect.mapError(connectionError), Effect.as({})),
     RestartUpdate: () => updates.requireReady.pipe(Effect.mapError(connectionError), Effect.zipRight(Effect.gen(function* () {
       if (!window || window.isDestroyed() || !window.isVisible() || window.isMinimized() || systemShutdownRequested) {
         return yield* new HostError({ message: "Open Magnitude before choosing Restart to update." })
@@ -328,7 +337,13 @@ const program = Effect.scoped(Effect.gen(function* () {
     reopenAfterUpdate = BrowserWindow.getAllWindows().some(window => window.isVisible())
     yield* updates.close
     const stopped = yield* service.shutdown.pipe(Effect.either)
-    if (stopped._tag === "Right") return systemShutdownRequested ? "Quit" as const : intent
+    if (stopped._tag === "Right") {
+      if (systemShutdownRequested || intent === "Quit") return "Quit" as const
+      if (!restartPreparedUpdate) return "Relaunch" as const
+      const installation = yield* restartPreparedUpdate({ showWindow: reopenAfterUpdate, allowAuthorizationPrompt: true }).pipe(Effect.either)
+      if (installation._tag === "Left") yield* Effect.logError(installation.left.message)
+      return installation._tag === "Right" && installation.right === "Started" ? "RestartUpdate" as const : "Relaunch" as const
+    }
     if (systemShutdownRequested) yield* Effect.logError(stopped.left.message)
     else {
       const retry = yield* resolveQuitFailure(stopped.left.message, {
@@ -342,23 +357,10 @@ const program = Effect.scoped(Effect.gen(function* () {
 Effect.runPromiseExit(program).then(Exit.match({
   onSuccess: intent => {
     exiting = true
-    if (intent !== "RestartUpdate") {
-      if (process.platform !== "darwin" && !systemShutdownRequested) void Effect.runPromise(discardPackageUpdate.pipe(Effect.timeoutOption("1 second"))).finally(() => app.quit())
-      else app.quit()
-      return
-    }
-    if (restartPackageUpdate) {
-      void Effect.runPromise(restartPackageUpdate()).then(() => app.quit(), error => {
-        dialog.showErrorBox("Magnitude could not restart for its update", String(error))
-        app.quit()
-      })
-      return
-    }
-    try { autoUpdater.quitAndInstall() }
-    catch (error) {
-      dialog.showErrorBox("Magnitude could not restart for its update", String(error))
-      app.quit()
-    }
+    if (intent === "Relaunch") app.relaunch({ args: reopenAfterUpdate ? [] : ["--background"] })
+    // Native staging happens only during installation. Squirrel applies on ordinary exit;
+    // the admitted helper preserves profile and window intent when relaunching afterward.
+    app.quit()
   },
   onFailure: cause => {
     const message = Cause.pretty(cause)

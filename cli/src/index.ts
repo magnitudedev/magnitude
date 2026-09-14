@@ -24,6 +24,10 @@ program.command("_complete-application-update", { hidden: true }).action(async (
   const { runLinuxUpdateHandoff } = await import("./startup/linux-update-installation")
   await runLinuxUpdateHandoff()
 })
+program.command("_complete-mac-application-update", { hidden: true }).action(async () => {
+  const { runMacUpdateHandoff } = await import("./startup/mac-update-installation")
+  await runMacUpdateHandoff()
+})
 program.command("_complete-windows-application-update", { hidden: true }).action(async () => {
   const { runWindowsUpdateHandoff } = await import("./startup/windows-update-installation")
   await runWindowsUpdateHandoff()

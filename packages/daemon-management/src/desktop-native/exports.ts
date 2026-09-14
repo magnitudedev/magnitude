@@ -10,7 +10,7 @@ export * from "./application-owner"
 
 export * from "./application-client"
 export * from "./application-host"
-export { MacApplicationInstallation, NativeMacApplicationInstallation, MacInstallationObservationFailed } from "./mac-update-installation"
+export { observeMacApplicationInstallation, MacApplicationInstallation, NativeMacApplicationInstallation, MacInstallationObservationFailed } from "./mac-update-installation"
 export * from "./application-state-directory"
 
 export * from "./login-startup"
@@ -23,5 +23,10 @@ export { ApplicationMemory, nativeApplicationMemoryLayer, observeApplicationMemo
 export { nativeMachineIdentity } from "./machine-identity"
 export { installLinuxApplicationUpdate } from "./linux-update-maintenance"
 export { LinuxPackageUpdate } from "./linux-update-package"
-export { LinuxUpdateResult, LinuxUpdateHandoffRequest, startLinuxUpdateHandoff, completeLinuxUpdateHandoff } from "./linux-update-handoff"
-export { WindowsUpdateResult, WindowsUpdateHandoffRequest, startWindowsUpdateHandoff, completeWindowsUpdateHandoff } from "./windows-update-handoff"
+export { relaunchLinuxAfterUpdate, LinuxUpdateHandoffRequest, startLinuxUpdateHandoff, completeLinuxUpdateHandoff } from "./linux-update-handoff"
+export { relaunchWindowsAfterUpdate, WindowsUpdateHandoffRequest, startWindowsUpdateHandoff, completeWindowsUpdateHandoff } from "./windows-update-handoff"
+export { PreparedUpdate, UpdateInstallation, PreparedUpdateStore, PreparedUpdateFailed, makePreparedUpdateStore, recordPreparedUpdateFailure } from "./prepared-update"
+export { acquireUpdateInstallationLease, isUpdateInstallationActive } from "./update-installation-lease"
+export { UpdatePreferences, UpdatePreferencesFailed, makeUpdatePreferences } from "./update-preferences"
+
+export { MacUpdateHandoff, MacUpdateHandoffRequest, MacUpdateHandoffFailed, startMacUpdateHandoff, relaunchMacAfterUpdate } from "./mac-update-handoff"

@@ -11,15 +11,15 @@ const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, tag: "@
 const request = Schema.decodeUnknownSync(UpdateRequest)({ protocol: "1", product: "desktop", version: "1.0.0", os: "darwin", os_version: "26.0", arch: "arm64", package: "mac-zip", channel: "stable", ts: "100", nonce: "ABCDEFGHIJKLMNOPQRSTUA" })
 describe("publisher-signed update manifest", () => {
   it("authenticates exact release bytes and the compatible target", async () => {
-    const envelope = await Effect.runPromise(signUpdateManifest(manifest, keyId, keys.privateKey))
+    const envelope = await Effect.runPromise(signUpdateManifest(manifest, keys.privateKey))
     const decoded = await Effect.runPromise(verifyUpdateManifest(envelope, trust))
     expect(decoded).toEqual(manifest)
     expect(acceptsUpdateManifest(decoded, request)).toBe(true)
   })
-  it("rejects payload changes, signature changes, unknown publishers, and installation keys", async () => {
-    const envelope = await Effect.runPromise(signUpdateManifest(manifest, keyId, keys.privateKey))
+  it("rejects mismatched stored content, signature changes, and installation keys", async () => {
+    const envelope = await Effect.runPromise(signUpdateManifest(manifest, keys.privateKey))
     const altered = { ...manifest, version: "3.0.0" }
-    for (const input of [{ ...envelope, payload: Buffer.from(JSON.stringify(altered)).toString("base64") }, { ...envelope, signature: "a".repeat(88) }, { ...envelope, keyId: "unknown" }]) {
+    for (const input of [{ ...envelope, manifest: altered }, { ...envelope, release: { ...envelope.release, signature: "a".repeat(88) } }, { ...envelope, keyId: "unknown" }]) {
       expect(Either.isLeft(await Effect.runPromise(Effect.either(verifyUpdateManifest(input, trust))))).toBe(true)
     }
     expect(Either.isLeft(await Effect.runPromise(Effect.either(verifyUpdateManifest(envelope, new Map([[keyId, generateKeyPairSync("ed25519").publicKey]])))))).toBe(true)

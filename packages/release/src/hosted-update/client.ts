@@ -1,10 +1,10 @@
-import { githubArtifactUrl } from "./github-artifact"
+import { isGithubReleaseAssetUrl } from "./github-artifact"
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "@effect/platform"
 import { Clock, Effect, Option, Schema, Stream } from "effect"
 import type { KeyObject } from "node:crypto"
 import { newUpdateNonce, updateQuery, type UpdateSigningFailed } from "./request-auth"
 import { UpdateRequest } from "./request"
-import { acceptsUpdateManifest, verifyUpdateManifest, SignedUpdateManifest, type UpdateManifest } from "./manifest"
+import { acceptsUpdateRelease, verifyUpdateRelease, UpdateRelease, ReleaseTarget } from "./release"
 import { releaseChannelOf } from "../client-update/release-channels"
 
 export const UpdateClientMetadata = UpdateRequest.pipe(Schema.omit("protocol", "product", "channel", "ts", "nonce"))
@@ -53,10 +53,11 @@ export const checkHostedUpdate = (options: HostedUpdateConnection & {
       : Effect.succeed({ chunks: [...state.chunks, chunk], size })
   }), Effect.mapError(() => new HostedUpdateCheckFailed({ reason: "response" })))
   const json = yield* Effect.try({ try: () => new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(bytes.chunks)), catch: () => new HostedUpdateCheckFailed({ reason: "response" }) })
-  const envelope = yield* Schema.decodeUnknown(Schema.parseJson(SignedUpdateManifest))(json, { onExcessProperty: "error" }).pipe(Effect.mapError(() => new HostedUpdateCheckFailed({ reason: "response" })))
-  const manifest = yield* verifyUpdateManifest(envelope, options.trustedPublishers).pipe(Effect.mapError(() => new HostedUpdateCheckFailed({ reason: "publisher" })))
-  if (!acceptsUpdateManifest(manifest, fields)) return yield* new HostedUpdateCheckFailed({ reason: "response" })
-  return Option.some({ manifest, envelope })
+  const offer = yield* Schema.decodeUnknown(Schema.parseJson(UpdateRelease))(json, { onExcessProperty: "error" }).pipe(Effect.mapError(() => new HostedUpdateCheckFailed({ reason: "response" })))
+  const target = yield* Schema.decodeUnknown(ReleaseTarget)({ os: fields.os, arch: fields.arch, package: fields.package }).pipe(Effect.mapError(() => new HostedUpdateCheckFailed({ reason: "request" })))
+  const release = yield* verifyUpdateRelease(offer, target, options.trustedPublishers).pipe(Effect.mapError(() => new HostedUpdateCheckFailed({ reason: "publisher" })))
+  if (!acceptsUpdateRelease(release, fields.version)) return yield* new HostedUpdateCheckFailed({ reason: "response" })
+  return Option.some(release)
 }).pipe(
   Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }),
   Effect.timeoutFail({ duration: "10 seconds", onTimeout: () => new HostedUpdateCheckFailed({ reason: "network" }) }),
@@ -64,14 +65,14 @@ export const checkHostedUpdate = (options: HostedUpdateConnection & {
 
 /** Resolve once, then transfer bytes without forwarding installation credentials to storage. */
 export const resolveHostedDownload = (options: HostedUpdateConnection & {
-  readonly manifest: UpdateManifest
+  readonly release: UpdateRelease
 }) => Effect.gen(function* () {
-  const { response, fields } = yield* signedRequest(options, "/api/download", { artifact: options.manifest.artifact.id, release: options.manifest.version })
-  if (!acceptsUpdateManifest(options.manifest, fields) || response.status !== 302) return yield* new HostedUpdateCheckFailed({ reason: "response" })
+  const { response, fields } = yield* signedRequest(options, "/api/download", { release: options.release.version })
+  if (!acceptsUpdateRelease(options.release, fields.version) || response.status !== 302) return yield* new HostedUpdateCheckFailed({ reason: "response" })
   return yield* Effect.try({ try: () => {
-    const expected = githubArtifactUrl(options.manifest)
-    if (response.headers.location !== expected) throw new Error("Unexpected artifact redirect")
-    return expected
+    const location = response.headers.location
+    if (!location || !isGithubReleaseAssetUrl(location)) throw new Error("Unexpected artifact redirect")
+    return location
   }, catch: () => new HostedUpdateCheckFailed({ reason: "response" }) })
 }).pipe(
   Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }),

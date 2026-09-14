@@ -256,6 +256,7 @@
         "@magnitudedev/acn-protocol": "workspace:*",
         "@magnitudedev/release": "workspace:*",
         "@magnitudedev/sdk": "workspace:*",
+        "@magnitudedev/storage": "workspace:*",
         "@magnitudedev/utils": "workspace:*",
         "dbus-native": "0.15.2",
         "effect": "3.21.2",

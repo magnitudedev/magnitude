@@ -3,6 +3,27 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { resolve } from "node:path";
 import { readFileSync } from "node:fs";
+import { isBuiltin } from "node:module";
+import type { Plugin } from "vite";
+
+if (process.versions.bun) {
+  throw new Error("Build Electron with Node.js installed on PATH; Bun's built-in modules differ from Electron's.");
+}
+
+// The installed app contains bundled JavaScript, not a repository node_modules tree.
+const bundledRuntime = (): Plugin => ({
+  name: "bundled-desktop-runtime",
+  generateBundle(_options, bundle) {
+    for (const output of Object.values(bundle)) {
+      if (output.type !== "chunk") continue;
+      for (const dependency of [...output.imports, ...output.dynamicImports]) {
+        if (dependency !== "electron" && !isBuiltin(dependency) && !bundle[dependency]) {
+          this.error(`Desktop runtime dependency was not bundled: ${dependency}`);
+        }
+      }
+    }
+  },
+});
 
 const acceptanceConfig = process.env.MAGNITUDE_UPDATE_ACCEPTANCE_CONFIG;
 const updateConfiguration = acceptanceConfig ? {
@@ -21,7 +42,7 @@ export default defineConfig({
       __MAGNITUDE_UPDATE_CONFIGURATION__: JSON.stringify(updateConfiguration),
       __MAGNITUDE_UPDATE_ACCEPTANCE__: JSON.stringify(Boolean(acceptanceConfig)),
     },
-    plugins: [{ name: "harness-skill-text", load(id) { if (id.endsWith(".md")) return `export default ${JSON.stringify(readFileSync(id, "utf8"))}` } }, {
+    plugins: [bundledRuntime(), { name: "harness-skill-text", load(id) { if (id.endsWith(".md")) return `export default ${JSON.stringify(readFileSync(id, "utf8"))}` } }, {
       name: "installed-update-trust",
       generateBundle() {
         this.emitFile({ type: "asset", fileName: "update-trust.json", source: JSON.stringify({ keyId: updateConfiguration.keyId, publicKey: updateConfiguration.publicKey }) });
@@ -40,6 +61,7 @@ export default defineConfig({
     },
   },
   preload: {
+    plugins: [bundledRuntime()],
     build: {
       externalizeDeps: false,
       rollupOptions: {

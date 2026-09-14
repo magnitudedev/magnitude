@@ -2,15 +2,15 @@ import { generateKeyPairSync } from "node:crypto"
 import { Effect, Option, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import { handleInstallerDownload } from "./installer"
-import { PublisherKeyId, signUpdateManifest, UpdateManifest, type SignedUpdateManifest } from "./manifest"
+import { PublisherKeyId, signUpdateManifest, UpdateManifest, type PublishedUpdate } from "./manifest"
 import { DistributionStore, DistributionStoreUnavailable, type InstallerDownloadObservation } from "./service"
 
 const publisher = generateKeyPairSync("ed25519"), keyId = PublisherKeyId.make("test")
 const options = { origin: "https://magnitude.dev", country: Option.some("US"), trustedPublishers: new Map([[keyId, publisher.publicKey]]) }
 const signed = (version = "2.0.0", pkg = "dmg") => Effect.runPromise(signUpdateManifest(Schema.decodeUnknownSync(UpdateManifest)({
   protocol: 1, tag: `@magnitudedev/cli@${version}`, version, commit: "a".repeat(40), artifact: { id: "mac", target: { os: "darwin", arch: "arm64", package: pkg }, filename: `mac.${pkg}`, bytes: 100, sha256: "a".repeat(64) },
-}), keyId, publisher.privateKey))
-const harness = (candidates: readonly SignedUpdateManifest[], overrides: Partial<DistributionStore> = {}) => {
+}), publisher.privateKey))
+const harness = (candidates: readonly PublishedUpdate[], overrides: Partial<DistributionStore> = {}) => {
   const records: (typeof InstallerDownloadObservation.Type)[] = []
   const store: DistributionStore = {
     admit: () => Effect.die("Public downloads must not create installation identities"),
@@ -42,7 +42,7 @@ describe("public installers", () => {
     expect((await harness([]).run()).status).toBe(404)
     expect((await harness([await signed()]).run("os=darwin&arch=x64&package=dmg")).status).toBe(404)
     const envelope = await signed()
-    expect((await harness([{ ...envelope, signature: "invalid" }]).run()).status).toBe(503)
+    expect((await harness([{ ...envelope, release: { ...envelope.release, signature: "invalid" } }]).run()).status).toBe(503)
   })
   it("serves verified installers through telemetry failure but fails closed on release-store failure", async () => {
     expect((await harness([await signed()], { recordInstallerDownload: () => new DistributionStoreUnavailable() }).run()).status).toBe(302)

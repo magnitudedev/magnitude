@@ -5,7 +5,7 @@ import { BunContext, BunRuntime } from "@effect/platform-bun"
 import { Config, Effect, Option, Schema } from "effect"
 import { join } from "node:path"
 import { ReleaseArtifactSchema } from "../../src/contracts"
-import { decodePublisherPrivateKey, PublisherKeyId, SignedUpdateManifest, UpdateManifest } from "../../src/hosted-update/manifest"
+import { decodePublisherPrivateKey, PublisherKeyId, PublishedUpdate, UpdateManifest } from "../../src/hosted-update/manifest"
 import { prepareHostedRelease } from "../../src/hosted-update/publication"
 import { isValidVersion } from "../../src/client-update/release-channels"
 
@@ -37,7 +37,7 @@ const run = Effect.gen(function* () {
   yield* verifyGithubRelease(manifests, Option.some(token))
   const envelopes = yield* prepareHostedRelease({ artifacts: manifests, keyId: PublisherKeyId.make("acceptance"), privateKey: key,
   })
-  yield* fs.writeFileString(join(directory, "prepared-manifests.json"), yield* Schema.encode(Schema.parseJson(Schema.Array(SignedUpdateManifest)))(envelopes))
+  yield* fs.writeFileString(join(directory, "prepared-manifests.json"), yield* Schema.encode(Schema.parseJson(Schema.Array(PublishedUpdate)))(envelopes))
   yield* Effect.logInfo("Acceptance artifacts published to GitHub, verified and publisher-signed; no channel promoted", { version, artifacts: envelopes.length })
 })
 BunRuntime.runMain(run.pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer])))

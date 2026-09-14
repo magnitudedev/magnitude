@@ -28,17 +28,22 @@ export const macUpdateJobIsActive = (output: string, executable: string) => Effe
   return state !== "not running"
 })
 
-export const NativeMacApplicationInstallation = Layer.succeed(MacApplicationInstallation, {
-  isInstalling: bundle => Effect.gen(function* () {
-    const canonical = yield* Effect.tryPromise({ try: () => realpath(bundle), catch: () => new MacInstallationObservationFailed({ message: "Could not locate the Magnitude app while checking its update." }) })
-    const metadata = yield* command("/usr/bin/plutil", ["-extract", "CFBundleIdentifier", "raw", "-o", "-", "--", join(canonical, "Contents/Info.plist")])
-    const identifier = metadata.stdout.trim()
-    if (metadata.code !== 0 || !/^[A-Za-z0-9.-]+$/.test(identifier)) return yield* new MacInstallationObservationFailed({ message: "Could not read the installed Magnitude app identity." })
+/** Capture bundle identity while it is stable, before replacement can temporarily move it. */
+export const observeMacApplicationInstallation = (bundle: string) => Effect.gen(function* () {
+  const canonical = yield* Effect.tryPromise({ try: () => realpath(bundle), catch: () => new MacInstallationObservationFailed({ message: "Could not locate the Magnitude app while checking its update." }) })
+  const metadata = yield* command("/usr/bin/plutil", ["-extract", "CFBundleIdentifier", "raw", "-o", "-", "--", join(canonical, "Contents/Info.plist")])
+  const identifier = metadata.stdout.trim()
+  if (metadata.code !== 0 || !/^[A-Za-z0-9.-]+$/.test(identifier)) return yield* new MacInstallationObservationFailed({ message: "Could not read the installed Magnitude app identity." })
+  return Effect.gen(function* () {
     const job = yield* command("/bin/launchctl", ["print", `gui/${process.getuid!()}/${identifier}.ShipIt`])
     if (job.code === 113) return false
     if (job.code !== 0) return yield* new MacInstallationObservationFailed({ message: "Could not inspect the native Magnitude update job. Retry the command." })
     return yield* macUpdateJobIsActive(job.stdout, join(canonical, "Contents/Frameworks/Squirrel.framework/Resources/ShipIt"))
-  }),
+  })
+})
+
+export const NativeMacApplicationInstallation = Layer.succeed(MacApplicationInstallation, {
+  isInstalling: bundle => observeMacApplicationInstallation(bundle).pipe(Effect.flatten),
 })
 
 /** Cold launch waits for the existing installer; it never cancels, replaces, or starts it. */

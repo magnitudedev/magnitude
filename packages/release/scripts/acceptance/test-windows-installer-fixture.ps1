@@ -1,5 +1,12 @@
 param([Parameter(Mandatory=$true)][string]$Root)
 $ErrorActionPreference = 'Stop'
+$data = Join-Path $Root 'user-data'
+$state = Join-Path $data 'state'
+$env:MAGNITUDE_DEV_DATA_DIR = $data
+$env:MAGNITUDE_DESKTOP_STATE_DIR = $state
+$addon = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..\daemon-management\dist\native\win32-x64\desktop-host.node'))
+& bun -e 'const native=require(process.argv[1]); for (const path of process.argv.slice(2)) native.preparePrivateDirectory(path)' $addon $data $state (Join-Path $data 'updates')
+if ($LASTEXITCODE -ne 0) { throw 'Native fixture profile initialization failed' }
 $installation = Join-Path $env:LOCALAPPDATA 'Programs\Magnitude'
 $registration = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\MagnitudeDesktop'
 if (Test-Path $installation) { throw 'Installer fixture requires an unused installation path' }
@@ -32,16 +39,20 @@ $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $startup = '"' + (Join-Path $installation 'Magnitude.exe') + '" --background'
 New-Item -Path $run -Force | Out-Null
 New-ItemProperty -Path $run -Name 'dev.magnitude.desktop' -Value $startup -PropertyType String -Force | Out-Null
-$state = Join-Path $Root 'update-state'
-$prepared = Join-Path $state ('application-updates\prepared-' + [Guid]::NewGuid())
+$prepared = Join-Path $state ('update-helpers\helper-' + [Guid]::NewGuid())
 New-Item -ItemType Directory -Force $prepared | Out-Null
-$helper = Join-Path $prepared 'magnitude-update.exe'
+$helper = Join-Path $prepared 'magnitude.exe'
 & bun (Join-Path $PSScriptRoot '..\..\..\version\scripts\generate-version.ts')
 if ($LASTEXITCODE -ne 0) { throw 'Update helper build identity generation failed' }
 & bun build (Join-Path $PSScriptRoot 'windows-update-handoff-entry.ts') --compile "--outfile=$helper"
 if ($LASTEXITCODE -ne 0) { throw 'Update handoff bootstrap compilation failed' }
-Copy-Item -LiteralPath $next -Destination (Join-Path $prepared 'magnitude-setup.exe')
-$request = @{ stateDirectory=$state; preparedDirectory=$prepared; applicationPath=(Join-Path $installation 'Magnitude.exe'); version='1.2.4'; showWindow=$false; envelope=@{keyId='fixture';payload='';signature=''} }
+Copy-Item -LiteralPath $addon -Destination (Join-Path $prepared 'desktop-host.node')
+Copy-Item -LiteralPath $next -Destination (Join-Path $data 'updates\magnitude-setup.exe')
+$release = @{ version='1.2.4'; bytes=(Get-Item $next).Length; sha256=(Get-FileHash $next -Algorithm SHA256).Hash.ToLowerInvariant(); signature=('A' * 86 + '==') }
+# This inert installer fixture exercises native ownership and handoff, not publisher cryptography.
+@{ release=$release; installation=@{_tag='Attempted'} } | ConvertTo-Json -Depth 5 -Compress | Set-Content -Encoding utf8 (Join-Path $data 'updates\update.json')
+$request = @{ stateDirectory=$state; helperDirectory=$prepared; dataDirectory=$data; applicationPath=(Join-Path $installation 'Magnitude.exe'); showWindow=$false; release=$release }
+
 $start = [Diagnostics.ProcessStartInfo]::new($helper)
 $start.WorkingDirectory = $prepared
 $start.UseShellExecute = $false
@@ -50,7 +61,7 @@ $start.RedirectStandardInput = $true
 $start.RedirectStandardOutput = $true
 $process = [Diagnostics.Process]::Start($start)
 try {
-  $process.StandardInput.WriteLine(($request | ConvertTo-Json -Compress))
+  $process.StandardInput.WriteLine(($request | ConvertTo-Json -Depth 5 -Compress))
   $ready = $process.StandardOutput.ReadLineAsync()
   if (!$ready.Wait(10000) -or $ready.Result -ne 'ready') { throw 'Update helper did not acknowledge readiness' }
   if ($process.WaitForExit(100)) { throw 'Update helper exited before its owner' }
@@ -58,8 +69,9 @@ try {
   $process.StandardInput.Close()
   if (!$process.WaitForExit(60000)) { throw 'Update handoff did not finish installation' }
   if ($process.ExitCode -ne 0) { throw 'Update helper failed' }
-  $result = Get-Content -Raw (Join-Path $state 'update-result.json') | ConvertFrom-Json
-  if ($result.request.version -ne '1.2.4' -or $result.error) { throw 'Update helper did not record installer success' }
+  $result = Get-Content -Raw (Join-Path $data 'updates\update.json') | ConvertFrom-Json
+  if ($result.release.version -ne '1.2.4' -or $result.installation._tag -ne 'Attempted') { throw 'Successful helper must leave reconciliation to the installed app' }
+  if (!(Test-Path (Join-Path $data 'updates\magnitude-setup.exe'))) { throw 'Helper discarded the retained installer' }
 } finally {
   if (!$process.HasExited) { $process.Kill(); $process.WaitForExit() }
   $process.Dispose()

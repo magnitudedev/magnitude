@@ -18,18 +18,19 @@ const check = (fetch: (...args: Parameters<typeof globalThis.fetch>) => Promise<
 }).pipe(Effect.provide(FetchHttpClient.layer), Effect.provideService(FetchHttpClient.Fetch, Object.assign(fetch, { preconnect: () => {} })))
 
 describe("hosted update client", () => {
-  it("signs the download selector and resolves only the exact trusted storage path without following it", async () => {
+  it("signs the download selector and resolves only the trusted GitHub release repository without following it", async () => {
     const expected = githubArtifactUrl(manifest)
+    const release = (await Effect.runPromise(signUpdateManifest(manifest, publisher.privateKey))).release
     for (const location of [expected, "https://untrusted.example/file.zip", `${expected}?changed=1`]) {
       let calls = 0
       const result = await Effect.runPromise(resolveHostedDownload({ origin: "https://magnitude.dev", metadata,
-        sign: url => signUpdateRequest(installation.privateKey, url), userAgent: "Magnitude/1.0.0", manifest,
+        sign: url => signUpdateRequest(installation.privateKey, url), userAgent: "Magnitude/1.0.0", release,
       }).pipe(Effect.provide(FetchHttpClient.layer), Effect.provideService(FetchHttpClient.Fetch, Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
         calls++
         const request = new Request(input, init), url = new URL(request.url)
         expect(init?.redirect).toBe("manual")
         expect(url.pathname).toBe("/api/download")
-        expect(url.searchParams.get("artifact")).toBe(manifest.artifact.id)
+        expect(url.searchParams.has("artifact")).toBe(false)
         expect(url.searchParams.get("release")).toBe(manifest.version)
         expect(await Effect.runPromise(verifyUpdateRequest(request.headers.get("authorization")!, url))).toBe(await Effect.runPromise(installationId(installation.publicKey)))
         return new Response(null, { status: 302, headers: { location } })
@@ -53,14 +54,14 @@ describe("hosted update client", () => {
     expect(calls).toBe(1)
   })
   it("accepts only a matching newer publisher-signed artifact", async () => {
-    const envelope = await Effect.runPromise(signUpdateManifest(manifest, keyId, publisher.privateKey))
-    const result = await Effect.runPromise(check(async () => Response.json(envelope)))
-    expect(Option.getOrThrow(result)).toEqual({ manifest, envelope })
+    const envelope = await Effect.runPromise(signUpdateManifest(manifest, publisher.privateKey))
+    const result = await Effect.runPromise(check(async () => Response.json(envelope.release)))
+    expect(Option.getOrThrow(result)).toEqual(envelope.release)
     for (const rejected of [{ ...manifest, version: "0.9.0", tag: "@magnitudedev/cli@0.9.0", artifact: { ...manifest.artifact, filename: "app.zip" } }, { ...manifest, artifact: { ...manifest.artifact, target: { ...manifest.artifact.target, arch: "x64" as const } } }]) {
-      const offer = await Effect.runPromise(signUpdateManifest(rejected, keyId, publisher.privateKey))
-      expect(Either.isLeft(await Effect.runPromise(Effect.either(check(async () => Response.json(offer)))))).toBe(true)
+      const offer = await Effect.runPromise(signUpdateManifest(rejected, publisher.privateKey))
+      expect(Either.isLeft(await Effect.runPromise(Effect.either(check(async () => Response.json(offer.release)))))).toBe(true)
     }
-    expect(Either.isLeft(await Effect.runPromise(Effect.either(check(async () => Response.json({ ...envelope, signature: "bad" })))))).toBe(true)
+    expect(Either.isLeft(await Effect.runPromise(Effect.either(check(async () => Response.json({ ...envelope.release, signature: "bad" })))))).toBe(true)
   })
   it.each([301, 302, 401, 409, 429, 500, 503])("does not turn HTTP %s into current or retry it", async status => {
     let calls = 0

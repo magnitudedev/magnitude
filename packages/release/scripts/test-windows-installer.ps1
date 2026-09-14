@@ -4,6 +4,11 @@ $projectRoot = [IO.Path]::GetFullPath((Join-Path $packageRoot '..\..'))
 . (Join-Path $projectRoot 'packages\daemon-management\scripts\windows-toolchain.ps1') -TargetArchitecture x86
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('Magnitude installer tests ' + [Guid]::NewGuid())
 New-Item -ItemType Directory $testRoot | Out-Null
+$previousDataDirectory = $env:MAGNITUDE_DEV_DATA_DIR
+$previousStateDirectory = $env:MAGNITUDE_DESKTOP_STATE_DIR
+$env:MAGNITUDE_DEV_DATA_DIR = Join-Path $testRoot 'native-user-data'
+$env:MAGNITUDE_DESKTOP_STATE_DIR = Join-Path $env:MAGNITUDE_DEV_DATA_DIR 'state'
+New-Item -ItemType Directory $env:MAGNITUDE_DEV_DATA_DIR | Out-Null
 Push-Location $testRoot
 try {
   $helper = Join-Path $testRoot 'MagnitudeInstallGuard.dll'
@@ -11,7 +16,7 @@ try {
   & cl.exe /nologo /W4 /WX /O2 /MT /std:c11 /D_WIN32_WINNT=0x0A00 /D_CRT_SECURE_NO_WARNINGS `
     "/I$(Join-Path $projectRoot 'packages\daemon-management\native')" `
     (Join-Path $projectRoot 'packages\daemon-management\native\windows-security.c') `
-    (Join-Path $packageRoot 'native\windows-installer.test.c') /Fe:windows-installer-test.exe /link /WX advapi32.lib
+    (Join-Path $packageRoot 'native\windows-installer.test.c') /Fe:windows-installer-test.exe /link /WX /MANIFEST:EMBED "/MANIFESTUAC:level='asInvoker' uiAccess='false'" advapi32.lib
   if ($LASTEXITCODE -ne 0) { throw 'Native installer test compilation failed.' }
   & (Join-Path $testRoot 'windows-installer-test.exe') $helper
   if ($LASTEXITCODE -ne 0) { throw 'Native installer configuration preservation failed.' }
@@ -32,6 +37,8 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'Production NSIS fixture compilation failed' }
   & (Join-Path $PSScriptRoot 'acceptance\test-windows-installer-fixture.ps1') -Root $testRoot
 } finally {
+  $env:MAGNITUDE_DEV_DATA_DIR = $previousDataDirectory
+  $env:MAGNITUDE_DESKTOP_STATE_DIR = $previousStateDirectory
   Remove-Item Env:MAGNITUDE_INSTALLER_TEST_ROOT -ErrorAction SilentlyContinue
   Remove-Item Env:MAGNITUDE_INSTALLER_TEST_NSIS -ErrorAction SilentlyContinue
   Pop-Location
