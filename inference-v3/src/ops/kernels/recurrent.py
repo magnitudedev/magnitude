@@ -239,9 +239,11 @@ def _register_delta_recurrence(
             state[chunk] = 0.0
             if channel < value_width and reduction < key_width:
                 state[chunk] = previous[sequence, head, channel, reduction]
-        count = offsets[sequence + 1] - offsets[sequence]
-        for step in T.serial(count):
-            row = offsets[sequence] + step
+        # An absolute bounded row domain lets lowering prove each input access
+        # is valid while retaining runtime sequence lengths and packed offsets.
+        for row in T.serial(
+            T.max(0, offsets[sequence]), T.min(query.shape[0], offsets[sequence + 1])
+        ):
             partial[0] = 0.0
             for chunk in T.unroll(T.ceildiv(key_width, lanes), explicit=True):
                 reduction = (
