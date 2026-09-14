@@ -76,8 +76,8 @@ outstanding executions.
 
 Magnitensor gives TileLang an ordered ABI, Python-authored TileLang kernel work,
 its static binding choices and a target. TileLang's public eager builder creates
-the final portable `PrimFunc`; its runtime returns an opaque pre-bound native
-entrypoint and target capability information. Magnitensor does not select
+the final portable single-entry `IRModule`; its runtime returns an opaque pre-bound
+native entrypoint and target capability information. Magnitensor does not select
 compiler passes, adapter internals, flags or backend pipelines.
 
 Magnitensor's runtime adapter opens the physical execution domain and may use

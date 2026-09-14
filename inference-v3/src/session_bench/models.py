@@ -110,9 +110,14 @@ def select(root: Path, models: list[str], engines: list[str], targets: list[str]
             engine, separator, reference = item.partition("=")
             if not separator:
                 raise ValueError("--target requires ENGINE=ARTIFACT")
-            selected.append(Target.model_validate({
-                "engine": engine, "reference": normalize_reference(reference, root),
-            }))
+            selected.append(
+                Target.model_validate(
+                    {
+                        "engine": engine,
+                        "reference": normalize_reference(reference, root),
+                    }
+                )
+            )
     else:
         if not models:
             raise ValueError("--model is required (aliases live in inference-v3/models.local.json)")

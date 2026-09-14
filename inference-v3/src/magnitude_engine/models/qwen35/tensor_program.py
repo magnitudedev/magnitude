@@ -110,10 +110,17 @@ class TensorProgram:
             resource = self.weights[descriptor.name]
             if resource.device is not device or resource.spec.shape != descriptor.shape:
                 raise ValueError(f"resident weight {descriptor.name!r} has incompatible ownership")
-        self._compiled: dict[tuple[str, InvocationSpecs], mt.CompiledFunction] = {}
+        self._compiled: dict[tuple[str, InvocationSpecs, str], mt.CompiledFunction] = {}
 
-    def specialize(self, mode: str, specs: InvocationSpecs) -> mt.CompiledFunction:
-        key = mode, specs
+    def specialize(
+        self,
+        mode: str,
+        specs: InvocationSpecs,
+        *,
+        static_resources: Mapping[int | str, mt.Resource] | None = None,
+        precision: str = "model",
+    ) -> mt.CompiledFunction:
+        key = mode, specs, precision
         compiled = self._compiled.get(key)
         if compiled is not None:
             return compiled
@@ -122,12 +129,14 @@ class TensorProgram:
             {name: resource.spec for name, resource in self.weights.items()},
             mode,
             specs,
+            precision=precision,
         )
         compiled = mt.compile(
             definition.function,
             signature=definition.signature,
             device=self.device,
             constants=cast(Mapping[int | str, mt.Resource], self.weights),
+            static_resources=static_resources,
             options=definition.options,
         )
         self._compiled[key] = compiled
@@ -144,6 +153,8 @@ def define(
     weight_specs: Mapping[str, mt.TensorSpec],
     mode: str,
     specs: InvocationSpecs,
+    *,
+    precision: str = "model",
 ) -> ProgramDefinition:
     """Build Qwen's semantic function and ABI without compiling or allocating it."""
     if mode not in {"prefill", "decode"}:
@@ -179,8 +190,7 @@ def define(
         arguments.append(mt.Argument(specs.output_rows, "output_rows"))
         arguments.append(mt.Argument(cast(mt.TensorSpec, specs.draws), "draws"))
     arguments.extend(
-        mt.Argument(spec, f"feature.{index}.rows")
-        for index, spec in enumerate(specs.feature_rows)
+        mt.Argument(spec, f"feature.{index}.rows") for index, spec in enumerate(specs.feature_rows)
     )
 
     def function(*args, **bound):
@@ -209,8 +219,7 @@ def define(
         delta = tuple(
             _concatenate_batch(
                 tuple(
-                    bound[f"recurrent.{layer}.{sequence}.delta"]
-                    for sequence in range(specs.batch)
+                    bound[f"recurrent.{layer}.{sequence}.delta"] for sequence in range(specs.batch)
                 )
             )
             for layer in range(recurrent)
@@ -238,7 +247,7 @@ def define(
     return ProgramDefinition(
         function,
         mt.Signature(tuple(arguments), kwargs),
-        mt.CompileOptions(mode=mode),
+        mt.CompileOptions(mode=mode, precision=precision),
         {name: weight_specs[name] for name in expected},
     )
 

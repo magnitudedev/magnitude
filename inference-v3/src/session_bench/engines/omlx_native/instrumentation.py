@@ -172,9 +172,8 @@ def _patch_batched_instrumentation() -> None:
             request = self.running.get(request_id)
             if request is None:
                 raise RuntimeError("oMLX response has no running request for native timing")
-            if (
-                metric.prompt_ms is None
-                and int(request.num_prompt_tokens) == int(request.cached_tokens or 0)
+            if metric.prompt_ms is None and int(request.num_prompt_tokens) == int(
+                request.cached_tokens or 0
             ):
                 # A fully cached prompt performs no prompt evaluation.
                 metric.prompt_ms = 0.0

@@ -1,7 +1,8 @@
 """Portable TileLang schedules and capability-selected lowering rules."""
 
-from .attention import AttentionOutputRule, OnlineAttentionRule
+from .attention import AttentionOutputRule, CausalAttentionRule
 from .attention_fusion import AttentionPrepareAppendRule
+from .chunked_recurrent import ChunkedDeltaRule
 from .experts import DenseSwiGLURule, RoutedSharedExpertsRule, SelectedExpertsRule
 from .fusion import PointwiseFusionRule
 from .grouped_experts import GroupedExpertsRule
@@ -11,7 +12,7 @@ from .matrix import (
     PackedMatrixRule,
     ParallelPackedMatrixRule,
 )
-from .normalization import RMSRule, ResidualRMSRule, RowDotRule
+from .normalization import ResidualRMSRule, RMSRule, RowDotRule
 from .portable import PrimitiveLoweringRule
 from .recurrent import GatedDeltaRule, RecurrentOutputRule, RecurrentPrepareRule
 from .routing import RouterTopKRule, RoutingRule
@@ -28,7 +29,7 @@ def register_builtin_lowerings(registry) -> None:
         SelectedExpertsRule(),
         RoutedSharedExpertsRule(),
         GroupedExpertsRule(),
-        OnlineAttentionRule(),
+        CausalAttentionRule(),
         AttentionOutputRule(),
         AttentionPrepareAppendRule(),
         ResidualRMSRule(),
@@ -37,6 +38,7 @@ def register_builtin_lowerings(registry) -> None:
         PointwiseFusionRule(),
         RecurrentPrepareRule(),
         GatedDeltaRule(),
+        ChunkedDeltaRule(),
         RecurrentOutputRule(),
         RoutingRule(),
         RouterTopKRule(),
@@ -54,9 +56,10 @@ __all__ = [
     "RoutedSharedExpertsRule",
     "GroupedExpertsRule",
     "GatedDeltaRule",
+    "ChunkedDeltaRule",
     "PackedEmbeddingRule",
     "ParallelPackedMatrixRule",
-    "OnlineAttentionRule",
+    "CausalAttentionRule",
     "AttentionOutputRule",
     "AttentionPrepareAppendRule",
     "PointwiseFusionRule",

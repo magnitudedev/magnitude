@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -155,9 +154,7 @@ def _whole_bytes(bits: int) -> int:
     return bits // 8
 
 
-def canonical_layout(
-    representation: Affine | Codebook, elements: int
-) -> CanonicalLayout:
+def canonical_layout(representation: Affine | Codebook, elements: int) -> CanonicalLayout:
     """Return the sole physical layout consumed by Magnitensor schedules."""
     if elements <= 0 or elements % representation.group:
         raise ValueError("encoded storage requires complete quantization groups")
@@ -172,9 +169,13 @@ def canonical_layout(
     if isinstance(coefficients, DirectCoefficients):
         groups = elements // representation.group
         low = 0
-        high = _whole_bytes(elements * low_bits) if high_bits else None
-        scales = _whole_bytes(elements * (low_bits + high_bits))
-        biases = scales + groups * coefficients.scale_dtype.itemsize if coefficients.has_bias else None
+        low_bytes = (elements * low_bits + 7) // 8
+        high = low_bytes if high_bits else None
+        high_bytes = (elements * high_bits + 7) // 8
+        scales = low_bytes + high_bytes
+        biases = (
+            scales + groups * coefficients.scale_dtype.itemsize if coefficients.has_bias else None
+        )
         end = scales + groups * coefficients.scale_dtype.itemsize
         if coefficients.bias_dtype is not None:
             end += groups * coefficients.bias_dtype.itemsize

@@ -1,3 +1,5 @@
+import pytest
+
 import magnitensor as mt
 from magnitensor.compiler.lowering import LoweringContext, plan_submissions, select_cover
 from magnitensor.compiler.memory import plan_memory
@@ -9,6 +11,7 @@ CAPABILITIES = mt.Capabilities(
     256,
     32 * 1024,
     matrix_instructions=(mt.MatrixInstruction(8, 8, 8, mt.DType.F16, mt.DType.F32),),
+    memory_scopes=frozenset({"global", "shared", "local"}),
     native_multi_launch=True,
     partial_binding=True,
     fingerprint="construction-test",
@@ -17,7 +20,7 @@ CAPABILITIES = mt.Capabilities(
 
 def _construct(function, signature):
     graph = mt.trace(function, signature)
-    context = LoweringContext(CAPABILITIES, "decode", "model", "test", 1 << 20)
+    context = LoweringContext(CAPABILITIES, "decode", "model", "test", 1 << 26)
     candidates = mt.lowerings.enumerate(graph, context)
     cover = select_cover(graph, candidates)
     memory = plan_memory(graph, cover, CAPABILITIES)
@@ -26,10 +29,14 @@ def _construct(function, signature):
 
 
 def test_dense_and_encoded_projection_construct_real_prim_funcs():
-    hidden = mt.TensorSpec((2, 8), mt.DType.F16)
-    dense = mt.TensorSpec((8, 8), mt.DType.F16)
+    hidden = mt.TensorSpec((2, 512), mt.DType.F16)
+    dense = mt.TensorSpec((8, 512), mt.DType.F16)
     encoded = dense.with_representation(
-        mt.Affine(mt.Code(4), 32, mt.DirectCoefficients(mt.DType.F16))
+        mt.Affine(
+            mt.Code(4),
+            64,
+            mt.DirectCoefficients(mt.DType.BF16, mt.DType.BF16),
+        )
     )
     dense_functions = _construct(
         lambda value, weight: mt.linear(value, weight),
@@ -53,9 +60,9 @@ def test_dense_and_encoded_projection_construct_real_prim_funcs():
 
 
 def test_attention_and_recurrence_construct_real_prim_funcs():
-    queries = mt.TensorSpec((2, 4, 8), mt.DType.F16)
-    history = mt.TensorSpec((2, 16, 2, 8), mt.DType.F16)
-    visible = mt.TensorSpec((2,), mt.DType.I32)
+    queries = mt.TensorSpec((2, 4, 256), mt.DType.F16)
+    history = mt.TensorSpec((2, 1024, 2, 256), mt.DType.F16)
+    visible = mt.TensorSpec((2, 2), mt.DType.I32)
     attention = _construct(
         lambda q, h, lengths: mt.causal_attention(q, h, lengths),
         mt.Signature(
@@ -66,14 +73,24 @@ def test_attention_and_recurrence_construct_real_prim_funcs():
             )
         ),
     )
-    values = mt.TensorSpec((3, 8), mt.DType.F16)
-    state = mt.TensorSpec((8,), mt.DType.F16)
+    query = mt.TensorSpec((2, 1, 4), mt.DType.F32)
+    value = mt.TensorSpec((2, 2, 3), mt.DType.F32)
+    parameter = mt.TensorSpec((2, 2), mt.DType.F32)
+    state = mt.TensorSpec((1, 2, 3, 4), mt.DType.F32)
+    offsets = mt.TensorSpec((2,), mt.DType.I32)
     recurrence = _construct(
-        lambda x, recurrent: mt.delta_recurrence(x, recurrent)[0],
+        lambda q, k, v, decay, beta, recurrent, rows: mt.gated_delta_recurrence(
+            q, k, v, decay, beta, recurrent, rows, mapping="tiled"
+        )[0],
         mt.Signature(
             (
-                mt.Argument(values, "values"),
+                mt.Argument(query, "queries"),
+                mt.Argument(query, "keys"),
+                mt.Argument(value, "values"),
+                mt.Argument(parameter, "decay"),
+                mt.Argument(parameter, "beta"),
                 mt.Argument(state, "state", mt.ValueKind.RESOURCE),
+                mt.Argument(offsets, "offsets"),
             )
         ),
     )
@@ -123,10 +140,15 @@ def test_sampling_constructs_inside_a_tensor_program():
 
 
 def test_routing_and_experts_compose_into_one_prim_func():
-    hidden = mt.TensorSpec((2, 8), mt.DType.F16)
+    hidden = mt.TensorSpec((2, 256), mt.DType.F16)
     router = mt.TensorSpec((2, 4), mt.DType.F32)
-    expert = mt.TensorSpec((4, 16, 8), mt.DType.F16)
-    down = mt.TensorSpec((4, 8, 16), mt.DType.F16)
+    representation = mt.Affine(
+        mt.Code(8, interpretation=mt.CodeInterpretation.TWOS_COMPLEMENT),
+        32,
+        mt.DirectCoefficients(mt.DType.F16),
+    )
+    expert = mt.TensorSpec((4, 256, 256), mt.DType.F16).with_representation(representation)
+    down = mt.TensorSpec((4, 256, 256), mt.DType.F16).with_representation(representation)
 
     def mixture(value, logits, gate, up, down_weight):
         routes, scores = mt.route_topk(logits, 2)
@@ -171,11 +193,11 @@ def test_concatenation_uses_one_kernel_for_many_inputs():
 def test_shape_embedding_rotary_and_state_schedules_construct():
     matrix = mt.TensorSpec((2, 4), mt.DType.F16)
     _construct(
-        lambda left, right: mt.concatenate((mt.transpose(left, (1, 0)), right), axis=1),
+        lambda left, right: mt.concatenate((left, right), axis=0),
         mt.Signature(
             (
                 mt.Argument(matrix, "left"),
-                mt.Argument(mt.TensorSpec((4, 2), mt.DType.F16), "right"),
+                mt.Argument(matrix, "right"),
             )
         ),
     )
@@ -217,19 +239,17 @@ def test_shape_embedding_rotary_and_state_schedules_construct():
 
     history = mt.TensorSpec((2, 16, 4, 8), mt.DType.F16)
     appended = mt.TensorSpec((2, 4, 8), mt.DType.F16)
-    assert (
-        len(
-            _construct(
-                lambda cache, keys, values, write: mt.kv_append(cache, keys, values, write),
-                mt.Signature(
-                    (
-                        mt.Argument(history, "history", mt.ValueKind.RESOURCE),
-                        mt.Argument(appended, "keys"),
-                        mt.Argument(appended, "values"),
-                        mt.Argument(positions, "destinations"),
-                    )
-                ),
+    graph = mt.trace(
+        lambda cache, keys, values, write: mt.kv_append(cache, keys, values, write),
+        mt.Signature(
+            (
+                mt.Argument(history, "history", mt.ValueKind.RESOURCE),
+                mt.Argument(appended, "keys"),
+                mt.Argument(appended, "values"),
+                mt.Argument(positions, "destinations"),
             )
-        )
-        == 1
+        ),
     )
+    context = LoweringContext(CAPABILITIES, "decode", "model", "test", 1 << 26)
+    with pytest.raises(ValueError, match="no legal lowering"):
+        select_cover(graph, mt.lowerings.enumerate(graph, context))

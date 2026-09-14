@@ -17,10 +17,10 @@ def _packed_embedding(indices, table, output, table_spec, tokens, width, threads
     assert packet is not None
     with T.Kernel(tokens, threads=threads) as token:
         row = indices[token]
-        for iteration in T.serial(T.ceildiv(width // packet.packet, threads)):
+        for iteration in T.serial(T.ceildiv(width // packet.matrix_packet, threads)):
             packet_index = iteration * threads + T.get_thread_binding()
-            if packet_index < width // packet.packet:
-                first = packet_index * packet.packet
+            if packet_index < width // packet.matrix_packet:
+                first = packet_index * packet.matrix_packet
                 decode_packet(output, token, first, table, table_spec, row, first)
 
 
@@ -30,8 +30,13 @@ class _PackedEmbeddingEmitter:
 
     def __call__(self, operands: tuple[Any, ...]) -> None:
         _packed_embedding(
-            operands[0], operands[1], operands[2], self.table_spec,
-            self.tokens, self.width, self.threads,
+            operands[0],
+            operands[1],
+            operands[2],
+            self.table_spec,
+            self.tokens,
+            self.width,
+            self.threads,
         )
 
 
@@ -48,15 +53,20 @@ class PackedEmbeddingRule:
             return ()
         tokens = indices.elements
         width = cast(int, table.shape[1])
-        if width % packet.packet:
+        if width % packet.matrix_packet:
             return ()
         threads = min(128, context.capabilities.threads_per_group)
-        return (Candidate(
-            f"embedding.packet@{root}", frozenset({root}), node.inputs, node.outputs,
-            _PackedEmbeddingEmitter(table, tokens, width, threads),
-            2e-7 + tokens * width * table.storage_nbytes / table.elements / 4e12,
-            priority=60,
-        ),)
+        return (
+            Candidate(
+                f"embedding.packet@{root}",
+                frozenset({root}),
+                node.inputs,
+                node.outputs,
+                _PackedEmbeddingEmitter(table, tokens, width, threads),
+                2e-7 + tokens * width * table.storage_nbytes / table.elements / 4e12,
+                priority=60,
+            ),
+        )
 
 
 __all__ = ["PackedEmbeddingRule"]

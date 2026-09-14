@@ -124,9 +124,7 @@ def _transpose_kernel(source, output, source_shape, output_shape, axes, threads)
 
 
 @T.macro
-def _concatenate_kernel(
-    sources, output, source_shapes, output_shape, axis, output_dtype, threads
-):
+def _concatenate_kernel(sources, output, source_shapes, output_shape, axis, output_dtype, threads):
     elements = _elements(output_shape)
     with T.Kernel(T.ceildiv(elements, threads), threads=threads) as block:
         for lane in T.Parallel(threads):
@@ -185,6 +183,10 @@ def _overlay_rows_kernel(
 
 @T.macro
 def _quantized_import_kernel(source, target, extent, target_spec, codec, staged_tiles, threads):
+    # Represented resources use a word-oriented compute ABI.  Residency owns
+    # construction of the byte-exact canonical format, so alias that storage
+    # as bytes only for this import kernel.
+    target_bytes = T.decl_buffer((target_spec.storage_nbytes,), "uint8", data=target.data)
     representation = target_spec.representation
     resident = canonical_layout(representation, target_spec.elements)
     elements = target_spec.elements
@@ -216,9 +218,9 @@ def _quantized_import_kernel(source, target, extent, target_spec, codec, staged_
                 byte = bit // 8
                 lane = bit % 8
                 if lane == 0:
-                    target[target_base + resident.low + byte] = 0
-                target[target_base + resident.low + byte] = T.cast(
-                    target[target_base + resident.low + byte]
+                    target_bytes[target_base + resident.low + byte] = 0
+                target_bytes[target_base + resident.low + byte] = T.cast(
+                    target_bytes[target_base + resident.low + byte]
                     | ((value & ((1 << low_bits) - 1)) << lane),
                     "uint8",
                 )
@@ -227,9 +229,9 @@ def _quantized_import_kernel(source, target, extent, target_spec, codec, staged_
                     high_byte = high_bit // 8
                     high_lane = high_bit % 8
                     if high_lane == 0:
-                        target[target_base + resident.high + high_byte] = 0
-                    target[target_base + resident.high + high_byte] = T.cast(
-                        target[target_base + resident.high + high_byte]
+                        target_bytes[target_base + resident.high + high_byte] = 0
+                    target_bytes[target_base + resident.high + high_byte] = T.cast(
+                        target_bytes[target_base + resident.high + high_byte]
                         | (((value >> low_bits) & ((1 << high_bits) - 1)) << high_lane),
                         "uint8",
                     )
@@ -237,7 +239,9 @@ def _quantized_import_kernel(source, target, extent, target_spec, codec, staged_
                 if tile_groups == 1:
                     scale_base = code_bytes + target_tile * coefficients.scale_dtype.itemsize
                     for byte in T.unroll(coefficients.scale_dtype.itemsize):
-                        target[scale_base + byte] = codec.scale_byte(source, source_base, byte)
+                        target_bytes[scale_base + byte] = codec.scale_byte(
+                            source, source_base, byte
+                        )
                     if coefficients.bias_dtype is not None:
                         bias_base = (
                             code_bytes
@@ -245,7 +249,9 @@ def _quantized_import_kernel(source, target, extent, target_spec, codec, staged_
                             + target_tile * coefficients.bias_dtype.itemsize
                         )
                         for byte in T.unroll(coefficients.bias_dtype.itemsize):
-                            target[bias_base + byte] = codec.bias_byte(source, source_base, byte)
+                            target_bytes[bias_base + byte] = codec.bias_byte(
+                                source, source_base, byte
+                            )
                 else:
                     for group in T.serial(tile_groups):
                         target_group = target_tile * tile_groups + group
@@ -255,7 +261,9 @@ def _quantized_import_kernel(source, target, extent, target_spec, codec, staged_
                         scale_bits = T.reinterpret(T.cast(scale, "float32"), "uint32")
                         scale_base = code_bytes + target_group * coefficients.scale_dtype.itemsize
                         for byte in T.unroll(coefficients.scale_dtype.itemsize):
-                            target[scale_base + byte] = T.cast(scale_bits >> (8 * byte), "uint8")
+                            target_bytes[scale_base + byte] = T.cast(
+                                scale_bits >> (8 * byte), "uint8"
+                            )
                         if coefficients.bias_dtype is not None:
                             bias = codec.direct_bias(
                                 source, source_base, group, T.if_then_else, T.reinterpret
@@ -267,41 +275,45 @@ def _quantized_import_kernel(source, target, extent, target_spec, codec, staged_
                                 + target_group * coefficients.bias_dtype.itemsize
                             )
                             for byte in T.unroll(coefficients.bias_dtype.itemsize):
-                                target[bias_base + byte] = T.cast(bias_bits >> (8 * byte), "uint8")
+                                target_bytes[bias_base + byte] = T.cast(
+                                    bias_bits >> (8 * byte), "uint8"
+                                )
             else:
                 assert isinstance(coefficients, HierarchicalCoefficients)
                 scale_base = target_base + resident.scales
                 tile_scale_bytes = math.ceil(tile_groups * coefficients.local_scale_bits / 8)
                 tile_scale_base = scale_base
                 for byte in T.serial(tile_scale_bytes):
-                    target[tile_scale_base + byte] = 0
+                    target_bytes[tile_scale_base + byte] = 0
                 for group in T.serial(tile_groups):
                     value = codec.local_scale(source, source_base, group, T.if_then_else)
                     bit = group * coefficients.local_scale_bits
-                    target[scale_base + bit // 8] |= T.cast(value << (bit % 8), "uint8")
+                    target_bytes[scale_base + bit // 8] |= T.cast(value << (bit % 8), "uint8")
                     if bit % 8 + coefficients.local_scale_bits > 8:
-                        target[scale_base + bit // 8 + 1] |= T.cast(value >> (8 - bit % 8), "uint8")
+                        target_bytes[scale_base + bit // 8 + 1] |= T.cast(
+                            value >> (8 - bit % 8), "uint8"
+                        )
                 cursor = scale_base + tile_scale_bytes
                 if coefficients.local_bias_bits is not None:
                     tile_bias_bytes = math.ceil(tile_groups * coefficients.local_bias_bits / 8)
                     tile_bias_base = cursor
                     for byte in T.serial(tile_bias_bytes):
-                        target[tile_bias_base + byte] = 0
+                        target_bytes[tile_bias_base + byte] = 0
                     for group in T.serial(tile_groups):
                         value = codec.local_bias(source, source_base, group, T.if_then_else)
                         bit = group * coefficients.local_bias_bits
-                        target[cursor + bit // 8] |= T.cast(value << (bit % 8), "uint8")
+                        target_bytes[cursor + bit // 8] |= T.cast(value << (bit % 8), "uint8")
                         if bit % 8 + coefficients.local_bias_bits > 8:
-                            target[cursor + bit // 8 + 1] |= T.cast(value >> (8 - bit % 8), "uint8")
+                            target_bytes[cursor + bit // 8 + 1] |= T.cast(
+                                value >> (8 - bit % 8), "uint8"
+                            )
                     cursor += tile_bias_bytes
                 for byte in T.unroll(coefficients.super_scale_dtype.itemsize):
-                    target[cursor + byte] = (
-                        codec.scale_byte(source, source_base, byte)
-                    )
+                    target_bytes[cursor + byte] = codec.scale_byte(source, source_base, byte)
                 cursor += coefficients.super_scale_dtype.itemsize
                 if coefficients.super_bias_dtype is not None:
                     for byte in T.unroll(coefficients.super_bias_dtype.itemsize):
-                        target[cursor + byte] = codec.bias_byte(source, source_base, byte)
+                        target_bytes[cursor + byte] = codec.bias_byte(source, source_base, byte)
 
 
 @T.macro
@@ -493,6 +505,16 @@ class PrimitiveEmitter:
         self.capabilities = capabilities
         self.threads = min(256, capabilities.threads_per_group)
 
+    def specialization_key(self):
+        """Identify generated code without graph-local value or node ids."""
+        return (
+            self.node.operation,
+            repr(dict(self.node.attributes)),
+            self.inputs,
+            self.outputs,
+            self.threads,
+        )
+
     def __call__(self, operands: tuple[Any, ...]) -> None:
         split = len(self.node.inputs)
         inputs = list(operands[:split])
@@ -642,6 +664,8 @@ _PRODUCTION_PRIMITIVES = frozenset(
     }
 )
 
+_REFERENCE_PRIMITIVES = frozenset({"reshape", "transpose"})
+
 
 class PrimitiveLoweringRule:
     name = "portable-primitive"
@@ -651,14 +675,18 @@ class PrimitiveLoweringRule:
         # This is an allowlist, not a catch-all fallback. New transformer or
         # contraction operations must acquire an explicit optimized schedule
         # before production graphs can lower them.
-        if node.operation not in _PRODUCTION_PRIMITIVES:
+        reference = (
+            context.precision == "reference"
+            or "reference_schedules" in context.capabilities.features
+        )
+        if node.operation not in _PRODUCTION_PRIMITIVES and not (
+            reference and node.operation in _REFERENCE_PRIMITIVES
+        ):
             return ()
         if context.mode in {"decode", "prefill"}:
             if node.operation == "embedding":
                 table = graph.values[node.inputs[1]].spec
-                if table.representation is not None and not isinstance(
-                    table.representation, Dense
-                ):
+                if table.representation is not None and not isinstance(table.representation, Dense):
                     return ()
         specs = tuple(graph.values[value].spec for value in (*node.inputs, *node.outputs))
         if any(not spec.static for spec in specs):

@@ -36,7 +36,10 @@ class _Allocation(NativeAllocation):
         tensor = self._require_tensor()
         representation = spec.representation
         if representation is not None and not isinstance(representation, Dense):
-            shape, dtype = (spec.storage_nbytes,), DType.U8
+            # Encoded compute kernels consume aligned packets, not individual
+            # bytes.  Keep the canonical layout byte-addressed at the tensor
+            # boundary while exposing its physical ABI as packed words.
+            shape, dtype = ((spec.storage_nbytes + 3) // 4,), DType.U32
         else:
             shape = cast(tuple[int, ...], spec.shape)
             dtype = spec.dtype if not isinstance(representation, Dense) else representation.dtype
@@ -163,10 +166,13 @@ class TileLangRuntime:
     def allocate(self, size: int, alignment: int) -> NativeAllocation:
         if size <= 0 or alignment <= 0:
             raise ValueError("allocation size and alignment must be positive")
-        return _Allocation(torch.empty(size, dtype=torch.uint8, device=self._device))
+        allocated = (size + alignment - 1) // alignment * alignment
+        return _Allocation(torch.empty(allocated, dtype=torch.uint8, device=self._device))
 
     def upload(self, spec: TensorSpec, content: bytes) -> NativeAllocation:
-        del spec
+        representation = spec.representation
+        if representation is not None and not isinstance(representation, Dense):
+            content += bytes(-len(content) % 4)
         host = torch.frombuffer(bytearray(content), dtype=torch.uint8)
         return _Allocation(host.to(self._device))
 
@@ -183,7 +189,7 @@ class TileLangRuntime:
         context = self._context
         with _compiler_recursion_budget(unit):
             kernel = tilelang.compile(
-                _build_prim_func(unit),
+                _build_reusable_module(unit),
                 out_idx=[],
                 execution_backend="tvm_ffi",
                 target=context.target,
@@ -201,7 +207,7 @@ class TileLangRuntime:
 def _annotation(T, spec: TensorSpec):
     representation = spec.representation
     if representation is not None and not isinstance(representation, Dense):
-        return T.Tensor((spec.storage_nbytes,), T.uint8)
+        return T.Tensor(((spec.storage_nbytes + 3) // 4,), T.uint32)
     dtype = spec.dtype if not isinstance(representation, Dense) else representation.dtype
     return T.Tensor(spec.shape, dtype.value)
 
@@ -245,6 +251,63 @@ def _build_prim_func(unit: TileCompilationUnit):
                 raise
 
     return T.build_prim_func(unit.name, parameters, body)
+
+
+def _freeze_specialization(value):
+    """Return a stable structural key for an emitter's static schedule facts."""
+    specialization_key = getattr(value, "specialization_key", None)
+    if specialization_key is not None:
+        return repr(specialization_key())
+    return repr(vars(value)) if hasattr(value, "__dict__") else repr(value)
+
+
+def _build_reusable_module(unit: TileCompilationUnit):
+    """Factor repeated layer schedules into reusable functions in one native module."""
+    import tilelang.language as T
+
+    parameter_by_name = {parameter.name: parameter for parameter in unit.parameters}
+    templates = {}
+    calls = []
+    definitions = []
+    for call in unit.calls:
+        operand_parameters = tuple(
+            parameter_by_name[binding.parameter] for binding in call.bindings
+        ) + tuple(unit.parameters[index] for index in call.workspace)
+        operand_specs = tuple(parameter.spec for parameter in operand_parameters)
+        key = (
+            type(call.candidate.emitter),
+            _freeze_specialization(call.candidate.emitter),
+            operand_specs,
+        )
+        template = templates.get(key)
+        if template is None:
+            index = len(templates)
+            name = f"{unit.name}_schedule_{index}"
+            annotations = tuple(
+                (f"p{position}", _annotation(T, spec))
+                for position, spec in enumerate(operand_specs)
+            )
+
+            def template_body(*bound, emitter=call.candidate.emitter):
+                emitter(tuple(bound))
+
+            definitions.append(T.PrimFuncDefinition(name, annotations, template_body))
+            template = name
+            templates[key] = template
+        calls.append((template, operand_parameters))
+
+    entry_parameters = tuple(
+        (parameter.name, _annotation(T, parameter.spec)) for parameter in unit.parameters
+    )
+
+    def entry_body(private, *bound) -> None:
+        by_name = {
+            parameter.name: value for parameter, value in zip(unit.parameters, bound, strict=True)
+        }
+        for schedule, operands in calls:
+            private[schedule](*(by_name[parameter.name] for parameter in operands))
+
+    return T.build_prim_module("main", entry_parameters, entry_body, definitions)
 
 
 def _capabilities(value) -> Capabilities:

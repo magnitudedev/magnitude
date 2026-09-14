@@ -111,21 +111,21 @@ from benchmark_fixtures.ruler import RulerFixture
 fixture = RulerFixture(seed=42, variant="multiquery", haystack="records", queries=4)
 prepared = await fixture.prepare(
     target=16_384,
-    counter=tokenizer.count,          # async (Context) -> int; full chat rendering
+    counter=tokenizer.count,  # async (Context) -> int; full chat rendering
     sizing_identity=tokenizer.identity,
     needle_depth=0.5,
 )
 
-prepared.content     # Context(messages=..., tools=[]): send through normal inference
-prepared.tokens      # Actual input count from the supplied renderer
-prepared.expected    # RetrievalAnswers; .values is the expected key/value mapping
+prepared.content  # Context(messages=..., tools=[]): send through normal inference
+prepared.tokens  # Actual input count from the supplied renderer
+prepared.expected  # RetrievalAnswers; .values is the expected key/value mapping
 prepared.provenance  # Recipe, upstream revision, seed, depth, positions and input digest
 
 score = prepared.score(response_text)
-score.exact_match    # Entire JSON object matches; extra keys fail
-score.correct        # Number of correctly retrieved fields
-score.total          # Number of requested fields
-score.format_valid   # JSON object of strings, without duplicate keys
+score.exact_match  # Entire JSON object matches; extra keys fail
+score.correct  # Number of correctly retrieved fields
+score.total  # Number of requested fields
+score.format_valid  # JSON object of strings, without duplicate keys
 ```
 
 `prepare` is independent of previous calls: 8K → 32K → 8K reproduces the original 8K

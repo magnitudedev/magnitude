@@ -93,10 +93,16 @@ async def observed(interaction, events):
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
-        request = (await compile_plan(
-            [interaction], "c", ("single",), (1024,),
-            counter=count_context, sizing_identity="test-bytes",
-        )).requests[0]
+        request = (
+            await compile_plan(
+                [interaction],
+                "c",
+                ("single",),
+                (1024,),
+                counter=count_context,
+                sizing_identity="test-bytes",
+            )
+        ).requests[0]
         return await measure(client, "http://engine", "test", request, lambda _: None)
 
 
@@ -168,10 +174,16 @@ async def test_cancel_records_partial_output(interaction):
 
     saved = []
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
-        request = (await compile_plan(
-            [interaction], "c", ("single",), (1024,),
-            counter=count_context, sizing_identity="test-bytes",
-        )).requests[0]
+        request = (
+            await compile_plan(
+                [interaction],
+                "c",
+                ("single",),
+                (1024,),
+                counter=count_context,
+                sizing_identity="test-bytes",
+            )
+        ).requests[0]
         task = asyncio.create_task(
             measure(
                 client, "http://engine", "test", request, lambda _: None, cancelled=saved.append

@@ -33,13 +33,14 @@ def test_canonical_quantized_sizes_preserve_every_source_bit():
         Encoding.IQ4_XS,
     ):
         representation, _ = quantization(encoding)
-        assert mt.TensorSpec(
-            (encoding.block_elements,), mt.DType.F16, representation=representation
-        ).storage_nbytes == encoding.block_bytes
+        assert (
+            mt.TensorSpec(
+                (encoding.block_elements,), mt.DType.F16, representation=representation
+            ).storage_nbytes
+            == encoding.block_bytes
+        )
 
-    mlx = mt.Affine(
-        mt.Code(4), 64, mt.DirectCoefficients(mt.DType.BF16, mt.DType.BF16)
-    )
+    mlx = mt.Affine(mt.Code(4), 64, mt.DirectCoefficients(mt.DType.BF16, mt.DType.BF16))
     assert mt.TensorSpec((64,), mt.DType.F16, representation=mlx).storage_nbytes == 36
 
 

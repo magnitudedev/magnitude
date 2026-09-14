@@ -155,7 +155,10 @@ def test_whole_hybrid_step_is_one_prebound_native_submission():
         convolution_state=(mt.TensorSpec((1, 16, 2), mt.DType.F16),),
         delta_state=(mt.TensorSpec((1, 2, 4, 4), mt.DType.F32),),
     )
-    compiled = program.specialize("prefill", specs)
+    compiled = program.specialize("prefill", specs, precision="reference")
+    preparation = [node for node in compiled.graph.nodes if node.operation == "recurrent_prepare"]
+    assert preparation
+    assert all(node.attributes["epsilon"] == pytest.approx(4e-6) for node in preparation)
     assert len(native.programs) == 1
     assert len(compiled.diagnostics.submissions) == 1
     assert native.executables[0].bound.static
@@ -192,7 +195,7 @@ def test_whole_hybrid_step_is_one_prebound_native_submission():
     device.close()
 
 
-def test_whole_moe_prefill_selects_grouped_pipeline_inside_one_submission():
+def test_whole_moe_prefill_rejects_dense_toy_expert_storage():
     base = _description()
     geometry = base.geometry.model_copy(
         update={
@@ -239,10 +242,8 @@ def test_whole_moe_prefill_selects_grouped_pipeline_inside_one_submission():
         convolution_state=(mt.TensorSpec((1, 16, 2), mt.DType.F16),),
         delta_state=(mt.TensorSpec((1, 2, 4, 4), mt.DType.F32),),
     )
-    compiled = program.specialize("prefill", specs)
-    selected = tuple(name for unit in compiled.diagnostics.submissions for name in unit)
-    assert sum(name.startswith("routed_experts.grouped@") for name in selected) == 2
-    assert len(compiled.diagnostics.submissions) == 1
+    with pytest.raises(ValueError, match="no legal lowering"):
+        program.specialize("prefill", specs, precision="reference")
     program.close()
     for resource in residency.resources:
         resource.close()
@@ -289,7 +290,7 @@ def test_whole_hybrid_qwen_step_matches_semantic_graph_on_metal(mode, rows):
     dynamic = resources = {}
     compiled = execution = None
     try:
-        compiled = program.specialize(mode, specs)
+        compiled = program.specialize(mode, specs, precision="reference")
         assert len(compiled.diagnostics.submissions) == 1
         bindings = {**residency.arrays, **dynamic_arrays, **state_arrays}
         expected = mt.evaluate_reference(compiled.graph, bindings).outputs

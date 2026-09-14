@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 from collections import Counter
 from dataclasses import asdict, dataclass
+from enum import Enum
 from pathlib import Path
+from typing import Any
 
 import magnitensor as mt
+from magnitensor.compiler.unit import ParameterKind, build_unit
+from magnitensor.kernels.packed import packet_format
 from magnitude_engine.models.qwen35.description import (
     AttentionWeights,
     DenseDescription,
@@ -24,7 +29,6 @@ from magnitude_engine.models.qwen35.tensor_program import (
 from magnitude_engine.weights.formats.gguf import GGUFFormat
 from magnitude_engine.weights.formats.mlx_safetensors import MLXFormat
 from magnitude_engine.weights.tensor_residency import TensorWeights
-from magnitensor.compiler.unit import ParameterKind, build_unit
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,8 +42,39 @@ class QualificationCase:
 
 
 @dataclass(frozen=True, slots=True)
+class ScheduleManifest:
+    name: str
+    nodes: tuple[int, ...]
+    kernel_count: int
+    workspace_bytes: int
+    inputs: tuple[str, ...]
+    outputs: tuple[str, ...]
+    packet_formats: tuple[str, ...]
+    packet_geometry: dict[str, dict[str, int]]
+    geometry: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ParameterManifest:
+    name: str
+    kind: str
+    binding: str
+    specification: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProgramManifest:
+    name: str
+    reason: str
+    kernel_count: int
+    schedules: tuple[str, ...]
+    parameters: tuple[ParameterManifest, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class QualificationResult:
     case: QualificationCase
+    capabilities: dict[str, Any]
     graph_fingerprint: str
     nodes: int
     kernels: int
@@ -50,6 +85,8 @@ class QualificationResult:
     largest_region_nodes: int
     representation_bytes: dict[str, int]
     selected: dict[str, int]
+    schedules: tuple[ScheduleManifest, ...]
+    programs: tuple[ProgramManifest, ...]
     failures: tuple[str, ...]
 
 
@@ -81,9 +118,7 @@ def invocation_specs(
         batch=case.batch,
         tokens=tokens,
         coordinates=mt.TensorSpec((case.rows, 3), mt.DType.I32),
-        recurrent_offsets=(
-            mt.TensorSpec((case.batch + 1,), mt.DType.I32) if recurrent else None
-        ),
+        recurrent_offsets=(mt.TensorSpec((case.batch + 1,), mt.DType.I32) if recurrent else None),
         output_rows=output_rows,
         draws=draws,
         destinations=tuple(destinations for _ in range(attention)),
@@ -119,18 +154,18 @@ def qualify(
         options=definition.options,
     )
     selected = Counter(
-        item.name.split("@", 1)[0]
-        for item in plan.diagnostics.candidates
-        if item.selected
+        item.name.split("@", 1)[0] for item in plan.diagnostics.candidates if item.selected
     )
     units = tuple(build_unit(plan.graph, plan.memory, unit) for unit in plan.submissions)
-    bound_parameters = sum(
-        parameter.kind in (ParameterKind.CONSTANT, ParameterKind.TEMPORARY)
-        for unit in units for parameter in unit.parameters
+    programs = tuple(
+        _program_manifest(unit, submission.reason)
+        for unit, submission in zip(units, plan.submissions, strict=True)
     )
-    dynamic_parameters = sum(
-        parameter.kind not in (ParameterKind.CONSTANT, ParameterKind.TEMPORARY)
-        for unit in units for parameter in unit.parameters
+    parameters = tuple(parameter for program in programs for parameter in program.parameters)
+    bound_parameters = sum(parameter.binding == "bound" for parameter in parameters)
+    dynamic_parameters = sum(parameter.binding == "dynamic" for parameter in parameters)
+    schedules = tuple(
+        _schedule_manifest(plan.graph, candidate) for candidate in plan.cover.candidates
     )
     representation_bytes = Counter()
     for spec in weight_specs.values():
@@ -142,9 +177,11 @@ def qualify(
         len(plan.submissions),
         weight_specs,
         plan.cover.candidates,
+        units,
     )
     return QualificationResult(
         case,
+        _capability_manifest(capabilities),
         plan.graph.fingerprint,
         len(plan.graph.nodes),
         plan.diagnostics.dispatches,
@@ -155,8 +192,108 @@ def qualify(
         max((len(candidate.nodes) for candidate in plan.cover.candidates), default=0),
         dict(sorted(representation_bytes.items())),
         dict(sorted(selected.items())),
+        schedules,
+        programs,
         tuple(failures),
     )
+
+
+def _schedule_manifest(graph, candidate: mt.Candidate) -> ScheduleManifest:
+    emitter = candidate.emitter
+    geometry = {
+        name: _manifest_value(value)
+        for name, value in sorted(vars(emitter).items())
+        if name not in {"specs", "weight_specs", "output_specs"}
+    }
+    packets = {
+        packet.name: {
+            "dot_packet": packet.dot_packet,
+            "matrix_packet": packet.matrix_packet,
+            "reduction_tile": packet.tile,
+        }
+        for value in (*candidate.inputs, *candidate.outputs)
+        if (packet := packet_format(graph.values[value].spec)) is not None
+    }
+    return ScheduleManifest(
+        candidate.name,
+        tuple(sorted(candidate.nodes)),
+        candidate.kernel_count,
+        candidate.workspace_bytes,
+        tuple(_value_manifest(graph.values[value]) for value in candidate.inputs),
+        tuple(_value_manifest(graph.values[value]) for value in candidate.outputs),
+        tuple(sorted(packets)),
+        dict(sorted(packets.items())),
+        geometry,
+    )
+
+
+def _capability_manifest(capabilities: mt.Capabilities) -> dict[str, Any]:
+    return {
+        "subgroup_width": capabilities.subgroup_width,
+        "threads_per_group": capabilities.threads_per_group,
+        "shared_memory_bytes": capabilities.shared_memory_bytes,
+        "matrix_instructions": tuple(
+            f"{item.input_dtype.value}:{item.m}x{item.n}x{item.k}->{item.accumulation_dtype.value}"
+            for item in capabilities.matrix_instructions
+        ),
+        "memory_scopes": tuple(sorted(capabilities.memory_scopes)),
+        "atomics": tuple(sorted(dtype.value for dtype in capabilities.atomics)),
+        "native_multi_launch": capabilities.native_multi_launch,
+        "partial_binding": capabilities.partial_binding,
+        "fingerprint": capabilities.fingerprint,
+    }
+
+
+def _program_manifest(unit, reason: str) -> ProgramManifest:
+    parameters = tuple(
+        ParameterManifest(
+            parameter.name,
+            parameter.kind.value,
+            "bound" if _statically_bound(parameter) else "dynamic",
+            _spec_manifest(parameter.spec),
+        )
+        for parameter in unit.parameters
+    )
+    return ProgramManifest(
+        unit.name,
+        reason,
+        sum(call.candidate.kernel_count for call in unit.calls),
+        tuple(call.candidate.name for call in unit.calls),
+        parameters,
+    )
+
+
+def _statically_bound(parameter) -> bool:
+    if parameter.kind in (ParameterKind.CONSTANT, ParameterKind.TEMPORARY):
+        return True
+    return (
+        parameter.kind == ParameterKind.RESOURCE
+        and parameter.name.startswith("attention.")
+        and parameter.name.endswith(".state")
+    )
+
+
+def _value_manifest(value) -> str:
+    return f"{value.name or 'v' + str(value.id)}:{_spec_manifest(value.spec)}"
+
+
+def _spec_manifest(spec: mt.TensorSpec) -> str:
+    shape = "x".join(str(value) for value in spec.shape)
+    return f"{shape}:{spec.dtype.value}:{_representation_name(spec)}"
+
+
+def _manifest_value(value: Any) -> Any:
+    if isinstance(value, mt.TensorSpec):
+        return _spec_manifest(value)
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, dict):
+        return {str(key): _manifest_value(item) for key, item in sorted(value.items())}
+    if isinstance(value, (tuple, list)):
+        return [_manifest_value(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
 
 
 def _failures(
@@ -166,6 +303,7 @@ def _failures(
     submissions: int,
     weight_specs: dict[str, mt.TensorSpec],
     candidates: tuple[mt.Candidate, ...],
+    units,
 ) -> list[str]:
     failures = []
     forbidden_primitives = {
@@ -187,7 +325,15 @@ def _failures(
         if selected[operation]:
             failures.append(f"selected forbidden production fallback {operation}")
     for name in selected:
-        if any(marker in name for marker in ("direct-encoded", "fragment-encoded", "scalar")):
+        if any(
+            marker in name
+            for marker in (
+                "direct-encoded",
+                "fragment-encoded",
+                "scalar",
+                "causal_attention.online",
+            )
+        ):
             failures.append(f"selected obsolete implementation {name}")
     expected_region_kernels = {
         "routed_experts.grouped": 4,
@@ -195,19 +341,24 @@ def _failures(
         "dense_swiglu.packet-prefill": 2,
         "dense_swiglu.packet-decode": 2,
         "attention.matrix-streaming-gated-output": 2,
-        "attention.partitioned-gated-output": 3,
+        "attention.register-partitioned-gated-output": 3,
         "recurrent.output-prefill": 2,
         "recurrent.output-decode": 2,
+        "gated_delta.chunked-matrix": 2,
     }
     for candidate in candidates:
         family = candidate.name.split("@", 1)[0]
         expected_kernels = expected_region_kernels.get(family)
+        if family == "attention.matrix-streaming-gated-output":
+            expected_kernels = 2 + (getattr(candidate.emitter, "partitions", 1) > 1)
         if expected_kernels is not None and candidate.kernel_count != expected_kernels:
             failures.append(
                 f"{family} uses {candidate.kernel_count} kernels; expected {expected_kernels}"
             )
     if submissions != 1:
         failures.append(f"expected one maximal submission, selected {submissions}")
+    if any(len(unit.calls) != len({call.candidate.name for call in unit.calls}) for unit in units):
+        failures.append("a maximal program contains duplicate candidate identities")
     for name, spec in weight_specs.items():
         representation = spec.representation
         if (
@@ -227,30 +378,40 @@ def _failures(
         )
     if selected["recurrent_prepare.channel-parallel"] != recurrent:
         failures.append("not every recurrent layer selected channel-parallel preparation")
-    if selected["gated_delta.register-state"] != recurrent:
-        failures.append("not every recurrent layer selected register-resident recurrence")
+    recurrence_family = (
+        "gated_delta.chunked-matrix"
+        if case.mode == "prefill" and case.rows >= 64 * case.batch
+        else "gated_delta.register-state"
+    )
+    if selected[recurrence_family] != recurrent:
+        failures.append(f"not every recurrent layer selected {recurrence_family}")
     if (
         case.mode == "prefill"
         and case.logits
         and selected["attention.matrix-streaming-gated-output"] != attention
     ):
         failures.append(
-            "not every attention layer fused matrix-streaming attention, gate, and output"
+            "not every attention layer selected a complete matrix attention/gate/output pipeline"
         )
     if case.name == "decode-b1":
         expected = len(description.blocks)
-        actual = selected["linear.parallel-packet"]
+        actual = selected["linear.parallel-packet-decode"]
         if actual != expected:
             failures.append(
                 f"expected {expected} fused parallel projection regions, selected {actual}"
             )
+    elif case.mode == "prefill":
+        expected = len(description.blocks)
+        actual = selected["linear.parallel-packet-prefill"]
+        if actual != expected:
+            failures.append(
+                f"expected {expected} tiled parallel projection regions, selected {actual}"
+            )
     routed = sum(
-        isinstance(block.feedforward, RoutedFeedForwardWeights)
-        for block in description.blocks
+        isinstance(block.feedforward, RoutedFeedForwardWeights) for block in description.blocks
     )
     dense = sum(
-        isinstance(block.feedforward, DenseFeedForwardWeights)
-        for block in description.blocks
+        isinstance(block.feedforward, DenseFeedForwardWeights) for block in description.blocks
     )
     if routed and case.logits:
         if case.name == "decode-b1":
@@ -265,25 +426,83 @@ def _failures(
                 f"selected {selected['route_topk.subgroup']}"
             )
         expected = (
-            "routed_experts.grouped"
-            if case.mode == "prefill"
-            else "routed_experts.packet-shared"
+            "routed_experts.grouped" if case.mode == "prefill" else "routed_experts.packet-shared"
         )
         if selected[expected] != routed:
             failures.append(f"expected {routed} {expected} regions, selected {selected[expected]}")
     if case.logits:
-        expected_dense = dense + (routed if case.mode == "prefill" else 0)
+        expected_dense = dense
         dense_name = f"dense_swiglu.packet-{case.mode}"
         if selected[dense_name] != expected_dense:
             failures.append(
                 f"expected {expected_dense} {dense_name} regions, selected {selected[dense_name]}"
             )
     if case.mode == "decode" and case.logits:
-        if selected["attention.partitioned-gated-output"] != attention:
+        if selected["attention.register-partitioned-gated-output"] != attention:
             failures.append("not every attention layer fused partition merge, gate, and output")
         if selected["recurrent.output-decode"] != recurrent:
             failures.append("not every recurrent layer fused normalization, gate, and output")
+    failures.extend(_inconsistent_schedule_failures(candidates))
+    failures.extend(_source_policy_failures())
     return failures
+
+
+def _inconsistent_schedule_failures(candidates: tuple[mt.Candidate, ...]) -> list[str]:
+    observed: dict[tuple[str, tuple[str, ...], tuple[str, ...]], str] = {}
+    failures = []
+    for candidate in candidates:
+        family = candidate.name.split("@", 1)[0]
+        emitter_specs = getattr(candidate.emitter, "specs", None)
+        output_specs = getattr(candidate.emitter, "output_specs", None)
+        if emitter_specs is None and output_specs is None:
+            continue
+        inputs = tuple(repr(spec) for spec in emitter_specs or ())
+        outputs = tuple(repr(spec) for spec in output_specs or ())
+        key = family, inputs, outputs
+        geometry = repr(
+            {
+                name: value
+                for name, value in vars(candidate.emitter).items()
+                if name not in {"specs", "weight_specs", "output_specs"}
+            }
+        )
+        previous = observed.setdefault(key, geometry)
+        if previous != geometry:
+            failures.append(f"identical {family} shapes selected different schedule geometry")
+    return failures
+
+
+def _source_policy_failures() -> list[str]:
+    root = Path(mt.__file__).resolve().parent
+    failures = []
+    forbidden_imports = (
+        "tilelang.metal",
+        "tilelang.cuda",
+        "tilelang.hip",
+        "mlx",
+        "numpy",
+        "torch",
+    )
+    backend_names = {"metal", "cuda", "hip", "rocm"}
+    for path in sorted((root / "kernels").glob("*.py")):
+        source = path.read_text()
+        tree = ast.parse(source, filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = tuple(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                names = () if node.module is None else (node.module,)
+            else:
+                names = ()
+            for name in names:
+                if any(name == item or name.startswith(item + ".") for item in forbidden_imports):
+                    failures.append(f"forbidden production import {name} in {path.name}")
+            if isinstance(node, ast.Constant) and node.value in backend_names:
+                failures.append(f"backend-name branch marker {node.value!r} in {path.name}")
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if node.func.attr in {"call_extern", "call_pure_extern", "call_intrin"}:
+                    failures.append(f"forbidden backend intrinsic call in {path.name}")
+    return sorted(set(failures))
 
 
 def _representation_name(spec: mt.TensorSpec) -> str:
@@ -292,9 +511,9 @@ def _representation_name(spec: mt.TensorSpec) -> str:
         return f"dense-{spec.dtype.value}"
     if isinstance(representation, mt.Affine):
         coefficients = representation.coefficients
-        family = "hierarchical" if isinstance(
-            coefficients, mt.HierarchicalCoefficients
-        ) else "direct"
+        family = (
+            "hierarchical" if isinstance(coefficients, mt.HierarchicalCoefficients) else "direct"
+        )
         return f"affine-{representation.code.bits}bit-g{representation.group}-{family}"
     if isinstance(representation, mt.Codebook):
         return f"codebook-{representation.code_bits}bit-g{representation.group}"
@@ -319,6 +538,11 @@ def main() -> None:
     parser.add_argument("--contexts", default="16384,65536")
     parser.add_argument("--max-batch", type=int, default=8)
     parser.add_argument("--memory-bytes", type=int, default=128 * 1024**3)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="write the complete deterministic JSON manifest to this path",
+    )
     parser.add_argument(
         "--case",
         action="append",
@@ -364,7 +588,16 @@ def main() -> None:
             )
             for case in cases
         )
-        print(json.dumps([asdict(result) for result in results], indent=2))
+        rendered = json.dumps([asdict(result) for result in results], indent=2) + "\n"
+        if args.output is None:
+            print(rendered, end="")
+        else:
+            output = args.output.expanduser().resolve()
+            output.write_text(rendered)
+            print(
+                f"wrote {output}: {len(results)} cases, "
+                f"{sum(len(result.failures) for result in results)} failures"
+            )
         if any(result.failures for result in results):
             raise SystemExit(1)
     finally:

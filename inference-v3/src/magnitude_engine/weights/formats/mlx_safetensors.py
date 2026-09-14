@@ -70,9 +70,7 @@ class MLXFormat:
                         "U32": mt.DType.U32,
                         "BF16": mt.DType.BF16,
                         "F32": mt.DType.F32,
-                    }.get(
-                        entry["dtype"]
-                    )
+                    }.get(entry["dtype"])
                     if dtype is None:
                         raise ValueError(
                             f"unsupported Safetensors dtype for {name}: {entry['dtype']}"

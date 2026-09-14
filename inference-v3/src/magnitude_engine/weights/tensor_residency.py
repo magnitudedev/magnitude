@@ -146,12 +146,14 @@ class TensorWeights:
         )
         try:
             compiled = mt.compile(
-                lambda value: mt.exp(
-                    mt.decode_bfloat16(value, mt.DType.F32)
-                    if source_dtype == mt.DType.BF16
-                    else mt.cast(value, mt.DType.F32)
-                )
-                * -1.0,
+                lambda value: (
+                    mt.exp(
+                        mt.decode_bfloat16(value, mt.DType.F32)
+                        if source_dtype == mt.DType.BF16
+                        else mt.cast(value, mt.DType.F32)
+                    )
+                    * -1.0
+                ),
                 signature=mt.Signature((mt.Argument(source.spec, "source"),)),
                 device=self.device,
                 constants={},

@@ -260,7 +260,11 @@ class Device:
 
     def allocate(self, spec: TensorSpec, *, alignment: int | None = None) -> Resource:
         self._check()
-        native = self._allocate(spec.storage_nbytes, max(spec.dtype.itemsize, alignment or 1))
+        represented_alignment = 4 if spec.representation is not None else 1
+        native = self._allocate(
+            spec.storage_nbytes,
+            max(spec.dtype.itemsize, represented_alignment, alignment or 1),
+        )
         return Resource(native.acquire(), spec)
 
     def allocate_temporary(self, size: int, alignment: int) -> Resource:
@@ -299,7 +303,7 @@ class Device:
             raise ValueError("read operands belong to another device")
         if after is not None:
             after.wait()
-        return self.runtime.download(resource.native)
+        return self.runtime.download(resource.native)[: resource.spec.storage_nbytes]
 
     def close(self) -> None:
         self._check()

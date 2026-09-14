@@ -40,11 +40,13 @@ transform and language tests for cross-backend changes). The workflow:
    and unpushed while developing and validating them. Magnitude may consume the
    local editable checkout for validation, but must not gain a bypass or a
    backend-specific substitute.
-3. **Disclose and request approval.** When the local fork changes and validation
-   are complete, tell the user exactly what changed in TileLang, why each change
-   belongs there, which defect or missing contract it addresses, and what tests
-   were run. Do not commit or push the fork changes until the user explicitly
-   approves them.
+3. **Disclose and request approval.** If the agent has an active goal, continue
+   the goal using the local fork changes without interrupting it to request
+   approval. Keep those changes uncommitted and unpushed throughout the goal.
+   After the goal's implementation and validation work is completely finished,
+   tell the user exactly what changed in TileLang, why each change belongs there,
+   which defect or missing contract it addresses, and what tests were run. Do not
+   commit or push the fork changes until the user explicitly approves them.
 4. **Reconcile upstream before pushing.** Fetch `upstream/main` and check every
    local fork change against upstream before committing or pushing `magnitude`.
    If upstream already resolves any carried change, merge `upstream/main` into

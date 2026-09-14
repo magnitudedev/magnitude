@@ -16,7 +16,7 @@ semantic operation or region
 portable T.Kernel emission
         │ Magnitensor assembles the maximal compilation unit
         ▼
-TileLang PrimFunc
+TileLang module
         │ TileLang lowers the whole unit for the target
         ▼
 native executable
@@ -66,20 +66,20 @@ through TileLang to TIR builders.
 
 A true fusion has one `T.Kernel` region and no globally materialized interior.
 An algorithm with required device-wide phases may use several ordered
-`T.Kernel` regions in one authored `PrimFunc`. Magnitensor never recovers,
+`T.Kernel` regions in one authored schedule function. Magnitensor never recovers,
 clones, splices or structurally compares existing PrimFuncs through private TVM
 IR.
 
 Already-finalized PrimFuncs are never recovered, cloned or combined. That would
 make a region the compilation boundary prematurely and require private compiler
-IR. Composition occurs before finalization from the selected lowerings. Dynamic
-`PrimFunc` construction is a generic TileLang language responsibility; graph regions,
-selection and operand planning remain entirely Magnitensor concepts.
+IR. Composition occurs from the selected lowerings through TileLang's public
+programmatic `PrimFunc` and `IRModule` construction. Graph regions, selection and
+operand planning remain entirely Magnitensor concepts.
 
 ## Native entrypoint
 
-One compiled multi-kernel `PrimFunc` is one TileLang program, not one device
-kernel. TileLang may lower its `T.Kernel` regions to several device launches, but
+One compiled multi-function module is one TileLang program, not one device
+kernel. TileLang may lower its private schedules' `T.Kernel` regions to several device launches, but
 its execution adapter encodes them through one native host entrypoint and one
 ordered stream or command-buffer context. A Python loop over device kernels does
 not satisfy this contract.
@@ -100,6 +100,12 @@ than permission to split the graph into Python calls.
 | State reads and writes match the operation's declared version | Fusion cannot reorder or expose tentative state |
 | Unsupported tails are handled or reject applicability | A fast interior kernel is not a complete schedule |
 
+Fusion eliminates storage and launches, not declared publication precision.
+When a region covers distinct normalization, activation, multiplication, or
+branch-add operations, their logical dtype boundaries remain observable even if
+the values never leave registers. Arithmetic internal to a single operation is
+governed by that operation's numerical contract, not invented intermediate nodes.
+
 Representation decoding happens where its values are consumed. A quantized
 matrix schedule decodes only the tile it reuses; it does not require a resident
 dequantized copy unless that representation is selected and charged explicitly.
@@ -112,11 +118,35 @@ semantic outputs remain visible to downstream operations without requiring
 separate launches.
 
 Long-context decode attention groups every query head sharing one KV head into
-the same partition workgroup. Each K/V channel is loaded once and one reduction
-barrier tree advances all members of the group. Partition statistics and partial
-values are merged by the second ordered `T.Kernel` in the same native
-submission. Prefill instead uses the matrix-streaming schedule because query-row
-reuse makes fragment products appropriate there.
+the same partition workgroup. Subgroups scan disjoint history spans, retain
+online-softmax state in registers, and reduce each query/key dot within the
+subgroup without a workgroup barrier per history token. One bounded shared merge
+combines subgroup results, and a second ordered kernel merges partitions.
+Prefill uses streaming matrix products with query-row reuse. Scores remain inside
+the streaming tile; bounded partial outputs and statistics may be used to combine
+history partitions without materializing the score matrix.
+
+Packed projections consume whole representation packets. Decode assigns packet
+GEMVs to subgroups; prefill decodes directly into shared matrix tiles consumed by
+`T.gemm`. Decoded weight arithmetic and logical publication dtype are separate:
+an available FP32 matrix path preserves decoded coefficient precision, while
+activation publication and gate/up rounding follow the logical tensor dtype.
+Only the consumed tile is expanded, and selection charges its actual arithmetic
+storage. Real-number reassociation of quantization coefficients is not assumed
+to preserve the qualified whole-model precision contract.
+Adjacent projections over one activation share a physical grid. Routed
+decode combines selected and shared expert gate/up work and their down work into
+two kernels. Routed prefill groups routes, combines routed/shared tiled gate/up,
+combines their tiled down projections, and performs one final unpermute/shared
+reduction.
+
+Long recurrent prefill may prepare independent chunk-local delta systems and
+carry the recurrent boundary through matrix contractions. Decode and small spans
+retain register recurrence. Chunk boundaries are numerical scheduling choices,
+not prefix-checkpoint boundaries. Both strategies expose the same output and
+final state, preserve empty sequences, and respect reset decays without dividing
+by cumulative decay products. Chunk scratch belongs in the ordinary workspace
+ledger, and extra device stages remain inside the native program entry.
 
 ## Qualification
 
