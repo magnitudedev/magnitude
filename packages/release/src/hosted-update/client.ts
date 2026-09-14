@@ -1,3 +1,4 @@
+import { githubArtifactUrl } from "./github-artifact"
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "@effect/platform"
 import { Clock, Effect, Option, Schema, Stream } from "effect"
 import type { KeyObject } from "node:crypto"
@@ -64,14 +65,11 @@ export const checkHostedUpdate = (options: HostedUpdateConnection & {
 /** Resolve once, then transfer bytes without forwarding installation credentials to storage. */
 export const resolveHostedDownload = (options: HostedUpdateConnection & {
   readonly manifest: UpdateManifest
-  readonly storageOrigin: string
 }) => Effect.gen(function* () {
   const { response, fields } = yield* signedRequest(options, "/api/download", { artifact: options.manifest.artifact.id, release: options.manifest.version })
   if (!acceptsUpdateManifest(options.manifest, fields) || response.status !== 302) return yield* new HostedUpdateCheckFailed({ reason: "response" })
   return yield* Effect.try({ try: () => {
-    const storage = new URL(options.storageOrigin)
-    if (storage.protocol !== "https:" || storage.origin !== options.storageOrigin) throw new Error("Invalid storage origin")
-    const expected = new URL(`/${options.manifest.artifact.path}`, storage).href
+    const expected = githubArtifactUrl(options.manifest)
     if (response.headers.location !== expected) throw new Error("Unexpected artifact redirect")
     return expected
   }, catch: () => new HostedUpdateCheckFailed({ reason: "response" }) })

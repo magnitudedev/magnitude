@@ -26,7 +26,6 @@
     "@magnitudedev/icn-protocol": "workspace:*",
     "@magnitudedev/utils": "workspace:*",
     "@magnitudedev/version": "workspace:*",
-    "@vercel/blob": "^2.8.0",
     "effect": "3.21.2",
     "mdast-util-from-markdown": "^2.0.3",
     "pg": "8.20.0",

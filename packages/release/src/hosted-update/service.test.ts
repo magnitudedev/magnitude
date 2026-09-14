@@ -11,7 +11,7 @@ const request = async () => {
   const url = new URL(options.origin + "/api/update?" + updateQuery({ protocol: "1", product: "desktop", version: "1.0.0", os: "darwin", os_version: "26.0", arch: "arm64", package: "mac-zip", channel: "stable", ts: String(Math.floor(Date.now() / 1000)), nonce: await Effect.runPromise(newUpdateNonce) }))
   return new Request(url, { headers: { Authorization: await Effect.runPromise(signUpdateRequest(installation.privateKey, url)) } })
 }
-const signed = (version: string) => Effect.runPromise(signUpdateManifest(Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, version, commit: "a".repeat(40), artifact: { id: "mac", target: { os: "darwin", arch: "arm64", package: "mac-zip" }, path: `releases/${version}/mac.zip`, bytes: 100, sha256: "a".repeat(64) } }), keyId, publisher.privateKey))
+const signed = (version: string) => Effect.runPromise(signUpdateManifest(Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, tag: `@magnitudedev/cli@${version}`, version, commit: "a".repeat(40), artifact: { id: "mac", target: { os: "darwin", arch: "arm64", package: "mac-zip" }, filename: `mac.zip`, bytes: 100, sha256: "a".repeat(64) } }), keyId, publisher.privateKey))
 const harness = (candidates: readonly SignedUpdateManifest[] = [], overrides: Partial<DistributionStore> = {}) => {
   const nonces = new Set<string>(), records: (typeof CheckObservation.Type)[] = []
   const store: DistributionStore = {

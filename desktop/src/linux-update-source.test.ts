@@ -15,13 +15,13 @@ describe("Linux update staging", () => {
     const directory = await mkdtemp(join(tmpdir(), "linux-update-stage-"))
     const archive = join(directory, "download.deb")
     await writeFile(archive, "verified-by-shared-download")
-    const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, version: "2.0.0", commit: "a".repeat(40), artifact: {
-      id: "linux", target: { os: "linux", arch: "arm64", package: "deb" }, path: "releases/2.0.0/desktop.deb", bytes: 26, sha256: "a".repeat(64),
+    const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, tag: "@magnitudedev/cli@2.0.0", version: "2.0.0", commit: "a".repeat(40), artifact: {
+      id: "linux", target: { os: "linux", arch: "arm64", package: "deb" }, filename: "desktop.deb", bytes: 26, sha256: "a".repeat(64),
     } })
     const envelope = await Effect.runPromise(signUpdateManifest(manifest, PublisherKeyId.make("test"), generateKeyPairSync("ed25519").privateKey))
     try {
       await Effect.runPromise(Effect.gen(function* () {
-        const linux = yield* makeLinuxUpdateSource({ origin: "https://magnitude.dev", storageOrigin: "https://storage.example", trustedPublishers: new Map(),
+        const linux = yield* makeLinuxUpdateSource({ origin: "https://magnitude.dev", trustedPublishers: new Map(),
           metadata: yield* Schema.decodeUnknown(UpdateClientMetadata)({ version: "1.0.0", os: "linux", os_version: "6.1", arch: "arm64", package: "deb" }),
           sign: () => Effect.succeed("unused"), userAgent: "fixture", cacheDirectory: join(directory, "cache"), stateDirectory: directory })
         expect(linux.previousFailure._tag).toBe("None")

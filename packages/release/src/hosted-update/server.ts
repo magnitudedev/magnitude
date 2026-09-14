@@ -11,7 +11,6 @@ export const DistributionServerConfig = Schema.Struct({
   databaseUrl: Schema.String,
   databaseCa: Schema.String,
   databaseNamespace: DistributionNamespace,
-  storageOrigin: Schema.String,
   publishers: Schema.Record({ key: Schema.String, value: Schema.String }),
 })
 export type DistributionServerConfig = typeof DistributionServerConfig.Type
@@ -23,9 +22,8 @@ export const makeDistributionServer = (config: DistributionServerConfig) => Effe
   const pool = yield* Effect.try({ try: () => {
     const url = new URL(config.databaseUrl)
     const origin = new URL(config.origin)
-    const storage = new URL(config.storageOrigin)
     if (!["postgres:", "postgresql:"].includes(url.protocol) || origin.protocol !== "https:" || origin.origin !== config.origin
-      || storage.protocol !== "https:" || storage.origin !== config.storageOrigin || !config.databaseCa.includes("BEGIN CERTIFICATE")) throw new Error("Invalid server configuration")
+      || !config.databaseCa.includes("BEGIN CERTIFICATE")) throw new Error("Invalid server configuration")
     return new Pool({
       host: url.hostname, port: Number(url.port || 5432), user: decodeURIComponent(url.username), password: decodeURIComponent(url.password), database: url.pathname.slice(1),
       ssl: { ca: config.databaseCa, rejectUnauthorized: true }, max: 5, connectionTimeoutMillis: 5000, idleTimeoutMillis: 30000, statement_timeout: 5000,
@@ -38,13 +36,13 @@ export const makeDistributionServer = (config: DistributionServerConfig) => Effe
   return {
     pool,
     installer: (request: Request, country: string | undefined) => handleInstallerDownload(request, {
-      origin: config.origin, storageOrigin: config.storageOrigin, country: Option.fromNullable(country), trustedPublishers: new Map(keys),
+      origin: config.origin, country: Option.fromNullable(country), trustedPublishers: new Map(keys),
     }).pipe(Effect.provideService(DistributionStore, store)),
     check: (request: Request, country: string | undefined) => handleUpdateCheck(request, {
       origin: config.origin, country: Option.fromNullable(country), trustedPublishers: new Map(keys),
     }).pipe(Effect.provideService(DistributionStore, store)),
     download: (request: Request, country: string | undefined) => handleArtifactDownload(request, {
-      origin: config.origin, storageOrigin: config.storageOrigin, country: Option.fromNullable(country), trustedPublishers: new Map(keys),
+      origin: config.origin, country: Option.fromNullable(country), trustedPublishers: new Map(keys),
     }).pipe(Effect.provideService(DistributionStore, store)),
   }
 })

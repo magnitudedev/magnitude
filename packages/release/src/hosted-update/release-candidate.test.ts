@@ -15,7 +15,7 @@ describe("production desktop publication admission", () => {
     const result = await Effect.runPromise(hostedDesktopManifests(release, commit))
     expect(result).toHaveLength(8)
     expect(new Set(result.map(m => `${m.artifact.target.os}/${m.artifact.target.arch}/${m.artifact.target.package}`)).size).toBe(8)
-    result.forEach((manifest, index) => expect(manifest.artifact).toMatchObject({ id: artifacts[index]!.id, bytes: 123, sha256: "b".repeat(64), path: `releases/2.0.0/${artifacts[index]!.filename}` }))
+    result.forEach((manifest, index) => expect(manifest.artifact).toMatchObject({ id: artifacts[index]!.id, bytes: 123, sha256: "b".repeat(64), filename: artifacts[index]!.filename }))
   })
   it.each([
     ["missing transport", artifacts.slice(1)],

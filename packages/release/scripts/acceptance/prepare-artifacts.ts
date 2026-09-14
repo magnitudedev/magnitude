@@ -1,3 +1,5 @@
+import { publishGithubAcceptance } from "../../src/hosted-update/github-acceptance"
+import { verifyGithubRelease } from "../../src/hosted-update/github-release"
 import { FileSystem, FetchHttpClient } from "@effect/platform"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
 import { Config, Effect, Option, Schema } from "effect"
@@ -24,15 +26,18 @@ const run = Effect.gen(function* () {
     const target = host.startsWith("darwin-") ? { os: "darwin", arch: host.endsWith("arm64") ? "arm64" : "x64", package: artifact.filename.endsWith(".dmg") ? "dmg" : "mac-zip" }
       : host === "windows-x64-msvc" ? { os: "windows", arch: "x64", package: "windows-exe" }
       : { os: "linux", arch: host.includes("arm64") ? "arm64" : "x64", package: artifact.filename.endsWith(".deb") ? "deb" : "rpm" }
-    const manifest = yield* Schema.decodeUnknown(UpdateManifest)({ protocol: 1, version, commit,
-      artifact: { id: artifact.id, target, path: `releases/${version}/acceptance-${commit}-${artifact.filename}`, bytes: artifact.bytes, sha256: artifact.sha256 },
+    const manifest = yield* Schema.decodeUnknown(UpdateManifest)({ protocol: 1, version, commit, tag: `desktop-update-acceptance/${commit}/${version}`,
+      artifact: { id: artifact.id, target, filename: artifact.filename, bytes: artifact.bytes, sha256: artifact.sha256 },
     })
     return { file: join(directory, artifact.filename), manifest }
   }))
-  const envelopes = yield* prepareHostedRelease({ artifacts, keyId: PublisherKeyId.make("acceptance"), privateKey: key,
-    storageOrigin: "https://5r3lqtpag4uzvtxd.public.blob.vercel-storage.com", token: yield* Config.string("DISTRIBUTION_BLOB_READ_WRITE_TOKEN"),
+  const token = yield* Config.string("GH_TOKEN")
+  yield* publishGithubAcceptance(artifacts, token)
+  const manifests = artifacts.map(a => a.manifest)
+  yield* verifyGithubRelease(manifests, Option.some(token))
+  const envelopes = yield* prepareHostedRelease({ artifacts: manifests, keyId: PublisherKeyId.make("acceptance"), privateKey: key,
   })
   yield* fs.writeFileString(join(directory, "prepared-manifests.json"), yield* Schema.encode(Schema.parseJson(Schema.Array(SignedUpdateManifest)))(envelopes))
-  yield* Effect.logInfo("Acceptance artifacts uploaded, fully downloaded and publisher-signed; no channel promoted", { version, artifacts: envelopes.length })
+  yield* Effect.logInfo("Acceptance artifacts published to GitHub, verified and publisher-signed; no channel promoted", { version, artifacts: envelopes.length })
 })
 BunRuntime.runMain(run.pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer])))

@@ -16,9 +16,9 @@ import { ApplicationUpdateHandoff } from "./update-handoff"
 describe("Mac update acquisition and native handoff", () => {
   it.each([false, true])("verifies downloaded bytes before native staging (corrupt=%s)", async corrupt => {
     const bytes = Buffer.from("verified ZIP fixture")
-    const candidate = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, version: "2.0.0", commit: "a".repeat(40), artifact: {
+    const candidate = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, tag: "@magnitudedev/cli@2.0.0", version: "2.0.0", commit: "a".repeat(40), artifact: {
       id: "desktop-update-darwin-arm64", target: { os: "darwin", arch: "arm64", package: "mac-zip" },
-      path: "releases/2.0.0/magnitude-desktop-darwin-arm64.zip", bytes: bytes.length,
+      filename: "magnitude-desktop-darwin-arm64.zip", bytes: bytes.length,
       sha256: createHash("sha256").update(bytes).digest("hex"),
     } })
     const offer = { manifest: candidate, envelope: await Effect.runPromise(signUpdateManifest(candidate, PublisherKeyId.make("test"), generateKeyPairSync("ed25519").privateKey)) }
@@ -29,9 +29,9 @@ describe("Mac update acquisition and native handoff", () => {
       const request = new Request(input, init)
       if (new URL(request.url).pathname === "/api/download") {
         expect(request.headers.has("authorization")).toBe(true)
-        return new Response(null, { status: 302, headers: { location: `https://storage.example/${candidate.artifact.path}` } })
+        return new Response(null, { status: 302, headers: { location: `https://github.com/magnitudedev/magnitude/releases/download/%40magnitudedev/cli%402.0.0/${candidate.artifact.filename}` } })
       }
-      expect(request.url).toBe(`https://storage.example/${candidate.artifact.path}`)
+      expect(request.url).toBe(`https://github.com/magnitudedev/magnitude/releases/download/%40magnitudedev/cli%402.0.0/${candidate.artifact.filename}`)
       expect(request.headers.has("authorization")).toBe(false)
       return new Response(corrupt ? Buffer.alloc(bytes.length, 0) : bytes, { headers: { "content-length": String(bytes.length) } })
     }, { preconnect: () => {} })
@@ -39,7 +39,7 @@ describe("Mac update acquisition and native handoff", () => {
     let recorded = false
     try {
       await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-        const source = yield* macUpdateSource({ origin: "https://magnitude.dev", storageOrigin: "https://storage.example", metadata, sign: url => signUpdateRequest(identity.privateKey, url), trustedPublishers: new Map(), userAgent: "Magnitude/1.0.0", cacheDirectory: root }).pipe(
+        const source = yield* macUpdateSource({ origin: "https://magnitude.dev", metadata, sign: url => signUpdateRequest(identity.privateKey, url), trustedPublishers: new Map(), userAgent: "Magnitude/1.0.0", cacheDirectory: root }).pipe(
           Effect.provideService(ApplicationUpdateHandoff, { record: version => Effect.sync(() => { expect(version).toBe(candidate.version); recorded = true }), inspect: () => Effect.succeed({ _tag: "Continue" as const }) }),
           Effect.provideService(NativeMacUpdate, {
             stage: feed => Effect.promise(async () => {

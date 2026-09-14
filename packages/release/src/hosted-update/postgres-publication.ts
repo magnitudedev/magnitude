@@ -12,7 +12,7 @@ export const postgresReleasePublicationStore = (pool: Pool, namespace: typeof Di
   promote: envelopes => Effect.gen(function* () {
     const manifests = yield* Effect.forEach(envelopes, envelope => verifyUpdateManifest(envelope, trustedPublishers)).pipe(
       Effect.mapError(() => new ReleasePublicationFailed({ stage: "batch" })))
-    yield* Schema.decodeUnknown(ReleasePublicationBatch)(manifests.map(manifest => ({ file: "", manifest }))).pipe(
+    yield* Schema.decodeUnknown(ReleasePublicationBatch)(manifests).pipe(
       Effect.mapError(() => new ReleasePublicationFailed({ stage: "batch" })))
     const first = manifests[0]!, channel = releaseChannelOf(first.version)
     if (channel === "unknown") return yield* new ReleasePublicationFailed({ stage: "batch" })

@@ -3,12 +3,11 @@ import { NodeContext } from "@effect/platform-node"
 import { checkHostedUpdate, resolveHostedDownload, downloadUpdateArtifact, type HostedUpdateConnection } from "@magnitudedev/release/hosted-update"
 import { Effect, Option } from "effect"
 import type { KeyObject } from "node:crypto"
-import { basename, join } from "node:path"
+import { join } from "node:path"
 import { ApplicationUpdateFailed, ApplicationUpdateSource } from "./application-update"
 
 export type HostedUpdateSourceOptions = HostedUpdateConnection & {
   readonly trustedPublishers: ReadonlyMap<string, KeyObject>
-  readonly storageOrigin: string
   readonly cacheDirectory: string
 }
 
@@ -23,7 +22,7 @@ export const hostedUpdateSource = (options: HostedUpdateSourceOptions, stage: Ap
     yield* fs.makeDirectory(options.cacheDirectory, { recursive: true, mode: 0o700 })
     const directory = yield* fs.makeTempDirectoryScoped({ directory: options.cacheDirectory, prefix: "desktop-update-" })
     const downloaded = yield* downloadUpdateArtifact({
-      url, destination: join(directory, basename(candidate.manifest.artifact.path)),
+      url, destination: join(directory, candidate.manifest.artifact.filename),
       manifest: candidate.manifest,
       onProgress: Option.some(value => progress(value.acceptedBytes)),
     })

@@ -21,8 +21,8 @@ describe.skipIf(process.platform !== "win32")("Windows installer staging", () =>
     const bytes = Buffer.from("publisher-verified installer fixture")
     await writeFile(archive, scenario === "changed" ? Buffer.from("changed installer bytes") : bytes)
     await writeFile(cli, "bundled CLI fixture")
-    const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, version: "2.0.0", commit: "a".repeat(40), artifact: {
-      id: "windows", target: { os: "windows", arch: "x64", package: "windows-exe" }, path: "releases/2.0.0/desktop.exe",
+    const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, tag: "@magnitudedev/cli@2.0.0", version: "2.0.0", commit: "a".repeat(40), artifact: {
+      id: "windows", target: { os: "windows", arch: "x64", package: "windows-exe" }, filename: "desktop.exe",
       bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
     } })
     const envelope = await Effect.runPromise(signUpdateManifest(manifest, PublisherKeyId.make("test"), generateKeyPairSync("ed25519").privateKey))
@@ -30,7 +30,7 @@ describe.skipIf(process.platform !== "win32")("Windows installer staging", () =>
     try {
       await Effect.runPromise(Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem
-        const windows = yield* makeWindowsUpdateSource({ origin: "https://magnitude.dev", storageOrigin: "https://storage.example", trustedPublishers: new Map(),
+        const windows = yield* makeWindowsUpdateSource({ origin: "https://magnitude.dev", trustedPublishers: new Map(),
           metadata: yield* Schema.decodeUnknown(UpdateClientMetadata)({ version: "1.0.0", os: "windows", os_version: "10", arch: "x64", package: "windows-exe" }),
           sign: () => Effect.succeed("unused"), userAgent: "fixture", cacheDirectory: join(directory, "cache"), stateDirectory: directory,
           applicationPath: join(directory, "Magnitude.exe"), cliPath: cli,

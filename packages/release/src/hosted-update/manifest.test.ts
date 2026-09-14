@@ -5,8 +5,8 @@ import { UpdateManifest, PublisherKeyId, signUpdateManifest, verifyUpdateManifes
 import { UpdateRequest } from "./request"
 const keys = generateKeyPairSync("ed25519"), keyId = PublisherKeyId.make("release-2026")
 const trust = new Map([[keyId, keys.publicKey]])
-const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, version: "2.0.0", commit: "a".repeat(40), artifact: {
-  id: "desktop-darwin-arm64", target: { os: "darwin", arch: "arm64", package: "mac-zip" }, path: "releases/2.0.0/magnitude-darwin-arm64.zip", bytes: 100, sha256: "a".repeat(64),
+const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, tag: "@magnitudedev/cli@2.0.0", version: "2.0.0", commit: "a".repeat(40), artifact: {
+  id: "desktop-darwin-arm64", target: { os: "darwin", arch: "arm64", package: "mac-zip" }, filename: "magnitude-darwin-arm64.zip", bytes: 100, sha256: "a".repeat(64),
 } })
 const request = Schema.decodeUnknownSync(UpdateRequest)({ protocol: "1", product: "desktop", version: "1.0.0", os: "darwin", os_version: "26.0", arch: "arm64", package: "mac-zip", channel: "stable", ts: "100", nonce: "ABCDEFGHIJKLMNOPQRSTUA" })
 describe("publisher-signed update manifest", () => {
@@ -31,7 +31,7 @@ describe("publisher-signed update manifest", () => {
     expect(acceptsUpdateManifest(manifest, { ...request, os: "linux", package: "deb" })).toBe(false)
   })
   it("rejects path traversal and invalid byte counts at the schema boundary", () => {
-    for (const artifact of [{ ...manifest.artifact, path: "releases/../secret" }, { ...manifest.artifact, path: "https://untrusted/file" }, { ...manifest.artifact, bytes: -1 }, { ...manifest.artifact, bytes: Number.MAX_SAFE_INTEGER + 1 }]) {
+    for (const artifact of [{ ...manifest.artifact, filename: "../secret" }, { ...manifest.artifact, filename: "https://untrusted/file" }, { ...manifest.artifact, bytes: -1 }, { ...manifest.artifact, bytes: Number.MAX_SAFE_INTEGER + 1 }]) {
       expect(Either.isLeft(Schema.decodeUnknownEither(UpdateManifest)({ ...manifest, artifact }))).toBe(true)
     }
   })

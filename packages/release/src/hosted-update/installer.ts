@@ -1,3 +1,4 @@
+import { githubArtifactUrl } from "./github-artifact"
 import { Effect, Option, Schema } from "effect"
 import type { KeyObject } from "node:crypto"
 import { ArtifactTarget, verifyUpdateManifest, type UpdateManifest } from "./manifest"
@@ -10,7 +11,6 @@ const response = (status: number) => new Response(null, { status, headers: { "Ca
 /** First downloads have no installation identity. Count requests, never pretend they identify users. */
 export const handleInstallerDownload = (request: Request, options: {
   readonly origin: string
-  readonly storageOrigin: string
   readonly country: Option.Option<string>
   readonly trustedPublishers: ReadonlyMap<string, KeyObject>
 }) => Effect.gen(function* () {
@@ -30,12 +30,11 @@ export const handleInstallerDownload = (request: Request, options: {
   }
   if (Option.isNone(selected)) return response(404)
   const manifest = selected.value
-  const location = new URL(manifest.artifact.path, options.storageOrigin + "/")
-  if (location.protocol !== "https:" || location.origin !== options.storageOrigin) return response(503)
+  const location = githubArtifactUrl(manifest)
   yield* store.recordInstallerDownload({ target, release: manifest.version, artifact: manifest.artifact.id, country: Option.filter(options.country, Schema.is(Country)) }).pipe(
     Effect.catchTag("DistributionStoreUnavailable", () => Effect.logWarning("Installer download telemetry write unavailable")),
   )
-  return new Response(null, { status: 302, headers: { "Cache-Control": "private, no-store", Location: location.href } })
+  return new Response(null, { status: 302, headers: { "Cache-Control": "private, no-store", Location: location } })
 }).pipe(Effect.catchTags({
   ParseError: () => Effect.succeed(response(400)),
   InvalidUpdateManifest: () => Effect.succeed(response(503)),

@@ -5,9 +5,9 @@ import { UpdatePreferences, UpdatePreferencesFailed } from "./update-preferences
 import { describe, expect, it } from "vitest"
 import { ApplicationUpdateFailed, ApplicationUpdateSource, makeApplicationUpdate, type ApplicationUpdate } from "./application-update"
 
-const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, version: "2.0.0", commit: "a".repeat(40), artifact: {
+const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, tag: "@magnitudedev/cli@2.0.0", version: "2.0.0", commit: "a".repeat(40), artifact: {
   id: "desktop-update-darwin-arm64", target: { os: "darwin", arch: "arm64", package: "mac-zip" },
-  path: "releases/2.0.0/magnitude-desktop-darwin-arm64.zip", bytes: 100, sha256: "a".repeat(64),
+  filename: "magnitude-desktop-darwin-arm64.zip", bytes: 100, sha256: "a".repeat(64),
 } })
 const candidate = { manifest, envelope: await Effect.runPromise(signUpdateManifest(manifest, PublisherKeyId.make("test"), generateKeyPairSync("ed25519").privateKey)) }
 const waitFor = (owner: ApplicationUpdate, tag: string) => owner.changes.pipe(Stream.filter(state => state.transfer._tag === tag), Stream.take(1), Stream.runDrain)
