@@ -27,7 +27,7 @@ def _construct(graph, mode="decode"):
     return _build_prim_func(build_unit(graph, memory, submission[0]))
 
 
-def test_attention_prepare_has_reference_and_portable_construction():
+def test_attention_prepare_has_reference_and_requires_production_fusion():
     specs = (
         mt.TensorSpec((2, 16), mt.DType.F32),
         mt.TensorSpec((2, 4), mt.DType.F32),
@@ -64,7 +64,27 @@ def test_attention_prepare_has_reference_and_portable_construction():
     }
     outputs = mt.evaluate_reference(graph, values).outputs
     assert tuple(output.shape for output in outputs) == ((2, 2, 4), (2, 1, 4), (2, 2, 4))
-    assert _construct(graph).attrs["global_symbol"]
+    # Independent four-channel RoPE oracle: the two frequencies are 1 and
+    # 1/sqrt(10000), with coordinates drawn from the first and second axes.
+    # Shape-only coverage missed an exponent denominator of half the width.
+    angles = np.asarray([[0.0, 0.0], [1.0, 0.02]], np.float32)[:, None, :]
+    raw_query = values["v0"].reshape(2, 2, 2, 4)
+    for raw, actual in zip(
+        (raw_query[:, :, 0], values["v1"].reshape(2, 1, 4)), outputs[:2], strict=True
+    ):
+        normalized = raw / np.sqrt(np.mean(raw * raw, axis=-1, keepdims=True) + 1e-6)
+        first, second = normalized[..., :2], normalized[..., 2:]
+        expected = np.concatenate(
+            (
+                first * np.cos(angles) - second * np.sin(angles),
+                second * np.cos(angles) + first * np.sin(angles),
+            ),
+            axis=-1,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+    np.testing.assert_array_equal(outputs[2], raw_query[:, :, 1])
+    with pytest.raises(ValueError, match="no legal lowering"):
+        _construct(graph)
 
 
 def test_gated_delta_recurrence_preserves_state_as_an_explicit_output():
@@ -90,11 +110,7 @@ def test_gated_delta_recurrence_preserves_state_as_an_explicit_output():
         signature,
     )
     values = {
-        f"v{i}": (
-            np.asarray([0, 2], np.int32)
-            if i == 6
-            else np.ones(spec.shape, np.float32) * 0.1
-        )
+        f"v{i}": (np.asarray([0, 2], np.int32) if i == 6 else np.ones(spec.shape, np.float32) * 0.1)
         for i, spec in enumerate(specs)
     }
     output, state = mt.evaluate_reference(graph, values).outputs
@@ -109,13 +125,13 @@ def test_gated_delta_recurrence_matches_reference_on_metal():
     if not torch.backends.mps.is_available():
         pytest.skip("Metal recurrent transition check requires MPS")
     specs = (
-        mt.TensorSpec((2, 1, 4), mt.DType.F32),
-        mt.TensorSpec((2, 1, 4), mt.DType.F32),
-        mt.TensorSpec((2, 2, 4), mt.DType.F32),
-        mt.TensorSpec((2, 2), mt.DType.F32),
-        mt.TensorSpec((2, 2), mt.DType.F32),
-        mt.TensorSpec((1, 2, 4, 4), mt.DType.F32),
-        mt.TensorSpec((2,), mt.DType.I32),
+        mt.TensorSpec((3, 1, 4), mt.DType.F32),
+        mt.TensorSpec((3, 1, 4), mt.DType.F32),
+        mt.TensorSpec((3, 2, 4), mt.DType.F32),
+        mt.TensorSpec((3, 2), mt.DType.F32),
+        mt.TensorSpec((3, 2), mt.DType.F32),
+        mt.TensorSpec((2, 2, 4, 4), mt.DType.F32),
+        mt.TensorSpec((3,), mt.DType.I32),
     )
     signature = mt.Signature(
         tuple(
@@ -130,7 +146,7 @@ def test_gated_delta_recurrence_matches_reference_on_metal():
     graph = mt.trace(function, signature)
     rng = np.random.default_rng(28)
     arrays = tuple(
-        np.asarray([0, 2], np.int32)
+        np.asarray([0, 1, 3], np.int32)
         if index == 6
         else rng.normal(0, 0.1, spec.shape).astype(np.float32)
         for index, spec in enumerate(specs)
@@ -143,8 +159,7 @@ def test_gated_delta_recurrence_matches_reference_on_metal():
     compiled = execution = None
     try:
         resources = [
-            device.upload(spec, value.tobytes())
-            for spec, value in zip(specs, arrays, strict=True)
+            device.upload(spec, value.tobytes()) for spec, value in zip(specs, arrays, strict=True)
         ]
         compiled = mt.compile(
             function,
@@ -156,9 +171,7 @@ def test_gated_delta_recurrence_matches_reference_on_metal():
         execution = compiled.submit(*resources[:5], resources[6], resources={"v5": resources[5]})
         execution.completion.wait()
         for actual, reference in zip(execution.outputs, expected, strict=True):
-            np.testing.assert_allclose(
-                actual.native.cpu().numpy(), reference, rtol=3e-3, atol=3e-3
-            )
+            np.testing.assert_allclose(actual.native.cpu().numpy(), reference, rtol=3e-3, atol=3e-3)
     finally:
         if execution is not None:
             for output in execution.outputs:

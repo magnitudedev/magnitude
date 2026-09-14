@@ -160,47 +160,40 @@ def _alignment(spec: TensorSpec, capabilities: Capabilities) -> int:
 def _assign_slots(
     intervals: tuple[_Interval, ...], alignment: int
 ) -> tuple[dict[tuple[str, int, int], int], int]:
-    """Plan byte ranges, then use each distinct range start as an ABI slot.
+    """Reuse whole native allocations across non-overlapping lifetimes.
 
-    Range planning retains best-fit lifetime reuse. Physical realization maps
-    every distinct start to a zero-offset allocation because packed TileLang
-    tensor arguments cannot carry a nonzero storage offset.
+    Native bindings require zero-offset buffers. Splitting a freed byte range
+    would create another allocation, not a view into the original allocation;
+    counting the virtual address extent would then understate physical memory.
     """
     ordered = sorted(intervals, key=lambda item: (item.start, -item.size, item.identity))
-    active: list[tuple[int, int, int]] = []  # end, offset, size
+    active: list[tuple[int, int, int]] = []  # end, slot, physical capacity
     free: list[tuple[int, int]] = []
-    offsets = {}
+    slots = {}
     extent = 0
     for interval in ordered:
         retained = []
-        for end, offset, size in active:
+        for end, slot, capacity in active:
             if end < interval.start:
-                free.append((offset, size))
+                free.append((slot, capacity))
             else:
-                retained.append((end, offset, size))
+                retained.append((end, slot, capacity))
         active = retained
-        choice = None
-        for index, (offset, size) in enumerate(free):
-            aligned = _align(offset, interval.alignment)
-            if aligned + interval.size <= offset + size:
-                waste = size - interval.size
-                if choice is None or waste < choice[0]:
-                    choice = waste, index, aligned
-        if choice is None:
-            offset = _align(extent, interval.alignment)
-            extent = offset + interval.size
+        choices = [
+            (capacity, index, slot)
+            for index, (slot, capacity) in enumerate(free)
+            if capacity >= interval.size and slot % interval.alignment == 0
+        ]
+        if choices:
+            capacity, index, slot = min(choices)
+            free.pop(index)
         else:
-            _, index, offset = choice
-            free_offset, free_size = free.pop(index)
-            before = offset - free_offset
-            after = free_offset + free_size - (offset + interval.size)
-            if before:
-                free.append((free_offset, before))
-            if after:
-                free.append((offset + interval.size, after))
-        offsets[interval.identity] = offset
-        active.append((interval.end, offset, interval.size))
-    return offsets, _align(extent, alignment)
+            slot = _align(extent, alignment)
+            capacity = _align(interval.size, alignment)
+            extent = slot + capacity
+        slots[interval.identity] = slot
+        active.append((interval.end, slot, capacity))
+    return slots, extent
 
 
 def _align(value: int, alignment: int) -> int:

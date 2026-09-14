@@ -5,7 +5,7 @@ import magnitensor as mt
 from magnitensor.compiler.lowering import LoweringContext, plan_submissions, select_cover
 from magnitensor.compiler.memory import plan_memory
 from magnitensor.compiler.unit import build_unit
-from magnitensor.runtime.tilelang import _build_prim_func
+from magnitensor.runtime.tilelang import _build_prim_func, _build_reusable_module
 from magnitensor.tensor.graph import prune_dead_nodes
 
 
@@ -31,9 +31,14 @@ def test_reference_and_pointwise_fusion_preserve_semantics():
 
 def test_multi_kernel_cover_becomes_one_tilelang_prim_func():
     signature = mt.Signature((mt.Argument(mt.TensorSpec((2, 4), mt.DType.F32), "x"),))
-    graph = mt.trace(lambda x: mt.softmax(mt.rms_norm(x), axis=-1), signature)
+    graph = mt.trace(lambda x: mt.tanh(mt.rms_norm(x)), signature)
     capabilities = mt.Capabilities(
-        32, 256, 32 * 1024, native_multi_launch=True, partial_binding=True
+        32,
+        256,
+        32 * 1024,
+        memory_scopes=frozenset({"global", "shared", "local"}),
+        native_multi_launch=True,
+        partial_binding=True,
     )
     context = LoweringContext(capabilities, "prefill", "model", "test", 1 << 20)
     cover = select_cover(graph, mt.lowerings.enumerate(graph, context))
@@ -47,10 +52,49 @@ def test_multi_kernel_cover_becomes_one_tilelang_prim_func():
     assert len(unit.calls) == 2
 
 
+def test_repeated_schedule_shapes_share_private_program_definitions():
+    signature = mt.Signature((mt.Argument(mt.TensorSpec((2, 4), mt.DType.F32), "x"),))
+    graph = mt.trace(
+        lambda x: mt.tanh(mt.rms_norm(mt.tanh(mt.rms_norm(x)))),
+        signature,
+    )
+    capabilities = mt.Capabilities(
+        32,
+        256,
+        32 * 1024,
+        memory_scopes=frozenset({"global", "shared", "local"}),
+        native_multi_launch=True,
+        partial_binding=True,
+    )
+    context = LoweringContext(capabilities, "prefill", "model", "test", 1 << 20)
+    cover = select_cover(graph, mt.lowerings.enumerate(graph, context))
+    memory = plan_memory(graph, cover, capabilities)
+    submissions = plan_submissions(graph, cover, capabilities)
+    assert len(submissions) == 1
+    unit = build_unit(graph, memory, submissions[0])
+
+    module = _build_reusable_module(unit)
+
+    exposed = [
+        function
+        for function in module.functions.values()
+        if function.attrs is not None and function.attrs.get("global_symbol") is not None
+    ]
+    assert len(unit.calls) == 4
+    assert len(module.functions) == 3
+    assert len(exposed) == 1
+
+
 def test_runtime_contract_rejects_python_launch_fallback():
     signature = mt.Signature((mt.Argument(mt.TensorSpec((2, 4), mt.DType.F32)),))
-    graph = mt.trace(lambda x: mt.softmax(mt.rms_norm(x)), signature)
-    capabilities = mt.Capabilities(32, 256, 32 * 1024, partial_binding=True)
+    graph = mt.trace(lambda x: mt.tanh(mt.rms_norm(x)), signature)
+    capabilities = mt.Capabilities(
+        32,
+        256,
+        32 * 1024,
+        memory_scopes=frozenset({"global", "shared", "local"}),
+        partial_binding=True,
+    )
     context = LoweringContext(capabilities, "decode", "model", "test", 1 << 20)
     cover = select_cover(graph, mt.lowerings.enumerate(graph, context))
     with pytest.raises(ValueError, match="native multi-launch"):

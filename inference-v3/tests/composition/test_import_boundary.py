@@ -69,11 +69,8 @@ def test_tilelang_is_reached_only_by_magnitensor_kernel_and_runtime_realization(
         if path == ENGINE / "platform" / "compiler.py":
             continue
         if any(
-            module == "tilelang" or module.startswith("tilelang.")
-            for module in _imports(path)
-        ) and not (
-            path.is_relative_to(allowed[0]) or path == allowed[1]
-        ):
+            module == "tilelang" or module.startswith("tilelang.") for module in _imports(path)
+        ) and not (path.is_relative_to(allowed[0]) or path == allowed[1]):
             offenders.append(str(path.relative_to(ROOT)))
     assert offenders == []
 

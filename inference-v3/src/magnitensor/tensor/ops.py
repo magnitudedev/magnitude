@@ -441,13 +441,14 @@ def _rms_norm(inputs, attrs):
     value = inputs[0]
     if not value.dtype.floating or value.rank < 1:
         raise ValueError("rms_norm needs a floating tensor")
-    if len(inputs) == 2 and (
-        inputs[1].shape != (value.shape[-1],) or inputs[1].dtype != value.dtype
-    ):
+    if len(inputs) == 2 and (inputs[1].shape != (value.shape[-1],) or not inputs[1].dtype.floating):
         raise ValueError("rms_norm weight geometry differs from the last axis")
     if attrs["epsilon"] <= 0:
         raise ValueError("rms_norm epsilon must be positive")
-    return (value,)
+    output_dtype = attrs.get("output_dtype") or value.dtype
+    if not output_dtype.floating:
+        raise ValueError("rms_norm output must be floating point")
+    return (TensorSpec(value.shape, output_dtype, value.layout),)
 
 
 def _rms_reference(inputs, attrs):
@@ -459,9 +460,15 @@ def _rms_reference(inputs, attrs):
     return result if len(inputs) == 1 else result * inputs[1]
 
 
-def rms_norm(value: Tensor, weight: Tensor | None = None, *, epsilon: float = 1e-6) -> Tensor:
+def rms_norm(
+    value: Tensor,
+    weight: Tensor | None = None,
+    *,
+    epsilon: float = 1e-6,
+    output_dtype: DType | None = None,
+) -> Tensor:
     inputs = (value,) if weight is None else (value, weight)
-    return _emit("rms_norm", *inputs, epsilon=epsilon)
+    return _emit("rms_norm", *inputs, epsilon=epsilon, output_dtype=output_dtype)
 
 
 @operation(
@@ -669,7 +676,7 @@ def _attention_prepare_reference(inputs, attrs):
     query_gate = query_gate.reshape(rows, query_heads, 2, width)
     query = normalize(query_gate[:, :, 0], query_norm)
     key = normalize(keys.reshape(rows, kv_heads, width), key_norm)
-    frequency = attrs["base"] ** (-np.arange(0, rotary_width, 2, dtype=np.float32) / half)
+    frequency = attrs["base"] ** (-np.arange(0, rotary_width, 2, dtype=np.float32) / rotary_width)
     index = np.arange(half)
     axis = np.where(
         (index % 3 == 1) & (index < sections[1] * 3),
@@ -832,9 +839,9 @@ def _attention_reference(inputs, attrs):
                 @ history[0, start : start + count, kv_head].astype(np.float32).T
             )
             probabilities = _softmax_reference(logits * attrs["scale"], -1)
-            result[token, head] = probabilities @ history[
-                1, start : start + count, kv_head
-            ].astype(np.float32)
+            result[token, head] = probabilities @ history[1, start : start + count, kv_head].astype(
+                np.float32
+            )
     return result
 
 
@@ -1048,9 +1055,7 @@ def _recurrent_prepare_reference(inputs, attrs):
             axis=1,
         )
         for step, row in enumerate(range(start, end)):
-            convolved[row] = np.sum(
-                joined[:, step : step + history + 1] * convolution, axis=1
-            )
+            convolved[row] = np.sum(joined[:, step : step + history + 1] * convolution, axis=1)
         following[sequence] = joined[:, -history:]
     convolved = convolved / (1 + np.exp(-convolved))
     heads = convolved.reshape(rows, 2 * key_heads + value_heads, width)

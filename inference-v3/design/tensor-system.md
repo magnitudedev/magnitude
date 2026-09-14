@@ -41,7 +41,7 @@ unrolled naturally. Dynamic tensor control is an explicit tensor operation.
 |---|---|
 | Dynamic tensor | Geometry and dtype constrain compilation; storage is bound per invocation |
 | Immutable weight | Numerical representation and value identity are captured; storage is bound once |
-| Mutable resource | Access and alias identity are explicit; storage is bound per state view |
+| Mutable resource | Access and alias identity are explicit; stable storage may bind once, while changing state views bind per invocation |
 | Static value | Controls architecture or specialization and is folded into the graph |
 
 Tensor values are immutable. A mutable resource is versioned: a write consumes
@@ -126,8 +126,9 @@ Selected lowerings contribute Python-authored `T.Kernel` work to a shared
 compilation unit. After storage and dependency planning, Magnitensor uses
 TileLang's public eager construction facility to declare the dynamically
 determined ordered ABI, invokes selected authored schedules in dependency order,
-and finalizes one `PrimFunc`. The default unit for a prefill, decode or
-verification specialization is the whole tensor function.
+and finalizes one module with one public entry and reusable private schedule
+functions. The default unit for a prefill, decode or verification specialization
+is the whole tensor function.
 
 A unit is split only by a required host observation, a data-dependent host
 decision, an unsupported dependency, or a qualified compiler/runtime limit.
@@ -138,7 +139,7 @@ regions were selected independently.
 selected graph cover + storage plan
               │ ordered kernel emission
               ▼
-maximal TileLang PrimFunc ──► one pre-bound native entrypoint
+maximal TileLang module ──► one pre-bound native entrypoint
 ```
 
 Warm host work is proportional to dynamic bindings and true submission units.
@@ -174,7 +175,8 @@ permits a backend side channel.
 Kernel composition is Python composition. Magnitensor never generates Python or
 TileLang source strings, calls `exec`, fabricates Python AST, or manipulates TIR.
 TileLang owns the eager IR builder that turns dynamic parameter declarations and
-ordinary TileLang macro calls into a valid `PrimFunc`.
+ordinary TileLang macro calls into valid private `PrimFunc`s and one public-entry
+`IRModule`.
 
 ## Compiled execution
 
@@ -186,6 +188,13 @@ inputs, invokes each native entrypoint once, and returns output tensors with one
 completion obligation. Selection, graph traversal, allocation planning,
 compilation, tuning and per-kernel Python dispatch are absent from the invocation
 hot path.
+
+Static binding describes resource identity, not immutability of its contents. A
+stable mutable resource such as a model-owned attention store can therefore be
+captured once while its versioned reads and writes remain explicit in the graph.
+Request-owned or replaceable state views remain dynamic. The compiled callable
+retains every captured resource through its own lifetime, and the bound native
+argument frame is never mutated by an invocation.
 
 Physical resources stay claimed through completion. Logical commit is a separate
 Magnitude event: completion proves that bytes exist, while commit decides whether

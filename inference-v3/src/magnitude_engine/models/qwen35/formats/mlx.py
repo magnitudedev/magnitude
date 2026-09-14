@@ -69,7 +69,7 @@ def describe(artifact: MLXFormat) -> DenseDescription:
     ):
         raise ValueError("invalid Qwen layer order")
     g = Geometry(
-        activation_dtype=mt.DType.F16,
+        activation_dtype=mt.DType.BF16,
         hidden=text.hidden_size,
         intermediate=text.intermediate_size,
         vocabulary=text.vocab_size,

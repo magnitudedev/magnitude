@@ -68,6 +68,7 @@ typeCheckingMode = "basic"
 # own typed DSL. Python's checker cannot interpret those three expression forms;
 # the compiler/reference suite checks them. Host operation contracts remain checked.
 executionEnvironments = [
+  { root = "src/magnitensor/kernels", reportInvalidTypeForm = false, reportCallIssue = false, reportAttributeAccessIssue = false, reportOptionalMemberAccess = false, reportOperatorIssue = false },
   { root = "src/magnitude_engine/numerics", reportInvalidTypeForm = false, reportCallIssue = false, reportAttributeAccessIssue = false },
   { root = "src/magnitude_engine" },
 ]

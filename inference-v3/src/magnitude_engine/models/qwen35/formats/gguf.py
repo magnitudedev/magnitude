@@ -119,7 +119,7 @@ def _inspect(
         else integer("feed_forward_length")
     )
     geometry = Geometry(
-        activation_dtype=mt.DType.F16,
+        activation_dtype=mt.DType.BF16,
         hidden=integer("embedding_length"),
         intermediate=intermediate,
         vocabulary=embedding.shape[0],

@@ -102,9 +102,7 @@ def test_prefill_uses_reusable_physical_row_capacity():
     native = Runtime()
     device = mt.Device(native, budget_bytes=1 << 24)
     residency = ModelResidency(device)
-    model = DenseRuntime(
-        _description(), device, residency, max_sequences=2, prefill_rows=4
-    )
+    model = DenseRuntime(_description(), device, residency, max_sequences=2, prefill_rows=4)
 
     first = model.create(InputPlan.text((TokenId(1), TokenId(2))))
     first_batch = model.prepare(

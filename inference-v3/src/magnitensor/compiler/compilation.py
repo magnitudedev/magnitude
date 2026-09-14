@@ -82,6 +82,7 @@ class CompiledFunction:
         memory: MemoryPlan,
         units: tuple[_CompiledUnit, ...],
         constants: Mapping[int, Resource],
+        static_resources: Mapping[int, Resource],
         owned_storage: tuple[Resource, ...],
         static_values: Mapping[int, Resource],
         static_workspace: Mapping[tuple[str, int], Resource],
@@ -92,6 +93,7 @@ class CompiledFunction:
         self.memory = memory
         self._units = units
         self._constants = {key: value.fork() for key, value in constants.items()}
+        self._static_resources = {key: value.fork() for key, value in static_resources.items()}
         self._owned_storage = owned_storage
         self._static_values = dict(static_values)
         self._static_workspace = dict(static_workspace)
@@ -110,7 +112,11 @@ class CompiledFunction:
             raise TypeError(
                 f"compiled function expects {len(self.graph.inputs)} inputs, got {len(inputs)}"
             )
-        values: dict[int, Resource] = {**self._constants, **self._static_values}
+        values: dict[int, Resource] = {
+            **self._constants,
+            **self._static_resources,
+            **self._static_values,
+        }
         retained: list[Resource] = []
         allocated_outputs: list[Resource] = []
         try:
@@ -120,6 +126,8 @@ class CompiledFunction:
                 retained.append(resource.fork())
             supplied = resources or {}
             for value_id in self.graph.resources:
+                if value_id in self._static_resources:
+                    continue
                 value = self.graph.values[value_id]
                 resource = supplied.get(value_id)
                 if resource is None and value.name is not None:
@@ -184,6 +192,8 @@ class CompiledFunction:
             resource.close()
         for resource in self._constants.values():
             resource.close()
+        for resource in self._static_resources.values():
+            resource.close()
         self._closed = True
 
 
@@ -193,6 +203,7 @@ def compile(
     signature: Signature,
     device: Device,
     constants: Mapping[int | str, Resource],
+    static_resources: Mapping[int | str, Resource] | None = None,
     options: CompileOptions,
     registry: LoweringRegistry = lowerings,
 ) -> CompiledFunction:
@@ -205,7 +216,12 @@ def compile(
         options=options,
         registry=registry,
     )
-    return materialize(plan, device=device, constants=constants)
+    return materialize(
+        plan,
+        device=device,
+        constants=constants,
+        static_resources=static_resources or {},
+    )
 
 
 def analyze(
@@ -255,10 +271,12 @@ def materialize(
     *,
     device: Device,
     constants: Mapping[int | str, Resource],
+    static_resources: Mapping[int | str, Resource] | None = None,
 ) -> CompiledFunction:
     """Allocate and compile one previously analyzed plan."""
     graph, memory, submissions = plan.graph, plan.memory, plan.submissions
     bound_constants = _bind_constants(graph, constants, device)
+    bound_resources = _bind_resources(graph, static_resources or {}, device)
     units = []
     owned_storage, static_values, static_workspace = _allocate_temporary_slots(device, memory)
     try:
@@ -280,10 +298,17 @@ def materialize(
                         static[parameter.index] = static_workspace[
                             (candidate, parameter.key[2])
                         ].native
+                elif (
+                    parameter.kind == ParameterKind.RESOURCE and parameter.key[1] in bound_resources
+                ):
+                    static[parameter.index] = bound_resources[parameter.key[1]].native
             dynamic_indices = tuple(
                 parameter.index
                 for parameter in compilation_unit.parameters
                 if parameter.kind not in (ParameterKind.CONSTANT, ParameterKind.TEMPORARY)
+                and not (
+                    parameter.kind == ParameterKind.RESOURCE and parameter.key[1] in bound_resources
+                )
             )
             executable = device.runtime.compile(compilation_unit, compilation_unit.signature)
             try:
@@ -295,6 +320,9 @@ def materialize(
                 parameter.key
                 for parameter in compilation_unit.parameters
                 if parameter.kind not in (ParameterKind.CONSTANT, ParameterKind.TEMPORARY)
+                and not (
+                    parameter.kind == ParameterKind.RESOURCE and parameter.key[1] in bound_resources
+                )
             )
             units.append(_CompiledUnit(compilation_unit, executable, entrypoint, dynamic))
     except BaseException:
@@ -309,6 +337,7 @@ def materialize(
         memory,
         tuple(units),
         bound_constants,
+        bound_resources,
         owned_storage,
         static_values,
         static_workspace,
@@ -373,6 +402,30 @@ def _bind_constants(
             raise KeyError(f"missing immutable constant {value.name or value_id}")
         _check_binding(device, value.spec, resource)
         result[value_id] = resource
+    return result
+
+
+def _bind_resources(
+    graph: Graph, supplied: Mapping[int | str, Resource], device: Device
+) -> dict[int, Resource]:
+    result = {}
+    for value_id in graph.resources:
+        value = graph.values[value_id]
+        resource = supplied.get(value_id)
+        if resource is None and value.name is not None:
+            resource = supplied.get(value.name)
+        if resource is None:
+            continue
+        _check_binding(device, value.spec, resource)
+        result[value_id] = resource
+    unknown_names = {
+        key
+        for key in supplied
+        if isinstance(key, str)
+        and key not in {graph.values[value_id].name for value_id in graph.resources}
+    }
+    if unknown_names:
+        raise KeyError(f"unknown static resources: {sorted(unknown_names)}")
     return result
 
 

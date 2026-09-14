@@ -124,6 +124,35 @@ def attention_mixer(
     weights: AttentionTensors,
     sequence_count: int,
 ) -> tuple[mt.Tensor, mt.Tensor]:
+    attended, gate, history = _attention_state(
+        hidden,
+        coordinates,
+        history,
+        destinations,
+        visible,
+        weights,
+        sequence_count,
+        attend=True,
+    )
+    assert attended is not None
+    rows = cast(int, hidden.shape[0])
+    mixed = mt.reshape(attended * mt.sigmoid(gate), (rows, weights.query_heads * weights.width))
+    return mt.linear(mixed, weights.output), history
+
+
+def _attention_state(
+    hidden: mt.Tensor,
+    coordinates: mt.Tensor,
+    history: mt.Tensor,
+    destinations: mt.Tensor,
+    visible: mt.Tensor,
+    weights: AttentionTensors,
+    sequence_count: int,
+    *,
+    attend: bool,
+) -> tuple[mt.Tensor | None, mt.Tensor, mt.Tensor]:
+    """Produce the KV transition and, when needed, the stateless mixer value."""
+
     query_gate = mt.linear(hidden, weights.query_gate)
     raw_keys = mt.linear(hidden, weights.key)
     raw_values = mt.linear(hidden, weights.value)
@@ -143,15 +172,17 @@ def attention_mixer(
     )
     values = mt.reshape(raw_values, keys.shape)
     history = mt.kv_append(history, keys, values, destinations)
-    attended = mt.causal_attention(
-        queries,
-        history,
-        visible,
-        sequence_count=sequence_count,
+    attended = (
+        mt.causal_attention(
+            queries,
+            history,
+            visible,
+            sequence_count=sequence_count,
+        )
+        if attend
+        else None
     )
-    rows = cast(int, hidden.shape[0])
-    mixed = mt.reshape(attended * mt.sigmoid(gate), (rows, weights.query_heads * weights.width))
-    return mt.linear(mixed, weights.output), history
+    return attended, gate, history
 
 
 def recurrent_mixer(
@@ -161,6 +192,29 @@ def recurrent_mixer(
     row_offsets: mt.Tensor,
     weights: RecurrentTensors,
 ) -> tuple[mt.Tensor, mt.Tensor, mt.Tensor]:
+    mixed, gate, convolution_state, delta_state = _recurrent_state(
+        hidden,
+        convolution_state,
+        delta_state,
+        row_offsets,
+        weights,
+    )
+    rows = cast(int, hidden.shape[0])
+    normalized = mt.rms_norm(mixed, weights.norm, epsilon=weights.epsilon)
+    flattened = mt.reshape(normalized, (rows, weights.value_heads * weights.width))
+    gated = flattened * mt.silu(gate)
+    return mt.linear(gated, weights.output), convolution_state, delta_state
+
+
+def _recurrent_state(
+    hidden: mt.Tensor,
+    convolution_state: mt.Tensor,
+    delta_state: mt.Tensor,
+    row_offsets: mt.Tensor,
+    weights: RecurrentTensors,
+) -> tuple[mt.Tensor, mt.Tensor, mt.Tensor, mt.Tensor]:
+    """Produce recurrent state transitions before the stateless output suffix."""
+
     projected = mt.linear(hidden, weights.query_key_value)
     gate = mt.linear(hidden, weights.gate)
     beta_input = mt.linear(hidden, weights.beta)
@@ -178,7 +232,9 @@ def recurrent_mixer(
         value_heads=weights.value_heads,
         width=weights.width,
         convolution_width=weights.convolution_width,
-        epsilon=weights.epsilon,
+        # Preparation uses a sum-of-squares L2 denominator. Qwen specifies
+        # RMS normalization, so convert its mean-domain epsilon explicitly.
+        epsilon=weights.epsilon * weights.width,
     )
     mixed, delta_state = mt.gated_delta_recurrence(
         queries,
@@ -190,11 +246,7 @@ def recurrent_mixer(
         row_offsets,
         mapping=weights.head_mapping,
     )
-    rows = cast(int, hidden.shape[0])
-    normalized = mt.rms_norm(mixed, weights.norm, epsilon=weights.epsilon)
-    flattened = mt.reshape(normalized, (rows, weights.value_heads * weights.width))
-    gated = flattened * mt.silu(gate)
-    return mt.linear(gated, weights.output), convolution_state, delta_state
+    return mixed, gate, convolution_state, delta_state
 
 
 def block(
@@ -210,7 +262,9 @@ def block(
     recurrent_offsets: mt.Tensor | None = None,
     sequence_count: int = 1,
 ):
-    normalized = mt.rms_norm(hidden, weights.input_norm, epsilon=weights.epsilon)
+    normalized = mt.rms_norm(
+        hidden, weights.input_norm, epsilon=weights.epsilon, output_dtype=weights.mixer.output.dtype
+    )
     if isinstance(weights.mixer, AttentionTensors):
         if coordinates is None or history is None or destinations is None or visible is None:
             raise ValueError("attention block requires rotary and KV operands")
@@ -231,14 +285,19 @@ def block(
             normalized, convolution_state, delta_state, recurrent_offsets, weights.mixer
         )
         state = convolution_state, delta_state
-    residual = hidden + mixer
-    normalized = mt.rms_norm(residual, weights.feedforward_norm, epsilon=weights.epsilon)
+    residual = hidden + mt.cast(mixer, hidden.dtype)
+    normalized = mt.rms_norm(
+        residual,
+        weights.feedforward_norm,
+        epsilon=weights.epsilon,
+        output_dtype=weights.mixer.output.dtype,
+    )
     feedforward = (
         dense_feedforward(normalized, weights.feedforward)
         if isinstance(weights.feedforward, DenseFeedForwardTensors)
         else routed_feedforward(normalized, weights.feedforward)
     )
-    return (residual + feedforward, *state)
+    return (residual + mt.cast(feedforward, residual.dtype), *state)
 
 
 def decoder(
@@ -259,7 +318,9 @@ def decoder(
 ):
     """One complete decoder specialization with explicit logical state boundaries."""
 
-    hidden = mt.embedding(tokens, weights.embedding)
+    # Retain the residual stream in FP32; only normalized operator inputs are
+    # published in the compact activation dtype used by projections and KV.
+    hidden = mt.cast(mt.embedding(tokens, weights.embedding), mt.DType.F32)
     if feature_values is not None or feature_rows is not None:
         if feature_values is None or feature_rows is None:
             raise ValueError("conditioned rows require both values and destinations")
@@ -269,7 +330,40 @@ def decoder(
     next_attention = []
     next_convolution = []
     next_delta = []
-    for layer in weights.blocks:
+    for layer_index, layer in enumerate(weights.blocks):
+        state_only = output_rows is None and layer_index + 1 == len(weights.blocks)
+        if state_only:
+            normalized = mt.rms_norm(
+                hidden,
+                layer.input_norm,
+                epsilon=layer.epsilon,
+                output_dtype=layer.mixer.output.dtype,
+            )
+            if isinstance(layer.mixer, AttentionTensors):
+                _, _, history = _attention_state(
+                    normalized,
+                    coordinates,
+                    attention_state[attention_index],
+                    destinations[attention_index],
+                    visible[attention_index],
+                    layer.mixer,
+                    sequence_count,
+                    attend=False,
+                )
+                next_attention.append(history)
+                attention_index += 1
+            else:
+                _, _, next_conv, next_recurrent = _recurrent_state(
+                    normalized,
+                    convolution_state[recurrent_index],
+                    delta_state[recurrent_index],
+                    cast(mt.Tensor, recurrent_offsets),
+                    layer.mixer,
+                )
+                next_convolution.append(next_conv)
+                next_delta.append(next_recurrent)
+                recurrent_index += 1
+            break
         if isinstance(layer.mixer, AttentionTensors):
             result = block(
                 hidden,

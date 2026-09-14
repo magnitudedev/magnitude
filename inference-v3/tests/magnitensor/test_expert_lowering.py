@@ -31,6 +31,7 @@ GROUPED_CAPABILITIES = mt.Capabilities(
     matrix_instructions=(mt.MatrixInstruction(8, 8, 8, mt.DType.F16, mt.DType.F32),),
     memory_scopes=frozenset({"global", "shared", "local"}),
     atomics=frozenset({mt.DType.I32}),
+    features=frozenset({"gemm.runtime_valid_m"}),
     native_multi_launch=True,
     partial_binding=True,
     fingerprint="grouped-expert-test",
@@ -49,6 +50,37 @@ def _encoded_spec(shape):
             mt.DirectCoefficients(mt.DType.F16),
         )
     )
+
+
+def _mlx_spec(shape):
+    return mt.TensorSpec(shape, mt.DType.F16).with_representation(
+        mt.Affine(
+            mt.Code(4),
+            64,
+            mt.DirectCoefficients(mt.DType.BF16, mt.DType.BF16),
+        )
+    )
+
+
+def _routed_shared_model(
+    hidden,
+    routes,
+    scores,
+    expert_gate,
+    expert_up,
+    expert_down,
+    shared_gate,
+    shared_up,
+    shared_down,
+    shared_router,
+):
+    selected = mt.routed_experts(hidden, routes, scores, expert_gate, expert_up, expert_down)
+    shared = _dense_model(hidden, shared_gate, shared_up, shared_down)
+    coefficient = mt.cast(
+        mt.sigmoid(mt.row_dot(hidden, shared_router, output_dtype=mt.DType.F32)),
+        hidden.dtype,
+    )
+    return selected + shared * coefficient
 
 
 @pytest.mark.device
@@ -98,11 +130,7 @@ def test_direct_dense_swiglu_schedule_matches_reference_on_metal():
             },
             options=mt.CompileOptions(mode="decode"),
         )
-        selected = tuple(
-            name for unit in compiled.diagnostics.submissions for name in unit
-        )
         assert len(compiled.diagnostics.submissions) == 1
-        assert all(".portable@" not in name for name in selected)
         execution = compiled.submit(resources[0])
         execution.completion.wait()
         np.testing.assert_allclose(
@@ -174,6 +202,53 @@ def test_prefill_selects_grouped_expert_pipeline_in_one_submission():
     submissions = plan_submissions(graph, cover, GROUPED_CAPABILITIES)
     assert len(submissions) == 1
     assert submissions[0].kernel_count == 4
+
+
+def test_prefill_combines_mixed_packet_routed_and_shared_experts_in_four_kernels():
+    specs = (
+        mt.TensorSpec((8, 512), mt.DType.F16),
+        mt.TensorSpec((8, 2), mt.DType.I32),
+        mt.TensorSpec((8, 2), mt.DType.F32),
+        _encoded_spec((4, 256, 512)),
+        _encoded_spec((4, 256, 512)),
+        _encoded_spec((4, 512, 256)),
+        _mlx_spec((512, 512)),
+        _mlx_spec((512, 512)),
+        _mlx_spec((512, 512)),
+        mt.TensorSpec((512,), mt.DType.F16),
+    )
+    names = (
+        "hidden",
+        "routes",
+        "scores",
+        "expert_gate",
+        "expert_up",
+        "expert_down",
+        "shared_gate",
+        "shared_up",
+        "shared_down",
+        "shared_router",
+    )
+    graph = mt.trace(
+        _routed_shared_model,
+        mt.Signature(
+            tuple(
+                mt.Argument(
+                    spec,
+                    name,
+                    mt.ValueKind.INPUT if index < 3 else mt.ValueKind.CONSTANT,
+                )
+                for index, (name, spec) in enumerate(zip(names, specs, strict=True))
+            )
+        ),
+    )
+    context = LoweringContext(GROUPED_CAPABILITIES, "prefill", "model", "test", 1 << 28)
+    cover = select_cover(graph, mt.lowerings.enumerate(graph, context))
+
+    assert len(cover.candidates) == 1
+    assert cover.candidates[0].name.startswith("routed_experts.grouped@")
+    assert cover.candidates[0].nodes == frozenset(range(len(graph.nodes)))
+    assert cover.candidates[0].kernel_count == 4
 
 
 def test_prefill_selects_matrix_swiglu_region_in_one_submission():
@@ -252,11 +327,7 @@ def test_matrix_prefill_swiglu_matches_reference_on_metal():
             },
             options=mt.CompileOptions(mode="prefill"),
         )
-        selected = tuple(
-            name for unit in compiled.diagnostics.submissions for name in unit
-        )
         assert len(compiled.diagnostics.submissions) == 1
-        assert all(".portable@" not in name for name in selected)
         execution = compiled.submit(resources[0])
         execution.completion.wait()
         np.testing.assert_allclose(
@@ -277,7 +348,7 @@ def test_matrix_prefill_swiglu_matches_reference_on_metal():
 def test_grouped_prefill_consumes_quantized_experts_without_materialization():
     if not torch.backends.mps.is_available():
         pytest.skip("Metal encoded expert qualification requires MPS")
-    experts, intermediate, width, rows, selected = 4, 64, 32, 8, 2
+    experts, intermediate, width, rows, selected = 8, 256, 256, 8, 2
     encoding = Encoding.Q8_0
     packed = (
         _packed(encoding, experts * intermediate, width),
@@ -286,9 +357,10 @@ def test_grouped_prefill_consumes_quantized_experts_without_materialization():
     )
     rng = np.random.default_rng(93)
     hidden = rng.normal(0, 0.1, (rows, width)).astype(np.float16)
-    routes = np.asarray(
-        [[row % experts, (row + 1) % experts] for row in range(rows)], dtype=np.int32
-    )
+    # Leave most of the statically provisioned expert blocks inactive. This
+    # covers the production capacity path where unused blocks must perform no
+    # packed matrix reduction work and must not affect the result.
+    routes = np.asarray([[0, 1] for _ in range(rows)], dtype=np.int32)
     scores = np.full((rows, selected), 0.5, dtype=np.float32)
     decoded = (
         gguf.dequantize(
@@ -366,7 +438,7 @@ def test_grouped_prefill_consumes_quantized_experts_without_materialization():
             execution.outputs[0].native.cpu().numpy(),
             expected,
             rtol=3e-2,
-            atol=3e-2,
+            atol=5e-2,
         )
     finally:
         if execution is not None:

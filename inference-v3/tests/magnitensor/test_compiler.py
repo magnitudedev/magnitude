@@ -61,6 +61,8 @@ class Runtime:
         32,
         256,
         32 * 1024,
+        memory_scopes=frozenset({"global", "shared", "local"}),
+        features=frozenset({"reference_schedules"}),
         native_multi_launch=True,
         partial_binding=True,
         fingerprint="test",
@@ -118,7 +120,7 @@ def test_compile_uses_one_unit_and_prebinds_constants_and_temporary_slots():
     assert len(runtime.executables[0].bound.static) >= 1
     assert compiled.diagnostics.submissions == (
         (
-            "linear.portable@0",
+            "linear.dense-vector@0",
             "pointwise.fused@1:2",
         ),
     )
@@ -149,6 +151,43 @@ def test_analyze_plans_without_allocating_or_compiling():
     assert plan.diagnostics.dispatches == 1
     assert not runtime.programs
     assert not runtime.executables
+
+
+def test_compile_can_prebind_a_stable_mutable_resource():
+    runtime = Runtime()
+    device = mt.Device(runtime, budget_bytes=1 << 20)
+    spec = mt.TensorSpec((4, 8), mt.DType.F32)
+    signature = mt.Signature(
+        (
+            mt.Argument(spec, "input"),
+            mt.Argument(spec, "state", mt.ValueKind.RESOURCE),
+        )
+    )
+    state = device.allocate(spec)
+    compiled = mt.compile(
+        lambda input, state: input + state,
+        signature=signature,
+        device=device,
+        constants={},
+        static_resources={"state": state},
+        options=mt.CompileOptions(mode="decode"),
+    )
+
+    bound = runtime.executables[0].bound
+    assert len(bound.static) == 1
+    # The invocation still binds its input and compiler-allocated output; the
+    # stable mutable state slot is absent from the dynamic ABI.
+    assert len(bound.dynamic) == 2
+    input_resource = device.allocate(spec)
+    execution = compiled.submit(input_resource)
+    assert len(bound.calls[0]) == 2
+    execution.completion.wait()
+    for output in execution.outputs:
+        output.close()
+    input_resource.close()
+    compiled.close()
+    state.close()
+    device.close()
 
 
 def test_symbolic_signature_is_specialized_before_tracing():

@@ -241,16 +241,10 @@ class DenseRuntime(ModelExecutor):
         if not requests or len({id(item.state) for item in requests}) != len(requests):
             raise ValueError("a forward requires distinct sequence states")
         with ExitStack() as owned:
-            mode = (
-                "decode"
-                if all(len(item.inputs.tokens) == 1 for item in requests)
-                else "prefill"
-            )
+            mode = "decode" if all(len(item.inputs.tokens) == 1 for item in requests) else "prefill"
             actual_rows = sum(len(item.inputs.tokens) for item in requests)
             physical_rows = (
-                actual_rows
-                if mode == "decode" or self.prefill_rows is None
-                else self.prefill_rows
+                actual_rows if mode == "decode" or self.prefill_rows is None else self.prefill_rows
             )
             if actual_rows > physical_rows:
                 raise ValueError("packed prefill exceeds the configured physical row capacity")
@@ -383,7 +377,14 @@ class DenseRuntime(ModelExecutor):
                 resources[f"recurrent.{layer}.{sequence}.delta"] = value.delta
             for index, value in enumerate(feature_values):
                 resources[f"feature.{index}.values"] = value
-            compiled = self.program.specialize(mode, specs)
+            compiled = self.program.specialize(
+                mode,
+                specs,
+                static_resources={
+                    f"attention.{index}.state": cache
+                    for index, cache in enumerate(self.states.attention)
+                },
+            )
             execution = compiled.submit(*dynamic, resources=resources)
             attention_count = len(self.states.attention)
             cursor = 2 if output_rows else 0

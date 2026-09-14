@@ -76,17 +76,23 @@ uv run magnitude-qualify \
 # Restrict an iteration to one or more standard shapes.
 uv run magnitude-qualify --target /path/to/model \
   --case decode-max-batch --case prefill-2048-logits
+
+# Preserve the complete manifest while keeping terminal output concise.
+uv run magnitude-qualify --target /path/to/model \
+  --output runs/qualification-manifest.json
 ```
 
 The standard matrix covers state-only prefill, logits prefill, long prefill,
 single-sequence decode and maximum-batch decode. The command exits unsuccessfully
 if it finds any production fallback, a non-maximal submission, an expanded
 hierarchical weight representation, a missing stateful fusion, or an
-inappropriate dense or MoE schedule. Its JSON reports graph fingerprints,
-selected schedule counts, kernel counts, submission counts and temporary bytes.
-It also reports resident bytes by physical representation, the largest selected
-region, and bound versus per-invocation native parameters so ABI growth is
-visible before compiling a kernel.
+inappropriate dense or MoE schedule. Its JSON reports graph fingerprints, target
+capabilities, selected schedule counts, packet formats, schedule geometry,
+workspace, physical kernel counts, submission counts, and temporary bytes. It
+also emits each maximal native program's ordered schedules and full parameter
+binding classification, plus resident bytes by physical representation and the
+largest selected region, so fallbacks, launch growth, and ABI growth are visible
+before compiling a kernel.
 
 Production lowering is intentionally fail-closed. Generic primitive lowering is
 an allowlist for indexing, pointwise work, import, and sampling; it is not a
@@ -112,7 +118,7 @@ uv run magnitude-kernel-bench gated-recurrence --mode prefill --rows 2048
 uv run magnitude-kernel-bench grouped-experts --mode prefill --rows 512
 ```
 
-The intended iteration order is:
+The normal focused-kernel iteration order is:
 
 1. run compile-free qualification for the affected shape;
 2. run the focused graph, construction and reference tests;
@@ -125,26 +131,41 @@ Routine kernel iteration must stop at the earliest layer that disproves the
 change. Full model startup and long session workloads are acceptance checks, not
 debugging loops.
 
+Large parity phases with a named validation gate are handled differently: finish
+the complete phase using source inspection, then run the entire named gate once.
+Do not compile kernels, run tests, or benchmark partial implementations between
+those gates.
+
 For shape-sensitive schedules, compare the real model geometry rather than the
 small defaults. Decode projections select `linear.packet-vector`; adjacent
 attention and recurrent projections sharing an activation select
-`linear.parallel-packet`; prefill projections select `linear.packet-gemm`; and
+`linear.parallel-packet-decode` or `linear.parallel-packet-prefill`; independent
+prefill projections select `linear.packet-gemm`; and
 dense feed-forward regions select `dense_swiglu.packet-decode` or
 `dense_swiglu.packet-prefill`. Prefill attention selects the
 `attention.matrix-streaming-gated-output` region, fusing matrix-streaming
-attention with query gating, flattening, and packed output projection. Long
+attention with query gating, flattening, and packed output projection. Short
+histories publish the gated activation directly. Long histories use bounded
+streaming partitions followed by a gated merge; their scratch buffers are reused
+across sequential layers through whole-allocation lifetime planning. Long
 decode attention selects the
-`attention.partitioned-gated-output` region, which processes all query heads
+`attention.register-partitioned-gated-output` region, which processes all query heads
 sharing a KV head together and fuses partition merge, query gating, and output
-projection. Recurrent output selects `recurrent.output-decode`. MoE single-row
+projection. Long recurrent prefill selects `gated_delta.chunked-matrix`: parallel
+chunk-system preparation followed by a matrix state scan, both inside the same
+native program. Decode and small spans retain `gated_delta.register-state`.
+Recurrent output selects `recurrent.output-decode`. MoE single-row
 decode selects `route_topk.fused-router` and
 `routed_experts.packet-shared`, avoiding a materialized router-logit tensor.
 The routed/shared expert region uses two launches: one combined packed gate/up
 activation for selected and shared experts (including the shared coefficient),
 then one combined weighted down projection. It never materializes a selected
-expert output before adding the shared expert. Prefill groups routes in one
-workgroup launch, fuses grouped gate/up GEMMs with SwiGLU, and completes grouped
-down projection plus unpermutation in four launches total.
+expert output before adding the shared expert. Prefill executes routed and shared
+experts in four launches total: grouping, combined tiled gate/up with SwiGLU,
+combined tiled down projection, and unpermutation/shared reduction.
+The two matrix stages use bounded workers over the actual packed tile count.
+Each worker reuses one shared-storage set across route kinds and consecutive
+tiles; grouping uses shared counters and publishes one completed block count.
 Prefill and wider decode batches instead use matrix-instruction router GEMM
 followed by `route_topk.subgroup`: preserving matrix throughput is faster there
 than assigning one serial dot product to each expert lane. Both paths remain in
@@ -163,16 +184,21 @@ Weights keep one compact resident representation from import through execution:
 
 Decode work is packet-native: a 32-lane subgroup consumes a 256- or 512-value
 reduction tile, loads each coefficient once, produces paired output rows, and
-reduces in FP32. Prefill decodes those same packets directly into shared-memory
-weight tiles and immediately reuses them with `T.gemm`; no full dequantized
-matrix exists. Full tiles have a structurally unpredicated path, while only the
-boundary tile pays validity checks.
+reduces in FP32. Prefill uses a distinct cooperative packet width: MLX Q4 keeps
+its 16-code-per-lane GEMV packet but distributes 8-code words across a matrix
+workgroup, matching GGUF's matrix packet and restoring full load parallelism.
+Every prefill projection decodes packets directly into shared-memory weight tiles
+and immediately reuses them with `T.gemm`; no full dequantized matrix exists.
+Full tiles have a structurally unpredicated path, while only the boundary tile
+pays validity checks.
 
-One decoder specialization is assembled as one maximal multi-kernel TileLang
-`PrimFunc` and submitted through one pre-bound native entrypoint. Immutable
-weights and compiler-owned temporary storage are bound once. Python supplies
-only invocation data and mutable model state; it does not loop over layers or
-launch numerical kernels itself.
+One decoder specialization is assembled as one maximal multi-function TileLang
+program and submitted through one pre-bound native entrypoint. Repeated layer
+schedules are private functions lowered once and called by the public entry
+through TileLang's existing module lowering. Immutable weights and compiler-owned
+temporary storage are bound once.
+Python supplies only invocation data and mutable model state; it does not loop
+over layers or launch numerical kernels itself.
 
 ## Measure
 

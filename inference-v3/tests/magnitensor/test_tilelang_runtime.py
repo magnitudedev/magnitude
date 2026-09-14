@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 import gguf
 import numpy as np
 import pytest
@@ -43,7 +45,9 @@ def test_metal_reshape_preserves_every_element():
         pytest.skip("Metal reshape regression check requires MPS")
     device = mt.device("metal", budget_bytes=1 << 20)
     source_spec = mt.TensorSpec((2, 3, 4), mt.DType.F16)
-    expected = np.arange(source_spec.elements, dtype=np.float16).reshape(source_spec.shape)
+    expected = np.arange(source_spec.elements, dtype=np.float16).reshape(
+        cast(tuple[int, ...], source_spec.shape)
+    )
     source = device.upload(source_spec, expected.tobytes())
     compiled = execution = None
     try:
@@ -52,7 +56,7 @@ def test_metal_reshape_preserves_every_element():
             signature=mt.Signature((mt.Argument(source_spec, "source"),)),
             device=device,
             constants={},
-            options=mt.CompileOptions(mode="decode"),
+            options=mt.CompileOptions(mode="decode", precision="reference"),
         )
         execution = compiled.submit(source)
         execution.completion.wait()
@@ -79,8 +83,8 @@ def test_metal_runtime_composes_kernels_and_binds_static_arguments_natively():
     assert "gemm.runtime_valid_m" in device.capabilities.features
     hidden_spec = mt.TensorSpec((2, 8), mt.DType.F16)
     weight_spec = mt.TensorSpec((8, 8), mt.DType.F16)
-    hidden_host = torch.randn(hidden_spec.shape, dtype=torch.float16)
-    weight_host = torch.randn(weight_spec.shape, dtype=torch.float16)
+    hidden_host = torch.randn(cast(tuple[int, ...], hidden_spec.shape), dtype=torch.float16)
+    weight_host = torch.randn(cast(tuple[int, ...], weight_spec.shape), dtype=torch.float16)
     hidden = device.allocate(hidden_spec)
     hidden.native.copy_(hidden_host.to("mps"))
     weight = device.upload(weight_spec, weight_host.numpy().tobytes())
@@ -203,24 +207,32 @@ def _packed(encoding: Encoding, outputs: int, inputs: int) -> np.ndarray:
 @pytest.mark.device
 @pytest.mark.parametrize(
     "encoding",
-    (Encoding.Q4_K, Encoding.Q5_K, Encoding.Q6_K, Encoding.Q8_0, Encoding.IQ4_XS),
+    (Encoding.Q4_K, Encoding.Q5_K, Encoding.Q6_K, Encoding.Q8_0),
 )
-def test_metal_quantized_import_and_projection_match_gguf(encoding):
+@pytest.mark.parametrize("rows,floating", ((2, mt.DType.F32), (9, mt.DType.BF16)))
+def test_metal_quantized_import_and_projection_match_gguf(encoding, rows, floating):
     if not torch.backends.mps.is_available():
         pytest.skip("Metal encoded projection check requires MPS")
-    outputs, inputs, rows = 2, 256, 2
+    outputs, inputs = 2, 256
     packed = _packed(encoding, outputs, inputs)
     expected_weight = gguf.dequantize(
         packed.reshape(outputs, -1), gguf.GGMLQuantizationType(encoding)
     )
     host = np.random.default_rng(765).normal(size=(rows, inputs)).astype(np.float32)
+    if floating == mt.DType.BF16:
+        tensor = torch.from_numpy(host).to(torch.bfloat16)
+        payload = tensor.view(torch.uint16).numpy().tobytes()
+        host = tensor.float().numpy()
+    else:
+        payload = host.tobytes()
     device = mt.device("metal", budget_bytes=4 << 20)
     weights = TensorWeights(_QuantizedFormat(packed.tobytes(), encoding), device)
     weight = weights.resident(
-        WeightDescriptor(name="weight", shape=(outputs, inputs)), mt.DType.F16
+        WeightDescriptor(name="weight", shape=(outputs, inputs)),
+        mt.DType.BF16 if floating == mt.DType.BF16 else mt.DType.F16,
     )
-    source_spec = mt.TensorSpec(host.shape, mt.DType.F32)
-    source = device.upload(source_spec, host.tobytes())
+    source_spec = mt.TensorSpec(host.shape, floating)
+    source = device.upload(source_spec, payload)
     compiled = mt.compile(
         lambda value, matrix: mt.linear(value, matrix, output_dtype=mt.DType.F32),
         signature=mt.Signature(

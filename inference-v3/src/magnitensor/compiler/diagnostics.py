@@ -61,9 +61,7 @@ class CompilationDiagnostics:
 
     def render_summary(self) -> str:
         """Render the selected lowering cover without dumping every rejected candidate."""
-        selected = Counter(
-            item.name.split("@", 1)[0] for item in self.candidates if item.selected
-        )
+        selected = Counter(item.name.split("@", 1)[0] for item in self.candidates if item.selected)
         cover = ", ".join(f"{name}={count}" for name, count in sorted(selected.items()))
         return (
             f"graph={self.graph_name} mode={self.mode} nodes="

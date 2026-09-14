@@ -7,9 +7,13 @@ CAPABILITIES = mt.Capabilities(
     32,
     256,
     32 * 1024,
-    matrix_instructions=(mt.MatrixInstruction(8, 8, 8, mt.DType.F16, mt.DType.F32),),
+    matrix_instructions=(
+        mt.MatrixInstruction(8, 8, 8, mt.DType.F16, mt.DType.F32),
+        mt.MatrixInstruction(8, 8, 8, mt.DType.F32, mt.DType.F32),
+    ),
     memory_scopes=frozenset({"global", "shared", "local"}),
     atomics=frozenset({mt.DType.I32}),
+    features=frozenset({"gemm.runtime_valid_m"}),
     native_multi_launch=True,
     partial_binding=True,
     fingerprint="development-tool-test",
@@ -30,9 +34,10 @@ def _encoded(shape):
     "name,mode,rows,expected",
     (
         ("encoded-linear", "decode", 1, "linear.packet-vector"),
-        ("parallel-linear", "decode", 1, "linear.parallel-packet"),
+        ("parallel-linear", "decode", 1, "linear.parallel-packet-decode"),
+        ("parallel-linear", "prefill", 64, "linear.parallel-packet-prefill"),
         ("dense-swiglu", "prefill", 8, "dense_swiglu.packet-prefill"),
-        ("attention", "decode", 1, "causal_attention.online"),
+        ("attention", "prefill", 8, "causal_attention.matrix-streaming"),
         ("recurrent-prepare", "prefill", 8, "recurrent_prepare.channel-parallel"),
         ("gated-recurrence", "prefill", 8, "gated_delta.register-state"),
         ("grouped-experts", "prefill", 8, "routed_experts.grouped"),
@@ -79,7 +84,7 @@ def test_small_parallel_projections_form_one_lowering_region():
     )
 
     assert [candidate.name.split("@", 1)[0] for candidate in plan.cover.candidates] == [
-        "linear.parallel-packet"
+        "linear.parallel-packet-decode"
     ]
     assert plan.diagnostics.dispatches == 1
     assert len(plan.submissions) == 1

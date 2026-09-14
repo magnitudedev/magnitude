@@ -104,9 +104,7 @@ def _attention(rows: int, context: int) -> KernelCase:
     visible = mt.TensorSpec((rows, 2), mt.DType.I32)
     limits = tuple(value for _ in range(rows) for value in (0, context))
     return KernelCase(
-        lambda value, limits, cache: mt.causal_attention(
-            value, cache, limits, sequence_count=1
-        ),
+        lambda value, limits, cache: mt.causal_attention(value, cache, limits, sequence_count=1),
         (
             Operand(mt.Argument(query, "query")),
             Operand(
@@ -168,17 +166,15 @@ def _gated_recurrence(rows: int) -> KernelCase:
     state = mt.TensorSpec((1, value_heads, width, width), mt.DType.F32)
     offsets = struct.pack("=ii", 0, rows)
     return KernelCase(
-        lambda query, keys, values, decay, beta, previous, ranges: (
-            mt.gated_delta_recurrence(
-                query,
-                keys,
-                values,
-                decay,
-                beta,
-                previous,
-                ranges,
-                mapping="tiled",
-            )
+        lambda query, keys, values, decay, beta, previous, ranges: mt.gated_delta_recurrence(
+            query,
+            keys,
+            values,
+            decay,
+            beta,
+            previous,
+            ranges,
+            mapping="tiled",
         ),
         (
             Operand(mt.Argument(key, "query")),
@@ -193,7 +189,7 @@ def _gated_recurrence(rows: int) -> KernelCase:
 
 
 def _experts(rows: int) -> KernelCase:
-    width, intermediate, experts, selected = 512, 256, 32, 4
+    width, intermediate, experts, selected = 512, 512, 32, 4
     hidden = mt.TensorSpec((rows, width), mt.DType.F16)
     routes = mt.TensorSpec((rows, selected), mt.DType.I32)
     scores = mt.TensorSpec((rows, selected), mt.DType.F32)
@@ -202,10 +198,8 @@ def _experts(rows: int) -> KernelCase:
     route_values = tuple(index % experts for index in range(rows * selected))
     score_values = tuple(1.0 / selected for _ in route_values)
     return KernelCase(
-        lambda value, indices, weights, gate_weight, up_weight, down_weight: (
-            mt.routed_experts(
-                value, indices, weights, gate_weight, up_weight, down_weight
-            )
+        lambda value, indices, weights, gate_weight, up_weight, down_weight: mt.routed_experts(
+            value, indices, weights, gate_weight, up_weight, down_weight
         ),
         (
             Operand(mt.Argument(hidden, "hidden")),
@@ -231,7 +225,7 @@ def definition(
     *,
     width: int = 1024,
     output: int = 3072,
-    intermediate: int = 2816,
+    intermediate: int = 3072,
 ) -> KernelCase:
     return {
         "encoded-linear": lambda: _linear(rows, width, output),
@@ -256,7 +250,7 @@ def run(
     memory_bytes: int,
     width: int = 1024,
     output: int = 3072,
-    intermediate: int = 2816,
+    intermediate: int = 3072,
 ) -> KernelResult:
     case = definition(
         name,
@@ -304,11 +298,7 @@ def run(
                     result_resource.close()
                 if iteration >= warmup:
                     samples.append(elapsed)
-            selected = tuple(
-                name
-                for unit in compiled.diagnostics.submissions
-                for name in unit
-            )
+            selected = tuple(name for unit in compiled.diagnostics.submissions for name in unit)
             return KernelResult(
                 name,
                 selected,
@@ -341,15 +331,13 @@ def main() -> None:
             "grouped-experts",
         ),
     )
-    parser.add_argument(
-        "--backend", default="metal", choices=("metal", "cuda", "hip", "llvm")
-    )
+    parser.add_argument("--backend", default="metal", choices=("metal", "cuda", "hip", "llvm"))
     parser.add_argument("--mode", default="prefill", choices=("prefill", "decode"))
     parser.add_argument("--rows", type=int, default=128)
     parser.add_argument("--context", type=int, default=4096)
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--output", type=int, default=3072)
-    parser.add_argument("--intermediate", type=int, default=2816)
+    parser.add_argument("--intermediate", type=int, default=3072)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--memory-bytes", type=int, default=8 * 1024**3)
