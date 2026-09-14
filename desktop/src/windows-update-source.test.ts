@@ -6,7 +6,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
-import { PrivateFilePermissions, WindowsInstallerVerifier } from "@magnitudedev/daemon-management/desktop-native"
+import { makePreparedUpdateStore, PreparedUpdateStore, PrivateFilePermissions, WindowsInstallerVerifier } from "@magnitudedev/daemon-management/desktop-native"
 import { WindowsInstallerSignatureFailed } from "../../packages/daemon-management/src/desktop-native/windows-update-signature"
 import { UpdateClientMetadata, UpdateManifest } from "@magnitudedev/release/hosted-update"
 import { PublisherKeyId, signUpdateManifest } from "../../packages/release/src/hosted-update/manifest"
@@ -25,38 +25,38 @@ describe.skipIf(process.platform !== "win32")("Windows installer staging", () =>
       id: "windows", target: { os: "windows", arch: "x64", package: "windows-exe" }, filename: "desktop.exe",
       bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
     } })
-    const envelope = await Effect.runPromise(signUpdateManifest(manifest, PublisherKeyId.make("test"), generateKeyPairSync("ed25519").privateKey))
+    const publisher = generateKeyPairSync("ed25519")
+    const envelope = await Effect.runPromise(signUpdateManifest(manifest, publisher.privateKey))
     let signatures = 0
     try {
       await Effect.runPromise(Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem
+        const permissions = PrivateFilePermissions.of({
+          prepareDirectory: path => fs.makeDirectory(path, { recursive: true }).pipe(Effect.orDie),
+          createFile: path => fs.writeFileString(path, "", { flag: "wx" }).pipe(Effect.orDie),
+          protectFile: () => Effect.void,
+        })
+        const store = yield* makePreparedUpdateStore({ dataDirectory: directory, target: manifest.artifact.target,
+          trustedPublishers: new Map([["test", publisher.publicKey]]) }).pipe(Effect.provideService(PrivateFilePermissions, permissions))
         const windows = yield* makeWindowsUpdateSource({ origin: "https://magnitude.dev", trustedPublishers: new Map(),
           metadata: yield* Schema.decodeUnknown(UpdateClientMetadata)({ version: "1.0.0", os: "windows", os_version: "10", arch: "x64", package: "windows-exe" }),
           sign: () => Effect.succeed("unused"), userAgent: "fixture", cacheDirectory: join(directory, "cache"), stateDirectory: directory,
-          applicationPath: join(directory, "Magnitude.exe"), cliPath: cli,
-        }).pipe(Effect.provideService(PrivateFilePermissions, {
-          prepareDirectory: path => fs.makeDirectory(path).pipe(Effect.orDie),
-          createFile: path => fs.writeFileString(path, "", { flag: "wx" }).pipe(Effect.orDie),
-          protectFile: () => Effect.void,
-        }), Effect.provideService(WindowsInstallerVerifier, {
+          applicationPath: join(directory, "Magnitude.exe"), cliPath: cli, dataDirectory: directory, addonPath: join(directory, "desktop-host.node"),
+        }).pipe(Effect.provideService(PreparedUpdateStore, store), Effect.provideService(PrivateFilePermissions, permissions), Effect.provideService(WindowsInstallerVerifier, {
           verify: path => Effect.gen(function* () {
             signatures++
-            expect(Buffer.from(yield* fs.readFile(path).pipe(Effect.orDie))).toEqual(bytes)
             if (scenario === "unsigned") return yield* new WindowsInstallerSignatureFailed()
           }),
         }))
-        const outcome = yield* windows.source.stage(archive, { manifest, envelope }).pipe(Effect.either)
+        const outcome = yield* windows.source.stage(archive, envelope.release).pipe(Effect.either)
         expect(outcome._tag).toBe(scenario === "valid" ? "Right" : "Left")
-        expect(signatures).toBe(scenario === "changed" ? 0 : 1)
-        const entries = yield* fs.readDirectory(join(directory, "application-updates"))
+        expect(signatures).toBe(1)
+        const pending = yield* store.read
+        expect(pending._tag).toBe(scenario === "valid" ? "Some" : "None")
         if (scenario === "valid") {
-          expect(entries).toHaveLength(1)
-          const prepared = join(directory, "application-updates", entries[0]!)
-          expect(yield* fs.readFileString(join(prepared, "magnitude-update.exe"))).toBe("bundled CLI fixture")
-          expect(yield* fs.readFileString(join(prepared, "magnitude-setup.exe"))).toBe(bytes.toString())
-          yield* windows.discard
-        } else expect(entries).toEqual([])
-        expect(yield* fs.readDirectory(join(directory, "application-updates"))).toEqual([])
+          expect(yield* fs.readFileString(join(directory, "updates", "magnitude-setup.exe"))).toBe(bytes.toString())
+          expect(yield* fs.exists(join(directory, "update-helpers"))).toBe(false)
+        }
       }).pipe(Effect.provide(NodeContext.layer)))
     } finally { await rm(directory, { recursive: true, force: true }) }
   })

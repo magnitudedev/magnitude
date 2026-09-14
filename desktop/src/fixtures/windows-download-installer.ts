@@ -4,13 +4,13 @@ import { Config, Effect, Option, Schema } from "effect"
 import { createPublicKey } from "node:crypto"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { githubArtifactUrl, downloadUpdateArtifact, SignedUpdateManifest, verifyUpdateManifest } from "@magnitudedev/release/hosted-update"
+import { githubArtifactUrl, downloadUpdateArtifact, PublishedUpdate, verifyUpdateManifest } from "@magnitudedev/release/hosted-update"
 
 NodeRuntime.runMain(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const root = yield* Config.string("MAGNITUDE_WINDOWS_ACCEPTANCE_ROOT")
   const version = yield* Config.string("MAGNITUDE_WINDOWS_ACCEPTANCE_FROM")
-  const envelopes = yield* Schema.decodeUnknown(Schema.parseJson(Schema.Tuple(SignedUpdateManifest)))(
+  const envelopes = yield* Schema.decodeUnknown(Schema.parseJson(Schema.Tuple(PublishedUpdate)))(
     yield* fs.readFileString(join(root, version, "artifacts/prepared-manifests.json")))
   const trusted = new Map([["acceptance", createPublicKey(yield* fs.readFileString(fileURLToPath(new URL("../../../packages/release/resources/distribution/acceptance.pub.pem", import.meta.url))))]])
   const manifest = yield* verifyUpdateManifest(envelopes[0], trusted)
@@ -20,7 +20,7 @@ NodeRuntime.runMain(Effect.gen(function* () {
       encoding: response.request.headers["accept-encoding"], range: response.headers["content-range"],
       expectedBytes: manifest.artifact.bytes, status: response.status,
     }) : Effect.void)))
-  const result = yield* downloadUpdateArtifact({ manifest,
+  const result = yield* downloadUpdateArtifact({ release: envelopes[0].release,
     url: githubArtifactUrl(manifest),
     destination: join(root, "consumer/downloaded-installer.exe"), onProgress: Option.none(),
   }).pipe(Effect.provideService(HttpClient.HttpClient, client))

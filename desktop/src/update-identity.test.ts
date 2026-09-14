@@ -14,9 +14,11 @@ describe("desktop installation identity", () => {
     const make = () => Effect.runPromise(identity)
     const url = new URL("https://magnitude.dev/api/update?ts=1&nonce=test")
     try {
-      const first = await make(), second = await make()
+      const first = await make()
+      await rm(join(root, "updates"), { recursive: true, force: true })
+      const second = await make()
       expect(await Effect.runPromise(first.sign(url))).toBe(await Effect.runPromise(second.sign(url)))
-      const path = join(root, "updates", "installation-key.pem")
+      const path = join(root, "identity.pem")
       if (process.platform !== "win32") expect((await stat(path)).mode & 0o777).toBe(0o600)
       await writeFile(path, "corrupt")
       expect(Either.isLeft(await Effect.runPromise(identity.pipe(Effect.either)))).toBe(true)

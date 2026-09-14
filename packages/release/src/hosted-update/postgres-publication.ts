@@ -2,7 +2,7 @@ import { Effect, Schema } from "effect"
 import type { KeyObject } from "node:crypto"
 import type { Pool } from "pg"
 import { isNewerVersion, releaseChannelOf } from "../client-update/release-channels"
-import { SignedUpdateManifest, verifyUpdateManifest } from "./manifest"
+import { PublishedUpdate, verifyUpdateManifest } from "./manifest"
 import { DistributionNamespace } from "./postgres-store"
 import { ReleasePublicationBatch, ReleasePublicationFailed, ReleasePublicationStore } from "./publication"
 
@@ -41,9 +41,9 @@ export const postgresReleasePublicationStore = (pool: Pool, namespace: typeof Di
             yield* query(`INSERT INTO magnitude_distribution.artifacts(release_version,artifact_id,os,arch,package,envelope)
               VALUES ($1,$2,$3,$4,$5,$6::jsonb) ON CONFLICT DO NOTHING`, [manifest.version, artifact.id, target.os, target.arch, target.package, JSON.stringify(envelope)])
             const existing = yield* query("SELECT envelope FROM magnitude_distribution.artifacts WHERE release_version=$1 AND artifact_id=$2", [manifest.version, artifact.id])
-            const stored = yield* Schema.decodeUnknown(Schema.Struct({ envelope: SignedUpdateManifest }))(existing.rows[0]).pipe(
+            const stored = yield* Schema.decodeUnknown(Schema.Struct({ envelope: PublishedUpdate }))(existing.rows[0]).pipe(
               Effect.mapError(() => new ReleasePublicationFailed({ stage: "conflict" })))
-            if (stored.envelope.payload !== envelope.payload || stored.envelope.signature !== envelope.signature || stored.envelope.keyId !== envelope.keyId) {
+            if (!Schema.equivalence(PublishedUpdate)(stored.envelope, envelope)) {
               return yield* new ReleasePublicationFailed({ stage: "conflict" })
             }
             const previous = yield* query("SELECT release_version FROM magnitude_distribution.channels WHERE channel=$1 AND os=$2 AND arch=$3 AND package=$4", [channel, target.os, target.arch, target.package])

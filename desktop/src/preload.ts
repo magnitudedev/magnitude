@@ -30,6 +30,7 @@ const api: DesktopApi = {
   updates: (value, error) => observe(client => client.Updates({}), value, error),
   setAutoDownload: enabled => command(client => client.SetAutoDownload({ enabled })),
   checkUpdate: () => command(client => client.CheckUpdate({})),
+  discardUpdate: () => command(client => client.DiscardUpdate({})),
   downloadUpdate: () => command(client => client.DownloadUpdate({})),
   restartUpdate: () => command(client => client.RestartUpdate({})),
   platform: process.platform,

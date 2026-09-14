@@ -1,7 +1,7 @@
 import { generateKeyPairSync } from 'node:crypto'
 import { Deferred, Effect, Option, Ref, Schema, Scope, Stream } from "effect"
 import { UpdateManifest, PublisherKeyId, signUpdateManifest } from "../../packages/release/src/hosted-update/manifest"
-import { UpdatePreferences, UpdatePreferencesFailed } from "./update-preferences"
+import { PreparedUpdateStore, PreparedUpdateFailed, UpdatePreferences, UpdatePreferencesFailed } from "@magnitudedev/daemon-management/desktop-native"
 import { describe, expect, it } from "vitest"
 import { ApplicationUpdateFailed, ApplicationUpdateSource, makeApplicationUpdate, type ApplicationUpdate } from "./application-update"
 
@@ -9,11 +9,42 @@ const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, tag: "@
   id: "desktop-update-darwin-arm64", target: { os: "darwin", arch: "arm64", package: "mac-zip" },
   filename: "magnitude-desktop-darwin-arm64.zip", bytes: 100, sha256: "a".repeat(64),
 } })
-const candidate = { manifest, envelope: await Effect.runPromise(signUpdateManifest(manifest, PublisherKeyId.make("test"), generateKeyPairSync("ed25519").privateKey)) }
+const candidate = (await Effect.runPromise(signUpdateManifest(manifest, generateKeyPairSync("ed25519").privateKey))).release
 const waitFor = (owner: ApplicationUpdate, tag: string) => owner.changes.pipe(Stream.filter(state => state.transfer._tag === tag), Stream.take(1), Stream.runDrain)
-const run = <A, E>(effect: Effect.Effect<A, E, Scope.Scope | UpdatePreferences>) => Effect.runPromise(effect.pipe(Effect.provideService(UpdatePreferences, { read: Effect.succeed(false), write: () => Effect.void }), Effect.scoped, Effect.timeout("3 seconds")))
+const run = <A, E>(effect: Effect.Effect<A, E, Scope.Scope | UpdatePreferences | PreparedUpdateStore>) => Effect.runPromise(effect.pipe(Effect.provideService(PreparedUpdateStore, { read: Effect.succeed(Option.none()), prepare: () => Effect.void, verify: () => Effect.die("Unexpected verification"), recordAttempt: () => Effect.void, recordFailure: () => Effect.void, discard: Effect.void, removeAbandonedTransfers: Effect.void }), Effect.provideService(UpdatePreferences, { read: Effect.succeed(false), write: () => Effect.void }), Effect.scoped, Effect.timeout("3 seconds")))
 
 describe("application-owned updates", () => {
+  it.each([false, true])("discards a retained update only after durable cleanup succeeds (failure=%s)", fail => run(Effect.gen(function* () {
+    const store = yield* PreparedUpdateStore
+    const calls = yield* Ref.make(0)
+    const owner = yield* makeApplicationUpdate(Option.some({ release: candidate, installation: { _tag: "Failed", reason: "Invalid retained bytes" } })).pipe(
+      Effect.provideService(PreparedUpdateStore, { ...store, discard: Ref.update(calls, n => n + 1).pipe(Effect.zipRight(fail ? new PreparedUpdateFailed({ message: "Cleanup failed" }) : Effect.void)) }),
+      Effect.provideService(ApplicationUpdateSource, { check: Effect.succeed(Option.some(candidate)), download: () => Effect.die("Discard must not download"), stage: () => Effect.void }),
+    )
+    const outcome = yield* owner.discard.pipe(Effect.either)
+    expect(outcome._tag).toBe(fail ? "Left" : "Right")
+    expect(yield* Ref.get(calls)).toBe(1)
+    expect((yield* owner.state).transfer._tag).toBe(fail ? "InstallationFailed" : "Idle")
+    if (!fail) {
+      expect((yield* owner.requireReady.pipe(Effect.either))._tag).toBe("Left")
+      yield* owner.check
+      yield* waitFor(owner, "Available")
+    }
+  })))
+  it.each(["Unattempted", "Attempted", "Failed"] as const)("keeps a saved %s update across checks without downloading it again", tag => run(Effect.gen(function* () {
+    const owner = yield* makeApplicationUpdate(Option.some({ release: candidate,
+      installation: tag === "Failed" ? { _tag: tag, reason: "Authorization cancelled" } : { _tag: tag },
+    })).pipe(Effect.provideService(UpdatePreferences, { read: Effect.succeed(true), write: () => Effect.void }),
+      Effect.provideService(ApplicationUpdateSource, {
+        check: Effect.succeed(Option.some(candidate)),
+        download: () => Effect.die("Retained installers must not be redownloaded"), stage: () => Effect.die("No new download"),
+      }))
+    yield* owner.check
+    yield* owner.changes.pipe(Stream.filter(state => state.check._tag === "Succeeded"), Stream.take(1), Stream.runDrain)
+    expect((yield* owner.state).transfer).toEqual(tag === "Unattempted" ? { _tag: "Ready", version: candidate.version }
+      : { _tag: "InstallationFailed", version: candidate.version, message: tag === "Failed" ? "Authorization cancelled" : "The update did not complete." })
+    yield* owner.requireReady
+  })))
   it("continues checking after a preference read failure and never claims an unsaved choice", () => run(Effect.gen(function* () {
     const owner = yield* makeApplicationUpdate().pipe(Effect.provideService(UpdatePreferences, {
       read: new UpdatePreferencesFailed({ message: "Unreadable preferences" }),

@@ -1,12 +1,12 @@
 import { Clock, Context, Effect, ExecutionStrategy, Exit, Fiber, Option, Schema, Scope, Stream, SubscriptionRef } from "effect"
-import { UpdateCandidate } from "@magnitudedev/release/hosted-update"
+import { UpdateRelease } from "@magnitudedev/release/hosted-update"
 import type { DesktopUpdateState } from "@magnitudedev/client-common"
-import { UpdatePreferences } from "./update-preferences"
+import { UpdatePreferences, PreparedUpdateStore, type PreparedUpdate } from "@magnitudedev/daemon-management/desktop-native"
 
 export class ApplicationUpdateFailed extends Schema.TaggedError<ApplicationUpdateFailed>()("ApplicationUpdateFailed", {
   message: Schema.String,
 }) {}
-type Candidate = typeof UpdateCandidate.Type
+type Candidate = typeof UpdateRelease.Type
 export interface ApplicationUpdateSource {
   readonly check: Effect.Effect<Option.Option<Candidate>, ApplicationUpdateFailed>
   readonly download: (candidate: Candidate, progress: (completed: number) => Effect.Effect<void>) => Effect.Effect<string, ApplicationUpdateFailed, Scope.Scope>
@@ -16,11 +16,12 @@ export const ApplicationUpdateSource = Context.GenericTag<ApplicationUpdateSourc
 
 const Transfer = Schema.Union(
   Schema.TaggedStruct("Idle", {}),
-  Schema.TaggedStruct("Available", { candidate: UpdateCandidate }),
-  Schema.TaggedStruct("Downloading", { candidate: UpdateCandidate, completed: Schema.Number, automatic: Schema.Boolean }),
-  Schema.TaggedStruct("Cancelling", { candidate: UpdateCandidate }),
-  Schema.TaggedStruct("Staging", { candidate: UpdateCandidate }),
+  Schema.TaggedStruct("Available", { candidate: UpdateRelease }),
+  Schema.TaggedStruct("Downloading", { candidate: UpdateRelease, completed: Schema.Number, automatic: Schema.Boolean }),
+  Schema.TaggedStruct("Cancelling", { candidate: UpdateRelease }),
+  Schema.TaggedStruct("Staging", { candidate: UpdateRelease }),
   Schema.TaggedStruct("Ready", { version: Schema.String }),
+  Schema.TaggedStruct("InstallationFailed", { version: Schema.String, message: Schema.String }),
   Schema.TaggedStruct("Failed", { message: Schema.String }),
   Schema.TaggedStruct("Closed", {}),
 )
@@ -29,10 +30,10 @@ type State = { readonly transfer: Transfer; readonly check: DesktopUpdateState["
 const present = (state: State): DesktopUpdateState => {
   const transfer = state.transfer
   switch (transfer._tag) {
-    case "Available": return { ...state, transfer: { _tag: "Available", version: transfer.candidate.manifest.version, bytes: transfer.candidate.manifest.artifact.bytes } }
-    case "Downloading": return { ...state, transfer: { _tag: "Downloading", version: transfer.candidate.manifest.version, completed: transfer.completed, total: transfer.candidate.manifest.artifact.bytes } }
+    case "Available": return { ...state, transfer: { _tag: "Available", version: transfer.candidate.version, bytes: transfer.candidate.bytes } }
+    case "Downloading": return { ...state, transfer: { _tag: "Downloading", version: transfer.candidate.version, completed: transfer.completed, total: transfer.candidate.bytes } }
     case "Cancelling": return { ...state, transfer: { _tag: "Cancelling" } }
-    case "Staging": return { ...state, transfer: { _tag: "Staging", version: transfer.candidate.manifest.version } }
+    case "Staging": return { ...state, transfer: { _tag: "Staging", version: transfer.candidate.version } }
     default: return { ...state, transfer }
   }
 }
@@ -41,6 +42,7 @@ export interface ApplicationUpdate {
   readonly changes: Stream.Stream<DesktopUpdateState>
   readonly check: Effect.Effect<void, ApplicationUpdateFailed>
   readonly download: Effect.Effect<void, ApplicationUpdateFailed>
+  readonly discard: Effect.Effect<void, ApplicationUpdateFailed>
   readonly setAutoDownload: (enabled: boolean) => Effect.Effect<void, ApplicationUpdateFailed>
   readonly requireReady: Effect.Effect<void, ApplicationUpdateFailed>
   readonly close: Effect.Effect<void>
@@ -48,8 +50,9 @@ export interface ApplicationUpdate {
 export const ApplicationUpdate = Context.GenericTag<ApplicationUpdate>("desktop/ApplicationUpdate")
 
 /** Checks and transfers have independent admission; workers belong to the desktop owner. */
-export const makeApplicationUpdate = (initialFailure: Option.Option<string> = Option.none()) => Effect.gen(function* () {
+export const makeApplicationUpdate = (pending: Option.Option<PreparedUpdate> = Option.none()) => Effect.gen(function* () {
   const source = yield* ApplicationUpdateSource
+  const store = yield* PreparedUpdateStore
   const preferences = yield* UpdatePreferences
   const preference = yield* preferences.read.pipe(Effect.match({
     onSuccess: autoDownload => ({ _tag: "Known", autoDownload }) as const,
@@ -57,7 +60,10 @@ export const makeApplicationUpdate = (initialFailure: Option.Option<string> = Op
   }))
   const owner = yield* Scope.fork(yield* Scope.Scope, ExecutionStrategy.sequential)
   const state = yield* SubscriptionRef.make<State>({ preference, check: { _tag: "Idle" },
-    transfer: Option.isSome(initialFailure) ? { _tag: "Failed", message: initialFailure.value } : { _tag: "Idle" } })
+    transfer: Option.isSome(pending) ? pending.value.installation._tag === "Unattempted"
+      ? { _tag: "Ready", version: pending.value.release.version }
+      : { _tag: "InstallationFailed", version: pending.value.release.version, message: pending.value.installation._tag === "Failed" ? pending.value.installation.reason : "The update did not complete." }
+      : { _tag: "Idle" } })
   const gate = yield* Effect.makeSemaphore(1)
   let transferWorker: Option.Option<Fiber.RuntimeFiber<void, never>> = Option.none()
   const closed = new ApplicationUpdateFailed({ message: "Magnitude is quitting." })
@@ -81,7 +87,7 @@ export const makeApplicationUpdate = (initialFailure: Option.Option<string> = Op
       if (!admitted) return
       yield* source.stage(archive, candidate)
       yield* gate.withPermits(1)(SubscriptionRef.update(state, (current): State => current.transfer._tag === "Staging"
-        ? { ...current, transfer: { _tag: "Ready", version: candidate.manifest.version } } : current))
+        ? { ...current, transfer: { _tag: "Ready", version: candidate.version } } : current))
     })).pipe(
       Effect.catchAll(failTransfer),
       Effect.catchAllDefect(() => failTransfer(new ApplicationUpdateFailed({ message: "The application update could not finish. Check again to retry." }))),
@@ -124,7 +130,15 @@ export const makeApplicationUpdate = (initialFailure: Option.Option<string> = Op
   })).pipe(Effect.uninterruptible)
   return ApplicationUpdate.of({
     state: SubscriptionRef.get(state).pipe(Effect.map(present)), changes: state.changes.pipe(Stream.map(present)), close, check,
-    requireReady: SubscriptionRef.get(state).pipe(Effect.flatMap(current => current.transfer._tag === "Ready" ? Effect.void
+    discard: gate.withPermits(1)(Effect.gen(function* () {
+      const current = yield* SubscriptionRef.get(state)
+      if (current.transfer._tag !== "Ready" && current.transfer._tag !== "InstallationFailed") {
+        return yield* new ApplicationUpdateFailed({ message: "There is no prepared update to discard." })
+      }
+      yield* store.discard.pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })))
+      yield* SubscriptionRef.set(state, { ...current, transfer: { _tag: "Idle" }, check: { _tag: "Idle" } })
+    })).pipe(Effect.uninterruptible),
+    requireReady: SubscriptionRef.get(state).pipe(Effect.flatMap(current => (current.transfer._tag === "Ready" || current.transfer._tag === "InstallationFailed") ? Effect.void
       : new ApplicationUpdateFailed({ message: "Download the application update before restarting." }))),
     download: gate.withPermits(1)(Effect.gen(function* () {
       const current = yield* SubscriptionRef.get(state)
@@ -148,6 +162,6 @@ export const makeApplicationUpdate = (initialFailure: Option.Option<string> = Op
 export const unavailableApplicationUpdate = (message: string): ApplicationUpdate => {
   const state: DesktopUpdateState = { transfer: { _tag: "Unavailable", message }, check: { _tag: "Idle" }, preference: { _tag: "Unavailable", message } }
   return { state: Effect.succeed(state), changes: Stream.succeed(state), check: new ApplicationUpdateFailed({ message }),
-    download: new ApplicationUpdateFailed({ message }), setAutoDownload: () => new ApplicationUpdateFailed({ message }),
+    download: new ApplicationUpdateFailed({ message }), discard: new ApplicationUpdateFailed({ message }), setAutoDownload: () => new ApplicationUpdateFailed({ message }),
     requireReady: new ApplicationUpdateFailed({ message }), close: Effect.void }
 }

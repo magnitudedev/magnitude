@@ -1,18 +1,22 @@
 import { CommandExecutor } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
-import { Effect, Schema } from "effect"
+import { Effect, Layer, Schema } from "effect"
 import { EventEmitter } from "node:events"
 import { spawn } from "node:child_process"
-import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { PassThrough, Writable } from "node:stream"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { completeLinuxUpdateHandoff, LinuxUpdateHandoffRequest, LinuxUpdateResult, startLinuxUpdateHandoff } from "./linux-update-handoff"
+import { completeLinuxUpdateHandoff, LinuxUpdateHandoffRequest, relaunchLinuxAfterUpdate, startLinuxUpdateHandoff } from "./linux-update-handoff"
+
+import { PreparedUpdate } from "./prepared-update"
+import { unixPrivateFilePermissions } from "./private-files"
 
 vi.mock("node:child_process", () => ({ spawn: vi.fn() }))
 afterEach(() => { vi.unstubAllGlobals(); vi.clearAllMocks() })
-const request = (directory: string): LinuxUpdateHandoffRequest => ({ stateDirectory: directory, requestPath: join(directory, "application-updates/prepared-123/request.json"), version: "2.0.0", showWindow: false })
+const request = (directory: string): LinuxUpdateHandoffRequest => ({ stateDirectory: join(directory, "state"), dataDirectory: directory, showWindow: false,
+  release: { version: "2.0.0", bytes: 1, sha256: "a".repeat(64), signature: "A".repeat(86) + "==" } })
 
 describe("Linux update handoff", () => {
   it("keeps the lifetime pipe open after handing off install intent", async () => {
@@ -30,8 +34,8 @@ describe("Linux update handoff", () => {
     expect(vi.mocked(spawn).mock.calls[0]?.slice(0, 2)).toEqual(["/usr/lib/magnitude-desktop/resources/magnitude", ["_complete-application-update"]])
     stdin.destroy()
   })
-  it("rejects staging paths outside its private update directory", () => {
-    expect(Schema.decodeUnknownEither(LinuxUpdateHandoffRequest)({ ...request("/tmp/state"), requestPath: "/home/user/request.json" })._tag).toBe("Left")
+  it("rejects noncanonical data directories", () => {
+    expect(Schema.decodeUnknownEither(LinuxUpdateHandoffRequest)({ ...request("/tmp/state"), dataDirectory: "/home/user/../other" })._tag).toBe("Left")
   })
   it("retires an unready helper before releasing its lifetime channel", async () => {
     const stdin = new Writable({ write(_, __, done) { done() } })
@@ -51,7 +55,8 @@ describe("Linux update handoff", () => {
     vi.stubGlobal("process", { ...process, platform: "linux", getuid: () => 1000 })
     const directory = await mkdtemp(join(tmpdir(), "linux-handoff-"))
     const input = request(directory)
-    await mkdir(join(directory, "application-updates/prepared-123"), { recursive: true })
+    await mkdir(join(directory, "updates"))
+    await writeFile(join(directory, "updates", "update.json"), Schema.encodeSync(Schema.parseJson(PreparedUpdate))({ release: input.release, installation: { _tag: "Attempted" } }))
     vi.mocked(spawn).mockImplementation(() => {
       const child = Object.assign(new EventEmitter(), { unref: vi.fn() })
       queueMicrotask(() => child.emit("spawn"))
@@ -64,13 +69,15 @@ describe("Linux update handoff", () => {
           expect(command._tag).toBe("StandardCommand")
           if (command._tag === "StandardCommand") {
             expect(command.command).toBe("/usr/bin/pkexec")
-            expect(command.args).toEqual(["--disable-internal-agent", "/usr/lib/magnitude-desktop/resources/magnitude", "_install-application-update", input.requestPath])
+            expect(command.args).toEqual(["--disable-internal-agent", "/usr/lib/magnitude-desktop/resources/magnitude", "_install-application-update", join(directory, "updates", "update.json")])
           }
           return CommandExecutor.ExitCode(code)
         }),
-      }), Effect.provide(BunContext.layer)))
-      const result = Schema.decodeUnknownSync(Schema.parseJson(LinuxUpdateResult))(await readFile(join(directory, "update-result.json"), "utf8"))
-      expect(result.error._tag).toBe(code === 0 ? "None" : "Some")
+      }), Effect.provide(unixPrivateFilePermissions.pipe(Layer.provideMerge(BunContext.layer)))))
+      const result = Schema.decodeUnknownSync(Schema.parseJson(PreparedUpdate))(await readFile(join(directory, "updates", "update.json"), "utf8"))
+      expect(result.installation._tag).toBe(code === 0 ? "Attempted" : "Failed")
+      expect(spawn).not.toHaveBeenCalled()
+      await Effect.runPromise(relaunchLinuxAfterUpdate(input))
       expect(vi.mocked(spawn).mock.calls[0]?.slice(0, 2)).toEqual(["/usr/bin/magnitude-desktop", ["--background"]])
     } finally { await rm(directory, { recursive: true, force: true }) }
   })

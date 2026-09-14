@@ -1,7 +1,7 @@
 import { Effect, Option, Schema } from "effect"
 import type { Pool } from "pg"
 import { DistributionStore, DistributionStoreUnavailable, type CheckObservation } from "./service"
-import { SignedUpdateManifest } from "./manifest"
+import { PublishedUpdate } from "./manifest"
 
 export const DistributionNamespace = Schema.Literal("magnitude_distribution", "magnitude_distribution_acceptance")
 
@@ -40,7 +40,7 @@ export const postgresDistributionStore = (pool: Pool, namespace: typeof Distribu
       JOIN magnitude_distribution.releases r ON r.version = c.release_version
       WHERE NOT r.withdrawn AND c.os = $1 AND c.arch = $2 AND c.package = $3
     `, [request.os, request.arch, request.package]).pipe(Effect.flatMap(result =>
-      Schema.decodeUnknown(Schema.Array(Schema.Struct({ envelope: SignedUpdateManifest })))(result.rows).pipe(
+      Schema.decodeUnknown(Schema.Array(Schema.Struct({ envelope: PublishedUpdate })))(result.rows).pipe(
         Effect.map(rows => rows.map(row => row.envelope)), Effect.mapError(() => new DistributionStoreUnavailable()),
       ))),
     recordCheck: observation => {
@@ -54,11 +54,11 @@ export const postgresDistributionStore = (pool: Pool, namespace: typeof Distribu
           last_seen = now(), offered_version = EXCLUDED.offered_version
       `, parameters).pipe(Effect.asVoid)
     },
-    artifact: (release, id) => query(`
+    artifact: (release, target) => query(`
       SELECT a.envelope FROM magnitude_distribution.artifacts a
       JOIN magnitude_distribution.releases r ON r.version = a.release_version
-      WHERE a.release_version = $1 AND a.artifact_id = $2 AND NOT r.withdrawn
-    `, [release, id]).pipe(Effect.flatMap(result => Schema.decodeUnknown(Schema.Array(Schema.Struct({ envelope: SignedUpdateManifest })))(result.rows).pipe(
+      WHERE a.release_version = $1 AND a.os = $2 AND a.arch = $3 AND a.package = $4 AND NOT r.withdrawn
+    `, [release, target.os, target.arch, target.package]).pipe(Effect.flatMap(result => Schema.decodeUnknown(Schema.Array(Schema.Struct({ envelope: PublishedUpdate })))(result.rows).pipe(
       Effect.map(rows => Option.map(Option.fromNullable(rows[0]), row => row.envelope)), Effect.mapError(() => new DistributionStoreUnavailable()),
     ))),
     recordDownload: observation => query(`

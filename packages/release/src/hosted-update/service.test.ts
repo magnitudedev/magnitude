@@ -3,7 +3,7 @@ import { Effect, Option, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import { DistributionStore, DistributionStoreUnavailable, handleUpdateCheck, type CheckObservation } from "./service"
 import { newUpdateNonce, signUpdateRequest, updateQuery } from "./request-auth"
-import { PublisherKeyId, UpdateManifest, signUpdateManifest, type SignedUpdateManifest } from "./manifest"
+import { PublisherKeyId, UpdateManifest, signUpdateManifest, type PublishedUpdate } from "./manifest"
 
 const installation = generateKeyPairSync("ed25519"), publisher = generateKeyPairSync("ed25519"), keyId = PublisherKeyId.make("publisher")
 const options = { origin: "https://magnitude.dev", country: Option.some("US"), trustedPublishers: new Map([[keyId, publisher.publicKey]]) }
@@ -11,8 +11,8 @@ const request = async () => {
   const url = new URL(options.origin + "/api/update?" + updateQuery({ protocol: "1", product: "desktop", version: "1.0.0", os: "darwin", os_version: "26.0", arch: "arm64", package: "mac-zip", channel: "stable", ts: String(Math.floor(Date.now() / 1000)), nonce: await Effect.runPromise(newUpdateNonce) }))
   return new Request(url, { headers: { Authorization: await Effect.runPromise(signUpdateRequest(installation.privateKey, url)) } })
 }
-const signed = (version: string) => Effect.runPromise(signUpdateManifest(Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, tag: `@magnitudedev/cli@${version}`, version, commit: "a".repeat(40), artifact: { id: "mac", target: { os: "darwin", arch: "arm64", package: "mac-zip" }, filename: `mac.zip`, bytes: 100, sha256: "a".repeat(64) } }), keyId, publisher.privateKey))
-const harness = (candidates: readonly SignedUpdateManifest[] = [], overrides: Partial<DistributionStore> = {}) => {
+const signed = (version: string) => Effect.runPromise(signUpdateManifest(Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, tag: `@magnitudedev/cli@${version}`, version, commit: "a".repeat(40), artifact: { id: "mac", target: { os: "darwin", arch: "arm64", package: "mac-zip" }, filename: `mac.zip`, bytes: 100, sha256: "a".repeat(64) } }), publisher.privateKey))
+const harness = (candidates: readonly PublishedUpdate[] = [], overrides: Partial<DistributionStore> = {}) => {
   const nonces = new Set<string>(), records: (typeof CheckObservation.Type)[] = []
   const store: DistributionStore = {
     admit: (id, nonce) => Effect.sync(() => { const key = `${id}:${nonce}`; if (nonces.has(key)) return false; nonces.add(key); return true }),
@@ -33,7 +33,7 @@ describe("hosted update checks", () => {
   it("returns the newest admissible offer regardless of store order", async () => {
     const newest = await signed("3.0.0"), h = harness([await signed("2.0.0"), newest])
     const res = await h.run(await request())
-    expect(res.status).toBe(200); expect(await res.json()).toEqual(newest)
+    expect(res.status).toBe(200); expect(await res.json()).toEqual(newest.release)
     expect(h.records[0]?.offeredVersion).toEqual(Option.some("3.0.0"))
   })
   it("admits a replay only once, including concurrent requests", async () => {

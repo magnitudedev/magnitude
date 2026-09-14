@@ -5,7 +5,8 @@ applies_to:
   - packages/release/scripts/build-distribution-server.ts
   - packages/release/scripts/publish-hosted.ts
   - desktop/src/*update*
-  - packages/daemon-management/src/desktop-native/linux-update*
+  - packages/daemon-management/src/desktop-native/*update*
+  - cli/src/startup/*update*
   - packages/client-common/src/desktop/update.ts
   - packages/sdk/src/desktop-update.ts
 ---
@@ -23,7 +24,7 @@ wakeups. Manual checks reset the deadline. Check admission is independent of a d
 update; a later check cannot replace an active transfer. Automatic downloads default on, with an
 atomically persisted preference independent of ACN. Corrupt preferences pause automatic downloads
 without replacing the file or suppressing checks. Turning the preference off cancels only automatic
-transfers before native staging. Cancellation retains transfer admission until scoped cleanup ends.
+transfers before prepared-update publication. Cancellation retains transfer admission until scoped cleanup ends.
 Neither renderer disconnection nor window closure owns or cancels this work.
 
 ## Signed checks
@@ -40,7 +41,7 @@ again. Invalid authentication and expired requests return 401; replay returns 40
 returns 400. Storage or publisher-verification failures return 503, never “up to date.”
 
 An admitted check returns 204 without a body when no qualifying release exists. A 200 response
-contains a signed manifest envelope. Checks are private and uncacheable; deployment must not apply
+contains exactly version, bytes, sha256 and signature. Checks are private and uncacheable; deployment must not apply
 ISR or shared response caching to them.
 
 The deployment edge limits only update/download endpoints before they reach the database. Its
@@ -49,26 +50,27 @@ are not installation observations. Ordinary website pages do not share this endp
 
 ## Release authenticity
 
-The envelope signs a versioned, domain-separated payload with a trusted publisher Ed25519 key.
-The payload binds release version, source commit, target OS/architecture/package, GitHub release
-tag, artifact filename, byte count and SHA-256. Filenames cannot escape their release. The client admits only
-newer versions compatible with its target and existing stable/beta/alpha channel policy. Candidate
-selection chooses the newest compatible version independently of storage enumeration order.
+The public release signature uses Ed25519 over a deterministic, versioned domain-separated
+representation of target OS/architecture/package, release version, byte count and SHA-256. The
+client tries its bundled publisher trust set; no response key identifier or server-provided key
+chooses trust. GitHub coordinates and accepted source identity remain server publication metadata,
+not fields in the public response. The client admits only newer versions compatible with its target
+and existing stable/beta/alpha channel policy, independently of storage enumeration order.
 
 Cryptographic verification does not replace checksum verification after transfer or native
-publisher verification before installation. Installation lifecycle belongs to desktop main.
-The original signed envelope accompanies a verified candidate through any process handoff; a
-parsed manifest is not a substitute for publisher proof at a later privileged boundary.
+publisher verification before installation. The exact signed public release remains with the
+installer for offline verification at every installation boundary, including privileged Linux
+installation. Readiness and success belong to the desktop lifecycle, independently of ACN.
 Windows additionally verifies the installer through WinVerifyTrust with whole-chain revocation
 checking and no verification UI. The verified signer's certificate must contain the publisher
 organization supplied by the installed build; a valid signature from another publisher is not enough.
 Native acceptance uses explicitly trusted, temporary test certificates to exercise valid signatures,
 unsigned files, payload tampering and publisher mismatch without weakening production trust.
-Windows stages the installer and a copy of the bundled CLI in a unique private directory outside
-the replaceable application. The temporary helper acknowledges readiness, waits for its desktop
-owner's lifetime pipe to close, then runs the per-user installer and records its actual exit result
-before relaunching. It owns no service and requests no elevation. The reopened desktop retires only
-that completed staging directory after the helper exits; installation identity remains in the profile.
+Windows retains the verified installer under the shared user update directory. Only its temporary
+helper and native adapter are copied outside the replaceable application for handoff. The helper
+acquires native installation exclusion before acknowledging readiness, then waits for its desktop
+owner's lifetime pipe to close. It runs the per-user installer without elevation and records a
+reported failure in the same prepared-update record before releasing exclusion and relaunching.
 
 GitHub Releases is the sole binary store. Production metadata registration consumes the complete
 desktop graph from the exact accepted public native release, verifies the resolved source commit
@@ -79,10 +81,11 @@ never uploads copies or repeats full binary verification downloads. Credentials 
 application-embedded public key. Retries register the same metadata without rebuilding or
 overwriting public artifacts.
 
-Magnitude download endpoints return private, uncacheable redirects to the exact signed GitHub
+Magnitude download endpoints return private, uncacheable redirects to the exact accepted GitHub
 release asset. They never stream installer bytes. The repository is fixed by trusted composition;
-requests cannot supply arbitrary URLs. The client validates the exact first redirect, then uses
-a fresh unauthenticated transfer to follow GitHub's delivery redirects. Installation credentials
+requests cannot supply arbitrary URLs. The client admits only the fixed GitHub repository’s release-asset route, then uses
+a fresh unauthenticated transfer that admits only that route and GitHub’s release-assets delivery host.
+Download selection uses release version and target, never a client-facing artifact identifier. Installation credentials
 never go to GitHub. Expiring delivery URLs are not persisted; retries use the canonical asset URL.
 Acceptance artifacts use separate signed test tags and trust, never production channels or latest.
 

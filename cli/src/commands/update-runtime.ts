@@ -13,6 +13,7 @@ export const renderApplicationUpdate = (state: DesktopUpdateState): string => {
     case "Available": return `Magnitude ${state.transfer.version} is available (${formatStorageSize(state.transfer.bytes)}).\nDownload: magnitude update download\n`
     case "Downloading": return `Downloading Magnitude ${state.transfer.version}: ${formatStorageSize(state.transfer.completed)} of ${formatStorageSize(state.transfer.total)}.\nCheck progress: magnitude update status\n`
     case "Staging": return `Preparing Magnitude ${state.transfer.version}.\nCheck progress: magnitude update status\n`
+    case "InstallationFailed": return `${state.transfer.message}\nRetry installation: magnitude update install\nDiscard download: magnitude update discard\n`
     case "Ready": return `Magnitude ${state.transfer.version} is ready to install.\nInstall and restart: magnitude update install\n`
     case "Cancelling": return "Cancelling the automatic update download.\nCheck progress: magnitude update status\n"
     case "Closed": return "Magnitude is quitting.\n"
@@ -24,5 +25,5 @@ export const renderApplicationUpdate = (state: DesktopUpdateState): string => {
 
 export const runUpdate = (input: string) => runCommand({
   effect: Schema.decodeUnknown(ApplicationUpdateAction)(input).pipe(Effect.flatMap(action => updateDesktopApplication(action).pipe(Effect.map(state => ({ action, state }))))),
-  render: ({ action, state }) => action === "install" ? "Magnitude is stopping its model and service to install the update and restart.\n" : renderApplicationUpdate(state),
+  render: ({ action, state }) => action === "install" ? "Magnitude is stopping its model and service to install the update and restart.\n" : action === "discard" ? "The prepared update was discarded.\n" : renderApplicationUpdate(state),
 })

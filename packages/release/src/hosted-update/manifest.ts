@@ -1,7 +1,8 @@
-import { createPrivateKey, createPublicKey, sign, verify, type KeyObject } from "node:crypto"
+import { createPrivateKey, createPublicKey, type KeyObject } from "node:crypto"
 import { Effect, Schema } from "effect"
 import { isNewerVersion, isValidVersion, admittedChannels, releaseChannelOf } from "../client-update/release-channels"
 import type { UpdateRequest } from "./request"
+import { ReleaseTarget, UpdateRelease, signUpdateRelease, verifyUpdateRelease } from "./release"
 
 const Version = Schema.String.pipe(Schema.maxLength(96), Schema.filter(isValidVersion))
 export const PublisherKeyId = Schema.String.pipe(Schema.pattern(/^[a-zA-Z0-9_-]{1,64}$/), Schema.brand("PublisherKeyId"))
@@ -10,11 +11,7 @@ export const ArtifactId = Schema.String.pipe(Schema.pattern(/^[a-zA-Z0-9][a-zA-Z
 export type ArtifactId = typeof ArtifactId.Type
 const ArtifactFilename = Schema.String.pipe(Schema.maxLength(255), Schema.pattern(/^[a-zA-Z0-9][a-zA-Z0-9._~-]*$/))
 const ReleaseTag = Schema.String.pipe(Schema.maxLength(256), Schema.pattern(/^(?:@magnitudedev\/cli@|desktop-update-acceptance\/[a-f0-9]{40}\/)[a-zA-Z0-9][a-zA-Z0-9._-]*$/))
-export const ArtifactTarget = Schema.Union(
-  Schema.Struct({ os: Schema.Literal("darwin"), arch: Schema.Literal("arm64", "x64"), package: Schema.Literal("mac-zip", "dmg") }),
-  Schema.Struct({ os: Schema.Literal("windows"), arch: Schema.Literal("x64"), package: Schema.Literal("windows-exe") }),
-  Schema.Struct({ os: Schema.Literal("linux"), arch: Schema.Literal("arm64", "x64"), package: Schema.Literal("deb", "rpm") }),
-)
+export const ArtifactTarget = ReleaseTarget
 export const UpdateManifest = Schema.Struct({
   protocol: Schema.Literal(1),
   version: Version,
@@ -29,42 +26,28 @@ export const UpdateManifest = Schema.Struct({
   }),
 }).pipe(Schema.filter(manifest => manifest.tag === `@magnitudedev/cli@${manifest.version}` || manifest.tag === `desktop-update-acceptance/${manifest.commit}/${manifest.version}`))
 export type UpdateManifest = typeof UpdateManifest.Type
-export const SignedUpdateManifest = Schema.Struct({
-  keyId: PublisherKeyId,
-  payload: Schema.String.pipe(Schema.maxLength(16384)),
-  signature: Schema.String.pipe(Schema.maxLength(128)),
-})
-export type SignedUpdateManifest = typeof SignedUpdateManifest.Type
-/** Retain publisher proof when a verified offer crosses an installation handoff. */
-export const UpdateCandidate = Schema.Struct({ manifest: UpdateManifest, envelope: SignedUpdateManifest })
-export type UpdateCandidate = typeof UpdateCandidate.Type
+/** Publisher-only metadata. HTTP handlers expose only release, never these coordinates. */
+export const PublishedUpdate = Schema.Struct({ manifest: UpdateManifest, release: UpdateRelease })
+export type PublishedUpdate = typeof PublishedUpdate.Type
 export class InvalidUpdateManifest extends Schema.TaggedError<InvalidUpdateManifest>()("InvalidUpdateManifest", {}) {}
 export class ReleaseSigningFailed extends Schema.TaggedError<ReleaseSigningFailed>()("ReleaseSigningFailed", {}) {}
-const context = "magnitude-release-v1\n"
 
-export const signUpdateManifest = (manifest: UpdateManifest, keyId: typeof PublisherKeyId.Type, privateKey: KeyObject) =>
-  Schema.encode(Schema.parseJson(UpdateManifest))(manifest).pipe(
-    Effect.mapError(() => new ReleaseSigningFailed()),
-    Effect.flatMap(json => Effect.try({ try: () => {
-      if (privateKey.asymmetricKeyType !== "ed25519") throw new Error("Expected Ed25519 publisher")
-      return SignedUpdateManifest.make({ keyId, payload: Buffer.from(json).toString("base64"),
-        signature: sign(null, Buffer.from(context + json), privateKey).toString("base64") })
-    }, catch: () => new ReleaseSigningFailed() })),
-  )
+export const signUpdateManifest = (manifest: UpdateManifest, privateKey: KeyObject) => Effect.gen(function* () {
+  const decoded = yield* Schema.decodeUnknown(UpdateManifest)(manifest, { onExcessProperty: "error" })
+  const release = yield* signUpdateRelease({ version: decoded.version, bytes: decoded.artifact.bytes, sha256: decoded.artifact.sha256 }, decoded.artifact.target, privateKey)
+  return PublishedUpdate.make({ manifest: decoded, release })
+}).pipe(Effect.mapError(() => new ReleaseSigningFailed()))
 
-/** Keys come only from application-embedded trust, never from the offer itself. */
+/** Verify stored content against bundled trust before serving the accepted publication. */
 export const verifyUpdateManifest = (input: unknown, trustedKeys: ReadonlyMap<string, KeyObject>) => Effect.gen(function* () {
-  const envelope = yield* Schema.decodeUnknown(SignedUpdateManifest)(input, { onExcessProperty: "error" }).pipe(Effect.mapError(() => new InvalidUpdateManifest()))
-  const json = yield* Effect.try({ try: () => {
-    const key = trustedKeys.get(envelope.keyId)
-    if (!key || key.asymmetricKeyType !== "ed25519") throw new Error("Unknown publisher")
-    const payload = Buffer.from(envelope.payload, "base64"), signature = Buffer.from(envelope.signature, "base64")
-    if (payload.toString("base64") !== envelope.payload || signature.toString("base64") !== envelope.signature || signature.length !== 64) throw new Error("Invalid envelope")
-    if (!verify(null, Buffer.concat([Buffer.from(context), payload]), key, signature)) throw new Error("Invalid signature")
-    return new TextDecoder("utf-8", { fatal: true }).decode(payload)
-  }, catch: () => new InvalidUpdateManifest() })
-  return yield* Schema.decodeUnknown(Schema.parseJson(UpdateManifest))(json, { onExcessProperty: "error" }).pipe(Effect.mapError(() => new InvalidUpdateManifest()))
-})
+  const published = yield* Schema.decodeUnknown(PublishedUpdate)(input, { onExcessProperty: "error" })
+  const { manifest } = published
+  const release = yield* verifyUpdateRelease(published.release, manifest.artifact.target, trustedKeys)
+  if (release.version !== manifest.version || release.bytes !== manifest.artifact.bytes || release.sha256 !== manifest.artifact.sha256) {
+    return yield* new InvalidUpdateManifest()
+  }
+  return manifest
+}).pipe(Effect.mapError(() => new InvalidUpdateManifest()))
 
 export const acceptsUpdateManifest = (manifest: UpdateManifest, request: Pick<UpdateRequest, "version" | "os" | "arch" | "package">): boolean =>
   isNewerVersion(manifest.version, request.version)

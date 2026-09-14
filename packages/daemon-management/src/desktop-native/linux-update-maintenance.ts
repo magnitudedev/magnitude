@@ -1,8 +1,10 @@
 import { FileSystem } from "@effect/platform"
 import { Effect, Option, Schema, Stream } from "effect"
-import { dirname, join, parse } from "node:path"
-import { decodePublisherPublicKey } from "@magnitudedev/release/hosted-update"
-import { LinuxPackageUpdate, LinuxPackageUpdateFailed, makeLinuxPackageInstaller } from "./linux-update-package"
+import { basename, dirname, join, parse } from "node:path"
+import { decodePublisherPublicKey, updateInstallerFilename } from "@magnitudedev/release/hosted-update"
+import { LinuxPackageUpdateFailed, makeLinuxPackageInstaller } from "./linux-update-package"
+
+import { PreparedUpdate } from "./prepared-update"
 
 const Trust = Schema.Struct({ keyId: Schema.NonEmptyString, publicKey: Schema.NonEmptyString })
 const installedCli = "/usr/lib/magnitude-desktop/resources/magnitude"
@@ -31,19 +33,22 @@ export const installLinuxApplicationUpdate = (requestPath: string, currentVersio
   const requestInfo = yield* fs.stat(requestPath)
   if (trustInfo.type !== "File" || trustInfo.size > 16_384n || formatInfo.type !== "File" || formatInfo.size > 1024n
     || Option.getOrUndefined(formatInfo.uid) !== 0 || (formatInfo.mode & 0o022) !== 0 || (yield* fs.realPath(formatPath)) !== formatPath
-    || requestInfo.type !== "File" || requestInfo.size > 32_768n
+    || requestInfo.type !== "File" || requestInfo.size > 4096n
+    || basename(requestPath) !== "update.json" || basename(dirname(requestPath)) !== "updates"
+    || (yield* fs.realPath(requestPath)) !== requestPath
     || Option.getOrUndefined(requestInfo.uid) !== callerUid) {
     return yield* new LinuxPackageUpdateFailed({ message: "The application update request is invalid." })
   }
   const trust = yield* fs.readFileString(trustPath).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(Trust))))
   const key = yield* decodePublisherPublicKey(trust.publicKey)
   const format = yield* fs.readFileString(formatPath).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ format: Schema.Literal("deb", "rpm") })))))
-  const request = yield* fs.stream(requestPath, { bytesToRead: 32_769 }).pipe(Stream.runFold(Buffer.alloc(0), (all, bytes) => Buffer.concat([all, bytes])),
+  const request = yield* fs.stream(requestPath, { bytesToRead: 4097 }).pipe(Stream.runFold(Buffer.alloc(0), (all, bytes) => Buffer.concat([all, bytes])),
     Effect.flatMap(bytes => Effect.gen(function* () {
-      if (bytes.length > 32_768) return yield* new LinuxPackageUpdateFailed({ message: "The update request exceeded its size limit." })
-      return yield* Schema.decodeUnknown(Schema.parseJson(LinuxPackageUpdate))(bytes.toString("utf8"))
+      if (bytes.length > 4096) return yield* new LinuxPackageUpdateFailed({ message: "The update request exceeded its size limit." })
+      return yield* Schema.decodeUnknown(Schema.parseJson(PreparedUpdate))(bytes.toString("utf8"), { onExcessProperty: "error" })
     })))
   const installer = yield* makeLinuxPackageInstaller({ currentVersion, package: format.format, callerUid, trustedPublishers: new Map([[trust.keyId, key]]) })
-  yield* installer.install(request)
+  if (request.installation._tag !== "Attempted") return yield* new LinuxPackageUpdateFailed({ message: "This update has not been authorized for installation." })
+  yield* installer.install({ release: request.release, packagePath: join(dirname(requestPath), updateInstallerFilename({ os: "linux", arch: process.arch === "arm64" ? "arm64" : "x64", package: format.format })) })
 }).pipe(Effect.mapError(error => error instanceof LinuxPackageUpdateFailed ? error
   : new LinuxPackageUpdateFailed({ message: "Could not verify the installed publisher trust or update request." })))

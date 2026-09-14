@@ -294,6 +294,8 @@ function ApplicationSettings() {
 function UpdateSettingsView({ service }: { service: DesktopSession }) {
   const observation = useAtomValue(service.updates)
   const check = useAtomSet(service.checkUpdate)
+  const discard = useAtomSet(service.discardUpdate)
+  const discarding = useAtomValue(service.discardUpdate)
   const download = useAtomSet(service.downloadUpdate)
   const restart = useAtomSet(service.restartUpdate)
   const setAutoDownload = useAtomSet(service.setAutoDownload)
@@ -303,7 +305,7 @@ function UpdateSettingsView({ service }: { service: DesktopSession }) {
   const saving = useAtomValue(service.setAutoDownload)
   const snapshot = Result.isSuccess(observation) ? observation.value : null
   const current = snapshot?.transfer
-  const pending = downloading.waiting || restarting.waiting
+  const pending = downloading.waiting || restarting.waiting || discarding.waiting
   const message = !current ? Result.isFailure(observation) ? "Update status unavailable." : "Reading update status…"
     : current._tag === "Idle" ? snapshot?.check._tag === "Succeeded" ? "You’re up to date." : "Magnitude checks for updates automatically."
     : current._tag === "Available" ? `Version ${current.version} is available · ${formatStorageSize(current.bytes)}`
@@ -329,10 +331,11 @@ function UpdateSettingsView({ service }: { service: DesktopSession }) {
     <div className="mt-3 flex flex-wrap gap-2">
       {current && !["Unavailable", "Closed"].includes(current._tag) && <Button variant="outline" disabled={checking.waiting || snapshot?.check._tag === "Checking"} onClick={() => check()}>{snapshot?.check._tag === "Checking" ? "Checking…" : "Check for updates"}</Button>}
       {current?._tag === "Available" && <Button disabled={pending} onClick={() => download()}>Download update</Button>}
-      {current?._tag === "Ready" && <Button disabled={pending} onClick={() => restart()}>Restart to update</Button>}
+      {(current?._tag === "Ready" || current?._tag === "InstallationFailed") && <Button disabled={pending} onClick={() => restart()}>{current._tag === "InstallationFailed" ? "Retry update" : "Restart to update"}</Button>}
+      {(current?._tag === "Ready" || current?._tag === "InstallationFailed") && <Button variant="outline" disabled={pending} onClick={() => discard()}>Discard download</Button>}
     </div>
     {current?._tag === "Ready" && <p className="mt-2 text-sm text-slate-500">Restarting stops the running model and service.</p>}
-    {[checking, downloading, restarting, saving].map((result, index) => Result.isFailure(result) ? <p key={index} role="alert" className="mt-2 text-sm">{hostFailureMessage(result.cause)}</p> : null)}
+    {[checking, downloading, restarting, discarding, saving].map((result, index) => Result.isFailure(result) ? <p key={index} role="alert" className="mt-2 text-sm">{hostFailureMessage(result.cause)}</p> : null)}
   </div>
 }
 function AppearanceSettings() {
@@ -414,6 +417,7 @@ const boot = Effect.gen(function* () {
     }, message => emit.fail(new DesktopHostFailed({ message })))), unsubscribe => Effect.sync(unsubscribe)).pipe(Effect.asVoid)),
     setAutoDownload: enabled => hostCommand(() => host.setAutoDownload(enabled)),
     checkUpdate: hostCommand(() => host.checkUpdate()),
+    discardUpdate: hostCommand(() => host.discardUpdate()),
     downloadUpdate: hostCommand(() => host.downloadUpdate()),
     restartUpdate: hostCommand(() => host.restartUpdate()),
     setLoginStartup: enabled => hostCommand(() => host.setLoginStartup(enabled)),

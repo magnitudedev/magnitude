@@ -2,8 +2,9 @@ import { Clock, Context, Effect, Option, Schema } from "effect"
 import type { KeyObject } from "node:crypto"
 import { decodeUpdateRequest, UpdateRequest } from "./request"
 import { verifyUpdateRequest, InstallationId, type RequestNonce } from "./request-auth"
+import { UpdateRelease } from "./release"
 import { isNewerVersion } from "../client-update/release-channels"
-import { acceptsUpdateManifest, verifyUpdateManifest, SignedUpdateManifest, ArtifactId, ArtifactTarget } from "./manifest"
+import { acceptsUpdateManifest, verifyUpdateManifest, PublishedUpdate, ArtifactId, ArtifactTarget } from "./manifest"
 
 export class DistributionStoreUnavailable extends Schema.TaggedError<DistributionStoreUnavailable>()("DistributionStoreUnavailable", {}) {}
 export const Country = Schema.String.pipe(Schema.pattern(/^[A-Z]{2}$/))
@@ -29,9 +30,9 @@ export const InstallerDownloadObservation = Schema.Struct({
 export interface DistributionStore {
   /** Atomic unique admission; expiry is server time, not an untrusted client TTL. */
   readonly admit: (installation: InstallationId, nonce: RequestNonce, expiresAt: number) => Effect.Effect<boolean, DistributionStoreUnavailable>
-  readonly candidates: (target: Pick<UpdateRequest, "os" | "arch"> & { readonly package: UpdateRequest["package"] | "dmg" }) => Effect.Effect<readonly SignedUpdateManifest[], DistributionStoreUnavailable>
+  readonly candidates: (target: Pick<UpdateRequest, "os" | "arch"> & { readonly package: UpdateRequest["package"] | "dmg" }) => Effect.Effect<readonly PublishedUpdate[], DistributionStoreUnavailable>
   readonly recordCheck: (observation: typeof CheckObservation.Type) => Effect.Effect<void, DistributionStoreUnavailable>
-  readonly artifact: (release: string, id: ArtifactId) => Effect.Effect<Option.Option<SignedUpdateManifest>, DistributionStoreUnavailable>
+  readonly artifact: (release: string, target: typeof ArtifactTarget.Type) => Effect.Effect<Option.Option<PublishedUpdate>, DistributionStoreUnavailable>
   readonly recordDownload: (observation: typeof DownloadObservation.Type) => Effect.Effect<void, DistributionStoreUnavailable>
   readonly recordInstallerDownload: (observation: typeof InstallerDownloadObservation.Type) => Effect.Effect<void, DistributionStoreUnavailable>
 }
@@ -55,7 +56,7 @@ export const handleUpdateCheck = (request: Request, options: {
   const store = yield* DistributionStore
   if (!(yield* store.admit(installation, fields.nonce, now + 600))) return response(409)
   const candidates = yield* store.candidates(fields)
-  let offer: Option.Option<SignedUpdateManifest> = Option.none()
+  let offer: Option.Option<PublishedUpdate> = Option.none()
   let offeredVersion: Option.Option<string> = Option.none()
   for (const candidate of candidates) {
     const manifest = yield* verifyUpdateManifest(candidate, options.trustedPublishers)
@@ -69,7 +70,7 @@ export const handleUpdateCheck = (request: Request, options: {
     Effect.catchTag("DistributionStoreUnavailable", () => Effect.logWarning("Update telemetry write unavailable")),
   )
   if (Option.isNone(offer)) return response(204)
-  const body = yield* Schema.encode(Schema.parseJson(SignedUpdateManifest))(offer.value).pipe(Effect.mapError(() => new DistributionStoreUnavailable()))
+  const body = yield* Schema.encode(Schema.parseJson(UpdateRelease))(offer.value.release).pipe(Effect.mapError(() => new DistributionStoreUnavailable()))
   return response(200, body)
 }).pipe(Effect.catchTags({
   InvalidUpdateRequest: () => Effect.succeed(response(400)),

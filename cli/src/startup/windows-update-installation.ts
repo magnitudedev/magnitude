@@ -1,27 +1,26 @@
 import { BunContext } from "@effect/platform-bun"
-import { completeWindowsUpdateHandoff, WindowsUpdateHandoffRequest } from "@magnitudedev/daemon-management/desktop-native"
-import { Effect, Schema } from "effect"
+import { acquireUpdateInstallationLease, completeWindowsUpdateHandoff, nativeHostLayer, relaunchWindowsAfterUpdate,
+  WindowsUpdateHandoffRequest, windowsPrivateFilePermissions } from "@magnitudedev/daemon-management/desktop-native"
+import { Effect } from "effect"
 import { win32 } from "node:path"
+import { readUpdateHandoff, UpdateHandoffChannelFailed } from "./update-handoff-channel"
 
 export const runWindowsUpdateHandoff = () => Effect.runPromise(Effect.gen(function* () {
-  const request = yield* Effect.tryPromise(async () => {
-    let buffer = Buffer.alloc(0)
-    let decoded: typeof WindowsUpdateHandoffRequest.Type | undefined
-    for await (const chunk of process.stdin) {
-      buffer = Buffer.concat([buffer, Buffer.from(chunk)])
-      if (decoded || buffer.length > 32_768) throw new Error("Invalid update handoff")
-      const newline = buffer.indexOf(10)
-      if (newline >= 0) {
-        if (newline !== buffer.length - 1) throw new Error("Invalid update handoff")
-        decoded = Schema.decodeUnknownSync(Schema.parseJson(WindowsUpdateHandoffRequest))(buffer.subarray(0, newline).toString("utf8"))
-        if (process.platform !== "win32" || win32.resolve(process.execPath) !== win32.join(decoded.preparedDirectory, "magnitude-update.exe")) {
-          throw new Error("Invalid update helper")
-        }
-        await new Promise<void>((resolve, reject) => process.stdout.write("ready\n", error => error ? reject(error) : resolve()))
-      }
-    }
-    if (!decoded) throw new Error("Missing update handoff")
-    return decoded
-  })
-  yield* completeWindowsUpdateHandoff(request)
+  const channel = yield* readUpdateHandoff(process.stdin, WindowsUpdateHandoffRequest)
+  const request = channel.request
+  if (process.platform !== "win32" || win32.resolve(process.execPath) !== win32.join(request.helperDirectory, "magnitude.exe")) {
+    return yield* new UpdateHandoffChannelFailed()
+  }
+  const addon = win32.join(request.helperDirectory, "desktop-host.node")
+  const completed = yield* Effect.scoped(Effect.gen(function* () {
+    yield* acquireUpdateInstallationLease(request.stateDirectory)
+    yield* Effect.async<void, UpdateHandoffChannelFailed>(resume => {
+      process.stdout.write("ready\n", error => resume(error ? new UpdateHandoffChannelFailed() : Effect.void))
+    })
+    yield* channel.awaitOwnerExit
+    return yield* completeWindowsUpdateHandoff(request).pipe(Effect.exit)
+  })).pipe(Effect.provide([nativeHostLayer(addon), windowsPrivateFilePermissions(addon)]))
+  // A recording failure still relaunches the old app, which reconciles the retained Attempted record.
+  yield* relaunchWindowsAfterUpdate(request)
+  yield* completed
 }).pipe(Effect.provide(BunContext.layer), Effect.catchAll(() => Effect.sync(() => { process.exitCode = 1 }))))

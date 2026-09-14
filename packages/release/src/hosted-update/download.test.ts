@@ -10,16 +10,16 @@ const keys = generateKeyPairSync("ed25519"), publisher = generateKeyPairSync("ed
 const options = { origin: "https://magnitude.dev", country: Option.some("US"), trustedPublishers: new Map([[keyId, publisher.publicKey]]) }
 const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, tag: "@magnitudedev/cli@2.0.0", version: "2.0.0", commit: "a".repeat(40), artifact: { id: "mac", target: { os: "darwin", arch: "arm64", package: "mac-zip" }, filename: "mac.zip", bytes: 42, sha256: "a".repeat(64) } })
 const request = async (fields: Record<string, string> = {}) => {
-  const url = new URL(options.origin + "/api/download?" + updateQuery({ artifact: "mac", protocol: "1", product: "desktop", version: "1.0.0", os: "darwin", os_version: "26.0", arch: "arm64", package: "mac-zip", channel: "stable", ts: String(Math.floor(Date.now() / 1000)), nonce: await Effect.runPromise(newUpdateNonce), release: "2.0.0", ...fields }))
+  const url = new URL(options.origin + "/api/download?" + updateQuery({ protocol: "1", product: "desktop", version: "1.0.0", os: "darwin", os_version: "26.0", arch: "arm64", package: "mac-zip", channel: "stable", ts: String(Math.floor(Date.now() / 1000)), nonce: await Effect.runPromise(newUpdateNonce), release: "2.0.0", ...fields }))
   return new Request(url, { headers: { authorization: await Effect.runPromise(signUpdateRequest(keys.privateKey, url)) } })
 }
 const harness = async (overrides: Partial<DistributionStore> = {}) => {
-  const envelope = await Effect.runPromise(signUpdateManifest(manifest, keyId, publisher.privateKey))
+  const envelope = await Effect.runPromise(signUpdateManifest(manifest, publisher.privateKey))
   let recorded = 0
   const seen = new Set<string>()
   const store: DistributionStore = {
     admit: (_, nonce) => Effect.sync(() => { if (seen.has(nonce)) return false; seen.add(nonce); return true }),
-    artifact: (version, id) => Effect.succeed(version === manifest.version && id === manifest.artifact.id ? Option.some(envelope) : Option.none()),
+    artifact: (version, target) => Effect.succeed(version === manifest.version && target.os === manifest.artifact.target.os && target.arch === manifest.artifact.target.arch && target.package === manifest.artifact.target.package ? Option.some(envelope) : Option.none()),
     recordDownload: () => Effect.sync(() => { recorded++ }), recordInstallerDownload: () => Effect.void,
     candidates: () => Effect.succeed([]), recordCheck: () => Effect.void, ...overrides,
   }
@@ -49,15 +49,16 @@ describe("authenticated artifact downloads", () => {
     const h = await harness({ recordDownload: () => new DistributionStoreUnavailable() })
     expect((await h.run(await request())).status).toBe(302)
   })
-  it("binds the artifact in the signed query and rejects duplicate or unexpected fields", async () => {
+  it("binds the version and target in the signed query and rejects duplicate or unexpected fields", async () => {
     const h = await harness(), signed = await request()
     const changed = new URL(signed.url)
-    changed.searchParams.set("artifact", "other")
+    changed.searchParams.set("arch", "x64")
     expect((await h.run(new Request(changed, { headers: signed.headers }))).status).toBe(401)
     const duplicate = new URL(signed.url)
-    duplicate.searchParams.append("artifact", "mac")
+    duplicate.searchParams.append("release", "2.0.0")
     expect((await h.run(new Request(duplicate, { headers: signed.headers }))).status).toBe(400)
     expect((await h.run(await request({ unexpected: "value" }))).status).toBe(400)
+    expect((await h.run(await request({ artifact: "mac" }))).status).toBe(400)
     expect(h.count()).toBe(0)
   })
 })

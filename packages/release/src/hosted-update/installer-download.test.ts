@@ -33,9 +33,12 @@ it.each([false, true])("recovers interrupted ranges and incorrect response total
       bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
     } })
     const destination = join(directory, "app.exe")
-    const result = await Effect.runPromise(downloadUpdateArtifact({ manifest, destination,
-      url: `http://127.0.0.1:${server.port}/app.exe`, onProgress: Option.none(),
-    }).pipe(Effect.provide([NodeContext.layer, FetchHttpClient.layer])))
+    const result = await Effect.runPromise(downloadUpdateArtifact({ release: { version: manifest.version, bytes: manifest.artifact.bytes, sha256: manifest.artifact.sha256, signature: "A".repeat(86) + "==" }, destination,
+      url: "https://github.com/magnitudedev/magnitude/releases/download/test/app.exe", onProgress: Option.none(),
+    }).pipe(Effect.provide([NodeContext.layer, FetchHttpClient.layer]), Effect.provideService(FetchHttpClient.Fetch, Object.assign(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      expect(init?.redirect).toBe("manual")
+      return fetch(`http://127.0.0.1:${server.port}/app.exe`, init)
+    }, { preconnect: () => {} }))))
     expect(result.strategy).toBe("Segmented")
     expect(attempts.get("bytes=0-0")).toBe(malformedProbe ? 2 : 1)
     expect(attempts.get("bytes=4194304-8388607")).toBe(2)

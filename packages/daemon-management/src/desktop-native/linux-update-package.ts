@@ -3,10 +3,10 @@ import { Context, Effect, Option, Schema, Stream } from "effect"
 import { createHash, type KeyObject } from "node:crypto"
 import { join } from "node:path"
 import { LINUX_DESKTOP_PACKAGE_NAME } from "@magnitudedev/release/executables"
-import { acceptsUpdateManifest, SignedUpdateManifest, verifyUpdateManifest } from "@magnitudedev/release/hosted-update"
+import { acceptsUpdateRelease, UpdateRelease, verifyUpdateRelease } from "@magnitudedev/release/hosted-update"
 
 export const LinuxPackageUpdate = Schema.Struct({
-  envelope: SignedUpdateManifest,
+  release: UpdateRelease,
   packagePath: Schema.NonEmptyString,
 })
 export class LinuxPackageUpdateFailed extends Schema.TaggedError<LinuxPackageUpdateFailed>()("LinuxPackageUpdateFailed", {
@@ -30,14 +30,16 @@ export const makeLinuxPackageInstaller = (options: {
     if (process.platform !== "linux" || process.getuid?.() !== 0 || !Number.isSafeInteger(options.callerUid) || options.callerUid <= 0) {
       return yield* new LinuxPackageUpdateFailed({ message: "Package installation requires system authorization from your desktop session." })
     }
-    const manifest = yield* verifyUpdateManifest(request.envelope, options.trustedPublishers)
-    const target = manifest.artifact.target
-    if (target.os !== "linux" || (process.arch !== "arm64" && process.arch !== "x64")
-      || !acceptsUpdateManifest(manifest, { version: options.currentVersion, os: "linux", arch: process.arch, package: options.package })) {
+    if (process.arch !== "arm64" && process.arch !== "x64") {
+      return yield* new LinuxPackageUpdateFailed({ message: "Unsupported package architecture." })
+    }
+    const target = { os: "linux" as const, arch: process.arch, package: options.package }
+    const release = yield* verifyUpdateRelease(request.release, target, options.trustedPublishers)
+    if (!acceptsUpdateRelease(release, options.currentVersion)) {
       return yield* new LinuxPackageUpdateFailed({ message: "This package is not a newer Magnitude release for this machine." })
     }
     const source = yield* fs.stat(request.packagePath)
-    if (source.type !== "File" || Number(source.size) !== manifest.artifact.bytes || Option.getOrUndefined(source.uid) !== options.callerUid) {
+    if (source.type !== "File" || Number(source.size) !== release.bytes || Option.getOrUndefined(source.uid) !== options.callerUid) {
       return yield* new LinuxPackageUpdateFailed({ message: "The downloaded update is missing or has changed." })
     }
     // Copy before verification so an unprivileged writer cannot change the bytes installed as root.
@@ -48,14 +50,14 @@ export const makeLinuxPackageInstaller = (options: {
     const digest = createHash("sha256")
     yield* fs.stream(request.packagePath).pipe(Stream.tap(bytes => Effect.gen(function* () {
       copied += bytes.length
-      if (copied > manifest.artifact.bytes) return yield* new LinuxPackageUpdateFailed({ message: "The downloaded update grew during preparation." })
+      if (copied > release.bytes) return yield* new LinuxPackageUpdateFailed({ message: "The downloaded update grew during preparation." })
       digest.update(bytes)
     })), Stream.run(fs.sink(archive, { flag: "wx", mode: 0o600 })))
     yield* fs.chmod(archive, 0o400)
-    if (Number((yield* fs.stat(archive)).size) !== manifest.artifact.bytes) {
+    if (Number((yield* fs.stat(archive)).size) !== release.bytes) {
       return yield* new LinuxPackageUpdateFailed({ message: "The downloaded update size changed during preparation." })
     }
-    if (digest.digest("hex") !== manifest.artifact.sha256) {
+    if (digest.digest("hex") !== release.sha256) {
       return yield* new LinuxPackageUpdateFailed({ message: "The downloaded update failed publisher verification." })
     }
     const query = target.package === "deb"
@@ -63,7 +65,7 @@ export const makeLinuxPackageInstaller = (options: {
       : Command.make("/usr/bin/rpm", "-qp", "--qf", "%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}", archive)
     const identity = (yield* executor.string(query)).trim().split("\t")
     const arch = target.package === "deb" ? target.arch === "arm64" ? "arm64" : "amd64" : target.arch === "arm64" ? "aarch64" : "x86_64"
-    const versionPrefix = `${manifest.version.replace("-", "~")}-`
+    const versionPrefix = `${release.version.replace("-", "~")}-`
     if (identity.length !== 3 || identity[0] !== LINUX_DESKTOP_PACKAGE_NAME || identity[2] !== arch
       || !identity[1]!.startsWith(versionPrefix) || !/^[1-9][0-9]*$/.test(identity[1]!.slice(versionPrefix.length))) {
       return yield* new LinuxPackageUpdateFailed({ message: "The package identity does not match the signed Magnitude release." })

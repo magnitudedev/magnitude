@@ -20,11 +20,11 @@ describe("privileged Linux application package verification", () => {
     const bytes = Buffer.from("publisher-owned package bytes")
     await writeFile(archive, bytes)
     const key = generateKeyPairSync("ed25519")
-    const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, version: "2.0.0", commit: "a".repeat(40), artifact: {
+    const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, tag: "@magnitudedev/cli@2.0.0", version: "2.0.0", commit: "a".repeat(40), artifact: {
       id: "desktop-linux-arm64-gnu-deb", target: { os: "linux", arch: scenario === "target" ? "x64" : "arm64", package: "deb" },
-      path: "releases/2.0.0/magnitude.deb", bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+      filename: "magnitude.deb", bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
     } })
-    const envelope = await Effect.runPromise(signUpdateManifest(manifest, PublisherKeyId.make("test"), key.privateKey))
+    const envelope = await Effect.runPromise(signUpdateManifest(manifest, key.privateKey))
     if (scenario === "hash") await writeFile(archive, Buffer.alloc(bytes.length))
     let queried = false
     let installed = false
@@ -35,7 +35,7 @@ describe("privileged Linux application package verification", () => {
       const result = await Effect.runPromise(Effect.gen(function* () {
         const installer = yield* makeLinuxPackageInstaller({ package: "deb", callerUid: uid, currentVersion: scenario === "downgrade" ? "3.0.0" : "1.0.0",
           trustedPublishers: new Map([["test", scenario === "signature" ? generateKeyPairSync("ed25519").publicKey : key.publicKey]]) })
-        return yield* installer.install({ envelope, packagePath: archive }).pipe(Effect.either)
+        return yield* installer.install({ release: envelope.release, packagePath: archive }).pipe(Effect.either)
       }).pipe(Effect.provideService(CommandExecutor.CommandExecutor, {
         ...executor,
         string: command => Effect.promise(async () => {

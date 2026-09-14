@@ -15,10 +15,9 @@ export const UpdateIdentity = Context.GenericTag<UpdateIdentity>("desktop/Update
 export const makeUpdateIdentity = (clientStateDirectory: string) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const permissions = yield* PrivateFilePermissions
-  const directory = join(clientStateDirectory, "updates")
-  const path = join(directory, "installation-key.pem")
+  const directory = clientStateDirectory
+  const path = join(directory, "identity.pem")
   yield* fs.makeDirectory(clientStateDirectory, { recursive: true, mode: 0o700 })
-  yield* permissions.prepareDirectory(directory)
   if (!(yield* fs.exists(path))) {
     const pem = yield* Effect.try({ try: () => generateKeyPairSync("ed25519").privateKey.export({ type: "pkcs8", format: "pem" }).toString(), catch: () => new UpdateIdentityFailed() })
     yield* Effect.scoped(Effect.gen(function* () {
