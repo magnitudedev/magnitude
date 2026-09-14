@@ -41,8 +41,10 @@ def _chunk_delta_systems(
     threads,
 ):
     with T.Kernel(chunks, heads, batch, threads=threads) as (block, head, sequence):
-        first = offsets[sequence] + block * chunk
-        end = offsets[sequence + 1]
+        # Preserve the packed sequence's valid range in the compiler's bounds
+        # analysis instead of treating offsets loaded from memory as unbounded.
+        first = T.min(query.shape[0], T.max(0, offsets[sequence])) + block * chunk
+        end = T.min(query.shape[0], T.max(0, offsets[sequence + 1]))
         kh = head % key_heads if mapping == "tiled" else head // (heads // key_heads)
         q = T.alloc_fragment((chunk, width), "float32")
         k = T.alloc_shared((chunk, width), "float32")
@@ -157,13 +159,16 @@ def _chunk_delta_scan(
         operand = T.alloc_shared((chunk, width), "float32")
         rhs = T.alloc_shared((chunk, columns), "float32")
         contraction = T.alloc_fragment((chunk, columns), "float32")
-        first = offsets[sequence]
-        count = offsets[sequence + 1] - first
+        first = T.min(key.shape[0], T.max(0, offsets[sequence]))
+        end = T.min(key.shape[0], T.max(0, offsets[sequence + 1]))
+        count = T.max(0, end - first)
         for v, d in T.Parallel(columns, width):
             state[v, d] = T.if_then_else(
                 tile * columns + v < value_width, previous[sequence, head, tile * columns + v, d], 0
             )
-        for block in T.serial(T.ceildiv(count, chunk)):
+        for block in T.serial(
+            T.min(T.ceildiv(count, chunk), T.ceildiv(key.shape[0], chunk))
+        ):
             start = first + block * chunk
             for v, d in T.Parallel(columns, width):
                 if tile * columns + v < value_width:
@@ -212,8 +217,8 @@ def _chunk_delta_output(
         sequence = owner // heads
         head = owner % heads
         kh = head % key_heads if mapping == "tiled" else head // (heads // key_heads)
-        first = offsets[sequence] + block * chunk
-        end = offsets[sequence + 1]
+        first = T.min(query.shape[0], T.max(0, offsets[sequence])) + block * chunk
+        end = T.min(query.shape[0], T.max(0, offsets[sequence + 1]))
         q = T.alloc_shared((chunk, width), "float32")
         state = T.alloc_shared((columns, width), "float32")
         rhs = T.alloc_shared((chunk, columns), "float32")

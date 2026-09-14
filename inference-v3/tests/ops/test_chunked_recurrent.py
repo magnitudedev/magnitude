@@ -72,7 +72,8 @@ def test_chunked_recurrence_selection_accounts_for_workspace_and_capabilities():
 @pytest.mark.device
 @pytest.mark.parametrize("dtype,mapping", [(ops.DType.F32, "tiled"), (ops.DType.BF16, "grouped")])
 @pytest.mark.parametrize("reset", [True, False])
-def test_chunked_recurrence_tails_resets_and_empty_sequence(dtype, mapping, reset):
+@pytest.mark.parametrize("chunked", [True, False])
+def test_chunked_recurrence_tails_resets_and_empty_sequence(dtype, mapping, reset, chunked):
     if not torch.backends.mps.is_available():
         pytest.skip("requires a Metal device")
     rows, batch = 193, 3
@@ -127,9 +128,10 @@ def test_chunked_recurrence_tails_resets_and_empty_sequence(dtype, mapping, rese
             signature=signature,
             device=device,
             constants={},
-            options=ops.CompileOptions(mode="prefill"),
+            options=ops.CompileOptions(mode="prefill", workspace_limit=None if chunked else 0),
         )
-        assert compiled.diagnostics.submissions == (("gated_delta.chunked-matrix@0",),)
+        selected = "chunked-matrix" if chunked else "register-state"
+        assert compiled.diagnostics.submissions == ((f"gated_delta.{selected}@0",),)
         execution = compiled.submit(*resources[:5], resources[6], resources={"v5": resources[5]})
         execution.completion.wait()
         actual_output, actual_state = [
