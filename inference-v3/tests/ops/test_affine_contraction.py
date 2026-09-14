@@ -11,18 +11,14 @@ from ops.compiler.lowering import LoweringContext
 from ops.kernels.matrix import (_packed_vector_geometry, _packet_matrix_instruction,
                                 _packet_reduction_width, matrix_geometry)
 from ops.kernels.packed import affine_shared_bytes, packet_format
-from ops.kernels.grouped_experts import _continuous_contraction
 from tests.ops.test_attention_normalization_lowering import CAPABILITIES
 
 
-def test_continuous_operand_tiles_require_native_precision_and_bounded_layout():
-    instruction = ops.MatrixInstruction(8, 8, 8, ops.DType.BF16, ops.DType.F32)
-    context = LoweringContext(replace(CAPABILITIES, features=CAPABILITIES.features | {"gemm.shared_instruction_tiles"}),
-                              "prefill", "model", "test", 1 << 20)
-    assert _continuous_contraction(context, ops.DType.BF16, instruction)
-    assert not _continuous_contraction(context, ops.DType.F16, instruction)
-    assert not _continuous_contraction(replace(context, capabilities=CAPABILITIES), ops.DType.BF16, instruction)
-    assert affine_shared_bytes(32, 64, 32, ops.DType.BF16, decoded=True) == 6144
+def test_continuous_operands_stage_codes_and_original_coefficients_not_decoded_weights():
+    spec = ops.TensorSpec((64, 256), ops.DType.BF16).with_representation(
+        ops.Affine(ops.Code(4), 16, ops.DirectCoefficients(ops.DType.F32, ops.DType.F32)))
+    assert affine_shared_bytes(32, 64, 32, ops.DType.BF16, spec) == 7168
+    assert affine_shared_bytes(32, 64, 32, ops.DType.F32, spec) == 9216
 
 
 def test_direct_group_packets_do_not_claim_unsupported_signed_nibbles():
@@ -45,7 +41,7 @@ def test_packet_vector_geometry_respects_device_limits(outputs, capacity, thread
 
 def test_matrix_input_precision_does_not_round_quantization_coefficients():
     context = LoweringContext(CAPABILITIES, "prefill", "model", "test", 1 << 20)
-    assert _packet_matrix_instruction(context, ops.DType.F16).input_dtype == ops.DType.F16
+    assert _packet_matrix_instruction(context, ops.DType.F16).input_dtype == ops.DType.F32
     assert _packet_matrix_instruction(context, ops.DType.F32).input_dtype == ops.DType.F32
     unsupported = replace(context, capabilities=replace(CAPABILITIES, matrix_instructions=(
         ops.MatrixInstruction(8, 8, 8, ops.DType.F16, ops.DType.F16),)))
@@ -56,12 +52,13 @@ def test_shared_capacity_includes_coefficient_pairs_and_group_boundaries():
     context = LoweringContext(replace(CAPABILITIES, shared_memory_bytes=4096),
                               "prefill", "model", "test", 1 << 20)
     instruction = _packet_matrix_instruction(context, ops.DType.F16)
-    bm, bn, _ = matrix_geometry(context, instruction, 2048, 2560, 64, coefficient_bytes=8)
-    assert affine_shared_bytes(bm, bn, 64, instruction.input_dtype) <= 4096
     specs = tuple(ops.TensorSpec((32, 512), ops.DType.F16).with_representation(
         ops.Affine(ops.Code(4), group, ops.DirectCoefficients(ops.DType.BF16, ops.DType.BF16)))
         for group in (16, 32, 64))
-    assert _packet_reduction_width(*specs) == 16
+    bm, bn, _ = matrix_geometry(context, instruction, 2048, 2560, 64,
+                                packed_specs=specs, storage_dtype=ops.DType.F16)
+    assert affine_shared_bytes(bm, bn, 64, ops.DType.F16, *specs) <= 4096
+    assert _packet_reduction_width(*specs) == 32
 
 
 @pytest.mark.device

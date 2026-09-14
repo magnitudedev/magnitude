@@ -99,9 +99,41 @@ def test_streaming_attention_workspace_is_bounded_by_partition_outputs(capacity,
         assert candidate.workspace_bytes <= budget
         assert candidate.kernel_count == (2 if capacity <= 4096 else 3)
         isolated, = CausalAttentionRule().build(graph, 0, context)
-        assert candidate.emitter.attention_tile == isolated.emitter.tile == (32, 32, 128)
-        assert candidate.emitter.partitions == isolated.emitter.partitions
-        assert candidate.emitter.span == isolated.emitter.span
+        schedule = candidate.emitter.schedule
+        assert schedule == isolated.emitter.schedule
+        assert schedule.tile == (32, 32, 256)
+        assert schedule.head_tile == 2
+        assert schedule.value_tile == 64
+        assert schedule.instruction_k == 8
+        assert schedule.shared_bytes == 21_120
+
+
+@pytest.mark.parametrize(
+    "heads,threads,dtype,shared,expected",
+    [
+        (8, 256, ops.DType.F16, 21_120, (2, 32, 21_120)),
+        (6, 256, ops.DType.F16, 32_768, (1, 32, 21_120)),
+        (8, 128, ops.DType.F16, 32_768, (1, 32, 21_120)),
+        (8, 256, ops.DType.F32, 32_768, (2, 16, 25_344)),
+        (8, 256, ops.DType.F16, 8_191, None),
+    ],
+)
+def test_attention_staging_respects_head_groups_and_physical_capacity(heads, threads, dtype, shared, expected):
+    from ops.kernels.attention import _matrix_attention_schedule
+
+    context = LoweringContext(
+        replace(CAPABILITIES, threads_per_group=threads, shared_memory_bytes=shared),
+        "prefill", "model", "test", 16 << 20,
+    )
+    schedule = _matrix_attention_schedule(
+        ops.TensorSpec((35, heads, 256), dtype),
+        ops.TensorSpec((2, 8192, 2, 256), dtype), context, 1,
+    )
+    if expected is None:
+        assert schedule is None
+    else:
+        assert schedule is not None
+        assert (schedule.head_tile, schedule.tile[1], schedule.shared_bytes) == expected
 
 
 @pytest.mark.device
@@ -240,7 +272,7 @@ def test_decode_attention_without_qualified_register_geometry_is_uncovered():
 
 @pytest.mark.device
 @pytest.mark.parametrize(
-    "mode,rows,capacity,width,visible,expected_name",
+    "mode,rows,capacity,width,visible,expected_name,heads,kv_heads,floating",
     (
         (
             "prefill",
@@ -249,6 +281,7 @@ def test_decode_attention_without_qualified_register_geometry_is_uncovered():
             8,
             np.asarray([[0, index + 1] for index in range(8)], dtype=np.int32),
             "causal_attention.matrix-streaming@0",
+            4, 1, ops.DType.F16,
         ),
         (
             "decode",
@@ -257,6 +290,7 @@ def test_decode_attention_without_qualified_register_geometry_is_uncovered():
             256,
             np.asarray([[0, 1000]], dtype=np.int32),
             "causal_attention.register-partitioned@0",
+            4, 1, ops.DType.F16,
         ),
         (
             "prefill",
@@ -265,6 +299,7 @@ def test_decode_attention_without_qualified_register_geometry_is_uncovered():
             256,
             np.asarray([[0, 8000 + index] for index in range(19)], dtype=np.int32),
             "causal_attention.matrix-streaming@0",
+            4, 1, ops.DType.F16,
         ),
         (
             "prefill",
@@ -273,22 +308,35 @@ def test_decode_attention_without_qualified_register_geometry_is_uncovered():
             24,
             np.asarray([[0, index + 1] for index in range(9)], dtype=np.int32),
             "causal_attention.matrix-streaming@0",
+            4, 1, ops.DType.F16,
+        ),
+        (
+            "prefill", 35, 8192, 256,
+            np.asarray([[7, 0 if index == 0 else 130 + index] for index in range(35)], dtype=np.int32),
+            "causal_attention.matrix-streaming@0", 8, 2, ops.DType.F32,
+        ),
+        (
+            "prefill", 35, 256, 256,
+            np.asarray([[7, 130 + index] for index in range(35)], dtype=np.int32),
+            "causal_attention.matrix-streaming@0", 6, 2, ops.DType.F32,
         ),
     ),
 )
 def test_optimized_attention_schedules_match_reference_on_metal(
-    mode, rows, capacity, width, visible, expected_name
+    mode, rows, capacity, width, visible, expected_name, heads, kv_heads, floating
 ):
     if not torch.backends.mps.is_available():
         pytest.skip("Metal optimized attention qualification requires MPS")
     rng = np.random.default_rng(45)
-    query = rng.normal(0, 0.1, (rows, 4, width)).astype(np.float16)
-    # Four query heads share one KV head. The long-history case crosses a
-    # query-tile boundary and ends in both a query and a value-subtile tail.
-    history = rng.normal(0, 0.1, (2, capacity, 1, width)).astype(np.float16)
+    dtype = np.float32 if floating == ops.DType.F32 else np.float16
+    query = rng.normal(0, 0.7, (rows, heads, width)).astype(dtype)
+    # Distinct queries and KV groups exercise paired and odd head cohorts.
+    # FP32 cases include empty partitions, a base offset and a query-tile tail;
+    # their strict tolerance rejects rounding probabilities to a 16-bit dtype.
+    history = rng.normal(0, 0.7, (2, capacity, kv_heads, width)).astype(dtype)
     specs = (
-        ops.TensorSpec(query.shape, ops.DType.F16),
-        ops.TensorSpec(history.shape, ops.DType.F16),
+        ops.TensorSpec(query.shape, floating),
+        ops.TensorSpec(history.shape, floating),
         ops.TensorSpec(visible.shape, ops.DType.I32),
     )
     signature = ops.Signature(
@@ -332,8 +380,8 @@ def test_optimized_attention_schedules_match_reference_on_metal(
         np.testing.assert_allclose(
             execution.outputs[0].native.cpu().numpy(),
             expected,
-            rtol=3e-2,
-            atol=3e-2,
+            rtol=3e-5 if floating == ops.DType.F32 else 3e-2,
+            atol=3e-6 if floating == ops.DType.F32 else 3e-3,
         )
     finally:
         if execution is not None:

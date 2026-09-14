@@ -448,7 +448,7 @@ class _RecurrentOutputEmitter:
                 outputs_per_subgroup,
             )
         else:
-            threads, bm, bn, bk, arithmetic_dtype = self.tile
+            threads, bm, bn, bk, instruction = self.tile
             _packed_matrix(
                 activation,
                 weight,
@@ -458,7 +458,7 @@ class _RecurrentOutputEmitter:
                 rows,
                 outputs,
                 channels,
-                arithmetic_dtype,
+                instruction,
                 self.specs[4].dtype.value,
                 threads,
                 bm,
@@ -507,9 +507,9 @@ class RecurrentOutputRule:
                 context.capabilities.subgroup_width * 4,
                 bm // instruction.m * context.capabilities.subgroup_width,
             )
-            if affine_shared_bytes(bm, bn, bk, instruction.input_dtype) > context.capabilities.shared_memory_bytes:
+            if affine_shared_bytes(bm, bn, bk, specs[0].dtype, specs[3]) > context.capabilities.shared_memory_bytes:
                 return ()
-            tile = (threads, bm, bn, bk, instruction.input_dtype.value)
+            tile = (threads, bm, bn, bk, instruction)
         else:
             vector = _packed_vector_geometry(specs[3], context)
             if rows > 8 or vector is None:
