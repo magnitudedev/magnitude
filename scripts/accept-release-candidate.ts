@@ -81,11 +81,12 @@ const server = Bun.serve({
 const baseUrl = `http://127.0.0.1:${server.port}`
 const root = await mkdtemp(resolve(tmpdir(), "magnitude-candidate-"))
 const dataDir = resolve(root, "home-bootstrap", ".magnitude")
+let desktopApplication = "/usr/bin/magnitude-desktop"
 const environment = (home: string) => ({
   ...process.env,
   HOME: home,
   USERPROFILE: home,
-  MAGNITUDE_ACN_VERSION: manifest.version,
+  MAGNITUDE_DESKTOP_PATH: desktopApplication,
   MAGNITUDE_RELEASE_BASE_URL: baseUrl,
 })
 
@@ -139,6 +140,9 @@ const acceptBootstrap = Effect.scoped(Effect.gen(function* () {
     }
     yield* validateDesktopDistribution({ image, updateArchive, version: manifest.version, revision: manifest.acnRevision,
       rpcVersion: manifest.rpc.version, inferenceInstallation: declaration })
+    const desktopRoot = resolve(root, "desktop")
+    yield* Command.make("/usr/bin/ditto", "-x", "-k", updateArchive, desktopRoot).pipe(Command.string)
+    desktopApplication = resolve(desktopRoot, "Magnitude.app")
   }
 })).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, NodeArchiveExtractor]))
 
@@ -157,6 +161,7 @@ const invoke = async (
 }
 
 try {
+  await Effect.runPromise(acceptBootstrap)
   const npmRoot = resolve(root, "npm")
   const bunRoot = resolve(root, "bun")
   await mkdir(npmRoot)
@@ -176,11 +181,10 @@ try {
     resolve(root, "home-bunx"),
   )
 
-  await Effect.runPromise(acceptBootstrap)
   server.stop(true)
   await invoke(["npx", "--no-install", "magnitude", "--version"], npmRoot, resolve(root, "home-npx"))
   await invoke(["bunx", "--bun", "magnitude", "--version"], bunRoot, resolve(root, "home-bunx"))
-  console.log("Cached Node and Bun CLI launchers work with the candidate artifact endpoint stopped")
+  console.log("Installed desktop CLI launchers work with the candidate artifact endpoint stopped")
   const plugins = process.argv[4]
   if (plugins) await run(["bun", resolve(import.meta.dir, "accept-integrations.ts"), resolve(plugins)])
 } finally {

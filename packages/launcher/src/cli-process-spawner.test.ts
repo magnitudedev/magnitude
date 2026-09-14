@@ -1,12 +1,10 @@
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { PackageManager } from "@magnitudedev/release"
-import { Effect, Layer, Option } from "effect"
+import { Effect, Layer } from "effect"
 import { afterEach, describe, expect, it } from "vitest"
-import { CliBinaryResolver, cliBinaryResolverPinnedLayer } from "./cli-binary-resolver"
+import { CliBinaryResolver } from "./cli-binary-resolver"
 import { CliProcessSpawner, cliProcessSpawnerLayer } from "./cli-process-spawner"
-import { LauncherInstallationInspector } from "./launcher-installation-inspector"
 
 const roots: string[] = []
 
@@ -19,16 +17,14 @@ afterEach(async () => {
 const fakeCliSource = `#!/usr/bin/env node
 require("node:fs").writeFileSync(process.env.TEST_SPAWN_OUTPUT, JSON.stringify({
   args: process.argv.slice(2),
-  managedBy: process.env.MAGNITUDE_MANAGED_BY,
-  packageRoot: process.env.MAGNITUDE_MANAGED_PACKAGE_ROOT,
-  launchProtocolVersion: process.env.MAGNITUDE_LAUNCH_PROTOCOL_VERSION,
+  custom: process.env.TEST_CUSTOM_VALUE,
   path: process.env.PATH,
+  application: process.env.MAGNITUDE_DESKTOP_PATH,
 }))
 process.exit(Number(process.env.TEST_SPAWN_EXIT ?? "0"))
 `
 
 const spawnWith = async (options: {
-  readonly packageManager: Option.Option<PackageManager>
   readonly args?: ReadonlyArray<string>
   readonly environment?: Readonly<Record<string, string | undefined>>
   readonly exitWith?: string
@@ -40,13 +36,6 @@ const spawnWith = async (options: {
   await chmod(binary, 0o755)
   const outputPath = join(root, "spawn-output.json")
 
-  const inspectorStub = Layer.succeed(LauncherInstallationInspector, {
-    inspect: Effect.succeed({
-      root: "/installed/launcher",
-      version: "1.0.0",
-      packageManager: options.packageManager,
-    }),
-  })
   const spawnerLayer = cliProcessSpawnerLayer({
     args: options.args ?? [],
     environment: {
@@ -56,8 +45,7 @@ const spawnWith = async (options: {
       ...options.environment,
     },
   }).pipe(
-    Layer.provide(inspectorStub),
-    Layer.provide(cliBinaryResolverPinnedLayer(binary)),
+    Layer.provide(Layer.succeed(CliBinaryResolver, { resolve: Effect.succeed({ executable: binary, application: "/Applications/Magnitude.app" }) })),
   )
 
   const exitCode = await Effect.runPromise(
@@ -70,39 +58,20 @@ const spawnWith = async (options: {
   return { exitCode: Number(exitCode), report }
 }
 
-describe("CliProcessSpawner", () => {
-  it("passes ownership and package root to the native CLI", async () => {
-    const { report } = await spawnWith({ packageManager: Option.some("pnpm") })
-    expect(report.managedBy).toBe("pnpm")
-    expect(report.packageRoot).toBe("/installed/launcher")
+describe.skipIf(process.platform === "win32")("CliProcessSpawner", () => {
+  it("passes the resolved desktop location and preserves the environment", async () => {
+    const { report } = await spawnWith({ environment: {
+      MAGNITUDE_DESKTOP_PATH: "/ignored-parent-app", TEST_CUSTOM_VALUE: "custom value",
+    } })
+    expect(report.application).toBe("/Applications/Magnitude.app")
+    expect(report.custom).toBe("custom value")
     expect(report.path).toBe(process.env.PATH)
   })
 
-  it("declares the launch protocol version it speaks", async () => {
-    const { report } = await spawnWith({ packageManager: Option.some("npm") })
-    expect(report.launchProtocolVersion).toBe("1")
-  })
-
-  it("claims npm when no package manager was detected", async () => {
-    const { report } = await spawnWith({ packageManager: Option.none() })
-    expect(report.managedBy).toBe("npm")
-  })
-
-  it("overrides inherited ownership claims", async () => {
-    const { report } = await spawnWith({
-      packageManager: Option.some("bun"),
-      environment: { MAGNITUDE_MANAGED_BY: "pnpm" },
-    })
-    expect(report.managedBy).toBe("bun")
-  })
-
-  it("passes arguments through and propagates the exit code", async () => {
-    const { exitCode, report } = await spawnWith({
-      packageManager: Option.some("npm"),
-      args: ["--resume", "abc"],
-      exitWith: "7",
-    })
-    expect(report.args).toEqual(["--resume", "abc"])
+  it("preserves literal arguments and the child's exit code", async () => {
+    const args = ["models", "a b", "$(echo unsafe)", ";", "--json"]
+    const { exitCode, report } = await spawnWith({ args, exitWith: "7" })
+    expect(report.args).toEqual(args)
     expect(exitCode).toBe(7)
   })
 })

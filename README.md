@@ -41,7 +41,7 @@ new app if desired. If Status reports an occupied port, stop the process using i
 
 ### Headless CLI
 
-Install the CLI for agents, scripts, and terminal use after installing the desktop application:
+The desktop includes the headless CLI. You can optionally add an npm launcher for agents, scripts, and terminal use:
 
 ```sh
 npm i -g @magnitudedev/cli
@@ -49,7 +49,7 @@ magnitude docs cli
 magnitude service status
 ```
 
-The CLI controls the same desktop-owned service. Background startup does not open a window. Use `magnitude app open` when you explicitly want to show the app. Onboarding lives in the desktop application.
+The npm package runs the CLI bundled with your installed desktop app; it does not download a separate CLI. App updates update the bundled CLI too. The CLI controls the same desktop-owned service. Background startup does not open a window. Use `magnitude app open` when you explicitly want to show the app. Onboarding lives in the desktop application.
 
 ## Why Magnitude?
 

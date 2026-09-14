@@ -17,6 +17,18 @@ Release discovery uses the Magnitude-hosted signed protocol. npm dist-tags and a
 manager are not application update authorities. Harness packages retain their independent npm
 publication and installation contracts.
 
+The optional npm package is only a launcher for the installed desktop's bundled CLI. It has no
+binary acquisition, release cache, package-manager ownership, or update/relaunch protocol. Its own
+npm version does not select the CLI version. Each invocation resolves the current app installation,
+preserves CLI arguments and exit status, and passes the desktop location to that CLI.
+
+Standard locations are `/Applications/Magnitude.app` (then `~/Applications/Magnitude.app`) on Mac,
+the per-user `LOCALAPPDATA/Programs/Magnitude` installation on Windows, and the native package on
+Linux. Linux retains `/usr/bin/magnitude-desktop` as the guarded app entry point. An explicit
+`MAGNITUDE_DESKTOP_PATH` selects a custom application; a missing override never silently falls back.
+No PATH search can resolve back into the npm launcher. Missing desktop installations produce a
+link to magnitude.dev instead of downloading a separate executable.
+
 ## Headless control
 
 `magnitude update` and `magnitude update check` request a fresh check from the desktop owner.

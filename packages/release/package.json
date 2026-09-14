@@ -9,7 +9,6 @@
     "./contracts": "./src/contracts.ts",
     "./executables": "./src/executables.ts",
     "./acquisition": "./src/acquisition.ts",
-    "./launcher": "./src/launcher.ts",
     "./trust": "./src/trust.ts",
     "./macos-app": "./src/macos-app.ts",
     "./plugins": "./src/plugins.ts",

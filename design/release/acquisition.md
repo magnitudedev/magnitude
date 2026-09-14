@@ -4,8 +4,7 @@ applies_to:
   - packages/release/src/archive*.ts
   - packages/release/src/artifact-download*.ts
   - packages/release/src/contracts.ts
-  - packages/release/src/launcher*.ts
-  - packages/launcher/src/wrapper.ts
+  - packages/launcher/src/**
   - packages/launcher/scripts/build-launcher.ts
   - packages/icn/src/lifecycle/release-installation.ts
 ---
@@ -16,7 +15,8 @@ Runtime acquisition installs only artifacts selected from the version's release 
 
 ## Ownership
 
-- The npm launcher acquires CLI.
+- The npm launcher locates and executes the installed desktop application's bundled CLI. It
+  downloads nothing; a missing application produces desktop installation guidance.
 - The installed desktop application bundles and owns its matching ACN executable. CLI and harness
   demand locate that application; they do not acquire a standalone daemon. Desktop distribution
   validates the application signature and publisher before installation.

@@ -2,9 +2,9 @@ import {
   mkdir,
   mkdtemp,
   rm,
-  symlink,
   writeFile,
 } from "node:fs/promises"
+import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { resolve } from "node:path"
 import { run } from "./build/common"
@@ -35,22 +35,18 @@ try {
     }
     const runtimeBin = resolve(root, runtime.command)
     await mkdir(runtimeBin, { mode: 0o700 })
-    await symlink(runtime.executable, resolve(runtimeBin, runtime.command))
-    const output = await run([executable, "--version"], {
+    // Clean machines get installation guidance; npm never acquires an independent CLI.
+    const result = spawnSync(runtime.executable, [executable, "--version"], {
       cwd: project,
+      encoding: "utf8",
+      timeout: 10000,
       env: {
-        ...process.env,
-        HOME: home,
-        USERPROFILE: home,
-        PATH: runtimeBin,
-        MAGNITUDE_RELEASE_BASE_URL:
-          "https://github.com/magnitudedev/magnitude/releases/download",
+        ...process.env, HOME: home, USERPROFILE: home, PATH: runtimeBin,
+        MAGNITUDE_DESKTOP_PATH: resolve(root, "missing-desktop"),
       },
     })
-    if (output.trim() !== version) {
-      throw new Error(
-        `public CLI returned ${output.trim()} with ${runtime.name}; expected ${version}`,
-      )
+    if (result.status !== 1 || !result.stderr.includes("https://magnitude.dev")) {
+      throw new Error(`Missing-desktop guidance failed with ${runtime.name}: ${result.stderr}`)
     }
   }
 } finally {
