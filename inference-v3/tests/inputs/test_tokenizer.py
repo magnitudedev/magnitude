@@ -5,12 +5,12 @@ from pathlib import Path
 import pytest
 from tokenizers import Tokenizer as ReferenceTokenizer
 
-from magnitude_engine.blueprints import inputs
-from magnitude_engine.blueprints import weights as containers
-from magnitude_engine.composition import build, dumps, loads
-from magnitude_engine.data import TokenId
-from magnitude_engine.inputs.tokenizer import BPEConfig, ByteBPETokenizer, PieceKind, SpecialTokens
-from magnitude_engine.weights.identity import ArtifactIdentity
+from engine.blueprints import inputs
+from engine.blueprints import weights as containers
+from engine.composition import build, dumps, loads
+from engine.data import TokenId
+from engine.inputs.tokenizer import BPEConfig, ByteBPETokenizer, PieceKind, SpecialTokens
+from engine.weights.identity import ArtifactIdentity
 
 
 def byte_tokenizer():

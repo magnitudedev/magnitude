@@ -4,8 +4,9 @@ import numpy as np
 import pytest
 import torch
 
-import magnitensor as mt
-from magnitude_engine.models.qwen35.description import (
+import ops
+from engine import DevicePlan
+from engine.models.qwen35.description import (
     AttentionWeights,
     BlockWeights,
     DenseDescription,
@@ -17,10 +18,10 @@ from magnitude_engine.models.qwen35.description import (
     RecurrentWeights,
     RoutedFeedForwardWeights,
 )
-from magnitude_engine.models.qwen35.tensor_program import InvocationSpecs, TensorProgram
-from magnitude_engine.weights.descriptor import WeightDescriptor
-from magnitude_engine.weights.identity import ArtifactIdentity
-from tests.magnitensor.test_compiler import Runtime
+from engine.models.qwen35.tensor_program import InvocationSpecs, TensorProgram
+from engine.weights.descriptor import WeightDescriptor
+from engine.weights.identity import ArtifactIdentity
+from tests.ops.test_compiler import Runtime
 
 
 def _weight(name, shape):
@@ -29,7 +30,7 @@ def _weight(name, shape):
 
 def _description():
     g = Geometry(
-        activation_dtype=mt.DType.F16,
+        activation_dtype=ops.DType.F16,
         hidden=8,
         intermediate=16,
         vocabulary=32,
@@ -101,8 +102,8 @@ class Residency:
         self.device = device
         self.resources = []
 
-    def resident(self, descriptor, dtype):
-        resource = self.device.allocate(mt.TensorSpec(descriptor.shape, dtype))
+    def bind(self, descriptor, dtype):
+        resource = self.device.allocate(ops.TensorSpec(descriptor.shape, dtype))
         self.resources.append(resource)
         return resource
 
@@ -114,7 +115,7 @@ class ArrayResidency:
         self.arrays = {}
         self.rng = np.random.default_rng(44)
 
-    def resident(self, descriptor, dtype):
+    def bind(self, descriptor, dtype):
         numpy_dtype = np.dtype(dtype.value)
         if descriptor.name.endswith("norm"):
             array = np.ones(descriptor.shape, dtype=numpy_dtype)
@@ -122,7 +123,7 @@ class ArrayResidency:
             array = np.full(descriptor.shape, -0.1, dtype=numpy_dtype)
         else:
             array = self.rng.normal(0, 0.05, descriptor.shape).astype(numpy_dtype)
-        resource = self.device.upload(mt.TensorSpec(descriptor.shape, dtype), array.tobytes())
+        resource = self.device.upload(ops.TensorSpec(descriptor.shape, dtype), array.tobytes())
         self.resources.append(resource)
         self.arrays[descriptor.name] = array
         return resource
@@ -130,30 +131,30 @@ class ArrayResidency:
 
 def _array_spec(value):
     dtype = {
-        np.dtype(np.int32): mt.DType.I32,
-        np.dtype(np.float16): mt.DType.F16,
-        np.dtype(np.float32): mt.DType.F32,
+        np.dtype(np.int32): ops.DType.I32,
+        np.dtype(np.float16): ops.DType.F16,
+        np.dtype(np.float32): ops.DType.F32,
     }[value.dtype]
-    return mt.TensorSpec(value.shape, dtype)
+    return ops.TensorSpec(value.shape, dtype)
 
 
 def test_whole_hybrid_step_is_one_prebound_native_submission():
     native = Runtime()
-    device = mt.Device(native, budget_bytes=1 << 24)
+    device = ops.DeviceRuntime(native, budget_bytes=1 << 24)
     residency = Residency(device)
     program = TensorProgram(_description(), device, residency)
     specs = InvocationSpecs(
         batch=1,
-        tokens=mt.TensorSpec((2,), mt.DType.I32),
-        coordinates=mt.TensorSpec((2, 3), mt.DType.I32),
-        recurrent_offsets=mt.TensorSpec((2,), mt.DType.I32),
-        output_rows=mt.TensorSpec((1,), mt.DType.I32),
-        draws=mt.TensorSpec((1, 6), mt.DType.U32),
-        destinations=(mt.TensorSpec((2,), mt.DType.I32),),
-        visible=(mt.TensorSpec((2, 2), mt.DType.I32),),
-        attention_state=(mt.TensorSpec((2, 16, 1, 4), mt.DType.F16),),
-        convolution_state=(mt.TensorSpec((1, 16, 2), mt.DType.F16),),
-        delta_state=(mt.TensorSpec((1, 2, 4, 4), mt.DType.F32),),
+        tokens=ops.TensorSpec((2,), ops.DType.I32),
+        coordinates=ops.TensorSpec((2, 3), ops.DType.I32),
+        recurrent_offsets=ops.TensorSpec((2,), ops.DType.I32),
+        output_rows=ops.TensorSpec((1,), ops.DType.I32),
+        draws=ops.TensorSpec((1, 6), ops.DType.U32),
+        destinations=(ops.TensorSpec((2,), ops.DType.I32),),
+        visible=(ops.TensorSpec((2, 2), ops.DType.I32),),
+        attention_state=(ops.TensorSpec((2, 16, 1, 4), ops.DType.F16),),
+        convolution_state=(ops.TensorSpec((1, 16, 2), ops.DType.F16),),
+        delta_state=(ops.TensorSpec((1, 2, 4, 4), ops.DType.F32),),
     )
     compiled = program.specialize("prefill", specs, precision="reference")
     preparation = [node for node in compiled.graph.nodes if node.operation == "recurrent_prepare"]
@@ -222,27 +223,27 @@ def test_whole_moe_prefill_rejects_dense_toy_expert_storage():
     native = Runtime()
     native.capabilities = replace(
         native.capabilities,
-        matrix_instructions=(mt.MatrixInstruction(8, 8, 8, mt.DType.F16, mt.DType.F32),),
-        atomics=frozenset({mt.DType.I32}),
+        matrix_instructions=(ops.MatrixInstruction(8, 8, 8, ops.DType.F16, ops.DType.F32),),
+        atomics=frozenset({ops.DType.I32}),
         memory_scopes=frozenset({"global", "shared", "local"}),
     )
-    device = mt.Device(native, budget_bytes=1 << 24)
+    device = ops.DeviceRuntime(native, budget_bytes=1 << 24)
     residency = Residency(device)
     program = TensorProgram(description, device, residency)
     specs = InvocationSpecs(
         batch=1,
-        tokens=mt.TensorSpec((8,), mt.DType.I32),
-        coordinates=mt.TensorSpec((8, 3), mt.DType.I32),
-        recurrent_offsets=mt.TensorSpec((2,), mt.DType.I32),
-        output_rows=mt.TensorSpec((1,), mt.DType.I32),
-        draws=mt.TensorSpec((1, 6), mt.DType.U32),
-        destinations=(mt.TensorSpec((8,), mt.DType.I32),),
-        visible=(mt.TensorSpec((8, 2), mt.DType.I32),),
-        attention_state=(mt.TensorSpec((2, 16, 1, 4), mt.DType.F16),),
-        convolution_state=(mt.TensorSpec((1, 16, 2), mt.DType.F16),),
-        delta_state=(mt.TensorSpec((1, 2, 4, 4), mt.DType.F32),),
+        tokens=ops.TensorSpec((8,), ops.DType.I32),
+        coordinates=ops.TensorSpec((8, 3), ops.DType.I32),
+        recurrent_offsets=ops.TensorSpec((2,), ops.DType.I32),
+        output_rows=ops.TensorSpec((1,), ops.DType.I32),
+        draws=ops.TensorSpec((1, 6), ops.DType.U32),
+        destinations=(ops.TensorSpec((8,), ops.DType.I32),),
+        visible=(ops.TensorSpec((8, 2), ops.DType.I32),),
+        attention_state=(ops.TensorSpec((2, 16, 1, 4), ops.DType.F16),),
+        convolution_state=(ops.TensorSpec((1, 16, 2), ops.DType.F16),),
+        delta_state=(ops.TensorSpec((1, 2, 4, 4), ops.DType.F32),),
     )
-    with pytest.raises(ValueError, match="no legal lowering"):
+    with pytest.raises(ValueError, match="no legal realization"):
         program.specialize("prefill", specs, precision="reference")
     program.close()
     for resource in residency.resources:
@@ -255,21 +256,21 @@ def test_whole_moe_prefill_rejects_dense_toy_expert_storage():
 def test_whole_hybrid_qwen_step_matches_semantic_graph_on_metal(mode, rows):
     if not torch.backends.mps.is_available():
         pytest.skip("Metal whole-model qualification requires MPS")
-    device = mt.device("metal", budget_bytes=1 << 26)
+    device = ops.DeviceRuntime.open(DevicePlan.discover(backend="metal", maximum_bytes=1 << 26))
     residency = ArrayResidency(device)
     program = TensorProgram(_description(), device, residency)
     specs = InvocationSpecs(
         batch=1,
-        tokens=mt.TensorSpec((rows,), mt.DType.I32),
-        coordinates=mt.TensorSpec((rows, 3), mt.DType.I32),
-        recurrent_offsets=mt.TensorSpec((2,), mt.DType.I32),
-        output_rows=mt.TensorSpec((1,), mt.DType.I32),
-        draws=mt.TensorSpec((1, 6), mt.DType.U32),
-        destinations=(mt.TensorSpec((rows,), mt.DType.I32),),
-        visible=(mt.TensorSpec((rows, 2), mt.DType.I32),),
-        attention_state=(mt.TensorSpec((2, 16, 1, 4), mt.DType.F16),),
-        convolution_state=(mt.TensorSpec((1, 16, 2), mt.DType.F16),),
-        delta_state=(mt.TensorSpec((1, 2, 4, 4), mt.DType.F32),),
+        tokens=ops.TensorSpec((rows,), ops.DType.I32),
+        coordinates=ops.TensorSpec((rows, 3), ops.DType.I32),
+        recurrent_offsets=ops.TensorSpec((2,), ops.DType.I32),
+        output_rows=ops.TensorSpec((1,), ops.DType.I32),
+        draws=ops.TensorSpec((1, 6), ops.DType.U32),
+        destinations=(ops.TensorSpec((rows,), ops.DType.I32),),
+        visible=(ops.TensorSpec((rows, 2), ops.DType.I32),),
+        attention_state=(ops.TensorSpec((2, 16, 1, 4), ops.DType.F16),),
+        convolution_state=(ops.TensorSpec((1, 16, 2), ops.DType.F16),),
+        delta_state=(ops.TensorSpec((1, 2, 4, 4), ops.DType.F32),),
     )
     dynamic_arrays = {
         "tokens": np.arange(1, rows + 1, dtype=np.int32),
@@ -293,7 +294,7 @@ def test_whole_hybrid_qwen_step_matches_semantic_graph_on_metal(mode, rows):
         compiled = program.specialize(mode, specs, precision="reference")
         assert len(compiled.diagnostics.submissions) == 1
         bindings = {**residency.arrays, **dynamic_arrays, **state_arrays}
-        expected = mt.evaluate_reference(compiled.graph, bindings).outputs
+        expected = ops.evaluate_reference(compiled.graph, bindings).outputs
         dynamic = {
             name: device.upload(spec, dynamic_arrays[name].tobytes())
             for name, spec in (

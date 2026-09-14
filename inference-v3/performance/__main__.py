@@ -1,4 +1,4 @@
-"""Manage Magnitensor-backed inference performance evidence."""
+"""Manage Ops-backed inference performance evidence."""
 
 from __future__ import annotations
 

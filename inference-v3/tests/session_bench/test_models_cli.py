@@ -75,7 +75,7 @@ def test_discovery_imports_no_engine_runtime():
             "import sys; import session_bench.cli; "
             "assert 'mlx' not in sys.modules; assert 'mlx.core' not in sys.modules; "
             "assert 'transformers' not in sys.modules; "
-            "assert 'magnitude_engine' not in sys.modules",
+            "assert 'engine' not in sys.modules",
         ],
         capture_output=True,
         text=True,

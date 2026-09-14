@@ -2,9 +2,9 @@ import json
 
 import pytest
 
-from magnitude_engine.composition import Blueprint, blueprint
-from magnitude_engine.composition.graph import Catalog, dumps, loads
-from magnitude_engine.platform.backend import Backend
+from engine.composition import Blueprint, blueprint
+from engine.composition.graph import Catalog, dumps, loads
+from engine.platform.backend import Backend
 
 
 @blueprint

@@ -2,7 +2,7 @@
 
 **Kernel optimization begins by identifying the dominant avoidable cost at the
 widest relevant execution scope, then changing the structure that causes it
-without crossing the Magnitude–Magnitensor–TileLang boundaries.**
+without crossing the Magnitude–Ops–TileLang boundaries.**
 
 The objective is not a locally faster instruction sequence. It is the best
 execution of the required model computation: numerically correct, composable
@@ -10,7 +10,7 @@ with adjacent work, portable through TileLang and competitive in enclosing
 prefill, time-to-first-token and decode measurements.
 
 This guide defines how to reason about and develop that execution.
-[Tensor compilation](../tensor-system.md) defines selection and composition,
+[Tensor compilation](../tensor-system.md) defines execution and composition,
 [portable kernels](../kernels.md) define the TileLang boundary, and
 [performance](../performance.md) defines acceptance evidence.
 
@@ -112,23 +112,23 @@ Do not repeatedly benchmark either of these:
 Such measurements answer no useful acceptance question. First build a candidate
 whose structure is both legal and plausibly sufficient.
 
-### Use the cheapest discriminating check
+### Use the formula measurement loop at the declared gate
 
-Kernel work advances through an explicit evidence ladder:
+Select the typed formula occurrence, implement its complete operation change, and
+remeasure it through the persistent Lab. Reuse independent fixtures/reference and
+compile only affected code. The target is under five seconds including changed
+compilation, checking, bounded sampling and publication in the TUI. Evidence stays
+comparable when kernel structure changes because formula semantics identify it.
 
-1. compile-free whole-model analysis proves graph shape, candidate coverage,
-   memory planning and maximal submission structure;
-2. focused construction and reference tests prove emitted schedule structure and
-   semantics;
-3. an isolated schedule benchmark measures the affected region;
-4. a tiny whole-model execution proves physical composition;
-5. real model startup proves artifact integration;
-6. session benchmarks provide final prefill, decode and end-to-end evidence.
+The active work plan determines when executable validation is allowed. During the
+current replacement, write the whole replacement before the consolidated final
+gate: no intermediate imports, symbolic construction, tests, native compilation,
+characterization or benchmarks. Source inspection and authoring checks are allowed.
+The future fast iteration loop is not an exception to this migration gate.
 
-A failed level is repaired at that level. Long model loads and session workloads
-must not be repeated while a compile-free plan or focused test already identifies
-the defect. Conversely, isolated latency does not establish acceptance when the
-change alters whole-program composition or state behavior.
+Whole-model startup, prefill/decode and serving evidence qualify integration at
+declared gates, not after every local change. Repair failed gates coherently and
+rerun failed or genuinely invalidated checks, not the entire suite by reflex.
 
 ## Phase-specific leaps
 
@@ -246,7 +246,7 @@ more than the eliminated traffic is worth.
 
 ### Multimodal computation
 
-Vision, audio and projectors use the same Magnitensor and TileLang path but retain
+Vision, audio and projectors use the same Ops and TileLang path but retain
 their own semantic operations and schedules. Optimize their tensor regions normally;
 do not introduce modality branches, media objects or preprocessing policy into
 generic kernels. Once projected embeddings enter the language model, their source
@@ -291,8 +291,8 @@ Before proposing a TileLang change:
 2. confirm the desired mechanism cannot already be expressed idiomatically;
 3. identify the exact category of deficiency: correctness bug, missing portable
    contract, missing backend implementation or poor lowering;
-4. add only the smallest generic TileLang correction, while Magnitensor retains
-   algorithm and selection policy.
+4. add only the smallest generic TileLang correction, while Ops retains
+   operation algorithms and physical execution policy.
 
 Difficulty expressing a schedule does not prove a missing primitive. First verify
 the meaning of TileLang's existing tiles, fragments, layouts, macros, regions and
@@ -301,24 +301,24 @@ the schedule is using those abstractions incorrectly.
 
 ### Compose Python IR as Python
 
-TileLang's language is already a Python construction interface. Magnitensor
+TileLang's language is already a Python construction interface. Ops
 composes authored schedules and macros while TileLang's eager builder is active;
 it does not generate source strings, synthesize Python AST, invoke `exec` or splice
 private TIR.
 
 An emitter contributes work to a compiler-owned program under construction. It
 does not prematurely finalize a `PrimFunc`. This distinction permits independent
-region selection while retaining whole-function storage and submission planning.
+operation composition while retaining whole-function storage and submission planning.
 
 `T.Kernel` denotes one device execution region. A `PrimFunc` may contain several
 ordered `T.Kernel` regions and represents one portable TileLang program. TileLang's
-runtime must expose that program through one native host entrypoint. Magnitensor
+runtime must expose that program through one native host entrypoint. Ops
 chooses which work shares the program; TileLang owns correct lowering, ordered
 native launch realization and generic argument binding.
 
 ### Specialize through capabilities
 
-Portable does not mean one schedule. Magnitensor selects mechanism-named schedule
+Portable does not mean one schedule. Ops selects mechanism-named schedule
 families from behavioral capabilities: subgroup and matrix geometry, memory
 capacity, movement, synchronization, atomics, dtype support, alignment and launch
 facilities. Neither model code nor portable kernels branch on `metal`, `cuda`, a
@@ -327,7 +327,7 @@ vendor name or a machine identity.
 If a fact legitimately changes the optimal schedule, it belongs in TileLang's
 target capability contract. If a portable operation exists but produces poor
 native code, repair its backend lowering. Do not duplicate target databases or
-create backend-specific side channels in Magnitensor.
+create backend-specific side channels in Ops.
 
 ### Respect physical regions and logical matrix axes
 
@@ -373,16 +373,17 @@ Native multi-launch and partial binding are execution-adapter capabilities. Thei
 absence is an explicit TileLang runtime limitation and may require splitting or
 rejecting a candidate; it is never silently replaced by a Python loop.
 
-## Select and tune coherently
+## Implement and tune coherently
 
-Candidate applicability proves legality; measurements choose among legal candidates.
-Selection considers the entire connected region, including representation changes,
-materializations, workspace and downstream compatibility. An individually faster
-kernel loses when it forces a more expensive enclosing graph.
+One operation implements the formula, including required representation changes,
+materializations, workspace and transfers. Capability and geometry behavior belongs
+inside it, not in a competing implementation registry. Measure the complete formula
+boundary: a faster kernel is not progress if its surrounding execution becomes slower.
 
 Tune only parameters that remain real degrees of freedom after algorithm, dataflow,
 layout and representation are sound. Search offline over meaningful schedule
-families and geometry, then retain results as deterministic candidate data. Production
+parameters through TileLang, then retain compatible schedules. Ops does not duplicate
+TileLang's autotuning space or rank operations by a synthetic cost model. Production
 startup does not discover basic schedules, and a benchmark identity never enters
 compiler policy.
 
@@ -407,8 +408,8 @@ instruction selection. When generated execution contradicts the explanation,
 revise the explanation and design rather than adding compensating patches.
 
 Source-only tests establish portable construction and lowering on machines without
-the target device. Target execution tests establish backend correctness. Magnitensor
-tests establish capability-based selection and composition. Whole-model evidence
+the target device. Target execution tests establish backend correctness. Ops
+tests establish capability-based behavior and composition. Whole-model evidence
 establishes acceptance. Each belongs to the layer whose guarantee it validates.
 
 Remove scaffolding and uncertain contributors after the mechanism wins. The retained

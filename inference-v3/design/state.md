@@ -1,6 +1,6 @@
 # KV state
 
-**Magnitude owns logical history, sharing and acceptance; Magnitensor owns the
+**Magnitude owns logical history, sharing and acceptance; Ops owns the
 physical tensor resources and ordered reads and writes that realize each
 tentative state version.**
 
@@ -10,7 +10,7 @@ tentative state version.**
 Magnitude logical state
 └── sequence spans: logical start, visible length, ownership
     └── runs: adjacency and sharing of resource slices
-        └── Magnitensor resources: physical storage and completion lifetime
+        └── Ops resources: physical storage and completion lifetime
 
 tensor invocation
 ├── read metadata: which logical segments are visible
@@ -27,7 +27,7 @@ them; neither owner adopts the other's policy.
 
 | Rule | Reason |
 |---|---|
-| A logical claim retains its Magnitensor resource slice | Shared prefixes survive without copying and physical ownership remains explicit |
+| A logical claim retains its Ops resource slice | Shared prefixes survive without copying and physical ownership remains explicit |
 | Append uses an exclusive tail or claims a new run | Tentative work never rewrites history visible to a checkpoint or fork |
 | Visibility is explicit metadata | A physical window may contain gaps or future capacity without making either readable |
 | Resource writes produce a new graph version | Attention cannot read before append or observe unordered mutation |
@@ -37,7 +37,7 @@ them; neither owner adopts the other's policy.
 
 ## Capacity and specialization
 
-Page size and extent placement are Magnitude state policy. Magnitensor receives
+Page size and extent placement are Magnitude state policy. Ops receives
 bounded resource views and visibility metadata. Stable capacity classes keep
 continuously changing history length dynamic while bounding compiled attention
 specializations.
@@ -61,10 +61,10 @@ state; no unresolved execution or tentative version is published as history.
 
 ## Reclamation
 
-Magnitude prices which logical owners could release a set of extents. Magnitensor
+Magnitude prices which logical owners could release a set of extents. Ops
 reports the physical bytes and outstanding executions retaining their resources.
 Capacity is reclaimed only when the final logical claim and every submitted use
 have both ended.
 
 The service chooses eviction. State placement does not select kernels, and
-Magnitensor does not select victims or infer logical visibility from allocation.
+Ops does not select victims or infer logical visibility from allocation.

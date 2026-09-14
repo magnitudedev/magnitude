@@ -1,100 +1,36 @@
 # Performance
 
-**Performance evidence qualifies the exact Magnitensor graph, selected
-lowerings and compiled execution used by production. Prefill, time to first
-token and decode are independent acceptance dimensions.**
+The normative measurement system lives in
+[Formula-defined execution and measurement](../../design/inference/formula-execution.md).
 
-## Evidence chain
+Formula identities define stable performance boundaries across operation rewrites.
+One persistent Lab and observation store serve isolated development and the required
+interactive TUI. Runtime observations and formula-derived useful units remain
+separate from justified theoretical bounds and empirical resource ceilings.
 
-```text
-model function + workload
-        │ trace and specialize
-        ▼
-semantic graph + static facts
-        │ select regions, representations, schedules and storage
-        ▼
-compiled callable ──invoke repeatedly──► completion
-        │                                  │
-        └── provenance                     └── independent validation + metrics
-```
+## Complete boundaries
 
-A performance record identifies the model function, artifact, workload,
-semantic graph fingerprint, selected region and operation lowerings, weight
-representations, materialization plan, compilation units, machine, TileLang
-build and compiler provenance. This makes a graph-selection change
-distinguishable from an improvement to the same portable kernel or to TileLang
-lowering.
+Initial resident import and compilation are preparation costs. Recurring streaming
+I/O, allocation, conversion, transfers, kernels and required completion belong to
+the measured invocation. Host durations are not GPU timestamps; source API bytes
+are not disk counters. Parent latency is measured, never inferred by adding isolated
+children. Cache/residency, device, precision and input conditions identify comparisons.
 
-Compilation, weight import and tuning are measured separately from steady-state
-invocation. They remain product costs and receive their own evidence; they are
-never silently included in or excluded from request latency.
+## Integration evidence
 
-## Acceptance
+Prefill covers the complete admitted prompt computation and required state publication.
+Decode begins from an identical retained history without prefix construction in the
+interval. Samples must not share a mutable tail: complete and abort each measured
+advance before reuse. Reference logits come independently from the same artifact.
+Time to first token is client-observed admission through availability of the first
+output, including serving, packing, sampling and publication costs.
 
-| Dimension | What the measurement includes |
-|---|---|
-| Prefill | The complete model computation for an admitted prompt chunk, including state publication required before decode |
-| Time to first token | Client-observed request admission through availability of the first generated token |
-| Decode | Repeated accepted model advances from an identical retained history |
-| Long context | The same phase measurements with state traversal and capacity behavior exercised at representative long histories |
-| Tail behavior | Non-ideal token, hidden, expert and vocabulary shapes required by supported models |
+Long histories, supported non-ideal shapes and correctness remain integration gates.
+V2 is a reference point, not the optimization target. Neither an isolated kernel win
+nor a favorable aggregate excuses an unexplained production regression.
 
-The primary supported workloads require parity with or improvement over the V2
-engine in every applicable dimension. A large win in one phase does not excuse
-a regression in another. An implementation is not accepted because its
-abstractions are clean, because an isolated kernel is fast, or because it
-improves over a slower V3 path; the whole selected production path must meet the
-phase target while preserving the numerical and architectural contracts.
-
-## Diagnosis follows ownership
-
-```text
-excess materialization or dispatches ──► Magnitensor graph and region selection
-wrong representation or schedule       ──► Magnitensor lowering and tuning
-portable program cannot express work   ──► TileLang language or capability gap
-portable program lowers poorly         ──► TileLang compiler, runtime or target adapter
-request admission or batching delay    ──► Magnitude service and generation policy
-```
-
-Evidence must locate the limiting layer before a change is proposed. Performance
-never justifies a backend-specific side channel, direct TileLang use from the
-engine, model identity in generic compiler policy, or benchmark-only execution.
-
-## Measurement rules
-
-| Rule | Reason |
-|---|---|
-| Production and measurement build the same model function and compiled callable | A benchmark-owned composition measures another system |
-| One machine-wide lock protects device timing | A run never shares the device with another timing or test |
-| Validation precedes assessment | A fast wrong result is not evidence |
-| Workload and source remain fixed during comparison | Selection and latency are attributable |
-| Observation, model and comparison remain separate fields | A measured latency, an analytical bound and a target are not interchangeable |
-| Warm and cold behavior are named explicitly | Compilation, caching and execution cannot be conflated |
-| Warm host work is reported against dynamic bindings and submission units | Per-layer, per-weight or per-kernel Python work is an architectural failure even before latency is aggregated |
-
-## Whole-model measurement
-
-A decode measurement performs no prefix construction inside the measured
-interval and shares no mutable tail with another sample. The case retains one
-accepted history and aborts each measured advance after completion, so every
-sample begins from the same state. The reference is independent logits from the
-same artifact.
-
-Prefill measurements cover the complete selected graph rather than a collection
-of favorable kernels. Time to first token is observed across the serving
-boundary so admission, packing, state publication and sampling costs remain
-visible.
-
-## External evidence
-
-Session bench measures serving with simulated agent sessions over disposable
-server processes. It is opaque to the engine and imported as external evidence;
-native service diagnostics are never substituted for client-observed latency.
-Its inputs are the [benchmark fixtures](benchmark-fixtures.md).
-
-## Where numbers live
-
-Raw runs live under `runs/`; written-up baselines live under `results/`. Design
-documents carry no benchmark numbers. A claim points at a record, and a record
-that cannot identify what was selected, on what machine and from which source is
-not evidence.
+Session bench remains opaque external serving evidence using the
+[benchmark fixtures](benchmark-fixtures.md); native service spans do not substitute
+for client-observed latency. Raw observations retain provenance; design documents
+carry no benchmark numbers. Existing runs/results remain historical evidence, not
+a second source of truth for formula measurement definitions.

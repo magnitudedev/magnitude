@@ -19,7 +19,7 @@ class Magnitude(Adapter):
             "--no-sync",
             "python",
             "-m",
-            "magnitude_engine.serving",
+            "engine.serving",
             "--target",
             str(self.artifact.path),
             "--model",

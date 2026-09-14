@@ -18,6 +18,7 @@ dependencies = [
   "fastapi==0.141.1",
   "uvicorn==0.52.4",
   "jinja2==3.1.6",
+  "textual>=1,<9",
 ]
 
 [dependency-groups]
@@ -37,11 +38,10 @@ tilelang = { path = "tilelang", editable = true }
 
 [project.scripts]
 session-bench = "session_bench.cli:main"
-magnitude-qualify = "magnitude_engine.qualification:main"
-magnitude-kernel-bench = "magnitude_engine.kernel_bench:main"
+magnitude-qualify = "engine.qualification:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/magnitude_engine", "src/magnitensor", "src/session_bench", "src/benchmark_fixtures"]
+packages = ["src/engine", "src/ops", "src/session_bench", "src/benchmark_fixtures"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -62,13 +62,13 @@ target-version = "py312"
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.pyright]
-include = ["src/magnitude_engine", "src/magnitensor"]
+include = ["src/engine", "src/ops"]
 typeCheckingMode = "basic"
 # TileLang parses kernel annotations, scalar constructors and intrinsics as its
 # own typed DSL. Python's checker cannot interpret those three expression forms;
 # the compiler/reference suite checks them. Host operation contracts remain checked.
 executionEnvironments = [
-  { root = "src/magnitensor/kernels", reportInvalidTypeForm = false, reportCallIssue = false, reportAttributeAccessIssue = false, reportOptionalMemberAccess = false, reportOperatorIssue = false },
-  { root = "src/magnitude_engine/numerics", reportInvalidTypeForm = false, reportCallIssue = false, reportAttributeAccessIssue = false },
-  { root = "src/magnitude_engine" },
+  { root = "src/ops/kernels", reportInvalidTypeForm = false, reportCallIssue = false, reportAttributeAccessIssue = false, reportOptionalMemberAccess = false, reportOperatorIssue = false },
+  { root = "src/engine/numerics", reportInvalidTypeForm = false, reportCallIssue = false, reportAttributeAccessIssue = false },
+  { root = "src/engine" },
 ]

@@ -9,7 +9,7 @@ from typing import Literal
 import httpx
 
 from benchmark_fixtures.ruler import RetrievalAnswers, RetrievalScore
-from magnitude_engine.components import component
+from engine.components import component
 
 from . import validation
 from .policy import REQUEST_TIMEOUT_SECONDS
