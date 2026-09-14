@@ -158,7 +158,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Install packaging dependencies at the supported Linux baseline
-        run: apt-get update && apt-get install -y git ca-certificates curl unzip build-essential python3 fakeroot rpm libgtk-3-0 libnss3 libasound2 libgbm1 libxss1 libxtst6
+        run: apt-get update && apt-get install -y git gh ca-certificates curl unzip build-essential python3 fakeroot rpm libgtk-3-0 libnss3 libasound2 libgbm1 libxss1 libxtst6
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
