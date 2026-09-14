@@ -1,16 +1,16 @@
 # Physical tensor execution
 
-**Magnitensor owns device tensors, allocation, binding, submission and physical
-completion; TileLang owns target execution adapters. Magnitude holds only
+**Ops owns device tensors, allocation, binding, submission and physical
+completion and physical observations; TileLang owns target execution adapters. Magnitude holds only
 generic resources and completion obligations.**
 
 ## Ownership
 
 ```text
-Magnitensor device owner
+Ops device owner
 ├── physical allocations and aliased tensor views
 ├── compiled-callable cache and immutable bindings
-├── reusable temporary slots derived from selected graphs
+├── source I/O, transfer/conversion and reusable planned temporary slots
 ├── submission order and outstanding executions
 └── TileLang target and runtime adapter
 ```
@@ -19,6 +19,14 @@ One owner governs one device execution domain. Upper layers cannot release a
 physical resource, reorder tensor work or observe a backend. TileLang realizes
 the target but does not decide model allocation, graph regions or inference
 state policy.
+
+An operation defines the entire physical sequence, not only its numerical kernels.
+The shared runtime realizes and observes those actions. Per-invocation memory
+windows report baseline, peak and end reservations against physical constraints;
+aliases do not increment reservations. Host API spans and byte counts are not
+hardware counters or native device timings. Completed observations require actual
+completion, not merely a successful submit. The normative measurement boundary is
+in [formula execution](../../design/inference/formula-execution.md).
 
 ## Lifetime
 
@@ -37,7 +45,7 @@ resource ──► tensor views ──► compiled invocation ──► completi
 | Failure unwinds unsubmitted claims completely | A partial bind or allocation cannot leave hidden ownership |
 
 Logical acceptance is separate. Magnitude may abort a candidate advance after
-its device work completes; Magnitensor still fulfilled and retired the physical
+its device work completes; Ops still fulfilled and retired the physical
 execution correctly.
 
 ## Compiled callables
@@ -74,13 +82,13 @@ outstanding executions.
 
 ## TileLang boundary
 
-Magnitensor gives TileLang an ordered ABI, Python-authored TileLang kernel work,
+Ops gives TileLang an ordered ABI, Python-authored TileLang kernel work,
 its static binding choices and a target. TileLang's public eager builder creates
 the final portable single-entry `IRModule`; its runtime returns an opaque pre-bound
-native entrypoint and target capability information. Magnitensor does not select
+native entrypoint and target capability information. Ops does not select
 compiler passes, adapter internals, flags or backend pipelines.
 
-Magnitensor's runtime adapter opens the physical execution domain and may use
+Ops's runtime adapter opens the physical execution domain and may use
 framework tensors and events strictly as ABI-compatible storage and completion
 handles. It owns allocation policy, resource leasing, completion aggregation and
 the association of work with a completion. Those handles perform no numerical
@@ -88,24 +96,24 @@ computation and encode no backend-specific kernel behavior.
 
 TileLang owns source compilation, ABI validation and binding, stream integration,
 native multi-launch command encoding and execution through its existing target
-adapters. This boundary does not require—and Magnitensor must not induce—a
+adapters. This boundary does not require—and Ops must not induce—a
 TileLang-level Device, Allocation, Completion or Executable object model.
-Compilation-unit selection remains a Magnitensor responsibility.
+Compilation-unit selection remains a Ops responsibility.
 
 ## Capability
 
 TileLang reports behavior: subgroup and matrix geometry, supported dtypes,
 memory scopes, asynchronous movement, synchronization, atomics, alignment and
-launch limits. Magnitensor uses these facts only during lowering and schedule
+launch limits. Ops uses these facts only during lowering and schedule
 selection. Magnitude never receives them.
 
 Capabilities describe what the selected target pipeline actually supports. They
-do not encode a vendor name, and Magnitensor does not maintain a second hardware
+do not encode a vendor name, and Ops does not maintain a second hardware
 database or probe native APIs independently.
 
 ## Host coordination
 
-The engine worker owns its Magnitensor device owner on one thread. Completion
+The engine worker owns its Ops device owner on one thread. Completion
 wakes cannot be starved by control work, and idle service does not poll. Tests
 and measurements take exclusive access to a device execution domain so timing
 and stateful work never overlap accidentally.

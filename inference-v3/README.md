@@ -1,8 +1,8 @@
 # Magnitude inference v3
 
-TileLang-native inference through Magnitensor. Magnitude owns model semantics,
-batching, serving, logical state and weight-container interpretation. Magnitensor
-owns semantic tensor graphs, lowering selection, memory planning, physical
+TileLang-native inference through Ops. Magnitude owns model semantics,
+batching, serving, logical state and weight-container interpretation. Ops
+owns formulas, operation composition, memory planning, physical
 resources, completion and maximal program submission. TileLang compiles and
 executes every numerical kernel through its existing target adapters. The current
 path supports dense and routed Qwen 3.5 models from GGUF files or MLX affine
@@ -36,7 +36,7 @@ correctness target, not a performance one.
 ## Run
 
 ```sh
-uv run --frozen python -m magnitude_engine.serving \
+uv run --frozen python -m engine.serving \
   --target /path/to/model.gguf-or-mlx-directory \
   --backend metal --memory-bytes 8589934592 \
   --context-tokens 131072 --prefill-tokens 512
@@ -50,126 +50,125 @@ its digest and the artifact identity are reported in the server properties.
 
 ```sh
 uv run pytest tests
-uv run pytest tests/magnitensor tests/models
+uv run pytest tests/ops tests/models
 ```
 
 Tests marked `device` compile and execute small programs on the selected machine.
 TileLang's own suites are under `tilelang/testing/python/<backend>`.
 
-## Fast kernel development
+## Formula development
 
-Do not load a model or start the server to debug graph construction, lowering
-selection, memory planning or submission composition. `magnitensor.analyze`
-performs those compiler passes without allocating storage, generating native
-code or executing a kernel. It returns the immutable graph, legal candidates,
-selected cover, memory plan, submission units and diagnostics; production
-`magnitensor.compile` materializes that same plan.
+The connected measurement system has qualified a production hybrid formula tree,
+an actual-GGUF FFN subtree, source-path observations, and a real edited-operation
+TUI cycle. Every measured region links formula work and ideal boundary traffic to
+device resource references and its own observation. Full-model throughput and the
+remaining engine work are separate, unfinished milestones.
 
-Use the model qualifier to apply this compile-free path to the actual Qwen model
-metadata and weight representations:
+The development interface is the persistent `ops.Lab`. It measures typed formula
+occurrences through the production operation, checks the independent reference,
+and publishes comparable history automatically. The Textual client uses that same
+worker and store. A selected measurement includes recurring I/O, transfers,
+allocations, kernels, completion and transient cleanup.
 
-```sh
-uv run magnitude-qualify \
-  --target /path/to/model.gguf-or-mlx-directory \
-  --backend metal --contexts 16384,65536 --max-batch 8
+```python
+from pathlib import Path
+import ops
+from ops.lab import Configuration, show
+from engine.models.qwen35.formulas import DecoderFormulas
 
-# Restrict an iteration to one or more standard shapes.
-uv run magnitude-qualify --target /path/to/model \
-  --case decode-max-batch --case prefill-2048-logits
+# definition is the existing Qwen ProgramDefinition. invocation_values and
+# weight_bindings come from the prepared production input/artifact context.
+fixture = definition.fixture(invocation_values, bindings=weight_bindings,
+                             capture=reference_input)
+configuration = Configuration(
+    label="Qwen · decode · retained-prefix fixture",
+    fixture=fixture,
+    device=lambda: ops.DeviceRuntime.open(device_plan),
+    options=definition.options,
+    store=Path("runs/formula-observations.sqlite"),
+)
+with configuration.open() as lab:
+    formulas = DecoderFormulas.from_trace(lab.formulas)
+    ticket = lab.measure(formulas.blocks[0].feed_forward)
+    result = ticket.result.result()
+    lab.acknowledge(result, client="development-api")
+    lab.show()
 
-# Preserve the complete manifest while keeping terminal output concise.
-uv run magnitude-qualify --target /path/to/model \
-  --output runs/qualification-manifest.json
+# Or select between prepared production contexts in the same TUI.
+show((configuration,))
 ```
 
-The standard matrix covers state-only prefill, logits prefill, long prefill,
-single-sequence decode and maximum-batch decode. The command exits unsuccessfully
-if it finds any production fallback, a non-maximal submission, an expanded
-hierarchical weight representation, a missing stateful fusion, or an
-inappropriate dense or MoE schedule. Its JSON reports graph fingerprints, target
-capabilities, selected schedule counts, packet formats, schedule geometry,
-workspace, physical kernel counts, submission counts, and temporary bytes. It
-also emits each maximal native program's ordered schedules and full parameter
-binding classification, plus resident bytes by physical representation and the
-largest selected region, so fallbacks, launch growth, and ABI growth are visible
-before compiling a kernel.
+The capture callback supplies typed root input values, including independently
+decoded artifact values when needed. Intermediate fixtures derive from the
+existing formula references. It does not define another model or benchmark.
+Initial fixture/reference preparation is separate from warm operation timing.
+`lab.subtree(handle)` previews a typed parent-first scope; `lab.measure_subtree(handle)`
+measures each boundary independently through its production implementation. Fused
+parents retain their fusion; isolated child times are not portions of parent time
+and are never summed to fabricate parent performance.
 
-Production lowering is intentionally fail-closed. Generic primitive lowering is
-an allowlist for indexing, pointwise work, import, and sampling; it is not a
-fallback for contractions or transformer regions. A packed representation with
-no qualified packet schedule is therefore a compile error. Reference evaluators
-remain available for correctness checks but are never candidates in a production
-cover.
+Protocol 2 requests bounded native compute-pass timestamps where supported. The
+same observation/history/TUI shows `kernel-device-time`, `kernel-count` and
+`kernel-rate:*` alongside complete-operation wall time and its rates. Native
+kernel time excludes I/O and submission gaps; it is not whole-operation latency.
+Unsupported timing is explicit. `MeasurementProtocol(kernel_limit=None)` disables
+instrumentation; changing the protocol creates a distinct comparison series.
 
-Once selection is structurally correct, compile and time only the affected
-region:
+TUI controls: **m** measures the selection, **s** previews its subtree, **a** previews the affected scope,
+**Enter** confirms that scope, **c** cancels/drains, **r** reloads comparable
+history, and **o** returns to the configuration chooser when available. **p**
+loads matching device characterization (measuring only if absent); **P** explicitly
+refreshes it. First measurement obtains missing resource characterization through
+that same path. It includes sustained conditioning and is cached across operation
+edits. These are empirical measurements, not physical-peak specifications.
+The tree shows isolated time, modeled reference time, ratio, gap and limiting
+resource. Details retain the useful units, rate provenance and assumptions; results
+above the reference flag inadequate calibration/model applicability rather than
+claiming super-optimal performance.
+Displaying or inspecting history never launches a measurement. The <5-second
+changed-operation-to-visible-result target includes refresh, compilation,
+checking and publication. The latest qualified pointwise helper edit took **1.6575s**,
+including **1.3548s of changed native compilation**.
+This is not a claim about every operation or cold model startup.
+
+For isolated production-shaped attention, open the actual attention formula using
+an existing artifact's geometry:
 
 ```sh
-uv run magnitude-kernel-bench encoded-linear --mode decode --rows 1
-uv run magnitude-kernel-bench encoded-linear --mode decode --rows 1 \
-  --width 2560 --output 248320
-uv run magnitude-kernel-bench parallel-linear --mode decode --rows 1 \
-  --width 2560 --output 8192
-uv run magnitude-kernel-bench dense-swiglu --mode prefill --rows 512 \
-  --width 2560 --intermediate 9216
-uv run magnitude-kernel-bench attention --mode decode --context 65536
-uv run magnitude-kernel-bench recurrent-prepare --mode prefill --rows 2048
-uv run magnitude-kernel-bench gated-recurrence --mode prefill --rows 2048
-uv run magnitude-kernel-bench grouped-experts --mode prefill --rows 512
+uv run --no-sync python examples/qwen_attention_lab.py /absolute/path/to/model
 ```
 
-The normal focused-kernel iteration order is:
+This offers decode and 2048-row prefill at 16K/64K history. Inputs are explicitly
+synthetic, not captured full-model state. Each selected configuration retains at
+most one preparation and 1 GiB of references; cold reference construction is
+reported separately. Read-only KV inputs remain resident between samples, while
+written state is reset from the immutable fixture. No alternate benchmark runner
+or implementation is involved.
 
-1. run compile-free qualification for the affected shape;
-2. run the focused graph, construction and reference tests;
-3. benchmark only the affected schedule;
-4. run a tiny numerical whole-model test;
-5. load a real model only after those checks pass;
-6. run session benchmarks only for final acceptance evidence.
+For actual GGUF weights and the production FFN composition, with explicitly
+synthetic hidden inputs, open an isolated layer in the same TUI:
 
-Routine kernel iteration must stop at the earliest layer that disproves the
-change. Full model startup and long session workloads are acceptance checks, not
-debugging loops.
+```sh
+uv run --no-sync python examples/qwen_artifact_lab.py /absolute/path/to/model.gguf --layer 0 --rows 2048
+```
 
-Large parity phases with a named validation gate are handled differently: finish
-the complete phase using source inspection, then run the entire named gate once.
-Do not compile kernels, run tests, or benchmark partial implementations between
-those gates.
+This extracts the typed formula from the model trace without compiling or loading
+the rest of the model. The artifact stays open until the measurement worker closes.
 
-For shape-sensitive schedules, compare the real model geometry rather than the
-small defaults. Decode projections select `linear.packet-vector`; adjacent
-attention and recurrent projections sharing an activation select
-`linear.parallel-packet-decode` or `linear.parallel-packet-prefill`; independent
-prefill projections select `linear.packet-gemm`; and
-dense feed-forward regions select `dense_swiglu.packet-decode` or
-`dense_swiglu.packet-prefill`. Prefill attention selects the
-`attention.matrix-streaming-gated-output` region, fusing matrix-streaming
-attention with query gating, flattening, and packed output projection. Short
-histories publish the gated activation directly. Long histories use bounded
-streaming partitions followed by a gated merge; their scratch buffers are reused
-across sequential layers through whole-allocation lifetime planning. Long
-decode attention selects the
-`attention.register-partitioned-gated-output` region, which processes all query heads
-sharing a KV head together and fuses partition merge, query gating, and output
-projection. Long recurrent prefill selects `gated_delta.chunked-matrix`: parallel
-chunk-system preparation followed by a matrix state scan, both inside the same
-native program. Decode and small spans retain `gated_delta.register-state`.
-Recurrent output selects `recurrent.output-decode`. MoE single-row
-decode selects `route_topk.fused-router` and
-`routed_experts.packet-shared`, avoiding a materialized router-logit tensor.
-The routed/shared expert region uses two launches: one combined packed gate/up
-activation for selected and shared experts (including the shared coefficient),
-then one combined weighted down projection. It never materializes a selected
-expert output before adding the shared expert. Prefill executes routed and shared
-experts in four launches total: grouping, combined tiled gate/up with SwiGLU,
-combined tiled down projection, and unpermutation/shared reduction.
-The two matrix stages use bounded workers over the actual packed tile count.
-Each worker reuses one shared-storage set across route kinds and consecutive
-tiles; grouping uses shared counters and publishes one completed block count.
-Prefill and wider decode batches instead use matrix-instruction router GEMM
-followed by `route_topk.subgroup`: preserving matrix throughput is faster there
-than assigning one serial dot product to each expert lane. Both paths remain in
-the same native multi-kernel program; neither adds a Python launch boundary.
+Browse recorded model/formula configurations without loading a model or opening a
+device with `python -m ops.lab /absolute/path/to/observations.sqlite`, or call
+`ops.lab.browse(Path(...))`. The stored hierarchy links each occurrence to its
+measured input conditions. Opening history never derives fixture/reference inputs.
+A new live configuration establishes those conditions on its first measurement;
+it does not silently present another configuration's evidence as current.
+
+`ops.analyze` remains a structural diagnostic: actual defined operations,
+readiness/effects, aliases, storage lifetimes and submission composition.
+`magnitude-qualify` applies that path to production model metadata at the
+declared gate. Kernel names, counts and geometry are provenance, not evidence of
+optimality or acceptance thresholds. There is no candidate ranking or latency
+predictor. The old `magnitude-kernel-bench` and kernel-family attribution runner
+were removed; historical output files remain intact.
 
 ## Physical kernel architecture
 
@@ -187,8 +186,10 @@ reduction tile, loads each coefficient once, produces paired output rows, and
 reduces in FP32. Prefill uses a distinct cooperative packet width: MLX Q4 keeps
 its 16-code-per-lane GEMV packet but distributes 8-code words across a matrix
 workgroup, matching GGUF's matrix packet and restoring full load parallelism.
-Every prefill projection decodes packets directly into shared-memory weight tiles
-and immediately reuses them with `T.gemm`; no full dequantized matrix exists.
+Prefill projections unpack exact integer codes into shared tiles for `T.gemm`,
+then apply each group's scale and bias in FP32. Activations are never paired with
+rounded decoded weight tiles; no full dequantized matrix exists. Shared-memory
+accounting includes coefficients, and publication rounding is unchanged.
 Full tiles have a structurally unpredicated path, while only the boundary tile
 pays validity checks.
 
@@ -200,9 +201,15 @@ temporary storage are bound once.
 Python supplies only invocation data and mutable model state; it does not loop
 over layers or launch numerical kernels itself.
 
+The enclosing block can publish its FP32 residual directly from dense down
+projection, routed decode down projection or grouped prefill's final combine.
+The child FFN result is still rounded to its declared activation dtype first.
+Isolating or explicitly capturing the child retains that child's output boundary;
+formula composition and comparable measurement identities remain unchanged.
+
 ## Measure
 
-`session-bench` measures the actual Magnitensor-backed service with simulated
+`session-bench` measures the actual Ops-backed service with simulated
 agent sessions for either GGUF or MLX artifacts:
 
 ```sh

@@ -1,4 +1,4 @@
-"""Static enforcement of the Magnitude / Magnitensor / TileLang boundary."""
+"""Static enforcement of the Magnitude / Ops / TileLang boundary."""
 
 import ast
 import subprocess
@@ -6,18 +6,17 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2] / "src"
-ENGINE = ROOT / "magnitude_engine"
-MT = ROOT / "magnitensor"
+ENGINE = ROOT / "engine"
+MT = ROOT / "ops"
 
 REMOVED_ENGINE_NUMERICS = {
-    "magnitude_engine.kernels",
-    "magnitude_engine.platform.binding",
-    "magnitude_engine.platform.driver",
-    "magnitude_engine.platform.execution",
-    "magnitude_engine.platform.specialization",
-    "magnitude_engine.weights.binding",
-    "magnitude_engine.weights.representation",
-    "magnitude_engine.weights.residency",
+    "engine.kernels",
+    "engine.platform.binding",
+    "engine.platform.driver",
+    "engine.platform.execution",
+    "engine.platform.specialization",
+    "engine.weights.binding",
+    "engine.weights.representation",
 }
 
 
@@ -62,38 +61,47 @@ def test_engine_model_and_service_code_contains_no_tilelang_or_torch_computation
     assert offenders == []
 
 
-def test_tilelang_is_reached_only_by_magnitensor_kernel_and_runtime_realization():
-    allowed = (MT / "kernels", MT / "runtime" / "tilelang.py")
+def test_tilelang_is_reached_only_by_ops_kernel_and_runtime_realization():
+    allowed = {MT / "runtime" / "tilelang.py", MT / "compiler" / "program.py", MT / "compiler" / "streaming.py"}
     offenders = []
     for path in _sources(ROOT):
-        if path == ENGINE / "platform" / "compiler.py":
-            continue
         if any(
             module == "tilelang" or module.startswith("tilelang.") for module in _imports(path)
-        ) and not (path.is_relative_to(allowed[0]) or path == allowed[1]):
+        ) and not (path.is_relative_to(MT / "kernels") or path in allowed):
             offenders.append(str(path.relative_to(ROOT)))
     assert offenders == []
 
 
-def test_model_code_expresses_numerics_only_through_magnitensor():
+def test_model_code_expresses_numerics_only_through_ops():
     offenders = [
         (str(path.relative_to(ROOT)), module)
         for path in _sources(ENGINE / "models")
         for module in _imports(path)
-        if module.startswith("magnitude_engine.operations")
-        or module.startswith("magnitude_engine.platform")
-        and module != "magnitude_engine.platform.storage"
+        if module.startswith("engine.operations")
+        or module.startswith("engine.platform")
+        and module != "engine.platform.storage"
     ]
     assert offenders == []
 
 
 def test_public_recipe_roundtrips_the_new_integration_graph_without_construction():
     source = """
-from magnitude_engine.blueprints import execution, inputs, models, service, serving, weights
-from magnitude_engine.composition import dumps, loads
-from magnitude_engine.platform.backend import Backend
+from engine.blueprints import execution, inputs, models, service, serving, weights
+from engine.composition import dumps, loads
+from engine.platform.backend import Backend
+from engine.devices import DevicePlan, DeviceTopology, MemoryConstraint
 container = weights.GGUF(path='/no-artifact-needed-for-inspection.gguf')
-device = execution.Device(backend=Backend.HIP, budget_bytes=1024, ordinal=2)
+topology = DeviceTopology.model_validate_json('''{
+  "devices":[{"id":"gpu","name":"test HIP","kind":"gpu"}],
+  "memory":[{"id":"host","kind":"host","capacity_bytes":4096}],
+  "constraints":[], "cpu_caches":[],
+  "endpoints":[{"id":"hip:2","device":"gpu","backend":"hip","ordinal":2,
+    "modes":[{"kind":"shared","domains":["host"],"constraints":[],
+      "access":[{"device":"gpu","kind":"direct","host_synchronization_required":true}],
+      "max_allocation_bytes":4096}]}]
+}''')
+device = execution.DeviceRuntime(plan=DevicePlan(topology=topology, endpoints=('hip:2',),
+    constraints=(MemoryConstraint(domains=('host',), maximum_bytes=1024),)))
 residency = weights.Weights(format=container, context=device)
 model = models.Qwen35Dense(
     description=models.Qwen35DenseDescription(format=container),

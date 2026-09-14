@@ -3,7 +3,7 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
-from magnitude_engine.composition import Blueprint, Catalog, blueprint, build, digest, dumps, loads
+from engine.composition import Blueprint, Catalog, blueprint, build, digest, dumps, loads
 
 
 class Value:

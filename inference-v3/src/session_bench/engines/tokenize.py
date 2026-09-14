@@ -10,8 +10,8 @@ def main():
     kind, artifact, source, output = sys.argv[1:]
     requests = [json.loads(line) for line in Path(source).read_text().splitlines()]
     if kind == "magnitude":
-        from magnitude_engine.inputs.formats.gguf_tokenizer import TokenizerArtifact
-        from magnitude_engine.serving.template import ChatTemplate
+        from engine.inputs.formats.gguf_tokenizer import TokenizerArtifact
+        from engine.serving.template import ChatTemplate
 
         template = ChatTemplate(TokenizerArtifact.load(Path(artifact)))
 

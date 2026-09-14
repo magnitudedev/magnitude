@@ -1,7 +1,7 @@
 import pytest
 
-from magnitude_engine.inputs.layout import BoundaryRule, InputLayout, InputSpan
-from magnitude_engine.models.qwen35.inputs import InputPlan, InputState
+from engine.inputs.layout import BoundaryRule, InputLayout, InputSpan
+from engine.models.qwen35.inputs import InputPlan, InputState
 
 
 def test_semantic_chunk_boundaries_and_language_history():

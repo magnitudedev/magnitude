@@ -1,0 +1,974 @@
+"""Packet-native SwiGLU and selected-expert schedules."""
+
+from __future__ import annotations
+
+from typing import Any, cast
+
+import tilelang.language as T
+
+from ..compiler.lowering import BoundOperation, LoweringContext
+from ..tensor.graph import Graph
+from ..tensor.types import TensorSpec
+from .matrix import (
+    _packed_matrix,
+    _packed_vector_geometry,
+    _packet_matrix_instruction,
+    _packet_reduction_width,
+)
+from .packed import (affine_gemm, affine_has_bias, affine_shared_bytes, affine_storage,
+                     load_matrix_tile, packet_dot, packet_format, prepare_packet_activation)
+from .publication import publish, residual_epilogue
+
+
+def _dense_swiglu_region(graph: Graph, root: int):
+    if not 0 <= root < len(graph.nodes):
+        return None
+    gate = graph.nodes[root]
+    if gate.operation != "linear" or len(gate.inputs) != 2:
+        return None
+    gate_users = graph.users[gate.outputs[0]]
+    if len(gate_users) != 1 or graph.nodes[gate_users[0]].operation != "silu":
+        return None
+    silu = graph.nodes[gate_users[0]]
+    users = graph.users[silu.outputs[0]]
+    if len(users) != 1 or graph.nodes[users[0]].operation != "multiply":
+        return None
+    multiply = graph.nodes[users[0]]
+    up_value = next((value for value in multiply.inputs if value != silu.outputs[0]), None)
+    if up_value is None:
+        return None
+    producer = graph.values[up_value].producer
+    if producer is None:
+        return None
+    up = graph.nodes[producer]
+    if up.operation != "linear" or up.inputs[0] != gate.inputs[0] or len(up.inputs) != 2:
+        return None
+    down_users = graph.users[multiply.outputs[0]]
+    if len(down_users) != 1 or graph.nodes[down_users[0]].operation != "linear":
+        return None
+    down = graph.nodes[down_users[0]]
+    nodes = frozenset({gate.id, up.id, silu.id, multiply.id, down.id})
+    if nodes != frozenset(range(min(nodes), max(nodes) + 1)):
+        return None
+    inputs = (gate.inputs[0], gate.inputs[1], up.inputs[1], down.inputs[1])
+    outputs = down.outputs
+    specs = tuple(graph.values[value].spec for value in (*inputs, *outputs))
+    hidden, gate_spec, up_spec, down_spec, output = specs
+    if (
+        any(not spec.static for spec in specs)
+        or hidden.rank != 2
+        or gate_spec.rank != 2
+        or up_spec.shape != gate_spec.shape
+        or down_spec.shape != (hidden.shape[1], gate_spec.shape[0])
+        or output.shape != hidden.shape
+        or any(packet_format(spec) is None for spec in (gate_spec, up_spec, down_spec))
+    ):
+        return None
+    return nodes, inputs, outputs, specs
+
+
+@T.macro
+def _gated_packet_vector(
+    hidden, gate, up, activation, gate_spec, up_spec, rows, width, intermediate,
+    threads, outputs_per_subgroup,
+):
+    gate_packet = packet_format(gate_spec)
+    up_packet = packet_format(up_spec)
+    assert gate_packet is not None and up_packet is not None and gate_packet == up_packet
+    packet = gate_packet
+    outputs_per_group = threads // 32 * outputs_per_subgroup
+    with T.Kernel(T.ceildiv(intermediate, outputs_per_group), rows, threads=threads) as (block, row):
+        thread = T.get_thread_binding()
+        lane = thread % 32
+        first = block * outputs_per_group + thread // 32 * outputs_per_subgroup
+        values = T.alloc_local((packet.dot_packet,), "float32")
+        partial = T.alloc_local((outputs_per_subgroup, 2), "float32")
+        T.clear(partial)
+        for chunk in T.serial(width // packet.tile):
+            for item in T.unroll(packet.dot_packet, explicit=True):
+                values[item] = T.cast(
+                    hidden[row, chunk * packet.tile + lane * packet.dot_packet + item], "float32"
+                )
+            activation_sum, masked = prepare_packet_activation(values, hidden.dtype, packet)
+            for owned in T.unroll(outputs_per_subgroup, explicit=True):
+                channel = first + owned
+                if channel < intermediate:
+                    partial[owned, 0] += packet_dot(values, gate, gate_spec, channel, chunk, lane, activation_sum, masked)
+                    partial[owned, 1] += packet_dot(values, up, up_spec, channel, chunk, lane, activation_sum, masked)
+        for owned in T.unroll(outputs_per_subgroup, explicit=True):
+            channel = first + owned
+            gate_value = T.cast(T.warp_reduce_sum(partial[owned, 0]), hidden.dtype)
+            up_value = T.cast(T.warp_reduce_sum(partial[owned, 1]), hidden.dtype)
+            if lane == 0 and channel < intermediate:
+                rounded_gate = T.cast(gate_value, "float32")
+                activated_gate = T.cast(rounded_gate * T.sigmoid(rounded_gate), hidden.dtype)
+                activation[row, channel] = T.cast(
+                    T.cast(activated_gate, "float32") * T.cast(up_value, "float32"), hidden.dtype
+                )
+
+
+@T.macro
+def _gated_packet_matrix(
+    hidden,
+    gate,
+    up,
+    activation,
+    gate_spec,
+    up_spec,
+    rows,
+    width,
+    intermediate,
+    dtype,
+    threads,
+    bm,
+    bn,
+    bk,
+    arithmetic_dtype,
+):
+    packet = packet_format(gate_spec)
+    assert packet is not None and packet_format(up_spec) == packet
+    full = (
+        rows % bm == 0
+        and intermediate % bn == 0
+        and width % bk == 0
+        and (bn * bk // packet.matrix_packet) % threads == 0
+    )
+    with T.Kernel(T.ceildiv(intermediate, bn), T.ceildiv(rows, bm), threads=threads) as (bx, by):
+        storage = affine_storage(bm, 2 * bn, bk, arithmetic_dtype)
+        x, paired_tile, coefficients, paired_accum, partial, sum_values, sums = storage
+        gate_activation = T.alloc_fragment((bm, bn), "float32")
+        T.clear(paired_accum)
+        for block in T.serial(T.ceildiv(width, bk)):
+            for i, k in T.Parallel(bm, bk):
+                if full:
+                    x[i, k] = hidden[by * bm + i, block * bk + k]
+                else:
+                    x[i, k] = T.if_then_else(
+                        by * bm + i < rows and block * bk + k < width,
+                        hidden[by * bm + i, block * bk + k],
+                        0,
+                    )
+            load_matrix_tile(
+                paired_tile,
+                coefficients,
+                gate,
+                gate_spec,
+                bx * bn,
+                block * bk,
+                intermediate,
+                width,
+                bn,
+                bk,
+                threads,
+                2,
+                0,
+            )
+            load_matrix_tile(
+                paired_tile,
+                coefficients,
+                up,
+                up_spec,
+                bx * bn,
+                block * bk,
+                intermediate,
+                width,
+                bn,
+                bk,
+                threads,
+                2,
+                1,
+            )
+            affine_gemm(storage, bm, 2 * bn, bk, bm, affine_has_bias(gate_spec, up_spec))
+        for i, j in T.Parallel(bm, bn):
+            gate_value = T.cast(T.cast(paired_accum[i, 2 * j], dtype), "float32")
+            gate_activation[i, j] = T.cast(gate_value * T.sigmoid(gate_value), dtype)
+        for i, j in T.Parallel(bm, bn):
+            if full or (by * bm + i < rows and bx * bn + j < intermediate):
+                up_value = T.cast(T.cast(paired_accum[i, 2 * j + 1], dtype), "float32")
+                activation[by * bm + i, bx * bn + j] = T.cast(
+                    gate_activation[i, j] * up_value, dtype
+                )
+
+
+class _DenseSwiGLUEmitter:
+    def __init__(self, specs, mode, tile=None, vector=None, residual=False, gate_vector=None):
+        self.specs, self.mode, self.tile, self.vector = specs, mode, tile, vector
+        self.residual = residual
+        self.gate_vector = gate_vector
+
+    def __call__(self, operands: tuple[Any, ...]) -> None:
+        residual = operands[4] if self.residual else None
+        if self.residual:
+            operands = (*operands[:4], *operands[5:])
+        hidden, gate, up, down, output, activation = operands
+        rows, width = cast(tuple[int, int], self.specs[0].shape)
+        intermediate = cast(int, self.specs[1].shape[0])
+        if self.mode == "decode":
+            assert self.gate_vector is not None
+            _gated_packet_vector(
+                hidden,
+                gate,
+                up,
+                activation,
+                self.specs[1],
+                self.specs[2],
+                rows,
+                width,
+                intermediate,
+                *self.gate_vector,
+            )
+        else:
+            assert self.tile is not None
+            _gated_packet_matrix(
+                hidden,
+                gate,
+                up,
+                activation,
+                self.specs[1],
+                self.specs[2],
+                rows,
+                width,
+                intermediate,
+                self.specs[0].dtype.value,
+                *self.tile,
+            )
+        packet = packet_format(self.specs[3])
+        assert packet is not None
+        if self.mode == "decode":
+            from .matrix import _packed_vector
+
+            assert self.vector is not None
+            threads, outputs_per_subgroup = self.vector
+            _packed_vector(
+                activation,
+                down,
+                activation,
+                output,
+                self.specs[3],
+                rows,
+                width,
+                intermediate,
+                self.specs[4].dtype.value,
+                False,
+                threads,
+                outputs_per_subgroup,
+                residual=residual,
+            )
+        else:
+            assert self.tile is not None
+            threads, bm, bn, bk, arithmetic_dtype = self.tile
+            _packed_matrix(
+                activation,
+                down,
+                activation,
+                output,
+                self.specs[3],
+                rows,
+                width,
+                intermediate,
+                arithmetic_dtype,
+                self.specs[4].dtype.value,
+                threads,
+                bm,
+                2 * bn,
+                _packet_reduction_width(self.specs[3]),
+                False,
+                residual=residual,
+            )
+
+
+@T.macro
+def _selected_activate(
+    hidden,
+    routes,
+    gate,
+    up,
+    activation,
+    gate_spec,
+    up_spec,
+    rows,
+    selected,
+    width,
+    intermediate,
+):
+    packet = packet_format(gate_spec)
+    assert packet is not None and packet_format(up_spec) == packet
+    with T.Kernel(selected * intermediate, rows, threads=32) as (combined, row):
+        lane = T.get_thread_binding()
+        rank, channel = combined // intermediate, combined % intermediate
+        expert = routes[row, rank]
+        values = T.alloc_local((packet.dot_packet,), "float32")
+        partial = T.alloc_local((2,), "float32")
+        T.clear(partial)
+        if 0 <= expert and expert < gate_spec.shape[0]:
+            weight_row = expert * intermediate + channel
+            for chunk in T.serial(width // packet.tile):
+                for item in T.unroll(packet.dot_packet, explicit=True):
+                    values[item] = T.cast(
+                        hidden[row, chunk * packet.tile + lane * packet.dot_packet + item],
+                        "float32",
+                    )
+                partial[0] += packet_dot(values, gate, gate_spec, weight_row, chunk, lane)
+                partial[1] += packet_dot(values, up, up_spec, weight_row, chunk, lane)
+        gate_value = T.cast(T.warp_reduce_sum(partial[0]), hidden.dtype)
+        up_value = T.cast(T.warp_reduce_sum(partial[1]), hidden.dtype)
+        if lane == 0:
+            rounded_gate = T.cast(gate_value, "float32")
+            activation[row, rank, channel] = T.cast(
+                rounded_gate * T.sigmoid(rounded_gate) * T.cast(up_value, "float32"), hidden.dtype
+            )
+
+
+@T.macro
+def _selected_down(
+    activation,
+    routes,
+    scores,
+    down,
+    output,
+    down_spec,
+    rows,
+    selected,
+    width,
+    intermediate,
+    output_dtype,
+):
+    packet = packet_format(down_spec)
+    assert packet is not None
+    with T.Kernel(T.ceildiv(width, 8), rows, threads=128) as (block, row):
+        thread = T.get_thread_binding()
+        lane = thread % 32
+        first_output = block * 8 + (thread // 32) * 2
+        values = T.alloc_local((packet.dot_packet,), "float32")
+        partial = T.alloc_local((2,), "float32")
+        T.clear(partial)
+        for rank in T.serial(selected):
+            expert = routes[row, rank]
+            if 0 <= expert and expert < down_spec.shape[0]:
+                for owned in T.unroll(2, explicit=True):
+                    channel = first_output + owned
+                    if channel < width:
+                        weight_row = expert * width + channel
+                        expert_sum = T.alloc_local((1,), "float32")
+                        expert_sum[0] = 0
+                        for chunk in T.serial(intermediate // packet.tile):
+                            for item in T.unroll(packet.dot_packet, explicit=True):
+                                values[item] = T.cast(
+                                    activation[
+                                        row,
+                                        rank,
+                                        chunk * packet.tile + lane * packet.dot_packet + item,
+                                    ],
+                                    "float32",
+                                )
+                            expert_sum[0] += packet_dot(
+                                values, down, down_spec, weight_row, chunk, lane
+                            )
+                        projected = T.cast(T.warp_reduce_sum(expert_sum[0]), output_dtype)
+                        partial[owned] += T.cast(scores[row, rank], "float32") * T.cast(projected, "float32")
+        for owned in T.unroll(2, explicit=True):
+            channel = first_output + owned
+            if lane == 0 and channel < width:
+                output[row, channel] = T.cast(partial[owned], output_dtype)
+
+
+class _SelectedExpertsEmitter:
+    def __init__(self, specs):
+        self.specs = specs
+
+    def __call__(self, operands):
+        hidden, routes, scores, gate, up, down, output, activation = operands
+        rows, width = cast(tuple[int, int], self.specs[0].shape)
+        selected = cast(int, self.specs[1].shape[1])
+        intermediate = cast(int, self.specs[3].shape[1])
+        _selected_activate(
+            hidden,
+            routes,
+            gate,
+            up,
+            activation,
+            self.specs[3],
+            self.specs[4],
+            rows,
+            selected,
+            width,
+            intermediate,
+        )
+        _selected_down(
+            activation,
+            routes,
+            scores,
+            down,
+            output,
+            self.specs[5],
+            rows,
+            selected,
+            width,
+            intermediate,
+            self.specs[6].dtype.value,
+        )
+
+
+class DenseSwiGLURule:
+    name = "packet-dense-swiglu"
+
+    def build(self, graph: Graph, root: int, context: LoweringContext, *, residual: bool = False):
+        region = _dense_swiglu_region(graph, root)
+        if region is None:
+            return ()
+        nodes, inputs, outputs, specs = region
+        if residual:
+            epilogue = residual_epilogue(graph, outputs[0])
+            if epilogue is None:
+                return ()
+            nodes |= epilogue.nodes
+            inputs += (epilogue.residual,)
+            outputs = (epilogue.output,)
+        rows, width = cast(tuple[int, int], specs[0].shape)
+        intermediate = cast(int, specs[1].shape[0])
+        gate_packet, up_packet, down_packet = (packet_format(spec) for spec in specs[1:4])
+        if (
+            gate_packet is None
+            or up_packet is None
+            or down_packet is None
+            or gate_packet != up_packet
+            or width % gate_packet.tile
+            or intermediate % down_packet.tile
+        ):
+            return ()
+        if context.mode == "decode":
+            vector = _packed_vector_geometry(specs[3], context)
+            gate_vector = (_packed_vector_geometry(specs[1], context)
+                           if gate_packet.name == "mlx-q4-group64" else (32, 1))
+            if vector is None or gate_vector is None:
+                return ()
+            tile = None
+        else:
+            vector = None
+            gate_vector = None
+            instruction = _packet_matrix_instruction(context, specs[0].dtype)
+            if instruction is None:
+                return ()
+            if rows >= 256 and min(intermediate, width) >= 512:
+                bm, bn, bk = 32, 32, 32
+            else:
+                bm, bn, bk = (
+                    instruction.m * 4,
+                    instruction.n * 4,
+                    instruction.k * 2,
+                )
+            bk = _packet_reduction_width(specs[1], specs[2])
+            down_bk = _packet_reduction_width(specs[3])
+            if bk % instruction.k or down_bk % instruction.k:
+                return ()
+            threads = min(
+                context.capabilities.threads_per_group,
+                context.capabilities.subgroup_width * 4,
+                bm // instruction.m * context.capabilities.subgroup_width,
+            )
+            shared = affine_shared_bytes(bm, 2 * bn, max(bk, down_bk), instruction.input_dtype)
+            if shared > context.capabilities.shared_memory_bytes:
+                return ()
+            tile = (threads, bm, bn, bk, instruction.input_dtype.value)
+        activation = TensorSpec((rows, intermediate), specs[0].dtype)
+        return (
+            BoundOperation(
+                f"dense_swiglu.packet-{context.mode}@{root}:{max(nodes)}",
+                nodes,
+                inputs,
+                outputs,
+                _DenseSwiGLUEmitter(specs, context.mode, tile, vector, residual, gate_vector),
+                workspace=(activation,),
+                kernel_count=2,
+            ),
+        )
+
+
+class SelectedExpertsRule:
+    name = "packet-selected-experts"
+
+    def build(self, graph: Graph, root: int, context: LoweringContext):
+        node = graph.nodes[root]
+        if node.operation != "routed_experts" or context.mode != "decode":
+            return ()
+        specs = tuple(graph.values[value].spec for value in (*node.inputs, *node.outputs))
+        hidden, routes, scores, gate, up, down, output = specs
+        if (
+            any(not spec.static for spec in specs)
+            or context.capabilities.subgroup_width != 32
+            or node.attributes["activation"] != "silu"
+            or any(packet_format(spec) is None for spec in (gate, up, down))
+        ):
+            return ()
+        rows, width = cast(tuple[int, int], hidden.shape)
+        selected = cast(int, routes.shape[1])
+        experts, intermediate, input_width = cast(tuple[int, int, int], gate.shape)
+        gate_packet, up_packet, down_packet = (packet_format(spec) for spec in (gate, up, down))
+        if (
+            input_width != width
+            or up.shape != gate.shape
+            or down.shape != (experts, width, intermediate)
+            or scores.shape != routes.shape
+            or output.shape != hidden.shape
+            or gate_packet is None
+            or up_packet is None
+            or down_packet is None
+            or gate_packet != up_packet
+            or width % gate_packet.tile
+            or intermediate % down_packet.tile
+        ):
+            return ()
+        activation = TensorSpec((rows, selected, intermediate), hidden.dtype)
+        moved = sum(spec.storage_nbytes for spec in specs)
+        return (
+            BoundOperation(
+                f"routed_experts.packet-selected@{root}",
+                frozenset({root}),
+                node.inputs,
+                node.outputs,
+                _SelectedExpertsEmitter(specs),
+                workspace=(activation,),
+                kernel_count=2,
+            ),
+        )
+
+
+@T.macro
+def _routed_shared_activate(
+    hidden,
+    routes,
+    expert_gate,
+    expert_up,
+    shared_gate,
+    shared_up,
+    shared_router,
+    selected_activation,
+    shared_activation,
+    coefficient,
+    expert_gate_spec,
+    expert_up_spec,
+    shared_gate_spec,
+    shared_up_spec,
+    rows,
+    selected,
+    width,
+    expert_intermediate,
+    shared_intermediate,
+):
+    expert_packet = packet_format(expert_gate_spec)
+    shared_packet = packet_format(shared_gate_spec)
+    assert expert_packet is not None and shared_packet is not None
+    # Each subgroup owns a pair of channels and reuses activation packets for
+    # both gate/up pairs. Route boundaries are aligned to complete subgroups.
+    expert_pairs = T.ceildiv(expert_intermediate, 2)
+    shared_pairs = T.ceildiv(shared_intermediate, 2)
+    pairs = selected * expert_pairs + shared_pairs
+    with T.Kernel(T.ceildiv(pairs, 4), rows, threads=128) as (block, row):
+        thread = T.get_thread_binding()
+        lane = thread % 32
+        pair = block * 4 + thread // 32
+        values = T.alloc_local(
+            (max(expert_packet.dot_packet, shared_packet.dot_packet),), "float32"
+        )
+        gate_partial = T.alloc_local((2,), "float32")
+        up_partial = T.alloc_local((2,), "float32")
+        router_partial = T.alloc_local((1,), "float32")
+        T.clear(gate_partial)
+        T.clear(up_partial)
+        router_partial[0] = 0.0
+        if pair < selected * expert_pairs:
+            rank = pair // expert_pairs
+            first = pair % expert_pairs * 2
+            expert = routes[row, rank]
+            if 0 <= expert and expert < expert_gate_spec.shape[0]:
+                for chunk in T.serial(width // expert_packet.tile):
+                    for item in T.unroll(expert_packet.dot_packet, explicit=True):
+                        values[item] = T.cast(
+                            hidden[
+                                row,
+                                chunk * expert_packet.tile + lane * expert_packet.dot_packet + item,
+                            ],
+                            "float32",
+                        )
+                    for owned in T.unroll(2, explicit=True):
+                        channel = first + owned
+                        if channel < expert_intermediate:
+                            weight_row = expert * expert_intermediate + channel
+                            gate_partial[owned] += packet_dot(
+                                values,
+                                expert_gate,
+                                expert_gate_spec,
+                                weight_row,
+                                chunk,
+                                lane,
+                            )
+                            up_partial[owned] += packet_dot(
+                                values,
+                                expert_up,
+                                expert_up_spec,
+                                weight_row,
+                                chunk,
+                                lane,
+                            )
+            for owned in T.unroll(2, explicit=True):
+                gate_value = T.cast(T.warp_reduce_sum(gate_partial[owned]), hidden.dtype)
+                up_value = T.cast(T.warp_reduce_sum(up_partial[owned]), hidden.dtype)
+                channel = first + owned
+                if lane == 0 and channel < expert_intermediate:
+                    value = T.cast(gate_value, "float32")
+                    selected_activation[row, rank, channel] = T.cast(
+                        value * T.sigmoid(value) * T.cast(up_value, "float32"),
+                        hidden.dtype,
+                    )
+        elif pair < pairs:
+            first = (pair - selected * expert_pairs) * 2
+            for chunk in T.serial(width // shared_packet.tile):
+                for item in T.unroll(shared_packet.dot_packet, explicit=True):
+                    channel = chunk * shared_packet.tile + lane * shared_packet.dot_packet + item
+                    values[item] = T.cast(hidden[row, channel], "float32")
+                    if first == 0:
+                        router_partial[0] += values[item] * T.cast(
+                            shared_router[channel], "float32"
+                        )
+                for owned in T.unroll(2, explicit=True):
+                    channel = first + owned
+                    if channel < shared_intermediate:
+                        gate_partial[owned] += packet_dot(
+                            values,
+                            shared_gate,
+                            shared_gate_spec,
+                            channel,
+                            chunk,
+                            lane,
+                        )
+                        up_partial[owned] += packet_dot(
+                            values,
+                            shared_up,
+                            shared_up_spec,
+                            channel,
+                            chunk,
+                            lane,
+                        )
+            router_value = T.warp_reduce_sum(router_partial[0])
+            if lane == 0 and first == 0:
+                coefficient[row, 0] = T.sigmoid(router_value)
+            for owned in T.unroll(2, explicit=True):
+                gate_value = T.cast(T.warp_reduce_sum(gate_partial[owned]), hidden.dtype)
+                up_value = T.cast(T.warp_reduce_sum(up_partial[owned]), hidden.dtype)
+                channel = first + owned
+                if lane == 0 and channel < shared_intermediate:
+                    value = T.cast(gate_value, "float32")
+                    activated_gate = T.cast(value * T.sigmoid(value), hidden.dtype)
+                    shared_activation[row, channel] = T.cast(
+                        T.cast(activated_gate, "float32") * T.cast(up_value, "float32"),
+                        hidden.dtype,
+                    )
+
+
+@T.macro
+def _routed_shared_down(
+    selected_activation,
+    shared_activation,
+    routes,
+    scores,
+    expert_weight,
+    shared_weight,
+    coefficient,
+    output,
+    expert_weight_spec,
+    shared_weight_spec,
+    rows,
+    selected,
+    outputs,
+    expert_inputs,
+    shared_inputs,
+    output_dtype,
+    residual=None,
+):
+    expert_packet = packet_format(expert_weight_spec)
+    shared_packet = packet_format(shared_weight_spec)
+    assert expert_packet is not None and shared_packet is not None
+    with T.Kernel(T.ceildiv(outputs, 8), rows, threads=128) as (block, row):
+        thread = T.get_thread_binding()
+        lane = thread % 32
+        first_output = block * 8 + (thread // 32) * 2
+        values = T.alloc_local(
+            (max(expert_packet.dot_packet, shared_packet.dot_packet),), "float32"
+        )
+        partial = T.alloc_local((2,), "float32")
+        T.clear(partial)
+        for rank in T.serial(selected):
+            expert = routes[row, rank]
+            if 0 <= expert and expert < expert_weight_spec.shape[0]:
+                expert_sum = T.alloc_local((2,), "float32")
+                T.clear(expert_sum)
+                for chunk in T.serial(expert_inputs // expert_packet.tile):
+                    for item in T.unroll(expert_packet.dot_packet, explicit=True):
+                        values[item] = T.cast(
+                            selected_activation[
+                                row,
+                                rank,
+                                chunk * expert_packet.tile + lane * expert_packet.dot_packet + item,
+                            ],
+                            "float32",
+                        )
+                    for owned in T.unroll(2, explicit=True):
+                        channel = first_output + owned
+                        if channel < outputs:
+                            expert_sum[owned] += packet_dot(
+                                values,
+                                expert_weight,
+                                expert_weight_spec,
+                                expert * outputs + channel,
+                                chunk,
+                                lane,
+                            )
+                for owned in T.unroll(2, explicit=True):
+                    projected = T.cast(T.warp_reduce_sum(expert_sum[owned]), output_dtype)
+                    partial[owned] += T.cast(scores[row, rank], "float32") * T.cast(projected, "float32")
+        shared_partial = T.alloc_local((2,), "float32")
+        T.clear(shared_partial)
+        for chunk in T.serial(shared_inputs // shared_packet.tile):
+            for item in T.unroll(shared_packet.dot_packet, explicit=True):
+                values[item] = T.cast(
+                    shared_activation[
+                        row,
+                        chunk * shared_packet.tile + lane * shared_packet.dot_packet + item,
+                    ],
+                    "float32",
+                )
+            for owned in T.unroll(2, explicit=True):
+                channel = first_output + owned
+                if channel < outputs:
+                    shared_partial[owned] += packet_dot(
+                        values, shared_weight, shared_weight_spec, channel, chunk, lane
+                    )
+        for owned in T.unroll(2, explicit=True):
+            projected = partial[owned]
+            shared_projected = T.warp_reduce_sum(shared_partial[owned])
+            channel = first_output + owned
+            if lane == 0 and channel < outputs:
+                routed_value = T.cast(projected, output_dtype)
+                shared_value = T.cast(shared_projected, output_dtype)
+                gated_shared = T.cast(
+                    T.cast(shared_value, "float32") * T.cast(coefficient[row, 0], "float32"),
+                    output_dtype,
+                )
+                publish(output, residual, row, channel,
+                        T.cast(routed_value, "float32") + T.cast(gated_shared, "float32"), output_dtype)
+
+
+def _routed_shared_region(graph: Graph, root: int):
+    selected = graph.nodes[root]
+    if selected.operation != "routed_experts":
+        return None
+    hidden = selected.inputs[0]
+    dense = None
+    for candidate in range(root + 1, min(root + 8, len(graph.nodes))):
+        dense = _dense_swiglu_region(graph, candidate)
+        if dense is not None and dense[1][0] == hidden:
+            break
+        dense = None
+    if dense is None:
+        return None
+    dense_nodes, dense_inputs, _, _ = dense
+    shared_output = graph.nodes[max(dense_nodes)].outputs[0]
+    row_dot = next(
+        (
+            node
+            for node in graph.nodes[
+                max(dense_nodes) + 1 : min(len(graph.nodes), max(dense_nodes) + 8)
+            ]
+            if node.operation == "row_dot" and node.inputs[0] == hidden
+        ),
+        None,
+    )
+    if row_dot is None or len(graph.users[row_dot.outputs[0]]) != 1:
+        return None
+    coefficient_node = graph.nodes[graph.users[row_dot.outputs[0]][0]]
+    if (
+        coefficient_node.operation != "sigmoid"
+        or len(graph.users[coefficient_node.outputs[0]]) != 1
+    ):
+        return None
+    coefficient_value = coefficient_node.outputs[0]
+    coefficient_nodes = {row_dot.id, coefficient_node.id}
+    coefficient_user = graph.nodes[graph.users[coefficient_value][0]]
+    if coefficient_user.operation == "cast":
+        coefficient_nodes.add(coefficient_user.id)
+        coefficient_value = coefficient_user.outputs[0]
+    multiply = next(
+        (
+            graph.nodes[user]
+            for user in graph.users[shared_output]
+            if graph.nodes[user].operation == "multiply"
+            and coefficient_value in graph.nodes[user].inputs
+        ),
+        None,
+    )
+    if multiply is None or len(graph.users[multiply.outputs[0]]) != 1:
+        return None
+    add = graph.nodes[graph.users[multiply.outputs[0]][0]]
+    if add.operation != "add" or selected.outputs[0] not in add.inputs:
+        return None
+    nodes = frozenset({selected.id, *dense_nodes, *coefficient_nodes, multiply.id, add.id})
+    if nodes != frozenset(range(min(nodes), max(nodes) + 1)):
+        return None
+    inputs = (
+        hidden,
+        selected.inputs[1],
+        selected.inputs[2],
+        selected.inputs[3],
+        selected.inputs[4],
+        selected.inputs[5],
+        dense_inputs[1],
+        dense_inputs[2],
+        dense_inputs[3],
+        row_dot.inputs[1],
+    )
+    outputs = add.outputs
+    specs = tuple(graph.values[value].spec for value in (*inputs, *outputs))
+    if any(not spec.static for spec in specs):
+        return None
+    return nodes, inputs, outputs, specs
+
+
+class _RoutedSharedEmitter:
+    def __init__(self, specs, residual=False):
+        self.specs = specs
+        self.residual = residual
+
+    def __call__(self, operands: tuple[Any, ...]) -> None:
+        residual = operands[10] if self.residual else None
+        if self.residual:
+            operands = (*operands[:10], *operands[11:])
+        (
+            hidden,
+            routes,
+            scores,
+            expert_gate,
+            expert_up,
+            expert_down,
+            shared_gate,
+            shared_up,
+            shared_down,
+            shared_router,
+            output,
+            selected_activation,
+            shared_activation,
+            coefficient,
+        ) = operands
+        rows, width = cast(tuple[int, int], self.specs[0].shape)
+        selected = cast(int, self.specs[1].shape[1])
+        intermediate = cast(int, self.specs[3].shape[1])
+        shared_intermediate = cast(int, self.specs[6].shape[0])
+        _routed_shared_activate(
+            hidden,
+            routes,
+            expert_gate,
+            expert_up,
+            shared_gate,
+            shared_up,
+            shared_router,
+            selected_activation,
+            shared_activation,
+            coefficient,
+            self.specs[3],
+            self.specs[4],
+            self.specs[6],
+            self.specs[7],
+            rows,
+            selected,
+            width,
+            intermediate,
+            shared_intermediate,
+        )
+        _routed_shared_down(
+            selected_activation,
+            shared_activation,
+            routes,
+            scores,
+            expert_down,
+            shared_down,
+            coefficient,
+            output,
+            self.specs[5],
+            self.specs[8],
+            rows,
+            selected,
+            width,
+            intermediate,
+            shared_intermediate,
+            self.specs[10].dtype.value,
+            residual,
+        )
+
+
+class RoutedSharedExpertsRule:
+    """One decode pipeline for routed and gated shared experts."""
+
+    name = "routed-shared-experts"
+
+    def build(self, graph: Graph, root: int, context: LoweringContext, *, residual: bool = False):
+        if context.mode != "decode" or context.capabilities.subgroup_width != 32:
+            return ()
+        region = _routed_shared_region(graph, root)
+        if region is None:
+            return ()
+        nodes, inputs, outputs, specs = region
+        if residual:
+            epilogue = residual_epilogue(graph, outputs[0])
+            if epilogue is None:
+                return ()
+            nodes |= epilogue.nodes
+            inputs += (epilogue.residual,)
+            outputs = (epilogue.output,)
+        (
+            expert_gate_packet,
+            expert_up_packet,
+            expert_down_packet,
+            shared_gate_packet,
+            shared_up_packet,
+            shared_down_packet,
+        ) = tuple(packet_format(spec) for spec in specs[3:9])
+        rows, width = cast(tuple[int, int], specs[0].shape)
+        selected = cast(int, specs[1].shape[1])
+        intermediate = cast(int, specs[3].shape[1])
+        shared_intermediate = cast(int, specs[6].shape[0])
+        if (
+            expert_gate_packet is None
+            or expert_up_packet is None
+            or expert_down_packet is None
+            or shared_gate_packet is None
+            or shared_up_packet is None
+            or shared_down_packet is None
+            or expert_gate_packet != expert_up_packet
+            or width % expert_gate_packet.tile
+            or width % shared_gate_packet.tile
+            or intermediate % expert_down_packet.tile
+            or shared_intermediate % shared_down_packet.tile
+        ):
+            return ()
+        workspace = (
+            TensorSpec((rows, selected, intermediate), specs[0].dtype),
+            TensorSpec((rows, shared_intermediate), specs[0].dtype),
+            TensorSpec((rows, 1), specs[0].dtype),
+        )
+        return (
+            BoundOperation(
+                f"routed_experts.packet-shared@{root}:{max(nodes)}",
+                nodes,
+                inputs,
+                outputs,
+                _RoutedSharedEmitter(specs, residual),
+                workspace=workspace,
+                kernel_count=2,
+            ),
+        )
+
+
+__all__ = [
+    "DenseSwiGLURule",
+    "SelectedExpertsRule",
+    "RoutedSharedExpertsRule",
+]

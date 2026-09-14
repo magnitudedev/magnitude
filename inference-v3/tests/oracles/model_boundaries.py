@@ -16,14 +16,14 @@ from model_logits import artifact_identity, capture_mlx, capture_v3
 
 
 def v3_boundaries(path, tokens, capacity):
-    import magnitensor as mt
-    from magnitude_engine.models.qwen35 import equations
+    import ops
+    from engine.models.qwen35 import equations
 
     observed = {}
-    original_compile, original_block = mt.compile, equations.block
+    original_compile, original_block = ops.compile, equations.block
 
     def compile_observed(function, **kwargs):
-        if function.__module__ != "magnitude_engine.models.qwen35.tensor_program":
+        if function.__module__ != "engine.models.qwen35.tensor_program":
             return original_compile(function, **kwargs)
         boundaries = []
 
@@ -60,11 +60,11 @@ def v3_boundaries(path, tokens, capacity):
         compiled.submit = submit_observed
         return compiled
 
-    mt.compile = compile_observed
+    ops.compile = compile_observed
     try:
         observed["logits"] = capture_v3(path, [tokens], capacity)[0]
     finally:
-        mt.compile = original_compile
+        ops.compile = original_compile
         equations.block = original_block
     return observed
 

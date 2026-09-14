@@ -49,19 +49,20 @@ def capture_mlx(path: Path, chunks: list[list[int]], capacity: int, fp32=False):
 
 
 def capture_v3(path: Path, chunks: list[list[int]], capacity: int):
-    import magnitensor as mt
-    from magnitude_engine.data import TokenId
-    from magnitude_engine.models.qwen35.formats.mlx import describe
-    from magnitude_engine.models.qwen35.inputs import InputPlan
-    from magnitude_engine.models.qwen35.runtime import DenseRuntime
-    from magnitude_engine.models.sequence import LogitsSelection, ModelRequest
-    from magnitude_engine.weights.formats.mlx_safetensors import MLXFormat
-    from magnitude_engine.weights.tensor_residency import TensorWeights
+    import ops
+    from engine import DevicePlan
+    from engine.data import TokenId
+    from engine.models.qwen35.formats.mlx import describe
+    from engine.models.qwen35.inputs import InputPlan
+    from engine.models.qwen35.runtime import DenseRuntime
+    from engine.models.sequence import LogitsSelection, ModelRequest
+    from engine.weights.formats.mlx_safetensors import MLXFormat
+    from engine.weights.tensor_residency import TensorWeights
 
     with ExitStack() as cleanup:
         format = MLXFormat(str(path))
         cleanup.callback(format.close)
-        device = mt.device("auto", budget_bytes=32 * 1024**3)
+        device = ops.DeviceRuntime.open(DevicePlan.discover(backend="auto", maximum_bytes=32 * 1024**3))
         cleanup.callback(device.close)
         weights = TensorWeights(format, device)
         cleanup.callback(weights.close)
@@ -91,7 +92,7 @@ def capture_v3(path: Path, chunks: list[list[int]], capacity: int):
             try:
                 batch.completion.wait()
                 advance = batch.advances[0]
-                if advance.logits is None or advance.logits.spec.dtype != mt.DType.F32:
+                if advance.logits is None or advance.logits.spec.dtype != ops.DType.F32:
                     raise ValueError("expected float32 logits")
                 outputs.append(
                     np.frombuffer(advance.forward.read_logits(), dtype=np.float32).copy()
@@ -183,7 +184,9 @@ def main():
     capture = commands.add_parser("capture")
     capture.add_argument("backend", choices=("mlx", "mlx-f32", "v3"))
     capture.add_argument("--model", type=Path, required=True)
-    capture.add_argument("--fixture", type=Path, required=True)
+    inputs = capture.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--fixture", type=Path)
+    inputs.add_argument("--replay", type=Path, help="reuse exact chunks/capacity from retained independent capture")
     capture.add_argument("--prefill", type=int, default=2048)
     capture.add_argument("--chunk", type=int, default=2048)
     capture.add_argument("--decode", type=int, default=4)
@@ -200,19 +203,30 @@ def main():
     if args.command == "compare":
         compare(args.reference, args.candidate, args.output, args.anchor)
         return
-    tokens = json.loads(args.fixture.read_text())["prompt"]
-    if not (
-        args.prefill >= 2
-        and args.chunk >= 2
-        and args.decode >= 1
-        and args.prefill + args.decode <= min(len(tokens), args.capacity)
-    ):
-        raise ValueError("invalid prefill/decode geometry")
-    chunks = [
-        tokens[i : min(i + args.chunk, args.prefill)] for i in range(0, args.prefill, args.chunk)
-    ]
-    chunks.extend([[token] for token in tokens[args.prefill : args.prefill + args.decode]])
     identity = artifact_identity(args.model)
+    if args.replay is not None:
+        with np.load(args.replay, allow_pickle=False) as retained:
+            original = json.loads(str(retained["metadata"]))
+        if original["backend"] not in {"mlx", "mlx-f32"} or original["artifact_identity"] != identity:
+            raise ValueError("replay requires an independent capture of this exact artifact")
+        chunks, args.capacity = original["chunks"], original["capacity"]
+        if not chunks or any(not chunk or any(type(token) is not int or token < 0 for token in chunk) for chunk in chunks):
+            raise ValueError("replayed chunks must contain nonnegative token IDs")
+        if sum(map(len, chunks)) > args.capacity:
+            raise ValueError("replayed chunks exceed capacity")
+    else:
+        tokens = json.loads(args.fixture.read_text())["prompt"]
+        if not (
+            args.prefill >= 2
+            and args.chunk >= 2
+            and args.decode >= 1
+            and args.prefill + args.decode <= min(len(tokens), args.capacity)
+        ):
+            raise ValueError("invalid prefill/decode geometry")
+        chunks = [
+            tokens[i : min(i + args.chunk, args.prefill)] for i in range(0, args.prefill, args.chunk)
+        ]
+        chunks.extend([[token] for token in tokens[args.prefill : args.prefill + args.decode]])
     outputs = (
         capture_v3(args.model, chunks, args.capacity)
         if args.backend == "v3"

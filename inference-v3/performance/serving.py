@@ -14,10 +14,10 @@ from pathlib import Path
 
 from benchmark_fixtures import prose
 from benchmark_fixtures.prose_history import Prose
-from magnitude_engine.models.qwen35.formats.gguf import describe
-from magnitude_engine.platform.compiler import compiler_build
-from magnitude_engine.platform.host.measurement import exclusive_measurement
-from magnitude_engine.weights.formats.gguf import GGUFFormat
+from engine.models.qwen35.formats.gguf import describe
+from engine.platform.compiler import compiler_build
+from ops.lab.ownership import exclusive_measurement
+from engine.weights.formats.gguf import GGUFFormat
 from performance import source_identity
 from performance.thermals import ThermalRecorder
 from session_bench import report

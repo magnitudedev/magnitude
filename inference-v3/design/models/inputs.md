@@ -7,7 +7,7 @@ learns a modality.**
 ## Boundary
 
 ```text
-Serving and model input adapter                 Magnitensor
+Serving and model input adapter                 Ops
 ───────────────────────────────                 ───────────
 bounded source media
   └── decode and model-specific preparation
@@ -19,13 +19,13 @@ expanded token layout + coordinates ◄─────────────�
 
 Magnitude owns source validation, decoding, preprocessing, placeholder
 interpretation, expanded token layout, coordinates and model-specific modality
-policy. Neural encoders and projectors are ordinary Magnitensor tensor functions
+policy. Neural encoders and projectors are ordinary Ops tensor functions
 with the same compilation, resource and completion contracts as language-model
 computation.
 
 The public boundary carries typed tensors, span metadata and generic resource
 handles. Raw media, processor objects and modality names never enter
-Magnitensor. Tensor graphs, kernels and device objects never enter input
+Ops. Tensor graphs, kernels and device objects never enter input
 preparation or scheduling.
 
 ## Semantic spans
@@ -82,6 +82,6 @@ Adding a modality may add:
 - semantic tensor operations only when the modality introduces new mathematics.
 
 It does not add a modality branch to service, generation, state ownership,
-Magnitensor compilation or TileLang. Unsupported media or conditional model
+Ops compilation or TileLang. Unsupported media or conditional model
 families fail during binding or preparation, before admission to numerical
 execution.

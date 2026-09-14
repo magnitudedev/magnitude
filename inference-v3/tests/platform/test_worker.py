@@ -7,8 +7,8 @@ from typing import cast
 
 import pytest
 
-import magnitensor as mt
-from magnitude_engine.platform.host.worker import Worker, WorkerUnavailable
+import ops
+from engine.platform.host.worker import Worker, WorkerUnavailable
 
 
 class Completion:
@@ -43,7 +43,7 @@ class Owner:
         if self.crash:
             raise ValueError("deliberate owner failure")
         if self.ticket is not None and not self.ticket.reconciled:
-            return cast(mt.Completion, self.ticket)
+            return cast(ops.Completion, self.ticket)
         return None
 
     def failed(self, error):

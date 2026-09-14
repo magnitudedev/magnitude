@@ -1,9 +1,9 @@
-import magnitensor as mt
-from magnitude_engine.data import TokenId
-from magnitude_engine.models.qwen35.inputs import InputPlan
-from magnitude_engine.models.qwen35.runtime import DenseRuntime
-from magnitude_engine.models.sequence import LogitsSelection, ModelRequest
-from tests.magnitensor.test_compiler import Runtime
+import ops
+from engine.data import TokenId
+from engine.models.qwen35.inputs import InputPlan
+from engine.models.qwen35.runtime import DenseRuntime
+from engine.models.sequence import LogitsSelection, ModelRequest
+from tests.ops.test_compiler import Runtime
 from tests.models.test_qwen35_tensor_program import Residency, _description
 
 
@@ -11,9 +11,9 @@ class ModelResidency(Residency):
     identity = _description().artifact_identity
 
 
-def test_model_state_checkpoint_and_decode_use_magnitensor_submissions():
+def test_model_state_checkpoint_and_decode_use_ops_submissions():
     native = Runtime()
-    device = mt.Device(native, budget_bytes=1 << 24)
+    device = ops.DeviceRuntime(native, budget_bytes=1 << 24)
     residency = ModelResidency(device)
     model = DenseRuntime(_description(), device, residency, max_sequences=3)
     sequence = model.create(InputPlan.text((TokenId(1), TokenId(2))))
@@ -67,7 +67,7 @@ def test_model_state_checkpoint_and_decode_use_magnitensor_submissions():
 
 def test_mixed_length_prefill_batch_uses_explicit_recurrent_row_offsets():
     native = Runtime()
-    device = mt.Device(native, budget_bytes=1 << 24)
+    device = ops.DeviceRuntime(native, budget_bytes=1 << 24)
     residency = ModelResidency(device)
     model = DenseRuntime(_description(), device, residency, max_sequences=3)
     first = model.create(InputPlan.text((TokenId(1),)))
@@ -85,7 +85,7 @@ def test_mixed_length_prefill_batch_uses_explicit_recurrent_row_offsets():
     )
     assert len(native.executables[-1].bound.calls) == 1
     assert any(
-        parameter.name == "v2" and parameter.spec == mt.TensorSpec((3,), mt.DType.I32)
+        parameter.name == "v2" and parameter.spec == ops.TensorSpec((3,), ops.DType.I32)
         for parameter in native.programs[-1].parameters
     )
     batch.completion.wait()
@@ -100,7 +100,7 @@ def test_mixed_length_prefill_batch_uses_explicit_recurrent_row_offsets():
 
 def test_prefill_uses_reusable_physical_row_capacity():
     native = Runtime()
-    device = mt.Device(native, budget_bytes=1 << 24)
+    device = ops.DeviceRuntime(native, budget_bytes=1 << 24)
     residency = ModelResidency(device)
     model = DenseRuntime(_description(), device, residency, max_sequences=2, prefill_rows=4)
 
@@ -117,7 +117,7 @@ def test_prefill_uses_reusable_physical_row_capacity():
     )
     programs = len(native.programs)
     assert any(
-        parameter.spec == mt.TensorSpec((4,), mt.DType.I32)
+        parameter.spec == ops.TensorSpec((4,), ops.DType.I32)
         for parameter in native.programs[-1].parameters
     )
     first_batch.completion.wait()
@@ -148,7 +148,7 @@ def test_prefill_uses_reusable_physical_row_capacity():
 
 def test_runtime_allocates_only_configured_context_capacity():
     native = Runtime()
-    device = mt.Device(native, budget_bytes=1 << 24)
+    device = ops.DeviceRuntime(native, budget_bytes=1 << 24)
     residency = ModelResidency(device)
     model = DenseRuntime(
         _description(),
@@ -169,7 +169,7 @@ def test_runtime_allocates_only_configured_context_capacity():
 
 def test_prime_materializes_state_prefill_logits_prefill_and_decode():
     native = Runtime()
-    device = mt.Device(native, budget_bytes=1 << 24)
+    device = ops.DeviceRuntime(native, budget_bytes=1 << 24)
     residency = ModelResidency(device)
     model = DenseRuntime(
         _description(),

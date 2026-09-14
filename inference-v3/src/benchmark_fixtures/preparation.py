@@ -32,8 +32,8 @@ class Tokenization:
     """Checkpoint tokenization; serving adapters may supply their own counter."""
 
     def __init__(self, artifact: Path):
-        from magnitude_engine.inputs.formats.gguf_tokenizer import TokenizerArtifact
-        from magnitude_engine.serving import template
+        from engine.inputs.formats.gguf_tokenizer import TokenizerArtifact
+        from engine.serving import template
 
         loaded = TokenizerArtifact.load(artifact)
         self.eos_tokens = loaded.eos_tokens

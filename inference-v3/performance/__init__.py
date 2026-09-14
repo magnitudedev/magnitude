@@ -10,8 +10,8 @@ def source_identity(root: Path) -> str:
     """Hash all engine, tensor-system, and measurement source used by a run."""
     digest = hashlib.sha256()
     paths = (
-        *root.joinpath("src/magnitensor").rglob("*.py"),
-        *root.joinpath("src/magnitude_engine").rglob("*.py"),
+        *root.joinpath("src/ops").rglob("*.py"),
+        *root.joinpath("src/engine").rglob("*.py"),
         *root.joinpath("performance").rglob("*.py"),
         root / "pyproject.toml",
         root / "uv.lock",
