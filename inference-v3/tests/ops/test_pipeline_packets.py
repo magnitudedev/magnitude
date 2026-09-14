@@ -328,10 +328,7 @@ def test_specialized_routed_shared_pipeline_covers_sparse_routes_and_partial_til
             constants=dict(zip(names[3:], resources[3:], strict=True)),
             options=ops.CompileOptions(mode="prefill"),
         )
-        continuous = (floating == ops.DType.BF16 and "gemm.shared_instruction_tiles" in device.capabilities.features
-                      and any(item.input_dtype == ops.DType.BF16 and (item.m, item.n, item.k) == (8, 8, 8)
-                              for item in device.capabilities.matrix_instructions))
-        assert compiled.diagnostics.dispatches == (7 if continuous else 8)
+        assert compiled.diagnostics.dispatches == 7
         execution = compiled.submit(*resources[:3])
         execution.completion.wait()
 

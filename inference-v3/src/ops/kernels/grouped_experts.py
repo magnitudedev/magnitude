@@ -11,20 +11,14 @@ from ..tensor.graph import Graph
 from ..tensor.types import DType, TensorSpec
 from .experts import _routed_shared_region
 from .matrix import _packet_matrix_instruction, _packet_reduction_width
-from .packed import (affine_gemm, affine_has_bias, affine_shared_bytes, affine_storage,
-                     load_matrix_tile, packet_format, prepare_decoded_packets, publish_decoded_packets)
+from .packed import (affine_gemm, affine_shared_bytes, affine_storage,
+                     load_matrix_tile, packet_format)
 from .publication import publish, residual_epilogue
 
 
 def _aligned_capacity(rows: int, selected: int, experts: int, tile: int) -> int:
     routes = rows * selected
     return ((routes + experts * (tile - 1) + tile - 1) // tile) * tile
-
-
-def _continuous_contraction(context, dtype, instruction):
-    return (dtype == DType.BF16 and instruction.input_dtype == DType.BF16
-            and (instruction.m, instruction.n, instruction.k) == (8, 8, 8)
-            and "gemm.shared_instruction_tiles" in context.capabilities.features)
 
 
 @T.macro
@@ -96,25 +90,19 @@ def _group_routes(
 
 
 @T.macro
-def _prepare_affine_rows(source, order, gathered, statistics, rows, capacity, width,
-                         selected, bm, bk, threads, routed=True):
-    """Resolve irregular rows and affine sums once, before output-channel tiling."""
+def _prepare_affine_rows(source, order, gathered, rows, capacity, width,
+                         selected, bm, bk, threads):
+    """Resolve irregular rows once, before output-channel tiling."""
     with T.Kernel(T.ceildiv(width, bk), T.ceildiv(capacity, bm), threads=threads) as (bx, by):
         values = T.alloc_fragment((bm, bk), "float32")
-        totals = T.alloc_fragment((bm,), "float32") if statistics is not None else None
         for i, k in T.Parallel(bm, bk):
             row, column = by * bm + i, bx * bk + k
-            route = order[row] if routed else row
-            source_row = route // selected if routed else row
+            route = order[row]
+            source_row = route // selected
             values[i, k] = T.if_then_else(row < capacity and route >= 0 and source_row < rows and column < width,
                                          T.cast(source[source_row, column], "float32"), 0)
-            if routed and row < capacity and column < width:
+            if row < capacity and column < width:
                 gathered[row, column] = T.cast(values[i, k], source.dtype)
-        if statistics is not None:
-            T.reduce_sum(values, totals, dim=1)
-            for i in T.Parallel(bm):
-                if by * bm + i < capacity:
-                    statistics[by * bm + i, bx] = totals[i]
 
 
 @T.macro
@@ -140,16 +128,11 @@ def _expert_gated_tile(
     bk,
     threads,
     storage,
-    statistics=None,
 ):
     """A complete tile contraction with the route kind fixed before reduction."""
     dtype = source.dtype
     contraction, gate_activation = storage
-    x, paired_tile, coefficients, paired_accum, partial, sum_values, sums = contraction
-    input_tile = T.alloc_fragment((bm, bk), dtype) if coefficients is None else x
-    owners = threads // 2
-    packet_width = min(16, max(8, bn * bk // owners))
-    packets = T.alloc_local((T.ceildiv(bn * bk, owners * packet_width), packet_width), "float32") if coefficients is None else None
+    x, paired_tile, coefficients, paired_accum, a, b = contraction
     T.clear(paired_accum)
     for reduction_block in T.serial(T.ceildiv(source_width, bk)):
         for i, k in T.Parallel(bm, bk):
@@ -157,40 +140,24 @@ def _expert_gated_tile(
             if routed and not source_grouped:
                 route = order[block * bm + i]
                 source_row = route // selected
-                input_tile[i, k] = T.if_then_else(
+                x[i, k] = T.if_then_else(
                     i < valid_m and route >= 0 and reduction < source_width,
                     source[source_row, reduction],
                     0,
                 )
             else:
-                input_tile[i, k] = T.if_then_else(
+                x[i, k] = T.if_then_else(
                     i < valid_m and reduction < source_width,
                     source[block * bm + i, reduction],
                     0,
                 )
-        if coefficients is None:
-            prepare_decoded_packets(packets, gate, gate_spec,
-                                    expert * output_width + output_block * bn, reduction_block * bk,
-                                    (expert + 1) * output_width, source_width, bn, bk, owners)
-            prepare_decoded_packets(packets, up, up_spec,
-                                    expert * output_width + output_block * bn, reduction_block * bk,
-                                    (expert + 1) * output_width, source_width, bn, bk, owners, owners)
-            T.sync_threads()
-            T.copy(input_tile, x)
-            publish_decoded_packets(packets, paired_tile, bn, bk, owners, 0, 2, 0)
-            publish_decoded_packets(packets, paired_tile, bn, bk, owners, owners, 2, 1)
-        else:
-            load_matrix_tile(paired_tile, coefficients, gate, gate_spec,
-                             expert * output_width + output_block * bn, reduction_block * bk,
-                             (expert + 1) * output_width, source_width, bn, bk, threads, 2, 0)
-            load_matrix_tile(paired_tile, coefficients, up, up_spec,
-                             expert * output_width + output_block * bn, reduction_block * bk,
-                             (expert + 1) * output_width, source_width, bn, bk, threads, 2, 1)
-        if statistics is not None:
-            for i in T.Parallel(bm):
-                sums[i] = statistics[block * bm + i, reduction_block]
-        affine_gemm(contraction, bm, 2 * bn, bk, valid_m, affine_has_bias(gate_spec, up_spec),
-                    sums_ready=statistics is not None)
+        load_matrix_tile(paired_tile, coefficients, gate, gate_spec,
+                         expert * output_width + output_block * bn, reduction_block * bk,
+                         (expert + 1) * output_width, source_width, bn, bk, threads, 2, 0)
+        load_matrix_tile(paired_tile, coefficients, up, up_spec,
+                         expert * output_width + output_block * bn, reduction_block * bk,
+                         (expert + 1) * output_width, source_width, bn, bk, threads, 2, 1)
+        affine_gemm(contraction, bm, 2 * bn, bk, valid_m)
     for i, j in T.Parallel(bm, bn):
         gate_value = T.cast(T.cast(paired_accum[i, 2 * j], dtype), "float32")
         if routed:
@@ -231,10 +198,7 @@ def _expert_down_tile(
     threads,
     storage,
 ):
-    x, w, coefficients, accum, partial, sum_values, sums = storage
-    input_tile = T.alloc_fragment((bm, bk), source.dtype) if coefficients is None else x
-    packet_width = min(16, max(8, bn * bk // threads))
-    packets = T.alloc_local((T.ceildiv(bn * bk, threads * packet_width), packet_width), "float32") if coefficients is None else None
+    x, w, coefficients, accum, a, b = storage
     T.clear(accum)
     for reduction_block in T.serial(T.ceildiv(source_width, bk)):
         for i, k in T.Parallel(bm, bk):
@@ -242,29 +206,21 @@ def _expert_down_tile(
             if routed and not source_grouped:
                 route = order[block * bm + i]
                 source_row = route // selected
-                input_tile[i, k] = T.if_then_else(
+                x[i, k] = T.if_then_else(
                     i < valid_m and route >= 0 and reduction < source_width,
                     source[source_row, reduction],
                     0,
                 )
             else:
-                input_tile[i, k] = T.if_then_else(
+                x[i, k] = T.if_then_else(
                     i < valid_m and reduction < source_width,
                     source[block * bm + i, reduction],
                     0,
                 )
-        if coefficients is None:
-            prepare_decoded_packets(packets, weight, weight_spec,
-                                    expert * output_width + output_block * bn, reduction_block * bk,
-                                    (expert + 1) * output_width, source_width, bn, bk, threads)
-            T.sync_threads()
-            T.copy(input_tile, x)
-            publish_decoded_packets(packets, w, bn, bk, threads)
-        else:
-            load_matrix_tile(w, coefficients, weight, weight_spec,
-                             expert * output_width + output_block * bn, reduction_block * bk,
-                             (expert + 1) * output_width, source_width, bn, bk, threads)
-        affine_gemm(storage, bm, bn, bk, valid_m, affine_has_bias(weight_spec))
+        load_matrix_tile(w, coefficients, weight, weight_spec,
+                         expert * output_width + output_block * bn, reduction_block * bk,
+                         (expert + 1) * output_width, source_width, bn, bk, threads)
+        affine_gemm(storage, bm, bn, bk, valid_m)
     for i, j in T.Parallel(bm, bn):
         channel = output_block * bn + j
         if i < valid_m and channel < output_width:
@@ -290,16 +246,14 @@ def _grouped_gated_projection(
     bn,
     bk,
     threads,
-    arithmetic_dtype,
+    instruction,
     routed=True,
     rows=0,
-    statistics=None,
-    decoded=False,
 ):
     with T.Kernel(T.ceildiv(output_width, bn), blocks, threads=threads) as (bx, by):
         # One homogeneous tile: route kind and encoding are compile-time inputs.
         storage = (
-            affine_storage(bm, 2 * bn, bk, arithmetic_dtype, decoded),
+            affine_storage(bm, 2 * bn, bk, source.dtype, instruction, (gate_spec, up_spec)),
             T.alloc_fragment((bm, bn), "float32"),
         )
         expert = block_metadata[by, 0] if routed else 0
@@ -327,7 +281,6 @@ def _grouped_gated_projection(
                 bk,
                 threads,
                 storage,
-                statistics,
             )
 
 
@@ -348,14 +301,13 @@ def _grouped_projection(
     bn,
     bk,
     threads,
-    arithmetic_dtype,
+    instruction,
     routed=True,
     rows=0,
-    decoded=False,
 ):
     with T.Kernel(T.ceildiv(output_width, bn), blocks, threads=threads) as (bx, by):
         # One homogeneous tile: route kind and encoding are compile-time inputs.
-        storage = affine_storage(bm, bn, bk, arithmetic_dtype, decoded)
+        storage = affine_storage(bm, bn, bk, source.dtype, instruction, (weight_spec,))
         expert = block_metadata[by, 0] if routed else 0
         valid_m = block_metadata[by, 1] if routed else (bm if rows % bm == 0 else T.min(bm, rows - by * bm))
         if expert >= 0:
@@ -464,14 +416,11 @@ class _GroupedExpertsEmitter:
             activation,
             projected,
             gathered,
-            *statistics,
         ) = operands[7:]
-        statistics = statistics[0] if statistics else None
         rows, width = cast(tuple[int, int], self.specs[0].shape)
         selected = cast(int, self.specs[1].shape[1])
         experts, intermediate, _ = cast(tuple[int, int, int], self.specs[3].shape)
-        instruction = self.tile
-        bm, bn, bk, threads, arithmetic_dtype, decoded = instruction
+        bm, bn, bk, threads, instruction = self.tile
         _group_routes(
             routes,
             order,
@@ -484,7 +433,7 @@ class _GroupedExpertsEmitter:
             self.capacity,
             bm,
         )
-        _prepare_affine_rows(hidden, order, gathered, statistics, rows, self.capacity,
+        _prepare_affine_rows(hidden, order, gathered, rows, self.capacity,
                              width, selected, bm, bk, threads)
         _grouped_gated_projection(
             gathered,
@@ -504,9 +453,7 @@ class _GroupedExpertsEmitter:
             bn,
             bk,
             threads,
-            arithmetic_dtype,
-            statistics=statistics,
-            decoded=decoded,
+            instruction,
         )
         _grouped_projection(
             activation,
@@ -522,10 +469,9 @@ class _GroupedExpertsEmitter:
             True,
             bm,
             bn,
-            32 if decoded else _packet_reduction_width(self.specs[5]),
+            _packet_reduction_width(self.specs[5]),
             threads,
-            arithmetic_dtype,
-            decoded=decoded,
+            instruction,
         )
         _unpermute(
             projected,
@@ -574,18 +520,13 @@ class _GroupedSharedExpertsEmitter:
             shared_activation,
             expert_projected,
             shared_projected,
-            *preparation,
+            gathered,
         ) = operands
-        preparation = iter(preparation)
-        gathered = next(preparation)
-        decoded = self.tile[5]
-        expert_statistics = next(preparation) if not decoded and affine_has_bias(self.specs[3], self.specs[4]) else None
-        shared_statistics = next(preparation) if not decoded and affine_has_bias(self.specs[6], self.specs[7]) else None
         rows, width = cast(tuple[int, int], self.specs[0].shape)
         selected = cast(int, self.specs[1].shape[1])
         experts, expert_width, _ = cast(tuple[int, int, int], self.specs[3].shape)
         shared_width = cast(int, self.specs[6].shape[0])
-        bm, bn, bk, threads, arithmetic_dtype, decoded = self.tile
+        bm, bn, bk, threads, instruction = self.tile
         _group_routes(
             routes,
             order,
@@ -598,35 +539,31 @@ class _GroupedSharedExpertsEmitter:
             self.capacity,
             bm,
         )
-        _prepare_affine_rows(hidden, order, gathered, expert_statistics, rows, self.capacity,
+        _prepare_affine_rows(hidden, order, gathered, rows, self.capacity,
                              width, selected, bm, bk, threads)
-        if shared_statistics is not None:
-            _prepare_affine_rows(hidden, order, hidden, shared_statistics, rows, rows, width,
-                                 selected, bm, _packet_reduction_width(self.specs[6], self.specs[7]),
-                                 threads, routed=False)
         # Static, homogeneous grids. No persistent worker owns both packet
         # interpretations or constrains a branch to another branch's group size.
         _grouped_gated_projection(
             gathered, order, block_experts, expert_gate, expert_up, expert_activation,
             self.specs[3], self.specs[4], self.expert_blocks, width, expert_width,
-            selected, True, bm, bn, bk, threads, arithmetic_dtype, statistics=expert_statistics, decoded=decoded,
+            selected, True, bm, bn, bk, threads, instruction,
         )
         _grouped_gated_projection(
             hidden, order, block_experts, shared_gate, shared_up, shared_activation,
             self.specs[6], self.specs[7], self.shared_blocks, width, shared_width,
-            selected, False, bm, bn, 32 if decoded else _packet_reduction_width(self.specs[6], self.specs[7]),
-            threads, arithmetic_dtype, routed=False, rows=rows, statistics=shared_statistics, decoded=decoded,
+            selected, False, bm, bn, _packet_reduction_width(self.specs[6], self.specs[7]),
+            threads, instruction, routed=False, rows=rows,
         )
         _grouped_projection(
             expert_activation, order, block_experts, expert_down, expert_projected,
             self.specs[5], self.expert_blocks, expert_width, width, selected, True,
-            bm, bn, 32 if decoded else _packet_reduction_width(self.specs[5]), threads, arithmetic_dtype, decoded=decoded,
+            bm, bn, _packet_reduction_width(self.specs[5]), threads, instruction,
         )
         _grouped_projection(
             shared_activation, order, block_experts, shared_down, shared_projected,
             self.specs[8], self.shared_blocks, shared_width, width, selected, True,
-            bm, bn, 32 if decoded else _packet_reduction_width(self.specs[8]), threads, arithmetic_dtype,
-            routed=False, rows=rows, decoded=decoded,
+            bm, bn, _packet_reduction_width(self.specs[8]), threads, instruction,
+            routed=False, rows=rows,
         )
         _unpermute_shared(
             expert_projected,
@@ -697,9 +634,8 @@ class GroupedExpertsRule:
         else:
             bm = instruction.m * 2
             bn = instruction.n * 2
-        decoded = _continuous_contraction(context, hidden.dtype, instruction)
-        bk = 32 if decoded else _packet_reduction_width(gate, up)
-        down_bk = 32 if decoded else _packet_reduction_width(down)
+        bk = _packet_reduction_width(gate, up)
+        down_bk = _packet_reduction_width(down)
         if bk % instruction.k or down_bk % instruction.k:
             return ()
         threads = min(
@@ -708,8 +644,8 @@ class GroupedExpertsRule:
             bm // instruction.m * context.capabilities.subgroup_width,
         )
         shared = max(
-            affine_shared_bytes(bm, 2 * bn, bk, instruction.input_dtype, decoded=decoded),
-            affine_shared_bytes(bm, bn, down_bk, instruction.input_dtype, decoded=decoded),
+            affine_shared_bytes(bm, 2 * bn, bk, hidden.dtype, gate, up),
+            affine_shared_bytes(bm, bn, down_bk, hidden.dtype, down),
         )
         if shared > context.capabilities.shared_memory_bytes:
             return ()
@@ -724,8 +660,6 @@ class GroupedExpertsRule:
             TensorSpec((capacity, width), hidden.dtype),
             TensorSpec((capacity, width), hidden.dtype),
         )
-        if not decoded and affine_has_bias(gate, up):
-            workspace += (TensorSpec((capacity, width // bk), DType.F32),)
         if sum(value.storage_nbytes for value in workspace) > context.workspace_limit:
             return ()
         return (
@@ -735,7 +669,7 @@ class GroupedExpertsRule:
                 node.inputs,
                 node.outputs,
                 _GroupedExpertsEmitter(
-                    specs, capacity, blocks, (bm, bn, bk, threads, instruction.input_dtype.value, decoded)
+                    specs, capacity, blocks, (bm, bn, bk, threads, instruction)
                 ),
                 workspace=workspace,
                 kernel_count=5,
@@ -813,11 +747,10 @@ def _grouped_shared_operation(
     else:
         bm = instruction.m * 2
         bn = instruction.n * 2
-    decoded = _continuous_contraction(context, hidden.dtype, instruction)
-    bk = 32 if decoded else _packet_reduction_width(expert_gate, expert_up)
-    shared_bk = 32 if decoded else _packet_reduction_width(shared_gate, shared_up)
-    down_bk = 32 if decoded else _packet_reduction_width(expert_down)
-    shared_down_bk = 32 if decoded else _packet_reduction_width(shared_down)
+    bk = _packet_reduction_width(expert_gate, expert_up)
+    shared_bk = _packet_reduction_width(shared_gate, shared_up)
+    down_bk = _packet_reduction_width(expert_down)
+    shared_down_bk = _packet_reduction_width(shared_down)
     if any(reduction % instruction.k for reduction in (bk, shared_bk, down_bk, shared_down_bk)):
         return None
     threads = min(
@@ -826,10 +759,10 @@ def _grouped_shared_operation(
         bm // instruction.m * context.capabilities.subgroup_width,
     )
     shared_bytes = max(
-        affine_shared_bytes(bm, 2 * bn, bk, instruction.input_dtype, decoded=decoded),
-        affine_shared_bytes(bm, 2 * bn, shared_bk, instruction.input_dtype, decoded=decoded),
-        affine_shared_bytes(bm, bn, down_bk, instruction.input_dtype, decoded=decoded),
-        affine_shared_bytes(bm, bn, shared_down_bk, instruction.input_dtype, decoded=decoded),
+        affine_shared_bytes(bm, 2 * bn, bk, hidden.dtype, expert_gate, expert_up),
+        affine_shared_bytes(bm, 2 * bn, shared_bk, hidden.dtype, shared_gate, shared_up),
+        affine_shared_bytes(bm, bn, down_bk, hidden.dtype, expert_down),
+        affine_shared_bytes(bm, bn, shared_down_bk, hidden.dtype, shared_down),
     )
     if shared_bytes > context.capabilities.shared_memory_bytes:
         return None
@@ -847,10 +780,6 @@ def _grouped_shared_operation(
         TensorSpec((rows, width), hidden.dtype),
         TensorSpec((capacity, width), hidden.dtype),
     )
-    if not decoded and affine_has_bias(expert_gate, expert_up):
-        workspace += (TensorSpec((capacity, width // bk), DType.F32),)
-    if not decoded and affine_has_bias(shared_gate, shared_up):
-        workspace += (TensorSpec((rows, width // shared_bk), DType.F32),)
     if sum(value.storage_nbytes for value in workspace) > context.workspace_limit:
         return None
     return BoundOperation(
@@ -863,10 +792,10 @@ def _grouped_shared_operation(
             capacity,
             expert_blocks,
             shared_blocks,
-            (bm, bn, bk, threads, instruction.input_dtype.value, decoded),
+            (bm, bn, bk, threads, instruction),
             context.capabilities.subgroup_width,
             residual,
         ),
         workspace=workspace,
-        kernel_count=7 + int(not decoded and affine_has_bias(shared_gate, shared_up)),
+        kernel_count=7,
     )

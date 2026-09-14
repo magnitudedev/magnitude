@@ -9,6 +9,8 @@ loaded once and reused by the dot product.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+from typing import cast
 
 import tilelang.language as T
 
@@ -98,17 +100,17 @@ def packet_format(spec: TensorSpec) -> PacketFormat | None:
     return None
 
 
-def affine_shared_bytes(rows: int, columns: int, reduction: int, dtype: DType, *, decoded=False) -> int:
-    """Code/activation tiles, FP32 coefficient pairs and the row-reduction bridge."""
-    if decoded:
-        return (rows + columns) * reduction * dtype.itemsize
-    return ((rows + columns) * reduction * dtype.itemsize
-            + (columns * 2 + rows) * DType.F32.itemsize)
+def affine_group_width(reduction: int, *specs: TensorSpec) -> int:
+    assert specs and all(isinstance(spec.representation, Affine) for spec in specs)
+    return min(reduction, math.gcd(*(cast(Affine, spec.representation).group for spec in specs)))
 
 
-def affine_has_bias(*specs: TensorSpec) -> bool:
-    return any(isinstance(spec.representation, Affine) and spec.representation.coefficients.has_bias
-               for spec in specs)
+def affine_shared_bytes(rows: int, columns: int, reduction: int, dtype: DType,
+                        *specs: TensorSpec) -> int:
+    """Native activations, exact F16 codes and original FP32 coefficient pairs."""
+    group = affine_group_width(reduction, *specs)
+    return (rows * reduction * dtype.itemsize + columns * reduction * DType.F16.itemsize
+            + columns * (reduction // group) * 2 * DType.F32.itemsize)
 
 
 def affine_code_center(spec: TensorSpec) -> float:
@@ -122,55 +124,32 @@ def affine_code_center(spec: TensorSpec) -> float:
 
 
 @T.macro
-def affine_storage(bm, bn, bk, dtype, decoded=False):
+def affine_storage(bm, bn, bk, dtype, instruction, specs):
     left = T.alloc_shared((bm, bk), dtype)
-    codes = T.alloc_shared((bn, bk), dtype)
-    if decoded:
-        T.annotate_layout({
-            left: T.Layout((bm, bk), lambda i, j: ((i // 8) * (bk // 8) + j // 8) * 64 + i % 8 * 8 + j % 8),
-            codes: T.Layout((bn, bk), lambda i, j: ((i // 8) * (bk // 8) + j // 8) * 64 + i % 8 * 8 + j % 8),
-        })
-        return left, codes, None, T.alloc_fragment((bm, bn), "float32"), None, None, None
-    coefficients = T.alloc_shared((bn, 2), "float32")
+    codes = T.alloc_shared((bn, bk), "float16")
+    group = affine_group_width(bk, *specs)
+    coefficients = T.alloc_shared((bn, bk // group, 2), "float32")
     accum = T.alloc_fragment((bm, bn), "float32")
-    partial = T.alloc_fragment((bm, bn), "float32")
-    sum_values = T.alloc_fragment((bm, bk), "float32")
-    # Reduction ownership and native matrix-fragment ownership need not agree.
-    # A bounded row vector bridges them without imposing a backend-specific
-    # fragment layout on either operation.
-    sums = T.alloc_shared((bm,), "float32")
-    return left, codes, coefficients, accum, partial, sum_values, sums
+    a = T.alloc_fragment((bm, instruction.k), "float32")
+    b = T.alloc_fragment((bn, instruction.k), "float32")
+    return left, codes, coefficients, accum, a, b
 
 
 @T.macro
-def affine_gemm(storage, bm, bn, bk, valid_m, has_bias, sums_ready=False):
-    """Continuous decoded contraction or exact code/coefficient contraction.
-
-    The decoded path has one explicit operand-dtype rounding boundary and keeps
-    FP32 accumulation across K. It must pass the unchanged formula accuracy gate.
-    The code path retains separate FP32 coefficients and group accumulation.
-    """
-    left, codes, coefficients, accum, partial, sum_values, sums = storage
+def affine_gemm(storage, bm, bn, bk, valid_m):
+    """Reconstruct immediate operands; keep one FP32 accumulator across all K."""
+    left, codes, coefficients, accum, a, b = storage
+    instruction_k = a.shape[1]
+    group = bk // coefficients.shape[1]
     T.sync_threads()
-    if coefficients is None:
-        T.gemm(left, codes, accum, transpose_B=True, valid_m=valid_m, policy=T.GemmWarpPolicy.Square)
-        return
-    if has_bias and not sums_ready:
-        for i, k in T.Parallel(bm, bk):
-            sum_values[i, k] = T.cast(left[i, k], "float32")
-        T.reduce_sum(sum_values, sums, dim=1)
-        T.sync_threads()
-    # Distribute matrix operands across both output axes. A row-only partition
-    # repeats each weight instruction tile in every row warp; balanced ownership
-    # retains the same accumulator size while reusing both matrix operands.
-    T.gemm(left, codes, partial, transpose_B=True, clear_accum=True,
-           valid_m=valid_m, policy=T.GemmWarpPolicy.Square)
-    for i, j in T.Parallel(bm, bn):
-        if i < valid_m:
-            if has_bias:
-                accum[i, j] += partial[i, j] * coefficients[j, 0] + sums[i] * coefficients[j, 1]
-            else:
-                accum[i, j] += partial[i, j] * coefficients[j, 0]
+    for instruction in T.serial(bk // instruction_k):
+        for i, k in T.Parallel(bm, instruction_k):
+            a[i, k] = T.cast(left[i, instruction * instruction_k + k], "float32")
+        for j, k in T.Parallel(bn, instruction_k):
+            column = instruction * instruction_k + k
+            b[j, k] = (T.cast(codes[j, column], "float32") * coefficients[j, column // group, 0]
+                       + coefficients[j, column // group, 1])
+        T.gemm(a, b, accum, transpose_B=True, valid_m=valid_m, policy=T.GemmWarpPolicy.Square)
     T.sync_threads()
 
 
@@ -414,7 +393,8 @@ def group_coefficients(words, spec, element):
 
 
 @T.macro
-def decode_packet(destination, tile_row, tile_column, words, spec, row, first, apply_coefficients=True):
+def decode_packet(destination, tile_row, tile_column, words, spec, row, first,
+                  apply_coefficients=True, center_codes=True):
     """Shared packet interpretation for value publication and raw-code contraction."""
     representation = spec.representation
     assert isinstance(representation, Affine)
@@ -428,7 +408,7 @@ def decode_packet(destination, tile_row, tile_column, words, spec, row, first, a
         scale = T.alloc_var("float32", init=scale_value)
         bias = T.alloc_var("float32", init=bias_value)
     else:
-        scale, bias = T.float32(1), T.float32(-affine_code_center(spec))
+        scale, bias = T.float32(1), T.float32(-affine_code_center(spec) if center_codes else 0)
 
     if packet.name == "mlx-q4-group64":
         low = word(words, layout.low + element // 2)
@@ -474,38 +454,6 @@ def decode_packet(destination, tile_row, tile_column, words, spec, row, first, a
 
 
 @T.macro
-def prepare_decoded_packets(values, words, spec, first_row, first_column, rows, columns,
-                            bn, bk, owners, owner_offset=0):
-    """Prepare private operand packets before waiting to reuse shared storage."""
-    width = values.shape[1]
-    owner = T.get_thread_binding() - owner_offset
-    if owner >= 0 and owner < owners:
-        for iteration in T.serial(values.shape[0]):
-            linear = iteration * owners + owner
-            row, column = linear // (bk // width), linear % (bk // width) * width
-            if row < bn and first_row + row < rows and first_column + column < columns:
-                for packet in T.unroll(width // 8, explicit=True):
-                    decode_packet(values, iteration, packet * 8, words, spec,
-                                  first_row + row, first_column + column + packet * 8)
-            else:
-                for item in T.unroll(width, explicit=True):
-                    values[iteration, item] = 0
-
-
-@T.macro
-def publish_decoded_packets(values, destination, bn, bk, owners, owner_offset=0, stride=1, offset=0):
-    width = values.shape[1]
-    owner = T.get_thread_binding() - owner_offset
-    if owner >= 0 and owner < owners:
-        for iteration in T.serial(values.shape[0]):
-            linear = iteration * owners + owner
-            row, column = linear // (bk // width), linear % (bk // width) * width
-            if row < bn:
-                for item in T.unroll(width, explicit=True):
-                    destination[row * stride + offset, column + item] = T.cast(values[iteration, item], destination.dtype)
-
-
-@T.macro
 def load_matrix_tile(
     destination,
     coefficients,
@@ -524,16 +472,18 @@ def load_matrix_tile(
     """One writer per code packet and per coefficient pair, including tails."""
     packet = packet_format(spec)
     assert packet is not None
-    assert isinstance(spec.representation, Affine) and spec.representation.group % bk == 0
-    for index in T.Parallel(bn):
+    assert isinstance(spec.representation, Affine)
+    group = bk // coefficients.shape[1]
+    assert spec.representation.group % group == 0
+    for index, coefficient in T.Parallel(bn, coefficients.shape[1]):
         destination_row = index * destination_row_stride + destination_row_offset
-        if first_row + index < rows and first_column < columns:
-            scale, bias = group_coefficients(words, spec, (first_row + index) * columns + first_column)
-            coefficients[destination_row, 0] = scale
-            coefficients[destination_row, 1] = bias + scale * affine_code_center(spec)
+        if first_row + index < rows and first_column + coefficient * group < columns:
+            scale, bias = group_coefficients(words, spec, (first_row + index) * columns + first_column + coefficient * group)
+            coefficients[destination_row, coefficient, 0] = scale
+            coefficients[destination_row, coefficient, 1] = bias
         else:
-            coefficients[destination_row, 0] = 0
-            coefficients[destination_row, 1] = 0
+            coefficients[destination_row, coefficient, 0] = 0
+            coefficients[destination_row, coefficient, 1] = 0
     packets = bn * bk // packet.matrix_packet
     for iteration in T.serial(T.ceildiv(packets, threads)):
         linear = iteration * threads + T.get_thread_binding()
@@ -549,6 +499,7 @@ def load_matrix_tile(
                     spec,
                     first_row + row,
                     first_column + column,
+                    False,
                     False,
                 )
             else:

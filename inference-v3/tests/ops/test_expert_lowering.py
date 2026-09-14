@@ -30,7 +30,8 @@ GROUPED_CAPABILITIES = ops.Capabilities(
     32,
     256,
     32 * 1024,
-    matrix_instructions=(ops.MatrixInstruction(8, 8, 8, ops.DType.F16, ops.DType.F32),),
+    matrix_instructions=(ops.MatrixInstruction(8, 8, 8, ops.DType.F16, ops.DType.F32),
+                         ops.MatrixInstruction(8, 8, 8, ops.DType.F32, ops.DType.F32)),
     memory_scopes=frozenset({"global", "shared", "local"}),
     atomics=frozenset({ops.DType.I32}),
     features=frozenset({"gemm.runtime_valid_m"}),
@@ -256,11 +257,11 @@ def test_prefill_prepares_rows_and_specializes_mixed_packets_in_one_submission()
     assert len(cover) == 1
     assert cover[0].name.startswith("routed_experts.grouped@")
     assert cover[0].nodes == frozenset(range(len(graph.nodes)))
-    assert cover[0].kernel_count == 8
+    assert cover[0].kernel_count == 7
     assert cover[0].emitter.tile[2] == 32
     assert cover[0].emitter.specs[6].representation.group == 64
     submissions = plan_submissions(graph, cover, GROUPED_CAPABILITIES)
-    assert len(submissions) == 1 and submissions[0].kernel_count == 8
+    assert len(submissions) == 1 and submissions[0].kernel_count == 7
 
 
 @pytest.mark.parametrize("mode,rows,fused", [("decode", 1, True), ("prefill", 256, False)])

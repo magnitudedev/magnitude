@@ -202,7 +202,7 @@ def _packed(encoding: Encoding, outputs: int, inputs: int) -> np.ndarray:
     "encoding",
     (Encoding.Q4_K, Encoding.Q5_K, Encoding.Q6_K, Encoding.Q8_0),
 )
-@pytest.mark.parametrize("rows,floating", ((2, ops.DType.F32), (9, ops.DType.BF16)))
+@pytest.mark.parametrize("rows,floating", ((2, ops.DType.F32), (9, ops.DType.BF16), (9, ops.DType.F32)))
 def test_metal_quantized_import_and_projection_match_gguf(encoding, rows, floating):
     if not torch.backends.mps.is_available():
         pytest.skip("Metal encoded projection check requires MPS")

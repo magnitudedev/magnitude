@@ -15,7 +15,7 @@ from .matrix import (
     _packet_matrix_instruction,
     _packet_reduction_width,
 )
-from .packed import (affine_gemm, affine_has_bias, affine_shared_bytes, affine_storage,
+from .packed import (affine_gemm, affine_shared_bytes, affine_storage,
                      load_matrix_tile, packet_dot, packet_format, prepare_packet_activation)
 from .publication import publish, residual_epilogue
 
@@ -123,7 +123,7 @@ def _gated_packet_matrix(
     bm,
     bn,
     bk,
-    arithmetic_dtype,
+    instruction,
 ):
     packet = packet_format(gate_spec)
     assert packet is not None and packet_format(up_spec) == packet
@@ -134,8 +134,8 @@ def _gated_packet_matrix(
         and (bn * bk // packet.matrix_packet) % threads == 0
     )
     with T.Kernel(T.ceildiv(intermediate, bn), T.ceildiv(rows, bm), threads=threads) as (bx, by):
-        storage = affine_storage(bm, 2 * bn, bk, arithmetic_dtype)
-        x, paired_tile, coefficients, paired_accum, partial, sum_values, sums = storage
+        storage = affine_storage(bm, 2 * bn, bk, hidden.dtype, instruction, (gate_spec, up_spec))
+        x, paired_tile, coefficients, paired_accum, a, b = storage
         gate_activation = T.alloc_fragment((bm, bn), "float32")
         T.clear(paired_accum)
         for block in T.serial(T.ceildiv(width, bk)):
@@ -178,7 +178,7 @@ def _gated_packet_matrix(
                 2,
                 1,
             )
-            affine_gemm(storage, bm, 2 * bn, bk, bm, affine_has_bias(gate_spec, up_spec))
+            affine_gemm(storage, bm, 2 * bn, bk, bm)
         for i, j in T.Parallel(bm, bn):
             gate_value = T.cast(T.cast(paired_accum[i, 2 * j], dtype), "float32")
             gate_activation[i, j] = T.cast(gate_value * T.sigmoid(gate_value), dtype)
@@ -256,7 +256,7 @@ class _DenseSwiGLUEmitter:
             )
         else:
             assert self.tile is not None
-            threads, bm, bn, bk, arithmetic_dtype = self.tile
+            threads, bm, bn, bk, instruction = self.tile
             _packed_matrix(
                 activation,
                 down,
@@ -266,7 +266,7 @@ class _DenseSwiGLUEmitter:
                 rows,
                 width,
                 intermediate,
-                arithmetic_dtype,
+                instruction,
                 self.specs[4].dtype.value,
                 threads,
                 bm,
@@ -466,10 +466,11 @@ class DenseSwiGLURule:
                 context.capabilities.subgroup_width * 4,
                 bm // instruction.m * context.capabilities.subgroup_width,
             )
-            shared = affine_shared_bytes(bm, 2 * bn, max(bk, down_bk), instruction.input_dtype)
+            shared = max(affine_shared_bytes(bm, 2 * bn, bk, specs[0].dtype, specs[1], specs[2]),
+                         affine_shared_bytes(bm, 2 * bn, down_bk, specs[0].dtype, specs[3]))
             if shared > context.capabilities.shared_memory_bytes:
                 return ()
-            tile = (threads, bm, bn, bk, instruction.input_dtype.value)
+            tile = (threads, bm, bn, bk, instruction)
         activation = TensorSpec((rows, intermediate), specs[0].dtype)
         return (
             BoundOperation(

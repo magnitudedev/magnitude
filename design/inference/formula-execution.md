@@ -94,6 +94,13 @@ the original child value; exposing that intermediate prevents its elimination.
 Formula hierarchy and evidence identity do not change merely because this storage
 and dispatch boundary is fused away in the parent.
 
+Grouped attention may reuse compact K/V staging across query heads sharing one
+KV head. That storage choice does not narrow probabilities, online softmax state
+or output accumulation: those remain FP32. Value operands widen on consumption,
+and the isolated and composed attention paths share one authored streaming body
+and physical-capacity calculation. Native shared staging is not a claim that all
+arithmetic has the storage dtype or that reduced storage guarantees lower latency.
+
 Kernel composition uses public Python-native TileLang construction, not generated
 source, AST fabrication or direct TIR manipulation. Physical storage planning
 respects alignment and live intervals; ABI views obey actual allocation bounds.
@@ -261,17 +268,17 @@ separately from source bytes. Reservation and evidence identities include the
 larger execution footprint.
 
 Grouped prefill resolves routed input rows before channel-tiled contractions.
-Native BF16 blocked-tile contractions explicitly round decoded FP32 weights at
-bounded shared operand publication and retain a continuous FP32 accumulator
-across K. Qualification uses the unchanged formula numerical protocol; this
-rounding is not exact coefficient preservation. Private operand preparation
-precedes the shared-reuse barrier. There is one matrix product per operand tile,
-not a mandatory correction product or per-group output correction.
-On exact-code paths, affine-biased gate/up contractions share FP32 coefficient-group row
-sums instead of repeating their reductions per output tile. These invocation
-workspaces and preparation launches are charged inside operation measurements;
-they are not permanent weight caches or hidden setup. Grouped down contractions
-consume their contiguous activation rows without redundant route lookup.
+Packed matrix contractions stage original activations, exactly represented small
+integer codes and original FP32 coefficient pairs. They reconstruct only the
+immediate FP32 matrix operands and retain one FP32 accumulator across the complete
+reduction. Quantization groups select metadata; they do not reset the accumulator
+or require output-wide coefficient correction or activation-sum workspaces.
+This common contraction serves resident, streamed, ordinary, parallel and grouped
+projections. It does not round reconstructed weights to a 16-bit dtype. Matrix
+capability comes from the selected device; decode's packet-vector arithmetic is
+separate. Gather work and staging remain charged inside the operation boundary,
+not permanent caches or hidden setup. Grouped down contractions consume their
+contiguous activation rows without redundant route lookup.
 
 Structural device facts come from supported interfaces. Ops runs bounded reusable
 portable probes to characterize applicable arithmetic, memory and transfer paths.

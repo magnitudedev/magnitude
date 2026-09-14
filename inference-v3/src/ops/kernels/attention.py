@@ -24,6 +24,10 @@ from .packed import affine_shared_bytes, packet_format
 @dataclass(frozen=True, slots=True)
 class _MatrixAttentionSchedule:
     tile: tuple[int, int, int]
+    head_tile: int
+    value_tile: int
+    instruction_k: int
+    padding: int
     partitions: int
     span: int
     shared_bytes: int
@@ -37,32 +41,126 @@ def _matrix_attention_schedule(
 
     Composition may eliminate the final merge/publication, not secretly choose
     a wider query-head register tile than the independently measured operation.
-    Keep four row subgroups and a bounded FP32 PV tile in both contexts.
+    Share compact K/V across heads; widen only immediate PV operands.
     """
     if context.mode != "prefill" or sequence_count != 1:
         return None
     instructions = context.capabilities.matrix_instructions
     instruction = next((item for item in instructions
                         if item.input_dtype == query.dtype and item.accumulation_dtype == DType.F32), None)
-    if instruction is None or not any(item.input_dtype == item.accumulation_dtype == DType.F32
-                                      for item in instructions):
+    fp32 = next((item for item in instructions
+                 if item.input_dtype == item.accumulation_dtype == DType.F32), None)
+    if instruction is None or fp32 is None:
         return None
     rows, heads, width = cast(tuple[int, int, int], query.shape)
-    if width < instruction.k or width % instruction.k:
+    if width < instruction.k or width % instruction.k or width % fp32.n:
         return None
     query_tile, key_tile = instruction.m * 4, instruction.n * 4
-    threads = context.capabilities.subgroup_width * 4
-    shared_bytes = key_tile * width * 4
+    group = heads // cast(int, history.shape[2])
+    paired_heads = group % 2 == 0 and context.capabilities.threads_per_group >= context.capabilities.subgroup_width * 8
+    head_tile = 2 if paired_heads else 1
+    threads = context.capabilities.subgroup_width * 4 * head_tile
+    padding = instruction.k
+    def staging_bytes() -> int:
+        return (width + padding) * (key_tile + padding) * query.dtype.itemsize
+
+    while staging_bytes() > context.capabilities.shared_memory_bytes and key_tile > instruction.n:
+        key_tile //= 2
+    shared_bytes = staging_bytes()
+    value_tile = min(width, query_tile * 2)
+    if key_tile % instruction.n or key_tile % fp32.k or (query_tile * head_tile) % fp32.m or value_tile % fp32.n:
+        return None
     if threads > context.capabilities.threads_per_group or shared_bytes > context.capabilities.shared_memory_bytes:
         return None
     capacity = cast(int, history.shape[1])
     partitions = math.ceil(capacity / 4096)
     span = math.ceil(capacity / (partitions * key_tile)) * key_tile
     return _MatrixAttentionSchedule(
-        (query_tile, key_tile, threads), partitions, span, shared_bytes,
+        (query_tile, key_tile, threads), head_tile, value_tile, fp32.k, padding,
+        partitions, span, shared_bytes,
         (TensorSpec((partitions, rows, heads, width), DType.F32),
          TensorSpec((partitions, rows, heads, 2), DType.F32)),
     )
+
+
+@T.macro
+def _attention_clear(output):
+    T.clear(output)
+
+
+def _attention_accumulators(rows, width, columns):
+    """Separate full fragments keep immediate V operands bounded by columns."""
+    outputs = tuple(T.alloc_fragment((rows, columns), "float32") for _ in range(math.ceil(width / columns)))
+    for output in outputs:
+        _attention_clear(output)
+    return outputs
+
+
+@T.macro
+def _attention_rescale_tile(output, alpha, rows, columns):
+    for row, column in T.Parallel(rows, columns):
+        output[row, column] *= alpha[row]
+
+
+def _attention_rescale(outputs, alpha, rows, columns):
+    for output in outputs:
+        _attention_rescale_tile(output, alpha, rows, columns)
+
+
+@T.macro
+def _attention_value_tile(probability, values, output, first_key, first_column,
+                          width, columns, instruction_k):
+    operand = T.alloc_fragment((instruction_k, columns), "float32")
+    for item, column in T.Parallel(instruction_k, columns):
+        operand[item, column] = T.if_then_else(
+            first_column + column < width,
+            T.cast(values[0, first_key + item, first_column + column], "float32"), 0,
+        )
+    T.gemm(probability, operand, output, policy=T.GemmWarpPolicy.FullRow)
+
+
+def _attention_value_columns(probability, values, outputs, first_key, width, columns, instruction_k):
+    for index, output in enumerate(outputs):
+        _attention_value_tile(probability, values, output, first_key, index * columns,
+                              width, columns, instruction_k)
+
+
+@T.macro
+def _attention_values(scores, values, outputs, rows, width, keys, columns, instruction_k):
+    probability = T.alloc_fragment((rows, instruction_k), "float32")
+    for instruction in T.serial(keys // instruction_k):
+        for row, item in T.Parallel(rows, instruction_k):
+            probability[row, item] = scores[row, instruction * instruction_k + item]
+        _attention_value_columns(probability, values, outputs, instruction * instruction_k,
+                                  width, columns, instruction_k)
+
+
+@T.macro
+def _attention_publish_tile(output, denominator, gate, partials, first_row, first_head,
+                            partition, partitions, tokens, query_tile, head_tile,
+                            width, columns, first_column, dtype, fuse_gate):
+    for row, column in T.Parallel(query_tile * head_tile, columns):
+        token = first_row + row % query_tile
+        head = first_head + row // query_tile
+        channel = first_column + column
+        if token < tokens and channel < width:
+            if fuse_gate and partitions == 1:
+                attended = T.cast(output[row, column] / T.max(denominator[row], 1e-30), dtype)
+                coefficient = T.cast(T.sigmoid(T.cast(gate[token, head, channel], "float32")), dtype)
+                partials[token, head * width + channel] = T.cast(
+                    T.cast(attended, "float32") * T.cast(coefficient, "float32"), dtype,
+                )
+            elif denominator[row] > 0:
+                partials[partition, token, head, channel] = output[row, column]
+
+
+def _attention_publish(outputs, denominator, gate, partials, first_row, first_head,
+                       partition, partitions, tokens, query_tile, head_tile, width,
+                       columns, dtype, fuse_gate):
+    for index, output in enumerate(outputs):
+        _attention_publish_tile(output, denominator, gate, partials, first_row, first_head,
+                                partition, partitions, tokens, query_tile, head_tile, width,
+                                columns, index * columns, dtype, fuse_gate)
 
 
 @T.macro
@@ -78,42 +176,45 @@ def _matrix_streaming_attention(
     kv_heads,
     width,
     scale,
-    partitions,
-    span,
-    query_tile,
-    key_tile,
-    threads,
+    schedule,
     dtype,
     fuse_gate,
 ):
-    """Stream one packed sequence through tiled QK and PV matrix products."""
+    """Reuse compact K/V across query heads with immediate FP32 PV operands."""
     group = heads // kv_heads
+    query_tile, key_tile, threads = schedule.tile
+    partitions, span = schedule.partitions, schedule.span
+    head_tile, columns = schedule.head_tile, schedule.value_tile
+    query_rows = query_tile * head_tile
+    padding = schedule.padding
     log2e = 1.4426950408889634
     with T.Kernel(
         T.ceildiv(tokens, query_tile),
-        heads,
+        heads // head_tile,
         partitions,
         threads=threads,
     ) as (
         block,
-        head,
+        head_block,
         partition,
     ):
-        kv_head = head // group
-        query_fragment = T.alloc_fragment((query_tile, width), dtype)
-        output_fragment = T.alloc_fragment((query_tile, width), "float32")
-        scores = T.alloc_fragment((query_tile, key_tile), "float32")
-        kv = T.alloc_shared((1, key_tile, width), "float32")
-        keys = T.view(
-            kv,
-            shape=(1, key_tile, width * (2 if dtype in ("float16", "bfloat16") else 1)),
-            dtype=dtype,
-        )
-        maximum = T.alloc_fragment((query_tile,), "float32")
-        previous = T.alloc_fragment((query_tile,), "float32")
-        denominator = T.alloc_fragment((query_tile,), "float32")
-        local_sum = T.alloc_fragment((query_tile,), "float32")
-        alpha = T.alloc_fragment((query_tile,), "float32")
+        first_head = head_block * head_tile
+        kv_head = first_head // group
+        query_fragment = T.alloc_fragment((query_rows, width), dtype)
+        outputs = _attention_accumulators(query_rows, width, columns)
+        scores = T.alloc_fragment((query_rows, key_tile), "float32")
+        # The 3D views retain their authored physical pitch. K is oriented for
+        # QK; V reuses that allocation only after QK has consumed it.
+        # Both views cover the entire backing, including padding on both axes;
+        # a smaller alias must not become the allocation's inferred extent.
+        kv = T.alloc_shared(((width + padding) * (key_tile + padding),), dtype)
+        keys = T.view(kv, shape=(1, width + padding, key_tile + padding), dtype=dtype)
+        values = T.view(kv, shape=(1, key_tile + padding, width + padding), dtype=dtype)
+        maximum = T.alloc_fragment((query_rows,), "float32")
+        previous = T.alloc_fragment((query_rows,), "float32")
+        denominator = T.alloc_fragment((query_rows,), "float32")
+        local_sum = T.alloc_fragment((query_rows,), "float32")
+        alpha = T.alloc_fragment((query_rows,), "float32")
         first_row = block * query_tile
         last_row = T.min(tokens - 1, first_row + query_tile - 1)
         base = T.cast(visible[first_row, 0], "int32")
@@ -122,9 +223,9 @@ def _matrix_streaming_attention(
         partition_count = T.max(0, T.min(span, count - first))
         T.fill(maximum, -3.402823466e38)
         T.clear(denominator)
-        T.clear(output_fragment)
-        for row, channel in T.Parallel(query_tile, width):
-            token = first_row + row
+        for row, channel in T.Parallel(query_rows, width):
+            token = first_row + row % query_tile
+            head = first_head + row // query_tile
             query_fragment[row, channel] = T.if_then_else(
                 partition_count > 0 and token < tokens,
                 query[token, head, channel],
@@ -135,20 +236,19 @@ def _matrix_streaming_attention(
             if aligned:
                 for item, channel in T.Parallel(key_tile, width):
                     relative = first + chunk * key_tile + item
-                    keys[0, item, channel] = history[0, base + relative, kv_head, channel]
+                    keys[0, channel, item] = history[0, base + relative, kv_head, channel]
             else:
                 for item, channel in T.Parallel(key_tile, width):
                     relative = first + chunk * key_tile + item
-                    keys[0, item, channel] = T.if_then_else(
+                    keys[0, channel, item] = T.if_then_else(
                         relative < count,
                         history[0, base + relative, kv_head, channel],
                         0,
                     )
             T.gemm(
                 query_fragment,
-                keys[0, :, :width],
+                keys[0, :width, :key_tile],
                 scores,
-                transpose_B=True,
                 clear_accum=True,
                 policy=T.GemmWarpPolicy.FullRow,
             )
@@ -158,11 +258,11 @@ def _matrix_streaming_attention(
                 and first + (chunk + 1) * key_tile <= visible[first_row, 1]
             )
             if wholly_visible:
-                for row, item in T.Parallel(query_tile, key_tile):
+                for row, item in T.Parallel(query_rows, key_tile):
                     scores[row, item] *= scale * log2e
             else:
-                for row, item in T.Parallel(query_tile, key_tile):
-                    token = first_row + row
+                for row, item in T.Parallel(query_rows, key_tile):
+                    token = first_row + row % query_tile
                     relative = first + chunk * key_tile + item
                     scores[row, item] = T.if_then_else(
                         token < tokens
@@ -172,50 +272,33 @@ def _matrix_streaming_attention(
                     )
             T.copy(maximum, previous)
             T.reduce_max(scores, maximum, dim=1, clear=False)
-            for row in T.Parallel(query_tile):
+            for row in T.Parallel(query_rows):
                 alpha[row] = T.exp2(previous[row] - maximum[row])
-            for row, item in T.Parallel(query_tile, key_tile):
+            for row, item in T.Parallel(query_rows, key_tile):
                 scores[row, item] = T.if_then_else(
                     scores[row, item] > -3.402823466e38,
                     T.exp2(scores[row, item] - maximum[row]),
                     0,
                 )
             T.reduce_sum(scores, local_sum, dim=1)
-            for row in T.Parallel(query_tile):
+            for row in T.Parallel(query_rows):
                 denominator[row] = (
                     denominator[row] * alpha[row] + local_sum[row]
                 )
-            for row, channel in T.Parallel(query_tile, width):
-                output_fragment[row, channel] *= alpha[row]
+            _attention_rescale(outputs, alpha, query_rows, columns)
             for item, channel in T.Parallel(key_tile, width):
                 relative = first + chunk * key_tile + item
-                kv[0, item, channel] = T.if_then_else(
+                values[0, item, channel] = T.if_then_else(
                     relative < count,
-                    T.cast(history[1, base + relative, kv_head, channel], "float32"),
+                    history[1, base + relative, kv_head, channel],
                     0,
                 )
-            T.gemm(scores, kv[0, :, :], output_fragment, policy=T.GemmWarpPolicy.FullRow)
-        if fuse_gate and partitions == 1:
-            # Prefill already has abundant row/head parallelism.  Publish the
-            # normalized, gated tile directly instead of materializing a
-            # capacity-sized FP32 partial tensor only to merge one useful run.
-            for row, channel in T.Parallel(query_tile, width):
-                token = first_row + row
-                if token < tokens:
-                    gate_value = T.cast(gate[token, head, channel], "float32")
-                    attended = T.cast(
-                        output_fragment[row, channel]
-                        / T.max(denominator[row], 1e-30),
-                        dtype,
-                    )
-                    coefficient = T.cast(T.sigmoid(gate_value), dtype)
-                    partials[token, head * width + channel] = T.cast(
-                        T.cast(attended, "float32") * T.cast(coefficient, "float32"),
-                        dtype,
-                    )
-        else:
-            for row in T.Parallel(query_tile):
-                token = first_row + row
+            _attention_values(scores, values, outputs, query_rows, width, key_tile,
+                              columns, schedule.instruction_k)
+        if not fuse_gate or partitions > 1:
+            for row in T.Parallel(query_rows):
+                token = first_row + row % query_tile
+                head = first_head + row // query_tile
                 if token < tokens:
                     statistics[partition, token, head, 0] = T.if_then_else(
                         denominator[row] > 0,
@@ -223,17 +306,9 @@ def _matrix_streaming_attention(
                         -3.402823466e38,
                     )
                     statistics[partition, token, head, 1] = denominator[row]
-            for row, channel in T.Parallel(query_tile, width):
-                token = first_row + row
-                if (
-                    token < tokens
-                    and denominator[row] > 0
-                ):
-                    # Publish the unnormalized numerator. Empty partitions
-                    # publish only zero statistics, never a width-sized tile.
-                    partials[partition, token, head, channel] = output_fragment[
-                        row, channel
-                    ]
+        _attention_publish(outputs, denominator, gate, partials, first_row, first_head,
+                           partition, partitions, tokens, query_tile, head_tile, width,
+                           columns, dtype, fuse_gate)
 
 
 @T.macro
@@ -381,20 +456,16 @@ class _MatrixAttentionEmitter:
         self,
         specs: tuple[TensorSpec, ...],
         scale: float,
-        partitions: int,
-        span: int,
-        tile,
+        schedule: _MatrixAttentionSchedule,
         merge_threads: int,
     ):
-        self.specs, self.scale, self.tile = specs, scale, tile
-        self.partitions, self.span = partitions, span
+        self.specs, self.scale, self.schedule = specs, scale, schedule
         self.merge_threads = merge_threads
 
     def __call__(self, operands: tuple[Any, ...]) -> None:
         tokens, heads, width = cast(tuple[int, int, int], self.specs[0].shape)
         kv_heads = cast(int, self.specs[1].shape[2])
         query, history, visible, output, partials, statistics = operands
-        query_tile, key_tile, threads = self.tile
         _matrix_streaming_attention(
             query,
             history,
@@ -407,11 +478,7 @@ class _MatrixAttentionEmitter:
             kv_heads,
             width,
             self.scale,
-            self.partitions,
-            self.span,
-            query_tile,
-            key_tile,
-            threads,
+            self.schedule,
             self.specs[0].dtype.value,
             False,
         )
@@ -422,7 +489,7 @@ class _MatrixAttentionEmitter:
             tokens,
             heads,
             width,
-            self.partitions,
+            self.schedule.partitions,
             self.merge_threads,
             self.specs[0].dtype.value,
         )
@@ -594,8 +661,7 @@ class CausalAttentionRule:
                 BoundOperation(
                     f"causal_attention.matrix-streaming@{root}",
                     frozenset({root}), node.inputs, node.outputs,
-                    _MatrixAttentionEmitter(specs, node.attributes["scale"], schedule.partitions,
-                                            schedule.span, schedule.tile, threads),
+                    _MatrixAttentionEmitter(specs, node.attributes["scale"], schedule, threads),
                     workspace=schedule.workspace, kernel_count=2,
                 ),
             )
@@ -757,17 +823,15 @@ class _AttentionOutputEmitter:
 
 
 class _PrefillAttentionOutputEmitter:
-    def __init__(self, specs, scale, partitions, span, attention_tile, projection_tile):
-        self.specs, self.scale = specs, scale
-        self.partitions, self.span = partitions, span
-        self.attention_tile, self.projection_tile = attention_tile, projection_tile
+    def __init__(self, specs, scale, schedule, projection_tile):
+        self.specs, self.scale, self.schedule = specs, scale, schedule
+        self.projection_tile = projection_tile
 
     def __call__(self, operands: tuple[Any, ...]) -> None:
         query, history, visible, gate, weight, output, activation = operands[:7]
-        partials, statistics = operands[7:] if self.partitions > 1 else (activation, activation)
+        partials, statistics = operands[7:] if self.schedule.partitions > 1 else (activation, activation)
         tokens, heads, width = cast(tuple[int, int, int], self.specs[0].shape)
         kv_heads = cast(int, self.specs[1].shape[2])
-        query_tile, key_tile, attention_threads = self.attention_tile
         _matrix_streaming_attention(
             query,
             history,
@@ -780,15 +844,11 @@ class _PrefillAttentionOutputEmitter:
             kv_heads,
             width,
             self.scale,
-            self.partitions,
-            self.span,
-            query_tile,
-            key_tile,
-            attention_threads,
+            self.schedule,
             self.specs[0].dtype.value,
             True,
         )
-        if self.partitions > 1:
+        if self.schedule.partitions > 1:
             _merge_attention_gate(
                 partials,
                 statistics,
@@ -797,11 +857,11 @@ class _PrefillAttentionOutputEmitter:
                 tokens,
                 heads,
                 width,
-                self.partitions,
+                self.schedule.partitions,
                 max(width, 128),
                 self.specs[0].dtype.value,
             )
-        projection_threads, bm, bn, bk, arithmetic_dtype = self.projection_tile
+        projection_threads, bm, bn, bk, instruction = self.projection_tile
         _packed_matrix(
             activation,
             weight,
@@ -811,7 +871,7 @@ class _PrefillAttentionOutputEmitter:
             tokens,
             cast(int, self.specs[4].shape[0]),
             heads * width,
-            arithmetic_dtype,
+            instruction,
             self.specs[5].dtype.value,
             projection_threads,
             bm,
@@ -860,13 +920,13 @@ class AttentionOutputRule:
             projection_threads = min(
                 projection_threads, bm // projection.m * context.capabilities.subgroup_width
             )
-            projection_shared = affine_shared_bytes(bm, bn, bk, projection.input_dtype)
+            projection_shared = affine_shared_bytes(bm, bn, bk, specs[0].dtype, specs[4])
             if max(schedule.shared_bytes, projection_shared) > context.capabilities.shared_memory_bytes:
                 return ()
             # Bound each history traversal. Whole-buffer workspace reuse keeps
             # partition storage shared across sequential layers, while short
             # histories publish the gated activation without a merge.
-            partitions, span = schedule.partitions, schedule.span
+            partitions = schedule.partitions
             activation = TensorSpec((tokens, heads * width), specs[0].dtype)
             workspace = (activation,)
             if partitions > 1:
@@ -882,10 +942,8 @@ class AttentionOutputRule:
                     _PrefillAttentionOutputEmitter(
                         specs,
                         scale,
-                        partitions,
-                        span,
-                        schedule.tile,
-                        (projection_threads, bm, bn, bk, projection.input_dtype.value),
+                        schedule,
+                        (projection_threads, bm, bn, bk, projection),
                     ),
                     workspace=workspace,
                     kernel_count=2 if partitions == 1 else 3,
