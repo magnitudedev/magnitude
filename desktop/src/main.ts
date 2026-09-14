@@ -119,10 +119,10 @@ const program = Effect.scoped(Effect.gen(function* () {
         Effect.provide((process.platform === "win32" ? windowsPrivateFilePermissions(addonPath) : unixPrivateFilePermissions).pipe(Layer.provideMerge(NodeContext.layer))),
       )
       const preferences = yield* makeUpdatePreferences(dataDir).pipe(Effect.provide(NodeContext.layer))
-      const { trustedPublishers, origin, storageOrigin } = updateConfiguration.value
+      const { trustedPublishers, origin } = updateConfiguration.value
       if (process.platform === "linux") {
         const metadata = yield* readLinuxUpdateMetadata(process.resourcesPath, app.getVersion(), process.getSystemVersion()).pipe(Effect.provide(NodeContext.layer))
-        const linux = yield* makeLinuxUpdateSource({ origin, storageOrigin, metadata, sign: identity.sign, trustedPublishers,
+        const linux = yield* makeLinuxUpdateSource({ origin, metadata, sign: identity.sign, trustedPublishers,
           userAgent: `Magnitude/${app.getVersion()} ${process.arch} Electron/${process.versions.electron} Linux/${process.getSystemVersion()}`,
           cacheDirectory: join(app.getPath("userData"), "updates"), stateDirectory: stateDir,
         }).pipe(Effect.provide(NodeContext.layer))
@@ -135,7 +135,7 @@ const program = Effect.scoped(Effect.gen(function* () {
         if (Option.isNone(publisher)) return unavailableApplicationUpdate("Application update publisher configuration is missing from this Windows build.")
         const metadata = yield* Schema.decodeUnknown(UpdateClientMetadata)({ version: app.getVersion(), os: "windows",
           os_version: process.getSystemVersion(), arch: process.arch, package: "windows-exe" })
-        const windows = yield* makeWindowsUpdateSource({ origin, storageOrigin, metadata, sign: identity.sign, trustedPublishers,
+        const windows = yield* makeWindowsUpdateSource({ origin, metadata, sign: identity.sign, trustedPublishers,
           userAgent: `Magnitude/${app.getVersion()} ${process.arch} Electron/${process.versions.electron} Windows/${process.getSystemVersion()}`,
           cacheDirectory: join(app.getPath("userData"), "updates"), stateDirectory: stateDir,
           applicationPath: process.execPath, cliPath: join(process.resourcesPath, "magnitude.exe"),
@@ -148,7 +148,7 @@ const program = Effect.scoped(Effect.gen(function* () {
       if (!handoff) return unavailableApplicationUpdate("Application update recovery is unavailable in this build.")
       const metadata = yield* Schema.decodeUnknown(UpdateClientMetadata)({ version: app.getVersion(), os: "darwin",
         os_version: process.getSystemVersion(), arch: process.arch, package: "mac-zip" })
-      const source = yield* macUpdateSource({ origin, storageOrigin, metadata,
+      const source = yield* macUpdateSource({ origin, metadata,
         sign: identity.sign, trustedPublishers, userAgent: `Magnitude/${app.getVersion()} ${process.arch} Electron/${process.versions.electron} macOS/${process.getSystemVersion()}`,
         cacheDirectory: join(app.getPath("userData"), "updates"),
       }).pipe(Effect.provideService(NativeMacUpdate, nativeMacUpdate(autoUpdater)), Effect.provideService(ApplicationUpdateHandoff, handoff))

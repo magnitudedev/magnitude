@@ -8,7 +8,8 @@ export const PublisherKeyId = Schema.String.pipe(Schema.pattern(/^[a-zA-Z0-9_-]{
 const Digest = Schema.String.pipe(Schema.pattern(/^[a-f0-9]{64}$/))
 export const ArtifactId = Schema.String.pipe(Schema.pattern(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/), Schema.brand("UpdateArtifactId"))
 export type ArtifactId = typeof ArtifactId.Type
-const ArtifactPath = Schema.String.pipe(Schema.maxLength(512), Schema.pattern(/^releases\/[a-zA-Z0-9][a-zA-Z0-9._-]*\/[a-zA-Z0-9][a-zA-Z0-9._-]*$/))
+const ArtifactFilename = Schema.String.pipe(Schema.maxLength(255), Schema.pattern(/^[a-zA-Z0-9][a-zA-Z0-9._~-]*$/))
+const ReleaseTag = Schema.String.pipe(Schema.maxLength(256), Schema.pattern(/^(?:@magnitudedev\/cli@|desktop-update-acceptance\/[a-f0-9]{40}\/)[a-zA-Z0-9][a-zA-Z0-9._-]*$/))
 export const ArtifactTarget = Schema.Union(
   Schema.Struct({ os: Schema.Literal("darwin"), arch: Schema.Literal("arm64", "x64"), package: Schema.Literal("mac-zip", "dmg") }),
   Schema.Struct({ os: Schema.Literal("windows"), arch: Schema.Literal("x64"), package: Schema.Literal("windows-exe") }),
@@ -17,15 +18,16 @@ export const ArtifactTarget = Schema.Union(
 export const UpdateManifest = Schema.Struct({
   protocol: Schema.Literal(1),
   version: Version,
+  tag: ReleaseTag,
   commit: Schema.String.pipe(Schema.pattern(/^[a-f0-9]{40}$/)),
   artifact: Schema.Struct({
     id: ArtifactId,
     target: ArtifactTarget,
-    path: ArtifactPath,
+    filename: ArtifactFilename,
     bytes: Schema.Number.pipe(Schema.int(), Schema.positive(), Schema.filter(Number.isSafeInteger)),
     sha256: Digest,
   }),
-}).pipe(Schema.filter(manifest => manifest.artifact.path.startsWith(`releases/${manifest.version}/`)))
+}).pipe(Schema.filter(manifest => manifest.tag === `@magnitudedev/cli@${manifest.version}` || manifest.tag === `desktop-update-acceptance/${manifest.commit}/${manifest.version}`))
 export type UpdateManifest = typeof UpdateManifest.Type
 export const SignedUpdateManifest = Schema.Struct({
   keyId: PublisherKeyId,

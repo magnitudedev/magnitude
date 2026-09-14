@@ -50,8 +50,8 @@ are not installation observations. Ordinary website pages do not share this endp
 ## Release authenticity
 
 The envelope signs a versioned, domain-separated payload with a trusted publisher Ed25519 key.
-The payload binds release version, source commit, target OS/architecture/package, immutable artifact
-path, byte count and SHA-256. Paths cannot escape the release object prefix. The client admits only
+The payload binds release version, source commit, target OS/architecture/package, GitHub release
+tag, artifact filename, byte count and SHA-256. Filenames cannot escape their release. The client admits only
 newer versions compatible with its target and existing stable/beta/alpha channel policy. Candidate
 selection chooses the newest compatible version independently of storage enumeration order.
 
@@ -70,14 +70,21 @@ owner's lifetime pipe to close, then runs the per-user installer and records its
 before relaunching. It owns no service and requests no elevation. The reopened desktop retires only
 that completed staging directory after the helper exits; installation identity remains in the profile.
 
-Artifact paths belong to their signed version directory. Immutable storage publication verifies
-the local file, refuses overwrites, and verifies the complete remotely downloaded byte count and
-digest before an artifact is eligible for promotion. An existing object requires the same remote
-verification; existence alone is not an accepted publication.
-Production publication consumes the complete desktop graph from the exact accepted public native
-release and verifies its source commit. Missing, duplicate, unexpected or mismatched desktop targets
-fail before any upload. Production signing credentials must match the application-embedded public
-key. Interrupted publication resumes from those same bytes without rebuilding or overwriting them.
+GitHub Releases is the sole binary store. Production metadata registration consumes the complete
+desktop graph from the exact accepted public native release, verifies the resolved source commit
+and GitHub asset sizes and digests against the accepted graph, signs metadata and atomically
+promotes channels. Missing, duplicate, unexpected or mismatched targets fail before promotion.
+The existing native GitHub publisher owns binary upload and verification. Metadata registration
+never uploads copies or repeats full binary verification downloads. Credentials must match the
+application-embedded public key. Retries register the same metadata without rebuilding or
+overwriting public artifacts.
+
+Magnitude download endpoints return private, uncacheable redirects to the exact signed GitHub
+release asset. They never stream installer bytes. The repository is fixed by trusted composition;
+requests cannot supply arbitrary URLs. The client validates the exact first redirect, then uses
+a fresh unauthenticated transfer to follow GitHub's delivery redirects. Installation credentials
+never go to GitHub. Expiring delivery URLs are not persisted; retries use the canonical asset URL.
+Acceptance artifacts use separate signed test tags and trust, never production channels or latest.
 
 The desktop owner creates its installation key only after native ownership is acquired. The key
 survives application replacement, remains outside the bundle, and is private to the user. Corrupt
@@ -99,7 +106,7 @@ may lose an observation but must not suppress an otherwise valid update response
 Authenticated download requests use the same signature and replay admission, including the release
 and artifact selectors. Static HTTP endpoints preserve the exact signed path and query; routing
 parameters must never be appended to or overwrite signed fields. They resolve only a matching signed artifact and record download intent before returning
-an uncached redirect. Authorization is not forwarded to object storage. CDN range requests do not
+an uncached redirect. Authorization is not forwarded to GitHub. CDN range requests do not
 create additional download records. Request counts do not claim completed transfers or installs.
 
 First installation uses a public installer endpoint with an explicit OS, architecture and package.

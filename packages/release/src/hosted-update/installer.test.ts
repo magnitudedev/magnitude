@@ -6,9 +6,9 @@ import { PublisherKeyId, signUpdateManifest, UpdateManifest, type SignedUpdateMa
 import { DistributionStore, DistributionStoreUnavailable, type InstallerDownloadObservation } from "./service"
 
 const publisher = generateKeyPairSync("ed25519"), keyId = PublisherKeyId.make("test")
-const options = { origin: "https://magnitude.dev", storageOrigin: "https://downloads.magnitude.dev", country: Option.some("US"), trustedPublishers: new Map([[keyId, publisher.publicKey]]) }
+const options = { origin: "https://magnitude.dev", country: Option.some("US"), trustedPublishers: new Map([[keyId, publisher.publicKey]]) }
 const signed = (version = "2.0.0", pkg = "dmg") => Effect.runPromise(signUpdateManifest(Schema.decodeUnknownSync(UpdateManifest)({
-  protocol: 1, version, commit: "a".repeat(40), artifact: { id: "mac", target: { os: "darwin", arch: "arm64", package: pkg }, path: `releases/${version}/mac.${pkg}`, bytes: 100, sha256: "a".repeat(64) },
+  protocol: 1, tag: `@magnitudedev/cli@${version}`, version, commit: "a".repeat(40), artifact: { id: "mac", target: { os: "darwin", arch: "arm64", package: pkg }, filename: `mac.${pkg}`, bytes: 100, sha256: "a".repeat(64) },
 }), keyId, publisher.privateKey))
 const harness = (candidates: readonly SignedUpdateManifest[], overrides: Partial<DistributionStore> = {}) => {
   const records: (typeof InstallerDownloadObservation.Type)[] = []
@@ -26,7 +26,7 @@ describe("public installers", () => {
     const h = harness([await signed("1.0.0"), await signed("3.0.0-beta.1"), await signed(), await signed("4.0.0", "mac-zip")])
     const response = await h.run()
     expect(response.status).toBe(302)
-    expect(response.headers.get("location")).toBe("https://downloads.magnitude.dev/releases/2.0.0/mac.dmg")
+    expect(response.headers.get("location")).toBe("https://github.com/magnitudedev/magnitude/releases/download/%40magnitudedev/cli%402.0.0/mac.dmg")
     expect(response.headers.get("cache-control")).toBe("private, no-store")
     expect(h.records).toHaveLength(1)
     expect(Object.keys(h.records[0]!)).toEqual(["target", "release", "artifact", "country"])

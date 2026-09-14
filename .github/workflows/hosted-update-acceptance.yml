@@ -32,6 +32,8 @@ concurrency:
 
 jobs:
   windows-packages:
+    permissions:
+      contents: write
     # Reuse immutable cohorts while iterating consumer checks.
     if: inputs.build_artifacts
     runs-on: windows-latest
@@ -51,7 +53,7 @@ jobs:
         env:
           MAGNITUDE_ACCEPTANCE_COMMIT: ${{ github.sha }}
           DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY: ${{ secrets.DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY }}
-          DISTRIBUTION_BLOB_READ_WRITE_TOKEN: ${{ secrets.DISTRIBUTION_BLOB_READ_WRITE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -66,8 +68,8 @@ jobs:
         shell: pwsh
         run: ./packages/release/scripts/acceptance/test-windows-hosted-update.ps1
         env:
-          MAGNITUDE_WINDOWS_ACCEPTANCE_FROM: '0.0.36'
-          MAGNITUDE_WINDOWS_ACCEPTANCE_TO: '0.0.37'
+          MAGNITUDE_WINDOWS_ACCEPTANCE_FROM: '0.0.38'
+          MAGNITUDE_WINDOWS_ACCEPTANCE_TO: '0.0.39'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -77,6 +79,8 @@ jobs:
           retention-days: 14
 
   signed-mac-apps:
+    permissions:
+      contents: write
     if: inputs.build_artifacts
     environment: apple-release
     runs-on: macos-15
@@ -84,7 +88,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["0.0.36", "0.0.37"]
+        version: ["0.0.38", "0.0.39"]
     env:
       MAGNITUDE_APPLE_DISTRIBUTION: developer-id
       MAGNITUDE_ACCEPTANCE_VERSION: ${{ matrix.version }}
@@ -111,13 +115,13 @@ jobs:
         run: bun packages/release/scripts/acceptance/build-desktop.ts
         env:
           MAGNITUDE_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/magnitude-update-acceptance
-      - name: Verify real storage transfers and prepare acceptance manifests
+      - name: Publish GitHub acceptance artifacts and register metadata
         run: bun packages/release/scripts/acceptance/prepare-artifacts.ts
         env:
           MAGNITUDE_ACCEPTANCE_ARTIFACTS: ${{ runner.temp }}/magnitude-update-acceptance/artifacts
           MAGNITUDE_ACCEPTANCE_COMMIT: ${{ github.sha }}
           DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY: ${{ secrets.DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY }}
-          DISTRIBUTION_BLOB_READ_WRITE_TOKEN: ${{ secrets.DISTRIBUTION_BLOB_READ_WRITE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
       - name: Retain signed installers and notarization evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -141,12 +145,14 @@ jobs:
         run: bash packages/release/scripts/apple/cleanup-credentials.sh
 
   linux-packages:
+    permissions:
+      contents: write
     if: inputs.build_artifacts
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04-arm]
-        version: ["0.0.36", "0.0.37"]
+        version: ["0.0.38", "0.0.39"]
     runs-on: ${{ matrix.os }}
     container: ubuntu:22.04
     timeout-minutes: 30
@@ -181,14 +187,14 @@ jobs:
           touch /var/lib/magnitude-desktop/installing
           node "$fixture" "$addon" invalid 9</var/lib/magnitude-desktop/installation.lock
           rm /var/lib/magnitude-desktop/installing
-      - name: Verify real storage transfers and prepare acceptance manifests
+      - name: Publish GitHub acceptance artifacts and register metadata
         run: bun packages/release/scripts/acceptance/prepare-artifacts.ts
         env:
           MAGNITUDE_ACCEPTANCE_VERSION: ${{ matrix.version }}
           MAGNITUDE_ACCEPTANCE_ARTIFACTS: ${{ runner.temp }}/magnitude-update-acceptance/artifacts
           MAGNITUDE_ACCEPTANCE_COMMIT: ${{ github.sha }}
           DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY: ${{ secrets.DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY }}
-          DISTRIBUTION_BLOB_READ_WRITE_TOKEN: ${{ secrets.DISTRIBUTION_BLOB_READ_WRITE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
       - uses: actions/upload-artifact@v4
         if: success() || failure()
         with:

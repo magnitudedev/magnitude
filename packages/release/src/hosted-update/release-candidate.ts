@@ -33,8 +33,8 @@ export const hostedDesktopManifests = (
     const suffix = entry.target.package === "mac-zip" ? ".zip" : `.${entry.target.package}`
     if (!artifact.filename.endsWith(suffix)) return yield* new HostedCandidateInvalid({ message: "Desktop artifact filename differs from its package format" })
     manifests.push(yield* Schema.decodeUnknown(UpdateManifest)({
-      protocol: 1, version: release.version, commit: release.sourceCommit,
-      artifact: { id: artifact.id, target: entry.target, path: `releases/${release.version}/${artifact.filename}`, bytes: artifact.bytes, sha256: artifact.sha256 },
+      protocol: 1, version: release.version, tag: `@magnitudedev/cli@${release.version}`, commit: release.sourceCommit,
+      artifact: { id: artifact.id, target: entry.target, filename: artifact.filename, bytes: artifact.bytes, sha256: artifact.sha256 },
     }).pipe(Effect.mapError(() => new HostedCandidateInvalid({ message: "Desktop artifact cannot be represented by the hosted release contract" }))))
   }
   return manifests

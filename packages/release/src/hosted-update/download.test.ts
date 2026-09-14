@@ -7,8 +7,8 @@ import { PublisherKeyId, signUpdateManifest, UpdateManifest } from "./manifest"
 import { newUpdateNonce, signUpdateRequest, updateQuery } from "./request-auth"
 
 const keys = generateKeyPairSync("ed25519"), publisher = generateKeyPairSync("ed25519"), keyId = PublisherKeyId.make("test")
-const options = { origin: "https://magnitude.dev", storageOrigin: "https://downloads.magnitude.dev", country: Option.some("US"), trustedPublishers: new Map([[keyId, publisher.publicKey]]) }
-const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, version: "2.0.0", commit: "a".repeat(40), artifact: { id: "mac", target: { os: "darwin", arch: "arm64", package: "mac-zip" }, path: "releases/2.0.0/mac.zip", bytes: 42, sha256: "a".repeat(64) } })
+const options = { origin: "https://magnitude.dev", country: Option.some("US"), trustedPublishers: new Map([[keyId, publisher.publicKey]]) }
+const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, tag: "@magnitudedev/cli@2.0.0", version: "2.0.0", commit: "a".repeat(40), artifact: { id: "mac", target: { os: "darwin", arch: "arm64", package: "mac-zip" }, filename: "mac.zip", bytes: 42, sha256: "a".repeat(64) } })
 const request = async (fields: Record<string, string> = {}) => {
   const url = new URL(options.origin + "/api/download?" + updateQuery({ artifact: "mac", protocol: "1", product: "desktop", version: "1.0.0", os: "darwin", os_version: "26.0", arch: "arm64", package: "mac-zip", channel: "stable", ts: String(Math.floor(Date.now() / 1000)), nonce: await Effect.runPromise(newUpdateNonce), release: "2.0.0", ...fields }))
   return new Request(url, { headers: { authorization: await Effect.runPromise(signUpdateRequest(keys.privateKey, url)) } })
@@ -29,7 +29,7 @@ describe("authenticated artifact downloads", () => {
   it("records one intent and redirects to the signed immutable object without credentials", async () => {
     const h = await harness(), req = await request(), result = await h.run(req)
     expect(result.status).toBe(302)
-    expect(result.headers.get("location")).toBe("https://downloads.magnitude.dev/releases/2.0.0/mac.zip")
+    expect(result.headers.get("location")).toBe("https://github.com/magnitudedev/magnitude/releases/download/%40magnitudedev/cli%402.0.0/mac.zip")
     expect(result.headers.get("authorization")).toBeNull()
     expect(result.headers.get("cache-control")).toBe("private, no-store")
     expect((await h.run(req)).status).toBe(409)

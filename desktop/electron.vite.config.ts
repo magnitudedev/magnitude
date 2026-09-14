@@ -9,7 +9,6 @@ const updateConfiguration = acceptanceConfig ? {
   ...JSON.parse(readFileSync(acceptanceConfig, "utf8")), acceptance: true,
 } : {
   origin: "https://magnitude.dev",
-  storageOrigin: "https://5r3lqtpag4uzvtxd.public.blob.vercel-storage.com",
   keyId: "magnitude-2026-01",
   publicKey: readFileSync(resolve(__dirname, "../packages/release/resources/distribution/magnitude-2026-01.pub.pem"), "utf8"),
   acceptance: false,

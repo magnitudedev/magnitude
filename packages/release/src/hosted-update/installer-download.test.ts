@@ -28,8 +28,8 @@ it.each([false, true])("recovers interrupted ranges and incorrect response total
     })
   } })
   try {
-    const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, version: "2.0.0", commit: "a".repeat(40), artifact: {
-      id: "windows", target: { os: "windows", arch: "x64", package: "windows-exe" }, path: "releases/2.0.0/app.exe",
+    const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, tag: "@magnitudedev/cli@2.0.0", version: "2.0.0", commit: "a".repeat(40), artifact: {
+      id: "windows", target: { os: "windows", arch: "x64", package: "windows-exe" }, filename: "app.exe",
       bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
     } })
     const destination = join(directory, "app.exe")

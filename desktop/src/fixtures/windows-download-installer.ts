@@ -4,7 +4,7 @@ import { Config, Effect, Option, Schema } from "effect"
 import { createPublicKey } from "node:crypto"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { downloadUpdateArtifact, SignedUpdateManifest, verifyUpdateManifest } from "@magnitudedev/release/hosted-update"
+import { githubArtifactUrl, downloadUpdateArtifact, SignedUpdateManifest, verifyUpdateManifest } from "@magnitudedev/release/hosted-update"
 
 NodeRuntime.runMain(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
@@ -21,7 +21,7 @@ NodeRuntime.runMain(Effect.gen(function* () {
       expectedBytes: manifest.artifact.bytes, status: response.status,
     }) : Effect.void)))
   const result = yield* downloadUpdateArtifact({ manifest,
-    url: new URL(manifest.artifact.path, "https://5r3lqtpag4uzvtxd.public.blob.vercel-storage.com/").href,
+    url: githubArtifactUrl(manifest),
     destination: join(root, "consumer/downloaded-installer.exe"), onProgress: Option.none(),
   }).pipe(Effect.provideService(HttpClient.HttpClient, client))
   yield* Effect.logInfo("Verified hosted installer transfer", { version, bytes: result.bytes, strategy: result.strategy })

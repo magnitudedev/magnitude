@@ -1,3 +1,4 @@
+import { githubArtifactUrl } from "./github-artifact"
 import { Clock, Effect, Option, Schema } from "effect"
 import type { KeyObject } from "node:crypto"
 import { decodeUpdateRequest } from "./request"
@@ -11,7 +12,6 @@ const response = (status: number) => new Response(null, { status, headers: { "Ca
 /** A redirect records intent once; range requests go directly to object storage without installation credentials. */
 export const handleArtifactDownload = (request: Request, options: {
   readonly origin: string
-  readonly storageOrigin: string
   readonly country: Option.Option<string>
   readonly trustedPublishers: ReadonlyMap<string, KeyObject>
 }) => Effect.gen(function* () {
@@ -40,9 +40,8 @@ export const handleArtifactDownload = (request: Request, options: {
   yield* store.recordDownload({ installation, request: fields, country: Option.filter(options.country, Schema.is(Country)), release, artifact }).pipe(
     Effect.catchTag("DistributionStoreUnavailable", () => Effect.logWarning("Download telemetry write unavailable")),
   )
-  const location = new URL(manifest.artifact.path, options.storageOrigin + "/")
-  if (location.protocol !== "https:" || location.origin !== options.storageOrigin) return response(503)
-  return new Response(null, { status: 302, headers: { "Cache-Control": "private, no-store", Location: location.href } })
+  const location = githubArtifactUrl(manifest)
+  return new Response(null, { status: 302, headers: { "Cache-Control": "private, no-store", Location: location } })
 }).pipe(Effect.catchTags({
   InvalidUpdateRequest: () => Effect.succeed(response(400)),
   ExpiredUpdateRequest: () => Effect.succeed(response(401)),

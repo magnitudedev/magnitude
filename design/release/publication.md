@@ -114,9 +114,10 @@ whether a release is needed; tarball integrity proves which bytes were accepted 
 5. Recheck the public baseline and source at the commit point.
 6. Publish or verify selected plugins first, consuming the accepted tarballs without repacking.
 7. Publish the accepted native graph and manifest as the exact GitHub release.
-8. Project the complete configured desktop graph into Magnitude-hosted signed manifests. Download
-   and verify the exact public native bytes, upload immutable objects, verify their full remote
-   transfers, then atomically promote their hosted channels. Desktop discovery never consults npm.
+8. Project the complete configured desktop graph into Magnitude-hosted signed manifests. Read
+   and verify the exact public release metadata against accepted artifact digests, sign it, then
+   atomically promote its channels. GitHub remains the sole binary store; metadata registration
+   neither copies nor re-downloads binaries. Desktop discovery never consults npm.
 9. The accepted CLI npm tarball acquires and executes that public release, then is published
    directly. Registry integrity must equal the accepted tarball integrity.
 

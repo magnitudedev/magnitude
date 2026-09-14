@@ -5,10 +5,10 @@ import { createPublicKey } from "node:crypto"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { Pool } from "pg"
-import { acquireRelease, releaseUrl } from "../src/acquisition"
+import { acquireRelease } from "../src/acquisition"
 import { decodePublisherPrivateKey, decodePublisherPublicKey, PublisherKeyId } from "../src/hosted-update/manifest"
 import { hostedDesktopManifests, HostedCandidateInvalid } from "../src/hosted-update/release-candidate"
-import { downloadUpdateArtifact } from "../src/hosted-update/installer-download"
+import { verifyGithubRelease } from "../src/hosted-update/github-release"
 import { postgresReleasePublicationStore } from "../src/hosted-update/postgres-publication"
 import { publishHostedRelease, ReleasePublicationFailed, ReleasePublicationStore } from "../src/hosted-update/publication"
 
@@ -25,12 +25,7 @@ const run = Effect.scoped(Effect.gen(function* () {
   const privateKey = yield* decodePublisherPrivateKey(Redacted.value(yield* Config.redacted("DISTRIBUTION_PUBLISHER_PRIVATE_KEY")))
   const publicKey = yield* decodePublisherPublicKey(yield* fs.readFileString(fileURLToPath(new URL("../resources/distribution/magnitude-2026-01.pub.pem", import.meta.url))))
   if (!createPublicKey(privateKey).equals(publicKey)) return yield* new HostedCandidateInvalid({ message: "Publisher credential differs from application-embedded trust" })
-  const artifacts = yield* Effect.forEach(manifests, manifest => Effect.gen(function* () {
-    const filename = manifest.artifact.path.split("/").at(-1)!
-    const file = join(directory, filename)
-    yield* downloadUpdateArtifact({ manifest, destination: file, url: releaseUrl(baseUrl, version, filename), onProgress: Option.none() })
-    return { file, manifest }
-  }), { concurrency: 2 })
+  yield* verifyGithubRelease(manifests, Option.map(yield* Config.option(Config.redacted("GH_TOKEN")), Redacted.value))
   const databaseUrl = Redacted.value(yield* Config.redacted("DISTRIBUTION_PUBLISHER_DATABASE_URL"))
   const ca = yield* Config.string("DISTRIBUTION_DATABASE_CA")
   const runtime = yield* Effect.runtime<never>()
@@ -42,9 +37,7 @@ const run = Effect.scoped(Effect.gen(function* () {
     pool.on("error", () => { Runtime.runSync(runtime)(Effect.logWarning("Publisher database connection closed")) })
     return pool
   }, catch: () => new ReleasePublicationFailed({ stage: "database" }) }), pool => Effect.promise(() => pool.end()))
-  const envelopes = yield* publishHostedRelease({ artifacts, keyId: PublisherKeyId.make("magnitude-2026-01"), privateKey,
-    storageOrigin: "https://5r3lqtpag4uzvtxd.public.blob.vercel-storage.com",
-    token: Redacted.value(yield* Config.redacted("DISTRIBUTION_BLOB_READ_WRITE_TOKEN")),
+  const envelopes = yield* publishHostedRelease({ artifacts: manifests, keyId: PublisherKeyId.make("magnitude-2026-01"), privateKey,
   }).pipe(Effect.provideService(ReleasePublicationStore, postgresReleasePublicationStore(pool, "magnitude_distribution", new Map([["magnitude-2026-01", publicKey]]))))
   yield* Effect.logInfo("Accepted desktop release published to Magnitude", { version, artifacts: envelopes.length })
 }))

@@ -27,10 +27,10 @@ const run = Effect.gen(function* () {
   const output = resolve(yield* Config.string("MAGNITUDE_ACCEPTANCE_OUTPUT"))
   yield* fs.makeDirectory(output, { recursive: true })
   const configPath = join(output, "update-acceptance.json")
-  yield* fs.writeFileString(configPath, yield* Schema.encode(Schema.parseJson(Schema.Struct({ origin: Schema.String, storageOrigin: Schema.String, keyId: Schema.String, publicKey: Schema.String,
+  yield* fs.writeFileString(configPath, yield* Schema.encode(Schema.parseJson(Schema.Struct({ origin: Schema.String, keyId: Schema.String, publicKey: Schema.String,
     windowsPublisher: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
   })) )({
-    origin: "https://magnitude-update-acceptance.vercel.app", storageOrigin: "https://5r3lqtpag4uzvtxd.public.blob.vercel-storage.com",
+    origin: "https://magnitude-update-acceptance.vercel.app",
     keyId: "acceptance", publicKey: yield* fs.readFileString(join(root, "packages/release/resources/distribution/acceptance.pub.pem")),
     windowsPublisher: target.platform === "win32" ? Option.some("Magnitude Update Acceptance") : Option.none(),
   }))

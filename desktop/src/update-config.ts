@@ -7,7 +7,6 @@ export const isUpdateAcceptanceBuild = __MAGNITUDE_UPDATE_ACCEPTANCE__
 
 const Configuration = Schema.Struct({
   origin: Schema.String,
-  storageOrigin: Schema.String,
   keyId: Schema.String,
   publicKey: Schema.String,
   acceptance: Schema.Boolean,
