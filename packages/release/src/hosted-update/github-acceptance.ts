@@ -30,7 +30,7 @@ export const publishGithubAcceptance = (artifacts: readonly { file: string; mani
     // Another platform may create the same test cohort concurrently. Inspect authoritative state
     // after either outcome; never overwrite assets when retrying an interrupted preparation.
     yield* run("release", "create", first.tag, "--repo", "magnitudedev/magnitude", "--target", first.commit,
-      "--prerelease", "--latest=false", "--title", `Desktop update acceptance ${first.version}`, "--notes", "Isolated updater acceptance artifacts; not a production release")
+      "--prerelease", "--title", `Desktop update acceptance ${first.version}`, "--notes", "Isolated updater acceptance artifacts; not a production release")
   } else if (before.status !== 200) return yield* new HostedCandidateInvalid({ message: "Could not inspect acceptance release" })
   const response = yield* inspect
   if (response.status !== 200) return yield* new HostedCandidateInvalid({ message: "Acceptance release was not created" })
