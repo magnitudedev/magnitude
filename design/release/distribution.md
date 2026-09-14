@@ -102,11 +102,11 @@ A conforming release satisfies all of the following:
   and the capability dependencies of the selected backend.
 - A backend pack composes with exactly its required base and cannot alter the base platform floor.
 - Final artifacts pass build-host-independent validation before publication.
-- GitHub assets are public before npm is published because the npm launcher acquires those assets.
+- GitHub assets are public before npm is published so the desktop required by the npm launcher is available.
 
 The concrete host dependency contracts are defined in
 [Platform contracts](./platform-contracts.md). Build acceptance is defined in
 [Build and validation](./build-and-validation.md). Runtime installation is defined in
-[Acquisition](./acquisition.md), native CLI package-manager updates are defined in
+[Acquisition](./acquisition.md), desktop-owned CLI updates are defined in
 [CLI updates](./client-updates.md), and remote publication is defined in
 [Publication](./publication.md).

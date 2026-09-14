@@ -118,7 +118,8 @@ whether a release is needed; tarball integrity proves which bytes were accepted 
    and verify the exact public release metadata against accepted artifact digests, sign it, then
    atomically promote its channels. GitHub remains the sole binary store; metadata registration
    neither copies nor re-downloads binaries. Desktop discovery never consults npm.
-9. The accepted CLI npm tarball acquires and executes that public release, then is published
+9. Candidate acceptance runs the npm launcher against the installed candidate desktop. The accepted
+   CLI npm tarball also proves missing-desktop guidance under Node and Bun, then is published
    directly. Registry integrity must equal the accepted tarball integrity.
 
 The public manifest records RPC and plugin artifact metadata beside the native graph. Ordinary
@@ -139,6 +140,6 @@ publication succeeds only if the registry exposes the exact expected integrity. 
 before publication require refreshing preparation, never renumbering already-built candidates.
 
 GitHub-public/CLI-npm-absent recovery checks out the public tag, verifies the existing release,
-completes or verifies hosted desktop publication, repeats acquisition acceptance, and publishes the accepted CLI tarball without rebuilding native
+completes or verifies hosted desktop publication, repeats npm installation-guidance acceptance, and publishes the accepted CLI tarball without rebuilding native
 assets. A plugin published before an interrupted main release is either reused byte-for-byte or
 superseded with a fresh plugin version during preparation.

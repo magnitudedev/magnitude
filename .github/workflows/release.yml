@@ -219,7 +219,7 @@ jobs:
           DISTRIBUTION_PUBLISHER_DATABASE_URL: ${{ secrets.DISTRIBUTION_PUBLISHER_DATABASE_URL }}
           DISTRIBUTION_DATABASE_CA: ${{ secrets.DISTRIBUTION_DATABASE_CA }}
           GH_TOKEN: ${{ github.token }}
-      - name: Verify public CLI acquisition
+      - name: Verify npm desktop installation guidance
         run: bun run packages/release/scripts/accept-public-cli.ts "${{ steps.npm-candidate.outputs.tarball }}"
         env:
           MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
@@ -244,7 +244,13 @@ jobs:
       - shell: bash
         run: |
           npm install --global "@magnitudedev/cli@${{ needs.preflight.outputs.version }}"
-          magnitude --version
+          export MAGNITUDE_DESKTOP_PATH="$RUNNER_TEMP/missing-desktop"
+          set +e
+          output=$(magnitude --version 2>&1)
+          status=$?
+          set -e
+          test "$status" = 1
+          [[ "$output" == *"https://magnitude.dev"* ]]
 
   # The CLI is already public: this Version PR changed only plugins, or is a retry after
   # a complete CLI release. Plugins publish on their own; unchanged ones verify as no-ops.
