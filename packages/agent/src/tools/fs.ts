@@ -377,7 +377,11 @@ export const grepTool = defineHarnessTool({
     })
 
     return yield* fs.search(searchParams).pipe(
-      Effect.mapError(() => fsError(`Search failed for ${pattern}`))
+      Effect.mapError((error) => fsError(
+        error.cause instanceof Error
+          ? `Search failed for ${pattern}: ${error.cause.message}`
+          : `Search failed for ${pattern}`
+      ))
     )
   }),
 })

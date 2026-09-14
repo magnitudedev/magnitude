@@ -24,6 +24,9 @@ export type FsSearchMatch = {
   readonly match: string
 }
 
+/** ripgrep's exit status for an error, as opposed to 1 for "no matches". */
+const RG_EXIT_ERROR = 2
+
 async function rgSearch(
   pattern: string,
   searchPath: string,
@@ -49,6 +52,8 @@ async function rgSearch(
     stdout: 'pipe',
     stderr: 'pipe',
   })
+  // Drain stderr concurrently so a chatty rg can never block on a full pipe.
+  const stderrText = new Response(proc.stderr).text()
 
   const matches: FsSearchMatch[] = []
   const decoder = new TextDecoder()
@@ -109,10 +114,17 @@ async function rgSearch(
       if (buffer) processLine(buffer)
     }
 
-    await proc.exited
+    const exitCode = await proc.exited
 
     if (timedOut) {
       throw new Error('Search timed out after 5s — try a more specific pattern or glob filter')
+    }
+
+    // rg exits 2 on an error (invalid regex, unreadable path). With no matches
+    // collected that is a failed search, not an empty one.
+    if (exitCode === RG_EXIT_ERROR && matches.length === 0) {
+      const stderr = (await stderrText).trim()
+      throw new Error(stderr.length > 0 ? stderr : `ripgrep exited with code ${exitCode}`)
     }
 
     return matches
