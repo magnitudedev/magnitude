@@ -67,8 +67,14 @@ def _chunk_delta_systems(
                 k[i, d] = T.if_then_else(
                     first + i < end, T.cast(key[first + i, kh, d], "float32"), 0
                 )
-            T.gemm(k, k, kk, transpose_B=True, clear_accum=True, policy=T.GemmWarpPolicy.Square)
-            T.gemm(q, k, qk, transpose_B=True, clear_accum=True, policy=T.GemmWarpPolicy.Square)
+            # Expand bounded matrix coordinates, leaving algorithm loops serial.
+            with T.attr(0, "pragma_auto_unroll_max_step", 4096):
+                with T.attr(0, "pragma_unroll_explicit", 1):
+                    T.gemm(k, k, kk, transpose_B=True, clear_accum=True, policy=T.GemmWarpPolicy.Square)
+            # Expand bounded matrix coordinates, leaving algorithm loops serial.
+            with T.attr(0, "pragma_auto_unroll_max_step", 4096):
+                with T.attr(0, "pragma_unroll_explicit", 1):
+                    T.gemm(q, k, qk, transpose_B=True, clear_accum=True, policy=T.GemmWarpPolicy.Square)
             for i, j in T.Parallel(chunk, chunk):
                 product[0] = 1.0
                 for step in T.serial(j + 1, T.max(j + 1, i + 1)):
@@ -115,7 +121,10 @@ def _chunk_delta_systems(
                         beta[first + i, head] * prefix[i] * k[i, tile * chunk + j],
                         0,
                     )
-                T.gemm(inverse, lower, prepared, clear_accum=True, policy=T.GemmWarpPolicy.Square)
+                # Expand bounded matrix coordinates, leaving algorithm loops serial.
+                with T.attr(0, "pragma_auto_unroll_max_step", 4096):
+                    with T.attr(0, "pragma_unroll_explicit", 1):
+                        T.gemm(inverse, lower, prepared, clear_accum=True, policy=T.GemmWarpPolicy.Square)
                 for i, j in T.Parallel(chunk, chunk):
                     if tile * chunk + j < width:
                         weights[sequence, block, head, i, tile * chunk + j] = prepared[i, j]
@@ -126,7 +135,10 @@ def _chunk_delta_systems(
                         beta[first + i, head] * T.cast(value[first + i, head, tile * chunk + j], "float32"),
                         0,
                     )
-                T.gemm(inverse, lower, prepared, clear_accum=True, policy=T.GemmWarpPolicy.Square)
+                # Expand bounded matrix coordinates, leaving algorithm loops serial.
+                with T.attr(0, "pragma_auto_unroll_max_step", 4096):
+                    with T.attr(0, "pragma_unroll_explicit", 1):
+                        T.gemm(inverse, lower, prepared, clear_accum=True, policy=T.GemmWarpPolicy.Square)
                 for i, j in T.Parallel(chunk, chunk):
                     if tile * chunk + j < value_width:
                         residuals[sequence, block, head, i, tile * chunk + j] = prepared[i, j]
@@ -181,14 +193,17 @@ def _chunk_delta_scan(
                     boundaries[sequence, block, head, tile * columns + v, d] = state[v, d]
             for i, d in T.Parallel(chunk, width):
                 operand[i, d] = weights[sequence, block, head, i, d]
-            T.gemm(
-                operand,
-                state,
-                contraction,
-                transpose_B=True,
-                clear_accum=True,
-                policy=T.GemmWarpPolicy.Square,
-            )
+            # Expand bounded matrix coordinates, leaving algorithm loops serial.
+            with T.attr(0, "pragma_auto_unroll_max_step", 4096):
+                with T.attr(0, "pragma_unroll_explicit", 1):
+                    T.gemm(
+                        operand,
+                        state,
+                        contraction,
+                        transpose_B=True,
+                        clear_accum=True,
+                        policy=T.GemmWarpPolicy.Square,
+                    )
             for i, v in T.Parallel(chunk, columns):
                 rhs[i, v] = T.if_then_else(
                     block * chunk + i < count and tile * columns + v < value_width,
@@ -206,7 +221,10 @@ def _chunk_delta_scan(
                 )
             for v, d in T.Parallel(columns, width):
                 state[v, d] *= factors[sequence, block, head, 0, chunk - 1]
-            T.gemm(rhs, operand, state, transpose_A=True, policy=T.GemmWarpPolicy.Square)
+            # Expand bounded matrix coordinates, leaving algorithm loops serial.
+            with T.attr(0, "pragma_auto_unroll_max_step", 4096):
+                with T.attr(0, "pragma_unroll_explicit", 1):
+                    T.gemm(rhs, operand, state, transpose_A=True, policy=T.GemmWarpPolicy.Square)
         for v, d in T.Parallel(columns, width):
             if tile * columns + v < value_width:
                 following[sequence, head, tile * columns + v, d] = state[v, d]
@@ -239,15 +257,21 @@ def _chunk_delta_output(
             for v, d in T.Parallel(columns, width):
                 state[v, d] = T.if_then_else(tile * columns + v < value_width,
                     boundaries[sequence, block, head, tile * columns + v, d], 0)
-            T.gemm(q, state, result, transpose_B=True, clear_accum=True,
-                   policy=T.GemmWarpPolicy.Square)
+            # Expand bounded matrix coordinates, leaving algorithm loops serial.
+            with T.attr(0, "pragma_auto_unroll_max_step", 4096):
+                with T.attr(0, "pragma_unroll_explicit", 1):
+                    T.gemm(q, state, result, transpose_B=True, clear_accum=True,
+                           policy=T.GemmWarpPolicy.Square)
             for i, v in T.Parallel(chunk, columns):
                 result[i, v] *= factors[sequence, block, head, 0, i]
                 rhs[i, v] = T.if_then_else(tile * columns + v < value_width,
                     residuals[sequence, block, head, i, tile * columns + v], 0)
             for i, j in T.Parallel(chunk, chunk):
                 causal[i, j] = systems[sequence, block, head, i, j]
-            T.gemm(causal, rhs, result, policy=T.GemmWarpPolicy.Square)
+            # Expand bounded matrix coordinates, leaving algorithm loops serial.
+            with T.attr(0, "pragma_auto_unroll_max_step", 4096):
+                with T.attr(0, "pragma_unroll_explicit", 1):
+                    T.gemm(causal, rhs, result, policy=T.GemmWarpPolicy.Square)
             for i, v in T.Parallel(chunk, columns):
                 if first + i < end and tile * columns + v < value_width:
                     output[first + i, head, tile * columns + v] = T.cast(result[i, v], dtype)

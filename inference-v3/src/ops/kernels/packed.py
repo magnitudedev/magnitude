@@ -149,7 +149,10 @@ def affine_gemm(storage, bm, bn, bk, valid_m):
             column = instruction * instruction_k + k
             b[j, k] = (T.cast(codes[j, column], "float32") * coefficients[j, column // group, 0]
                        + coefficients[j, column // group, 1])
-        T.gemm(a, b, accum, transpose_B=True, valid_m=valid_m, policy=T.GemmWarpPolicy.Square)
+        # Expand bounded matrix coordinates, leaving algorithm loops serial.
+        with T.attr(0, "pragma_auto_unroll_max_step", 4096):
+            with T.attr(0, "pragma_unroll_explicit", 1):
+                T.gemm(a, b, accum, transpose_B=True, valid_m=valid_m, policy=T.GemmWarpPolicy.Square)
     T.sync_threads()
 
 
