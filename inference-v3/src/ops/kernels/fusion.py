@@ -131,5 +131,5 @@ def pointwise(context):
            for value in (*context.inputs, *context.outputs)):
         raise ValueError("pointwise body requires dense physical ports")
     emitter = _PointwiseEmitter(graph, nodes, inputs, outputs[0],
-                               min(256, context.lowering.capabilities.threads_per_group))
+                               min(256, context.lowering.compiler_target.threads_per_group))
     return (BoundOperation(f"pointwise.fused@{min(nodes)}:{max(nodes)}", nodes, inputs, outputs, emitter),)

@@ -28,7 +28,7 @@ def test_same_device_with_changed_runtime_is_a_different_evidence_scope():
     first, second = Runtime(), Runtime()
     second.runtime_identity = "updated-driver"
     with DeviceRuntime(first, budget_bytes=1024) as before, DeviceRuntime(second, budget_bytes=1024) as after:
-        assert before.capabilities == after.capabilities
+        assert before.compiler_target == after.compiler_target
         assert before.compiler_identity == after.compiler_identity
         assert before.evidence_identity != after.evidence_identity
 
@@ -44,7 +44,7 @@ def test_characterized_rate_must_match_its_published_measurement(tmp_path):
                 dtype=DType.U8, conditions=("resident", "complete-operation wall timing"))
     profile = Characterization(identity="profile", key="device-probes-v1", created=datetime.now(UTC),
                                device=evidence.series.device, compiler=evidence.implementation.compiler,
-                               capabilities="test", protocol=ProbeProtocol(measurement=evidence.series.protocol), rates=(rate,))
+                               compiler_target="test", protocol=ProbeProtocol(measurement=evidence.series.protocol), rates=(rate,))
     with ObservationStore(tmp_path / "evidence.sqlite") as store:
         with pytest.raises(ValueError, match="missing measured evidence"):
             store.publish_characterization(profile)

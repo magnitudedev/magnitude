@@ -1,3 +1,5 @@
+
+from tests.ops.target_fixture import matrix_query
 """Coefficient-group contraction eligibility and bounded source publication."""
 
 from dataclasses import replace
@@ -43,8 +45,8 @@ def test_matrix_input_precision_does_not_round_quantization_coefficients():
     context = LoweringContext(CAPABILITIES, "prefill", "model", "test", 1 << 20)
     assert _packet_matrix_instruction(context, ops.DType.F16).input_dtype == ops.DType.F32
     assert _packet_matrix_instruction(context, ops.DType.F32).input_dtype == ops.DType.F32
-    unsupported = replace(context, capabilities=replace(CAPABILITIES, matrix_instructions=(
-        ops.MatrixInstruction(8, 8, 8, ops.DType.F16, ops.DType.F16),)))
+    unsupported = replace(context, compiler_target=replace(CAPABILITIES, matrix_query=matrix_query((
+        ops.MatrixTile(8, 8, 8, ops.DType.F16, ops.DType.F16),))))
     assert _packet_matrix_instruction(unsupported, ops.DType.F16) is None
 
 

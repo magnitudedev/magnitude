@@ -1,3 +1,5 @@
+
+from tests.ops.target_fixture import matrix_query
 from dataclasses import replace
 
 import numpy as np
@@ -221,11 +223,11 @@ def test_whole_moe_prefill_rejects_dense_toy_expert_storage():
     blocks = tuple(block.model_copy(update={"feedforward": routed}) for block in base.blocks)
     description = base.model_copy(update={"geometry": geometry, "blocks": blocks})
     native = Runtime()
-    native.capabilities = replace(
-        native.capabilities,
-        matrix_instructions=(ops.MatrixInstruction(8, 8, 8, ops.DType.F16, ops.DType.F32),),
-        atomics=frozenset({ops.DType.I32}),
-        memory_scopes=frozenset({"global", "shared", "local"}),
+    native.compiler_target = replace(
+        native.compiler_target,
+        matrix_query=matrix_query((ops.MatrixTile(8, 8, 8, ops.DType.F16, ops.DType.F32),)),
+
+
     )
     device = ops.DeviceRuntime(native, budget_bytes=1 << 24)
     residency = Residency(device)

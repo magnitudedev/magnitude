@@ -78,7 +78,7 @@ class Characterization(Record):
     created: datetime
     device: str = Field(min_length=1)
     compiler: str = Field(min_length=1)
-    capabilities: str = Field(min_length=1)
+    compiler_target: str = Field(min_length=1)
     protocol: ProbeProtocol
     rates: tuple[Rate, ...]
     unavailable: tuple[UnavailableMetric, ...] = ()
@@ -119,12 +119,11 @@ def matrix_probe(context):
     m, k = left.spec.shape
     n = right.spec.shape[0]
     dtype = left.spec.dtype.value
-    instruction = next(item for item in context.lowering.capabilities.matrix_instructions
-                       if item.input_dtype == left.spec.dtype and item.accumulation_dtype == DType.F32)
+    instruction = context.lowering.compiler_target.matrix_tile(left.spec.dtype)
     # Enough independent accumulator chains to expose arithmetic throughput,
     # rather than the latency of repeatedly updating four matrix fragments.
     bm, bn = instruction.m * 8, instruction.n * 8
-    threads = context.lowering.capabilities.subgroup_width * 4
+    threads = context.lowering.compiler_target.subgroup_width * 4
     repetitions = sum(context.graph.node(node).operation == "linear" for node in context.nodes)
 
     @T.macro
@@ -199,7 +198,7 @@ def characterize(device, store, *, protocol: ProbeProtocol = ProbeProtocol(),
     with exclusive_measurement():
         OperationSources().refresh()
     identity = device.evidence_identity
-    payload = (identity, device.compiler_identity, device.capabilities.fingerprint,
+    payload = (identity, device.compiler_identity, device.compiler_target.identity,
                protocol.model_dump(mode="json"), code_identity(copy.function),
                code_identity(matrix.function), code_identity(arithmetic.function),
                code_identity(special.function), code_identity(comparisons.function), code_identity(memory.function))
@@ -265,16 +264,13 @@ def characterize(device, store, *, protocol: ProbeProtocol = ProbeProtocol(),
             spec = TensorSpec((size // 4,), DType.F32)
             probe(memory, (Argument(spec, "source"),), (np.ones(spec.shape, dtype=np.float32),),
                   Resource.EXECUTION_COPY, "rate:boundary-bytes", DType.F32)
-        supported = {instruction.input_dtype for instruction in device.capabilities.matrix_instructions
-                     if instruction.accumulation_dtype == DType.F32}
         for dtype in (DType.F16, DType.BF16, DType.F32):
-            if dtype not in supported:
+            instruction = device.compiler_target.matrix_tile(dtype)
+            if instruction is None:
                 unavailable.append(UnavailableMetric(name=f"matrix:{dtype.value}",
                                                       reason="no declared portable matrix instruction for this precision"))
                 continue
             width = protocol.matrix_width
-            instruction = next(item for item in device.capabilities.matrix_instructions
-                               if item.input_dtype == dtype and item.accumulation_dtype == DType.F32)
             spec = TensorSpec((width, instruction.k * 4), dtype)
             if 4 * (2 * spec.storage_nbytes + width * width * 4) > device.available_bytes:
                 raise ValueError("matrix probe working set exceeds available capacity")
@@ -301,7 +297,7 @@ def characterize(device, store, *, protocol: ProbeProtocol = ProbeProtocol(),
               Resource.COMPARISONS, "rate:comparisons", DType.F32)
         result = Characterization(identity=str(uuid4()), key=key, created=datetime.now(UTC),
                                   device=identity, compiler=device.compiler_identity,
-                                  capabilities=device.capabilities.fingerprint, protocol=protocol,
+                                  compiler_target=device.compiler_target.identity, protocol=protocol,
                                   rates=tuple(rates), unavailable=tuple(unavailable))
         store.publish_characterization(result)
         return result

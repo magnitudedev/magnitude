@@ -14,7 +14,7 @@ from typing import Any, cast
 
 import torch
 
-from ..compiler.lowering import Capabilities, MatrixInstruction
+from ..compiler.lowering import CompilerTarget, MatrixTile
 from ..compiler.unit import TileCompilationUnit
 from ..representations import Dense
 from ..tensor.types import DType, TensorSpec
@@ -191,7 +191,7 @@ class TileLangRuntime:
                 raise ValueError("CPU execution exposes only process device ordinal zero")
             self._device = torch.device("cpu")
             self._completion = _Completion
-        self._capabilities = _capabilities(self._context.capabilities)
+        self._compiler_target = _compiler_target(self._context, ordinal=ordinal)
         from tilelang.cache import compiler_identity
 
         self._compiler_identity = (f"{compiler_identity()}:{self._context.target}:"
@@ -206,8 +206,8 @@ class TileLangRuntime:
         }, sort_keys=True).encode()).hexdigest()
 
     @property
-    def capabilities(self) -> Capabilities:
-        return self._capabilities
+    def compiler_target(self) -> CompilerTarget:
+        return self._compiler_target
 
     @property
     def compiler_identity(self) -> str:
@@ -343,35 +343,35 @@ def _build_reusable_module(unit: TileCompilationUnit):
     return T.build_prim_module("main", entry_parameters, entry_body, definitions)
 
 
-def _capabilities(value) -> Capabilities:
-    shared = value.shared_memory_bytes > 0
-    atomics = frozenset(dtype for dtype in DType if value.supports(f"atomic.add.{dtype.value}"))
-    return Capabilities(
-        subgroup_width=value.subgroup_width,
-        threads_per_group=value.max_threads_per_group,
-        shared_memory_bytes=value.shared_memory_bytes,
-        matrix_instructions=tuple(
-            MatrixInstruction(
-                item.m, item.n, item.k, DType(item.input_dtype), DType(item.accumulation_dtype)
-            )
-            for item in value.matrix_instructions
-        ),
-        supported_dtypes=frozenset(DType(item) for item in value.supported_dtypes),
-        memory_scopes=(
-            frozenset({"global", "shared", "local"}) if shared else frozenset({"global", "local"})
-        ),
-        barrier_scopes=frozenset({"workgroup"}) if shared else frozenset(),
-        asynchronous_copy=value.supports("async_copy"),
-        subgroup_exchange=value.supports("subgroup_exchange"),
-        vector_bytes=(1, 2, 4, 8, 16),
-        atomics=atomics,
-        features=frozenset(value.features),
-        alignments={dtype: dtype.itemsize for dtype in DType},
-        native_multi_launch=value.native_multi_launch,
-        partial_binding=value.native_argument_binding,
-        max_kernels_per_program=value.max_kernels_per_program,
-        fingerprint=value.fingerprint,
-    )
+def _compiler_target(context, *, ordinal: int) -> CompilerTarget:
+    from functools import lru_cache
+    from tilelang import tvm
+    from tilelang.analysis import plan_gemm
+    from tilelang.backend.resources import target_resources
+    from tilelang.cache import compiler_identity
+
+    device = tvm.device(context.target.get_target_device_type(), ordinal)
+    resources = target_resources(context.target, device=device)
+    identity = hashlib.sha256(json.dumps({
+        "target": str(context.target), "host": str(context.target_host),
+        "execution": context.execution_backend.name, "compiler": compiler_identity(),
+        "resources": asdict(resources), "ordinal": ordinal,
+    }, sort_keys=True).encode()).hexdigest()
+
+    @lru_cache(maxsize=256)
+    def matrix_query(dtype, m, n, k, threads, a_scope, b_scope, c_scope):
+        plan = plan_gemm(target=context.target, m=m, n=n, k=k, input_dtype=dtype.value,
+                         threads=threads, a_scope=a_scope, b_scope=b_scope, c_scope=c_scope)
+        if plan is None:
+            return None
+        # Native CUDA FP32 storage can select TF32 multiplication. That is not
+        # the exact FP32 contraction required by these operation schedules.
+        if "tf32" in plan.input_precision:
+            return None
+        return MatrixTile(*plan.instruction_shape, dtype, DType(plan.accumulation_dtype))
+
+    return CompilerTarget(resources.subgroup_width, resources.threads_per_group,
+                          resources.shared_memory_bytes, matrix_query=matrix_query, identity=identity)
 
 
 def describe_configuration(configuration):
@@ -383,5 +383,5 @@ def describe_configuration(configuration):
         raise ValueError("distributed operation planning is not yet implemented")
     endpoint = configuration.selected_endpoints[0]
     context = create_backend_context(str(endpoint.backend), execution_backend="tvm_ffi")
-    return (_capabilities(context.capabilities),
+    return (_compiler_target(context, ordinal=endpoint.ordinal or 0),
             f"{compiler_identity()}:{context.target}:{context.execution_backend.name}")

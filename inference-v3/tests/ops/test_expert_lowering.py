@@ -1,3 +1,5 @@
+
+from tests.ops.target_fixture import matrix_query
 import gguf
 import numpy as np
 import pytest
@@ -16,28 +18,24 @@ from engine.weights.tensor_residency import TensorWeights
 from tests.ops.test_tilelang_runtime import _packed, _QuantizedFormat
 from tests.ops.definitions import implement
 
-CAPABILITIES = ops.Capabilities(
+CAPABILITIES = ops.CompilerTarget(
     32,
     256,
     32 * 1024,
-    memory_scopes=frozenset({"global", "shared", "local"}),
-    native_multi_launch=True,
-    partial_binding=True,
-    fingerprint="packet-expert-test",
+
+
+    identity="packet-expert-test",
 )
 
-GROUPED_CAPABILITIES = ops.Capabilities(
+GROUPED_CAPABILITIES = ops.CompilerTarget(
     32,
     256,
     32 * 1024,
-    matrix_instructions=(ops.MatrixInstruction(8, 8, 8, ops.DType.F16, ops.DType.F32),
-                         ops.MatrixInstruction(8, 8, 8, ops.DType.F32, ops.DType.F32)),
-    memory_scopes=frozenset({"global", "shared", "local"}),
-    atomics=frozenset({ops.DType.I32}),
-    features=frozenset({"gemm.runtime_valid_m"}),
-    native_multi_launch=True,
-    partial_binding=True,
-    fingerprint="grouped-expert-test",
+    matrix_query=matrix_query((ops.MatrixTile(8, 8, 8, ops.DType.F16, ops.DType.F32),
+                         ops.MatrixTile(8, 8, 8, ops.DType.F32, ops.DType.F32))),
+
+
+    identity="grouped-expert-test",
 )
 
 
@@ -198,7 +196,7 @@ def test_decode_selects_two_stage_packet_expert_lowering_in_one_submission():
     assert tuple(candidate.name for candidate in cover) == (
         "routed_experts.packet-selected@0",
     )
-    submissions = plan_submissions(graph, cover, CAPABILITIES)
+    submissions = plan_submissions(graph, cover)
     assert len(submissions) == 1
     assert submissions[0].kernel_count == 2
 
@@ -208,7 +206,7 @@ def test_prefill_selects_grouped_expert_pipeline_in_one_submission():
     context = LoweringContext(GROUPED_CAPABILITIES, "prefill", "model", "test", 1 << 20)
     cover = build_operations(graph, context)
     assert tuple(candidate.name for candidate in cover) == ("routed_experts.grouped@0",)
-    submissions = plan_submissions(graph, cover, GROUPED_CAPABILITIES)
+    submissions = plan_submissions(graph, cover)
     assert len(submissions) == 1
     assert submissions[0].kernel_count == 5
 
@@ -260,7 +258,7 @@ def test_prefill_prepares_rows_and_specializes_mixed_packets_in_one_submission()
     assert cover[0].kernel_count == 7
     assert cover[0].emitter.tile[2] == 32
     assert cover[0].emitter.specs[6].representation.group == 64
-    submissions = plan_submissions(graph, cover, GROUPED_CAPABILITIES)
+    submissions = plan_submissions(graph, cover)
     assert len(submissions) == 1 and submissions[0].kernel_count == 7
 
 
@@ -302,7 +300,7 @@ def test_prefill_selects_matrix_swiglu_region_in_one_submission():
     assert tuple(candidate.name for candidate in cover) == (
         "dense_swiglu.packet-prefill@0:4",
     )
-    submissions = plan_submissions(graph, cover, GROUPED_CAPABILITIES)
+    submissions = plan_submissions(graph, cover)
     assert len(submissions) == 1 and submissions[0].kernel_count == 2
 
 

@@ -22,7 +22,7 @@ def write_state(state, ranges):
 
 
 class Runtime(MemoryRuntime):
-    capabilities = ops.Capabilities(32, 256, 32768)
+    compiler_target = ops.CompilerTarget(32, 256, 32768)
     compiler_identity = "preparation-test"
     runtime_identity = "preparation-test"
 

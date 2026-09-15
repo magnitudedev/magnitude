@@ -40,10 +40,10 @@ def profile_for(boundary):
                        conditions=("synthetic unit-test evidence, never a real device measurement",))
                   for demand in demands(boundary))
     profile = Characterization(identity="test-profile", key="test-key", created=datetime.now(UTC),
-                               device="test-device", compiler="test-compiler", capabilities="test-caps",
+                               device="test-device", compiler="test-compiler", compiler_target="test-caps",
                                protocol=ProbeProtocol(), rates=rates)
     return SimpleNamespace(characterization=profile, evidence_identity=profile.device,
-                           compiler_identity=profile.compiler, capabilities=SimpleNamespace(fingerprint=profile.capabilities))
+                           compiler_identity=profile.compiler, compiler_target=SimpleNamespace(identity=profile.compiler_target))
 
 
 def test_composed_demands_count_matrix_and_vector_work_once():
@@ -197,7 +197,7 @@ def test_comparison_probe_has_explicit_semantics_and_one_fused_operation():
     count, = (item for item in demands(fixture.boundary(root)) if item.resource == Resource.COMPARISONS)
     assert count.lower == 32 * 256
     runtime = Runtime()
-    plan = analyze_graph(graph, capabilities=runtime.capabilities, compiler_identity="fixture",
+    plan = analyze_graph(graph, compiler_target=runtime.compiler_target, compiler_identity="fixture",
                          available_bytes=1 << 20, options=ops.CompileOptions(mode="prefill"))
     assert len(plan.operations) == 1
 

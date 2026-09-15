@@ -172,13 +172,13 @@ class AttentionPrepareRule:
         node = graph.node(root)
         attrs = node.attributes
         threads = _reduction_threads(attrs["width"], context)
-        if threads is None or "shared" not in context.capabilities.memory_scopes:
+        if threads is None or context.compiler_target.shared_memory_bytes <= 0:
             return ()
         source = graph.value(node.inputs[0]).spec
-        subgroups = min(threads // context.capabilities.subgroup_width,
+        subgroups = min(threads // context.compiler_target.subgroup_width,
                         attrs["query_heads"] + attrs["kv_heads"])
         return (BoundOperation(f"attention.prepare@{root}", frozenset({root}), node.inputs, node.outputs,
-                               _PrepareEmitter(attrs, source.shape[0], context.capabilities.subgroup_width,
+                               _PrepareEmitter(attrs, source.shape[0], context.compiler_target.subgroup_width,
                                                subgroups, source.dtype.value)),)
 
 
@@ -211,7 +211,7 @@ class KVAppendRule:
         node = graph.node(root)
         shape = graph.value(node.inputs[1]).spec.shape
         return (BoundOperation(f"kv.append@{root}", frozenset({root}), node.inputs, node.outputs,
-                               _AppendEmitter(shape, min(256, context.capabilities.threads_per_group)),
+                               _AppendEmitter(shape, min(256, context.compiler_target.threads_per_group)),
                                aliases=((node.outputs[0], node.inputs[0]),)),)
 
 
@@ -247,11 +247,11 @@ class AttentionPrepareAppendRule:
         rows = cast(int, specs[0].shape[0])
         width = prepare.attributes["width"]
         threads = _reduction_threads(width, context)
-        if threads is None or "shared" not in context.capabilities.memory_scopes:
+        if threads is None or context.compiler_target.shared_memory_bytes <= 0:
             return ()
         moved = sum(spec.storage_nbytes for spec in specs)
         subgroups = min(
-            threads // context.capabilities.subgroup_width,
+            threads // context.compiler_target.subgroup_width,
             prepare.attributes["query_heads"] + prepare.attributes["kv_heads"],
         )
         return (
@@ -263,7 +263,7 @@ class AttentionPrepareAppendRule:
                 _PrepareAppendEmitter(
                     prepare.attributes,
                     rows,
-                    context.capabilities.subgroup_width,
+                    context.compiler_target.subgroup_width,
                     subgroups,
                     specs[0].dtype.value,
                 ),

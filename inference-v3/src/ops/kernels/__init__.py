@@ -88,7 +88,7 @@ def build_primitive(graph, root, context, *, remaining):
         body = PrimitiveLoweringRule()
     result = body.build(graph, root, context)
     if not result:
-        raise ValueError(f"{node.operation} has no legal realization for these shapes, precision and capabilities")
+        raise ValueError(f"{node.operation} has no legal realization for these shapes, precision and compiler_target")
     return _authored(result, body)
 
 

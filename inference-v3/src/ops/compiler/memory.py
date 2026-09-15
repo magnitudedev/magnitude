@@ -9,7 +9,7 @@ from types import MappingProxyType
 
 from ..tensor.graph import Graph
 from ..tensor.types import TensorSpec
-from .lowering import BoundOperation, Capabilities
+from .lowering import BoundOperation
 
 
 class StorageClass(StrEnum):
@@ -58,7 +58,7 @@ class _Interval:
     spec: TensorSpec
 
 
-def plan_memory(graph: Graph, operations: tuple[BoundOperation, ...], capabilities: Capabilities) -> MemoryPlan:
+def plan_memory(graph: Graph, operations: tuple[BoundOperation, ...]) -> MemoryPlan:
     candidate_index = {
         node: index for index, candidate in enumerate(operations) for node in candidate.nodes
     }
@@ -110,7 +110,7 @@ def plan_memory(graph: Graph, operations: tuple[BoundOperation, ...], capabiliti
         consumers = [index for index, operation in enumerate(operations)
                      if any(alias_sources.get(operand, operand) == value.id for operand in operation.inputs)]
         end = max(consumers, default=producer)
-        alignment = _alignment(value.spec, capabilities)
+        alignment = _alignment(value.spec)
         intervals.append(
             _Interval(
                 ("value", value.id, 0),
@@ -124,7 +124,7 @@ def plan_memory(graph: Graph, operations: tuple[BoundOperation, ...], capabiliti
 
     for index, candidate in enumerate(operations):
         for workspace_index, spec in enumerate(candidate.workspace):
-            alignment = _alignment(spec, capabilities)
+            alignment = _alignment(spec)
             intervals.append(
                 _Interval(
                     ("workspace", index, workspace_index),
@@ -159,8 +159,8 @@ def plan_memory(graph: Graph, operations: tuple[BoundOperation, ...], capabiliti
     return MemoryPlan(placements, tuple(workspaces), temporary_bytes, alignment)
 
 
-def _alignment(spec: TensorSpec, capabilities: Capabilities) -> int:
-    return max(spec.dtype.itemsize, capabilities.alignments.get(spec.dtype, spec.dtype.itemsize))
+def _alignment(spec: TensorSpec) -> int:
+    return spec.dtype.itemsize
 
 
 def _assign_slots(

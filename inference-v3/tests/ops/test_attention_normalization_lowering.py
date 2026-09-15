@@ -1,3 +1,5 @@
+
+from tests.ops.target_fixture import matrix_query
 import numpy as np
 from dataclasses import replace
 import pytest
@@ -9,18 +11,17 @@ from ops.operation import build_operations
 from engine import DevicePlan
 from ops.compiler.lowering import LoweringContext
 
-CAPABILITIES = ops.Capabilities(
+CAPABILITIES = ops.CompilerTarget(
     32,
     256,
     32 * 1024,
-    matrix_instructions=(
-        ops.MatrixInstruction(8, 8, 8, ops.DType.F16, ops.DType.F32),
-        ops.MatrixInstruction(8, 8, 8, ops.DType.F32, ops.DType.F32),
-    ),
-    memory_scopes=frozenset({"global", "shared", "local"}),
-    native_multi_launch=True,
-    partial_binding=True,
-    fingerprint="attention-normalization-test",
+    matrix_query=matrix_query((
+        ops.MatrixTile(8, 8, 8, ops.DType.F16, ops.DType.F32),
+        ops.MatrixTile(8, 8, 8, ops.DType.F32, ops.DType.F32),
+    )),
+
+
+    identity="attention-normalization-test",
 )
 
 

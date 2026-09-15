@@ -99,7 +99,7 @@ class PreparedFormula:
                 else:
                     self._dynamic[identity] = resource
             self.plan = analyze_graph(
-                graph, capabilities=device.capabilities, compiler_identity=device.compiler_identity,
+                graph, compiler_target=device.compiler_target, compiler_identity=device.compiler_identity,
                 available_bytes=device.available_bytes, options=options, constants=constants,
             )
             self.compiled: CompiledFunction = materialize(self.plan, device=device, constants=constants)
@@ -132,7 +132,7 @@ class PreparedFormula:
             payload = (dependencies,
                        tuple((item.module, item.symbol, item.fingerprint) for item in self.code_dependencies),
                        self.plan.graph.fingerprint, options.mode, options.precision,
-                       device.compiler_identity, device.capabilities.fingerprint)
+                       device.compiler_identity, device.compiler_target.identity)
             fingerprint = hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
             self.implementation = Implementation(
                 fingerprint=fingerprint, compiler=device.compiler_identity, dependencies=dependencies,

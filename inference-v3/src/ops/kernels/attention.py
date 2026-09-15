@@ -55,8 +55,7 @@ def _decode_attention_schedule(query, history, context):
     """
     if context.mode != "decode":
         return None
-    instruction = next((item for item in context.capabilities.matrix_instructions
-                        if item.input_dtype == item.accumulation_dtype == DType.F32), None)
+    instruction = context.compiler_target.matrix_tile(DType.F32)
     if instruction is None:
         return None
     rows, heads, width = query.shape
@@ -65,20 +64,20 @@ def _decode_attention_schedule(query, history, context):
     keys = instruction.n * 4
     contraction = instruction.k * 4
     columns = instruction.n * 8
-    threads = context.capabilities.subgroup_width * 4
+    threads = context.compiler_target.subgroup_width * 4
     padding = instruction.k
     def staging_bytes():
         return ((width + padding) * (keys + padding) * history.dtype.itemsize
                 + head_tile * keys * DType.F32.itemsize)
 
-    while staging_bytes() > context.capabilities.shared_memory_bytes and keys > instruction.n:
+    while staging_bytes() > context.compiler_target.shared_memory_bytes and keys > instruction.n:
         keys //= 2
     # Each subgroup owns at least one complete QK column instruction tile.
     # A narrower history tile needs fewer participants, not empty column owners.
-    threads = context.capabilities.subgroup_width * min(4, keys // instruction.n)
+    threads = context.compiler_target.subgroup_width * min(4, keys // instruction.n)
     if (group % head_tile or width % contraction or width % columns
-            or threads > context.capabilities.threads_per_group
-            or staging_bytes() > context.capabilities.shared_memory_bytes):
+            or threads > context.compiler_target.threads_per_group
+            or staging_bytes() > context.compiler_target.shared_memory_bytes):
         return None
     # Each partition amortizes staging over a bounded history segment. The
     # complete grid remains independent of changing visible token counts.
@@ -99,11 +98,8 @@ def _matrix_attention_schedule(
     """
     if context.mode != "prefill" or sequence_count != 1:
         return None
-    instructions = context.capabilities.matrix_instructions
-    instruction = next((item for item in instructions
-                        if item.input_dtype == query.dtype and item.accumulation_dtype == DType.F32), None)
-    fp32 = next((item for item in instructions
-                 if item.input_dtype == item.accumulation_dtype == DType.F32), None)
+    instruction = context.compiler_target.matrix_tile(query.dtype)
+    fp32 = context.compiler_target.matrix_tile(DType.F32)
     if instruction is None or fp32 is None:
         return None
     rows, heads, width = cast(tuple[int, int, int], query.shape)
@@ -111,20 +107,20 @@ def _matrix_attention_schedule(
         return None
     query_tile, key_tile = instruction.m * 4, instruction.n * 4
     group = heads // cast(int, history.shape[2])
-    paired_heads = group % 2 == 0 and context.capabilities.threads_per_group >= context.capabilities.subgroup_width * 8
+    paired_heads = group % 2 == 0 and context.compiler_target.threads_per_group >= context.compiler_target.subgroup_width * 8
     head_tile = 2 if paired_heads else 1
-    threads = context.capabilities.subgroup_width * 4 * head_tile
+    threads = context.compiler_target.subgroup_width * 4 * head_tile
     padding = instruction.k
     def staging_bytes() -> int:
         return (width + padding) * (key_tile + padding) * query.dtype.itemsize
 
-    while staging_bytes() > context.capabilities.shared_memory_bytes and key_tile > instruction.n:
+    while staging_bytes() > context.compiler_target.shared_memory_bytes and key_tile > instruction.n:
         key_tile //= 2
     shared_bytes = staging_bytes()
     value_tile = min(width, query_tile * 2)
     if key_tile % instruction.n or key_tile % fp32.k or (query_tile * head_tile) % fp32.m or value_tile % fp32.n:
         return None
-    if threads > context.capabilities.threads_per_group or shared_bytes > context.capabilities.shared_memory_bytes:
+    if threads > context.compiler_target.threads_per_group or shared_bytes > context.compiler_target.shared_memory_bytes:
         return None
     capacity = cast(int, history.shape[1])
     partitions = math.ceil(capacity / 4096)
@@ -814,7 +810,7 @@ class CausalAttentionRule:
         if (
             node.operation != "causal_attention"
             or len(node.inputs) != 3
-            or "shared" not in context.capabilities.memory_scopes
+            or context.compiler_target.shared_memory_bytes <= 0
         ):
             return ()
         specs = tuple(graph.values[value].spec for value in node.inputs)
@@ -822,13 +818,13 @@ class CausalAttentionRule:
             return ()
         width = cast(int, specs[0].shape[-1])
         threads = 1 << (width - 1).bit_length()
-        if threads > context.capabilities.threads_per_group:
+        if threads > context.compiler_target.threads_per_group:
             return ()
         rows, heads, width = cast(tuple[int, int, int], specs[0].shape)
         capacity = cast(int, specs[1].shape[1])
         if (
             context.precision == "reference"
-            or "reference_schedules" in context.capabilities.features
+            or context.compiler_target.reference_schedules
         ):
             return (
                 BoundOperation(
@@ -853,14 +849,14 @@ class CausalAttentionRule:
             )
         if (
             width % 32 == 0
-            and context.capabilities.subgroup_width == 32
-            and context.capabilities.threads_per_group >= 64
+            and context.compiler_target.subgroup_width == 32
+            and context.compiler_target.threads_per_group >= 64
         ):
             group = heads // cast(int, specs[1].shape[2])
-            subgroups = min(2, context.capabilities.shared_memory_bytes // (group * (width + 2) * 4))
+            subgroups = min(2, context.compiler_target.shared_memory_bytes // (group * (width + 2) * 4))
             if subgroups < 1:
                 raise ValueError("one attention head group exceeds shared-memory capacity")
-            stride = context.capabilities.subgroup_width * subgroups
+            stride = context.compiler_target.subgroup_width * subgroups
             target_partitions = max(1, math.ceil(512 / (rows * cast(int, specs[1].shape[2]))))
             span = math.ceil(capacity / target_partitions / stride) * stride
             partitions = math.ceil(capacity / span)
@@ -1090,7 +1086,7 @@ class AttentionOutputRule:
         if (
             packet is None
             or heads * width % packet.tile
-            or context.capabilities.subgroup_width != 32
+            or context.compiler_target.subgroup_width != 32
         ):
             return ()
         if context.mode == "prefill":
@@ -1099,7 +1095,7 @@ class AttentionOutputRule:
             )
             if schedule is None:
                 return ()
-            projection_threads = min(context.capabilities.threads_per_group, 128)
+            projection_threads = min(context.compiler_target.threads_per_group, 128)
             projection = _packet_matrix_instruction(context, specs[0].dtype)
             if projection is None:
                 return ()
@@ -1111,10 +1107,10 @@ class AttentionOutputRule:
             if bk % projection.k:
                 return ()
             projection_threads = min(
-                projection_threads, bm // projection.m * context.capabilities.subgroup_width
+                projection_threads, bm // projection.m * context.compiler_target.subgroup_width
             )
             projection_shared = affine_shared_bytes(bm, bn, bk, specs[0].dtype, specs[4])
-            if max(schedule.shared_bytes, projection_shared) > context.capabilities.shared_memory_bytes:
+            if max(schedule.shared_bytes, projection_shared) > context.compiler_target.shared_memory_bytes:
                 return ()
             # Bound each history traversal. Whole-buffer workspace reuse keeps
             # partition storage shared across sequential layers, while short
@@ -1147,10 +1143,10 @@ class AttentionOutputRule:
         vector = _packed_vector_geometry(specs[4], context)
         if vector is None:
             return ()
-        if width != 256 or context.capabilities.threads_per_group < 64:
+        if width != 256 or context.compiler_target.threads_per_group < 64:
             return ()
         subgroups = 2
-        stride = context.capabilities.subgroup_width * subgroups
+        stride = context.compiler_target.subgroup_width * subgroups
         target_partitions = max(1, math.ceil(512 / (tokens * cast(int, specs[1].shape[2]))))
         span = math.ceil(capacity / target_partitions / stride) * stride
         partitions = math.ceil(capacity / span)

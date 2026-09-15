@@ -351,18 +351,11 @@ class ChunkedDeltaRule:
             return ()
         rows = cast(int, specs[0].shape[0])
         batch, heads, value_width, width = cast(tuple[int, int, int, int], specs[5].shape)
-        instruction = next(
-            (
-                item
-                for item in context.capabilities.matrix_instructions
-                if item.input_dtype == DType.F32 and item.accumulation_dtype == DType.F32
-            ),
-            None,
-        )
+        instruction = context.compiler_target.matrix_tile(DType.F32)
         chunk, columns = 32, 16
         if (
             instruction is None
-            or "shared" not in context.capabilities.memory_scopes
+            or context.compiler_target.shared_memory_bytes <= 0
             or rows < 64 * batch
             or width % instruction.k
             or chunk % instruction.m
@@ -372,15 +365,15 @@ class ChunkedDeltaRule:
             or columns % instruction.n
         ):
             return ()
-        threads = (chunk // instruction.m) * context.capabilities.subgroup_width
+        threads = (chunk // instruction.m) * context.compiler_target.subgroup_width
         # Include conservative affine-row padding for each shared matrix.
         prepare_shared = (chunk * (width + 4) + 2 * chunk * (chunk + 4) + chunk) * 4
         scan_shared = (
             (columns + chunk) * (width + 4) + chunk * (columns + 4)
         ) * 4
         if (
-            threads > context.capabilities.threads_per_group
-            or max(prepare_shared, scan_shared) > context.capabilities.shared_memory_bytes
+            threads > context.compiler_target.threads_per_group
+            or max(prepare_shared, scan_shared) > context.compiler_target.shared_memory_bytes
         ):
             return ()
         chunks = math.ceil(rows / chunk)

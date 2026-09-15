@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import tilelang.language as T
 
-from ..compiler.lowering import BoundOperation, Capabilities, LoweringContext
+from ..compiler.lowering import BoundOperation, CompilerTarget, LoweringContext
 from ..representations import (
     Affine,
     Dense,
@@ -404,7 +404,7 @@ def _kv_copy_kernel(cache, ranges, cache_spec, range_spec, max_count, threads):
 
 
 class PrimitiveEmitter:
-    def __init__(self, node: Node, graph: Graph, capabilities: Capabilities):
+    def __init__(self, node: Node, graph: Graph, compiler_target: CompilerTarget):
         self.node = node
         self.inputs: tuple[TensorSpec, ...] = tuple(
             graph.values[value].spec for value in node.inputs
@@ -412,8 +412,8 @@ class PrimitiveEmitter:
         self.outputs: tuple[TensorSpec, ...] = tuple(
             graph.values[value].spec for value in node.outputs
         )
-        self.capabilities = capabilities
-        self.threads = min(256, capabilities.threads_per_group)
+        self.compiler_target = compiler_target
+        self.threads = min(256, compiler_target.threads_per_group)
 
     def specialization_key(self):
         """Identify generated code without graph-local value or node ids."""
@@ -584,7 +584,7 @@ class PrimitiveLoweringRule:
         # before production graphs can lower them.
         reference = (
             context.precision == "reference"
-            or "reference_schedules" in context.capabilities.features
+            or context.compiler_target.reference_schedules
         )
         if node.operation not in _PRODUCTION_PRIMITIVES and not (
             reference and node.operation in _REFERENCE_PRIMITIVES
@@ -612,7 +612,7 @@ class PrimitiveLoweringRule:
                 frozenset({root}),
                 inputs,
                 outputs,
-                PrimitiveEmitter(node, graph, context.capabilities),
+                PrimitiveEmitter(node, graph, context.compiler_target),
                 aliases=aliases,
                 kernel_count=kernel_count,
             ),

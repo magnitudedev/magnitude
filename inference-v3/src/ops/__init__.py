@@ -13,8 +13,8 @@ from .compiler.compilation import (
     materialize,
 )
 from .compiler.lowering import (
-    Capabilities,
-    MatrixInstruction,
+    CompilerTarget,
+    MatrixTile,
 )
 from .operation import Operation, OperationContext, operation
 from .kernels import composition as operation_bodies
@@ -100,7 +100,7 @@ __all__ = [
     "Affine",
     "Argument",
     "Operation",
-    "Capabilities",
+    "CompilerTarget",
     "CapacityError",
     "Code",
     "CodeInterpretation",
@@ -125,7 +125,7 @@ __all__ = [
     "OperationContext",
     "operation",
     "operation_bodies",
-    "MatrixInstruction",
+    "MatrixTile",
     "Node",
     "NumericalContract",
     "Resource",

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from threading import get_ident
 from typing import TYPE_CHECKING, Any, Protocol
 
-from ..compiler.lowering import Capabilities
+from ..compiler.lowering import CompilerTarget
 from ..tensor.types import DType, TensorSpec
 from .configuration import DeviceConfiguration
 from .memory import CapacityError, Limit, Reservation, ReservationLedger
@@ -68,7 +68,7 @@ class NativeKernelCapture(Protocol):
 
 class NativeRuntime(Protocol):
     @property
-    def capabilities(self) -> Capabilities: ...
+    def compiler_target(self) -> CompilerTarget: ...
 
     @property
     def compiler_identity(self) -> str: ...
@@ -381,7 +381,7 @@ class DeviceRuntime:
     @property
     def evidence_identity(self) -> str:
         hardware = (self.configuration.fingerprint if self.configuration is not None else
-                    f"{self.device_id}:{self.capabilities.fingerprint}")
+                    f"{self.device_id}:{self.compiler_target.identity}")
         return f"{hardware}:{self.runtime.runtime_identity}"
 
     def characterize(self, store, *, protocol=None, refresh=False, cancellation=None):
@@ -553,8 +553,8 @@ class DeviceRuntime:
             raise
 
     @property
-    def capabilities(self) -> Capabilities:
-        return self.runtime.capabilities
+    def compiler_target(self) -> CompilerTarget:
+        return self.runtime.compiler_target
 
     @property
     def compiler_identity(self) -> str:

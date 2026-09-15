@@ -133,14 +133,14 @@ class RoutingRule:
 
     def build(self, graph: Graph, root: int, context: LoweringContext):
         node = graph.nodes[root]
-        if node.operation != "route_topk" or "shared" not in context.capabilities.memory_scopes:
+        if node.operation != "route_topk" or context.compiler_target.shared_memory_bytes <= 0:
             return ()
         source = graph.values[node.inputs[0]].spec
-        if not source.static or source.rank != 2 or context.capabilities.subgroup_width != 32:
+        if not source.static or source.rank != 2 or context.compiler_target.subgroup_width != 32:
             return ()
         rows, experts = cast(tuple[int, int], source.shape)
         threads = max(32, 1 << (experts - 1).bit_length())
-        if threads > context.capabilities.threads_per_group:
+        if threads > context.compiler_target.threads_per_group:
             return ()
         selected = node.attributes["k"]
         return (
@@ -229,8 +229,8 @@ class RouterTopKRule:
             or hidden.rank != 2
             or router.rank != 2
             or router.representation is not None
-            or "shared" not in context.capabilities.memory_scopes
-            or context.capabilities.subgroup_width != 32
+            or context.compiler_target.shared_memory_bytes <= 0
+            or context.compiler_target.subgroup_width != 32
         ):
             return ()
         rows, width = cast(tuple[int, int], hidden.shape)
@@ -241,7 +241,7 @@ class RouterTopKRule:
             return ()
         experts, router_width = cast(tuple[int, int], router.shape)
         threads = max(32, 1 << (experts - 1).bit_length())
-        if router_width != width or threads > context.capabilities.threads_per_group:
+        if router_width != width or threads > context.compiler_target.threads_per_group:
             return ()
         return (
             BoundOperation(

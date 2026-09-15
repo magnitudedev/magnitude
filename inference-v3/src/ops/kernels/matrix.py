@@ -26,15 +26,12 @@ def _dense(spec: TensorSpec) -> bool:
 
 
 def _matrix_instruction(context: LoweringContext, dtype):
-    return next(
-        (item for item in context.capabilities.matrix_instructions if item.input_dtype == dtype),
-        None,
-    )
+    return context.compiler_target.matrix_tile(dtype)
 
 
 def _packet_matrix_instruction(context: LoweringContext, dtype):
-    return next((item for item in context.capabilities.matrix_instructions
-                 if item.input_dtype == item.accumulation_dtype == DType.F32), None)
+    # Reconstructed operands are FP32 fragments; query that exact storage/precision path.
+    return context.compiler_target.matrix_tile(DType.F32, a_scope="local.fragment", b_scope="local.fragment")
 
 
 def _packet_reduction_width(*specs: TensorSpec) -> int:
@@ -47,19 +44,19 @@ def _packet_reduction_width(*specs: TensorSpec) -> int:
 
 def _packed_vector_geometry(spec: TensorSpec, context: LoweringContext) -> tuple[int, int] | None:
     packet = packet_format(spec)
-    if packet is None or context.capabilities.subgroup_width != 32:
+    if packet is None or context.compiler_target.subgroup_width != 32:
         return None
     outputs_per_subgroup = 4 if packet.name == "mlx-q4-group64" else 2
     if packet.name == "mlx-q4-group64":
         outputs = cast(int, spec.shape[0])
         groups = min(2, max(1, (outputs + outputs_per_subgroup - 1) // outputs_per_subgroup))
-        threads = min(groups * 32, context.capabilities.threads_per_group // 32 * 32)
+        threads = min(groups * 32, context.compiler_target.threads_per_group // 32 * 32)
         return (threads, outputs_per_subgroup) if threads >= 32 else None
     outputs = cast(int, spec.shape[0])
     required_subgroups = max(
         1, min(4, (outputs + outputs_per_subgroup - 1) // outputs_per_subgroup)
     )
-    threads = min(context.capabilities.threads_per_group, required_subgroups * 32)
+    threads = min(context.compiler_target.threads_per_group, required_subgroups * 32)
     threads = threads // 32 * 32
     if threads < 32:
         return None
@@ -663,7 +660,7 @@ class ParallelPackedMatrixRule:
     name = "parallel-packed-matrix"
 
     def build(self, graph: Graph, root: int, context: LoweringContext):
-        if context.mode not in {"decode", "prefill"} or context.capabilities.subgroup_width != 32:
+        if context.mode not in {"decode", "prefill"} or context.compiler_target.subgroup_width != 32:
             return ()
         first = graph.nodes[root]
         if first.operation != "linear" or len(first.inputs) != 2:
@@ -693,13 +690,13 @@ class ParallelPackedMatrixRule:
             packet.name == "mlx-q4-group64" for packet in formats if packet is not None
         )
         threads = min(
-            context.capabilities.threads_per_group,
+            context.compiler_target.threads_per_group,
             64 if context.mode == "decode" and mlx_affine else 128,
         )
         threads = (
-            threads // context.capabilities.subgroup_width * context.capabilities.subgroup_width
+            threads // context.compiler_target.subgroup_width * context.compiler_target.subgroup_width
         )
-        if threads < context.capabilities.subgroup_width:
+        if threads < context.compiler_target.subgroup_width:
             return ()
         tile = None
         instruction = None
@@ -724,8 +721,8 @@ class ParallelPackedMatrixRule:
             bk = _packet_reduction_width(*weight_specs)
             if bk % instruction.k:
                 return ()
-            threads = min(threads, bm // instruction.m * context.capabilities.subgroup_width)
-            if affine_shared_bytes(bm, bn, bk, source_spec.dtype, *weight_specs) > context.capabilities.shared_memory_bytes:
+            threads = min(threads, bm // instruction.m * context.compiler_target.subgroup_width)
+            if affine_shared_bytes(bm, bn, bk, source_spec.dtype, *weight_specs) > context.compiler_target.shared_memory_bytes:
                 return ()
             tile = (bm, bn, bk)
         moved = sum(spec.storage_nbytes for spec in weight_specs)
@@ -765,7 +762,7 @@ class PackedMatrixRule:
             or not right.static
             or left.rank != 2
             or right.rank != 2
-            or context.capabilities.subgroup_width != 32
+            or context.compiler_target.subgroup_width != 32
         ):
             return ()
         m, k = cast(tuple[int, int], left.shape)
@@ -822,8 +819,8 @@ class DenseMatrixRule:
         k = cast(int, left.shape[-1])
         n = cast(int, output.shape[-1])
         instruction = _matrix_instruction(context, left.dtype)
-        if (node.operation == "linear" and context.capabilities.subgroup_width == 32 and
-                context.capabilities.threads_per_group >= 128 and
+        if (node.operation == "linear" and context.compiler_target.subgroup_width == 32 and
+                context.compiler_target.threads_per_group >= 128 and
                 (m < (instruction.m if instruction is not None else 2) or instruction is None)):
             emitter = _DenseVectorEmitter(m, n, k, output.dtype.value, len(node.inputs) == 3)
             return (BoundOperation(f"linear.dense-vector@{root}", frozenset({root}),
@@ -852,15 +849,15 @@ def matrix_geometry(context, instruction, rows, columns, reduction, *, packed_sp
                                        reduction, storage_dtype, *packed_specs)
         return (instruction.m * m_tiles + instruction.n * n_tiles) * reduction * instruction.input_dtype.itemsize
 
-    while shared() > context.capabilities.shared_memory_bytes:
+    while shared() > context.compiler_target.shared_memory_bytes:
         if n_tiles > 1:
             n_tiles //= 2
         elif m_tiles > 1:
             m_tiles //= 2
         else:
             raise ValueError("one matrix tile exceeds device shared-memory capacity")
-    threads = min(context.capabilities.threads_per_group,
-                  context.capabilities.subgroup_width * min(4, m_tiles))
+    threads = min(context.compiler_target.threads_per_group,
+                  context.compiler_target.subgroup_width * min(4, m_tiles))
     return instruction.m * m_tiles, instruction.n * n_tiles, threads
 
 

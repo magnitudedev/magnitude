@@ -462,13 +462,13 @@ class DenseSwiGLURule:
             if bk % instruction.k or down_bk % instruction.k:
                 return ()
             threads = min(
-                context.capabilities.threads_per_group,
-                context.capabilities.subgroup_width * 4,
-                bm // instruction.m * context.capabilities.subgroup_width,
+                context.compiler_target.threads_per_group,
+                context.compiler_target.subgroup_width * 4,
+                bm // instruction.m * context.compiler_target.subgroup_width,
             )
             shared = max(affine_shared_bytes(bm, 2 * bn, bk, specs[0].dtype, specs[1], specs[2]),
                          affine_shared_bytes(bm, 2 * bn, down_bk, specs[0].dtype, specs[3]))
-            if shared > context.capabilities.shared_memory_bytes:
+            if shared > context.compiler_target.shared_memory_bytes:
                 return ()
             tile = (threads, bm, bn, bk, instruction)
         activation = TensorSpec((rows, intermediate), specs[0].dtype)
@@ -496,7 +496,7 @@ class SelectedExpertsRule:
         hidden, routes, scores, gate, up, down, output = specs
         if (
             any(not spec.static for spec in specs)
-            or context.capabilities.subgroup_width != 32
+            or context.compiler_target.subgroup_width != 32
             or node.attributes["activation"] != "silu"
             or any(packet_format(spec) is None for spec in (gate, up, down))
         ):
@@ -911,7 +911,7 @@ class RoutedSharedExpertsRule:
     name = "routed-shared-experts"
 
     def build(self, graph: Graph, root: int, context: LoweringContext, *, residual: bool = False):
-        if context.mode != "decode" or context.capabilities.subgroup_width != 32:
+        if context.mode != "decode" or context.compiler_target.subgroup_width != 32:
             return ()
         region = _routed_shared_region(graph, root)
         if region is None:
