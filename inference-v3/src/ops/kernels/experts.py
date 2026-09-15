@@ -12,7 +12,6 @@ from ..tensor.types import TensorSpec
 from .matrix import (
     _packed_matrix,
     _packed_vector_geometry,
-    _packet_matrix_instruction,
     _packet_reduction_width,
 )
 from .packed import (affine_gemm, affine_shared_bytes, affine_storage,
@@ -123,7 +122,7 @@ def _gated_packet_matrix(
     bm,
     bn,
     bk,
-    instruction,
+    reduction_step,
 ):
     packet = packet_format(gate_spec)
     assert packet is not None and packet_format(up_spec) == packet
@@ -134,7 +133,7 @@ def _gated_packet_matrix(
         and (bn * bk // packet.matrix_packet) % threads == 0
     )
     with T.Kernel(T.ceildiv(intermediate, bn), T.ceildiv(rows, bm), threads=threads) as (bx, by):
-        storage = affine_storage(bm, 2 * bn, bk, hidden.dtype, instruction, (gate_spec, up_spec))
+        storage = affine_storage(bm, 2 * bn, bk, hidden.dtype, reduction_step, (gate_spec, up_spec))
         x, paired_tile, coefficients, paired_accum, a, b = storage
         gate_activation = T.alloc_fragment((bm, bn), "float32")
         T.clear(paired_accum)
@@ -256,7 +255,7 @@ class _DenseSwiGLUEmitter:
             )
         else:
             assert self.tile is not None
-            threads, bm, bn, bk, instruction = self.tile
+            threads, bm, bn, bk, reduction_step = self.tile
             _packed_matrix(
                 activation,
                 down,
@@ -266,7 +265,7 @@ class _DenseSwiGLUEmitter:
                 rows,
                 width,
                 intermediate,
-                instruction,
+                reduction_step,
                 self.specs[4].dtype.value,
                 threads,
                 bm,
@@ -446,31 +445,29 @@ class DenseSwiGLURule:
         else:
             vector = None
             gate_vector = None
-            instruction = _packet_matrix_instruction(context, specs[0].dtype)
-            if instruction is None:
-                return ()
+            reduction_step = 8
             if rows >= 256 and min(intermediate, width) >= 512:
                 bm, bn, bk = 32, 32, 32
             else:
                 bm, bn, bk = (
-                    instruction.m * 4,
-                    instruction.n * 4,
-                    instruction.k * 2,
+                    32,
+                    32,
+                    16,
                 )
             bk = _packet_reduction_width(specs[1], specs[2])
             down_bk = _packet_reduction_width(specs[3])
-            if bk % instruction.k or down_bk % instruction.k:
+            if bk % 8 or down_bk % 8:
                 return ()
             threads = min(
                 context.compiler_target.threads_per_group,
                 context.compiler_target.subgroup_width * 4,
-                bm // instruction.m * context.compiler_target.subgroup_width,
+                bm // 8 * context.compiler_target.subgroup_width,
             )
             shared = max(affine_shared_bytes(bm, 2 * bn, bk, specs[0].dtype, specs[1], specs[2]),
                          affine_shared_bytes(bm, 2 * bn, down_bk, specs[0].dtype, specs[3]))
             if shared > context.compiler_target.shared_memory_bytes:
                 return ()
-            tile = (threads, bm, bn, bk, instruction)
+            tile = (threads, bm, bn, bk, reduction_step)
         activation = TensorSpec((rows, intermediate), specs[0].dtype)
         return (
             BoundOperation(

@@ -108,7 +108,6 @@ def test_metal_runtime_composes_kernels_and_binds_static_arguments_natively():
 
     runtime = TileLangRuntime("metal")
     device = ops.DeviceRuntime(runtime, budget_bytes=1 << 20)
-    assert device.compiler_target.matrix_tile(ops.DType.F32) is not None
     hidden_spec = ops.TensorSpec((2, 8), ops.DType.F16)
     weight_spec = ops.TensorSpec((8, 8), ops.DType.F16)
     hidden_host = torch.randn(cast(tuple[int, ...], hidden_spec.shape), dtype=torch.float16)

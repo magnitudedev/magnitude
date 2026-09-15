@@ -1,5 +1,3 @@
-
-from tests.ops.target_fixture import matrix_query
 import numpy as np
 from dataclasses import replace
 import pytest
@@ -15,10 +13,6 @@ CAPABILITIES = ops.CompilerTarget(
     32,
     256,
     32 * 1024,
-    matrix_query=matrix_query((
-        ops.MatrixTile(8, 8, 8, ops.DType.F16, ops.DType.F32),
-        ops.MatrixTile(8, 8, 8, ops.DType.F32, ops.DType.F32),
-    )),
 
 
     identity="attention-normalization-test",
@@ -105,7 +99,7 @@ def test_streaming_attention_workspace_is_bounded_by_partition_outputs(capacity,
         assert schedule.tile == (32, 32, 256)
         assert schedule.head_tile == 2
         assert schedule.value_tile == 64
-        assert schedule.instruction_k == 8
+        assert schedule.reduction_step == 8
         assert schedule.shared_bytes == 21_120
 
 

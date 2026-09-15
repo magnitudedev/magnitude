@@ -15,7 +15,6 @@ from .matrix import (
     _packed_matrix,
     _packed_vector,
     _packed_vector_geometry,
-    _packet_matrix_instruction,
     _packet_reduction_width,
 )
 from .packed import affine_shared_bytes, packet_format
@@ -26,7 +25,7 @@ class _MatrixAttentionSchedule:
     tile: tuple[int, int, int]
     head_tile: int
     value_tile: int
-    instruction_k: int
+    reduction_step: int
     padding: int
     partitions: int
     span: int
@@ -40,7 +39,7 @@ class _DecodeAttentionSchedule:
     keys: int
     contraction: int
     columns: int
-    instruction_k: int
+    reduction_step: int
     threads: int
     padding: int
     partitions: int
@@ -55,26 +54,23 @@ def _decode_attention_schedule(query, history, context):
     """
     if context.mode != "decode":
         return None
-    instruction = context.compiler_target.matrix_tile(DType.F32)
-    if instruction is None:
-        return None
     rows, heads, width = query.shape
     group = heads // history.shape[2]
-    head_tile = instruction.m
-    keys = instruction.n * 4
-    contraction = instruction.k * 4
-    columns = instruction.n * 8
+    head_tile = 8
+    keys = 32
+    contraction = 32
+    columns = 64
     threads = context.compiler_target.subgroup_width * 4
-    padding = instruction.k
+    padding = 8
     def staging_bytes():
         return ((width + padding) * (keys + padding) * history.dtype.itemsize
                 + head_tile * keys * DType.F32.itemsize)
 
-    while staging_bytes() > context.compiler_target.shared_memory_bytes and keys > instruction.n:
+    while staging_bytes() > context.compiler_target.shared_memory_bytes and keys > 8:
         keys //= 2
-    # Each subgroup owns at least one complete QK column instruction tile.
+    # Each subgroup owns at least one complete eight-column QK strip.
     # A narrower history tile needs fewer participants, not empty column owners.
-    threads = context.compiler_target.subgroup_width * min(4, keys // instruction.n)
+    threads = context.compiler_target.subgroup_width * min(4, keys // 8)
     if (group % head_tile or width % contraction or width % columns
             or threads > context.compiler_target.threads_per_group
             or staging_bytes() > context.compiler_target.shared_memory_bytes):
@@ -84,7 +80,7 @@ def _decode_attention_schedule(query, history, context):
     span = keys * 16
     partitions = math.ceil(history.shape[1] / span)
     return _DecodeAttentionSchedule(head_tile, keys, contraction, columns,
-                                    instruction.k, threads, padding, partitions, span)
+                                    8, threads, padding, partitions, span)
 
 
 def _matrix_attention_schedule(
@@ -98,27 +94,23 @@ def _matrix_attention_schedule(
     """
     if context.mode != "prefill" or sequence_count != 1:
         return None
-    instruction = context.compiler_target.matrix_tile(query.dtype)
-    fp32 = context.compiler_target.matrix_tile(DType.F32)
-    if instruction is None or fp32 is None:
-        return None
     rows, heads, width = cast(tuple[int, int, int], query.shape)
-    if width < instruction.k or width % instruction.k or width % fp32.n:
+    if width < 8 or width % 8:
         return None
-    query_tile, key_tile = instruction.m * 4, instruction.n * 4
+    query_tile, key_tile = 32, 32
     group = heads // cast(int, history.shape[2])
     paired_heads = group % 2 == 0 and context.compiler_target.threads_per_group >= context.compiler_target.subgroup_width * 8
     head_tile = 2 if paired_heads else 1
     threads = context.compiler_target.subgroup_width * 4 * head_tile
-    padding = instruction.k
+    padding = 8
     def staging_bytes() -> int:
         return (width + padding) * (key_tile + padding) * query.dtype.itemsize
 
-    while staging_bytes() > context.compiler_target.shared_memory_bytes and key_tile > instruction.n:
+    while staging_bytes() > context.compiler_target.shared_memory_bytes and key_tile > 8:
         key_tile //= 2
     shared_bytes = staging_bytes()
     value_tile = min(width, query_tile * 2)
-    if key_tile % instruction.n or key_tile % fp32.k or (query_tile * head_tile) % fp32.m or value_tile % fp32.n:
+    if key_tile % 8 or (query_tile * head_tile) % 8 or value_tile % 8:
         return None
     if threads > context.compiler_target.threads_per_group or shared_bytes > context.compiler_target.shared_memory_bytes:
         return None
@@ -126,7 +118,7 @@ def _matrix_attention_schedule(
     partitions = math.ceil(capacity / 4096)
     span = math.ceil(capacity / (partitions * key_tile)) * key_tile
     return _MatrixAttentionSchedule(
-        (query_tile, key_tile, threads), head_tile, value_tile, fp32.k, padding,
+        (query_tile, key_tile, threads), head_tile, value_tile, 8, padding,
         partitions, span, shared_bytes,
         (TensorSpec((partitions, rows, heads, width), DType.F32),
          TensorSpec((partitions, rows, heads, 2), DType.F32)),
@@ -159,33 +151,33 @@ def _attention_rescale(outputs, alpha, rows, columns):
 
 @T.macro
 def _attention_value_tile(probability, values, output, first_key, first_column,
-                          width, columns, instruction_k):
-    operand = T.alloc_fragment((instruction_k, columns), "float32")
-    for item, column in T.Parallel(instruction_k, columns):
+                          width, columns, reduction_step):
+    operand = T.alloc_fragment((reduction_step, columns), "float32")
+    for item, column in T.Parallel(reduction_step, columns):
         operand[item, column] = T.if_then_else(
             first_column + column < width,
             T.cast(values[0, first_key + item, first_column + column], "float32"), 0,
         )
-    # Keep instruction coordinates static without expanding the history traversal.
+    # Keep fragment coordinates static without expanding the history traversal.
     with T.attr(0, "pragma_auto_unroll_max_step", 4096):
         with T.attr(0, "pragma_unroll_explicit", 1):
             T.gemm(probability, operand, output, policy=T.GemmWarpPolicy.FullRow)
 
 
-def _attention_value_columns(probability, values, outputs, first_key, width, columns, instruction_k):
+def _attention_value_columns(probability, values, outputs, first_key, width, columns, reduction_step):
     for index, output in enumerate(outputs):
         _attention_value_tile(probability, values, output, first_key, index * columns,
-                              width, columns, instruction_k)
+                              width, columns, reduction_step)
 
 
 @T.macro
-def _attention_values(scores, values, outputs, rows, width, keys, columns, instruction_k):
-    probability = T.alloc_fragment((rows, instruction_k), "float32")
-    for instruction in T.serial(keys // instruction_k):
-        for row, item in T.Parallel(rows, instruction_k):
-            probability[row, item] = scores[row, instruction * instruction_k + item]
-        _attention_value_columns(probability, values, outputs, instruction * instruction_k,
-                                  width, columns, instruction_k)
+def _attention_values(scores, values, outputs, rows, width, keys, columns, reduction_step):
+    probability = T.alloc_fragment((rows, reduction_step), "float32")
+    for step in T.serial(keys // reduction_step):
+        for row, item in T.Parallel(rows, reduction_step):
+            probability[row, item] = scores[row, step * reduction_step + item]
+        _attention_value_columns(probability, values, outputs, step * reduction_step,
+                                  width, columns, reduction_step)
 
 
 @T.macro
@@ -356,7 +348,7 @@ def _matrix_streaming_attention(
                     0,
                 )
             _attention_values(scores, values, outputs, query_rows, width, key_tile,
-                              columns, schedule.instruction_k)
+                              columns, schedule.reduction_step)
         if not fuse_gate or partitions > 1:
             for row in T.Parallel(query_rows):
                 token = first_row + row % query_tile
@@ -468,7 +460,7 @@ def _tiled_decode_attention(query, history, visible, partials, statistics,
                         history[1, base + chunk_first + item, kv_head, channel], 0)
             T.copy(scores, probabilities)
             _attention_values(probabilities, values, outputs, head_tile, width, key_tile,
-                              columns, schedule.instruction_k)
+                              columns, schedule.reduction_step)
         for head in T.Parallel(head_tile):
             statistics[partition, token, first_head + head, 0] = T.if_then_else(
                 denominator[head] > 0, maximum[head] / log2e, -3.402823466e38)
@@ -1050,7 +1042,7 @@ class _PrefillAttentionOutputEmitter:
                 max(width, 128),
                 self.specs[0].dtype.value,
             )
-        projection_threads, bm, bn, bk, instruction = self.projection_tile
+        projection_threads, bm, bn, bk, reduction_step = self.projection_tile
         _packed_matrix(
             activation,
             weight,
@@ -1060,7 +1052,7 @@ class _PrefillAttentionOutputEmitter:
             tokens,
             cast(int, self.specs[4].shape[0]),
             heads * width,
-            instruction,
+            reduction_step,
             self.specs[5].dtype.value,
             projection_threads,
             bm,
@@ -1096,18 +1088,16 @@ class AttentionOutputRule:
             if schedule is None:
                 return ()
             projection_threads = min(context.compiler_target.threads_per_group, 128)
-            projection = _packet_matrix_instruction(context, specs[0].dtype)
-            if projection is None:
-                return ()
+            projection = 8
             if tokens >= 256 and min(cast(int, specs[4].shape[0]), heads * width) >= 512:
                 bm, bn = 32, 64
             else:
-                bm, bn = projection.m * 4, projection.n * 4
+                bm, bn = 32, 32
             bk = _packet_reduction_width(specs[4])
-            if bk % projection.k:
+            if bk % 8:
                 return ()
             projection_threads = min(
-                projection_threads, bm // projection.m * context.compiler_target.subgroup_width
+                projection_threads, bm // 8 * context.compiler_target.subgroup_width
             )
             projection_shared = affine_shared_bytes(bm, bn, bk, specs[0].dtype, specs[4])
             if max(schedule.shared_bytes, projection_shared) > context.compiler_target.shared_memory_bytes:

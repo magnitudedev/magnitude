@@ -30,9 +30,10 @@ engine. V2 is reference evidence, not the performance ceiling.
 
 Resource budgets reflect the resolved compilation target and explicitly selected
 execution device. Missing resource information is unknown, never a claim of zero
-capacity. Matrix schedule information comes from concrete compiler analysis using
-the same implementation as lowering, not an independently maintained backend
-catalogue. Native composition and binding are execution-interface requirements.
+capacity. Ops authors matrix work tiles and reduction steps; TileLang selects
+instructions and infers layouts from the actual program. No instruction catalogue
+or synthetic compiler probe gates construction. Native composition and binding
+are execution-interface requirements.
 Plan and measurement identity includes compiler provenance, target configuration
 and resolved schedules.
 
@@ -41,6 +42,13 @@ not expose TileLang/TVM values. Numerical work, including import conversion, use
 portable TileLang. Source I/O is not numerical kernel computation.
 
 DeviceTopology is a non-live inventory including memory domains and relationships.
+Host discovery reports every endpoint executable by the process's existing transfer
+runtime and its physical memory backing. CUDA and HIP discovery follows the installed
+Torch build on Linux and Windows; Metal uses the operating-system API. An integrated
+accelerator references the host memory domains and host physical budget; a discrete
+accelerator contributes its own device-memory domain and budget.
+Compiler-specific capabilities such as legal matrix instructions and kernel resource
+usage remain the compiler target's responsibility.
 DevicePlan selects resources and MemoryConstraints without allocating them.
 Ops DeviceRuntime is the sole live owner, including reservations, completion,
 characterization caches and shutdown. Engine's plan implements an ops-owned
@@ -296,8 +304,9 @@ reduction. Quantization groups select metadata; they do not reset the accumulato
 or require output-wide coefficient correction or activation-sum workspaces.
 This common contraction serves resident, streamed, ordinary, parallel and grouped
 projections. It does not round reconstructed weights to a 16-bit dtype. Matrix
-geometry and precision come from analysis of the actual TileLang lowering; decode's packet-vector arithmetic is
-separate. Gather work and staging remain charged inside the operation boundary,
+work tiles and reduction steps are authored by Ops; TileLang selects instructions
+and infers layouts during normal compilation. Decode's packet-vector arithmetic
+is separate. Gather work and staging remain charged inside the operation boundary,
 not permanent caches or hidden setup. Grouped down contractions consume their
 contiguous activation rows without redundant route lookup.
 

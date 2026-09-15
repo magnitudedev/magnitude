@@ -2,20 +2,20 @@
 
 import sys
 
-from engine.platform.backend import Backend
-from engine.platform.host import hwloc
 from engine.devices import (
     AccessKind,
     AllocationKind,
     AllocationMode,
     ConstraintId,
     ConstraintKind,
+    DeviceTopology,
     Endpoint,
     EndpointId,
-    DeviceTopology,
     MemoryAccess,
     MemoryConstraint,
 )
+from engine.platform.backend import Backend
+from engine.platform.host import hwloc
 
 
 def discover() -> DeviceTopology:
@@ -59,8 +59,21 @@ def discover() -> DeviceTopology:
         endpoints += gpu_endpoints
         memory += gpu_memory
         constraints += gpu_budgets
+    elif sys.platform.startswith("linux") or sys.platform == "win32":
+        from engine.platform.host.accelerator import inventory, torch_accelerators
+
+        backend, found, diagnostic = torch_accelerators()
+        if backend is not None:
+            gpu_devices, gpu_endpoints, gpu_memory, gpu_budgets = inventory(
+                backend, found, cpu, memory, host_budget.id
+            )
+            devices += gpu_devices
+            endpoints += gpu_endpoints
+            memory += gpu_memory
+            constraints += gpu_budgets
+        diagnostics = () if diagnostic is None else (diagnostic,)
     else:
-        diagnostics = ("GPU and process-limit discovery is not implemented for this host OS",)
+        diagnostics = (f"GPU and process-limit discovery is not implemented for {sys.platform}",)
     return DeviceTopology(
         devices=devices,
         endpoints=endpoints,

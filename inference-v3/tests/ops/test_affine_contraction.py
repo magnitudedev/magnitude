@@ -1,5 +1,3 @@
-
-from tests.ops.target_fixture import matrix_query
 """Coefficient-group contraction eligibility and bounded source publication."""
 
 from dataclasses import replace
@@ -10,7 +8,7 @@ import pytest
 import ops
 from engine import DevicePlan
 from ops.compiler.lowering import LoweringContext
-from ops.kernels.matrix import (_packed_vector_geometry, _packet_matrix_instruction,
+from ops.kernels.matrix import (_packed_vector_geometry,
                                 _packet_reduction_width, matrix_geometry)
 from ops.kernels.packed import affine_shared_bytes, packet_format
 from tests.ops.test_attention_normalization_lowering import CAPABILITIES
@@ -41,23 +39,13 @@ def test_packet_vector_geometry_respects_device_limits(outputs, capacity, thread
     assert _packed_vector_geometry(spec, context) == (None if threads is None else (threads, 4))
 
 
-def test_matrix_input_precision_does_not_round_quantization_coefficients():
-    context = LoweringContext(CAPABILITIES, "prefill", "model", "test", 1 << 20)
-    assert _packet_matrix_instruction(context, ops.DType.F16).input_dtype == ops.DType.F32
-    assert _packet_matrix_instruction(context, ops.DType.F32).input_dtype == ops.DType.F32
-    unsupported = replace(context, compiler_target=replace(CAPABILITIES, matrix_query=matrix_query((
-        ops.MatrixTile(8, 8, 8, ops.DType.F16, ops.DType.F16),))))
-    assert _packet_matrix_instruction(unsupported, ops.DType.F16) is None
-
-
 def test_shared_capacity_includes_coefficient_pairs_and_group_boundaries():
     context = LoweringContext(replace(CAPABILITIES, shared_memory_bytes=4096),
                               "prefill", "model", "test", 1 << 20)
-    instruction = _packet_matrix_instruction(context, ops.DType.F16)
     specs = tuple(ops.TensorSpec((32, 512), ops.DType.F16).with_representation(
         ops.Affine(ops.Code(4), group, ops.DirectCoefficients(ops.DType.BF16, ops.DType.BF16)))
         for group in (16, 32, 64))
-    bm, bn, _ = matrix_geometry(context, instruction, 2048, 2560, 64,
+    bm, bn, _ = matrix_geometry(context, ops.DType.F16, 2048, 2560, 64,
                                 packed_specs=specs, storage_dtype=ops.DType.F16)
     assert affine_shared_bytes(bm, bn, 64, ops.DType.F16, *specs) <= 4096
     assert _packet_reduction_width(*specs) == 32

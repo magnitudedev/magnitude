@@ -22,7 +22,6 @@ def _definition(rows, vocabulary):
 def test_sampling_geometry_accounts_for_all_summaries_and_reduction_threads():
     graph, _ = _definition(7, 4099)
     compiler_target = ops.CompilerTarget(32, 96, 1536,
-
                                      )
     context = LoweringContext(compiler_target, "decode", "model", "test", 1 << 20)
     selected, = SamplingRule().build(graph, 0, context)
@@ -34,7 +33,6 @@ def test_sampling_geometry_accounts_for_all_summaries_and_reduction_threads():
     assert limited.emitter.partitions == 3
     single, = SamplingRule().build(graph, 0, replace(context, workspace_limit=7 * 2 * 12 - 1))
     assert single.kernel_count == 1 and single.workspace == ()
-
 
 
 @pytest.mark.device
