@@ -10,11 +10,19 @@ def library_path(name: str) -> str:
     if discovered is not None:
         return discovered
     suffix = ".dylib" if sys.platform == "darwin" else ".dll" if sys.platform == "win32" else ".so"
+    filenames = (
+        (f"{name}{suffix}", f"lib{name}{suffix}")
+        if sys.platform == "win32"
+        else (f"lib{name}{suffix}",)
+    )
     directories = [Path(__file__).parent / "_native", Path(sys.prefix) / "lib"]
     if sys.platform == "darwin":
         directories += [Path("/opt/homebrew/lib"), Path("/usr/local/lib")]
+    elif sys.platform == "win32":
+        directories += [Path(sys.prefix) / "Library" / "bin", Path(sys.prefix) / "DLLs"]
     for directory in directories:
-        path = directory / f"lib{name}{suffix}"
-        if path.is_file():
-            return str(path)
+        for filename in filenames:
+            path = directory / filename
+            if path.is_file():
+                return str(path)
     raise RuntimeError(f"required native library {name!r} was not found")
