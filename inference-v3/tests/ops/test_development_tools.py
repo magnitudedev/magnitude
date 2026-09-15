@@ -1,5 +1,3 @@
-
-from tests.ops.target_fixture import matrix_query
 import pytest
 
 import ops
@@ -10,10 +8,6 @@ CAPABILITIES = ops.CompilerTarget(
     32,
     256,
     32 * 1024,
-    matrix_query=matrix_query((
-        ops.MatrixTile(8, 8, 8, ops.DType.F16, ops.DType.F32),
-        ops.MatrixTile(8, 8, 8, ops.DType.F32, ops.DType.F32),
-    )),
 
 
     identity="development-tool-test",

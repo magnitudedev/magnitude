@@ -30,9 +30,10 @@ engine. V2 is reference evidence, not the performance ceiling.
 
 Resource budgets reflect the resolved compilation target and explicitly selected
 execution device. Missing resource information is unknown, never a claim of zero
-capacity. Matrix schedule information comes from concrete compiler analysis using
-the same implementation as lowering, not an independently maintained backend
-catalogue. Native composition and binding are execution-interface requirements.
+capacity. Ops authors matrix work tiles and reduction steps; TileLang selects
+instructions and infers layouts from the actual program. No instruction catalogue
+or synthetic compiler probe gates construction. Native composition and binding
+are execution-interface requirements.
 Plan and measurement identity includes compiler provenance, target configuration
 and resolved schedules.
 
@@ -296,8 +297,9 @@ reduction. Quantization groups select metadata; they do not reset the accumulato
 or require output-wide coefficient correction or activation-sum workspaces.
 This common contraction serves resident, streamed, ordinary, parallel and grouped
 projections. It does not round reconstructed weights to a 16-bit dtype. Matrix
-geometry and precision come from analysis of the actual TileLang lowering; decode's packet-vector arithmetic is
-separate. Gather work and staging remain charged inside the operation boundary,
+work tiles and reduction steps are authored by Ops; TileLang selects instructions
+and infers layouts during normal compilation. Decode's packet-vector arithmetic
+is separate. Gather work and staging remain charged inside the operation boundary,
 not permanent caches or hidden setup. Grouped down contractions consume their
 contiguous activation rows without redundant route lookup.
 

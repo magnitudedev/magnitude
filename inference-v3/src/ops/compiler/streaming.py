@@ -10,7 +10,6 @@ from ..runtime.imports import plan_import
 from ..tensor.types import DType, TensorSpec
 from .program import KernelDefinition, KernelPort, PortRole, define_kernel
 from .dependencies import code_dependencies
-from .lowering import MatrixTile
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,7 +141,7 @@ class ProjectionTileEmitter:
     strategy: str
     threads: int
     tile: tuple[int, int, int]
-    instruction: MatrixTile | None
+    reduction_step: int | None
     bias: bool
     outputs_per_subgroup: int = 1
 
@@ -160,7 +159,7 @@ class ProjectionTileEmitter:
             _dense_vector(hidden, weight, bias, output, m, n, k, self.output.dtype.value, self.bias,
                           extent)
         elif self.strategy == "packet-matrix":
-            _packed_matrix(hidden, weight, bias, output, self.weight, m, n, k, self.instruction,
+            _packed_matrix(hidden, weight, bias, output, self.weight, m, n, k, self.reduction_step,
                            self.output.dtype.value, self.threads, *self.tile, self.bias, extent)
         else:
             _dense_matrix(hidden, weight, bias, output, "linear", m, n, k, self.hidden.dtype.value,
@@ -302,7 +301,7 @@ class ProjectionLoop:
 
 def projection_loop(graph, root, context, binding):
     """One bounded source-projection operation, with capacity-constrained regions."""
-    from ..kernels.matrix import (_dense, _matrix_instruction, _packet_matrix_instruction,
+    from ..kernels.matrix import (_dense,
                                   _packed_vector_geometry, _packet_reduction_width, matrix_geometry)
     from ..kernels.packed import packet_format
     from .lowering import BoundOperation
@@ -322,27 +321,21 @@ def projection_loop(graph, root, context, binding):
     vector = None
     if packed is not None and width % packed.tile == 0:
         vector = _packed_vector_geometry(weight, context)
-        instruction = _packet_matrix_instruction(context, hidden.dtype)
     elif _dense(weight):
         if context.compiler_target.threads_per_group >= 128:
             vector = (128, 1)
-        instruction = _matrix_instruction(context, hidden.dtype)
     else:
         raise ValueError("streamed weight representation has no projection realization")
-    if vector is not None and (instruction is None or hidden.shape[0] < instruction.m):
+    if vector is not None and hidden.shape[0] < 8:
         strategy = "packet-vector" if packed else "dense-vector"
         threads, outputs_per_subgroup = vector
         tile, arithmetic = (1, 1, 1), None
-    elif instruction is not None:
-        bk = _packet_reduction_width(weight) if packed else instruction.k * 2
-        if bk % instruction.k:
-            raise ValueError("encoded reduction width is incompatible with the matrix instruction")
-        bm, bn, threads = matrix_geometry(context, instruction, hidden.shape[0], columns, bk,
+    else:
+        bk = _packet_reduction_width(weight) if packed else 16
+        bm, bn, threads = matrix_geometry(context, hidden.dtype, hidden.shape[0], columns, bk,
                                           packed_specs=(weight,) if packed else (), storage_dtype=hidden.dtype)
         strategy = "packet-matrix" if packed else "dense-matrix"
-        tile, arithmetic, outputs_per_subgroup = (bm, bn, bk), instruction, 1
-    else:
-        raise ValueError("source projection has no supported numerical geometry")
+        tile, arithmetic, outputs_per_subgroup = (bm, bn, bk), 8, 1
     bytes_per_row = max(1, math.ceil(binding.spec.storage_nbytes / columns))
     step = min(columns, max(row_alignment, ((8 << 20) // bytes_per_row // row_alignment) * row_alignment))
     budget = max(0, context.workspace_limit - output.storage_nbytes)

@@ -25,15 +25,6 @@ def _dense(spec: TensorSpec) -> bool:
     return spec.representation is None or spec.representation == Dense(spec.dtype)
 
 
-def _matrix_instruction(context: LoweringContext, dtype):
-    return context.compiler_target.matrix_tile(dtype)
-
-
-def _packet_matrix_instruction(context: LoweringContext, dtype):
-    # Reconstructed operands are FP32 fragments; query that exact storage/precision path.
-    return context.compiler_target.matrix_tile(DType.F32, a_scope="local.fragment", b_scope="local.fragment")
-
-
 def _packet_reduction_width(*specs: TensorSpec) -> int:
     representations = tuple(spec.representation for spec in specs)
     assert all(isinstance(value, Affine) for value in representations)
@@ -160,7 +151,7 @@ def _packed_matrix(
     m,
     n,
     k_size,
-    instruction,
+    reduction_step,
     output_dtype,
     threads,
     bm,
@@ -180,7 +171,7 @@ def _packed_matrix(
     )
     with T.Kernel(T.ceildiv(n, bn), T.ceildiv(m, bm), threads=threads) as (bx, by):
         offset = extent[0] if extent is not None else 0
-        storage = affine_storage(bm, bn, bk, source.dtype, instruction, (spec,))
+        storage = affine_storage(bm, bn, bk, source.dtype, reduction_step, (spec,))
         left, right, coefficients, accum, a, b = storage
         T.clear(accum)
         for block in T.serial(T.ceildiv(k_size, bk)):
@@ -209,9 +200,9 @@ def _packed_matrix(
 
 
 class _PackedMatrixEmitter:
-    def __init__(self, spec, m, n, k, instruction, output, threads, tile, bias):
+    def __init__(self, spec, m, n, k, reduction_step, output, threads, tile, bias):
         self.spec, self.m, self.n, self.k = spec, m, n, k
-        self.instruction, self.output = instruction, output
+        self.reduction_step, self.output = reduction_step, output
         self.threads, self.tile, self.bias = threads, tile, bias
 
     def __call__(self, operands: tuple[Any, ...]) -> None:
@@ -227,7 +218,7 @@ class _PackedMatrixEmitter:
             self.m,
             self.n,
             self.k,
-            self.instruction,
+            self.reduction_step,
             self.output,
             self.threads,
             *self.tile,
@@ -495,7 +486,7 @@ def _parallel_packed_matrix(
     sizes,
     blocks,
     count,
-    instruction,
+    reduction_step,
     threads,
     bm,
     bn,
@@ -504,7 +495,7 @@ def _parallel_packed_matrix(
     total_blocks = sum(blocks[:count])
     full_rows = rows % bm == 0 and width % bk == 0
     with T.Kernel(total_blocks, T.ceildiv(rows, bm), threads=threads) as (branch_block, by):
-        storage = affine_storage(bm, bn, bk, source.dtype, instruction, specs[:count])
+        storage = affine_storage(bm, bn, bk, source.dtype, reduction_step, specs[:count])
         left, right, coefficients, accum, a, b = storage
         T.clear(accum)
         for reduction_block in T.serial(T.ceildiv(width, bk)):
@@ -601,14 +592,14 @@ class _ParallelPackedEmitter:
         rows,
         width,
         mode,
-        instruction,
+        reduction_step,
         threads,
         outputs_per_subgroup,
         tile,
     ):
         self.weight_specs, self.output_specs = weight_specs, output_specs
         self.rows, self.width = rows, width
-        self.mode, self.instruction, self.threads = mode, instruction, threads
+        self.mode, self.reduction_step, self.threads = mode, reduction_step, threads
         self.outputs_per_subgroup, self.tile = outputs_per_subgroup, tile
 
     def __call__(self, operands):
@@ -646,7 +637,7 @@ class _ParallelPackedEmitter:
                 sizes,
                 blocks,
                 count,
-                self.instruction,
+                self.reduction_step,
                 self.threads,
                 bm,
                 bn,
@@ -699,7 +690,7 @@ class ParallelPackedMatrixRule:
         if threads < context.compiler_target.subgroup_width:
             return ()
         tile = None
-        instruction = None
+        reduction_step = None
         outputs_per_subgroup = 1
         if context.mode == "decode":
             if rows > 8:
@@ -710,18 +701,18 @@ class ParallelPackedMatrixRule:
                 else 2
             )
         else:
-            instruction = _packet_matrix_instruction(context, source_spec.dtype)
-            if instruction is None or rows < instruction.m:
+            reduction_step = 8
+            if rows < 8:
                 return ()
             bm, bn, bk = (
                 (32, 64, 32)
                 if rows >= 64
-                else (instruction.m * 2, instruction.n * 2, instruction.k)
+                else (16, 16, 8)
             )
             bk = _packet_reduction_width(*weight_specs)
-            if bk % instruction.k:
+            if bk % 8:
                 return ()
-            threads = min(threads, bm // instruction.m * context.compiler_target.subgroup_width)
+            threads = min(threads, bm // 8 * context.compiler_target.subgroup_width)
             if affine_shared_bytes(bm, bn, bk, source_spec.dtype, *weight_specs) > context.compiler_target.shared_memory_bytes:
                 return ()
             tile = (bm, bn, bk)
@@ -738,7 +729,7 @@ class ParallelPackedMatrixRule:
                     rows,
                     width,
                     context.mode,
-                    instruction,
+                    reduction_step,
                     threads,
                     outputs_per_subgroup,
                     tile,
@@ -771,8 +762,8 @@ class PackedMatrixRule:
             return ()
         output = graph.values[node.outputs[0]].spec
         vector = _packed_vector_geometry(right, context)
-        instruction = _packet_matrix_instruction(context, left.dtype)
-        if vector is not None and (m < (instruction.m if instruction is not None else 2) or instruction is None):
+        reduction_step = 8
+        if vector is not None and m < 8:
             threads, outputs_per_subgroup = vector
             emitter = _PackedVectorEmitter(
                 right,
@@ -786,15 +777,14 @@ class PackedMatrixRule:
             )
             return (BoundOperation(f"linear.packet-vector@{root}", frozenset({root}),
                                    node.inputs, node.outputs, emitter),)
-        if instruction is not None:
-            bk = _packet_reduction_width(right)
-            if bk % instruction.k == 0:
-                bm, bn, threads = matrix_geometry(context, instruction, m, n, bk,
-                                                  packed_specs=(right,), storage_dtype=left.dtype)
-                emitter = _PackedMatrixEmitter(right, m, n, k, instruction,
-                                               output.dtype.value, threads, (bm, bn, bk), len(node.inputs) == 3)
-                return (BoundOperation(f"linear.packet-gemm@{root}", frozenset({root}),
-                                       node.inputs, node.outputs, emitter),)
+        bk = _packet_reduction_width(right)
+        if bk % 8 == 0:
+            bm, bn, threads = matrix_geometry(context, left.dtype, m, n, bk,
+                                              packed_specs=(right,), storage_dtype=left.dtype)
+            emitter = _PackedMatrixEmitter(right, m, n, k, reduction_step,
+                                           output.dtype.value, threads, (bm, bn, bk), len(node.inputs) == 3)
+            return (BoundOperation(f"linear.packet-gemm@{root}", frozenset({root}),
+                                   node.inputs, node.outputs, emitter),)
         raise ValueError("packed projection cannot express the declared contraction on this device")
 
 
@@ -818,36 +808,33 @@ class DenseMatrixRule:
         m = left.elements // cast(int, left.shape[-1])
         k = cast(int, left.shape[-1])
         n = cast(int, output.shape[-1])
-        instruction = _matrix_instruction(context, left.dtype)
         if (node.operation == "linear" and context.compiler_target.subgroup_width == 32 and
                 context.compiler_target.threads_per_group >= 128 and
-                (m < (instruction.m if instruction is not None else 2) or instruction is None)):
+                m < 8):
             emitter = _DenseVectorEmitter(m, n, k, output.dtype.value, len(node.inputs) == 3)
             return (BoundOperation(f"linear.dense-vector@{root}", frozenset({root}),
                                    node.inputs, node.outputs, emitter),)
-        if instruction is not None:
-            bk = instruction.k * 2
-            bm, bn, threads = matrix_geometry(context, instruction, m, n, bk)
-            emitter = _DenseMatrixEmitter(node.operation, m, n, k, left.dtype.value,
-                                          output.dtype.value, threads, (bm, bn, bk), len(node.inputs) == 3)
-            return (BoundOperation(f"{node.operation}.dense-gemm@{root}", frozenset({root}),
-                                   node.inputs, node.outputs, emitter),)
-        raise ValueError("dense contraction requires a supported matrix instruction or row-vector geometry")
+        bk = 16
+        bm, bn, threads = matrix_geometry(context, left.dtype, m, n, bk)
+        emitter = _DenseMatrixEmitter(node.operation, m, n, k, left.dtype.value,
+                                      output.dtype.value, threads, (bm, bn, bk), len(node.inputs) == 3)
+        return (BoundOperation(f"{node.operation}.dense-gemm@{root}", frozenset({root}),
+                               node.inputs, node.outputs, emitter),)
 
 
-def matrix_geometry(context, instruction, rows, columns, reduction, *, packed_specs=(), storage_dtype=None):
-    """One legal authored schedule; this is not an ops-level tuning space.
+def matrix_geometry(context, dtype, rows, columns, reduction, *, packed_specs=(), storage_dtype=None):
+    """Choose work tiles in eight-element strips within the shared-memory budget.
 
-    Geometry specializes to tile occupancy and shared capacity. TileLang owns
-    any subsequent schedule tuning; the compiler does not enumerate alternatives.
+    These are schedule parameters. TileLang selects instructions and infers the
+    layout of the concrete GEMMs; no instruction dimensions are queried.
     """
-    m_tiles = min(4, max(1, math.ceil(rows / instruction.m)))
-    n_tiles = min(4, max(1, math.ceil(columns / instruction.n)))
+    m_tiles = min(4, max(1, math.ceil(rows / 8)))
+    n_tiles = min(4, max(1, math.ceil(columns / 8)))
     def shared():
         if packed_specs:
-            return affine_shared_bytes(instruction.m * m_tiles, instruction.n * n_tiles,
+            return affine_shared_bytes(8 * m_tiles, 8 * n_tiles,
                                        reduction, storage_dtype, *packed_specs)
-        return (instruction.m * m_tiles + instruction.n * n_tiles) * reduction * instruction.input_dtype.itemsize
+        return (8 * m_tiles + 8 * n_tiles) * reduction * dtype.itemsize
 
     while shared() > context.compiler_target.shared_memory_bytes:
         if n_tiles > 1:
@@ -858,7 +845,7 @@ def matrix_geometry(context, instruction, rows, columns, reduction, *, packed_sp
             raise ValueError("one matrix tile exceeds device shared-memory capacity")
     threads = min(context.compiler_target.threads_per_group,
                   context.compiler_target.subgroup_width * min(4, m_tiles))
-    return instruction.m * m_tiles, instruction.n * n_tiles, threads
+    return 8 * m_tiles, 8 * n_tiles, threads
 
 
 __all__ = [

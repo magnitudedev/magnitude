@@ -3,35 +3,25 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Protocol
 
 from ..tensor.graph import Graph
-from ..tensor.types import DType, Layout, TensorSpec
+from ..tensor.types import Layout, TensorSpec
 from .program import KernelDefinition
 from .dependencies import CodeDependency
 from ..binding import Binding
 
 
 @dataclass(frozen=True, slots=True)
-class MatrixTile:
-    m: int
-    n: int
-    k: int
-    input_dtype: DType
-    accumulation_dtype: DType
-
-
-@dataclass(frozen=True, slots=True)
 class CompilerTarget:
-    """Resolved resources and access to concrete compiler analysis."""
+    """Resolved physical resources and compiler configuration identity."""
 
     subgroup_width: int
     threads_per_group: int
     shared_memory_bytes: int
-    matrix_query: Callable[[DType, int, int, int, int, str, str, str], MatrixTile | None] | None = field(default=None, compare=False, repr=False)
     reference_schedules: bool = False
     identity: str = "host-reference"
 
@@ -40,13 +30,6 @@ class CompilerTarget:
             raise ValueError("invalid compilation resource limits")
         if not self.identity:
             raise ValueError("compiler configuration identity must not be empty")
-
-    def matrix_tile(self, dtype: DType, *, m=32, n=32, k=32, threads=None,
-                    a_scope="shared", b_scope="shared", c_scope="local.fragment") -> MatrixTile | None:
-        if self.matrix_query is None:
-            return None
-        return self.matrix_query(dtype, m, n, k, threads or min(128, self.threads_per_group),
-                                 a_scope, b_scope, c_scope)
 
 
 HOST_TARGET = CompilerTarget(1, 1, 0)
