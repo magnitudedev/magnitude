@@ -170,7 +170,10 @@ def _attention_value_tile(probability, values, output, first_key, first_column,
             first_column + column < width,
             T.cast(values[0, first_key + item, first_column + column], "float32"), 0,
         )
-    T.gemm(probability, operand, output, policy=T.GemmWarpPolicy.FullRow)
+    # Keep instruction coordinates static without expanding the history traversal.
+    with T.attr(0, "pragma_auto_unroll_max_step", 4096):
+        with T.attr(0, "pragma_unroll_explicit", 1):
+            T.gemm(probability, operand, output, policy=T.GemmWarpPolicy.FullRow)
 
 
 def _attention_value_columns(probability, values, outputs, first_key, width, columns, instruction_k):
@@ -305,13 +308,16 @@ def _matrix_streaming_attention(
                         history[0, base + relative, kv_head, channel],
                         0,
                     )
-            T.gemm(
-                query_fragment,
-                keys[0, :width, :key_tile],
-                scores,
-                clear_accum=True,
-                policy=T.GemmWarpPolicy.FullRow,
-            )
+            # Expand the bounded contraction, preserving the full score reduction.
+            with T.attr(0, "pragma_auto_unroll_max_step", 4096):
+                with T.attr(0, "pragma_unroll_explicit", 1):
+                    T.gemm(
+                        query_fragment,
+                        keys[0, :width, :key_tile],
+                        scores,
+                        clear_accum=True,
+                        policy=T.GemmWarpPolicy.FullRow,
+                    )
             wholly_visible = (
                 aligned
                 and first_row + query_tile <= tokens
