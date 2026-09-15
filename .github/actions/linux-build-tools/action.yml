@@ -1,0 +1,36 @@
+name: Linux build tools
+description: Install Ubuntu build dependencies with cached package downloads
+inputs:
+  packages:
+    description: Space-separated Ubuntu package names
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Resolve build-tool packages
+      id: packages
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        sudo apt-get update
+        read -r -a packages <<< "$PACKAGES"
+        sudo apt-get --print-uris --download-only --yes install "${packages[@]}" > "$RUNNER_TEMP/build-tools-plan"
+        . /etc/os-release
+        digest="$(sha256sum "$RUNNER_TEMP/build-tools-plan" | cut -d ' ' -f 1)"
+        echo "key=apt-build-tools-v1-${ID}-${VERSION_ID}-${{ runner.arch }}-${digest}" >> "$GITHUB_OUTPUT"
+        mkdir -p "$RUNNER_TEMP/apt-build-tools"
+    - uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/apt-build-tools/*.deb
+        key: ${{ steps.packages.outputs.key }}
+    - name: Install build-tool packages
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        read -r -a packages <<< "$PACKAGES"
+        sudo apt-get --yes \
+          -o "Dir::Cache::archives=$RUNNER_TEMP/apt-build-tools" \
+          -o APT::Keep-Downloaded-Packages=true \
+          install "${packages[@]}"

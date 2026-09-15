@@ -1,6 +1,7 @@
 ---
 applies_to:
   - .github/workflows/release*.yml
+  - .github/actions/linux-build-tools/**
   - packages/release/scripts/**
   - packages/release/src/targets.ts
   - scripts/accept-release-candidate.ts
@@ -46,12 +47,17 @@ archives, not only on intermediate build outputs.
 Every Linux host, CPU base, CUDA pack, and Vulkan pack builds on its architecture's Ubuntu 22.04
 runner. CUDA 11.8 and CUDA 12.9 use the same userspace baseline.
 
+Build-tool download caches are keyed by Ubuntu version, architecture, and the resolved APT package
+plan. APT still resolves and installs dependencies normally; a cache hit never skips installation.
+These archives are separate from CUDA downloads and survive CUDA's package-cache cleanup.
+
 Ubuntu 22.04's Vulkan headers are older than the Vulkan API types used by the pinned llama.cpp.
 Vulkan jobs therefore construct a build-only SDK prefix from Vulkan-Headers 1.4.313 and shaderc
 `v2023.8` `glslc`, while linking against Jammy's system Vulkan loader. The headers and shader
 compiler are not included in the release and do not become customer dependencies.
 
 Linux desktop packaging runs its installer tooling under Node and validates the final package,
+compressing the DEB once with zstd level 9 after finalizing its payload,
 including a root-owned mode-04755 Chromium sandbox helper. Package permissions are a postcondition,
 not an assumption about filesystem API calls. Installed-consumer acceptance must exercise ordinary
 launch without sandbox-disabling test flags, verify the canonical CLI/application-menu path and
