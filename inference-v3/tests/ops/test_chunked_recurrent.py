@@ -13,7 +13,7 @@ from engine import DevicePlan
 from ops.compiler.lowering import LoweringContext
 
 
-def _program(rows, batch, dtype, mapping):
+def _program(rows, batch, dtype, mapping, sequence_length=None):
     specs = (
         ops.TensorSpec((rows, 2, 128), dtype),
         ops.TensorSpec((rows, 2, 128), dtype),
@@ -31,7 +31,10 @@ def _program(rows, batch, dtype, mapping):
     )
 
     def function(q, k, v, decay, beta, state, offsets):
-        return ops.gated_delta_recurrence(q, k, v, decay, beta, state, offsets, mapping=mapping)
+        return ops.gated_delta_recurrence(
+            q, k, v, decay, beta, state, offsets,
+            mapping=mapping, sequence_length=sequence_length,
+        )
 
     return function, signature, specs
 
@@ -69,15 +72,35 @@ def test_chunked_recurrence_selection_accounts_for_workspace_and_capabilities():
     )
 
 
+@pytest.mark.parametrize("batch,length", [(1, -1), (1, 194), (1, True), (3, 193)])
+def test_static_recurrence_rejects_incompatible_geometry(batch, length):
+    function, signature, _ = _program(193, batch, ops.DType.F32, "tiled", length)
+    with pytest.raises(ValueError, match="static recurrence length"):
+        ops.trace(function, signature)
+
+
+def test_static_recurrence_reference_checks_declared_offsets():
+    function, signature, specs = _program(2, 1, ops.DType.F32, "tiled", 2)
+    graph = ops.trace(function, signature)
+    inputs = {f"v{i}": np.zeros(spec.shape, dtype=np.float32)
+              for i, spec in enumerate(specs[:-1])}
+    inputs["v6"] = np.array([0, 1], dtype=np.int32)
+    with pytest.raises(ValueError, match="declared static sequence length"):
+        ops.evaluate_reference(graph, inputs)
+
+
 @pytest.mark.device
 @pytest.mark.parametrize("dtype,mapping", [(ops.DType.F32, "tiled"), (ops.DType.BF16, "grouped")])
 @pytest.mark.parametrize("reset", [True, False])
 @pytest.mark.parametrize("chunked", [True, False])
-def test_chunked_recurrence_tails_resets_and_empty_sequence(dtype, mapping, reset, chunked):
+@pytest.mark.parametrize("static", [True, False])
+def test_chunked_recurrence_tails_resets_and_empty_sequence(dtype, mapping, reset, chunked, static):
     if not torch.backends.mps.is_available():
         pytest.skip("requires a Metal device")
-    rows, batch = 193, 3
-    function, signature, specs = _program(rows, batch, dtype, mapping)
+    rows, batch = 193, 1 if static else 3
+    function, signature, specs = _program(
+        rows, batch, dtype, mapping, sequence_length=rows if static else None
+    )
     rng = np.random.default_rng(139)
     arrays: list[np.ndarray] = [
         rng.normal(0, 0.1, cast(tuple[int, ...], spec.shape)).astype(np.float32)
@@ -89,7 +112,7 @@ def test_chunked_recurrence_tails_resets_and_empty_sequence(dtype, mapping, rese
     else:
         arrays[3].fill(1)  # No reset/decay may hide an incorrect carried chunk state.
     arrays[4] = rng.uniform(0, 1, (rows, 4)).astype(np.float32)
-    arrays.append(np.asarray([0, 65, 65, 193], dtype=np.int32))
+    arrays.append(np.asarray([0, 193] if static else [0, 65, 65, 193], dtype=np.int32))
     natives = [
         torch.from_numpy(array).to(
             torch.bfloat16
@@ -142,7 +165,8 @@ def test_chunked_recurrence_tails_resets_and_empty_sequence(dtype, mapping, rese
         )
         np.testing.assert_allclose(actual_state, state, rtol=3e-4, atol=3e-5)
         np.testing.assert_array_equal(resources[5].native.cpu().numpy(), initial.astype(np.float32))
-        np.testing.assert_array_equal(actual_state[1], initial[1].astype(np.float32))
+        if not static:
+            np.testing.assert_array_equal(actual_state[1], initial[1].astype(np.float32))
     finally:
         if execution is not None:
             for output in execution.outputs:

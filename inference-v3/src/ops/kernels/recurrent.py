@@ -210,6 +210,7 @@ def _register_delta_recurrence(
     lanes,
     output_tile,
     dtype,
+    sequence_length,
 ):
     """Keep each state row in registers for the complete sequence span."""
     with T.Kernel(
@@ -242,7 +243,9 @@ def _register_delta_recurrence(
         # An absolute bounded row domain lets lowering prove each input access
         # is valid while retaining runtime sequence lengths and packed offsets.
         for row in T.serial(
-            T.max(0, offsets[sequence]), T.min(query.shape[0], offsets[sequence + 1])
+            0 if sequence_length is not None else T.max(0, offsets[sequence]),
+            sequence_length if sequence_length is not None else
+            T.min(query.shape[0], offsets[sequence + 1]),
         ):
             partial[0] = 0.0
             for chunk in T.unroll(T.ceildiv(key_width, lanes), explicit=True):
@@ -289,9 +292,10 @@ def _register_delta_recurrence(
 
 
 class _GatedDeltaEmitter:
-    def __init__(self, specs, mapping, lanes, output_tile):
+    def __init__(self, specs, mapping, lanes, output_tile, sequence_length):
         self.specs, self.mapping = specs, mapping
         self.lanes, self.output_tile = lanes, output_tile
+        self.sequence_length = sequence_length
 
     def __call__(self, operands: tuple[Any, ...]) -> None:
         batch, value_heads, value_width, key_width = cast(
@@ -311,6 +315,7 @@ class _GatedDeltaEmitter:
             self.lanes,
             self.output_tile,
             self.specs[7].dtype.value,
+            self.sequence_length,
         )
 
 
@@ -337,7 +342,10 @@ class GatedDeltaRule:
                 frozenset({root}),
                 node.inputs,
                 node.outputs,
-                _GatedDeltaEmitter(specs, node.attributes["mapping"], lanes, output_tile),
+                _GatedDeltaEmitter(
+                    specs, node.attributes["mapping"], lanes, output_tile,
+                    node.attributes.get("sequence_length"),
+                ),
             ),
         )
 

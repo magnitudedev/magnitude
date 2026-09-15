@@ -39,12 +39,15 @@ def _chunk_delta_systems(
     chunk,
     mapping,
     threads,
+    sequence_length,
 ):
     with T.Kernel(chunks, heads, batch, threads=threads) as (block, head, sequence):
         # Preserve the packed sequence's valid range in the compiler's bounds
         # analysis instead of treating offsets loaded from memory as unbounded.
-        first = T.min(query.shape[0], T.max(0, offsets[sequence])) + block * chunk
-        end = T.min(query.shape[0], T.max(0, offsets[sequence + 1]))
+        first = (0 if sequence_length is not None else
+                 T.min(query.shape[0], T.max(0, offsets[sequence]))) + block * chunk
+        end = (sequence_length if sequence_length is not None else
+               T.min(query.shape[0], T.max(0, offsets[sequence + 1])))
         kh = head % key_heads if mapping == "tiled" else head // (heads // key_heads)
         q = T.alloc_fragment((chunk, width), "float32")
         k = T.alloc_shared((chunk, width), "float32")
@@ -148,6 +151,7 @@ def _chunk_delta_scan(
     columns,
     mapping,
     threads,
+    sequence_length,
 ):
     with T.Kernel(T.ceildiv(value_width, columns), heads, batch, threads=threads) as (
         tile,
@@ -159,8 +163,10 @@ def _chunk_delta_scan(
         operand = T.alloc_shared((chunk, width), "float32")
         rhs = T.alloc_shared((chunk, columns), "float32")
         contraction = T.alloc_fragment((chunk, columns), "float32")
-        first = T.min(key.shape[0], T.max(0, offsets[sequence]))
-        end = T.min(key.shape[0], T.max(0, offsets[sequence + 1]))
+        first = (0 if sequence_length is not None else
+                 T.min(key.shape[0], T.max(0, offsets[sequence])))
+        end = (sequence_length if sequence_length is not None else
+               T.min(key.shape[0], T.max(0, offsets[sequence + 1])))
         count = T.max(0, end - first)
         for v, d in T.Parallel(columns, width):
             state[v, d] = T.if_then_else(
@@ -210,15 +216,17 @@ def _chunk_delta_scan(
 def _chunk_delta_output(
     query, offsets, systems, factors, residuals, boundaries, output,
     batch, chunks, key_heads, heads, width, value_width, chunk, columns,
-    mapping, threads, dtype,
+    mapping, threads, dtype, sequence_length,
 ):
     with T.Kernel(T.ceildiv(value_width, columns), chunks, batch * heads,
                   threads=threads) as (tile, block, owner):
         sequence = owner // heads
         head = owner % heads
         kh = head % key_heads if mapping == "tiled" else head // (heads // key_heads)
-        first = T.min(query.shape[0], T.max(0, offsets[sequence])) + block * chunk
-        end = T.min(query.shape[0], T.max(0, offsets[sequence + 1]))
+        first = (0 if sequence_length is not None else
+                 T.min(query.shape[0], T.max(0, offsets[sequence]))) + block * chunk
+        end = (sequence_length if sequence_length is not None else
+               T.min(query.shape[0], T.max(0, offsets[sequence + 1])))
         q = T.alloc_shared((chunk, width), "float32")
         state = T.alloc_shared((columns, width), "float32")
         rhs = T.alloc_shared((chunk, columns), "float32")
@@ -246,9 +254,10 @@ def _chunk_delta_output(
 
 
 class _ChunkedDeltaEmitter:
-    def __init__(self, specs, mapping, chunk, columns, threads):
+    def __init__(self, specs, mapping, chunk, columns, threads, sequence_length):
         self.specs, self.mapping = specs, mapping
         self.chunk, self.columns, self.threads = chunk, columns, threads
+        self.sequence_length = sequence_length
 
     def __call__(self, operands: tuple[Any, ...]) -> None:
         (q, k, v, decay, beta, state, offsets, output, following,
@@ -275,6 +284,7 @@ class _ChunkedDeltaEmitter:
             self.chunk,
             self.mapping,
             self.threads,
+            self.sequence_length,
         )
         _chunk_delta_scan(
             k,
@@ -294,12 +304,14 @@ class _ChunkedDeltaEmitter:
             self.columns,
             self.mapping,
             self.threads,
+            self.sequence_length,
         )
         _chunk_delta_output(
             q, offsets, systems, factors, residuals, boundaries, output,
             batch, math.ceil(rows / self.chunk), key_heads, heads, width,
             value_width, self.chunk, self.columns, self.mapping, self.threads,
             self.specs[7].dtype.value,
+            self.sequence_length,
         )
 
 
@@ -363,7 +375,10 @@ class ChunkedDeltaRule:
                 frozenset({root}),
                 node.inputs,
                 node.outputs,
-                _ChunkedDeltaEmitter(specs, node.attributes["mapping"], chunk, columns, threads),
+                _ChunkedDeltaEmitter(
+                    specs, node.attributes["mapping"], chunk, columns, threads,
+                    node.attributes.get("sequence_length"),
+                ),
                 workspace=workspace,
                 kernel_count=3,
             ),
