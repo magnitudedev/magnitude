@@ -9,13 +9,13 @@ from enum import StrEnum
 from statistics import median
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_serializer, model_validator
 
 from ..binding import SourceInfo
 from ..compiler.dependencies import CodeDependency
 from ..formula import FormulaRef, Unit, units
-from ..runtime.observation import Activity, ObservationStatus, RuntimeObservation
 from ..performance.resources import Resource
+from ..runtime.observation import Activity, ObservationStatus, RuntimeObservation
 from ..tensor.types import DType
 
 
@@ -41,6 +41,8 @@ class MeasurementProtocol(Record):
     absolute_tolerance: float = Field(default=0, ge=0)
     relative_tolerance: float = Field(default=0, ge=0)
     kernel_limit: int | None = Field(default=1024, ge=1, le=65536)
+    measure_invalid: bool = False
+    inputs: Literal["reference", "production"] = "reference"
 
     @model_validator(mode="before")
     @classmethod
@@ -59,6 +61,10 @@ class MeasurementProtocol(Record):
         # No extra conditioning preserves the established ordinary series key.
         if not self.minimum_warmup_seconds:
             value.pop("minimum_warmup_seconds", None)
+        if not self.measure_invalid:
+            value.pop("measure_invalid", None)
+        if self.inputs == "reference":
+            value.pop("inputs", None)
         if self.version == 1:
             value.pop("kernel_limit", None)
         return value
@@ -257,6 +263,8 @@ class Measurement(Record):
     error: str | None = None
     unavailable: tuple[UnavailableMetric, ...] = ()
     roofline: Roofline | None = None
+    preparation: dict[str, JsonValue] = Field(default_factory=dict)
+    artifacts: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def valid_evidence(self):
@@ -299,6 +307,15 @@ class Measurement(Record):
         return median(sample.elapsed_ns for sample in self.samples) / 1_000_000_000
 
     @property
+    def observed_seconds(self) -> float | None:
+        """Timing evidence can survive a numerical failure without qualifying it."""
+        if len(self.samples) != self.series.protocol.samples or any(
+            s.status != ObservationStatus.COMPLETE for s in self.samples
+        ):
+            return None
+        return median(sample.elapsed_ns for sample in self.samples) / 1_000_000_000
+
+    @property
     def work_seconds(self) -> float:
         """Reported phases, not a substitute for request-to-visible turnaround."""
         return sum(phase.elapsed_ns for phase in self.phases) / 1_000_000_000
@@ -311,6 +328,10 @@ class Measurement(Record):
         values = [Metric(name="elapsed", value=duration, unit=units.second,
                          basis="median complete-operation wall duration")]
         kernel_seconds = None
+        busy = [s.kernels.busy_ns for s in self.samples if s.kernels is not None]
+        if len(busy) == len(self.samples) and all(value is not None for value in busy):
+            values.append(Metric(name="kernel-busy-time", value=median(v for v in busy if v is not None) / 1e9,
+                                 unit=units.second, basis="median union of native intervals per sample"))
         native = tuple(sample.kernels for sample in self.samples if sample.kernels is not None)
         if len(native) == len(self.samples):
             kernel_seconds = median(sample.elapsed_ns for sample in native) / 1e9

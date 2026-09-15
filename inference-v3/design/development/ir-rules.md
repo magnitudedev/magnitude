@@ -458,6 +458,22 @@ force a wider vector across that boundary.
 annotation. A legal scalar tail is expected. Scalarization of a proven contiguous
 interior needs an explanation or a lowering fix.
 
+### Match packed loads to the bits actually consumed
+
+A packet decoder should request its exact field width. Eight two-bit fields
+occupy sixteen bits. When their byte offset is even, they fit in one aligned
+32-bit backing word, including packets starting at its upper half. A general
+unaligned 32-bit load can instead introduce an unnecessary neighbouring load,
+merge, and lane-varying branch; a later mask need not remove that work.
+
+Use the sixteen-bit field helper for this packet, preserving its existing bit
+interpretation and coefficient arithmetic. Prove the offset alignment across
+rows, planes, and tiles before assuming a single backing load.
+
+**Check:** emitted code has one backing load and a shift/mask, with no cross-word
+merge or alignment branch. Confirm identical decoded values and measure the
+affected projection on retained inputs, then verify its enclosing model impact.
+
 ### Make copy extents unambiguous
 
 ```python

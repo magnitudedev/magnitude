@@ -12,12 +12,12 @@ from typing import Any
 from ..binding import Binding, Residency
 from ..formula import FormulaTree
 from ..runtime.configuration import DeviceConfiguration
-
 from ..runtime.resources import Completion, DeviceRuntime, Execution, Resource
 from ..tensor.graph import Graph, prune_dead_nodes
 from ..tensor.tracing import Signature, trace
 from ..tensor.types import TensorSpec
 from .diagnostics import CompilationDiagnostics, build_diagnostics
+from .execution import ExecutionGraph, execution_graph
 from .lowering import (
     BoundOperation,
     Capabilities,
@@ -27,7 +27,6 @@ from .lowering import (
 )
 from .memory import MemoryPlan, StorageClass, plan_memory
 from .unit import BindingKey, ParameterKind, TileCompilationUnit, build_unit
-from .execution import ExecutionGraph, execution_graph
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +151,7 @@ class CompiledFunction:
             raise TypeError(
                 f"compiled function expects {len(self.graph.inputs)} inputs, got {len(inputs)}"
             )
+        self.device.observations.program(self.graph, self._units)
         source_bindings = dict(self._source_bindings)
         for identity, binding in (sources or {}).items():
             original = source_bindings.get(identity)
@@ -303,6 +303,20 @@ class CompiledFunction:
                         for item in program.code_dependencies:
                             dependencies[item.module, item.symbol] = item
         return tuple(dependencies[key] for key in sorted(dependencies))
+
+    def evidence(self) -> dict[str, str]:
+        """Supported compiled sources, never estimates of native instruction counts."""
+        result = {}
+        for index, unit in enumerate(self._units):
+            describe = getattr(unit.executable, "evidence", None)
+            if describe is not None:
+                for kind, source in describe().items():
+                    result[f"unit-{index}/{kind}"] = source
+            for call in unit.unit.calls:
+                definition = call.operation.definition
+                if definition is not None:
+                    result[f"{definition.identity}/authored"] = str(definition.program)
+        return result
 
     def close(self) -> None:
         if self._closed:

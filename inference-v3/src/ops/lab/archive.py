@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from uuid import uuid4
 from typing import Literal
+from uuid import uuid4
 
 from pydantic import Field, model_validator
 
@@ -91,15 +91,9 @@ class StoredConfiguration:
 
 
 def browse(path: Path) -> None:
-    """Open recorded configurations without a production fixture or live runtime."""
+    """Browse published models without a production fixture or live runtime."""
+    from .model_view import ModelApp
     from .store import ObservationStore
-    from .tui import ConfigurationApp, RecordedApp
 
-    store = ObservationStore(path)
-    try:
-        while (selected := ConfigurationApp(store.configurations(), recorded=True).run()) is not None:
-            result = RecordedApp(store, selected).run()
-            if result != "choose":
-                return
-    finally:
-        store.close()
+    with ObservationStore(path, read_only=True) as store:
+        ModelApp(store).run()

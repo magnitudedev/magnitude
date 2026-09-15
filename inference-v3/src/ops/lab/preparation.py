@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ..binding import Binding, Residency
-from ..compiler.compilation import CompileOptions, CompiledFunction, analyze_graph, materialize
+from ..compiler.compilation import CompiledFunction, CompileOptions, analyze_graph, materialize
 from ..compiler.dependencies import CodeDependency
 from ..runtime.observation import RuntimeObservation
 from ..runtime.resources import DeviceRuntime, Execution, Resource
@@ -26,6 +26,10 @@ class InvocationInputs:
     state: dict[int, Resource]
 
 
+class NumericalMismatch(ArithmeticError):
+    """A value disagrees with the oracle; distinct from illegal state mutation."""
+
+
 class PreparedFormula:
     """Resident fixtures and one compiled production specialization.
 
@@ -35,7 +39,7 @@ class PreparedFormula:
     """
 
     def __init__(self, fixture: FormulaFixture, device: DeviceRuntime, options: CompileOptions):
-        self.fixture, self.device = fixture, device
+        self.fixture, self.device, self.options = fixture, device, options
         self._closed = False
         self._owned = ExitStack()
         self._dynamic: dict[int, Resource] = {}
@@ -188,12 +192,20 @@ class PreparedFormula:
 
     def check(self, inputs: InvocationInputs, protocol: MeasurementProtocol) -> None:
         execution = self.execute(inputs)
+        mismatches = []
+
+        def check_value(resource, expected):
+            try:
+                self._check_value(resource, expected, protocol)
+            except NumericalMismatch as failure:
+                mismatches.append(str(failure))
+
         try:
             execution.completion.wait()
             # The isolated reference retains the original output order, including
             # duplicate ports. Pruning does not reorder observable outputs.
             for resource, expected in zip(execution.outputs, self.fixture.reference.outputs, strict=True):
-                self._check_value(resource, expected, protocol)
+                check_value(resource, expected)
             # Check complete mutated resources too, including untouched regions
             # and writes that are observable without being a formula return port.
             latest = {}
@@ -215,7 +227,7 @@ class PreparedFormula:
                     continue
                 final = latest[value.resource_id]
                 expected = self.fixture.reference.values[final.id]
-                self._check_value(resource, np.asarray(expected).reshape(resource.spec.shape), protocol)
+                check_value(resource, np.asarray(expected).reshape(resource.spec.shape))
             by_resource = {self.compiled.graph.value(identity).resource_id: resource
                            for identity, resource in inputs.state.items()}
             for identity, resource in zip(self.compiled.graph.outputs, execution.outputs, strict=True):
@@ -224,6 +236,8 @@ class PreparedFormula:
                     backing = by_resource[value.resource_id]
                     if resource._lease.allocation is not backing._lease.allocation:
                         raise AssertionError("formula state alias was materialized as unrelated backing")
+            if mismatches:
+                raise NumericalMismatch("\n".join(mismatches))
         finally:
             for output in execution.outputs:
                 output.close()
@@ -232,11 +246,14 @@ class PreparedFormula:
         actual = decode_dense(self.device.read(resource), resource.spec)
         if tuple(actual.shape) != tuple(np.shape(expected)):
             raise AssertionError("operation output shape differs from formula reference")
-        if resource.spec.dtype.floating:
-            np.testing.assert_allclose(actual, expected, atol=protocol.absolute_tolerance,
-                                       rtol=protocol.relative_tolerance, equal_nan=True)
-        else:
-            np.testing.assert_array_equal(actual, expected)
+        try:
+            if resource.spec.dtype.floating:
+                np.testing.assert_allclose(actual, expected, atol=protocol.absolute_tolerance,
+                                           rtol=protocol.relative_tolerance, equal_nan=True)
+            else:
+                np.testing.assert_array_equal(actual, expected)
+        except AssertionError as error:
+            raise NumericalMismatch(str(error)) from error
 
     def sample(self, inputs: InvocationInputs, *, kernel_limit: int | None = None) -> RuntimeObservation:
         with self.device.observe(kernel_limit=kernel_limit) as capture:

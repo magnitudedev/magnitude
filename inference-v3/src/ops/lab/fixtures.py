@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from contextlib import ExitStack
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from weakref import WeakValueDictionary
 
@@ -13,7 +14,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ..binding import Binding
-from ..formula import FormulaHandle
+from ..formula import FormulaHandle, FormulaIndex
 from ..isolation import IsolatedFormula
 from ..representations import Dense
 from ..runtime.resources import Resource
@@ -62,6 +63,16 @@ def decode_dense(content: bytes, spec: TensorSpec) -> NDArray:
     else:
         result = np.frombuffer(content, dtype=dtype.value)
     return result.reshape(spec.shape)
+
+
+def tensor_identity(spec, reference, physical):
+    digest = hashlib.sha256()
+    digest.update(json.dumps(_stable(spec), sort_keys=True).encode())
+    digest.update(reference.dtype.str.encode())
+    digest.update(memoryview(np.ascontiguousarray(reference)).cast("B"))
+    if isinstance(physical, Binding):
+        digest.update(physical.value_identity.encode())
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -247,18 +258,17 @@ class Fixture:
         physical = self._bindings.get(identity)
         if physical is None:
             physical = encode_dense(value, spec)
-        digest = hashlib.sha256()
-        digest.update(json.dumps(_stable(spec), sort_keys=True).encode())
-        digest.update(value.dtype.str.encode())
-        digest.update(memoryview(np.ascontiguousarray(value)).cast("B"))
-        if isinstance(physical, Binding):
-            # Logical fixture identity is separate from where/how bytes arrive.
-            # Streamed paths/cache conditions enter the observation series; moving
-            # a resident artifact on disk does not change its input values.
-            digest.update(physical.value_identity.encode())
-        cached = FixtureTensor(spec, value, physical, digest.hexdigest())
+        cached = FixtureTensor(spec, value, physical, tensor_identity(spec, value, physical))
         self._tensors[identity] = cached
         return cached
+
+    @property
+    def source_spans(self):
+        """Actual streamed paths available for an explicit characterization request."""
+        from ..binding import Residency
+        return tuple(plane.span for binding in self._bindings.values()
+                     if isinstance(binding, Binding) and binding.residency == Residency.STREAMED
+                     for plane in binding.planes)
 
     def boundary(self, target: FormulaHandle) -> FormulaFixture:
         if not isinstance(target, FormulaHandle) or target.graph is not self.root:
@@ -277,3 +287,86 @@ class Fixture:
     def release_boundary(self, target: FormulaHandle) -> None:
         """Allow bounded worker caches to discard derived references without losing inputs."""
         self._boundaries.pop(target, None)
+
+    def capture_boundary(self, target: FormulaHandle, device, options):
+        """Execute upstream production operations once, stopping before target.
+
+        This is an explicit preparation build: exposing boundary values can change
+        fusion. Its execution is never reported as production parent timing.
+        Returns an immutable boundary snapshot and its compiled dependencies.
+        """
+        from ..compiler.compilation import analyze_graph, materialize
+        from ..tensor.graph import ValueKind
+
+        if target.graph is not self.root or not target.call.complete:
+            raise ValueError("capture requires a complete scope in this production trace")
+        isolated = target.isolate()
+        cutoff = min(target.call.nodes) if target.call.nodes else 0
+        nodes = self.root.nodes[:cutoff]
+        declared = (*self.root.inputs, *self.root.constants, *self.root.resources)
+        available = set(declared) | {v for node in nodes for v in node.outputs}
+        outputs = tuple(port.original for port in isolated.inputs
+                        if self.root.value(port.original).kind != ValueKind.CONSTANT)
+        if not set(outputs) <= available:
+            raise ValueError("selected boundary requires computation outside its upstream prefix")
+        prefix = replace(self.root, nodes=nodes, outputs=outputs, formulas=FormulaIndex(tuple(
+            call.remap({v: v for v in available}, {node.id: node.id for node in nodes})
+            for call in self.root.formulas)))
+        captured = {}
+        with ExitStack() as retained:
+            constants, resources = {}, {}
+            backing = {}
+            for identity in declared:
+                value = self.root.value(identity)
+                physical = self._bindings.get(identity)
+                if value.kind == ValueKind.CONSTANT and isinstance(physical, Binding):
+                    constants[identity] = physical
+                    continue
+                # Mutable starting state is copied; preparation must never advance
+                # the caller's retained history. Immutable resources may be leased.
+                tensor = self._tensor(identity)
+                if isinstance(physical, Resource) and value.kind != ValueKind.RESOURCE:
+                    resource = physical.fork()
+                else:
+                    content = (tensor.physical if isinstance(tensor.physical, bytes)
+                               else encode_dense(tensor.reference, tensor.spec))
+                    shared = backing.get(value.resource_id) if value.resource_id is not None else None
+                    if shared is not None:
+                        resource, prior = shared
+                        if prior != content or resource.spec != tensor.spec:
+                            raise ValueError("capture requires compatible aliased state views")
+                        resources[identity] = resource
+                        continue
+                    resource = device.upload(tensor.spec, content)
+                    if value.resource_id is not None:
+                        backing[value.resource_id] = resource, content
+                retained.callback(resource.close)
+                resources[identity] = resource
+                if value.kind == ValueKind.CONSTANT:
+                    constants[identity] = resource
+            plan = analyze_graph(prefix, capabilities=device.capabilities,
+                                 compiler_identity=device.compiler_identity, options=options,
+                                 available_bytes=device.available_bytes, constants=constants)
+            compiled = materialize(plan, device=device, constants=constants)
+            retained.callback(compiled.close)
+            original = (*prefix.inputs, *prefix.constants, *prefix.resources)
+            local = (*compiled.graph.inputs, *compiled.graph.constants, *compiled.graph.resources)
+            mapping = dict(zip(local, original, strict=True))
+            execution = compiled.submit(*(resources[mapping[i]] for i in compiled.graph.inputs),
+                                        resources={i: resources[mapping[i]] for i in compiled.graph.resources})
+            try:
+                execution.completion.wait()
+                for identity, resource in zip(outputs, execution.outputs, strict=True):
+                    captured[identity] = decode_dense(device.read(resource), resource.spec).copy()
+            finally:
+                for resource in execution.outputs:
+                    resource.close()
+            dependencies = compiled.code_dependencies
+        # Preserve production immutable weight bindings. Captured state owns bytes;
+        # no live alias can be mutated behind a replay fixture's identity.
+        bindings = {port.original: self._bindings[port.original] for port in isolated.inputs
+                    if port.original in self._bindings and port.original not in captured}
+        snapshot = Fixture(self.root, captured, bindings=bindings,
+                           capture=lambda value: self._tensor(value.id).reference)
+        boundary = snapshot.boundary(target)
+        return boundary, dependencies, prefix.fingerprint

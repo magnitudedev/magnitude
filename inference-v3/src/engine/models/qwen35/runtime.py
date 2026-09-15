@@ -87,6 +87,7 @@ class Forward:
             execution.outputs[0] if any(value.logits is not None for value in outputs) else None
         )
         self._owned = owned
+        self._observation = None
         self.completion = execution.completion
         self.closed = False
         for output in self.outputs:
@@ -102,6 +103,8 @@ class Forward:
             self._owned.close()
             self.closed = True
             self.runtime._forwards.discard(self)
+            if self._observation is not None:
+                self._observation()
 
 
 class DenseRuntime(ModelExecutor):
@@ -135,6 +138,7 @@ class DenseRuntime(ModelExecutor):
         self._forwards: set[Forward] = set()
         self._sequences: set[Sequence] = set()
         self._checkpoints: set[Checkpoint] = set()
+        self._inspection = None
         self.closed = False
 
     def prime(self, rows: int, horizon: int) -> None:
@@ -254,6 +258,10 @@ class DenseRuntime(ModelExecutor):
         if not requests or len({id(item.state) for item in requests}) != len(requests):
             raise ValueError("a forward requires distinct sequence states")
         with ExitStack() as owned:
+            capture = None
+            if self._inspection is not None and self._inspection[1] is not None:
+                # Enter before packing; exit is attached after transient cleanup.
+                capture = owned.enter_context(self.device.observe(kernel_limit=self._inspection[2]))
             mode = "decode" if all(len(item.inputs.tokens) == 1 for item in requests) else "prefill"
             actual_rows = sum(len(item.inputs.tokens) for item in requests)
             physical_rows = (
@@ -404,6 +412,14 @@ class DenseRuntime(ModelExecutor):
                     for index, cache in enumerate(self.states.attention)
                 },
             )
+            if self._inspection is not None:
+                from .inspection import Invocation
+                invocation = Invocation(compiled, tuple(dynamic), resources, self.program.weights,
+                                        mode, tuple(r.state.position for r in requests),
+                                        tuple(len(r.inputs.tokens) for r in requests), physical_rows)
+                captured, observed, _ = self._inspection
+                if captured is not None:
+                    captured(invocation)
             execution = compiled.submit(*dynamic, resources=resources)
             attention_count = len(self.states.attention)
             cursor = 2 if output_rows else 0
@@ -437,7 +453,10 @@ class DenseRuntime(ModelExecutor):
                     )
                 advance.submitted(execution.completion, tuple(following_states))
                 outputs.append(ForwardOutput(self, advance, logit, sample))
-            return Forward(self, outputs, execution, owned.pop_all())
+            forward = Forward(self, outputs, execution, owned.pop_all())
+            if capture is not None:
+                forward._observation = lambda: observed(invocation, capture.result)
+            return forward
 
     def _upload(self, code, values, shape, dtype, owned):
         resource = self.device.upload(

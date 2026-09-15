@@ -435,7 +435,10 @@ def decode_packet(destination, tile_row, tile_column, words, spec, row, first,
         if representation.code.high_bits == 1:
             high = byte(words, base + layout.high + within // 8)
         elif representation.code.high_bits == 2:
-            high = word(words, base + layout.high + within // 4)
+            # Eight two-bit fields occupy exactly one aligned halfword. Loading
+            # a full unaligned word would fetch an unused neighbour and branch
+            # on alternating lanes just to discard its upper sixteen bits.
+            high = halfword(words, base + layout.high + within // 4)
         else:
             high = T.uint32(0)
         for index in T.unroll(8, explicit=True):

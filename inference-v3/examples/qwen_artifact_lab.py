@@ -6,14 +6,13 @@ No full model is loaded, executed or compiled to measure the selected boundary.
 """
 
 import argparse
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 
 import numpy as np
 
 import ops
-from ops.lab import Configuration, Fixture, MeasurementProtocol, show
-from ops.tensor.primitive import round_reference
 from engine import DevicePlan
 from engine.models.qwen35 import equations
 from engine.models.qwen35.formats.gguf import describe
@@ -22,6 +21,8 @@ from engine.qualification import QualificationCase, invocation_specs
 from engine.weights.descriptor import WeightTransform
 from engine.weights.formats.gguf import Encoding, GGUFFormat
 from engine.weights.tensor_residency import describe_binding
+from ops.lab import Configuration, Fixture, MeasurementProtocol, show
+from ops.tensor.primitive import round_reference
 
 
 def feedforward(format: GGUFFormat, *, rows: int, plan: DevicePlan, store: Path,
@@ -75,6 +76,19 @@ def feedforward(format: GGUFFormat, *, rows: int, plan: DevicePlan, store: Path,
         protocol=MeasurementProtocol(absolute_tolerance=3e-3, relative_tolerance=2**-7),
         prepared_limit=1, reference_bytes=4 << 30,
     )
+
+
+@contextmanager
+def configuration(model: str, rows: int = 2048, layer: int = 0,
+                  maximum_bytes: int = 4 << 30, seed: int = 157):
+    """Headless factory retaining the existing artifact fixture's source lifetime."""
+    format = GGUFFormat(model)
+    try:
+        yield feedforward(format, rows=rows, layer=layer, seed=seed,
+                          plan=DevicePlan.discover(maximum_bytes=maximum_bytes),
+                          store=Path("runs/formula-lab.sqlite"))
+    finally:
+        format.close()
 
 
 def main():
