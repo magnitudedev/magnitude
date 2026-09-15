@@ -43,6 +43,7 @@ jobs:
       - run: bun run --cwd packages/version test
       - run: bun run --cwd packages/release typecheck
       - run: bun scripts/check-sdk-boundary.ts
+      - run: bun packages/daemon-management/scripts/build-native.ts
       - run: bunx --bun vitest run packages/sdk packages/daemon-management packages/release packages/acn-protocol
       # Allocate against the real public baselines (GitHub releases, npm); nothing is committed.
       - run: bun packages/release/scripts/prepare-release.ts
