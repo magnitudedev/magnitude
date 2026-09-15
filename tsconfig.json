@@ -9,7 +9,7 @@
     "esModuleInterop": true,
     "resolveJsonModule": true,
     "jsx": "react-jsx",
-    "jsxImportSource": "@opentui/react",
+    "jsxImportSource": "react",
     "paths": {
       "@magnitudedev/agent": ["./packages/agent/src"],
       "@magnitudedev/roles": ["./packages/roles/src"],
