@@ -108,6 +108,17 @@ jobs:
           sudo apt-get install -y clang
           echo "CC=clang" >> "$GITHUB_ENV"
           echo "CXX=clang++" >> "$GITHUB_ENV"
+      - name: Install Windows native build components
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installerRoot = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer'
+          $installation = & (Join-Path $installerRoot 'vswhere.exe') -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$installation) { throw 'Visual Studio C++ Build Tools are required.' }
+          $arguments = @('modify', '--installPath', "`"$installation`"", '--add', 'Microsoft.VisualStudio.Component.VC.Llvm.Clang', '--add', 'Microsoft.VisualStudio.Component.VC.CMake.Project', '--quiet', '--norestart')
+          $setup = Start-Process -FilePath (Join-Path $installerRoot 'setup.exe') -ArgumentList $arguments -Wait -PassThru
+          if ($setup.ExitCode -notin @(0, 3010)) { throw "Visual Studio component installation failed ($($setup.ExitCode))." }
+          if (!(Test-Path (Join-Path $installation 'VC\Tools\Llvm\x64\bin\libclang.dll'))) { throw 'Visual Studio Clang installation is incomplete.' }
       - name: Install Windows installer tools
         if: runner.os == 'Windows'
         shell: pwsh
