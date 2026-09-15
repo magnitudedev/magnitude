@@ -12,6 +12,9 @@ export const windowsSigning = Config.literal("unsigned", "artifact-signing")("MA
 
 export const windowsSigningScript = fileURLToPath(new URL("./windows-signing.ps1", import.meta.url))
 
+/** Engine-built DLLs receive our signature; bundled Microsoft CRT DLLs retain theirs. */
+export const isWindowsEngineLibrary = (filename: string): boolean => /^(?:ggml|llama|mtmd)(?:-.*)?\.dll$/i.test(filename)
+
 /** Verify publisher and timestamp before any signed bytes enter an archive or installer. */
 export const signWindowsCode = (file: string) => Effect.gen(function* () {
   if ((yield* windowsSigning) === "unsigned") return

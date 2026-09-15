@@ -7,7 +7,7 @@ import {setTimeout as delay} from 'node:timers/promises';
 import {_electron as electron} from 'playwright';
 assert.equal(process.platform,'linux');
 assert.equal(process.versions.bun,undefined,'Playwright Electron acceptance requires Node, not the Bun node shim');
-const executablePath='/usr/lib/magnitude-desktop/magnitude';
+const executablePath='/usr/bin/magnitude-desktop';
 const cliExecutable=process.env.MAGNITUDE_TEST_CLI_EXECUTABLE;
 assert.ok(cliExecutable,'MAGNITUDE_TEST_CLI_EXECUTABLE must name the compiled CLI');
 const assembled=process.env.MAGNITUDE_TEST_ASSEMBLED_DESKTOP;
@@ -25,7 +25,7 @@ const inferenceInstallation=process.env.MAGNITUDE_TEST_INFERENCE_INSTALLATION;
 const env={...process.env,HOME:root,XDG_CONFIG_HOME:join(root,'config'),MAGNITUDE_ICN_PATH:inferenceInstallation??join(root,'absent-engine.json'),MAGNITUDE_SHELL_ENV_INHERITED:'1'};
 delete env.MAGNITUDE_DESKTOP_PATH;
 delete env.MAGNITUDE_DEV_DATA_DIR;delete env.MAGNITUDE_DEV_PORT;delete env.MAGNITUDE_DESKTOP_STATE_DIR;
-const endpoint=join(root,'.magnitude/desktop/application.sock');
+const endpoint=join(root,'.magnitude/state/application.sock');
 const entry=join(env.XDG_CONFIG_HOME,'autostart/dev.magnitude.desktop');
 const until=async(fn)=>{for(let i=0;i<150;i++){if(await fn())return;await delay(100)}throw Error('condition timed out')};
 const request=intent=>new Promise((resolve,reject)=>{

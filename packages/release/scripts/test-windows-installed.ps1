@@ -9,11 +9,15 @@ $installation = Join-Path $env:LOCALAPPDATA 'Programs\Magnitude'
 if (Test-Path -LiteralPath $installation) { throw 'Installed acceptance requires a disposable Windows consumer without Magnitude installed.' }
 if ($RequireSignature -and [string]::IsNullOrWhiteSpace($env:MAGNITUDE_WINDOWS_PUBLISHER)) { throw 'Missing expected Windows publisher.' }
 
-function AssertSignature([string]$Path) {
+function AssertSignature([string]$Path, [switch]$AllowMicrosoftRuntime) {
   if (!$RequireSignature) { return }
+  $publisher = $env:MAGNITUDE_WINDOWS_PUBLISHER
+  if ($AllowMicrosoftRuntime -and [IO.Path]::GetFileName($Path) -match '^(msvcp140|vcruntime140(_1)?)\.dll$') {
+    $publisher = 'Microsoft Windows Software Compatibility Publisher'
+  }
   $signature = Get-AuthenticodeSignature -LiteralPath $Path
   if ($signature.Status -ne 'Valid' -or !$signature.TimeStamperCertificate -or
-      $signature.SignerCertificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) -cne $env:MAGNITUDE_WINDOWS_PUBLISHER) {
+      $signature.SignerCertificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) -cne $publisher) {
     throw "Invalid publisher signature or timestamp: $Path"
   }
 }
@@ -43,9 +47,17 @@ if ($LASTEXITCODE -ne 0 -or $cliVersion.Trim() -cne $Version) { throw 'Installed
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ('magnitude-installed-consumer-' + [guid]::NewGuid())
 New-Item -ItemType Directory $scratch | Out-Null
 try {
-  foreach ($kind in @('cli', 'acn')) {
+  foreach ($kind in @('cli', 'acn', 'icn-base')) {
     & tar.exe -xzf (Join-Path $Directory "magnitude-$kind-windows-x64-msvc.tar.gz") -C $scratch
     if ($LASTEXITCODE -ne 0) { throw "Could not extract accepted $kind archive." }
+  }
+  $engine = Join-Path $scratch 'bin\magnitude-inference.exe'
+  if (!(Test-Path -LiteralPath $engine -PathType Leaf)) { throw 'Missing accepted inference executable.' }
+  AssertSignature $engine
+  foreach ($directory in @('runtime', 'backends')) {
+    foreach ($library in Get-ChildItem -LiteralPath (Join-Path $scratch $directory) -Filter '*.dll' -File) {
+      AssertSignature $library.FullName -AllowMicrosoftRuntime
+    }
   }
   foreach ($pair in @(@('magnitude-cli.exe', 'magnitude.exe'), @('magnitude-service.exe', 'magnitude-service.exe'))) {
     $accepted = (Get-FileHash -LiteralPath (Join-Path $scratch "bin\$($pair[0])") -Algorithm SHA256).Hash

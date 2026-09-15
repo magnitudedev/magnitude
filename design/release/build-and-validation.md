@@ -87,8 +87,10 @@ production installer. Bundling preserves the signed CLI and service bytes from t
 Local unsigned builds carry no production trust claim.
 The independent consumer installs and uninstalls the accepted installer under a fresh user profile,
 verifies installed registration and CLI versions, compares bundled CLI/service bytes to their
-accepted archives, and requires publisher signatures for production inputs. Signing credentials
-belong to the protected Windows signing environment; ordinary pull-request validation is unsigned.
+accepted archives, and requires publisher signatures for production inputs.
+The consumer also verifies the inference executable and every shipped engine/runtime DLL; engine
+code must carry Magnitude's timestamped signature, while Microsoft CRT files retain Microsoft's signature.
+Signing credentials belong to the protected Windows signing environment; ordinary pull-request validation is unsigned.
 
 ## Apple build baseline
 

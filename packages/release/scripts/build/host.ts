@@ -3,7 +3,7 @@ import { buildMacApp } from "../apple/build-app"
 import { buildDesktopApplication, DesktopBuildFailed } from "./desktop"
 import { buildLinuxDesktopInstaller } from "./desktop-linux"
 import { buildWindowsDesktopInstaller } from "./desktop-windows"
-import { signWindowsCode } from "./windows-signing"
+import { isWindowsEngineLibrary, signWindowsCode } from "./windows-signing"
 import { BunContext } from "@effect/platform-bun"
 import { buildDesktopDmg, validateDesktopDistribution } from "../apple/desktop"
 import { appleSigning, signAppleCode, appleCommand } from "../apple/signing"
@@ -375,7 +375,7 @@ export const buildHostArtifacts = async (
   const cliArchivePath = resolve(output, cliArchive(host.id))
   if (host.id === "windows-x64-msvc") {
     await Effect.runPromise(Effect.forEach([cli, acn, icn.binary, ...cpuModules,
-      ...icn.runtimeLibraries.filter(file => /^(?:ggml(?:-.*)?|llama|mtmd)\.dll$/i.test(basename(file))),
+      ...icn.runtimeLibraries.filter(file => isWindowsEngineLibrary(basename(file))),
     ], signWindowsCode, { discard: true }).pipe(Effect.provide(BunContext.layer)))
   }
   const acnArchivePath = resolve(output, acnArchive(host.id))
