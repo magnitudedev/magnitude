@@ -26,7 +26,7 @@ const PackageFields = {
     desktopTemplate: Schema.String,
     version: Schema.String,
 }
-const DebianOptions = Schema.Struct({ options: Schema.Struct({ ...PackageFields, depends: Schema.Array(Schema.String), scripts: Schema.Record({ key: Schema.String, value: Schema.String }) }) })
+const DebianOptions = Schema.Struct({ options: Schema.Struct({ ...PackageFields, compression: Schema.Literal("none"), depends: Schema.Array(Schema.String), scripts: Schema.Record({ key: Schema.String, value: Schema.String }) }) })
 const RpmOptions = Schema.Struct({ options: Schema.Struct({ ...PackageFields, requires: Schema.Array(Schema.String), license: Schema.String, specTemplate: Schema.String }) })
 
 export const validateLinuxPayloadPermissions = (format: "deb" | "rpm", listing: string) => Effect.gen(function* () {
@@ -115,7 +115,7 @@ export const buildLinuxDesktopInstaller = (options: {
     version: options.version.replace("-", "~"),
   } as const
   yield* fs.writeFileString(config, options.format === "deb"
-    ? yield* Schema.encode(Schema.parseJson(DebianOptions))({ options: { ...metadata, depends: ["libc6 (>= 2.35)", "libasound2t64 | libasound2", "util-linux", "pkexec"], scripts } })
+    ? yield* Schema.encode(Schema.parseJson(DebianOptions))({ options: { ...metadata, compression: "none", depends: ["libc6 (>= 2.35)", "libasound2t64 | libasound2", "util-linux", "pkexec"], scripts } })
     : yield* Schema.encode(Schema.parseJson(RpmOptions))({ options: { ...metadata, requires: ["glibc >= 2.35", "alsa-lib", "util-linux", "polkit"], license: "Apache-2.0", specTemplate } }))
   const destination = join(stage, "packages")
   const tool = options.format === "deb" ? "electron-installer-debian" : "electron-installer-redhat"
@@ -147,7 +147,8 @@ export const buildLinuxDesktopInstaller = (options: {
       const normalized = yield* Command.make("find", application, "-type", type, "-exec", "chmod", mode, "{}", "+").pipe(Command.exitCode)
       if (normalized !== 0) return yield* new DesktopBuildFailed({ message: "Could not protect the Debian application payload" })
     }
-    const rebuilt = yield* Command.make("dpkg-deb", "--root-owner-group", "--build", contents, candidate).pipe(Command.exitCode)
+    // Compress only the final package; Ubuntu's default zstd level 19 is needlessly slow.
+    const rebuilt = yield* Command.make("dpkg-deb", "--root-owner-group", "-Zzstd", "-z9", "--build", contents, candidate).pipe(Command.exitCode)
     if (rebuilt !== 0) return yield* new DesktopBuildFailed({ message: "Could not package the bundled CLI entry" })
   }
   yield* validateLinuxDesktopInstaller({ ...options, file: candidate })

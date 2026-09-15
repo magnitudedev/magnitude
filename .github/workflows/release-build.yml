@@ -105,11 +105,12 @@ jobs:
           scope: ${{ matrix.id }}
       - name: Install Linux build tools
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake libclang-dev fakeroot rpm libgtk-3-0 libnss3 libasound2 libgbm1 libxss1 libxtst6
+        uses: ./.github/actions/linux-build-tools
+        with:
+          packages: build-essential cmake libclang-dev fakeroot rpm libgtk-3-0 libnss3 libasound2 libgbm1 libxss1 libxtst6 ${{ matrix.id == 'linux-arm64-gnu' && 'clang' || '' }}
       - name: Install Linux ARM64 compiler
         if: runner.os == 'Linux' && matrix.id == 'linux-arm64-gnu'
         run: |
-          sudo apt-get install -y clang
           echo "CC=clang" >> "$GITHUB_ENV"
           echo "CXX=clang++" >> "$GITHUB_ENV"
       - name: Install Windows native build components
@@ -211,11 +212,12 @@ jobs:
           scope: ${{ matrix.id }}
       - name: Install Linux build tools
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake libclang-dev
+        uses: ./.github/actions/linux-build-tools
+        with:
+          packages: build-essential cmake libclang-dev ${{ matrix.host == 'linux-arm64-gnu' && 'clang' || '' }} ${{ matrix.backend == 'vulkan' && 'libvulkan-dev spirv-headers ninja-build python3' || '' }}
       - name: Install Linux ARM64 compiler
         if: runner.os == 'Linux' && matrix.host == 'linux-arm64-gnu'
         run: |
-          sudo apt-get install -y clang
           echo "CC=clang" >> "$GITHUB_ENV"
           echo "CXX=clang++" >> "$GITHUB_ENV"
       - name: Cache Linux Vulkan tools
@@ -229,7 +231,6 @@ jobs:
         if: runner.os == 'Linux' && matrix.backend == 'vulkan'
         shell: bash
         run: |
-          sudo apt-get install -y libvulkan-dev spirv-headers ninja-build python3
           vulkan_root="$RUNNER_TEMP/vulkan-sdk-1.4.313"
           if [ "${{ steps.vulkan-cache.outputs.cache-hit }}" != "true" ]; then
           headers_root="$RUNNER_TEMP/vulkan-headers-1.4.313"
