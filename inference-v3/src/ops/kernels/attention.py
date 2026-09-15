@@ -219,6 +219,12 @@ def _matrix_streaming_attention(
         last_row = T.min(tokens - 1, first_row + query_tile - 1)
         base = T.cast(visible[first_row, 0], "int32")
         count = T.cast(visible[last_row, 1], "int32")
+        # Visibility is a valid interval within the history allocation. The
+        # single-sequence matrix schedule shares its base across this query tile.
+        T.assume(base >= 0)
+        T.assume(count >= 0)
+        T.assume(base <= history.shape[1])
+        T.assume(count <= history.shape[1] - base)
         first = partition * span
         partition_count = T.max(0, T.min(span, count - first))
         T.fill(maximum, -3.402823466e38)
