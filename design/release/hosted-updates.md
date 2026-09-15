@@ -2,7 +2,6 @@
 applies_to:
   - packages/release/src/hosted-update/**
   - packages/release/resources/distribution/**
-  - packages/release/scripts/build-distribution-server.ts
   - packages/release/scripts/publish-hosted.ts
   - desktop/src/*update*
   - packages/daemon-management/src/desktop-native/*update*
@@ -125,11 +124,13 @@ retention. The request runtime cannot execute retention or modify release/channe
 
 ## Website deployment
 
-The website consumes a private, content-addressed bundle of this server implementation. The bundle
-contains the same request, manifest and database contracts; the website does not maintain a second
-verifier. Native Vercel API routes adapt HTTP requests and trusted edge country metadata, with one
-small pooled database connection set per function instance. Database credentials stay server-side,
-use a restricted role, and validate the Supabase certificate chain and hostname.
+The magnitude-dev-landing repository owns the update API, request authentication, telemetry,
+database migrations, and server implementation as readable source. It builds independently without
+private package archives or a dependency on the application repository. Magnitude owns the client
+and release publication tooling. Fixed protocol vectors test both sides of their wire contract.
+Native Vercel API routes adapt HTTP requests and trusted edge country metadata, with one small
+pooled database connection set per function instance. Database credentials stay server-side, use a
+restricted role, and validate the Supabase certificate chain and hostname.
 
 ## Acceptance
 
