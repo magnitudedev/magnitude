@@ -466,3 +466,49 @@ def test_grouped_prefill_consumes_quantized_experts_without_materialization(rows
         for owner in reversed(owners):
             owner.close()
         device.close()
+
+
+@pytest.mark.device
+@pytest.mark.parametrize("scoring,normalize", [("softmax", True), ("sigmoid", False)])
+def test_parallel_router_preserves_scores_and_cutoff_ties(scoring, normalize):
+    if not torch.backends.mps.is_available():
+        pytest.skip("requires a Metal device")
+    rng = np.random.default_rng(812)
+    hidden = rng.normal(0, .2, (2, 2048)).astype(np.float16)
+    hidden[0] = 0  # All 256 experts tie; preserve index and output ordering.
+    router = rng.normal(0, .2, (256, 2048)).astype(np.float32)
+    specs = (ops.TensorSpec(hidden.shape, ops.DType.F16),
+             ops.TensorSpec(router.shape, ops.DType.F32))
+    signature = ops.Signature((ops.Argument(specs[0], "hidden"), ops.Argument(specs[1], "router")))
+
+    def function(x, w):
+        return ops.route_topk(ops.linear(x, w, output_dtype=ops.DType.F32),
+                              k=8, scoring=scoring, normalize=normalize)
+
+    function = implement(function, ops.operation_bodies.routed_feedforward)
+    graph = ops.trace(function, signature)
+    expected = ops.evaluate_reference(graph, {"hidden": hidden, "router": router}).outputs
+    device = ops.DeviceRuntime.open(DevicePlan.discover(backend="metal", maximum_bytes=32 << 20))
+    resources = []
+    compiled = execution = None
+    try:
+        for spec, value in zip(specs, (hidden, router), strict=True):
+            resources.append(device.upload(spec, value.tobytes()))
+        compiled = ops.compile(function, signature=signature, device=device, constants={},
+                               options=ops.CompileOptions(mode="decode"))
+        assert compiled.diagnostics.dispatches == 2
+        assert "route_topk.parallel-router" in str(compiled.diagnostics.submissions)
+        execution = compiled.submit(*resources)
+        execution.completion.wait()
+        np.testing.assert_array_equal(execution.outputs[0].native.cpu().numpy(), expected[0])
+        np.testing.assert_allclose(execution.outputs[1].native.cpu().numpy(), expected[1],
+                                   rtol=3e-5, atol=3e-6)
+    finally:
+        if execution is not None:
+            for output in execution.outputs:
+                output.close()
+        if compiled is not None:
+            compiled.close()
+        for resource in reversed(resources):
+            resource.close()
+        device.close()
