@@ -282,7 +282,7 @@ def _build_reusable_module(unit: TileCompilationUnit):
     parameter_by_name = {parameter.name: parameter for parameter in unit.parameters}
     templates = {}
     calls = []
-    definitions = []
+    definitions = {}
     for call in unit.calls:
         operand_parameters = tuple(
             parameter_by_name[binding.parameter] for binding in call.bindings
@@ -299,7 +299,7 @@ def _build_reusable_module(unit: TileCompilationUnit):
         key = definition.identity
         template = templates.get(key)
         if template is None:
-            definitions.append(definition.private_definition())
+            definitions[definition.name] = definition.program
             template = definition.name
             templates[key] = template
         calls.append((template, operand_parameters, definition.ports))

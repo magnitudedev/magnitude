@@ -41,11 +41,6 @@ class KernelDefinition:
     program: Any
     dependencies: tuple[CodeDependency, ...] = ()
 
-    def private_definition(self):
-        import tilelang.language as T
-
-        return T.PrimFuncDefinition.from_program(self.name, self.program)
-
 
 def annotation(T, spec: TensorSpec):
     representation = spec.representation
