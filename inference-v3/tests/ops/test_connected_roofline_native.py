@@ -11,6 +11,7 @@ import ops
 from engine import DevicePlan
 from engine.models.qwen35.tensor_program import InvocationSpecs, define, weight_roles
 from ops.lab import Lab, MeasurementProtocol, ObservationStore
+from ops.lab.evidence import ExecutionContext, Model, Workload
 from ops.lab.records import Outcome
 from ops.performance.resources import Resource
 from ops.runtime.observation import Activity
@@ -69,8 +70,15 @@ def test_production_qwen_tree_has_independent_measurements_and_resource_models(t
     path = Path(os.environ.get("MAGNITUDE_ROOFLINE_STORE", tmp_path / "production-tree.sqlite"))
     # Match the existing hybrid production check, not a new tolerance relaxation.
     protocol = MeasurementProtocol(absolute_tolerance=.08, relative_tolerance=.08)
-    with Lab(fixture=fixture, device=lambda: ops.DeviceRuntime.open(plan), store=path,
+    context = ExecutionContext(
+        model=Model(identity="qualification:qwen35-hybrid-small", label="Qwen 3.5 hybrid · synthetic qualification"),
+        workload=Workload(kind="synthetic", recipe={"seed": 44, "rows": rows}, realization=fixture.root.fingerprint),
+        engine="v3", artifact="deterministic synthetic weights, seed 44", numerical_contract="reference",
+        hardware="resolved-at-execution", implementation="resolved-at-compilation",
+    )
+    with Lab(fixture=fixture, device=lambda: ops.DeviceRuntime.open(plan), store=path, context=context,
              options=definition.options, protocol=protocol, label="Qwen hybrid production composition · small fixture") as lab:
+        lab.characterize().result(timeout=300)
         root, = lab.formulas.roots
         targets = lab.subtree(root)
         assert len(targets) > 20
@@ -89,6 +97,10 @@ def test_production_qwen_tree_has_independent_measurements_and_resource_models(t
     with ObservationStore(path) as store:
         record = store.configurations()[0]
         assert len(store.recorded_rooflines(record)) == len(targets)
+        runs = store.runs(context.model.identity)
+        assert len(runs) >= len(targets)
+        assert {r.scope.occurrence for r in runs} == {t.call.occurrence for t in targets}
+        assert all(r.correctness == "passed" for r in runs)
 
 
 @pytest.mark.device
@@ -115,6 +127,7 @@ def test_streamed_source_has_matching_path_evidence(tmp_path, file_source):
     store_path = Path(os.environ.get("MAGNITUDE_ROOFLINE_STORE", tmp_path / "streamed.sqlite"))
     with Lab(fixture=fixture, device=lambda: ops.DeviceRuntime.open(plan), store=store_path,
              options=ops.CompileOptions(mode="prefill")) as lab:
+        lab.characterize().result(timeout=300)
         root, = lab.formulas.roots
         result = lab.measure(root).result.result(timeout=300)
         assert result.outcome == Outcome.COMPLETE, result.error

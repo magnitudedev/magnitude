@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import sys
 import hashlib
 import json
 import platform
-from dataclasses import asdict
+import sys
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
+from dataclasses import asdict
 from threading import Lock
 from typing import Any, cast
 
@@ -18,8 +18,14 @@ from ..compiler.lowering import Capabilities, MatrixInstruction
 from ..compiler.unit import TileCompilationUnit
 from ..representations import Dense
 from ..tensor.types import DType, TensorSpec
-from .resources import NativeAllocation, NativeBoundEntrypoint, NativeCompletion, NativeExecutable, NativeSubmissionError
 from .observation import KernelActivity
+from .resources import (
+    NativeAllocation,
+    NativeBoundEntrypoint,
+    NativeCompletion,
+    NativeExecutable,
+    NativeSubmissionError,
+)
 
 _COMPILER_RECURSION_LOCK = Lock()
 
@@ -33,7 +39,8 @@ class _KernelCapture:
         self._capture.start()
 
     def finish(self) -> tuple[KernelActivity, ...]:
-        return tuple(KernelActivity(item.name, item.elapsed_ns) for item in self._capture.finish())
+        return tuple(KernelActivity(item.name, item.elapsed_ns, item.started_ns,
+                                    item.ended_ns, item.dispatch) for item in self._capture.finish())
 
     def close(self) -> None:
         self._capture.close()
@@ -136,6 +143,12 @@ class _Executable(NativeExecutable):
     def __init__(self, kernel, completion: Callable[[], NativeCompletion]):
         self._kernel = kernel
         self._completion = completion
+
+    def evidence(self) -> dict[str, str]:
+        if self._kernel is None:
+            raise RuntimeError("executable is closed")
+        return {"device-source": self._kernel.get_kernel_source(),
+                "host-source": self._kernel.get_host_source()}
 
     def bind(
         self, static: Mapping[int, Any], dynamic_indices: tuple[int, ...]

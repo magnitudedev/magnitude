@@ -3,8 +3,8 @@ from engine.data import TokenId
 from engine.models.qwen35.inputs import InputPlan
 from engine.models.qwen35.runtime import DenseRuntime
 from engine.models.sequence import LogitsSelection, ModelRequest
-from tests.ops.test_compiler import Runtime
 from tests.models.test_qwen35_tensor_program import Residency, _description
+from tests.ops.test_compiler import Runtime
 
 
 class ModelResidency(Residency):
@@ -214,3 +214,46 @@ def test_prime_materializes_state_prefill_logits_prefill_and_decode():
     for resource in residency.resources:
         resource.close()
     device.close()
+
+
+def test_explicit_forward_observation_and_capture_share_production_execution(tmp_path):
+    from engine.models.qwen35.inspection import inspect_forwards, publish_forward
+    from ops.lab.store import ObservationStore
+    from tests.ops.test_model_evidence import run
+
+    native = Runtime()
+    device = ops.DeviceRuntime(native, budget_bytes=1 << 24)
+    residency = ModelResidency(device)
+    model = DenseRuntime(_description(), device, residency, max_sequences=2)
+    sequence = model.create(InputPlan.text((TokenId(1), TokenId(2))))
+    try:
+        with ObservationStore(tmp_path / 'model.sqlite') as store:
+            collected = []
+            def observed(invocation, observation):
+                collected.append(publish_forward(store, run().context, invocation, observation))
+            with inspect_forwards(model, observed=observed, kernel_limit=None):
+                batch = model.prepare((ModelRequest(sequence, (TokenId(1), TokenId(2)),
+                                      LogitsSelection.LAST, (0, 0, 0, 0, 0, 0)),))
+                batch.completion.wait()
+                batch.advances[0].commit()
+                batch.close()
+            assert len(collected) == 1
+            assert collected[0].context.conditions['positions'] == [0]
+            assert collected[0].observations[0].status.value == 'complete'
+            assert store.models()[0].identity == 'qwen-4b'
+            assert store.configurations()[0].formulas
+        captures = []
+        with inspect_forwards(model, captured=captures.append):
+            batch = model.prepare((ModelRequest(sequence, (TokenId(3),),
+                                  LogitsSelection.LAST, (0, 0, 0, 0, 0, 0)),))
+            batch.completion.wait()
+            batch.close()
+        assert len(captures) == 1
+        assert captures[0].positions == (2,)
+        assert sequence.position == 2  # Uncommitted measured advance was aborted.
+    finally:
+        sequence.close()
+        model.close()
+        for resource in residency.resources:
+            resource.close()
+        device.close()

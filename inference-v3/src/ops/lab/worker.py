@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import platform
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, replace
@@ -16,12 +17,22 @@ from uuid import uuid4
 from ..compiler.compilation import CompileOptions
 from ..formula import FormulaHandle, FormulaTree
 from ..runtime.resources import DeviceRuntime
+from .characterization import Characterization
+from .evidence import ExecutionContext, RunEvidence, Scope
 from .fixtures import Fixture
-from .records import History, JobResult, JobStart, MeasurementProtocol, Outcome, Phase, PhaseTime, Visibility
+from .ownership import exclusive_measurement
+from .records import (
+    History,
+    JobResult,
+    JobStart,
+    MeasurementProtocol,
+    Outcome,
+    Phase,
+    PhaseTime,
+    Visibility,
+)
 from .runner import MeasurementRunner
 from .store import ObservationStore
-from .ownership import exclusive_measurement
-from .characterization import Characterization
 
 
 class Status(StrEnum):
@@ -100,6 +111,14 @@ class _Characterize:
     cancel: Event
 
 
+@dataclass(frozen=True, slots=True)
+class _Boundary:
+    target: FormulaHandle
+    path: Path
+    restore: bool
+    result: Future[str]
+
+
 class Lab:
     """One worker, runtime, fixture cache and store for API and TUI clients.
 
@@ -113,6 +132,7 @@ class Lab:
         options: CompileOptions, protocol: MeasurementProtocol = MeasurementProtocol(),
         prepared_limit: int = 8, reference_bytes: int = 256 << 20,
         label: str = "Prepared configuration",
+        context: ExecutionContext | None = None,
     ):
         if any(type(value) is not int or value < 1 for value in (prepared_limit, reference_bytes)):
             raise ValueError("preparation count and reference byte limits must be positive integers")
@@ -121,9 +141,10 @@ class Lab:
         self._options, self._protocol, self._prepared_limit = options, protocol, prepared_limit
         self._reference_bytes = reference_bytes
         self._label = label
+        self._context = context
         self._recorded = None
         self._lock = Lock()
-        self._queue: Queue[_Measure | _Invalidate | _Inspect | _Characterize | Visibility | None] = Queue()
+        self._queue: Queue[_Measure | _Invalidate | _Inspect | _Characterize | _Boundary | Visibility | None] = Queue()
         self._profile_request: _Characterize | None = None
         self._characterization: Characterization | None = None
         self._source_error = None
@@ -200,6 +221,17 @@ class Lab:
             self._revision += 1
             self._queue.put(_Measure(ticket, datetime.now(UTC), perf_counter_ns()))
             return ticket
+
+    def boundary(self, target: FormulaHandle, path: Path, *, restore: bool = False) -> Future[str]:
+        """Explicitly retain or restore a fixed-input experiment on the owner thread."""
+        self._check_target(target)
+        result: Future[str] = Future()
+        result.set_running_or_notify_cancel()
+        with self._lock:
+            if not self._accepting:
+                raise RuntimeError(self._error or "measurement owner is closing")
+            self._queue.put(_Boundary(target, path, restore, result))
+        return result
 
     def measure_affected(self, target: FormulaHandle) -> tuple[Ticket, ...]:
         """Measure the explicitly displayed dependency scope, not an implicit sweep."""
@@ -331,8 +363,33 @@ class Lab:
                                Outcome.CANCELLED: Status.CANCELLED}[outcome],
                        job=result, phase=None, error=error, visibility=None)
         if measurement is not None:
+            previous = store.recorded_history(self._recorded, target.call.occurrence)
+            if previous is not None and previous.series != measurement.series:
+                from .archive import RecordedConfiguration
+                self._recorded = RecordedConfiguration.capture(
+                    self.formulas, label=self._label, device=measurement.series.device)
+                store.publish_configuration(self._recorded)
             store.link_series(self._recorded, target.call.occurrence, measurement.series)
             changes["history"] = store.history(measurement.series)
+            if self._context is not None:
+                context = self._context.model_copy(update={
+                    "hardware": measurement.series.device, "host": platform.node(),
+                    "implementation": (measurement.implementation.fingerprint
+                                       if measurement.implementation else self._context.implementation),
+                    "workload": self._context.workload.model_copy(update={
+                        "realization": measurement.series.fixture}),
+                })
+                store.publish_run(RunEvidence(
+                    identity=result.identity, created=measurement.created, context=context,
+                    scope=Scope(kind="formula", formula=target.definition,
+                                semantics=target.semantic_identity, occurrence=target.call.occurrence),
+                    protocol=measurement.series.protocol.model_dump(mode="json"),
+                    status="complete" if measurement.observed_seconds is not None else outcome.value,
+                    correctness=("passed" if measurement.checked else
+                                 "failed" if (measurement.error or "").startswith("NumericalMismatch:")
+                                 else "unchecked"),
+                    configuration=self._recorded.identity, measurements=(measurement.identity,),
+                ))
         with self._lock:
             self._pending.pop(target, None)
             self._deliveries[ticket.identity] = request.started_ns, perf_counter_ns()
@@ -403,11 +460,23 @@ class Lab:
                     break
                 if isinstance(request, _Measure):
                     self._measure(request, runner, store)
+                elif isinstance(request, _Boundary):
+                    try:
+                        with exclusive_measurement():
+                            runner.refresh()
+                            identity = (runner.restore if request.restore else runner.retain)(request.target, request.path)
+                        request.result.set_result(identity)
+                    except Exception as failure:
+                        device.drain()
+                        request.result.set_exception(failure)
                 elif isinstance(request, _Characterize):
                     try:
                         with exclusive_measurement():
                             evidence = device.characterize(store, refresh=request.refresh,
                                                            cancellation=request.cancel)
+                            if self._fixture.source_spans:
+                                evidence = device.characterize_sources(
+                                    store, self._fixture.source_spans, cancellation=request.cancel)
                         with self._lock:
                             self._characterization = evidence
                             self._profile_request = None

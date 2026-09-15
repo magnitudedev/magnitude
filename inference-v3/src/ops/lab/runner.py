@@ -8,7 +8,7 @@ import math
 from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from threading import Event
 from time import perf_counter_ns
@@ -22,14 +22,21 @@ from ..runtime.resources import DeviceRuntime
 from ..tensor.graph import _stable
 from .fixtures import Fixture, FormulaFixture
 from .ownership import exclusive_measurement
-from .preparation import PreparedFormula
+from .preparation import NumericalMismatch, PreparedFormula
 from .records import (
-    CacheCondition, Measurement, MeasurementProtocol, Outcome, Phase, Series,
-    SourceCondition, UnavailableMetric, UsefulQuantity,
+    CacheCondition,
+    Measurement,
+    MeasurementProtocol,
+    Outcome,
+    Phase,
+    Series,
+    SourceCondition,
+    UnavailableMetric,
+    UsefulQuantity,
 )
+from .refresh import OperationSources
 from .store import ObservationStore
 from .timing import PhaseClock
-from .refresh import OperationSources
 
 
 class MeasurementCancelled(Exception):
@@ -41,6 +48,26 @@ class RunResult:
     measurement: Measurement
     publish_ns: int
     elapsed_ns: int
+
+
+def measurement_series(fixture: FormulaFixture, device, options, protocol) -> Series:
+    sources = []
+    for tensor in fixture.inputs.values():
+        physical = tensor.physical
+        if isinstance(physical, Binding) and physical.residency == Residency.STREAMED:
+            for info in dict.fromkeys(plane.span.source.info for plane in physical.planes):
+                sources.append(SourceCondition(
+                    binding=physical.value_identity, source=info,
+                    cache=CacheCondition.SOURCE_CACHE_UNCONTROLLED,
+                ))
+    geometry = tuple(_stable(port.spec) for port in (*fixture.isolated.inputs, *fixture.isolated.outputs))
+    device = device.evidence_identity
+    return Series(
+        formula=fixture.isolated.target.definition,
+        semantics=fixture.isolated.target.semantic_identity, fixture=fixture.identity,
+        device=device, geometry=hashlib.sha256(json.dumps(geometry, sort_keys=True).encode()).hexdigest(),
+        precision=options.precision, sources=tuple(sources), protocol=protocol,
+    )
 
 
 class MeasurementRunner:
@@ -64,6 +91,9 @@ class MeasurementRunner:
         # Evidence dependencies outlive native preparation cache entries. Evicting
         # an executable must not make its displayed measurement immune to edits.
         self._dependencies = {}
+        self._captures = {}
+        self._restored = {}
+        self._artifacts = {}
         self._closed = False
         self._sources = OperationSources()
         self._resource_probe = _resource_probe
@@ -72,6 +102,9 @@ class MeasurementRunner:
         """Install changed Python definitions, then retire affected preparations."""
         self.device.check()
         revision = self._sources.refresh()
+        for target, (dependencies, _) in tuple(self._captures.items()):
+            if any((item.module, item.symbol) in revision.changed for item in dependencies):
+                self._evict(target)
         changed = tuple(target for target, dependencies in self._dependencies.items()
                         if any((item.module, item.symbol) in revision.changed
                                for item in dependencies))
@@ -86,6 +119,40 @@ class MeasurementRunner:
             prepared.close()
             del self._prepared[target]
         self._boundaries.pop(target, None)
+        self._captures.pop(target, None)
+        self._restored.pop(target, None)
+        self._artifacts.pop(target, None)
+
+    def retain(self, target, path):
+        from .retention import save_boundary
+        boundary = self._boundaries.get(target)
+        if boundary is None:
+            if self.protocol.inputs == "production":
+                boundary, dependencies, prefix = self.fixture.capture_boundary(target, self.device, self.options)
+                self._captures[target] = dependencies, prefix
+            else:
+                boundary = self.fixture.boundary(target)
+            self._retain(target, boundary)
+        retained = sum(boundary.storage().values()) <= self.reference_bytes
+        save_boundary(boundary, path, provenance={
+            "inputs": self.protocol.inputs,
+            "upstream": self._captures[target][1] if target in self._captures else None,
+            "device": self.device.evidence_identity,
+            "compiler": self.device.compiler_identity,
+            "upstream_dependencies": [asdict(item) for item in self._captures[target][0]]
+                                     if target in self._captures else [],
+        })
+        if not retained:
+            self._evict(target)
+        return boundary.identity
+
+    def restore(self, target, path):
+        from .retention import load_boundary
+        boundary, provenance = load_boundary(self.fixture, target, path)
+        self._evict(target)
+        self._retain(target, boundary)
+        self._restored[target] = provenance
+        return boundary.identity
 
     def _retain(self, target, boundary):
         self._boundaries[target] = boundary
@@ -113,6 +180,7 @@ class MeasurementRunner:
         self.device.check()
         affected = FormulaTree(self.fixture.root).affected(changed)
         for target in affected:
+            self._artifacts.pop(target, None)
             prepared = self._prepared.get(target)
             if prepared is not None:
                 prepared.close()
@@ -120,23 +188,7 @@ class MeasurementRunner:
         return affected
 
     def _series(self, fixture: FormulaFixture) -> Series:
-        sources = []
-        for tensor in fixture.inputs.values():
-            physical = tensor.physical
-            if isinstance(physical, Binding) and physical.residency == Residency.STREAMED:
-                for info in dict.fromkeys(plane.span.source.info for plane in physical.planes):
-                    sources.append(SourceCondition(
-                        binding=physical.value_identity, source=info,
-                        cache=CacheCondition.SOURCE_CACHE_UNCONTROLLED,
-                    ))
-        geometry = tuple(_stable(port.spec) for port in (*fixture.isolated.inputs, *fixture.isolated.outputs))
-        device = self.device.evidence_identity
-        return Series(
-            formula=fixture.isolated.target.definition,
-            semantics=fixture.isolated.target.semantic_identity, fixture=fixture.identity,
-            device=device, geometry=hashlib.sha256(json.dumps(geometry, sort_keys=True).encode()).hexdigest(),
-            precision=self.options.precision, sources=tuple(sources), protocol=self.protocol,
-        )
+        return measurement_series(fixture, self.device, self.options, self.protocol)
 
     def _quantities(self, fixture: FormulaFixture):
         target = fixture.isolated.target
@@ -196,8 +248,14 @@ class MeasurementRunner:
         # not performance observations with invented fixture identities.
         with clock.track(Phase.PREPARE):
             boundary = self._boundaries.get(target)
+            reused = boundary is not None
             if boundary is None:
-                boundary = self.fixture.boundary(target)
+                if self.protocol.inputs == "production":
+                    boundary, dependencies, prefix = self.fixture.capture_boundary(
+                        target, self.device, self.options)
+                    self._captures[target] = dependencies, prefix
+                else:
+                    boundary = self.fixture.boundary(target)
             series = self._series(boundary)
         samples = []
         checked = False
@@ -211,22 +269,24 @@ class MeasurementRunner:
                 checkpoint(Phase.PREPARE)
                 with clock.track(Phase.PREPARE):
                     _ = boundary.reference
-                    quantities, unavailable = self._quantities(boundary)
+                    try:
+                        quantities, unavailable = self._quantities(boundary)
+                    except Exception as failure:
+                        unavailable = (UnavailableMetric(name="useful-quantities", reason=str(failure)),)
                     retain = self._retain(target, boundary)
-                if not self._resource_probe:
+                if not self._resource_probe and self.device.characterization is not None:
                     from .roofline import model
 
                     checkpoint(Phase.CHARACTERIZE)
                     with clock.track(Phase.CHARACTERIZE):
-                        if self.device.characterization is None:
-                            self.device.characterize(self.store, cancellation=cancellation)
-                        spans = tuple(plane.span for tensor in boundary.inputs.values()
-                                      if isinstance(tensor.physical, Binding) and
-                                      tensor.physical.residency == Residency.STREAMED
-                                      for plane in tensor.physical.planes)
-                        if spans:
-                            self.device.characterize_sources(self.store, spans, cancellation=cancellation)
-                        roofline = model(boundary, self.device)
+                        try:
+                            roofline = model(boundary, self.device)
+                        except Exception as failure:
+                            unavailable = (*unavailable, UnavailableMetric(
+                                name="resource-model", reason=str(failure)))
+                elif not self._resource_probe:
+                    unavailable = (*unavailable, UnavailableMetric(
+                        name="resource-model", reason="No loaded characterization; characterize explicitly"))
                 prepared = self._prepared.get(target)
                 if prepared is None:
                     checkpoint(Phase.COMPILE)
@@ -236,6 +296,14 @@ class MeasurementRunner:
                         prepared = PreparedFormula(boundary, self.device, self.options)
                     self._prepared[target] = prepared
                     self._dependencies[target] = prepared.code_dependencies
+                    try:
+                        self._artifacts[target] = {
+                            kind: self.store.put_artifact(source.encode())
+                            for kind, source in prepared.compiled.evidence().items()
+                        }
+                    except Exception as failure:
+                        unavailable = (*unavailable, UnavailableMetric(
+                            name="compiled-artifacts", reason=str(failure)))
                 self._prepared.move_to_end(target)
 
                 def inputs(stack):
@@ -246,8 +314,13 @@ class MeasurementRunner:
                 with ExitStack() as retained:
                     invocation = inputs(retained)
                     with clock.track(Phase.CHECK):
-                        prepared.check(invocation, self.protocol)
-                checked = True
+                        try:
+                            prepared.check(invocation, self.protocol)
+                            checked = True
+                        except NumericalMismatch as failure:
+                            if not self.protocol.measure_invalid:
+                                raise
+                            outcome, error = Outcome.FAILED, f"NumericalMismatch: {failure}"
 
                 conditioning_started = perf_counter_ns()
                 index = 0
@@ -283,7 +356,10 @@ class MeasurementRunner:
         if outcome == Outcome.COMPLETE:
             from .ceilings import formula_ceilings
 
-            ceilings, missing = formula_ceilings(boundary, self.device, self.protocol)
+            try:
+                ceilings, missing = formula_ceilings(boundary, self.device, self.protocol)
+            except Exception as failure:
+                ceilings, missing = (), (UnavailableMetric(name="ceilings", reason=str(failure)),)
             unavailable = (*unavailable, *missing)
             if any(sample.kernels is None for sample in samples):
                 unavailable = (*unavailable, UnavailableMetric(
@@ -297,6 +373,11 @@ class MeasurementRunner:
             outcome=outcome, checked=checked, samples=tuple(samples), quantities=quantities, ceilings=ceilings,
             unavailable=unavailable, phases=clock.snapshot(), error=error,
             roofline=roofline,
+            preparation={"boundary_reused": reused, "inputs": self.protocol.inputs,
+                         "boundary": boundary.identity,
+                         "upstream": self._captures[target][1] if target in self._captures else None,
+                         "restored_fixed_fixture": self._restored.get(target)},
+            artifacts=self._artifacts.get(target, {}),
         )
         if not retain:
             self._evict(target)

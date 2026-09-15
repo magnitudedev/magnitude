@@ -12,12 +12,13 @@ import shlex
 from collections.abc import Callable
 from pathlib import Path
 
+from engine.platform.compiler import compiler_build
+
 from benchmark_fixtures import prose
 from benchmark_fixtures.prose_history import Prose
 from engine.models.qwen35.formats.gguf import describe
-from engine.platform.compiler import compiler_build
-from ops.lab.ownership import exclusive_measurement
 from engine.weights.formats.gguf import GGUFFormat
+from ops.lab.ownership import exclusive_measurement
 from performance import source_identity
 from performance.thermals import ThermalRecorder
 from session_bench import report
@@ -65,7 +66,11 @@ async def run(
     contexts: tuple[int, ...] = (4096,),
     repeat: int = 1,
     progress: Callable[[str], None] = print,
+    model_identity: str | None = None,
+    evidence_store: Path | None = None,
 ) -> dict:
+    if (model_identity is None) != (evidence_store is None):
+        raise ValueError("model evidence requires both stable identity and store")
     if repeat < 1 or not sections or any(section not in SECTIONS for section in sections):
         raise ValueError("choose supported sections and a positive repetition count")
     if not contexts or any(value < 1 for value in contexts):
@@ -155,7 +160,8 @@ async def run(
                 async with adapter.launch(
                     allocated_context, plan.parallel_sequences, f"block-{block}"
                 ) as engine:
-                    await execute(plan, adapter, engine, store, block, records, progress)
+                    await execute(plan, adapter, engine, store, block, records, progress,
+                                  model_identity=model_identity, evidence_store=evidence_store)
                 store.append(
                     "footprints.jsonl",
                     dict(
@@ -191,6 +197,8 @@ def main() -> None:
     parser.add_argument("--suite", default="single")
     parser.add_argument("--context", default="4096")
     parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--model-identity")
+    parser.add_argument("--evidence-store", type=Path)
     args = parser.parse_args()
     result = asyncio.run(
         run(
@@ -199,6 +207,7 @@ def main() -> None:
             sections=tuple(args.suite.split(",")),
             contexts=tuple(map(int, args.context.split(","))),
             repeat=args.repeat,
+            model_identity=args.model_identity, evidence_store=args.evidence_store,
         )
     )
     print(json.dumps(result, indent=2))

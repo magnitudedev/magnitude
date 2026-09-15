@@ -3,6 +3,8 @@ applies_to:
   - inference-v3/src/ops/**
   - inference-v3/src/engine/**
   - inference-v3/performance/**
+  - inference-v3/src/session_bench/**
+  - inference-v3/tests/session_bench/**
   - inference-v3/tests/ops/**
   - inference-v3/tests/models/**
   - inference-v3/tests/platform/**
@@ -154,8 +156,10 @@ authorize eviction of active prefixes or implicit unloading of an active model.
 
 The runner identifies a formula occurrence and invokes its production operation.
 Prepared Lab configurations reuse the engine's ProgramDefinition and invocation
-argument names, not another benchmark model. Root reference inputs may be captured
-lazily; selected intermediate inputs derive from the existing primitive references.
+argument names, not another benchmark model. Root inputs may be captured lazily. Intermediate inputs may derive from independent
+primitive references or from executing the production prefix once; that choice is
+recorded. Production captures provide the starting values, never the correctness
+oracle for the selected implementation.
 Configuration selection passes typed prepared objects and opens only the selected
 worker-owned device. Switching drains and closes that owner before opening another.
 An isolated artifact fixture may supply synthetic boundary inputs, but must label
@@ -206,9 +210,13 @@ and exclude borrowed inputs/state. Compare it with observed reservation increase
 not lifetime peak. It excludes scratch and transfer staging and is not a latency
 prediction. Alias declarations must be preserved and cannot invent input mutation.
 
-Every successful optimization measurement connects formula-derived resource
-demands to compatible device characterization and its actual complete-operation
-duration. Conventional contraction work is separate from vector, integer, special
+Measurement, numerical qualification and resource analysis are independent results.
+A completed timing remains available when useful-work analysis or compatible device
+characterization is unavailable. An explicit exploratory protocol can time a
+numerically failing implementation, but cannot qualify it as correct or best-correct.
+Unsafe state mutation and incomplete execution remain execution failures. Qualified
+resource analysis connects formula-derived demands to compatible characterization
+and the actual complete-operation duration. Conventional contraction work is separate from vector, integer, special
 function and comparison work. Primitive semantic rules own those quantities;
 implementations do not duplicate them. Concrete control values determine visible
 attention, selected experts and sampling policy. Finite algorithm-dependent work
@@ -290,11 +298,11 @@ portable probes to characterize applicable arithmetic, memory and transfer paths
 Source-path characterization belongs to the source/path and cache conditions, not
 a GPU bandwidth field. Cache by resource identity, runtime/compiler/probe version
 and relevant conditions; refresh explicitly, not on every measurement.
-The first requested measurement loads compatible cached evidence or performs its
-one-time characterization as a separately timed setup phase. Ordinary operation
-edits do not rerun calibration or move its denominator. A source-backed formula
-adds a bounded probe of its actual source path through the same streamed operation
-runner. Memory-source evidence is never substituted for file-source evidence.
+Characterization is an explicit agent request, which loads compatible cached
+evidence or runs bounded probes. Ordinary measurements never initiate calibration;
+an absent compatible profile is reported as unavailable. Ordinary operation edits
+do not rerun calibration or move its denominator. Explicit characterization of a
+source-backed configuration also probes its actual streamed source paths. Memory-source evidence is never substituted for file-source evidence.
 
 Ops owns the byte-source protocol and source provenance: source identity, snapshot
 revision, kind, optional location and composed backing sources. Engine artifact
@@ -318,9 +326,13 @@ includes other cached preparations is not the operation's isolated storage minim
 
 ## Persistent development system
 
-One persistent Lab owns typed selection, fixture/reference reuse, isolated
-measurement, dependency invalidation and durable observations. The TUI and other
-clients use that same service and store, not separate benchmark definitions.
+The agent owns execution: workload plus scope selects what to run. A persistent
+measurement worker owns fixture/reference reuse, isolated measurement, dependency
+invalidation and durable observations. Benchmark requests and their recipes remain
+owned by the existing benchmark system; a formula fixture materializes the chosen
+boundary for those inputs, or explicitly identifies synthetic inputs. There is no
+second workload renderer. Enclosing request records, production forward observations
+and isolated formula measurements publish into the same evidence store.
 Independent workers and readers may open the same history file concurrently.
 First-open WAL initialization handles transient SQLite lock upgrades within a
 bounded deadline; it must not downgrade journaling or swallow permanent errors.
@@ -336,15 +348,39 @@ occurrences and dependent ancestors stale; it preserves historical measurements.
 Moving a display node does not discard a comparable series. Shared dependencies
 remain a DAG rather than falsely independent tree work.
 
-The required TUI exposes the model/formula hierarchy, latest/stale observations,
-history, useful metrics, ceilings and provenance. It supports selected and affected
-remeasurement, cancellation, progress and phase durations through the same Lab.
-It also supports an explicit whole-subtree scope. Each measured node displays its
-isolated time, modeled reference time, resource bottleneck, efficiency ratio and
-model-relative gap. Recorded browsing exposes the same model without opening a
-device. An unmeasured node stays unmeasured; model estimates never masquerade as
-observations. Parent/child gaps cannot be added into a claimed total saving.
-Device work stays on its owning worker and timing is serialized on the device.
+The primary TUI is read-only and starts with a stable model identity. It displays
+already published engine performance, condition-specific histories, formula
+observations, ceilings and provenance. Opening or refreshing it never opens a
+device, constructs a fixture or queues measurement. The agent executes and publishes;
+the user does not have to select a workload to inspect a model. Unmeasured conditions
+stay unmeasured and current-code freshness is unknown until verified. Detailed
+formula selection is pinned to the selected execution, not a later result silently
+substituted from the same series. Existing developer measurement clients use the
+same worker; they do not define the model overview's behavior.
+
+Model identity groups evidence; it does not make timings interchangeable. Artifact,
+numerical contract, concrete workload/state, hardware, host, protocol and scope
+qualify comparisons. Implementation revision belongs to each observation. Histories
+follow execution timestamps rather than import order. Different hardware contributes
+evidence about the same formula and implementations, with separate resource rates
+and measured curves. No averaging device timings or assuming normalized efficiency
+transfers between devices. Paired deltas require the same host and explicit shared
+pair identities. Failing numerical candidates remain visibly unqualified.
+
+External engines retain their native timing boundaries and token counts. Formula
+mapping identifies an equivalent contract, declared differences, or an enclosing
+region, with versioned supporting evidence. Opaque or fused regions stay combined;
+missing attribution cannot be replaced by a guessed split. Reference engines supply
+observations and hypotheses, not an upper bound on performance.
+
+Remote execution is ordinary agent coordination: copy the request and necessary
+inputs, invoke the same headless tools over SSH, and copy a portable evidence bundle
+back. Import validates schema, integrity, references and immutable identities before
+atomically publishing records; it does not execute imported code. Duplicate imports
+are harmless. Compiled source artifacts travel by content hash. Large model blobs
+remain separately provisioned. There is no scheduler, remote daemon or automatic
+host selection. Independent investigations may run on the two M4 Pros; comparisons
+within one investigation remain paired on the same host.
 
 Each prepared configuration records its actual composition and links measured
 occurrences to their exact comparable series. Recorded browsing needs no model,
@@ -363,8 +399,12 @@ changed-operation target.
 Complete-operation host time and native kernel execution time are separate
 observations. Where supported, the same sample may include bounded native
 timestamp intervals for every numerical dispatch on the production stream.
-Their sum excludes host I/O, allocation and submission overhead; it is not the
-operation's wall latency. Formula useful-work rates state which denominator they
+Native endpoints preserve interval unions and overlap; summed kernel durations
+are not GPU busy time when work overlaps. Neither is complete-operation wall time.
+Attribution checks the compiled dispatch count and symbols against captured native
+events, retaining origins and one exclusive formula owner where justified. Dynamic
+or mismatched launches keep valid durations with attribution unavailable. Inclusive
+formula views may share fused events, while totals count every event once. Formula useful-work rates state which denominator they
 use. Native instrumentation is opt-in, versioned in the measurement protocol,
 and never requires replay or a second implementation. Unsupported counters are
 explicitly unavailable; overflow, incomplete execution and invalid counters do
@@ -379,9 +419,9 @@ require a fresh process; operation edits use the live worker's bounded refresh.
 Persist request starts and terminal job outcomes separately from performance
 observations, so failure before fixture/series construction and unfinished work
 remain visible without inventing numerical evidence. Queue time is distinct from
-active work. A TUI acknowledges a result after rendering its details; that receipt
-measures request-to-visible turnaround, including publication. Worker completion
-alone must not be reported as display completion.
+active work. A measurement client may acknowledge a result after rendering; only that receipt
+measures request-to-visible turnaround. Worker completion and read-only browsing
+must not fabricate a display acknowledgement.
 
 Operation refresh reloads original authored Python definitions and their import
 dependants, not the live device owner. Executable provenance follows loaded code
@@ -400,6 +440,15 @@ preparations. Fixture indexes are non-owning; visiting more formula nodes must n
 retain an unbounded collection of decoded weights and intermediate tensors. Retain
 immutable references across operation edits while replacing affected executables.
 An individually oversized boundary may run but is not kept beyond its request.
+A retained production boundary records upstream code dependencies, precise inputs
+and starting state. Editing the selected implementation preserves independent
+upstream work; editing a captured dependency invalidates it. Explicit disk replay
+uses a fixed historical input snapshot with provenance, rather than pretending to
+be a recomputation of the latest upstream code. Snapshot contents and tensor schemas
+are validated without deserializing executable code; immutable artifact bindings
+must resolve to matching values. Mutable resources are reset before every invocation.
+Unsupported alias layouts fail explicitly rather than silently copying independent
+values. Disk retention does not imply device residency after the worker exits.
 Live configurations explicitly set positive preparation-count and reference-byte
 budgets. Large attention references can therefore remain resident for repeated
 operation edits without making the default cache unbounded. Formula effects
@@ -425,8 +474,18 @@ must not hide proportional temporary copies from operation memory accounting.
   complete measurement boundary; aliases do not inflate allocation counts.
 - Kernel restructuring retains comparable formula history and invalidates exactly
   its dependent observations, without claiming summed children are parent latency.
-- The TUI can request a typed isolated measurement, cancel it safely and display
-  its stored result and phase timings without invoking a second execution system.
+- The agent can discover production scopes without compilation, measure typed
+  occurrences, retain/replay boundaries and cancel safely through one execution API.
+- The model TUI displays published evidence with no execution callbacks, workload
+  prerequisite, fixture derivation or live device.
+- Paired experiments alternate explicit prepared candidates on identical boundary
+  inputs; compilation stays outside samples and mutable state resets every time.
+- Historical imports preserve chronological latest/best results and reject immutable
+  conflicts atomically. Cross-host and unpaired timings cannot become paired deltas.
+- Session evidence reuses the benchmark's actual recipes and exact native counters;
+  absent formula attribution and token equivalence remain explicit.
+- Unavailable analysis does not erase valid timing; numerical failures are retained
+  only as unqualified evidence and cannot enter best-correct results.
 - Fast feedback is demonstrated with an actual changed operation. Whole-model
   prefill/decode/serving gates remain necessary for integration, not each edit.
 - A populated production formula hierarchy with meaningful resource models and

@@ -7,7 +7,7 @@ kernel timestamps are separate. Lab attaches both to one typed formula occurrenc
 from __future__ import annotations
 
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from time import perf_counter_ns
 from typing import TYPE_CHECKING
@@ -65,24 +65,59 @@ class HostActivity:
 class KernelActivity:
     name: str
     elapsed_ns: int
+    started_ns: int | None = None
+    ended_ns: int | None = None
+    dispatch: int | None = None
+    origins: tuple[int, ...] = ()
+    owner: int | None = None
+    invocation: int | None = None
+    graph: str | None = None
 
     def __post_init__(self):
         if not self.name or type(self.elapsed_ns) is not int or self.elapsed_ns < 0:
             raise ValueError("kernel timestamps require a name and nonnegative nanoseconds")
+        if (self.started_ns is None) != (self.ended_ns is None):
+            raise ValueError("kernel interval needs both endpoints")
+        if self.started_ns is not None and self.ended_ns is not None and (
+            self.started_ns < 0 or self.ended_ns - self.started_ns != self.elapsed_ns
+        ):
+            raise ValueError("kernel endpoints disagree with duration")
+        if self.dispatch is not None and self.dispatch < 0:
+            raise ValueError("dispatch identity must be nonnegative")
 
 
 @dataclass(frozen=True, slots=True)
 class KernelObservation:
     clock: str
     activities: tuple[KernelActivity, ...]
+    attribution: str = "unavailable"
 
     def __post_init__(self):
         if not self.clock:
             raise ValueError("kernel timestamps require their native clock method")
+        ids = [a.dispatch for a in self.activities if a.dispatch is not None]
+        if len(ids) != len(set(ids)):
+            raise ValueError("dynamic dispatch is recorded once per capture")
 
     @property
     def elapsed_ns(self) -> int:
         return sum(activity.elapsed_ns for activity in self.activities)
+
+    @property
+    def busy_ns(self) -> int | None:
+        if any(a.started_ns is None for a in self.activities):
+            return None
+        total, end = 0, 0
+        for activity in sorted(self.activities, key=lambda a: a.started_ns if a.started_ns is not None else 0):
+            assert activity.started_ns is not None and activity.ended_ns is not None
+            total += max(0, activity.ended_ns - max(end, activity.started_ns))
+            end = max(end, activity.ended_ns)
+        return total
+
+    @property
+    def overlap_ns(self) -> int | None:
+        busy = self.busy_ns
+        return None if busy is None else self.elapsed_ns - busy
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +201,46 @@ class RuntimeCapture(AbstractContextManager):
         self._next_index = 0
         self._entered = False
         self._result: RuntimeObservation | None = None
+        self._expected = []
+        self._invocations = 0
+        self._mapping_complete = True
+
+    def program(self, graph, units) -> None:
+        """Retain actual compiled call order; qualify it against native dispatches.
+
+        Dynamic source loops are intentionally not guessed from static counts.
+        A mismatch leaves timing valid and attribution unavailable.
+        """
+        invocation = self._invocations
+        self._invocations += 1
+        for unit in units:
+            if unit.source_loop is not None:
+                self._mapping_complete = False
+                continue
+            for call in unit.unit.calls:
+                operation = call.operation
+                definition = operation.definition
+                if definition is None:
+                    self._mapping_complete = False
+                    continue
+                nodes = set(operation.nodes)
+                touched = tuple(c.occurrence for c in graph.formulas if nodes.intersection(c.nodes))
+                containing = [c for c in graph.formulas if nodes <= set(c.nodes)]
+                owner = min(containing, key=lambda c: (len(c.nodes), -c.occurrence)).occurrence if containing else None
+                self._expected.extend((definition.name, touched, owner, invocation, graph.fingerprint)
+                                      for _ in range(operation.kernel_count))
+
+    def _attribute(self, activities):
+        assert self._native is not None
+        if not self._mapping_complete or len(activities) != len(self._expected):
+            return KernelObservation(self._native.clock, activities, "unavailable: dynamic/count mismatch")
+        for activity, (name, *_) in zip(activities, self._expected, strict=True):
+            if activity.name != name and not activity.name.startswith(name + "_"):
+                return KernelObservation(self._native.clock, activities, "unavailable: compiled/native name mismatch")
+        attributed = tuple(replace(activity, origins=origins, owner=owner, invocation=invocation, graph=graph)
+                           for activity, (_, origins, owner, invocation, graph)
+                           in zip(activities, self._expected, strict=True))
+        return KernelObservation(self._native.clock, attributed, "compiled-order-and-symbols")
 
     @property
     def result(self) -> RuntimeObservation:
@@ -211,7 +286,7 @@ class RuntimeCapture(AbstractContextManager):
         kernels, failure = None, None
         try:
             if self._native is not None and status == ObservationStatus.COMPLETE:
-                kernels = KernelObservation(self._native.clock, self._native.finish())
+                kernels = self._attribute(self._native.finish())
         except BaseException as error:
             status, failure = ObservationStatus.FAILED, error
         finally:
@@ -245,6 +320,10 @@ class RuntimeRecorder:
 
     def capture(self, kernel_limit: int | None = None) -> RuntimeCapture:
         return RuntimeCapture(self, kernel_limit)
+
+    def program(self, graph, units) -> None:
+        if self._active is not None:
+            self._active.program(graph, units)
 
     def span(
         self, kind: Activity, *, source: tuple[str, ...] = (),

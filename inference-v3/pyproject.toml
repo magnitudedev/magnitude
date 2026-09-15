@@ -37,6 +37,7 @@ dev = [
 tilelang = { path = "tilelang", editable = true }
 
 [project.scripts]
+magnitude-performance = "ops.lab.__main__:main"
 session-bench = "session_bench.cli:main"
 magnitude-qualify = "engine.qualification:main"
 

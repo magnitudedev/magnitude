@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic, sleep
 
@@ -38,13 +40,24 @@ class ObservationStore:
     and its queryable index. Failure/cancellation never replaces a good record.
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, read_only: bool = False):
         self.path = path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # The journal transition owns its deadline; an additional SQLite busy
-        # wait must not extend each retry past that deadline. Ordinary schema
-        # and publication operations regain their existing timeout afterward.
-        self._connection = sqlite3.connect(path, timeout=0)
+        self.read_only = read_only
+        if not read_only:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        self._connection = sqlite3.connect(
+            path.resolve().as_uri() + "?mode=ro" if read_only else path,
+            uri=read_only, timeout=0,
+        )
+        self._connection.create_function(
+            "observed_at", 1, lambda timestamp: datetime.fromisoformat(timestamp).timestamp(),
+            deterministic=True,
+        )
+        if read_only:
+            self._connection.execute("PRAGMA query_only=ON")
+            self._connection.execute("PRAGMA busy_timeout=5000")
+            return
+        # WAL initialization owns its bounded retry deadline.
         try:
             _enable_wal(self._connection)
             self._connection.execute("PRAGMA busy_timeout=5000")
@@ -127,6 +140,16 @@ class ObservationStore:
                         PRIMARY KEY(job, client)
                     )
                 """)
+                self._connection.execute("""
+                    CREATE TABLE IF NOT EXISTS model_runs (
+                        identity TEXT PRIMARY KEY,
+                        model TEXT NOT NULL,
+                        created TEXT NOT NULL,
+                        record TEXT NOT NULL
+                    )
+                """)
+                self._connection.execute(
+                    "CREATE INDEX IF NOT EXISTS model_history ON model_runs(model,created)")
         except BaseException:
             self._connection.close()
             raise
@@ -183,9 +206,9 @@ class ObservationStore:
         return {row[0]: (row[1], row[2]) for row in self._connection.execute("""
             SELECT c.occurrence,
                 (SELECT median_seconds FROM formula_measurements m
-                 WHERE m.series=c.series AND m.outcome='complete' ORDER BY sequence DESC LIMIT 1),
+                 WHERE m.series=c.series AND m.outcome='complete' ORDER BY observed_at(json_extract(record, '$.created')) DESC, identity DESC LIMIT 1),
                 (SELECT outcome FROM formula_measurements m
-                 WHERE m.series=c.series ORDER BY sequence DESC LIMIT 1)
+                 WHERE m.series=c.series ORDER BY observed_at(json_extract(record, '$.created')) DESC, identity DESC LIMIT 1)
             FROM formula_configuration_series c WHERE c.configuration=?
         """, (configuration.identity,))}
 
@@ -196,7 +219,7 @@ class ObservationStore:
         rows = self._connection.execute("""
             SELECT c.occurrence,
                 (SELECT json_extract(record, '$.roofline') FROM formula_measurements m
-                 WHERE m.series=c.series AND m.outcome='complete' ORDER BY sequence DESC LIMIT 1)
+                 WHERE m.series=c.series AND m.outcome='complete' ORDER BY observed_at(json_extract(record, '$.created')) DESC, identity DESC LIMIT 1)
             FROM formula_configuration_series c WHERE c.configuration=?
         """, (configuration.identity,))
         return {occurrence: Roofline.model_validate_json(payload)
@@ -258,17 +281,17 @@ class ObservationStore:
         self._connection.execute("BEGIN")
         try:
             rows = self._connection.execute(
-                "SELECT record FROM formula_measurements WHERE series=? ORDER BY sequence DESC LIMIT ?",
+                "SELECT record FROM formula_measurements WHERE series=? ORDER BY observed_at(json_extract(record, '$.created')) DESC, identity DESC LIMIT ?",
                 (series.identity, limit),
             ).fetchall()
             latest_success = self._connection.execute(
                 """SELECT record FROM formula_measurements WHERE series=? AND outcome=?
-                   ORDER BY sequence DESC LIMIT 1""",
+                   ORDER BY observed_at(json_extract(record, '$.created')) DESC, identity DESC LIMIT 1""",
                 (series.identity, Outcome.COMPLETE.value),
             ).fetchone()
             best = self._connection.execute(
                 """SELECT record FROM formula_measurements WHERE series=? AND outcome=?
-                   ORDER BY median_seconds, sequence DESC LIMIT 1""",
+                   ORDER BY median_seconds, observed_at(json_extract(record, '$.created')) DESC, identity DESC LIMIT 1""",
                 (series.identity, Outcome.COMPLETE.value),
             ).fetchone()
             observations = tuple(Measurement.model_validate_json(row[0]) for row in rows)
@@ -389,6 +412,87 @@ class ObservationStore:
 
     def close(self) -> None:
         self._connection.close()
+
+    def measurement(self, identity: str) -> Measurement:
+        row = self._connection.execute(
+            "SELECT record FROM formula_measurements WHERE identity=?", (identity,)).fetchone()
+        if row is None:
+            raise KeyError(identity)
+        return Measurement.model_validate_json(row[0])
+
+    def put_artifact(self, content: bytes) -> str:
+        if self.read_only:
+            raise sqlite3.OperationalError("readonly evidence store")
+        identity = hashlib.sha256(content).hexdigest()
+        directory = self.path.parent / (self.path.name + ".artifacts")
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / identity
+        if path.exists():
+            if path.read_bytes() != content:
+                raise ValueError("artifact content identity conflict")
+        else:
+            import tempfile
+            with tempfile.NamedTemporaryFile(dir=directory, delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(content)
+            temporary.replace(path)
+        return identity
+
+    def artifact(self, identity: str) -> bytes:
+        if len(identity) != 64 or any(c not in "0123456789abcdef" for c in identity):
+            raise ValueError("artifact identity must be a SHA256 digest")
+        content = (self.path.parent / (self.path.name + ".artifacts") / identity).read_bytes()
+        if hashlib.sha256(content).hexdigest() != identity:
+            raise ValueError("artifact checksum mismatch")
+        return content
+
+    def publish_run(self, run) -> None:
+        from .evidence import RunEvidence
+
+        run = RunEvidence.model_validate_json(run.model_dump_json())
+        for identity in run.measurements:
+            measurement = self.measurement(identity)
+            if run.scope.kind == "formula" and (
+                measurement.series.formula != run.scope.formula
+                or measurement.series.semantics != run.scope.semantics
+                or measurement.series.fixture != run.context.workload.realization
+            ):
+                raise ValueError("run and formula measurement contract or boundary differ")
+            if measurement.series.device != run.context.hardware:
+                raise ValueError("run and formula measurement hardware differ")
+            if (run.correctness == "passed" and not measurement.checked or
+                    run.status == "complete" and measurement.observed_seconds is None):
+                raise ValueError("run qualification exceeds its measured evidence")
+        if run.configuration is not None and not self._connection.execute(
+            "SELECT 1 FROM formula_configurations WHERE identity=?", (run.configuration,)
+        ).fetchone():
+            raise ValueError("run refers to missing configuration")
+        payload = run.model_dump_json()
+        with self._connection:
+            prior = self._connection.execute(
+                "SELECT record FROM model_runs WHERE identity=?", (run.identity,)).fetchone()
+            if prior is not None and RunEvidence.model_validate_json(prior[0]) != run:
+                raise ValueError("run identities are immutable")
+            self._connection.execute(
+                "INSERT OR IGNORE INTO model_runs(identity,model,created,record) VALUES(?,?,?,?)",
+                (run.identity, run.context.model.identity, run.created.astimezone(UTC).isoformat(), payload))
+
+    def runs(self, model: str | None = None):
+        from .evidence import RunEvidence
+
+        # Device-free readers may open historical stores that predate model indexing.
+        if not self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='model_runs'"
+        ).fetchone():
+            return ()
+        rows = self._connection.execute(
+            "SELECT record FROM model_runs" + (" WHERE model=?" if model is not None else "")
+            + " ORDER BY created DESC,identity", (model,) if model is not None else ())
+        return tuple(RunEvidence.model_validate_json(row[0]) for row in rows)
+
+    def models(self):
+        return tuple({run.context.model.identity: run.context.model
+                      for run in reversed(self.runs())}.values())
 
     def __enter__(self) -> ObservationStore:
         return self
