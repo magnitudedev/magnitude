@@ -143,11 +143,24 @@ class DenseRuntime(ModelExecutor):
             raise ValueError("prime geometry must fit the bound model context")
         sequence = self.create(InputPlan.text(tuple(TokenId(0) for _ in range(horizon))))
         try:
-            for count, selection, draws in (
-                (rows, LogitsSelection.NONE, None),
-                (rows, LogitsSelection.LAST, (0, 0, 0, 0, 0, 0)),
-                (1, LogitsSelection.LAST, (0, 0, 0, 0, 0, 0)),
+            counts = [rows]
+            if (
+                self.prefill_rows == rows and rows > 2
+                and MixerKind.RECURRENT in self.geometry.layers
             ):
+                # Full and padded recurrence domains have distinct cache entries.
+                # Prime both once so a partial chunk does not compile on arrival.
+                counts.append(rows - 1)
+            invocations = [
+                (count, selection, draws)
+                for count in counts
+                for selection, draws in (
+                    (LogitsSelection.NONE, None),
+                    (LogitsSelection.LAST, (0, 0, 0, 0, 0, 0)),
+                )
+            ]
+            invocations.append((1, LogitsSelection.LAST, (0, 0, 0, 0, 0, 0)))
+            for count, selection, draws in invocations:
                 batch = self.prepare(
                     (
                         ModelRequest(
@@ -365,6 +378,12 @@ class DenseRuntime(ModelExecutor):
                 delta_state=tuple(value.delta.spec for value in recurrent),
                 features=tuple(value.spec for value in feature_values),
                 feature_rows=tuple(value.spec for value in feature_rows),
+                recurrent_sequence_length=(
+                    actual_rows
+                    if mode == "prefill" and len(requests) == 1 and padding == 0
+                    and recurrent_offset_resource is not None
+                    else None
+                ),
             )
             resources = {}
             for index, cache in enumerate(self.states.attention):

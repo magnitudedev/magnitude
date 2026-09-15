@@ -197,6 +197,8 @@ def recurrent_mixer(
     delta_state: ops.Tensor,
     row_offsets: ops.Tensor,
     weights: RecurrentTensors,
+    *,
+    sequence_length: int | None = None,
 ) -> tuple[ops.Tensor, ops.Tensor, ops.Tensor]:
     mixed, gate, convolution_state, delta_state = _recurrent_state(
         hidden,
@@ -204,6 +206,7 @@ def recurrent_mixer(
         delta_state,
         row_offsets,
         weights,
+        sequence_length=sequence_length,
     )
     rows = cast(int, hidden.shape[0])
     normalized = ops.rms_norm(mixed, weights.norm, epsilon=weights.epsilon)
@@ -219,6 +222,8 @@ def _recurrent_state(
     delta_state: ops.Tensor,
     row_offsets: ops.Tensor,
     weights: RecurrentTensors,
+    *,
+    sequence_length: int | None = None,
 ) -> tuple[ops.Tensor, ops.Tensor, ops.Tensor, ops.Tensor]:
     """Produce recurrent state transitions before the stateless output suffix."""
 
@@ -252,6 +257,7 @@ def _recurrent_state(
         delta_state,
         row_offsets,
         mapping=weights.head_mapping,
+        sequence_length=sequence_length,
     )
     return mixed, gate, convolution_state, delta_state
 
@@ -269,6 +275,7 @@ def block(
     delta_state: ops.Tensor | None = None,
     recurrent_offsets: ops.Tensor | None = None,
     sequence_count: int = 1,
+    recurrent_sequence_length: int | None = None,
 ):
     normalized = ops.rms_norm(
         hidden, weights.input_norm, epsilon=weights.epsilon, output_dtype=weights.mixer.output.dtype
@@ -290,7 +297,8 @@ def block(
         if convolution_state is None or delta_state is None or recurrent_offsets is None:
             raise ValueError("recurrent block requires recurrent state operands")
         mixer, convolution_state, delta_state = recurrent_mixer(
-            normalized, convolution_state, delta_state, recurrent_offsets, weights.mixer
+            normalized, convolution_state, delta_state, recurrent_offsets, weights.mixer,
+            sequence_length=recurrent_sequence_length,
         )
         state = convolution_state, delta_state
     residual = hidden + ops.cast(mixer, hidden.dtype)
@@ -321,6 +329,7 @@ def decoder(
     weights: DecoderTensors,
     *,
     sequence_count: int = 1,
+    recurrent_sequence_length: int | None = None,
     output_rows: ops.Tensor | None = None,
     feature_values: ops.Tensor | None = None,
     feature_rows: ops.Tensor | None = None,
@@ -368,6 +377,7 @@ def decoder(
                     delta_state[recurrent_index],
                     cast(ops.Tensor, recurrent_offsets),
                     layer.mixer,
+                    sequence_length=recurrent_sequence_length,
                 )
                 next_convolution.append(next_conv)
                 next_delta.append(next_recurrent)
@@ -394,6 +404,7 @@ def decoder(
                 delta_state=delta_state[recurrent_index],
                 recurrent_offsets=recurrent_offsets,
                 sequence_count=sequence_count,
+                recurrent_sequence_length=recurrent_sequence_length,
             )
             hidden = result[0]
             next_convolution.append(result[1])

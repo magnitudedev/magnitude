@@ -84,6 +84,7 @@ def test_mixed_length_prefill_batch_uses_explicit_recurrent_row_offsets():
         )
     )
     assert len(native.executables[-1].bound.calls) == 1
+    assert all(specs.recurrent_sequence_length is None for _, specs, _ in model.program._compiled)
     assert any(
         parameter.name == "v2" and parameter.spec == ops.TensorSpec((3,), ops.DType.I32)
         for parameter in native.programs[-1].parameters
@@ -140,6 +141,28 @@ def test_prefill_uses_reusable_physical_row_capacity():
     second_batch.close()
     second.close()
 
+    assert all(specs.recurrent_sequence_length is None for _, specs, _ in model.program._compiled)
+    for repeat in range(2):
+        tokens = (TokenId(1), TokenId(2), TokenId(3), TokenId(4))
+        full = model.create(InputPlan.text(tokens))
+        full_batch = model.prepare((
+            ModelRequest(full, tokens, LogitsSelection.LAST, (0, 0, 0, 0, 0, 0)),
+        ))
+        full_programs = [compiled for (_, specs, _), compiled in model.program._compiled.items()
+                         if specs.recurrent_sequence_length == 4]
+        assert len(full_programs) == 1
+        recurrence = [node for node in full_programs[0].graph.nodes
+                      if node.operation == "gated_delta_recurrence"]
+        assert recurrence and all(node.attributes["sequence_length"] == 4 for node in recurrence)
+        if repeat == 0:
+            specialized_count = len(native.programs)
+            assert specialized_count > programs
+        else:
+            assert len(native.programs) == specialized_count
+        full_batch.completion.wait()
+        full_batch.close()
+        full.close()
+
     model.close()
     for resource in residency.resources:
         resource.close()
@@ -182,7 +205,11 @@ def test_prime_materializes_state_prefill_logits_prefill_and_decode():
 
     model.prime(4, 8)
 
-    assert len(native.programs) == 3
+    assert len(native.programs) == 5
+    assert {(mode, specs.recurrent_sequence_length)
+            for mode, specs, _ in model.program._compiled} == {
+        ("prefill", 4), ("prefill", None), ("decode", None),
+    }
     model.close()
     for resource in residency.resources:
         resource.close()

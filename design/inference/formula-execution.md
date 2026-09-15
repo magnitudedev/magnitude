@@ -121,6 +121,12 @@ that no device work was submitted.
 
 Gated-delta recurrence publishes a separate following-state allocation, leaving
 the prior checkpoint untouched; its operation must not invent an in-place alias.
+An optional static single-sequence length is a declaration that packed offsets
+are exactly zero and that length. Engine may specialize complete unpadded
+single-sequence prefill only after deriving those facts from the actual admitted
+rows. The geometry participates in executable identity; partial and packed
+invocations retain runtime offsets. Priming covers both full and padded classes,
+and repeated invocations reuse their compiled executables.
 Pure arithmetic can read resource-valued ports. Those read hazards are derived
 from the actual ports even when the primitive also accepts immutable tensors,
 so a later independent writer cannot overtake an earlier delayed consumer.

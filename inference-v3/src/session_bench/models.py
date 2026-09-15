@@ -18,7 +18,7 @@ class Alias(Record):
 
 
 class Target(Record):
-    engine: Literal["magnitude", "mlx-vlm", "omlx", "llama.cpp"]
+    engine: Literal["magnitude", "mlx-vlm", "omlx", "llama.cpp", "tilelang-poc"]
     reference: str
 
     @property

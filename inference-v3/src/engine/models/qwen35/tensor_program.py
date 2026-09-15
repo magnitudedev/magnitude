@@ -42,8 +42,16 @@ class InvocationSpecs:
     delta_state: tuple[ops.TensorSpec, ...]
     features: tuple[ops.TensorSpec, ...] = ()
     feature_rows: tuple[ops.TensorSpec, ...] = ()
+    recurrent_sequence_length: int | None = None
 
     def __post_init__(self) -> None:
+        if self.recurrent_sequence_length is not None and (
+            type(self.recurrent_sequence_length) is not int
+            or self.batch != 1
+            or self.recurrent_offsets is None
+            or self.recurrent_sequence_length != self.tokens.shape[0]
+        ):
+            raise ValueError("static recurrent geometry requires one complete unpadded sequence")
         if type(self.batch) is not int or self.batch <= 0:
             raise ValueError("Qwen invocation batch must be positive")
         if self.tokens.rank != 1 or not self.tokens.dtype.integer:
@@ -256,6 +264,7 @@ def define(
             recurrent_offsets,
             weights,
             sequence_count=specs.batch,
+            recurrent_sequence_length=specs.recurrent_sequence_length,
             output_rows=output_rows,
             feature_values=(ops.concatenate(feature_values, axis=0) if feature_values else None),
             feature_rows=(ops.concatenate(feature_rows, axis=0) if feature_rows else None),

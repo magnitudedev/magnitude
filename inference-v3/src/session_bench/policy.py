@@ -10,7 +10,7 @@ STARTUP_TIMEOUT_SECONDS = 900
 PREFILL_TOKENS = 2048
 OUTPUT_CAPACITY = 64
 DEFAULT_CONTEXTS = (1_024, 4_096, 16_384)
-ENGINES = ("magnitude", "mlx-vlm", "omlx", "llama.cpp")
+ENGINES = ("magnitude", "mlx-vlm", "omlx", "llama.cpp", "tilelang-poc")
 
 
 def project_root() -> Path:

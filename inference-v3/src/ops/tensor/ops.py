@@ -1045,12 +1045,20 @@ def _gated_delta_recurrence(inputs, attrs):
         or offsets.dtype != DType.I32
     ):
         raise ValueError("invalid gated delta recurrence geometry")
+    length = attrs.get("sequence_length")
+    if length is not None and (
+        type(length) is not int or previous.shape[0] != 1 or not 0 <= length <= query.shape[0]
+    ):
+        raise ValueError("static recurrence length requires one sequence within input capacity")
     return value, previous
 
 
 def _gated_delta_reference(inputs, attrs):
     np = _np()
     query, key, value, decay, beta, previous, offsets = inputs
+    length = attrs.get("sequence_length")
+    if length is not None and tuple(offsets) != (0, length):
+        raise ValueError("recurrent offsets do not match the declared static sequence length")
     batch, value_heads, value_width, key_width = previous.shape
     key_heads = query.shape[1]
     state = previous.astype(np.float32).copy()
@@ -1086,7 +1094,13 @@ def gated_delta_recurrence(
     offsets: Tensor,
     *,
     mapping: str = "tiled",
+    sequence_length: int | None = None,
 ):
+    """Apply recurrence; a static length declares offsets exactly (0, length).
+
+    Callers providing that specialization must establish it from invocation
+    metadata, not from the allocated input capacity alone.
+    """
     return _emit(
         "gated_delta_recurrence",
         query,
@@ -1097,6 +1111,7 @@ def gated_delta_recurrence(
         previous,
         offsets,
         mapping=mapping,
+        sequence_length=sequence_length,
     )
 
 
