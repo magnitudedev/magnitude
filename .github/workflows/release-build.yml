@@ -10,6 +10,10 @@ on:
         required: false
         default: false
         type: boolean
+      windows_distribution:
+        required: false
+        default: false
+        type: boolean
       validate_candidate:
         required: true
         type: boolean
@@ -69,7 +73,10 @@ jobs:
           if-no-files-found: error
 
   host:
-    environment: ${{ inputs.apple_distribution && 'apple-release' || 'release-validation' }}
+    permissions:
+      contents: read
+      id-token: write
+    environment: ${{ matrix.id == 'windows-x64-msvc' && inputs.windows_distribution && 'windows-signing' || startsWith(matrix.id, 'darwin-') && inputs.apple_distribution && 'apple-release' || 'release-validation' }}
     needs: [matrix, catalog]
     strategy:
       fail-fast: false
@@ -99,6 +106,12 @@ jobs:
           sudo apt-get install -y clang
           echo "CC=clang" >> "$GITHUB_ENV"
           echo "CXX=clang++" >> "$GITHUB_ENV"
+      - name: Install Windows installer tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nsis --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS installation failed' }
       - run: bun install --frozen-lockfile
       - uses: actions/download-artifact@v4
         with:
@@ -115,7 +128,31 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
           APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
           APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
-      - run: bun run packages/release/scripts/build/host.ts "${{ matrix.id }}" catalog-inputs "release/${{ matrix.id }}"
+      - name: Build Unix host
+        if: runner.os != 'Windows'
+        run: bun run packages/release/scripts/build/host.ts "${{ matrix.id }}" catalog-inputs "release/${{ matrix.id }}"
+      - name: Install Windows signing runtime
+        if: runner.os == 'Windows' && inputs.windows_distribution
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Authenticate Windows Artifact Signing
+        if: runner.os == 'Windows' && inputs.windows_distribution
+        uses: azure/login@8216e11d8cd9b42fe925c852af8e76311ff067ac # v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Build Windows host
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./packages/release/scripts/build/windows.ps1 -CatalogDirectory catalog-inputs -OutputDirectory "release/${{ matrix.id }}"
+        env:
+          MAGNITUDE_WINDOWS_DISTRIBUTION: ${{ inputs.windows_distribution && 'artifact-signing' || 'unsigned' }}
+          MAGNITUDE_WINDOWS_PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
+          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_CERTIFICATE_PROFILE: ${{ vars.AZURE_SIGNING_CERTIFICATE_PROFILE }}
       - uses: actions/upload-artifact@v4
         with:
           name: host-${{ matrix.id }}
@@ -366,8 +403,35 @@ jobs:
           path: release/${{ matrix.id }}/apple-consumer.receipt.json
           if-no-files-found: error
 
+  windows-consumer:
+    needs: [matrix, host]
+    environment: ${{ inputs.windows_distribution && 'windows-signing' || 'release-validation' }}
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_commit }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: host-windows-x64-msvc
+          path: release/windows-x64-msvc
+      - run: bun run packages/release/scripts/validate-host.ts windows-x64-msvc release/windows-x64-msvc
+      - name: Install and remove the accepted Windows application
+        timeout-minutes: 10
+        shell: pwsh
+        run: ./packages/release/scripts/test-windows-installed.ps1 -Directory release/windows-x64-msvc -Version '${{ needs.matrix.outputs.version }}' -RequireSignature:([bool]::Parse('${{ inputs.windows_distribution }}'))
+        env:
+          MAGNITUDE_WINDOWS_PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
+
   candidate:
-    needs: [matrix, host, backend, linux-consumer, apple-consumer]
+    needs: [matrix, host, backend, linux-consumer, apple-consumer, windows-consumer]
     if: inputs.validate_candidate
     runs-on: ubuntu-22.04
     steps:

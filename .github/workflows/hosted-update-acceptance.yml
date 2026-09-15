@@ -225,6 +225,9 @@ jobs:
           bun-version: "1.4.2"
       - run: bun install --frozen-lockfile --ignore-scripts
       - name: Exercise signed requests and update ownership on the native runtime
+        # Installation skips scripts; protocol/build identities must exist before imports.
+        run: bun run packages/version/scripts/generate-version.ts
+      - name: Test signed requests and update ownership on the native runtime
         working-directory: desktop
         run: bunx --bun vitest run src/update-identity.test.ts src/update-preferences.test.ts src/update-schedule.test.ts src/application-update.test.ts
       - name: Verify bounded installer transfers and interrupted range recovery

@@ -128,6 +128,9 @@ jobs:
             *) echo "::error::Invalid preflight action: '${ACTION}'"; exit 1 ;;
           esac
   build:
+    permissions:
+      contents: read
+      id-token: write
     needs: preflight
     if: needs.preflight.outputs.action == 'release'
     uses: ./.github/workflows/release-build.yml
@@ -135,6 +138,7 @@ jobs:
       source_commit: ${{ needs.preflight.outputs.source_commit }}
       validate_candidate: false
       apple_distribution: true
+      windows_distribution: true
     secrets: inherit
 
   publish:

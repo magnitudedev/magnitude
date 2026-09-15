@@ -21,6 +21,8 @@ export const hostedDesktopManifests = (
       expected.set(`desktop-update-${host.id}`, { host: host.id, target: { os: "darwin", arch, package: "mac-zip" } })
     } else if (host.id.startsWith("linux-")) {
       for (const format of ["deb", "rpm"] as const) expected.set(`desktop-${host.id}-${format}`, { host: host.id, target: { os: "linux", arch, package: format } })
+    } else if (host.id === "windows-x64-msvc") {
+      expected.set(`desktop-${host.id}`, { host: host.id, target: { os: "windows", arch: "x64", package: "windows-exe" } })
     } else return yield* new HostedCandidateInvalid({ message: "Configured release host has no accepted desktop publication contract" })
   }
   const desktops = release.artifacts.filter(artifact => artifact.kind === "desktop")
@@ -30,7 +32,7 @@ export const hostedDesktopManifests = (
     const entry = expected.get(artifact.id)
     if (!entry || Option.getOrUndefined(artifact.host) !== entry.host) return yield* new HostedCandidateInvalid({ message: "Unexpected desktop artifact identity or host" })
     expected.delete(artifact.id)
-    const suffix = entry.target.package === "mac-zip" ? ".zip" : `.${entry.target.package}`
+    const suffix = entry.target.package === "mac-zip" ? ".zip" : entry.target.package === "windows-exe" ? ".exe" : `.${entry.target.package}`
     if (!artifact.filename.endsWith(suffix)) return yield* new HostedCandidateInvalid({ message: "Desktop artifact filename differs from its package format" })
     manifests.push(yield* Schema.decodeUnknown(UpdateManifest)({
       protocol: 1, version: release.version, tag: `@magnitudedev/cli@${release.version}`, commit: release.sourceCommit,

@@ -132,6 +132,14 @@ before connecting its private owner pipe. The desktop checks the pipe client's n
 the retained child identity before consuming Booted. Windows commands invoke the known executable
 directly with CRT argument encoding; the native boundary orders environment keys using Windows
 ordinal case-insensitive comparison and rejects duplicate names or premature block terminators.
+Child environment overrides replace inherited names case-insensitively before encoding, so an
+installation's `PATH` replaces Windows' inherited `Path` without mutating the parent environment.
+Inference probes and launches use extended Windows executable and runtime paths, so deep
+installation directories do not depend on machine-wide long-path policy. Stored paths and errors
+retain their ordinary filesystem representation.
+Inference stream admission stays interruptible inside masked lifecycle acquisition. Once streams
+connect, its competing process-exit observation must cancel without waiting for the engine to exit;
+the already-acquired job scope retains cleanup authority throughout admission.
 Platform build and packaged lifecycle acceptance are required before enabling production ownership.
 
 Acceptance includes live contention without takeover, acquisition after owner death without file

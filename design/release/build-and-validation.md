@@ -63,6 +63,31 @@ Linux candidate assembly requires both formats for each selected Linux host. Nat
 verifies the embedded package name, version, architecture and sandbox permissions against the
 release target; an installer extension or matching checksum alone is insufficient.
 
+## Windows build baseline
+
+Windows CPU artifacts target x64 MSVC. CMake receives that target explicitly, including when the
+build tools run under x64 emulation on Windows ARM; the build machine's processor must not select
+ARM backend variants for an x64 artifact. Desktop, service, and installer builds share the native
+host toolchain discovery. The Node import library is verified against the selected Node release's
+checksums and remains a build-only input.
+
+The engine package includes the Microsoft C++ runtime DLLs required by its native import graph.
+Build validation resolves imports only against the owned payload, the selected toolchain's x64 CRT
+redistributable, and Windows system libraries/API sets. An ambient developer PATH or installed VC
+redistributable cannot satisfy a missing package dependency. Redistributable DLL imports are checked
+recursively; the resulting files use the existing installation-owned runtime directory.
+An independent Windows consumer extracts and runs the final archives, checks their metadata,
+and exercises engine readiness and parent-loss shutdown before candidate assembly can pass.
+Production Windows packaging uses Artifact Signing with an explicit publisher identity. Owned code,
+the embedded uninstaller, and the final installer are signed and timestamped before checksums are
+recorded. Publisher and signature validation fail the build; missing credentials cannot produce a
+production installer. Bundling preserves the signed CLI and service bytes from their archives.
+Local unsigned builds carry no production trust claim.
+The independent consumer installs and uninstalls the accepted installer under a fresh user profile,
+verifies installed registration and CLI versions, compares bundled CLI/service bytes to their
+accepted archives, and requires publisher signatures for production inputs. Signing credentials
+belong to the protected Windows signing environment; ordinary pull-request validation is unsigned.
+
 ## Apple build baseline
 
 Apple arm64 and Apple x64 target macOS 13.0. The release configuration passes that floor through

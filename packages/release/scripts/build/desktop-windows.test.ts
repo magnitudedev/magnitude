@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { Cause, Effect, Exit, Schema } from "effect"
+import { Cause, ConfigProvider, Effect, Exit, Schema } from "effect"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as NodeContext from "@effect/platform-node/NodeContext"
 import { join } from "node:path"
@@ -57,7 +57,7 @@ describe("Windows installer source boundary", () => {
       const fixture = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-installer-input-" })
       const app = join(fixture, "app")
       yield* fs.makeDirectory(join(app, "resources"), { recursive: true })
-      for (const name of ["Magnitude.exe", "resources/app.asar", "resources/magnitude-service.exe", "resources/desktop-host.node", "resources/Magnitude-LICENSE.txt"]) {
+      for (const name of ["Magnitude.exe", "resources/app.asar", "resources/magnitude.exe", "resources/magnitude-service.exe", "resources/desktop-host.node", "resources/Magnitude-LICENSE.txt"]) {
         yield* fs.writeFileString(join(app, name), "fixture")
       }
       const guard = join(fixture, "guard.dll")
@@ -82,6 +82,8 @@ describe("Windows installer source boundary", () => {
       if (Exit.isFailure(result)) expect(Cause.pretty(result.cause)).toContain(scenario === "redirected payload" ? "redirected path" : "x86 PE DLL")
       expect(yield* fs.exists(output)).toBe(false)
       if (scenario === "redirected payload") expect(yield* fs.readFileString(join(fixture, "outside.txt"))).toBe("outside payload")
-    })).pipe(Effect.provide(NodeContext.layer)))
+    })).pipe(Effect.provide(NodeContext.layer), Effect.withConfigProvider(ConfigProvider.fromMap(new Map([
+      ["MAGNITUDE_WINDOWS_DISTRIBUTION", "artifact-signing"],
+    ])))))
   })
 })

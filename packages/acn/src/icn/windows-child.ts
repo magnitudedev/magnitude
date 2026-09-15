@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto"
 import { Effect, Layer, Schema, Stream } from "effect"
 import { IcnChildSpawner, IcnChildLaunch, IcnChildAcquisitionFailed, IcnChildObservationFailed, IcnChildRetirementFailed } from "@magnitudedev/icn"
 import { IcnParentCommand } from "@magnitudedev/icn-protocol"
-import { WindowsJobOwner, WindowsPrivatePipes, WindowsPipeName, encodeWindowsCommand, type WindowsPrivatePipe } from "@magnitudedev/utils/windows-native"
+import { WindowsJobOwner, WindowsPrivatePipes, WindowsPipeName, encodeWindowsCommand, mergeWindowsEnvironment, type WindowsPrivatePipe } from "@magnitudedev/utils/windows-native"
 
 /** ACN's job scope outlives the attempt scope and retains failed-retirement authority. */
 export const WindowsIcnChildSpawner = Layer.effect(IcnChildSpawner, Effect.gen(function* () {
@@ -18,7 +18,7 @@ export const WindowsIcnChildSpawner = Layer.effect(IcnChildSpawner, Effect.gen(f
     const stdin = yield* pipes.bind(names.input, true).pipe(Effect.mapError(error => acquisition(error.message)))
     const stdout = yield* pipes.bind(names.output, true).pipe(Effect.mapError(error => acquisition(error.message)))
     const stderr = yield* pipes.bind(names.error, true).pipe(Effect.mapError(error => acquisition(error.message)))
-    const command = yield* encodeWindowsCommand({ executable: launch.executable, arguments: launch.arguments, environment: { ...process.env, ...launch.environment } }).pipe(Effect.mapError(error => acquisition(error.message)))
+    const command = yield* encodeWindowsCommand({ executable: launch.executable, arguments: launch.arguments, environment: mergeWindowsEnvironment(process.env, launch.environment) }).pipe(Effect.mapError(error => acquisition(error.message)))
     const shutdownFrame = yield* Schema.encode(Schema.parseJson(IcnParentCommand))({ type: "shutdown" })
     const owned = yield* Effect.acquireRelease(Effect.gen(function* () {
       const job = yield* jobs.spawn(command, { _tag: "Separate", ...names }).pipe(Effect.mapError(error => acquisition(error.message)))
@@ -36,7 +36,7 @@ export const WindowsIcnChildSpawner = Layer.effect(IcnChildSpawner, Effect.gen(f
     yield* Effect.raceFirst(
       Effect.all([stdin.accept, stdout.accept, stderr.accept], { concurrency: "unbounded" }).pipe(Effect.mapError(error => acquisition(error.message))),
       job.exit.pipe(Effect.mapError(error => acquisition(error.message)), Effect.flatMap(code => Effect.fail(acquisition(`Inference exited before its inherited streams were admitted (exit code ${code}).`)))),
-    ).pipe(Effect.timeoutFail({ duration: "10 seconds", onTimeout: () => acquisition("Inference inherited-stream admission timed out.") }))
+    ).pipe(Effect.interruptible, Effect.timeoutFail({ duration: "10 seconds", onTimeout: () => acquisition("Inference inherited-stream admission timed out.") }))
     const observation = (message: string) => new IcnChildObservationFailed({ pid: identity.pid, message })
     const read = (pipe: WindowsPrivatePipe) => Stream.repeatEffect(pipe.read).pipe(Stream.takeWhile(bytes => bytes.length > 0), Stream.mapError(error => observation(error.message)))
     return {

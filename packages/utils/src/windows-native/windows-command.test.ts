@@ -1,9 +1,16 @@
 import { Effect } from "effect"
 import { describe, expect, it } from "vitest"
-import { encodeWindowsCommand } from "./windows-command"
+import { encodeWindowsCommand, mergeWindowsEnvironment } from "./windows-command"
 
 const executable = String.raw`C:\Program Files\Magnitude\magnitude-service.exe`
 describe("Windows service command encoding", () => {
+  it("replaces inherited Path without emitting a duplicate PATH or mutating the parent", async () => {
+    const inherited = { Path: "C:\\Windows\\System32", Keep: "unchanged", Remove: "old" }
+    const environment = mergeWindowsEnvironment(inherited, { PATH: "C:\\Magnitude\\runtime;C:\\Windows\\System32", REMOVE: undefined })
+    const result = await Effect.runPromise(encodeWindowsCommand({ executable, arguments: [], environment }))
+    expect(result.environment).toBe("Keep=unchanged\0PATH=C:\\Magnitude\\runtime;C:\\Windows\\System32\0\0")
+    expect(inherited).toEqual({ Path: "C:\\Windows\\System32", Keep: "unchanged", Remove: "old" })
+  })
   it("preserves empty, quoted, Unicode and shell-looking arguments without invoking a shell", async () => {
     const result = await Effect.runPromise(encodeWindowsCommand({ executable,
       arguments: ["", "two words", 'say "hello"', "模型🙂", "& echo %PATH%", "line\nbreak", "ends\\"], environment: {},

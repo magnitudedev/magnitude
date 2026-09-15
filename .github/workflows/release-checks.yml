@@ -1,6 +1,12 @@
 name: Release checks
 
 on:
+  workflow_dispatch:
+    inputs:
+      windows_distribution:
+        description: Validate Azure-signed Windows artifacts without publishing
+        type: boolean
+        default: false
   pull_request:
     paths:
       - ".changeset/**"
@@ -61,8 +67,12 @@ jobs:
       - run: bun run packages/release/scripts/prepare-npm.ts release/npm-candidate
 
   release-build:
+    permissions:
+      contents: read
+      id-token: write
     needs: [static, integrations]
     uses: ./.github/workflows/release-build.yml
     with:
       source_commit: ${{ github.sha }}
       validate_candidate: true
+      windows_distribution: ${{ github.event_name == 'workflow_dispatch' && inputs.windows_distribution }}

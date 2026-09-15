@@ -2,6 +2,8 @@ import { acnExecutableRelativePath } from "../../src/macos-app"
 import { buildMacApp } from "../apple/build-app"
 import { buildDesktopApplication, DesktopBuildFailed } from "./desktop"
 import { buildLinuxDesktopInstaller } from "./desktop-linux"
+import { buildWindowsDesktopInstaller } from "./desktop-windows"
+import { signWindowsCode } from "./windows-signing"
 import { BunContext } from "@effect/platform-bun"
 import { buildDesktopDmg, validateDesktopDistribution } from "../apple/desktop"
 import { appleSigning, signAppleCode, appleCommand } from "../apple/signing"
@@ -17,8 +19,9 @@ import {
 } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { basename, delimiter, dirname, resolve } from "node:path"
-import { Effect, Option, Schema } from "effect"
+import { Effect, Option, Schedule, Schema } from "effect"
 import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native"
+import { mergeWindowsEnvironment } from "@magnitudedev/utils/windows-native"
 import {
   BackendEligibilityReport,
   IcnInstallationDeclaration,
@@ -179,6 +182,7 @@ const smokeIcnServer = async (
         await child.exited
       }
     }
+    await child[Symbol.asyncDispose]()
   }
 }
 
@@ -242,12 +246,11 @@ export const smokeHostArchives = async (
       backendModuleAbi: Option.getOrThrow(icnArtifact.backendModuleAbi),
     })}\n`)
     const environment = host.id.startsWith("windows-")
-      ? {
-        ...process.env,
+      ? mergeWindowsEnvironment(process.env, {
         PATH: [resolve(icnRoot, "runtime"), process.env.PATH]
           .filter(Boolean)
           .join(delimiter),
-      }
+      })
       : {
         ...process.env,
         ...(host.id.startsWith("darwin-")
@@ -270,7 +273,10 @@ export const smokeHostArchives = async (
       if (signing.mode === "developer-id") await run(["/usr/bin/xcrun", "stapler", "validate", app])
     }
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await Effect.runPromise(Effect.tryPromise(() => rm(root, { recursive: true, force: true })).pipe(
+      Effect.retry({ times: 6, schedule: Schedule.spaced("500 millis"), while: error => process.platform === "win32" &&
+        Schema.is(Schema.Struct({ code: Schema.Literal("EPERM", "EBUSY", "ENOTEMPTY") }))(error.cause) }),
+    ))
   }
 }
 
@@ -367,6 +373,11 @@ export const buildHostArtifacts = async (
   )(eligibility)
 
   const cliArchivePath = resolve(output, cliArchive(host.id))
+  if (host.id === "windows-x64-msvc") {
+    await Effect.runPromise(Effect.forEach([cli, acn, icn.binary, ...cpuModules,
+      ...icn.runtimeLibraries.filter(file => /^(?:ggml(?:-.*)?|llama|mtmd)\.dll$/i.test(basename(file))),
+    ], signWindowsCode, { discard: true }).pipe(Effect.provide(BunContext.layer)))
+  }
   const acnArchivePath = resolve(output, acnArchive(host.id))
   const icnArchivePath = resolve(output, icnBaseArchive(host.id))
   const cliNotary = host.id.startsWith("darwin-")
@@ -432,6 +443,23 @@ export const buildHostArtifacts = async (
       return artifacts
     }).pipe(Effect.provide(BunContext.layer)))
     desktopArtifacts.push(...installers)
+  } else if (host.id === "windows-x64-msvc") {
+    await run(["bun", "run", "build"], { cwd: resolve(PROJECT_ROOT, "desktop") })
+    const guard = resolve(output, ".desktop-build", "MagnitudeInstallGuard.dll")
+    await run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+      resolve(PROJECT_ROOT, "packages/release/scripts/build/windows-installer.ps1"), "-Output", guard])
+    const installer = await Effect.runPromise(Effect.gen(function* () {
+      const applications = yield* buildDesktopApplication({
+        service: acn, cli, outputDirectory: resolve(output, ".desktop-build", "application"),
+        version, revision: ACN_COORDINATION_REVISION, target: { platform: "win32", arch: "x64" },
+      })
+      if (applications.length !== 1) return yield* new DesktopBuildFailed({ message: "Desktop packaging did not produce exactly one Windows application" })
+      return yield* buildWindowsDesktopInstaller({
+        app: applications[0]!, guard, makensis: "makensis.exe", version,
+        revision: ACN_COORDINATION_REVISION, output,
+      })
+    }).pipe(Effect.provide(BunContext.layer)))
+    desktopArtifacts.push(installer.artifact)
   }
   const acnArtifact = await buildArchive(
     acnArchivePath,

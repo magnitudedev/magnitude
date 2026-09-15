@@ -24,6 +24,10 @@ content identities. Companion projector material preserves its bounded GGUF meta
 directory, so native assessment can establish modalities without an authored capability flag.
 Catalog desired, catalog effective, and discovered targets resolve this same input shape.
 
+Temporary assessment files preserve the artifact's logical size without allocating its absent
+tensor payload. Windows explicitly marks these files sparse before extending them; unsupported
+filesystem operations fail that assessment rather than consuming model-sized disk space.
+
 The automatic ICN pool assesses catalog desired material when not installed, effective material
 when installed, and only `Ready` discoveries. It publishes a read-only revisioned snapshot with
 independent catalog and discovery source slices. Exact work identity guards publication, so removed

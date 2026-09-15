@@ -6,6 +6,15 @@ export interface WindowsChildCommand {
   readonly environment: Readonly<Record<string, string | undefined>>
 }
 
+/** Overrides replace inherited Windows names regardless of their casing. */
+export const mergeWindowsEnvironment = (
+  inherited: WindowsChildCommand["environment"],
+  overrides: WindowsChildCommand["environment"],
+): WindowsChildCommand["environment"] => {
+  const replaced = new Set(Object.keys(overrides).map(key => key.toUpperCase()))
+  return { ...Object.fromEntries(Object.entries(inherited).filter(([key]) => !replaced.has(key.toUpperCase()))), ...overrides }
+}
+
 const text = Schema.String.pipe(Schema.filter(value => !value.includes("\0")))
 const executable = text.pipe(Schema.filter(value => win32.isAbsolute(value) && win32.parse(value).root.length > 1 && !value.includes('"')))
 const environmentKey = text.pipe(Schema.filter(value => value.length > 0 && (!value.includes("=") || /^=[a-z]:$/i.test(value))))

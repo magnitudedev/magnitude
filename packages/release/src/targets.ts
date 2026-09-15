@@ -83,6 +83,14 @@ export const releaseHosts = [
     executableExtension: "",
     cargoFeatures: ["mtmd", "dynamic-backends"],
   },
+  {
+    id: "windows-x64-msvc",
+    runner: "windows-2022",
+    bunTarget: "bun-windows-x64",
+    rustTarget: "x86_64-pc-windows-msvc",
+    executableExtension: ".exe",
+    cargoFeatures: ["mtmd", "dynamic-backends"],
+  },
 ] as const satisfies readonly ReleaseHost[]
 
 const cudaBuilds = [
@@ -121,8 +129,7 @@ const cudaBackendPacks: readonly BackendPack[] = cudaHosts.flatMap(({ host, runn
     cuda,
   })))
 
-// Windows release artifacts are intentionally disabled for now. Runtime support outside the
-// release system remains available to revisit once Windows builds are reliable.
+// Windows currently ships the CPU base; accelerator packs remain host-specific.
 export const backendPacks: readonly BackendPack[] = [
   {
     id: "metal-darwin-arm64",
@@ -177,6 +184,7 @@ export const cliArchive = (host: HostId) => `magnitude-cli-${host}.tar.gz`
 export const acnArchive = (host: HostId) => `magnitude-acn-${host}.tar.gz`
 export const desktopInstaller = (host: "darwin-arm64" | "darwin-x64") => `magnitude-desktop-${host}.dmg`
 export const desktopUpdateArchive = (host: "darwin-arm64" | "darwin-x64") => `magnitude-desktop-${host}.zip`
+export const windowsDesktopInstaller = (version: string) => `magnitude-desktop-windows-x64-${version}.exe`
 export const linuxDesktopInstaller = (host: "linux-arm64-gnu" | "linux-x64-gnu", format: "deb" | "rpm", version: string, revision: number) => {
   const packageVersion = version.replace("-", "~")
   return format === "deb"

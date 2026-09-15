@@ -24,6 +24,7 @@ const artifact = Schema.decodeUnknownSync(Schema.parseJson(ReleaseArtifactSchema
 const ids = ["cli", "acn", "icn-base"].map(kind => `${kind}-${hostId}`)
 if (hostId.startsWith("darwin-")) ids.push(`desktop-${hostId}`, `desktop-update-${hostId}`)
 if (hostId.startsWith("linux-")) ids.push(`desktop-${hostId}-deb`, `desktop-${hostId}-rpm`)
+if (hostId === "windows-x64-msvc") ids.push(`desktop-${hostId}`)
 const artifacts = await Promise.all(ids.map(async (id) => {
   const metadata = Schema.decodeUnknownSync(Schema.parseJson(ReleaseArtifactSchema))(await readFile(resolve(root, `${id}.artifact.json`), "utf8"))
   if (metadata.id !== id || Number((await stat(resolve(root, metadata.filename))).size) !== metadata.bytes || await fileSha256(resolve(root, metadata.filename)) !== metadata.sha256) throw new Error(`Consumer received changed ${id} bytes`)
