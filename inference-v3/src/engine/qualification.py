@@ -76,7 +76,7 @@ class ProgramManifest:
 @dataclass(frozen=True, slots=True)
 class QualificationResult:
     case: QualificationCase
-    capabilities: dict[str, Any]
+    compiler_target: dict[str, Any]
     graph_fingerprint: str
     nodes: int
     kernels: int
@@ -134,7 +134,7 @@ def invocation_specs(
 def qualify(
     description: DenseDescription,
     weight_specs: dict[str, ops.TensorSpec],
-    capabilities: ops.Capabilities,
+    compiler_target: ops.CompilerTarget,
     compiler_identity: str,
     case: QualificationCase,
     *,
@@ -150,7 +150,7 @@ def qualify(
     plan = ops.analyze(
         definition.function,
         signature=definition.signature,
-        capabilities=capabilities,
+        compiler_target=compiler_target,
         compiler_identity=compiler_identity,
         available_bytes=available_bytes,
         options=definition.options,
@@ -175,7 +175,7 @@ def qualify(
     failures = _failures(plan, units)
     return QualificationResult(
         case,
-        _capability_manifest(capabilities),
+        _target_manifest(compiler_target),
         plan.graph.fingerprint,
         len(plan.graph.nodes),
         plan.diagnostics.dispatches,
@@ -221,20 +221,12 @@ def _schedule_manifest(graph, candidate: BoundOperation) -> ScheduleManifest:
     )
 
 
-def _capability_manifest(capabilities: ops.Capabilities) -> dict[str, Any]:
+def _target_manifest(compiler_target: ops.CompilerTarget) -> dict[str, Any]:
     return {
-        "subgroup_width": capabilities.subgroup_width,
-        "threads_per_group": capabilities.threads_per_group,
-        "shared_memory_bytes": capabilities.shared_memory_bytes,
-        "matrix_instructions": tuple(
-            f"{item.input_dtype.value}:{item.m}x{item.n}x{item.k}->{item.accumulation_dtype.value}"
-            for item in capabilities.matrix_instructions
-        ),
-        "memory_scopes": tuple(sorted(capabilities.memory_scopes)),
-        "atomics": tuple(sorted(dtype.value for dtype in capabilities.atomics)),
-        "native_multi_launch": capabilities.native_multi_launch,
-        "partial_binding": capabilities.partial_binding,
-        "fingerprint": capabilities.fingerprint,
+        "subgroup_width": compiler_target.subgroup_width,
+        "threads_per_group": compiler_target.threads_per_group,
+        "shared_memory_bytes": compiler_target.shared_memory_bytes,
+        "fingerprint": compiler_target.identity,
     }
 
 
@@ -426,7 +418,7 @@ def main() -> None:
             qualify(
                 description,
                 weight_specs,
-                device.capabilities,
+                device.compiler_target,
                 device.compiler_identity,
                 case,
                 slots=args.max_batch,

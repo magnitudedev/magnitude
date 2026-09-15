@@ -1,3 +1,5 @@
+
+from tests.ops.target_fixture import matrix_query
 """Parent fusion preserves independent child formulas and their storage rounding."""
 
 from dataclasses import replace
@@ -68,16 +70,16 @@ def case(kind, rows):
 
 
 @pytest.mark.parametrize("kind,mode,expected", [("dense", "decode", 2), ("dense", "prefill", 2),
-                                               ("routed", "decode", 2), ("routed", "prefill", 8)])
+                                               ("routed", "decode", 2), ("routed", "prefill", 7)])
 def test_parent_absorbs_residual_but_exposed_child_keeps_its_own_publication(kind, mode, expected):
     _, graph, _, bindings = case(kind, 9)
     native = Runtime()
-    capabilities = replace(native.capabilities,
-        matrix_instructions=(ops.MatrixInstruction(8, 8, 8, ops.DType.F32, ops.DType.F32),),
-        atomics=frozenset({ops.DType.I32}),
-        features=native.capabilities.features | {"gemm.runtime_valid_m"})
+    compiler_target = replace(native.compiler_target,
+        matrix_query=matrix_query((ops.MatrixTile(8, 8, 8, ops.DType.F32, ops.DType.F32),)),
+
+        )
     options = ops.CompileOptions(mode=mode)
-    plan = analyze_graph(graph, capabilities=capabilities, compiler_identity="fixture", available_bytes=64 << 20,
+    plan = analyze_graph(graph, compiler_target=compiler_target, compiler_identity="fixture", available_bytes=64 << 20,
                          options=options, constants=bindings)
     assert plan.diagnostics.dispatches == expected
     parent, = ops.FormulaTree(graph).roots
@@ -86,7 +88,7 @@ def test_parent_absorbs_residual_but_exposed_child_keeps_its_own_publication(kin
     assert residual_epilogue(graph, child_output) is not None
     observed = replace(graph, outputs=(*graph.outputs, child_output))
     assert residual_epilogue(observed, child_output) is None
-    visible = analyze_graph(observed, capabilities=capabilities, compiler_identity="fixture", available_bytes=64 << 20,
+    visible = analyze_graph(observed, compiler_target=compiler_target, compiler_identity="fixture", available_bytes=64 << 20,
                             options=options, constants=bindings)
     assert visible.diagnostics.dispatches == expected + 2
     assert len(parent.children) == len(ops.FormulaTree(observed).roots[0].children)

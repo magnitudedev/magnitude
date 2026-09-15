@@ -1,3 +1,5 @@
+
+from tests.ops.target_fixture import matrix_query
 import pytest
 
 import ops
@@ -7,15 +9,14 @@ from ops.compiler.memory import plan_memory
 from ops.compiler.unit import build_unit
 from ops.runtime.tilelang import _build_reusable_module
 
-CAPABILITIES = ops.Capabilities(
+CAPABILITIES = ops.CompilerTarget(
     32,
     256,
     32 * 1024,
-    matrix_instructions=(ops.MatrixInstruction(8, 8, 8, ops.DType.F16, ops.DType.F32),),
-    memory_scopes=frozenset({"global", "shared", "local"}),
-    native_multi_launch=True,
-    partial_binding=True,
-    fingerprint="construction-test",
+    matrix_query=matrix_query((ops.MatrixTile(8, 8, 8, ops.DType.F16, ops.DType.F32),)),
+
+
+    identity="construction-test",
 )
 
 
@@ -23,8 +24,8 @@ def _construct(function, signature):
     graph = ops.trace(function, signature)
     context = LoweringContext(CAPABILITIES, "decode", "model", "test", 1 << 26)
     cover = build_operations(graph, context)
-    memory = plan_memory(graph, cover, CAPABILITIES)
-    submissions = plan_submissions(graph, cover, CAPABILITIES)
+    memory = plan_memory(graph, cover)
+    submissions = plan_submissions(graph, cover)
     return tuple(_build_reusable_module(build_unit(graph, memory, unit)) for unit in submissions)
 
 
@@ -184,9 +185,9 @@ def test_concatenation_uses_one_kernel_for_many_inputs():
     graph = ops.trace(lambda *values: ops.concatenate(values, axis=0), signature)
     context = LoweringContext(CAPABILITIES, "decode", "model", "test", 1 << 20)
     cover = build_operations(graph, context)
-    submissions = plan_submissions(graph, cover, CAPABILITIES)
+    submissions = plan_submissions(graph, cover)
     assert len(submissions) == 1 and submissions[0].kernel_count == 1
-    memory = plan_memory(graph, cover, CAPABILITIES)
+    memory = plan_memory(graph, cover)
     assert _build_reusable_module(build_unit(graph, memory, submissions[0])).functions
 
 

@@ -61,15 +61,15 @@ class Runtime:
     def capture_kernels(self, limit):
         return None
 
-    capabilities = ops.Capabilities(
+    compiler_target = ops.CompilerTarget(
         32,
         256,
         32 * 1024,
-        memory_scopes=frozenset({"global", "shared", "local"}),
-        features=frozenset({"reference_schedules"}),
-        native_multi_launch=True,
-        partial_binding=True,
-        fingerprint="test",
+
+        reference_schedules=True,
+
+
+        identity="test",
     )
     compiler_identity = "test-compiler"
     runtime_identity = "test-runtime"
@@ -148,7 +148,7 @@ def test_analyze_plans_without_allocating_or_compiling():
     plan = ops.analyze(
         activation_residual,
         signature=ops.Signature((ops.Argument(spec, "value"),)),
-        capabilities=runtime.capabilities,
+        compiler_target=runtime.compiler_target,
         compiler_identity=runtime.compiler_identity,
         options=ops.CompileOptions(mode="prefill"),
     )

@@ -25,7 +25,7 @@ class CompilationDiagnostics:
     graph_name: str
     graph_fingerprint: str
     compiler_identity: str
-    capability_fingerprint: str
+    configuration_identity: str
     mode: str
     precision: str
     operations: tuple[OperationDiagnostic, ...]
@@ -43,7 +43,7 @@ class CompilationDiagnostics:
             f"graph {self.graph_name} {self.graph_fingerprint}",
             f"mode={self.mode} precision={self.precision}",
             f"compiler={self.compiler_identity}",
-            f"capability={self.capability_fingerprint}",
+            f"configuration={self.configuration_identity}",
             f"temporaries={self.temporary_bytes} bytes units={len(self.submissions)} "
             f"numerical-kernel-upper-bound={self.dispatches}",
         ]
@@ -74,7 +74,7 @@ def build_diagnostics(
     submissions: tuple[SubmissionUnit, ...],
     *,
     compiler_identity: str,
-    capability_fingerprint: str,
+    configuration_identity: str,
     mode: str,
     precision: str,
 ) -> CompilationDiagnostics:
@@ -91,7 +91,7 @@ def build_diagnostics(
         graph.name,
         graph.fingerprint,
         compiler_identity,
-        capability_fingerprint,
+        configuration_identity,
         mode,
         precision,
         items,

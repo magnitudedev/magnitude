@@ -1,4 +1,4 @@
-"""Grouped expert prefill pipeline selected from explicit target capabilities."""
+"""Grouped expert prefill pipeline using target resources and matrix plans."""
 
 from __future__ import annotations
 
@@ -590,9 +590,7 @@ class GroupedExpertsRule:
             node.operation != "routed_experts"
             or node.attributes["activation"] != "silu"
             or context.mode == "decode"
-            or DType.I32 not in context.capabilities.atomics
-            or "shared" not in context.capabilities.memory_scopes
-            or "gemm.runtime_valid_m" not in context.capabilities.features
+            or context.compiler_target.shared_memory_bytes <= 0
         ):
             return ()
         specs = tuple(graph.values[value].spec for value in (*node.inputs, *node.outputs))
@@ -631,15 +629,15 @@ class GroupedExpertsRule:
         if bk % instruction.k or down_bk % instruction.k:
             return ()
         threads = min(
-            context.capabilities.threads_per_group,
-            context.capabilities.subgroup_width * 4,
-            bm // instruction.m * context.capabilities.subgroup_width,
+            context.compiler_target.threads_per_group,
+            context.compiler_target.subgroup_width * 4,
+            bm // instruction.m * context.compiler_target.subgroup_width,
         )
         shared = max(
             affine_shared_bytes(bm, 2 * bn, bk, hidden.dtype, gate, up),
             affine_shared_bytes(bm, bn, down_bk, hidden.dtype, down),
         )
-        if shared > context.capabilities.shared_memory_bytes:
+        if shared > context.compiler_target.shared_memory_bytes:
             return ()
         capacity = _aligned_capacity(rows, selected, experts, bm)
         blocks = capacity // bm
@@ -683,11 +681,7 @@ def _grouped_shared_operation(
         nodes |= epilogue.nodes
         inputs += (epilogue.residual,)
         outputs = (epilogue.output,)
-    if (
-        DType.I32 not in context.capabilities.atomics
-        or "shared" not in context.capabilities.memory_scopes
-        or "gemm.runtime_valid_m" not in context.capabilities.features
-    ):
+    if context.compiler_target.shared_memory_bytes <= 0:
         return None
     hidden, routes, scores = specs[:3]
     expert_gate, expert_up, expert_down = specs[3:6]
@@ -746,9 +740,9 @@ def _grouped_shared_operation(
     if any(reduction % instruction.k for reduction in (bk, shared_bk, down_bk, shared_down_bk)):
         return None
     threads = min(
-        context.capabilities.threads_per_group,
-        context.capabilities.subgroup_width * 4,
-        bm // instruction.m * context.capabilities.subgroup_width,
+        context.compiler_target.threads_per_group,
+        context.compiler_target.subgroup_width * 4,
+        bm // instruction.m * context.compiler_target.subgroup_width,
     )
     shared_bytes = max(
         affine_shared_bytes(bm, 2 * bn, bk, hidden.dtype, expert_gate, expert_up),
@@ -756,7 +750,7 @@ def _grouped_shared_operation(
         affine_shared_bytes(bm, bn, down_bk, hidden.dtype, expert_down),
         affine_shared_bytes(bm, bn, shared_down_bk, hidden.dtype, shared_down),
     )
-    if shared_bytes > context.capabilities.shared_memory_bytes:
+    if shared_bytes > context.compiler_target.shared_memory_bytes:
         return None
     capacity = _aligned_capacity(rows, selected, experts, bm)
     expert_blocks = capacity // bm
@@ -785,7 +779,7 @@ def _grouped_shared_operation(
             expert_blocks,
             shared_blocks,
             (bm, bn, bk, threads, instruction),
-            context.capabilities.subgroup_width,
+            context.compiler_target.subgroup_width,
             residual,
         ),
         workspace=workspace,

@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import math
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Protocol
@@ -17,7 +16,7 @@ from ..binding import Binding
 
 
 @dataclass(frozen=True, slots=True)
-class MatrixInstruction:
+class MatrixTile:
     m: int
     n: int
     k: int
@@ -26,44 +25,31 @@ class MatrixInstruction:
 
 
 @dataclass(frozen=True, slots=True)
-class Capabilities:
-    """Backend-neutral target behavior reported by TileLang."""
+class CompilerTarget:
+    """Resolved resources and access to concrete compiler analysis."""
 
     subgroup_width: int
     threads_per_group: int
     shared_memory_bytes: int
-    matrix_instructions: tuple[MatrixInstruction, ...] = ()
-    supported_dtypes: frozenset[DType] = frozenset(DType)
-    memory_scopes: frozenset[str] = frozenset({"global", "local"})
-    barrier_scopes: frozenset[str] = frozenset()
-    asynchronous_copy: bool = False
-    subgroup_exchange: bool = False
-    vector_bytes: tuple[int, ...] = (1,)
-    atomics: frozenset[DType] = frozenset()
-    features: frozenset[str] = frozenset()
-    alignments: Mapping[DType, int] = field(default_factory=dict)
-    native_multi_launch: bool = False
-    partial_binding: bool = False
-    max_kernels_per_program: int | None = None
-    fingerprint: str = "portable"
+    matrix_query: Callable[[DType, int, int, int, int, str, str, str], MatrixTile | None] | None = field(default=None, compare=False, repr=False)
+    reference_schedules: bool = False
+    identity: str = "host-reference"
 
     def __post_init__(self) -> None:
         if self.subgroup_width <= 0 or self.threads_per_group <= 0 or self.shared_memory_bytes < 0:
-            raise ValueError("invalid target capability geometry")
-        if self.max_kernels_per_program is not None and self.max_kernels_per_program <= 0:
-            raise ValueError("kernel program limit must be positive")
-        if (
-            not self.supported_dtypes
-            or any(value <= 0 for value in self.vector_bytes)
-            or any(not value for value in self.features)
-        ):
-            raise ValueError("target capability sets must not be empty or invalid")
-        if not self.fingerprint:
-            raise ValueError("capability fingerprint must not be empty")
-        object.__setattr__(self, "alignments", MappingProxyType(dict(self.alignments)))
+            raise ValueError("invalid compilation resource limits")
+        if not self.identity:
+            raise ValueError("compiler configuration identity must not be empty")
+
+    def matrix_tile(self, dtype: DType, *, m=32, n=32, k=32, threads=None,
+                    a_scope="shared", b_scope="shared", c_scope="local.fragment") -> MatrixTile | None:
+        if self.matrix_query is None:
+            return None
+        return self.matrix_query(dtype, m, n, k, threads or min(128, self.threads_per_group),
+                                 a_scope, b_scope, c_scope)
 
 
-HOST_CAPABILITIES = Capabilities(1, 1, 0, fingerprint="host-reference")
+HOST_TARGET = CompilerTarget(1, 1, 0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +95,7 @@ class BoundOperation:
 
 @dataclass(frozen=True, slots=True)
 class LoweringContext:
-    capabilities: Capabilities
+    compiler_target: CompilerTarget
     mode: str
     precision: str
     compiler_identity: str
@@ -181,21 +167,12 @@ class SubmissionUnit:
 
 
 def plan_submissions(
-    graph: Graph, operations: tuple[BoundOperation, ...], capabilities: Capabilities, *, streamed: frozenset[int] = frozenset()
+    graph: Graph, operations: tuple[BoundOperation, ...], *, streamed: frozenset[int] = frozenset()
 ) -> tuple[SubmissionUnit, ...]:
-    if (
-        sum(operation.kernel_count for operation in operations) > 1
-        and not capabilities.native_multi_launch
-    ):
-        raise ValueError("TileLang target lacks native multi-launch execution")
-    if not capabilities.partial_binding and graph.constants:
-        raise ValueError("TileLang target lacks generic partial binding")
-
     units: list[SubmissionUnit] = []
     current: list[BoundOperation] = []
     current_kernels = 0
     current_sources: frozenset[int] = frozenset()
-    limit = capabilities.max_kernels_per_program or math.inf
 
     def flush(reason: str) -> None:
         nonlocal current_kernels
@@ -218,8 +195,6 @@ def plan_submissions(
         if current and sources != current_sources:
             flush("source residency/transfer boundary")
         current_sources = sources
-        if current and current_kernels + candidate.kernel_count > limit:
-            flush("qualified TileLang compilation-unit kernel limit")
         current.append(candidate)
         current_kernels += candidate.kernel_count
         if observed:

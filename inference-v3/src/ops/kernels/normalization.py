@@ -21,10 +21,10 @@ def _row_coordinates(row, channel, shape: tuple[int, ...]):
 
 
 def _reduction_threads(width: int, context: LoweringContext) -> int | None:
-    subgroup = context.capabilities.subgroup_width
+    subgroup = context.compiler_target.subgroup_width
     groups = min(
         (width + subgroup - 1) // subgroup,
-        context.capabilities.threads_per_group // subgroup,
+        context.compiler_target.threads_per_group // subgroup,
     )
     return None if groups < 1 else groups * subgroup
 
@@ -164,7 +164,7 @@ class ResidualRMSRule:
                 spec.representation is not None and not isinstance(spec.representation, Dense)
                 for spec in specs
             )
-            or "shared" not in context.capabilities.memory_scopes
+            or context.compiler_target.shared_memory_bytes <= 0
         ):
             return ()
         threads = _reduction_threads(cast(int, specs[0].shape[-1]), context)
@@ -191,7 +191,7 @@ class ResidualRMSRule:
                     specs,
                     norm.attributes["epsilon"],
                     threads,
-                    context.capabilities.subgroup_width,
+                    context.compiler_target.subgroup_width,
                     residual_dtype,
                     graph.values[norm.outputs[0]].spec.dtype,
                 ),
@@ -272,7 +272,7 @@ class RMSRule:
 
     def build(self, graph: Graph, root: int, context: LoweringContext):
         node = graph.nodes[root]
-        if node.operation != "rms_norm" or "shared" not in context.capabilities.memory_scopes:
+        if node.operation != "rms_norm" or context.compiler_target.shared_memory_bytes <= 0:
             return ()
         specs = tuple(graph.values[value].spec for value in (*node.inputs, *node.outputs))
         source = specs[0]
@@ -293,7 +293,7 @@ class RMSRule:
                     source,
                     node.attributes["epsilon"],
                     threads,
-                    context.capabilities.subgroup_width,
+                    context.compiler_target.subgroup_width,
                     len(node.inputs) == 2,
                     specs[-1].dtype,
                 ),
@@ -345,7 +345,7 @@ class RowDotRule:
                 node.inputs,
                 node.outputs,
                 _RowDotEmitter(
-                    rows, width, context.capabilities.subgroup_width, output.dtype.value
+                    rows, width, context.compiler_target.subgroup_width, output.dtype.value
                 ),
             ),
         )

@@ -27,29 +27,25 @@ target function, pass target-specific compiler flags, inspect generated IR or
 branch on a backend name. TileLang and TVM values remain inside the kernel and
 runtime packages and never cross Ops's public tensor API.
 
-## Capability-specialized portability
+## Target-aware portability
 
-Portable does not mean one schedule for every device. An operation expresses
-its behavior using backend-neutral capabilities reported through TileLang;
-TileLang owns schedule tuning. Ops has no competing implementation registry.
+Portable does not mean one schedule for every device. Ops chooses a physical
+strategy using resolved resource budgets and concrete TileLang matrix analysis.
+TileLang owns the actual lowering and schedule tuning; Ops has no competing
+backend catalogue or tuning registry.
 
-| Capability fact | Schedule consequence |
-|---|---|
-| Subgroup geometry and exchange | Reduction ownership, vector width and cooperative traversal |
-| Supported matrix shapes and dtypes | Fragment geometry and accumulation strategy |
-| Fast memory scopes and capacity | Tile residency and pipeline depth |
-| Asynchronous movement and barriers | Load/compute overlap and stage count |
-| Atomics and synchronization | Grouping, reduction and routing algorithms |
-| Alignment and launch limits | Vectorization, workgroup shape and tail handling |
+Resource limits come from the compilation target and its explicitly selected
+execution device. Missing information is unknown rather than zero capacity.
+Explicit and offline targets retain their constraints.
 
-Strategies are named by mechanisms such as fragment-tiled,
-subgroup-streaming, split-reduction and persistent-weight. A strategy may be
-ideal for one vendor today without containing that vendor's identity.
+Matrix geometry and operand precision come from the same implementation used by
+lowering for the proposed tile, storage arrangement and thread configuration.
+Analysis does not replace device compilation or numerical qualification. A
+storage dtype alone does not establish arithmetic precision.
 
-If a needed fact is absent, TileLang's public target capability is incomplete.
-If a portable language operation cannot reach the required native mechanism,
-TileLang's primitive or backend lowering is incomplete. Neither defect permits a
-side channel in Ops.
+Strategies are named by their computation and data movement. Backend-specific
+realization stays in TileLang. Unsupported operations are diagnosed by their
+compiler or execution interface rather than inferred from a general feature list.
 
 ## Construction and compilation
 
@@ -187,5 +183,5 @@ operation's materializations, I/O, transfers and completion in the comparison.
 
 Target-specific tests belong with TileLang when they validate a capability,
 primitive or lowering. Ops tests validate that portable operations and their
-capability-based behavior produce correct, performant execution across the
-capability classes it supports.
+target-dependent behavior produce correct, performant execution across the
+compilation targets it supports.

@@ -1,23 +1,22 @@
+
+from tests.ops.target_fixture import matrix_query
 import pytest
 
 import ops
 import numpy as np
 from ops.lab import Fixture
 
-CAPABILITIES = ops.Capabilities(
+CAPABILITIES = ops.CompilerTarget(
     32,
     256,
     32 * 1024,
-    matrix_instructions=(
-        ops.MatrixInstruction(8, 8, 8, ops.DType.F16, ops.DType.F32),
-        ops.MatrixInstruction(8, 8, 8, ops.DType.F32, ops.DType.F32),
-    ),
-    memory_scopes=frozenset({"global", "shared", "local"}),
-    atomics=frozenset({ops.DType.I32}),
-    features=frozenset({"gemm.runtime_valid_m"}),
-    native_multi_launch=True,
-    partial_binding=True,
-    fingerprint="development-tool-test",
+    matrix_query=matrix_query((
+        ops.MatrixTile(8, 8, 8, ops.DType.F16, ops.DType.F32),
+        ops.MatrixTile(8, 8, 8, ops.DType.F32, ops.DType.F32),
+    )),
+
+
+    identity="development-tool-test",
 )
 
 
@@ -54,7 +53,7 @@ def test_small_parallel_projections_form_one_lowering_region():
                 ops.Argument(weight, "third", ops.ValueKind.CONSTANT),
             )
         ),
-        capabilities=CAPABILITIES,
+        compiler_target=CAPABILITIES,
         options=ops.CompileOptions(mode="decode"),
         available_bytes=1 << 30,
     )

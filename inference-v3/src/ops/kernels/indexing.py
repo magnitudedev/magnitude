@@ -74,7 +74,7 @@ class PackedEmbeddingRule:
         width = cast(int, table.shape[1])
         if width % packet.matrix_packet:
             return ()
-        threads = min(128, context.capabilities.threads_per_group)
+        threads = min(128, context.compiler_target.threads_per_group)
         return (
             BoundOperation(
                 f"embedding.packet@{root}",

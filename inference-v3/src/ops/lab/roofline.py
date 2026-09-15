@@ -71,7 +71,7 @@ def model(fixture, device):
     profile = device.characterization
     if (profile is None or profile.device != device.evidence_identity or
             profile.compiler != device.compiler_identity or
-            profile.capabilities != device.capabilities.fingerprint):
+            profile.compiler_target != device.compiler_target.identity):
         raise RooflineCoverageError("load/measure resource characterization for this device and compiler first")
     limits = []
     for demand in demands(fixture):

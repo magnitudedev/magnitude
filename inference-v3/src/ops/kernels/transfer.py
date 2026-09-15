@@ -33,5 +33,5 @@ class ByteCopyRule:
             return ()
         return (BoundOperation(f"byte_copy@{root}", frozenset({root}), node.inputs, node.outputs,
                           ByteCopyEmitter(graph.value(node.inputs[0]).spec.elements,
-                                          min(256, context.capabilities.threads_per_group)),
+                                          min(256, context.compiler_target.threads_per_group)),
                           aliases=((node.outputs[0], node.inputs[1]),)),)

@@ -10,21 +10,20 @@ from ops.compiler.memory import plan_memory
 from ops.compiler.unit import build_unit
 from ops.runtime.tilelang import _build_reusable_module
 
-CAPABILITIES = ops.Capabilities(
+CAPABILITIES = ops.CompilerTarget(
     32,
     256,
     32 * 1024,
-    memory_scopes=frozenset({"global", "shared", "local"}),
-    native_multi_launch=True,
-    partial_binding=True,
+
+
 )
 
 
 def _construct(graph, mode="decode"):
     context = LoweringContext(CAPABILITIES, mode, "model", "test", 1 << 20)
     cover = build_operations(graph, context)
-    memory = plan_memory(graph, cover, CAPABILITIES)
-    submission = plan_submissions(graph, cover, CAPABILITIES)
+    memory = plan_memory(graph, cover)
+    submission = plan_submissions(graph, cover)
     assert len(submission) == 1
     return _build_reusable_module(build_unit(graph, memory, submission[0]))
 

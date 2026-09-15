@@ -93,7 +93,7 @@ class SoftmaxRule:
         parts = math.ceil(width / tile)
         workspace = (TensorSpec((spec.elements // width, parts, 2), DType.F32),) if parts > 1 else ()
         return (BoundOperation(f"softmax.tiled@{root}", frozenset({root}), node.inputs, node.outputs,
-                               _SoftmaxEmitter(spec, axis, tile, min(256, context.capabilities.threads_per_group)),
+                               _SoftmaxEmitter(spec, axis, tile, min(256, context.compiler_target.threads_per_group)),
                                workspace=workspace, kernel_count=2 if parts > 1 else 1),)
 
 
@@ -137,5 +137,5 @@ class AffineScanRule:
         decay_rank = graph.value(node.inputs[2]).spec.rank if len(node.inputs) == 3 else 0
         return (BoundOperation(f"delta.affine-scan@{root}", frozenset({root}), node.inputs, node.outputs,
                                _AffineScanEmitter(values.shape, state.rank, decay_rank,
-                                                  min(256, context.capabilities.threads_per_group)),
+                                                  min(256, context.compiler_target.threads_per_group)),
                                aliases=((node.outputs[1], node.inputs[1]),)),)

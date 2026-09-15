@@ -164,18 +164,18 @@ class SamplingRule:
         if node.operation != "sample":
             return ()
         logits = graph.value(node.inputs[0]).spec
-        if not logits.static or "shared" not in context.capabilities.memory_scopes:
+        if not logits.static or context.compiler_target.shared_memory_bytes <= 0:
             return ()
         rows, vocabulary = logits.shape
-        available = min(128, context.capabilities.threads_per_group,
-                        context.capabilities.shared_memory_bytes // 12)
+        available = min(128, context.compiler_target.threads_per_group,
+                        context.compiler_target.shared_memory_bytes // 12)
         if available < 1 or vocabulary > 0x7FFFFFFF:
             return ()
         threads = 1 << (available.bit_length() - 1)
         desired = max(1, math.ceil(vocabulary / (threads * 8)))
         affordable = context.workspace_limit // (rows * 12) if rows else 1
         partitions = (max(1, min(desired, affordable))
-                      if context.capabilities.native_multi_launch else 1)
+)
         workspace = ((TensorSpec((rows, partitions, 3), DType.U32),)
                      if partitions > 1 else ())
         return (BoundOperation(

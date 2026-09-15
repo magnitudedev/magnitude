@@ -153,10 +153,6 @@ class OperationContext:
 
 
 def build_operations(graph: Graph, context: LoweringContext) -> tuple[BoundOperation, ...]:
-    unsupported = {value.spec.dtype for value in graph.values
-                   if value.spec.dtype not in context.capabilities.supported_dtypes}
-    if unsupported:
-        raise ValueError(f"device cannot represent graph dtypes {sorted(item.value for item in unsupported)}")
     root = OperationContext(graph, None, context, frozenset(range(len(graph.nodes))))
     operations = order_operations(graph, root.compose())
     result = []

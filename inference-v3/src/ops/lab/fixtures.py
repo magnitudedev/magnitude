@@ -344,7 +344,7 @@ class Fixture:
                 resources[identity] = resource
                 if value.kind == ValueKind.CONSTANT:
                     constants[identity] = resource
-            plan = analyze_graph(prefix, capabilities=device.capabilities,
+            plan = analyze_graph(prefix, compiler_target=device.compiler_target,
                                  compiler_identity=device.compiler_identity, options=options,
                                  available_bytes=device.available_bytes, constants=constants)
             compiled = materialize(plan, device=device, constants=constants)

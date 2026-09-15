@@ -12,14 +12,13 @@ from engine.models.qwen35.equations import (
     routed_feedforward,
 )
 
-CAPABILITIES = ops.Capabilities(
+CAPABILITIES = ops.CompilerTarget(
     32,
     256,
     32 * 1024,
-    memory_scopes=frozenset({"global", "shared", "local"}),
-    native_multi_launch=True,
-    partial_binding=True,
-    fingerprint="qwen-equations-test",
+
+
+    identity="qwen-equations-test",
 )
 
 
@@ -65,7 +64,7 @@ def test_dense_feedforward_is_model_composition_not_an_execution_object():
     assert tuple(candidate.name for candidate in cover) == (
         "dense_swiglu.packet-decode@0:4",
     )
-    submissions = plan_submissions(graph, cover, CAPABILITIES)
+    submissions = plan_submissions(graph, cover)
     assert len(submissions) == 1
     assert submissions[0].kernel_count == 2
 
@@ -119,6 +118,6 @@ def test_routed_feedforward_lowers_as_one_maximal_decode_submission():
     cover = build_operations(graph, context)
     names = tuple(candidate.name.split("@", 1)[0] for candidate in cover)
     assert names == ("route_topk.fused-router", "routed_experts.packet-shared")
-    submissions = plan_submissions(graph, cover, CAPABILITIES)
+    submissions = plan_submissions(graph, cover)
     assert len(submissions) == 1
     assert submissions[0].kernel_count == 3

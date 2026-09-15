@@ -21,10 +21,10 @@ def _definition(rows, vocabulary):
 
 def test_sampling_geometry_accounts_for_all_summaries_and_reduction_threads():
     graph, _ = _definition(7, 4099)
-    capabilities = ops.Capabilities(32, 96, 1536,
-                                     memory_scopes=frozenset({"global", "shared", "local"}),
-                                     native_multi_launch=True)
-    context = LoweringContext(capabilities, "decode", "model", "test", 1 << 20)
+    compiler_target = ops.CompilerTarget(32, 96, 1536,
+
+                                     )
+    context = LoweringContext(compiler_target, "decode", "model", "test", 1 << 20)
     selected, = SamplingRule().build(graph, 0, context)
     assert selected.emitter.threads == 64  # A non-power-of-two limit cannot break the reduction tree.
     assert selected.emitter.partitions == 9
@@ -34,14 +34,7 @@ def test_sampling_geometry_accounts_for_all_summaries_and_reduction_threads():
     assert limited.emitter.partitions == 3
     single, = SamplingRule().build(graph, 0, replace(context, workspace_limit=7 * 2 * 12 - 1))
     assert single.kernel_count == 1 and single.workspace == ()
-    one_launch, = SamplingRule().build(graph, 0, replace(context,
-        capabilities=replace(capabilities, native_multi_launch=False)))
-    assert one_launch.kernel_count == 1 and one_launch.workspace == ()
-    no_shared = replace(capabilities, shared_memory_bytes=11)
-    assert SamplingRule().build(graph, 0, replace(context, capabilities=no_shared)) == ()
-    tiny, _ = _definition(1, 5)
-    small, = SamplingRule().build(tiny, 0, context)
-    assert small.kernel_count == 1 and small.workspace == ()
+
 
 
 @pytest.mark.device

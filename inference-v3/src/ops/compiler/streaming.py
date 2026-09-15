@@ -10,7 +10,7 @@ from ..runtime.imports import plan_import
 from ..tensor.types import DType, TensorSpec
 from .program import KernelDefinition, KernelPort, PortRole, define_kernel
 from .dependencies import code_dependencies
-from .lowering import MatrixInstruction
+from .lowering import MatrixTile
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,7 +121,7 @@ def gather_loop(graph, root, context, binding):
         if step == 1:
             raise ValueError("one gathered source group exceeds available capacity")
         step = max(1, step // 2)
-    emitter = GatherTileEmitter(prototype.spec, output, step, min(128, context.capabilities.threads_per_group))
+    emitter = GatherTileEmitter(prototype.spec, output, step, min(128, context.compiler_target.threads_per_group))
     ports = (KernelPort(prototype.spec, PortRole.READ),
              KernelPort(TensorSpec((step, 2), DType.I64), PortRole.READ),
              KernelPort(output, PortRole.WRITE))
@@ -142,7 +142,7 @@ class ProjectionTileEmitter:
     strategy: str
     threads: int
     tile: tuple[int, int, int]
-    instruction: MatrixInstruction | None
+    instruction: MatrixTile | None
     bias: bool
     outputs_per_subgroup: int = 1
 
@@ -245,7 +245,7 @@ def expert_loop(graph, root, context, bindings):
     inner_budget = context.workspace_limit - output.storage_nbytes - outer_storage
     if inner_budget <= 0:
         raise ValueError("expert row staging exceeds physical capacity")
-    inner = analyze_graph(inner_graph, capabilities=context.capabilities, compiler_identity=context.compiler_identity,
+    inner = analyze_graph(inner_graph, compiler_target=context.compiler_target, compiler_identity=context.compiler_identity,
                           available_bytes=inner_budget,
                           options=CompileOptions(mode=context.mode, precision=context.precision), constants=prototypes)
     from .memory import StorageClass
@@ -254,7 +254,7 @@ def expert_loop(graph, root, context, bindings):
                                                        if placement.storage == StorageClass.OUTPUT)
     inner_storage += max((operation.source_loop.peak_bytes for operation in inner.operations
                           if operation.source_loop is not None), default=0)
-    threads = min(128, context.capabilities.threads_per_group)
+    threads = min(128, context.compiler_target.threads_per_group)
     definitions = (
         define_kernel(GatherExpertRows(step, hidden.shape[1], selected, threads), (
             KernelPort(hidden, PortRole.READ), KernelPort(route_map, PortRole.READ), KernelPort(gathered, PortRole.WRITE))),
@@ -312,7 +312,7 @@ def projection_loop(graph, root, context, binding):
         raise ValueError("source projection requires a streamed linear binding")
     hidden, weight = (graph.value(value).spec for value in node.inputs[:2])
     output = graph.value(node.outputs[0]).spec
-    if hidden.rank != 2 or weight.rank != 2 or context.capabilities.subgroup_width != 32:
+    if hidden.rank != 2 or weight.rank != 2 or context.compiler_target.subgroup_width != 32:
         raise ValueError("streamed projection requires a legal rank-two subgroup geometry")
     columns, width = weight.shape
     row_alignment = binding.region_alignment // math.gcd(binding.region_alignment, width)
@@ -324,7 +324,7 @@ def projection_loop(graph, root, context, binding):
         vector = _packed_vector_geometry(weight, context)
         instruction = _packet_matrix_instruction(context, hidden.dtype)
     elif _dense(weight):
-        if context.capabilities.threads_per_group >= 128:
+        if context.compiler_target.threads_per_group >= 128:
             vector = (128, 1)
         instruction = _matrix_instruction(context, hidden.dtype)
     else:

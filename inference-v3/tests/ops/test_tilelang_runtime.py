@@ -32,6 +32,42 @@ class _QuantizedFormat:
 
 
 @pytest.mark.device
+def test_cuda_detected_target_compiles_and_executes_shared_memory_normalization():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA normalization integration check requires CUDA")
+    runtime = TileLangRuntime("cuda")
+    device = ops.DeviceRuntime(runtime, budget_bytes=1 << 20)
+    assert device.compiler_target.shared_memory_bytes > 0
+    spec = ops.TensorSpec((2, 128), ops.DType.F32)
+    gain_spec = ops.TensorSpec((128,), ops.DType.F32)
+    host = torch.randn((2, 128), generator=torch.Generator().manual_seed(0))
+    source = device.upload(spec, host.numpy().tobytes())
+    gain = device.upload(gain_spec, torch.ones(128).numpy().tobytes())
+    compiled = execution = None
+    try:
+        compiled = ops.compile(
+            lambda value, weight: ops.rms_norm(value, weight, epsilon=1e-6),
+            signature=ops.Signature((ops.Argument(spec, "source"),
+                                     ops.Argument(gain_spec, "gain", ops.ValueKind.CONSTANT))),
+            device=device, constants={"gain": gain},
+            options=ops.CompileOptions(mode="decode"),
+        )
+        execution = compiled.submit(source)
+        execution.completion.wait()
+        expected = host * torch.rsqrt(host.square().mean(dim=-1, keepdim=True) + 1e-6)
+        torch.testing.assert_close(execution.outputs[0].native.cpu(), expected, atol=2e-5, rtol=2e-5)
+    finally:
+        if execution is not None:
+            for output in execution.outputs:
+                output.close()
+        if compiled is not None:
+            compiled.close()
+        gain.close()
+        source.close()
+        device.close()
+
+
+@pytest.mark.device
 def test_metal_reshape_preserves_every_element():
     if not torch.backends.mps.is_available():
         pytest.skip("Metal reshape regression check requires MPS")
@@ -72,7 +108,7 @@ def test_metal_runtime_composes_kernels_and_binds_static_arguments_natively():
 
     runtime = TileLangRuntime("metal")
     device = ops.DeviceRuntime(runtime, budget_bytes=1 << 20)
-    assert "gemm.runtime_valid_m" in device.capabilities.features
+    assert device.compiler_target.matrix_tile(ops.DType.F32) is not None
     hidden_spec = ops.TensorSpec((2, 8), ops.DType.F16)
     weight_spec = ops.TensorSpec((8, 8), ops.DType.F16)
     hidden_host = torch.randn(cast(tuple[int, ...], hidden_spec.shape), dtype=torch.float16)

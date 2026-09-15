@@ -166,7 +166,7 @@ class RecurrentPrepareRule:
         node = graph.nodes[root]
         if (
             node.operation != "recurrent_prepare"
-            or "shared" not in context.capabilities.memory_scopes
+            or context.compiler_target.shared_memory_bytes <= 0
         ):
             return ()
         specs = tuple(graph.values[value].spec for value in (*node.inputs, *node.outputs))
@@ -184,7 +184,7 @@ class RecurrentPrepareRule:
                 node.inputs,
                 node.outputs,
                 _RecurrentPrepareEmitter(
-                    specs, node.attributes, threads, context.capabilities.subgroup_width
+                    specs, node.attributes, threads, context.compiler_target.subgroup_width
                 ),
             ),
         )
@@ -326,14 +326,14 @@ class GatedDeltaRule:
         node = graph.nodes[root]
         if (
             node.operation != "gated_delta_recurrence"
-            or "shared" not in context.capabilities.memory_scopes
+            or context.compiler_target.shared_memory_bytes <= 0
         ):
             return ()
         specs = tuple(graph.values[value].spec for value in (*node.inputs, *node.outputs))
         if any(not spec.static for spec in specs):
             return ()
-        lanes = context.capabilities.subgroup_width
-        output_tile = min(4, context.capabilities.threads_per_group // lanes)
+        lanes = context.compiler_target.subgroup_width
+        output_tile = min(4, context.compiler_target.threads_per_group // lanes)
         if lanes < 2 or lanes & (lanes - 1) or output_tile < 1:
             return ()
         return (
@@ -513,11 +513,11 @@ class RecurrentOutputRule:
             if bk % instruction.k:
                 return ()
             threads = min(
-                context.capabilities.threads_per_group,
-                context.capabilities.subgroup_width * 4,
-                bm // instruction.m * context.capabilities.subgroup_width,
+                context.compiler_target.threads_per_group,
+                context.compiler_target.subgroup_width * 4,
+                bm // instruction.m * context.compiler_target.subgroup_width,
             )
-            if affine_shared_bytes(bm, bn, bk, specs[0].dtype, specs[3]) > context.capabilities.shared_memory_bytes:
+            if affine_shared_bytes(bm, bn, bk, specs[0].dtype, specs[3]) > context.compiler_target.shared_memory_bytes:
                 return ()
             tile = (threads, bm, bn, bk, instruction)
         else:
@@ -539,7 +539,7 @@ class RecurrentOutputRule:
                     tile,
                     vector,
                     norm_threads,
-                    context.capabilities.subgroup_width,
+                    context.compiler_target.subgroup_width,
                 ),
                 workspace=(activation,),
                 kernel_count=2,

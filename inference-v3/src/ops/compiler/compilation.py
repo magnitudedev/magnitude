@@ -20,7 +20,7 @@ from .diagnostics import CompilationDiagnostics, build_diagnostics
 from .execution import ExecutionGraph, execution_graph
 from .lowering import (
     BoundOperation,
-    Capabilities,
+    CompilerTarget,
     LoweringContext,
     SubmissionUnit,
     plan_submissions,
@@ -347,7 +347,7 @@ def compile(
     plan = analyze(
         function,
         signature=signature,
-        capabilities=device.capabilities,
+        compiler_target=device.compiler_target,
         compiler_identity=device.compiler_identity,
         available_bytes=device.available_bytes,
         constants=constants,
@@ -365,7 +365,7 @@ def analyze(
     function,
     *,
     signature: Signature,
-    capabilities: Capabilities | None = None,
+    compiler_target: CompilerTarget | None = None,
     options: CompileOptions,
     compiler_identity: str = "analysis",
     available_bytes: int | None = None,
@@ -375,7 +375,7 @@ def analyze(
     """Plan a function without allocation, code generation, or native execution."""
     graph = trace(function, _specialize_signature(signature, options.dimensions))
     return analyze_graph(
-        graph, capabilities=capabilities, options=options, compiler_identity=compiler_identity,
+        graph, compiler_target=compiler_target, options=options, compiler_identity=compiler_identity,
         available_bytes=available_bytes, constants=constants, device=device,
     )
 
@@ -383,7 +383,7 @@ def analyze(
 def analyze_graph(
     formula_graph: Graph,
     *,
-    capabilities: Capabilities | None = None,
+    compiler_target: CompilerTarget | None = None,
     options: CompileOptions,
     compiler_identity: str = "analysis",
     available_bytes: int | None = None,
@@ -394,16 +394,16 @@ def analyze_graph(
     if device is not None:
         from ..runtime.tilelang import describe_configuration
 
-        selected_capabilities, selected_compiler = describe_configuration(device)
-        if capabilities is not None and capabilities != selected_capabilities:
-            raise ValueError("explicit capabilities disagree with the device plan")
-        capabilities, compiler_identity = selected_capabilities, selected_compiler
+        selected_target, selected_compiler = describe_configuration(device)
+        if compiler_target is not None and compiler_target != selected_target:
+            raise ValueError("explicit compiler target disagrees with the device plan")
+        compiler_target, compiler_identity = selected_target, selected_compiler
         if available_bytes is None:
             domains = frozenset(device.selected_endpoints[0].modes[0].domains)
             available_bytes = min(constraint.maximum_bytes for constraint in device.memory_constraints
                                   if domains.intersection(constraint.domains))
-    if capabilities is None:
-        raise TypeError("analysis requires a device plan or an explicit compiler capability snapshot")
+    if compiler_target is None:
+        raise TypeError("analysis requires a device plan or an explicit compiler target")
     graph = prune_dead_nodes(formula_graph)
     bindings = {}
     for value_id in graph.constants:
@@ -417,7 +417,7 @@ def analyze_graph(
     if workspace_limit is None:
         workspace_limit = maxsize if available_bytes is None else available_bytes
     context = LoweringContext(
-        capabilities,
+        compiler_target,
         options.mode,
         options.precision,
         compiler_identity,
@@ -427,14 +427,14 @@ def analyze_graph(
     from ..operation import build_operations
 
     operations = build_operations(graph, context)
-    memory = plan_memory(graph, operations, capabilities)
+    memory = plan_memory(graph, operations)
     required = memory.temporary_bytes + sum(
         placement.spec.storage_nbytes for placement in memory.values.values()
         if placement.storage == StorageClass.OUTPUT
     ) + max((item.source_loop.peak_bytes for item in operations if item.source_loop is not None), default=0)
     if available_bytes is not None and required > available_bytes:
         raise ValueError(f"operation storage requires {required} bytes; only {available_bytes} available")
-    submissions = plan_submissions(graph, operations, capabilities,
+    submissions = plan_submissions(graph, operations,
                                    streamed=frozenset(value for value, binding in bindings.items()
                                                       if binding.residency == Residency.STREAMED))
     diagnostics = build_diagnostics(
@@ -443,7 +443,7 @@ def analyze_graph(
         memory,
         submissions,
         compiler_identity=compiler_identity,
-        capability_fingerprint=capabilities.fingerprint,
+        configuration_identity=compiler_target.identity,
         mode=options.mode,
         precision=options.precision,
     )

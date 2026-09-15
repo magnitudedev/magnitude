@@ -1,3 +1,5 @@
+
+from tests.ops.target_fixture import matrix_query
 """Gate coverage for matrix-chunk recurrence and its state boundaries."""
 
 from dataclasses import replace
@@ -42,15 +44,15 @@ def _program(rows, batch, dtype, mapping, sequence_length=None):
 def test_chunked_recurrence_selection_accounts_for_workspace_and_capabilities():
     function, signature, _ = _program(193, 3, ops.DType.F32, "tiled")
     graph = ops.trace(function, signature)
-    capabilities = ops.Capabilities(
+    compiler_target = ops.CompilerTarget(
         32,
         256,
         32768,
-        matrix_instructions=(ops.MatrixInstruction(8, 8, 8, ops.DType.F32, ops.DType.F32),),
-        memory_scopes=frozenset({"global", "shared", "local"}),
-        native_multi_launch=True,
+        matrix_query=matrix_query((ops.MatrixTile(8, 8, 8, ops.DType.F32, ops.DType.F32),)),
+
+
     )
-    context = LoweringContext(capabilities, "prefill", "model", "test", 8 << 20)
+    context = LoweringContext(compiler_target, "prefill", "model", "test", 8 << 20)
 
     def selected(ctx):
         return build_operations(graph, ctx)[0]
@@ -67,7 +69,7 @@ def test_chunked_recurrence_selection_accounts_for_workspace_and_capabilities():
     assert decoded.aliases == ()
     assert selected(replace(context, workspace_limit=1)).name == "gated_delta.register-state@0"
     assert (
-        selected(replace(context, capabilities=replace(capabilities, matrix_instructions=()))).name
+        selected(replace(context, compiler_target=replace(compiler_target, matrix_query=matrix_query(())))).name
         == "gated_delta.register-state@0"
     )
 
