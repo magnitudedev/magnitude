@@ -30,7 +30,7 @@ env:
 
 jobs:
   matrix:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       hosts: ${{ steps.matrix.outputs.hosts }}
       backends: ${{ steps.matrix.outputs.backends }}
@@ -52,7 +52,7 @@ jobs:
         run: echo "version=$(jq -r '.version' packages/launcher/package.json)" >> "$GITHUB_OUTPUT"
 
   catalog:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,6 +64,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
+      - uses: ./.github/actions/build-cache
       - run: bun install --frozen-lockfile
       - run: bun run icn:catalog:build-bundle
       - uses: actions/upload-artifact@v4
@@ -97,6 +98,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           targets: ${{ matrix.rustTarget }}
+      - uses: ./.github/actions/build-cache
       - name: Install Linux build tools
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y build-essential cmake libclang-dev fakeroot rpm libgtk-3-0 libnss3 libasound2 libgbm1 libxss1 libxtst6
@@ -189,6 +191,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
+      - uses: ./.github/actions/build-cache
       - name: Install Linux build tools
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y build-essential cmake libclang-dev
@@ -198,12 +201,20 @@ jobs:
           sudo apt-get install -y clang
           echo "CC=clang" >> "$GITHUB_ENV"
           echo "CXX=clang++" >> "$GITHUB_ENV"
+      - name: Cache Linux Vulkan tools
+        if: runner.os == 'Linux' && matrix.backend == 'vulkan'
+        id: vulkan-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/vulkan-sdk-1.4.313
+          key: vulkan-tools-jammy-${{ runner.arch }}-headers-409c16be502e39fe70dd6fe2d9ad4842ef2c9a53-shaderc-e6edd6d48fa5bdd9d176794c6810fae7f8e938e1
       - name: Install Linux Vulkan tools
         if: runner.os == 'Linux' && matrix.backend == 'vulkan'
         shell: bash
         run: |
           sudo apt-get install -y libvulkan-dev spirv-headers ninja-build python3
           vulkan_root="$RUNNER_TEMP/vulkan-sdk-1.4.313"
+          if [ "${{ steps.vulkan-cache.outputs.cache-hit }}" != "true" ]; then
           headers_root="$RUNNER_TEMP/vulkan-headers-1.4.313"
           shaderc_root="$RUNNER_TEMP/shaderc-v2023.8"
           git clone --filter=blob:none https://github.com/google/shaderc.git "$shaderc_root"
@@ -227,6 +238,7 @@ jobs:
           cmake --build "$headers_root/build" --target install
           mkdir -p "$vulkan_root/bin"
           cp "$shaderc_root/build/glslc/glslc" "$vulkan_root/bin/glslc"
+          fi
           "$vulkan_root/bin/glslc" --version
           test -f "$vulkan_root/include/vulkan/vulkan.hpp"
           echo "VULKAN_SDK=$vulkan_root" >> "$GITHUB_ENV"
@@ -406,7 +418,7 @@ jobs:
   windows-consumer:
     needs: [matrix, host]
     environment: ${{ inputs.windows_distribution && 'windows-signing' || 'release-validation' }}
-    runs-on: windows-2022
+    runs-on: blacksmith-8vcpu-windows-2025
     steps:
       - uses: actions/checkout@v4
         with:
@@ -433,7 +445,7 @@ jobs:
   candidate:
     needs: [matrix, host, backend, linux-consumer, apple-consumer, windows-consumer]
     if: inputs.validate_candidate
-    runs-on: ubuntu-22.04
+    runs-on: blacksmith-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
         with:

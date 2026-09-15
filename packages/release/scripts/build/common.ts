@@ -97,8 +97,12 @@ export const verifyAppleDeploymentTarget = async (
       file,
     ])
     const platform = report.match(/^\s*platform\s+(\S+)\s*$/m)?.[1]
-    const minimum = report.match(/^\s*minos\s+(\d+(?:\.\d+){1,2})\s*$/m)?.[1]
-    if (platform !== "MACOS" || minimum === undefined) {
+    const minimum = platform === "MACOS"
+      ? report.match(/^\s*minos\s+(\d+(?:\.\d+){1,2})\s*$/m)?.[1]
+      : platform === undefined
+        ? report.match(/\bcmd\s+LC_VERSION_MIN_MACOSX\s+cmdsize\s+\d+\s+version\s+(\d+(?:\.\d+){1,2})\b/)?.[1]
+        : undefined
+    if (minimum === undefined) {
       throw new Error(`${basename(file)} has no macOS deployment target`)
     }
     if (compareVersions(minimum, MACOS_DEPLOYMENT_TARGET) > 0) {

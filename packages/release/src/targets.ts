@@ -53,7 +53,7 @@ export type BackendPack =
 export const releaseHosts = [
   {
     id: "darwin-arm64",
-    runner: "macos-latest",
+    runner: "blacksmith-12vcpu-macos-15",
     bunTarget: "bun-darwin-arm64",
     rustTarget: "aarch64-apple-darwin",
     executableExtension: "",
@@ -61,7 +61,7 @@ export const releaseHosts = [
   },
   {
     id: "darwin-x64",
-    runner: "macos-15-intel",
+    runner: "macos-15-large",
     bunTarget: "bun-darwin-x64",
     rustTarget: "x86_64-apple-darwin",
     executableExtension: "",
@@ -69,7 +69,7 @@ export const releaseHosts = [
   },
   {
     id: "linux-arm64-gnu",
-    runner: "ubuntu-22.04-arm",
+    runner: "blacksmith-16vcpu-ubuntu-2204-arm",
     bunTarget: "bun-linux-arm64",
     rustTarget: "aarch64-unknown-linux-gnu",
     executableExtension: "",
@@ -77,7 +77,7 @@ export const releaseHosts = [
   },
   {
     id: "linux-x64-gnu",
-    runner: "ubuntu-22.04",
+    runner: "blacksmith-16vcpu-ubuntu-2204",
     bunTarget: "bun-linux-x64-baseline",
     rustTarget: "x86_64-unknown-linux-gnu",
     executableExtension: "",
@@ -85,7 +85,7 @@ export const releaseHosts = [
   },
   {
     id: "windows-x64-msvc",
-    runner: "windows-2022",
+    runner: "blacksmith-16vcpu-windows-2025",
     bunTarget: "bun-windows-x64",
     rustTarget: "x86_64-pc-windows-msvc",
     executableExtension: ".exe",
@@ -109,11 +109,11 @@ const cudaBuilds = [
 const cudaHosts = [
   {
     host: "linux-arm64-gnu",
-    runners: { "11.8": "ubuntu-22.04-arm", "12.9": "ubuntu-22.04-arm" },
+    runners: { "11.8": "blacksmith-16vcpu-ubuntu-2204-arm", "12.9": "blacksmith-16vcpu-ubuntu-2204-arm" },
   },
   {
     host: "linux-x64-gnu",
-    runners: { "11.8": "ubuntu-22.04", "12.9": "ubuntu-22.04" },
+    runners: { "11.8": "blacksmith-16vcpu-ubuntu-2204", "12.9": "blacksmith-16vcpu-ubuntu-2204" },
   },
 ] as const
 
@@ -135,7 +135,7 @@ export const backendPacks: readonly BackendPack[] = [
     id: "metal-darwin-arm64",
     host: "darwin-arm64",
     backend: "metal",
-    runner: "macos-latest",
+    runner: "blacksmith-12vcpu-macos-15",
     cargoFeatures: ["dynamic-backends", "metal"],
     module: "libggml-metal.so",
     runtimeLibraries: [],
@@ -146,7 +146,7 @@ export const backendPacks: readonly BackendPack[] = [
     id: "vulkan1-linux-arm64-gnu",
     host: "linux-arm64-gnu",
     backend: "vulkan",
-    runner: "ubuntu-22.04-arm",
+    runner: "blacksmith-16vcpu-ubuntu-2204-arm",
     cargoFeatures: ["dynamic-backends", "vulkan"],
     module: "libggml-vulkan.so",
     runtimeLibraries: [],
@@ -156,7 +156,7 @@ export const backendPacks: readonly BackendPack[] = [
     id: "vulkan1-linux-x64-gnu",
     host: "linux-x64-gnu",
     backend: "vulkan",
-    runner: "ubuntu-22.04",
+    runner: "blacksmith-16vcpu-ubuntu-2204",
     cargoFeatures: ["dynamic-backends", "vulkan"],
     module: "libggml-vulkan.so",
     runtimeLibraries: [],

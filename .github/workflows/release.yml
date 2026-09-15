@@ -33,7 +33,7 @@ jobs:
         github.event.pull_request.head.ref == 'changeset-release/main' &&
         github.event.pull_request.head.repo.full_name == github.repository
       )
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       action: ${{ steps.preflight.outputs.action }}
       version: ${{ steps.preflight.outputs.version }}
@@ -148,7 +148,7 @@ jobs:
       MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
     needs: [preflight, build]
     if: needs.preflight.outputs.action == 'release'
-    runs-on: ubuntu-22.04
+    runs-on: blacksmith-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
         with:
@@ -236,7 +236,7 @@ jobs:
 
   public-smoke:
     needs: [preflight, publish]
-    runs-on: ubuntu-22.04
+    runs-on: blacksmith-4vcpu-ubuntu-2204
     steps:
       - uses: actions/setup-node@v4
         with:
@@ -261,7 +261,7 @@ jobs:
   publish-integrations:
     needs: preflight
     if: needs.preflight.outputs.action == 'complete'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
         with:

@@ -24,7 +24,12 @@ const matrices = {
   linuxHosts: {
     include: releaseHosts
       .filter((host) => host.id.startsWith("linux-"))
-      .map((host) => ({ id: host.id, runner: host.runner })),
+      .map((host) => ({
+        id: host.id,
+        runner: host.id === "linux-arm64-gnu"
+          ? "blacksmith-8vcpu-ubuntu-2204-arm"
+          : "blacksmith-8vcpu-ubuntu-2204",
+      })),
   },
 }
 

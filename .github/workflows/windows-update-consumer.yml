@@ -25,7 +25,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   installed-application:
-    runs-on: windows-latest
+    runs-on: blacksmith-8vcpu-windows-2025
     timeout-minutes: 30
     env:
       MAGNITUDE_WINDOWS_ACCEPTANCE_FROM: ${{ inputs.from_version }}
