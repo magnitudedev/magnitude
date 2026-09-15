@@ -371,10 +371,13 @@ Both differ from hoping the native compiler recognizes a profitable loop.
 
 On Metal, short-loop defaults use cost/extent/nesting thresholds. Remaining
 constant loops longer than four iterations can receive an explicit
-unroll-disable directive. The backend's matrix lowering explicitly expands
-instruction-fragment coordinates independently of the outer reduction loop.
-These are backend behaviors to verify, not thresholds to hard-code into portable
-kernel policy.
+unroll-disable directive. Matrix lowering can leave instruction-fragment loops
+serial too; do not assume its coordinates are expanded. A schedule can scope
+`T.attr(0, "pragma_auto_unroll_max_step", budget)` and
+`T.attr(0, "pragma_unroll_explicit", 1)` around a bounded `T.gemm` to request
+expansion of its generated loops while preserving outer algorithm loops. Choose a
+bounded code-growth budget and inspect the resulting source. Backend defaults are
+behaviors to verify, not thresholds to hard-code into portable kernel policy.
 
 **Check:** local/fragment indexing is static where scalar replacement requires it;
 inspect loop annotations and final source, including disable directives. Bound
