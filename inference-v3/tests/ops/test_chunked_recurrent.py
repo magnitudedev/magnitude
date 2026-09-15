@@ -1,5 +1,3 @@
-
-from tests.ops.target_fixture import matrix_query
 """Gate coverage for matrix-chunk recurrence and its state boundaries."""
 
 from dataclasses import replace
@@ -48,9 +46,6 @@ def test_chunked_recurrence_selection_accounts_for_workspace_and_capabilities():
         32,
         256,
         32768,
-        matrix_query=matrix_query((ops.MatrixTile(8, 8, 8, ops.DType.F32, ops.DType.F32),)),
-
-
     )
     context = LoweringContext(compiler_target, "prefill", "model", "test", 8 << 20)
 
@@ -68,10 +63,6 @@ def test_chunked_recurrence_selection_accounts_for_workspace_and_capabilities():
     assert decoded.name == "gated_delta.register-state@0"
     assert decoded.aliases == ()
     assert selected(replace(context, workspace_limit=1)).name == "gated_delta.register-state@0"
-    assert (
-        selected(replace(context, compiler_target=replace(compiler_target, matrix_query=matrix_query(())))).name
-        == "gated_delta.register-state@0"
-    )
 
 
 @pytest.mark.parametrize("batch,length", [(1, -1), (1, 194), (1, True), (3, 193)])

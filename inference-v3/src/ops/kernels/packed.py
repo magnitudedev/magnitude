@@ -124,14 +124,14 @@ def affine_code_center(spec: TensorSpec) -> float:
 
 
 @T.macro
-def affine_storage(bm, bn, bk, dtype, instruction, specs):
+def affine_storage(bm, bn, bk, dtype, reduction_step, specs):
     left = T.alloc_shared((bm, bk), dtype)
     codes = T.alloc_shared((bn, bk), "float16")
     group = affine_group_width(bk, *specs)
     coefficients = T.alloc_shared((bn, bk // group, 2), "float32")
     accum = T.alloc_fragment((bm, bn), "float32")
-    a = T.alloc_fragment((bm, instruction.k), "float32")
-    b = T.alloc_fragment((bn, instruction.k), "float32")
+    a = T.alloc_fragment((bm, reduction_step), "float32")
+    b = T.alloc_fragment((bn, reduction_step), "float32")
     return left, codes, coefficients, accum, a, b
 
 

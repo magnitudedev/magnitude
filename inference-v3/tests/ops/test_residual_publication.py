@@ -1,5 +1,3 @@
-
-from tests.ops.target_fixture import matrix_query
 """Parent fusion preserves independent child formulas and their storage rounding."""
 
 from dataclasses import replace
@@ -74,10 +72,7 @@ def case(kind, rows):
 def test_parent_absorbs_residual_but_exposed_child_keeps_its_own_publication(kind, mode, expected):
     _, graph, _, bindings = case(kind, 9)
     native = Runtime()
-    compiler_target = replace(native.compiler_target,
-        matrix_query=matrix_query((ops.MatrixTile(8, 8, 8, ops.DType.F32, ops.DType.F32),)),
-
-        )
+    compiler_target = native.compiler_target
     options = ops.CompileOptions(mode=mode)
     plan = analyze_graph(graph, compiler_target=compiler_target, compiler_identity="fixture", available_bytes=64 << 20,
                          options=options, constants=bindings)

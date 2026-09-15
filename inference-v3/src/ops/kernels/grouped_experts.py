@@ -10,7 +10,7 @@ from ..compiler.lowering import BoundOperation, LoweringContext
 from ..tensor.graph import Graph
 from ..tensor.types import DType, TensorSpec
 from .experts import _routed_shared_region
-from .matrix import _packet_matrix_instruction, _packet_reduction_width
+from .matrix import _packet_reduction_width
 from .packed import (affine_gemm, affine_shared_bytes, affine_storage,
                      load_matrix_tile, packet_format)
 from .publication import publish, residual_epilogue
@@ -246,14 +246,14 @@ def _grouped_gated_projection(
     bn,
     bk,
     threads,
-    instruction,
+    reduction_step,
     routed=True,
     rows=0,
 ):
     with T.Kernel(T.ceildiv(output_width, bn), blocks, threads=threads) as (bx, by):
         # One homogeneous tile: route kind and encoding are compile-time inputs.
         storage = (
-            affine_storage(bm, 2 * bn, bk, source.dtype, instruction, (gate_spec, up_spec)),
+            affine_storage(bm, 2 * bn, bk, source.dtype, reduction_step, (gate_spec, up_spec)),
             T.alloc_fragment((bm, bn), "float32"),
         )
         expert = block_metadata[by, 0] if routed else 0
@@ -296,13 +296,13 @@ def _grouped_projection(
     bn,
     bk,
     threads,
-    instruction,
+    reduction_step,
     routed=True,
     rows=0,
 ):
     with T.Kernel(T.ceildiv(output_width, bn), blocks, threads=threads) as (bx, by):
         # One homogeneous tile: route kind and encoding are compile-time inputs.
-        storage = affine_storage(bm, bn, bk, source.dtype, instruction, (weight_spec,))
+        storage = affine_storage(bm, bn, bk, source.dtype, reduction_step, (weight_spec,))
         expert = block_metadata[by, 0] if routed else 0
         valid_m = block_metadata[by, 1] if routed else (bm if rows % bm == 0 else T.min(bm, rows - by * bm))
         if expert >= 0:
@@ -412,7 +412,7 @@ class _GroupedExpertsEmitter:
         rows, width = cast(tuple[int, int], self.specs[0].shape)
         selected = cast(int, self.specs[1].shape[1])
         experts, intermediate, _ = cast(tuple[int, int, int], self.specs[3].shape)
-        bm, bn, bk, threads, instruction = self.tile
+        bm, bn, bk, threads, reduction_step = self.tile
         _group_routes(
             routes,
             order,
@@ -445,7 +445,7 @@ class _GroupedExpertsEmitter:
             bn,
             bk,
             threads,
-            instruction,
+            reduction_step,
         )
         _grouped_projection(
             activation,
@@ -463,7 +463,7 @@ class _GroupedExpertsEmitter:
             bn,
             _packet_reduction_width(self.specs[5]),
             threads,
-            instruction,
+            reduction_step,
         )
         _unpermute(
             projected,
@@ -518,7 +518,7 @@ class _GroupedSharedExpertsEmitter:
         selected = cast(int, self.specs[1].shape[1])
         experts, expert_width, _ = cast(tuple[int, int, int], self.specs[3].shape)
         shared_width = cast(int, self.specs[6].shape[0])
-        bm, bn, bk, threads, instruction = self.tile
+        bm, bn, bk, threads, reduction_step = self.tile
         _group_routes(
             routes,
             order,
@@ -538,23 +538,23 @@ class _GroupedSharedExpertsEmitter:
         _grouped_gated_projection(
             gathered, order, block_experts, expert_gate, expert_up, expert_activation,
             self.specs[3], self.specs[4], self.expert_blocks, width, expert_width,
-            selected, True, bm, bn, bk, threads, instruction,
+            selected, True, bm, bn, bk, threads, reduction_step,
         )
         _grouped_gated_projection(
             hidden, order, block_experts, shared_gate, shared_up, shared_activation,
             self.specs[6], self.specs[7], self.shared_blocks, width, shared_width,
             selected, False, bm, bn, _packet_reduction_width(self.specs[6], self.specs[7]),
-            threads, instruction, routed=False, rows=rows,
+            threads, reduction_step, routed=False, rows=rows,
         )
         _grouped_projection(
             expert_activation, order, block_experts, expert_down, expert_projected,
             self.specs[5], self.expert_blocks, expert_width, width, selected, True,
-            bm, bn, _packet_reduction_width(self.specs[5]), threads, instruction,
+            bm, bn, _packet_reduction_width(self.specs[5]), threads, reduction_step,
         )
         _grouped_projection(
             shared_activation, order, block_experts, shared_down, shared_projected,
             self.specs[8], self.shared_blocks, shared_width, width, selected, True,
-            bm, bn, _packet_reduction_width(self.specs[8]), threads, instruction,
+            bm, bn, _packet_reduction_width(self.specs[8]), threads, reduction_step,
             routed=False, rows=rows,
         )
         _unpermute_shared(
@@ -601,10 +601,9 @@ class GroupedExpertsRule:
         selected = cast(int, routes.shape[1])
         experts, intermediate, input_width = cast(tuple[int, int, int], gate.shape)
         gate_packet, up_packet, down_packet = (packet_format(spec) for spec in (gate, up, down))
-        instruction = _packet_matrix_instruction(context, hidden.dtype)
+        reduction_step = 8
         if (
-            instruction is None
-            or rows * selected < experts
+            rows * selected < experts
             or input_width != width
             or up.shape != gate.shape
             or down.shape != (experts, width, intermediate)
@@ -622,16 +621,16 @@ class GroupedExpertsRule:
         if rows >= 256:
             bm, bn = 32, 32
         else:
-            bm = instruction.m * 2
-            bn = instruction.n * 2
+            bm = 16
+            bn = 16
         bk = _packet_reduction_width(gate, up)
         down_bk = _packet_reduction_width(down)
-        if bk % instruction.k or down_bk % instruction.k:
+        if bk % 8 or down_bk % 8:
             return ()
         threads = min(
             context.compiler_target.threads_per_group,
             context.compiler_target.subgroup_width * 4,
-            bm // instruction.m * context.compiler_target.subgroup_width,
+            bm // 8 * context.compiler_target.subgroup_width,
         )
         shared = max(
             affine_shared_bytes(bm, 2 * bn, bk, hidden.dtype, gate, up),
@@ -659,7 +658,7 @@ class GroupedExpertsRule:
                 node.inputs,
                 node.outputs,
                 _GroupedExpertsEmitter(
-                    specs, capacity, blocks, (bm, bn, bk, threads, instruction)
+                    specs, capacity, blocks, (bm, bn, bk, threads, reduction_step)
                 ),
                 workspace=workspace,
                 kernel_count=5,
@@ -702,10 +701,9 @@ def _grouped_shared_operation(
             shared_down,
         )
     )
-    instruction = _packet_matrix_instruction(context, hidden.dtype)
+    reduction_step = 8
     if (
-        instruction is None
-        or any(packet is None for packet in packets)
+        any(packet is None for packet in packets)
         or packets[0] != packets[1]
         or packets[3] != packets[4]
         or rows * selected < experts
@@ -731,18 +729,18 @@ def _grouped_shared_operation(
     if rows >= 256:
         bm, bn = 32, 32
     else:
-        bm = instruction.m * 2
-        bn = instruction.n * 2
+        bm = 16
+        bn = 16
     bk = _packet_reduction_width(expert_gate, expert_up)
     shared_bk = _packet_reduction_width(shared_gate, shared_up)
     down_bk = _packet_reduction_width(expert_down)
     shared_down_bk = _packet_reduction_width(shared_down)
-    if any(reduction % instruction.k for reduction in (bk, shared_bk, down_bk, shared_down_bk)):
+    if any(reduction % 8 for reduction in (bk, shared_bk, down_bk, shared_down_bk)):
         return None
     threads = min(
         context.compiler_target.threads_per_group,
         context.compiler_target.subgroup_width * 4,
-        bm // instruction.m * context.compiler_target.subgroup_width,
+        bm // 8 * context.compiler_target.subgroup_width,
     )
     shared_bytes = max(
         affine_shared_bytes(bm, 2 * bn, bk, hidden.dtype, expert_gate, expert_up),
@@ -778,7 +776,7 @@ def _grouped_shared_operation(
             capacity,
             expert_blocks,
             shared_blocks,
-            (bm, bn, bk, threads, instruction),
+            (bm, bn, bk, threads, reduction_step),
             context.compiler_target.subgroup_width,
             residual,
         ),

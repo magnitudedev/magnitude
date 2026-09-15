@@ -14,7 +14,6 @@ from .matrix import (
     _packed_matrix,
     _packed_vector,
     _packed_vector_geometry,
-    _packet_matrix_instruction,
     _packet_reduction_width,
 )
 from .normalization import _reduction_threads
@@ -458,7 +457,7 @@ class _RecurrentOutputEmitter:
                 outputs_per_subgroup,
             )
         else:
-            threads, bm, bn, bk, instruction = self.tile
+            threads, bm, bn, bk, reduction_step = self.tile
             _packed_matrix(
                 activation,
                 weight,
@@ -468,7 +467,7 @@ class _RecurrentOutputEmitter:
                 rows,
                 outputs,
                 channels,
-                instruction,
+                reduction_step,
                 self.specs[4].dtype.value,
                 threads,
                 bm,
@@ -498,28 +497,26 @@ class RecurrentOutputRule:
         tile = None
         vector = None
         if context.mode == "prefill":
-            instruction = _packet_matrix_instruction(context, specs[0].dtype)
-            if instruction is None:
-                return ()
+            reduction_step = 8
             if rows >= 256 and min(cast(int, specs[3].shape[0]), channels) >= 512:
                 bm, bn, bk = 32, 64, 32
             else:
                 bm, bn, bk = (
-                    instruction.m * 4,
-                    instruction.n * 4,
-                    instruction.k * 2,
+                    32,
+                    32,
+                    16,
                 )
             bk = _packet_reduction_width(specs[3])
-            if bk % instruction.k:
+            if bk % 8:
                 return ()
             threads = min(
                 context.compiler_target.threads_per_group,
                 context.compiler_target.subgroup_width * 4,
-                bm // instruction.m * context.compiler_target.subgroup_width,
+                bm // 8 * context.compiler_target.subgroup_width,
             )
             if affine_shared_bytes(bm, bn, bk, specs[0].dtype, specs[3]) > context.compiler_target.shared_memory_bytes:
                 return ()
-            tile = (threads, bm, bn, bk, instruction)
+            tile = (threads, bm, bn, bk, reduction_step)
         else:
             vector = _packed_vector_geometry(specs[3], context)
             if rows > 8 or vector is None:

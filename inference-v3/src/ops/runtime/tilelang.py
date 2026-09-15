@@ -14,7 +14,7 @@ from typing import Any, cast
 
 import torch
 
-from ..compiler.lowering import CompilerTarget, MatrixTile
+from ..compiler.lowering import CompilerTarget
 from ..compiler.unit import TileCompilationUnit
 from ..representations import Dense
 from ..tensor.types import DType, TensorSpec
@@ -344,9 +344,7 @@ def _build_reusable_module(unit: TileCompilationUnit):
 
 
 def _compiler_target(context, *, ordinal: int) -> CompilerTarget:
-    from functools import lru_cache
     from tilelang import tvm
-    from tilelang.analysis import plan_gemm
     from tilelang.backend.resources import target_resources
     from tilelang.cache import compiler_identity
 
@@ -358,20 +356,8 @@ def _compiler_target(context, *, ordinal: int) -> CompilerTarget:
         "resources": asdict(resources), "ordinal": ordinal,
     }, sort_keys=True).encode()).hexdigest()
 
-    @lru_cache(maxsize=256)
-    def matrix_query(dtype, m, n, k, threads, a_scope, b_scope, c_scope):
-        plan = plan_gemm(target=context.target, m=m, n=n, k=k, input_dtype=dtype.value,
-                         threads=threads, a_scope=a_scope, b_scope=b_scope, c_scope=c_scope)
-        if plan is None:
-            return None
-        # Native CUDA FP32 storage can select TF32 multiplication. That is not
-        # the exact FP32 contraction required by these operation schedules.
-        if "tf32" in plan.input_precision:
-            return None
-        return MatrixTile(*plan.instruction_shape, dtype, DType(plan.accumulation_dtype))
-
     return CompilerTarget(resources.subgroup_width, resources.threads_per_group,
-                          resources.shared_memory_bytes, matrix_query=matrix_query, identity=identity)
+                          resources.shared_memory_bytes, identity=identity)
 
 
 def describe_configuration(configuration):

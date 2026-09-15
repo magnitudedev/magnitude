@@ -119,10 +119,9 @@ def matrix_probe(context):
     m, k = left.spec.shape
     n = right.spec.shape[0]
     dtype = left.spec.dtype.value
-    instruction = context.lowering.compiler_target.matrix_tile(left.spec.dtype)
     # Enough independent accumulator chains to expose arithmetic throughput,
     # rather than the latency of repeatedly updating four matrix fragments.
-    bm, bn = instruction.m * 8, instruction.n * 8
+    bm, bn = 64, 64
     threads = context.lowering.compiler_target.subgroup_width * 4
     repetitions = sum(context.graph.node(node).operation == "linear" for node in context.nodes)
 
@@ -265,13 +264,8 @@ def characterize(device, store, *, protocol: ProbeProtocol = ProbeProtocol(),
             probe(memory, (Argument(spec, "source"),), (np.ones(spec.shape, dtype=np.float32),),
                   Resource.EXECUTION_COPY, "rate:boundary-bytes", DType.F32)
         for dtype in (DType.F16, DType.BF16, DType.F32):
-            instruction = device.compiler_target.matrix_tile(dtype)
-            if instruction is None:
-                unavailable.append(UnavailableMetric(name=f"matrix:{dtype.value}",
-                                                      reason="no declared portable matrix instruction for this precision"))
-                continue
             width = protocol.matrix_width
-            spec = TensorSpec((width, instruction.k * 4), dtype)
+            spec = TensorSpec((width, 32), dtype)
             if 4 * (2 * spec.storage_nbytes + width * width * 4) > device.available_bytes:
                 raise ValueError("matrix probe working set exceeds available capacity")
             # Exact dyadic values avoid an arbitrary relaxed numerical check.

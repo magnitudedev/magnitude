@@ -30,7 +30,7 @@ runtime packages and never cross Ops's public tensor API.
 ## Target-aware portability
 
 Portable does not mean one schedule for every device. Ops chooses a physical
-strategy using resolved resource budgets and concrete TileLang matrix analysis.
+strategy using tensor shapes, representations and resolved resource budgets.
 TileLang owns the actual lowering and schedule tuning; Ops has no competing
 backend catalogue or tuning registry.
 
@@ -38,10 +38,11 @@ Resource limits come from the compilation target and its explicitly selected
 execution device. Missing information is unknown rather than zero capacity.
 Explicit and offline targets retain their constraints.
 
-Matrix geometry and operand precision come from the same implementation used by
-lowering for the proposed tile, storage arrangement and thread configuration.
-Analysis does not replace device compilation or numerical qualification. A
-storage dtype alone does not establish arithmetic precision.
+Ops authors work-tile sizes, reduction steps, operand storage and thread counts.
+TileLang selects instructions and infers layouts for those concrete operations.
+No synthetic GEMM probe or instruction inventory gates kernel construction.
+Numerical qualification checks the resulting program; a storage dtype alone
+does not establish arithmetic precision.
 
 Strategies are named by their computation and data movement. Backend-specific
 realization stays in TileLang. Unsupported operations are diagnosed by their

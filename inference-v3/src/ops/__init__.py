@@ -14,7 +14,6 @@ from .compiler.compilation import (
 )
 from .compiler.lowering import (
     CompilerTarget,
-    MatrixTile,
 )
 from .operation import Operation, OperationContext, operation
 from .kernels import composition as operation_bodies
@@ -125,7 +124,6 @@ __all__ = [
     "OperationContext",
     "operation",
     "operation_bodies",
-    "MatrixTile",
     "Node",
     "NumericalContract",
     "Resource",
