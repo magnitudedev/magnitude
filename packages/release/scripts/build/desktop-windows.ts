@@ -141,7 +141,7 @@ export const buildWindowsDesktopInstaller = (options: {
   const signed = (yield* windowsSigning) === "artifact-signing"
   if (signed) yield* fs.copyFile(windowsSigningScript, join(stage, "sign.ps1"))
   yield* fs.writeFileString(scriptPath, script + (signed
-    ? '\n!uninstfinalize \'powershell.exe -NoProfile -ExecutionPolicy Bypass -File sign.ps1 -Path "%1"\' = 0\n'
+    ? '\n!uninstfinalize \'pwsh.exe -NoProfile -ExecutionPolicy Bypass -File sign.ps1 -Path "%1"\' = 0\n'
     : ""))
   const code = yield* Command.make(options.makensis, scriptPath).pipe(Command.workingDirectory(stage), Command.stdout("inherit"), Command.stderr("inherit"), Command.exitCode)
   if (code !== 0) return yield* new DesktopBuildFailed({ message: `Windows installer compilation exited ${code}` })
