@@ -136,6 +136,37 @@ def test_attention_staging_respects_head_groups_and_physical_capacity(heads, thr
         assert (schedule.head_tile, schedule.tile[1], schedule.shared_bytes) == expected
 
 
+@pytest.mark.parametrize("floating", [ops.DType.F16, ops.DType.BF16, ops.DType.F32])
+def test_decode_attention_keeps_its_schedule_when_output_projection_is_composed(floating):
+    from ops.kernels.attention import CausalAttentionRule
+
+    query = ops.TensorSpec((1, 16, 256), floating)
+    history = ops.TensorSpec((2, 66048, 2, 256), floating)
+    visible = ops.TensorSpec((1, 2), ops.DType.I32)
+    weight = ops.TensorSpec((32, 4096), floating).with_representation(
+        ops.Affine(ops.Code(4), 64, ops.DirectCoefficients(ops.DType.BF16, ops.DType.BF16))
+    )
+
+    def function(q, kv, reads, gate, projection):
+        attended = ops.causal_attention(q, kv, reads, sequence_count=1)
+        return ops.linear(ops.reshape(attended * ops.sigmoid(gate), (1, 4096)), projection)
+
+    graph = ops.trace(
+        implement(function, ops.operation_bodies.attention_mixer),
+        ops.Signature(tuple(ops.Argument(spec, name, ops.ValueKind.RESOURCE if name == "kv"
+                                        else ops.ValueKind.INPUT)
+                            for spec, name in zip((query, history, visible, query, weight),
+                                                  ("q", "kv", "reads", "gate", "weight"), strict=True))),
+    )
+    context = LoweringContext(CAPABILITIES, "decode", "model", "test", 16 << 20)
+    composed, = build_operations(graph, context)
+    isolated, = CausalAttentionRule().build(graph, 0, context)
+    assert composed.name.startswith("attention.matrix-decode-gated-output")
+    assert isolated.name.startswith("causal_attention.matrix-decode")
+    assert composed.emitter.schedule == isolated.emitter.schedule
+    assert composed.workspace[:2] == isolated.workspace
+
+
 @pytest.mark.device
 def test_fused_residual_rms_matches_reference_on_metal():
     if not torch.backends.mps.is_available():
@@ -319,6 +350,16 @@ def test_decode_attention_without_qualified_register_geometry_is_uncovered():
             "prefill", 35, 256, 256,
             np.asarray([[7, 215 + index] for index in range(35)], dtype=np.int32),
             "causal_attention.matrix-streaming@0", 6, 2, ops.DType.F32,
+        ),
+        (
+            "decode", 1, 1024, 256,
+            np.asarray([[7, 1017]], dtype=np.int32),
+            "causal_attention.matrix-decode@0", 16, 2, ops.DType.F16,
+        ),
+        (
+            "decode", 3, 1024, 256,
+            np.asarray([[0, 0], [7, 1017], [511, 1]], dtype=np.int32),
+            "causal_attention.matrix-decode@0", 16, 2, ops.DType.F32,
         ),
     ),
 )

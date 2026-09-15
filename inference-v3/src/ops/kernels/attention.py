@@ -34,6 +34,60 @@ class _MatrixAttentionSchedule:
     workspace: tuple[TensorSpec, TensorSpec]
 
 
+@dataclass(frozen=True, slots=True)
+class _DecodeAttentionSchedule:
+    heads: int
+    keys: int
+    contraction: int
+    columns: int
+    instruction_k: int
+    threads: int
+    padding: int
+    partitions: int
+    span: int
+
+
+def _decode_attention_schedule(query, history, context):
+    """Use grouped heads as matrix rows and reduce history in complete tiles.
+
+    Only complete head cohorts use this schedule. K/V retain their storage
+    precision; both contractions and all normalization state are FP32.
+    """
+    if context.mode != "decode":
+        return None
+    instruction = next((item for item in context.capabilities.matrix_instructions
+                        if item.input_dtype == item.accumulation_dtype == DType.F32), None)
+    if instruction is None:
+        return None
+    rows, heads, width = query.shape
+    group = heads // history.shape[2]
+    head_tile = instruction.m
+    keys = instruction.n * 4
+    contraction = instruction.k * 4
+    columns = instruction.n * 8
+    threads = context.capabilities.subgroup_width * 4
+    padding = instruction.k
+    def staging_bytes():
+        return ((width + padding) * (keys + padding) * history.dtype.itemsize
+                + head_tile * keys * DType.F32.itemsize)
+
+    while staging_bytes() > context.capabilities.shared_memory_bytes and keys > instruction.n:
+        keys //= 2
+    # Each subgroup owns at least one complete QK column instruction tile.
+    # A narrower history tile needs fewer participants, not empty column owners.
+    threads = context.capabilities.subgroup_width * min(4, keys // instruction.n)
+    if (group % head_tile or width % contraction or width % columns
+            or threads > context.capabilities.threads_per_group
+            or staging_bytes() > context.capabilities.shared_memory_bytes):
+        return None
+    # Each partition amortizes staging over a bounded history segment. The
+    # complete grid remains independent of changing visible token counts.
+    span = keys * 16
+    partitions = math.ceil(history.shape[1] / span)
+    return _DecodeAttentionSchedule(head_tile, keys, contraction, columns,
+                                    instruction.k, threads, padding, partitions, span)
+
+
 def _matrix_attention_schedule(
     query: TensorSpec, history: TensorSpec, context: LoweringContext, sequence_count: int | None,
 ) -> _MatrixAttentionSchedule | None:
@@ -318,6 +372,123 @@ def _matrix_streaming_attention(
 
 
 @T.macro
+def _decode_scores(query, keys, scores, token, first_head, heads, width,
+                   key_tile, contraction):
+    """Immediate FP32 operands avoid narrowing Q/K or dynamic fragment indices."""
+    q = T.alloc_fragment((heads, contraction), "float32")
+    k = T.alloc_fragment((contraction, key_tile), "float32")
+    T.clear(scores)
+    for block in T.serial(width // contraction):
+        for head, channel in T.Parallel(heads, contraction):
+            q[head, channel] = T.cast(query[token, first_head + head,
+                                            block * contraction + channel], "float32")
+        for channel, item in T.Parallel(contraction, key_tile):
+            k[channel, item] = T.cast(keys[0, block * contraction + channel, item], "float32")
+        T.gemm(q, k, scores, policy=T.GemmWarpPolicy.FullRow)
+
+
+@T.macro
+def _tiled_decode_attention(query, history, visible, partials, statistics,
+                             tokens, heads, kv_heads, width, scale, schedule):
+    """One K/V tile serves a complete query-head cohort and a stable softmax.
+
+    The online dependency advances per history tile. Both QK and PV use matrix
+    contraction with FP32 operands; only the original K/V staging is compact.
+    """
+    group = heads // kv_heads
+    head_tile, key_tile = schedule.heads, schedule.keys
+    columns, padding = schedule.columns, schedule.padding
+    log2e = 1.4426950408889634
+    with T.Kernel(heads // head_tile, tokens, schedule.partitions,
+                  threads=schedule.threads) as (cohort, token, partition):
+        first_head = cohort * head_tile
+        kv_head = first_head // group
+        outputs = _attention_accumulators(head_tile, width, columns)
+        scores = T.alloc_fragment((head_tile, key_tile), "float32")
+        # QK distributes history columns across subgroups. PV distributes
+        # output channels, so every subgroup needs the probability tile.
+        # Make that exchange explicit instead of copying incompatible fragments.
+        probabilities = T.alloc_shared((head_tile, key_tile), "float32")
+        staging = T.alloc_shared(((width + padding) * (key_tile + padding),), history.dtype)
+        keys = T.view(staging, shape=(1, width + padding, key_tile + padding), dtype=history.dtype)
+        values = T.view(staging, shape=(1, key_tile + padding, width + padding), dtype=history.dtype)
+        maximum = T.alloc_fragment((head_tile,), "float32")
+        previous = T.alloc_fragment((head_tile,), "float32")
+        denominator = T.alloc_fragment((head_tile,), "float32")
+        local_sum = T.alloc_fragment((head_tile,), "float32")
+        alpha = T.alloc_fragment((head_tile,), "float32")
+        base = T.cast(visible[token, 0], "int32")
+        count = T.cast(visible[token, 1], "int32")
+        # Engine visibility is a valid interval inside this physical history.
+        T.assume(base >= 0)
+        T.assume(count >= 0)
+        T.assume(base <= history.shape[1])
+        T.assume(count <= history.shape[1] - base)
+        first = partition * schedule.span
+        size = T.max(0, T.min(schedule.span, count - first))
+        T.fill(maximum, -3.402823466e38)
+        T.clear(denominator)
+        for chunk in T.serial(T.ceildiv(size, key_tile)):
+            chunk_first = first + chunk * key_tile
+            full = chunk_first + key_tile <= count
+            if full:
+                for item, channel in T.Parallel(key_tile, width):
+                    keys[0, channel, item] = history[0, base + chunk_first + item, kv_head, channel]
+            else:
+                for item, channel in T.Parallel(key_tile, width):
+                    keys[0, channel, item] = T.if_then_else(
+                        chunk_first + item < count,
+                        history[0, base + chunk_first + item, kv_head, channel], 0)
+            _decode_scores(query, keys, scores, token, first_head, head_tile,
+                           width, key_tile, schedule.contraction)
+            for head, item in T.Parallel(head_tile, key_tile):
+                scores[head, item] = T.if_then_else(chunk_first + item < count,
+                                                   scores[head, item] * scale * log2e,
+                                                   -3.402823466e38)
+            T.copy(maximum, previous)
+            T.reduce_max(scores, maximum, dim=1, clear=False)
+            for head in T.Parallel(head_tile):
+                alpha[head] = T.exp2(previous[head] - maximum[head])
+            for head, item in T.Parallel(head_tile, key_tile):
+                scores[head, item] = T.if_then_else(chunk_first + item < count,
+                                                   T.exp2(scores[head, item] - maximum[head]), 0)
+            T.reduce_sum(scores, local_sum, dim=1)
+            for head in T.Parallel(head_tile):
+                denominator[head] = denominator[head] * alpha[head] + local_sum[head]
+            _attention_rescale(outputs, alpha, head_tile, columns)
+            if full:
+                for item, channel in T.Parallel(key_tile, width):
+                    values[0, item, channel] = history[1, base + chunk_first + item, kv_head, channel]
+            else:
+                for item, channel in T.Parallel(key_tile, width):
+                    values[0, item, channel] = T.if_then_else(
+                        chunk_first + item < count,
+                        history[1, base + chunk_first + item, kv_head, channel], 0)
+            T.copy(scores, probabilities)
+            _attention_values(probabilities, values, outputs, head_tile, width, key_tile,
+                              columns, schedule.instruction_k)
+        for head in T.Parallel(head_tile):
+            statistics[partition, token, first_head + head, 0] = T.if_then_else(
+                denominator[head] > 0, maximum[head] / log2e, -3.402823466e38)
+            statistics[partition, token, first_head + head, 1] = denominator[head]
+        _attention_publish(outputs, denominator, query, partials, token, first_head,
+                           partition, schedule.partitions, tokens, 1, head_tile,
+                           width, columns, query.dtype, False)
+
+
+def _decode_partition_body(query, history, visible, partials, statistics, tokens,
+                           heads, kv_heads, width, partitions, span, scale,
+                           subgroups, schedule):
+    if schedule is None:
+        _register_partition_attention(query, history, visible, partials, statistics,
+                                      tokens, heads, kv_heads, width, partitions,
+                                      span, scale, subgroups)
+    else:
+        _tiled_decode_attention(query, history, visible, partials, statistics,
+                                tokens, heads, kv_heads, width, scale, schedule)
+
+
+@T.macro
 def _register_partition_attention(
     query,
     history,
@@ -510,6 +681,7 @@ class _PartitionedAttentionEmitter:
         span: int,
         subgroups: int,
         merge_threads: int,
+        schedule: _DecodeAttentionSchedule | None = None,
     ):
         self.specs = specs
         self.scale = scale
@@ -517,12 +689,13 @@ class _PartitionedAttentionEmitter:
         self.span = span
         self.subgroups = subgroups
         self.merge_threads = merge_threads
+        self.schedule = schedule
 
     def __call__(self, operands: tuple[Any, ...]) -> None:
         query, history, visible, output, partials, statistics = operands
         tokens, heads, width = cast(tuple[int, int, int], self.specs[0].shape)
         kv_heads = cast(int, self.specs[1].shape[2])
-        _register_partition_attention(
+        _decode_partition_body(
             query,
             history,
             visible,
@@ -536,6 +709,7 @@ class _PartitionedAttentionEmitter:
             self.span,
             self.scale,
             self.subgroups,
+            self.schedule,
         )
         _merge_attention(
             partials,
@@ -684,12 +858,15 @@ class CausalAttentionRule:
             target_partitions = max(1, math.ceil(512 / (rows * cast(int, specs[1].shape[2]))))
             span = math.ceil(capacity / target_partitions / stride) * stride
             partitions = math.ceil(capacity / span)
+            decode_schedule = _decode_attention_schedule(specs[0], specs[1], context)
+            if decode_schedule is not None:
+                partitions, span = decode_schedule.partitions, decode_schedule.span
             partials = TensorSpec((partitions, rows, heads, width), DType.F32)
             statistics = TensorSpec((partitions, rows, heads, 2), DType.F32)
             if partials.storage_nbytes + statistics.storage_nbytes <= context.workspace_limit:
                 return (
                     BoundOperation(
-                        f"causal_attention.register-partitioned@{root}",
+                        f"causal_attention.{'matrix-decode' if decode_schedule else 'register-partitioned'}@{root}",
                         frozenset({root}),
                         node.inputs,
                         node.outputs,
@@ -700,6 +877,7 @@ class CausalAttentionRule:
                             span,
                             subgroups,
                             threads,
+                            decode_schedule,
                         ),
                         workspace=(partials, statistics),
                         kernel_count=2,
@@ -774,17 +952,19 @@ def _attention_output_region(graph: Graph, root: int):
 
 
 class _AttentionOutputEmitter:
-    def __init__(self, specs, scale, partitions, span, subgroups, merge_threads, vector):
+    def __init__(self, specs, scale, partitions, span, subgroups, merge_threads, vector,
+                 schedule=None):
         self.specs, self.scale = specs, scale
         self.partitions, self.span, self.subgroups = partitions, span, subgroups
         self.merge_threads = merge_threads
         self.vector = vector
+        self.schedule = schedule
 
     def __call__(self, operands: tuple[Any, ...]) -> None:
         query, history, visible, gate, weight, output, partials, statistics, activation = operands
         tokens, heads, width = cast(tuple[int, int, int], self.specs[0].shape)
         kv_heads = cast(int, self.specs[1].shape[2])
-        _register_partition_attention(
+        _decode_partition_body(
             query,
             history,
             visible,
@@ -798,6 +978,7 @@ class _AttentionOutputEmitter:
             self.span,
             self.scale,
             self.subgroups,
+            self.schedule,
         )
         _merge_attention_gate(
             partials,
@@ -967,6 +1148,9 @@ class AttentionOutputRule:
         target_partitions = max(1, math.ceil(512 / (tokens * cast(int, specs[1].shape[2]))))
         span = math.ceil(capacity / target_partitions / stride) * stride
         partitions = math.ceil(capacity / span)
+        decode_schedule = _decode_attention_schedule(specs[0], specs[1], context)
+        if decode_schedule is not None:
+            partitions, span = decode_schedule.partitions, decode_schedule.span
         partials = TensorSpec((partitions, tokens, heads, width), DType.F32)
         statistics = TensorSpec((partitions, tokens, heads, 2), DType.F32)
         activation = TensorSpec((tokens, heads * width), specs[0].dtype)
@@ -975,7 +1159,7 @@ class AttentionOutputRule:
             return ()
         return (
             BoundOperation(
-                f"attention.register-partitioned-gated-output@{root}:{max(nodes)}",
+                f"attention.{'matrix-decode' if decode_schedule else 'register-partitioned'}-gated-output@{root}:{max(nodes)}",
                 nodes,
                 inputs,
                 outputs,
@@ -987,6 +1171,7 @@ class AttentionOutputRule:
                     subgroups,
                     1 << (width - 1).bit_length(),
                     vector,
+                    decode_schedule,
                 ),
                 workspace=workspace,
                 kernel_count=3,
