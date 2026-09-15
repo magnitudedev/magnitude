@@ -80,12 +80,11 @@ bound. A required host observation, streaming dependency or documented native
 limit may split a unit. Fusion means eliminating an intermediate inside one
 kernel; several kernels behind one host entrypoint are not fusion.
 
-A native submission-queue crossing is not a per-kernel semantic barrier. A
-proven region of ordered device launches may share one queue entry, preserving
-its argument preparation, control flow and individual kernel observations.
-Arbitrary host callbacks remain on the submitting thread. An error stops later
-launches, reaches that original thread and preserves completion ownership for
-earlier work; queue batching never implies a command-buffer commit or GPU wait.
+Device launches enter the native submission queue in program order, preserving
+argument preparation, control flow and individual kernel observations. A queue
+crossing does not commit a command buffer or wait for GPU completion. Arbitrary
+host callbacks remain on the submitting thread. An error stops later launches,
+reaches that original thread and preserves completion ownership for earlier work.
 
 A parent operation may absorb a child's output publication and its own residual
 addition. It must still round the child result to the child's declared dtype
