@@ -382,20 +382,30 @@ jobs:
         timeout-minutes: 15
         run: |
           node_root="$(dirname "$(dirname "$(readlink -f "$(command -v node)")")")"
+          # Permit Chromium's own namespace sandbox without disabling container seccomp.
+          curl --fail --silent --show-error --location \
+            https://raw.githubusercontent.com/moby/profiles/3c28324314729dbade8287e868eef6338c42807a/seccomp/default.json \
+            -o "$RUNNER_TEMP/docker-seccomp.json"
+          echo "536529b665dd0972c37bfb569f5d4ac8a53592e7b00752bc39ff063ca9864c74  $RUNNER_TEMP/docker-seccomp.json" | sha256sum --check
+          jq '.syscalls += [{"names": ["clone", "setns", "unshare"], "action": "SCMP_ACT_ALLOW"}]' \
+            "$RUNNER_TEMP/docker-seccomp.json" > "$RUNNER_TEMP/chromium-seccomp.json"
           docker run --rm --init \
+            --security-opt "seccomp=$RUNNER_TEMP/chromium-seccomp.json" \
             -v "$GITHUB_WORKSPACE:/workspace:ro" \
             -v "$RUNNER_TEMP/magnitude-release-cli:/accepted:ro" \
             -v "$node_root:/node:ro" \
             registry.fedoraproject.org/fedora:44 bash -euc '
               set -- /workspace/release/${{ matrix.id }}/*.rpm
               test "$#" -eq 1
-              dnf install -y --setopt=install_weak_deps=False "$1" \
+              dnf install -y --setopt=install_weak_deps=False \
+                --setopt=minrate=100000 --setopt=timeout=30 --setopt=max_parallel_downloads=10 "$1" \
                 xorg-x11-server-Xvfb xorg-x11-xauth xprop dbus-daemon \
                 xfwm4 desktop-file-utils shadow-utils diffutils
               cmp /accepted/bin/magnitude-service /usr/lib/magnitude-desktop/resources/magnitude-service
               test "$(stat -c "%u:%g:%a" /usr/lib/magnitude-desktop/chrome-sandbox)" = "0:0:4755"
               useradd --create-home magnitude-test
               runuser -u magnitude-test -- env PATH=/node/bin:/usr/bin:/bin \
+                DEBUG=pw:browser \
                 MAGNITUDE_TEST_CLI_EXECUTABLE=/accepted/bin/magnitude-cli \
                 xvfb-run -a dbus-run-session -- node /workspace/desktop/src/fixtures/linux-installed-lifecycle.mjs
             '
