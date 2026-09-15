@@ -305,7 +305,7 @@ try {
   application = await electron.launch({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 30000 });
   await eventually(async () => (await health())?.state?._tag, 'Ready', 60000);
   const reopened = await application.firstWindow();
-  await reopened.getByRole('button', { name: 'Download', exact: true }).first().waitFor();
+  await reopened.getByRole('button', { name: /^Download \([0-9.]+[KMGT]B\)$/ }).first().waitFor();
   assert.equal(await reopened.getByRole('button', { name: 'Skip setup', exact: true }).count(), 0);
   assert.deepEqual(await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().map(window => window.isVisible())), [false]);
   console.log('No setup flow after full Quit and hidden relaunch');
