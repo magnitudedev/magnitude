@@ -15,7 +15,7 @@ export const windowsSigningScript = fileURLToPath(new URL("./windows-signing.ps1
 /** Verify publisher and timestamp before any signed bytes enter an archive or installer. */
 export const signWindowsCode = (file: string) => Effect.gen(function* () {
   if ((yield* windowsSigning) === "unsigned") return
-  const code = yield* Command.make("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+  const code = yield* Command.make("pwsh.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
     "-File", windowsSigningScript, "-Path", file).pipe(
     Command.stdout("inherit"), Command.stderr("inherit"), Command.exitCode,
   )
