@@ -219,6 +219,13 @@ class _Lease:
             self.closed = True
 
 
+@dataclass(frozen=True, slots=True)
+class _ResourceView:
+    """Validated immutable geometry shared by independent allocation leases."""
+    spec: TensorSpec
+    offset: int
+
+
 class Resource:
     """A typed view whose allocation is retained independently of its owner."""
 
@@ -232,8 +239,15 @@ class Resource:
         ):
             raise ValueError("resource view exceeds or misaligns its allocation")
         self._lease = lease
-        self.spec = spec
-        self.offset = offset
+        self._view = _ResourceView(spec, offset)
+
+    @property
+    def spec(self) -> TensorSpec:
+        return self._view.spec
+
+    @property
+    def offset(self) -> int:
+        return self._view.offset
 
     @property
     def device(self) -> DeviceRuntime:
@@ -249,7 +263,16 @@ class Resource:
         self._lease.check()
         return self._lease.allocation.charged_bytes
 
+    @property
+    def sole_owner(self) -> bool:
+        """Whether this lease is the only owner, including completion pins."""
+        self.device._check_thread()
+        self._lease.check()
+        return self._lease.allocation.claims == 1
+
     def view(self, spec: TensorSpec, offset: int = 0) -> Resource:
+        if offset == 0 and spec == self.spec:
+            return self.fork()
         if offset < 0 or offset + spec.storage_nbytes > self.spec.storage_nbytes:
             raise ValueError("resource subview exceeds parent")
         lease = self._lease.fork()
@@ -260,7 +283,12 @@ class Resource:
             raise
 
     def fork(self) -> Resource:
-        return Resource(self._lease.fork(), self.spec, self.offset)
+        # Only the lease is new. The immutable view already passed all bounds,
+        # alignment and concrete-geometry checks when it was constructed.
+        resource = object.__new__(Resource)
+        resource._lease = self._lease.fork()
+        resource._view = self._view
+        return resource
 
     def close(self) -> None:
         self._lease.close()

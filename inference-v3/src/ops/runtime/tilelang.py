@@ -49,6 +49,7 @@ class _KernelCapture:
 class _Allocation(NativeAllocation):
     def __init__(self, tensor: torch.Tensor):
         self._tensor: torch.Tensor | None = tensor
+        self._views: dict[tuple, torch.Tensor] = {}
 
     def _require_tensor(self) -> torch.Tensor:
         if self._tensor is None:
@@ -70,16 +71,24 @@ class _Allocation(NativeAllocation):
         else:
             shape = cast(tuple[int, ...], spec.shape)
             dtype = spec.dtype if not isinstance(representation, Dense) else representation.dtype
+        key = offset, shape, dtype
+        existing = self._views.get(key)
+        if existing is not None:
+            return existing
         torch_dtype = getattr(torch, dtype.value)
-        width = torch.empty((), dtype=torch_dtype).element_size()
+        width = dtype.itemsize
         if offset % width:
             raise ValueError("view offset is not aligned to its element type")
         count = 1
         for extent in shape:
             count *= extent
-        return tensor[offset : offset + count * width].view(torch_dtype).view(shape)
+        result = tensor[offset : offset + count * width].view(torch_dtype).view(shape)
+        if len(self._views) < 64:
+            self._views[key] = result
+        return result
 
     def close(self) -> None:
+        self._views.clear()
         self._tensor = None
 
 

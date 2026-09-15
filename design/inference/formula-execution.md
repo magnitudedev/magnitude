@@ -8,6 +8,10 @@ applies_to:
   - inference-v3/tests/ops/**
   - inference-v3/tests/models/**
   - inference-v3/tests/platform/**
+  - inference-v3/tilelang/tilelang/metal/transform/**
+  - inference-v3/tilelang/src/backend/common/codegen/codegen_c_host.cc
+  - inference-v3/tilelang/3rdparty/tvm/src/runtime/metal/metal_module.mm
+  - inference-v3/tilelang/testing/python/metal/test_metal_submission_regions.py
 ---
 
 # Formula-defined execution and measurement
@@ -97,6 +101,14 @@ work composes into maximal native entrypoints, with immutable operands partially
 bound. A required host observation, streaming dependency or documented native
 limit may split a unit. Fusion means eliminating an intermediate inside one
 kernel; several kernels behind one host entrypoint are not fusion.
+Safe contiguous device-launch regions also share the native queue handoff and
+compute-pass lifetime where the execution adapter supports it. Argument-frame
+preparation may enter that region; arbitrary host callbacks, external effects and
+returns remain explicit boundaries. A scoped owner closes the pass on both normal
+and exceptional exits before returning the borrowed command buffer to its owner.
+Per-kernel timing may require separate passes and must identify that instrumentation
+rather than claiming it observes an unchanged ordinary submission path.
+
 
 Device launches enter the native submission queue in program order, preserving
 argument preparation, control flow and individual kernel observations. A queue
@@ -117,6 +129,63 @@ or output accumulation: those remain FP32. Value operands widen on consumption,
 and the isolated and composed attention paths share one authored streaming body
 and physical-capacity calculation. Native shared staging is not a claim that all
 arithmetic has the storage dtype or that reduced storage guarantees lower latency.
+
+Wide-head persistent prefill may stream bounded coordinate slices while keeping
+its complete query-row cohort. Its resource plan prices the actual sliced arena,
+not a whole-head allocation. QK finishes all coordinate slices before each FP32
+softmax update; PV consumes all value slices before advancing history. The
+probability fragment remains with its query-row owners, and immediate matrix
+subfragments use statically selected coordinates so an enlarged register tile
+does not require dynamic fragment-array addressing. Logical head width still
+controls normalization and codec interpretation; physical slice width does not.
+
+Persistent attention receives prepared logical queries, keys and values after
+the model's normalization and positional transforms. Ops owns the KV codec,
+packing, history-query transform, append, history traversal and partial merge;
+model equations supply geometry and visibility without selecting codec kernels.
+The current batch attends through its dense prepared values. Committed history
+is consumed directly from its representation in bounded on-chip tiles. Current
+rows must not be read back from their freshly encoded destinations, and packed
+history must not acquire a dense full-prefix shadow or reconstruction buffer.
+Both sources participate in one FP32 online softmax and return the model's
+logical value basis before any nonlinear output gate.
+
+A persistent KV representation is an immutable semantic identity covering codecs,
+widths, metadata precision, packing, codebook and rotation conventions. Independently
+aligned code and metadata planes belong to one backing resource; claims, copies,
+completion pins and reclamation cover that entire bundle. Read visibility separates
+committed history from current causal rows and reserved write destinations. A state
+advance becomes visible only after both attention consumption and persistence finish.
+An explicitly reserved append promises that its destinations are disjoint from
+the committed-history intervals consumed during that advance. Its reservation
+owner establishes this precondition. Only this declaration permits a component
+to schedule producer persistence alongside a logical pre-advance read; arbitrary
+overwrites retain their ordinary ordering. The component owns preparation,
+attention and append together, so linear resource versions remain valid at its
+external boundary and completion joins the output with the next cache state.
+Compression memory savings and attention latency are qualified independently;
+chunked prefill comparisons include every chunk's packed-prefix traversal and append.
+Matrix query tiles derive their traversal extent from valid row visibility,
+including partially padded tiles. A zero-visibility final physical row cannot
+suppress preceding valid queries, and padding never enables an unmasked fast path.
+
+Sequential execution may retain a bounded set of output backings. A backing becomes
+reusable only when its retained owner holds every remaining allocation lease,
+including completion pins and checkpoint/state views. A busy set causes fresh
+allocation; it never permits overwriting an escaped result. Idle backings remain
+charged to the device budget and are explicitly reclaimable. Closing a compiled
+owner releases its claims without invalidating results retained by callers.
+Native view reuse changes binding work, not tensor math or state publication.
+Validated resource view geometry is immutable and may be shared by independent
+leases. Forking a lease preserves that geometry; constructing a different view
+still validates its bounds and alignment against the backing allocation.
+An invocation may transfer its integer control fields in one dense word record.
+Its public typed materialization preserves every signed-index and random-draw
+bit, owns its output storage, and remains inside the measured invocation. Fields
+shared across layer consumers need materialization only once; mutable model state
+retains its ordinary resource and completion ownership.
+Report preparation and submission-through-completion time separately so reducing
+host preparation cannot masquerade as faster numerical kernels.
 
 Kernel composition uses public Python-native TileLang construction, not generated
 source, AST fabrication or direct TIR manipulation. Physical storage planning

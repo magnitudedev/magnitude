@@ -8,6 +8,8 @@ from typing import Any, cast
 import tilelang.language as T
 
 from ..compiler.lowering import BoundOperation, CompilerTarget, LoweringContext
+from ..kv import KVRepresentation
+from .kv_packed import copy_bundle
 from ..representations import (
     Affine,
     Dense,
@@ -17,7 +19,7 @@ from ..representations import (
 )
 from ..tensor.graph import Graph, Node
 from ..tensor.primitive import primitives
-from ..tensor.types import TensorSpec, dense_strides
+from ..tensor.types import DType, TensorSpec, dense_strides
 
 
 def _indices(flat, shape: tuple[int, ...]):
@@ -56,6 +58,27 @@ def _load(buffer, spec: TensorSpec, flat, broadcast: TensorSpec | None = None):
         0 if extent == 1 else coordinates[pad + axis] for axis, extent in enumerate(shape)
     )
     return buffer[indices]
+
+
+@T.macro
+def _unpack_field(source, output, spec, flat, offset):
+    if offset <= flat and flat < offset + spec.elements:
+        output[_indices(flat - offset, spec.shape)] = T.reinterpret(source[flat], spec.dtype.value)
+
+
+def _unpack_fields(source, outputs, specs, flat):
+    offset = 0
+    for output, spec in zip(outputs, specs, strict=True):
+        _unpack_field(source, output, spec, flat, offset)
+        offset += spec.elements
+
+
+@T.macro
+def _unpack_words_kernel(source, outputs, specs, words, threads):
+    with T.Kernel(T.ceildiv(words, threads), threads=threads) as block:
+        for lane in T.Parallel(threads):
+            flat = block * threads + lane
+            _unpack_fields(source, outputs, specs, flat)
 
 
 @T.macro
@@ -310,12 +333,22 @@ def _quantized_import_kernel(source, target, extent, target_spec, codec, staged_
                                 value >> (8 - bit % 8), "uint8"
                             )
                     cursor += tile_bias_bytes
-                for byte in T.unroll(coefficients.super_scale_dtype.itemsize):
-                    target_bytes[cursor + byte] = codec.scale_byte(source, source_base, byte)
+                if coefficients.super_scale_dtype == DType.F32:
+                    bits = T.reinterpret(codec.super_scale(source, source_base, T.reinterpret), "uint32")
+                    for byte in T.unroll(4):
+                        target_bytes[cursor + byte] = T.cast(bits >> (byte * 8), "uint8")
+                else:
+                    for byte in T.unroll(coefficients.super_scale_dtype.itemsize):
+                        target_bytes[cursor + byte] = codec.scale_byte(source, source_base, byte)
                 cursor += coefficients.super_scale_dtype.itemsize
                 if coefficients.super_bias_dtype is not None:
-                    for byte in T.unroll(coefficients.super_bias_dtype.itemsize):
-                        target_bytes[cursor + byte] = codec.bias_byte(source, source_base, byte)
+                    if coefficients.super_bias_dtype == DType.F32:
+                        bits = T.reinterpret(codec.super_bias(source, source_base, T.reinterpret), "uint32")
+                        for byte in T.unroll(4):
+                            target_bytes[cursor + byte] = T.cast(bits >> (byte * 8), "uint8")
+                    else:
+                        for byte in T.unroll(coefficients.super_bias_dtype.itemsize):
+                            target_bytes[cursor + byte] = codec.bias_byte(source, source_base, byte)
 
 
 @T.macro
@@ -455,6 +488,9 @@ class PrimitiveEmitter:
             _unary_kernel(
                 inputs[0], outputs[0], self.inputs[0], self.outputs[0], operation, self.threads
             )
+        elif operation == 'unpack_words':
+            _unpack_words_kernel(inputs[0], tuple(outputs), self.outputs,
+                                 self.inputs[0].elements, self.threads)
         elif operation == "transpose":
             _transpose_kernel(
                 inputs[0],
@@ -534,7 +570,8 @@ class PrimitiveEmitter:
                 self.threads,
             )
         elif operation == "kv_copy":
-            _kv_copy_kernel(
+            copier = copy_bundle if isinstance(self.inputs[0].representation, KVRepresentation) else _kv_copy_kernel
+            copier(
                 inputs[0],
                 inputs[1],
                 self.inputs[0],
@@ -556,6 +593,7 @@ _PRODUCTION_PRIMITIVES = frozenset(
         "less",
         "cast",
         "decode_bfloat16",
+        "unpack_words",
         "concatenate",
         "take_rows",
         "overlay_rows",
@@ -606,6 +644,8 @@ class PrimitiveLoweringRule:
         )
         moved = sum(spec.storage_nbytes for spec in specs)
         kernel_count = 1
+        if node.operation == "kv_copy" and isinstance(specs[0].representation, KVRepresentation):
+            kernel_count = len(specs[0].representation.planes(specs[0].shape[0] * specs[0].shape[1]))
         return (
             BoundOperation(
                 f"{node.operation}.portable@{root}",

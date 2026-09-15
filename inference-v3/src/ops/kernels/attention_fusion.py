@@ -8,6 +8,8 @@ import tilelang.language as T
 
 from ..compiler.lowering import BoundOperation, LoweringContext
 from ..tensor.graph import Graph
+from ..kv import KVRepresentation
+from .kv_packed import store_vector, validate_vector_codec
 from .normalization import _reduction_threads
 
 
@@ -37,6 +39,7 @@ def _prepare_append(
     subgroup_width,
     subgroups,
     publish_cache,
+    packed_spec=None,
 ):
     half = rotary_width // 2
     heads = query_heads + kv_heads
@@ -78,6 +81,9 @@ def _prepare_append(
                 square[0] += raw[0] * raw[0]
         inverse = T.rsqrt(T.warp_reduce_sum(square[0]) / width + epsilon)
         destination = T.cast(positions[row], "int32") if publish_cache else 0
+        packed_key = T.alloc_local((channels_per_lane,), "float32")
+        packed_value = T.alloc_local((channels_per_lane,), "float32")
+        packed_scratch = T.alloc_local((channels_per_lane,), "float32")
         for item in T.serial(channels_per_lane):
             channel = lane * channels_per_lane + item
             if head < heads and channel < width:
@@ -113,20 +119,31 @@ def _prepare_append(
                     gate_out[row, head, channel] = query_gate[
                         row, head * 2 * width + width + channel
                     ]
-                elif not publish_cache:
+                elif not publish_cache or packed_spec is not None:
                     key_out[row, head - query_heads, channel] = T.cast(prepared[0], dtype)
+                    if packed_spec is not None:
+                        packed_key[item] = T.cast(T.cast(prepared[0], dtype), "float32")
+                        packed_value[item] = T.cast(values[row, (head - query_heads) * width + channel], "float32")
                 elif destination >= 0:
                     kv_head = head - query_heads
                     next_cache[0, destination, kv_head, channel] = T.cast(prepared[0], dtype)
                     next_cache[1, destination, kv_head, channel] = values[
                         row, kv_head * width + channel
                     ]
+        if packed_spec is not None:
+            if head >= query_heads and head < heads and destination >= 0:
+                vector = destination * kv_heads + head - query_heads
+                store_vector(packed_key, packed_scratch, next_cache, packed_spec,
+                             "key", vector, lane, subgroup_width)
+                store_vector(packed_value, packed_scratch, next_cache, packed_spec,
+                             "value", vector, lane, subgroup_width)
 
 
 class _PrepareAppendEmitter:
-    def __init__(self, attrs, rows, subgroup_width, subgroups, dtype):
+    def __init__(self, attrs, rows, subgroup_width, subgroups, dtype, packed_spec=None):
         self.attrs, self.rows = attrs, rows
         self.subgroup_width, self.subgroups, self.dtype = subgroup_width, subgroups, dtype
+        self.packed_spec = packed_spec
 
     def __call__(self, operands: tuple[Any, ...]) -> None:
         # Inputs are explicitly ordered by the rule; outputs follow them.
@@ -135,7 +152,7 @@ class _PrepareAppendEmitter:
             operands[8],
             operands[9],
             operands[10],
-            operands[8],
+            operands[11] if self.packed_spec is not None else operands[8],
             self.rows,
             self.attrs["query_heads"],
             self.attrs["kv_heads"],
@@ -148,6 +165,7 @@ class _PrepareAppendEmitter:
             self.subgroup_width,
             self.subgroups,
             True,
+            self.packed_spec,
         )
 
 
@@ -206,10 +224,42 @@ class _AppendEmitter:
         _append_cache(keys, values, destinations, output, *self.shape, self.threads)
 
 
+@T.macro
+def _append_packed(keys, values, destinations, output, rows, heads, width, spec, subgroup_width):
+    count = width // subgroup_width
+    with T.Kernel(heads, rows, threads=subgroup_width) as (head, row):
+        lane = T.get_thread_binding()
+        k = T.alloc_local((count,), "float32")
+        v = T.alloc_local((count,), "float32")
+        scratch = T.alloc_local((count,), "float32")
+        destination = destinations[row]
+        if destination >= 0:
+            for item in T.unroll(count):
+                k[item] = T.cast(keys[row, head, lane * count + item], "float32")
+                v[item] = T.cast(values[row, head, lane * count + item], "float32")
+            store_vector(k, scratch, output, spec, "key", destination * heads + head, lane, subgroup_width)
+            store_vector(v, scratch, output, spec, "value", destination * heads + head, lane, subgroup_width)
+
+
+class _PackedAppendEmitter:
+    def __init__(self, shape, spec, subgroup_width):
+        self.shape, self.spec, self.subgroup_width = shape, spec, subgroup_width
+        validate_vector_codec(spec, subgroup_width)
+
+    def __call__(self, operands):
+        _, keys, values, destinations, output = operands
+        _append_packed(keys, values, destinations, output, *self.shape, self.spec, self.subgroup_width)
+
+
 class KVAppendRule:
     def build(self, graph, root, context):
         node = graph.node(root)
         shape = graph.value(node.inputs[1]).spec.shape
+        spec = graph.value(node.inputs[0]).spec
+        if isinstance(spec.representation, KVRepresentation):
+            return (BoundOperation(f"kv.append-packed@{root}", frozenset({root}), node.inputs, node.outputs,
+                                   _PackedAppendEmitter(shape, spec, context.compiler_target.subgroup_width),
+                                   aliases=((node.outputs[0], node.inputs[0]),)),)
         return (BoundOperation(f"kv.append@{root}", frozenset({root}), node.inputs, node.outputs,
                                _AppendEmitter(shape, min(256, context.compiler_target.threads_per_group)),
                                aliases=((node.outputs[0], node.inputs[0]),)),)
@@ -241,6 +291,11 @@ class AttentionPrepareAppendRule:
             positions,
         )
         outputs = (prepare.outputs[0], prepare.outputs[2], append.outputs[0])
+        packed_spec = graph.value(cache).spec
+        packed_spec = packed_spec if isinstance(packed_spec.representation, KVRepresentation) else None
+        if packed_spec is not None:
+            validate_vector_codec(packed_spec, context.compiler_target.subgroup_width)
+            outputs += (prepare.outputs[1], reshape.outputs[0])
         specs = tuple(graph.values[value].spec for value in (*inputs, *outputs))
         if any(not spec.static for spec in specs):
             return ()
@@ -266,8 +321,10 @@ class AttentionPrepareAppendRule:
                     context.compiler_target.subgroup_width,
                     subgroups,
                     specs[0].dtype.value,
+                    packed_spec,
                 ),
-                aliases=((append.outputs[0], cache),),
+                aliases=((append.outputs[0], cache),) + (((reshape.outputs[0], raw_values),)
+                                                        if packed_spec is not None else ()),
             ),
         )
 

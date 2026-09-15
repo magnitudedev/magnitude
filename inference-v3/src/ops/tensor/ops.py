@@ -10,6 +10,7 @@ from .primitive import NumericalContract, primitive
 from .tracing import Tensor, active_trace
 from .types import DType, TensorSpec, broadcast_shape, normalize_axes
 from ..formula import formula
+from ..kv import KVRepresentation
 from ..performance import semantics as useful
 
 
@@ -156,6 +157,44 @@ def _decode_bfloat16(inputs, attrs):
 
 def decode_bfloat16(value: Tensor, dtype: DType) -> Tensor:
     return _emit("decode_bfloat16", value, dtype=dtype)
+
+
+def _unpack_words_reference(inputs, attrs):
+    np = _np()
+    words = np.asarray(inputs[0], dtype=np.uint32)
+    offset, outputs = 0, []
+    for shape, dtype in attrs['fields']:
+        count = math.prod(shape)
+        outputs.append(words[offset:offset + count].view(dtype.value).reshape(shape))
+        offset += count
+    return tuple(outputs)
+
+
+@primitive('unpack_words', work=useful.no_arithmetic, reference=_unpack_words_reference)
+def _unpack_words(inputs, attrs):
+    _one(inputs, 1, 'unpack_words')
+    source = inputs[0]
+    if (source.rank != 1 or source.dtype != DType.U32 or source.representation is not None
+            or source.layout.strides is not None):
+        raise ValueError('word records require a dense one-dimensional uint32 input')
+    outputs = tuple(TensorSpec(tuple(shape), dtype) for shape, dtype in attrs['fields'])
+    if not outputs or any(not spec.static or spec.dtype not in (DType.I32, DType.U32) for spec in outputs):
+        raise ValueError('word record fields must be concrete 32-bit integer tensors')
+    if source.shape[0] != sum(spec.elements for spec in outputs):
+        raise ValueError('word record fields must cover the input exactly')
+    return outputs
+
+
+def unpack_words(value: Tensor, specs: Sequence[TensorSpec]) -> tuple[Tensor, ...]:
+    """Materialize typed integer fields from one contiguous word record.
+
+    Signed fields reinterpret bits, preserving negative indices and all unsigned
+    random-draw bits. Field storage is independent of the record's input lease.
+    """
+    if any(spec.representation is not None or spec.layout.strides is not None for spec in specs):
+        raise ValueError('word record fields require dense logical storage')
+    result = _emit('unpack_words', value, fields=tuple((spec.shape, spec.dtype) for spec in specs))
+    return (result,) if len(specs) == 1 else result
 
 
 @primitive(
@@ -831,11 +870,19 @@ def _kv_append(inputs, attrs):
     if len(inputs) != 4:
         raise ValueError("kv_append expects resource, keys, values and destinations")
     resource, keys, values, destinations = inputs
-    if keys.shape != values.shape or keys.dtype != values.dtype:
+    if keys.shape[:2] != values.shape[:2] or keys.dtype != values.dtype:
         raise ValueError("KV keys and values must agree")
-    if keys.rank != 3 or resource.rank != 4 or resource.shape[0] != 2:
+    if isinstance(resource.representation, KVRepresentation):
+        representation = resource.representation
+        if (resource.rank != 3 or keys.rank != 3 or values.rank != 3
+                or resource.shape[1] != keys.shape[1]
+                or resource.shape[2] != representation.logical_width
+                or keys.shape[2] != representation.key_width
+                or values.shape[2] != representation.value_width):
+            raise ValueError("appended KV vectors disagree with persistent representation")
+    elif keys.rank != 3 or resource.rank != 4 or resource.shape[0] != 2:
         raise ValueError("KV storage uses [2, capacity, head, channel] geometry")
-    if resource.shape[2:] != keys.shape[1:]:
+    elif resource.shape[2:] != keys.shape[1:] or keys.shape != values.shape:
         raise ValueError("KV storage head geometry differs from appended values")
     if resource.dtype != keys.dtype or not keys.dtype.floating:
         raise ValueError("KV storage and appended values require the same floating dtype")
@@ -849,6 +896,18 @@ def _kv_append_reference(inputs, attrs):
     destinations = inputs[3]
     valid = destinations >= 0
     written = destinations[valid]
+    representation = attrs.get("representation")
+    if isinstance(representation, KVRepresentation):
+        if _np().any(written >= resource.shape[0]) or len(_np().unique(written)) != len(written):
+            raise ValueError("KV destinations must be distinct in-capacity rows or negative padding")
+        if len(written) == 0:
+            return resource
+        from ..kv_codecs import quantize_reference, dequantize_reference
+        resource[written, :, :representation.key_width] = dequantize_reference(
+            quantize_reference(inputs[1][valid], representation.key), representation.key)
+        resource[written, :, representation.key_width:] = dequantize_reference(
+            quantize_reference(inputs[2][valid], representation.value), representation.value)
+        return resource
     if _np().any(written >= resource.shape[1]) or len(_np().unique(written)) != len(written):
         raise ValueError("KV destinations must be distinct in-capacity rows or negative padding")
     resource[0, destinations[valid]] = inputs[1][valid]
@@ -857,18 +916,27 @@ def _kv_append_reference(inputs, attrs):
 
 
 @formula(id="kv_append", version=1)
-def kv_append(resource: Tensor, keys: Tensor, values: Tensor, destinations: Tensor) -> Tensor:
+def kv_append(resource: Tensor, keys: Tensor, values: Tensor, destinations: Tensor, *,
+              reserved: bool = False) -> Tensor:
     """Publish distinct cache rows; negative destinations denote padding.
 
     The engine supplies valid, nonoverlapping destination rows. The independent
     reference checks this input precondition before a measurement is qualified.
+    ``reserved=True`` additionally promises that destinations are outside every
+    committed-history interval consumed by this advance. A reservation owner
+    must establish that promise before constructing the formula; it permits
+    producer persistence to overlap pre-advance history consumption.
     """
-    return _emit("kv_append", resource, keys, values, destinations)
+    if type(reserved) is not bool:
+        raise TypeError("KV reservation declaration must be boolean")
+    return _emit("kv_append", resource, keys, values, destinations,
+                 representation=resource.spec.representation, reserved=reserved)
 
 
 @primitive(
     "kv_copy",
     work=useful.no_arithmetic,
+    reference=lambda inputs, attrs: (_kv_copy_reference(inputs, attrs),),
     resource_reads=(0,),
     resource_writes=(0,),
     aliases=((0, 0),),
@@ -878,8 +946,8 @@ def _kv_copy(inputs, attrs):
     _one(inputs, 2, "kv_copy")
     resource, ranges = inputs
     if (
-        resource.rank != 4
-        or resource.shape[0] != 2
+        (not isinstance(resource.representation, KVRepresentation)
+         and (resource.rank != 4 or resource.shape[0] != 2))
         or ranges.rank != 2
         or ranges.shape[1] != 3
         or ranges.dtype != DType.I32
@@ -889,8 +957,116 @@ def _kv_copy(inputs, attrs):
     return (resource,)
 
 
+def _kv_copy_reference(inputs, attrs):
+    source, ranges = inputs
+    result = source.copy()
+    typed = isinstance(attrs.get("representation"), KVRepresentation)
+    capacity = source.shape[0 if typed else 1]
+    reads, writes = [], []
+    for start, destination, count in ranges:
+        start, destination, count = int(start), int(destination), int(count)
+        if (min(start, destination, count) < 0 or count > attrs["max_count"]
+                or max(start, destination) + count > capacity):
+            raise ValueError("KV copy range lies outside its declared capacity")
+        if count:
+            reads.append((start, start + count))
+            writes.append((destination, destination + count))
+        if typed:
+            result[destination:destination + count] = source[start:start + count]
+        else:
+            result[:, destination:destination + count] = source[:, start:start + count]
+    for index, target in enumerate(writes):
+        if any(max(target[0], other[0]) < min(target[1], other[1])
+               for other in writes[:index]):
+            raise ValueError("KV copy destinations must be disjoint")
+        if any(max(target[0], other[0]) < min(target[1], other[1])
+               and not (other == target and reads[index] == target)
+               for other in reads):
+            raise ValueError("KV copy destinations must not overwrite source ranges")
+    return result
+
+
 def kv_copy(resource: Tensor, ranges: Tensor, *, max_count: int) -> Tensor:
-    return _emit("kv_copy", resource, ranges, max_count=max_count)
+    """Copy disjoint ranges, preserving the entire represented plane bundle."""
+    return _emit("kv_copy", resource, ranges, max_count=max_count,
+                 representation=resource.spec.representation)
+
+
+@primitive(
+    "persistent_attention",
+    work=useful.persistent_attention,
+    reference=lambda inputs, attrs: (_persistent_attention_reference(inputs, attrs),),
+    numerical=NumericalContract(DType.F32),
+    resource_reads=(1,),
+    tags=frozenset({"attention"}),
+)
+def _persistent_attention(inputs, attrs):
+    _one(inputs, 5, "persistent_attention")
+    queries, history, keys, values, visible = inputs
+    representation = history.representation
+    if not isinstance(representation, KVRepresentation) or history.rank != 3:
+        raise ValueError("persistent attention requires typed KV state")
+    if (queries.rank != 3 or keys.rank != 3 or values.rank != 3
+            or not queries.dtype.floating
+            or queries.dtype != keys.dtype or keys.dtype != values.dtype
+            or keys.shape[:2] != values.shape[:2]
+            or keys.shape[1] != history.shape[1]
+            or queries.shape[1] % keys.shape[1]
+            or queries.shape[2] != representation.key_width
+            or keys.shape[2] != representation.key_width
+            or values.shape[2] != representation.value_width
+            or history.shape[2] != representation.logical_width):
+        raise ValueError("persistent attention source geometry disagrees")
+    if visible.shape != (queries.shape[0], 4) or visible.dtype != DType.I32:
+        raise ValueError("visibility requires history start/count and current start/count")
+    if not math.isfinite(attrs["scale"]) or attrs["scale"] <= 0:
+        raise ValueError("attention scale must be finite and positive")
+    return (TensorSpec((*queries.shape[:2], values.shape[2]), queries.dtype),)
+
+
+def _persistent_attention_reference(inputs, attrs):
+    """Logical reference: represented history is decoded by reference binding.
+
+    Current rows are supplied independently and never round-trip through the
+    persistence codec. Range counts carry causal visibility for each query.
+    """
+    np = _np()
+    queries, history, keys, values, visible = inputs
+    width = queries.shape[-1]
+    result = np.zeros((*queries.shape[:2], values.shape[-1]), dtype=np.float32)
+    group = queries.shape[1] // keys.shape[1]
+    for row, ranges in enumerate(visible):
+        start, count, current, current_count = map(int, ranges)
+        if (min(start, count, current, current_count) < 0
+                or start + count > history.shape[0]
+                or current + current_count > keys.shape[0]):
+            raise ValueError("persistent attention visibility lies outside its sources")
+        if count + current_count == 0:
+            continue
+        for head in range(queries.shape[1]):
+            kv_head = head // group
+            k = np.concatenate((history[start:start + count, kv_head, :width],
+                                keys[current:current + current_count, kv_head]), axis=0).astype(np.float32)
+            v = np.concatenate((history[start:start + count, kv_head, width:],
+                                values[current:current + current_count, kv_head]), axis=0).astype(np.float32)
+            logits = queries[row, head].astype(np.float32) @ k.T * attrs["scale"]
+            result[row, head] = _softmax_reference(logits, -1) @ v
+    return result
+
+
+@formula(id="persistent_attention", version=1)
+def persistent_attention(queries: Tensor, history: Tensor, keys: Tensor, values: Tensor,
+                         visible: Tensor, *, scale: float | None = None,
+                         sequence_count: int | None = None) -> Tensor:
+    """Attend to committed history and dense current rows in a single softmax.
+
+    Visibility rows are [history_start, history_count, current_start,
+    current_count]. The caller excludes newly reserved cache destinations from
+    history and supplies current causal ranges explicitly.
+    """
+    return _emit("persistent_attention", queries, history, keys, values, visible,
+                 scale=queries.shape[-1] ** -0.5 if scale is None else scale,
+                 sequence_count=sequence_count)
 
 
 @primitive(

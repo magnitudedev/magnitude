@@ -307,8 +307,9 @@ def _selected_activate(
                         hidden[row, chunk * packet.tile + lane * packet.dot_packet + item],
                         "float32",
                     )
-                partial[0] += packet_dot(values, gate, gate_spec, weight_row, chunk, lane)
-                partial[1] += packet_dot(values, up, up_spec, weight_row, chunk, lane)
+                activation_sum, masked = prepare_packet_activation(values, hidden.dtype, packet)
+                partial[0] += packet_dot(values, gate, gate_spec, weight_row, chunk, lane, activation_sum, masked)
+                partial[1] += packet_dot(values, up, up_spec, weight_row, chunk, lane, activation_sum, masked)
         gate_value = T.cast(T.warp_reduce_sum(partial[0]), hidden.dtype)
         up_value = T.cast(T.warp_reduce_sum(partial[1]), hidden.dtype)
         if lane == 0:
@@ -588,6 +589,7 @@ def _routed_shared_activate(
                             ],
                             "float32",
                         )
+                    activation_sum, masked = prepare_packet_activation(values, hidden.dtype, expert_packet)
                     for owned in T.unroll(2, explicit=True):
                         channel = first + owned
                         if channel < expert_intermediate:
@@ -598,7 +600,7 @@ def _routed_shared_activate(
                                 expert_gate_spec,
                                 weight_row,
                                 chunk,
-                                lane,
+                                lane, activation_sum, masked,
                             )
                             up_partial[owned] += packet_dot(
                                 values,
@@ -606,7 +608,7 @@ def _routed_shared_activate(
                                 expert_up_spec,
                                 weight_row,
                                 chunk,
-                                lane,
+                                lane, activation_sum, masked,
                             )
             for owned in T.unroll(2, explicit=True):
                 gate_value = T.cast(T.warp_reduce_sum(gate_partial[owned]), hidden.dtype)
@@ -628,6 +630,7 @@ def _routed_shared_activate(
                         router_partial[0] += values[item] * T.cast(
                             shared_router[channel], "float32"
                         )
+                activation_sum, masked = prepare_packet_activation(values, hidden.dtype, shared_packet)
                 for owned in T.unroll(2, explicit=True):
                     channel = first + owned
                     if channel < shared_intermediate:
@@ -637,7 +640,7 @@ def _routed_shared_activate(
                             shared_gate_spec,
                             channel,
                             chunk,
-                            lane,
+                            lane, activation_sum, masked,
                         )
                         up_partial[owned] += packet_dot(
                             values,
@@ -645,7 +648,7 @@ def _routed_shared_activate(
                             shared_up_spec,
                             channel,
                             chunk,
-                            lane,
+                            lane, activation_sum, masked,
                         )
             router_value = T.warp_reduce_sum(router_partial[0])
             if lane == 0 and first == 0:
@@ -710,6 +713,7 @@ def _routed_shared_down(
                             ],
                             "float32",
                         )
+                    activation_sum, masked = prepare_packet_activation(values, output_dtype, expert_packet)
                     for owned in T.unroll(2, explicit=True):
                         channel = first_output + owned
                         if channel < outputs:
@@ -719,7 +723,7 @@ def _routed_shared_down(
                                 expert_weight_spec,
                                 expert * outputs + channel,
                                 chunk,
-                                lane,
+                                lane, activation_sum, masked,
                             )
                 for owned in T.unroll(2, explicit=True):
                     projected = T.cast(T.warp_reduce_sum(expert_sum[owned]), output_dtype)
@@ -735,11 +739,12 @@ def _routed_shared_down(
                     ],
                     "float32",
                 )
+            activation_sum, masked = prepare_packet_activation(values, output_dtype, shared_packet)
             for owned in T.unroll(2, explicit=True):
                 channel = first_output + owned
                 if channel < outputs:
                     shared_partial[owned] += packet_dot(
-                        values, shared_weight, shared_weight_spec, channel, chunk, lane
+                        values, shared_weight, shared_weight_spec, channel, chunk, lane, activation_sum, masked
                     )
         for owned in T.unroll(2, explicit=True):
             projected = partial[owned]
