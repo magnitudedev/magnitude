@@ -43,8 +43,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-24.04]
-    runs-on: ${{ matrix.os }}
+        include:
+          - os: ubuntu-22.04
+            runner: blacksmith-8vcpu-ubuntu-2204
+          - os: ubuntu-24.04
+            runner: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -110,7 +114,7 @@ jobs:
           xvfb-run -a dbus-run-session -- bunx --bun vitest run --config desktop/vitest.config.ts desktop/src/linux-installed-lifecycle.test.ts
 
   windows-job-containment:
-    runs-on: windows-latest
+    runs-on: blacksmith-8vcpu-windows-2025
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4

@@ -37,7 +37,7 @@ jobs:
     uses: ./.github/workflows/integrations.yml
 
   static:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
         with:
@@ -51,6 +51,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
+      - uses: ./.github/actions/build-cache
       - run: npm install --global "npm@${NPM_VERSION}"
       - run: bun install --frozen-lockfile
       - run: bun run icn:check-generated

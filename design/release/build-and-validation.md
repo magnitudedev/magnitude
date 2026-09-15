@@ -25,6 +25,8 @@ archives, not only on intermediate build outputs.
 - Planner inputs are generated once and shared by every host build.
 - Toolchains, backend features, CUDA targets, and shader compiler versions are explicit release
   inputs. Ambient runner packages must not enable optional native features.
+- Compiler-result caches may reuse objects matched by compiler inputs; clean release output,
+  final linking, packaging, signing, and independent artifact acceptance remain mandatory.
 - The workspace and CI use the same pinned Bun runtime. Runtime changes require native
   Windows pipe acceptance under Node, Bun, and compiled Bun, including unread replies after
   server closure, plus client and lifecycle regressions on the build host. Child compiler

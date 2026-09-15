@@ -36,7 +36,7 @@ jobs:
       contents: write
     # Reuse immutable cohorts while iterating consumer checks.
     if: inputs.build_artifacts
-    runs-on: windows-latest
+    runs-on: blacksmith-8vcpu-windows-2025
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -83,7 +83,7 @@ jobs:
       contents: write
     if: inputs.build_artifacts
     environment: apple-release
-    runs-on: macos-15
+    runs-on: blacksmith-12vcpu-macos-15
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -151,9 +151,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-24.04-arm]
+        include:
+          - os: ubuntu-22.04
+            runner: blacksmith-8vcpu-ubuntu-2204
+          - os: ubuntu-24.04-arm
+            runner: blacksmith-8vcpu-ubuntu-2404-arm
         version: ["0.0.38", "0.0.39"]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     container: ubuntu:22.04
     timeout-minutes: 30
     steps:
@@ -212,8 +216,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-22.04, ubuntu-24.04, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.os }}
+        include:
+          - os: windows-latest
+            runner: blacksmith-8vcpu-windows-2025
+          - os: ubuntu-22.04
+            runner: blacksmith-8vcpu-ubuntu-2204
+          - os: ubuntu-24.04
+            runner: blacksmith-8vcpu-ubuntu-2404
+          - os: ubuntu-24.04-arm
+            runner: blacksmith-8vcpu-ubuntu-2404-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
