@@ -29,6 +29,7 @@ import {
   desktopInstaller,
   desktopUpdateArchive,
   linuxDesktopInstaller,
+  windowsDesktopInstaller,
   icnBaseArchive,
   releaseHosts,
 } from "../src/targets"
@@ -93,6 +94,7 @@ const expectedArtifacts = new Map<string, string>([
     ...(host.id === "linux-arm64-gnu" || host.id === "linux-x64-gnu"
       ? (["deb", "rpm"] as const).map(format => [`desktop-${host.id}-${format}`, linuxDesktopInstaller(host.id as "linux-arm64-gnu" | "linux-x64-gnu", format, version, ACN_COORDINATION_REVISION)] as const)
       : []),
+    ...(host.id === "windows-x64-msvc" ? [[`desktop-${host.id}`, windowsDesktopInstaller(version)] as const] : []),
   ]),
   ...candidateBackendPacks.map((pack) =>
     [`icn-backend-${pack.id}`, backendArchive(pack)] as const
@@ -111,6 +113,16 @@ const validateLayout = async (
 ): Promise<void> => {
   if (artifact.kind === "desktop") {
     const host = Option.getOrThrow(artifact.host)
+    if (host === "windows-x64-msvc") {
+      // Native Windows consumption validates the installer and its final payload.
+      // Assembly only checks the container; a renamed arbitrary file is not an installer.
+      const header = new Uint8Array(await Bun.file(archive).slice(0, 64).arrayBuffer())
+      if (header.length !== 64 || header[0] !== 0x4d || header[1] !== 0x5a) throw new Error(`${artifact.id} is not a Windows executable`)
+      const offset = new DataView(header.buffer).getUint32(60, true)
+      const pe = new Uint8Array(await Bun.file(archive).slice(offset, offset + 4).arrayBuffer())
+      if (offset < 64 || pe.length !== 4 || pe[0] !== 0x50 || pe[1] !== 0x45 || pe[2] !== 0 || pe[3] !== 0) throw new Error(`${artifact.id} has no PE header`)
+      return
+    }
     if (host === "linux-arm64-gnu" || host === "linux-x64-gnu") {
       const format = artifact.id === `desktop-${host}-deb` ? "deb" : artifact.id === `desktop-${host}-rpm` ? "rpm" : undefined
       if (format === undefined) throw new Error(`Unexpected Linux desktop artifact ${artifact.id}`)

@@ -28,7 +28,7 @@ import {
   Stream,
   SubscriptionRef,
 } from "effect";
-import { installationLoaderEnvironment } from "./installation-environment.js";
+import { installationLoaderEnvironment, installationNativePath } from "./installation-environment.js";
 import { ICN_EXECUTABLE_NAME } from "@magnitudedev/release/executables";
 import {
   IcnApiIncompatible,
@@ -191,7 +191,7 @@ export const makeIcnBinaryResolver = () => Layer.effect(
             )
               return yield* new IcnBinaryNotExecutable({ path: canonical });
             const output = yield* Command.string(
-              Command.make(canonical, "version", "--json").pipe(
+              Command.make(installationNativePath(canonical), "version", "--json").pipe(
                 Command.env(candidate.environment)
               )
             ).pipe(
@@ -390,7 +390,7 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
     const { process, terminateProcess } = yield* Effect.uninterruptibleMask(() =>
       Effect.gen(function* () {
         const process = yield* children.spawn(new IcnChildLaunch({
-          executable: binary.path,
+          executable: installationNativePath(binary.path),
           arguments: renderIcnArguments(config, instanceId, binary.installation),
           environment: { ...binary.environment, MAGNITUDE_ICN_AUTH_TOKEN: authorization, HF_HUB_DISABLE_IMPLICIT_TOKEN: "1" },
           gracefulShutdownTimeout: config.gracefulShutdownTimeout,

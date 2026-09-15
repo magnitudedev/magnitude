@@ -1157,11 +1157,7 @@ async fn publish_snapshot_link(
     tokio::task::spawn_blocking(move || -> Result<(), DownloadError> {
         match destination_clone.symlink_metadata() {
             Ok(_) => {
-                let matching = destination_clone
-                    .canonicalize()
-                    .ok()
-                    .zip(blob.canonicalize().ok())
-                    .is_some_and(|(existing, expected)| existing == expected);
+                let matching = same_file::is_same_file(&destination_clone, &blob).unwrap_or(false);
                 if matching {
                     return Ok(());
                 }
@@ -1177,7 +1173,7 @@ async fn publish_snapshot_link(
         }
         #[cfg(not(unix))]
         {
-            fs::hard_link(&blob, &destination_clone).map_err(download_io)?;
+            std::fs::hard_link(&blob, &destination_clone).map_err(download_io)?;
         }
         Ok(())
     })
@@ -1230,9 +1226,8 @@ async fn atomic_json(path: &Path, value: &impl serde::Serialize) -> Result<(), D
     tokio::fs::rename(&temporary, path)
         .await
         .map_err(download_io)?;
-    // Persist the directory entry as well as the manifest contents. Without
-    // this fsync a power loss can lose the rename even though the file itself
-    // was synced successfully.
+    // Unix additionally flushes the renamed directory entry. File contents are
+    // already flushed above; Windows has no equivalent directory fsync.
     sync_parent(path).await
 }
 
@@ -1240,13 +1235,18 @@ async fn sync_parent(path: &Path) -> Result<(), DownloadError> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
-    let directory = tokio::fs::File::open(parent).await.map_err(download_io)?;
-    directory.sync_all().await.map_err(download_io)
+    sync_directory(parent).await
 }
 
 async fn sync_directory(path: &Path) -> Result<(), DownloadError> {
-    let directory = tokio::fs::File::open(path).await.map_err(download_io)?;
-    directory.sync_all().await.map_err(download_io)
+    #[cfg(unix)]
+    {
+        let directory = tokio::fs::File::open(path).await.map_err(download_io)?;
+        directory.sync_all().await.map_err(download_io)?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 async fn resumable_bytes(repo_root: &Path, components: &[ModelComponent]) -> u64 {

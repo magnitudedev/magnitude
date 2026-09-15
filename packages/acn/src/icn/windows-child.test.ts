@@ -1,5 +1,5 @@
 import { Effect, Layer, Option, Stream } from "effect"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { IcnChildLaunch, IcnChildSpawner } from "@magnitudedev/icn"
 import { Duration } from "effect"
 import { WindowsPrivatePipes, WindowsPipeFailed, WindowsProcessId, windowsJobOwnerLayer } from "@magnitudedev/utils/windows-native"
@@ -28,6 +28,30 @@ const fixture = (failAccept = false, cooperative = true, unprovenRetirement = fa
   return { observed, layer: WindowsIcnChildSpawner.pipe(Layer.provide(Layer.merge(jobs, pipes))) }
 }
 describe("Windows ICN child (simulated native boundaries)", () => {
+  it("finishes stream admission inside masked acquisition without waiting for process exit", async () => {
+    const test = fixture()
+    // Bound the regression: a non-interruptible race loser otherwise waits forever.
+    const exit = setTimeout(() => { test.observed.exited = true }, 2_000)
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+        const children = yield* IcnChildSpawner
+        yield* children.spawn(launch).pipe(Effect.uninterruptible)
+        expect(test.observed.exited).toBe(false)
+      })).pipe(Effect.provide(test.layer)))
+    } finally { clearTimeout(exit) }
+  })
+  it("replaces the inherited Path with the installation runtime PATH", async () => {
+    vi.stubEnv("Path", "C:\\Windows\\System32")
+    const test = fixture()
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+        const children = yield* IcnChildSpawner
+        yield* children.spawn(new IcnChildLaunch({ ...launch, environment: { ...launch.environment, PATH: "C:\\Magnitude\\runtime;C:\\Windows\\System32" } }))
+        const paths = test.observed.environment.split("\0").filter(entry => /^path=/i.test(entry))
+        expect(paths).toEqual(["PATH=C:\\Magnitude\\runtime;C:\\Windows\\System32"])
+      })).pipe(Effect.provide(test.layer)))
+    } finally { vi.unstubAllEnvs() }
+  })
   it("keeps inherited lifetime input open, separates records and diagnostics, and retires one job", async () => {
     const test = fixture()
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {

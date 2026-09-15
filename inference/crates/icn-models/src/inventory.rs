@@ -1129,7 +1129,7 @@ fn catalog_components_present(
         destination.metadata().is_ok_and(|metadata| {
             metadata.is_file()
                 && metadata.len() == component.size_bytes
-                && destination.canonicalize().ok().as_ref() == Some(&canonical_blob)
+                && same_file::is_same_file(&destination, &canonical_blob).unwrap_or(false)
         })
     })
 }
@@ -2006,15 +2006,9 @@ mod tests {
             discovered.availability,
             ModelAvailability::Available { .. }
         ));
-        assert_eq!(
-            snapshot
-                .join(&artifact_name)
-                .canonicalize()
-                .expect("repaired snapshot link"),
-            blobs
-                .join(&artifact_name)
-                .canonicalize()
-                .expect("model blob"),
+        assert!(
+            same_file::is_same_file(snapshot.join(&artifact_name), blobs.join(&artifact_name),)
+                .expect("snapshot refers to the verified blob")
         );
 
         fs::remove_file(snapshot.join(&artifact_name)).expect("remove installed link");
@@ -2022,6 +2016,11 @@ mod tests {
             .expect("read-only filesystem-derived inventory");
         assert!(after_delete.models.is_empty());
         assert!(!snapshot.join(&artifact_name).exists());
+
+        fs::copy(blobs.join(&artifact_name), snapshot.join(&artifact_name))
+            .expect("unlinked copy with identical bytes");
+        let after_copy = scan(&config, &cache, &BTreeMap::new()).expect("scan unlinked copy");
+        assert!(after_copy.models.is_empty());
     }
 
     #[cfg(unix)]

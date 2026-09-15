@@ -7,7 +7,8 @@ import { basename, delimiter, dirname, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { IcnBinaryIdentity } from "@magnitudedev/icn-protocol"
 import { ICN_EXECUTABLE_NAME } from "@magnitudedev/release/executables"
-import { Schema } from "effect"
+import { Effect, Schema } from "effect"
+import { collectWindowsRuntime } from "../../packages/release/scripts/build/windows-runtime"
 import { getTargetInfo } from "../../scripts/release-target"
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..")
@@ -156,7 +157,7 @@ const rustTarget = (target: string): string => {
   return value
 }
 
-const nativeRuntimeLinkageEnvironment = (
+const nativeBuildEnvironment = (
   target: string,
 ): Readonly<Record<string, string>> => {
   const { platform } = getTargetInfo(target)
@@ -169,6 +170,15 @@ const nativeRuntimeLinkageEnvironment = (
   if (platform === "darwin") {
     return {
       CMAKE_INSTALL_RPATH: "@loader_path;@loader_path/../runtime",
+    }
+  }
+  if (platform === "windows") {
+    return {
+      // Follow the x64 artifact target even on Windows ARM running x64 tools.
+      CMAKE_SYSTEM_NAME: "Windows",
+      CMAKE_SYSTEM_PROCESSOR: "AMD64",
+      // The fit wrapper uses C++ entry points, as does llama-common's existing Windows build.
+      CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS: "ON",
     }
   }
   return {}
@@ -302,7 +312,7 @@ export const buildIcnBinary = async ({
     env: {
       ...process.env,
       ...buildEnvironment,
-      ...nativeRuntimeLinkageEnvironment(target),
+      ...nativeBuildEnvironment(target),
       CARGO_TARGET_DIR: targetDirectory,
     },
   })
@@ -347,6 +357,14 @@ export const buildIcnBinary = async ({
     ...installedRuntimeLibraries,
     ...supplementalRuntimeLibraries,
   ]
+  if (getTargetInfo(target).platform === "windows") {
+    const redist = process.env.VCToolsRedistDir
+    if (!redist) throw new Error("Windows engine builds require the Visual Studio compiler environment (VCToolsRedistDir)")
+    runtimeLibraries.push(...await Effect.runPromise(collectWindowsRuntime({
+      files: [binary, ...backendModules, ...runtimeLibraries],
+      redistributable: resolve(redist, "x64", "Microsoft.VC143.CRT"),
+    })))
+  }
   const identity = await readIdentity(
     binary,
     [...new Set(runtimeLibraries.map(dirname))],

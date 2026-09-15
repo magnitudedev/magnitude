@@ -111,6 +111,8 @@ Each repository in the Magnitude-owned store may contain any number of complete 
 Each snapshot directory names its immutable revision and contains links to installed
 content-addressed blobs. Publishing a package is additive: it adds that package's exact components
 to its revision snapshot and does not infer that other components or revisions are obsolete.
+Snapshot links must identify the same underlying file as the verified blob: Unix symbolic links
+and Windows hard links satisfy this requirement. Equal paths or equal byte sizes alone do not.
 
 ICN derives managed inventory by bounded, containment-safe enumeration of every complete snapshot.
 The observation path never creates, repairs, or removes artifact links. Component paths, sizes, content
@@ -222,6 +224,10 @@ A partial component may carry a narrowly scoped integrity checkpoint containing 
 content identity and size, committed offset, and serializable digest state. The retry command
 supplies acquisition intent. Missing or invalid checkpoint evidence discards the reusable prefix;
 it never hides completed files or fails startup. Checkpoints have no format-version gate.
+The component prefix is flushed before its checkpoint is atomically replaced. Unix also flushes
+the containing directory; Windows uses file flushing and atomic rename without attempting Unix
+directory fsync. Lost checkpoint or snapshot entries after interruption cause verified recovery or
+reacquisition, never acceptance of incomplete bytes.
 
 ## Product projection
 

@@ -9,16 +9,23 @@ const artifacts = ["darwin-arm64", "darwin-x64", "linux-arm64-gnu", "linux-x64-g
     id: format === "zip" ? `desktop-update-${host}` : format === "dmg" ? `desktop-${host}` : `desktop-${host}-${format}`,
     kind: "desktop", host, filename: `magnitude-${host}.${format}`, bytes: 123, sha256: "b".repeat(64),
   })))
+artifacts.push(Schema.decodeUnknownSync(ReleaseArtifactSchema)({
+  id: "desktop-windows-x64-msvc", kind: "desktop", host: "windows-x64-msvc",
+  filename: "magnitude-desktop-windows-x64-2.0.0.exe", bytes: 123, sha256: "b".repeat(64),
+}))
 const release = { version: "2.0.0", sourceCommit: commit, artifacts }
 describe("production desktop publication admission", () => {
-  it("preserves exact accepted byte identities across both Mac transports and both Linux formats", async () => {
+  it("preserves exact accepted byte identities across Mac, Linux, and Windows transports", async () => {
     const result = await Effect.runPromise(hostedDesktopManifests(release, commit))
-    expect(result).toHaveLength(8)
-    expect(new Set(result.map(m => `${m.artifact.target.os}/${m.artifact.target.arch}/${m.artifact.target.package}`)).size).toBe(8)
+    expect(result).toHaveLength(9)
+    expect(new Set(result.map(m => `${m.artifact.target.os}/${m.artifact.target.arch}/${m.artifact.target.package}`)).size).toBe(9)
+    expect(result.at(-1)!.artifact.target).toEqual({ os: "windows", arch: "x64", package: "windows-exe" })
     result.forEach((manifest, index) => expect(manifest.artifact).toMatchObject({ id: artifacts[index]!.id, bytes: 123, sha256: "b".repeat(64), filename: artifacts[index]!.filename }))
   })
   it.each([
     ["missing transport", artifacts.slice(1)],
+    ["missing Windows installer", artifacts.slice(0, -1)],
+    ["wrong Windows format", [...artifacts.slice(0, -1), { ...artifacts.at(-1)!, filename: "magnitude.windows-exe" }]],
     ["duplicate identity", [...artifacts.slice(1), artifacts[1]!]],
     ["mismatched host", [{ ...artifacts[0]!, host: artifacts[2]!.host }, ...artifacts.slice(1)]],
     ["wrong format", [{ ...artifacts[0]!, filename: "magnitude.zip" }, ...artifacts.slice(1)]],

@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url"
 import { DesktopBuildFailed } from "./desktop"
 import { ReleaseArtifactSchema } from "../../src/contracts"
 import { sha256File } from "../../src/macos-app"
+import { windowsDesktopInstaller } from "../../src/targets"
+import { signWindowsCode, windowsSigning, windowsSigningScript } from "./windows-signing"
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..")
 const validPayloadPath = (path: string) => path.split("/").every(segment =>
@@ -83,7 +85,7 @@ export const renderWindowsInstaller = (template: string, input: typeof WindowsIn
   return `${prefix}\n${metadata}\n${template.replace(/@(?:PAYLOAD_FILES|REMOVE_FILES|REMOVE_DIRECTORIES)@/g, token => replacements[token]!)}`
 })
 
-/** Package a matched application with an explicitly built x86 NSIS helper. No publication or signing claim. */
+/** Package a matched application with an explicitly built x86 NSIS helper. */
 export const buildWindowsDesktopInstaller = (options: {
   readonly app: string; readonly guard: string; readonly makensis: string
   readonly version: string; readonly revision: number; readonly output: string
@@ -105,7 +107,7 @@ export const buildWindowsDesktopInstaller = (options: {
     }
   })
   yield* inspect("")
-  for (const required of ["Magnitude.exe", "resources/app.asar", "resources/magnitude-service.exe", "resources/desktop-host.node", "resources/Magnitude-LICENSE.txt"]) {
+  for (const required of ["Magnitude.exe", "resources/app.asar", "resources/magnitude.exe", "resources/magnitude-service.exe", "resources/desktop-host.node", "resources/Magnitude-LICENSE.txt"]) {
     if (!files.includes(required)) return yield* new DesktopBuildFailed({ message: `Windows application is missing ${required}` })
   }
   const guard = yield* fs.readFile(resolve(options.guard))
@@ -116,6 +118,9 @@ export const buildWindowsDesktopInstaller = (options: {
       !(new DataView(guard.buffer, guard.byteOffset, guard.byteLength).getUint16(pe + 22, true) & 0x2000)) {
     return yield* new DesktopBuildFailed({ message: "NSIS installer helper must be an x86 PE DLL" })
   }
+  for (const file of ["Magnitude.exe", "resources/magnitude-service.exe", "resources/magnitude.exe", "resources/desktop-host.node"]) {
+    yield* signWindowsCode(join(source, file))
+  }
   const app = join(stage, "payload")
   files.sort()
   for (const [index, file] of files.entries()) {
@@ -125,6 +130,7 @@ export const buildWindowsDesktopInstaller = (options: {
   }
   const helper = join(stage, "MagnitudeInstallGuard.dll")
   yield* fs.writeFile(helper, guard)
+  yield* signWindowsCode(helper)
   const candidate = join(stage, "Magnitude-setup.exe")
   const template = yield* fs.readFileString(join(root, "packages/release/resources/windows/desktop.nsi"))
   yield* fs.copyFile(join(root, "packages/release/resources/windows/Magnitude.ico"), join(stage, "Magnitude.ico"))
@@ -132,12 +138,17 @@ export const buildWindowsDesktopInstaller = (options: {
   const inventory = yield* renderWindowsInstallationInventory({ version: options.version, revision: options.revision, files: files as [string, ...string[]] })
   yield* fs.writeFile(join(stage, "installation-files.txt"), Buffer.from(`\uFEFF${inventory}`, "utf16le"))
   const scriptPath = join(stage, "desktop.nsi")
-  yield* fs.writeFileString(scriptPath, script)
+  const signed = (yield* windowsSigning) === "artifact-signing"
+  if (signed) yield* fs.copyFile(windowsSigningScript, join(stage, "sign.ps1"))
+  yield* fs.writeFileString(scriptPath, script + (signed
+    ? '\n!uninstfinalize \'powershell.exe -NoProfile -ExecutionPolicy Bypass -File sign.ps1 -Path "%1"\' = 0\n'
+    : ""))
   const code = yield* Command.make(options.makensis, scriptPath).pipe(Command.workingDirectory(stage), Command.stdout("inherit"), Command.stderr("inherit"), Command.exitCode)
   if (code !== 0) return yield* new DesktopBuildFailed({ message: `Windows installer compilation exited ${code}` })
   if ((yield* fs.stat(candidate)).size === 0n) return yield* new DesktopBuildFailed({ message: "Windows installer compilation produced an empty artifact" })
+  yield* signWindowsCode(candidate)
   yield* fs.makeDirectory(options.output, { recursive: true })
-  const output = resolve(options.output, `magnitude-desktop-windows-x64-${options.version}.exe`)
+  const output = resolve(options.output, windowsDesktopInstaller(options.version))
   yield* fs.copyFile(candidate, output)
   const artifact = yield* Schema.decodeUnknown(ReleaseArtifactSchema)({
     id: "desktop-windows-x64-msvc", kind: "desktop", host: "windows-x64-msvc",
