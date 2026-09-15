@@ -1,0 +1,130 @@
+{
+  "publicKey": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAO2onvM62pC1io6jQKm8Nc2UyFXcd4kOmOsBIoYtZ2ik=\n-----END PUBLIC KEY-----\n",
+  "publications": [
+    {
+      "manifest": {
+        "protocol": 1,
+        "version": "2.0.0",
+        "tag": "@magnitudedev/cli@2.0.0",
+        "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "artifact": {
+          "id": "artifact-0",
+          "target": {
+            "os": "darwin",
+            "arch": "arm64",
+            "package": "mac-zip"
+          },
+          "filename": "artifact-0.mac-zip",
+          "bytes": 123456,
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      },
+      "release": {
+        "version": "2.0.0",
+        "bytes": 123456,
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "signature": "jv/IRF5shWzi29g5uiZWJAnMauXam/+jOfbTLrDcXAqlW4iRKqxG9UvIlwwpOGCvFfRwKW0f8wsYkzw+Rck4Ag=="
+      }
+    },
+    {
+      "manifest": {
+        "protocol": 1,
+        "version": "2.0.0",
+        "tag": "@magnitudedev/cli@2.0.0",
+        "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "artifact": {
+          "id": "artifact-1",
+          "target": {
+            "os": "darwin",
+            "arch": "x64",
+            "package": "dmg"
+          },
+          "filename": "artifact-1.dmg",
+          "bytes": 123456,
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      },
+      "release": {
+        "version": "2.0.0",
+        "bytes": 123456,
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "signature": "d7u2p9nIJVsfhTmHNVhVZi0F7XmffREF2+brxXQtQKSjOgw+ENvZCszEeLQG5p1RAF+gk8TiRv2Sj8jUhlSKAw=="
+      }
+    },
+    {
+      "manifest": {
+        "protocol": 1,
+        "version": "2.0.0",
+        "tag": "@magnitudedev/cli@2.0.0",
+        "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "artifact": {
+          "id": "artifact-2",
+          "target": {
+            "os": "windows",
+            "arch": "x64",
+            "package": "windows-exe"
+          },
+          "filename": "artifact-2.windows-exe",
+          "bytes": 123456,
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      },
+      "release": {
+        "version": "2.0.0",
+        "bytes": 123456,
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "signature": "2WU3utEsI4vVh83TnXg9YyDs9eUUn30GHBKwFLvocDp/YO0W7IwQrRFYZfPdLFZ3xLlr21AnSdNufINh9WWTBQ=="
+      }
+    },
+    {
+      "manifest": {
+        "protocol": 1,
+        "version": "2.0.0",
+        "tag": "@magnitudedev/cli@2.0.0",
+        "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "artifact": {
+          "id": "artifact-3",
+          "target": {
+            "os": "linux",
+            "arch": "x64",
+            "package": "deb"
+          },
+          "filename": "artifact-3.deb",
+          "bytes": 123456,
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      },
+      "release": {
+        "version": "2.0.0",
+        "bytes": 123456,
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "signature": "o2MaLgeS5YmyGa2zGr3QrwHtY3XzWhpEe0/6jiFQrkx6rBTA84jGBsuzlJz+F8DWgDHzfggaGf16EjxNl5PyCw=="
+      }
+    },
+    {
+      "manifest": {
+        "protocol": 1,
+        "version": "2.0.0",
+        "tag": "@magnitudedev/cli@2.0.0",
+        "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "artifact": {
+          "id": "artifact-4",
+          "target": {
+            "os": "linux",
+            "arch": "arm64",
+            "package": "rpm"
+          },
+          "filename": "artifact-4.rpm",
+          "bytes": 123456,
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      },
+      "release": {
+        "version": "2.0.0",
+        "bytes": 123456,
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "signature": "LefRiJcwibSVFDc/3rgm/Enf7uXEa15/Md5eItfeexQkOQ6SBfCHZ43BYw5rE0TQRILE7SY8utbbYtQDsnQ0Bw=="
+      }
+    }
+  ]
+}

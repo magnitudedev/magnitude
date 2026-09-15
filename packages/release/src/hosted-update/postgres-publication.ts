@@ -3,8 +3,9 @@ import type { KeyObject } from "node:crypto"
 import type { Pool } from "pg"
 import { isNewerVersion, releaseChannelOf } from "../client-update/release-channels"
 import { PublishedUpdate, verifyUpdateManifest } from "./manifest"
-import { DistributionNamespace } from "./postgres-store"
 import { ReleasePublicationBatch, ReleasePublicationFailed, ReleasePublicationStore } from "./publication"
+
+const DistributionNamespace = Schema.Literal("magnitude_distribution", "magnitude_distribution_acceptance")
 
 /** The publisher has separate credentials; request runtimes cannot mutate releases or channels. */
 export const postgresReleasePublicationStore = (pool: Pool, namespace: typeof DistributionNamespace.Type,
