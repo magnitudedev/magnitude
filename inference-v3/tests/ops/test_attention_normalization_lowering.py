@@ -317,7 +317,7 @@ def test_decode_attention_without_qualified_register_geometry_is_uncovered():
         ),
         (
             "prefill", 35, 256, 256,
-            np.asarray([[7, 130 + index] for index in range(35)], dtype=np.int32),
+            np.asarray([[7, 215 + index] for index in range(35)], dtype=np.int32),
             "causal_attention.matrix-streaming@0", 6, 2, ops.DType.F32,
         ),
     ),
@@ -331,7 +331,8 @@ def test_optimized_attention_schedules_match_reference_on_metal(
     dtype = np.float32 if floating == ops.DType.F32 else np.float16
     query = rng.normal(0, 0.7, (rows, heads, width)).astype(dtype)
     # Distinct queries and KV groups exercise paired and odd head cohorts.
-    # FP32 cases include empty partitions, a base offset and a query-tile tail;
+    # FP32 cases include empty partitions, a base offset, an interval ending
+    # exactly at physical capacity, and a query-tile tail;
     # their strict tolerance rejects rounding probabilities to a 16-bit dtype.
     history = rng.normal(0, 0.7, (2, capacity, kv_heads, width)).astype(dtype)
     specs = (

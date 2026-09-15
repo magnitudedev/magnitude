@@ -259,29 +259,24 @@ def _grouped_gated_projection(
         expert = block_metadata[by, 0] if routed else 0
         valid_m = block_metadata[by, 1] if routed else (bm if rows % bm == 0 else T.min(bm, rows - by * bm))
         if expert >= 0:
-            _expert_gated_tile(
-                source,
-                order,
-                gate,
-                up,
-                output,
-                gate_spec,
-                up_spec,
-                expert,
-                valid_m,
-                by,
-                bx,
-                source_width,
-                output_width,
-                selected,
-                routed,
-                source_grouped,
-                bm,
-                bn,
-                bk,
-                threads,
-                storage,
-            )
+            # _group_routes publishes only bounded expert IDs and nonempty tiles.
+            # Retain the -1 sentinel branch for unused provisioned blocks.
+            T.assume(expert < gate_spec.shape[0] if routed else expert == 0)
+            T.assume(valid_m > 0)
+            T.assume(valid_m <= bm)
+            # Keep the common full-tile contraction constant through lowering.
+            if valid_m == bm:
+                _expert_gated_tile(
+                    source, order, gate, up, output, gate_spec, up_spec,
+                    expert, bm, by, bx, source_width, output_width, selected,
+                    routed, source_grouped, bm, bn, bk, threads, storage,
+                )
+            else:
+                _expert_gated_tile(
+                    source, order, gate, up, output, gate_spec, up_spec,
+                    expert, valid_m, by, bx, source_width, output_width, selected,
+                    routed, source_grouped, bm, bn, bk, threads, storage,
+                )
 
 
 @T.macro
@@ -311,27 +306,24 @@ def _grouped_projection(
         expert = block_metadata[by, 0] if routed else 0
         valid_m = block_metadata[by, 1] if routed else (bm if rows % bm == 0 else T.min(bm, rows - by * bm))
         if expert >= 0:
-            _expert_down_tile(
-                source,
-                order,
-                weight,
-                output,
-                weight_spec,
-                expert,
-                valid_m,
-                by,
-                bx,
-                source_width,
-                output_width,
-                selected,
-                routed,
-                source_grouped,
-                bm,
-                bn,
-                bk,
-                threads,
-                storage,
-            )
+            # _group_routes publishes only bounded expert IDs and nonempty tiles.
+            # Retain the -1 sentinel branch for unused provisioned blocks.
+            T.assume(expert < weight_spec.shape[0] if routed else expert == 0)
+            T.assume(valid_m > 0)
+            T.assume(valid_m <= bm)
+            # Keep the common full-tile contraction constant through lowering.
+            if valid_m == bm:
+                _expert_down_tile(
+                    source, order, weight, output, weight_spec, expert, bm,
+                    by, bx, source_width, output_width, selected, routed,
+                    source_grouped, bm, bn, bk, threads, storage,
+                )
+            else:
+                _expert_down_tile(
+                    source, order, weight, output, weight_spec, expert, valid_m,
+                    by, bx, source_width, output_width, selected, routed,
+                    source_grouped, bm, bn, bk, threads, storage,
+                )
 
 
 @T.macro

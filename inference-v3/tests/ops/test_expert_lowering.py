@@ -369,10 +369,11 @@ def test_matrix_prefill_swiglu_matches_reference_on_metal():
 
 
 @pytest.mark.device
-def test_grouped_prefill_consumes_quantized_experts_without_materialization():
+@pytest.mark.parametrize("rows", [8, 33])
+def test_grouped_prefill_consumes_quantized_experts_without_materialization(rows):
     if not torch.backends.mps.is_available():
         pytest.skip("Metal encoded expert qualification requires MPS")
-    experts, intermediate, width, rows, selected = 8, 256, 256, 8, 2
+    experts, intermediate, width, selected = 8, 256, 256, 2
     encoding = Encoding.Q8_0
     packed = (
         _packed(encoding, experts * intermediate, width),
@@ -384,7 +385,7 @@ def test_grouped_prefill_consumes_quantized_experts_without_materialization():
     # Leave most of the statically provisioned expert blocks inactive. This
     # covers the production capacity path where unused blocks must perform no
     # packed matrix reduction work and must not affect the result.
-    routes = np.asarray([[0, 1] for _ in range(rows)], dtype=np.int32)
+    routes = np.asarray([[0, experts - 1] for _ in range(rows)], dtype=np.int32)
     scores = np.full((rows, selected), 0.5, dtype=np.float32)
     decoded = (
         gguf.dequantize(
