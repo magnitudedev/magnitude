@@ -118,7 +118,7 @@ class PersistentAttentionRule:
             # registers. Decode retains code words and a shared probability
             # bridge. Price the phase's actual storage, not a discarded body.
             shared_bytes = (schedule.shared_bytes + 4 if matrix else
-                            (max_words + schedule.heads) * key_tile * 4)
+                            (max_words + schedule.rows) * key_tile * 4)
             if isinstance(history.representation.key, RotatedLloydMax):
                 shared_bytes += 16 * 4
             if shared_bytes > context.compiler_target.shared_memory_bytes:
@@ -169,7 +169,7 @@ def _persistent_decode(query, history, visible, current_keys, current_values, su
     """
     group = heads // kv_heads
     encoded = from_history and isinstance(history_spec.representation.key, (AffineKVCodec, RotatedLloydMax))
-    head_tile, key_tile = schedule.heads, schedule.keys
+    head_tile, matrix_rows, key_tile = schedule.heads, schedule.rows, schedule.keys
     columns, padding = schedule.columns, schedule.padding
     log2e = 1.4426950408889634
     with T.Kernel(heads // head_tile, tokens, schedule.partitions,
@@ -177,28 +177,28 @@ def _persistent_decode(query, history, visible, current_keys, current_values, su
         table = prepare_codebook(history_spec, from_history)
         first_head = cohort * head_tile
         kv_head = first_head // group
-        outputs = _attention_accumulators(head_tile, width, columns)
-        scores = T.alloc_fragment((head_tile, key_tile), "float32")
+        outputs = _attention_accumulators(matrix_rows, width, columns)
+        scores = T.alloc_fragment((matrix_rows, key_tile), "float32")
         affine_values = from_history and isinstance(history_spec.representation.value, AffineKVCodec)
-        bias = T.alloc_fragment((head_tile,), "float32") if affine_values else None
-        local_bias = T.alloc_fragment((head_tile,), "float32") if affine_values else None
+        bias = T.alloc_fragment((matrix_rows,), "float32") if affine_values else None
+        local_bias = T.alloc_fragment((matrix_rows,), "float32") if affine_values else None
         if affine_values:
             T.clear(bias)
         # QK distributes history columns across subgroups. PV distributes
         # output channels, so every subgroup needs the probability tile.
         # Make that exchange explicit instead of copying incompatible fragments.
-        probabilities = T.alloc_shared((head_tile, key_tile), "float32")
+        probabilities = T.alloc_shared((matrix_rows, key_tile), "float32")
         if encoded:
             packed = allocate_compact(history_spec, key_tile)
         else:
             staging = T.alloc_shared(((width + padding) * (key_tile + padding),), query.dtype)
             keys = T.view(staging, shape=(1, key_tile + padding, width + padding), dtype=query.dtype)
             values = T.view(staging, shape=(1, key_tile + padding, width + padding), dtype=query.dtype)
-        maximum = T.alloc_fragment((head_tile,), "float32")
-        previous = T.alloc_fragment((head_tile,), "float32")
-        denominator = T.alloc_fragment((head_tile,), "float32")
-        local_sum = T.alloc_fragment((head_tile,), "float32")
-        alpha = T.alloc_fragment((head_tile,), "float32")
+        maximum = T.alloc_fragment((matrix_rows,), "float32")
+        previous = T.alloc_fragment((matrix_rows,), "float32")
+        denominator = T.alloc_fragment((matrix_rows,), "float32")
+        local_sum = T.alloc_fragment((matrix_rows,), "float32")
+        alpha = T.alloc_fragment((matrix_rows,), "float32")
         base = T.cast(visible[token, 0 if from_history else 2], "int32")
         count = T.cast(visible[token, 1 if from_history else 3], "int32")
         # Engine visibility is a valid interval inside this physical history.
@@ -215,7 +215,7 @@ def _persistent_decode(query, history, visible, current_keys, current_values, su
             full = chunk_first + key_tile <= count
             if encoded:
                 stage_compact(history, packed, history_spec, "key", kv_head, base, chunk_first, count, key_tile)
-                compact_decode_scores(query, packed, table, scores, token, first_head, head_tile,
+                compact_decode_scores(query, packed, table, scores, token, first_head, head_tile, matrix_rows,
                                        width, key_tile, schedule.contraction, history_spec.representation.key.bits,
                                        isinstance(history_spec.representation.key, RotatedLloydMax))
             elif from_history:
@@ -223,26 +223,26 @@ def _persistent_decode(query, history, visible, current_keys, current_values, su
             else:
                 stage_current(current_keys, keys, kv_head, base, chunk_first, count, key_tile, width, False)
             if not encoded:
-                _decode_scores(query, keys, scores, token, first_head, head_tile,
+                _decode_scores(query, keys, scores, token, first_head, head_tile, matrix_rows,
                                width, key_tile, schedule.contraction, True)
             if from_history:
                 correct_key_scores(scores, sums, history, history_spec, base, chunk_first, count,
                                     kv_head, head_tile, key_tile, 1, token, first_head, tokens)
-            for head, item in T.Parallel(head_tile, key_tile):
-                scores[head, item] = T.if_then_else(chunk_first + item < count,
+            for head, item in T.Parallel(matrix_rows, key_tile):
+                scores[head, item] = T.if_then_else(head < head_tile and chunk_first + item < count,
                                                    scores[head, item] * scale * log2e,
                                                    -3.402823466e38)
             T.copy(maximum, previous)
             T.reduce_max(scores, maximum, dim=1, clear=False)
-            for head in T.Parallel(head_tile):
+            for head in T.Parallel(matrix_rows):
                 alpha[head] = T.exp2(previous[head] - maximum[head])
-            for head, item in T.Parallel(head_tile, key_tile):
-                scores[head, item] = T.if_then_else(chunk_first + item < count,
+            for head, item in T.Parallel(matrix_rows, key_tile):
+                scores[head, item] = T.if_then_else(head < head_tile and chunk_first + item < count,
                                                    T.exp2(scores[head, item] - maximum[head]), 0)
             T.reduce_sum(scores, local_sum, dim=1)
-            for head in T.Parallel(head_tile):
+            for head in T.Parallel(matrix_rows):
                 denominator[head] = denominator[head] * alpha[head] + local_sum[head]
-            _attention_rescale(outputs, alpha, head_tile, columns)
+            _attention_rescale(outputs, alpha, matrix_rows, columns)
             if encoded:
                 stage_compact(history, packed, history_spec, "value", kv_head, base, chunk_first, count, key_tile)
             elif from_history:
@@ -251,15 +251,15 @@ def _persistent_decode(query, history, visible, current_keys, current_values, su
                 stage_current(current_values, values, kv_head, base, chunk_first, count, key_tile, width, False)
             if affine_values:
                 value_coefficients(scores, probabilities, history, history_spec, base, chunk_first,
-                                     count, kv_head, head_tile, key_tile)
-                update_bias(scores, bias, local_bias, alpha, head_tile)
+                                     count, kv_head, matrix_rows, key_tile)
+                update_bias(scores, bias, local_bias, alpha, matrix_rows)
             else:
                 T.copy(scores, probabilities)
             if encoded:
-                compact_values(probabilities, packed, outputs, head_tile, key_tile, columns,
+                compact_values(probabilities, packed, outputs, matrix_rows, key_tile, columns,
                                 schedule.reduction_step, history_spec.representation.value.bits)
             else:
-                _attention_values(probabilities, values, outputs, head_tile, width, key_tile,
+                _attention_values(probabilities, values, outputs, matrix_rows, width, key_tile,
                                    columns, schedule.reduction_step)
         if affine_values:
             finish_bias(outputs, bias, head_tile, columns)

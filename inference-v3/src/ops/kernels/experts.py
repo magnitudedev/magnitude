@@ -134,7 +134,7 @@ def _gated_packet_matrix(
     )
     with T.Kernel(T.ceildiv(intermediate, bn), T.ceildiv(rows, bm), threads=threads) as (bx, by):
         storage = affine_storage(bm, 2 * bn, bk, hidden.dtype, reduction_step, (gate_spec, up_spec))
-        x, paired_tile, coefficients, paired_accum, a, b = storage
+        x, paired_tile, coefficients, paired_accum, b = storage
         gate_activation = T.alloc_fragment((bm, bn), "float32")
         T.clear(paired_accum)
         for block in T.serial(T.ceildiv(width, bk)):
@@ -446,7 +446,7 @@ class DenseSwiGLURule:
         else:
             vector = None
             gate_vector = None
-            reduction_step = 8
+            reduction_step = 16
             if rows >= 256 and min(intermediate, width) >= 512:
                 bm, bn, bk = 32, 32, 32
             else:

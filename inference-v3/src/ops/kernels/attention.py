@@ -36,6 +36,7 @@ class _MatrixAttentionSchedule:
 @dataclass(frozen=True, slots=True)
 class _DecodeAttentionSchedule:
     heads: int
+    rows: int
     keys: int
     contraction: int
     columns: int
@@ -57,6 +58,7 @@ def _decode_attention_schedule(query, history, context):
     rows, heads, width = query.shape
     group = heads // history.shape[2]
     head_tile = 8
+    matrix_rows = 16
     keys = 32
     contraction = 32
     columns = 64
@@ -64,7 +66,7 @@ def _decode_attention_schedule(query, history, context):
     padding = 8
     def staging_bytes():
         return ((width + padding) * (keys + padding) * history.dtype.itemsize
-                + head_tile * keys * DType.F32.itemsize)
+                + matrix_rows * keys * DType.F32.itemsize)
 
     while staging_bytes() > context.compiler_target.shared_memory_bytes and keys > 8:
         keys //= 2
@@ -79,7 +81,7 @@ def _decode_attention_schedule(query, history, context):
     # complete grid remains independent of changing visible token counts.
     span = keys * 16
     partitions = math.ceil(history.shape[1] / span)
-    return _DecodeAttentionSchedule(head_tile, keys, contraction, columns,
+    return _DecodeAttentionSchedule(head_tile, matrix_rows, keys, contraction, columns,
                                     8, threads, padding, partitions, span)
 
 
@@ -104,7 +106,8 @@ def _matrix_attention_schedule(
     threads = context.compiler_target.subgroup_width * 4 * head_tile
     padding = 8
     def staging_bytes() -> int:
-        return (width + padding) * (key_tile + padding) * query.dtype.itemsize
+        probability = query_tile * head_tile * 8 * DType.F32.itemsize
+        return (width + padding) * (key_tile + padding) * query.dtype.itemsize + probability
 
     while staging_bytes() > context.compiler_target.shared_memory_bytes and key_tile > 8:
         key_tile //= 2
@@ -172,12 +175,17 @@ def _attention_value_columns(probability, values, outputs, first_key, width, col
 
 @T.macro
 def _attention_values(scores, values, outputs, rows, width, keys, columns, reduction_step):
-    probability = T.alloc_fragment((rows, reduction_step), "float32")
+    # QK accumulator ownership and PV A-operand ownership are not generally
+    # compatible. Publish each narrow probability strip so TileLang can infer
+    # both matrix layouts independently on every backend.
+    probability = T.alloc_shared((rows, reduction_step), "float32")
     for step in T.serial(keys // reduction_step):
         for row, item in T.Parallel(rows, reduction_step):
             probability[row, item] = scores[row, step * reduction_step + item]
+        T.sync_threads()
         _attention_value_columns(probability, values, outputs, step * reduction_step,
                                   width, columns, reduction_step)
+        T.sync_threads()
 
 
 @T.macro
@@ -387,16 +395,19 @@ def _matrix_streaming_attention(
 
 
 @T.macro
-def _decode_scores(query, keys, scores, token, first_head, heads, width,
+def _decode_scores(query, keys, scores, token, first_head, heads, rows, width,
                    key_tile, contraction, key_major=False):
     """Immediate FP32 operands avoid narrowing Q/K or dynamic fragment indices."""
-    q = T.alloc_fragment((heads, contraction), "float32")
+    q = T.alloc_fragment((rows, contraction), "float32")
     k = T.alloc_fragment((contraction, key_tile), "float32")
     T.clear(scores)
     for block in T.serial(width // contraction):
-        for head, channel in T.Parallel(heads, contraction):
-            q[head, channel] = T.cast(query[token, first_head + head,
-                                            block * contraction + channel], "float32")
+        for head, channel in T.Parallel(rows, contraction):
+            q[head, channel] = T.if_then_else(
+                head < heads,
+                T.cast(query[token, first_head + head, block * contraction + channel], "float32"),
+                0,
+            )
         for channel, item in T.Parallel(contraction, key_tile):
             if key_major:
                 k[channel, item] = T.cast(keys[0, item, block * contraction + channel], "float32")
@@ -414,27 +425,27 @@ def _tiled_decode_attention(query, history, visible, partials, statistics,
     contraction with FP32 operands; only the original K/V staging is compact.
     """
     group = heads // kv_heads
-    head_tile, key_tile = schedule.heads, schedule.keys
+    head_tile, matrix_rows, key_tile = schedule.heads, schedule.rows, schedule.keys
     columns, padding = schedule.columns, schedule.padding
     log2e = 1.4426950408889634
     with T.Kernel(heads // head_tile, tokens, schedule.partitions,
                   threads=schedule.threads) as (cohort, token, partition):
         first_head = cohort * head_tile
         kv_head = first_head // group
-        outputs = _attention_accumulators(head_tile, width, columns)
-        scores = T.alloc_fragment((head_tile, key_tile), "float32")
+        outputs = _attention_accumulators(matrix_rows, width, columns)
+        scores = T.alloc_fragment((matrix_rows, key_tile), "float32")
         # QK distributes history columns across subgroups. PV distributes
         # output channels, so every subgroup needs the probability tile.
         # Make that exchange explicit instead of copying incompatible fragments.
-        probabilities = T.alloc_shared((head_tile, key_tile), "float32")
+        probabilities = T.alloc_shared((matrix_rows, key_tile), "float32")
         staging = T.alloc_shared(((width + padding) * (key_tile + padding),), history.dtype)
         keys = T.view(staging, shape=(1, width + padding, key_tile + padding), dtype=history.dtype)
         values = T.view(staging, shape=(1, key_tile + padding, width + padding), dtype=history.dtype)
-        maximum = T.alloc_fragment((head_tile,), "float32")
-        previous = T.alloc_fragment((head_tile,), "float32")
-        denominator = T.alloc_fragment((head_tile,), "float32")
-        local_sum = T.alloc_fragment((head_tile,), "float32")
-        alpha = T.alloc_fragment((head_tile,), "float32")
+        maximum = T.alloc_fragment((matrix_rows,), "float32")
+        previous = T.alloc_fragment((matrix_rows,), "float32")
+        denominator = T.alloc_fragment((matrix_rows,), "float32")
+        local_sum = T.alloc_fragment((matrix_rows,), "float32")
+        alpha = T.alloc_fragment((matrix_rows,), "float32")
         base = T.cast(visible[token, 0], "int32")
         count = T.cast(visible[token, 1], "int32")
         # Engine visibility is a valid interval inside this physical history.
@@ -457,23 +468,23 @@ def _tiled_decode_attention(query, history, visible, partials, statistics,
                     keys[0, channel, item] = T.if_then_else(
                         chunk_first + item < count,
                         history[0, base + chunk_first + item, kv_head, channel], 0)
-            _decode_scores(query, keys, scores, token, first_head, head_tile,
+            _decode_scores(query, keys, scores, token, first_head, head_tile, matrix_rows,
                            width, key_tile, schedule.contraction)
-            for head, item in T.Parallel(head_tile, key_tile):
-                scores[head, item] = T.if_then_else(chunk_first + item < count,
+            for head, item in T.Parallel(matrix_rows, key_tile):
+                scores[head, item] = T.if_then_else(head < head_tile and chunk_first + item < count,
                                                    scores[head, item] * scale * log2e,
                                                    -3.402823466e38)
             T.copy(maximum, previous)
             T.reduce_max(scores, maximum, dim=1, clear=False)
-            for head in T.Parallel(head_tile):
+            for head in T.Parallel(matrix_rows):
                 alpha[head] = T.exp2(previous[head] - maximum[head])
-            for head, item in T.Parallel(head_tile, key_tile):
-                scores[head, item] = T.if_then_else(chunk_first + item < count,
+            for head, item in T.Parallel(matrix_rows, key_tile):
+                scores[head, item] = T.if_then_else(head < head_tile and chunk_first + item < count,
                                                    T.exp2(scores[head, item] - maximum[head]), 0)
             T.reduce_sum(scores, local_sum, dim=1)
-            for head in T.Parallel(head_tile):
+            for head in T.Parallel(matrix_rows):
                 denominator[head] = denominator[head] * alpha[head] + local_sum[head]
-            _attention_rescale(outputs, alpha, head_tile, columns)
+            _attention_rescale(outputs, alpha, matrix_rows, columns)
             if full:
                 for item, channel in T.Parallel(key_tile, width):
                     values[0, item, channel] = history[1, base + chunk_first + item, kv_head, channel]
@@ -483,7 +494,7 @@ def _tiled_decode_attention(query, history, visible, partials, statistics,
                         chunk_first + item < count,
                         history[1, base + chunk_first + item, kv_head, channel], 0)
             T.copy(scores, probabilities)
-            _attention_values(probabilities, values, outputs, head_tile, width, key_tile,
+            _attention_values(probabilities, values, outputs, matrix_rows, width, key_tile,
                               columns, schedule.reduction_step)
         for head in T.Parallel(head_tile):
             statistics[partition, token, first_head + head, 0] = T.if_then_else(

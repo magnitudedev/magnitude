@@ -49,14 +49,20 @@ def _reduce_summary(scores, indices, invalid, lane, threads):
     T.sync_threads()
     for step in T.unroll(int(math.log2(threads))):
         distance = threads >> (step + 1)
-        if lane < distance:
-            if scores[lane + distance] > scores[lane] or (
-                scores[lane + distance] == scores[lane]
-                and indices[lane + distance] < indices[lane]
-            ):
-                scores[lane] = scores[lane + distance]
-                indices[lane] = indices[lane + distance]
-            invalid[lane] |= invalid[lane + distance]
+        # Every thread participates in every reduction step. Inactive lanes
+        # select themselves, avoiding a conditional region around shared-memory
+        # dependencies and keeping the inter-step barrier meaningful on every
+        # backend.
+        partner = T.if_then_else(lane < distance, lane + distance, lane)
+        candidate_score = scores[partner]
+        candidate_index = indices[partner]
+        choose = lane < distance and (
+            candidate_score > scores[lane]
+            or (candidate_score == scores[lane] and candidate_index < indices[lane])
+        )
+        scores[lane] = T.if_then_else(choose, candidate_score, scores[lane])
+        indices[lane] = T.if_then_else(choose, candidate_index, indices[lane])
+        invalid[lane] |= invalid[partner]
         T.sync_threads()
 
 
