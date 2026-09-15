@@ -210,9 +210,10 @@ try {
   await eventually(() => window.evaluate(() => document.documentElement.dataset.theme === (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')), true);
   console.log('Packaged appearance: Light/Dark/System, native theme, persisted reload, distinct backgrounds, and loaded Inter/Martian Mono fonts pass');
   await window.getByRole('button', { name: 'Status', exact: true }).click();
-  await window.getByText('No downloads in progress.', { exact: true }).waitFor();
+  await window.getByRole('heading', { name: 'Ready when you are', exact: true }).waitFor();
+  await window.getByText('No model loaded', { exact: true }).waitFor();
   await window.getByText(/^Magnitude keeps running when you close the window\./).waitFor();
-  await window.getByRole('button', { name: 'Discover', exact: true }).click();
+  await window.getByRole('button', { name: 'Catalog', exact: true }).click();
   await eventually(() => window.locator('main').evaluate(element => element.scrollHeight > element.clientHeight + 100), true);
   await window.locator('main').evaluate(element => { element.scrollTop = 100; });
   assert.ok(await window.locator('main').evaluate(element => element.scrollTop > 0));
