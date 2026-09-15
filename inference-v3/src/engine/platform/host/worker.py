@@ -118,7 +118,13 @@ class Worker[Owner: Driven]:
                             with self._lock:
                                 self._queued -= 1
                             event.run(owner)
-                        completion = owner.advance()
+                        # The completion event is the sole authority that
+                        # retires an outstanding submission. A concurrent
+                        # control call can arrive after the native ticket has
+                        # become done but before its callback is dequeued; do
+                        # not let that call advance the owner to a second
+                        # submission while `waiting` still names the first.
+                        completion = None if waiting is not None else owner.advance()
                         if completion is not None and completion is not waiting:
                             if waiting is not None:
                                 raise RuntimeError("execution advanced before pending completion")

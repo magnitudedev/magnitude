@@ -175,6 +175,7 @@ def _chunk_delta_scan(
         operand = T.alloc_shared((chunk, width), "float32")
         rhs = T.alloc_shared((chunk, columns), "float32")
         contraction = T.alloc_fragment((chunk, columns), "float32")
+        update = T.alloc_fragment((columns, width), "float32")
         first = (0 if sequence_length is not None else
                  T.min(key.shape[0], T.max(0, offsets[sequence])))
         end = (sequence_length if sequence_length is not None else
@@ -224,7 +225,16 @@ def _chunk_delta_scan(
             # Expand bounded matrix coordinates, leaving algorithm loops serial.
             with T.attr(0, "pragma_auto_unroll_max_step", 4096):
                 with T.attr(0, "pragma_unroll_explicit", 1):
-                    T.gemm(rhs, operand, state, transpose_A=True, policy=T.GemmWarpPolicy.Square)
+                    T.gemm(
+                        rhs,
+                        operand,
+                        update,
+                        transpose_A=True,
+                        clear_accum=True,
+                        policy=T.GemmWarpPolicy.Square,
+                    )
+            for v, d in T.Parallel(columns, width):
+                state[v, d] += update[v, d]
         for v, d in T.Parallel(columns, width):
             if tile * columns + v < value_width:
                 following[sequence, head, tile * columns + v, d] = state[v, d]

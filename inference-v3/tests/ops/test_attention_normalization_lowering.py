@@ -100,16 +100,16 @@ def test_streaming_attention_workspace_is_bounded_by_partition_outputs(capacity,
         assert schedule.head_tile == 2
         assert schedule.value_tile == 64
         assert schedule.reduction_step == 8
-        assert schedule.shared_bytes == 21_120
+        assert schedule.shared_bytes == 23_168
 
 
 @pytest.mark.parametrize(
     "heads,threads,dtype,shared,expected",
     [
-        (8, 256, ops.DType.F16, 21_120, (2, 32, 21_120)),
-        (6, 256, ops.DType.F16, 32_768, (1, 32, 21_120)),
-        (8, 128, ops.DType.F16, 32_768, (1, 32, 21_120)),
-        (8, 256, ops.DType.F32, 32_768, (2, 16, 25_344)),
+        (8, 256, ops.DType.F16, 21_120, (2, 16, 14_720)),
+        (6, 256, ops.DType.F16, 32_768, (1, 32, 22_144)),
+        (8, 128, ops.DType.F16, 32_768, (1, 32, 22_144)),
+        (8, 256, ops.DType.F32, 32_768, (2, 16, 27_392)),
         (8, 256, ops.DType.F16, 8_191, None),
     ],
 )

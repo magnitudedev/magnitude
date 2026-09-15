@@ -143,29 +143,28 @@ def affine_storage(bm, bn, bk, dtype, reduction_step, specs):
     group = affine_group_width(bk, *specs)
     coefficients = T.alloc_shared((bn, bk // group, 2), "float32")
     accum = T.alloc_fragment((bm, bn), "float32")
-    a = T.alloc_fragment((bm, reduction_step), "float32")
-    b = T.alloc_fragment((bn, reduction_step), "float32")
-    return left, codes, coefficients, accum, a, b
+    b = T.alloc_fragment((bn, bk), dtype)
+    return left, codes, coefficients, accum, b
 
 
 @T.macro
 def affine_gemm(storage, bm, bn, bk, valid_m):
     """Reconstruct immediate operands; keep one FP32 accumulator across all K."""
-    left, codes, coefficients, accum, a, b = storage
-    instruction_k = a.shape[1]
+    left, codes, coefficients, accum, b = storage
     group = bk // coefficients.shape[1]
     T.sync_threads()
-    for instruction in T.serial(bk // instruction_k):
-        for i, k in T.Parallel(bm, instruction_k):
-            a[i, k] = T.cast(left[i, instruction * instruction_k + k], "float32")
-        for j, k in T.Parallel(bn, instruction_k):
-            column = instruction * instruction_k + k
-            b[j, k] = (T.cast(codes[j, column], "float32") * coefficients[j, column // group, 0]
-                       + coefficients[j, column // group, 1])
-        # Expand bounded matrix coordinates, leaving algorithm loops serial.
-        with T.attr(0, "pragma_auto_unroll_max_step", 4096):
-            with T.attr(0, "pragma_unroll_explicit", 1):
-                T.gemm(a, b, accum, transpose_B=True, valid_m=valid_m, policy=T.GemmWarpPolicy.Square)
+    for j, k in T.Parallel(bn, bk):
+        b[j, k] = T.cast(
+            T.cast(codes[j, k], "float32") * coefficients[j, k // group, 0]
+            + coefficients[j, k // group, 1],
+            left.dtype,
+        )
+    # Keep dequantization in the portable IR and let the target select its
+    # native matrix instruction for the complete reduction tile.
+    with T.attr(0, "pragma_auto_unroll_max_step", 4096):
+        with T.attr(0, "pragma_unroll_explicit", 1):
+            T.gemm(left, b, accum, transpose_B=True, valid_m=valid_m,
+                   policy=T.GemmWarpPolicy.Square)
     T.sync_threads()
 
 

@@ -71,13 +71,17 @@ def _key_operand(shared, operand, table, block, contraction, keys, bits, rotated
 
 @T.macro
 def compact_decode_scores(query, shared, table, scores, token, first_head,
-                           rows, width, keys, contraction, bits, rotated):
+                           heads, rows, width, keys, contraction, bits, rotated):
     q = T.alloc_fragment((rows, contraction), "float32")
     k = T.alloc_fragment((contraction, keys), "float32")
     T.clear(scores)
     for block in T.serial(width // contraction):
         for row, channel in T.Parallel(rows, contraction):
-            q[row, channel] = T.cast(query[token, first_head + row, block * contraction + channel], "float32")
+            q[row, channel] = T.if_then_else(
+                row < heads,
+                T.cast(query[token, first_head + row, block * contraction + channel], "float32"),
+                0,
+            )
         _key_operand(shared, k, table, block, contraction, keys, bits, rotated)
         T.gemm(q, k, scores, policy=T.GemmWarpPolicy.FullRow)
 
@@ -115,8 +119,10 @@ def _value_columns(probability, shared, outputs, first_key, columns, reduction, 
 
 @T.macro
 def compact_values(scores, shared, outputs, rows, keys, columns, reduction, bits, probability_start=0):
-    probability = T.alloc_fragment((rows, reduction), "float32")
+    probability = T.alloc_shared((rows, reduction), "float32")
     for block in T.serial(keys // reduction):
         for row, key in T.Parallel(rows, reduction):
             probability[row, key] = scores[row, probability_start + block * reduction + key]
+        T.sync_threads()
         _value_columns(probability, shared, outputs, block * reduction, columns, reduction, bits)
+        T.sync_threads()

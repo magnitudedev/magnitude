@@ -22,7 +22,8 @@ def prefill_schedule(query, history, context):
     slice_width = math.gcd(64, width)
     padding = 8
     def shared_bytes():
-        return (slice_width + padding) * (key_tile + padding) * query.dtype.itemsize
+        probability = query_tile * head_tile * 8 * DType.F32.itemsize
+        return (slice_width + padding) * (key_tile + padding) * query.dtype.itemsize + probability
     while key_tile > 8 and shared_bytes() + 4 > target.shared_memory_bytes:
         key_tile //= 2
     if threads > target.threads_per_group or shared_bytes() + 4 > target.shared_memory_bytes:
@@ -38,14 +39,16 @@ def prefill_schedule(query, history, context):
 
 @T.macro
 def _resident_probability_values(scores, values, output, rows, keys, columns, reduction):
-    probability = T.alloc_fragment((rows, reduction), 'float32')
+    probability = T.alloc_shared((rows, reduction), 'float32')
     # The enlarged score register file must never acquire a dynamic subscript.
     # Statically select each immediate left operand before the column GEMM.
     for step in T.unroll(keys // reduction):
         for row, key in T.Parallel(rows, reduction):
             probability[row, key] = scores[row, step * reduction + key]
+        T.sync_threads()
         _attention_value_tile(probability, values, output, step * reduction, 0,
                               columns, columns, reduction)
+        T.sync_threads()
 
 
 @T.macro

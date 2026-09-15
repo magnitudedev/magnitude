@@ -137,3 +137,52 @@ def test_fatal_owner_failure_rejects_already_queued_work_with_cause():
     finally:
         release.set()
         worker.close()
+
+
+def test_control_call_cannot_retire_done_submission_before_completion_event():
+    callback_release = Event()
+
+    class DelayedCompletion(Completion):
+        def completion_waiter(self):
+            wait = super().completion_waiter()
+
+            def delayed():
+                wait()
+                assert callback_release.wait(5)
+
+            return delayed
+
+    class RaceOwner(Owner):
+        def __init__(self):
+            super().__init__()
+            self.advanced_early = False
+
+        def advance(self):
+            if self.ticket is not None and self.ticket.completed.is_set() and not self.ticket.reconciled:
+                self.advanced_early = True
+                self.ticket.reconciled = True
+                return cast(ops.Completion, Completion())
+            return super().advance()
+
+    owner = RaceOwner()
+
+    @contextmanager
+    def open_owner():
+        yield owner
+
+    worker = Worker(open_owner)
+    try:
+        worker.ready.result(5)
+
+        def submit(current):
+            current.ticket = DelayedCompletion()
+
+        worker.call(submit).result(5)
+        assert owner.ticket is not None and owner.ticket.started.wait(5)
+        owner.ticket.completed.set()
+        assert worker.call(lambda current: None).result(5) is None
+        assert not owner.advanced_early
+        callback_release.set()
+    finally:
+        callback_release.set()
+        worker.close()

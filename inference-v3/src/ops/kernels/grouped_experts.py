@@ -132,7 +132,7 @@ def _expert_gated_tile(
     """A complete tile contraction with the route kind fixed before reduction."""
     dtype = source.dtype
     contraction, gate_activation = storage
-    x, paired_tile, coefficients, paired_accum, a, b = contraction
+    x, paired_tile, coefficients, paired_accum, b = contraction
     T.clear(paired_accum)
     for reduction_block in T.serial(T.ceildiv(source_width, bk)):
         for i, k in T.Parallel(bm, bk):
@@ -198,7 +198,7 @@ def _expert_down_tile(
     threads,
     storage,
 ):
-    x, w, coefficients, accum, a, b = storage
+    x, w, coefficients, accum, b = storage
     T.clear(accum)
     for reduction_block in T.serial(T.ceildiv(source_width, bk)):
         for i, k in T.Parallel(bm, bk):
@@ -460,7 +460,7 @@ class _GroupedExpertsEmitter:
             selected,
             True,
             bm,
-            bn,
+            2 * bn,
             _packet_reduction_width(self.specs[5]),
             threads,
             reduction_step,
@@ -549,12 +549,12 @@ class _GroupedSharedExpertsEmitter:
         _grouped_projection(
             expert_activation, order, block_experts, expert_down, expert_projected,
             self.specs[5], self.expert_blocks, expert_width, width, selected, True,
-            bm, bn, _packet_reduction_width(self.specs[5]), threads, reduction_step,
+            bm, 2 * bn, _packet_reduction_width(self.specs[5]), threads, reduction_step,
         )
         _grouped_projection(
             shared_activation, order, block_experts, shared_down, shared_projected,
             self.specs[8], self.shared_blocks, shared_width, width, selected, True,
-            bm, bn, _packet_reduction_width(self.specs[8]), threads, reduction_step,
+            bm, 2 * bn, _packet_reduction_width(self.specs[8]), threads, reduction_step,
             routed=False, rows=rows,
         )
         _unpermute_shared(
@@ -601,7 +601,7 @@ class GroupedExpertsRule:
         selected = cast(int, routes.shape[1])
         experts, intermediate, input_width = cast(tuple[int, int, int], gate.shape)
         gate_packet, up_packet, down_packet = (packet_format(spec) for spec in (gate, up, down))
-        reduction_step = 8
+        reduction_step = 16
         if (
             rows * selected < experts
             or input_width != width
@@ -634,7 +634,7 @@ class GroupedExpertsRule:
         )
         shared = max(
             affine_shared_bytes(bm, 2 * bn, bk, hidden.dtype, gate, up),
-            affine_shared_bytes(bm, bn, down_bk, hidden.dtype, down),
+            affine_shared_bytes(bm, 2 * bn, down_bk, hidden.dtype, down),
         )
         if shared > context.compiler_target.shared_memory_bytes:
             return ()
@@ -701,7 +701,7 @@ def _grouped_shared_operation(
             shared_down,
         )
     )
-    reduction_step = 8
+    reduction_step = 16
     if (
         any(packet is None for packet in packets)
         or packets[0] != packets[1]
@@ -745,8 +745,8 @@ def _grouped_shared_operation(
     shared_bytes = max(
         affine_shared_bytes(bm, 2 * bn, bk, hidden.dtype, expert_gate, expert_up),
         affine_shared_bytes(bm, 2 * bn, shared_bk, hidden.dtype, shared_gate, shared_up),
-        affine_shared_bytes(bm, bn, down_bk, hidden.dtype, expert_down),
-        affine_shared_bytes(bm, bn, shared_down_bk, hidden.dtype, shared_down),
+        affine_shared_bytes(bm, 2 * bn, down_bk, hidden.dtype, expert_down),
+        affine_shared_bytes(bm, 2 * bn, shared_down_bk, hidden.dtype, shared_down),
     )
     if shared_bytes > context.compiler_target.shared_memory_bytes:
         return None

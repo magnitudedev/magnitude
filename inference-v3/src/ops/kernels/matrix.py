@@ -172,7 +172,7 @@ def _packed_matrix(
     with T.Kernel(T.ceildiv(n, bn), T.ceildiv(m, bm), threads=threads) as (bx, by):
         offset = extent[0] if extent is not None else 0
         storage = affine_storage(bm, bn, bk, source.dtype, reduction_step, (spec,))
-        left, right, coefficients, accum, a, b = storage
+        left, right, coefficients, accum, b = storage
         T.clear(accum)
         for block in T.serial(T.ceildiv(k_size, bk)):
             for i, k in T.Parallel(bm, bk):
@@ -496,7 +496,7 @@ def _parallel_packed_matrix(
     full_rows = rows % bm == 0 and width % bk == 0
     with T.Kernel(total_blocks, T.ceildiv(rows, bm), threads=threads) as (branch_block, by):
         storage = affine_storage(bm, bn, bk, source.dtype, reduction_step, specs[:count])
-        left, right, coefficients, accum, a, b = storage
+        left, right, coefficients, accum, b = storage
         T.clear(accum)
         for reduction_block in T.serial(T.ceildiv(width, bk)):
             for i, k in T.Parallel(bm, bk):
@@ -701,7 +701,7 @@ class ParallelPackedMatrixRule:
                 else 2
             )
         else:
-            reduction_step = 8
+            reduction_step = 16
             if rows < 8:
                 return ()
             bm, bn, bk = (
@@ -762,7 +762,7 @@ class PackedMatrixRule:
             return ()
         output = graph.values[node.outputs[0]].spec
         vector = _packed_vector_geometry(right, context)
-        reduction_step = 8
+        reduction_step = 16
         if vector is not None and m < 8:
             threads, outputs_per_subgroup = vector
             emitter = _PackedVectorEmitter(
@@ -828,7 +828,11 @@ def matrix_geometry(context, dtype, rows, columns, reduction, *, packed_specs=()
     These are schedule parameters. TileLang selects instructions and infers the
     layout of the concrete GEMMs; no instruction dimensions are queried.
     """
-    m_tiles = min(4, max(1, math.ceil(rows / 8)))
+    # A sixteen-row physical tile is the smallest shape shared by the native
+    # matrix paths.  Logical tails remain masked by the surrounding loads and
+    # stores; keeping the physical contraction legal lets TileLang select the
+    # efficient instruction for each target without backend branches here.
+    m_tiles = min(4, max(2, math.ceil(rows / 8)))
     n_tiles = min(4, max(1, math.ceil(columns / 8)))
     def shared():
         if packed_specs:
