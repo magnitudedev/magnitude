@@ -258,6 +258,20 @@ jobs:
       - name: Verify real Debian package rollback restores application admission
         if: runner.os == 'Linux'
         run: bun packages/release/scripts/acceptance/linux-update-rollback.ts
+      - name: Build Windows native host for installer acceptance
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $library = Join-Path $env:RUNNER_TEMP 'magnitude-node.lib'
+          $version = (node -p process.versions.node).Trim()
+          $base = "https://nodejs.org/download/release/v$version"
+          Invoke-WebRequest "$base/win-x64/node.lib" -OutFile $library
+          $checksums = (Invoke-WebRequest "$base/SHASUMS256.txt").Content
+          $match = [regex]::Match($checksums, '(?m)^([a-f0-9]{64})\s+win-x64/node\.lib\r?$')
+          if (!$match.Success -or (Get-FileHash $library -Algorithm SHA256).Hash.ToLowerInvariant() -ne $match.Groups[1].Value) { throw 'Node import library integrity check failed' }
+          $env:MAGNITUDE_NODE_LIBRARY = $library
+          bun packages/daemon-management/scripts/build-native.ts
+          if ($LASTEXITCODE -ne 0) { throw 'Windows native host build failed' }
       - name: Validate Windows installation inventory and configuration ownership
         if: runner.os == 'Windows'
         shell: pwsh
