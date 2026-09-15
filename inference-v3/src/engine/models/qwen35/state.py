@@ -145,6 +145,7 @@ class QwenStateStore:
         geometry: Geometry,
         slots: int = 8,
         context_capacity: int | None = None,
+        kv_representation: ops.KVRepresentation | None = None,
     ):
         if slots <= 0:
             raise ValueError("Qwen state slot count must be positive")
@@ -162,19 +163,14 @@ class QwenStateStore:
         self._states: set[QwenState] = set()
         self._checkpoints: set[QwenCheckpoint] = set()
         attention = sum(kind == MixerKind.ATTENTION for kind in geometry.layers)
+        representation = kv_representation or ops.default_kv_representation(
+            geometry.attention_width, geometry.attention_width)
         with ExitStack() as cleanup:
             caches = []
             for _ in range(attention):
                 cache = device.allocate(
-                    ops.TensorSpec(
-                        (
-                            2,
-                            slots * context_capacity,
-                            geometry.kv_heads,
-                            geometry.attention_width,
-                        ),
-                        geometry.activation_dtype,
-                    )
+                    ops.kv_state_spec(slots * context_capacity, geometry.kv_heads,
+                                      geometry.activation_dtype, representation)
                 )
                 cleanup.callback(cache.close)
                 caches.append(cache)

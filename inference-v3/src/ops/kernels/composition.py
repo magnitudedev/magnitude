@@ -10,6 +10,8 @@ from ..binding import Residency
 from ..compiler.dependencies import code_dependencies
 from ..operation import OperationContext
 from .attention import AttentionOutputRule
+from .persistent_attention import PersistentAttentionGateRule
+from .persistent_component import PersistentAttentionComponentRule, PersistentAttentionMixerRule
 from .attention_fusion import AttentionPrepareAppendRule
 from .experts import DenseSwiGLURule, RoutedSharedExpertsRule
 from .grouped_experts import GroupedExpertsRule
@@ -79,14 +81,19 @@ def routed_feedforward(context: OperationContext):
     return context.compose(*authored)
 
 
-def _attention_prefix(context):
+def _attention_prefix(context, *, persistent_gate=False):
     authored = []
     graph = context.graph
     for node_id in sorted(context.nodes):
         node = graph.node(node_id)
         if node.operation == "attention_prepare":
             authored.extend(_build(context, ParallelPackedMatrixRule(), graph.value(node.inputs[0]).producer))
-            authored.extend(_build(context, AttentionPrepareAppendRule(), node_id))
+            component = (_build(context, PersistentAttentionMixerRule(), node_id) if persistent_gate else ())
+            if not component:
+                component = _build(context, PersistentAttentionComponentRule(gated=persistent_gate), node_id)
+            if not component and persistent_gate:
+                component = _build(context, PersistentAttentionComponentRule(), node_id)
+            authored.extend(component or _build(context, AttentionPrepareAppendRule(), node_id))
     return authored
 
 
@@ -95,10 +102,12 @@ def attention_state(context: OperationContext):
 
 
 def attention_mixer(context: OperationContext):
-    authored = _attention_prefix(context)
+    authored = _attention_prefix(context, persistent_gate=True)
     for node_id in sorted(context.nodes):
         if context.graph.node(node_id).operation == "causal_attention":
             authored.extend(_build(context, AttentionOutputRule(), node_id))
+        elif context.graph.node(node_id).operation == "persistent_attention":
+            authored.extend(_build(context, PersistentAttentionGateRule(), node_id))
     return context.compose(*authored)
 
 

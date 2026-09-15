@@ -6,6 +6,7 @@ from ..binding import Residency
 from ..compiler.dependencies import code_dependencies
 from ..compiler.lowering import BoundOperation
 from .attention import CausalAttentionRule
+from .persistent_attention import PersistentAttentionRule
 from .attention_fusion import AttentionPrepareRule, KVAppendRule
 from .chunked_recurrent import ChunkedDeltaRule
 from .experts import SelectedExpertsRule
@@ -46,6 +47,8 @@ def build_primitive(graph, root, context, *, remaining):
                 else DenseMatrixRule())
     elif node.operation == "causal_attention":
         body = CausalAttentionRule()
+    elif node.operation == "persistent_attention":
+        body = PersistentAttentionRule()
     elif node.operation == "attention_prepare":
         body = AttentionPrepareRule()
     elif node.operation == "kv_append":

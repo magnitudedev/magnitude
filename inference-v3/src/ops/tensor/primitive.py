@@ -101,6 +101,7 @@ class Primitive:
 
     def evaluate(self, inputs, attributes, outputs: tuple[TensorSpec, ...]) -> tuple[Any, ...]:
         import numpy as np
+        from ..kv import KVRepresentation
 
         if self.reference is None:
             raise NotImplementedError(f"{self.name} has no reference evaluator")
@@ -112,7 +113,12 @@ class Primitive:
         values = self.reference(tuple(readonly), attributes)
         if not isinstance(values, tuple) or len(values) != len(outputs):
             raise ValueError(f"{self.name} reference returned the wrong number of outputs")
-        result = tuple(round_reference(value, spec.dtype) for value, spec in zip(values, outputs, strict=True))
+        # A represented KV state denotes the codec's reconstructed values.
+        # Its logical activation dtype does not introduce another BF16 rounding
+        # after a codec-aware write or an exact state copy.
+        result = tuple(np.asarray(value, dtype=np.float32) if isinstance(spec.representation, KVRepresentation)
+                       else round_reference(value, spec.dtype)
+                       for value, spec in zip(values, outputs, strict=True))
         if any(value.shape != spec.shape for value, spec in zip(result, outputs, strict=True)):
             raise ValueError(f"{self.name} reference returned the wrong output shape")
         return result

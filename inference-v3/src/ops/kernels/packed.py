@@ -38,6 +38,19 @@ def packet_format(spec: TensorSpec) -> PacketFormat | None:
     if not isinstance(value, Affine):
         return None
     coefficients = value.coefficients
+    if (isinstance(coefficients, HierarchicalCoefficients)
+            and coefficients.supergroup == 256
+            and coefficients.local_scale_bits == 8
+            and coefficients.super_scale_dtype == DType.F32
+            and coefficients.local_scale_interpretation in
+                (CodeInterpretation.UNSIGNED, CodeInterpretation.TWOS_COMPLEMENT)
+            and (not coefficients.has_bias or
+                 (coefficients.local_bias_bits == 8 and coefficients.super_bias_dtype == DType.F32))
+            and value.code.low_bits == 4 and value.code.high_bits in (0, 1, 2)
+            and value.code.interpretation in
+                (CodeInterpretation.UNSIGNED, CodeInterpretation.OFFSET_BINARY)
+            and value.group in (16, 32)):
+        return PacketFormat("affine-factored", 8, 8, 256)
     if (isinstance(coefficients, DirectCoefficients)
             and coefficients.scale_dtype == DType.F32
             and coefficients.bias_dtype in (None, DType.F32)
@@ -216,6 +229,12 @@ def prepare_packet_activation(values, dtype, packet):
     Keep the original path when rescaling would create an FP32 subnormal.
     Other packet formats retain their unmodified activation representation.
     """
+    if packet.name in ("affine-direct-grouped", "affine-factored"):
+        total = T.alloc_local((1,), "float32")
+        total[0] = 0.0
+        for item in T.unroll(packet.dot_packet, explicit=True):
+            total[0] += values[item]
+        return total[0], False
     if packet.name == "mlx-q4-group64":
         total = T.alloc_local((1,), "float32")
         normal = T.alloc_local((1,), "bool")
@@ -297,14 +316,16 @@ def packet_dot(values, words, spec, row, chunk, lane, prepared_sum=None, prepare
         scale = half(words, layout.scales + (first // 32) * 2)
         return dot[0] * scale
 
-    if packet.name == "affine-direct-grouped":
+    if packet.name in ("affine-direct-grouped", "affine-factored"):
         decoded = T.alloc_local((1, 8), "float32")
         decode_packet(decoded, 0, 0, words, spec, row, chunk * packet.tile + lane * packet.dot_packet, False)
         for offset in T.unroll(8, explicit=True):
             dot[0] += T.cast(values[offset], "float32") * decoded[0, offset]
-            total[0] += T.cast(values[offset], "float32")
+            if prepared_sum is None:
+                total[0] += T.cast(values[offset], "float32")
         scale, bias = group_coefficients(words, spec, first)
-        return dot[0] * scale + total[0] * (bias + scale * affine_code_center(spec))
+        activation_sum = total[0] if prepared_sum is None else prepared_sum
+        return dot[0] * scale + activation_sum * (bias + scale * affine_code_center(spec))
 
     assert isinstance(coefficients, HierarchicalCoefficients)
     tile = first // layout.tile_elements
@@ -366,6 +387,23 @@ def group_coefficients(words, spec, element):
         scale = T.reinterpret(words[layout.scales // 4 + group], "float32")
         bias = (T.reinterpret(words[layout.biases // 4 + group], "float32")
                 if layout.biases is not None else T.float32(0))
+    elif packet.name == "affine-factored":
+        base = element // layout.tile_elements * layout.tile_bytes
+        group = element % layout.tile_elements // representation.group
+        assert layout.super_scale is not None
+        local = T.cast(byte(words, base + layout.scales + group), "uint8")
+        if representation.coefficients.local_scale_interpretation == CodeInterpretation.TWOS_COMPLEMENT:
+            factor = T.cast(T.cast(local, "int8"), "float32")
+        else:
+            factor = T.cast(local, "float32")
+        scale = T.reinterpret(words[(base + layout.super_scale) // 4], "float32") * factor
+        if layout.biases is not None:
+            assert layout.super_bias is not None
+            bias = (representation.coefficients.bias_sign
+                    * T.reinterpret(words[(base + layout.super_bias) // 4], "float32")
+                    * T.cast(byte(words, base + layout.biases + group), "float32"))
+        else:
+            bias = T.float32(0)
     elif packet.name == "mlx-q4-group64":
         group = element // representation.group
         assert layout.biases is not None

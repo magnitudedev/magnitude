@@ -111,6 +111,10 @@ class CompiledFunction:
         self.graph = graph
         self.formulas = FormulaTree(formula_graph if formula_graph is not None else graph)
         self.memory = memory
+        self._invocation_placements = tuple(
+            (identity, placement) for identity, placement in memory.values.items()
+            if placement.storage in (StorageClass.OUTPUT, StorageClass.ALIAS)
+        )
         self._units = units
         self._constants = {}
         self._static_resources = {}
@@ -131,7 +135,53 @@ class CompiledFunction:
         self.execution_graph = execution_graph
         self._closed = False
         self._active = False
+        self._output_frame_limit = 0
+        self._output_frames: list[dict[int, Resource]] = []
         device._executables.add(self)
+
+    def reuse_output_storage(self, *, max_frames: int = 2) -> None:
+        """Retain a bounded set of output backings for sequential invocations.
+
+        Escaped results and checkpoints keep their ordinary leases. A frame is
+        reusable only when this compiled owner holds every remaining lease.
+        If all retained frames are pinned, the invocation uses fresh outputs.
+        """
+        self.device.check()
+        if self._closed or self._active or self._output_frames:
+            raise RuntimeError("output reuse must be configured before invocation")
+        if type(max_frames) is not int or max_frames <= 0:
+            raise ValueError("output reuse requires a positive frame bound")
+        self._output_frame_limit = max_frames
+
+    def _output_frame(self) -> dict[int, Resource] | None:
+        if not self._output_frame_limit:
+            return None
+        for frame in self._output_frames:
+            if all(resource.sole_owner for resource in frame.values()):
+                return frame
+        if len(self._output_frames) == self._output_frame_limit:
+            return None
+        frame = {}
+        try:
+            for identity, placement in self._invocation_placements:
+                if placement.storage == StorageClass.OUTPUT:
+                    frame[identity] = self.device.allocate(placement.spec)
+        except BaseException:
+            for resource in frame.values():
+                resource.close()
+            raise
+        self._output_frames.append(frame)
+        return frame
+
+    def release_output_storage(self) -> int:
+        """Drop cached ownership; escaped results and completion pins survive."""
+        self.device.check()
+        before = self.device.allocated_bytes
+        for frame in self._output_frames:
+            for resource in frame.values():
+                resource.close()
+        self._output_frames.clear()
+        return before - self.device.allocated_bytes
 
     def submit(
         self, *inputs: Resource, resources: Mapping[int | str, Resource] | None = None,
@@ -190,9 +240,11 @@ class CompiledFunction:
                 values[value_id] = resource
                 retained.append(resource.fork())
 
-            for value_id, placement in self.memory.values.items():
+            output_frame = self._output_frame()
+            for value_id, placement in self._invocation_placements:
                 if placement.storage == StorageClass.OUTPUT:
-                    values[value_id] = self.device.allocate(placement.spec)
+                    values[value_id] = (output_frame[value_id].fork() if output_frame is not None
+                                        else self.device.allocate(placement.spec))
                     allocated_outputs.append(values[value_id])
                     retained.append(values[value_id].fork())
                 elif placement.storage == StorageClass.ALIAS:
@@ -332,6 +384,10 @@ class CompiledFunction:
             resource.close()
         for resource in self._static_resources.values():
             resource.close()
+        for frame in self._output_frames:
+            for resource in frame.values():
+                resource.close()
+        self._output_frames.clear()
         self._closed = True
 
 

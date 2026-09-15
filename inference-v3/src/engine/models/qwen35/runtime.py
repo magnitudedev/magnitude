@@ -181,7 +181,7 @@ class DenseRuntime(ModelExecutor):
             sequence.close()
 
     def reclaim(self) -> int:
-        return self.states.release_idle()
+        return self.states.release_idle() + self.program.reclaim()
 
     def reclaimable(self, sequences: tuple[ModelSequence, ...]) -> int:
         states = []
@@ -289,7 +289,7 @@ class DenseRuntime(ModelExecutor):
                 base = state.slot * self.context_capacity
                 for offset in range(len(inputs.tokens)):
                     destinations.append(base + state.position + offset)
-                    visible.extend((base, state.position + offset + 1))
+                    visible.extend((base, state.position, start, offset + 1))
                 selected = (
                     range(start, start + len(inputs.tokens))
                     if request.selection == LogitsSelection.ALL
@@ -309,36 +309,43 @@ class DenseRuntime(ModelExecutor):
             tokens.extend(TokenId(0) for _ in range(padding))
             coordinates.extend(0 for _ in range(padding * 3))
             destinations.extend(-1 for _ in range(padding))
-            visible.extend(0 for _ in range(padding * 2))
+            visible.extend(0 for _ in range(padding * 4))
 
-            token_resource = self._upload("i", tokens, (len(tokens),), ops.DType.I32, owned)
-            coordinate_resource = self._upload(
-                "i", coordinates, (len(tokens), 3), ops.DType.I32, owned
-            )
-            dynamic = [token_resource, coordinate_resource]
+            packed_controls = mode == "decode" and not feature_slices
+            token_spec = ops.TensorSpec((len(tokens),), ops.DType.I32)
+            coordinate_spec = ops.TensorSpec((len(tokens), 3), ops.DType.I32)
+            destination_spec = ops.TensorSpec((len(tokens),), ops.DType.I32)
+            visible_spec = ops.TensorSpec((len(tokens), 4), ops.DType.I32)
+            fields = [("tokens", "i", tokens, token_spec),
+                      ("coordinates", "i", coordinates, coordinate_spec)]
             recurrent_offsets = [0]
             for request in requests:
                 recurrent_offsets.append(recurrent_offsets[-1] + len(request.inputs.tokens))
-            recurrent_offset_resource = None
+            recurrent_offset_spec = None
             if any(kind == MixerKind.RECURRENT for kind in self.geometry.layers):
-                recurrent_offset_resource = self._upload(
-                    "i",
-                    recurrent_offsets,
-                    (len(recurrent_offsets),),
-                    ops.DType.I32,
-                    owned,
-                )
-                dynamic.append(recurrent_offset_resource)
+                recurrent_offset_spec = ops.TensorSpec((len(recurrent_offsets),), ops.DType.I32)
+                fields.append(("recurrent_offsets", "i", recurrent_offsets, recurrent_offset_spec))
             output_spec = draw_spec = None
             if output_rows:
-                output_resource = self._upload(
-                    "i", output_rows, (len(output_rows),), ops.DType.I32, owned
-                )
-                draw_resource = self._upload(
-                    "I", draw_words, (len(output_rows), 6), ops.DType.U32, owned
-                )
-                dynamic.extend((output_resource, draw_resource))
-                output_spec, draw_spec = output_resource.spec, draw_resource.spec
+                output_spec = ops.TensorSpec((len(output_rows),), ops.DType.I32)
+                draw_spec = ops.TensorSpec((len(output_rows), 6), ops.DType.U32)
+                fields.extend((("output_rows", "i", output_rows, output_spec),
+                               ("draws", "I", draw_words, draw_spec)))
+            argument_fields = len(fields)
+            if self.states.attention:
+                fields.extend((("destinations", "i", destinations, destination_spec),
+                               ("visible", "i", visible, visible_spec)))
+            control_resources = {}
+            if packed_controls:
+                payload = b"".join(struct.pack(f"={len(values)}{code}", *values)
+                                   for _, code, values, _ in fields)
+                control = self.device.upload(ops.TensorSpec((len(payload) // 4,), ops.DType.U32), payload)
+                owned.callback(control.close)
+                dynamic = [control]
+            else:
+                for name, code, values, spec in fields:
+                    control_resources[name] = self._upload(code, values, spec.shape, spec.dtype, owned)
+                dynamic = [control_resources[name] for name, _, _, _ in fields[:argument_fields]]
             feature_values = []
             feature_rows = []
             for batch_start, feature in feature_slices:
@@ -357,10 +364,6 @@ class DenseRuntime(ModelExecutor):
                 feature_values.append(value)
                 feature_rows.append(row_resource)
             dynamic.extend(feature_rows)
-            destination_resource = self._upload(
-                "i", destinations, (len(tokens),), ops.DType.I32, owned
-            )
-            visible_resource = self._upload("i", visible, (len(tokens), 2), ops.DType.I32, owned)
             recurrent = [state for request in requests for state in request.state.recurrent]
             recurrent_layers = len(recurrent) // len(requests)
             recurrent = [
@@ -370,33 +373,31 @@ class DenseRuntime(ModelExecutor):
             ]
             specs = InvocationSpecs(
                 batch=len(requests),
-                tokens=token_resource.spec,
-                coordinates=coordinate_resource.spec,
-                recurrent_offsets=(
-                    recurrent_offset_resource.spec
-                    if recurrent_offset_resource is not None
-                    else None
-                ),
+                tokens=token_spec,
+                coordinates=coordinate_spec,
+                recurrent_offsets=recurrent_offset_spec,
                 output_rows=output_spec,
                 draws=draw_spec,
-                destinations=tuple(destination_resource.spec for _ in self.states.attention),
-                visible=tuple(visible_resource.spec for _ in self.states.attention),
+                destinations=tuple(destination_spec for _ in self.states.attention),
+                visible=tuple(visible_spec for _ in self.states.attention),
                 attention_state=tuple(cache.spec for cache in self.states.attention),
                 convolution_state=tuple(value.convolution.spec for value in recurrent),
                 delta_state=tuple(value.delta.spec for value in recurrent),
                 features=tuple(value.spec for value in feature_values),
                 feature_rows=tuple(value.spec for value in feature_rows),
+                packed_controls=packed_controls,
                 recurrent_sequence_length=(
                     actual_rows
                     if mode == "prefill" and len(requests) == 1 and padding == 0
-                    and recurrent_offset_resource is not None
+                    and recurrent_offset_spec is not None
                     else None
                 ),
             )
             resources = {}
             for index, cache in enumerate(self.states.attention):
-                resources[f"attention.{index}.destinations"] = destination_resource
-                resources[f"attention.{index}.visible"] = visible_resource
+                if not packed_controls:
+                    resources[f"attention.{index}.destinations"] = control_resources["destinations"]
+                    resources[f"attention.{index}.visible"] = control_resources["visible"]
                 resources[f"attention.{index}.state"] = cache
             for index, value in enumerate(recurrent):
                 layer, sequence = divmod(index, len(requests))

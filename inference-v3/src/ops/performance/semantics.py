@@ -93,6 +93,26 @@ def recurrence(inputs, attrs, outputs, *, values=None):
     return work(floating=inputs[0].elements * (2 if len(inputs) == 3 else 0))
 
 
+def persistent_attention(inputs, attrs, outputs, *, values=None):
+    query, history, keys, value, visible = inputs
+    rows, heads, width = query.shape
+    if values is None:
+        pairs = Bounds(0, rows * heads * (history.shape[0] + keys.shape[0]))
+    else:
+        ranges = values[4]
+        for history_start, history_count, current_start, current_count in ranges:
+            if (min(history_start, history_count, current_start, current_count) < 0
+                    or history_start + history_count > history.shape[0]
+                    or current_start + current_count > keys.shape[0]):
+                raise ValueError("persistent attention visibility lies outside its sources")
+        pairs = heads * sum(int(row[1]) + int(row[3]) for row in ranges)
+    contractions = pairs * 2 * (width + value.shape[-1])
+    return work(floating=contractions + pairs * 4, matrix=contractions,
+                special=pairs, comparisons=pairs,
+                issues=("persistent attention useful work requires concrete visible ranges",)
+                if isinstance(pairs, Bounds) else ())
+
+
 def gated_delta(inputs, attrs, outputs, *, values=None):
     query, key, value = inputs[:3]
     rows, heads, value_width = value.shape

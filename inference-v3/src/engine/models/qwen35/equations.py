@@ -176,18 +176,22 @@ def _attention_state(
         epsilon=weights.epsilon,
     )
     values = ops.reshape(raw_values, keys.shape)
-    history = ops.kv_append(history, keys, values, destinations)
+    # History consumption and persistence share the prepared inputs. Attention
+    # reads only the pre-advance visible interval; fresh rows use dense K/V.
     attended = (
-        ops.causal_attention(
+        ops.persistent_attention(
             queries,
             history,
+            keys,
+            values,
             visible,
             sequence_count=sequence_count,
         )
         if attend
         else None
     )
-    return attended, gate, history
+    next_history = ops.kv_append(history, keys, values, destinations, reserved=True)
+    return attended, gate, next_history
 
 
 @ops.formula(id="qwen35.recurrent_mixer", version=1)

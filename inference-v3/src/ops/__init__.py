@@ -16,6 +16,10 @@ from .compiler.lowering import (
     CompilerTarget,
 )
 from .operation import Operation, OperationContext, operation
+from .kv import (AttentionGeometry, AttentionSemantics, KVRepresentation,
+                 DenseKVCodec, AffineKVCodec, RotatedLloydMax, dense_kv,
+                 affine_k8_uniform_v4, rotated_k4_uniform_v4, kv_state_spec,
+                 default_kv_representation)
 from .kernels import composition as operation_bodies
 from .formula import (Formula, FormulaCall, FormulaHandle, FormulaIndex, FormulaRef,
                       FormulaTree, formula, quantity, units)
@@ -43,6 +47,7 @@ from .tensor.ops import (
     byte_copy,
     cast,
     causal_attention,
+    persistent_attention,
     concatenate,
     decode_bfloat16,
     delta_recurrence,
@@ -74,12 +79,17 @@ from .tensor.ops import (
     take_rows,
     tanh,
     transpose,
+    unpack_words,
 )
 from .tensor.tracing import Argument, Signature, Tensor, trace
 from .tensor.types import DENSE, Dim, DimExpr, DType, Layout, TensorSpec, ceil_divide
 from .lab import Lab
 
 __all__ = [
+    "AttentionGeometry", "AttentionSemantics", "KVRepresentation", "DenseKVCodec",
+    "AffineKVCodec", "RotatedLloydMax", "dense_kv", "affine_k8_uniform_v4",
+    "rotated_k4_uniform_v4", "default_kv_representation", "kv_state_spec",
+    "persistent_attention", "unpack_words",
     "Binding", "CanonicalImport", "DenseImport", "EncodedImport", "Residency",
     "SourcePlane", "SourceSpan", "Transform",
     "ByteSource", "MemorySource", "SegmentedSource", "ZeroSource", "SourceInfo", "SourceKind",

@@ -53,6 +53,10 @@ def encode_dense(value: NDArray, spec: TensorSpec) -> bytes:
 
 
 def decode_dense(content: bytes, spec: TensorSpec) -> NDArray:
+    from ..kv import KVRepresentation
+    if isinstance(spec.representation, KVRepresentation):
+        from ..kv_codecs import decode_kv_reference
+        return decode_kv_reference(content, spec)
     if spec.layout != DENSE:
         raise ValueError("non-dense observations require their declared physical decoder")
     dtype = _storage_dtype(spec)
@@ -72,6 +76,8 @@ def tensor_identity(spec, reference, physical):
     digest.update(memoryview(np.ascontiguousarray(reference)).cast("B"))
     if isinstance(physical, Binding):
         digest.update(physical.value_identity.encode())
+    elif isinstance(physical, bytes):
+        digest.update(physical)
     return digest.hexdigest()
 
 
@@ -136,7 +142,7 @@ class Fixture:
 
     def __init__(
         self, root: Graph, values: Mapping[int, NDArray], *,
-        bindings: Mapping[int, Binding | Resource] | None = None,
+        bindings: Mapping[int, Binding | Resource | bytes] | None = None,
         capture: Callable[[Value], NDArray] | None = None,
     ):
         self.root = root
@@ -155,13 +161,15 @@ class Fixture:
                 raise ValueError("fixture value must have concrete numeric storage and the traced shape")
             self._values[identity] = array
         for identity, binding in self._bindings.items():
-            if (identity not in self._values and capture is None) or binding.spec != root.value(identity).spec:
+            spec = root.value(identity).spec
+            compatible = len(binding) == spec.storage_nbytes if isinstance(binding, bytes) else binding.spec == spec
+            if (identity not in self._values and capture is None) or not compatible:
                 raise ValueError("physical fixture binding requires matching reference values and specification")
 
     @classmethod
     def from_inputs(
         cls, root: Graph, inputs: Mapping[int, NDArray], *,
-        bindings: Mapping[int, Binding | Resource] | None = None,
+        bindings: Mapping[int, Binding | Resource | bytes] | None = None,
         capture: Callable[[Value], NDArray] | None = None,
     ) -> Fixture:
         """Derive selected boundary inputs from this production trace on demand.
@@ -256,6 +264,12 @@ class Fixture:
         value.flags.writeable = False
         spec = self.root.value(identity).spec
         physical = self._bindings.get(identity)
+        from ..kv import KVRepresentation
+        if isinstance(spec.representation, KVRepresentation):
+            if isinstance(physical, Resource):
+                physical = physical.device.read(physical)
+            if physical is None:
+                raise ValueError("represented KV fixtures require original packed bytes or a resource binding")
         if physical is None:
             physical = encode_dense(value, spec)
         cached = FixtureTensor(spec, value, physical, tensor_identity(spec, value, physical))
@@ -313,6 +327,7 @@ class Fixture:
             call.remap({v: v for v in available}, {node.id: node.id for node in nodes})
             for call in self.root.formulas)))
         captured = {}
+        captured_bytes = {}
         with ExitStack() as retained:
             constants, resources = {}, {}
             backing = {}
@@ -357,7 +372,9 @@ class Fixture:
             try:
                 execution.completion.wait()
                 for identity, resource in zip(outputs, execution.outputs, strict=True):
-                    captured[identity] = decode_dense(device.read(resource), resource.spec).copy()
+                    content = device.read(resource)
+                    captured[identity] = decode_dense(content, resource.spec).copy()
+                    captured_bytes[identity] = content
             finally:
                 for resource in execution.outputs:
                     resource.close()
@@ -366,6 +383,7 @@ class Fixture:
         # no live alias can be mutated behind a replay fixture's identity.
         bindings = {port.original: self._bindings[port.original] for port in isolated.inputs
                     if port.original in self._bindings and port.original not in captured}
+        bindings.update(captured_bytes)
         snapshot = Fixture(self.root, captured, bindings=bindings,
                            capture=lambda value: self._tensor(value.id).reference)
         boundary = snapshot.boundary(target)

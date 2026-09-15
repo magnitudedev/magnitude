@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 
 from .tensor.types import DType
+from .kv import KVRepresentation
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,19 +124,23 @@ class Codebook:
             raise ValueError("invalid codebook representation")
 
 
-type Representation = Dense | Affine | Codebook
+type Representation = Dense | Affine | Codebook | KVRepresentation
 
 
 def execution_representation(representation: Representation) -> Representation:
-    """Keep affine codes packed; resolve hierarchical coefficients at import.
+    """Keep exact affine factors in word-aligned execution packets.
 
     This is an execution-storage choice, not a change to the encoded source or
-    logical values. FP32 retains the product of the source half scale and local
-    integer coefficient without another low-precision rounding boundary.
+    logical values. Byte-wide local factors remove bitfield extraction; FP32
+    super-scales preserve the source values and align every complete packet.
+    Products are reconstructed at the consumer's original FP32 boundary.
     """
     if isinstance(representation, Affine) and isinstance(representation.coefficients, HierarchicalCoefficients):
-        return Affine(representation.code, representation.group,
-                      DirectCoefficients(DType.F32, DType.F32 if representation.coefficients.has_bias else None))
+        coefficients = representation.coefficients
+        return replace(representation, coefficients=replace(
+            coefficients, local_scale_bits=8, super_scale_dtype=DType.F32,
+            local_bias_bits=8 if coefficients.has_bias else None,
+            super_bias_dtype=DType.F32 if coefficients.has_bias else None))
     return representation
 
 
@@ -243,4 +248,6 @@ def represented_nbytes(representation: Representation, elements: int) -> int:
         raise ValueError("element count must be positive")
     if isinstance(representation, Dense):
         return elements * representation.dtype.itemsize
+    if isinstance(representation, KVRepresentation):
+        return representation.storage_nbytes(elements)
     return canonical_layout(representation, elements).nbytes

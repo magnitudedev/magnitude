@@ -23,7 +23,7 @@ class Format:
         pass
 
 
-@pytest.mark.parametrize("encoding,bytes_per_block", [(Encoding.Q4_K, 192), (Encoding.Q5_K, 224), (Encoding.Q6_K, 256)])
+@pytest.mark.parametrize("encoding,bytes_per_block", [(Encoding.Q4_K, 152), (Encoding.Q5_K, 184), (Encoding.Q6_K, 212)])
 @pytest.mark.parametrize("residency", [ops.Residency.RESIDENT, ops.Residency.STREAMED])
 def test_hierarchical_import_prepares_coefficients_without_expanding_codes(encoding, bytes_per_block, residency, monkeypatch):
     from engine.weights.descriptor import StoredQuantized
@@ -47,10 +47,10 @@ def test_hierarchical_import_prepares_coefficients_without_expanding_codes(encod
                                ops.DType.BF16, residency)
     assert binding.spec.representation.code == representation.code
     assert binding.spec.representation.group == representation.group
-    assert binding.spec.representation.coefficients.scale_dtype == ops.DType.F32
+    assert binding.spec.representation.coefficients.super_scale_dtype == ops.DType.F32
     assert binding.spec.storage_nbytes == bytes_per_block * 2
     assert binding.planes[0].span.length == codec.block_bytes * 2
-    assert packet_format(binding.spec).name == "affine-direct-grouped"
+    assert packet_format(binding.spec).name == "affine-factored"
     assert ops.execution_representation(binding.spec.representation) == binding.spec.representation
     plan = plan_import(binding, chunk_bytes=codec.block_bytes)
     assert sum(action.bytes for action in plan.actions if action.kind == ImportActionKind.PUBLISH) == binding.spec.storage_nbytes

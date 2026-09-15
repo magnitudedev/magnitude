@@ -199,6 +199,16 @@ class GGUFCodec:
             local = local.astype("uint8").astype("int8")
         return super_scale * local.astype("float32")
 
+    def super_scale(self, data, base, reinterpret):
+        bits = self.scale_byte(data, base, 0).astype("uint32") | (
+            self.scale_byte(data, base, 1).astype("uint32") << 8)
+        return reinterpret(bits.astype("uint16"), "float16").astype("float32")
+
+    def super_bias(self, data, base, reinterpret):
+        bits = self.bias_byte(data, base, 0).astype("uint32") | (
+            self.bias_byte(data, base, 1).astype("uint32") << 8)
+        return reinterpret(bits.astype("uint16"), "float16").astype("float32")
+
     def direct_bias(
         self,
         data: TraceBuffer,

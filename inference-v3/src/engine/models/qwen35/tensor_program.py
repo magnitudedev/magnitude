@@ -43,8 +43,13 @@ class InvocationSpecs:
     features: tuple[ops.TensorSpec, ...] = ()
     feature_rows: tuple[ops.TensorSpec, ...] = ()
     recurrent_sequence_length: int | None = None
+    packed_controls: bool = False
 
     def __post_init__(self) -> None:
+        if self.packed_controls and (self.features or self.feature_rows
+                or any(spec != self.destinations[0] for spec in self.destinations)
+                or any(spec != self.visible[0] for spec in self.visible)):
+            raise ValueError("packed controls require shared attention ranges and no feature rows")
         if self.recurrent_sequence_length is not None and (
             type(self.recurrent_sequence_length) is not int
             or self.batch != 1
@@ -79,6 +84,23 @@ class InvocationSpecs:
             for value, rows in zip(self.features, self.feature_rows, strict=True)
         ):
             raise ValueError("Qwen feature values and row indices must be paired")
+
+
+    @property
+    def control_specs(self) -> tuple[ops.TensorSpec, ...]:
+        """The transfer record follows the existing logical invocation fields."""
+        fields = [self.tokens, self.coordinates]
+        if self.recurrent_offsets is not None:
+            fields.append(self.recurrent_offsets)
+        if self.output_rows is not None:
+            fields.extend((self.output_rows, cast(ops.TensorSpec, self.draws)))
+        if self.destinations:
+            fields.extend((self.destinations[0], self.visible[0]))
+        return tuple(fields)
+
+    @property
+    def control_record(self) -> ops.TensorSpec:
+        return ops.TensorSpec((sum(spec.elements for spec in self.control_specs),), ops.DType.U32)
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,8 +190,13 @@ class TensorProgram:
             static_resources=static_resources,
             options=definition.options,
         )
+        if mode == "decode":
+            compiled.reuse_output_storage(max_frames=2)
         self._compiled[key] = compiled
         return compiled
+
+    def reclaim(self) -> int:
+        return sum(compiled.release_output_storage() for compiled in self._compiled.values())
 
     def close(self) -> None:
         for compiled in reversed(tuple(self._compiled.values())):
@@ -222,7 +249,19 @@ def define(
         ops.Argument(spec, f"feature.{index}.rows") for index, spec in enumerate(specs.feature_rows)
     )
 
+    if specs.packed_controls:
+        arguments = [ops.Argument(specs.control_record, "controls")]
+
     def function(*args, **bound):
+        if specs.packed_controls:
+            unpacked = ops.unpack_words(args[0], specs.control_specs)
+            if specs.destinations:
+                destinations, visible = unpacked[-2:]
+                unpacked = unpacked[:-2]
+                for index in range(len(specs.destinations)):
+                    bound[f"attention.{index}.destinations"] = destinations
+                    bound[f"attention.{index}.visible"] = visible
+            args = unpacked
         tokens, coordinates = args[:2]
         cursor = 2
         recurrent_offsets = args[cursor] if specs.recurrent_offsets is not None else None
@@ -289,10 +328,11 @@ def _concatenate_batch(values: tuple[ops.Tensor, ...]) -> ops.Tensor:
 def _state_arguments(specs: InvocationSpecs):
     for index, spec in enumerate(specs.features):
         yield f"feature.{index}.values", spec
-    for index, spec in enumerate(specs.destinations):
-        yield f"attention.{index}.destinations", spec
-    for index, spec in enumerate(specs.visible):
-        yield f"attention.{index}.visible", spec
+    if not specs.packed_controls:
+        for index, spec in enumerate(specs.destinations):
+            yield f"attention.{index}.destinations", spec
+        for index, spec in enumerate(specs.visible):
+            yield f"attention.{index}.visible", spec
     for index, spec in enumerate(specs.attention_state):
         yield f"attention.{index}.state", spec
     for index, spec in enumerate(specs.convolution_state):

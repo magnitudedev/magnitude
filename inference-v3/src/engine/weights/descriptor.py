@@ -87,6 +87,10 @@ class SourceCodec(Protocol):
     def bias_byte(
         self, data: TraceBuffer, base: int | TraceValue, byte_index: int | TraceValue
     ) -> TraceValue: ...
+    def super_scale(self, data: TraceBuffer, base: int | TraceValue,
+                    reinterpret: Callable[[Any, str], Any]) -> TraceValue: ...
+    def super_bias(self, data: TraceBuffer, base: int | TraceValue,
+                   reinterpret: Callable[[Any, str], Any]) -> TraceValue: ...
     def direct_scale(
         self,
         data: TraceBuffer,

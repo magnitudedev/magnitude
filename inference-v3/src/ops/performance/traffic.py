@@ -10,6 +10,7 @@ import math
 
 def boundary_accesses(graph, values):
     from ..tensor.primitive import primitives
+    from ..kv import KVRepresentation
 
     external = {graph.alias_root(value) for value in (*graph.inputs, *graph.constants, *graph.resources)}
     reads, writes = {}, {}
@@ -78,22 +79,34 @@ def boundary_accesses(graph, values):
             selected[1] = tuple(((plane * capacity + int(start)) * stride,
                                   (plane * capacity + int(start) + int(count)) * stride)
                                  for plane in range(2) for start, count in ranges)
+        elif node.operation == "persistent_attention":
+            visible = concrete(node, 4)
+            stride = math.prod(specs[1].shape[1:])
+            selected[1] = tuple((int(start) * stride, (int(start) + int(count)) * stride)
+                                for start, count, _, _ in visible)
+            for index in (2, 3):
+                stride = math.prod(specs[index].shape[1:])
+                selected[index] = tuple((int(start) * stride, (int(start) + int(count)) * stride)
+                                        for _, _, start, count in visible)
         elif node.operation == "kv_append":
             destinations = concrete(node, 3)
-            mutated[0] = rows(specs[0], destinations[destinations >= 0], axis=1)
+            axis = 0 if isinstance(specs[0].representation, KVRepresentation) else 1
+            mutated[0] = rows(specs[0], destinations[destinations >= 0], axis=axis)
             active = tuple(index for index, destination in enumerate(destinations) if destination >= 0)
             selected[1], selected[2] = rows(specs[1], active), rows(specs[2], active)
             omitted.add(0)
         elif node.operation == "kv_copy":
             ranges = concrete(node, 1)
-            stride = math.prod(specs[0].shape[2:])
-            capacity = specs[0].shape[1]
+            typed = isinstance(specs[0].representation, KVRepresentation)
+            axis = 0 if typed else 1
+            stride = math.prod(specs[0].shape[axis + 1:])
+            capacity = specs[0].shape[axis]
             selected[0] = tuple(((plane * capacity + int(source)) * stride,
                                   (plane * capacity + int(source) + int(count)) * stride)
-                                 for plane in range(2) for source, _, count in ranges if count > 0)
+                                 for plane in range(1 if typed else 2) for source, _, count in ranges if count > 0)
             mutated[0] = tuple(((plane * capacity + int(destination)) * stride,
                                  (plane * capacity + int(destination) + int(count)) * stride)
-                                for plane in range(2) for _, destination, count in ranges if count > 0)
+                                for plane in range(1 if typed else 2) for _, destination, count in ranges if count > 0)
         elif node.operation == "byte_copy":
             offset, count = map(int, concrete(node, 2))
             selected[0] = ((0, count),)

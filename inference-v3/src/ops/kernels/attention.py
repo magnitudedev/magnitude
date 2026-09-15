@@ -209,6 +209,26 @@ def _attention_publish(outputs, denominator, gate, partials, first_row, first_he
 
 
 @T.macro
+def _matrix_visible_count(visible, first_row, query_tile, tokens, column):
+    """Padding has zero visibility; the last physical row need not be valid."""
+    result = T.alloc_shared((1,), "int32")
+    thread = T.get_thread_binding()
+    if thread < 32:
+        maximum = T.alloc_local((1,), "int32")
+        maximum[0] = 0
+        for group in T.unroll(T.ceildiv(query_tile, 32)):
+            row = first_row + group * 32 + thread
+            maximum[0] = T.max(maximum[0], T.if_then_else(
+                group * 32 + thread < query_tile and row < tokens,
+                T.cast(visible[row, column], "int32"), 0))
+        count = T.warp_reduce_max(maximum[0])
+        if thread == 0:
+            result[0] = count
+    T.sync_threads()
+    return result[0]
+
+
+@T.macro
 def _matrix_streaming_attention(
     query,
     history,
@@ -263,7 +283,7 @@ def _matrix_streaming_attention(
         first_row = block * query_tile
         last_row = T.min(tokens - 1, first_row + query_tile - 1)
         base = T.cast(visible[first_row, 0], "int32")
-        count = T.cast(visible[last_row, 1], "int32")
+        count = _matrix_visible_count(visible, first_row, query_tile, tokens, 1)
         # Visibility is a valid interval within the history allocation. The
         # single-sequence matrix schedule shares its base across this query tile.
         T.assume(base >= 0)
@@ -310,6 +330,7 @@ def _matrix_streaming_attention(
                 aligned
                 and first_row + query_tile <= tokens
                 and first + (chunk + 1) * key_tile <= visible[first_row, 1]
+                and first + (chunk + 1) * key_tile <= visible[last_row, 1]
             )
             if wholly_visible:
                 for row, item in T.Parallel(query_rows, key_tile):
@@ -367,7 +388,7 @@ def _matrix_streaming_attention(
 
 @T.macro
 def _decode_scores(query, keys, scores, token, first_head, heads, width,
-                   key_tile, contraction):
+                   key_tile, contraction, key_major=False):
     """Immediate FP32 operands avoid narrowing Q/K or dynamic fragment indices."""
     q = T.alloc_fragment((heads, contraction), "float32")
     k = T.alloc_fragment((contraction, key_tile), "float32")
@@ -377,7 +398,10 @@ def _decode_scores(query, keys, scores, token, first_head, heads, width,
             q[head, channel] = T.cast(query[token, first_head + head,
                                             block * contraction + channel], "float32")
         for channel, item in T.Parallel(contraction, key_tile):
-            k[channel, item] = T.cast(keys[0, block * contraction + channel, item], "float32")
+            if key_major:
+                k[channel, item] = T.cast(keys[0, item, block * contraction + channel], "float32")
+            else:
+                k[channel, item] = T.cast(keys[0, block * contraction + channel, item], "float32")
         T.gemm(q, k, scores, policy=T.GemmWarpPolicy.FullRow)
 
 
@@ -1062,6 +1086,18 @@ class _PrefillAttentionOutputEmitter:
         )
 
 
+def attention_projection_tile(context, activation, weight):
+    """The output contraction schedule shared by dense and persistent mixers."""
+    tokens, channels = activation.shape
+    bm, bn = (32, 64) if tokens >= 256 and min(weight.shape[0], channels) >= 512 else (32, 32)
+    bk = _packet_reduction_width(weight)
+    threads = min(context.compiler_target.threads_per_group, 128,
+                  bm // 8 * context.compiler_target.subgroup_width)
+    if bk % 8 or affine_shared_bytes(bm, bn, bk, activation.dtype, weight) > context.compiler_target.shared_memory_bytes:
+        return None
+    return threads, bm, bn, bk, 8
+
+
 class AttentionOutputRule:
     """Matrix attention, query gating, flattening, and packed output projection."""
 
@@ -1087,26 +1123,16 @@ class AttentionOutputRule:
             )
             if schedule is None:
                 return ()
-            projection_threads = min(context.compiler_target.threads_per_group, 128)
-            projection = 8
-            if tokens >= 256 and min(cast(int, specs[4].shape[0]), heads * width) >= 512:
-                bm, bn = 32, 64
-            else:
-                bm, bn = 32, 32
-            bk = _packet_reduction_width(specs[4])
-            if bk % 8:
+            activation = TensorSpec((tokens, heads * width), specs[0].dtype)
+            projection_tile = attention_projection_tile(context, activation, specs[4])
+            if projection_tile is None:
                 return ()
-            projection_threads = min(
-                projection_threads, bm // 8 * context.compiler_target.subgroup_width
-            )
-            projection_shared = affine_shared_bytes(bm, bn, bk, specs[0].dtype, specs[4])
-            if max(schedule.shared_bytes, projection_shared) > context.compiler_target.shared_memory_bytes:
+            if schedule.shared_bytes > context.compiler_target.shared_memory_bytes:
                 return ()
             # Bound each history traversal. Whole-buffer workspace reuse keeps
             # partition storage shared across sequential layers, while short
             # histories publish the gated activation without a merge.
             partitions = schedule.partitions
-            activation = TensorSpec((tokens, heads * width), specs[0].dtype)
             workspace = (activation,)
             if partitions > 1:
                 workspace += schedule.workspace
@@ -1122,7 +1148,7 @@ class AttentionOutputRule:
                         specs,
                         scale,
                         schedule,
-                        (projection_threads, bm, bn, bk, projection),
+                        projection_tile,
                     ),
                     workspace=workspace,
                     kernel_count=2 if partitions == 1 else 3,
