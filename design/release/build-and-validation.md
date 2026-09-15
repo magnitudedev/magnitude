@@ -168,6 +168,8 @@ dependencies disabled, compare the installed service bytes and sandbox permissio
 the installed desktop lifecycle under an unprivileged user. Container init must reap detached
 children so process-exit checks retain their ordinary operating-system meaning. This gate does
 not replace native desktop-environment or real logout acceptance.
+The container syscall policy must permit Chromium to create its sandbox namespaces while retaining
+the default restrictions on other operations. Acceptance never disables Chromium's sandbox.
 
 The complete candidate gate additionally installs the packed npm package through Node and Bun,
 runs the installed desktop’s bundled CLI and service, acquires ICN from an empty data root, reaches ACN/ICN
