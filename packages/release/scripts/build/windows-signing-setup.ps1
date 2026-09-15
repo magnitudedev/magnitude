@@ -7,6 +7,10 @@ foreach ($name in @('AZURE_SIGNING_ENDPOINT', 'AZURE_SIGNING_ACCOUNT', 'AZURE_SI
 }
 & az account show --output none
 if ($LASTEXITCODE -ne 0) { throw 'Artifact Signing requires an authenticated Azure CLI session.' }
+# Acquire the signing audience while the GitHub login assertion is still valid.
+# Azure CLI otherwise first requests this token after the native compilation finishes.
+& az account get-access-token --resource 'https://codesigning.azure.net' --output none
+if ($LASTEXITCODE -ne 0) { throw 'Could not acquire the Artifact Signing access token.' }
 $sdk = Join-Path $env:WindowsSdkDir "bin\$($env:WindowsSDKVersion.TrimEnd('\'))\x64\signtool.exe"
 if (!(Test-Path -LiteralPath $sdk)) { throw 'The selected Windows SDK is missing x64 SignTool.' }
 if ((Get-Item -LiteralPath $sdk).VersionInfo.FileVersionRaw -lt [version]'10.0.22621.755') {
