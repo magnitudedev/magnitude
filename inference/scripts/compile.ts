@@ -108,40 +108,51 @@ export const readCargoMessages = async (
   }
 }
 
-const runCargoBuild = async (
+export const runCargoBuild = (
   command: readonly string[],
   options: {
     readonly cwd: string
     readonly env: Readonly<Record<string, string | undefined>>
     readonly diagnostics: "all" | "errors"
   },
-): Promise<readonly CargoMessage[]> => {
-  const child = Bun.spawn([...command], {
+): Promise<readonly CargoMessage[]> => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+  const child = yield* Effect.acquireRelease(Effect.try(() => Bun.spawn([...command], {
     cwd: options.cwd,
     env: options.env,
     stdin: "ignore",
     stdout: "pipe",
-    stderr: options.diagnostics === "all" ? "inherit" : "pipe",
-  })
+    stderr: "pipe",
+  })), child => Effect.promise(async () => { await child[Symbol.asyncDispose]() }))
   const renderedDiagnostics: string[] = []
-  const [code, messages, stderr] = await Promise.all([
+  const [capturedStderr, displayedStderr] = child.stderr.tee()
+  const [code, messages, stderr] = yield* Effect.tryPromise(() => Promise.all([
     child.exited,
-    readCargoMessages(child.stdout, options.diagnostics === "all"
-      ? (rendered) => process.stderr.write(rendered)
-      : (rendered) => renderedDiagnostics.push(rendered)),
-    options.diagnostics === "all"
-      ? Promise.resolve("")
-      : new Response(child.stderr).text(),
-  ])
+    readCargoMessages(child.stdout, rendered => {
+      renderedDiagnostics.push(rendered)
+      if (options.diagnostics === "all") process.stderr.write(rendered)
+    }),
+    new Response(capturedStderr).text(),
+    displayedStderr.pipeTo(new WritableStream({
+      async write(chunk) {
+        if (options.diagnostics === "all") await Bun.write(Bun.stderr, chunk)
+      },
+    })),
+  ]))
   if (code !== 0) {
     const diagnostics = [stderr, ...renderedDiagnostics]
-      .filter((value) => value.trim().length > 0)
+      .filter(value => value.trim().length > 0)
       .join("\n")
       .trim()
-    throw new Error(`${command[0]} failed with exit ${code}${diagnostics.length > 0 ? `: ${diagnostics}` : ""}`)
+    return yield* new CargoBuildFailed({ command: command[0] ?? "cargo", code, diagnostics })
   }
   return messages
-}
+})))
+
+class CargoBuildFailed extends Schema.TaggedError<CargoBuildFailed>()("CargoBuildFailed", {
+  command: Schema.String,
+  code: Schema.Number,
+  diagnostics: Schema.String,
+}) {}
 
 const rustTarget = (target: string): string => {
   const { platform, arch } = getTargetInfo(target)
