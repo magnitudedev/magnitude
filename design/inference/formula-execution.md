@@ -42,6 +42,13 @@ not expose TileLang/TVM values. Numerical work, including import conversion, use
 portable TileLang. Source I/O is not numerical kernel computation.
 
 DeviceTopology is a non-live inventory including memory domains and relationships.
+Host discovery reports every endpoint executable by the process's existing transfer
+runtime and its physical memory backing. CUDA and HIP discovery follows the installed
+Torch build on Linux and Windows; Metal uses the operating-system API. An integrated
+accelerator references the host memory domains and host physical budget; a discrete
+accelerator contributes its own device-memory domain and budget.
+Compiler-specific capabilities such as legal matrix instructions and kernel resource
+usage remain the compiler target's responsibility.
 DevicePlan selects resources and MemoryConstraints without allocating them.
 Ops DeviceRuntime is the sole live owner, including reservations, completion,
 characterization caches and shutdown. Engine's plan implements an ops-owned
