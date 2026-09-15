@@ -369,7 +369,7 @@ jobs:
         env:
           MAGNITUDE_TEST_CLI_EXECUTABLE: ${{ runner.temp }}/magnitude-release-cli/bin/magnitude-cli
         run: |
-          set -- release/${{ matrix.id }}/*.deb
+          set -- ./release/${{ matrix.id }}/*.deb
           test "$#" -eq 1
           sudo apt-get install -y --no-install-recommends "$1"
           mkdir -p "$RUNNER_TEMP/magnitude-release-cli"

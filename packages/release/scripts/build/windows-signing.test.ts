@@ -1,9 +1,13 @@
 import { ConfigProvider, Effect } from "effect"
 import { describe, expect, it } from "vitest"
 import * as NodeContext from "@effect/platform-node/NodeContext"
-import { signWindowsCode, windowsSigning } from "./windows-signing"
+import { isWindowsEngineLibrary, signWindowsCode, windowsSigning } from "./windows-signing"
 
 describe("Windows distribution signing policy", () => {
+  it("signs the common engine library while preserving Microsoft runtime signatures", () => {
+    const runtime = ["ggml-base.dll", "ggml.dll", "llama-common.dll", "llama.dll", "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"]
+    expect(runtime.filter(isWindowsEngineLibrary)).toEqual(["ggml-base.dll", "ggml.dll", "llama-common.dll", "llama.dll"])
+  })
   const config = (entries: readonly (readonly [string, string])[]) => ConfigProvider.fromMap(new Map(entries))
   it("allows local builds without invoking signing tools", async () => {
     await expect(Effect.runPromise(signWindowsCode("does-not-exist.exe").pipe(
