@@ -158,9 +158,15 @@ try {
   console.log('Fresh profile: ordinary model actions without a setup flow');
   await window.getByRole('button', { name: 'Connections', exact: true }).click();
   await window.getByRole('heading', { name: 'Connections', exact: true }).waitFor();
-  await eventually(() => window.getByRole('button', { name: 'Connect', exact: true }).count(), 8);
+  await eventually(() => window.getByRole('article').count(), 8);
+  const notInstalled = window.getByRole('region', { name: 'Not installed', exact: true });
+  assert.equal(await notInstalled.getByRole('button', { name: 'Connect', exact: true }).count(), 0);
+  const installed = window.getByRole('region', { name: 'Installed on your machine', exact: true });
+  assert.equal(await installed.getByRole('button', { name: 'Connect', exact: true }).count(), await installed.getByRole('article').count());
   assert.equal(await window.getByRole('button', { name: 'Disconnect', exact: true }).count(), 0);
-  assert.equal(await window.getByRole('button', { name: 'Connect', exact: true }).first().isDisabled(), true);
+  for (const connect of await installed.getByRole('button', { name: 'Connect', exact: true }).all()) {
+    assert.equal(await connect.isDisabled(), true);
+  }
   const rejectedConnection = await window.evaluate(async () => {
     try { await window.__magnitudeDesktop.connect({ harness: 'codex' }); return null; }
     catch (error) { return error.message; }
