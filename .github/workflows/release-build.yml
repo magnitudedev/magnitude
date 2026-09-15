@@ -65,6 +65,8 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: ./.github/actions/build-cache
+        with:
+          scope: catalog
       - run: bun install --frozen-lockfile
       - run: bun run icn:catalog:build-bundle
       - uses: actions/upload-artifact@v4
@@ -99,6 +101,8 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           targets: ${{ matrix.rustTarget }}
       - uses: ./.github/actions/build-cache
+        with:
+          scope: ${{ matrix.id }}
       - name: Install Linux build tools
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y build-essential cmake libclang-dev fakeroot rpm libgtk-3-0 libnss3 libasound2 libgbm1 libxss1 libxtst6
@@ -203,6 +207,8 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: ./.github/actions/build-cache
+        with:
+          scope: ${{ matrix.id }}
       - name: Install Linux build tools
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y build-essential cmake libclang-dev

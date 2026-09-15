@@ -1,5 +1,9 @@
 name: Build cache
 description: Cache compiler results independently of clean release output directories
+inputs:
+  scope:
+    description: Build configuration whose compiler cache is retained
+    required: true
 runs:
   using: composite
   steps:
@@ -12,13 +16,21 @@ runs:
         key: dependencies-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('inference/Cargo.lock', 'bun.lock') }}
         restore-keys: |
           dependencies-${{ runner.os }}-${{ runner.arch }}-
+    - uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/sccache
+        key: compiler-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ github.sha }}
+        restore-keys: |
+          compiler-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-
     - uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       with:
         version: v0.16.0
     - name: Enable compiler caching
       shell: bash
       run: |
-        echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+        echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
+        echo "SCCACHE_DIR=${{ runner.temp }}/sccache" >> "$GITHUB_ENV"
+        echo "SCCACHE_CACHE_SIZE=4G" >> "$GITHUB_ENV"
         echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
         echo "CMAKE_C_COMPILER_LAUNCHER=sccache" >> "$GITHUB_ENV"
         echo "CMAKE_CXX_COMPILER_LAUNCHER=sccache" >> "$GITHUB_ENV"

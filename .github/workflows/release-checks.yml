@@ -52,6 +52,8 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: ./.github/actions/build-cache
+        with:
+          scope: static
       - run: npm install --global "npm@${NPM_VERSION}"
       - run: bun install --frozen-lockfile
       - run: bun run icn:check-generated
