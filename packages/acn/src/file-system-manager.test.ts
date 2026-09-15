@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { describe, expect, it } from "vitest"
-import { Effect, Either } from "effect"
+import { Data, Effect, Either } from "effect"
 import { DirectoryPathSchema, RelativePathSchema } from "@magnitudedev/acn-protocol"
 import { FileSystemManager, type OpenedDirectory } from "./file-system-manager"
 import { testFileSystemManagerLayer } from "./session-test-support"
@@ -106,7 +106,7 @@ describe("FileSystemManager", () => {
   it("writeFileAtomic aborts on guard failure and leaves the target untouched", async () => {
     await withOpenRoot((open, root) => Effect.gen(function* () {
       yield* Effect.promise(() => writeFile(join(root, "target.txt"), "before"))
-      class GuardRejected extends Error {}
+      class GuardRejected extends Data.TaggedError("GuardRejected") {}
       const rejected = yield* Effect.either(open.writeFileAtomic(
         path("target.txt"),
         new TextEncoder().encode("after"),
