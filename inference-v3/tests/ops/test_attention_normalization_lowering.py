@@ -165,7 +165,8 @@ def test_decode_attention_keeps_its_schedule_when_output_projection_is_composed(
     assert composed.name.startswith("attention.matrix-decode-gated-output")
     assert isolated.name.startswith("causal_attention.matrix-decode")
     assert composed.emitter.schedule == isolated.emitter.schedule
-    assert composed.workspace[:2] == isolated.workspace
+    assert composed.workspace[:2] == isolated.workspace[:2]
+    assert composed.workspace[3:] == isolated.workspace[2:]
 
 
 @pytest.mark.device
@@ -362,6 +363,11 @@ def test_decode_attention_without_qualified_register_geometry_is_uncovered():
             np.asarray([[0, 0], [7, 1017], [511, 1]], dtype=np.int32),
             "causal_attention.matrix-decode@0", 16, 2, ops.DType.F32,
         ),
+        (
+            "decode", 3, 66816, 256,
+            np.asarray([[0, 65537], [7, 513], [511, 0]], dtype=np.int32),
+            "causal_attention.matrix-decode@0", 16, 2, ops.DType.BF16,
+        ),
     ),
 )
 def test_optimized_attention_schedules_match_reference_on_metal(
@@ -377,6 +383,15 @@ def test_optimized_attention_schedules_match_reference_on_metal(
     # exactly at physical capacity, and a query-tile tail;
     # their strict tolerance rejects rounding probabilities to a 16-bit dtype.
     history = rng.normal(0, 0.7, (2, capacity, kv_heads, width)).astype(dtype)
+    if floating == ops.DType.BF16:
+        query = torch.from_numpy(query).to(torch.bfloat16).float().numpy()
+        history = torch.from_numpy(history).to(torch.bfloat16).float().numpy()
+
+    def payload(value):
+        if floating == ops.DType.BF16:
+            return torch.from_numpy(value).to(torch.bfloat16).view(torch.uint8).numpy().tobytes()
+        return value.tobytes()
+
     specs = (
         ops.TensorSpec(query.shape, floating),
         ops.TensorSpec(history.shape, floating),
@@ -398,14 +413,13 @@ def test_optimized_attention_schedules_match_reference_on_metal(
         graph,
         {"query": query, "history": history, "visible": visible},
     ).outputs[0]
-    device = ops.DeviceRuntime.open(DevicePlan.discover(backend="metal", maximum_bytes=1 << 28))
-    resources = compiled = execution = None
+    device = ops.DeviceRuntime.open(DevicePlan.discover(backend="metal", maximum_bytes=1 << 29))
+    resources = []
+    compiled = execution = None
     try:
-        resources = (
-            device.upload(specs[0], query.tobytes()),
-            device.upload(specs[1], history.tobytes()),
-            device.upload(specs[2], visible.tobytes()),
-        )
+        for spec, value in zip(specs, (query, history, visible), strict=True):
+            resources.append(device.upload(spec, value.tobytes() if spec.dtype == ops.DType.I32
+                                            else payload(value)))
         compiled = ops.compile(
             function,
             signature=signature,
@@ -421,7 +435,7 @@ def test_optimized_attention_schedules_match_reference_on_metal(
         )
         execution.completion.wait()
         np.testing.assert_allclose(
-            execution.outputs[0].native.cpu().numpy(),
+            execution.outputs[0].native.cpu().float().numpy(),
             expected,
             rtol=3e-5 if floating == ops.DType.F32 else 3e-2,
             atol=3e-6 if floating == ops.DType.F32 else 3e-3,

@@ -8,6 +8,7 @@ import tilelang.language as T
 
 from ..compiler.lowering import BoundOperation, LoweringContext
 from ..tensor.graph import Graph
+from ..tensor.types import DType, TensorSpec
 
 
 @T.macro
@@ -162,42 +163,24 @@ class RoutingRule:
 
 
 @T.macro
-def _router_topk(
-    hidden,
-    router,
-    indices,
-    weights,
-    rows,
-    width,
-    experts,
-    selected,
-    scoring,
-    normalize,
-    threads,
-):
-    with T.Kernel(rows, threads=threads) as row:
+def _router_projection(hidden, router, logits, rows, width, experts, threads):
+    """Distribute independent expert dots across the device before selection."""
+    subgroups = threads // 32
+    with T.Kernel(T.ceildiv(experts, subgroups), rows, threads=threads) as (block, row):
         thread = T.get_thread_binding()
         lane = thread % 32
-        subgroup = thread // 32
-        subgroups = threads // 32
-        logits = T.alloc_shared((experts,), "float32")
+        expert = block * subgroups + thread // 32
         partial = T.alloc_local((1,), "float32")
-        for expert_block in T.serial(T.ceildiv(experts, subgroups)):
-            expert = expert_block * subgroups + subgroup
-            partial[0] = 0.0
-            if expert < experts:
-                for channel_block in T.serial(T.ceildiv(width, 32)):
-                    channel = channel_block * 32 + lane
-                    if channel < width:
-                        partial[0] += T.cast(hidden[row, channel], "float32") * T.cast(
-                            router[expert, channel], "float32"
-                        )
-            projected = T.warp_reduce_sum(partial[0])
-            if lane == 0 and expert < experts:
-                logits[expert] = projected
-        T.sync_threads()
-        score = T.if_then_else(thread < experts, logits[thread], -3.402823466e38)
-        _finish_topk(score, indices, weights, row, experts, selected, scoring, normalize, threads)
+        partial[0] = 0.0
+        if expert < experts:
+            for channel_block in T.serial(T.ceildiv(width, 32)):
+                channel = channel_block * 32 + lane
+                if channel < width:
+                    partial[0] += T.cast(hidden[row, channel], "float32") * T.cast(
+                        router[expert, channel], "float32")
+        projected = T.warp_reduce_sum(partial[0])
+        if lane == 0 and expert < experts:
+            logits[row, expert] = projected
 
 
 class _RouterTopKEmitter:
@@ -205,7 +188,10 @@ class _RouterTopKEmitter:
         self.args = rows, width, experts, selected, scoring, normalize, threads
 
     def __call__(self, operands: tuple[Any, ...]) -> None:
-        _router_topk(operands[0], operands[1], operands[2], operands[3], *self.args)
+        rows, width, experts, selected, scoring, normalize, threads = self.args
+        _router_projection(operands[0], operands[1], operands[4], rows, width, experts, min(128, threads))
+        _subgroup_topk(operands[4], operands[2], operands[3],
+                       rows, experts, selected, scoring, normalize, threads)
 
 
 class RouterTopKRule:
@@ -243,9 +229,12 @@ class RouterTopKRule:
         threads = max(32, 1 << (experts - 1).bit_length())
         if router_width != width or threads > context.compiler_target.threads_per_group:
             return ()
+        logits = TensorSpec((rows, experts), DType.F32)
+        if logits.storage_nbytes > context.workspace_limit:
+            return ()
         return (
             BoundOperation(
-                f"route_topk.fused-router@{root}:{route.id}",
+                f"route_topk.parallel-router@{root}:{route.id}",
                 frozenset({root, route.id}),
                 linear.inputs,
                 route.outputs,
@@ -258,6 +247,8 @@ class RouterTopKRule:
                     route.attributes["normalize"],
                     threads,
                 ),
+                workspace=(logits,),
+                kernel_count=2,
             ),
         )
 

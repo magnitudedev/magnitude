@@ -117,7 +117,7 @@ def test_routed_feedforward_lowers_as_one_maximal_decode_submission():
     context = LoweringContext(CAPABILITIES, "decode", "model", "test", 1 << 20)
     cover = build_operations(graph, context)
     names = tuple(candidate.name.split("@", 1)[0] for candidate in cover)
-    assert names == ("route_topk.fused-router", "routed_experts.packet-shared")
+    assert names == ("route_topk.parallel-router", "routed_experts.packet-shared")
     submissions = plan_submissions(graph, cover)
     assert len(submissions) == 1
-    assert submissions[0].kernel_count == 3
+    assert submissions[0].kernel_count == 4
