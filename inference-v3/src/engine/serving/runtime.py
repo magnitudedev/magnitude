@@ -210,8 +210,8 @@ class Runtime:
 
 @contextmanager
 def open_runtime(config: Config) -> Iterator[Runtime]:
-    from engine.blueprints import execution, models, service, serving
-    from engine.blueprints import weights as containers
+    from engine.blueprints import execution, service, serving
+    from engine.loading import model_recipe
     from engine.composition import build, digest, dumps
     from engine.devices import DevicePlan
 
@@ -220,22 +220,9 @@ def open_runtime(config: Config) -> Iterator[Runtime]:
     )
     endpoint = plan.selected_endpoints[0]
     context = execution.DeviceRuntime(plan=plan, schedules=config.schedules)
-    if Path(config.target).is_dir():
-        container = containers.MLX(path=config.target)
-        description = models.Qwen35MLXDescription(format=container)
-        metadata = serving.MLXChatMetadata(artifact=container)
-    else:
-        container = containers.GGUF(path=config.target)
-        description = models.Qwen35DenseDescription(format=container)
-        metadata = serving.ChatMetadata(artifact=container)
-    residency = containers.Weights(format=container, context=context)
-    model = models.Qwen35Dense(
-        description=description,
-        device=context,
-        weights=residency,
-        max_sequences=config.parallel_sequences,
-        prefill_rows=config.prefill_tokens,
-        context_capacity=config.context_tokens,
+    model, metadata = model_recipe(
+        path=config.target, device=context, max_sequences=config.parallel_sequences,
+        batch_tokens=config.prefill_tokens, context_tokens=config.context_tokens,
     )
     recipe = serving.ChatComponents(
         engine=service.Continuous(

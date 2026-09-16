@@ -211,6 +211,9 @@ class DenseRuntime(ModelExecutor):
             states.append(sequence.state)
         return self.states.reclaimable(tuple(states))
 
+    def text_input(self, tokens: tuple[TokenId, ...]):
+        return self.input(InputPlan.text(tokens))
+
     def input(self, plan: InputPlan, features: tuple[Feature, ...] = ()):
         from engine.models.qwen35.sequence import Source
 
@@ -246,10 +249,11 @@ class DenseRuntime(ModelExecutor):
                     for token in request.tokens
                 ):
                     raise ValueError("model input tokens must belong to the bound vocabulary")
-                if (request.draw_words is None) != (request.selection == LogitsSelection.NONE):
-                    raise ValueError("sampling draws must exactly accompany requested logits")
+                if request.draw_words is not None and request.selection == LogitsSelection.NONE:
+                    raise ValueError("sampling requires requested logits")
                 if request.allowed_tokens is not None and (
-                    request.selection != LogitsSelection.LAST
+                    request.draw_words is None
+                    or request.selection != LogitsSelection.LAST
                     or (
                         len(request.allowed_tokens) != ((self.geometry.vocabulary + 31) // 32) * 4
                         if isinstance(request.allowed_tokens, bytes)
@@ -377,7 +381,7 @@ class DenseRuntime(ModelExecutor):
             if output_rows:
                 output_spec = ops.TensorSpec((len(output_rows),), ops.DType.I32)
                 fields.append(field("output_rows", "i", output_rows, output_spec))
-                if not deferred:
+                if not deferred and any(request.draw_words is not None for request in requests):
                     draw_spec = ops.TensorSpec((len(output_rows), 6), ops.DType.U32)
                     fields.append(field("draws", "I", draw_words, draw_spec))
             masks_spec = mask_rows_spec = None
@@ -486,9 +490,10 @@ class DenseRuntime(ModelExecutor):
             if sampler is not None:
                 execution = self._sample_deferred(execution, sampler, requests, selections, draw_words)
             attention_count = len(self.states.attention)
-            cursor = 2 if output_rows else 0
+            sampled = bool(output_rows) and (draw_spec is not None or deferred)
+            cursor = (2 if sampled else 1) if output_rows else 0
             logits = execution.outputs[0] if output_rows else None
-            samples = execution.outputs[1] if output_rows else None
+            samples = execution.outputs[1] if sampled else None
             cursor += attention_count
             convolution = execution.outputs[cursor : cursor + recurrent_layers]
             cursor += recurrent_layers
@@ -499,12 +504,15 @@ class DenseRuntime(ModelExecutor):
             ):
                 logit = sample = None
                 if count:
-                    assert logits is not None and samples is not None
+                    assert logits is not None
                     logit = logits.view(
                         ops.TensorSpec((count, self.geometry.vocabulary), ops.DType.F32),
                         first * self.geometry.vocabulary * 4,
                     )
-                    sample = samples.view(ops.TensorSpec((count, 2), ops.DType.I32), first * 8)
+                    if samples is not None and requests[sequence].draw_words is not None:
+                        sample = samples.view(
+                            ops.TensorSpec((count, 2), ops.DType.I32), first * 8
+                        )
                 following_states = []
                 for layer in range(recurrent_layers):
                     conv_spec = recurrent[layer * len(requests) + sequence].convolution.spec

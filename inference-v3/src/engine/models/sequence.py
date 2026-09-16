@@ -23,6 +23,7 @@ class ModelAdvance(Protocol):
     def logits(self) -> ops.Resource | None: ...
     def commit(self) -> None: ...
     def read_sample(self) -> tuple[int, int] | None: ...
+    def read_logits(self) -> tuple[tuple[float, ...], ...]: ...
     def close(self) -> None: ...
 
 
@@ -56,6 +57,10 @@ class ModelBatch(Protocol):
 
 class ModelExecutor(ABC):
     context: ops.DeviceRuntime
+
+    def text_input(self, tokens: tuple[TokenId, ...]) -> ModelInput:
+        """Construct text conditioning when supported by this architecture."""
+        raise NotImplementedError("this model does not support plain-text input")
 
     @abstractmethod
     def prime(self, rows: int, horizon: int) -> None:

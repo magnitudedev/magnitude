@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import struct
 from contextlib import ExitStack
 from typing import TYPE_CHECKING
 
@@ -30,6 +31,13 @@ class SequenceAdvance:
         self.sequence.pending = None
         self.committed = True
         previous.close()
+
+    def read_logits(self) -> tuple[tuple[float, ...], ...]:
+        """Return owned host rows, waiting for this advance's execution."""
+        content = self.forward.read_logits()
+        rows, columns = self.forward.logits.spec.shape
+        values = struct.unpack(f"={rows * columns}f", content)
+        return tuple(tuple(values[row * columns:(row + 1) * columns]) for row in range(rows))
 
     def read_sample(self):
         return self.forward.read_sample()

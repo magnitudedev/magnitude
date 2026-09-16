@@ -33,6 +33,49 @@ The host backend needs an LLVM-enabled build: add `USE_LLVM=ON` with an
 `llvm-config` from a release TileLang's TVM supports on the path. It is a
 correctness target, not a performance one.
 
+## Python library
+
+The existing `magnitude-engine-v3` distribution now includes the public `magnitude`
+module. Internal `engine`, `ops`, and `templates` packages keep their existing names.
+After the setup above, use:
+
+```python
+from magnitude import ModelRequest, SpecialTokens, load_model
+
+with load_model("/path/to/model", memory_bytes=8 * 1024**3) as loaded:
+    tokens = loaded.tokenizer.encode("The capital of France is", special=SpecialTokens.LITERAL)
+    source = loaded.input(tokens)
+    sequence = source.open()
+    try:
+        batch = loaded.executor.prepare((ModelRequest(sequence, tokens),))
+        try:
+            logits = batch.advances[0].read_logits()[0]
+            next_token = max(range(len(logits)), key=logits.__getitem__)
+            print(loaded.tokenizer.decode((next_token,)))
+            batch.advances[0].commit()
+        finally:
+            batch.close()
+    finally:
+        sequence.close()
+        source.close()
+```
+
+`load_model` accepts a local supported GGUF file or MLX directory. It owns loading
+and cleanup on the calling thread; it does not download weights or start a server.
+`backend`, `ordinal`, `context_tokens`, `max_sequences`, and `batch_tokens` configure
+the existing executor. Compilation happens on first execution. Process long inputs
+in chunks within `batch_tokens`; `LogitsSelection.NONE` requests state-only work.
+Readout returns owned host rows and waits for completion. Sampling is optional and
+explicit through `ModelRequest.draw_words`; reading logits does not commit an advance.
+Use the ordinary sequence checkpoint/fork methods for independent continuations.
+All model handles must be closed within the load context and used on its owner thread.
+
+To build the existing distribution with this import surface, run `uv build --wheel`.
+Install the resulting wheel into an environment containing the qualified TileLang
+fork and the declared runtime dependencies. This change adds the library surface;
+it does not publish a new package or establish a compiler-free installation path.
+See [examples/library.py](examples/library.py) for an executable example.
+
 ## Run
 
 ```sh
