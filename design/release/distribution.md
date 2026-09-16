@@ -115,17 +115,18 @@ The concrete host dependency contracts are defined in
 
 ## Desktop-owned command registration
 
-The installed desktop exposes its bundled CLI directly. macOS offers an authorized symlink in
-`/usr/local/bin` on installed-app launch; Windows registers the bundled CLI directory in the
-current user's PATH. Linux retains its package-owned `/usr/bin/magnitude` link. App replacement
-keeps the command pointed at the matching bundled version. No npm launcher is required.
+The installed desktop exposes its bundled CLI directly. macOS silently creates the user-owned
+`~/.magnitude/bin/magnitude` link on installed-app launch and prepends that directory using marked
+shell configuration entries. It never requests administrator authorization. Windows registers the
+bundled CLI directory in the current user's PATH. Linux retains its package-owned
+`/usr/bin/magnitude` link. App replacement keeps the command pointed at the matching bundled
+version. No npm launcher is required.
 
-Registration replaces existing `magnitude` commands on PATH so the bundled CLI takes precedence.
-On macOS these become links to the bundle; on Windows prior command shims are removed after the
-new payload and PATH registration are installed. Other command names and directories are untouched. Removal deletes only
-an exact symlink targeting this installation or a PATH entry recorded as added by this installer;
-pre-existing PATH entries and other user entries are preserved. Windows changes notify new shell
-launches; existing terminals may retain their old environment. macOS Finder deletion has no
-uninstall callback, so the app provides explicit command-link removal.
-macOS elevation uses native Authorization Services from the application, not AppleScript.
-Successful registration is silent and already-correct links require no authorization.
+Registration replaces writable existing `magnitude` commands on PATH so the bundled CLI takes
+precedence. Protected macOS commands remain untouched and are shadowed by the user PATH entry.
+On Windows prior command shims are removed after the new payload and PATH registration are
+installed. Other command names and directories are untouched. Removal deletes only exact links
+targeting this installation and unchanged managed shell blocks, or a Windows PATH entry recorded
+as added by this installer. Other user configuration is preserved. New terminals pick up PATH
+changes; existing terminals may retain their old environment. macOS Finder deletion has no uninstall
+callback, so the app provides explicit command-link removal. Successful registration is silent.

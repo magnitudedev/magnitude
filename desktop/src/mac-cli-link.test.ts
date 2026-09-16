@@ -3,7 +3,7 @@ import { NodeContext } from "@effect/platform-node"
 import { Effect } from "effect"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
-import { CliLinkFailed, makeMacCliLink } from "./mac-cli-link"
+import { makeMacCliLink } from "./mac-cli-link"
 
 const fixture = <A>(test: (link: ReturnType<typeof makeFixture>, fs: FileSystem.FileSystem) => Effect.Effect<A, unknown, FileSystem.FileSystem>) =>
   Effect.runPromise(Effect.scoped(Effect.gen(function* () {
@@ -16,13 +16,12 @@ const fixture = <A>(test: (link: ReturnType<typeof makeFixture>, fs: FileSystem.
 const makeFixture = (root: string) => ({
   root, link: join(root, "bin/magnitude"), target: join(root, "Magnitude's App.app/Contents/Resources/magnitude"),
 })
-const noAuthorization = () => Effect.fail(new CliLinkFailed({ message: "Unexpected authorization request" }))
 
 describe("Mac desktop command link", () => {
   it("survives replacement of the bundled CLI and removes only its own link", () => fixture((paths, fs) => Effect.gen(function* () {
     yield* fs.makeDirectory(join(paths.target, ".."), { recursive: true })
     yield* fs.writeFileString(paths.target, "first version")
-    const cli = yield* makeMacCliLink({ ...paths, authorize: noAuthorization })
+    const cli = yield* makeMacCliLink({ ...paths })
     expect(yield* cli.read).toBe("Missing")
     yield* cli.install
     yield* cli.install
@@ -44,7 +43,7 @@ describe("Mac desktop command link", () => {
       if (kind === "foreign-link") yield* fs.writeFileString(other, "other installation")
       yield* fs.symlink(other, paths.link)
     }
-    const cli = yield* makeMacCliLink({ ...paths, authorize: noAuthorization })
+    const cli = yield* makeMacCliLink({ ...paths })
     expect(yield* cli.read).toBe("Other")
     yield* cli.install
     expect(yield* cli.read).toBe("Installed")
@@ -55,7 +54,7 @@ describe("Mac desktop command link", () => {
   })))
 
   it("preserves a command replaced after installation", () => fixture((paths, fs) => Effect.gen(function* () {
-    const cli = yield* makeMacCliLink({ ...paths, authorize: noAuthorization })
+    const cli = yield* makeMacCliLink({ ...paths })
     yield* cli.install
     yield* fs.remove(paths.link)
     yield* fs.writeFileString(paths.link, "user replacement")
@@ -69,7 +68,7 @@ describe("Mac desktop command link", () => {
     yield* fs.makeDirectory(npmBin, { recursive: true })
     yield* fs.writeFileString(npmCommand, "#!/bin/sh\nexit 0\n")
     yield* fs.chmod(npmCommand, 0o755)
-    const cli = yield* makeMacCliLink({ ...paths, path: `${npmBin}:${missingBin}:${npmBin}`, authorize: noAuthorization })
+    const cli = yield* makeMacCliLink({ ...paths, path: `${npmBin}:${missingBin}:${npmBin}` })
     yield* cli.install
     expect(yield* fs.readLink(npmCommand)).toBe(paths.target)
     expect(yield* fs.exists(missingBin)).toBe(false)
@@ -84,7 +83,7 @@ describe("Mac desktop command link", () => {
   it("does not remove a directory named magnitude", () => fixture((paths, fs) => Effect.gen(function* () {
     yield* fs.makeDirectory(paths.link, { recursive: true })
     yield* fs.writeFileString(join(paths.link, "keep"), "keep")
-    const cli = yield* makeMacCliLink({ ...paths, authorize: noAuthorization })
+    const cli = yield* makeMacCliLink({ ...paths })
     expect((yield* Effect.either(cli.install))._tag).toBe("Left")
     expect(yield* fs.readFileString(join(paths.link, "keep"))).toBe("keep")
   })))

@@ -30,5 +30,3 @@ export { acquireUpdateInstallationLease, isUpdateInstallationActive } from "./up
 export { UpdatePreferences, UpdatePreferencesFailed, makeUpdatePreferences } from "./update-preferences"
 
 export { MacUpdateHandoff, MacUpdateHandoffRequest, MacUpdateHandoffFailed, startMacUpdateHandoff, relaunchMacAfterUpdate } from "./mac-update-handoff"
-
-export { authorizeMacCliLink, MacCliAuthorizationFailed } from "./mac-cli-authorization"

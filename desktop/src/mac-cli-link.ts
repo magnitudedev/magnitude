@@ -15,7 +15,6 @@ export const makeMacCliLink = (options: {
   readonly link: string
   readonly target: string
   readonly path?: string
-  readonly authorize: (link: string, target: string, remove: boolean) => Effect.Effect<void, CliLinkFailed>
 }) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const lock = yield* Effect.makeSemaphore(1)
@@ -40,17 +39,17 @@ export const makeMacCliLink = (options: {
       if (state !== "Missing") yield* fs.remove(link)
       yield* fs.symlink(options.target, link)
     })
-    yield* create.pipe(Effect.catchAll(error => error._tag === "SystemError" && error.reason === "PermissionDenied"
-      ? options.authorize(link, options.target, false)
+    const created = yield* create.pipe(Effect.as(true), Effect.catchAll(error => error._tag === "SystemError" && error.reason === "PermissionDenied"
+      ? (link !== options.link ? Effect.succeed(false) : Effect.fail(new CliLinkFailed({ message: `Cannot write the user command at ${link}.` })))
       : Effect.fail(new CliLinkFailed({ message: `Could not install ${link}: ${error.message}` }))))
-    if ((yield* readAt(link)) !== "Installed") return yield* new CliLinkFailed({ message: `The command-line link was not installed at ${link}.` })
+    if (created && (yield* readAt(link)) !== "Installed") return yield* new CliLinkFailed({ message: `The command-line link was not installed at ${link}.` })
   }), { discard: true }))
   const remove = lock.withPermits(1)(Effect.forEach(candidates, link => Effect.gen(function* () {
     if ((yield* readAt(link)) !== "Installed") return
-    yield* fs.remove(link).pipe(Effect.catchAll(error => error._tag === "SystemError" && error.reason === "PermissionDenied"
-      ? options.authorize(link, options.target, true)
+    yield* fs.remove(link).pipe(Effect.catchAll(error => error._tag === "SystemError" && error.reason === "PermissionDenied" && link !== options.link
+      ? Effect.void
       : Effect.fail(new CliLinkFailed({ message: `Could not remove ${link}: ${error.message}` }))))
-    if ((yield* readAt(link)) === "Installed") return yield* new CliLinkFailed({ message: `The command-line link could not be removed at ${link}.` })
+
   }), { discard: true }))
   return MacCliLink.of({ read, install, remove })
 })
