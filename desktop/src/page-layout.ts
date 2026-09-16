@@ -21,5 +21,5 @@ export const pageLayout = {
   harnessCard: "rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-750 dark:bg-slate-850",
   harnessGrid: "grid items-start gap-5 xl:grid-cols-2",
   usageTokens: "grid gap-5 min-[1100px]:grid-cols-3",
-  usageTiming: "grid gap-5 min-[900px]:grid-cols-2",
+  usageTiming: "grid gap-5 min-[1100px]:grid-cols-3",
 } as const
