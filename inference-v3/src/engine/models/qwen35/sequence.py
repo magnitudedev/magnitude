@@ -179,6 +179,10 @@ class Source:
     def prompt(self):
         return self.inputs.plan.tokens
 
+    def prepare(self):
+        self.inputs.check()
+        return None
+
     def open(self) -> Sequence:
         self.inputs.check()
         return self.model.create(self.inputs.plan, self.inputs.features)

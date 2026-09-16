@@ -5,6 +5,8 @@ import math
 
 import tilelang.language as T
 
+from .buffers import rebase_buffer
+
 from ..compiler.schedules import select_schedule
 from ..tensor.types import DType, TensorSpec
 from .attention import (
@@ -144,6 +146,9 @@ def dimension_tiled_prefill(
         head_block,
         partition,
     ):
+        query = rebase_buffer(query)
+        current_keys = rebase_buffer(current_keys)
+        current_values = rebase_buffer(current_values)
         table = prepare_codebook(history_spec, from_history)
         first_head = head_block * head_tile
         kv_head = first_head // group

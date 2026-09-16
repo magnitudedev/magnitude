@@ -13,7 +13,7 @@ from types import FunctionType
 from typing import Any
 
 from ..representations import Dense
-from ..tensor.graph import Graph, Node, SourceLocation, _stable
+from ..tensor.graph import Graph, Node, SourceLocation, ValueKind, _stable
 from ..tensor.types import TensorSpec
 from .dependencies import CodeDependency, code_dependencies, code_identity
 
@@ -29,6 +29,7 @@ class PortRole(StrEnum):
 class KernelPort:
     spec: TensorSpec
     role: PortRole
+    offset: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,12 +43,25 @@ class KernelDefinition:
     dependencies: tuple[CodeDependency, ...] = ()
 
 
-def annotation(T, spec: TensorSpec):
+def annotation(T, spec: TensorSpec, *, offset: bool = True) -> Any:
+    # Resources include views into retained outputs and partially consumed input
+    # features. Their DLPack byte offset is dynamic, even when shape is static.
     representation = spec.representation
     if representation is not None and not isinstance(representation, Dense):
-        return T.Tensor(((spec.storage_nbytes + 3) // 4,), T.uint32)
-    dtype = spec.dtype if not isinstance(representation, Dense) else representation.dtype
-    return T.Tensor(spec.shape, dtype.value)
+        shape, dtype = ((spec.storage_nbytes + 3) // 4,), "uint32"
+    else:
+        shape = spec.shape
+        dtype = (
+            spec.dtype if not isinstance(representation, Dense) else representation.dtype
+        ).value
+    if not offset:
+        return T.Tensor(shape, dtype)
+    strides = []
+    stride = 1
+    for extent in reversed(shape):
+        strides.append(stride)
+        stride *= extent
+    return T.buffer(shape, dtype, strides=tuple(reversed(strides)), offset_factor=1)
 
 
 def _identity(value):
@@ -89,23 +103,44 @@ _LOCK = RLock()
 
 def define_kernel(emitter, ports: tuple[KernelPort, ...]) -> KernelDefinition:
     """Build symbolic TileLang only; never lowers, compiles, allocates or executes."""
-    import tilelang
     import tilelang.language as T
 
+    import tilelang
+
     dependencies = code_dependencies(emitter)
-    payload = (_identity(emitter), _identity(ports),
-               tuple((item.module, item.symbol, item.fingerprint) for item in dependencies),
-               tilelang.__version__)
-    identity = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    payload = (
+        _identity(emitter),
+        _identity(ports),
+        tuple((item.module, item.symbol, item.fingerprint) for item in dependencies),
+        tilelang.__version__,
+    )
+    identity = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     with _LOCK:
         cached = _DEFINITIONS.get(identity)
         if cached is not None:
             _DEFINITIONS.move_to_end(identity)
             return cached
         name = f"ops_{identity[:24]}"
-        parameters = tuple((f"p{index}", annotation(T, port.spec)) for index, port in enumerate(ports))
+        buffers = tuple(
+            (f"p{index}", annotation(T, port.spec, offset=port.offset))
+            for index, port in enumerate(ports)
+        )
+        # Private launchers receive raw buffer pointers. Carry their element
+        # offsets explicitly instead of leaving free variables in the launcher.
+        parameters = (
+            *buffers,
+            *(
+                (f"offset{index}", buffer.elem_offset)
+                for index, (_, buffer) in enumerate(buffers)
+                if ports[index].offset
+            ),
+        )
+
         def body(*bound):
-            emitter(tuple(bound))
+            emitter(tuple(bound[: len(ports)]))
+
         program = T.build_prim_func(name, parameters, body)
         definition = KernelDefinition(identity, name, ports, program, dependencies)
         _DEFINITIONS[identity] = definition
@@ -118,9 +153,28 @@ def define_kernel(emitter, ports: tuple[KernelPort, ...]) -> KernelDefinition:
 
 def operation_definition(graph: Graph, operation) -> KernelDefinition:
     reads, writes = set(operation.inputs), set(operation.outputs)
-    ports = tuple(KernelPort(graph.value(value).spec,
-                            PortRole.READ_WRITE if value in reads and value in writes
-                            else PortRole.READ if value in reads else PortRole.WRITE)
-                  for value in (*operation.inputs, *operation.outputs))
-    ports += tuple(KernelPort(spec, PortRole.WORKSPACE) for spec in operation.workspace)
+
+    def offset(value):
+        tensor = graph.value(value)
+        if tensor.kind in (ValueKind.INPUT, ValueKind.RESOURCE) or tensor.resource_id is not None:
+            return True
+        if tensor.producer is not None:
+            for result, source in graph.nodes[tensor.producer].effects.aliases:
+                if result == value:
+                    return offset(source)
+        return False
+
+    ports = tuple(
+        KernelPort(
+            graph.value(value).spec,
+            PortRole.READ_WRITE
+            if value in reads and value in writes
+            else PortRole.READ
+            if value in reads
+            else PortRole.WRITE,
+            offset(value),
+        )
+        for value in (*operation.inputs, *operation.outputs)
+    )
+    ports += tuple(KernelPort(spec, PortRole.WORKSPACE, False) for spec in operation.workspace)
     return define_kernel(operation.emitter, ports)

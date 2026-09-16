@@ -4,7 +4,8 @@ import json
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
-from time import time, perf_counter_ns
+from pathlib import Path
+from time import perf_counter_ns, time
 from typing import Literal
 
 from pydantic import TypeAdapter
@@ -12,10 +13,11 @@ from pydantic import TypeAdapter
 from engine.data import TokenId
 from engine.generation.constraints import ConstraintPlan
 from engine.inputs.formats.gguf_tokenizer import TokenizerArtifact
+from engine.inputs.media import PreparedMedia
 from engine.inputs.tokenizer import ByteBPETokenizer
+from engine.serving.metrics import PreparationMetrics
 from engine.serving.requests import Message, NamedChoice, Tool
 from engine.serving.tool_choice import select_tools
-from engine.serving.metrics import PreparationMetrics
 from templates import Template
 from templates.bundle import Variant
 from templates.native import PreparedRequest
@@ -31,6 +33,7 @@ class PreparedChat:
     variant: Variant
     profile: ReasoningProfile
     metrics: PreparationMetrics
+    media: PreparedMedia | None = None
 
     def close(self) -> None:
         self.native.close()
@@ -43,10 +46,13 @@ class ChatTemplate:
         *,
         variant: str | None = None,
         override: Variant | None = None,
+        image_directory: Path | None = None,
     ):
         self.artifact = artifact
         self.tokenizer = ByteBPETokenizer(artifact.config)
         self.variant, self.override = variant, override
+        self._image_directory = image_directory
+        self._images = None
         self._lock = threading.RLock()
         self._closed = False
         self._templates: dict[str, Template] = {}
@@ -117,8 +123,13 @@ class ChatTemplate:
                     self._profile_bytes -= removed
                 self._profiles[key] = profile, size
                 self._profile_bytes += size
-        return selected, template, profile, PreparationMetrics(
-            template_create_ns=create_ns, effort_probe_ns=probe_ns, profile_cache_hit=hit
+        return (
+            selected,
+            template,
+            profile,
+            PreparationMetrics(
+                template_create_ns=create_ns, effort_probe_ns=probe_ns, profile_cache_hit=hit
+            ),
         )
 
     def render(
@@ -136,10 +147,40 @@ class ChatTemplate:
         messages = TypeAdapter(list[Message]).validate_python(messages)
         tools = TypeAdapter(list[Tool]).validate_python([] if tools is None else tools)
         normalized = [message.model_dump(mode="json", exclude_none=True) for message in messages]
+        has_images = any(
+            isinstance(message.get("content"), list)
+            and any(part["type"] == "image_url" for part in message["content"])
+            for message in normalized
+        )
+        images = ()
+        image_preparation = None
+        image_prepare_ns = 0
+        if has_images:
+            image_started = perf_counter_ns()
+            from engine.models.qwen35.preparation import ImagePreparation
+            from engine.serving.images import resolve_images
+
+            if self._image_directory is None:
+                raise ValueError("the served artifact does not provide an image encoder")
+            with self._lock:
+                if self._images is None:
+                    self._images = ImagePreparation(
+                        self._image_directory, self.artifact.config.pieces
+                    )
+                image_preparation = self._images
+            normalized, images = resolve_images(normalized)
+            image_prepare_ns = perf_counter_ns() - image_started
         for message in normalized:
             content = message.get("content", "")
             message["content"] = (
-                "".join(part["text"] for part in content) if isinstance(content, list) else content
+                "".join(
+                    image_preparation.marker
+                    if image_preparation is not None and part["type"] == "image"
+                    else part["text"]
+                    for part in content
+                )
+                if isinstance(content, list)
+                else content
             )
             for call in message.get("tool_calls", []):
                 arguments = call["function"]["arguments"]
@@ -186,7 +227,14 @@ class ChatTemplate:
             rendered = perf_counter_ns()
             try:
                 description = native.description
-                tokens = self.tokenizer.encode(description.prompt)
+                text, media = description.prompt, None
+                if images:
+                    assert image_preparation is not None
+                    image_started = perf_counter_ns()
+                    text, media = image_preparation.prepare(text, images)
+                    image_prepare_ns += perf_counter_ns() - image_started
+                tokenize_started = perf_counter_ns() if images else rendered
+                tokens = self.tokenizer.encode(text)
                 tokenized = perf_counter_ns()
                 if not tokens:
                     raise ValueError("chat template produced no input tokens")
@@ -205,11 +253,20 @@ class ChatTemplate:
                         "selected template did not produce required output constraints"
                     )
                 return PreparedChat(
-                    description.prompt, tokens, native, constraint, variant, profile,
-                    metrics.model_copy(update={
-                        "render_ns": rendered - started,
-                        "tokenize_ns": tokenized - rendered,
-                    }),
+                    text,
+                    tokens,
+                    native,
+                    constraint,
+                    variant,
+                    profile,
+                    metrics.model_copy(
+                        update={
+                            "render_ns": rendered - started,
+                            "tokenize_ns": tokenized - tokenize_started,
+                            "image_prepare_ns": image_prepare_ns,
+                        }
+                    ),
+                    media,
                 )
             except BaseException:
                 native.close()

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..formula import FormulaCall
-from .bounds import Bounds, ZERO
+from .bounds import ZERO, Bounds
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +61,11 @@ def normalization(inputs, attrs, outputs, *, values=None):
     rows = inputs[0].elements // inputs[0].shape[-1]
     return work(floating=inputs[0].elements * (4 if len(inputs) == 2 else 3) + rows,
                 special=rows)
+
+
+def layer_normalization(inputs, attrs, outputs, *, values=None):
+    rows = inputs[0].elements // inputs[0].shape[-1]
+    return work(floating=inputs[0].elements * 8 + rows * 3, special=rows)
 
 
 def softmax(inputs, attrs, outputs, *, values=None):

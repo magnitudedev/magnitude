@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from enum import StrEnum
 
 from ..tensor.graph import Graph
 from ..tensor.types import TensorSpec
 from .lowering import BoundOperation, KernelBinding, SubmissionUnit
 from .memory import MemoryPlan
+from .program import define_kernel
 
 
 class ParameterKind(StrEnum):
@@ -29,6 +31,7 @@ class UnitParameter:
     key: BindingKey
     spec: TensorSpec
     kind: ParameterKind
+    offset: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,7 +56,11 @@ class TileCompilationUnit:
         return tuple(parameter.spec for parameter in self.parameters)
 
 
-def build_unit(graph: Graph, memory: MemoryPlan, unit: SubmissionUnit) -> TileCompilationUnit:
+def build_unit(graph: Graph, memory: MemoryPlan, unit: SubmissionUnit, *,
+               bound_offsets: Mapping[int, int] | None = None) -> TileCompilationUnit:
+    # A fixed binding proves its origin for the lifetime of the executable.
+    # Unbound inputs, resources and constants must accept arbitrary views.
+    bound_offsets = bound_offsets or {}
     keys: dict[BindingKey, tuple[str, TensorSpec, ParameterKind]] = {}
 
     def add_value(value_id: int) -> None:
@@ -85,10 +92,15 @@ def build_unit(graph: Graph, memory: MemoryPlan, unit: SubmissionUnit) -> TileCo
         ),
     )
     parameters = tuple(
-        UnitParameter(index, name, key, spec, kind)
+        UnitParameter(
+            index, name, key, spec, kind,
+            kind in (ParameterKind.DYNAMIC, ParameterKind.RESOURCE, ParameterKind.CONSTANT)
+            and not (key[0] == "value" and bound_offsets.get(key[1]) == 0),
+        )
         for index, (key, (name, spec, kind)) in enumerate(ordered)
     )
     parameter_by_key = {parameter.key: parameter.index for parameter in parameters}
+    parameter_by_name = {parameter.name: parameter for parameter in parameters}
 
     calls = []
     for candidate in unit.operations:
@@ -106,6 +118,16 @@ def build_unit(graph: Graph, memory: MemoryPlan, unit: SubmissionUnit) -> TileCo
             parameter_by_key[("workspace", min(candidate.nodes), index)]
             for index in range(len(candidate.workspace))
         )
+        if candidate.definition is not None:
+            operands = tuple(parameter_by_name[binding.parameter] for binding in bindings) + tuple(
+                parameters[index] for index in workspace
+            )
+            ports = tuple(
+                replace(port, offset=parameter.offset)
+                for port, parameter in zip(candidate.definition.ports, operands, strict=True)
+            )
+            if ports != candidate.definition.ports:
+                candidate = replace(candidate, definition=define_kernel(candidate.emitter, ports))
         calls.append(KernelCall(candidate, tuple(bindings), workspace))
 
     output_parameters = tuple(

@@ -6,6 +6,8 @@ from typing import Any, cast
 
 import tilelang.language as T
 
+from .buffers import reshape_buffer
+
 from ..compiler.lowering import BoundOperation, LoweringContext
 from ..tensor.graph import Graph
 from .packed import decode_packet, packet_format
@@ -52,7 +54,7 @@ class _PackedEmbeddingEmitter:
         _packed_embedding(
             operands[0],
             operands[1],
-            T.view(operands[2], shape=(self.tokens, self.width)),
+            reshape_buffer(operands[2], shape=(self.tokens, self.width)),
             self.table_spec,
             self.tokens,
             self.width,

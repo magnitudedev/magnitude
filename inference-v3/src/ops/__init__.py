@@ -83,8 +83,11 @@ from .tensor.ops import (
                       embedding,
                       exp,
                       gated_delta_recurrence,
+    gelu,
+    gelu_tanh,
                       kv_append,
                       kv_copy,
+    layer_norm,
                       less,
                       linear,
                       matmul,
@@ -119,6 +122,9 @@ from .tensor.tracing import Argument, Signature, Tensor, trace
 from .tensor.types import DENSE, Dim, DimExpr, DType, Layout, TensorSpec, ceil_divide
 
 __all__ = [
+    "gelu",
+    "gelu_tanh",
+    "layer_norm",
     "QualifiedSchedules",
     "ScheduleRequest",
     "ScheduleResolver",

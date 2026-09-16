@@ -4,16 +4,17 @@ import asyncio
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from functools import partial
+from threading import Lock
 
 from engine.generation.plain import FinishReason, Options
 from engine.operations.sampling import SamplingSeed, SelectionKind
 from engine.platform.host.worker import Worker
 from engine.service.engine import Snapshot
-from engine.serving.requests import ChatRequest, SchemaFormat
+from engine.serving.metrics import ParsingMetrics, PreparationMetrics
+from engine.serving.requests import ChatRequest, ImagePart, SchemaFormat
 from engine.serving.runtime import Config, Runtime, ServerProperties, open_runtime
 from engine.serving.template import ChatTemplate, PreparedChat
 from engine.serving.text import StopText
-from engine.serving.metrics import PreparationMetrics, ParsingMetrics
 from templates.events import ContentDelta, ReasoningDelta, ToolArguments, ToolComplete, ToolStart
 
 
@@ -41,7 +42,10 @@ class ChatService:
             await asyncio.shield(asyncio.wrap_future(worker.ready))
             ready = await asyncio.wrap_future(worker.call(lambda owner: owner.ready))
             template = ChatTemplate(
-                ready.tokenizer, variant=config.template_variant, override=config.template_override
+                ready.tokenizer,
+                variant=config.template_variant,
+                override=config.template_override,
+                image_directory=ready.image_directory,
             )
             return cls(worker, ready.properties, template)
         except BaseException:
@@ -70,6 +74,43 @@ class ChatService:
             raise ValueError("rendered prompt exceeds the configured context limit")
         return prompt
 
+    async def prepare_async(self, body: ChatRequest) -> PreparedChat:
+        if not any(
+            isinstance(message.content, list)
+            and any(isinstance(part, ImagePart) for part in message.content)
+            for message in body.messages
+        ):
+            return self.prepare(body)
+
+        # Cancelling the await does not stop host image preparation. Keep the
+        # result owned until the event loop takes it, or close it on abandonment.
+        lock = Lock()
+        abandoned = False
+        prompt: PreparedChat | None = None
+
+        def build():
+            nonlocal prompt
+            prepared = self.prepare(body)
+            with lock:
+                if not abandoned:
+                    prompt = prepared
+                    return
+            prepared.close()
+
+        try:
+            await asyncio.to_thread(build)
+        except BaseException:
+            with lock:
+                abandoned = True
+                discarded, prompt = prompt, None
+            if discarded is not None:
+                discarded.close()
+            raise
+        with lock:
+            result, prompt = prompt, None
+        assert result is not None
+        return result
+
     async def events(
         self, body: ChatRequest, prompt: PreparedChat
     ) -> AsyncGenerator[
@@ -95,7 +136,9 @@ class ChatService:
             stops = StopText(body.stops + prompt.native.description.additional_stops)
             admission = asyncio.wrap_future(
                 self.worker.call(
-                    lambda owner: owner.admit(prompt.tokens, options, prompt.constraint)
+                    lambda owner: owner.admit(
+                        prompt.tokens, options, prompt.constraint, prompt.media
+                    )
                 )
             )
             # A cancelled await must not orphan an admission that already began.
@@ -157,7 +200,11 @@ class ChatService:
                     if calls_completed and cause == "natural":
                         reason = "tool_calls"
                     yield ChatFinished(
-                        reason, len(prompt.tokens), state, stops.matched, prompt.metrics,
+                        reason,
+                        len(prompt.tokens),
+                        state,
+                        stops.matched,
+                        prompt.metrics,
                         ParsingMetrics(
                             elapsed_ns=parser.elapsed_ns,
                             input_bytes=parser.input_bytes,

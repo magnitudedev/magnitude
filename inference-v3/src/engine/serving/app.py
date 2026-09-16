@@ -67,7 +67,7 @@ def create_app(config: Config) -> FastAPI:
         if body.model != service.model:
             return JSONResponse(error_payload("requested model is not loaded"), status_code=404)
         try:
-            prompt = await asyncio.to_thread(service.prepare, body)
+            prompt = await service.prepare_async(body)
         except (ValueError, TypeError, NativeError) as error:
             return JSONResponse(error_payload(str(error)), status_code=400)
         response = ChatResponse(body.model)

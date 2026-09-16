@@ -83,7 +83,13 @@ def test_repeated_schedule_shapes_share_private_program_definitions():
         if function.attrs is not None and function.attrs.get("global_symbol") is not None
     ]
     assert len(unit.calls) == 4
-    assert len(module.functions) == 3
+    # The first normalization accepts a borrowed input with a dynamic origin;
+    # the second consumes an owned zero-offset intermediate. These have distinct
+    # ABIs. The two equal-shape tanh operations still share one private body.
+    definitions = [call.operation.definition for call in unit.calls]
+    assert definitions[0].identity != definitions[2].identity
+    assert definitions[1].identity == definitions[3].identity
+    assert len(module.functions) == 4
     assert len(exposed) == 1
 
 

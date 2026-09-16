@@ -563,7 +563,11 @@ def materialize(
         bound_resources = _bind_resources(graph, static_resources or {}, device)
         owned_storage, static_values, static_workspace = _allocate_temporary_slots(device, memory)
         for submission in submissions:
-            compilation_unit = build_unit(graph, memory, submission)
+            compilation_unit = build_unit(
+                graph, memory, submission,
+                bound_offsets={value: resource.offset for value, resource in
+                               {**bound_constants, **bound_resources}.items()},
+            )
             if len(submission.operations) == 1 and submission.operations[0].source_loop is not None:
                 from ..runtime.streaming import compile_source_loop
 

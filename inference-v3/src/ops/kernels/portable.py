@@ -9,7 +9,6 @@ import tilelang.language as T
 
 from ..compiler.lowering import BoundOperation, CompilerTarget, LoweringContext
 from ..kv import KVRepresentation
-from .kv_packed import copy_bundle
 from ..representations import (
     Affine,
     Dense,
@@ -20,6 +19,7 @@ from ..representations import (
 from ..tensor.graph import Graph, Node
 from ..tensor.primitive import primitives
 from ..tensor.types import DType, TensorSpec, dense_strides
+from .kv_packed import copy_bundle
 
 
 def _indices(flat, shape: tuple[int, ...]):
@@ -133,6 +133,14 @@ def _unary_kernel(source, output, source_spec, output_spec, op, threads):
                     value[0] = source_value * T.sigmoid(source_value)
                 elif op == "tanh":
                     value[0] = T.tanh(source_value)
+                if op == "gelu":
+                    x = T.cast(source_value, "float32")
+                    value[0] = 0.5 * x * (1.0 + T.erf(x * 0.7071067811865476))
+                if op == "gelu_tanh":
+                    x = T.cast(source_value, "float32")
+                    value[0] = (
+                        0.5 * x * (1.0 + T.tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
+                    )
                 output[_indices(flat, output_spec.shape)] = value[0]
 
 
@@ -484,13 +492,16 @@ class PrimitiveEmitter:
             "sigmoid",
             "silu",
             "tanh",
+            "gelu",
+            "gelu_tanh",
         }:
             _unary_kernel(
                 inputs[0], outputs[0], self.inputs[0], self.outputs[0], operation, self.threads
             )
-        elif operation == 'unpack_words':
-            _unpack_words_kernel(inputs[0], tuple(outputs), self.outputs,
-                                 self.inputs[0].elements, self.threads)
+        elif operation == "unpack_words":
+            _unpack_words_kernel(
+                inputs[0], tuple(outputs), self.outputs, self.inputs[0].elements, self.threads
+            )
         elif operation == "transpose":
             _transpose_kernel(
                 inputs[0],
@@ -570,7 +581,11 @@ class PrimitiveEmitter:
                 self.threads,
             )
         elif operation == "kv_copy":
-            copier = copy_bundle if isinstance(self.inputs[0].representation, KVRepresentation) else _kv_copy_kernel
+            copier = (
+                copy_bundle
+                if isinstance(self.inputs[0].representation, KVRepresentation)
+                else _kv_copy_kernel
+            )
             copier(
                 inputs[0],
                 inputs[1],
@@ -602,6 +617,8 @@ _PRODUCTION_PRIMITIVES = frozenset(
         "sigmoid",
         "silu",
         "tanh",
+        "gelu",
+        "gelu_tanh",
         "rotary",
         "kv_copy",
         "embedding",

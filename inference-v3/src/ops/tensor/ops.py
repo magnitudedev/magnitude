@@ -6,12 +6,12 @@ import math
 from collections.abc import Sequence
 from typing import Any
 
-from .primitive import NumericalContract, primitive
-from .tracing import Tensor, active_trace
-from .types import DType, TensorSpec, broadcast_shape, normalize_axes
 from ..formula import formula
 from ..kv import KVRepresentation
 from ..performance import semantics as useful
+from .primitive import NumericalContract, primitive
+from .tracing import Tensor, active_trace
+from .types import DType, TensorSpec, broadcast_shape, normalize_axes
 
 
 def _np():
@@ -75,18 +75,30 @@ def _binary_ref(operator):
     return lambda inputs, _attrs: (operator(inputs[0], inputs[1]),)
 
 
-primitive("add", reference=_binary_ref(lambda a, b: a + b), tags=frozenset({"cheap"}), work=useful.elementwise(floating=1))(
-    _binary_abstract
-)
-primitive("subtract", reference=_binary_ref(lambda a, b: a - b), tags=frozenset({"cheap"}), work=useful.elementwise(floating=1))(
-    _binary_abstract
-)
-primitive("multiply", reference=_binary_ref(lambda a, b: a * b), tags=frozenset({"cheap"}), work=useful.elementwise(floating=1))(
-    _binary_abstract
-)
-primitive("divide", reference=_binary_ref(lambda a, b: a / b), tags=frozenset({"cheap"}), work=useful.elementwise(floating=1))(
-    _binary_abstract
-)
+primitive(
+    "add",
+    reference=_binary_ref(lambda a, b: a + b),
+    tags=frozenset({"cheap"}),
+    work=useful.elementwise(floating=1),
+)(_binary_abstract)
+primitive(
+    "subtract",
+    reference=_binary_ref(lambda a, b: a - b),
+    tags=frozenset({"cheap"}),
+    work=useful.elementwise(floating=1),
+)(_binary_abstract)
+primitive(
+    "multiply",
+    reference=_binary_ref(lambda a, b: a * b),
+    tags=frozenset({"cheap"}),
+    work=useful.elementwise(floating=1),
+)(_binary_abstract)
+primitive(
+    "divide",
+    reference=_binary_ref(lambda a, b: a / b),
+    tags=frozenset({"cheap"}),
+    work=useful.elementwise(floating=1),
+)(_binary_abstract)
 
 
 @primitive("less", reference=_binary_ref(lambda a, b: a < b), tags=frozenset({"cheap"}),
@@ -554,6 +566,28 @@ exp = _unary("exp", lambda np, x: np.exp(x), special=1)
 sigmoid = _unary("sigmoid", lambda np, x: 1 / (1 + np.exp(-x)), floating=3, special=1)
 silu = _unary("silu", lambda np, x: x / (1 + np.exp(-x)), floating=3, special=1)
 tanh = _unary("tanh", lambda np, x: np.tanh(x), special=1)
+gelu = _unary(
+    "gelu",
+    lambda np, x: 0.5 * x * (1 + np.vectorize(math.erf)(x.astype(np.float32) / math.sqrt(2))),
+    floating=4,
+    special=1,
+)
+gelu_tanh = _unary(
+    "gelu_tanh",
+    lambda np, x: (
+        0.5
+        * x
+        * (
+            1
+            + np.tanh(
+                math.sqrt(2 / math.pi)
+                * (x.astype(np.float32) + 0.044715 * x.astype(np.float32) ** 3)
+            )
+        )
+    ),
+    floating=9,
+    special=1,
+)
 
 
 @primitive(
@@ -614,6 +648,38 @@ def _rms_reference(inputs, attrs):
     if len(inputs) == 2:
         result = result * inputs[1]
     return result
+
+
+@primitive(
+    "layer_norm",
+    work=useful.layer_normalization,
+    reference=lambda inputs, attrs: (_layer_norm_reference(inputs, attrs),),
+    numerical=NumericalContract(DType.F32),
+)
+def _layer_norm(inputs, attrs):
+    _one(inputs, 3, "layer_norm")
+    value, weight, bias = inputs
+    if value.rank < 1 or any(not item.dtype.floating for item in inputs):
+        raise ValueError("layer_norm requires floating input, scale and bias")
+    if weight.shape != (value.shape[-1],) or bias.shape != weight.shape:
+        raise ValueError("layer_norm parameters must match the final axis")
+    if not math.isfinite(attrs["epsilon"]) or attrs["epsilon"] <= 0:
+        raise ValueError("layer_norm epsilon must be finite and positive")
+    return (TensorSpec(value.shape, value.dtype, value.layout),)
+
+
+def _layer_norm_reference(inputs, attrs):
+    np = _np()
+    value, weight, bias = (item.astype(np.float32) for item in inputs)
+    centered = value - np.mean(value, axis=-1, keepdims=True)
+    variance = np.mean(centered * centered, axis=-1, keepdims=True)
+    return centered / np.sqrt(variance + attrs["epsilon"]) * weight + bias
+
+
+@formula(id="layer_norm", version=1, metric="output-elements")
+def layer_norm(value: Tensor, weight: Tensor, bias: Tensor, *, epsilon: float = 1e-6) -> Tensor:
+    """Final-axis population normalization with FP32 reductions and affine output."""
+    return _emit("layer_norm", value, weight, bias, epsilon=epsilon)
 
 
 @formula(id="rms_norm", version=1, metric="output-elements")
@@ -947,14 +1013,19 @@ def _kv_append_reference(inputs, attrs):
     representation = attrs.get("representation")
     if isinstance(representation, KVRepresentation):
         if _np().any(written >= resource.shape[0]) or len(_np().unique(written)) != len(written):
-            raise ValueError("KV destinations must be distinct in-capacity rows or negative padding")
+            raise ValueError(
+                "KV destinations must be distinct in-capacity rows or negative padding"
+            )
         if len(written) == 0:
             return resource
-        from ..kv_codecs import quantize_reference, dequantize_reference
-        resource[written, :, :representation.key_width] = dequantize_reference(
-            quantize_reference(inputs[1][valid], representation.key), representation.key)
-        resource[written, :, representation.key_width:] = dequantize_reference(
-            quantize_reference(inputs[2][valid], representation.value), representation.value)
+        from ..kv_codecs import dequantize_reference, quantize_reference
+
+        resource[written, :, : representation.key_width] = dequantize_reference(
+            quantize_reference(inputs[1][valid], representation.key), representation.key
+        )
+        resource[written, :, representation.key_width :] = dequantize_reference(
+            quantize_reference(inputs[2][valid], representation.value), representation.value
+        )
         return resource
     if _np().any(written >= resource.shape[1]) or len(_np().unique(written)) != len(written):
         raise ValueError("KV destinations must be distinct in-capacity rows or negative padding")
@@ -1122,7 +1193,6 @@ def persistent_attention(queries: Tensor, history: Tensor, keys: Tensor, values:
     work=useful.attention,
     reference=lambda inputs, attrs: (_attention_reference(inputs, attrs),),
     numerical=NumericalContract(DType.F32),
-    resource_reads=(1,),
     tags=frozenset({"attention"}),
 )
 def _causal_attention(inputs, attrs):

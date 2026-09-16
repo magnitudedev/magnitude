@@ -1,6 +1,8 @@
 """One component owns prepared-input attention and its persistent state sink."""
 import tilelang.language as T
 
+from .buffers import reshape_buffer
+
 from ..compiler.lowering import BoundOperation
 from ..compiler.schedules import schedule_boundary
 from ..kv import KVRepresentation
@@ -24,7 +26,7 @@ class _PersistentComponentEmitter:
             attended, next_history, query, key, gate, *scratch = operands[9:]
         else:
             attended, gate, next_history, query, key, *scratch = operands[9:]
-        values = T.view(raw_value, shape=self.value_shape, dtype=raw_value.dtype)
+        values = reshape_buffer(raw_value, shape=self.value_shape)
         # Reserved destinations are disjoint from committed read visibility.
         # The sink shares the preparation's registers; completion covers both
         # the appended state and attention's dense-current/packed-history result.

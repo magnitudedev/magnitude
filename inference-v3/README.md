@@ -46,6 +46,13 @@ The server exposes an OpenAI-style chat endpoint. `--max-active`, `--max-queued`
 and `--output-capacity` size the continuous service. The composition it built,
 its digest and the artifact identity are reported in the server properties.
 
+Vision requests use OpenAI-style `image_url` content parts containing inline
+base64 data URLs, alongside text parts. The Qwen 3.5 MLX artifact must include
+its vision weights and processor configuration. Image order, repeated images,
+and images in follow-up turns are preserved. The current input contract supports
+single-frame images with `detail: "auto"`; remote URLs and video are rejected.
+Image preprocessing and encoder loading are lazy for text-only service.
+
 ## Test
 
 ```sh

@@ -180,7 +180,8 @@ async def test_service_uses_prepared_parser_and_passes_constraint_before_publica
             self.released = False
             self.plan = None
 
-        def admit(self, prompt, options, plan):
+        def admit(self, prompt, options, plan, media):
+            assert media is None
             self.plan = plan
             return 7
 

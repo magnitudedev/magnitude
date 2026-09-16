@@ -21,7 +21,7 @@ from engine.generation.plain import (
     WaitReason,
     WorkKind,
 )
-from engine.models.sequence import ModelExecutor, ModelInput
+from engine.models.sequence import InputPreparation, ModelExecutor, ModelInput
 from time import perf_counter_ns as clock_ns
 from engine.service.policy import (
     Operation,
@@ -147,6 +147,15 @@ class Pending:
     preparation_ns: int
 
 
+@dataclass
+class PendingInput:
+    batch: InputPreparation
+    selection: Selection
+    started_ns: int
+    submission: Submission
+    preparation_ns: int
+
+
 class _NotPrepared(Exception):
     """The selected request has a recorded terminal or changing wait condition."""
 
@@ -156,7 +165,7 @@ class Engine:
         self.model, self.context = model, model.context
         self.scheduler = Scheduler(Limits() if limits is None else limits)
         self.requests: dict[RequestId, Request] = {}
-        self.pending: Pending | None = None
+        self.pending: Pending | PendingInput | None = None
         self._next = 0
         self._epoch = 0
         self.closed = False
@@ -198,7 +207,9 @@ class Engine:
         g = r.generation
         if r.finish is not None:
             status = Status.TERMINAL
-        elif g is not None and g.pending is not None:
+        elif (g is not None and g.pending is not None) or (
+            self.pending is not None and identity in self.pending.submission.requests
+        ):
             status = Status.COMPLETION
         elif g is not None and len(g.output) >= g.options.output_capacity:
             status = Status.OUTPUT
@@ -382,7 +393,9 @@ class Engine:
         # the model's ownership query and actual budget before/after release.
         return self.context.allocated_bytes < before
 
-    def _prepare(self, selection: Selection) -> tuple[GenerationBatch, Selection, int]:
+    def _prepare(
+        self, selection: Selection
+    ) -> tuple[GenerationBatch | InputPreparation, Selection, int]:
         identities = list(selection.requests)
         allowance = (
             self.scheduler.limits.decode_tokens
@@ -400,6 +413,18 @@ class Engine:
                 for current in identities:
                     if selection.phase == Phase.PREFILL and remaining <= 0:
                         break
+                    request = self.requests[current]
+                    if request.generation is None:
+                        conditioning = request.source.prepare()
+                        if conditioning is not None:
+                            # Original conditioning is prefill work in the same
+                            # service policy. Its completion is a scheduling
+                            # boundary, allowing existing decoders their share.
+                            return (
+                                conditioning,
+                                Selection(Phase.PREFILL, (current,), selection.contended),
+                                0,
+                            )
                     g = self._open(self.requests[current])
                     proposal = g.ready(
                         max(1, remaining) if selection.phase == Phase.PREFILL else allowance
@@ -463,6 +488,9 @@ class Engine:
     def _complete(self) -> None:
         pending = self.pending
         assert pending is not None and pending.submission.completion.done
+        if isinstance(pending, PendingInput):
+            self._complete_input(pending)
+            return
         elapsed = max(0, clock_ns() - pending.started_ns)
         try:
             pending.batch.finish()
@@ -501,6 +529,24 @@ class Engine:
                     r.finish = g.finish_reason
                     g.retire()
                     r.retire_source()
+        self._epoch += 1
+
+    def _complete_input(self, pending: PendingInput) -> None:
+        elapsed = max(0, clock_ns() - pending.started_ns)
+        request = self.requests[pending.submission.requests[0]]
+        try:
+            if request.finish is None:
+                pending.batch.finish()
+        except Exception as error:
+            logger.exception("conditioning preparation failed")
+            self._fail(request, FailureKind.EXECUTION, error)
+        finally:
+            pending.batch.close()
+            self.pending = None
+        self.scheduler.completed(pending.selection, elapsed + pending.preparation_ns)
+        request.service_ns += elapsed
+        request.prefill_ns += elapsed
+        request.waiting_since_ns = clock_ns()
         self._epoch += 1
 
     def fail(self, error: Exception) -> None:
@@ -566,7 +612,11 @@ class Engine:
                     r.decode_preparation_ns += attributed
                     if r.decode_ns == 0:
                         r.first_decode_preparation_ns = attributed
-            self.pending = Pending(batch, selected, started, submission, preparation_elapsed)
+            self.pending = (
+                Pending(batch, selected, started, submission, preparation_elapsed)
+                if isinstance(batch, GenerationBatch)
+                else PendingInput(batch, selected, started, submission, preparation_elapsed)
+            )
             return submission
         return Idle(tuple(self.snapshot(identity) for identity in self.requests))
 
