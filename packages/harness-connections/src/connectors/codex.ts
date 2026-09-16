@@ -128,7 +128,7 @@ export const makeCodexConnector = (
   name: "Codex",
   executable: "codex",
   skillInstallationTarget: "shared-agents",
-  configurationFiles: [paths.codex, paths.codexUser, paths.codexModels],
+  configurationFiles: [paths.codexUser, paths.codexModels],
   connect: (spec) => Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
     const bundled = yield* bundledCatalog(spec.installation.executable)

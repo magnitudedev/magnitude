@@ -46,3 +46,16 @@ it("sorts connected installations first and only shows verified configuration pa
   expect(render([installed])).toContain("bg-slate-400")
   expect(render([installed])).not.toContain("/private/old-config.json")
 })
+
+it("offers disconnect for detected external configuration", () => {
+  expect(render([{ ...installed, managed: false, inspection: { _tag: "Connected" } }])).toContain("Disconnect")
+  expect(render([installed])).not.toContain("Disconnect")
+})
+
+it("shows a themed warning and one repair action for damaged connections", () => {
+  const html = render([{ ...installed, managed: true, inspection: { _tag: "Disconnected", reason: "Magnitude skill is missing or has changed" } }])
+  for (const text of ["Connection needs repair", "bg-orange-500", "text-orange-600", "Repair connection"]) expect(html).toContain(text)
+  expect(html.match(/<button/g)).toHaveLength(1)
+  for (const text of ["Reconnect", "Disconnect", "Magnitude skill", "Remove configuration"]) expect(html).not.toContain(text)
+  expect(html).not.toContain("Not connected")
+})

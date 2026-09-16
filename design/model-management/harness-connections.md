@@ -36,8 +36,17 @@ dependency-local binaries. Desktop hosts may resolve a login environment asynchr
 roots and command environment are scoped to the connection service, never global process mutations. Installation and connection are independent observations. Connected means
 that required Magnitude provider fields, skill contents, and plugin files/activation still exist and
 match the connector contract. Receipts alone never imply Connected. Missing or overwritten fields
-are Disconnected; filesystem access failures are Unavailable. Unrelated user fields do not invalidate
+are Disconnected; unreadable or malformed configuration is Unavailable and is never overwritten
+to manufacture a successful connection. Managed disconnected configurations are presented as needing
+attention, with their reason and repair/removal actions. Unrelated user fields do not invalidate
 a connection. The desktop refreshes this observation after mutations and while the page is observed.
+Every verified connection can be explicitly disconnected, including configurations with no manifest
+receipt. Without a receipt, disconnect first verifies the Magnitude provider, removes its projection,
+and clears its active selection without inventing a previous model or removing unrecorded companion
+packages. Managed connections remain disconnectable when required files have changed or disappeared.
+Configuration uses each harness's native format and precedence. OpenCode merges its global files
+and explicit override; disconnect removes Magnitude from every contributing file. OpenClaw edits
+preserve valid JSON5 syntax and unrelated comments.
 
 ## Ownership
 

@@ -38,7 +38,7 @@ import {
   type HarnessRestore,
   HarnessRestoreSchema,
 } from "./contract"
-import { harnessConnectionPaths, type HarnessConnectionPaths } from "./paths"
+import { resolveHarnessConnectionPaths, type HarnessConnectionPaths } from "./paths"
 import { makeHarnessConnectorRegistry, type HarnessConnectorRegistry } from "./registry"
 import { OPENAI_BASE_URL, readOr } from "./shared"
 import skillContents from "./magnitude-skill.md" with { type: "text" }
@@ -68,7 +68,7 @@ export {
   piProviderConfig,
 } from "./connectors/pi"
 export { makeHarnessConnectorRegistry } from "./registry"
-export { harnessConnectionPaths, type HarnessConnectionPaths } from "./paths"
+export { harnessConnectionPaths, resolveHarnessConnectionPaths, type HarnessConnectionPaths } from "./paths"
 export type { HarnessConnectionSpec, HarnessConnector, HarnessInstallation, HarnessModel } from "./contract"
 
 const ManifestEntrySchema = Schema.Struct({
@@ -173,7 +173,7 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
   const runtime = yield* Effect.runtime<
     FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor | HttpClient.HttpClient | SqliteDriver
   >()
-  const paths = options.paths ?? harnessConnectionPaths()
+  const paths = options.paths ?? (yield* resolveHarnessConnectionPaths())
   const registry = options.registry ?? makeHarnessConnectorRegistry(paths, options.serviceEndpoint === undefined ? {} : { serviceEndpoint: options.serviceEndpoint })
   const now = options.now ?? (() => new Date())
   const manifestState = makeStateDocument({
@@ -388,8 +388,19 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
   const disconnect = (harness: HarnessId) => provide(connectionTransaction(Effect.gen(function* () {
     const manifest = yield* readManifest
     const entry = manifest.connections.find((candidate) => candidate.harness === harness)
-    if (entry === undefined) return
     const connector = registry.get(harness)
+    if (entry === undefined) {
+      const inspection = yield* inspectHarnessConnection(paths, connector, [],
+        connector.skillRequired === true ? Option.some(skillContents) : Option.none(), options.serviceEndpoint)
+      if (inspection._tag === "Unavailable") return yield* failure("disconnect", inspection.reason, harness)
+      if (inspection._tag !== "Connected") return
+      // Existing provider configuration can predate the receipt. Explicit disconnect removes
+      // that verified provider and its selection; there is no previous selection to restore.
+      yield* connectorOperation("disconnect", connector, connector.disconnect({
+        models: [], restore: Option.some({ model: Option.none() }),
+      }))
+      return
+    }
     const installation = connector.companion === undefined
       ? Option.none<HarnessInstallation>()
       : yield* installed(connector)

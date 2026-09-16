@@ -4,7 +4,7 @@ import * as FileSystem from "@effect/platform/FileSystem"
 import { BunContext } from "@effect/platform-bun"
 import { HARNESS_PRIORITY, HarnessIdSchema, UnavailableHarnessConnection } from "@magnitudedev/client-common"
 import { ProviderModelIdSchema, ReasoningEffortSchema } from "@magnitudedev/sdk"
-import { Effect, Option, Schema } from "effect"
+import { Brand, Effect, Option, Schema } from "effect"
 import { parse } from "jsonc-parser"
 import { delimiter, dirname, resolve } from "node:path"
 import { parseDocument } from "yaml"
@@ -172,7 +172,7 @@ const initialFiles = (paths: HarnessConnectionPaths): Readonly<Record<string, st
     models: { providers: {} },
     agents: {
       defaults: { model: { primary: "user/model" } },
-      list: [{ id: "main", model: "user/model" }],
+      entries: { main: { model: "user/model", default: true } },
     },
   }),
   [paths.codexUser]: 'model_provider = "openai"\nmodel = "user/model"\n',
@@ -386,7 +386,6 @@ describe("HarnessConnector contract and registry", () => {
       high: "high",
     })
     expect(openClawAgentConfig(adaptiveModel)).toEqual({
-      id: "magnitude",
       model: `magnitude/${model}`,
       thinkingDefault: "medium",
     })
@@ -1257,7 +1256,7 @@ describe("HarnessConnection model-set behavior", () => {
         [paths.hermes]: "providers:\n  magnitude: old\n",
         [paths.openclaw]: stringifyJson({
           models: { providers: { magnitude: "old" } },
-          agents: { list: [{ id: "magnitude", model: "old" }] },
+          agents: { entries: { magnitude: { model: "old" } } },
         }),
         [paths.codex]: "unrecognized old contents\n",
         [paths.codexModels]: "unrecognized old contents\n",
@@ -1312,7 +1311,7 @@ describe("HarnessConnection model-set behavior", () => {
       })
       expect(readJson(yield* fs.readFileString(paths.openclaw))).toMatchObject({
         models: { providers: { magnitude: openClawProviderConfig(models) } },
-        agents: { defaults: { model: { primary: "user/model" } }, list: [{ id: "main", model: "user/model" }] },
+        agents: { defaults: { model: { primary: "user/model" } }, entries: { main: { model: "user/model", default: true } } },
       })
       const codexSpec = {
         models,
@@ -1427,10 +1426,10 @@ describe("HarnessConnection model-set behavior", () => {
         agents: { defaults: { model: { primary: `magnitude/${model}` } } },
       })
       expect(readJson(yield* fs.readFileString(paths.openclaw))).toMatchObject({
-        agents: { list: [
-          { id: "main", model: "user/model" },
-          { id: "magnitude", model: `magnitude/${model}`, thinkingDefault: "high" },
-        ] },
+        agents: { entries: {
+          main: { model: "user/model", default: true },
+          magnitude: { model: `magnitude/${model}`, thinkingDefault: "high" },
+        } },
       })
       expect(Bun.TOML.parse(yield* fs.readFileString(paths.codexUser))).toMatchObject({
         model_provider: "magnitude",
@@ -2028,6 +2027,44 @@ describe("read-only connection inspection", () => {
       expect((yield* service.inspect).find((row) => row.id === "opencode")?.managed).toBe(false)
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
   })
+  it.each(HARNESS_PRIORITY)("disconnects verified %s configuration after its receipt is lost", async (id) => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-external-disconnect-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const service = yield* installedService(paths)
+      yield* service.connect(id, { model: Option.some(model) })
+      yield* fs.remove(paths.manifest)
+      const before = (yield* service.inspect).find(row => row.id === id)!
+      expect(before.inspection._tag).toBe("Connected")
+      expect(before.managed).toBe(false)
+      yield* service.disconnect(id)
+      expect((yield* service.inspect).find(row => row.id === id)?.inspection._tag).toBe("Disconnected")
+      yield* service.disconnect(id)
+      const settings = ({ pi: paths.piSettings, opencode: paths.opencode, hermes: paths.hermes,
+        openclaw: paths.openclaw, codex: paths.codexUser, "claude-code": paths.claude,
+        "oh-my-pi": paths.ompSettings, cline: paths.clineProviders })[Brand.unbranded(id)]
+      const content = yield* fs.readFileString(settings)
+      expect(content).not.toContain("magnitude/local/model")
+      expect(content).not.toContain("magnitude-local/local/model")
+      expect(content).not.toContain("custom:magnitude")
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+  it.each(HARNESS_PRIORITY)("reports unreadable %s configuration without claiming disconnection or changing it", async id => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-unreadable-connection-" })
+      const paths = fixturePaths(root)
+      const registry = makeHarnessConnectorRegistry(paths)
+      const primary = id === "codex" ? paths.codexUser : registry.get(id).configurationFiles[0]!
+      yield* fs.makeDirectory(primary, { recursive: true })
+      const service = yield* installedService(paths)
+      expect((yield* service.inspect).find(row => row.id === id)?.inspection._tag).toBe("Unavailable")
+      expect((yield* Effect.either(service.disconnect(id)))._tag).toBe("Left")
+      expect((yield* fs.stat(primary)).type).toBe("Directory")
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
   it("remembers a chosen optional skill and detects its later removal", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
@@ -2047,4 +2084,92 @@ describe("read-only connection inspection", () => {
       expect((yield* reopened.inspect).find((row) => row.id === "opencode")?.managed).toBe(false)
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
   })
+})
+
+it("merges OpenCode files and removes lower-priority providers without changing unrelated settings", async () => {
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-opencode-merge-" })
+    const base = fixturePaths(root)
+    const paths = { ...base, opencode: `${base.opencode}c`, opencodeFiles: [base.opencode, `${base.opencode}c`] }
+    yield* writeFixtures({
+      [base.opencode]: stringifyJson({ provider: { magnitude: openCodeProviderConfig(models), other: { name: "Keep" } }, model: "magnitude/local/model" }),
+      [paths.opencode]: '// keep this comment\n{"theme":"dark"}',
+    })
+    const service = yield* installedService(paths)
+    const inspect = service.inspect.pipe(Effect.map(rows => rows.find(row => row.id === "opencode")!))
+    expect((yield* inspect).inspection._tag).toBe("Connected")
+    yield* service.disconnect(HarnessIdSchema.make("opencode"))
+    expect((yield* inspect).inspection._tag).toBe("Disconnected")
+    expect(readJson(yield* fs.readFileString(base.opencode))).toEqual({ provider: { other: { name: "Keep" } } })
+    expect((yield* fs.readFileString(paths.opencode)).trim()).toBe('// keep this comment\n{"theme":"dark"}')
+    yield* fs.writeFileString(base.opencode, stringifyJson({ model: "other/model" }))
+    yield* service.connect(HarnessIdSchema.make("opencode"), { model: Option.some(model) })
+    expect((yield* inspect).inspection._tag).toBe("Connected")
+    yield* service.disconnect(HarnessIdSchema.make("opencode"))
+    expect(readJson(yield* fs.readFileString(paths.opencode))).toEqual({ theme: "dark", provider: {}, model: "other/model" })
+    expect(yield* fs.readFileString(paths.opencode)).toContain("// keep this comment")
+  }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+})
+
+it.each(HARNESS_PRIORITY)("preserves malformed %s configuration and explains why it cannot be verified", async id => {
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-malformed-connection-" })
+    const paths = fixturePaths(root)
+    const service = yield* installedService(paths)
+    yield* service.connect(id, { model: Option.some(model) })
+    const file = ({ pi: paths.piModels, opencode: paths.opencode, hermes: paths.hermes,
+      openclaw: paths.openclaw, codex: paths.codexUser, "claude-code": paths.claude,
+      "oh-my-pi": paths.ompModels, cline: paths.clineProviders })[Brand.unbranded(id)]
+    const original = yield* fs.readFileString(file)
+    const malformed = id === "codex" ? 'model = "unterminated' : '{ broken:'
+    yield* fs.writeFileString(file, malformed)
+    const row = (yield* service.inspect).find(row => row.id === id)!
+    expect(row.inspection._tag).toBe("Unavailable")
+    if (row.inspection._tag === "Unavailable") expect(row.inspection.reason).toContain("Fix invalid")
+    expect((yield* Effect.either(service.connect(id, { model: Option.none() })))._tag).toBe("Left")
+    expect((yield* Effect.either(service.disconnect(id)))._tag).toBe("Left")
+    expect(yield* fs.readFileString(file)).toBe(malformed)
+    yield* fs.writeFileString(file, original)
+    expect((yield* service.inspect).find(row => row.id === id)?.inspection._tag).toBe("Connected")
+  }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+})
+
+it.each([
+  { entries: { main: { model: "user/model" } } },
+  { entries: { main: { default: true, model: "user/model" } } },
+  { ownership: "explicit", entries: { first: {}, second: {} } },
+])("preserves OpenClaw's existing agent roster and ownership: %j", async agents => {
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-openclaw-agents-" })
+    const paths = fixturePaths(root)
+    yield* writeFixtures({ [paths.openclaw]: stringifyJson({ agents }) })
+    const service = yield* installedService(paths)
+    const id = HarnessIdSchema.make("openclaw")
+    yield* service.connect(id, { model: Option.some(model) })
+    const connected = readJson(yield* fs.readFileString(paths.openclaw))
+    expect(connected).toMatchObject({ agents: { ...agents, entries: { ...agents.entries, magnitude: { model: `magnitude/${model}` } } } })
+    yield* service.disconnect(id)
+    expect(readJson(yield* fs.readFileString(paths.openclaw))).toMatchObject({ agents })
+  }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+})
+
+it.each(HARNESS_PRIORITY)("disconnects %s after its provider configuration has been cleared", async id => {
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-cleared-connection-" })
+    const paths = fixturePaths(root)
+    const service = yield* installedService(paths)
+    yield* service.connect(id, { model: Option.some(model) })
+    const file = ({ pi: paths.piModels, opencode: paths.opencode, hermes: paths.hermes,
+      openclaw: paths.openclaw, codex: paths.codexUser, "claude-code": paths.claude,
+      "oh-my-pi": paths.ompModels, cline: paths.clineProviders })[Brand.unbranded(id)]
+    yield* fs.writeFileString(file, id === "codex" ? "" : "{}")
+    yield* service.disconnect(id)
+    const row = (yield* service.inspect).find(row => row.id === id)!
+    expect(row.managed).toBe(false)
+    expect(row.inspection._tag).toBe("Disconnected")
+  }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
 })

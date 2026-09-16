@@ -155,7 +155,7 @@ export const removeOwnedJsonc = (source: string, owned: ReadonlyArray<OwnedValue
 export const removeJsoncPaths = (
   source: string,
   paths: ReadonlyArray<ReadonlyArray<string>>,
-): string => paths.reduce((current, segments) => applyEdits(current, modify(
+): string => paths.reduce((current, segments) => valueAt(jsonObject(current), segments) === undefined ? current : applyEdits(current, modify(
   current,
   [...segments],
   undefined,
@@ -173,6 +173,7 @@ export const updateYaml = (
 }
 
 const deleteYamlPath = (document: ReturnType<typeof parseDocument>, segments: ReadonlyArray<string>): void => {
+  if (valueAt(document.toJS(), segments) === undefined) return
   document.deleteIn([...segments])
   for (let length = segments.length - 1; length > 0; length -= 1) {
     const parent = segments.slice(0, length)

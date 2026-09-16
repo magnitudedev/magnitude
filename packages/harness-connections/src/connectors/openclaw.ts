@@ -1,3 +1,4 @@
+import { json5Object, updateJson5 } from "../json5"
 import { Effect, Option } from "effect"
 import type { HarnessConnectionPaths } from "../paths"
 import {
@@ -5,10 +6,7 @@ import {
   LOCAL_TOKEN,
   OPENAI_BASE_URL,
   defineConnector,
-  jsonObject,
   readOr,
-  removeJsoncPaths,
-  updateJsonc,
   valueAt,
   writeIfChanged,
 } from "../shared"
@@ -55,7 +53,6 @@ export const openClawProviderConfig = (models: HarnessConnectionSpec["models"], 
 export const openClawAgentConfig = (model: HarnessConnectionSpec["models"][number]) => {
   const { defaultControl } = openClawReasoning(model)
   return {
-    id: "magnitude",
     model: `magnitude/${model.id}`,
     ...(defaultControl === undefined ? {} : { thinkingDefault: defaultControl }),
   }
@@ -69,9 +66,11 @@ export const makeOpenClawConnector = (paths: HarnessConnectionPaths, baseUrl = O
   configurationFiles: [paths.openclaw],
   connect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.openclaw, "{}\n")
-    const value = jsonObject(source)
-    const existingAgents = valueAt(value, ["agents", "list"])
-    const agents: ReadonlyArray<unknown> = Array.isArray(existingAgents) ? existingAgents : []
+    const value = json5Object(source)
+    const entries = valueAt(value, ["agents", "entries"])
+    const hasDefault = entries !== null && typeof entries === "object"
+      && Object.values(entries).some(entry => valueAt(entry, ["default"]) === true)
+    const explicitOwnership = valueAt(value, ["agents", "ownership"]) === "explicit"
     const changes: Array<readonly [ReadonlyArray<string>, unknown]> = [[
       ["models", "providers", "magnitude"], openClawProviderConfig(spec.models, baseUrl),
     ]]
@@ -81,33 +80,35 @@ export const makeOpenClawConnector = (paths: HarnessConnectionPaths, baseUrl = O
       const selected = spec.models.find((model) => model.id === selectedModelId)
       if (selected !== undefined) changes.push(
         [["agents", "defaults", "model", "primary"], `magnitude/${selectedModelId}`],
-        [["agents", "list"], [
-          ...agents.filter((entry) => valueAt(entry, ["id"]) !== "magnitude"),
-          openClawAgentConfig(selected),
-        ]],
+        [["agents", "entries", "magnitude"], {
+          ...openClawAgentConfig(selected),
+          ...(!explicitOwnership && entries !== null && typeof entries === "object" && Object.keys(entries).some(key => key !== "magnitude")
+            && (!hasDefault || valueAt(entries, ["magnitude", "default"]) === true) ? { default: true } : {}),
+        }],
       )
     }
-    yield* writeIfChanged(paths.openclaw, source, updateJsonc(source, changes))
+    yield* writeIfChanged(paths.openclaw, source, updateJson5(source, changes))
     return Option.map(spec.model, () => ({
       model: typeof previous === "string" ? Option.some(previous) : Option.none(),
     }))
   }),
   disconnect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.openclaw, "{}\n")
-    const value = jsonObject(source)
-    const agents = valueAt(value, ["agents", "list"])
+    const value = json5Object(source)
     const current = valueAt(value, ["agents", "defaults", "model", "primary"])
-    const withoutProvider = removeJsoncPaths(source, [["models", "providers", "magnitude"]])
-    const withoutAgent = !Array.isArray(agents)
-      ? withoutProvider
-      : updateJsonc(withoutProvider, [[
-          ["agents", "list"], agents.filter((entry) => valueAt(entry, ["id"]) !== "magnitude"),
-        ]])
-    const next = typeof current === "string" && current.startsWith("magnitude/") && Option.isSome(spec.restore)
-      ? updateJsonc(withoutAgent, [[
+    const withoutProvider = updateJson5(source, [[["models", "providers", "magnitude"], undefined]])
+    const withoutAgent = updateJson5(withoutProvider, [[["agents", "entries", "magnitude"], undefined]])
+    let next = typeof current === "string" && current.startsWith("magnitude/") && Option.isSome(spec.restore)
+      ? updateJson5(withoutAgent, [[
           ["agents", "defaults", "model", "primary"], Option.getOrUndefined(spec.restore.value.model),
         ]])
       : withoutAgent
+    for (const parent of [["agents", "entries"], ["agents", "defaults", "model"], ["agents", "defaults"], ["agents"]]) {
+      const remaining = valueAt(json5Object(next), parent)
+      if (remaining !== null && typeof remaining === "object" && Object.keys(remaining).length === 0) {
+        next = updateJson5(next, [[parent, undefined]])
+      }
+    }
     yield* writeIfChanged(paths.openclaw, source, next)
   }),
 })
