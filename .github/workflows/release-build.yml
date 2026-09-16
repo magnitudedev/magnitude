@@ -496,10 +496,8 @@ jobs:
         with:
           pattern: backend-*
           path: release-artifacts
-      - id: npm-candidate
-        run: bun run packages/release/scripts/prepare-npm.ts release/npm-candidate
       - run: bun run packages/release/scripts/assemble.ts release-artifacts release-candidate
         env:
           MAGNITUDE_RELEASE_VERSION: ${{ needs.matrix.outputs.version }}
           MAGNITUDE_SOURCE_COMMIT: ${{ inputs.source_commit }}
-      - run: bun run scripts/accept-release-candidate.ts release-candidate "${{ steps.npm-candidate.outputs.tarball }}"
+      - run: bun run scripts/accept-release-candidate.ts release-candidate

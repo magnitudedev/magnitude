@@ -197,6 +197,40 @@ static void check_interrupted_replacement(HMODULE library, LPCWSTR mode) {
   puts("PASS interrupted installation recovery");
 }
 
+static void check_cli_path(HMODULE library, HKEY isolated) {
+  DWORD (WINAPI *configure)(LPCWSTR, LPCWSTR, BOOL);
+  RESOLVE_FUNCTION(library, configure, "ConfigureCliPath");
+  LPCWSTR directory = L"C:\\Users\\Fixture User\\Magnitude\\resources";
+  LPCWSTR original = L"C:\\Tools;C:\\Other";
+  LPCWSTR installed = L"C:\\Users\\Fixture User\\Magnitude\\resources;C:\\Tools;C:\\Other";
+  set_value(isolated, L"Installation", L"DisplayName", L"Magnitude");
+  set_value(isolated, L"Environment", L"Path", original);
+  require_success(configure(directory, L"Installation", FALSE), "register bundled CLI PATH");
+  check_value(isolated, L"Environment", L"Path", installed);
+  check_value(isolated, L"Installation", L"OwnedCliPath", directory);
+  require_success(configure(directory, L"Installation", FALSE), "repeat installation preserves ownership");
+  check_value(isolated, L"Environment", L"Path", installed);
+  require_success(configure(directory, L"Installation", TRUE), "remove owned CLI PATH");
+  check_value(isolated, L"Environment", L"Path", original);
+  check_value(isolated, L"Installation", L"OwnedCliPath", NULL);
+  require_success(configure(directory, L"Installation", TRUE), "repeat removal is harmless");
+
+  set_value(isolated, L"Environment", L"Path", installed);
+  require_success(configure(directory, L"Installation", FALSE), "accept pre-existing PATH");
+  check_value(isolated, L"Installation", L"OwnedCliPath", NULL);
+  require_success(configure(directory, L"Installation", TRUE), "preserve unowned PATH");
+  check_value(isolated, L"Environment", L"Path", installed);
+
+  set_value(isolated, L"Environment", L"Path", original);
+  require_success(configure(directory, L"Installation", FALSE), "install before external edit");
+  set_value(isolated, L"Environment", L"Path", L"C:\\User replacement");
+  require_success(configure(directory, L"Installation", TRUE), "remove obsolete ownership after external edit");
+  check_value(isolated, L"Environment", L"Path", L"C:\\User replacement");
+  check_value(isolated, L"Installation", L"OwnedCliPath", NULL);
+  require_success(configure(directory, L"MissingInstallation", TRUE), "missing registration needs no cleanup");
+  puts("PASS actual installer DLL: CLI PATH registration, idempotence, and owned-only removal");
+}
+
 int wmain(int argc, wchar_t **argv) {
   require(argc == 2 || argc == 3, "expected absolute helper DLL path and optional interruption mode");
   HMODULE library = LoadLibraryW(argv[1]); require(library != NULL, "load actual x86 helper DLL");
@@ -218,6 +252,8 @@ int wmain(int argc, wchar_t **argv) {
   require(RegCreateKeyExW(original, fixture, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &isolated, &disposition) == ERROR_SUCCESS &&
     disposition == REG_CREATED_NEW_KEY, "create unique registry fixture");
   require(RegOverridePredefKey(HKEY_CURRENT_USER, isolated) == ERROR_SUCCESS, "isolate registry operations");
+
+  check_cli_path(library, isolated);
 
   LPCWSTR executable = L"C:\\Users\\Fixture User\\Magnitude\\Magnitude.exe";
   LPCWSTR command = L"\"C:\\Users\\Fixture User\\Magnitude\\Magnitude.exe\" --background";

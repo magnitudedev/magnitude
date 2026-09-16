@@ -17,3 +17,5 @@ EXPORTS
   RemoveOwnedStartup=_RemoveOwnedStartup@4
   RemoveRegistration=_RemoveRegistration@4
   RemoveRemovalExecutable=_RemoveRemovalExecutable@0
+  ConfigureCliPath=_ConfigureCliPath@12
+  RemovePreviousCliCommands=_RemovePreviousCliCommands@12

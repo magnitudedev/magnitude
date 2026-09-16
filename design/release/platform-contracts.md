@@ -41,8 +41,7 @@ acquisition has its own network requirements.
 
 Customer systems do not need Rust, Bun, CMake, C/C++ compilers, CUDA toolkits, Vulkan SDKs,
 developer headers, OpenSSL packages, OpenMP packages, or build-system package-manager prefixes.
-The npm launcher requires its supported Node.js runtime, but acquired native artifacts do not use
-Node.js as a native dependency.
+The desktop-bundled CLI needs neither npm nor a separately installed Node.js runtime.
 
 ## GNU Linux contract
 

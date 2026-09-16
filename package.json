@@ -43,7 +43,6 @@
     "cs": "changeset",
     "changeset": "changeset",
     "version": "bun run packages/release/scripts/apply-changesets-version.ts",
-    "publish": "bun run packages/release/scripts/publish-npm.ts",
     "pre:alpha": "changeset pre enter alpha",
     "pre:beta": "changeset pre enter beta",
     "pre:exit": "changeset pre exit",

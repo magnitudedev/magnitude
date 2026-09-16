@@ -10,11 +10,9 @@ import { sha256File } from "@magnitudedev/release/macos-app"
 import { validateDesktopDistribution } from "../packages/release/scripts/apple/desktop"
 import { validateLinuxDesktopInstaller } from "../packages/release/scripts/build/desktop-linux"
 import {
-  mkdir,
   mkdtemp,
   readFile,
   rm,
-  writeFile,
 } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { resolve } from "node:path"
@@ -24,12 +22,6 @@ import { ReleaseManifestSchema, validateReleaseManifest } from "@magnitudedev/re
 class CandidateAcceptanceFailed extends Schema.TaggedError<CandidateAcceptanceFailed>()("CandidateAcceptanceFailed", { message: Schema.String }) {}
 
 const candidate = resolve(process.argv[2] ?? "release-candidate")
-const tarballArgument = process.argv[3]
-if (!tarballArgument) {
-  throw new Error("accepted npm tarball is required")
-}
-const tarball = resolve(tarballArgument)
-
 // Script entry points use Promises; subprocess lifetime and output bounds remain Effect-owned.
 const run = (
   command: readonly string[],
@@ -82,6 +74,7 @@ const baseUrl = `http://127.0.0.1:${server.port}`
 const root = await mkdtemp(resolve(tmpdir(), "magnitude-candidate-"))
 const dataDir = resolve(root, "home-bootstrap", ".magnitude")
 let desktopApplication = "/usr/bin/magnitude-desktop"
+let cliExecutable = "/usr/bin/magnitude"
 const environment = (home: string) => ({
   ...process.env,
   HOME: home,
@@ -122,11 +115,9 @@ const acceptBootstrap = Effect.scoped(Effect.gen(function* () {
       Command.stdout("inherit"), Command.stderr("inherit"), Command.exitCode,
     )
     if (installed !== 0) return yield* new CandidateAcceptanceFailed({ message: "Candidate DEB installation failed" })
-    const cli = yield* selectArtifact(manifest, "cli", host)
-    const cliRoot = yield* installArtifact(baseUrl, manifest.version, cli, resolve(dataDir, "cli"))
     const code = yield* Command.make("xvfb-run", "-a", "dbus-run-session", "--", process.env.MAGNITUDE_TEST_NODE ?? "node",
       resolve(import.meta.dir, "../desktop/src/fixtures/linux-installed-lifecycle.mjs")).pipe(
-      Command.env({ MAGNITUDE_TEST_CLI_EXECUTABLE: resolve(cliRoot, "bin/magnitude-cli"), MAGNITUDE_TEST_INFERENCE_INSTALLATION: declaration }),
+      Command.env({ MAGNITUDE_TEST_CLI_EXECUTABLE: cliExecutable, MAGNITUDE_TEST_INFERENCE_INSTALLATION: declaration }),
       Command.stdout("inherit"), Command.stderr("inherit"), Command.exitCode, Effect.timeout("3 minutes"),
     )
     if (code !== 0) return yield* new CandidateAcceptanceFailed({ message: "Candidate Linux desktop lifecycle failed" })
@@ -143,6 +134,7 @@ const acceptBootstrap = Effect.scoped(Effect.gen(function* () {
     const desktopRoot = resolve(root, "desktop")
     yield* Command.make("/usr/bin/ditto", "-x", "-k", updateArchive, desktopRoot).pipe(Command.string)
     desktopApplication = resolve(desktopRoot, "Magnitude.app")
+    cliExecutable = resolve(desktopApplication, "Contents/Resources/magnitude")
   }
 })).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, NodeArchiveExtractor]))
 
@@ -162,31 +154,10 @@ const invoke = async (
 
 try {
   await Effect.runPromise(acceptBootstrap)
-  const npmRoot = resolve(root, "npm")
-  const bunRoot = resolve(root, "bun")
-  await mkdir(npmRoot)
-  await mkdir(bunRoot)
-  await writeFile(resolve(npmRoot, "package.json"), "{}\n")
-  await writeFile(resolve(bunRoot, "package.json"), "{}\n")
-  await run(["npm", "install", "--ignore-scripts", tarball], { cwd: npmRoot })
-  await invoke(
-    ["npx", "--no-install", "magnitude", "--version"],
-    npmRoot,
-    resolve(root, "home-npx"),
-  )
-  await run(["bun", "add", "--ignore-scripts", tarball], { cwd: bunRoot })
-  await invoke(
-    ["bunx", "--bun", "magnitude", "--version"],
-    bunRoot,
-    resolve(root, "home-bunx"),
-  )
-
+  await invoke([cliExecutable, "--version"], root, resolve(root, "home-cli"))
   server.stop(true)
-  await invoke(["npx", "--no-install", "magnitude", "--version"], npmRoot, resolve(root, "home-npx"))
-  await invoke(["bunx", "--bun", "magnitude", "--version"], bunRoot, resolve(root, "home-bunx"))
-  console.log("Installed desktop CLI launchers work with the candidate artifact endpoint stopped")
-  const plugins = process.argv[4]
-  if (plugins) await run(["bun", resolve(import.meta.dir, "accept-integrations.ts"), resolve(plugins)])
+  await invoke([cliExecutable, "--version"], root, resolve(root, "home-cli"))
+  console.log("Desktop-bundled CLI works with the candidate artifact endpoint stopped")
 } finally {
   server.stop(true)
   await rm(root, { recursive: true, force: true })

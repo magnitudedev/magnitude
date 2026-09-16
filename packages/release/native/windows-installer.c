@@ -693,6 +693,8 @@ static DWORD read_registration_string(HKEY key, LPCWSTR name, LPWSTR output, DWO
       output[bytes / sizeof(WCHAR) - 1] || wcslen(output) + 1 != bytes / sizeof(WCHAR)) return ERROR_INVALID_DATA;
   return ERROR_SUCCESS;
 }
+#include "windows-cli-path.h"
+
 __declspec(dllexport) DWORD WINAPI ReadInstallationVersion(LPCWSTR path, LPCWSTR registration, LPWSTR output, DWORD capacity) {
   if (!leaseHeld || !path || !registration || !output || !capacity || capacity > 32768) return ERROR_INVALID_PARAMETER;
   output[0] = 0;

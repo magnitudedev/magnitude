@@ -15,6 +15,13 @@ applies_to:
 `HarnessConnection` configures an external agent harness to use Magnitude. `Connections` is the
 public CLI noun; there is no separate connection-manager domain.
 
+## Pi extension distribution
+
+Normal Pi connections write model/provider configuration and install the shared Magnitude skill.
+They do not install, require, upgrade, or remove the Magnitude Pi extension. Existing user packages
+remain untouched. A companion source can be explicitly injected by local development tooling or
+tests; there is no release-plan default or npm package selection in the connection registry.
+
 ## Observation
 
 The shared identifier schema, registry and unavailable-host fallback expose only external harnesses.
@@ -196,16 +203,13 @@ endpoints; disconnect removes owned settings only while they retain Magnitude's 
 An injected service origin governs both generated configuration and read-only inspection; development
 profiles use an isolated origin and filesystem root.
 
-The Magnitude skill remains independently installable from a harness companion package. It remains optional for ordinary
-connectors, but is required for Pi because catalog discovery, recommendation, acquisition, and
-removal are agent-guided rather than duplicated as Pi extension commands. Connecting Pi always
-installs or enables the desired Magnitude Pi package through Pi's package command and installs the
-skill into Pi's shared agent-skill target. Both the
-non-interactive `connections add pi` flow and desktop onboarding submit the same connection
-request to the shared service; neither presentation surface owns a second installation path.
-Desktop onboarding discloses the exact package source and that Pi extensions execute with the
-user's authority. A successful connection reports whether an already-running harness must reload
-or restart.
+The Magnitude skill remains independently installable from a harness companion package. Connecting
+Pi installs the skill into its shared agent-skill target and writes model/provider configuration.
+Both the headless CLI and desktop submit the same connection request to the shared service.
+Normal connections neither install the Pi companion nor modify the user's existing packages.
+
+The following companion behavior applies only when a source is explicitly injected for development
+or tests. The extension remains in the repository but is not distributed with desktop releases.
 
 Native Pi package installation also bundles the canonical Magnitude usage skill, using it only when
 no skill of that name is already loaded and automatic skills have not been disabled. Loading the
@@ -251,26 +255,11 @@ cleanup restores Pi's default working message and prevents late events from appe
 
 The extension bundles the private SDK and owns one SDK scope, inference observer, and live-row timer.
 Model commands use existing RPC; the injected SDK starter runs `magnitude service start` when needed.
-The SDK checks the exact RPC version and instance identity. CLI connection management installs the
-exact generated plugin version when nothing usable is present. An installed package of any version
-is compatible when its recorded file hashes verify and its declared RPC version equals the CLI's;
-no other check applies. Unrelated user-owned packages are not replaced.
-An unversioned npm installation accepts stable and prerelease package versions alike; absence of
-a version constraint cannot implicitly exclude a compatible prerelease.
-An npm dist-tag such as `alpha` or `latest` is an installation selector, not a semantic-version
-range. Reconciliation preserves the user's tag and validates the installed package without resolving
-the tag again or upgrading it. Explicit versions and ranges must still match the installed version;
-tagged installations retain the same content-integrity and RPC-version checks.
-
-On a protocol mismatch from an explicit model command, the Pi extension runs
-`magnitude connections sync pi` once per loaded extension, through the same CLI executable used
-for service startup. Concurrent mismatches cannot launch another sync. The CLI selects its own
-exact plugin pin and preserves the ordinary connection ownership rules; the plugin does not select
-versions or install packages directly. Successful sync reloads Pi through its command-context API,
-after leaving the old runtime's scoped work, and ends the old callback without replaying the model
-command. Autocomplete and inference callbacks never install or reload software. Failed or cancelled
-sync does not reload; persistent mismatch requires manual action, not another automatic attempt.
-The SDK continues to report mismatches without owning plugin repair or CLI upgrades.
+The SDK checks the exact RPC version and instance identity. Development connections use their
+explicitly injected package source and retain content-integrity and package-ownership checks.
+User-owned packages are not replaced or removed. The retained extension's protocol-mismatch sync
+uses that explicit development source; normal desktop connections do not repair or upgrade an
+extension. The SDK itself does not own plugin repair or CLI upgrades.
 
 The extension owns the starter and sync commands' scoped lifetimes. Disposing it cancels
 pending work; terminal request handles and older runs cannot mutate newer presentation. Presentation
@@ -286,8 +275,8 @@ status snapshots are ready but empty, then selects it, connects
 Pi through the ordinary connection service using the local package source, and launches
 Pi with a scoped executable for the current source CLI. Temporary executables live outside the
 repository and remain available for the entire child session. This development path exercises the
-same provider configuration, package ownership, skill installation, and Pi extension loading as a
-published connection. Pi's user configuration, connection receipts, and bundled skill are isolated
+normal provider configuration and skill installation, plus explicitly requested local companion
+installation and loading. Pi's user configuration, connection receipts, and bundled skill are isolated
 in the development scope. Pi inherits the caller's working directory: project files and context
 remain available, and development setup never substitutes a temporary workspace.
 Automatic skill discovery is disabled for this launcher; only the explicit checkout skill is loaded,
@@ -320,7 +309,7 @@ A conforming connector must prove that:
 - disconnect removes only Magnitude-owned state and conditionally restores selection; and
 - required companion packages are reconciled transactionally, user-owned packages survive
   disconnect, and every connection entry accurately records package ownership; and
-- Pi connection, sync, source replacement, and removal address the exact recorded local or npm
-  package source, and the local development entrypoint leaves no repository artifacts; and
+- explicit development companion connection, sync, source replacement, and removal address the
+  recorded source, and the local development entrypoint leaves no repository artifacts; and
 - reasoning behavior matches the projection table across startup, persisted state, session override,
   model switching, and direct TUI launch.

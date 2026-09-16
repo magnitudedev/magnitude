@@ -1,3 +1,4 @@
+import { CliLinkFailed, makeMacCliLink } from "./mac-cli-link"
 import { ApplicationUpdateControlFailed } from "@magnitudedev/sdk/desktop-host"
 import { makeRendererRecovery } from "./renderer-recovery"
 import { resolveQuitFailure } from "./quit-failure"
@@ -37,7 +38,7 @@ import {
   unixPrivateFilePermissions, windowsPrivateFilePermissions,
   nativeWindowsInstallerVerifier,
   adoptLinuxInstallationLease,
-  MacUpdateHandoff, startMacUpdateHandoff, MacApplicationInstallation, PreparedUpdateStore, makePreparedUpdateStore, NativeMacApplicationInstallation, nativeMachineIdentity, ApplicationMemory, nativeApplicationMemoryLayer, observeApplicationMemory,
+  authorizeMacCliLink, MacUpdateHandoff, startMacUpdateHandoff, MacApplicationInstallation, PreparedUpdateStore, makePreparedUpdateStore, NativeMacApplicationInstallation, nativeMachineIdentity, ApplicationMemory, nativeApplicationMemoryLayer, observeApplicationMemory,
 } from "@magnitudedev/daemon-management/desktop-native"
 import { ProcessGroupController } from "@magnitudedev/utils/process-groups"
 import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native"
@@ -323,8 +324,22 @@ const program = Effect.scoped(Effect.gen(function* () {
     value.webContents.on("preload-error", (_event, path, error) => console.error(path, error))
     return value
   }), value => Effect.sync(() => value.destroy()))
+  const cliLink = process.platform === "darwin" && app.isPackaged && !isolatedProfile && app.isInApplicationsFolder()
+    ? yield* makeMacCliLink({ link: "/usr/local/bin/magnitude", target: join(process.resourcesPath, "magnitude"),
+      path: (yield* Fiber.join(harnessEnvironment)).PATH ?? "",
+      authorize: (link, target, remove) => authorizeMacCliLink(addonPath, link, target, remove).pipe(
+        Effect.mapError(error => new CliLinkFailed({ message: error.message }))),
+    }).pipe(Effect.provide(NodeContext.layer)) : undefined
+  const installCli = cliLink?.install ?? Effect.void
+  const cliResult = (operation: typeof installCli) => operation.pipe(
+    Effect.catchAll(error => Effect.sync(() => dialog.showErrorBox("Magnitude command-line tool", error.message))),
+  )
   Menu.setApplicationMenu(Menu.buildFromTemplate(buildApplicationMenu(process.platform, {
     open: page => run(show(page)), quit: requestQuit,
+    ...(cliLink ? { commandLine: {
+      install: () => run(cliResult(installCli)),
+      remove: () => run(cliResult(cliLink.remove)),
+    } } : {}),
   })))
   yield* loadRenderer()
   // Initial activation belongs to launch intent. Subsequent Dock activation is an explicit Open.
@@ -332,6 +347,9 @@ const program = Effect.scoped(Effect.gen(function* () {
   app.on("activate", activate)
   yield* Effect.addFinalizer(() => Effect.sync(() => app.removeListener("activate", activate)))
   if (wantsWindow) yield* show()
+  if (cliLink && wantsWindow && !startupUpdateDeferred) yield* installCli.pipe(
+    Effect.catchAll(error => Effect.logWarning("Could not install the magnitude command", error.message)),
+  ).pipe(Effect.forkScoped)
   for (;;) {
     const intent = yield* Queue.take(quit)
     reopenAfterUpdate = BrowserWindow.getAllWindows().some(window => window.isVisible())

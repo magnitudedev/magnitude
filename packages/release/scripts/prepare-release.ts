@@ -1,22 +1,13 @@
-import * as Command from "@effect/platform/Command";
 import * as FileSystem from "@effect/platform/FileSystem";
 import { BunContext, BunRuntime } from "@effect/platform-bun";
-import { Console, Effect, Option, Schema } from "effect";
-import { inc } from "semver";
+import { Console, Effect, Schema } from "effect";
 import { resolve } from "node:path";
 import { canonical } from "@magnitudedev/utils/canonical-key";
 import { JsonValueSchema } from "@magnitudedev/utils/schema";
-import { verifyPluginContent } from "@magnitudedev/release/plugin-content";
 import {
   generateVersionFiles,
   readGeneratedRpcVersion,
 } from "@magnitudedev/version/scripts/generate-version";
-import {
-  packPlugin,
-  publishedPlugin,
-  publishedPluginIntegrity,
-  requireNpm,
-} from "../src/plugin-artifacts";
 import {
   CLI_PACKAGE_NAME,
   declaredChangesetReleases,
@@ -26,13 +17,10 @@ import {
 } from "./derived-changeset";
 import { rpcFingerprint } from "./rpc-fingerprint";
 import { readPublicBaseline } from "./public-baseline";
-import { readPrereleaseTag } from "./release-channel";
-import { reconcilePluginChangelog } from "./plugin-changelog";
 import {
   allocateRevision,
   allocateRpcVersion,
   isAwaitingPublication,
-  planPlugin,
   PreparedReleaseSchema,
   ReleasePreparationFailed,
   validatePreparedRelease,
@@ -46,7 +34,6 @@ export const releasePlanPath = resolve(
 );
 const changesetDirectory = resolve(root, ".changeset");
 const markerPath = resolve(root, "packages/release/rpc-breaks");
-const pluginDirectory = resolve(root, "integrations/pi");
 const JsonObject = Schema.Record({
   key: Schema.String,
   value: JsonValueSchema,
@@ -109,8 +96,6 @@ export const prepareRelease = (mode: "detect" | "allocate" | "verify") =>
       const cliVersion = yield* Schema.decodeUnknown(Schema.String)(
         cli.version
       );
-      // Prereleases prepare exactly like stable; only the plugin baseline tag differs.
-      const channel = yield* readPrereleaseTag(root);
       // The committed plan is the only record of the daemon revision; it must already exist.
       if (!(yield* fs.exists(releasePlanPath)))
         return yield* new ReleasePreparationFailed({
@@ -121,29 +106,11 @@ export const prepareRelease = (mode: "detect" | "allocate" | "verify") =>
       const baseline = yield* readPublicBaseline;
 
       // A merged allocation is not a new public baseline. Do not stack another
-      // release PR on it while publication is outstanding. The same holds for a
-      // plugin allocated for publication that npm does not serve yet.
+      // release PR on it while publication is outstanding.
       if (mode === "detect") {
         if (isAwaitingPublication(existing, cliVersion, baseline)) {
           yield* Console.log(
             `Release ${cliVersion} is awaiting publication; retaining its allocation.`
-          );
-          return { pending: true };
-        }
-        const unpublished = yield* Effect.forEach(
-          existing.plugins.filter((plugin) => plugin.publish),
-          ({ artifact }) =>
-            publishedPluginIntegrity(artifact.name, artifact.version, root).pipe(
-              Effect.map((integrity) =>
-                integrity === null ? Option.some(artifact) : Option.none()
-              )
-            )
-        ).pipe(Effect.map((results) => results.flatMap(Option.toArray)));
-        if (unpublished.length > 0) {
-          yield* Console.log(
-            `${unpublished
-              .map((artifact) => `${artifact.name}@${artifact.version}`)
-              .join(", ")} awaiting publication; retaining the allocation.`
           );
           return { pending: true };
         }
@@ -198,41 +165,20 @@ export const prepareRelease = (mode: "detect" | "allocate" | "verify") =>
         }
         yield* verifyPublicBaseline(existing);
       } else {
-        // Generated identity must reflect this allocation before the plugin bundles it.
+        // Generated identity must reflect the desktop allocation.
         yield* generation(() =>
           generateVersionFiles({ cliVersion, revision, rpcVersion: rpc.version })
         );
       }
-      // Run in a new process: the generated RPC version must not come from this
-      // process's already-evaluated protocol module cache.
-      const buildCode = yield* Command.make("bun", "run", "build").pipe(
-        Command.workingDirectory(pluginDirectory),
-        Command.stdout("inherit"),
-        Command.stderr("inherit"),
-        Command.exitCode
-      );
-      if (buildCode !== 0)
-        return yield* new ReleasePreparationFailed({
-          message: "Plugin build failed",
-        });
-      const { metadata } = yield* verifyPluginContent(pluginDirectory);
-      // The plugin's baseline is what npm serves, so a plugin-only publication is its own baseline.
-      const previousPlugin = yield* publishedPlugin(
-        "pi",
-        metadata.name,
-        root,
-        channel
-      );
-      const candidate = yield* planPlugin(metadata, previousPlugin);
       if (mode === "detect") {
-        // The only derived release is a new RPC contract: the CLI and the plugins must follow it.
+        // A new RPC contract requires a new desktop/CLI release.
         // Anything else ships only through a human changeset.
         const rpcChanged = canonical(existing.rpc) !== canonical(rpc);
         const declared = yield* declaredChangesetReleases(changesetDirectory);
         const changeset = rpcChanged
           ? derivedChangeset({
               rpcVersion: rpc.version,
-              releases: [CLI_PACKAGE_NAME, metadata.name].filter(
+              releases: [CLI_PACKAGE_NAME].filter(
                 (name) => !declared.has(name)
               ),
             })
@@ -254,110 +200,8 @@ export const prepareRelease = (mode: "detect" | "allocate" | "verify") =>
         return { pending: false };
       }
       if (mode === "verify") {
-        const selected = existing.plugins.find(
-          (plugin) => plugin.artifact.host === "pi"
-        );
-        if (selected === undefined)
-          return yield* new ReleasePreparationFailed({
-            message: "Release plan omitted the Pi plugin",
-          });
-        if (
-          selected.artifact.name !== metadata.name ||
-          selected.artifact.version !== metadata.version ||
-          selected.artifact.rpcVersion !== metadata.rpcVersion ||
-          (selected.publish &&
-            selected.artifact.contentFingerprint !== metadata.contentFingerprint)
-        ) {
-          return yield* new ReleasePreparationFailed({
-            message: "Bundled plugin contents differ from the prepared release",
-          });
-        }
-        // A reused plugin ships its published bytes. The rebuild only proves the contract
-        // still matches; the bytes are proven against the registry.
-        if (
-          !selected.publish &&
-          (yield* publishedPluginIntegrity(
-            selected.artifact.name,
-            selected.artifact.version,
-            root
-          )) !== selected.artifact.integrity
-        ) {
-          return yield* new ReleasePreparationFailed({
-            message: `${selected.artifact.name}@${selected.artifact.version} on npm is not the artifact the release plan reuses`,
-          });
-        }
-        yield* Console.log(
-          "RPC contract, bundled plugin and exact CLI pins verified."
-        );
+        yield* Console.log("RPC contract and desktop release identity verified.");
         return { pending: false };
-      }
-
-      if ((yield* requireNpm(["--version"], root)).trim() !== "11.6.2")
-        return yield* new ReleasePreparationFailed({
-          message: "Release preparation requires npm 11.6.2",
-        });
-      const packageJson = yield* readPackage(pluginDirectory);
-      let version = candidate.version;
-      let artifact;
-      if (!candidate.publish && Option.isSome(candidate.previous)) {
-        artifact = candidate.previous.value;
-        yield* write(
-          `${pluginDirectory}/package.json`,
-          `${JSON.stringify({ ...packageJson, version }, null, 2)}\n`
-        );
-      } else {
-        const output = yield* fs.makeTempDirectoryScoped({
-          prefix: "magnitude-plugin-allocation-",
-        });
-        // A version published by an interrupted prior release is immutable. Reuse
-        // identical bytes or reserve the next patch before committing the plan.
-        for (;;) {
-          yield* write(
-            `${pluginDirectory}/package.json`,
-            `${JSON.stringify({ ...packageJson, version }, null, 2)}\n`
-          );
-          const code = yield* Command.make("bun", "run", "build").pipe(
-            Command.workingDirectory(pluginDirectory),
-            Command.stdout("inherit"),
-            Command.stderr("inherit"),
-            Command.exitCode
-          );
-          if (code !== 0)
-            return yield* new ReleasePreparationFailed({
-              message: "Plugin metadata rebuild failed",
-            });
-          const packed = yield* packPlugin(pluginDirectory, output);
-          const published = yield* publishedPluginIntegrity(
-            packed.name,
-            packed.version,
-            root
-          );
-          if (published === null || published === packed.integrity) {
-            artifact = packed;
-            break;
-          }
-          const next = inc(version, "patch");
-          if (next === null)
-            return yield* new ReleasePreparationFailed({
-              message: "Cannot allocate the next plugin version",
-            });
-          version = next;
-        }
-      }
-      const changelogPath = `${pluginDirectory}/CHANGELOG.md`;
-      if (yield* fs.exists(changelogPath)) {
-        const currentVersion = yield* Schema.decodeUnknown(Schema.String)(
-          packageJson.version
-        );
-        yield* write(
-          changelogPath,
-          reconcilePluginChangelog(
-            yield* fs.readFileString(changelogPath),
-            currentVersion,
-            version,
-            candidate.publish
-          )
-        );
       }
       yield* writePlan({
         format: 2,
@@ -366,11 +210,11 @@ export const prepareRelease = (mode: "detect" | "allocate" | "verify") =>
         revision,
         rpc,
         semanticBreaks,
-        plugins: [{ artifact, publish: candidate.publish }],
+        plugins: [],
       });
       for (const marker of markers) yield* fs.remove(`${markerPath}/${marker}`);
       yield* Console.log(
-        `Prepared revision ${revision}, RPC ${rpc.version} and ${artifact.name}@${artifact.version}.`
+        `Prepared desktop revision ${revision} and RPC ${rpc.version}.`
       );
       return { pending: false };
     })

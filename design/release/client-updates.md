@@ -14,20 +14,16 @@ applies_to:
 
 The installed desktop application owns updates for itself, its bundled service and headless CLI.
 Release discovery uses the Magnitude-hosted signed protocol. npm dist-tags and a caller's package
-manager are not application update authorities. Harness packages retain their independent npm
-publication and installation contracts.
+manager are not application update authorities. Neither the CLI nor the Pi extension is published
+to npm. Normal Pi connections configure its models and skill without installing the extension.
 
-The optional npm package is only a launcher for the installed desktop's bundled CLI. It has no
-binary acquisition, release cache, package-manager ownership, or update/relaunch protocol. Its own
-npm version does not select the CLI version. Each invocation resolves the current app installation,
-preserves CLI arguments and exit status, and passes the desktop location to that CLI.
-
-Standard locations are `/Applications/Magnitude.app` (then `~/Applications/Magnitude.app`) on Mac,
-the per-user `LOCALAPPDATA/Programs/Magnitude` installation on Windows, and the native package on
-Linux. Linux retains `/usr/bin/magnitude-desktop` as the guarded app entry point. An explicit
-`MAGNITUDE_DESKTOP_PATH` selects a custom application; a missing override never silently falls back.
-No PATH search can resolve back into the npm launcher. Missing desktop installations produce a
-link to magnitude.dev instead of downloading a separate executable.
+Desktop installation exposes its bundled CLI directly: /usr/local/bin/magnitude points into the
+Mac application, Windows adds the installed resources directory to the user's PATH, and Linux
+retains its package-owned /usr/bin/magnitude link. Replacing the desktop at the same location
+updates the command's executable without a second package update. On macOS the CLI resolves
+its real executable path to locate its enclosing app, so a symlink cannot make it start a different
+copy in /Applications. An explicit application override remains authoritative. Existing conflicting commands
+must be resolved explicitly; uninstall removes only registration owned by that installation.
 
 ## Headless control
 

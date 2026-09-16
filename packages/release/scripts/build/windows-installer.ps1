@@ -15,7 +15,7 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'Windows installer helper compilation failed.' }
   & link.exe /nologo /WX /DLL /MACHINE:X86 /DYNAMICBASE /NXCOMPAT "/OUT:$Output" `
     "/DEF:$(Join-Path $projectRoot 'packages\release\native\windows-installer.def')" `
-    windows-installer.obj windows-security.obj advapi32.lib shell32.lib ole32.lib uuid.lib ntdll.lib
+    windows-installer.obj windows-security.obj advapi32.lib user32.lib shell32.lib ole32.lib uuid.lib ntdll.lib
   if ($LASTEXITCODE -ne 0) { throw 'Windows installer helper linking failed.' }
 } finally {
   Pop-Location

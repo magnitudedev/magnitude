@@ -1,4 +1,4 @@
-name: Publish npm
+name: Recover desktop release metadata
 
 on:
   workflow_call:
@@ -12,14 +12,14 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Exact public GitHub release version to publish to npm
+        description: Exact public GitHub release version to register
         required: true
         type: string
 
 concurrency:
   group: >-
     ${{ inputs.within_release
-      && format('magnitude-npm-completion-{0}', github.run_id)
+      && format('magnitude-metadata-completion-{0}', github.run_id)
       || 'magnitude-production-release' }}
   cancel-in-progress: false
 
@@ -28,10 +28,9 @@ permissions:
 
 env:
   BUN_VERSION: "1.4.2"
-  NPM_VERSION: "11.6.2"
 
 jobs:
-  publish:
+  register:
     runs-on: blacksmith-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
@@ -44,8 +43,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
-      - run: npm install --global "npm@${NPM_VERSION}"
       - run: bun install --frozen-lockfile
       - name: Verify released source
         id: source
@@ -69,15 +66,3 @@ jobs:
           DISTRIBUTION_PUBLISHER_DATABASE_URL: ${{ secrets.DISTRIBUTION_PUBLISHER_DATABASE_URL }}
           DISTRIBUTION_DATABASE_CA: ${{ secrets.DISTRIBUTION_DATABASE_CA }}
           GH_TOKEN: ${{ github.token }}
-      - id: npm-candidate
-        run: bun run packages/release/scripts/prepare-npm.ts release/npm-candidate
-      - name: Verify npm desktop installation guidance
-        run: bun run packages/release/scripts/accept-public-cli.ts "${{ steps.npm-candidate.outputs.tarball }}"
-        env:
-          MAGNITUDE_RELEASE_VERSION: ${{ inputs.version }}
-      - name: Publish accepted CLI tarball
-        run: bun run publish "${{ steps.npm-candidate.outputs.tarball }}"
-        env:
-          MAGNITUDE_RELEASE_VERSION: ${{ inputs.version }}
-          MAGNITUDE_EXPECTED_NPM_INTEGRITY: ${{ steps.npm-candidate.outputs.integrity }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

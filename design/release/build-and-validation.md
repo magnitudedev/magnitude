@@ -177,10 +177,9 @@ not replace native desktop-environment or real logout acceptance.
 The container syscall policy must permit Chromium to create its sandbox namespaces while retaining
 the default restrictions on other operations. Acceptance never disables Chromium's sandbox.
 
-The complete candidate gate additionally installs the packed npm package through Node and Bun,
-runs the installed desktop’s bundled CLI and service, acquires ICN from an empty data root, reaches ACN/ICN
+The complete candidate gate runs the installed desktop’s bundled CLI and service, acquires ICN from an empty data root, reaches ACN/ICN
 readiness and local-model ranking readiness, shuts down the exact owned processes, and proves
-the npm launcher continues to run the installed CLI when the artifact endpoint is unavailable.
+the bundled CLI works when the artifact endpoint is unavailable.
 On Linux this gate runs in a disposable Ubuntu consumer, explicitly installs the candidate DEB,
 and passes the acquired candidate ICN installation to the installed desktop lifecycle test. It must
 observe a Ready service; an intentionally missing engine only certifies failure handling and cannot

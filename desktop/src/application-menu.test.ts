@@ -30,4 +30,21 @@ describe("application menu", () => {
     expect(actions.open.mock.calls).toEqual([["discover"], ["catalog"], ["models"], ["connections"], ["usage"], ["status"], ["settings"]])
     expect(actions.quit).not.toHaveBeenCalled()
   })
+  it("offers Mac command registration separately from application Quit", () => {
+    const commandLine = { install: vi.fn(), remove: vi.fn() }
+    const actions = { open: vi.fn(), quit: vi.fn(), commandLine }
+    const menu = buildApplicationMenu("darwin", actions)
+    const app = menu[0]?.submenu
+    if (!Array.isArray(app)) throw new Error("Application menu missing")
+    const commands = app.find(item => item.label === "Command-line Tool")?.submenu
+    if (!Array.isArray(commands)) throw new Error("Command menu missing")
+    for (const item of commands) {
+      if (!item.click) throw new Error("Command action missing")
+      Reflect.apply(item.click, undefined, [])
+    }
+    expect(commandLine.install).toHaveBeenCalledOnce()
+    expect(commandLine.remove).toHaveBeenCalledOnce()
+    expect(actions.quit).not.toHaveBeenCalled()
+  })
+
 })

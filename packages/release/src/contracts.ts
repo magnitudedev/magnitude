@@ -1,6 +1,6 @@
 import { Data, Effect, Option, Schema } from "effect"
 import type { Backend } from "./targets"
-import { PluginArtifactSchema, PluginHostSchema, RpcReleaseSchema, type PluginHost } from "./plugins"
+import { PluginArtifactSchema, RpcReleaseSchema, type PluginHost } from "./plugins"
 
 export const CLI_PACKAGE_NAME = "@magnitudedev/cli"
 
@@ -62,7 +62,7 @@ export const ReleaseManifestSchema = Schema.Struct({
   tag: NonEmpty,
   sourceCommit: Schema.String.pipe(Schema.pattern(/^[a-f0-9]{40}$/)),
   rpc: RpcReleaseSchema,
-  plugins: Schema.NonEmptyArray(PluginArtifactSchema),
+  plugins: Schema.Array(PluginArtifactSchema),
   artifacts: Schema.NonEmptyArray(ReleaseArtifactSchema),
 })
 export type ReleaseManifest = typeof ReleaseManifestSchema.Type
@@ -95,7 +95,6 @@ export const validateReleaseManifest = (
     pluginNames.add(plugin.name)
     pluginHosts.add(plugin.host)
   }
-  if (PluginHostSchema.literals.some((host) => !pluginHosts.has(host))) return fail("release is missing a plugin selection for a declared host")
   for (const artifact of manifest.artifacts) {
     if (ids.has(artifact.id) || names.has(artifact.filename)) {
       return fail("release artifact IDs and filenames must be unique")

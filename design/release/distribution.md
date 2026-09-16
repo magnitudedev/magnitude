@@ -6,6 +6,7 @@ applies_to:
   - packages/release/scripts/assemble.ts
   - packages/release/scripts/build/**
   - packages/release/native/windows-installer.*
+  - packages/release/native/windows-cli-path.h
   - packages/release/resources/windows/desktop.nsi
   - packages/release/scripts/apple/desktop.ts
   - packages/launcher/package.json
@@ -13,7 +14,7 @@ applies_to:
 
 # Release distribution
 
-Magnitude distributes one versioned release as an npm package plus a fixed graph of native
+Magnitude distributes one versioned release as a fixed graph of native desktop, CLI, and engine
 artifacts. The release graph is product configuration, not a plugin system.
 
 ## Published artifacts
@@ -103,7 +104,7 @@ A conforming release satisfies all of the following:
   and the capability dependencies of the selected backend.
 - A backend pack composes with exactly its required base and cannot alter the base platform floor.
 - Final artifacts pass build-host-independent validation before publication.
-- GitHub assets are public before npm is published so the desktop required by the npm launcher is available.
+- GitHub assets are public and verified before hosted update metadata promotes them. No npm packages are published.
 
 The concrete host dependency contracts are defined in
 [Platform contracts](./platform-contracts.md). Build acceptance is defined in
@@ -111,3 +112,20 @@ The concrete host dependency contracts are defined in
 [Acquisition](./acquisition.md), desktop-owned CLI updates are defined in
 [CLI updates](./client-updates.md), and remote publication is defined in
 [Publication](./publication.md).
+
+## Desktop-owned command registration
+
+The installed desktop exposes its bundled CLI directly. macOS offers an authorized symlink in
+`/usr/local/bin` on installed-app launch; Windows registers the bundled CLI directory in the
+current user's PATH. Linux retains its package-owned `/usr/bin/magnitude` link. App replacement
+keeps the command pointed at the matching bundled version. No npm launcher is required.
+
+Registration replaces existing `magnitude` commands on PATH so the bundled CLI takes precedence.
+On macOS these become links to the bundle; on Windows prior command shims are removed after the
+new payload and PATH registration are installed. Other command names and directories are untouched. Removal deletes only
+an exact symlink targeting this installation or a PATH entry recorded as added by this installer;
+pre-existing PATH entries and other user entries are preserved. Windows changes notify new shell
+launches; existing terminals may retain their old environment. macOS Finder deletion has no
+uninstall callback, so the app provides explicit command-link removal.
+macOS elevation uses native Authorization Services from the application, not AppleScript.
+Successful registration is silent and already-correct links require no authorization.
