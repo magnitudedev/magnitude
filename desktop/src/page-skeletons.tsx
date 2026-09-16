@@ -56,9 +56,13 @@ export function ModelCardsSkeleton({ library = false }: { library?: boolean }) {
     </div></article>)}</div>
   </LoadingRegion>
 }
-export const modelDescriptions = { discover: "Your best local models, matched to your machine.", catalog: "Explore every model in the curated catalog.", models: "Your downloads and installed models, in one place." } as const
-export function ModelsSkeleton({ page }: { page: keyof typeof modelDescriptions }) {
-  return <><p className="mt-2 text-slate-500">{modelDescriptions[page]}</p>{page === "discover" ? <><HardwarePending /><RecommendationPreference /><RecommendationsSkeleton /></> : <><div className={pageLayout.catalogToolbar}><h2 className="font-heading text-xl">{page === "models" ? "Your library" : "Explore the catalog"}</h2><Skeleton className="h-8 w-full max-w-sm" /></div>{page === "catalog" && <div className="mb-5 flex h-5 items-center justify-between"><Skeleton className="h-3 w-32" /><Skeleton className="h-3 w-28" /></div>}<ModelCardsSkeleton library={page === "models"} /></>}</>
+export function ModelsSkeleton({ page }: { page: "discover" | "catalog" | "models" }) {
+  if (page === "discover") return <><HardwarePending /><RecommendationPreference /><RecommendationsSkeleton /></>
+  return <>
+    <div className={pageLayout.modelHeader}><h1 className={pageLayout.pageTitle}>{page === "models" ? "My Models" : "Catalog"}</h1><Skeleton className="h-5 w-16" /></div>
+    <div className={pageLayout.catalogToolbar}><div className="flex flex-wrap items-center gap-2"><Skeleton className="h-8 w-32" /><Skeleton className="h-8 w-44" /></div><Skeleton className={`h-8 ${pageLayout.modelSearch}`} /></div>
+    <ModelCardsSkeleton library={page === "models"} />
+  </>
 }
 export function ConnectionsSkeleton() {
   return <LoadingRegion label="Loading connections" className="mt-7 space-y-8"><SkeletonLine className="mb-4 h-5 text-sm" width="180px" /><div className={pageLayout.harnessGrid}>{Array.from({length:8},(_,index) => <article className={pageLayout.harnessCard} key={index}><div className="flex flex-wrap items-center justify-between gap-4"><div className="flex min-w-0 items-center gap-3"><Skeleton className="size-14 shrink-0 rounded-2xl" /><div><SkeletonLine className="h-7 w-32 text-lg" /><SkeletonLine className="mt-1 h-5 w-28 text-sm" /></div></div><Skeleton className="h-8 w-24" /></div></article>)}</div></LoadingRegion>

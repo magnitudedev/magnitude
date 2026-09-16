@@ -1,4 +1,4 @@
-import { LoadingRegion, SkeletonLine, ModelsSkeleton, RecommendationsSkeleton, ConnectionsSkeleton, LoginSkeleton, UpdatesSkeleton, modelDescriptions } from "./page-skeletons"
+import { LoadingRegion, SkeletonLine, ModelsSkeleton, RecommendationsSkeleton, ConnectionsSkeleton, LoginSkeleton, UpdatesSkeleton } from "./page-skeletons"
 import { pageLayout } from "./page-layout"
 import { RecommendationPreference } from "./model-preference-slider"
 import { ServingUsage } from "./serving-usage"
@@ -6,6 +6,7 @@ import { initializeAppearance, setAppearancePreference, useAppearancePreference,
 import { ActionTooltip, TooltipProvider } from "../../web/src/components/ui/tooltip"
 import { Button } from "../../web/src/components/ui/button"
 import { Input } from "../../web/src/components/ui/input"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../web/src/components/ui/select"
 import { Progress } from "../../web/src/components/ui/progress"
 import { MagnitudeMark } from "../../web/src/components/magnitude-mark"
 import { ChevronDown, Eye, ArrowUpRight, Layers3, Library, HardDrive, Plug, Activity, BarChart3, Check, Settings2, Download, Play, Square, Trash2, X, Monitor, Sun, Moon } from "lucide-react"
@@ -186,14 +187,22 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const stopResult = useLocalModelStopStatus()
   const hardware = useLocalInferenceHardware()
   const [search, setSearch] = useState("")
-  const [fitOnly, setFitOnly] = useState(false)
+  const filterOptions = installedOnly
+    ? [{ value: "all", label: "All models" }, { value: "downloaded", label: "Downloaded" }, { value: "downloading", label: "Downloading" }]
+    : [{ value: "all", label: "All models" }, { value: "fits", label: "Fits my machine" }]
+  const sortOptions = [
+    ...(!installedOnly ? [{ value: "recommended", label: "Recommended" }] : []),
+    { value: "name", label: "Name A–Z" }, { value: "smallest", label: "Smallest download" }, { value: "largest", label: "Largest download" },
+  ]
+  const [filter, setFilter] = useState("all")
+  const [sort, setSort] = useState(installedOnly ? "name" : "recommended")
   const client = useAgentClient()
   const session = useMemo(() => client.runtime.atom(DesktopSession), [client])
   const preferenceAtom = useMemo(() => Atom.make(get => Result.map(get(session), service => get(service.rankingPreference))), [session])
   const preferenceResult = useAtomValue(preferenceAtom)
   const preference = Result.isSuccess(preferenceResult) ? preferenceResult.value : 2
   const setPreference = useAtomSet(useMemo(() => client.runtime.fn((index: number) => Effect.flatMap(DesktopSession, service => service.setRankingPreference(index))), [client]))
-  if (Result.isFailure(catalog)) return <p role="alert">{localModelFailureMessage(catalog.cause, "Could not read the model catalog. Check Status and try again.")}</p>
+  if (Result.isFailure(catalog)) return <>{!discover && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<p role="alert" className="mt-5">{localModelFailureMessage(catalog.cause, "Could not read the model catalog. Check Status and try again.")}</p></>
   if (!Result.isSuccess(catalog) && !discover) return <ModelsSkeleton page={page} />
   const models = (Result.isSuccess(catalog) ? catalog.value.models : []).filter((model): model is CatalogLocalModel => model._tag === "Catalog")
   const ranked = !installedOnly && Result.isSuccess(hardware) ? rankedLocalModelOptions(models.map(model => ({ id: model.modelId, kind: localModelIsInstalled(model) ? "stored" as const : "downloadable" as const, model })), { fastToSmart: LOCAL_MODEL_RANKING_SCALE_VALUES[preference]!, memoryBudgetBytes: targetPhysicalMemoryBytes(hardware.value) }, models.length).flatMap(option => option.model._tag === "Catalog" ? [option.model] : []) : []
@@ -201,9 +210,39 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const recommendationsPending = !Result.isFailure(hardware) && (Result.isInitial(hardware) || !assessment?.complete)
   const rankedIds = new Set(ranked.map(model => model.modelId))
   const ordered = installedOnly ? models : [...ranked, ...models.filter(model => !rankedIds.has(model.modelId))]
-  const visible = ordered.filter(model => (!installedOnly || model.acquisitionState._tag !== "NotInstalled") && (!fitOnly || model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits") && `${formatLocalModelDisplayName(model)} ${model.presentation.description}`.toLowerCase().includes(search.toLowerCase()))
+  const library = ordered.filter(model => !installedOnly || model.acquisitionState._tag !== "NotInstalled")
+  const visible = library.filter(model => {
+    const acquisition = model.acquisitionState
+    const matchesFilter = filter === "all"
+      || filter === "fits" && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits"
+      || filter === "downloaded" && localModelIsInstalled(model)
+      || filter === "downloading" && (acquisition._tag === "Installing" || acquisition._tag === "Updating")
+    return matchesFilter && `${formatLocalModelDisplayName(model)} ${model.presentation.description}`.toLowerCase().includes(search.trim().toLowerCase())
+  })
+  if (sort !== "recommended") visible.sort((a, b) => {
+    const byName = formatLocalModelDisplayName(a).localeCompare(formatLocalModelDisplayName(b), undefined, { numeric: true }) || a.modelId.localeCompare(b.modelId)
+    return sort === "smallest" ? a.storageBytes - b.storageBytes || byName : sort === "largest" ? b.storageBytes - a.storageBytes || byName : byName
+  })
   return <>
-    <p className="mt-2 text-slate-500">{modelDescriptions[page]}</p>
+    {!discover && <>
+      <div className={pageLayout.modelHeader}>
+        <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>
+        <span className="text-sm tabular-nums text-slate-500" role="status">{visible.length} {visible.length === 1 ? "model" : "models"}</span>
+      </div>
+      <div className={pageLayout.catalogToolbar}>
+        <div className="flex flex-wrap items-center gap-2">
+          <Select items={filterOptions} value={filter} onValueChange={value => { if (value !== null) setFilter(value) }}>
+            <SelectTrigger aria-label="Filter models"><SelectValue /></SelectTrigger>
+            <SelectContent>{filterOptions.map(option => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
+          </Select>
+          <Select items={sortOptions} value={sort} onValueChange={value => { if (value !== null) setSort(value) }}>
+            <SelectTrigger aria-label="Sort models"><span className="text-slate-500">Sort:</span><SelectValue /></SelectTrigger>
+            <SelectContent>{sortOptions.map(option => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
+          </Select>
+        </div>
+        <Input aria-label="Search models" placeholder="Search models…" className={pageLayout.modelSearch} value={search} onChange={event => setSearch(event.target.value)} />
+      </div>
+    </>}
     {discover && <HardwareOverview /> }
     {Option.isSome(stopResult.failure) && <p role="alert" className="mt-5 text-sm">{stopResult.failure.value}</p>}
     {discover && <RecommendationPreference value={preference} onChange={setPreference} />}
@@ -212,10 +251,8 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
       ? <RecommendationsSkeleton assessment={assessment} />
       : <Recommendations key={preference} models={featuredCatalogModels(ranked, 5)} active={Option.fromNullable(active)} />)}
     {!discover && <>
-    <div className={pageLayout.catalogToolbar}><h2 className="font-heading text-xl">{installedOnly?"Your library":"Explore the catalog"}</h2><Input aria-label="Search models" placeholder="Find a model…" className="max-w-sm" value={search} onChange={event=>setSearch(event.target.value)} /></div>
-    {!installedOnly && <div className="mb-5 flex items-center justify-between text-sm text-slate-500"><label className="flex items-center gap-2"><input type="checkbox" checked={fitOnly} onChange={event => setFitOnly(event.target.checked)} className="accent-blue-600" />Fits my machine</label><span>{visible.length} configurations</span></div>}
     <div className="grid items-start gap-5">{visible.map(model => <ModelCard key={model.modelId} model={model} showMemory={installedOnly} {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})} />)}</div>
-    {visible.length === 0 && <p className="py-8 text-slate-500">{search ? "No matching models." : installedOnly ? "No models downloaded yet. Find one in Discover." : "No models match this filter."}</p>}
+    {visible.length === 0 && <p className="py-8 text-slate-500">{search.trim() || filter !== "all" ? "No models match your search or filter." : installedOnly ? "No models downloaded yet. Find one in Discover." : "No models match this filter."}</p>}
     </>}
     {discover && ranked.length === 0 && !recommendationsPending && Result.isSuccess(hardware) && <p className="py-8 text-slate-500">No fitting recommendations right now. Explore Catalog for compatibility details.</p>}
   </>
@@ -224,10 +261,7 @@ function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; s
   const client = useAgentClient()
   const session = useMemo(() => client.runtime.atom(DesktopSession), [client])
   const service = useAtomValue(session)
-  return Result.isSuccess(service) ? <ConnectionsView service={service.value} serviceReady={serviceReady} selectedModel={selectedModel} /> : Result.isFailure(service) ? <p role="alert" className="mt-5">Could not prepare connections. {hostFailureMessage(service.cause)}</p> : <><ConnectionsDescription /><ConnectionsSkeleton /></>
-}
-function ConnectionsDescription() {
-  return <p className="mt-2 text-slate-500">Use your local models in the tools you already work with. Connect installs the configuration and Magnitude instructions.</p>
+  return Result.isSuccess(service) ? <ConnectionsView service={service.value} serviceReady={serviceReady} selectedModel={selectedModel} /> : Result.isFailure(service) ? <p role="alert" className="mt-5">Could not prepare connections. {hostFailureMessage(service.cause)}</p> : <ConnectionsSkeleton />
 }
 function ConnectionsView({ service, serviceReady, selectedModel }: { service: DesktopSession; serviceReady: boolean; selectedModel: Option.Option<ProviderModelId> }) {
   const models = useLocalModels()
@@ -242,7 +276,6 @@ function ConnectionsView({ service, serviceReady, selectedModel }: { service: De
   const busy = connecting.waiting || disconnecting.waiting
   const error = [connecting, disconnecting].find(Result.isFailure)
   return <>
-    <ConnectionsDescription />
     {!serviceReady && <p className="mt-5 text-sm text-slate-500">Configuration checks are available. Start the service from Status before connecting a harness.</p>}
     {serviceReady && !canConnect && !Result.isInitial(models) && <div className="mt-5 flex flex-wrap items-center gap-3 text-sm text-slate-500"><p>{Result.isFailure(models) ? "Model availability could not be checked." : !Result.isSuccess(models) ? "Checking available models…" : "Download a compatible model before connecting a harness. It doesn’t need to be loaded."}</p><Button variant="outline" onClick={() => discover()}>Discover models</Button></div>}
     {error && Result.isFailure(error) && <p role="alert" className="mt-5 text-sm">{hostFailureMessage(error.cause)}</p>}
@@ -394,7 +427,7 @@ function App() {
       : page === "usage" ? <ServingUsage />
       : page === "settings" ? <><AppearanceSettings /><LoginSettings /><ApplicationSettings /></>
       : page === "connections" ? <Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} />
-      : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(state) ? <p role="alert" className="mt-8">The service needs attention. Open Status for details.</p> : <ModelsSkeleton page={page} />)
+      : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(state) ? <>{page !== "discover" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<p role="alert" className="mt-8">The service needs attention. Open Status for details.</p></> : <ModelsSkeleton page={page} />)
       : page === "discover" || page === "catalog" || page === "models" ? <Models page={page} />
       : null}
   </DesktopShell>
@@ -402,7 +435,7 @@ function App() {
 function DesktopShell({ page, navigate, children }: { page: Page; navigate?: (page: Page) => void; children: ReactNode }) {
   return <div className="flex h-screen bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200">
     <aside className="flex w-56 shrink-0 flex-col border-r border-slate-200 px-4 py-8 dark:border-slate-750"><div className="mb-10 flex items-center gap-3 px-3 font-heading text-base font-semibold"><MagnitudeMark className="h-8 w-8" />Magnitude</div><nav className="flex min-h-0 flex-1 flex-col gap-2">{(Object.keys(pageNames) as Page[]).map(key => <Button variant="ghost" key={key} disabled={!navigate} onClick={() => navigate?.(key)} aria-current={page === key ? "page" : undefined} className={`h-10 justify-start gap-3 rounded-lg px-3 text-left text-sm font-medium ${key === "status" ? "mt-auto" : ""} ${page === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>{(() => { const Icon = pageIcons[key]; return <Icon className="size-4" /> })()}{pageNames[key]}</Button>)}</nav></aside>
-    <main key={page} className="min-w-0 flex-1 overflow-y-auto px-10 py-9"><h1 className="font-heading text-[28px] font-semibold tracking-tight">{pageNames[page]}</h1>
+    <main key={page} className="min-w-0 flex-1 overflow-y-auto px-10 py-9">{page !== "catalog" && page !== "models" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}
       {children}
     </main>
   </div>

@@ -19,8 +19,7 @@ export function ServingUsage() {
   const names = Result.isSuccess(catalog) ? new Map(catalog.value.models.map(model => [String(model.modelId), formatLocalModelDisplayName(model)])) : new Map<string, string>()
   const snapshot = Result.isSuccess(result) ? result.value : null
   return <section aria-label="Local usage" className="mt-6 space-y-8">
-    <div className="flex flex-wrap items-center justify-between gap-4">
-      <p className="text-sm text-slate-500">Token usage and performance across your local models.</p>
+    <div className="flex flex-wrap items-center justify-end gap-4">
       <div className="flex flex-wrap items-center gap-3">
         <div className="flex rounded-lg bg-slate-100 p-1 dark:bg-slate-900" aria-label="Usage period">
           {(["Today", "AllTime"] as const).map(value => <button key={value} aria-pressed={period === value} onClick={() => setPeriod(value)} className={`rounded-md px-3 py-1.5 text-sm ${period === value ? "bg-white text-blue-700 shadow-sm dark:bg-slate-750 dark:text-blue-300" : "text-slate-500"}`}>{value === "Today" ? "Today" : "All time"}</button>)}
