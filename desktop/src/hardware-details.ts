@@ -27,9 +27,12 @@ export const normalizeProcessorName = (name: string) => normalizeHardwareName(na
   .replace(/\s+\d+-core processor$/, "")
   .replace(/\s+processor$/, "")
   .replace(/\s+/g, " ").trim()
-const publishedFacts = (target: typeof CatalogEntry.Type.target, name: string, physicalCores: Option.Option<number> = Option.none(), dedicatedMemoryBytes: Option.Option<number> = Option.none()) => {
+const findHardwareFacts = (target: typeof CatalogEntry.Type.target, name: string) => {
   const normalize = target === "Accelerator" ? normalizeGpuName : target === "Processor" ? normalizeProcessorName : normalizeHardwareName
-  const entry = hardwareFactsCatalog.find(entry => entry.target === target && entry.names.some(candidate => normalize(candidate) === normalize(name)))
+  return hardwareFactsCatalog.find(entry => entry.target === target && entry.names.some(candidate => normalize(candidate) === normalize(name)))
+}
+const publishedFacts = (target: typeof CatalogEntry.Type.target, name: string, physicalCores: Option.Option<number> = Option.none(), dedicatedMemoryBytes: Option.Option<number> = Option.none()) => {
+  const entry = findHardwareFacts(target, name)
   if (!entry) return []
   const variant = Option.flatMap(physicalCores, cores => Option.flatMap(entry.variants, variants =>
     Option.fromNullable(variants.find(variant => variant.physicalCpuCores === cores))))
@@ -87,14 +90,14 @@ export const hardwareDetails = (identity: MachineIdentityObservation | null, har
     observed.acceleratorId === accelerator.id && domainFor(observed.memoryDomainId)?.sharesSystemMemory === true &&
     normalizeHardwareName(observed.name) === normalizeHardwareName(processorName)))
   const memoryFacts = summary.filter(fact => fact.label.includes("memory") || fact.label === "System RAM" || fact.label === "Memory bandwidth (spec)")
-  const processorDetails = summary.filter(fact => !memoryFacts.includes(fact))
-  const acceleratorUnitLabels = new Set(["CUDA cores (spec)", "GPU compute units (spec)", "Xe cores (spec)", "Stream processors (spec)"])
+  const processorDetails = summary.filter(fact => !memoryFacts.includes(fact) && fact.label !== "Neural Engine cores (spec)")
+  const hiddenAcceleratorFactLabels = new Set(["CUDA cores (spec)", "GPU compute units (spec)", "Xe cores (spec)", "Stream processors (spec)", "GPU architecture (spec)"])
   const groups = [
-    { label: integratedChip ? "Chip" : "CPU", name: processorName, details: processorDetails.map(fact => `${fact.value} ${fact.label}`) },
-    { label: "Memory", name: memoryFacts[0]?.value ?? "Unknown", details: memoryFacts.map((fact, index) => index === 0 ? fact.label : `${fact.value} ${fact.label}`) },
+    { label: integratedChip ? "Chip" : "CPU", name: processorName, truncateName: !findHardwareFacts("Processor", processorName), details: processorDetails.map(fact => `${fact.value} ${fact.label}`) },
+    { label: "Memory", name: memoryFacts[0]?.value ?? "Unknown", truncateName: false, details: memoryFacts.map((fact, index) => index === 0 ? fact.label : `${fact.value} ${fact.label}`) },
     ...visibleAccelerators.map((accelerator, index) => ({
-      label: visibleAccelerators.length > 1 ? `GPU ${index + 1}` : "GPU", name: accelerator.name,
-      details: [accelerator.detail, ...accelerator.facts.filter(fact => !acceleratorUnitLabels.has(fact.label)).map(fact => `${fact.value} ${fact.label}`)],
+      label: visibleAccelerators.length > 1 ? `GPU ${index + 1}` : "GPU", name: accelerator.name, truncateName: !findHardwareFacts("Accelerator", accelerator.name),
+      details: [accelerator.detail, ...accelerator.facts.filter(fact => !hiddenAcceleratorFactLabels.has(fact.label)).map(fact => `${fact.value} ${fact.label}`)],
     })),
   ]
   return { ...presentation, summary, accelerators, groups, cpuInference: hardware.accelerators.length === 0 }

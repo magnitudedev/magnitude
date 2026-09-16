@@ -66,7 +66,7 @@ export function HardwareSummary({ identity, value }: { identity: MachineIdentity
       {Option.isSome(presentation.photo) && <div className="w-full max-w-[260px]"><HardwarePhotograph photo={presentation.photo.value} /></div>}
       <div className="min-w-0">
         <p className="text-xs font-medium uppercase tracking-widest text-slate-500 dark:text-slate-400">{presentation.category}{presentation.cpuInference ? " · CPU inference" : ""}</p>
-        <h2 className="mt-2 break-words font-heading text-xl">{Option.getOrElse(presentation.name, () => "Your computer")}</h2>
+        <h2 title={Option.isNone(presentation.deviceId) ? Option.getOrElse(presentation.name, () => "Your computer") : undefined} className={`mt-2 font-heading text-xl ${Option.isSome(presentation.deviceId) ? "break-words" : "truncate"}`}>{Option.getOrElse(presentation.name, () => "Your computer")}</h2>
         <div className="mt-4 grid grid-cols-[repeat(auto-fit,minmax(min(100%,220px),1fr))] gap-x-6 gap-y-4">
           {presentation.groups.map(group => {
             const Icon = group.label === "Memory" ? MemoryIcon : group.label.startsWith("GPU") ? CircuitryIcon : CpuIcon
@@ -76,7 +76,7 @@ export function HardwareSummary({ identity, value }: { identity: MachineIdentity
                 <p className="m-0 text-xs font-medium leading-tight text-slate-500 dark:text-slate-400">{group.label}</p>
               </div>
               <div className="min-w-0">
-                <p className="mb-0 mt-1 break-words text-sm font-semibold leading-snug">{group.name}</p>
+                <p title={group.truncateName ? group.name : undefined} className={`mb-0 mt-1 text-sm font-semibold leading-snug ${group.truncateName ? "truncate" : "break-words"}`}>{group.name}</p>
                 <div className="mt-1 flex flex-col gap-0.5">{group.details.map(detail => <p key={detail} className="m-0 text-xs leading-snug text-slate-500 dark:text-slate-400">{detail.replace(/ \(spec\)/g, "")}</p>)}</div>
               </div>
             </div>
