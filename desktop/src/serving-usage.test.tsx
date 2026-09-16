@@ -15,9 +15,11 @@ it("renders all token categories and measurements without counting cache twice",
   for (const [label, count] of [["Input tokens",100],["Cached input",40],["Output tokens",20]]) expect(html).toContain(`data-usage="${label}">${count}</p>`)
   expect(html).toContain("80 tokens/s"); expect(html).toContain("125 ms")
 })
-it("renders missing evidence and partial totals honestly", () => {
+it("renders missing measurements without diagnostic notices", () => {
   const html = renderToStaticMarkup(<UsageFigures usage={{ ...usage, cachedInputRequests: 0, tokensPerSecond: null, timeToFirstTokenMs: null, incompleteRequests: 1, recordingFailures: 1 }} />)
   expect(html).toContain('data-usage="Cached input">—</p>')
   expect(html).toContain('data-usage="speed">—</p>'); expect(html).toContain('data-usage="ttft">—</p>')
-  expect(html).toContain('Totals are partial.'); expect(html).toContain('could not be saved')
+  expect(html).not.toContain('Totals are partial.')
+  expect(html).not.toContain('complete usage evidence')
+  expect(html).not.toContain('could not be saved')
 })
