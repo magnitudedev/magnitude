@@ -6,7 +6,7 @@ import hashlib
 import json
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -39,6 +39,8 @@ class PreparedFormula:
     """
 
     def __init__(self, fixture: FormulaFixture, device: DeviceRuntime, options: CompileOptions):
+        if options.schedules is None and device.schedules is not None:
+            options = replace(options, schedules=device.schedules)
         self.fixture, self.device, self.options = fixture, device, options
         self._closed = False
         self._owned = ExitStack()
@@ -101,6 +103,7 @@ class PreparedFormula:
             self.plan = analyze_graph(
                 graph, compiler_target=device.compiler_target, compiler_identity=device.compiler_identity,
                 available_bytes=device.available_bytes, options=options, constants=constants,
+                device_identity=device.evidence_identity if options.schedules is not None else None,
             )
             self.compiled: CompiledFunction = materialize(self.plan, device=device, constants=constants)
             self._owned.callback(self.compiled.close)

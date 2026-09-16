@@ -6,8 +6,7 @@ import numpy as np
 import pytest
 
 import ops
-from ops.lab import Fixture, MeasurementProtocol
-from ops.lab import preparation
+from ops.lab import Fixture, MeasurementProtocol, preparation
 from tests.ops.test_runtime_observation import Runtime as MemoryRuntime
 
 
@@ -28,7 +27,8 @@ class Runtime(MemoryRuntime):
 
 
 @pytest.mark.parametrize("writable", [False, True])
-def test_only_written_state_needs_new_conditioning_storage(monkeypatch, writable):
+@pytest.mark.parametrize("selected", [False, True])
+def test_only_written_state_needs_new_conditioning_storage(monkeypatch, writable, selected):
     spec = ops.TensorSpec((2, 2, 1, 1), ops.DType.F32)
     arguments = [ops.Argument(spec, "state", ops.ValueKind.RESOURCE)]
     if writable:
@@ -39,11 +39,15 @@ def test_only_written_state_needs_new_conditioning_storage(monkeypatch, writable
         values[graph.inputs[0]] = np.array([[0, 1, 1]], dtype=np.int32)
     fixture = Fixture(graph, values)
     boundary = fixture.boundary(ops.FormulaTree(graph).roots[0])
-    monkeypatch.setattr(preparation, "analyze_graph", lambda graph, **kwargs:
-                        SimpleNamespace(graph=graph, operations=()))
+    resolver = object() if selected else None
+    def analyze(graph, **kwargs):
+        assert kwargs["options"].schedules is resolver
+        assert kwargs["device_identity"] == (device.evidence_identity if selected else None)
+        return SimpleNamespace(graph=graph, operations=())
+    monkeypatch.setattr(preparation, "analyze_graph", analyze)
     monkeypatch.setattr(preparation, "materialize", lambda plan, **kwargs:
                         SimpleNamespace(graph=plan.graph, code_dependencies=(), close=lambda: None))
-    with ops.DeviceRuntime(Runtime(), budget_bytes=4096) as device:
+    with ops.DeviceRuntime(Runtime(), budget_bytes=4096, schedules=resolver) as device:
         prepared = preparation.PreparedFormula(boundary, device, ops.CompileOptions(mode="decode"))
         try:
             identity, = boundary.isolated.graph.resources

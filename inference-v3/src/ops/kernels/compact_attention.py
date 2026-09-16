@@ -4,7 +4,7 @@ from __future__ import annotations
 import tilelang.language as T
 
 from ..kv import RotatedLloydMax
-from .kv_packed import plane_view, word_offset, _packet_layout, lookup_centroid
+from .kv_packed import _packet_layout, lookup_centroid, plane_view, word_offset
 
 
 def _compact_layout(words, keys):
@@ -118,11 +118,10 @@ def _value_columns(probability, shared, outputs, first_key, columns, reduction, 
 
 
 @T.macro
-def compact_values(scores, shared, outputs, rows, keys, columns, reduction, bits, probability_start=0):
-    probability = T.alloc_shared((rows, reduction), "float32")
+def compact_values(probabilities, shared, outputs, rows, keys, columns, reduction, bits):
+    """Consume the caller's probability exchange directly for packed values."""
+    T.sync_threads()
     for block in T.serial(keys // reduction):
-        for row, key in T.Parallel(rows, reduction):
-            probability[row, key] = scores[row, probability_start + block * reduction + key]
-        T.sync_threads()
-        _value_columns(probability, shared, outputs, block * reduction, columns, reduction, bits)
-        T.sync_threads()
+        _value_columns(probabilities[0:rows, block * reduction:(block + 1) * reduction],
+                       shared, outputs, block * reduction, columns, reduction, bits)
+    T.sync_threads()

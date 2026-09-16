@@ -1,9 +1,11 @@
 """Owned model serving entry point, including the verbatim session-bench flags."""
 
 import argparse
+from pathlib import Path
 
 import uvicorn
 
+from engine.blueprints.execution import ScheduleProfile
 from engine.platform.backend import Backend
 from engine.serving.app import create_app
 from engine.serving.runtime import Config
@@ -24,6 +26,8 @@ def main() -> None:
     parser.add_argument("--retained-prefixes", type=int, choices=(0,), default=0)
     parser.add_argument("--backend", type=Backend, choices=tuple(Backend))
     parser.add_argument("--ordinal", type=int, default=0)
+    parser.add_argument("--schedule-profile", type=Path,
+                        help="JSON selection-store directory and validation identity; requires complete calibration")
     args = parser.parse_args()
     config = Config(
         target=args.target,
@@ -37,6 +41,8 @@ def main() -> None:
         retained_prefixes=args.retained_prefixes,
         backend=args.backend,
         ordinal=args.ordinal,
+        schedules=(ScheduleProfile.model_validate_json(args.schedule_profile.read_text())
+                   if args.schedule_profile is not None else None),
     )
     uvicorn.run(create_app(config), host=args.host, port=args.port)
 

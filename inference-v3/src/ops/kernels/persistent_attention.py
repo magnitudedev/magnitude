@@ -3,20 +3,44 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
+
 import tilelang.language as T
 
 from ..compiler.lowering import BoundOperation
-from ..tensor.types import TensorSpec, DType
+from ..compiler.schedules import schedule_boundary, select_schedule
 from ..kv import AffineKVCodec, RotatedLloydMax
-from .attention import (_attention_accumulators, _attention_rescale, _attention_values,
-                        _attention_publish, _decode_scores, _merge_attention, _merge_attention_gate,
-                        _decode_attention_schedule)
-from .kv_packed import stage_history, stage_current, signed_wht, prepare_codebook, validate_vector_codec
-from .kv_contraction import (query_sums, correct_key_scores, value_coefficients,
-                             update_bias, finish_bias)
+from ..tensor.types import DType, TensorSpec
+from .attention import (
+    _attention_accumulators,
+    _attention_publish,
+    _attention_rescale,
+    _attention_shared_values,
+    _decode_attention_schedule,
+    _decode_scores,
+    _merge_attention,
+    _merge_attention_gate,
+)
+from .compact_attention import (
+    allocate_compact,
+    compact_decode_scores,
+    compact_values,
+    stage_compact,
+)
 from .dimension_attention import dimension_tiled_prefill, prefill_schedule
-from .compact_attention import (allocate_compact, stage_compact, compact_decode_scores,
-                                compact_values)
+from .kv_contraction import (
+    correct_key_scores,
+    finish_bias,
+    query_sums,
+    update_bias,
+    value_coefficients,
+)
+from .kv_packed import (
+    prepare_codebook,
+    signed_wht,
+    stage_current,
+    stage_history,
+    validate_vector_codec,
+)
 
 
 @T.macro
@@ -94,21 +118,46 @@ class PersistentAttentionRule:
         logical_history = TensorSpec((2, history.shape[0], history.shape[1], width), query.dtype)
         matrix = context.mode == "prefill" and node.attributes["sequence_count"] == 1
         if matrix:
-            schedule = prefill_schedule(query, history, context)
+            schedule = prefill_schedule(query, history, context, template=_PersistentEmitter, workload=specs)
             if schedule is None:
                 raise ValueError("persistent matrix attention exceeds target resources")
             current = replace(schedule, partitions=math.ceil(keys.shape[0] / schedule.span))
         else:
-            schedule = _decode_attention_schedule(query, logical_history, replace(context, mode="decode"))
-            if schedule is None:
+            # Compact history and dense current rows have different staging
+            # footprints. Select the final history realization, never overwrite
+            # its geometry after the tuner has identified it.
+            base = _decode_attention_schedule(
+                query, logical_history, replace(context, mode="decode", schedules=None))
+            if base is None:
                 raise ValueError("persistent grouped decode requires a legal complete head cohort")
-            current = replace(schedule, partitions=math.ceil(keys.shape[0] / schedule.span))
-            if isinstance(history.representation.key, (AffineKVCodec, RotatedLloydMax)):
+            compact = isinstance(history.representation.key, (AffineKVCodec, RotatedLloydMax))
+            if compact:
                 max_words = max(p.row_elements for p in history.representation.planes(history.shape[0] * history.shape[1])
                                 if p.name.endswith(".codes"))
                 key_tile = min(64, 8192 // (max_words * 4))
-                schedule = replace(schedule, keys=key_tile, span=key_tile * 16,
-                                   partitions=math.ceil(history.shape[0] / (key_tile * 16)))
+                default = replace(base, keys=key_tile, span=key_tile * 16,
+                                  partitions=math.ceil(history.shape[0] / (key_tile * 16)))
+                extra = 64 if isinstance(history.representation.key, RotatedLloydMax) else 0
+                candidates = tuple(
+                    replace(default, rows=physical_rows, columns=columns, keys=keys_per_tile,
+                            span=span, partitions=math.ceil(history.shape[0] / span))
+                    for physical_rows in (8, 16)
+                    for columns in (32, 64)
+                    for keys_per_tile, span in dict.fromkeys(((key_tile, key_tile * 16), (32, 512), (64, 2048)))
+                    if width % columns == 0
+                    and (max_words + physical_rows) * keys_per_tile * 4 + extra <= context.compiler_target.shared_memory_bytes
+                    and ((width + base.padding) * (base.keys + base.padding) * query.dtype.itemsize
+                         + physical_rows * base.keys * 4 <= context.compiler_target.shared_memory_bytes)
+                )
+                schedule = select_schedule(context, "attention.decode", candidates, default,
+                                           template=_PersistentEmitter, workload=(specs, "compact-history"))
+                current = replace(base, rows=schedule.rows, columns=schedule.columns,
+                                  partitions=math.ceil(keys.shape[0] / base.span))
+            else:
+                schedule = _decode_attention_schedule(
+                    query, logical_history, replace(context, mode="decode"),
+                    template=_PersistentEmitter, workload=specs)
+                current = replace(schedule, partitions=math.ceil(keys.shape[0] / schedule.span))
         partitions = schedule.partitions + current.partitions
         if isinstance(history.representation.key, (AffineKVCodec, RotatedLloydMax)):
             max_words = max(p.row_elements for p in history.representation.planes(history.shape[0] * history.shape[1])
@@ -117,7 +166,7 @@ class PersistentAttentionRule:
             # Prefill expands a bounded native tile and keeps its scores in
             # registers. Decode retains code words and a shared probability
             # bridge. Price the phase's actual storage, not a discarded body.
-            shared_bytes = (schedule.shared_bytes + 4 if matrix else
+            shared_bytes = (schedule.shared_bytes + 16 if matrix else
                             (max_words + schedule.rows) * key_tile * 4)
             if isinstance(history.representation.key, RotatedLloydMax):
                 shared_bytes += 16 * 4
@@ -149,6 +198,8 @@ class PersistentAttentionGateRule:
                 or set(multiply.inputs) != {attention.outputs[0], sigmoid.outputs[0]}
                 or reshape.inputs != multiply.outputs):
             return ()
+        context = schedule_boundary(context, _PersistentEmitter,
+                                    ("gated", graph.value(sigmoid.inputs[0]).spec, graph.value(reshape.outputs[0]).spec))
         operation = PersistentAttentionRule().build(graph, root, context)[0]
         emitter = operation.emitter
         fused = _PersistentEmitter(emitter.specs, emitter.scale, emitter.history_schedule,
@@ -259,7 +310,7 @@ def _persistent_decode(query, history, visible, current_keys, current_values, su
                 compact_values(probabilities, packed, outputs, matrix_rows, key_tile, columns,
                                 schedule.reduction_step, history_spec.representation.value.bits)
             else:
-                _attention_values(probabilities, values, outputs, matrix_rows, width, key_tile,
+                _attention_shared_values(probabilities, values, outputs, matrix_rows, width, key_tile,
                                    columns, schedule.reduction_step)
         if affine_values:
             finish_bias(outputs, bias, head_tile, columns)

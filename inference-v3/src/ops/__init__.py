@@ -1,91 +1,126 @@
 """Ops: composable inference tensors compiled through TileLang."""
 
-from .binding import (Binding, CanonicalImport, DenseImport, EncodedImport, Residency,
-                      ByteSource, MemorySource, SegmentedSource, ZeroSource, SourceInfo, SourceKind, SourcePlane, SourceSpan, Transform)
-
+from .binding import (
+                      Binding,
+                      ByteSource,
+                      CanonicalImport,
+                      DenseImport,
+                      EncodedImport,
+                      MemorySource,
+                      Residency,
+                      SegmentedSource,
+                      SourceInfo,
+                      SourceKind,
+                      SourcePlane,
+                      SourceSpan,
+                      Transform,
+                      ZeroSource,
+)
 from .compiler.compilation import (
-    CompilationPlan,
-    CompiledFunction,
-    CompileOptions,
-    analyze,
-    analyze_graph,
-    compile,
-    materialize,
+                      CompilationPlan,
+                      CompiledFunction,
+                      CompileOptions,
+                      analyze,
+                      analyze_graph,
+                      compile,
+                      materialize,
 )
 from .compiler.lowering import (
-    CompilerTarget,
+                      CompilerTarget,
 )
-from .operation import Operation, OperationContext, operation
-from .kv import (AttentionGeometry, AttentionSemantics, KVRepresentation,
-                 DenseKVCodec, AffineKVCodec, RotatedLloydMax, dense_kv,
-                 affine_k8_uniform_v4, rotated_k4_uniform_v4, kv_state_spec,
-                 default_kv_representation)
-from .kernels import composition as operation_bodies
-from .formula import (Formula, FormulaCall, FormulaHandle, FormulaIndex, FormulaRef,
-                      FormulaTree, formula, quantity, units)
+from .compiler.schedules import QualifiedSchedules, ScheduleRequest, ScheduleResolver
+from .formula import (
+                      Formula,
+                      FormulaCall,
+                      FormulaHandle,
+                      FormulaIndex,
+                      FormulaRef,
+                      FormulaTree,
+                      formula,
+                      quantity,
+                      units,
+)
 from .isolation import BoundaryValue, IsolatedFormula
+from .kernels import composition as operation_bodies
+from .kv import (
+                      AffineKVCodec,
+                      AttentionGeometry,
+                      AttentionSemantics,
+                      DenseKVCodec,
+                      KVRepresentation,
+                      RotatedLloydMax,
+                      affine_k8_uniform_v4,
+                      default_kv_representation,
+                      dense_kv,
+                      kv_state_spec,
+                      rotated_k4_uniform_v4,
+)
+from .lab import Lab
+from .operation import Operation, OperationContext, operation
 from .representations import (
-    Affine,
-    Code,
-    Codebook,
-    CodeInterpretation,
-    Dense,
-    DirectCoefficients,
-    execution_representation,
-    HierarchicalCoefficients,
+                      Affine,
+                      Code,
+                      Codebook,
+                      CodeInterpretation,
+                      Dense,
+                      DirectCoefficients,
+                      HierarchicalCoefficients,
+                      execution_representation,
 )
 from .runtime.resources import CapacityError, Completion, DeviceRuntime, Execution, Resource
 from .runtime.tilelang import TileLangRuntime
 from .tensor.graph import Effects, Graph, Node, Value, ValueKind
-from .tensor.primitive import (
-    NumericalContract,
-    evaluate_reference,
-)
 from .tensor.ops import (
-    add,
-    attention_prepare,
-    byte_copy,
-    cast,
-    causal_attention,
-    persistent_attention,
-    concatenate,
-    decode_bfloat16,
-    delta_recurrence,
-    divide,
-    embedding,
-    exp,
-    gated_delta_recurrence,
-    kv_append,
-    kv_copy,
-    linear,
-    less,
-    matmul,
-    multiply,
-    overlay_rows,
-    quantized_import,
-    recurrent_prepare,
-    reshape,
-    rms_norm,
-    rotary,
-    route_topk,
-    routed_experts,
-    row_dot,
-    sample,
-    scalar,
-    sigmoid,
-    silu,
-    softmax,
-    subtract,
-    take_rows,
-    tanh,
-    transpose,
-    unpack_words,
+                      add,
+                      attention_prepare,
+                      byte_copy,
+                      cast,
+                      causal_attention,
+                      concatenate,
+                      decode_bfloat16,
+                      delta_recurrence,
+                      divide,
+                      embedding,
+                      exp,
+                      gated_delta_recurrence,
+                      kv_append,
+                      kv_copy,
+                      less,
+                      linear,
+                      matmul,
+                      multiply,
+                      overlay_rows,
+                      persistent_attention,
+                      quantized_import,
+                      recurrent_prepare,
+                      reshape,
+                      rms_norm,
+                      rotary,
+                      route_topk,
+                      routed_experts,
+                      row_dot,
+                      sample,
+                      scalar,
+                      sigmoid,
+                      silu,
+                      softmax,
+                      subtract,
+                      take_rows,
+                      tanh,
+                      transpose,
+                      unpack_words,
+)
+from .tensor.primitive import (
+                      NumericalContract,
+                      evaluate_reference,
 )
 from .tensor.tracing import Argument, Signature, Tensor, trace
 from .tensor.types import DENSE, Dim, DimExpr, DType, Layout, TensorSpec, ceil_divide
-from .lab import Lab
 
 __all__ = [
+    "QualifiedSchedules",
+    "ScheduleRequest",
+    "ScheduleResolver",
     "AttentionGeometry", "AttentionSemantics", "KVRepresentation", "DenseKVCodec",
     "AffineKVCodec", "RotatedLloydMax", "dense_kv", "affine_k8_uniform_v4",
     "rotated_k4_uniform_v4", "default_kv_representation", "kv_state_spec",

@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 
 from ..binding import Binding, Residency
+from ..kernels.schedules import AffineSchedule, select_affine_tile
 from ..runtime.imports import plan_import
 from ..tensor.types import DType, TensorSpec
-from .program import KernelDefinition, KernelPort, PortRole, define_kernel
 from .dependencies import code_dependencies
+from .program import KernelDefinition, KernelPort, PortRole, define_kernel
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +22,7 @@ class GatherTileEmitter:
 
     def __call__(self, operands):
         import tilelang.language as T
+
         from ..kernels.indexing import _streamed_embedding
 
         table, destinations, output = operands
@@ -141,7 +143,7 @@ class ProjectionTileEmitter:
     strategy: str
     threads: int
     tile: tuple[int, int, int]
-    reduction_step: int | None
+    contraction_schedule: AffineSchedule | None
     bias: bool
     outputs_per_subgroup: int = 1
 
@@ -159,7 +161,7 @@ class ProjectionTileEmitter:
             _dense_vector(hidden, weight, bias, output, m, n, k, self.output.dtype.value, self.bias,
                           extent)
         elif self.strategy == "packet-matrix":
-            _packed_matrix(hidden, weight, bias, output, self.weight, m, n, k, self.reduction_step,
+            _packed_matrix(hidden, weight, bias, output, self.weight, m, n, k, self.contraction_schedule,
                            self.output.dtype.value, self.threads, *self.tile, self.bias, extent)
         else:
             _dense_matrix(hidden, weight, bias, output, "linear", m, n, k, self.hidden.dtype.value,
@@ -210,9 +212,9 @@ class ExpertLoop:
 
 
 def expert_loop(graph, root, context, bindings):
-    from ..kernels.source_experts import GatherExpertRows, ScatterExpertRows, CombineExpertRows
-    from ..tensor.tracing import Argument, Signature, trace
+    from ..kernels.source_experts import CombineExpertRows, GatherExpertRows, ScatterExpertRows
     from ..tensor.graph import ValueKind
+    from ..tensor.tracing import Argument, Signature, trace
     from .compilation import CompileOptions, analyze_graph
     from .lowering import BoundOperation
 
@@ -245,8 +247,9 @@ def expert_loop(graph, root, context, bindings):
     if inner_budget <= 0:
         raise ValueError("expert row staging exceeds physical capacity")
     inner = analyze_graph(inner_graph, compiler_target=context.compiler_target, compiler_identity=context.compiler_identity,
-                          available_bytes=inner_budget,
-                          options=CompileOptions(mode=context.mode, precision=context.precision), constants=prototypes)
+                          available_bytes=inner_budget, device_identity=context.device_identity,
+                          options=CompileOptions(mode=context.mode, precision=context.precision,
+                                                 schedules=context.schedules), constants=prototypes)
     from .memory import StorageClass
 
     inner_storage = inner.memory.temporary_bytes + sum(placement.spec.storage_nbytes for placement in inner.memory.values.values()
@@ -301,8 +304,12 @@ class ProjectionLoop:
 
 def projection_loop(graph, root, context, binding):
     """One bounded source-projection operation, with capacity-constrained regions."""
-    from ..kernels.matrix import (_dense,
-                                  _packed_vector_geometry, _packet_reduction_width, matrix_geometry)
+    from ..kernels.matrix import (
+        _dense,
+        _packed_vector_geometry,
+        _packet_reduction_width,
+        matrix_geometry,
+    )
     from ..kernels.packed import packet_format
     from .lowering import BoundOperation
 
@@ -335,7 +342,15 @@ def projection_loop(graph, root, context, binding):
         bm, bn, threads = matrix_geometry(context, hidden.dtype, hidden.shape[0], columns, bk,
                                           packed_specs=(weight,) if packed else (), storage_dtype=hidden.dtype)
         strategy = "packet-matrix" if packed else "dense-matrix"
-        tile, arithmetic, outputs_per_subgroup = (bm, bn, bk), 8, 1
+        tile, arithmetic, outputs_per_subgroup = (bm, bn, bk), None, 1
+        if packed:
+            schedule = select_affine_tile(
+                context, hidden, (weight,), (bm, bn, bk, threads),
+                template=ProjectionTileEmitter, name="linear.streamed-affine",
+                workload=(output, len(node.inputs) == 3, context.workspace_limit),
+            )
+            tile = (schedule.rows, schedule.columns, schedule.reduction)
+            threads, arithmetic = schedule.threads, schedule.operands
     bytes_per_row = max(1, math.ceil(binding.spec.storage_nbytes / columns))
     step = min(columns, max(row_alignment, ((8 << 20) // bytes_per_row // row_alignment) * row_alignment))
     budget = max(0, context.workspace_limit - output.storage_nbytes)

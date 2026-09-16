@@ -2,14 +2,15 @@
 import tilelang.language as T
 
 from ..compiler.lowering import BoundOperation
+from ..compiler.schedules import schedule_boundary
 from ..kv import KVRepresentation
-from .attention_fusion import _PrepareAppendEmitter
-from .normalization import _reduction_threads
-from .persistent_attention import PersistentAttentionRule
-from .kv_packed import validate_vector_codec
 from .attention import attention_projection_tile
+from .attention_fusion import _PrepareAppendEmitter
+from .kv_packed import validate_vector_codec
 from .matrix import _packed_matrix, _packed_vector, _packed_vector_geometry
+from .normalization import _reduction_threads
 from .packed import packet_format
+from .persistent_attention import PersistentAttentionRule
 
 
 class _PersistentComponentEmitter:
@@ -58,11 +59,8 @@ class PersistentAttentionComponentRule:
         threads = _reduction_threads(prepare.attributes['width'], context)
         if threads is None:
             return ()
-        persistent = PersistentAttentionRule().build(graph, attention.id, context)[0]
-        emitter = persistent.emitter
         nodes = frozenset((prepare.id, reshape.id, attention.id, append.id))
         outputs = (attention.outputs[0], gate, append.outputs[0])
-        workspace = (graph.value(query).spec, graph.value(key).spec, *persistent.workspace)
         if self.gated:
             if root + 6 >= len(graph.nodes):
                 return ()
@@ -74,8 +72,15 @@ class PersistentAttentionComponentRule:
                 return ()
             nodes |= frozenset((sigmoid.id, multiply.id, flatten.id))
             outputs = (flatten.outputs[0], append.outputs[0])
-            workspace = (graph.value(query).spec, graph.value(key).spec, graph.value(gate).spec,
-                         *persistent.workspace)
+        boundary_specs = tuple(graph.value(value).spec for node in graph.nodes[root:root + (7 if self.gated else 4)]
+                               for value in (*node.inputs, *node.outputs))
+        context = schedule_boundary(context, _PersistentComponentEmitter,
+                                    (boundary_specs, prepare.attributes, self.gated))
+        persistent = PersistentAttentionRule().build(graph, attention.id, context)[0]
+        emitter = persistent.emitter
+        workspace = (graph.value(query).spec, graph.value(key).spec,
+                     *((graph.value(gate).spec,) if self.gated else ()), *persistent.workspace)
+        if self.gated:
             emitter = type(emitter)(emitter.specs, emitter.scale, emitter.history_schedule,
                                     emitter.current_schedule, emitter.matrix, emitter.threads,
                                     emitter.subgroup_width, fuse_gate=True)
@@ -108,9 +113,9 @@ class _PersistentMixerEmitter:
         rows, width = self.activation.shape
         columns = self.weight.shape[0]
         if self.tile is not None:
-            threads, bm, bn, bk, reduction = self.tile
+            threads, bm, bn, bk, contraction_schedule = self.tile
             _packed_matrix(activation, weight, activation, output, self.weight,
-                           rows, columns, width, reduction, self.output.dtype.value,
+                           rows, columns, width, contraction_schedule, self.output.dtype.value,
                            threads, bm, bn, bk, False)
         else:
             threads, outputs_per_subgroup = self.vector
@@ -123,6 +128,13 @@ class PersistentAttentionMixerRule:
     """Keep state, attention, gate and output contraction in the same owner."""
 
     def build(self, graph, root, context):
+        if root + 7 >= len(graph.nodes):
+            return ()
+        projection = graph.nodes[root + 7]
+        if projection.operation != 'linear' or len(projection.inputs) != 2:
+            return ()
+        context = schedule_boundary(context, _PersistentMixerEmitter,
+                                    tuple(graph.value(value).spec for value in (*projection.inputs, *projection.outputs)))
         built = PersistentAttentionComponentRule(gated=True).build(graph, root, context)
         if not built:
             return ()
@@ -144,7 +156,9 @@ class PersistentAttentionMixerRule:
             return ()
         tile = vector = None
         if context.mode == 'prefill':
-            tile = attention_projection_tile(context, activation, weight)
+            tile = attention_projection_tile(context, activation, weight,
+                                             template=_PersistentMixerEmitter,
+                                             workload=(component.emitter, activation, weight, output))
             if tile is None:
                 return ()
         else:

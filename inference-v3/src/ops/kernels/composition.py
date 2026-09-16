@@ -8,18 +8,19 @@ from dataclasses import replace
 
 from ..binding import Residency
 from ..compiler.dependencies import code_dependencies
+from ..compiler.schedules import CollectSchedules, select_composed_schedule
 from ..operation import OperationContext
 from .attention import AttentionOutputRule
-from .persistent_attention import PersistentAttentionGateRule
-from .persistent_component import PersistentAttentionComponentRule, PersistentAttentionMixerRule
 from .attention_fusion import AttentionPrepareAppendRule
 from .experts import DenseSwiGLURule, RoutedSharedExpertsRule
+from .fusion import pointwise
 from .grouped_experts import GroupedExpertsRule
 from .matrix import ParallelPackedMatrixRule
 from .normalization import ResidualRMSRule
+from .persistent_attention import PersistentAttentionGateRule
+from .persistent_component import PersistentAttentionComponentRule, PersistentAttentionMixerRule
 from .recurrent import RecurrentOutputRule
 from .routing import RouterTopKRule
-from .fusion import pointwise
 
 
 def residual_normalization(context: OperationContext):
@@ -39,7 +40,9 @@ def parallel_projections(context: OperationContext):
 def _build(context, body, root, **arguments):
     if root is None or root not in context.nodes:
         return ()
-    built = body.build(context.graph, root, context.lowering, **arguments)
+    collected = CollectSchedules() if context.lowering.schedules is not None else None
+    lowering = (replace(context.lowering, schedules=collected) if collected is not None else context.lowering)
+    built = body.build(context.graph, root, lowering, **arguments)
     if any(not item.nodes <= context.nodes for item in built):
         return ()
     for item in built:
@@ -58,6 +61,21 @@ def _build(context, body, root, **arguments):
         return ()
     if any(item.workspace_bytes > context.lowering.workspace_limit for item in built):
         return ()
+    if collected is not None and collected.requests and built:
+        graph = context.graph
+        workload = tuple((tuple(graph.value(value).spec for value in (*item.inputs, *item.outputs)),
+                          tuple((item.outputs.index(output), item.inputs.index(source))
+                                for output, source in item.aliases), item.kernel_count) for item in built)
+        expected = tuple((item.nodes, item.inputs, item.outputs, item.aliases) for item in built)
+        built = select_composed_schedule(
+            context.lowering, collected, name="+".join(item.name.split("@", 1)[0] for item in built),
+            template=type(body), workload=(workload, arguments),
+            build=lambda selected: body.build(graph, root, selected, **arguments),
+        )
+        if tuple((item.nodes, item.inputs, item.outputs, item.aliases) for item in built) != expected:
+            raise ValueError("selected schedule changed the composed operation boundary")
+        if any(item.workspace_bytes > context.lowering.workspace_limit for item in built):
+            raise ValueError("selected composed schedule exceeds the workspace budget")
     dependencies = code_dependencies(body)
     return tuple(replace(item, dependencies=dependencies) for item in built)
 

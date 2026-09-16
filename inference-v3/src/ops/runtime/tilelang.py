@@ -205,14 +205,7 @@ class TileLangRuntime:
 
         self._compiler_identity = (f"{compiler_identity()}:{self._context.target}:"
                                    f"{self._context.execution_backend.name}")
-        from tilelang.backend import runtime_info
-
-        self._runtime_identity = hashlib.sha256(json.dumps({
-            "native": asdict(runtime_info(self._context.target, ordinal=ordinal)),
-            "os": (platform.system(), platform.release(), platform.version(), platform.machine()),
-            "python": (platform.python_implementation(), platform.python_version()),
-            "transfer_runtime": (torch.__version__, torch.version.git_version),
-        }, sort_keys=True).encode()).hexdigest()
+        self._runtime_identity = _runtime_identity(self._context.target, ordinal)
 
     @property
     def compiler_target(self) -> CompilerTarget:
@@ -353,9 +346,10 @@ def _build_reusable_module(unit: TileCompilationUnit):
 
 
 def _compiler_target(context, *, ordinal: int) -> CompilerTarget:
-    from tilelang import tvm
     from tilelang.backend.resources import target_resources
     from tilelang.cache import compiler_identity
+
+    from tilelang import tvm
 
     device = tvm.device(context.target.get_target_device_type(), ordinal)
     resources = target_resources(context.target, device=device)
@@ -380,3 +374,35 @@ def describe_configuration(configuration):
     context = create_backend_context(str(endpoint.backend), execution_backend="tvm_ffi")
     return (_compiler_target(context, ordinal=endpoint.ordinal or 0),
             f"{compiler_identity()}:{context.target}:{context.execution_backend.name}")
+
+
+def _runtime_identity(target, ordinal):
+    import torch
+    from tilelang.backend import runtime_info
+
+    return hashlib.sha256(json.dumps({
+        "native": asdict(runtime_info(target, ordinal=ordinal)),
+        "os": (platform.system(), platform.release(), platform.version(), platform.machine()),
+        "python": (platform.python_implementation(), platform.python_version()),
+        "transfer_runtime": (torch.__version__, torch.version.git_version),
+    }, sort_keys=True).encode()).hexdigest()
+
+
+def describe_schedule_device(configuration):
+    """Physical inventory plus live driver/OS provenance for schedule evidence."""
+    from tilelang.backend.module import create_backend_context
+
+    if len(configuration.selected_endpoints) != 1:
+        raise ValueError("schedule selection requires one physical execution endpoint")
+    endpoint = configuration.selected_endpoints[0]
+    context = create_backend_context(str(endpoint.backend), execution_backend="tvm_ffi")
+    return f"{configuration.fingerprint}:{_runtime_identity(context.target, endpoint.ordinal or 0)}"
+
+
+def describe_selection_configuration(configuration):
+    from tilelang.backend.module import create_backend_context
+    from tilelang.cache import compiler_identity
+
+    physical = describe_schedule_device(configuration)
+    context = create_backend_context(str(configuration.selected_endpoints[0].backend), execution_backend="tvm_ffi")
+    return compiler_identity(), str(context.target), physical

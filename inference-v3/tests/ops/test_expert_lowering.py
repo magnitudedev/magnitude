@@ -4,17 +4,17 @@ import pytest
 import torch
 
 import ops
-from ops.operation import build_operations
 from engine import DevicePlan
+from engine.weights.descriptor import WeightDescriptor
+from engine.weights.formats.gguf import Encoding
+from engine.weights.tensor_residency import TensorWeights
 from ops.compiler.lowering import (
     LoweringContext,
     plan_submissions,
 )
-from engine.weights.descriptor import WeightDescriptor
-from engine.weights.formats.gguf import Encoding
-from engine.weights.tensor_residency import TensorWeights
-from tests.ops.test_tilelang_runtime import _packed, _QuantizedFormat
+from ops.operation import build_operations
 from tests.ops.definitions import implement
+from tests.ops.test_tilelang_runtime import _packed, _QuantizedFormat
 
 CAPABILITIES = ops.CompilerTarget(
     32,
@@ -252,7 +252,7 @@ def test_prefill_prepares_rows_and_specializes_mixed_packets_in_one_submission()
     assert cover[0].name.startswith("routed_experts.grouped@")
     assert cover[0].nodes == frozenset(range(len(graph.nodes)))
     assert cover[0].kernel_count == 7
-    assert cover[0].emitter.tile[2] == 32
+    assert cover[0].emitter.tile.reduction == 32
     assert cover[0].emitter.specs[6].representation.group == 64
     submissions = plan_submissions(graph, cover)
     assert len(submissions) == 1 and submissions[0].kernel_count == 7

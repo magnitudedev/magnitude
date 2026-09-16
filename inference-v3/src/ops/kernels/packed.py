@@ -8,8 +8,8 @@ loaded once and reused by the dot product.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 from typing import cast
 
 import tilelang.language as T
@@ -22,6 +22,7 @@ from ..representations import (
     canonical_layout,
 )
 from ..tensor.types import DType, TensorSpec
+from .schedules import AffineSchedule, OperandPreparation
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,11 +120,14 @@ def affine_group_width(reduction: int, *specs: TensorSpec) -> int:
 
 
 def affine_shared_bytes(rows: int, columns: int, reduction: int, dtype: DType,
-                        *specs: TensorSpec) -> int:
+                        *specs: TensorSpec, schedule: AffineSchedule | None = None) -> int:
     """Native activations, exact F16 codes and original FP32 coefficient pairs."""
     group = affine_group_width(reduction, *specs)
+    decoded = (columns * reduction * DType.F32.itemsize
+               if schedule is not None and schedule.preparation == OperandPreparation.SHARED else 0)
+    totals = rows * DType.F32.itemsize if schedule is not None and schedule.preparation == OperandPreparation.FACTORED else 0
     return (rows * reduction * dtype.itemsize + columns * reduction * DType.F16.itemsize
-            + columns * (reduction // group) * 2 * DType.F32.itemsize)
+            + columns * (reduction // group) * 2 * DType.F32.itemsize + decoded + totals)
 
 
 def affine_code_center(spec: TensorSpec) -> float:
@@ -137,34 +141,69 @@ def affine_code_center(spec: TensorSpec) -> float:
 
 
 @T.macro
-def affine_storage(bm, bn, bk, dtype, reduction_step, specs):
+def affine_storage(bm, bn, bk, dtype, schedule, specs):
     left = T.alloc_shared((bm, bk), dtype)
     codes = T.alloc_shared((bn, bk), "float16")
     group = affine_group_width(bk, *specs)
     coefficients = T.alloc_shared((bn, bk // group, 2), "float32")
     accum = T.alloc_fragment((bm, bn), "float32")
-    b = T.alloc_fragment((bn, bk), dtype)
-    return left, codes, coefficients, accum, b
+    step = group if schedule.preparation == OperandPreparation.FACTORED else schedule.reduction_extent(bk)
+    if schedule.preparation == OperandPreparation.FACTORED:
+        a = T.alloc_fragment((bm, step), dtype)
+        b = T.alloc_fragment((bn, step), dtype)
+        partial = T.alloc_fragment((bm, bn), "float32")
+        widened = T.alloc_fragment((bm, step), "float32")
+        total = T.alloc_fragment((bm,), "float32")
+        shared_total = T.alloc_shared((bm,), "float32")
+    else:
+        a = T.alloc_fragment((bm, step), "float32")
+        if schedule.preparation == OperandPreparation.SHARED:
+            b = T.alloc_shared((bn, bk), "float32")
+        else:
+            b = T.alloc_fragment((bn, step), "float32")
+        partial, widened, total, shared_total = None, None, None, None
+    return left, codes, coefficients, accum, (a, b, schedule, partial, widened, total, shared_total)
 
 
 @T.macro
 def affine_gemm(storage, bm, bn, bk, valid_m):
-    """Reconstruct immediate operands; keep one FP32 accumulator across all K."""
-    left, codes, coefficients, accum, b = storage
+    """One affine contraction; coefficients never acquire activation rounding."""
+    left, codes, coefficients, accum, operands = storage
+    a, b, schedule, partial, widened, total, shared_total = operands
     group = bk // coefficients.shape[1]
+    step = group if schedule.preparation == OperandPreparation.FACTORED else schedule.reduction_extent(bk)
     T.sync_threads()
-    for j, k in T.Parallel(bn, bk):
-        b[j, k] = T.cast(
-            T.cast(codes[j, k], "float32") * coefficients[j, k // group, 0]
-            + coefficients[j, k // group, 1],
-            left.dtype,
-        )
-    # Keep dequantization in the portable IR and let the target select its
-    # native matrix instruction for the complete reduction tile.
-    with T.attr(0, "pragma_auto_unroll_max_step", 4096):
-        with T.attr(0, "pragma_unroll_explicit", 1):
-            T.gemm(left, b, accum, transpose_B=True, valid_m=valid_m,
-                   policy=T.GemmWarpPolicy.Square)
+    for piece in T.serial(bk // step):
+        for i, k in T.Parallel(bm, step):
+            a[i, k] = T.cast(left[i, piece * step + k], a.dtype)
+        if schedule.preparation == OperandPreparation.FACTORED:
+            for i, k in T.Parallel(bm, step):
+                widened[i, k] = T.cast(left[i, piece * step + k], "float32")
+            T.reduce_sum(widened, total, dim=1)
+            T.copy(total, shared_total)
+            T.sync_threads()
+            for j, k in T.Parallel(bn, step):
+                b[j, k] = T.cast(codes[j, piece * step + k], b.dtype)
+            T.clear(partial)
+            with T.attr(0, "pragma_auto_unroll_max_step", 4096):
+                with T.attr(0, "pragma_unroll_explicit", 1):
+                    T.gemm(a, b, partial, transpose_B=True, valid_m=valid_m,
+                           policy=T.GemmWarpPolicy.Square)
+            for i, j in T.Parallel(bm, bn):
+                accum[i, j] += (partial[i, j] * coefficients[j, piece, 0]
+                                + shared_total[i] * coefficients[j, piece, 1])
+            T.sync_threads()
+        else:
+            for j, k in T.Parallel(bn, step):
+                column = piece * step + k
+                b[j, k] = (T.cast(codes[j, column], "float32") * coefficients[j, column // group, 0]
+                           + coefficients[j, column // group, 1])
+            if schedule.preparation == OperandPreparation.SHARED:
+                T.sync_threads()
+            with T.attr(0, "pragma_auto_unroll_max_step", 4096):
+                with T.attr(0, "pragma_unroll_explicit", 1):
+                    T.gemm(a, b, accum, transpose_B=True, valid_m=valid_m,
+                           policy=T.GemmWarpPolicy.Square)
     T.sync_threads()
 
 
