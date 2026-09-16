@@ -1,3 +1,4 @@
+import { windowChrome, windowControlColors } from "./window-chrome"
 import { makeMacCliPath } from "./mac-cli-path"
 import { makeMacCliLink } from "./mac-cli-link"
 import { ApplicationUpdateControlFailed } from "@magnitudedev/sdk/desktop-host"
@@ -292,7 +293,13 @@ const program = Effect.scoped(Effect.gen(function* () {
   })
   yield* RpcServer.layer(InferenceHostRpcs).pipe(Layer.provide(handlers), Layer.provide(makeElectronRpcServerLayer(ipcMain)), Layer.build)
   window = yield* Effect.acquireRelease(Effect.sync(() => {
-    const value = new BrowserWindow({ width: 1120, height: 800, minWidth: 800, minHeight: 600, show: false, title: "Magnitude", icon: app.isPackaged ? join(process.resourcesPath, "application-icon.png") : join(root, "assets/brand/application-icon.png"), backgroundColor: nativeTheme.shouldUseDarkColors ? slate[925] : slate[50], webPreferences: { preload: join(here, "../preload/preload.mjs"), contextIsolation: true, nodeIntegration: false, sandbox: false, backgroundThrottling: false } })
+    const value = new BrowserWindow({ ...windowChrome(process.platform, nativeTheme.shouldUseDarkColors), width: 1120, height: 800, minWidth: 800, minHeight: 600, show: false, title: "Magnitude", icon: app.isPackaged ? join(process.resourcesPath, "application-icon.png") : join(root, "assets/brand/application-icon.png"), backgroundColor: nativeTheme.shouldUseDarkColors ? slate[925] : slate[50], webPreferences: { preload: join(here, "../preload/preload.mjs"), contextIsolation: true, nodeIntegration: false, sandbox: false, backgroundThrottling: false } })
+    const syncWindowAppearance = () => {
+      value.setBackgroundColor(nativeTheme.shouldUseDarkColors ? slate[925] : slate[50])
+      if (process.platform === "win32") value.setTitleBarOverlay(windowControlColors(nativeTheme.shouldUseDarkColors))
+    }
+    nativeTheme.on("updated", syncWindowAppearance)
+    value.once("closed", () => nativeTheme.removeListener("updated", syncWindowAppearance))
     value.on("close", event => { if (!exiting) { event.preventDefault(); value.hide() } })
     value.webContents.on("render-process-gone", () => run(Effect.gen(function* () {
       yield* Ref.set(model, { label: "Model status unavailable", canStop: false })
