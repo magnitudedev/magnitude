@@ -73,7 +73,7 @@ const makeDesktopSession = Effect.gen(function* () {
     )
   }
   const loginStartup = Atom.make(Option.isSome(bridge) ? bridge.value.loginStartup : Stream.succeed({ _tag: "Unavailable" as const, message: "Desktop host unavailable" }))
-  const machineIdentity = Atom.keepAlive(Atom.make(Option.isSome(bridge) ? bridge.value.machineIdentity : Effect.succeed({ _tag: "Unavailable" as const })))
+  const machineIdentity = Atom.keepAlive(Atom.make(Option.isSome(bridge) ? bridge.value.machineIdentity : Effect.succeed({ _tag: "Unavailable" as const, formFactor: "Unknown" as const })))
   const memory = Atom.make(Option.isSome(bridge) ? bridge.value.memory : Stream.succeed({ _tag: "Unavailable" as const, message: "Desktop host unavailable" }))
   const applicationInfo = Atom.make(Option.isSome(bridge) ? bridge.value.applicationInfo : Effect.fail(new DesktopHostUnavailable()))
   const updates = Atom.make(Option.isSome(bridge) ? bridge.value.updates : Stream.succeed({ transfer: { _tag: "Unavailable" as const, message: "Desktop host unavailable" }, check: { _tag: "Idle" as const }, preference: { _tag: "Unavailable" as const, message: "Desktop host unavailable" } }))

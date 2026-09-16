@@ -3,11 +3,12 @@ import { pageLayout } from "./page-layout"
 import { Option } from "effect"
 import { useMemo } from "react"
 import { Result, useAtomValue } from "@effect-atom/atom-react"
-import { MemoryStick, CircuitBoard } from "lucide-react"
-import { DesktopSession, useAgentClient, localModelRadarAxes, useLocalInferenceHardware, formatMemorySize } from "@magnitudedev/client-common"
-import { hardwarePresentation, type HardwarePhoto } from "./hardware-photos"
+import { MemoryStick, CircuitBoard, Cpu } from "lucide-react"
+import { DesktopSession, useAgentClient, localModelRadarAxes, useLocalInferenceHardware } from "@magnitudedev/client-common"
+import { type HardwarePhoto } from "./hardware-photos"
+import { hardwareDetails } from "./hardware-details"
 import type { MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
-import type { CatalogLocalModel } from "@magnitudedev/sdk"
+import type { CatalogLocalModel, LocalInferenceHardware } from "@magnitudedev/sdk"
 
 export function ModelRadar({ model }: { model: CatalogLocalModel }) {
   const axes = localModelRadarAxes(model)
@@ -44,27 +45,40 @@ function ObservedHardware({ service }: { service: DesktopSession }) {
   if (Result.isInitial(identity)) return <HardwarePending />
   return <HardwareCard identity={Result.isSuccess(identity) ? identity.value : null} />
 }
-function HardwarePhotograph({ photo }: { photo: HardwarePhoto }) {
-  return <figure className={pageLayout.hardwarePhoto}>
-    <img src={photo.src} alt={photo.subject} className="aspect-[4/3] w-full object-contain" />
+export function HardwarePhotograph({ photo }: { photo: HardwarePhoto }) {
+  const frame = photo.framing
+  return <figure className={`${pageLayout.hardwarePhoto} aspect-[4/3] p-[6%]`}>
+    <svg role="img" aria-label={photo.subject} viewBox={`${frame.x} ${frame.y} ${frame.width} ${frame.height}`} className="h-full w-full" preserveAspectRatio="xMidYMid meet">
+      <image href={photo.src} width={frame.sourceWidth} height={frame.sourceHeight} />
+    </svg>
   </figure>
 }
 function HardwareCard({ identity }: { identity: MachineIdentityObservation | null }) {
   const hardware = useLocalInferenceHardware()
   if (Result.isInitial(hardware)) return <HardwarePending />
   if (!Result.isSuccess(hardware)) return <div className="my-6 rounded-2xl border border-slate-200 p-6 text-sm text-slate-500 dark:border-slate-750">{Result.isFailure(hardware) ? "Hardware observation unavailable. Recommendations will return when it recovers." : "Getting to know your machine…"}</div>
-  const value = hardware.value
-  const presentation = hardwarePresentation(identity, value.accelerators.map(accelerator => accelerator.name))
+  return <HardwareSummary identity={identity} value={hardware.value} />
+}
+export function HardwareSummary({ identity, value }: { identity: MachineIdentityObservation | null; value: LocalInferenceHardware }) {
+  const presentation = hardwareDetails(identity, value)
   return <section aria-label="Your hardware" className={pageLayout.hardware}>
     <div className={`grid items-center gap-6 ${Option.isSome(presentation.photo) ? pageLayout.hardwareGrid : ""}`}>
       {Option.isSome(presentation.photo) && <div className="w-full max-w-[260px]"><HardwarePhotograph photo={presentation.photo.value} /></div>}
       <div className="min-w-0">
-        <p className="text-xs font-medium uppercase tracking-widest text-slate-500">Your machine</p>
-        <h2 className="mt-2 break-words font-heading text-xl">{Option.getOrElse(presentation.name, () => Option.getOrElse(value.processor, () => value.platform))}</h2>
-        {Option.isSome(presentation.name) && <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">{Option.getOrElse(value.processor, () => value.platform)}</p>}
-        <div className="mt-5 flex flex-wrap gap-x-7 gap-y-4">
-          <div className="flex items-center gap-3"><MemoryStick className="size-5 shrink-0 text-blue-600 dark:text-blue-400" /><div><p className="text-lg font-semibold">{formatMemorySize(value.totalSystemMemoryBytes)}</p><p className="text-xs text-slate-500">System memory</p></div></div>
-          {value.accelerators.map(accelerator => <div key={accelerator.name} className="flex min-w-0 items-center gap-3"><CircuitBoard className="size-5 shrink-0 text-blue-600 dark:text-blue-400" /><div className="min-w-0"><p className="break-words text-sm font-medium">{accelerator.name}</p><p className="text-xs text-slate-500">Local acceleration</p></div></div>)}
+        <p className="text-xs font-medium uppercase tracking-widest text-slate-500 dark:text-slate-400">{presentation.category}{presentation.cpuInference ? " · CPU inference" : ""}</p>
+        <h2 className="mt-2 break-words font-heading text-xl">{Option.getOrElse(presentation.name, () => "Your computer")}</h2>
+        <div className="mt-4 grid grid-cols-[repeat(auto-fit,minmax(min(100%,220px),1fr))] gap-x-6 gap-y-4">
+          {presentation.groups.map(group => {
+            const Icon = group.label === "Memory" ? MemoryStick : group.label.startsWith("GPU") ? CircuitBoard : Cpu
+            return <div key={group.label} className="flex min-w-0 items-start gap-2.5">
+              <Icon aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-blue-600 dark:text-blue-400" />
+              <div className="min-w-0">
+                <p className="m-0 text-xs font-medium leading-tight text-slate-500 dark:text-slate-400">{group.label}</p>
+                <p className="mb-0 mt-1 break-words text-sm font-semibold leading-snug">{group.name}</p>
+                <div className="mt-1 flex flex-col gap-0.5">{group.details.map(detail => <p key={detail} className="m-0 text-xs leading-snug text-slate-500 dark:text-slate-400">{detail.replace(/ \(spec\)/g, "")}</p>)}</div>
+              </div>
+            </div>
+          })}
         </div>
       </div>
     </div>

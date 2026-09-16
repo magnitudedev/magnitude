@@ -4039,6 +4039,14 @@
               "null"
             ]
           },
+          "physical_cores": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "OS-reported physical CPU cores, independent of process scheduling limits.",
+            "minimum": 0
+          },
           "logical_cores": {
             "type": "integer",
             "minimum": 0

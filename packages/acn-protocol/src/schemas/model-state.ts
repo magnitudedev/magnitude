@@ -1126,6 +1126,7 @@ export const LocalInferenceHardwareSchema = Schema.Struct({
   architecture: Schema.Literal("Arm64", "X64"),
   productName: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
   processor: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  physicalCores: Schema.optionalWith(PositiveSafeInteger, { as: "Option", exact: true }),
   logicalCores: PositiveSafeInteger,
   totalSystemMemoryBytes: NonNegativeSafeInteger,
   availableSystemMemoryBytes: NonNegativeSafeInteger,

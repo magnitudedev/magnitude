@@ -10,6 +10,7 @@ pub(crate) fn system_memory_topology(capacity_bytes: u64) -> MemoryTopology {
         architecture: "test".to_owned(),
         system_product_name: None,
         cpu_model: None,
+        physical_cores: None,
         logical_cores: 1,
         system_memory: HardwareSystemMemory {
             physical_capacity_bytes: capacity_bytes,
