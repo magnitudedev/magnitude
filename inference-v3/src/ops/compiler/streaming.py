@@ -148,11 +148,16 @@ class ProjectionTileEmitter:
     outputs_per_subgroup: int = 1
 
     def __call__(self, operands):
+        import tilelang.language as T
+
         from ..kernels.matrix import _dense_matrix, _dense_vector, _packed_matrix, _packed_vector
 
         hidden, weight, extent, output = operands[:4]
         bias = operands[4] if self.bias else hidden
-        m, k = self.hidden.shape
+        k = self.hidden.shape[-1]
+        m = self.hidden.elements // k
+        hidden = T.view(hidden, shape=(m, k))
+        output = T.view(output, shape=(m, self.output.shape[-1]))
         n = self.weight.shape[0]
         if self.strategy == "packet-vector":
             _packed_vector(hidden, weight, bias, output, self.weight, m, n, k, self.output.dtype.value,
@@ -318,28 +323,30 @@ def projection_loop(graph, root, context, binding):
         raise ValueError("source projection requires a streamed linear binding")
     hidden, weight = (graph.value(value).spec for value in node.inputs[:2])
     output = graph.value(node.outputs[0]).spec
-    if hidden.rank != 2 or weight.rank != 2 or context.compiler_target.subgroup_width != 32:
-        raise ValueError("streamed projection requires a legal rank-two subgroup geometry")
+    if hidden.rank < 1 or weight.rank != 2 or context.compiler_target.subgroup_width != 32:
+        raise ValueError("streamed projection requires logical rows and a rank-two weight matrix")
     columns, width = weight.shape
+    rows = hidden.elements // width
     row_alignment = binding.region_alignment // math.gcd(binding.region_alignment, width)
     if columns % row_alignment:
         raise ValueError("source projection rows violate encoded-region alignment")
     packed = packet_format(weight)
     vector = None
-    if packed is not None and width % packed.tile == 0:
-        vector = _packed_vector_geometry(weight, context)
+    if packed is not None:
+        if width % packed.tile == 0:
+            vector = _packed_vector_geometry(weight, context)
     elif _dense(weight):
         if context.compiler_target.threads_per_group >= 128:
             vector = (128, 1)
     else:
         raise ValueError("streamed weight representation has no projection realization")
-    if vector is not None and hidden.shape[0] < 8:
+    if vector is not None and rows < 8:
         strategy = "packet-vector" if packed else "dense-vector"
         threads, outputs_per_subgroup = vector
         tile, arithmetic = (1, 1, 1), None
     else:
         bk = _packet_reduction_width(weight) if packed else 16
-        bm, bn, threads = matrix_geometry(context, hidden.dtype, hidden.shape[0], columns, bk,
+        bm, bn, threads = matrix_geometry(context, hidden.dtype, rows, columns, bk,
                                           packed_specs=(weight,) if packed else (), storage_dtype=hidden.dtype)
         strategy = "packet-matrix" if packed else "dense-matrix"
         tile, arithmetic, outputs_per_subgroup = (bm, bn, bk), None, 1

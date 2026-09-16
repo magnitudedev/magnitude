@@ -171,3 +171,53 @@ def test_composed_selection_qualifies_joint_choices_once():
     assert {
         tuple(choice.value for choice in candidate.choices) for candidate in calls[0].candidates
     } == {(8, 32), (8, 64), (16, 32), (16, 64)}
+
+
+def test_affine_family_tries_smaller_tiles_when_preferred_tile_exceeds_resources():
+    import ops
+    from ops.kernels.packed import affine_shared_bytes
+    from ops.kernels.schedules import select_affine_tile
+
+    source = ops.TensorSpec((32, 256), ops.DType.F16)
+    weight = ops.TensorSpec((256, 256), ops.DType.F16).with_representation(ops.Affine(
+        ops.Code(8, interpretation=ops.CodeInterpretation.TWOS_COMPLEMENT), 32,
+        ops.DirectCoefficients(ops.DType.F16)))
+    small = affine_shared_bytes(8, 32, 32, source.dtype, weight)
+    preferred = affine_shared_bytes(64, 32, 32, source.dtype, weight)
+    assert small < preferred
+    context = LoweringContext(CompilerTarget(32, 128, small), "prefill", "model", "test", 1 << 20)
+    selected = select_affine_tile(context, source, (weight,), (64, 32, 32, 128),
+                                  template=template_one, name="test.affine")
+    assert selected is not None
+    assert affine_shared_bytes(selected.rows, selected.columns, selected.reduction,
+                               source.dtype, weight, schedule=selected.operands) <= small
+
+
+def test_chunked_recurrence_tries_narrower_output_tiles_before_omitting_strategy():
+    import ops
+    from ops.kernels.chunked_recurrent import ChunkedDeltaRule
+    from tests.ops.test_chunked_recurrent import _program
+
+    function, signature, _ = _program(128, 1, ops.DType.F32, "tiled")
+    context = LoweringContext(CompilerTarget(32, 128, 27000), "prefill", "model", "test", 8 << 20)
+    built = ChunkedDeltaRule().build(ops.trace(function, signature), 0, context)
+    assert built
+    assert built[0].emitter.columns == 8
+
+
+def test_compact_attention_selects_a_feasible_cohort_when_preferred_storage_does_not_fit():
+    import ops
+
+    query = ops.TensorSpec((1, 8, 256), ops.DType.F16)
+    history = ops.kv_state_spec(17, 1, ops.DType.F16, ops.default_kv_representation(256, 256))
+    current = ops.TensorSpec((1, 1, 256), ops.DType.F16)
+    specs = (query, history, current, current, ops.TensorSpec((1, 4), ops.DType.I32))
+    signature = ops.Signature(tuple(ops.Argument(spec, name, ops.ValueKind.RESOURCE if name == "h" else ops.ValueKind.INPUT) for spec, name in zip(
+        specs, ("q", "h", "k", "v", "r"), strict=True)))
+    plan = ops.analyze(
+        lambda q, h, k, v, r: ops.persistent_attention(q, h, k, v, r, sequence_count=1),
+        signature=signature, compiler_target=CompilerTarget(32, 128, 10_000),
+        compiler_identity="test", available_bytes=1 << 28,
+        options=ops.CompileOptions(mode="decode"),
+    )
+    assert any("attention.persistent" in operation.name for operation in plan.operations)

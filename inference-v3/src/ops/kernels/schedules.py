@@ -81,6 +81,10 @@ def select_affine_tile(context, source, weights, tile, *, template, name, worklo
         if affine_shared_bytes(rows, bn, bk, source.dtype, *weights, schedule=operands)
         <= context.compiler_target.shared_memory_bytes
     )
+    if not candidates:
+        return None
+    if default not in candidates:
+        default = candidates[0]
     return select_schedule(
         context,
         name,
@@ -96,7 +100,8 @@ class AffineRegionTile(AffineTile):
     output_columns: int
 
 
-def select_affine_region(context, source, contractions, tile, *, template, name, workload):
+def select_affine_region(context, source, contractions, tile, *, template, name, workload,
+                         workspace=None):
     """Select a common traversal for a region with several contraction widths.
 
     Each contraction is (is output projection, K extent, weight specifications).
@@ -129,6 +134,14 @@ def select_affine_region(context, source, contractions, tile, *, template, name,
             for is_output, reduction, weights in contractions
         )
     )
+    if workspace is not None:
+        candidates = tuple(candidate for candidate in candidates
+                           if sum(spec.storage_nbytes for spec in workspace(candidate))
+                           <= context.workspace_limit)
+    if not candidates:
+        return None
+    if default not in candidates:
+        default = candidates[0]
     return select_schedule(
         context,
         name,

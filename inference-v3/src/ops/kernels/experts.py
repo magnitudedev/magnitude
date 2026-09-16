@@ -10,13 +10,13 @@ from ..compiler.lowering import BoundOperation, LoweringContext
 from ..tensor.graph import Graph
 from ..tensor.types import TensorSpec
 from .matrix import (
+    _dense,
     _packed_matrix,
     _packed_vector_geometry,
     _packet_reduction_width,
 )
 from .packed import (
     affine_gemm,
-    affine_shared_bytes,
     affine_storage,
     load_matrix_tile,
     packet_dot,
@@ -301,25 +301,33 @@ def _selected_activate(
     intermediate,
 ):
     packet = packet_format(gate_spec)
-    assert packet is not None and packet_format(up_spec) == packet
+    assert packet_format(up_spec) == packet
     with T.Kernel(selected * intermediate, rows, threads=32) as (combined, row):
         lane = T.get_thread_binding()
         rank, channel = combined // intermediate, combined % intermediate
         expert = routes[row, rank]
-        values = T.alloc_local((packet.dot_packet,), "float32")
+        values = T.alloc_local((packet.dot_packet if packet is not None else 1,), "float32")
         partial = T.alloc_local((2,), "float32")
         T.clear(partial)
         if 0 <= expert and expert < gate_spec.shape[0]:
             weight_row = expert * intermediate + channel
-            for chunk in T.serial(width // packet.tile):
-                for item in T.unroll(packet.dot_packet, explicit=True):
-                    values[item] = T.cast(
-                        hidden[row, chunk * packet.tile + lane * packet.dot_packet + item],
-                        "float32",
-                    )
-                activation_sum, masked = prepare_packet_activation(values, hidden.dtype, packet)
-                partial[0] += packet_dot(values, gate, gate_spec, weight_row, chunk, lane, activation_sum, masked)
-                partial[1] += packet_dot(values, up, up_spec, weight_row, chunk, lane, activation_sum, masked)
+            if packet is None:
+                for chunk in T.serial(T.ceildiv(width, 32)):
+                    reduction = chunk * 32 + lane
+                    if reduction < width:
+                        value = T.cast(hidden[row, reduction], "float32")
+                        partial[0] += value * T.cast(gate[expert, channel, reduction], "float32")
+                        partial[1] += value * T.cast(up[expert, channel, reduction], "float32")
+            else:
+                for chunk in T.serial(width // packet.tile):
+                    for item in T.unroll(packet.dot_packet, explicit=True):
+                        values[item] = T.cast(
+                            hidden[row, chunk * packet.tile + lane * packet.dot_packet + item],
+                            "float32",
+                        )
+                    activation_sum, masked = prepare_packet_activation(values, hidden.dtype, packet)
+                    partial[0] += packet_dot(values, gate, gate_spec, weight_row, chunk, lane, activation_sum, masked)
+                    partial[1] += packet_dot(values, up, up_spec, weight_row, chunk, lane, activation_sum, masked)
         gate_value = T.cast(T.warp_reduce_sum(partial[0]), hidden.dtype)
         up_value = T.cast(T.warp_reduce_sum(partial[1]), hidden.dtype)
         if lane == 0:
@@ -344,12 +352,11 @@ def _selected_down(
     output_dtype,
 ):
     packet = packet_format(down_spec)
-    assert packet is not None
     with T.Kernel(T.ceildiv(width, 8), rows, threads=128) as (block, row):
         thread = T.get_thread_binding()
         lane = thread % 32
         first_output = block * 8 + (thread // 32) * 2
-        values = T.alloc_local((packet.dot_packet,), "float32")
+        values = T.alloc_local((packet.dot_packet if packet is not None else 1,), "float32")
         partial = T.alloc_local((2,), "float32")
         T.clear(partial)
         for rank in T.serial(selected):
@@ -361,19 +368,25 @@ def _selected_down(
                         weight_row = expert * width + channel
                         expert_sum = T.alloc_local((1,), "float32")
                         expert_sum[0] = 0
-                        for chunk in T.serial(intermediate // packet.tile):
-                            for item in T.unroll(packet.dot_packet, explicit=True):
-                                values[item] = T.cast(
-                                    activation[
-                                        row,
-                                        rank,
-                                        chunk * packet.tile + lane * packet.dot_packet + item,
-                                    ],
-                                    "float32",
+                        if packet is None:
+                            for chunk in T.serial(T.ceildiv(intermediate, 32)):
+                                reduction = chunk * 32 + lane
+                                if reduction < intermediate:
+                                    expert_sum[0] += T.cast(activation[row, rank, reduction], "float32") * T.cast(down[expert, channel, reduction], "float32")
+                        else:
+                            for chunk in T.serial(intermediate // packet.tile):
+                                for item in T.unroll(packet.dot_packet, explicit=True):
+                                    values[item] = T.cast(
+                                        activation[
+                                            row,
+                                            rank,
+                                            chunk * packet.tile + lane * packet.dot_packet + item,
+                                        ],
+                                        "float32",
+                                    )
+                                expert_sum[0] += packet_dot(
+                                    values, down, down_spec, weight_row, chunk, lane
                                 )
-                            expert_sum[0] += packet_dot(
-                                values, down, down_spec, weight_row, chunk, lane
-                            )
                         projected = T.cast(T.warp_reduce_sum(expert_sum[0]), output_dtype)
                         partial[owned] += T.cast(scores[row, rank], "float32") * T.cast(projected, "float32")
         for owned in T.unroll(2, explicit=True):
@@ -473,15 +486,13 @@ class DenseSwiGLURule:
                 context.compiler_target.subgroup_width * 4,
                 bm // 8 * context.compiler_target.subgroup_width,
             )
-            shared = max(affine_shared_bytes(bm, 2 * bn, bk, specs[0].dtype, specs[1], specs[2]),
-                         affine_shared_bytes(bm, 2 * bn, down_bk, specs[0].dtype, specs[3]))
-            if shared > context.compiler_target.shared_memory_bytes:
-                return ()
             schedule = select_affine_region(
                 context, specs[0], ((False, bk, specs[1:3]), (True, down_bk, (specs[3],))),
                 (bm, bn, bk, threads), template=_DenseSwiGLUEmitter,
                 name="swiglu.affine", workload=specs,
             )
+            if schedule is None:
+                return ()
             tile = schedule
         activation = TensorSpec((rows, intermediate), specs[0].dtype)
         return (
@@ -502,7 +513,7 @@ class SelectedExpertsRule:
 
     def build(self, graph: Graph, root: int, context: LoweringContext):
         node = graph.nodes[root]
-        if node.operation != "routed_experts" or context.mode != "decode":
+        if node.operation != "routed_experts":
             return ()
         specs = tuple(graph.values[value].spec for value in (*node.inputs, *node.outputs))
         hidden, routes, scores, gate, up, down, output = specs
@@ -510,7 +521,9 @@ class SelectedExpertsRule:
             any(not spec.static for spec in specs)
             or context.compiler_target.subgroup_width != 32
             or node.attributes["activation"] != "silu"
-            or any(packet_format(spec) is None for spec in (gate, up, down))
+            or context.compiler_target.threads_per_group < 128
+            or not (all(_dense(spec) for spec in (gate, up, down))
+                    or all(packet_format(spec) is not None for spec in (gate, up, down)))
         ):
             return ()
         rows, width = cast(tuple[int, int], hidden.shape)
@@ -523,16 +536,14 @@ class SelectedExpertsRule:
             or down.shape != (experts, width, intermediate)
             or scores.shape != routes.shape
             or output.shape != hidden.shape
-            or gate_packet is None
-            or up_packet is None
-            or down_packet is None
             or gate_packet != up_packet
-            or width % gate_packet.tile
-            or intermediate % down_packet.tile
+            or (gate_packet is not None and width % gate_packet.tile)
+            or (down_packet is not None and intermediate % down_packet.tile)
         ):
             return ()
         activation = TensorSpec((rows, selected, intermediate), hidden.dtype)
-        moved = sum(spec.storage_nbytes for spec in specs)
+        if activation.storage_nbytes > context.workspace_limit:
+            return ()
         return (
             BoundOperation(
                 f"routed_experts.packet-selected@{root}",

@@ -226,7 +226,7 @@ class _AppendEmitter:
 
 @T.macro
 def _append_packed(keys, values, destinations, output, rows, heads, width, spec, subgroup_width):
-    count = width // subgroup_width
+    count = (width + subgroup_width - 1) // subgroup_width
     with T.Kernel(heads, rows, threads=subgroup_width) as (head, row):
         lane = T.get_thread_binding()
         k = T.alloc_local((count,), "float32")
@@ -235,8 +235,8 @@ def _append_packed(keys, values, destinations, output, rows, heads, width, spec,
         destination = destinations[row]
         if destination >= 0:
             for item in T.unroll(count):
-                k[item] = T.cast(keys[row, head, lane * count + item], "float32")
-                v[item] = T.cast(values[row, head, lane * count + item], "float32")
+                k[item] = T.if_then_else(lane * count + item < width, T.cast(keys[row, head, lane * count + item], "float32"), 0.0)
+                v[item] = T.if_then_else(lane * count + item < width, T.cast(values[row, head, lane * count + item], "float32"), 0.0)
             store_vector(k, scratch, output, spec, "key", destination * heads + head, lane, subgroup_width)
             store_vector(v, scratch, output, spec, "value", destination * heads + head, lane, subgroup_width)
 

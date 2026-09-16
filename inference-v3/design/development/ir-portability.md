@@ -87,6 +87,35 @@ An optimization assumption needs a producer or caller that establishes it. A
 common fixture pattern is not a contract: one sequence does not imply equal
 visibility starts, ordered counts, full tiles or nonempty rows.
 
+### Define coverage independently of model variants
+
+A model family supplies dimensions and semantic choices; it must not supply a
+list of variants for which the kernel happens to work. Kernels shared between
+families follow the common operation contract. Differences in mathematics,
+rounding or state effects remain explicit contracts, not shape heuristics.
+
+Distinguish three kinds of restriction before writing a guard:
+
+| Restriction | Owner and obligation |
+|---|---|
+| Mathematical or encoded-format requirement | The semantic operation or representation validates it; for example, a transform may require a power-of-two dimension |
+| Workload fact enabling an optimization | A producer establishes it, or the realization checks it; the remaining valid domain retains a correct realization |
+| Physical schedule limit | Candidate construction handles it through tiling, padding, ownership or another strategy; it does not redefine the model's valid shapes |
+
+The declared union of realizations must cover the supported operation domain.
+A prefill/decode label, preferred tile, or occupancy threshold may choose a
+strategy; it cannot make otherwise valid work disappear. Rejecting an optional
+fusion is safe when its children remain realizable. Rejecting every realization
+requires a stated unsupported capability or a genuine resource limit, not merely
+a failed preferred candidate. Enumerate and price alternatives before deciding
+that the operation cannot fit, including geometry-dependent workspace.
+
+A new variant that exposes a missing case is evidence about this domain. Repair
+the violated invariant and test its boundary class rather than adding a model
+name, a one-off dimension branch, or a shorter list of accepted variants. Growing
+reuse across families means strengthening these shared contracts and their
+qualification, not erasing meaningful mathematical differences.
+
 ### Choose alternatives with different cost structures
 
 Start with a small family whose members change reuse, live state, parallelism or
@@ -191,6 +220,32 @@ neutral value, including partially occupied expert groups and reduction tails.
 Do not derive valid work from a convenient physical endpoint. A padded last row
 cannot suppress earlier valid rows. Entirely empty work must have defined output
 and state behavior without reading invalid addresses or dividing by zero.
+
+Logical ownership must survive every stage, including correction terms, merges
+and stores after the main contraction. In particular:
+
+- A query-head tile sharing K/V belongs to one logical KV group. Physical matrix
+  rows may exceed its active heads; padding must never acquire another group's
+  query, coefficients or output address.
+- A channel dimension can exceed the thread count. Assign every channel to a
+  thread and an iteration; a guard on the thread index alone covers only one
+  strip. Reductions must include all strips before normalization.
+- Quantization blocks, packed-word ownership and dot-product work tiles are
+  different boundaries. Source alignment does not imply alignment to a preferred
+  reduction tile. Vector reads must cover partial groups without crossing the
+  encoded row; word stores must remain unique when lane-owned coordinates cross
+  a word boundary.
+- Empty sequences still own their outgoing state. Token work cannot be the only
+  way that state receives a writer. Likewise, an empty reduction partition needs
+  a neutral merge summary when the complete reduction contains valid values.
+- Flattening leading dimensions is a physical view of contiguous logical rows.
+  It does not reduce the public operation's supported rank. Apply the same rule
+  to resident and streamed inputs and to fused and standalone consumers.
+
+Express loops over the physical fragment domain and predicate logical work when
+slicing to a smaller domain would invalidate ownership. A reduction result
+needed by different owners requires a proven broadcast or explicit exchange;
+one scalar result is not automatically available to every consuming thread.
 
 ### 4. Derive traversal and fast paths from different proofs
 
@@ -322,6 +377,46 @@ Use repeated comparable measurements and a predeclared noise rule. An isolated
 kernel win cannot establish application recovery, and a difference inside noise
 cannot establish an improvement. Keep raw measurements, compiler provenance,
 unsupported cases and investigation notes in run records, outside this guide.
+
+### Make boundary coverage a reusable gate
+
+Derive test cases from the operation's independent dimensions and the boundaries
+of its realizations. For a tile, subgroup, thread limit or partition boundary,
+exercise valid sizes below, at and above it, respecting genuine representation
+constraints. Include ordinary full tiles as well as tails. Vary head-group size
+independently of the number of KV groups, input/output/reduction widths
+independently, and sequence occupancy independently of physical row capacity.
+
+Use mixed batches with empty first, middle and last sequences, empty local
+partitions inside nonempty reductions, arbitrary permitted visibility intervals,
+and multiple leading ranks. Check complete outputs and every resulting resource,
+including untouched regions and retained empty-sequence state. An accepted plan
+or a correct prefix of an output is not a numerical qualification.
+
+Keep an independent reference for the shared semantic contract. Exercise each
+retained strategy and relevant composition against it, including dtype boundaries
+that fusion removes from memory. Add the minimal discovered counterexample and
+neighboring cases to the lasting suite. Known model fixtures then validate the
+integration; they are not the only definition of kernel coverage. Record which
+domain classes and targets were exercised, and distinguish planning, native
+correctness and performance evidence.
+
+### Preserve performance while completing the domain
+
+Keep profitable full-tile specializations and choose them from proven geometry.
+A general realization need not add dynamic masks or smaller tiles to every
+existing workload. Conversely, omitted stores, missing state transitions and
+rejected inputs provide no correct performance baseline: completing that work
+may have a necessary cost.
+
+Before accepting a coverage repair, compare existing supported regimes using the
+same inputs, artifacts, device, compiler and execution boundary. Inspect changes
+to contractions, live storage, synchronization and publication, and measure both
+the complete affected operation and its enclosing production path. Qualify newly
+supported regimes separately. Investigate repeatable regressions rather than
+loosening tolerances, weakening the operation, or hiding slow cases in an
+aggregate. A successful gate establishes the tested regimes; it is not a promise
+of identical performance for every architecture and target.
 
 ### Classify failures before changing the design
 

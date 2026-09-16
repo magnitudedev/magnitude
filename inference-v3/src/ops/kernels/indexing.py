@@ -9,6 +9,7 @@ import tilelang.language as T
 from ..compiler.lowering import BoundOperation, LoweringContext
 from ..tensor.graph import Graph
 from .packed import decode_packet, packet_format
+from .portable import _indices
 
 
 @T.macro
@@ -35,7 +36,7 @@ def _packed_embedding(indices, table, output, table_spec, tokens, width, threads
     packet = packet_format(table_spec)
     assert packet is not None
     with T.Kernel(tokens, threads=threads) as token:
-        row = indices[token]
+        row = indices[_indices(token, indices.shape)]
         for iteration in T.serial(T.ceildiv(width // packet.matrix_packet, threads)):
             packet_index = iteration * threads + T.get_thread_binding()
             if packet_index < width // packet.matrix_packet:
@@ -51,7 +52,7 @@ class _PackedEmbeddingEmitter:
         _packed_embedding(
             operands[0],
             operands[1],
-            operands[2],
+            T.view(operands[2], shape=(self.tokens, self.width)),
             self.table_spec,
             self.tokens,
             self.width,

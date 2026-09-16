@@ -27,7 +27,7 @@ def _softmax_first(source, output, statistics, shape, axis, inner, rows, width, 
                 T.cast(source[_coordinates(row, column, shape, axis, inner)], "float32"), -math.inf)
         T.reduce_max(values, maximum, dim=0)
         for lane in T.Parallel(tile):
-            values[lane] = T.if_then_else(part * tile + lane < width, T.exp(values[lane] - maximum[0]), 0.0)
+            values[lane] = T.if_then_else(part * tile + lane < width, T.exp(values[lane] - T.if_then_else(maximum[0] == -math.inf, 0.0, maximum[0])), 0.0)
         T.reduce_sum(values, total, dim=0)
         if parts == 1:
             for lane in T.Parallel(tile):

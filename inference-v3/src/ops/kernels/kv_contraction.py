@@ -13,8 +13,10 @@ def query_sums(query, output, tokens, heads, width):
         lane = T.get_thread_binding()
         total = T.alloc_local((1,), "float32")
         total[0] = 0.0
-        for item in T.unroll(width // 32):
-            total[0] += T.cast(query[token, head, lane * (width // 32) + item], "float32")
+        for item in T.unroll(T.ceildiv(width, 32)):
+            channel = lane * T.ceildiv(width, 32) + item
+            if channel < width:
+                total[0] += T.cast(query[token, head, channel], "float32")
         result = T.warp_reduce_sum(total[0])
         if lane == 0:
             output[token, head] = result
@@ -23,7 +25,7 @@ def query_sums(query, output, tokens, heads, width):
 @T.macro
 def _key_coefficients(scores, sums, coefficients, zeros, coefficient_base, zero_base,
                        base, first, count, kv_head, kv_heads, rows, keys, query_tile,
-                       first_row, first_head, tokens, rotated, width):
+                       first_row, first_head, tokens, rotated, width, valid_rows):
     for row, item in T.Parallel(rows, keys):
         token = first_row + row % query_tile
         head = first_head + row // query_tile
@@ -35,12 +37,12 @@ def _key_coefficients(scores, sums, coefficients, zeros, coefficient_base, zero_
         else:
             zero = T.if_then_else(first + item < count,
                                   T.cast(zeros[zero_base + vector], "float32"), 0.0)
-            query_sum = T.if_then_else(token < tokens, sums[token, head], 0.0)
+            query_sum = T.if_then_else(row < valid_rows and token < tokens, sums[token, head], 0.0)
             scores[row, item] = scores[row, item] * factor + query_sum * zero
 
 
 def correct_key_scores(scores, sums, storage, spec, base, first, count, kv_head,
-                        rows, keys, query_tile, first_row, first_head, tokens):
+                        rows, keys, query_tile, first_row, first_head, tokens, valid_rows=None):
     codec = spec.representation.key
     if not isinstance(codec, (AffineKVCodec, RotatedLloydMax)):
         return
@@ -49,7 +51,8 @@ def correct_key_scores(scores, sums, storage, spec, base, first, count, kv_head,
     zeros, zero_offset, _ = (coefficients, offset, 1) if rotated else plane_view(storage, spec, "key.zero")
     _key_coefficients(scores, sums, coefficients, zeros, offset, zero_offset,
                        base, first, count, kv_head, spec.shape[1], rows, keys, query_tile,
-                       first_row, first_head, tokens, rotated, spec.representation.key_width)
+                       first_row, first_head, tokens, rotated, spec.representation.key_width,
+                       rows if valid_rows is None else valid_rows)
 
 
 @T.macro

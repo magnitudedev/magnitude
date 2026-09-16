@@ -380,12 +380,9 @@ class ChunkedDeltaRule:
         threads = (chunk // 8) * context.compiler_target.subgroup_width
         # Include conservative affine-row padding for each shared matrix.
         prepare_shared = (chunk * (width + 4) + 2 * chunk * (chunk + 4) + chunk) * 4
-        scan_shared = (
-            (columns + chunk) * (width + 4) + chunk * (columns + 4)
-        ) * 4
         if (
             threads > context.compiler_target.threads_per_group
-            or max(prepare_shared, scan_shared) > context.compiler_target.shared_memory_bytes
+            or prepare_shared > context.compiler_target.shared_memory_bytes
         ):
             return ()
         default = RecurrentSchedule(chunk, columns, threads, StateAccumulation.FRAGMENT_UPDATE)
@@ -397,6 +394,10 @@ class ChunkedDeltaRule:
                                    + chunk * (candidate_columns + 4)) * 4)
             <= context.compiler_target.shared_memory_bytes
         )
+        if not candidates:
+            return ()
+        if default not in candidates:
+            default = candidates[0]
         schedule = select_schedule(context, "recurrent.chunked", candidates, default,
                                    template=_ChunkedDeltaEmitter,
                                    workload=(specs, node.attributes["mapping"],

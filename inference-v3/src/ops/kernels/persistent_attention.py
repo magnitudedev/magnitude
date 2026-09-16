@@ -134,7 +134,8 @@ class PersistentAttentionRule:
             if compact:
                 max_words = max(p.row_elements for p in history.representation.planes(history.shape[0] * history.shape[1])
                                 if p.name.endswith(".codes"))
-                key_tile = min(64, 8192 // (max_words * 4))
+                key_capacity = min(64, 8192 // (max_words * 4))
+                key_tile = 1 << (max(1, key_capacity).bit_length() - 1)
                 default = replace(base, keys=key_tile, span=key_tile * 16,
                                   partitions=math.ceil(history.shape[0] / (key_tile * 16)))
                 extra = 64 if isinstance(history.representation.key, RotatedLloydMax) else 0
@@ -142,13 +143,17 @@ class PersistentAttentionRule:
                     replace(default, rows=physical_rows, columns=columns, keys=keys_per_tile,
                             span=span, partitions=math.ceil(history.shape[0] / span))
                     for physical_rows in (8, 16)
-                    for columns in (32, 64)
+                    for columns in sorted({base.columns, 32, 64})
                     for keys_per_tile, span in dict.fromkeys(((key_tile, key_tile * 16), (32, 512), (64, 2048)))
-                    if width % columns == 0
+                    if width % columns == 0 and keys_per_tile % 8 == 0
                     and (max_words + physical_rows) * keys_per_tile * 4 + extra <= context.compiler_target.shared_memory_bytes
                     and ((width + base.padding) * (base.keys + base.padding) * query.dtype.itemsize
                          + physical_rows * base.keys * 4 <= context.compiler_target.shared_memory_bytes)
                 )
+                if not candidates:
+                    raise ValueError("persistent compact attention exceeds target resources")
+                if default not in candidates:
+                    default = candidates[0]
                 schedule = select_schedule(context, "attention.decode", candidates, default,
                                            template=_PersistentEmitter, workload=(specs, "compact-history"))
                 current = replace(base, rows=schedule.rows, columns=schedule.columns,
@@ -278,7 +283,7 @@ def _persistent_decode(query, history, visible, current_keys, current_values, su
                                width, key_tile, schedule.contraction, True)
             if from_history:
                 correct_key_scores(scores, sums, history, history_spec, base, chunk_first, count,
-                                    kv_head, head_tile, key_tile, 1, token, first_head, tokens)
+                                    kv_head, matrix_rows, key_tile, 1, token, first_head, tokens, valid_rows=head_tile)
             for head, item in T.Parallel(matrix_rows, key_tile):
                 scores[head, item] = T.if_then_else(head < head_tile and chunk_first + item < count,
                                                    scores[head, item] * scale * log2e,
@@ -313,11 +318,12 @@ def _persistent_decode(query, history, visible, current_keys, current_values, su
                 _attention_shared_values(probabilities, values, outputs, matrix_rows, width, key_tile,
                                    columns, schedule.reduction_step)
         if affine_values:
-            finish_bias(outputs, bias, head_tile, columns)
-        for head in T.Parallel(head_tile):
-            statistics[partition + partition_offset, token, first_head + head, 0] = T.if_then_else(
-                denominator[head] > 0, maximum[head] / log2e, -3.402823466e38)
-            statistics[partition + partition_offset, token, first_head + head, 1] = denominator[head]
+            finish_bias(outputs, bias, matrix_rows, columns)
+        for head in T.Parallel(matrix_rows):
+            if head < head_tile:
+                statistics[partition + partition_offset, token, first_head + head, 0] = T.if_then_else(
+                    denominator[head] > 0, maximum[head] / log2e, -3.402823466e38)
+                statistics[partition + partition_offset, token, first_head + head, 1] = denominator[head]
         _attention_publish(outputs, denominator, query, partials, token, first_head,
                            partition + partition_offset, schedule.partitions, tokens, 1, head_tile,
-                           width, columns, query.dtype, False)
+                           width, columns, query.dtype, False, matrix_rows)

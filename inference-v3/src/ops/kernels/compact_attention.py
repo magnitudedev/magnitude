@@ -11,7 +11,7 @@ def _compact_layout(words, keys):
     # Both token-major and four-word-block producers cover distinct banks.
     # Matrix readers of one word broadcast the same location across its codes.
     return T.Layout((words, keys), lambda word, key:
-                     (word, key ^ ((word % 4) * 8 + (word // 4) % 8)))
+                     (word, key ^ (((word % 4) * 8 + (word // 4) % 8) % keys)))
 
 
 def allocate_compact(spec, keys):
@@ -64,7 +64,11 @@ def _key_operand(shared, operand, table, block, contraction, keys, bits, rotated
         packed = shared[coordinate // per_word, key]
         code = (packed >> ((coordinate % per_word) * bits)) & ((1 << bits) - 1)
         if rotated:
-            operand[channel, key] = lookup_centroid(code, table)
+            # Materialize the owner-local index before the shared gather.
+            # Its loop coordinates must not escape fragment layout lowering.
+            index = T.alloc_local((1,), "int32")
+            index[0] = T.cast(code, "int32")
+            operand[channel, key] = lookup_centroid(index[0], table)
         else:
             operand[channel, key] = T.cast(code, "float32")
 

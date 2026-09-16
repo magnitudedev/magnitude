@@ -21,14 +21,18 @@ def source(value):
 
 
 @pytest.mark.device
-@pytest.mark.parametrize("kind", ["projection", "embedding"])
+@pytest.mark.parametrize("kind", ["projection", "projection-vector", "projection-batched", "embedding"])
 def test_bounded_source_consumers_include_tail_io_without_invocation_compilation(kind):
     if not torch.backends.mps.is_available():
         pytest.skip("requires the designated Metal gate device")
     weights = (np.arange(257 * 32, dtype=np.float32).reshape(257, 32) % 13) / 16
     binding = source(weights)
-    if kind == "projection":
+    if kind.startswith("projection"):
         values = np.eye(32, dtype=np.float32)[:2]
+        if kind == "projection-vector":
+            values = values[0]
+        elif kind == "projection-batched":
+            values = values.reshape(1, 2, 32)
         function, dtype = ops.linear, ops.DType.F32
         expected = values @ weights.T
     else:
@@ -51,7 +55,7 @@ def test_bounded_source_consumers_include_tail_io_without_invocation_compilation
                 actual = np.frombuffer(device.read(execution.outputs[0]), np.float32).reshape(expected.shape)
                 np.testing.assert_array_equal(actual, expected)
                 source_bytes = capture.result.completed_bytes(Activity.SOURCE_READ)
-                if kind == "projection":
+                if kind.startswith("projection"):
                     assert source_bytes == weights.nbytes
                 else:
                     assert 0 < source_bytes <= values.size * weights.shape[1] * weights.dtype.itemsize

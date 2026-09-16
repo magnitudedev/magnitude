@@ -9,17 +9,14 @@ from ..kv_codecs import lloyd_max_centroids, rotation_signs
 
 def validate_vector_codec(spec, subgroup_width):
     representation = spec.representation
-    if (subgroup_width != 32 or representation.key_width % subgroup_width
+    if (subgroup_width != 32 or representation.key_width % 8
             or representation.value_width != representation.key_width):
-        raise ValueError("packed KV realization requires equal widths divisible by the subgroup width")
+        raise ValueError("packed KV realization requires equal widths divisible by eight")
     for codec in (representation.key, representation.value):
         if isinstance(codec, AffineKVCodec) and codec.group_size:
             raise ValueError("packed KV realization requires whole-vector affine groups")
-        if isinstance(codec, (AffineKVCodec, RotatedLloydMax)):
-            count = representation.key_width // subgroup_width
-            packet = 32 // codec.bits
-            if count % packet and packet % count:
-                raise ValueError("packed KV coordinates must partition complete word ownership groups")
+        if isinstance(codec, RotatedLloydMax) and representation.key_width < subgroup_width:
+            raise ValueError("rotated KV realization requires at least one subgroup of coordinates")
 
 
 def plane_view(storage, spec, name):
@@ -127,14 +124,15 @@ def _publish_word(packed, words, word_base, destination, row_words, count,
 
 @T.macro
 def _affine_store(vector, words, scales, zeros, word_base, scale_base, zero_base,
-                  destination, row_words, count, bits, lane, metadata_dtype, capacity, heads, blocked):
+                  destination, row_words, count, bits, lane, metadata_dtype, capacity, heads, blocked, width):
     low = T.alloc_local((1,), "float32")
     high = T.alloc_local((1,), "float32")
-    low[0] = vector[0]
-    high[0] = vector[0]
+    low[0] = float("inf")
+    high[0] = -float("inf")
     for item in T.unroll(count):
-        low[0] = T.min(low[0], vector[item])
-        high[0] = T.max(high[0], vector[item])
+        if lane * count + item < width:
+            low[0] = T.min(low[0], vector[item])
+            high[0] = T.max(high[0], vector[item])
     minimum = T.warp_reduce_min(low[0])
     zero = T.cast(minimum, metadata_dtype)
     scale = T.cast((T.warp_reduce_max(high[0]) - minimum) / ((1 << bits) - 1), metadata_dtype)
@@ -143,16 +141,38 @@ def _affine_store(vector, words, scales, zeros, word_base, scale_base, zero_base
         scales[scale_base + destination] = scale
         zeros[zero_base + destination] = zero
     per_word = 32 // bits
-    for packet in T.unroll(max(1, count // per_word)):
-        packed = T.alloc_local((1,), "uint32")
-        packed[0] = 0
-        for item in T.unroll(min(count, per_word)):
-            code = T.cast(T.min((1 << bits) - 1,
-                                T.max(0, T.round((vector[packet * per_word + item]
-                                                 - T.cast(zero, "float32")) * inverse))), "uint32")
-            packed[0] |= code << (item * bits)
-        _publish_word(packed, words, word_base, destination, row_words, count,
-                      bits, packet, lane, capacity, heads, blocked)
+    if width == count * 32 and (count % per_word == 0 or per_word % count == 0):
+        for packet in T.unroll(max(1, count // per_word)):
+            packed = T.alloc_local((1,), "uint32")
+            packed[0] = 0
+            for item in T.unroll(min(count, per_word)):
+                code = T.cast(T.min((1 << bits) - 1,
+                                    T.max(0, T.round((vector[packet * per_word + item]
+                                                     - T.cast(zero, "float32")) * inverse))), "uint32")
+                packed[0] |= code << (item * bits)
+            _publish_word(packed, words, word_base, destination, row_words, count,
+                          bits, packet, lane, capacity, heads, blocked)
+    else:
+        # Quantization ownership is independent of packed-word ownership.
+        # Gather coordinates across lane boundaries only for irregular groups.
+        codes = T.alloc_local((count,), "uint32")
+        for item in T.unroll(count):
+            codes[item] = T.if_then_else(lane * count + item < width,
+                T.cast(T.min((1 << bits) - 1, T.max(0, T.round(
+                    (vector[item] - T.cast(zero, "float32")) * inverse))), "uint32"), T.uint32(0))
+        for packet in T.unroll(T.ceildiv(row_words, 32)):
+            word = packet * 32 + lane
+            packed = T.alloc_local((1,), "uint32")
+            packed[0] = 0
+            for slot in T.unroll(per_word):
+                coordinate = word * per_word + slot
+                owner = T.min(coordinate // count, 31)
+                for item in T.unroll(count):
+                    code = T.tvm_warp_shuffle(0xFFFFFFFF, codes[item], owner, 32, 32)
+                    packed[0] |= T.if_then_else(coordinate < width and coordinate % count == item,
+                                               code << (slot * bits), T.uint32(0))
+            if word < row_words:
+                words[word_base + word_offset(destination, word, row_words, capacity, heads, blocked)] = packed[0]
 
 
 @T.macro
@@ -186,10 +206,10 @@ def store_vector(vector, scratch, storage, spec, prefix, destination, lane, subg
     representation = spec.representation
     codec = representation.key if prefix == "key" else representation.value
     width = representation.key_width if prefix == "key" else representation.value_width
-    count = width // subgroup_width
+    count = (width + subgroup_width - 1) // subgroup_width
     if isinstance(codec, DenseKVCodec):
         dense, base, row = plane_view(storage, spec, prefix + ".dense")
-        _dense_store(vector, dense, base, destination, row, count, lane)
+        _dense_store(vector, dense, base, destination, row, count, lane, width)
         return
     words, word_base, row_words = plane_view(storage, spec, prefix + ".codes")
     if isinstance(codec, AffineKVCodec):
@@ -199,7 +219,7 @@ def store_vector(vector, scratch, storage, spec, prefix, destination, lane, subg
         zeros, zero_base, _ = plane_view(storage, spec, prefix + ".zero")
         _affine_store(vector, words, scales, zeros, word_base, scale_base, zero_base,
                       destination, row_words, count, codec.bits, lane, codec.scale_dtype.value,
-                      spec.shape[0], spec.shape[1], representation.packing_version == 2)
+                      spec.shape[0], spec.shape[1], representation.packing_version == 2, width)
     elif isinstance(codec, RotatedLloydMax):
         norms, norm_base, _ = plane_view(storage, spec, prefix + ".norm")
         _rotated_store(vector, scratch, words, norms, word_base, norm_base, destination,
@@ -209,9 +229,10 @@ def store_vector(vector, scratch, storage, spec, prefix, destination, lane, subg
 
 
 @T.macro
-def _dense_store(vector, dense, base, destination, row, count, lane):
+def _dense_store(vector, dense, base, destination, row, count, lane, width):
     for item in T.unroll(count):
-        dense[base + destination * row + lane * count + item] = vector[item]
+        if lane * count + item < width:
+            dense[base + destination * row + lane * count + item] = vector[item]
 
 
 @T.macro
@@ -270,12 +291,14 @@ def _stage_blocked(words, coefficient, zero, output, word_base, coefficient_base
                     row_words, capacity, heads, head, base, first, count, tile, width,
                     bits, transpose, rotated, table, codes_only, first_channel=0, logical_width=0):
     packet_width = 32 // bits
-    groups = width // (packet_width * 4)
+    groups = (width + packet_width * 4 - 1) // (packet_width * 4)
     packets = T.alloc_fragment((groups, tile, 4), "uint32")
     T.annotate_layout({packets: _packet_layout(groups, tile, T.get_thread_extent())})
     for group, item, word in T.Parallel(groups, tile, 4):
         vector = (base + first + item) * heads + head
-        packets[group, item, word] = T.if_then_else(first + item < count,
+        packets[group, item, word] = T.if_then_else(
+            first + item < count and (width % (packet_width * 4) == 0
+                                     or first_channel // packet_width + group * 4 + word < row_words),
             words[word_base + word_offset(vector, first_channel // packet_width + group * 4 + word, row_words, capacity, heads, True)], T.uint32(0))
     for group, item, word in T.Parallel(groups, tile, 4):
         vector = (base + first + item) * heads + head
@@ -293,10 +316,11 @@ def _stage_blocked(words, coefficient, zero, output, word_base, coefficient_base
             else:
                 decoded[0] = T.cast(code, "float32") * factor + bias
             channel = (group * 4 + word) * packet_width + element
-            if transpose:
-                output[0, channel, item] = decoded[0]
-            else:
-                output[0, item, channel] = decoded[0]
+            if channel < width:
+                if transpose:
+                    output[0, channel, item] = decoded[0]
+                else:
+                    output[0, item, channel] = decoded[0]
 
 
 @T.macro
