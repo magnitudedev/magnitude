@@ -72,8 +72,8 @@ Selectable recommendations require authoritative hardware and assessment evidenc
 The five semantic positions are Fastest, Faster, Balanced, Smarter, and Smartest, corresponding to
 normalized weights `0.05`, `0.25`, `0.5`, `0.75`, and `0.95`. The softened endpoints keep both speed
 and intelligence relevant at every position. Discover renders these positions as a Fast-to-Smart slider and orders the
-eligible catalog entries by the selected preference. Its featured set takes the first configuration
-for each distinct canonical model base, then the first three models in that order. The complete
+eligible catalog entries by the selected preference. Its featured set allows up to two configurations
+per canonical model base, then takes the first five configurations in ranking order. The complete
 configuration ranking remains available in the catalog. Other catalog entries retain their assessment
 status and cannot be mistaken for compatible recommendations. There is no memory control.
 
