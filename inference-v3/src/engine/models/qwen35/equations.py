@@ -81,17 +81,16 @@ class DecoderTensors:
     epsilon: float
 
 
-@ops.formula(id="qwen35.dense_feedforward", version=1)
+@ops.formula(id="qwen35.dense_feedforward", version=1, metric="tokens", rows="hidden")
 def dense_feedforward(hidden: ops.Tensor, weights: DenseFeedForwardTensors) -> ops.Tensor:
     """SwiGLU followed by the down projection."""
 
-    ops.quantity("tokens", hidden.shape[0], unit=ops.units.token)
     gate = ops.linear(hidden, weights.gate)
     up = ops.linear(hidden, weights.up)
     return ops.linear(ops.silu(gate) * up, weights.down)
 
 
-@ops.formula(id="qwen35.routed_feedforward", version=1)
+@ops.formula(id="qwen35.routed_feedforward", version=1, metric="tokens", rows="hidden")
 def routed_feedforward(hidden: ops.Tensor, weights: RoutedFeedForwardTensors) -> ops.Tensor:
     """Selected experts plus the independently gated shared expert."""
 
@@ -118,7 +117,7 @@ def routed_feedforward(hidden: ops.Tensor, weights: RoutedFeedForwardTensors) ->
     return selected + shared * coefficient
 
 
-@ops.formula(id="qwen35.attention_mixer", version=1)
+@ops.formula(id="qwen35.attention_mixer", version=1, metric="tokens", rows="hidden")
 def attention_mixer(
     hidden: ops.Tensor,
     coordinates: ops.Tensor,
@@ -144,7 +143,7 @@ def attention_mixer(
     return ops.linear(mixed, weights.output), history
 
 
-@ops.formula(id="qwen35.attention_state", version=1)
+@ops.formula(id="qwen35.attention_state", version=1, metric="tokens", rows="hidden")
 def _attention_state(
     hidden: ops.Tensor,
     coordinates: ops.Tensor,
@@ -194,7 +193,7 @@ def _attention_state(
     return attended, gate, next_history
 
 
-@ops.formula(id="qwen35.recurrent_mixer", version=1)
+@ops.formula(id="qwen35.recurrent_mixer", version=1, metric="tokens", rows="hidden")
 def recurrent_mixer(
     hidden: ops.Tensor,
     convolution_state: ops.Tensor,
@@ -219,7 +218,7 @@ def recurrent_mixer(
     return ops.linear(gated, weights.output), convolution_state, delta_state
 
 
-@ops.formula(id="qwen35.recurrent_state", version=1)
+@ops.formula(id="qwen35.recurrent_state", version=1, metric="tokens", rows="hidden")
 def _recurrent_state(
     hidden: ops.Tensor,
     convolution_state: ops.Tensor,
@@ -266,7 +265,7 @@ def _recurrent_state(
     return mixed, gate, convolution_state, delta_state
 
 
-@ops.formula(id="qwen35.block", version=1)
+@ops.formula(id="qwen35.block", version=1, metric="tokens", rows="hidden")
 def block(
     hidden: ops.Tensor,
     weights: BlockTensors,
@@ -320,7 +319,7 @@ def block(
     return (residual + ops.cast(feedforward, residual.dtype), *state)
 
 
-@ops.formula(id="qwen35.decoder", version=1)
+@ops.formula(id="qwen35.decoder", version=1, metric="tokens", rows="tokens")
 def decoder(
     tokens: ops.Tensor,
     coordinates: ops.Tensor,

@@ -33,24 +33,28 @@ class Tokenization:
 
     def __init__(self, artifact: Path):
         from engine.inputs.formats.gguf_tokenizer import TokenizerArtifact
+        from engine.inputs.tokenizer import ByteBPETokenizer
         from engine.serving import template
 
         loaded = TokenizerArtifact.load(artifact)
-        self.eos_tokens = loaded.eos_tokens
-        self.tokenizer = loaded.tokenizer
+        self.eos_tokens = loaded.config.stop_tokens
+        self.tokenizer = ByteBPETokenizer(loaded.config)
         self.template = template.ChatTemplate(loaded)
+        config = loaded.config.model_dump(mode="json")
+        config["stop_tokens"] = sorted(config["stop_tokens"])
         self.identity = digest(
             {
-                "tokenizer": loaded.identity,
+                "tokenizer": config,
+                "chat_template": loaded.chat_template,
                 "renderer": "magnitude-chat-v1",
-                "transformers": importlib.metadata.version("transformers"),
+                "jinja2": importlib.metadata.version("jinja2"),
                 "tokenizers": importlib.metadata.version("tokenizers"),
                 "renderer_source": hashlib.sha256(Path(template.__file__).read_bytes()).hexdigest(),
             }
         )
 
     def encode(self, text: str) -> tuple[int, ...]:
-        return tuple(self.tokenizer.encode(text, add_special_tokens=False))
+        return tuple(self.tokenizer.encode(text))
 
     def chat(self, context: Context) -> tuple[int, ...]:
         context = Context.model_validate_json(encoded(context.model_dump(mode="json")))

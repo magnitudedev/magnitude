@@ -99,7 +99,8 @@ class PersistentAttentionComponentRule:
             f'attention.persistent-component{"-gated" if self.gated else ""}@{root}', nodes, inputs, outputs,
             _PersistentComponentEmitter(preparation, emitter, graph.value(values).spec.shape, self.gated),
             workspace=workspace, aliases=((append.outputs[0], history),),
-            kernel_count=persistent.kernel_count + 1),)
+            kernel_count=persistent.kernel_count + 1,
+            workspace_values={query: 0, key: 1, **({gate: 2} if self.gated else {})}),)
 
 
 class _PersistentMixerEmitter:
@@ -172,4 +173,6 @@ class PersistentAttentionMixerRule:
             f'attention.persistent-mixer@{root}', component.nodes | frozenset((projection.id,)),
             (*component.inputs, projection.inputs[1]), (projection.outputs[0], next_history),
             _PersistentMixerEmitter(component.emitter, activation, weight, output, tile, vector),
-            workspace=workspace, aliases=component.aliases, kernel_count=component.kernel_count + 1),)
+            workspace=workspace, aliases=component.aliases, kernel_count=component.kernel_count + 1,
+            workspace_values={attended: 0, **{value: index + 1
+                for value, index in component.workspace_values.items()}}),)

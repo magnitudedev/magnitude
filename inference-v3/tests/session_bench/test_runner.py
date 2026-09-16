@@ -57,23 +57,9 @@ async def test_real_process_full_run_and_readable_evidence(tmp_path, artifact_pa
         1,
         None,
         lambda _: None,
-        model_identity="fixture-model", evidence_store=tmp_path / "evidence.sqlite",
     )
     assert result["status"] == "completed", result
     assert result["completed"] == result["planned"] == 10
-    from ops.lab.store import ObservationStore
-    with ObservationStore(tmp_path / "evidence.sqlite", read_only=True) as evidence:
-        runs = evidence.runs("fixture-model")
-        assert len(runs) == 10
-        assert all(r.context.workload.kind == "benchmark" for r in runs)
-        assert all("plan" in r.context.workload.recipe for r in runs)
-        assert all(r.correctness == "unchecked" for r in runs)
-        for run in runs:
-            source = run.attachments["session_validation"]["terminal"]["timings"]
-            prefill = next(m for m in run.metrics if m.name == "prefill-time")
-            assert prefill.counts == (source["prompt_n"],)
-            assert prefill.samples == (source["prompt_ms"] / 1000,)
-
     path = Path(result["path"])
     assert inspect_run(path)["status"] == "completed"
     assert str(artifact_path) in (path / "command.txt").read_text()
@@ -87,9 +73,7 @@ async def test_real_process_full_run_and_readable_evidence(tmp_path, artifact_pa
     assert result["thermals"]["channels"]["cpu_mean"]["start_c"] == 65.0
     assert result["thermals"]["channels"]["gpu_mean"]["end_c"] == 45.0
     assert "Time-weighted mean °C" in (path / "report.md").read_text()
-    imported = list((tmp_path / "runs" / "performance" / "runs").glob("*/run.json"))
-    assert imported
-    assert json.loads(imported[0].read_text())["external"]["thermals"] == saved["thermals"]
+    assert not (tmp_path / "runs" / "performance").exists()
     events = [json.loads(line) for line in (path / "events.jsonl").read_text().splitlines()]
     assert sum(event["event"] == "stopped" for event in events) == 2
     assert (path / "memory.jsonl").is_file()

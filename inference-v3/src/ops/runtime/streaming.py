@@ -10,7 +10,8 @@ from ..tensor.types import DType, TensorSpec
 from .resources import Completion, NativeSubmissionError
 
 
-def _submit_stage(device, entrypoint, resources):
+def _submit_stage(device, entrypoint, resources, definition):
+    device.observations.stage(definition.name)
     try:
         return device.submit_native(entrypoint, tuple(value.native for value in resources))
     except NativeSubmissionError as error:
@@ -86,7 +87,8 @@ class CompiledGatherLoop:
                 mapping = completion = None
                 try:
                     mapping = self.device.upload(map_spec, destinations)
-                    native = _submit_stage(self.device, self._entrypoint, (weight, mapping, output))
+                    native = _submit_stage(self.device, self._entrypoint, (weight, mapping, output),
+                                           self.loop.templates[0].definition)
                     completions.append(native)
                     completion = Completion(self.device, native, (weight, mapping))
                     completion.wait()
@@ -122,7 +124,7 @@ class CompiledExpertLoop:
             raise
 
     def _stage(self, index, resources):
-        native = _submit_stage(self.device, self._stages[index], resources)
+        native = _submit_stage(self.device, self._stages[index], resources, self.loop.templates[index].definition)
         completion = Completion(self.device, native, tuple(value.fork() for value in resources))
         completion.wait()
         return native
@@ -235,7 +237,8 @@ class CompiledProjectionLoop:
                 if self.loop.bias is not None:
                     arguments += (values[self.loop.bias],)
                 entrypoint = self._programs[binding.spec.shape[0]]
-                native = _submit_stage(self.device, entrypoint, arguments)
+                native = _submit_stage(self.device, entrypoint, arguments,
+                                       next(t.definition for t in self.loop.templates if t.extent == binding.spec.shape[0]))
                 completions.append(native)
                 completion = Completion(self.device, native, (weight, extent))
                 completion.wait()

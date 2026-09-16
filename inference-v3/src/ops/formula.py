@@ -77,6 +77,7 @@ class FormulaCall:
     quantities: tuple[Quantity, ...] = ()
     static: tuple[tuple[tuple[str | int, ...], Any], ...] = ()
     complete: bool = True
+    metric: str | None = None
 
     def remap(self, values: dict[int, int], nodes: dict[int, int]) -> FormulaCall:
         return replace(
@@ -113,9 +114,11 @@ class FormulaIndex:
 
 
 class Formula:
-    def __init__(self, function: Callable, *, id: str, version: int = 1):
+    def __init__(self, function: Callable, *, id: str, version: int = 1,
+                 metric: str | None = None, rows: str | None = None):
         self.ref = FormulaRef(id, version)
         self.function = function
+        self.metric, self.rows = metric, rows
         self.signature = inspect.signature(function)
         update_wrapper(self, function)
 
@@ -143,6 +146,8 @@ class Formula:
         start_values = len(state.values)
         resource_versions = dict(state._resource_versions)
         try:
+            if self.rows is not None:
+                quantity("tokens", arguments.arguments[self.rows].shape[0], unit=units.token)
             result = self.function(*args, **kwargs)
             outputs = tuple(Port(path, value.value_id) for path, value in leaves(result)
                             if isinstance(value, Tensor))
@@ -157,7 +162,7 @@ class Formula:
                 raise ValueError("formula tensor dependencies must be explicit arguments, not captured tensors")
             state.formula_calls[occurrence] = FormulaCall(
                 occurrence, self.ref, parent, inputs, outputs, tuple(range(start, len(state.nodes))),
-                tuple(state.formula_quantities[occurrence]), static,
+                tuple(state.formula_quantities[occurrence]), static, metric=self.metric,
             )
             return result
         except BaseException:
@@ -177,9 +182,10 @@ class Formula:
             state.formula_stack.pop()
 
 
-def formula(function=None, *, id: str | None = None, version: int = 1):
+def formula(function=None, *, id: str | None = None, version: int = 1,
+            metric: str | None = None, rows: str | None = None):
     def decorate(body):
-        return Formula(body, id=id or body.__name__, version=version)
+        return Formula(body, id=id or body.__name__, version=version, metric=metric, rows=rows)
     return decorate(function) if function is not None else decorate
 
 
@@ -236,7 +242,7 @@ def semantic_fingerprint(graph, call: FormulaCall) -> str:
                       primitive.host_observation, _stable(primitive.numerical)))
     payload = (_stable(call.formula), inputs, nodes,
                [(port.path, value_id(port.value)) for port in call.outputs],
-               _stable(call.static), _stable(call.quantities))
+               _stable(call.static), _stable(call.quantities), call.metric)
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 

@@ -6,7 +6,7 @@ kernel timestamps are separate. Lab attaches both to one typed formula occurrenc
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from time import perf_counter_ns
@@ -217,31 +217,39 @@ class RuntimeCapture(AbstractContextManager):
         self._expected = []
         self._invocations = 0
         self._mapping_complete = True
+        self._provenance = []
 
-    def program(self, graph, units) -> None:
-        """Retain actual compiled call order; qualify it against native dispatches.
-
-        Dynamic source loops are intentionally not guessed from static counts.
-        A mismatch leaves timing valid and attribution unavailable.
-        """
+    def invocation(self):
         invocation = self._invocations
         self._invocations += 1
-        for unit in units:
-            if unit.source_loop is not None:
+        return invocation
+
+    def provenance(self, graph, nodes, invocation):
+        if self._provenance:
+            return self._provenance[-1]
+        nodes = set(nodes)
+        touched = tuple(c.occurrence for c in graph.formulas if nodes.intersection(c.nodes))
+        containing = [c for c in graph.formulas if nodes and nodes <= set(c.nodes)]
+        owner = min(containing, key=lambda c: (len(c.nodes), -c.occurrence)).occurrence if containing else None
+        return touched, owner, invocation, graph.fingerprint
+
+    def dispatch(self, graph, unit, invocation):
+        # Register only submitted calls, in execution order. An enclosing source
+        # operation owns its conversion kernels and dynamically selected stages.
+        for call in unit.calls:
+            operation = call.operation
+            if operation.definition is None:
                 self._mapping_complete = False
                 continue
-            for call in unit.unit.calls:
-                operation = call.operation
-                definition = operation.definition
-                if definition is None:
-                    self._mapping_complete = False
-                    continue
-                nodes = set(operation.nodes)
-                touched = tuple(c.occurrence for c in graph.formulas if nodes.intersection(c.nodes))
-                containing = [c for c in graph.formulas if nodes <= set(c.nodes)]
-                owner = min(containing, key=lambda c: (len(c.nodes), -c.occurrence)).occurrence if containing else None
-                self._expected.extend((definition.name, touched, owner, invocation, graph.fingerprint)
-                                      for _ in range(operation.kernel_count))
+            provenance = self.provenance(graph, operation.nodes, invocation)
+            self._expected.extend((operation.definition.name, *provenance)
+                                  for _ in range(operation.kernel_count))
+
+    def stage(self, name):
+        if not self._provenance:
+            self._mapping_complete = False
+            return
+        self._expected.append((name, *self._provenance[-1]))
 
     def _attribute(self, activities):
         assert self._native is not None
@@ -334,9 +342,29 @@ class RuntimeRecorder:
     def capture(self, kernel_limit: int | None = None) -> RuntimeCapture:
         return RuntimeCapture(self, kernel_limit)
 
-    def program(self, graph, units) -> None:
+    def invocation(self):
+        return self._active.invocation() if self._active is not None else None
+
+    @contextmanager
+    def _scope(self, graph, unit, invocation):
+        capture = self._active
+        nodes = {n for call in unit.calls for n in call.operation.nodes}
+        capture._provenance.append(capture.provenance(graph, nodes, invocation))
+        try:
+            yield
+        finally:
+            capture._provenance.pop()
+
+    def scope(self, graph, unit, invocation):
+        return self._scope(graph, unit, invocation) if self._active is not None else self._disabled
+
+    def dispatch(self, graph, unit, invocation):
         if self._active is not None:
-            self._active.program(graph, units)
+            self._active.dispatch(graph, unit, invocation)
+
+    def stage(self, name):
+        if self._active is not None:
+            self._active.stage(name)
 
     def span(
         self, kind: Activity, *, source: tuple[str, ...] = (),

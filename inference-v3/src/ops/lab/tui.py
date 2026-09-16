@@ -63,7 +63,14 @@ def label(state: FormulaState | RecordedState) -> Text:
     latest = state.history.latest_success if state.history is not None else None
     timing = duration(latest.median_seconds) if latest is not None else "—"
     pending = " · source edited" if state.source_pending else ""
-    model = roofline_label(latest.roofline, latest.median_seconds) if latest is not None else ""
+    model = ""
+    if latest is not None and latest.performance is not None:
+        point = latest.performance["points"][-1]
+        unit = latest.performance["metric"]["unit"]["name"] + "/s"
+        model = f" · {point['rate']:.4g} {unit}" if point["rate"] is not None else ""
+        if point["attainment"] is not None:
+            model += f" · {point['attainment']:.1%} of ceiling"
+
     return Text(f"{state.target.definition.id} · {state.status.value}{pending} · isolated {timing}{model}")
 
 
@@ -125,7 +132,7 @@ def details(state: FormulaState | RecordedState) -> Text:
             lines += ["", "Observed metrics"]
             if observed.roofline is not None:
                 model = observed.roofline
-                lines += ["", "Formula roofline (modeled, empirically calibrated)",
+                lines += ["", "Empirical resource reference",
                           f"Ideal reference time: {duration(model.seconds)} · limiting resource: {model.bottleneck}",
                           "Gap is relative to this model, not guaranteed recoverable wall time.",
                           f"Model: {model.revision} · calibration: {model.characterization}"]

@@ -108,10 +108,12 @@ class CompiledFunction:
         source_bindings: Mapping[int, Binding] | None = None,
         execution_graph: ExecutionGraph | None = None,
         formula_graph: Graph | None = None,
+        plan: CompilationPlan | None = None,
     ):
         self.device = device
         self.graph = graph
         self.formulas = FormulaTree(formula_graph if formula_graph is not None else graph)
+        self.plan = plan
         self.memory = memory
         self._invocation_placements = tuple(
             (identity, placement) for identity, placement in memory.values.items()
@@ -188,6 +190,7 @@ class CompiledFunction:
     def submit(
         self, *inputs: Resource, resources: Mapping[int | str, Resource] | None = None,
         sources: Mapping[int, Binding] | None = None,
+        inspect=None,
     ) -> Execution:
         """Invoke with optional same-geometry immutable streamed source ports.
 
@@ -203,7 +206,7 @@ class CompiledFunction:
             raise TypeError(
                 f"compiled function expects {len(self.graph.inputs)} inputs, got {len(inputs)}"
             )
-        self.device.observations.program(self.graph, self._units)
+        invocation = self.device.observations.invocation()
         source_bindings = dict(self._source_bindings)
         for identity, binding in (sources or {}).items():
             original = source_bindings.get(identity)
@@ -262,18 +265,26 @@ class CompiledFunction:
                 if unit_sources and native_completions:
                     native_completions[-1].wait()
                 try:
-                    for value in unit_sources:
-                        from ..runtime.imports import plan_import
+                    with self.device.observations.scope(self.graph, unit.unit, invocation):
+                        for value in unit_sources:
+                            from ..runtime.imports import plan_import
 
-                        importer = self.device.prepare_binding(self._source_bindings[value])
-                        resource = importer.load(plan=plan_import(source_bindings[value]))
-                        values[value] = resource
-                        streamed.append(resource)
-                    if unit.source_loop is not None:
-                        if native_completions:
-                            native_completions[-1].wait()
-                        native_completions.append(unit.source_loop.submit(values, sources=source_bindings))
-                        continue
+                            importer = self.device.prepare_binding(self._source_bindings[value])
+                            resource = importer.load(plan=plan_import(source_bindings[value]))
+                            values[value] = resource
+                            streamed.append(resource)
+                        if inspect is not None:
+                            if native_completions:
+                                native_completions[-1].wait()
+                            inspect("before", unit.unit, values, self._static_workspace)
+                        if unit.source_loop is not None:
+                            if native_completions:
+                                native_completions[-1].wait()
+                            native_completions.append(unit.source_loop.submit(values, sources=source_bindings))
+                            if inspect is not None:
+                                native_completions[-1].wait()
+                                inspect("after", unit.unit, values, self._static_workspace)
+                            continue
                     dynamic = []
                     for key in unit.dynamic:
                         if key[0] == "value":
@@ -285,8 +296,12 @@ class CompiledFunction:
                                 if min(item.operation.nodes) == key[1]
                             )
                             dynamic.append(self._static_workspace[(candidate, key[2])].native)
+                    self.device.observations.dispatch(self.graph, unit.unit, invocation)
                     native = self.device.submit_native(unit.entrypoint, tuple(dynamic))
                     native_completions.append(native)
+                    if inspect is not None:
+                        native.wait()
+                        inspect("after", unit.unit, values, self._static_workspace)
                     if streamed:
                         native.wait()
                 except BaseException:
@@ -606,7 +621,7 @@ def materialize(
         compiled = CompiledFunction(
             device, graph, memory, tuple(units), bound_constants, bound_resources,
             owned_storage, static_values, static_workspace, plan.diagnostics,
-            streamed, plan.execution, plan.formula_graph,
+            streamed, plan.execution, plan.formula_graph, plan,
         )
     except BaseException:
         for unit in reversed(units):

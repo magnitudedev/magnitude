@@ -263,6 +263,14 @@ class Measurement(Record):
     error: str | None = None
     unavailable: tuple[UnavailableMetric, ...] = ()
     roofline: Roofline | None = None
+    performance: dict[str, JsonValue] | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_performance(self, handler):
+        result = handler(self)
+        if self.performance is None:
+            result.pop("performance", None)
+        return result
     preparation: dict[str, JsonValue] = Field(default_factory=dict)
     artifacts: dict[str, str] = Field(default_factory=dict)
 

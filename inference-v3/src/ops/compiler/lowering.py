@@ -66,12 +66,18 @@ class BoundOperation:
     definition: KernelDefinition | None = field(default=None, compare=False, repr=False)
     source_loop: Any | None = field(default=None, compare=False, repr=False)
     dependencies: tuple[CodeDependency, ...] = field(default=(), compare=False, repr=False)
+    # Logical values retained in scratch until this operation completes. This is
+    # inspection provenance, not an extra output or a changed storage lifetime.
+    workspace_values: Mapping[int, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.name or not self.nodes or self.kernel_count < 0:
             raise ValueError("invalid physical operation")
         object.__setattr__(self, "accepted_layouts", MappingProxyType(dict(self.accepted_layouts)))
         object.__setattr__(self, "produced_layouts", MappingProxyType(dict(self.produced_layouts)))
+        object.__setattr__(self, "workspace_values", MappingProxyType(dict(self.workspace_values)))
+        if any(not 0 <= index < len(self.workspace) for index in self.workspace_values.values()):
+            raise ValueError("inspected value refers to absent operation workspace")
 
     @property
     def workspace_bytes(self) -> int:
@@ -195,6 +201,11 @@ def _validate_operation(graph: Graph, candidate: BoundOperation) -> None:
         not 0 <= node < len(graph.nodes) for node in candidate.nodes
     ):
         raise ValueError(f"candidate {candidate.name} has an invalid region")
+    for value, index in candidate.workspace_values.items():
+        if (not 0 <= value < len(graph.values)
+                or graph.value(value).producer not in candidate.nodes
+                or graph.value(value).spec != candidate.workspace[index]):
+            raise ValueError("inspected scratch does not match an operation's logical value")
     if not _connected(graph, candidate.nodes):
         raise ValueError(f"candidate {candidate.name} region is disconnected")
     if not _convex(graph, candidate.nodes):

@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "TileLang-native Magnitude inference engine"
 requires-python = ">=3.12"
 dependencies = [
+  "magnitude-formula-performance",
   "pydantic==2.13.5",
   "numpy>=2.5.3",
   "tilelang==0.1.14",
@@ -23,6 +24,7 @@ dependencies = [
 ]
 
 [dependency-groups]
+performance = ["gguf==0.19.0"]
 dev = [
   "pytest>=9.1.1",
   "pytest-asyncio>=1",
@@ -35,10 +37,10 @@ dev = [
 ]
 
 [tool.uv.sources]
+magnitude-formula-performance = { path = "formula-performance", editable = true }
 tilelang = { path = "tilelang", editable = true }
 
 [project.scripts]
-magnitude-performance = "ops.lab.__main__:main"
 session-bench = "session_bench.cli:main"
 magnitude-qualify = "engine.qualification:main"
 
@@ -58,7 +60,7 @@ only-include = ["src", "native/templates", "hatch_build.py", "pyproject.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src", "."]
+pythonpath = ["src", ".", "formula-performance/src"]
 addopts = "-q"
 asyncio_mode = "auto"
 markers = [

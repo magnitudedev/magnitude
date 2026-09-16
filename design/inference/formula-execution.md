@@ -1,5 +1,7 @@
 ---
 applies_to:
+  - inference-v3/formula-performance/**
+  - inference-v3/roofline/**
   - inference-v3/src/ops/**
   - inference-v3/src/engine/**
   - inference-v3/performance/**
@@ -28,7 +30,11 @@ engine. V2 is reference evidence, not the performance ceiling.
 - Engine owns architecture composition, blueprints, artifact interpretation,
   admission, logical prefix state, acceptance and reclamation policy.
 - Ops owns formulas, operations, representations, complete physical execution,
-  resource lifetimes, characterization and shared measurement facilities.
+  resource lifetimes, characterization and numerical measurement facilities.
+- Roofline owns development-tool orchestration, worker supervision, published
+  evidence, model history, comparison reports and the read-only Textual browser.
+- Session bench owns HTTP workloads and response validation; explicit import
+  transfers its records into Roofline without coupling the runners.
 - TileLang owns the portable kernel language, target resource resolution, kernel
   scheduling/autotuning, compilation and native execution/timing.
 
@@ -71,6 +77,11 @@ shape/precision/representation rules, independent reference semantics and useful
 quantities. Composition preserves occurrences, parent/child relationships, shared
 dependencies and versioned state effects. Static control uses known facts;
 data-dependent control uses explicit traced constructs. There is no string DSL.
+Each measurable formula declares its primary useful quantity, unit and numerator
+expression. Primitive semantic rules supply shared work accounting. Parent useful
+quantities follow their own contracts; repeated processing of the same tokens by
+children does not multiply the parent's token count. Missing metric declarations
+are supported-formula validation failures, not a request for a display fallback.
 
 An operation is one physical implementation of a formula. Its body may compose
 children or implement the parent directly. Shape, representation and capability
@@ -295,6 +306,25 @@ fixture setup and reference preparation have separate phase times. Returning fro
 an asynchronous submit is not completion. A failed or unfinished observation is
 not a valid successful latency measurement.
 
+Whole-model numerical qualification is compositional. Check each selected
+production operation against independent primitive equations at its actual input
+boundary. A separate diagnostic replay preserves operation bodies, fusion and
+schedules while allowing synchronization and inspection before scratch reuse.
+Its private state must not retain production's statically bound mutable slabs.
+The ordinary invocation's final outputs and state must agree with the checked
+replay; read-only resources remain byte-identical. Diagnostic times are excluded
+from ordinary performance samples.
+
+Lossy state encoding is a discontinuous numerical boundary. First check its actual
+producer values against the independent arithmetic reference at the declared
+tolerance, then independently encode those verified values and compare the stored
+bytes, including preservation outside the write destinations. A single floating
+tolerance applied after two independently rounded encodings cannot substitute for
+these checks. Operations may declare which logical values remain materialized in
+scratch for inspection; those declarations must match the actual storage and do
+not change kernel mathematics or ordinary storage lifetimes. A missing observable
+boundary cannot be claimed as numerically qualified.
+
 For streamed projection, report the enclosing invocation wall time, source bytes
 returned, transfer API bytes, host spans, available native device timings and
 reservation baseline/peak/end. The formula supplies useful projection work and
@@ -312,8 +342,8 @@ occurrences without duplicating it in totals. Parent elapsed time is measured
 directly; isolated child times and overlapping stage spans are not additive.
 Isolated measurement is a normal operation on any supported complete formula
 subtree. It reuses the production operation definitions and captured/reference
-boundary inputs, not a benchmark-specific numerical implementation. A subtree
-request measures its parent and children independently. The parent retains its
+boundary inputs, not a benchmark-specific numerical implementation. A selected subtree
+request measures that boundary; ancestors and children require their own measurements. The parent retains its
 actual fusion; a child's isolation may introduce publication and transfer costs.
 The stable hierarchy displays both without presenting isolated times as actual
 contributions inside the parent. Fusion is not a reason to leave the tree empty.
@@ -342,21 +372,23 @@ attention, selected experts and sampling policy. Finite algorithm-dependent work
 ranges remain ranges; missing semantic rules or resource evidence fail model
 qualification rather than silently selecting a different objective.
 
-The modeled roofline divides demands by measured resource references, adds demand
-within a shared resource pool and takes the maximum across constraints under ideal
-overlap. It is not a prediction of this implementation's latency or proof of an
-absolute hardware limit. Its assumptions, precision, probe identity and source
-conditions are part of the recorded evidence. Ratios above 100% remain visible and
-challenge the reference/model; they are not clamped or called super-optimal.
+The mathematical roofline divides necessary demands by applicable hardware
+capacity bounds, adds demands within a shared resource pool, and takes the maximum
+across independent constraints under ideal overlap. Certified execution barriers
+may add sequential stages. It is not a prediction of this implementation's latency.
+Its capacity provenance, assumptions, precision and source conditions are part of
+the derivation. Measured resource rates are empirical references, not capacity
+upper bounds. Ratios above 100% remain visible and challenge the bound's assumptions;
+they are not clamped or called super-optimal.
 
 Resource probes must expose throughput rather than application staging overhead:
 matrix probes reuse operands on chip and memory probes use coalesced element
 streams. Their counts still come from ordinary formula semantics and boundary
 traffic, not handwritten benchmark counters. The best measured resource rate is
-the empirical ceiling reference; matching a small probe's launch-dominated latency
-is a performance prediction, not a roofline. Storage bandwidth is byte-based and
-does not require matching the stream's arithmetic dtype. A populated tree with
-large above-reference results fails calibration qualification.
+an achieved reference; matching a small probe's launch-dominated latency is a
+performance prediction, not a roofline. Storage bandwidth is byte-based and does
+not require matching the stream's arithmetic dtype. Above-reference observations
+challenge the probe's representativeness without changing the mathematical ceiling.
 
 Resource calibration explicitly records sustained warm-up duration to avoid
 comparing a cold low-power GPU probe with a long-running model. Ordinary edit
@@ -434,9 +466,21 @@ reader. Compiled numerical code may still be shared. A file source is not assert
 to be a physical disk: filesystem/page caching and remote backing remain distinct.
 
 Formula-derived lower bounds must state their residency, precision and resource
-assumptions. Distinguish theoretical peaks from measured sustainable ceilings;
+assumptions. Distinguish capacity upper bounds from measured sustainable rates;
 an empirical probe maximum is not a proof of optimality. Compare matching units,
-paths and conditions. Do not restore a latency simulator or fallback selector.
+paths and conditions. Performance derivation follows the existing formula graph;
+it does not introduce an operation-selection simulator or fallback selector.
+
+Necessary obligations, value/state dependencies and hardware capacity constraints
+compose into justified latency floors. Conventional work counts are not universally
+necessary instructions. Parent bounds retain shared producers, allowed reuse,
+fusion and resource mappings; child scalar bounds are not automatically additive.
+Every bound retains its applicability, assumptions and derivation dependencies.
+The roofline is a mathematical function of the formula's operating parameters and
+hardware capabilities. Profiles bind this common function; evidence from each
+machine contributes to the same relation after normalization against its applicable
+hardware-relative ceiling. Hardware normalization preserves remaining explanatory
+conditions and does not imply constant efficiency across all hardware.
 
 Bounds are not restricted to rates: a formula may have a throughput ceiling, a
 latency floor or a minimum storage requirement in the appropriate units. Record
@@ -446,19 +490,20 @@ includes other cached preparations is not the operation's isolated storage minim
 
 ## Persistent development system
 
-The agent owns execution: workload plus scope selects what to run. A persistent
-measurement worker owns fixture/reference reuse, isolated measurement, dependency
-invalidation and durable observations. Benchmark requests and their recipes remain
-owned by the existing benchmark system; a formula fixture materializes the chosen
-boundary for those inputs, or explicitly identifies synthetic inputs. There is no
-second workload renderer. Enclosing request records, production forward observations
-and isolated formula measurements publish into the same evidence store.
-Independent workers and readers may open the same history file concurrently.
-First-open WAL initialization handles transient SQLite lock upgrades within a
-bounded deadline; it must not downgrade journaling or swallow permanent errors.
-Selection uses Formula objects and typed occurrence handles, never string paths
-or dynamic attribute proxies. The engine's typed hierarchy is derived from actual
-formula occurrences, not a second benchmark-only model tree.
+Roofline resolves model/workload/scope requests into production formula boundaries.
+Its coordinator freezes source and configured definitions, dispatches to local or
+SSH workers, and collects immutable measurements into one query workspace. Workers
+own runtime and prepared-input reuse across CLI invocations. Ops provides numerical
+preparation, checking, sampling and resource analysis without importing Roofline.
+Its internal numerical evidence storage is not a second public model-history service.
+
+Both performance tools consume shared fixture preparation. Session bench remains
+independent; explicit Roofline import preserves its original timers and validation
+without claiming numerical checks or equal rendered inputs. Native measurements
+publish automatically; no user-managed investigation or retention lifecycle exists.
+Worker journals and caches are execution/delivery storage, separate from the central
+query authority. Public selectors resolve to typed production formula occurrences;
+Roofline does not define another computation graph.
 
 Comparable history is keyed by formula semantics/revision, shapes, precision,
 representation, inputs/artifacts, state, residency/cache conditions, device and
@@ -468,15 +513,28 @@ occurrences and dependent ancestors stale; it preserves historical measurements.
 Moving a display node does not discard a comparable series. Shared dependencies
 remain a DAG rather than falsely independent tree work.
 
-The primary TUI is read-only and starts with a stable model identity. It displays
-already published engine performance, condition-specific histories, formula
-observations, ceilings and provenance. Opening or refreshing it never opens a
-device, constructs a fixture or queues measurement. The agent executes and publishes;
-the user does not have to select a workload to inspect a model. Unmeasured conditions
-stay unmeasured and current-code freshness is unknown until verified. Detailed
-formula selection is pinned to the selected execution, not a later result silently
-substituted from the same series. Existing developer measurement clients use the
-same worker; they do not define the model overview's behavior.
+A parameterized performance relation connects each formula's mathematical bound,
+observations, actual execution attribution and implementation predictions. Evidence
+from every workload enters the applicable relation. Publishing child evidence
+reevaluates dependent ancestor predictions and constraints; enclosing observations
+supply mapped child evidence or joint constraints on unresolved costs. Mathematical
+ceilings and implementation predictions share the graph without conflating their
+claims. Physical execution dependencies and qualified correspondence determine
+whether isolated evidence can inform an enclosing prediction. Observations retain
+their original boundaries and are never overwritten with inferred values.
+
+The primary TUI is read-only and starts with a stable model identity. Its hierarchy
+is the recorded model composition, with each logical formula component appearing
+once. It consolidates all workload and hardware evidence automatically. Phase,
+context, batch and hardware capabilities are operating coordinates within the
+component's accumulated performance knowledge. No workload or hardware selection
+is required. Rows name the declared formula metric and show hardware-normalized
+performance against the common roofline and contribution information. Details
+expose operating points, raw rates, hardware substitutions and derivations.
+Named evidence navigation opens exact measurements and provenance. Opening or
+refreshing never opens a device, constructs a fixture or queues measurement.
+Unmeasured terms stay explicit; current-code freshness is unknown until verified.
+Model queries and developer tools consume the same analytical result.
 
 Model identity groups evidence; it does not make timings interchangeable. Artifact,
 numerical contract, concrete workload/state, hardware, host, protocol and scope
@@ -493,14 +551,14 @@ region, with versioned supporting evidence. Opaque or fused regions stay combine
 missing attribution cannot be replaced by a guessed split. Reference engines supply
 observations and hypotheses, not an upper bound on performance.
 
-Remote execution is ordinary agent coordination: copy the request and necessary
-inputs, invoke the same headless tools over SSH, and copy a portable evidence bundle
-back. Import validates schema, integrity, references and immutable identities before
-atomically publishing records; it does not execute imported code. Duplicate imports
-are harmless. Compiled source artifacts travel by content hash. Large model blobs
-remain separately provisioned. There is no scheduler, remote daemon or automatic
-host selection. Independent investigations may run on the two M4 Pros; comparisons
-within one investigation remain paired on the same host.
+Roofline workers receive verified source and fixture blobs over SSH and execute in
+worker-owned directories. They do not modify existing engine repositories or use
+their environments. Model artifacts remain separately provisioned and verified.
+Stable attempt IDs and durable journals survive transport disconnection; collection
+reconciles the same attempt. Setup, execution and cancellation are supervised and
+bounded. Independent hosts execute concurrently; paired samples remain on one host.
+Export/import transfers selected evidence closures, validates schema and hashes,
+and never executes imported source. Duplicate delivery preserves identities.
 
 Each prepared configuration records its actual composition and links measured
 occurrences to their exact comparable series. Recorded browsing needs no model,
@@ -512,7 +570,9 @@ another recording's conditions merely because formula names and shapes match.
 The development target is under five seconds from editing a small operation to a
 checked, persisted, visible observation, including affected compilation. Keep the
 worker/resources alive, reuse independent fixtures/reference and compile only
-affected code. Use bounded sampling. Report setup, compile, check, sample and
+affected code. Module reload ordering follows eagerly evaluated imports; function-local
+imports resolve when called and cannot manufacture initialization cycles. Explicit
+submodule imports depend on that submodule rather than its package re-exports. Use bounded sampling. Report setup, compile, check, sample and
 publication times separately. An unchanged warm cache hit does not qualify the
 changed-operation target.
 
@@ -530,6 +590,9 @@ and never requires replay or a second implementation. Unsupported counters are
 explicitly unavailable; overflow, incomplete execution and invalid counters do
 not produce successful partial timings. Observation never implicitly commits
 or synchronizes the execution stream.
+During native instrumentation, the execution owner's explicit completion wait
+also retires command-buffer timing records; a signaled device event alone need
+not make those records readable. Ordinary execution retains event-only completion.
 
 Persistent executable keys include both Python lowering content and native
 compiler-library content. A native rebuild must not load a binary produced by

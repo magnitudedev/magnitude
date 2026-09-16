@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 
@@ -279,7 +280,7 @@ def test_partial_submission_remains_tracked_and_pins_streamed_tiles_until_drain(
     with DeviceRuntime(Runtime(), budget_bytes=4096) as device:
         resource = device.allocate(TensorSpec((8,), DType.U8))
         with pytest.raises(RuntimeError, match="drain failed"):
-            _submit_stage(device, PartialEntrypoint(), (resource,))
+            _submit_stage(device, PartialEntrypoint(), (resource,), SimpleNamespace(name="stage"))
         resource.close()
         assert device.allocated_bytes == 8
         assert device._submissions and device._completions

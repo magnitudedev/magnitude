@@ -75,10 +75,7 @@ async def execute(
     block: int,
     records: list[dict],
     progress: Callable[[str], None],
-    *, evidence_store: Path | None = None, model_identity: str | None = None,
 ) -> None:
-    if (evidence_store is None) != (model_identity is None):
-        raise ValueError("model evidence requires both a stable model identity and store")
     settled = {}
     tasks = {}
     recorded = set()
@@ -112,10 +109,6 @@ async def execute(
             row["retrieval_total"] = len(request.expected.values)
         records.append(row)
         store.append("results.jsonl", row)
-        if phase == "measured" and evidence_store is not None:
-            from performance.publication import publish_session
-            publish_session(evidence_store, model_identity, plan, adapter, store,
-                            request, observation, block)
         store.event(
             "request_finished",
             target=adapter.target.id,
@@ -226,8 +219,6 @@ async def run(
     prose: bool = False,
     retrieval: RulerFixture | None = None,
     needle_depth: float = 0.5,
-    model_identity: str | None = None,
-    evidence_store: Path | None = None,
 ) -> dict:
     if retrieval is not None and (prose or categories or case is not None):
         raise ValueError("retrieval cannot be combined with prose or tool selection")
@@ -358,8 +349,7 @@ async def run(
                         context_capacity, plan.parallel_sequences, f"block-{block}"
                     ) as engine:
                         execution = asyncio.create_task(
-                            execute(plan, adapter, engine, store, block, records, progress,
-                                    evidence_store=evidence_store, model_identity=model_identity)
+                            execute(plan, adapter, engine, store, block, records, progress)
                         )
                         exit_watch = asyncio.create_task(engine.process.wait())
                         try:

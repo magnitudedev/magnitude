@@ -32,19 +32,26 @@ _COMPILER_RECURSION_LOCK = Lock()
 
 
 class _KernelCapture:
-    def __init__(self, capture):
+    def __init__(self, capture, runtime):
         self._capture = capture
+        self._runtime = runtime
         self.clock = capture.clock
 
     def start(self) -> None:
         self._capture.start()
+        self._runtime._kernel_capture_active = True
 
     def finish(self) -> tuple[KernelActivity, ...]:
-        return tuple(KernelActivity(item.name, item.elapsed_ns, item.started_ns,
-                                    item.ended_ns, item.dispatch) for item in self._capture.finish())
+        return tuple(
+            KernelActivity(item.name, item.elapsed_ns, item.started_ns, item.ended_ns, item.dispatch)
+            for item in self._capture.finish()
+        )
 
     def close(self) -> None:
-        self._capture.close()
+        try:
+            self._capture.close()
+        finally:
+            self._runtime._kernel_capture_active = False
 
 
 class _Allocation(NativeAllocation):
@@ -94,20 +101,26 @@ class _Allocation(NativeAllocation):
 
 
 class _Completion(NativeCompletion):
-    def __init__(self, event=None):
+    def __init__(self, event=None, synchronize: Callable[[], None] | None = None):
         self._event: Any = event
-        self._done = event is None
+        self._synchronize = synchronize
+        self._done = event is None and synchronize is None
 
     def ready(self) -> bool:
         if self._done:
             return True
+        if self._synchronize is not None:
+            return False
         self._done = bool(self._event.query())
         return self._done
 
     def wait(self) -> None:
         if self._done:
             return
-        self._event.synchronize()
+        if self._event is not None:
+            self._event.synchronize()
+        if self._synchronize is not None:
+            self._synchronize()
         self._done = True
 
 
@@ -175,6 +188,7 @@ class TileLangRuntime:
 
         self._context = create_backend_context(target, execution_backend="tvm_ffi")
         self._ordinal = ordinal
+        self._kernel_capture_active = False
         kind = self._context.target.kind.name
         if kind == "metal":
             if ordinal:
@@ -187,7 +201,15 @@ class TileLangRuntime:
                 # buffer pending throughout independent host preparation.
                 event = torch.mps.Event()
                 event.record()
-                return _Completion(event=event)
+                # A signaled event proves device work finished, but Metal may
+                # still be finalizing command-buffer timestamp records. The
+                # execution owner's explicit wait must retire those records
+                # before a capture can read them. Ordinary submissions keep
+                # their asynchronous event-only completion.
+                return _Completion(
+                    event=event,
+                    synchronize=torch.mps.synchronize if self._kernel_capture_active else None,
+                )
 
             self._completion = completion
         elif kind in ("cuda", "hip"):
@@ -279,7 +301,7 @@ class TileLangRuntime:
         from tilelang.backend import kernel_capture
 
         capture = kernel_capture(self._context.target, ordinal=self._ordinal, max_kernels=limit)
-        return None if capture is None else _KernelCapture(capture)
+        return None if capture is None else _KernelCapture(capture, self)
 
     def close(self) -> None:
         self._device = None
