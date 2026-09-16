@@ -19,7 +19,7 @@ import {
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import type { Components } from "react-markdown"
-import { Copy, Check } from "lucide-react"
+import { CopyIcon, CheckIcon } from "@phosphor-icons/react"
 import {
   subscribeShiki,
   getShikiSnapshot,
@@ -49,7 +49,7 @@ function CopyButton({ text }: { text: string }) {
         setTimeout(() => setCopied(false), 2000)
       }}
     >
-      {copied ? <Check size={14} /> : <Copy size={14} />}
+      {copied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
     </Button>
   )
 }

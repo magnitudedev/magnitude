@@ -19,7 +19,7 @@ for(const theme of ['light','dark']) for(const width of [800,1120,1600]) {
   const geometry=async()=>page.locator('main').evaluate(el=>({width:el.clientWidth,scrollWidth:el.scrollWidth,sections:[...el.querySelectorAll('article,section')].map(n=>{const b=n.getBoundingClientRect();return {tag:n.tagName,label:n.getAttribute('aria-label'),x:b.x,y:b.y,width:b.width,height:b.height}})}))
   const stableFrames=async()=>page.evaluate(name=>{
    const main=document.querySelector('main'); let nodes=[];
-   if(name==='usage') nodes=[...main.querySelectorAll('div.rounded-2xl')];
+   if(name==='usage') nodes=[main.querySelector('[aria-label="Token activity"]'),...main.querySelectorAll('[data-usage]')];
    if(name==='status') nodes=[...main.querySelectorAll('section')];
    if(name==='settings') nodes=[...main.querySelectorAll('h2')].map(n=>n.closest('section,[aria-busy]'));
    if(name==='catalog'||name==='models'||name==='connections') nodes=[main.querySelector('article')];

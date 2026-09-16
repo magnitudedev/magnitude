@@ -7,7 +7,15 @@ import {
   type MouseEvent,
   type ReactNode,
 } from "react"
-import { FilePlus2, FileText, FolderTree, Globe2, PanelRight, Plus, X } from "lucide-react"
+import {
+  FilePlusIcon,
+  FileTextIcon,
+  TreeStructureIcon,
+  GlobeHemisphereWestIcon,
+  SidebarSimpleIcon,
+  PlusIcon,
+  XIcon,
+} from "@phosphor-icons/react"
 import { Atom, useAtomMount, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { Effect, Option } from "effect"
 import {
@@ -124,14 +132,14 @@ function WorkspaceTabView({
         title={tab.kind === "file" ? tab.document?.path ?? "Select a file" : title}
         className="h-full min-w-0 flex-1 justify-start gap-1.5 border-0 bg-transparent! px-2 text-inherit! shadow-none hover:bg-transparent! hover:text-inherit! after:hidden data-active:bg-transparent! dark:bg-transparent! dark:text-inherit! dark:hover:bg-transparent! dark:hover:text-inherit! dark:data-active:bg-transparent!"
       >
-        {tab.kind === "file" ? <FileText size={14} />
+        {tab.kind === "file" ? <FileTextIcon size={14} />
           : browserTab?.phase === "loading" ? <span className="size-3.5 animate-spin rounded-full border-2 border-slate-300 border-t-blue-500 motion-reduce:animate-none dark:border-slate-600 dark:border-t-blue-400" />
             : browserTab?.faviconUrl ? <img src={browserTab.faviconUrl} alt="" className="size-3.5 shrink-0" />
-              : <Globe2 size={14} />}
+              : <GlobeHemisphereWestIcon size={14} />}
         <span className="min-w-0 flex-1 truncate text-left">{title}</span>
         {dirty ? <span className="size-1.5 shrink-0 rounded-full bg-blue-500" aria-label="Unsaved changes" /> : null}
       </TabsTrigger>
-      <button type="button" aria-label={`Close ${title}`} onClick={onClose} className={`mr-1 flex size-5 shrink-0 items-center justify-center rounded hover:bg-slate-200 focus:opacity-100 group-hover:opacity-100 dark:hover:bg-slate-700 ${active ? "opacity-100" : "opacity-0"}`}><X size={12} /></button>
+      <button type="button" aria-label={`Close ${title}`} onClick={onClose} className={`mr-1 flex size-5 shrink-0 items-center justify-center rounded hover:bg-slate-200 focus:opacity-100 group-hover:opacity-100 dark:hover:bg-slate-700 ${active ? "opacity-100" : "opacity-0"}`}><XIcon size={12} /></button>
     </div>
   )
 }
@@ -294,7 +302,7 @@ export function WorkspacePanel({
       }} className="flex min-h-0 flex-1 gap-0">
       <header className="flex h-11 shrink-0 select-none items-end gap-1 border-b border-slate-200 px-2 pt-1 dark:border-slate-800 [-webkit-app-region:drag]">
         <ActionTooltip label="Collapse sidebar" side="bottom" disabled={entering} trigger={(
-          <Button variant="ghost" size="icon-sm" onClick={collapse} className="mb-1 [-webkit-app-region:no-drag]" aria-label="Collapse sidebar"><PanelRight size={18} /></Button>
+          <Button variant="ghost" size="icon-sm" onClick={collapse} className="mb-1 [-webkit-app-region:no-drag]" aria-label="Collapse sidebar"><SidebarSimpleIcon size={18} /></Button>
         )} />
         <TabsList activateOnFocus aria-label="Workspace tabs" variant="line" className="h-9 min-w-0 max-w-full flex-1 justify-start gap-0 overflow-hidden p-0 [-webkit-app-region:no-drag]">
             <div className="flex h-9 min-w-0 max-w-[calc(100%-2.25rem)] shrink items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
@@ -313,21 +321,21 @@ export function WorkspacePanel({
               ))}
             </div>
             <DropdownMenu>
-              <DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" className="ml-1 shrink-0" aria-label="New workspace tab" />}><Plus size={15} /></DropdownMenuTrigger>
+              <DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" className="ml-1 shrink-0" aria-label="New workspace tab" />}><PlusIcon size={15} /></DropdownMenuTrigger>
               <DropdownMenuContent align="start" className="w-44">
                 <DropdownMenuItem disabled={projectId === null} onClick={() => {
                   if (projectId !== null) setWorkspace((current) => addEmptyFileTab(current, makeWorkspaceTabId(), projectId))
-                }}><FilePlus2 />File</DropdownMenuItem>
+                }}><FilePlusIcon />File</DropdownMenuItem>
                 {browser !== undefined ? <DropdownMenuItem onClick={() => runCommand(browser.createTab(), "Could not create a browser tab.", (browserTabId) => {
                   setWorkspace((current) => addBrowserTab(current, makeWorkspaceTabId(), browserTabId))
-                })}><Globe2 />Browser</DropdownMenuItem> : null}
+                })}><GlobeHemisphereWestIcon />Browser</DropdownMenuItem> : null}
               </DropdownMenuContent>
             </DropdownMenu>
           </TabsList>
         <ActionTooltip label={workspace.treeOpen ? "Hide project files" : "Show project files"} side="bottom" trigger={(
-          <Button variant="ghost" size="icon-sm" className="mb-1 aria-pressed:bg-slate-200 aria-pressed:text-slate-900 dark:aria-pressed:bg-slate-700 dark:aria-pressed:text-white [-webkit-app-region:no-drag]" disabled={projectId === null} aria-label={workspace.treeOpen ? "Hide project files" : "Show project files"} aria-pressed={workspace.treeOpen} onClick={() => setWorkspace((current) => ({ ...current, treeOpen: !current.treeOpen }))}><FolderTree size={17} /></Button>
+          <Button variant="ghost" size="icon-sm" className="mb-1 aria-pressed:bg-slate-200 aria-pressed:text-slate-900 dark:aria-pressed:bg-slate-700 dark:aria-pressed:text-white [-webkit-app-region:no-drag]" disabled={projectId === null} aria-label={workspace.treeOpen ? "Hide project files" : "Show project files"} aria-pressed={workspace.treeOpen} onClick={() => setWorkspace((current) => ({ ...current, treeOpen: !current.treeOpen }))}><TreeStructureIcon size={17} /></Button>
         )} />
-        <Button variant="ghost" size="icon-sm" className="mb-1 [-webkit-app-region:no-drag]" onClick={collapse} aria-label="Close sidebar"><X size={16} /></Button>
+        <Button variant="ghost" size="icon-sm" className="mb-1 [-webkit-app-region:no-drag]" onClick={collapse} aria-label="Close sidebar"><XIcon size={16} /></Button>
       </header>
       <div className="flex min-h-0 flex-1">
         {activeTab === null ? (

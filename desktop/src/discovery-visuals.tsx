@@ -3,7 +3,7 @@ import { pageLayout } from "./page-layout"
 import { Option } from "effect"
 import { useMemo } from "react"
 import { Result, useAtomValue } from "@effect-atom/atom-react"
-import { MemoryStick, CircuitBoard, Cpu } from "lucide-react"
+import { MemoryIcon, CircuitryIcon, CpuIcon } from "@phosphor-icons/react"
 import { DesktopSession, useAgentClient, localModelRadarAxes, useLocalInferenceHardware } from "@magnitudedev/client-common"
 import { type HardwarePhoto } from "./hardware-photos"
 import { hardwareDetails } from "./hardware-details"
@@ -69,11 +69,13 @@ export function HardwareSummary({ identity, value }: { identity: MachineIdentity
         <h2 className="mt-2 break-words font-heading text-xl">{Option.getOrElse(presentation.name, () => "Your computer")}</h2>
         <div className="mt-4 grid grid-cols-[repeat(auto-fit,minmax(min(100%,220px),1fr))] gap-x-6 gap-y-4">
           {presentation.groups.map(group => {
-            const Icon = group.label === "Memory" ? MemoryStick : group.label.startsWith("GPU") ? CircuitBoard : Cpu
-            return <div key={group.label} className="flex min-w-0 items-start gap-2.5">
-              <Icon aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-blue-600 dark:text-blue-400" />
-              <div className="min-w-0">
+            const Icon = group.label === "Memory" ? MemoryIcon : group.label.startsWith("GPU") ? CircuitryIcon : CpuIcon
+            return <div key={group.label} className="min-w-0">
+              <div className="flex items-center gap-2">
+                <Icon aria-hidden="true" className="size-4 shrink-0 text-blue-600 dark:text-blue-400" />
                 <p className="m-0 text-xs font-medium leading-tight text-slate-500 dark:text-slate-400">{group.label}</p>
+              </div>
+              <div className="min-w-0">
                 <p className="mb-0 mt-1 break-words text-sm font-semibold leading-snug">{group.name}</p>
                 <div className="mt-1 flex flex-col gap-0.5">{group.details.map(detail => <p key={detail} className="m-0 text-xs leading-snug text-slate-500 dark:text-slate-400">{detail.replace(/ \(spec\)/g, "")}</p>)}</div>
               </div>

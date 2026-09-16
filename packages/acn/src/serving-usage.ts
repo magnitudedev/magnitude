@@ -82,9 +82,22 @@ export const ServingUsageLive = Layer.scoped(ServingUsage, Effect.gen(function* 
         COUNT(first_token_ms) AS latencySamples
         FROM usage WHERE completed_at >= ? AND (? IS NULL OR model = ?)`)
         .get(since, model, model)
+      // One indexed interval per local calendar day keeps DST and fractional-offset zones exact.
+      // Activity spans 53 Sunday-first weeks through today, independently of the summary period.
+      const today = DateTime.startOf(zone.value, "day")
+      const start = DateTime.subtract(DateTime.startOf(today, "week", { weekStartsOn: 0 }), { weeks: 52 })
+      const days: Array<readonly [string, number, number]> = []
+      for (let day = start; DateTime.toEpochMillis(day) <= DateTime.toEpochMillis(today); day = DateTime.add(day, { days: 1 })) {
+        days.push([DateTime.formatIsoDate(day), DateTime.toEpochMillis(day), DateTime.toEpochMillis(DateTime.add(day, { days: 1 }))])
+      }
+      const dailyActivity = db.query(`WITH days(date, start, end) AS (VALUES ${days.map(() => "(?, ?, ?)").join(",")})
+        SELECT days.date, COALESCE(SUM(COALESCE(usage.input, 0) + COALESCE(usage.output, 0)), 0) AS totalTokens
+        FROM days LEFT JOIN usage ON usage.completed_at >= days.start AND usage.completed_at < days.end
+          AND (? IS NULL OR usage.model = ?)
+        GROUP BY days.date ORDER BY days.date`).all(...days.flat(), model, model)
       const models = db.query("SELECT model AS id, COUNT(*) AS requests FROM usage GROUP BY model ORDER BY model").all()
       const metadata = db.query("SELECT since FROM metadata WHERE id = 1").get()
-      return Schema.decodeUnknownSync(ServingUsageSnapshot)({ _tag: "Available", ...metadata!, ...totals!, models, recordingFailures })
+      return Schema.decodeUnknownSync(ServingUsageSnapshot)({ _tag: "Available", ...metadata!, ...totals!, dailyActivity, models, recordingFailures })
     })
   })).pipe(Effect.catchAll(error => Effect.succeed({ _tag: "Unavailable" as const, message: error.message })))
   return ServingUsage.of({ record, read })

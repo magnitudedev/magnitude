@@ -29,20 +29,20 @@ import {
 import { Option } from "effect"
 import { Result } from "@effect-atom/atom-react"
 import {
-  AlertTriangle,
-  Cpu,
-  Download,
-  EllipsisVertical,
-  FolderOpen,
-  Layers3,
-  Loader2,
-  MemoryStick,
-  PackageOpen,
-  RefreshCw,
-  Search,
-  Trash2,
-  X,
-} from "lucide-react"
+  WarningIcon,
+  CpuIcon,
+  DownloadSimpleIcon,
+  DotsThreeVerticalIcon,
+  FolderOpenIcon,
+  StackIcon,
+  CircleNotchIcon,
+  MemoryIcon,
+  PackageIcon,
+  ArrowsClockwiseIcon,
+  MagnifyingGlassIcon,
+  TrashIcon,
+  XIcon,
+} from "@phosphor-icons/react"
 import {
   deriveHardwareMemoryView,
   formatLocalModelDisplayName,
@@ -92,7 +92,7 @@ function QueryNotice({
   if (Result.isFailure(result)) {
     return (
       <div className="flex items-center gap-2 rounded-[7px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-850 px-3 py-2.5 text-slate-600 dark:text-slate-400 text-xs [&.danger]:border-red-300 [&.danger]:text-red-600 dark:[&.danger]:border-red-700 dark:[&.danger]:text-red-400 danger">
-        <AlertTriangle size={15} />
+        <WarningIcon size={15} />
         Unable to load {label}.
       </div>
     )
@@ -100,7 +100,7 @@ function QueryNotice({
   if (Option.isNone(Result.value(result))) {
     return (
       <div className="flex items-center gap-2 rounded-[7px] border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-850 px-3 py-2.5 text-slate-600 dark:text-slate-400 text-xs [&.danger]:border-red-300 [&.danger]:text-red-600 dark:[&.danger]:border-red-700 dark:[&.danger]:text-red-400">
-        <Loader2 className="animate-spin" size={15} />
+        <CircleNotchIcon className="animate-spin" size={15} />
         Loading {label}…
       </div>
     )
@@ -121,7 +121,7 @@ function LoadingNotice({
       role="status"
       aria-live="polite"
     >
-      <Loader2 className="shrink-0 animate-spin" size={20} aria-hidden="true" />
+      <CircleNotchIcon className="shrink-0 animate-spin" size={20} aria-hidden="true" />
       <div>
         <h2>{title}</h2>
         <p>{description}</p>
@@ -322,7 +322,7 @@ function InstalledModelMenu({
             />
           }
         >
-          <EllipsisVertical aria-hidden="true" />
+          <DotsThreeVerticalIcon aria-hidden="true" />
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className="w-44">
           <DropdownMenuItem
@@ -331,7 +331,7 @@ function InstalledModelMenu({
               if (installedPath !== null) platform.showItemInFolder(installedPath)
             }}
           >
-            <FolderOpen aria-hidden="true" />
+            <FolderOpenIcon aria-hidden="true" />
             Reveal in Finder
           </DropdownMenuItem>
           {!externallyManaged ? (
@@ -342,7 +342,7 @@ function InstalledModelMenu({
                 disabled={configurationId === null}
                 onClick={() => setConfirmingRemoval(true)}
               >
-                <Trash2 aria-hidden="true" />
+                <TrashIcon aria-hidden="true" />
                 Remove Model
               </DropdownMenuItem>
             </>
@@ -410,7 +410,7 @@ function InstalledLibrary({
             {filteredModels.length} {filteredModels.length === 1 ? "model" : "models"}
           </span>
           <div className="relative w-full max-w-[300px]">
-            <Search
+            <MagnifyingGlassIcon
               size={15}
               aria-hidden="true"
               className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-500"
@@ -450,7 +450,7 @@ function InstalledLibrary({
                 role="listitem"
                 key={modelKey(model)}
               >
-                <PackageOpen size={17} aria-hidden="true" />
+                <PackageIcon size={17} aria-hidden="true" />
                 <div className="flex min-w-0 flex-col gap-[3px]">
                   <strong className="break-words text-[13px] font-semibold text-slate-900 dark:text-slate-200">
                     {displayName}
@@ -659,9 +659,9 @@ function CatalogInspector({
           onClick={() => modelActions.install(configurationId)}
         >
           {model.acquisitionState._tag === "InstallFailed" ? (
-            <RefreshCw size={14} />
+            <ArrowsClockwiseIcon size={14} />
           ) : (
-            <Download size={14} />
+            <DownloadSimpleIcon size={14} />
           )}
           {model.acquisitionState._tag === "InstallFailed"
             ? "Retry download"
@@ -678,7 +678,7 @@ function CatalogInspector({
             disabled={starting}
             onClick={() => modelActions.install(configurationId)}
           >
-            <RefreshCw size={14} />
+            <ArrowsClockwiseIcon size={14} />
             {model.acquisitionState._tag === "UpdateFailed" ? "Retry update" : "Update"}
           </Button>
         )}
@@ -689,7 +689,7 @@ function CatalogInspector({
           type="button"
           onClick={() => modelActions.cancel(configurationId)}
         >
-          <X size={14} /> Cancel
+          <XIcon size={14} /> Cancel
         </Button>
       )}
     </div>
@@ -741,7 +741,7 @@ function CatalogInspector({
           </section>
         ) : (
           <div className="mt-7 flex items-center gap-2 text-[11px] text-slate-500">
-            <AlertTriangle size={15} />A complete comparison profile is not
+            <WarningIcon size={15} />A complete comparison profile is not
             available for this configuration.
           </div>
         )}
@@ -841,7 +841,7 @@ function CatalogView(): ReactNode {
             </div>
             <div className="mt-5 flex min-w-0 flex-wrap items-center gap-3">
               <div className="relative w-[280px] max-[620px]:w-full">
-                <Search
+                <MagnifyingGlassIcon
                   size={15}
                   aria-hidden="true"
                   className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-500"
@@ -976,7 +976,7 @@ function HardwareView(): ReactNode {
       {hardware && (
         <>
           <section className="flex items-center gap-4 border-b border-slate-300 dark:border-slate-750 pb-[26px] max-[620px]:flex-wrap max-[620px]:items-start [&_h2]:mb-1 [&_h2]:text-[19px] [&_h2]:leading-tight [&_h2]:tracking-[-.015em] [&_h2]:text-slate-900 dark:[&_h2]:text-slate-200 [&_p]:text-[12px] [&_p]:leading-normal [&_p]:text-slate-600 dark:[&_p]:text-slate-400">
-            <Cpu
+            <CpuIcon
               className="shrink-0 text-blue-700 dark:text-blue-500"
               size={24}
               aria-hidden="true"
@@ -1014,7 +1014,7 @@ function HardwareView(): ReactNode {
               </div>
             </div>
             <article className="grid min-h-[68px] grid-cols-[auto_minmax(180px,1fr)_minmax(300px,auto)] items-center gap-3.5 border-t border-slate-300 border-b border-b-slate-200 px-2.5 py-3.5 dark:border-t-slate-750 dark:border-b-slate-800 [&>div]:flex [&>div]:flex-col [&_strong]:text-[13px] [&_strong]:text-slate-900 dark:[&_strong]:text-slate-200 [&_span]:text-[10px] [&_span]:text-slate-500 max-[620px]:grid-cols-[auto_minmax(0,1fr)]">
-              <Layers3 size={18} aria-hidden="true" />
+              <StackIcon size={18} aria-hidden="true" />
               <div>
                 <strong>
                   {primary?._tag === "Unassigned" || primary === null
@@ -1076,7 +1076,7 @@ function HardwareView(): ReactNode {
                   className="grid grid-cols-[auto_minmax(0,1fr)] gap-3 border-b border-slate-200 dark:border-slate-800 px-2.5 py-4 text-slate-500"
                   key={domain.id}
                 >
-                  <MemoryStick size={17} aria-hidden="true" />
+                  <MemoryIcon size={17} aria-hidden="true" />
                   <div className="min-w-0 [&_p]:mt-2 [&_p]:text-[10px] [&_p]:text-slate-500">
                     <div className="flex justify-between gap-3.5 [&_strong]:text-[12px] [&_strong]:text-slate-900 dark:[&_strong]:text-slate-200 [&_span]:font-mono [&_span]:text-[10px] [&_span]:text-slate-600 dark:[&_span]:text-slate-400">
                       <strong>{domain.label}</strong>
@@ -1192,7 +1192,7 @@ function HardwareView(): ReactNode {
                     className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 border-b border-slate-200 dark:border-slate-800 px-2.5 py-[13px] text-slate-500 [&>div]:flex [&>div]:flex-col [&_strong]:text-[12px] [&_strong]:text-slate-900 dark:[&_strong]:text-slate-200 [&_span]:text-[10px] [&_span]:text-slate-500"
                     key={accelerator.acceleratorId}
                   >
-                    <Cpu size={17} aria-hidden="true" />
+                    <CpuIcon size={17} aria-hidden="true" />
                     <div>
                       <strong>{accelerator.name}</strong>
                       <span>{accelerator.backend}</span>

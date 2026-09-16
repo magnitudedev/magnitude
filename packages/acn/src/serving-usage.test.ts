@@ -61,3 +61,41 @@ it("starts with real empty totals and unavailable timing averages", async () => 
   const value = await Effect.runPromise(Effect.flatMap(ServingUsage, store => store.read(query)).pipe(Effect.provide(layer(root()))))
   expect(value).toMatchObject({ requests: 0, totalTokens: 0, tokensPerSecond: null, timeToFirstTokenMs: null, models: [] })
 })
+
+it("buckets a full calendar independently of Today and counts cached input once", async () => {
+  vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-03-09T18:00:00Z"))
+  const values = await Effect.runPromise(Effect.gen(function* () {
+    const store = yield* ServingUsage
+    for (const [id, timestamp] of [["before", "2026-03-08T07:59:59Z"], ["start", "2026-03-08T08:00:00Z"], ["end", "2026-03-09T06:59:59Z"], ["next", "2026-03-09T07:00:00Z"]]) {
+      yield* store.record(record(id!, { completedAt: Date.parse(timestamp!) }))
+    }
+    yield* store.record(record("other", { model: ServingModelId.make("model-b"), output: 80 }))
+    yield* store.record(record("old", { completedAt: Date.parse("2020-01-01T00:00:00Z") }))
+    return [yield* store.read({ ...query, period: "Today" }), yield* store.read({ ...query, model: Option.some(ServingModelId.make("model-a")) })]
+  }).pipe(Effect.provide(layer(root()))))
+  vi.restoreAllMocks()
+  const [all, selected] = values
+  if (all?._tag !== "Available" || selected?._tag !== "Available") throw new Error("Missing activity")
+  expect(all.totalTokens).toBe(300)
+  expect(all.dailyActivity.slice(-3)).toEqual([
+    { date: "2026-03-07", totalTokens: 120 }, { date: "2026-03-08", totalTokens: 240 }, { date: "2026-03-09", totalTokens: 300 },
+  ])
+  expect(selected.dailyActivity.at(-1)?.totalTokens).toBe(120)
+  expect(all.dailyActivity.length).toBe(366)
+  expect(new Date(`${all.dailyActivity[0]!.date}T00:00:00Z`).getUTCDay()).toBe(0)
+  expect(all.dailyActivity.reduce((sum, day) => sum + day.totalTokens, 0)).toBe(660)
+})
+
+it("handles fractional-offset midnight and the repeated hour at fall DST", async () => {
+  vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-11-02T18:00:00Z"))
+  const values = await Effect.runPromise(Effect.gen(function* () {
+    const store = yield* ServingUsage
+    for (const [id, timestamp] of [["first-hour", "2026-11-01T08:30:00Z"], ["second-hour", "2026-11-01T09:30:00Z"], ["before-midnight", "2026-11-01T18:14:59Z"], ["midnight", "2026-11-01T18:15:00Z"]]) {
+      yield* store.record(record(id!, { completedAt: Date.parse(timestamp!) }))
+    }
+    return [yield* store.read(query), yield* store.read({ ...query, timeZone: "Asia/Kathmandu" })]
+  }).pipe(Effect.provide(layer(root()))))
+  vi.restoreAllMocks()
+  expect(values[0]).toMatchObject({ dailyActivity: expect.arrayContaining([{ date: "2026-11-01", totalTokens: 480 }]) })
+  expect(values[1]).toMatchObject({ dailyActivity: expect.arrayContaining([{ date: "2026-11-01", totalTokens: 360 }, { date: "2026-11-02", totalTokens: 120 }]) })
+})

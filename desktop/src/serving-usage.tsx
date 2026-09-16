@@ -1,3 +1,4 @@
+import { UsageActivity } from "./serving-usage-activity"
 import { LoadingRegion, SkeletonLine } from "./page-skeletons"
 import { pageLayout } from "./page-layout"
 import { useState } from "react"
@@ -5,7 +6,7 @@ import { Result, useAtomValue } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import { ServingModelId, type ServingUsageSnapshot } from "@magnitudedev/sdk"
 import { useAgentClient, useLocalModels, formatLocalModelDisplayName } from "@magnitudedev/client-common"
-import { Gauge, Timer, ArrowDown, ArrowUp, Layers3 } from "lucide-react"
+import { GaugeIcon, TimerIcon, ArrowDownIcon, ArrowUpIcon, StackIcon } from "@phosphor-icons/react"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../web/src/components/ui/select"
 
 const number = (value: number) => value.toLocaleString()
@@ -18,39 +19,43 @@ export function ServingUsage() {
   const catalog = useLocalModels()
   const names = Result.isSuccess(catalog) ? new Map(catalog.value.models.map(model => [String(model.modelId), formatLocalModelDisplayName(model)])) : new Map<string, string>()
   const snapshot = Result.isSuccess(result) ? result.value : null
-  return <section aria-label="Local usage" className="mt-6 space-y-8">
-    <div className="flex flex-wrap items-center justify-end gap-4">
-      <div className="flex flex-wrap items-center gap-3">
+  return <section aria-label="Local usage" className="mt-6 space-y-6">
+    <div className="flex flex-wrap items-center justify-between gap-3">
+      <Select value={model} onValueChange={value => setModel(value ?? "")}>
+        <SelectTrigger aria-label="Usage model" className="w-[240px] max-w-full">
+          <SelectValue>{model ? names.get(model) ?? model : "All models"}</SelectValue>
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="">All models</SelectItem>
+          {snapshot?._tag === "Available" && snapshot.models.map(item => <SelectItem key={item.id} value={item.id}>{names.get(item.id) ?? item.id}</SelectItem>)}
+          {model && (snapshot?._tag !== "Available" || !snapshot.models.some(item => item.id === model)) && <SelectItem value={model}>{names.get(model) ?? model}</SelectItem>}
+        </SelectContent>
+      </Select>
+      <div className="flex items-center gap-3">
+        <span className="text-xs text-slate-500">Totals</span>
         <div className="flex rounded-lg bg-slate-100 p-1 dark:bg-slate-900" aria-label="Usage period">
           {(["Today", "AllTime"] as const).map(value => <button key={value} aria-pressed={period === value} onClick={() => setPeriod(value)} className={`rounded-md px-3 py-1.5 text-sm ${period === value ? "bg-white text-blue-700 shadow-sm dark:bg-slate-750 dark:text-blue-300" : "text-slate-500"}`}>{value === "Today" ? "Today" : "All time"}</button>)}
         </div>
-        <Select value={model} onValueChange={value => setModel(value ?? "")}>
-          <SelectTrigger aria-label="Usage model" className="h-10 w-[240px] max-w-full rounded-lg text-sm">
-            <SelectValue>{model ? names.get(model) ?? model : "All models"}</SelectValue>
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="">All models</SelectItem>
-            {snapshot?._tag === "Available" && snapshot.models.map(item => <SelectItem key={item.id} value={item.id}>{names.get(item.id) ?? item.id}</SelectItem>)}
-            {model && (snapshot?._tag !== "Available" || !snapshot.models.some(item => item.id === model)) && <SelectItem value={model}>{names.get(model) ?? model}</SelectItem>}
-          </SelectContent>
-        </Select>
       </div>
     </div>
-    {snapshot?._tag === "Available" ? <UsageFigures usage={snapshot} /> : Result.isInitial(result) ? <LoadingRegion label="Loading usage"><div className="space-y-8"><UsageFigures usage={null} /></div></LoadingRegion> : <p className="mt-6 text-sm text-slate-500">{snapshot?._tag === "Unavailable" ? snapshot.message : Result.isFailure(result) ? "Usage history is unavailable. Reconnecting…" : "Reading usage history…"}</p>}
+    {snapshot?._tag === "Available" ? <UsageActivity days={snapshot.dailyActivity} /> : Result.isInitial(result) ? <UsageActivity days={null} /> : null}
+    <div className="space-y-6 border-t border-slate-200 pt-6 dark:border-slate-750">
+      {snapshot?._tag === "Available" ? <UsageFigures usage={snapshot} /> : Result.isInitial(result) ? <LoadingRegion label="Loading usage"><div className="space-y-6"><UsageFigures usage={null} /></div></LoadingRegion> : <p role="alert" className="text-sm text-slate-500">{snapshot?._tag === "Unavailable" ? snapshot.message : Result.isFailure(result) ? "Usage history is unavailable. Reconnecting…" : "Reading usage history…"}</p>}
+    </div>
   </section>
 }
 export function UsageFigures({ usage }: { usage: Extract<ServingUsageSnapshot, { _tag: "Available" }> | null }) {
   const missingCache = usage ? usage.requests - usage.cachedInputRequests : 0
   const metrics = [
-    { label: "Input tokens", value: usage ? number(usage.inputTokens) : null, icon: ArrowDown, note: "Includes cached input" },
-    { label: "Cached input", value: !usage ? null : usage.cachedInputRequests === 0 && usage.requests > 0 ? "—" : number(usage.cachedInputTokens), icon: Layers3, note: missingCache > 0 ? `Not reported for ${number(missingCache)} requests` : "Reused from the prompt cache" },
-    { label: "Output tokens", value: usage ? number(usage.outputTokens) : null, icon: ArrowUp, note: "Generated by your models" },
+    { label: "Input tokens", value: usage ? number(usage.inputTokens) : null, icon: ArrowDownIcon, note: "Includes cached input" },
+    { label: "Cached input", value: !usage ? null : usage.cachedInputRequests === 0 && usage.requests > 0 ? "—" : number(usage.cachedInputTokens), icon: StackIcon, note: missingCache > 0 ? `Not reported for ${number(missingCache)} requests` : "Reused from the prompt cache" },
+    { label: "Output tokens", value: usage ? number(usage.outputTokens) : null, icon: ArrowUpIcon, note: "Generated by your models" },
   ]
   return <>
-    <div className={pageLayout.usageTokens}>{metrics.map(({ label, value, icon: Icon, note }) => <div key={label} className={pageLayout.card}><p className="flex items-center gap-2 text-sm text-slate-500"><Icon className="size-4" />{label}</p><p className="mt-5 font-heading text-4xl tabular-nums" data-usage={label}>{value ?? <SkeletonLine className="h-10 text-4xl" width="100px" />}</p><p className="mt-1 text-xs text-slate-500">{note}</p></div>)}</div>
-    <div className={pageLayout.usageTiming}>
-      <div className={pageLayout.card}><p className="flex items-center gap-2 text-sm text-slate-500"><Gauge className="size-4" />Generation speed</p><p className="mt-4 text-2xl tabular-nums" data-usage="speed">{!usage ? <SkeletonLine className="h-8 text-2xl" width="160px" /> : usage.tokensPerSecond === null ? "—" : `${decimal(usage.tokensPerSecond)} tokens/s`}</p></div>
-      <div className={pageLayout.card}><p className="flex items-center gap-2 text-sm text-slate-500"><Timer className="size-4" />Time to first token</p><p className="mt-4 text-2xl tabular-nums" data-usage="ttft">{!usage ? <SkeletonLine className="h-8 text-2xl" width="120px" /> : usage.timeToFirstTokenMs === null ? "—" : usage.timeToFirstTokenMs < 1000 ? `${decimal(usage.timeToFirstTokenMs)} ms` : `${decimal(usage.timeToFirstTokenMs / 1000)} s`}</p></div>
+    <div className={pageLayout.usageTokens}>{metrics.map(({ label, value, icon: Icon, note }) => <div key={label} className="min-w-0"><p className="flex items-center gap-2 text-sm text-slate-500"><Icon className="size-4" />{label}</p><p className="mt-3 font-heading text-3xl tabular-nums" data-usage={label}>{value ?? <SkeletonLine className="h-9 text-3xl" width="100px" />}</p><p className="mt-1 text-xs text-slate-500">{note}</p></div>)}</div>
+    <div className={`${pageLayout.usageTiming} border-t border-slate-200 pt-5 dark:border-slate-750`}>
+      <div className="min-w-0"><p className="flex items-center gap-2 text-sm text-slate-500"><GaugeIcon className="size-4" />Generation speed</p><p className="mt-4 text-2xl tabular-nums" data-usage="speed">{!usage ? <SkeletonLine className="h-8 text-2xl" width="160px" /> : usage.tokensPerSecond === null ? "—" : `${decimal(usage.tokensPerSecond)} tokens/s`}</p></div>
+      <div className="min-w-0"><p className="flex items-center gap-2 text-sm text-slate-500"><TimerIcon className="size-4" />Time to first token</p><p className="mt-4 text-2xl tabular-nums" data-usage="ttft">{!usage ? <SkeletonLine className="h-8 text-2xl" width="120px" /> : usage.timeToFirstTokenMs === null ? "—" : usage.timeToFirstTokenMs < 1000 ? `${decimal(usage.timeToFirstTokenMs)} ms` : `${decimal(usage.timeToFirstTokenMs / 1000)} s`}</p></div>
     </div>
     {usage && usage.requests === 0 && <p className="mt-5 text-sm text-slate-500">No requests in this view yet. Usage appears as your connected tools run models.</p>}
     {usage ? <details className="mt-5 text-xs text-slate-500"><summary className="cursor-pointer">About these numbers</summary><p className="mt-2 leading-relaxed">Input includes cached input; total is input plus output. Speed is weighted by generation time across {number(usage.speedSamples)} measured requests. First-token time is averaged across {number(usage.latencySamples)} measured requests. Native timings are used when available; other streaming timings are measured at the service. Missing measurements are excluded, not counted as zero. History covers local requests through Magnitude{usage.since === null ? "." : ` since ${new Date(usage.since).toLocaleDateString()}.`}</p></details> : <SkeletonLine className="mt-5 h-4 text-xs" width="130px" />}

@@ -6,7 +6,7 @@
  * for main, task+model for worker), following the TUI pattern where the
  * loading screen shows what's already known.
  */
-import { Loader2 } from "lucide-react"
+import { CircleNotchIcon } from "@phosphor-icons/react"
 import type { ReactNode } from "react"
 export interface TimelineLoadingStateProps {
   title: string
@@ -28,7 +28,7 @@ export function TimelineLoadingState({
           {subtitle}
         </div>
       )}
-      <Loader2
+      <CircleNotchIcon
         size={16}
         className="text-blue-700 dark:text-blue-500 [animation:spin_1s_linear_infinite] [margin-top:16px]"
       />

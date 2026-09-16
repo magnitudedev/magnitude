@@ -8,9 +8,6 @@
         "dark": "/wordmark-white.svg"
     },
     "favicon": "/logo.svg",
-    "icons": {
-        "library": "lucide"
-    },
     "fonts": {
         "heading": {
             "family": "Martian Mono",
@@ -47,17 +44,17 @@
             "anchors": [
                 {
                     "anchor": "GitHub",
-                    "icon": "github",
+                    "icon": "/icons/github.svg",
                     "href": "https://github.com/magnitudedev/magnitude"
                 },
                 {
                     "anchor": "Community",
-                    "icon": "discord",
+                    "icon": "/icons/discord.svg",
                     "href": "https://discord.gg/EHt48pPWdC"
                 },
                 {
                     "anchor": "Contact",
-                    "icon": "mail",
+                    "icon": "/icons/mail.svg",
                     "href": "mailto:founders@magnitude.dev"
                 }
             ]

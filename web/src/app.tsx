@@ -15,7 +15,7 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from "react"
-import { Menu, PanelRight } from "lucide-react"
+import { ListIcon, SidebarSimpleIcon } from "@phosphor-icons/react"
 import { Gear, NotePencil, SidebarSimple } from "@phosphor-icons/react"
 import { Cause, Option, Effect } from "effect"
 import {
@@ -632,7 +632,7 @@ function ChatTitleBar({
             disabled={!workspacePanelAvailable}
             className="flex size-8 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-slate-150 dark:text-slate-400 dark:hover:bg-slate-800"
             aria-label="Expand sidebar"
-          ><PanelRight size={18} /></Button>
+          ><SidebarSimpleIcon size={18} /></Button>
         </span>
       }
     />
@@ -745,7 +745,7 @@ function ChatTitleBar({
               aria-label="Open sessions"
               onClick={onOpenSidebar}
             >
-              <Menu size={17} />
+              <ListIcon size={17} />
             </Button>
           }
         />
@@ -960,7 +960,7 @@ function AuthenticatedAppContent({
                         aria-label="Open settings navigation"
                         onClick={() => setSidebarVisible(true)}
                       >
-                        <Menu size={17} />
+                        <ListIcon size={17} />
                       </Button>
                     }
                   />
