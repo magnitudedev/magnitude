@@ -1,4 +1,5 @@
-import { CliLinkFailed, makeMacCliLink } from "./mac-cli-link"
+import { makeMacCliPath } from "./mac-cli-path"
+import { makeMacCliLink } from "./mac-cli-link"
 import { ApplicationUpdateControlFailed } from "@magnitudedev/sdk/desktop-host"
 import { makeRendererRecovery } from "./renderer-recovery"
 import { resolveQuitFailure } from "./quit-failure"
@@ -38,7 +39,7 @@ import {
   unixPrivateFilePermissions, windowsPrivateFilePermissions,
   nativeWindowsInstallerVerifier,
   adoptLinuxInstallationLease,
-  authorizeMacCliLink, MacUpdateHandoff, startMacUpdateHandoff, MacApplicationInstallation, PreparedUpdateStore, makePreparedUpdateStore, NativeMacApplicationInstallation, nativeMachineIdentity, ApplicationMemory, nativeApplicationMemoryLayer, observeApplicationMemory,
+  MacUpdateHandoff, startMacUpdateHandoff, MacApplicationInstallation, PreparedUpdateStore, makePreparedUpdateStore, NativeMacApplicationInstallation, nativeMachineIdentity, ApplicationMemory, nativeApplicationMemoryLayer, observeApplicationMemory,
 } from "@magnitudedev/daemon-management/desktop-native"
 import { ProcessGroupController } from "@magnitudedev/utils/process-groups"
 import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native"
@@ -325,10 +326,20 @@ const program = Effect.scoped(Effect.gen(function* () {
     return value
   }), value => Effect.sync(() => value.destroy()))
   const cliLink = process.platform === "darwin" && app.isPackaged && !isolatedProfile && app.isInApplicationsFolder()
-    ? yield* makeMacCliLink({ link: "/usr/local/bin/magnitude", target: join(process.resourcesPath, "magnitude"),
-      path: (yield* Fiber.join(harnessEnvironment)).PATH ?? "",
-      authorize: (link, target, remove) => authorizeMacCliLink(addonPath, link, target, remove).pipe(
-        Effect.mapError(error => new CliLinkFailed({ message: error.message }))),
+    ? yield* Effect.gen(function* () {
+      const environment = yield* Fiber.join(harnessEnvironment)
+      const link = yield* makeMacCliLink({ link: join(homedir(), ".magnitude/bin/magnitude"),
+        target: join(process.resourcesPath, "magnitude"), path: environment.PATH ?? "" })
+      const path = yield* makeMacCliPath(homedir(), environment)
+      const registration = yield* Effect.makeSemaphore(1)
+      return {
+        install: registration.withPermits(1)(link.install.pipe(Effect.zipRight(path.install))),
+        remove: registration.withPermits(1)(Effect.gen(function* () {
+          if ((yield* link.read) !== "Installed") return
+          yield* path.remove
+          yield* link.remove
+        })),
+      }
     }).pipe(Effect.provide(NodeContext.layer)) : undefined
   const installCli = cliLink?.install ?? Effect.void
   const cliResult = (operation: typeof installCli) => operation.pipe(

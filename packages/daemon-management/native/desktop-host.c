@@ -23,9 +23,6 @@ void magnitude_register_windows_updates(napi_env env, napi_value exports);
 #include <unistd.h>
 #endif
 
-#ifdef __APPLE__
-void magnitude_register_mac_cli_link(napi_env env, napi_value exports);
-#endif
 
 void magnitude_register_application_memory(napi_env env, napi_value exports);
 void magnitude_register_machine_identity(napi_env env, napi_value exports);
@@ -364,9 +361,6 @@ static napi_value init(napi_env env, napi_value exports) {
   magnitude_register_windows_jobs(env, exports);
   magnitude_register_windows_observers(env, exports);
   magnitude_register_windows_updates(env, exports);
-  #endif
-  #ifdef __APPLE__
-  magnitude_register_mac_cli_link(env, exports);
   #endif
   magnitude_register_application_memory(env, exports);
   magnitude_register_machine_identity(env, exports);
