@@ -1,7 +1,7 @@
 [
   {
     "id": "book16",
-    "file": "book16.png",
+    "file": "book16.webp",
     "subject": "16-inch MacBook Pro",
     "manufacturer": "Apple",
     "source": "https://www.apple.com/shop/refurbished/mac",
@@ -21,11 +21,20 @@
         "Mac15,9",
         "Mac15,11"
       ]
+    },
+    "category": "Laptop",
+    "framing": {
+      "sourceWidth": 960,
+      "sourceHeight": 960,
+      "x": 47,
+      "y": 215,
+      "width": 866,
+      "height": 531
     }
   },
   {
     "id": "book14",
-    "file": "book14.png",
+    "file": "book14.webp",
     "subject": "14-inch MacBook Pro",
     "manufacturer": "Apple",
     "source": "https://www.apple.com/shop/refurbished/mac",
@@ -48,11 +57,20 @@
         "Mac15,8",
         "Mac15,10"
       ]
+    },
+    "category": "Laptop",
+    "framing": {
+      "sourceWidth": 960,
+      "sourceHeight": 960,
+      "x": 100,
+      "y": 249,
+      "width": 761,
+      "height": 462
     }
   },
   {
     "id": "air13",
-    "file": "air13.png",
+    "file": "air13.webp",
     "subject": "13-inch MacBook Air",
     "manufacturer": "Apple",
     "source": "https://www.apple.com/shop/refurbished/mac",
@@ -65,11 +83,20 @@
         "Mac14,2",
         "Mac15,12"
       ]
+    },
+    "category": "Laptop",
+    "framing": {
+      "sourceWidth": 960,
+      "sourceHeight": 960,
+      "x": 109,
+      "y": 273,
+      "width": 742,
+      "height": 452
     }
   },
   {
     "id": "air15-m4",
-    "file": "air15-m4.png",
+    "file": "air15-m4.webp",
     "subject": "15-inch MacBook Air",
     "manufacturer": "Apple",
     "source": "https://www.apple.com/shop/refurbished/mac",
@@ -82,11 +109,20 @@
         "Mac14,15",
         "Mac15,13"
       ]
+    },
+    "category": "Laptop",
+    "framing": {
+      "sourceWidth": 960,
+      "sourceHeight": 960,
+      "x": 9,
+      "y": 193,
+      "width": 943,
+      "height": 574
     }
   },
   {
     "id": "air13-m1",
-    "file": "air13-m1.png",
+    "file": "air13-m1.webp",
     "subject": "MacBook Air (M1)",
     "manufacturer": "Apple",
     "source": "https://www.apple.com/shop/refurbished/mac",
@@ -96,11 +132,20 @@
       "models": [
         "MacBookAir10,1"
       ]
+    },
+    "category": "Laptop",
+    "framing": {
+      "sourceWidth": 960,
+      "sourceHeight": 960,
+      "x": 48,
+      "y": 229,
+      "width": 866,
+      "height": 503
     }
   },
   {
     "id": "pro13-m1",
-    "file": "pro13-m1.png",
+    "file": "pro13-m1.webp",
     "subject": "13-inch MacBook Pro (M1 / M2)",
     "manufacturer": "Apple",
     "source": "https://www.apple.com/shop/refurbished/mac",
@@ -111,15 +156,24 @@
         "MacBookPro17,1",
         "Mac14,7"
       ]
+    },
+    "category": "Laptop",
+    "framing": {
+      "sourceWidth": 960,
+      "sourceHeight": 960,
+      "x": 66,
+      "y": 95,
+      "width": 828,
+      "height": 791
     }
   },
   {
     "id": "studio",
-    "file": "studio.png",
+    "file": "studio.webp",
     "subject": "Mac Studio",
     "manufacturer": "Apple",
-    "source": "https://www.apple.com/shop/buy-mac/mac-studio",
-    "imageUrl": "https://store.storeimages.cdn-apple.com/4982/as-images.apple.com/is/mac-studio-select-202503?wid=1200&hei=1200&fmt=png-alpha",
+    "source": "https://www.apple.com/mac-studio/",
+    "imageUrl": "https://store.storeimages.cdn-apple.com/8756/as-images.apple.com/is/mac-studio-202203-gallery-3?wid=4000&hei=3072&fmt=png-alpha&.v=1644975841189",
     "match": {
       "_tag": "Apple",
       "models": [
@@ -130,26 +184,44 @@
         "Mac15,14",
         "Mac16,9"
       ]
+    },
+    "category": "Workstation",
+    "framing": {
+      "sourceWidth": 1472,
+      "sourceHeight": 1130,
+      "x": 254,
+      "y": 350,
+      "width": 964,
+      "height": 473
     }
   },
   {
     "id": "mini",
-    "file": "mini.png",
+    "file": "mini.webp",
     "subject": "Mac mini (2024)",
     "manufacturer": "Apple",
-    "source": "https://www.apple.com/shop/buy-mac/mac-mini",
-    "imageUrl": "https://store.storeimages.cdn-apple.com/4982/as-images.apple.com/is/mac-mini-select-202410?wid=1200&hei=1200&fmt=png-alpha",
+    "source": "https://support.apple.com/en-us/121555",
+    "imageUrl": "https://store.storeimages.cdn-apple.com/4982/as-images.apple.com/is/mac-mini-202410-gallery-1?wid=4000&hei=3074&fmt=png-alpha",
     "match": {
       "_tag": "Apple",
       "models": [
         "Mac16,10",
         "Mac16,11"
       ]
+    },
+    "category": "Mini PC",
+    "framing": {
+      "sourceWidth": 1440,
+      "sourceHeight": 1107,
+      "x": 238,
+      "y": 360,
+      "width": 965,
+      "height": 387
     }
   },
   {
     "id": "mini-m1",
-    "file": "mini-m1.png",
+    "file": "mini-m1.webp",
     "subject": "Mac mini (M1 / M2)",
     "manufacturer": "Apple",
     "source": "https://www.apple.com/shop/refurbished/mac",
@@ -161,11 +233,20 @@
         "Mac14,3",
         "Mac14,12"
       ]
+    },
+    "category": "Mini PC",
+    "framing": {
+      "sourceWidth": 960,
+      "sourceHeight": 960,
+      "x": 30,
+      "y": 281,
+      "width": 901,
+      "height": 313
     }
   },
   {
     "id": "imac-m4",
-    "file": "imac-m4.png",
+    "file": "imac-m4.webp",
     "subject": "24-inch iMac (M4)",
     "manufacturer": "Apple",
     "source": "https://www.apple.com/shop/refurbished/mac",
@@ -180,26 +261,44 @@
         "Mac15,4",
         "Mac15,5"
       ]
+    },
+    "category": "All-in-one",
+    "framing": {
+      "sourceWidth": 960,
+      "sourceHeight": 960,
+      "x": 131,
+      "y": 192,
+      "width": 699,
+      "height": 630
     }
   },
   {
     "id": "mac-pro-2013",
-    "file": "mac-pro-2013.jpg",
+    "file": "mac-pro-2013.webp",
     "subject": "Mac Pro",
     "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/102887",
-    "imageUrl": "https://cdsassets.apple.com/live/7WUAS350/images/mac-pro/id-mac-pro-2013.jpg",
+    "source": "https://theapplewiki.com/wiki/File:Mac_Pro_(Late_2013).webp",
+    "imageUrl": "https://theapplewiki.com/images/applewiki/7/76/Mac_Pro_%28Late_2013%29.webp",
     "match": {
       "_tag": "Apple",
       "models": [
         "MacPro6,1"
       ]
+    },
+    "category": "Desktop",
+    "framing": {
+      "sourceWidth": 551,
+      "sourceHeight": 960,
+      "x": 0,
+      "y": 0,
+      "width": 551,
+      "height": 960
     }
   },
   {
     "id": "rtx5090",
-    "file": "rtx5090.png",
-    "subject": "GeForce RTX 5090 Founders Edition",
+    "file": "rtx5090.webp",
+    "subject": "GeForce RTX 5090",
     "manufacturer": "PNY",
     "source": "https://www.pny.com/geforce-rtx-5090-models?sku=VCG509032TFXPB1",
     "imageUrl": "https://d2vfia6k6wrouk.cloudfront.net/productimages/74e8f739-cf99-4cad-bccd-b25f00affcce/images/2-pny-rtx-5090-std-triple-fan-ra.png",
@@ -209,11 +308,20 @@
         "RTX 5090",
         "RTX 5090 Founders Edition"
       ]
+    },
+    "category": "Graphics card",
+    "framing": {
+      "sourceWidth": 800,
+      "sourceHeight": 800,
+      "x": 40,
+      "y": 116,
+      "width": 720,
+      "height": 568
     }
   },
   {
     "id": "rtx5080",
-    "file": "rtx5080.png",
+    "file": "rtx5080.webp",
     "subject": "NVIDIA GeForce RTX 5080",
     "manufacturer": "PNY",
     "source": "https://www.pny.com/geforce-rtx-5080-models",
@@ -224,11 +332,20 @@
         "RTX 5080",
         "NVIDIA GeForce RTX 5080"
       ]
+    },
+    "category": "Graphics card",
+    "framing": {
+      "sourceWidth": 800,
+      "sourceHeight": 800,
+      "x": 41,
+      "y": 122,
+      "width": 718,
+      "height": 556
     }
   },
   {
     "id": "rtx5070ti",
-    "file": "rtx5070ti.png",
+    "file": "rtx5070ti.webp",
     "subject": "RTX 5070 Ti",
     "manufacturer": "PNY",
     "source": "https://www.pny.com/geforce-rtx-5070-ti-models",
@@ -238,11 +355,20 @@
       "names": [
         "RTX 5070 Ti"
       ]
+    },
+    "category": "Graphics card",
+    "framing": {
+      "sourceWidth": 800,
+      "sourceHeight": 800,
+      "x": 40,
+      "y": 161,
+      "width": 720,
+      "height": 478
     }
   },
   {
     "id": "rtx5070",
-    "file": "rtx5070.png",
+    "file": "rtx5070.webp",
     "subject": "NVIDIA GeForce RTX 5070",
     "manufacturer": "PNY",
     "source": "https://www.pny.com/geforce-rtx-5070-models",
@@ -253,11 +379,20 @@
         "RTX 5070",
         "NVIDIA GeForce RTX 5070"
       ]
+    },
+    "category": "Graphics card",
+    "framing": {
+      "sourceWidth": 800,
+      "sourceHeight": 800,
+      "x": 41,
+      "y": 147,
+      "width": 719,
+      "height": 506
     }
   },
   {
     "id": "rtx5060",
-    "file": "rtx5060.png",
+    "file": "rtx5060.webp",
     "subject": "RTX 5060",
     "manufacturer": "PNY",
     "source": "https://www.pny.com/geforce-rtx-5060-8gb-models?sku=VCG50608DFXPB1",
@@ -267,11 +402,20 @@
       "names": [
         "RTX 5060"
       ]
+    },
+    "category": "Graphics card",
+    "framing": {
+      "sourceWidth": 800,
+      "sourceHeight": 800,
+      "x": 40,
+      "y": 104,
+      "width": 720,
+      "height": 592
     }
   },
   {
     "id": "rtx4090",
-    "file": "rtx4090.png",
+    "file": "rtx4090.webp",
     "subject": "RTX 4090",
     "manufacturer": "PNY",
     "source": "https://www.pny.com/pny-geforce-rtx-4090-24gb-verto-triple-fan-led",
@@ -281,11 +425,20 @@
       "names": [
         "RTX 4090"
       ]
+    },
+    "category": "Graphics card",
+    "framing": {
+      "sourceWidth": 800,
+      "sourceHeight": 800,
+      "x": 40,
+      "y": 68,
+      "width": 720,
+      "height": 664
     }
   },
   {
     "id": "rtx4070super",
-    "file": "rtx4070super.png",
+    "file": "rtx4070super.webp",
     "subject": "RTX 4070 SUPER",
     "manufacturer": "PNY",
     "source": "https://www.pny.com/pny-geforce-rtx-4070-super-12-gb-verto-oc-edition-dual-fan",
@@ -295,11 +448,20 @@
       "names": [
         "RTX 4070 SUPER"
       ]
+    },
+    "category": "Graphics card",
+    "framing": {
+      "sourceWidth": 800,
+      "sourceHeight": 800,
+      "x": 40,
+      "y": 110,
+      "width": 720,
+      "height": 580
     }
   },
   {
     "id": "rtx3070",
-    "file": "rtx3070.png",
+    "file": "rtx3070.webp",
     "subject": "RTX 3070",
     "manufacturer": "PNY",
     "source": "https://www.pny.com/geforc-rtx-3070-uprising-lhr",
@@ -309,11 +471,20 @@
       "names": [
         "RTX 3070"
       ]
+    },
+    "category": "Graphics card",
+    "framing": {
+      "sourceWidth": 1000,
+      "sourceHeight": 1000,
+      "x": 52,
+      "y": 117,
+      "width": 895,
+      "height": 765
     }
   },
   {
     "id": "rtx3060",
-    "file": "rtx3060.png",
+    "file": "rtx3060.webp",
     "subject": "RTX 3060",
     "manufacturer": "PNY",
     "source": "https://www.pny.com/geforce-rtx-3060-12gb-xlr8-gaming-revel-epic-x-rgb-df",
@@ -323,81 +494,99 @@
       "names": [
         "RTX 3060"
       ]
+    },
+    "category": "Graphics card",
+    "framing": {
+      "sourceWidth": 800,
+      "sourceHeight": 800,
+      "x": 45,
+      "y": 220,
+      "width": 712,
+      "height": 349
     }
   },
   {
     "id": "rtx3090",
-    "file": "rtx3090.jpg",
+    "file": "rtx3090.webp",
     "subject": "RTX 3090",
-    "manufacturer": "NVIDIA",
-    "source": "https://www.nvidia.com/en-us/geforce/graphics-cards/30-series/rtx-3090-3090ti/",
-    "imageUrl": "https://www.nvidia.com/content/dam/en-zz/Solutions/geforce/ampere/rtx-3090/geforce-rtx-3090-product-gallery-full-screen-3840-2.jpg",
+    "manufacturer": "PNY",
+    "source": "https://www.pny.com/geforce-rtx-3090-xlr8-gaming-epic-x-rgb-triple-fan-m",
+    "imageUrl": "https://d2vfia6k6wrouk.cloudfront.net/productimages/202b98f0-cf51-4663-8a7e-ac290120d917/images/o-2-xlr8-rtx-3090-epic-x-triple-fan-m-ra-2-no-logo.png",
     "match": {
       "_tag": "Gpu",
       "names": [
         "RTX 3090"
       ]
+    },
+    "category": "Graphics card",
+    "framing": {
+      "sourceWidth": 1000,
+      "sourceHeight": 1000,
+      "x": 115,
+      "y": 115,
+      "width": 771,
+      "height": 771
     }
   },
   {
     "id": "rx6800xt",
-    "file": "rx6800xt.jpg",
-    "subject": "RX 6800 XT",
-    "manufacturer": "AMD",
-    "source": "https://www.amd.com/en/products/graphics/desktops.html",
-    "imageUrl": "https://www.amd.com/content/dam/amd/en/images/products/graphics/2648997-amd-radeon-6800xt.jpg",
+    "file": "rx6800xt.webp",
+    "subject": "Radeon RX 6800 XT / 6900 XT",
+    "manufacturer": "PowerColor",
+    "source": "https://www.powercolor.com/product-detail191.htm",
+    "imageUrl": "https://www.powercolor.com/Upload/202410/product_2024100410485007.webp",
     "match": {
       "_tag": "Gpu",
       "names": [
-        "RX 6800 XT"
-      ]
-    }
-  },
-  {
-    "id": "rx6900xt",
-    "file": "rx6900xt.jpg",
-    "subject": "RX 6900 XT",
-    "manufacturer": "AMD",
-    "source": "https://www.amd.com/en/products/graphics/desktops.html",
-    "imageUrl": "https://www.amd.com/content/dam/amd/en/images/products/graphics/2648997-amd-radeon-6900xt.jpg",
-    "match": {
-      "_tag": "Gpu",
-      "names": [
+        "RX 6800 XT",
         "RX 6900 XT"
       ]
-    }
-  },
-  {
-    "id": "rx7900xt",
-    "file": "rx7900xt.jpg",
-    "subject": "RX 7900 XT",
-    "manufacturer": "AMD",
-    "source": "https://www.amd.com/en/products/graphics/desktops.html",
-    "imageUrl": "https://www.amd.com/content/dam/amd/en/images/products/graphics/2648997-amd-radeon-7900xt.jpg",
-    "match": {
-      "_tag": "Gpu",
-      "names": [
-        "RX 7900 XT"
-      ]
+    },
+    "category": "Graphics card",
+    "sharedDesignSources": [
+      "https://www.powercolor.com/product-detail191.htm",
+      "https://www.powercolor.com/product-detail176.htm"
+    ],
+    "framing": {
+      "sourceWidth": 900,
+      "sourceHeight": 500,
+      "x": 25,
+      "y": 29,
+      "width": 851,
+      "height": 442
     }
   },
   {
     "id": "rx7900xtx",
-    "file": "rx7900xtx.jpg",
-    "subject": "RX 7900 XTX",
-    "manufacturer": "AMD",
-    "source": "https://www.amd.com/en/products/graphics/desktops.html",
-    "imageUrl": "https://www.amd.com/content/dam/amd/en/images/products/graphics/2648997-amd-radeon-7900xtx.jpg",
+    "file": "rx7900.webp",
+    "subject": "Radeon RX 7900 XT / XTX",
+    "manufacturer": "PowerColor",
+    "source": "https://www.powercolor.com/product-detail72.htm",
+    "imageUrl": "https://www.powercolor.com/Upload/202408/product_2024081511444607.webp",
     "match": {
       "_tag": "Gpu",
       "names": [
-        "RX 7900 XTX"
+        "RX 7900 XTX",
+        "RX 7900 XT"
       ]
+    },
+    "category": "Graphics card",
+    "sharedDesignSources": [
+      "https://www.powercolor.com/product-detail72.htm",
+      "https://www.powercolor.com/product-detail120.htm"
+    ],
+    "framing": {
+      "sourceWidth": 900,
+      "sourceHeight": 500,
+      "x": 24,
+      "y": 18,
+      "width": 860,
+      "height": 465
     }
   },
   {
     "id": "arc-b580",
-    "file": "arc-b580.png",
+    "file": "arc-b580.webp",
     "subject": "Arc B580",
     "manufacturer": "SPARKLE",
     "source": "https://www.sparkle.com.tw/tw/products/view/6893fe373180",
@@ -407,11 +596,20 @@
       "names": [
         "Arc B580"
       ]
+    },
+    "category": "Graphics card",
+    "framing": {
+      "sourceWidth": 960,
+      "sourceHeight": 960,
+      "x": 64,
+      "y": 312,
+      "width": 832,
+      "height": 336
     }
   },
   {
     "id": "rx580",
-    "file": "rx580.png",
+    "file": "rx580.webp",
     "subject": "RX 580",
     "manufacturer": "SAPPHIRE",
     "source": "https://www.sapphiretech.com/en/consumer/pulse-rx-580-8g-g5",
@@ -421,25 +619,43 @@
       "names": [
         "RX 580"
       ]
+    },
+    "category": "Graphics card",
+    "framing": {
+      "sourceWidth": 800,
+      "sourceHeight": 500,
+      "x": 53,
+      "y": 15,
+      "width": 678,
+      "height": 485
     }
   },
   {
     "id": "rx9060xt",
-    "file": "rx9060xt.jpg",
+    "file": "rx9060xt.webp",
     "subject": "RX 9060 XT",
-    "manufacturer": "SAPPHIRE",
-    "source": "https://www.sapphiretech.com/en/consumer/pulse-radeon-rx-9060-xt-16g-gddr6",
-    "imageUrl": "https://media.cdn.sapphiretech.com.cn/-/media/sites/sapphire/pim/product-images/11350_03_rx9060xt_pulse_16ggddr6/rx9060xt_pulse_16gb_photo_c01_800x500.ashx?v=a513c6c1e3224d2f9d27eb34c56e355d",
+    "manufacturer": "PowerColor",
+    "source": "https://www.powercolor.com/product-detail249.htm",
+    "imageUrl": "https://www.powercolor.com/Upload/202505/1748497844_dafb868f4637382e.webp",
     "match": {
       "_tag": "Gpu",
       "names": [
         "RX 9060 XT"
       ]
+    },
+    "category": "Graphics card",
+    "framing": {
+      "sourceWidth": 900,
+      "sourceHeight": 500,
+      "x": 126,
+      "y": 132,
+      "width": 645,
+      "height": 249
     }
   },
   {
     "id": "arc-a770",
-    "file": "arc-a770.png",
+    "file": "arc-a770.webp",
     "subject": "Arc A770",
     "manufacturer": "SPARKLE",
     "source": "https://www.sparkle.com.tw/en/products/view/6A1A31428cBE",
@@ -449,11 +665,20 @@
       "names": [
         "Arc A770"
       ]
+    },
+    "category": "Graphics card",
+    "framing": {
+      "sourceWidth": 960,
+      "sourceHeight": 960,
+      "x": 36,
+      "y": 307,
+      "width": 882,
+      "height": 367
     }
   },
   {
     "id": "dgx-a100",
-    "file": "dgx-a100.png",
+    "file": "dgx-a100.webp",
     "subject": "NVIDIA DGX A100",
     "manufacturer": "NVIDIA",
     "source": "https://docs.nvidia.com/dgx/dgxa100-user-guide/introduction-to-dgxa100.html",
@@ -466,16 +691,26 @@
       ],
       "models": [
         "DGXA100 920-23687-2530-000"
-      ]
+      ],
+      "field": "model"
+    },
+    "category": "Server",
+    "framing": {
+      "sourceWidth": 639,
+      "sourceHeight": 325,
+      "x": 15,
+      "y": 7,
+      "width": 560,
+      "height": 311
     }
   },
   {
     "id": "surface-go",
-    "file": "surface-go.jpg",
+    "file": "surface-go.webp",
     "subject": "Surface Laptop Go",
     "manufacturer": "Microsoft",
-    "source": "https://www.domayne.com.au/microsoft-surface-laptop-go-12-4-inch-i5-8gb-256gb-ssd-laptop-platinum.html",
-    "imageUrl": "https://dmau.imgix.net/media/catalog/product/f/e/feature_01-platinum_2_2.jpg",
+    "source": "https://www.grover.com/nl-en/products/microsoft-laptop-microsoft-microsoft-surface-laptop-go-2020-english-qwerty-12-4-8gb-128gb-ssd-intel-uhd-graphics",
+    "imageUrl": "https://res-3.cloudinary.com/grover/image/upload/v1636364859/tlx9wk4xmlfxsmky0t65.png",
     "match": {
       "_tag": "Pc",
       "manufacturers": [
@@ -483,16 +718,26 @@
       ],
       "models": [
         "Surface Laptop Go"
-      ]
+      ],
+      "field": "model"
+    },
+    "category": "Laptop",
+    "framing": {
+      "sourceWidth": 960,
+      "sourceHeight": 540,
+      "x": 172,
+      "y": 56,
+      "width": 617,
+      "height": 434
     }
   },
   {
     "id": "surface-studio",
-    "file": "surface-studio.jpg",
+    "file": "surface-studio.webp",
     "subject": "Surface Laptop Studio",
     "manufacturer": "Microsoft",
-    "source": "https://www.walmart.com/ip/799143780",
-    "imageUrl": "https://i5.walmartimages.com/seo/Microsoft-Surface-Laptop-Studio-14-4-Pixel-Sense-Flow-Display-10-Point-Multi-touch-Intel-Core-H35-i5-11300H-16GB-RAM-512GB-SSD-Platinum-Windows-11-9W_b283a552-4a85-44aa-bc6d-041f134a6815.ea6ab6cc3b6d6b8e54c8af0858167b44.jpeg",
+    "source": "https://www.grover.com/de-en/products/microsoft-surface-laptop-studio-i5-11300h-14-4-16gb-256gb-english-qwerty",
+    "imageUrl": "https://res.cloudinary.com/grover/image/upload/v1659612339/zgzq1v1wumhxiabkdr9t.webp",
     "match": {
       "_tag": "Pc",
       "manufacturers": [
@@ -500,7 +745,471 @@
       ],
       "models": [
         "Surface Laptop Studio"
+      ],
+      "field": "model"
+    },
+    "category": "Laptop",
+    "framing": {
+      "sourceWidth": 2240,
+      "sourceHeight": 1619,
+      "x": 0,
+      "y": 0,
+      "width": 2240,
+      "height": 1619
+    }
+  },
+  {
+    "id": "dell-xps",
+    "file": "dell-xps.webp",
+    "subject": "Dell XPS 15 (2023)",
+    "manufacturer": "Dell",
+    "category": "Laptop",
+    "source": "https://www.dell.com/support/product-details/en-us/product/xps-15-9530-laptop/overview",
+    "imageUrl": "https://i.dell.com/is/image/DellContent/content/dam/ss2/product-images/dell-client-products/notebooks/xps-notebooks/xps-15-9530/spi/ng/notebook-xps-15-9530-t-silver-relsize-500-ng.psd?fmt=png-alpha&wid=1600",
+    "identitySources": [
+      "https://browser.geekbench.com/v6/cpu/10417413",
+      "https://www.dell.com/support/manuals/es-ar/xps-15-9530-laptop/xps-15-9530-setup-and-specifications/procesador?guid=guid-8f9ccf13-6058-450a-ab47-ab607f32696b&lang=es-mx"
+    ],
+    "match": {
+      "_tag": "Pc",
+      "field": "model",
+      "manufacturers": [
+        "Dell Inc.",
+        "Dell"
+      ],
+      "models": [
+        "XPS 15 9530"
       ]
+    },
+    "processorModels": [
+      "i5-13500H",
+      "i7-13620H",
+      "i7-13700H",
+      "i9-13900H"
+    ],
+    "framing": {
+      "sourceWidth": 960,
+      "sourceHeight": 395,
+      "x": 133,
+      "y": 0,
+      "width": 694,
+      "height": 387
+    }
+  },
+  {
+    "id": "dell-inspiron-open",
+    "file": "dell-inspiron-open.webp",
+    "subject": "Dell Inspiron 15 3520",
+    "manufacturer": "Dell",
+    "category": "Laptop",
+    "source": "https://www.dell.com/en-uk/shop/laptops-2-in-1-pcs/inspiron-15-laptop/spd/inspiron-15-3520-laptop",
+    "imageUrl": "https://i.dell.com/is/image/DellContent/content/dam/ss2/product-images/dell-client-products/notebooks/inspiron-notebooks/15-3520/media-gallery/in3520-cnb-05000ff090-sl.psd?fmt=png-alpha&wid=1600",
+    "identitySources": [
+      "https://www.dell.com/en-uk/shop/laptops-2-in-1-pcs/inspiron-15-laptop/spd/inspiron-15-3520-laptop"
+    ],
+    "match": {
+      "_tag": "Pc",
+      "field": "model",
+      "manufacturers": [
+        "Dell Inc.",
+        "Dell"
+      ],
+      "models": [
+        "Inspiron 15 3520",
+        "Inspiron 3520"
+      ]
+    },
+    "processorModels": [
+      "i7-1165G7",
+      "i5-1155G7",
+      "i5-1135G7",
+      "i3-1115G4",
+      "7505",
+      "i7-1255U",
+      "i5-1235U",
+      "i3-1215U",
+      "8505",
+      "7305"
+    ],
+    "framing": {
+      "sourceWidth": 960,
+      "sourceHeight": 637,
+      "x": 0,
+      "y": 0,
+      "width": 960,
+      "height": 636
+    }
+  },
+  {
+    "id": "dell-g15",
+    "file": "dell-g15.webp",
+    "subject": "Dell G15 5530",
+    "manufacturer": "Dell",
+    "category": "Gaming laptop",
+    "source": "https://www.dell.com/support/product-details/en-us/product/g-series-15-5530-laptop/overview",
+    "imageUrl": "https://i.dell.com/is/image/DellContent/content/dam/ss2/product-images/dell-client-products/notebooks/g-series/g15-5530/spi/black/ng/notebook-g15-5530-nt-black-relsize-500-ng.psd?fmt=png-alpha&wid=1600",
+    "identitySources": [
+      "https://www.dell.com/support/product-details/en-us/product/g-series-15-5530-laptop/overview"
+    ],
+    "match": {
+      "_tag": "Pc",
+      "field": "model",
+      "manufacturers": [
+        "Dell Inc.",
+        "Dell"
+      ],
+      "models": [
+        "Dell G15 5530",
+        "G15 5530"
+      ]
+    },
+    "framing": {
+      "sourceWidth": 1600,
+      "sourceHeight": 774,
+      "x": 219,
+      "y": 0,
+      "width": 1165,
+      "height": 766
+    }
+  },
+  {
+    "id": "hp-elitebook-co",
+    "file": "hp-elitebook-co.webp",
+    "subject": "HP EliteBook 840 G10",
+    "manufacturer": "HP",
+    "category": "Laptop",
+    "source": "https://www.hp.com/co-es/shop/laptop-hp-elitebook-840-g10-de-14-846v7lt.html",
+    "imageUrl": "https://co-media.hptiendaenlinea.com/catalog/product/8/4/846V7LT-1_T1715642932.png",
+    "identitySources": [
+      "https://www.hp.com/co-es/shop/laptop-hp-elitebook-840-g10-de-14-846v7lt.html"
+    ],
+    "match": {
+      "_tag": "Pc",
+      "field": "model",
+      "manufacturers": [
+        "HP",
+        "Hewlett-Packard"
+      ],
+      "models": [
+        "HP EliteBook 840 14 inch G10 Notebook PC"
+      ]
+    },
+    "framing": {
+      "sourceWidth": 1200,
+      "sourceHeight": 901,
+      "x": 65,
+      "y": 1,
+      "width": 1070,
+      "height": 900
+    }
+  },
+  {
+    "id": "hp-pavilion",
+    "file": "hp-pavilion.webp",
+    "subject": "HP Pavilion Plus 14-ey",
+    "manufacturer": "HP",
+    "category": "Laptop",
+    "source": "https://www.hp.com/us-en/shop/tech-takes/best-hp-laptops-for-photo-editing",
+    "imageUrl": "https://www.hp.com/content/dam/sites/worldwide/tech-takes/us-en/creative/best/best-hp-laptops-for-photo-editing/HP_Pavilion_Plus_Laptop_14_ey1067nr1724959423310318.png",
+    "identitySources": [
+      "https://h30434.www3.hp.com/t5/Notebook-Software-and-How-To-Questions/Can-t-access-to-support-this-device-HP-Pavilion-Plus-14/td-p/9019102"
+    ],
+    "match": {
+      "_tag": "Pc",
+      "field": "model",
+      "manufacturers": [
+        "HP",
+        "Hewlett-Packard"
+      ],
+      "models": [
+        "HP Pavilion Plus Laptop 14-ey0xxx",
+        "HP Pavilion Plus Laptop 14-ey1xxx"
+      ]
+    },
+    "framing": {
+      "sourceWidth": 575,
+      "sourceHeight": 432,
+      "x": 28,
+      "y": 0,
+      "width": 519,
+      "height": 432
+    }
+  },
+  {
+    "id": "hp-envy",
+    "file": "hp-envy.webp",
+    "subject": "HP Envy 17-cw",
+    "manufacturer": "HP",
+    "category": "Laptop",
+    "source": "https://www.hp.com/us-en/shop/tech-takes/best-hp-laptops-for-photo-editing",
+    "imageUrl": "https://www.hp.com/content/dam/sites/worldwide/tech-takes/us-en/creative/best/best-hp-laptops-for-photo-editing/HP_Envy_Laptop_17t_cw0001701983242745516.png",
+    "identitySources": [
+      "https://www.hp.com/us-en/shop/tech-takes/best-hp-laptops-for-photo-editing"
+    ],
+    "match": {
+      "_tag": "Pc",
+      "field": "model",
+      "manufacturers": [
+        "HP",
+        "Hewlett-Packard"
+      ],
+      "models": [
+        "HP ENVY Laptop 17-cw0xxx",
+        "HP Envy Laptop 17-cw1xxx"
+      ]
+    },
+    "framing": {
+      "sourceWidth": 500,
+      "sourceHeight": 376,
+      "x": 6,
+      "y": 0,
+      "width": 487,
+      "height": 376
+    }
+  },
+  {
+    "id": "rog-g14",
+    "file": "rog-g14.webp",
+    "subject": "ASUS ROG Zephyrus G14 (2024)",
+    "manufacturer": "ASUS",
+    "category": "Gaming laptop",
+    "source": "https://rog.asus.com/us/laptops/rog-zephyrus/rog-zephyrus-g14-2024/",
+    "imageUrl": "https://dlcdnwebimgs.asus.com/files/media/F78BEA60-7937-4C78-A45A-F1AE66AADC68/v1/images/large/1x/software_laptop.png",
+    "identitySources": [
+      "https://browser.geekbench.com/v6/cpu/9585031"
+    ],
+    "match": {
+      "_tag": "Pc",
+      "field": "model",
+      "manufacturers": [
+        "ASUSTeK COMPUTER INC.",
+        "ASUS"
+      ],
+      "models": [
+        "ROG Zephyrus G14 GA403UI_GA403UI",
+        "ROG Zephyrus G14 GA403UV_GA403UV",
+        "ROG Zephyrus G14 GA403UU_GA403UU"
+      ]
+    },
+    "framing": {
+      "sourceWidth": 960,
+      "sourceHeight": 669,
+      "x": 0,
+      "y": 0,
+      "width": 960,
+      "height": 669
+    }
+  },
+  {
+    "id": "rog-z13",
+    "file": "rog-z13.webp",
+    "subject": "ASUS ROG Flow Z13 (2025)",
+    "manufacturer": "ASUS",
+    "category": "Gaming tablet",
+    "source": "https://rog.asus.com/laptops/rog-flow/rog-flow-z13-2025/",
+    "imageUrl": "https://dlcdnwebimgs.asus.com/files/media/2523515c-4a57-41a5-9004-67490621ae51/v1/images/large/1x/software_z13.png",
+    "identitySources": [
+      "https://retrace.fedoraproject.org/faf/reports/1244251/"
+    ],
+    "match": {
+      "_tag": "Pc",
+      "field": "model",
+      "manufacturers": [
+        "ASUSTeK COMPUTER INC.",
+        "ASUS"
+      ],
+      "models": [
+        "ROG Flow Z13 GZ302EA_GZ302EA"
+      ]
+    },
+    "framing": {
+      "sourceWidth": 1000,
+      "sourceHeight": 808,
+      "x": 0,
+      "y": 0,
+      "width": 1000,
+      "height": 808
+    }
+  },
+  {
+    "id": "dgx-spark",
+    "file": "dgx-spark.webp",
+    "subject": "NVIDIA DGX Spark",
+    "manufacturer": "NVIDIA",
+    "category": "AI mini PC",
+    "source": "https://www.pny.com/nvidia-dgx-spark",
+    "imageUrl": "https://d2vfia6k6wrouk.cloudfront.net/productimages/ef15a000-baca-4109-a81e-b2f9010d00f9/images/spark-3qtr-right.png",
+    "identitySources": [
+      "https://www.spec.org/cpu2026/results/res2026q2/cpu2026-20260210-00020.pdf"
+    ],
+    "match": {
+      "_tag": "Pc",
+      "field": "model",
+      "manufacturers": [
+        "NVIDIA"
+      ],
+      "models": [
+        "NVIDIA_DGX_Spark"
+      ]
+    },
+    "framing": {
+      "sourceWidth": 800,
+      "sourceHeight": 800,
+      "x": 98,
+      "y": 317,
+      "width": 605,
+      "height": 167
+    }
+  },
+  {
+    "id": "beelink-gtr9",
+    "file": "beelink-gtr9.webp",
+    "subject": "Beelink GTR9 Pro",
+    "manufacturer": "Beelink",
+    "category": "AI mini PC",
+    "source": "https://www.bee-link.com/products/beelink-gtr9-pro-amd-ryzen-ai-max-395",
+    "imageUrl": "https://cdn.shopify.com/s/files/1/0505/1360/8884/files/GTR9__01.png?v=1764744455",
+    "identitySources": [
+      "https://bbs.bee-link.com/d/11942-beelink-gtr-9-pro-v10-ethernet-disappearing"
+    ],
+    "match": {
+      "_tag": "Pc",
+      "field": "model",
+      "manufacturers": [
+        "AZW"
+      ],
+      "models": [
+        "GTR Pro"
+      ]
+    },
+    "framing": {
+      "sourceWidth": 960,
+      "sourceHeight": 960,
+      "x": 170,
+      "y": 241,
+      "width": 618,
+      "height": 485
+    }
+  },
+  {
+    "id": "minisforum-ms-s1",
+    "file": "minisforum-ms-s1.webp",
+    "subject": "MINISFORUM MS-S1 MAX",
+    "manufacturer": "MINISFORUM",
+    "category": "AI mini PC",
+    "source": "https://store.minisforum.com/products/ms-s1-max",
+    "imageUrl": "https://cdn.shopify.com/s/files/1/0401/1032/5921/files/Compressed_MS-S1_Max.png?v=1784442536",
+    "identitySources": [
+      "https://browser.geekbench.com/v6/cpu/15772202"
+    ],
+    "match": {
+      "_tag": "Pc",
+      "field": "model",
+      "manufacturers": [
+        "Micro Computer (HK) Tech Limited",
+        "Meigao Innovation Technology (Shen Zhen) Co., Ltd"
+      ],
+      "models": [
+        "MS-S1 MAX"
+      ]
+    },
+    "framing": {
+      "sourceWidth": 960,
+      "sourceHeight": 960,
+      "x": 255,
+      "y": 153,
+      "width": 419,
+      "height": 654
+    }
+  },
+  {
+    "id": "hp-z2a",
+    "file": "hp-z2a.webp",
+    "subject": "HP Z2 Mini G1a",
+    "manufacturer": "HP",
+    "category": "AI mini PC",
+    "source": "https://www.hp.com/us-en/workstations/z2-mini-a.html",
+    "imageUrl": "https://www.hp.com/content/dam/sites/worldwide/personal-computers/commercial/workstations/z2-mini-a/hero-z-2-mini-desktopnew.png",
+    "identitySources": [
+      "https://lists.ubuntu.com/archives/kernel-team/2026-January/165070.html"
+    ],
+    "match": {
+      "_tag": "Pc",
+      "field": "model",
+      "manufacturers": [
+        "HP"
+      ],
+      "models": [
+        "HP Z2 Mini G1a Workstation Desktop PC"
+      ]
+    },
+    "framing": {
+      "sourceWidth": 960,
+      "sourceHeight": 452,
+      "x": 174,
+      "y": 67,
+      "width": 579,
+      "height": 318
+    }
+  },
+  {
+    "id": "hp-zbook",
+    "file": "hp-zbook.webp",
+    "subject": "HP ZBook Ultra G1a 14",
+    "manufacturer": "HP",
+    "category": "Mobile workstation",
+    "source": "https://www.hp.com/us-en/workstations/zbook-ultra.html",
+    "imageUrl": "https://www.hp.com/content/dam/sites/worldwide/personal-computers/commercial/workstations/zbook-ultra/mobility-image-desktop.png",
+    "identitySources": [
+      "https://browser.geekbench.com/v6/cpu/18457102"
+    ],
+    "match": {
+      "_tag": "Pc",
+      "field": "model",
+      "manufacturers": [
+        "HP"
+      ],
+      "models": [
+        "HP ZBook Ultra G1a 14 inch Mobile Workstation PC"
+      ]
+    },
+    "framing": {
+      "sourceWidth": 1276,
+      "sourceHeight": 996,
+      "x": 104,
+      "y": 177,
+      "width": 1101,
+      "height": 771
+    }
+  },
+  {
+    "id": "thinkpad-t14",
+    "file": "thinkpad-t14.webp",
+    "subject": "ThinkPad T14 Gen 4",
+    "manufacturer": "Lenovo",
+    "category": "Laptop",
+    "source": "https://www.lenovo.com/us/en/p/len101t0057",
+    "imageUrl": "https://p4-ofp.static.pub//fes/cms/2024/03/27/mo52s9lzdkybc5gqgao9op5793fw47934281.png",
+    "identitySources": [
+      "https://bbs.archlinux.org/viewtopic.php?pid=2297242"
+    ],
+    "match": {
+      "_tag": "Pc",
+      "manufacturers": [
+        "LENOVO"
+      ],
+      "field": "version",
+      "models": [
+        "ThinkPad T14 Gen 4"
+      ]
+    },
+    "framing": {
+      "sourceWidth": 584,
+      "sourceHeight": 584,
+      "x": 12,
+      "y": 88,
+      "width": 560,
+      "height": 407
     }
   }
 ]

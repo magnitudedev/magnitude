@@ -6980,6 +6980,7 @@ mod tests {
             architecture: "test".to_owned(),
             system_product_name: Some("test-system".to_owned()),
             cpu_model: Some("test-cpu".to_owned()),
+            physical_cores: None,
             logical_cores: 1,
             system_memory: icn_contracts::HardwareSystemMemory {
                 physical_capacity_bytes: 10,

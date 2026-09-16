@@ -1,0 +1,666 @@
+[
+  {
+    "photoId": "book16",
+    "processors": [
+      "Apple M1 Pro",
+      "Apple M1 Max",
+      "Apple M2 Pro",
+      "Apple M2 Max",
+      "Apple M3 Pro",
+      "Apple M3 Max",
+      "Apple M4 Pro",
+      "Apple M4 Max",
+      "Apple M5 Pro",
+      "Apple M5 Max"
+    ],
+    "accelerators": [],
+    "sources": [
+      "https://support.apple.com/en-us/121553",
+      "https://support.apple.com/en-us/117736",
+      "https://support.apple.com/en-us/111902",
+      "https://support.apple.com/en-us/111900",
+      "https://support.apple.com/en-us/111340",
+      "https://support.apple.com/en-us/111835",
+      "https://support.apple.com/it-it/126318",
+      "https://support.apple.com/en-ie/126319"
+    ],
+    "configurationNote": "CPU chip name is observed. GPU bins vary within a chip name; use observed physical CPU cores only where the published mapping is unique. M1 Pro/Max/Ultra, M2 Max/Ultra, base M1\u2013M5 and M5 Max can retain GPU ambiguity. Memory capacity is always observed."
+  },
+  {
+    "photoId": "book14",
+    "processors": [
+      "Apple M1 Pro",
+      "Apple M1 Max",
+      "Apple M2 Pro",
+      "Apple M2 Max",
+      "Apple M3",
+      "Apple M3 Pro",
+      "Apple M3 Max",
+      "Apple M4",
+      "Apple M4 Pro",
+      "Apple M4 Max",
+      "Apple M5",
+      "Apple M5 Pro",
+      "Apple M5 Max"
+    ],
+    "accelerators": [],
+    "sources": [
+      "https://support.apple.com/en-gb/121556",
+      "https://support.apple.com/en-us/121553",
+      "https://support.apple.com/en-us/117736",
+      "https://support.apple.com/en-us/111902",
+      "https://support.apple.com/en-us/111900",
+      "https://support.apple.com/en-us/111340",
+      "https://support.apple.com/en-us/111835",
+      "https://support.apple.com/en-us/118551",
+      "https://support.apple.com/en-ie/126320",
+      "https://support.apple.com/it-it/126318",
+      "https://support.apple.com/en-ie/126319"
+    ],
+    "configurationNote": "CPU chip name is observed. GPU bins vary within a chip name; use observed physical CPU cores only where the published mapping is unique. M1 Pro/Max/Ultra, M2 Max/Ultra, base M1\u2013M5 and M5 Max can retain GPU ambiguity. Memory capacity is always observed."
+  },
+  {
+    "photoId": "air13",
+    "processors": [
+      "Apple M2",
+      "Apple M3",
+      "Apple M4",
+      "Apple M5"
+    ],
+    "accelerators": [],
+    "sources": [
+      "https://support.apple.com/en-gb/121556",
+      "https://support.apple.com/en-us/111867",
+      "https://support.apple.com/en-us/118551",
+      "https://support.apple.com/en-ie/126320"
+    ],
+    "configurationNote": "CPU chip name is observed. GPU bins vary within a chip name; use observed physical CPU cores only where the published mapping is unique. M1 Pro/Max/Ultra, M2 Max/Ultra, base M1\u2013M5 and M5 Max can retain GPU ambiguity. Memory capacity is always observed."
+  },
+  {
+    "photoId": "air15-m4",
+    "processors": [
+      "Apple M2",
+      "Apple M3",
+      "Apple M4",
+      "Apple M5"
+    ],
+    "accelerators": [],
+    "sources": [
+      "https://support.apple.com/en-gb/121556",
+      "https://support.apple.com/en-us/111867",
+      "https://support.apple.com/en-us/118551",
+      "https://support.apple.com/en-ie/126320"
+    ],
+    "configurationNote": "CPU chip name is observed. GPU bins vary within a chip name; use observed physical CPU cores only where the published mapping is unique. M1 Pro/Max/Ultra, M2 Max/Ultra, base M1\u2013M5 and M5 Max can retain GPU ambiguity. Memory capacity is always observed."
+  },
+  {
+    "photoId": "air13-m1",
+    "processors": [
+      "Apple M1"
+    ],
+    "accelerators": [],
+    "sources": [
+      "https://support.apple.com/en-us/111883"
+    ],
+    "configurationNote": "CPU chip name is observed. GPU bins vary within a chip name; use observed physical CPU cores only where the published mapping is unique. M1 Pro/Max/Ultra, M2 Max/Ultra, base M1\u2013M5 and M5 Max can retain GPU ambiguity. Memory capacity is always observed."
+  },
+  {
+    "photoId": "pro13-m1",
+    "processors": [
+      "Apple M1",
+      "Apple M2"
+    ],
+    "accelerators": [],
+    "sources": [
+      "https://support.apple.com/en-us/111883",
+      "https://support.apple.com/en-us/111867"
+    ],
+    "configurationNote": "CPU chip name is observed. GPU bins vary within a chip name; use observed physical CPU cores only where the published mapping is unique. M1 Pro/Max/Ultra, M2 Max/Ultra, base M1\u2013M5 and M5 Max can retain GPU ambiguity. Memory capacity is always observed."
+  },
+  {
+    "photoId": "studio",
+    "processors": [
+      "Apple M1 Max",
+      "Apple M1 Ultra",
+      "Apple M2 Max",
+      "Apple M2 Ultra",
+      "Apple M3 Ultra",
+      "Apple M4 Max"
+    ],
+    "accelerators": [],
+    "sources": [
+      "https://support.apple.com/en-us/111900",
+      "https://support.apple.com/en-us/111835",
+      "https://support.apple.com/en-us/122211",
+      "https://support.apple.com/en-us/121553"
+    ],
+    "configurationNote": "CPU chip name is observed. GPU bins vary within a chip name; use observed physical CPU cores only where the published mapping is unique. M1 Pro/Max/Ultra, M2 Max/Ultra, base M1\u2013M5 and M5 Max can retain GPU ambiguity. Memory capacity is always observed."
+  },
+  {
+    "photoId": "mini",
+    "processors": [
+      "Apple M4",
+      "Apple M4 Pro"
+    ],
+    "accelerators": [],
+    "sources": [
+      "https://support.apple.com/en-gb/121556",
+      "https://support.apple.com/en-us/121553"
+    ],
+    "configurationNote": "CPU chip name is observed. GPU bins vary within a chip name; use observed physical CPU cores only where the published mapping is unique. M1 Pro/Max/Ultra, M2 Max/Ultra, base M1\u2013M5 and M5 Max can retain GPU ambiguity. Memory capacity is always observed."
+  },
+  {
+    "photoId": "mini-m1",
+    "processors": [
+      "Apple M1",
+      "Apple M2",
+      "Apple M2 Pro"
+    ],
+    "accelerators": [],
+    "sources": [
+      "https://support.apple.com/en-us/111883",
+      "https://support.apple.com/en-us/111867",
+      "https://support.apple.com/en-us/111340"
+    ],
+    "configurationNote": "CPU chip name is observed. GPU bins vary within a chip name; use observed physical CPU cores only where the published mapping is unique. M1 Pro/Max/Ultra, M2 Max/Ultra, base M1\u2013M5 and M5 Max can retain GPU ambiguity. Memory capacity is always observed."
+  },
+  {
+    "photoId": "imac-m4",
+    "processors": [
+      "Apple M1",
+      "Apple M3",
+      "Apple M4"
+    ],
+    "accelerators": [],
+    "sources": [
+      "https://support.apple.com/en-gb/121556",
+      "https://support.apple.com/en-us/111883",
+      "https://support.apple.com/en-us/118551"
+    ],
+    "configurationNote": "CPU chip name is observed. GPU bins vary within a chip name; use observed physical CPU cores only where the published mapping is unique. M1 Pro/Max/Ultra, M2 Max/Ultra, base M1\u2013M5 and M5 Max can retain GPU ambiguity. Memory capacity is always observed."
+  },
+  {
+    "photoId": "mac-pro-2013",
+    "processors": [
+      "Intel Xeon E5-1620 v2",
+      "Intel Xeon E5-1650 v2",
+      "Intel Xeon E5-1680 v2",
+      "Intel Xeon E5-2697 v2"
+    ],
+    "accelerators": [
+      "FirePro D300",
+      "FirePro D500",
+      "FirePro D700"
+    ],
+    "sources": [
+      "https://support.apple.com/en-la/112025"
+    ],
+    "configurationNote": "Factory CPU configurations are 4/6/8/12 cores. User CPU replacements are possible. D300/D500/D700 are distinct GPUs; Apple publishes an anomalous 1526 stream-processor count for D500; that unresolved count is omitted and only its unambiguous bandwidth is published."
+  },
+  {
+    "photoId": "rtx5090",
+    "processors": [],
+    "accelerators": [
+      "RTX 5090",
+      "RTX 5090 Founders Edition"
+    ],
+    "sources": [
+      "https://www.nvidia.com/en-us/geforce/graphics-cards/50-series/rtx-5090/"
+    ],
+    "configurationNote": "GPU core units are vendor-specific; observed VRAM is authoritative. Shared photo does not merge distinct chip specifications. CPU is not implied by a standalone GPU."
+  },
+  {
+    "photoId": "rtx5080",
+    "processors": [],
+    "accelerators": [
+      "RTX 5080",
+      "NVIDIA GeForce RTX 5080"
+    ],
+    "sources": [
+      "https://www.nvidia.com/en-us/geforce/graphics-cards/compare/"
+    ],
+    "configurationNote": "GPU core units are vendor-specific; observed VRAM is authoritative. Shared photo does not merge distinct chip specifications. CPU is not implied by a standalone GPU."
+  },
+  {
+    "photoId": "rtx5070ti",
+    "processors": [],
+    "accelerators": [
+      "RTX 5070 Ti"
+    ],
+    "sources": [
+      "https://www.nvidia.com/en-us/geforce/graphics-cards/compare/"
+    ],
+    "configurationNote": "GPU core units are vendor-specific; observed VRAM is authoritative. Shared photo does not merge distinct chip specifications. CPU is not implied by a standalone GPU."
+  },
+  {
+    "photoId": "rtx5070",
+    "processors": [],
+    "accelerators": [
+      "RTX 5070",
+      "NVIDIA GeForce RTX 5070"
+    ],
+    "sources": [
+      "https://www.nvidia.com/en-us/geforce/graphics-cards/compare/"
+    ],
+    "configurationNote": "GPU core units are vendor-specific; observed VRAM is authoritative. Shared photo does not merge distinct chip specifications. CPU is not implied by a standalone GPU."
+  },
+  {
+    "photoId": "rtx5060",
+    "processors": [],
+    "accelerators": [
+      "RTX 5060"
+    ],
+    "sources": [
+      "https://www.nvidia.com/en-us/geforce/graphics-cards/compare/"
+    ],
+    "configurationNote": "GPU core units are vendor-specific; observed VRAM is authoritative. Shared photo does not merge distinct chip specifications. CPU is not implied by a standalone GPU."
+  },
+  {
+    "photoId": "rtx4090",
+    "processors": [],
+    "accelerators": [
+      "RTX 4090"
+    ],
+    "sources": [
+      "https://images.nvidia.com/aem-dam/Solutions/geforce/ada/nvidia-ada-gpu-architecture.pdf"
+    ],
+    "configurationNote": "GPU core units are vendor-specific; observed VRAM is authoritative. Shared photo does not merge distinct chip specifications. CPU is not implied by a standalone GPU."
+  },
+  {
+    "photoId": "rtx4070super",
+    "processors": [],
+    "accelerators": [
+      "RTX 4070 SUPER"
+    ],
+    "sources": [
+      "https://www.nvidia.com/en-us/geforce/graphics-cards/compare/"
+    ],
+    "configurationNote": "GPU core units are vendor-specific; observed VRAM is authoritative. Shared photo does not merge distinct chip specifications. CPU is not implied by a standalone GPU."
+  },
+  {
+    "photoId": "rtx3070",
+    "processors": [],
+    "accelerators": [
+      "RTX 3070"
+    ],
+    "sources": [
+      "https://www.nvidia.com/en-us/geforce/graphics-cards/compare/"
+    ],
+    "configurationNote": "GPU core units are vendor-specific; observed VRAM is authoritative. Shared photo does not merge distinct chip specifications. CPU is not implied by a standalone GPU."
+  },
+  {
+    "photoId": "rtx3060",
+    "processors": [],
+    "accelerators": [
+      "RTX 3060"
+    ],
+    "sources": [
+      "https://www.nvidia.com/en-us/geforce/graphics-cards/compare/"
+    ],
+    "configurationNote": "GPU core units are vendor-specific; observed VRAM is authoritative. Shared photo does not merge distinct chip specifications. CPU is not implied by a standalone GPU."
+  },
+  {
+    "photoId": "rtx3090",
+    "processors": [],
+    "accelerators": [
+      "RTX 3090"
+    ],
+    "sources": [
+      "https://www.nvidia.com/en-us/geforce/graphics-cards/compare/"
+    ],
+    "configurationNote": "GPU core units are vendor-specific; observed VRAM is authoritative. Shared photo does not merge distinct chip specifications. CPU is not implied by a standalone GPU."
+  },
+  {
+    "photoId": "rx6800xt",
+    "processors": [],
+    "accelerators": [
+      "RX 6800 XT",
+      "RX 6900 XT"
+    ],
+    "sources": [
+      "https://rocm.docs.amd.com/en/docs-6.1.2/reference/gpu-arch-specs.html"
+    ],
+    "configurationNote": "GPU core units are vendor-specific; observed VRAM is authoritative. Shared photo does not merge distinct chip specifications. CPU is not implied by a standalone GPU."
+  },
+  {
+    "photoId": "rx7900xtx",
+    "processors": [],
+    "accelerators": [
+      "RX 7900 XTX",
+      "RX 7900 XT"
+    ],
+    "sources": [
+      "https://rocm.docs.amd.com/en/docs-6.1.2/reference/gpu-arch-specs.html"
+    ],
+    "configurationNote": "GPU core units are vendor-specific; observed VRAM is authoritative. Shared photo does not merge distinct chip specifications. CPU is not implied by a standalone GPU."
+  },
+  {
+    "photoId": "arc-b580",
+    "processors": [],
+    "accelerators": [
+      "Arc B580"
+    ],
+    "sources": [
+      "https://www.intel.com/content/www/us/en/products/sku/241598/intel-arc-b580-graphics/specifications.html"
+    ],
+    "configurationNote": "GPU core units are vendor-specific; observed VRAM is authoritative. Shared photo does not merge distinct chip specifications. CPU is not implied by a standalone GPU."
+  },
+  {
+    "photoId": "rx580",
+    "processors": [],
+    "accelerators": [
+      "RX 580"
+    ],
+    "sources": [
+      "https://www.sapphiretech.com/en/consumer/pulse-rx-580-4g-g5"
+    ],
+    "configurationNote": "GPU core units are vendor-specific; observed VRAM is authoritative. Shared photo does not merge distinct chip specifications. CPU is not implied by a standalone GPU."
+  },
+  {
+    "photoId": "rx9060xt",
+    "processors": [],
+    "accelerators": [
+      "RX 9060 XT"
+    ],
+    "sources": [
+      "https://ir.amd.com/news-events/press-releases/detail/1253/amd-introduces-new-radeon-graphics-cards-and-ryzen-threadripper-processors-at-computex-2025"
+    ],
+    "configurationNote": "GPU core units are vendor-specific; observed VRAM is authoritative. Shared photo does not merge distinct chip specifications. CPU is not implied by a standalone GPU."
+  },
+  {
+    "photoId": "arc-a770",
+    "processors": [],
+    "accelerators": [
+      "Arc A770"
+    ],
+    "sources": [
+      "https://game.intel.com/stories/intel-arc-graphics-qa-hardware-specs/"
+    ],
+    "configurationNote": "GPU core units are vendor-specific; observed VRAM is authoritative. Shared photo does not merge distinct chip specifications. CPU is not implied by a standalone GPU."
+  },
+  {
+    "photoId": "dgx-a100",
+    "processors": [
+      "AMD EPYC 7742"
+    ],
+    "accelerators": [
+      "A100-SXM4-40GB",
+      "A100-SXM4-80GB"
+    ],
+    "sources": [
+      "https://docs.nvidia.com/dgx/dgxa100-user-guide/introduction-to-dgxa100.html"
+    ],
+    "configurationNote": "Two EPYC 7742 sockets: published 64 CPU cores is per processor, not total. Eight A100 GPUs can have 40 or 80 GB each; retain separate observed device memory domains."
+  },
+  {
+    "photoId": "surface-go",
+    "processors": [
+      "Intel Core i5-1035G1"
+    ],
+    "accelerators": [],
+    "sources": [
+      "https://support.microsoft.com/nl-nl/surface/models/surface-laptop-go-1st-gen-specs-and-features"
+    ],
+    "configurationNote": "Match the observed exact processor SKU, not the enclosure family. Installed GPU and memory configuration remain observations; generic Iris Xe/UHD/Radeon names do not prove an exact GPU core count or memory bandwidth."
+  },
+  {
+    "photoId": "surface-studio",
+    "processors": [
+      "Intel Core i5-11300H",
+      "Intel Core i7-11370H"
+    ],
+    "accelerators": [
+      "RTX 3050 Ti Laptop GPU",
+      "RTX A2000 Laptop GPU"
+    ],
+    "sources": [
+      "https://news.microsoft.com/wp-content/uploads/prod/sites/617/2021/09/Surface-Laptop-Studio-Fact-Sheet.pdf"
+    ],
+    "configurationNote": "Match the observed exact processor SKU, not the enclosure family. Installed GPU and memory configuration remain observations; generic Iris Xe/UHD/Radeon names do not prove an exact GPU core count or memory bandwidth."
+  },
+  {
+    "photoId": "dell-xps",
+    "processors": [
+      "Intel Core i5-13500H",
+      "Intel Core i7-13620H",
+      "Intel Core i7-13700H",
+      "Intel Core i9-13900H"
+    ],
+    "accelerators": [
+      "Arc A370M",
+      "RTX 4050 Laptop GPU",
+      "RTX 4060 Laptop GPU",
+      "RTX 4070 Laptop GPU"
+    ],
+    "sources": [
+      "https://www.dell.com/support/manuals/en-us/xps-15-9530-laptop/xps-15-9530-setup-and-specifications/processor?guid=guid-8f9ccf13-6058-450a-ab47-ab607f32696b&lang=en-us"
+    ],
+    "configurationNote": "Match the observed exact processor SKU, not the enclosure family. Installed GPU and memory configuration remain observations; generic Iris Xe/UHD/Radeon names do not prove an exact GPU core count or memory bandwidth."
+  },
+  {
+    "photoId": "dell-inspiron-open",
+    "processors": [
+      "Intel Core i7-1165G7",
+      "Intel Core i5-1155G7",
+      "Intel Core i5-1135G7",
+      "Intel Core i3-1115G4",
+      "Intel Core i7-1255U",
+      "Intel Core i5-1235U",
+      "Intel Core i3-1215U",
+      "Intel Pentium Gold 7505",
+      "Intel Pentium Gold 8505",
+      "Intel Celeron 7305"
+    ],
+    "accelerators": [],
+    "sources": [
+      "https://www.dell.com/support/manuals/en-us/inspiron-15-3520-laptop/inspiron_3520_ss/processor?guid=guid-3fa8a438-c8cd-4d01-b101-3924958b26fe"
+    ],
+    "configurationNote": "Match the observed exact processor SKU, not the enclosure family. Installed GPU and memory configuration remain observations; generic Iris Xe/UHD/Radeon names do not prove an exact GPU core count or memory bandwidth."
+  },
+  {
+    "photoId": "dell-g15",
+    "processors": [
+      "Intel Core i5-13450HX",
+      "Intel Core i7-13650HX",
+      "Intel Core i7-13700HX",
+      "Intel Core i9-13900HX"
+    ],
+    "accelerators": [
+      "RTX 3050 Laptop GPU",
+      "RTX 4050 Laptop GPU",
+      "RTX 4060 Laptop GPU"
+    ],
+    "sources": [
+      "https://www.dell.com/support/manuals/en-us/g-series-15-5530-laptop/dell-g15-5530-owners-manual/processor?guid=guid-44e8114f-cf39-4d53-ab93-a873c4a6ab0a&lang=en-us"
+    ],
+    "configurationNote": "Match the observed exact processor SKU, not the enclosure family. Installed GPU and memory configuration remain observations; generic Iris Xe/UHD/Radeon names do not prove an exact GPU core count or memory bandwidth."
+  },
+  {
+    "photoId": "hp-elitebook-co",
+    "processors": [
+      "Intel Core i7-1370P",
+      "Intel Core i7-1360P",
+      "Intel Core i5-1350P",
+      "Intel Core i5-1340P",
+      "Intel Core i7-1365U",
+      "Intel Core i7-1355U",
+      "Intel Core i5-1345U",
+      "Intel Core i5-1335U"
+    ],
+    "accelerators": [],
+    "sources": [
+      "https://support.hp.com/ca-en/document/ish_7775077-7775121-16"
+    ],
+    "configurationNote": "Match the observed exact processor SKU, not the enclosure family. Installed GPU and memory configuration remain observations; generic Iris Xe/UHD/Radeon names do not prove an exact GPU core count or memory bandwidth."
+  },
+  {
+    "photoId": "hp-pavilion",
+    "processors": [
+      "AMD Ryzen 7 7840H",
+      "AMD Ryzen 7 7840U",
+      "AMD Ryzen 5 7640H",
+      "AMD Ryzen 5 7540U",
+      "AMD Ryzen 7 8845H",
+      "AMD Ryzen 7 8845HS",
+      "AMD Ryzen 5 8645H",
+      "AMD Ryzen 5 8645HS"
+    ],
+    "accelerators": [
+      "Radeon 780M",
+      "Radeon 760M",
+      "Radeon 740M"
+    ],
+    "sources": [
+      "https://support.hp.com/in-en/document/ish_9938732-9938845-16",
+      "https://support.hp.com/my-en/document/ish_9174005-9174073-16"
+    ],
+    "configurationNote": "Match the observed exact processor SKU, not the enclosure family. Installed GPU and memory configuration remain observations; generic Iris Xe/UHD/Radeon names do not prove an exact GPU core count or memory bandwidth. HP lists 7540U graphics as 760M; AMD identifies this chip as 740M. The observed GPU name selects graphics facts; the HP table does not override it."
+  },
+  {
+    "photoId": "hp-envy",
+    "processors": [
+      "Intel Core i7-1355U",
+      "Intel Core i7-13700H",
+      "Intel Core i5-13500H",
+      "Intel Core Ultra 7 155U",
+      "Intel Core Ultra 7 155H",
+      "Intel Core Ultra 5 125H"
+    ],
+    "accelerators": [
+      "RTX 3050 Laptop GPU"
+    ],
+    "sources": [
+      "https://support.hp.com/pl-pl/document/ish_8083550-8089770-16",
+      "https://support.hp.com/us-en/document/ish_10206518-10206567-16"
+    ],
+    "configurationNote": "Match the observed exact processor SKU, not the enclosure family. Installed GPU and memory configuration remain observations; generic Iris Xe/UHD/Radeon names do not prove an exact GPU core count or memory bandwidth."
+  },
+  {
+    "photoId": "rog-g14",
+    "processors": [
+      "AMD Ryzen 9 8945HS"
+    ],
+    "accelerators": [
+      "Radeon 780M",
+      "RTX 4050 Laptop GPU",
+      "RTX 4060 Laptop GPU",
+      "RTX 4070 Laptop GPU"
+    ],
+    "sources": [
+      "https://rog.asus.com/us/laptops/rog-zephyrus/rog-zephyrus-g14-2024/spec/"
+    ],
+    "configurationNote": "Match the observed exact processor SKU, not the enclosure family. Installed GPU and memory configuration remain observations; generic Iris Xe/UHD/Radeon names do not prove an exact GPU core count or memory bandwidth."
+  },
+  {
+    "photoId": "rog-z13",
+    "processors": [
+      "AMD Ryzen AI Max 390",
+      "AMD Ryzen AI Max+ 395"
+    ],
+    "accelerators": [
+      "Radeon 8050S",
+      "Radeon 8060S"
+    ],
+    "sources": [
+      "https://rog.asus.com/us/laptops/rog-flow/rog-flow-z13-2025/spec/"
+    ],
+    "configurationNote": "Match the observed exact processor SKU, not the enclosure family. Installed GPU and memory configuration remain observations; generic Iris Xe/UHD/Radeon names do not prove an exact GPU core count or memory bandwidth."
+  },
+  {
+    "photoId": "dgx-spark",
+    "processors": [
+      "NVIDIA GB10"
+    ],
+    "accelerators": [],
+    "sources": [
+      "https://docs.nvidia.com/dgx/dgx-spark/hardware.html"
+    ],
+    "configurationNote": "Match the observed exact processor SKU, not the enclosure family. Installed GPU and memory configuration remain observations; generic Iris Xe/UHD/Radeon names do not prove an exact GPU core count or memory bandwidth."
+  },
+  {
+    "photoId": "beelink-gtr9",
+    "processors": [
+      "AMD Ryzen AI Max+ 395"
+    ],
+    "accelerators": [
+      "Radeon 8060S"
+    ],
+    "sources": [
+      "https://www.bee-link.com/products/beelink-gtr9-pro-amd-ryzen-ai-max-395"
+    ],
+    "configurationNote": "Match the observed exact processor SKU, not the enclosure family. Installed GPU and memory configuration remain observations; generic Iris Xe/UHD/Radeon names do not prove an exact GPU core count or memory bandwidth. This row covers the researched 395 configuration; future identically named revisions must use their observed processor and do not inherit 395 specs."
+  },
+  {
+    "photoId": "minisforum-ms-s1",
+    "processors": [
+      "AMD Ryzen AI Max+ 395"
+    ],
+    "accelerators": [
+      "Radeon 8060S"
+    ],
+    "sources": [
+      "https://store.minisforum.com/products/minisforum-ms-s1-max-mini-pc"
+    ],
+    "configurationNote": "Match the observed exact processor SKU, not the enclosure family. Installed GPU and memory configuration remain observations; generic Iris Xe/UHD/Radeon names do not prove an exact GPU core count or memory bandwidth. This row covers the researched 395 configuration; future identically named revisions must use their observed processor and do not inherit 395 specs."
+  },
+  {
+    "photoId": "hp-z2a",
+    "processors": [
+      "AMD Ryzen AI Max PRO 380",
+      "AMD Ryzen AI Max PRO 385",
+      "AMD Ryzen AI Max PRO 390",
+      "AMD Ryzen AI Max+ PRO 395"
+    ],
+    "accelerators": [
+      "Radeon 8040S",
+      "Radeon 8050S",
+      "Radeon 8060S"
+    ],
+    "sources": [
+      "https://h20195.www2.hp.com/v2/GetPDF.aspx/c09086887"
+    ],
+    "configurationNote": "Match the observed exact processor SKU, not the enclosure family. Installed GPU and memory configuration remain observations; generic Iris Xe/UHD/Radeon names do not prove an exact GPU core count or memory bandwidth."
+  },
+  {
+    "photoId": "hp-zbook",
+    "processors": [
+      "AMD Ryzen AI Max PRO 380",
+      "AMD Ryzen AI Max PRO 385",
+      "AMD Ryzen AI Max PRO 390",
+      "AMD Ryzen AI Max+ PRO 395"
+    ],
+    "accelerators": [
+      "Radeon 8040S",
+      "Radeon 8050S",
+      "Radeon 8060S"
+    ],
+    "sources": [
+      "https://h20195.www2.hp.com/v2/GetPDF.aspx/c09086129"
+    ],
+    "configurationNote": "Match the observed exact processor SKU, not the enclosure family. Installed GPU and memory configuration remain observations; generic Iris Xe/UHD/Radeon names do not prove an exact GPU core count or memory bandwidth."
+  },
+  {
+    "photoId": "thinkpad-t14",
+    "processors": [
+      "Intel Core i7-1370P",
+      "Intel Core i7-1360P",
+      "Intel Core i5-1350P",
+      "Intel Core i5-1340P",
+      "Intel Core i7-1365U",
+      "Intel Core i7-1355U",
+      "Intel Core i5-1345U",
+      "Intel Core i5-1335U",
+      "AMD Ryzen 5 PRO 7540U",
+      "AMD Ryzen 7 PRO 7840U"
+    ],
+    "accelerators": [
+      "Radeon 740M",
+      "Radeon 780M"
+    ],
+    "sources": [
+      "https://psref.lenovo.com/syspool/Sys/PDF/ThinkPad/ThinkPad_T14_Gen_4_Intel/ThinkPad_T14_Gen_4_Intel_Spec.PDF",
+      "https://psref.lenovo.com/syspool/Sys/PDF/ThinkPad/ThinkPad_T14_Gen_4_AMD/ThinkPad_T14_Gen_4_AMD_Spec.pdf"
+    ],
+    "configurationNote": "Match the observed exact processor SKU, not the enclosure family. Installed GPU and memory configuration remain observations; generic Iris Xe/UHD/Radeon names do not prove an exact GPU core count or memory bandwidth. Intel P-series may also have GeForce MX550; no enabled-core claim is made for that SKU in this catalog."
+  }
+]

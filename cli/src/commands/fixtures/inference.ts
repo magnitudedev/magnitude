@@ -29,6 +29,7 @@ export const makeHardware = (
   architecture: "X64",
   productName: Option.none(),
   processor: Option.some("Test CPU"),
+  physicalCores: Option.none(),
   logicalCores: 16,
   totalSystemMemoryBytes: 64 * GIB,
   availableSystemMemoryBytes: 12 * GIB,

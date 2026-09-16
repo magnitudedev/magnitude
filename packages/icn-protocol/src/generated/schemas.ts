@@ -1118,6 +1118,10 @@ export const HardwareSnapshot = S.Struct({
     S.suspend((): S.Schema<HardwareMemoryDomain, HardwareMemoryDomainEncoded> => HardwareMemoryDomain),
   ),
   native_build: S.String,
+  physical_cores: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
+    exact: true,
+    as: "Option",
+  }),
   platform: S.String,
   system_memory: S.suspend((): S.Schema<HardwareSystemMemory, HardwareSystemMemoryEncoded> => HardwareSystemMemory),
   system_product_name: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),

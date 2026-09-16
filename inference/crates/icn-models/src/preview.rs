@@ -1901,6 +1901,7 @@ mod tests {
                     architecture: "test".to_owned(),
                     system_product_name: None,
                     cpu_model: None,
+                    physical_cores: None,
                     logical_cores: 1,
                     system_memory: icn_contracts::HardwareSystemMemory {
                         physical_capacity_bytes: 1,
