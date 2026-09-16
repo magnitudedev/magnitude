@@ -43,35 +43,6 @@
       }
     },
     {
-      "id": "qwen3.6-27b",
-      "displayName": "Qwen3.6 27B",
-      "description": "Large dense coding model with strong agent and coding capability.",
-      "releaseDate": "2026-04-21",
-      "parameterization": { "architecture": "dense", "totalParameters": 27000000000 },
-      "repository": "unsloth/Qwen3.6-27B-MTP-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
-      "contextLength": 100000,
-      "projector": { "path": "mmproj-BF16.gguf" },
-      "speculativeDecoding": {
-        "method": "dflash",
-        "draft": {
-          "type": "file",
-          "repository": "magnitudedev/Qwen3.6-27B-DFlash-GGUF",
-          "path": "Qwen3.6-27B-DFlash-Q8_0.gguf"
-        }
-      },
-      "license": "apache-2.0",
-      "intelligence": {
-        "score": 37.7,
-        "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-26",
-          "url": "https://artificialanalysis.ai/models/qwen3-6-27b"
-        }
-      }
-    },
-    {
       "id": "qwen3.8-27b",
       "displayName": "Qwen3.8 27B",
       "description": "Large dense multimodal model with frontier-class agentic coding capability for its size.",
