@@ -2,13 +2,16 @@
 
 import ops
 from engine.composition import Blueprint, blueprint
+from engine.inputs.formats.gguf_tokenizer import TokenizerArtifact
+from engine.loading import LoadedModel
 from engine.models.qwen35.description import DenseDescription
 from engine.models.qwen35.runtime import DenseRuntime
+from engine.models.sequence import ModelExecutor
 from engine.weights.formats.gguf import GGUFFormat
 from engine.weights.formats.mlx_safetensors import MLXFormat
 from engine.weights.residency import WeightResidency
 
-__all__ = ["Qwen35DenseDescription", "Qwen35MLXDescription", "Qwen35Dense"]
+__all__ = ["Qwen35DenseDescription", "Qwen35MLXDescription", "Qwen35Dense", "LoadedComponents"]
 
 
 @blueprint
@@ -68,3 +71,18 @@ class Qwen35Dense(Blueprint[DenseRuntime]):
             )
 
         return build
+
+
+@blueprint
+class LoadedComponents(Blueprint[LoadedModel]):
+    executor: Blueprint[ModelExecutor]
+    metadata: Blueprint[TokenizerArtifact]
+
+    @staticmethod
+    def implementation():
+        from engine.inputs.tokenizer import ByteBPETokenizer
+
+        def construct(executor, metadata) -> LoadedModel:
+            return LoadedModel(executor, ByteBPETokenizer(metadata.config))
+
+        return construct
