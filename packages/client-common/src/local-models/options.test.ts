@@ -32,19 +32,21 @@ const option = (
 })
 
 describe("local model ranking", () => {
-  it("features distinct catalog bases after ranking without losing their exact configuration", () => {
+  it("features up to two configurations per base while preserving ranking order", () => {
     const scores = { intelligence: 1, speed: 1, fidelity: 1 }
     const model = (id: string) => option(id, 1, scores).model as CatalogLocalModel
     const best = model("first:gguf:q8")
     const sameBase = model("first:gguf:q4")
+    const thirdQuant = model("first:gguf:q6")
     const second = model("second:gguf:q4")
     const third = model("third:gguf:q4")
     const fourth = model("fourth:gguf:q4")
-    const ranked = [best, sameBase, second, third, fourth]
-    expect(featuredCatalogModels(ranked)).toEqual([best, second, third])
+    const ranked = [best, second, sameBase, thirdQuant, third, fourth]
+    expect(featuredCatalogModels(ranked)).toEqual([best, second, sameBase, third, fourth])
     expect(featuredCatalogModels(ranked, 2)).toEqual([best, second])
     expect(featuredCatalogModels(ranked, 0)).toEqual([])
-    expect(featuredCatalogModels([sameBase, best, second])).toEqual([sameBase, second])
+    expect(featuredCatalogModels([sameBase, thirdQuant, best, second])).toEqual([sameBase, thirdQuant, second])
+    expect(featuredCatalogModels([best, sameBase, thirdQuant])).toEqual([best, sameBase])
   })
 
   it("moves utility from speed toward intelligence while fidelity always contributes", () => {
