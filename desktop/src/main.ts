@@ -202,7 +202,8 @@ const program = Effect.scoped(Effect.gen(function* () {
       window.focus()
     })
     if (reload) yield* loadRenderer()
-    yield* PubSub.publish(actions, { _tag: "Navigate", page: pendingPage })
+    // Raising the retained window must preserve the renderer's current page.
+    if (page !== undefined) yield* PubSub.publish(actions, { _tag: "Navigate", page })
   })))
   const refreshTray = Effect.gen(function* () {
     const current = yield* Ref.get(state)
