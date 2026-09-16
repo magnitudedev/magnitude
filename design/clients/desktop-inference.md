@@ -115,7 +115,8 @@ The tray shows service and model state without a setup-completion state. First u
 
 A background launch starts the owner and tray without showing or focusing a window. Explicit Show
 Window or navigation intent opens it. Dock activation reopens a hidden window and explicit Open
-restores a minimized window. Window close hides the retained renderer. Full Quit stops owned
+restores a minimized window. Raising or reactivating the retained window preserves its selected page;
+only an explicit destination from a native menu action requests navigation. Window close hides the retained renderer. Full Quit stops owned
 children, proves cleanup, and releases application ownership. Cleanup failure stays visible
 and retains ownership. The failure dialog offers Keep Open, Retry Quit, and an explicit Force Quit
 that warns cleanup is unproven and exits unsuccessfully. Cancel never forces exit. Application control carries lifecycle intent and observation,
