@@ -25,6 +25,7 @@ from .resources import (
     NativeCompletion,
     NativeExecutable,
     NativeSubmissionError,
+    NativeUpload,
 )
 
 _COMPILER_RECURSION_LOCK = Lock()
@@ -93,26 +94,20 @@ class _Allocation(NativeAllocation):
 
 
 class _Completion(NativeCompletion):
-    def __init__(self, event=None, synchronize: Callable[[], None] | None = None):
-        self._event = event
-        self._synchronize = synchronize
-        self._done = event is None and synchronize is None
+    def __init__(self, event=None):
+        self._event: Any = event
+        self._done = event is None
 
     def ready(self) -> bool:
         if self._done:
             return True
-        if self._event is None:
-            return False
         self._done = bool(self._event.query())
         return self._done
 
     def wait(self) -> None:
         if self._done:
             return
-        if self._event is not None:
-            self._event.synchronize()
-        elif self._synchronize is not None:
-            self._synchronize()
+        self._event.synchronize()
         self._done = True
 
 
@@ -185,7 +180,16 @@ class TileLangRuntime:
             if ordinal:
                 raise ValueError("Metal exposes only process device ordinal zero")
             self._device = torch.device("mps")
-            self._completion = lambda: _Completion(synchronize=torch.mps.synchronize)
+
+            def completion() -> NativeCompletion:
+                # A recorded completion starts the submitted work without waiting
+                # for it. A deferred global synchronize would keep the command
+                # buffer pending throughout independent host preparation.
+                event = torch.mps.Event()
+                event.record()
+                return _Completion(event=event)
+
+            self._completion = completion
         elif kind in ("cuda", "hip"):
             self._device = torch.device("cuda", ordinal)
 
@@ -241,6 +245,16 @@ class TileLangRuntime:
         # Host transfer is an ABI operation. Numerical work remains in the
         # compiled TileLang program.
         return value.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes()
+
+    def upload_async(self, spec: TensorSpec, content: bytes) -> NativeUpload:
+        size = len(content)
+        if spec.representation is not None and not isinstance(spec.representation, Dense):
+            size = (size + 3) // 4 * 4
+        staging = bytearray(size)
+        staging[:len(content)] = content
+        host = torch.frombuffer(staging, dtype=torch.uint8)
+        allocation = _Allocation(host.to(self._device, copy=True, non_blocking=True))
+        return NativeUpload(allocation, self._completion(), host)
 
     def compile(self, program: object, signature: tuple[TensorSpec, ...]) -> NativeExecutable:
         import tilelang

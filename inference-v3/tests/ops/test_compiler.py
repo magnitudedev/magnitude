@@ -84,6 +84,11 @@ class Runtime:
     def upload(self, spec, content):
         return Allocation(len(content))
 
+    def upload_async(self, spec, content):
+        from ops.runtime.resources import NativeUpload
+
+        return NativeUpload(self.upload(spec, content), Completion(), content)
+
     def compile(self, program, signature):
         self.programs.append(program)
         executable = Executable()

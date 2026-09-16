@@ -94,7 +94,7 @@ def build_primitive(graph, root, context, *, remaining):
         body = RowDotRule()
     elif node.operation == "route_topk":
         body = RoutingRule()
-    elif node.operation == "sample":
+    elif node.operation in {"sample", "sample_constrained"}:
         body = SamplingRule()
     elif node.operation == "byte_copy":
         body = ByteCopyRule()

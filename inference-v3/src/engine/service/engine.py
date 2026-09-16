@@ -10,6 +10,7 @@ from enum import StrEnum
 
 import ops
 from engine.data import Record
+from engine.generation.constraints import ConstraintState, ConstraintMetrics
 from engine.generation.plain import (
     FinishReason,
     Generation,
@@ -76,6 +77,11 @@ class Snapshot(Record):
     service_ns: int
     preemptions: int
     generated_tokens: int
+    forced_tokens: int = 0
+    sampled_tokens: int = 0
+    constraint_metrics: ConstraintMetrics | None = None
+    forced_runs: tuple[tuple[int, int], ...] = ()
+    state_only_input_tokens: int = 0
     preparation_ns: int
     prefill_preparation_ns: int
     decode_preparation_ns: int
@@ -93,6 +99,7 @@ class Request:
     source: ModelInput
     options: Options
     waiting_since_ns: int
+    constraint: ConstraintState | None = None
     generation: Generation | None = None
     finish: FinishReason | None = None
     failure: Failure | None = None
@@ -137,6 +144,7 @@ class Pending:
     selection: Selection
     started_ns: int
     submission: Submission
+    preparation_ns: int
 
 
 class _NotPrepared(Exception):
@@ -158,7 +166,9 @@ class Engine:
         if self.closed:
             raise RuntimeError("service is closed")
 
-    def admit(self, source: ModelInput, options: Options) -> RequestId:
+    def admit(
+        self, source: ModelInput, options: Options, *, constraint: ConstraintState | None = None
+    ) -> RequestId:
         """Transfer the source on success; state allocation waits for service."""
         self.check()
         self.context.check()
@@ -166,9 +176,15 @@ class Engine:
             raise ValueError("request source must belong to this model and have input")
         if len(self.requests) >= self.scheduler.limits.max_requests:
             raise ValueError("service request limit reached; retire completed requests")
+        if constraint is not None:
+            if constraint.position != 0 or constraint.stopped:
+                raise ValueError("admission requires an unconsumed constraint")
+            if constraint.vocabulary.tokenizer.stop_tokens != options.stop_tokens:
+                raise ValueError("generation and constraint EOS identities differ")
+            constraint = constraint.fork()
         identity = RequestId(self._next)
         self._next += 1
-        request = Request(identity, source, options, clock_ns())
+        request = Request(identity, source, options, clock_ns(), constraint=constraint)
         self.requests[identity] = request
         if options.max_tokens == 0:
             request.finish = FinishReason.LENGTH
@@ -206,7 +222,16 @@ class Engine:
             failure=r.failure,
             service_ns=r.service_ns,
             preemptions=r.preemptions,
-            generated_tokens=0 if g is None else len(g.sampled),
+            generated_tokens=0 if g is None else len(g.generated),
+            forced_tokens=0 if g is None else g.forced_tokens,
+            sampled_tokens=0 if g is None else len(g.generated) - g.forced_tokens,
+            forced_runs=() if g is None else tuple(sorted(g.forced_runs.items())),
+            state_only_input_tokens=0 if g is None else g.state_only_input_tokens,
+            constraint_metrics=(
+                g.constraint.metrics
+                if r.finish is not None and g is not None and g.constraint is not None
+                else None
+            ),
             preparation_ns=r.preparation_ns,
             prefill_preparation_ns=r.prefill_preparation_ns,
             decode_preparation_ns=r.decode_preparation_ns,
@@ -270,10 +295,10 @@ class Engine:
         return Operation(
             r.identity,
             phase,
-            g is not None and bool(g.processed or g.sampled),
+            g is not None and bool(g.processed or g.generated),
             g is not None and g.resident,
             r.waiting_since_ns,
-            r.service_ns,
+            r.service_ns + r.preparation_ns,
             r.preemption_debt,
         )
 
@@ -282,7 +307,10 @@ class Engine:
             sequence = r.source.open()
             try:
                 if r.generation is None:
-                    r.generation = Generation(sequence, r.source.prompt, r.options)
+                    r.generation = Generation(
+                        sequence, r.source.prompt, r.options, constraint=r.constraint
+                    )
+                    r.constraint = None
                 else:
                     r.generation.restore(sequence)
             except BaseException:
@@ -326,7 +354,7 @@ class Engine:
                     len(g.output) >= g.options.output_capacity,
                     -r.preemption_debt,
                     exclusive / max(1, g.processed),
-                    -r.service_ns,
+                    -(r.service_ns + r.preparation_ns),
                     r,
                 )
             )
@@ -356,7 +384,11 @@ class Engine:
 
     def _prepare(self, selection: Selection) -> tuple[GenerationBatch, Selection, int]:
         identities = list(selection.requests)
-        allowance = 1 if selection.phase == Phase.DECODE else self.scheduler.limits.prefill_tokens
+        allowance = (
+            self.scheduler.limits.decode_tokens
+            if selection.phase == Phase.DECODE
+            else self.scheduler.limits.prefill_tokens
+        )
         reclaimed = False
         last_shape = None
         capacity: ops.CapacityError | None = None
@@ -369,7 +401,9 @@ class Engine:
                     if selection.phase == Phase.PREFILL and remaining <= 0:
                         break
                     g = self._open(self.requests[current])
-                    proposal = g.ready(max(1, remaining) if selection.phase == Phase.PREFILL else 1)
+                    proposal = g.ready(
+                        max(1, remaining) if selection.phase == Phase.PREFILL else allowance
+                    )
                     if not isinstance(proposal, Ready):
                         raise RuntimeError("selected request lost eligibility")
                     ready.append(proposal)
@@ -395,7 +429,7 @@ class Engine:
                     continue
                 if allowance > 1 and last_shape != tuple(len(r.tokens) for r in ready):
                     last_shape = tuple(len(r.tokens) for r in ready)
-                    allowance = max(1, allowance // 2)
+                    allowance = max(1, min(allowance // 2, max(last_shape, default=1) // 2))
                     continue
                 if self._evict(set(identities), error):
                     last_shape = None
@@ -441,7 +475,7 @@ class Engine:
         finally:
             pending.batch.close()
             self.pending = None
-        self.scheduler.completed(pending.selection, elapsed)
+        self.scheduler.completed(pending.selection, elapsed + pending.preparation_ns)
         share, extra = divmod(elapsed, len(pending.submission.requests))
         now = clock_ns()
         for index, identity in enumerate(pending.submission.requests):
@@ -532,7 +566,7 @@ class Engine:
                     r.decode_preparation_ns += attributed
                     if r.decode_ns == 0:
                         r.first_decode_preparation_ns = attributed
-            self.pending = Pending(batch, selected, started, submission)
+            self.pending = Pending(batch, selected, started, submission, preparation_elapsed)
             return submission
         return Idle(tuple(self.snapshot(identity) for identity in self.requests))
 

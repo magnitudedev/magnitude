@@ -74,7 +74,8 @@ def _publish_sample(output, row, index, invalid):
 
 
 @T.macro
-def _score_partitions(logits, draws, output, partials, rows, vocabulary, threads, partitions):
+def _score_partitions(logits, draws, output, partials, masks, mask_rows, mask_count,
+                      constrained, rows, vocabulary, threads, partitions):
     with T.Kernel(rows, partitions, threads=threads) as (row, partition):
         lane = T.get_thread_binding(0)
         scores = T.alloc_shared((threads,), "float32")
@@ -98,7 +99,17 @@ def _score_partitions(logits, draws, output, partials, rows, vocabulary, threads
                     0x7F800000, "uint32"
                 ) or bits == T.cast(0x7F800000, "uint32"):
                     flag[0] = 1
-                elif bits != T.cast(0xFF800000, "uint32"):
+                allowed = T.alloc_local((1,), "bool")
+                allowed[0] = True
+                if constrained:
+                    mask_row = mask_rows[row]
+                    if mask_row < -1 or mask_row >= mask_count:
+                        flag[0] = 1
+                        allowed[0] = False
+                    elif mask_row >= 0:
+                        allowed[0] = (masks[mask_row, token // 32] &
+                                      (T.cast(1, "uint32") << (token % 32))) != 0
+                if allowed[0] and bits != T.cast(0xFF800000, "uint32"):
                     value = T.alloc_local((1,), "float32")
                     value[0] = raw
                     if kind == 1:
@@ -152,11 +163,19 @@ class _SamplingEmitter:
     vocabulary: int
     threads: int
     partitions: int
+    constrained: bool = False
+    mask_count: int = 0
 
     def __call__(self, operands):
-        logits, draws, output = operands[:3]
-        partials = operands[3] if self.partitions > 1 else output
-        _score_partitions(logits, draws, output, partials, self.rows, self.vocabulary,
+        if self.constrained:
+            logits, draws, masks, mask_rows, output = operands[:5]
+            partials = operands[5] if self.partitions > 1 else output
+        else:
+            logits, draws, output = operands[:3]
+            masks = mask_rows = output  # Dead operands in the ordinary static branch.
+            partials = operands[3] if self.partitions > 1 else output
+        _score_partitions(logits, draws, output, partials, masks, mask_rows, self.mask_count,
+                          self.constrained, self.rows, self.vocabulary,
                           self.threads, self.partitions)
         if self.partitions > 1:
             _merge_partitions(partials, output, self.rows, self.partitions, self.threads)
@@ -167,7 +186,7 @@ class SamplingRule:
 
     def build(self, graph: Graph, root: int, context: LoweringContext):
         node = graph.node(root)
-        if node.operation != "sample":
+        if node.operation not in {"sample", "sample_constrained"}:
             return ()
         logits = graph.value(node.inputs[0]).spec
         if not logits.static or context.compiler_target.shared_memory_bytes <= 0:
@@ -187,6 +206,9 @@ class SamplingRule:
         return (BoundOperation(
             f"sample.{'partitioned' if partitions > 1 else 'single'}@{root}",
             frozenset({root}), node.inputs, node.outputs,
-            _SamplingEmitter(rows, vocabulary, threads, partitions),
+            _SamplingEmitter(rows, vocabulary, threads, partitions,
+                             node.operation == "sample_constrained",
+                             graph.value(node.inputs[2]).spec.shape[0]
+                             if node.operation == "sample_constrained" else 0),
             workspace=workspace, kernel_count=2 if partitions > 1 else 1,
         ),)

@@ -20,6 +20,7 @@ class Limits(Record):
     max_requests: int = Field(default=128, gt=0)
     max_batch: int = Field(default=8, gt=0)
     prefill_tokens: int = Field(default=512, gt=0)
+    decode_tokens: int = Field(default=32, gt=0, le=256)
     decode_share: float = Field(default=0.5, gt=0, lt=1)
     locality_seconds: float = Field(default=0.05, ge=0, allow_inf_nan=False)
 

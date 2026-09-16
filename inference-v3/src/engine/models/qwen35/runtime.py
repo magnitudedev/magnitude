@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import struct
+from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
 
@@ -28,6 +29,7 @@ from engine.models.sequence import (
     ModelExecutor,
     ModelRequest,
     ModelSequence,
+    TokenMask,
 )
 from engine.weights.residency import WeightResidency
 
@@ -38,6 +40,15 @@ class ForwardRequest:
     inputs: Inputs
     selection: LogitsSelection = LogitsSelection.LAST
     draw_words: tuple[int, int, int, int, int, int] | None = None
+    allowed_tokens: bytes | TokenMask | None = None
+
+
+@dataclass(frozen=True)
+class _FixedMask:
+    content: bytes
+
+    def mask(self) -> bytes:
+        return self.content
 
 
 class ForwardOutput:
@@ -87,7 +98,7 @@ class Forward:
             execution.outputs[0] if any(value.logits is not None for value in outputs) else None
         )
         self._owned = owned
-        self._observation = None
+        self._observation: Callable[[], object] | None = None
         self.completion = execution.completion
         self.closed = False
         for output in self.outputs:
@@ -128,6 +139,7 @@ class DenseRuntime(ModelExecutor):
             raise ValueError("prefill row capacity must exceed one")
         self.prefill_rows = prefill_rows
         self.program = TensorProgram(description, device, weights)
+        self._samplers: dict[tuple[int, int], ops.CompiledFunction] = {}
         self.states = QwenStateStore(
             device,
             self.geometry,
@@ -138,7 +150,9 @@ class DenseRuntime(ModelExecutor):
         self._forwards: set[Forward] = set()
         self._sequences: set[Sequence] = set()
         self._checkpoints: set[Checkpoint] = set()
-        self._inspection = None
+        self._inspection: tuple[
+            Callable[..., object] | None, Callable[..., object] | None, int | None
+        ] | None = None
         self.closed = False
 
     def prime(self, rows: int, horizon: int) -> None:
@@ -147,24 +161,28 @@ class DenseRuntime(ModelExecutor):
             raise ValueError("prime geometry must fit the bound model context")
         sequence = self.create(InputPlan.text(tuple(TokenId(0) for _ in range(horizon))))
         try:
-            counts = [rows]
-            if (
-                self.prefill_rows == rows and rows > 2
-                and MixerKind.RECURRENT in self.geometry.layers
-            ):
+            capacities = {rows}
+            if self.prefill_rows is not None:
+                capacities.update(1 << power for power in range(1, rows.bit_length()) if 1 << power <= rows)
+            counts = sorted(capacities)
+            if MixerKind.RECURRENT in self.geometry.layers:
                 # Full and padded recurrence domains have distinct cache entries.
-                # Prime both once so a partial chunk does not compile on arrival.
-                counts.append(rows - 1)
+                counts = sorted(set(counts) | {count - 1 for count in capacities if count > 2})
+            unrestricted_mask = _FixedMask(b"\xff" * (((self.geometry.vocabulary + 31) // 32) * 4))
             invocations = [
-                (count, selection, draws)
+                (count, selection, draws, mask)
                 for count in counts
-                for selection, draws in (
-                    (LogitsSelection.NONE, None),
-                    (LogitsSelection.LAST, (0, 0, 0, 0, 0, 0)),
+                for selection, draws, mask in (
+                    (LogitsSelection.NONE, None, None),
+                    (LogitsSelection.LAST, (0, 0, 0, 0, 0, 0), None),
+                    (LogitsSelection.LAST, (0, 0, 0, 0, 0, 0), unrestricted_mask),
                 )
             ]
-            invocations.append((1, LogitsSelection.LAST, (0, 0, 0, 0, 0, 0)))
-            for count, selection, draws in invocations:
+            invocations.extend(
+                (1, LogitsSelection.LAST, (0, 0, 0, 0, 0, 0), mask)
+                for mask in (None, unrestricted_mask)
+            )
+            for count, selection, draws, mask in invocations:
                 batch = self.prepare(
                     (
                         ModelRequest(
@@ -172,6 +190,7 @@ class DenseRuntime(ModelExecutor):
                             tuple(TokenId(0) for _ in range(count)),
                             selection,
                             draws,
+                            mask,
                         ),
                     )
                 )
@@ -181,7 +200,8 @@ class DenseRuntime(ModelExecutor):
             sequence.close()
 
     def reclaim(self) -> int:
-        return self.states.release_idle() + self.program.reclaim()
+        return (self.states.release_idle() + self.program.reclaim()
+                + sum(sampler.release_output_storage() for sampler in self._samplers.values()))
 
     def reclaimable(self, sequences: tuple[ModelSequence, ...]) -> int:
         states = []
@@ -228,6 +248,15 @@ class DenseRuntime(ModelExecutor):
                     raise ValueError("model input tokens must belong to the bound vocabulary")
                 if (request.draw_words is None) != (request.selection == LogitsSelection.NONE):
                     raise ValueError("sampling draws must exactly accompany requested logits")
+                if request.allowed_tokens is not None and (
+                    request.selection != LogitsSelection.LAST
+                    or (
+                        len(request.allowed_tokens) != ((self.geometry.vocabulary + 31) // 32) * 4
+                        if isinstance(request.allowed_tokens, bytes)
+                        else not callable(getattr(request.allowed_tokens, "mask", None))
+                    )
+                ):
+                    raise ValueError("selection mask requires one last-logit row and exact vocabulary words")
                 sequence = request.sequence
                 if not isinstance(sequence, Sequence) or sequence.runtime is not self:
                     raise ValueError("sequence belongs to another model")
@@ -240,7 +269,8 @@ class DenseRuntime(ModelExecutor):
                 sequences.append(sequence)
                 following.append(next_inputs)
                 numerical.append(
-                    ForwardRequest(sequence.state, inputs, request.selection, request.draw_words)
+                    ForwardRequest(sequence.state, inputs, request.selection, request.draw_words,
+                                   request.allowed_tokens)
                 )
             forward = self._prepare_numerical(tuple(numerical))
             cleanup.callback(forward.close)
@@ -258,23 +288,32 @@ class DenseRuntime(ModelExecutor):
         if not requests or len({id(item.state) for item in requests}) != len(requests):
             raise ValueError("a forward requires distinct sequence states")
         with ExitStack() as owned:
+            deferred = any(
+                request.allowed_tokens is not None and not isinstance(request.allowed_tokens, bytes)
+                for request in requests
+            )
             capture = None
             if self._inspection is not None and self._inspection[1] is not None:
                 # Enter before packing; exit is attached after transient cleanup.
                 capture = owned.enter_context(self.device.observe(kernel_limit=self._inspection[2]))
             mode = "decode" if all(len(item.inputs.tokens) == 1 for item in requests) else "prefill"
             actual_rows = sum(len(item.inputs.tokens) for item in requests)
-            physical_rows = (
-                actual_rows if mode == "decode" or self.prefill_rows is None else self.prefill_rows
-            )
-            if actual_rows > physical_rows:
+            if mode != "decode" and self.prefill_rows is not None and actual_rows > self.prefill_rows:
                 raise ValueError("packed prefill exceeds the configured physical row capacity")
+            physical_rows = (
+                actual_rows
+                if mode == "decode" or self.prefill_rows is None
+                else min(self.prefill_rows, 1 << (actual_rows - 1).bit_length())
+            )
             tokens = []
             coordinates = []
             destinations = []
             visible = []
             output_rows = []
             draw_words = []
+            mask_payload = bytearray()
+            mask_rows = []
+            mask_width = (self.geometry.vocabulary + 31) // 32
             selections = []
             advances = []
             feature_slices = []
@@ -299,7 +338,13 @@ class DenseRuntime(ModelExecutor):
                 )
                 first = len(output_rows)
                 output_rows.extend(selected)
+                mask_row = -1
+                if request.allowed_tokens is not None and not deferred:
+                    assert isinstance(request.allowed_tokens, bytes)
+                    mask_row = len(mask_payload) // (mask_width * 4)
+                    mask_payload.extend(request.allowed_tokens)
                 for _ in selected:
+                    mask_rows.append(mask_row)
                     draw_words.extend(request.draw_words or (0, 0, 0, 0, 0, 0))
                 selections.append((first, len(tuple(selected))))
                 for feature in inputs.features:
@@ -316,36 +361,46 @@ class DenseRuntime(ModelExecutor):
             coordinate_spec = ops.TensorSpec((len(tokens), 3), ops.DType.I32)
             destination_spec = ops.TensorSpec((len(tokens),), ops.DType.I32)
             visible_spec = ops.TensorSpec((len(tokens), 4), ops.DType.I32)
-            fields = [("tokens", "i", tokens, token_spec),
-                      ("coordinates", "i", coordinates, coordinate_spec)]
+            def field(name, code, values, spec) -> tuple[str, bytes, ops.TensorSpec]:
+                return name, struct.pack(f"={len(values)}{code}", *values), spec
+
+            fields = [field("tokens", "i", tokens, token_spec),
+                      field("coordinates", "i", coordinates, coordinate_spec)]
             recurrent_offsets = [0]
             for request in requests:
                 recurrent_offsets.append(recurrent_offsets[-1] + len(request.inputs.tokens))
             recurrent_offset_spec = None
             if any(kind == MixerKind.RECURRENT for kind in self.geometry.layers):
                 recurrent_offset_spec = ops.TensorSpec((len(recurrent_offsets),), ops.DType.I32)
-                fields.append(("recurrent_offsets", "i", recurrent_offsets, recurrent_offset_spec))
+                fields.append(field("recurrent_offsets", "i", recurrent_offsets, recurrent_offset_spec))
             output_spec = draw_spec = None
             if output_rows:
                 output_spec = ops.TensorSpec((len(output_rows),), ops.DType.I32)
-                draw_spec = ops.TensorSpec((len(output_rows), 6), ops.DType.U32)
-                fields.extend((("output_rows", "i", output_rows, output_spec),
-                               ("draws", "I", draw_words, draw_spec)))
+                fields.append(field("output_rows", "i", output_rows, output_spec))
+                if not deferred:
+                    draw_spec = ops.TensorSpec((len(output_rows), 6), ops.DType.U32)
+                    fields.append(field("draws", "I", draw_words, draw_spec))
+            masks_spec = mask_rows_spec = None
+            if mask_payload:
+                masks_spec = ops.TensorSpec((len(mask_payload) // (mask_width * 4), mask_width), ops.DType.U32)
+                mask_rows_spec = ops.TensorSpec((len(output_rows),), ops.DType.I32)
+                fields.extend((("masks", bytes(mask_payload), masks_spec),
+                               field("mask_rows", "i", mask_rows, mask_rows_spec)))
             argument_fields = len(fields)
             if self.states.attention:
-                fields.extend((("destinations", "i", destinations, destination_spec),
-                               ("visible", "i", visible, visible_spec)))
+                fields.extend((field("destinations", "i", destinations, destination_spec),
+                               field("visible", "i", visible, visible_spec)))
             control_resources = {}
             if packed_controls:
-                payload = b"".join(struct.pack(f"={len(values)}{code}", *values)
-                                   for _, code, values, _ in fields)
+                payload = b"".join(content for _, content, _ in fields)
                 control = self.device.upload(ops.TensorSpec((len(payload) // 4,), ops.DType.U32), payload)
                 owned.callback(control.close)
                 dynamic = [control]
             else:
-                for name, code, values, spec in fields:
-                    control_resources[name] = self._upload(code, values, spec.shape, spec.dtype, owned)
-                dynamic = [control_resources[name] for name, _, _, _ in fields[:argument_fields]]
+                for name, content, spec in fields:
+                    control_resources[name] = self.device.upload(spec, content)
+                    owned.callback(control_resources[name].close)
+                dynamic = [control_resources[name] for name, _, _ in fields[:argument_fields]]
             feature_values = []
             feature_rows = []
             for batch_start, feature in feature_slices:
@@ -378,6 +433,8 @@ class DenseRuntime(ModelExecutor):
                 recurrent_offsets=recurrent_offset_spec,
                 output_rows=output_spec,
                 draws=draw_spec,
+                masks=masks_spec,
+                mask_rows=mask_rows_spec,
                 destinations=tuple(destination_spec for _ in self.states.attention),
                 visible=tuple(visible_spec for _ in self.states.attention),
                 attention_state=tuple(cache.spec for cache in self.states.attention),
@@ -421,7 +478,13 @@ class DenseRuntime(ModelExecutor):
                 captured, observed, _ = self._inspection
                 if captured is not None:
                     captured(invocation)
+            sampler = (
+                self._sampler(len(output_rows), sum(r.allowed_tokens is not None for r in requests))
+                if deferred else None
+            )
             execution = compiled.submit(*dynamic, resources=resources)
+            if sampler is not None:
+                execution = self._sample_deferred(execution, sampler, requests, selections, draw_words)
             attention_count = len(self.states.attention)
             cursor = 2 if output_rows else 0
             logits = execution.outputs[0] if output_rows else None
@@ -456,8 +519,81 @@ class DenseRuntime(ModelExecutor):
                 outputs.append(ForwardOutput(self, advance, logit, sample))
             forward = Forward(self, outputs, execution, owned.pop_all())
             if capture is not None:
+                assert observed is not None
                 forward._observation = lambda: observed(invocation, capture.result)
             return forward
+
+    def _sampler(self, rows: int, masked: int) -> ops.CompiledFunction:
+        key = rows, masked
+        if key not in self._samplers:
+            width = self.geometry.vocabulary
+            specs = (
+                ops.TensorSpec((rows, 6), ops.DType.U32),
+                ops.TensorSpec((masked, (width + 31) // 32), ops.DType.U32),
+                ops.TensorSpec((rows,), ops.DType.I32),
+            )
+
+            def select(logits, controls):
+                draws, masks, mask_rows = ops.unpack_words(controls, specs)
+                return ops.sample_constrained(logits, draws, masks, mask_rows)
+
+            sampler = ops.compile(
+                select,
+                signature=ops.Signature((
+                    ops.Argument(ops.TensorSpec((rows, width), ops.DType.F32), "logits"),
+                    ops.Argument(
+                        ops.TensorSpec((sum(spec.elements for spec in specs),), ops.DType.U32),
+                        "controls",
+                    ),
+                )),
+                device=self.device, constants={}, options=ops.CompileOptions(mode="decode"),
+            )
+            sampler.reuse_output_storage(max_frames=2)
+            self._samplers[key] = sampler
+        return self._samplers[key]
+
+    def _sample_deferred(
+        self, forward: ops.Execution, sampler: ops.CompiledFunction,
+        requests: tuple[ForwardRequest, ...], selections: list[tuple[int, int]],
+        draw_words: list[int],
+    ) -> ops.Execution:
+        transfer = selected = None
+        try:
+            masks, rows = [], []
+            width = ((self.geometry.vocabulary + 31) // 32) * 4
+            for request, (_, count) in zip(requests, selections, strict=True):
+                value = request.allowed_tokens
+                if value is None:
+                    rows.extend([-1] * count)
+                else:
+                    mask = value if isinstance(value, bytes) else value.mask()
+                    if type(mask) is not bytes or len(mask) != width:
+                        raise ValueError("selection mask requires exact vocabulary words")
+                    rows.extend([len(masks)] * count)
+                    masks.append(mask)
+            payload = (struct.pack(f"={len(draw_words)}I", *draw_words) + b"".join(masks)
+                       + struct.pack(f"={len(rows)}i", *rows))
+            transfer = self.device.upload_async(
+                ops.TensorSpec((len(payload) // 4,), ops.DType.U32), payload
+            )
+            selected = sampler.submit(forward.outputs[0], transfer.outputs[0])
+            completion = ops.Completion.join((
+                forward.completion, transfer.completion, selected.completion,
+            ))
+            outputs = (forward.outputs[0], selected.outputs[0], *forward.outputs[1:])
+            return ops.Execution(outputs, completion)
+        except BaseException:
+            executions = [value for value in (forward, transfer, selected) if value is not None]
+            try:
+                ops.Completion.join(tuple(value.completion for value in executions)).wait()
+            finally:
+                for execution in executions:
+                    for output in execution.outputs:
+                        output.close()
+            raise
+        finally:
+            if transfer is not None:
+                transfer.outputs[0].close()
 
     def _upload(self, code, values, shape, dtype, owned):
         resource = self.device.upload(
@@ -475,5 +611,7 @@ class DenseRuntime(ModelExecutor):
             for forward in tuple(self._forwards):
                 forward.close()
             self.program.close()
+            for sampler in self._samplers.values():
+                sampler.close()
             self.states.close()
             self.closed = True

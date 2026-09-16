@@ -53,8 +53,11 @@ and completion.
 ## Precision
 
 The model declares its observable finite-precision contract. Production Qwen
-descriptions currently select FP16 activation and KV storage with FP32 reduction
-and recurrent state where declared. Norms, rotary,
+descriptions select activation types, persistent KV codecs, reduction precision
+and recurrent state explicitly. Fresh keys and values participate in their batch
+before persistent encoding; committed history uses the declared codec. Changing
+chunk boundaries can therefore change quantization error and must be numerically
+qualified. Norms, rotary,
 projection boundaries, gates, residuals, recurrent state, reductions and logits
 retain their required accumulation and storage boundaries through fusion. A
 lowering that changes an observable rounding point is not a substitute for the
@@ -80,6 +83,16 @@ explicit graph inputs or static specialization facts.
 History lengths remain dynamic within bounded capacity classes. A growing
 history changes resource metadata, not model topology. A state-only invocation
 omits the stateless suffix whose result has no consumer.
+
+Packed row capacities form bounded reusable classes sized to actual work. A small
+multi-token advance does not automatically pay for the maximum prompt chunk.
+Serving primes full and padded domains and both ordinary and constrained selection
+before admission; compilation is not deferred into the first decode that needs a
+qualified shape. Numerical specialization does not redefine service work kinds.
+When selection requires independent host work, the forward publishes selected
+logits and the following state without sampling. A separate Ops selection consumes
+those device-resident logits and the completed mask; logits never visit the host.
+Both stages and the control transfer share one physical completion obligation.
 
 ## State
 

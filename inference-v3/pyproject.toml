@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling>=1.27", "cmake==4.4.3", "ninja==1.13.2"]
 build-backend = "hatchling.build"
 
 [project]
@@ -15,6 +15,7 @@ dependencies = [
   "httpx==0.28.1",
   "psutil>=7",
   "tokenizers==0.23.2",
+  "llguidance==1.8.0",
   "fastapi==0.141.1",
   "uvicorn==0.52.4",
   "jinja2==3.1.6",
@@ -41,8 +42,19 @@ magnitude-performance = "ops.lab.__main__:main"
 session-bench = "session_bench.cli:main"
 magnitude-qualify = "engine.qualification:main"
 
+[tool.hatch.build]
+# Only the hook's freshly built library belongs in a wheel. This must also
+# hold in source archives and checkouts without Git ignore metadata.
+exclude = ["src/templates/_native/**"]
+
 [tool.hatch.build.targets.wheel]
-packages = ["src/engine", "src/ops", "src/session_bench", "src/benchmark_fixtures"]
+packages = ["src/engine", "src/ops", "src/session_bench", "src/benchmark_fixtures", "src/templates"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.sdist]
+only-include = ["src", "native/templates", "hatch_build.py", "pyproject.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

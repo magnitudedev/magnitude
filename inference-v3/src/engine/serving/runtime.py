@@ -7,11 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 import ops
 from engine.blueprints.execution import ScheduleProfile
 from engine.data import Record, TokenId
+from engine.generation.constraints import ConstraintPlan, ConstraintVocabulary
 from engine.generation.plain import Options, OutputToken
 from engine.inputs.formats.gguf_tokenizer import TokenizerArtifact
 from engine.models.qwen35.inputs import InputPlan
@@ -20,6 +21,7 @@ from engine.platform.backend import Backend
 from engine.service.engine import Engine, Snapshot, Submission
 from engine.service.policy import RequestId
 from engine.weights.identity import ArtifactIdentity
+from templates.bundle import Variant
 
 
 class Config(Record):
@@ -31,10 +33,19 @@ class Config(Record):
     max_queued: int = Field(default=128, ge=0)
     prefill_tokens: int = Field(default=512, gt=0)
     output_capacity: int = Field(default=16, gt=0)
+    forced_quantum: int = Field(default=32, ge=0, le=256)
     retained_prefixes: Literal[0] = 0
     backend: Backend | None = None
     ordinal: int = Field(default=0, ge=0)
     schedules: ScheduleProfile | None = None
+    template_variant: str | None = None
+    template_override: Variant | None = None
+
+    @model_validator(mode="after")
+    def template_selection(self):
+        if self.template_variant is not None and self.template_override is not None:
+            raise ValueError("configure a template source override or variant, not both")
+        return self
 
 
 @dataclass(frozen=True)
@@ -52,6 +63,7 @@ class ServerProperties(Record):
     retained_prefixes: Literal[0] = 0
     prefill_tokens: int
     output_capacity: int
+    forced_quantum: int
     memory_bytes: int
     backend: Backend
     composition_json: str
@@ -73,13 +85,30 @@ class Runtime:
         if not isinstance(engine.model, DenseRuntime):
             raise ValueError("this serving composition requires the dense Qwen adapter")
         self.model = engine.model
+        self._constraint_vocabulary: ConstraintVocabulary | None = None
         self.receivers: dict[RequestId, Future[Publication]] = {}
         self.detached: set[RequestId] = set()
 
-    def admit(self, tokens: tuple[TokenId, ...], options: Options) -> RequestId:
+    def admit(
+        self,
+        tokens: tuple[TokenId, ...],
+        options: Options,
+        constraint: ConstraintPlan | None = None,
+    ) -> RequestId:
+        state = None
+        if constraint is not None:
+            # Compile and initialize before creating input state or queueing work.
+            if constraint.artifact_identity != self.ready.properties.artifact_identity:
+                raise ValueError("constraint plan belongs to another served artifact")
+            if self._constraint_vocabulary is None:
+                self._constraint_vocabulary = ConstraintVocabulary(
+                    self.ready.tokenizer.config,
+                    projection_vocabulary=self.model.geometry.vocabulary,
+                )
+            state = self._constraint_vocabulary.bind(constraint)
         source = self.model.input(InputPlan.text(tokens))
         try:
-            return self.engine.admit(source, options)
+            return self.engine.admit(source, options, constraint=state)
         except BaseException:
             source.close()
             raise
@@ -181,6 +210,7 @@ def open_runtime(config: Config) -> Iterator[Runtime]:
                 max_requests=config.max_queued + config.parallel_sequences,
                 max_batch=config.parallel_sequences,
                 prefill_tokens=config.prefill_tokens,
+                decode_tokens=min(config.prefill_tokens, max(1, config.forced_quantum)),
             ),
         ),
         tokenizer=metadata,
@@ -199,6 +229,7 @@ def open_runtime(config: Config) -> Iterator[Runtime]:
                 retained_prefixes=config.retained_prefixes,
                 prefill_tokens=config.prefill_tokens,
                 output_capacity=config.output_capacity,
+                forced_quantum=config.forced_quantum,
                 memory_bytes=config.memory_bytes,
                 backend=endpoint.backend,
                 composition_json=dumps(recipe),

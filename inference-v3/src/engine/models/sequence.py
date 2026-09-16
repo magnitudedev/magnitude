@@ -26,12 +26,19 @@ class ModelAdvance(Protocol):
     def close(self) -> None: ...
 
 
+class TokenMask(Protocol):
+    """Owner-thread symbolic work independent of the numerical forward."""
+
+    def mask(self) -> bytes: ...
+
+
 @dataclass(frozen=True)
 class ModelRequest:
     sequence: ModelSequence
     tokens: tuple[TokenId, ...]
     selection: LogitsSelection = LogitsSelection.LAST
     draw_words: tuple[int, int, int, int, int, int] | None = None
+    allowed_tokens: bytes | TokenMask | None = None
 
 
 class ModelBatch(Protocol):
