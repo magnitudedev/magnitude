@@ -11,10 +11,22 @@ injectPaletteCssVars()
 const dark = new URLSearchParams(location.search).has("dark")
 document.documentElement.dataset.theme = dark ? "dark" : "light"
 const unknowns = [
+  { label: "Long unknown names — ellipsis and full name on hover", identity: identity("Example vendor", "Unrecognized custom workstation with an unusually long manufacturer model identifier 1234567890", "Desktop"), value: hardware("Unrecognized processor with an unusually long model name and additional firmware identification text", 64, 16, [{name: "Unrecognized accelerator with an unusually long vendor and product model identifier", memory: 16}]) },
   { label: "Unknown hardware — no enclosure identity", identity: null, value: hardware("Unrecognized processor", 16, 8) },
   { label: "Unknown laptop — recognizable GPU, no matching laptop photo", identity: identity("Example vendor", "Unlisted laptop", "Portable"), value: hardware("Intel Core i7-13700H", 32, 20, [{name: "NVIDIA GeForce RTX 4060 Laptop GPU", memory: 8}], 14) },
   { label: "Unknown desktop — recognized discrete GPU", identity: identity("Example vendor", "Custom desktop", "Desktop"), value: hardware("Unrecognized processor", 64, 16, [{name: "NVIDIA GeForce RTX 5090", memory: 32}]) },
   { label: "Unknown desktop and unknown GPU", identity: identity("Example vendor", "Unlisted desktop", "Desktop"), value: hardware("Unrecognized processor", 32, 8, [{name: "Unrecognized accelerator", memory: 8}]) },
+]
+// Synthetic observations isolate presentation rules; these are not asserted retail configurations.
+const detailExamples = [
+  { label: "RTX 3050 Laptop · 4 GB — architecture and maximum bandwidth", note: "Shows ‘Up to 192 GB/s’. The GPU architecture label is now omitted.", identity: null, value: hardware("Intel Core i7-13700H", 32, 20, [{name: "NVIDIA GeForce RTX 3050 Laptop GPU", memory: 4}], 14) },
+  { label: "RTX 3050 Laptop · 6 GB — same GPU name, different bandwidth", note: "The 6 GB variant selects ‘Up to 168 GB/s’; The GPU architecture label is omitted.", identity: null, value: hardware("Intel Core i7-13700H", 32, 20, [{name: "NVIDIA GeForce RTX 3050 Laptop GPU", memory: 6}], 14) },
+  { label: "M4 — physical CPU count unavailable", note: "Omits the CPU count when it is unknown. The catalog’s ‘8 or 10’ range is already excluded from the card.", identity: identity("Apple", "Mac16,10"), value: hardware("Apple M4", 24, 10, [{name: "Apple M4", memory: 24, shared: true}]) },
+  { label: "M4 — physical CPU count available", note: "Compare with the previous card: an observed 10-core CPU adds a definite count.", identity: identity("Apple", "Mac16,10"), value: hardware("Apple M4", 24, 10, [{name: "Apple M4", memory: 24, shared: true}], 10) },
+  { label: "M4 Max — your chip configuration", note: "16 CPU cores, 40 GPU cores, and 546 GB/s bandwidth. Neural Engine cores are omitted.", identity: identity("Apple", "Mac16,5"), value: hardware("Apple M4 Max", 64, 16, [{name: "Apple M4 Max", memory: 64, shared: true}], 16) },
+  { label: "Shared GPU memory — Strix Halo", note: "Keeps ‘Shares unified memory’, making clear that GPU memory is not an additional VRAM pool.", identity: identity("HP", "HP Z2 Mini G1a Workstation Desktop PC", "MiniPc"), value: hardware("AMD Ryzen AI Max+ PRO 395", 128, 32, [{name: "AMD Radeon 8060S Graphics", memory: 128, shared: true}], 16) },
+  { label: "RTX 3060 · 12 GB — dedicated VRAM", note: "System RAM and GPU VRAM remain separate. CUDA core counts are omitted.", identity: null, value: hardware("AMD Ryzen 9 9950X", 64, 32, [{name: "NVIDIA GeForce RTX 3060", memory: 12}], 16) },
+  { label: "RTX 3060 · 8 GB — memory-dependent specification", note: "Compare its bandwidth with the 12 GB version; the card uses the observed VRAM capacity to choose the specification.", identity: null, value: hardware("AMD Ryzen 9 9950X", 64, 32, [{name: "NVIDIA GeForce RTX 3060", memory: 8}], 16) },
 ]
 const catalog = hardwarePhotoInventory.map(entry => {
   const row = coverage.find(row => row.photoId === entry.id)!
@@ -27,7 +39,8 @@ createRoot(document.getElementById("root")!).render(<main className="mx-auto max
   <h1>Hardware gallery</h1>
   <p>All {catalog.length} photo groups, all matching identifiers, {facts.length} published specification entries, and unknown-hardware fallbacks.</p>
   <p>The hardware cards below use example configurations, not a scan of your computer. The photo catalog shows every image without inventing a configuration. Open each mapping to see all supported identifiers and researched configurations.</p>
-  <nav><a href="#unknown">Unknown hardware</a><a href="#scenarios">Configuration examples</a><a href="#catalog">All 44 photo options</a><a href="#facts">All specifications</a><a href={dark ? "?" : "?dark"}>{dark ? "Light mode" : "Dark mode"}</a></nav>
+  <nav><a href="#detail-examples">Details to review</a><a href="#unknown">Unknown hardware</a><a href="#scenarios">Configuration examples</a><a href="#catalog">All 44 photo options</a><a href="#facts">All specifications</a><a href={dark ? "?" : "?dark"}>{dark ? "Light mode" : "Dark mode"}</a></nav>
+  <section id="detail-examples"><h2>Details to review · {detailExamples.length} examples</h2><p>Real hardware-card rendering with synthetic observations to expose each display rule. These examples are not scans of your machine or a list of verified retail configurations.</p>{detailExamples.map(s => <article key={s.label}><h3>{s.label}</h3><p>{s.note}</p><HardwareSummary identity={s.identity} value={s.value}/></article>)}</section>
   <section id="unknown"><h2>Unknown hardware</h2>{unknowns.map(s => <article key={s.label}><h3>{s.label}</h3><HardwareSummary identity={s.identity} value={s.value}/></article>)}</section>
   <section id="scenarios"><h2>Configuration examples</h2><p>Representative laptop, unified-memory, multi-GPU and AI mini PC configurations.</p>{hardwareScenarios.map(s => <article key={s.label}><h3>{s.label}</h3><HardwareSummary identity={s.identity} value={s.value}/></article>)}</section>
   <section id="catalog"><h2>All photo options</h2>{catalog.map(({entry,row,names},i) => <article id={entry.id} key={entry.id} data-photo-id={entry.id}>
