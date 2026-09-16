@@ -26,6 +26,7 @@ from .lowering import (
     plan_submissions,
 )
 from .memory import MemoryPlan, StorageClass, plan_memory
+from .schedules import ScheduleResolver
 from .unit import BindingKey, ParameterKind, TileCompilationUnit, build_unit
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ class CompileOptions:
     precision: str = "model"
     workspace_limit: int | None = None
     dimensions: Mapping[str, int] = field(default_factory=dict)
+    schedules: ScheduleResolver | None = None
 
     def __post_init__(self) -> None:
         if not self.mode:
@@ -400,11 +402,14 @@ def compile(
     static_resources: Mapping[int | str, Resource] | None = None,
     options: CompileOptions,
 ) -> CompiledFunction:
+    if options.schedules is None and device.schedules is not None:
+        options = replace(options, schedules=device.schedules)
     plan = analyze(
         function,
         signature=signature,
         compiler_target=device.compiler_target,
         compiler_identity=device.compiler_identity,
+        device_identity=device.evidence_identity if options.schedules is not None else None,
         available_bytes=device.available_bytes,
         constants=constants,
         options=options,
@@ -427,12 +432,13 @@ def analyze(
     available_bytes: int | None = None,
     constants: Mapping[int | str, Resource | Binding] | None = None,
     device: DeviceConfiguration | None = None,
+    device_identity: str | None = None,
 ) -> CompilationPlan:
     """Plan a function without allocation, code generation, or native execution."""
     graph = trace(function, _specialize_signature(signature, options.dimensions))
     return analyze_graph(
         graph, compiler_target=compiler_target, options=options, compiler_identity=compiler_identity,
-        available_bytes=available_bytes, constants=constants, device=device,
+        available_bytes=available_bytes, constants=constants, device=device, device_identity=device_identity,
     )
 
 
@@ -445,6 +451,7 @@ def analyze_graph(
     available_bytes: int | None = None,
     constants: Mapping[int | str, Resource | Binding] | None = None,
     device: DeviceConfiguration | None = None,
+    device_identity: str | None = None,
 ) -> CompilationPlan:
     """The same production planning path for full traces and isolated formulas."""
     if device is not None:
@@ -472,6 +479,12 @@ def analyze_graph(
     workspace_limit = options.workspace_limit
     if workspace_limit is None:
         workspace_limit = maxsize if available_bytes is None else available_bytes
+    if device_identity is None:
+        device_identity = device.fingerprint if device is not None else compiler_target.identity
+    if options.schedules is not None and device is not None:
+        from ..runtime.tilelang import describe_schedule_device
+
+        device_identity = describe_schedule_device(device)
     context = LoweringContext(
         compiler_target,
         options.mode,
@@ -479,6 +492,8 @@ def analyze_graph(
         compiler_identity,
         workspace_limit,
         bindings,
+        options.schedules,
+        device_identity,
     )
     from ..operation import build_operations
 

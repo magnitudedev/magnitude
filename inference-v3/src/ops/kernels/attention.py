@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 import tilelang.language as T
 
 from ..compiler.lowering import BoundOperation, LoweringContext
+from ..compiler.schedules import select_schedule
 from ..tensor.graph import Graph
 from ..tensor.types import DType, TensorSpec
 from .matrix import (
@@ -18,6 +19,7 @@ from .matrix import (
     _packet_reduction_width,
 )
 from .packed import affine_shared_bytes, packet_format
+from .schedules import ProbabilityTransfer, select_affine_tile
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +33,7 @@ class _MatrixAttentionSchedule:
     span: int
     shared_bytes: int
     workspace: tuple[TensorSpec, TensorSpec]
+    probability_transfer: ProbabilityTransfer = ProbabilityTransfer.SHARED
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,7 +50,7 @@ class _DecodeAttentionSchedule:
     span: int
 
 
-def _decode_attention_schedule(query, history, context):
+def _decode_attention_schedule(query, history, context, *, template=None, workload=()):
     """Use grouped heads as matrix rows and reduce history in complete tiles.
 
     Only complete head cohorts use this schedule. K/V retain their storage
@@ -81,12 +84,29 @@ def _decode_attention_schedule(query, history, context):
     # complete grid remains independent of changing visible token counts.
     span = keys * 16
     partitions = math.ceil(history.shape[1] / span)
-    return _DecodeAttentionSchedule(head_tile, matrix_rows, keys, contraction, columns,
-                                    8, threads, padding, partitions, span)
+    default = _DecodeAttentionSchedule(head_tile, matrix_rows, keys, contraction, columns,
+                                       8, threads, padding, partitions, span)
+    candidates = tuple(
+        replace(default, rows=physical_rows, columns=value_columns, keys=key_columns,
+                threads=context.compiler_target.subgroup_width * min(4, key_columns // 8),
+                span=history_span, partitions=math.ceil(history.shape[1] / history_span))
+        for physical_rows in (8, 16)
+        for value_columns in (32, 64)
+        for key_columns, history_span in dict.fromkeys(((keys, span), (16, 256), (32, 256), (32, 1024)))
+        if width % value_columns == 0
+        and context.compiler_target.subgroup_width * min(4, key_columns // 8) <= context.compiler_target.threads_per_group
+        and ((width + padding) * (key_columns + padding) * history.dtype.itemsize
+             + physical_rows * key_columns * DType.F32.itemsize
+             <= context.compiler_target.shared_memory_bytes)
+    )
+    return select_schedule(context, "attention.decode", candidates, default,
+                           template=template or _PartitionedAttentionEmitter,
+                           workload=(query, history, workload))
 
 
 def _matrix_attention_schedule(
     query: TensorSpec, history: TensorSpec, context: LoweringContext, sequence_count: int | None,
+    *, template=None, workload=(),
 ) -> _MatrixAttentionSchedule | None:
     """One streaming body geometry, whether isolated or composed with its output.
 
@@ -109,9 +129,9 @@ def _matrix_attention_schedule(
         probability = query_tile * head_tile * 8 * DType.F32.itemsize
         return (width + padding) * (key_tile + padding) * query.dtype.itemsize + probability
 
-    while staging_bytes() > context.compiler_target.shared_memory_bytes and key_tile > 8:
+    while staging_bytes() + 16 > context.compiler_target.shared_memory_bytes and key_tile > 8:
         key_tile //= 2
-    shared_bytes = staging_bytes()
+    shared_bytes = staging_bytes() + 16
     value_tile = min(width, query_tile * 2)
     if key_tile % 8 or (query_tile * head_tile) % 8 or value_tile % 8:
         return None
@@ -120,12 +140,17 @@ def _matrix_attention_schedule(
     capacity = cast(int, history.shape[1])
     partitions = math.ceil(capacity / 4096)
     span = math.ceil(capacity / (partitions * key_tile)) * key_tile
-    return _MatrixAttentionSchedule(
+    default = _MatrixAttentionSchedule(
         (query_tile, key_tile, threads), head_tile, value_tile, 8, padding,
         partitions, span, shared_bytes,
         (TensorSpec((partitions, rows, heads, width), DType.F32),
          TensorSpec((partitions, rows, heads, 2), DType.F32)),
     )
+    inferred = replace(default, probability_transfer=ProbabilityTransfer.INFERRED,
+                       shared_bytes=shared_bytes - query_tile * head_tile * 8 * DType.F32.itemsize)
+    return select_schedule(context, "attention.prefill", (default, inferred), default,
+                           template=template or _MatrixAttentionEmitter,
+                           workload=(query, history, sequence_count, workload))
 
 
 @T.macro
@@ -174,17 +199,36 @@ def _attention_value_columns(probability, values, outputs, first_key, width, col
 
 
 @T.macro
-def _attention_values(scores, values, outputs, rows, width, keys, columns, reduction_step):
-    # QK accumulator ownership and PV A-operand ownership are not generally
-    # compatible. Publish each narrow probability strip so TileLang can infer
-    # both matrix layouts independently on every backend.
-    probability = T.alloc_shared((rows, reduction_step), "float32")
+def _attention_shared_values(probabilities, values, outputs, rows, width, keys, columns, reduction_step):
+    """Consume an established ownership exchange without copying it again."""
+    T.sync_threads()
+    for step in T.serial(keys // reduction_step):
+        _attention_value_columns(
+            probabilities[0:rows, step * reduction_step:(step + 1) * reduction_step],
+            values, outputs, step * reduction_step, width, columns, reduction_step,
+        )
+    T.sync_threads()
+
+
+@T.macro
+def _attention_values(scores, values, outputs, rows, width, keys, columns, reduction_step, transfer):
+    # A fragment chain is admissible only when TileLang can infer compatible
+    # producer/consumer ownership. The other candidate explicitly exchanges it.
+    if transfer == ProbabilityTransfer.SHARED:
+        probability = T.alloc_shared((rows, reduction_step), "float32")
+    else:
+        probability = T.alloc_fragment((rows, reduction_step), "float32")
+        T.sync_threads()
     for step in T.serial(keys // reduction_step):
         for row, item in T.Parallel(rows, reduction_step):
             probability[row, item] = scores[row, step * reduction_step + item]
-        T.sync_threads()
+        if transfer == ProbabilityTransfer.SHARED:
+            T.sync_threads()
         _attention_value_columns(probability, values, outputs, step * reduction_step,
                                   width, columns, reduction_step)
+        if transfer == ProbabilityTransfer.SHARED:
+            T.sync_threads()
+    if transfer == ProbabilityTransfer.INFERRED:
         T.sync_threads()
 
 
@@ -217,23 +261,36 @@ def _attention_publish(outputs, denominator, gate, partials, first_row, first_he
 
 
 @T.macro
-def _matrix_visible_count(visible, first_row, query_tile, tokens, column):
-    """Padding has zero visibility; the last physical row need not be valid."""
-    result = T.alloc_shared((1,), "int32")
+def _matrix_visible_interval(visible, first_row, query_tile, tokens, column):
+    """Stage the interval union; only its intersection may omit row masks."""
+    result = T.alloc_shared((4,), "int32")
     thread = T.get_thread_binding()
     if thread < 32:
-        maximum = T.alloc_local((1,), "int32")
-        maximum[0] = 0
+        limits = T.alloc_local((4,), "int32")
+        limits[0] = 2147483647
+        limits[1] = 0
+        limits[2] = 0
+        limits[3] = 2147483647
         for group in T.unroll(T.ceildiv(query_tile, 32)):
             row = first_row + group * 32 + thread
-            maximum[0] = T.max(maximum[0], T.if_then_else(
-                group * 32 + thread < query_tile and row < tokens,
-                T.cast(visible[row, column], "int32"), 0))
-        count = T.warp_reduce_max(maximum[0])
+            valid = group * 32 + thread < query_tile and row < tokens
+            start = T.if_then_else(valid, T.cast(visible[row, column - 1], "int32"), 0)
+            count = T.if_then_else(valid, T.cast(visible[row, column], "int32"), 0)
+            limits[0] = T.min(limits[0], T.if_then_else(valid and count > 0, start, 2147483647))
+            limits[1] = T.max(limits[1], T.if_then_else(valid and count > 0, start + count, 0))
+            limits[2] = T.max(limits[2], start)
+            limits[3] = T.min(limits[3], T.if_then_else(valid, start + count, 2147483647))
+        first = T.warp_reduce_min(limits[0])
+        last = T.warp_reduce_max(limits[1])
+        common_first = T.warp_reduce_max(limits[2])
+        common_last = T.warp_reduce_min(limits[3])
         if thread == 0:
-            result[0] = count
+            result[0] = T.if_then_else(last > 0, first, 0)
+            result[1] = T.if_then_else(last > 0, last - first, 0)
+            result[2] = common_first
+            result[3] = common_last
     T.sync_threads()
-    return result[0]
+    return result[0], result[1], result[2], result[3]
 
 
 @T.macro
@@ -289,11 +346,10 @@ def _matrix_streaming_attention(
         local_sum = T.alloc_fragment((query_rows,), "float32")
         alpha = T.alloc_fragment((query_rows,), "float32")
         first_row = block * query_tile
-        last_row = T.min(tokens - 1, first_row + query_tile - 1)
-        base = T.cast(visible[first_row, 0], "int32")
-        count = _matrix_visible_count(visible, first_row, query_tile, tokens, 1)
+        base, count, common_first, common_last = _matrix_visible_interval(
+            visible, first_row, query_tile, tokens, 1)
         # Visibility is a valid interval within the history allocation. The
-        # single-sequence matrix schedule shares its base across this query tile.
+        # staged union may include gaps; every row keeps its own visible interval.
         T.assume(base >= 0)
         T.assume(count >= 0)
         T.assume(base <= history.shape[1])
@@ -337,8 +393,8 @@ def _matrix_streaming_attention(
             wholly_visible = (
                 aligned
                 and first_row + query_tile <= tokens
-                and first + (chunk + 1) * key_tile <= visible[first_row, 1]
-                and first + (chunk + 1) * key_tile <= visible[last_row, 1]
+                and base + first + chunk * key_tile >= common_first
+                and base + first + (chunk + 1) * key_tile <= common_last
             )
             if wholly_visible:
                 for row, item in T.Parallel(query_rows, key_tile):
@@ -349,7 +405,8 @@ def _matrix_streaming_attention(
                     relative = first + chunk * key_tile + item
                     scores[row, item] = T.if_then_else(
                         token < tokens
-                        and relative < visible[token, 1],
+                        and base + relative >= visible[token, 0]
+                        and base + relative < visible[token, 0] + visible[token, 1],
                         scores[row, item] * scale * log2e,
                         -3.402823466e38,
                     )
@@ -377,7 +434,7 @@ def _matrix_streaming_attention(
                     0,
                 )
             _attention_values(scores, values, outputs, query_rows, width, key_tile,
-                              columns, schedule.reduction_step)
+                              columns, schedule.reduction_step, schedule.probability_transfer)
         if not fuse_gate or partitions > 1:
             for row in T.Parallel(query_rows):
                 token = first_row + row % query_tile
@@ -494,7 +551,7 @@ def _tiled_decode_attention(query, history, visible, partials, statistics,
                         chunk_first + item < count,
                         history[1, base + chunk_first + item, kv_head, channel], 0)
             T.copy(scores, probabilities)
-            _attention_values(probabilities, values, outputs, matrix_rows, width, key_tile,
+            _attention_shared_values(probabilities, values, outputs, matrix_rows, width, key_tile,
                               columns, schedule.reduction_step)
         for head in T.Parallel(head_tile):
             statistics[partition, token, first_head + head, 0] = T.if_then_else(
@@ -1077,7 +1134,7 @@ class _PrefillAttentionOutputEmitter:
                 max(width, 128),
                 self.specs[0].dtype.value,
             )
-        projection_threads, bm, bn, bk, reduction_step = self.projection_tile
+        projection_threads, bm, bn, bk, contraction_schedule = self.projection_tile
         _packed_matrix(
             activation,
             weight,
@@ -1087,7 +1144,7 @@ class _PrefillAttentionOutputEmitter:
             tokens,
             cast(int, self.specs[4].shape[0]),
             heads * width,
-            reduction_step,
+            contraction_schedule,
             self.specs[5].dtype.value,
             projection_threads,
             bm,
@@ -1097,7 +1154,7 @@ class _PrefillAttentionOutputEmitter:
         )
 
 
-def attention_projection_tile(context, activation, weight):
+def attention_projection_tile(context, activation, weight, *, template, workload):
     """The output contraction schedule shared by dense and persistent mixers."""
     tokens, channels = activation.shape
     bm, bn = (32, 64) if tokens >= 256 and min(weight.shape[0], channels) >= 512 else (32, 32)
@@ -1106,7 +1163,10 @@ def attention_projection_tile(context, activation, weight):
                   bm // 8 * context.compiler_target.subgroup_width)
     if bk % 8 or affine_shared_bytes(bm, bn, bk, activation.dtype, weight) > context.compiler_target.shared_memory_bytes:
         return None
-    return threads, bm, bn, bk, 8
+    schedule = select_affine_tile(context, activation, (weight,), (bm, bn, bk, threads),
+                                  template=template, name="attention.output-affine",
+                                  workload=workload)
+    return schedule.threads, schedule.rows, schedule.columns, schedule.reduction, schedule.operands
 
 
 class AttentionOutputRule:
@@ -1131,11 +1191,13 @@ class AttentionOutputRule:
         if context.mode == "prefill":
             schedule = _matrix_attention_schedule(
                 specs[0], specs[1], context, graph.nodes[root].attributes["sequence_count"],
+                template=_PrefillAttentionOutputEmitter, workload=specs,
             )
             if schedule is None:
                 return ()
             activation = TensorSpec((tokens, heads * width), specs[0].dtype)
-            projection_tile = attention_projection_tile(context, activation, specs[4])
+            projection_tile = attention_projection_tile(context, activation, specs[4],
+                                                       template=_PrefillAttentionOutputEmitter, workload=(specs, schedule))
             if projection_tile is None:
                 return ()
             if schedule.shared_bytes > context.compiler_target.shared_memory_bytes:
@@ -1177,7 +1239,8 @@ class AttentionOutputRule:
         target_partitions = max(1, math.ceil(512 / (tokens * cast(int, specs[1].shape[2]))))
         span = math.ceil(capacity / target_partitions / stride) * stride
         partitions = math.ceil(capacity / span)
-        decode_schedule = _decode_attention_schedule(specs[0], specs[1], context)
+        decode_schedule = _decode_attention_schedule(
+            specs[0], specs[1], context, template=_AttentionOutputEmitter, workload=specs)
         if decode_schedule is not None:
             partitions, span = decode_schedule.partitions, decode_schedule.span
         partials = TensorSpec((partitions, tokens, heads, width), DType.F32)

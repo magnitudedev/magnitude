@@ -78,6 +78,29 @@ branches belong inside that definition. There is no competing implementation
 registry, cost-ranked cover, unknown-cost preference or ops autotuning layer.
 TileLang owns kernel schedule tuning; retuning is an explicit development action.
 
+A physical implementation may expose a bounded family of static portable schedules
+under one numerical and effect contract. Schedule values describe geometry,
+operand lifetime and ownership exchange; they contain no backend identity or
+instruction catalogue. TileLang independently rejects illegal candidates, validates
+legal candidates against an independent reference, and measures the complete
+candidate boundary. A fused operation selects the joint child-schedule combination;
+child choices cannot be independently reused after changing their enclosing work.
+Configuration selection precedes private-function composition.
+
+Ops persists TileLang's selected configurations as qualified schedule records,
+separate from compiled executables. TileLang owns candidate evaluation and ranking;
+Ops owns workload/validation identity, storage and exact-match reuse.
+Their identity covers the complete candidate family and authored dependencies,
+logical geometry, storage representations, numerical mode, reference qualification,
+compiler/target resources, physical inventory, and live driver/OS/runtime provenance.
+A strict qualified compilation rejects missing or stale records. Ordinary planning
+only reads a configuration and reconstructs its static schedule; neither planning
+nor warm execution starts calibration. A choice qualified for an isolated operation
+does not automatically qualify a differently composed boundary.
+An explicitly configured engine profile supplies the selection store and validation
+identity through its device blueprint. Nested source execution and lab preparation
+inherit that runtime selection context; explicit compile options may override it.
+
 An operation encompasses source reads, allocations, staging, transfers, numerical
 conversion, kernels, dependencies, synchronization and temporary release. It
 expresses that work through shared ops facilities. DeviceRuntime owns the actual
@@ -168,6 +191,10 @@ chunked prefill comparisons include every chunk's packed-prefix traversal and ap
 Matrix query tiles derive their traversal extent from valid row visibility,
 including partially padded tiles. A zero-visibility final physical row cannot
 suppress preceding valid queries, and padding never enables an unmasked fast path.
+Each query row owns its start/count interval; a single sequence does not imply
+equal starts or monotonic counts. Staging may traverse the union of nonempty
+intervals, while an unmasked contraction must lie within every valid row's
+interval. Empty rows publish zero and do not enlarge that traversal union.
 
 Sequential execution may retain a bounded set of output backings. A backing becomes
 reusable only when its retained owner holds every remaining allocation lease,

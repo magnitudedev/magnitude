@@ -14,9 +14,17 @@ from .matrix import (
     _packed_vector_geometry,
     _packet_reduction_width,
 )
-from .packed import (affine_gemm, affine_shared_bytes, affine_storage,
-                     load_matrix_tile, packet_dot, packet_format, prepare_packet_activation)
+from .packed import (
+    affine_gemm,
+    affine_shared_bytes,
+    affine_storage,
+    load_matrix_tile,
+    packet_dot,
+    packet_format,
+    prepare_packet_activation,
+)
 from .publication import publish, residual_epilogue
+from .schedules import select_affine_region
 
 
 def _dense_swiglu_region(graph: Graph, root: int):
@@ -122,7 +130,7 @@ def _gated_packet_matrix(
     bm,
     bn,
     bk,
-    reduction_step,
+    contraction_schedule,
 ):
     packet = packet_format(gate_spec)
     assert packet is not None and packet_format(up_spec) == packet
@@ -133,7 +141,7 @@ def _gated_packet_matrix(
         and (bn * bk // packet.matrix_packet) % threads == 0
     )
     with T.Kernel(T.ceildiv(intermediate, bn), T.ceildiv(rows, bm), threads=threads) as (bx, by):
-        storage = affine_storage(bm, 2 * bn, bk, hidden.dtype, reduction_step, (gate_spec, up_spec))
+        storage = affine_storage(bm, 2 * bn, bk, hidden.dtype, contraction_schedule, (gate_spec, up_spec))
         x, paired_tile, coefficients, paired_accum, b = storage
         gate_activation = T.alloc_fragment((bm, bn), "float32")
         T.clear(paired_accum)
@@ -229,7 +237,8 @@ class _DenseSwiGLUEmitter:
                 width,
                 intermediate,
                 self.specs[0].dtype.value,
-                *self.tile,
+                self.tile.threads, self.tile.rows, self.tile.columns,
+                self.tile.reduction, self.tile.operands,
             )
         packet = packet_format(self.specs[3])
         assert packet is not None
@@ -255,7 +264,8 @@ class _DenseSwiGLUEmitter:
             )
         else:
             assert self.tile is not None
-            threads, bm, bn, bk, reduction_step = self.tile
+            threads, bm, bk, contraction_schedule = (self.tile.threads, self.tile.rows,
+                                                     self.tile.reduction, self.tile.operands)
             _packed_matrix(
                 activation,
                 down,
@@ -265,11 +275,11 @@ class _DenseSwiGLUEmitter:
                 rows,
                 width,
                 intermediate,
-                reduction_step,
+                contraction_schedule,
                 self.specs[4].dtype.value,
                 threads,
                 bm,
-                2 * bn,
+                self.tile.output_columns,
                 _packet_reduction_width(self.specs[3]),
                 False,
                 residual=residual,
@@ -446,7 +456,6 @@ class DenseSwiGLURule:
         else:
             vector = None
             gate_vector = None
-            reduction_step = 16
             if rows >= 256 and min(intermediate, width) >= 512:
                 bm, bn, bk = 32, 32, 32
             else:
@@ -468,7 +477,12 @@ class DenseSwiGLURule:
                          affine_shared_bytes(bm, 2 * bn, down_bk, specs[0].dtype, specs[3]))
             if shared > context.compiler_target.shared_memory_bytes:
                 return ()
-            tile = (threads, bm, bn, bk, reduction_step)
+            schedule = select_affine_region(
+                context, specs[0], ((False, bk, specs[1:3]), (True, down_bk, (specs[3],))),
+                (bm, bn, bk, threads), template=_DenseSwiGLUEmitter,
+                name="swiglu.affine", workload=specs,
+            )
+            tile = schedule
         activation = TensorSpec((rows, intermediate), specs[0].dtype)
         return (
             BoundOperation(

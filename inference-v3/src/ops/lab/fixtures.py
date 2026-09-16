@@ -314,6 +314,8 @@ class Fixture:
 
         if target.graph is not self.root or not target.call.complete:
             raise ValueError("capture requires a complete scope in this production trace")
+        if options.schedules is None and device.schedules is not None:
+            options = replace(options, schedules=device.schedules)
         isolated = target.isolate()
         cutoff = min(target.call.nodes) if target.call.nodes else 0
         nodes = self.root.nodes[:cutoff]
@@ -361,7 +363,8 @@ class Fixture:
                     constants[identity] = resource
             plan = analyze_graph(prefix, compiler_target=device.compiler_target,
                                  compiler_identity=device.compiler_identity, options=options,
-                                 available_bytes=device.available_bytes, constants=constants)
+                                 available_bytes=device.available_bytes, constants=constants,
+                                 device_identity=device.evidence_identity if options.schedules is not None else None)
             compiled = materialize(plan, device=device, constants=constants)
             retained.callback(compiled.close)
             original = (*prefix.inputs, *prefix.constants, *prefix.resources)

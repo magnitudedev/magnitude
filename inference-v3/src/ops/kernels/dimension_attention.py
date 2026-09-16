@@ -5,72 +5,103 @@ import math
 
 import tilelang.language as T
 
-from ..tensor.types import TensorSpec, DType
-from .attention import (_MatrixAttentionSchedule, _attention_accumulators, _attention_rescale, _attention_value_tile,
-                        _attention_publish, _matrix_visible_count)
-from .kv_packed import stage_history, stage_current, prepare_codebook
+from ..compiler.schedules import select_schedule
+from ..tensor.types import DType, TensorSpec
+from .attention import (
+    _attention_accumulators,
+    _attention_publish,
+    _attention_rescale,
+    _attention_value_tile,
+    _matrix_visible_interval,
+    _MatrixAttentionSchedule,
+)
+from .kv_packed import prepare_codebook, stage_current, stage_history
+from .schedules import ProbabilityTransfer
 
 
-def prefill_schedule(query, history, context):
+def prefill_schedule(query, history, context, *, template=None, workload=()):
     """Price the streamed arena independently of a whole-head staging schedule."""
     rows, heads, width = query.shape
     group = heads // history.shape[1]
     target = context.compiler_target
-    head_tile = 2 if group % 2 == 0 and target.threads_per_group >= target.subgroup_width * 8 else 1
-    query_tile, key_tile = 32, 64
-    threads = target.subgroup_width * 4 * head_tile
     slice_width = math.gcd(64, width)
     padding = 8
-    def shared_bytes():
-        probability = query_tile * head_tile * 8 * DType.F32.itemsize
-        return (slice_width + padding) * (key_tile + padding) * query.dtype.itemsize + probability
-    while key_tile > 8 and shared_bytes() + 4 > target.shared_memory_bytes:
-        key_tile //= 2
-    if threads > target.threads_per_group or shared_bytes() + 4 > target.shared_memory_bytes:
+
+    def candidate(query_tile, key_tile, head_tile, transfer):
+        threads = target.subgroup_width * 4 * head_tile
+        probability = (query_tile * head_tile * 8 * DType.F32.itemsize
+                       if transfer == ProbabilityTransfer.SHARED else 0)
+        shared = (slice_width + padding) * (key_tile + padding) * query.dtype.itemsize + probability
+        if (group % head_tile or threads > target.threads_per_group
+                or shared + 16 > target.shared_memory_bytes):
+            return None
+        partitions = math.ceil(history.shape[0] / 4096)
+        span = math.ceil(history.shape[0] / (partitions * key_tile)) * key_tile
+        partitions = math.ceil(history.shape[0] / span)
+        workspace = (TensorSpec((partitions, rows, heads, width), DType.F32),
+                     TensorSpec((partitions, rows, heads, 2), DType.F32))
+        return _MatrixAttentionSchedule((query_tile, key_tile, threads), head_tile,
+            slice_width, 8, padding, partitions, span, shared, workspace, transfer)
+
+    # Row reuse and head reuse have different accumulator lifetimes. Keep both
+    # decompositions available, together with a shorter history tile; none is
+    # inferred to be optimal from the target's maximum resource limits.
+    geometries = ((32, 64, 2), (32, 64, 1), (16, 64, 2),
+                  (32, 32, 2), (64, 32, 1), (64, 64, 1), (32, 8, 1))
+    candidates = tuple(
+        schedule
+        for geometry in geometries
+        for transfer in ProbabilityTransfer
+        if (schedule := candidate(*geometry, transfer)) is not None
+    )
+    if not candidates:
         return None
-    partitions = math.ceil(history.shape[0] / 4096)
-    span = math.ceil(history.shape[0] / (partitions * key_tile)) * key_tile
-    partitions = math.ceil(history.shape[0] / span)
-    workspace = (TensorSpec((partitions, rows, heads, width), DType.F32),
-                 TensorSpec((partitions, rows, heads, 2), DType.F32))
-    return _MatrixAttentionSchedule((query_tile, key_tile, threads), head_tile,
-        slice_width, 8, padding, partitions, span, shared_bytes(), workspace)
+    return select_schedule(context, "attention.persistent-prefill", candidates, candidates[0],
+                           template=template or dimension_tiled_prefill, workload=(query, history, workload))
 
 
 @T.macro
-def _resident_probability_values(scores, values, output, rows, keys, columns, reduction):
-    probability = T.alloc_shared((rows, reduction), 'float32')
+def _resident_probability_values(scores, values, output, rows, keys, columns, reduction, transfer):
+    if transfer == ProbabilityTransfer.SHARED:
+        probability = T.alloc_shared((rows, reduction), 'float32')
+    else:
+        probability = T.alloc_fragment((rows, reduction), 'float32')
+        T.sync_threads()
     # The enlarged score register file must never acquire a dynamic subscript.
     # Statically select each immediate left operand before the column GEMM.
     for step in T.unroll(keys // reduction):
         for row, key in T.Parallel(rows, reduction):
             probability[row, key] = scores[row, step * reduction + key]
-        T.sync_threads()
+        if transfer == ProbabilityTransfer.SHARED:
+            T.sync_threads()
         _attention_value_tile(probability, values, output, step * reduction, 0,
                               columns, columns, reduction)
+        if transfer == ProbabilityTransfer.SHARED:
+            T.sync_threads()
+    if transfer == ProbabilityTransfer.INFERRED:
         T.sync_threads()
 
 
 @T.macro
 def _stream_value_column(history, current, staging, spec, from_history, head, base,
                          first, count, keys, table, probabilities, output, rows, columns,
-                         reduction, first_channel):
+                         reduction, first_channel, transfer):
     if from_history:
         stage_history(history, staging, spec, "value", head, base, first, count, keys,
                       table, first_channel=first_channel, tile_width=columns)
     else:
         stage_current(current, staging, head, base, first, count, keys, columns,
                       False, first_channel)
-    _resident_probability_values(probabilities, staging, output, rows, keys, columns, reduction)
+    _resident_probability_values(probabilities, staging, output, rows, keys, columns, reduction, transfer)
 
 
 def _stream_value_columns(history, current, staging, spec, from_history, head, base,
                           first, count, keys, table, probabilities, outputs, rows,
-                          columns, reduction):
+                          columns, reduction, transfer):
     for index, output in enumerate(outputs):
         _stream_value_column(history, current, staging, spec, from_history, head, base,
                              first, count, keys, table, probabilities, output, rows,
-                             columns, reduction, index * columns)
+                             columns, reduction, index * columns, transfer)
 
 
 @T.macro
@@ -131,12 +162,10 @@ def dimension_tiled_prefill(
         local_sum = T.alloc_fragment((query_rows,), "float32")
         alpha = T.alloc_fragment((query_rows,), "float32")
         first_row = block * query_tile
-        last_row = T.min(tokens - 1, first_row + query_tile - 1)
-        base = T.cast(visible[first_row, 0 if from_history else 2], "int32")
-        count = _matrix_visible_count(visible, first_row, query_tile, tokens,
-                                      1 if from_history else 3)
+        base, count, common_first, common_last = _matrix_visible_interval(
+            visible, first_row, query_tile, tokens, 1 if from_history else 3)
         # Visibility is a valid interval within the history allocation. The
-        # single-sequence matrix schedule shares its base across this query tile.
+        # staged union may include gaps; masks retain each row's own interval.
         T.assume(base >= 0)
         T.assume(count >= 0)
         T.assume(base <= (history_spec.shape[0] if from_history else current_keys.shape[0]))
@@ -173,8 +202,8 @@ def dimension_tiled_prefill(
             wholly_visible = (
                 aligned
                 and first_row + query_tile <= tokens
-                and first + (chunk + 1) * key_tile <= visible[first_row, 1 if from_history else 3]
-                and first + (chunk + 1) * key_tile <= visible[last_row, 1 if from_history else 3]
+                and base + first + chunk * key_tile >= common_first
+                and base + first + (chunk + 1) * key_tile <= common_last
             )
             if wholly_visible:
                 for row, item in T.Parallel(query_rows, key_tile):
@@ -185,7 +214,9 @@ def dimension_tiled_prefill(
                     relative = first + chunk * key_tile + item
                     scores[row, item] = T.if_then_else(
                         token < tokens
-                        and relative < visible[token, 1 if from_history else 3],
+                        and base + relative >= visible[token, 0 if from_history else 2]
+                        and base + relative < (visible[token, 0 if from_history else 2]
+                                               + visible[token, 1 if from_history else 3]),
                         scores[row, item] * scale * log2e,
                         -3.402823466e38,
                     )
@@ -208,7 +239,7 @@ def dimension_tiled_prefill(
             _stream_value_columns(history, current_values, values, history_spec, from_history,
                                    kv_head, base, first + chunk * key_tile, count, key_tile,
                                    table, scores, outputs, query_rows, columns,
-                                   schedule.reduction_step)
+                                   schedule.reduction_step, schedule.probability_transfer)
         for row in T.Parallel(query_rows):
             token = first_row + row % query_tile
             head = first_head + row // query_tile

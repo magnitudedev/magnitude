@@ -14,8 +14,10 @@ from typing import Any, cast
 import tilelang.language as T
 
 from ..compiler.lowering import BoundOperation, LoweringContext
+from ..compiler.schedules import select_schedule
 from ..tensor.graph import Graph
 from ..tensor.types import DType, TensorSpec
+from .schedules import RecurrentSchedule, StateAccumulation
 
 
 @T.macro
@@ -164,6 +166,7 @@ def _chunk_delta_scan(
     mapping,
     threads,
     sequence_length,
+    state_accumulation,
 ):
     with T.Kernel(T.ceildiv(value_width, columns), heads, batch, threads=threads) as (
         tile,
@@ -175,7 +178,10 @@ def _chunk_delta_scan(
         operand = T.alloc_shared((chunk, width), "float32")
         rhs = T.alloc_shared((chunk, columns), "float32")
         contraction = T.alloc_fragment((chunk, columns), "float32")
-        update = T.alloc_fragment((columns, width), "float32")
+        if state_accumulation == StateAccumulation.FRAGMENT_UPDATE:
+            update = T.alloc_fragment((columns, width), "float32")
+        else:
+            update = state
         first = (0 if sequence_length is not None else
                  T.min(key.shape[0], T.max(0, offsets[sequence])))
         end = (sequence_length if sequence_length is not None else
@@ -230,11 +236,12 @@ def _chunk_delta_scan(
                         operand,
                         update,
                         transpose_A=True,
-                        clear_accum=True,
+                        clear_accum=state_accumulation == StateAccumulation.FRAGMENT_UPDATE,
                         policy=T.GemmWarpPolicy.Square,
                     )
-            for v, d in T.Parallel(columns, width):
-                state[v, d] += update[v, d]
+            if state_accumulation == StateAccumulation.FRAGMENT_UPDATE:
+                for v, d in T.Parallel(columns, width):
+                    state[v, d] += update[v, d]
         for v, d in T.Parallel(columns, width):
             if tile * columns + v < value_width:
                 following[sequence, head, tile * columns + v, d] = state[v, d]
@@ -288,9 +295,10 @@ def _chunk_delta_output(
 
 
 class _ChunkedDeltaEmitter:
-    def __init__(self, specs, mapping, chunk, columns, threads, sequence_length):
+    def __init__(self, specs, mapping, schedule, sequence_length):
         self.specs, self.mapping = specs, mapping
-        self.chunk, self.columns, self.threads = chunk, columns, threads
+        self.chunk, self.columns, self.threads = schedule.chunk, schedule.columns, schedule.threads
+        self.state_accumulation = schedule.state_accumulation
         self.sequence_length = sequence_length
 
     def __call__(self, operands: tuple[Any, ...]) -> None:
@@ -339,6 +347,7 @@ class _ChunkedDeltaEmitter:
             self.mapping,
             self.threads,
             self.sequence_length,
+            self.state_accumulation,
         )
         _chunk_delta_output(
             q, offsets, systems, factors, residuals, boundaries, output,
@@ -379,6 +388,20 @@ class ChunkedDeltaRule:
             or max(prepare_shared, scan_shared) > context.compiler_target.shared_memory_bytes
         ):
             return ()
+        default = RecurrentSchedule(chunk, columns, threads, StateAccumulation.FRAGMENT_UPDATE)
+        candidates = tuple(
+            RecurrentSchedule(chunk, candidate_columns, threads, accumulation)
+            for candidate_columns in (8, 16, 32)
+            for accumulation in StateAccumulation
+            if max(prepare_shared, ((candidate_columns + chunk) * (width + 4)
+                                   + chunk * (candidate_columns + 4)) * 4)
+            <= context.compiler_target.shared_memory_bytes
+        )
+        schedule = select_schedule(context, "recurrent.chunked", candidates, default,
+                                   template=_ChunkedDeltaEmitter,
+                                   workload=(specs, node.attributes["mapping"],
+                                             node.attributes.get("sequence_length")))
+        chunk, columns, threads = schedule.chunk, schedule.columns, schedule.threads
         chunks = math.ceil(rows / chunk)
         workspace = (
             TensorSpec((batch, chunks, heads, chunk, chunk), DType.F32),
@@ -396,7 +419,7 @@ class ChunkedDeltaRule:
                 node.inputs,
                 node.outputs,
                 _ChunkedDeltaEmitter(
-                    specs, node.attributes["mapping"], chunk, columns, threads,
+                    specs, node.attributes["mapping"], schedule,
                     node.attributes.get("sequence_length"),
                 ),
                 workspace=workspace,

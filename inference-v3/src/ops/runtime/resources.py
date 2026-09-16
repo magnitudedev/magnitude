@@ -15,6 +15,7 @@ from .observation import Activity, KernelActivity, RuntimeCapture, RuntimeRecord
 
 if TYPE_CHECKING:
     from ..binding import SourceSpan
+    from ..compiler.schedules import ScheduleResolver
 
 
 class NativeAllocation(Protocol):
@@ -361,11 +362,13 @@ class DeviceRuntime:
     def __init__(
         self, runtime: NativeRuntime, *, budget_bytes: int,
         configuration: DeviceConfiguration | None = None,
+        schedules: ScheduleResolver | None = None,
     ):
         if budget_bytes <= 0:
             raise ValueError("device budget must be positive")
         self.runtime = runtime
         self.configuration = configuration
+        self.schedules = schedules
         self.endpoint_id = "injected"
         self.device_id = "injected"
         self.domains = frozenset({"injected"})
@@ -557,7 +560,7 @@ class DeviceRuntime:
             del self._import_programs[key]
 
     @classmethod
-    def open(cls, configuration: DeviceConfiguration) -> DeviceRuntime:
+    def open(cls, configuration: DeviceConfiguration, *, schedules: ScheduleResolver | None = None) -> DeviceRuntime:
         endpoints = configuration.selected_endpoints
         if len(endpoints) != 1:
             raise ValueError("this runtime requires one execution endpoint; distributed execution is not implemented")
@@ -575,7 +578,7 @@ class DeviceRuntime:
 
         native = TileLangRuntime(str(endpoint.backend), ordinal=endpoint.ordinal)
         try:
-            return cls(native, budget_bytes=min(capacities), configuration=configuration)
+            return cls(native, budget_bytes=min(capacities), configuration=configuration, schedules=schedules)
         except BaseException:
             native.close()
             raise

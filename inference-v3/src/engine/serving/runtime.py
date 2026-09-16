@@ -10,6 +10,7 @@ from typing import Literal
 from pydantic import Field
 
 import ops
+from engine.blueprints.execution import ScheduleProfile
 from engine.data import Record, TokenId
 from engine.generation.plain import Options, OutputToken
 from engine.inputs.formats.gguf_tokenizer import TokenizerArtifact
@@ -33,6 +34,7 @@ class Config(Record):
     retained_prefixes: Literal[0] = 0
     backend: Backend | None = None
     ordinal: int = Field(default=0, ge=0)
+    schedules: ScheduleProfile | None = None
 
 
 @dataclass(frozen=True)
@@ -154,7 +156,7 @@ def open_runtime(config: Config) -> Iterator[Runtime]:
         backend=config.backend, maximum_bytes=config.memory_bytes, ordinal=config.ordinal
     )
     endpoint = plan.selected_endpoints[0]
-    context = execution.DeviceRuntime(plan=plan)
+    context = execution.DeviceRuntime(plan=plan, schedules=config.schedules)
     if Path(config.target).is_dir():
         container = containers.MLX(path=config.target)
         description = models.Qwen35MLXDescription(format=container)

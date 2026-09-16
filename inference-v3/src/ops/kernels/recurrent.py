@@ -18,6 +18,7 @@ from .matrix import (
 )
 from .normalization import _reduction_threads
 from .packed import affine_shared_bytes, packet_format
+from .schedules import select_affine_tile
 
 
 @T.macro
@@ -457,7 +458,7 @@ class _RecurrentOutputEmitter:
                 outputs_per_subgroup,
             )
         else:
-            threads, bm, bn, bk, reduction_step = self.tile
+            threads, bm, bn, bk, contraction_schedule = self.tile
             _packed_matrix(
                 activation,
                 weight,
@@ -467,7 +468,7 @@ class _RecurrentOutputEmitter:
                 rows,
                 outputs,
                 channels,
-                reduction_step,
+                contraction_schedule,
                 self.specs[4].dtype.value,
                 threads,
                 bm,
@@ -497,7 +498,6 @@ class RecurrentOutputRule:
         tile = None
         vector = None
         if context.mode == "prefill":
-            reduction_step = 8
             if rows >= 256 and min(cast(int, specs[3].shape[0]), channels) >= 512:
                 bm, bn, bk = 32, 64, 32
             else:
@@ -516,7 +516,12 @@ class RecurrentOutputRule:
             )
             if affine_shared_bytes(bm, bn, bk, specs[0].dtype, specs[3]) > context.compiler_target.shared_memory_bytes:
                 return ()
-            tile = (threads, bm, bn, bk, reduction_step)
+            schedule = select_affine_tile(
+                context, TensorSpec((rows, channels), specs[0].dtype), (specs[3],),
+                (bm, bn, bk, threads), template=_RecurrentOutputEmitter,
+                name="recurrent.output-affine", workload=(specs, epsilon),
+            )
+            tile = (schedule.threads, schedule.rows, schedule.columns, schedule.reduction, schedule.operands)
         else:
             vector = _packed_vector_geometry(specs[3], context)
             if rows > 8 or vector is None:

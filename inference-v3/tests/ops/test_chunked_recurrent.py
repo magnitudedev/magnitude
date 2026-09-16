@@ -8,9 +8,10 @@ import pytest
 import torch
 
 import ops
-from ops.operation import build_operations
 from engine import DevicePlan
 from ops.compiler.lowering import LoweringContext
+from ops.kernels.schedules import StateAccumulation
+from ops.operation import build_operations
 
 
 def _program(rows, batch, dtype, mapping, sequence_length=None):
@@ -82,12 +83,25 @@ def test_static_recurrence_reference_checks_declared_offsets():
         ops.evaluate_reference(graph, inputs)
 
 
+class StateSchedule:
+    def __init__(self, accumulation):
+        self.accumulation = accumulation
+
+    def select(self, request, default):
+        return next(s for s in request.candidates
+                    if s.columns == 16 and s.state_accumulation == self.accumulation)
+
+
 @pytest.mark.device
 @pytest.mark.parametrize("dtype,mapping", [(ops.DType.F32, "tiled"), (ops.DType.BF16, "grouped")])
 @pytest.mark.parametrize("reset", [True, False])
-@pytest.mark.parametrize("chunked", [True, False])
+@pytest.mark.parametrize("chunked,state_accumulation", [
+    (True, StateAccumulation.FRAGMENT_UPDATE),
+    (True, StateAccumulation.SHARED_UPDATE),
+    (False, None),
+])
 @pytest.mark.parametrize("static", [True, False])
-def test_chunked_recurrence_tails_resets_and_empty_sequence(dtype, mapping, reset, chunked, static):
+def test_chunked_recurrence_tails_resets_and_empty_sequence(dtype, mapping, reset, chunked, static, state_accumulation):
     if not torch.backends.mps.is_available():
         pytest.skip("requires a Metal device")
     rows, batch = 193, 1 if static else 3
@@ -144,7 +158,8 @@ def test_chunked_recurrence_tails_resets_and_empty_sequence(dtype, mapping, rese
             signature=signature,
             device=device,
             constants={},
-            options=ops.CompileOptions(mode="prefill", workspace_limit=None if chunked else 0),
+            options=ops.CompileOptions(mode="prefill", workspace_limit=None if chunked else 0,
+                                       schedules=StateSchedule(state_accumulation) if chunked else None),
         )
         selected = "chunked-matrix" if chunked else "register-state"
         assert compiled.diagnostics.submissions == ((f"gated_delta.{selected}@0",),)

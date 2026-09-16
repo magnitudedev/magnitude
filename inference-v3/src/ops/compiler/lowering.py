@@ -8,11 +8,12 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Protocol
 
+from ..binding import Binding
 from ..tensor.graph import Graph
 from ..tensor.types import Layout, TensorSpec
-from .program import KernelDefinition
 from .dependencies import CodeDependency
-from ..binding import Binding
+from .program import KernelDefinition
+from .schedules import ScheduleResolver
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +85,9 @@ class LoweringContext:
     compiler_identity: str
     workspace_limit: int
     bindings: Mapping[int, Binding] = field(default_factory=dict)
+    schedules: ScheduleResolver | None = None
+    device_identity: str = "unspecified"
+    schedule_scope: tuple = ()
 
 
 def order_operations(graph: Graph, operations: tuple[BoundOperation, ...]) -> tuple[BoundOperation, ...]:
