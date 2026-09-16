@@ -270,6 +270,7 @@ def define(
     if specs.packed_controls:
         arguments = [ops.Argument(specs.control_record, "controls")]
 
+    @ops.formula(id="qwen35.model", version=1, metric="tokens")
     def function(*args, **bound):
         if specs.packed_controls:
             unpacked = ops.unpack_words(args[0], specs.control_specs)
@@ -281,6 +282,7 @@ def define(
                     bound[f"attention.{index}.visible"] = visible
             args = unpacked
         tokens, coordinates = args[:2]
+        ops.quantity("tokens", tokens.shape[0], unit=ops.units.token)
         cursor = 2
         recurrent_offsets = args[cursor] if specs.recurrent_offsets is not None else None
         cursor += specs.recurrent_offsets is not None

@@ -371,7 +371,7 @@ def _byte_copy(inputs, attrs):
     return (destination,)
 
 
-@formula(id="byte_copy", version=1)
+@formula(id="byte_copy", version=1, metric="boundary-bytes")
 def byte_copy(source: Tensor, destination: Tensor, extent: Tensor) -> Tensor:
     return _emit("byte_copy", source, destination, extent)
 
@@ -395,7 +395,7 @@ def _sample(inputs, _attrs):
     return (TensorSpec((logits.shape[0], 2), DType.I32),)
 
 
-@formula(id="sample", version=1)
+@formula(id="sample", version=1, metric="tokens", rows="logits")
 def sample(logits: Tensor, draws: Tensor) -> Tensor:
     """Select token/status rows using position-addressed deterministic draws."""
 
@@ -522,7 +522,7 @@ def _matmul(inputs, attrs):
     return (TensorSpec((*batch, left.shape[-2], right.shape[-1]), attrs["output"]),)
 
 
-@formula(id="matmul", version=1)
+@formula(id="matmul", version=1, metric="floating-work")
 def matmul(left: Tensor, right: Tensor, *, accumulate: DType = DType.F32,
            output: DType | None = None) -> Tensor:
     return _emit("matmul", left, right, accumulate=accumulate, output=output or left.dtype)
@@ -547,7 +547,7 @@ def _unary(name, function, *, floating=0, special=0):
             raise ValueError(f"{name} requires floating input")
         return (inputs[0],)
 
-    return formula(lambda value: _emit(name, value), id=name, version=1)
+    return formula(lambda value: _emit(name, value), id=name, version=1, metric="output-elements")
 
 
 exp = _unary("exp", lambda np, x: np.exp(x), special=1)
@@ -578,7 +578,7 @@ def _softmax_reference(value, axis):
     return (values / np.sum(values, axis=axis, keepdims=True)).astype(value.dtype)
 
 
-@formula(id="softmax", version=1)
+@formula(id="softmax", version=1, metric="output-elements")
 def softmax(value: Tensor, axis: int = -1) -> Tensor:
     return _emit("softmax", value, axis=axis)
 
@@ -616,7 +616,7 @@ def _rms_reference(inputs, attrs):
     return result
 
 
-@formula(id="rms_norm", version=1)
+@formula(id="rms_norm", version=1, metric="output-elements")
 def rms_norm(
     value: Tensor,
     weight: Tensor | None = None,
@@ -655,7 +655,7 @@ def _linear_reference(inputs, attrs):
     return result
 
 
-@formula(id="linear", version=1)
+@formula(id="linear", version=1, metric="floating-work")
 def linear(
     value: Tensor, weight: Tensor, bias: Tensor | None = None, *, output_dtype: DType | None = None
 ) -> Tensor:
@@ -696,7 +696,7 @@ def _row_dot_reference(inputs, attrs):
     return result
 
 
-@formula(id="row_dot", version=1)
+@formula(id="row_dot", version=1, metric="floating-work")
 def row_dot(value: Tensor, weight: Tensor, *, output_dtype: DType | None = None) -> Tensor:
     return _emit("row_dot", value, weight, output_dtype=output_dtype)
 
@@ -715,7 +715,7 @@ def _embedding(inputs, _attrs):
     return (TensorSpec((*indices.shape, table.shape[1]), table.dtype),)
 
 
-@formula(id="embedding", version=1)
+@formula(id="embedding", version=1, metric="tokens", rows="indices")
 def embedding(indices: Tensor, table: Tensor) -> Tensor:
     """Look up vocabulary rows; indices must be nonnegative and below table rows."""
     return _emit("embedding", indices, table)
@@ -767,7 +767,7 @@ def _rotary_reference(inputs, attrs):
     return apply(inputs[0]), apply(inputs[1])
 
 
-@formula(id="rotary", version=1)
+@formula(id="rotary", version=1, metric="output-elements")
 def rotary(
     q: Tensor,
     k: Tensor,
@@ -872,7 +872,7 @@ def _attention_prepare_reference(inputs, attrs):
     return rotate(query), rotate(key), query_gate[:, :, 1].astype(query_gate.dtype)
 
 
-@formula(id="attention_prepare", version=1)
+@formula(id="attention_prepare", version=1, metric="tokens", rows="query_gate")
 def attention_prepare(
     query_gate: Tensor,
     keys: Tensor,
@@ -963,7 +963,7 @@ def _kv_append_reference(inputs, attrs):
     return resource
 
 
-@formula(id="kv_append", version=1)
+@formula(id="kv_append", version=1, metric="tokens", rows="keys")
 def kv_append(resource: Tensor, keys: Tensor, values: Tensor, destinations: Tensor, *,
               reserved: bool = False) -> Tensor:
     """Publish distinct cache rows; negative destinations denote padding.
@@ -1102,7 +1102,7 @@ def _persistent_attention_reference(inputs, attrs):
     return result
 
 
-@formula(id="persistent_attention", version=1)
+@formula(id="persistent_attention", version=1, metric="tokens", rows="queries")
 def persistent_attention(queries: Tensor, history: Tensor, keys: Tensor, values: Tensor,
                          visible: Tensor, *, scale: float | None = None,
                          sequence_count: int | None = None) -> Tensor:
@@ -1178,7 +1178,7 @@ def _attention_reference(inputs, attrs):
     return result
 
 
-@formula(id="causal_attention", version=1)
+@formula(id="causal_attention", version=1, metric="tokens", rows="queries")
 def causal_attention(
     queries: Tensor,
     history: Tensor,
@@ -1235,7 +1235,7 @@ def _recurrence_reference(inputs, attrs):
     return result, updated
 
 
-@formula(id="delta_recurrence", version=1)
+@formula(id="delta_recurrence", version=1, metric="tokens", rows="values")
 def delta_recurrence(values: Tensor, state: Tensor, *parameters: Tensor, **attributes: Any):
     return _emit("delta_recurrence", values, state, *parameters, **attributes)
 
@@ -1307,7 +1307,7 @@ def _gated_delta_reference(inputs, attrs):
     return output, state
 
 
-@formula(id="gated_delta_recurrence", version=1)
+@formula(id="gated_delta_recurrence", version=1, metric="tokens", rows="query")
 def gated_delta_recurrence(
     query: Tensor,
     key: Tensor,
@@ -1428,7 +1428,7 @@ def _recurrent_prepare_reference(inputs, attrs):
     return query, key, value, beta, decay, following
 
 
-@formula(id="recurrent_prepare", version=1)
+@formula(id="recurrent_prepare", version=1, metric="tokens", rows="projected")
 def recurrent_prepare(
     projected: Tensor,
     convolution: Tensor,
@@ -1501,7 +1501,7 @@ def _route_reference(logits, attrs):
     return indices.astype(np.int32), selected.astype(np.float32)
 
 
-@formula(id="route_topk", version=1)
+@formula(id="route_topk", version=1, metric="tokens", rows="logits")
 def route_topk(logits: Tensor, k: int, *, scoring: str = "softmax", normalize: bool = True):
     return _emit("route_topk", logits, k=k, scoring=scoring, normalize=normalize)
 
@@ -1571,7 +1571,7 @@ def _experts_reference(inputs, attrs):
     return result
 
 
-@formula(id="routed_experts", version=1)
+@formula(id="routed_experts", version=1, metric="tokens", rows="hidden")
 def routed_experts(
     hidden: Tensor,
     routes: Tensor,

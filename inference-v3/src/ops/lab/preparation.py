@@ -197,9 +197,9 @@ class PreparedFormula:
         execution = self.execute(inputs)
         mismatches = []
 
-        def check_value(resource, expected):
+        def check_output(resource, expected):
             try:
-                self._check_value(resource, expected, protocol)
+                check_value(self.device, resource, expected, protocol)
             except NumericalMismatch as failure:
                 mismatches.append(str(failure))
 
@@ -208,7 +208,7 @@ class PreparedFormula:
             # The isolated reference retains the original output order, including
             # duplicate ports. Pruning does not reorder observable outputs.
             for resource, expected in zip(execution.outputs, self.fixture.reference.outputs, strict=True):
-                check_value(resource, expected)
+                check_output(resource, expected)
             # Check complete mutated resources too, including untouched regions
             # and writes that are observable without being a formula return port.
             latest = {}
@@ -230,7 +230,7 @@ class PreparedFormula:
                     continue
                 final = latest[value.resource_id]
                 expected = self.fixture.reference.values[final.id]
-                check_value(resource, np.asarray(expected).reshape(resource.spec.shape))
+                check_output(resource, np.asarray(expected).reshape(resource.spec.shape))
             by_resource = {self.compiled.graph.value(identity).resource_id: resource
                            for identity, resource in inputs.state.items()}
             for identity, resource in zip(self.compiled.graph.outputs, execution.outputs, strict=True):
@@ -245,19 +245,6 @@ class PreparedFormula:
             for output in execution.outputs:
                 output.close()
 
-    def _check_value(self, resource: Resource, expected, protocol: MeasurementProtocol) -> None:
-        actual = decode_dense(self.device.read(resource), resource.spec)
-        if tuple(actual.shape) != tuple(np.shape(expected)):
-            raise AssertionError("operation output shape differs from formula reference")
-        try:
-            if resource.spec.dtype.floating:
-                np.testing.assert_allclose(actual, expected, atol=protocol.absolute_tolerance,
-                                           rtol=protocol.relative_tolerance, equal_nan=True)
-            else:
-                np.testing.assert_array_equal(actual, expected)
-        except AssertionError as error:
-            raise NumericalMismatch(str(error)) from error
-
     def sample(self, inputs: InvocationInputs, *, kernel_limit: int | None = None) -> RuntimeObservation:
         with self.device.observe(kernel_limit=kernel_limit) as capture:
             execution = self.execute(inputs)
@@ -271,3 +258,16 @@ class PreparedFormula:
             self.device.drain()
             self._owned.close()
             self._closed = True
+
+def check_value(device, resource: Resource, expected, protocol: MeasurementProtocol) -> None:
+    actual = decode_dense(device.read(resource), resource.spec)
+    if tuple(actual.shape) != tuple(np.shape(expected)):
+        raise AssertionError("operation output shape differs from formula reference")
+    try:
+        if resource.spec.dtype.floating:
+            np.testing.assert_allclose(actual, expected, atol=protocol.absolute_tolerance,
+                                       rtol=protocol.relative_tolerance, equal_nan=True)
+        else:
+            np.testing.assert_array_equal(actual, expected)
+    except AssertionError as error:
+        raise NumericalMismatch(str(error)) from error

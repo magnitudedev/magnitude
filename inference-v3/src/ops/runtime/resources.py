@@ -426,6 +426,22 @@ class DeviceRuntime:
         self._source_kernels: dict[str, tuple[object, object]] = {}
         self.observations = RuntimeRecorder(self)
         self._characterization = None
+        self._capacity_evidence = ()
+
+    @property
+    def capacity_evidence(self):
+        self.check()
+        return self._capacity_evidence
+
+    def load_capacity_evidence(self, capacities):
+        """Bind explicit hardware capacity facts; this does not execute calibration."""
+        from formula_performance.records import Capacity
+
+        self.check()
+        records = tuple(Capacity.model_validate(c) for c in capacities)
+        if len({c.parameter for c in records}) != len(records):
+            raise ValueError("duplicate hardware capacity parameter")
+        self._capacity_evidence = records
 
     @property
     def characterization(self):
@@ -438,6 +454,15 @@ class DeviceRuntime:
         hardware = (self.configuration.fingerprint if self.configuration is not None else
                     f"{self.device_id}:{self.compiler_target.identity}")
         return f"{hardware}:{self.runtime.runtime_identity}"
+
+    def load_characterization(self, profile):
+        """Load recorded compatible resource evidence without running probes."""
+        self.check()
+        if (profile.device != self.evidence_identity
+                or profile.compiler != self.compiler_identity
+                or profile.compiler_target != self.compiler_target.identity):
+            raise ValueError("characterization does not match the live runtime")
+        self._characterization = profile
 
     def characterize(self, store, *, protocol=None, refresh=False, cancellation=None):
         from ..lab.characterization import ProbeProtocol, characterize

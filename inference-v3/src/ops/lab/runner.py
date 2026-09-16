@@ -223,7 +223,29 @@ class MeasurementRunner:
                 unavailable.append(UnavailableMetric(
                     name=name, reason="; ".join(work.work.issues) or "not a fixed mathematical work count",
                 ))
+        if isolated.call.metric is not None:
+            from ..performance.publication import primary_quantity
+            from ..formula import Unit
+
+            name, amount, unit, meaning = primary_quantity(graph, isolated, fixture.reference.values)
+            if not any(q.name == name for q in quantities):
+                quantities.append(UsefulQuantity(name=name, amount=amount,
+                    unit=Unit(unit.name, unit.dimension), basis=meaning))
         return tuple(quantities), tuple(unavailable)
+
+    def diagnose(self, target: FormulaHandle, *, kernel_limit: int = 1024):
+        """Observe a checked resident preparation separately from ordinary samples.
+
+        The caller records this as instrumentation of the isolated invocation,
+        never as another ordinary sample or a contribution in its original parent.
+        """
+        self.device.check()
+        prepared = self._prepared.get(target)
+        if prepared is None:
+            raise ValueError("diagnostics require an available checked preparation")
+        with exclusive_measurement(), prepared.inputs() as invocation:
+            observation = prepared.sample(invocation, kernel_limit=kernel_limit)
+        return observation, prepared.compiled
 
     def measure(
         self, target: FormulaHandle, *, cancellation: Event | None = None,
@@ -379,6 +401,22 @@ class MeasurementRunner:
                          "restored_fixed_fixture": self._restored.get(target)},
             artifacts=self._artifacts.get(target, {}),
         )
+        if target.call.metric is not None:
+            from ..performance.publication import measured_publication
+
+            publication = measured_publication(target, boundary, self.device, measurement,
+                                               compiled=prepared.compiled if prepared is not None else None)
+            from formula_performance.evidence import evaluate
+            import json
+
+            report = evaluate((publication,))
+            relation = report["components"][publication.observations[0].component]
+            performance = json.loads(json.dumps(relation))
+            artifact = self.store.put_artifact(publication.model_dump_json().encode())
+            measurement = measurement.model_copy(update={
+                "artifacts": {**measurement.artifacts, "formula-performance": artifact},
+                "performance": performance,
+            })
         if not retain:
             self._evict(target)
         if progress is not None:

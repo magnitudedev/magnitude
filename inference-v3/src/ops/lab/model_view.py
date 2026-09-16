@@ -8,7 +8,6 @@ from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Footer, Static, Tree
 
 from .evidence import Model, RunEvidence
-from .records import Outcome
 from .store import ObservationStore
 
 
@@ -84,69 +83,48 @@ def run_details(store: ObservationStore, run: RunEvidence) -> Text:
     return text
 
 
-def model_details(store: ObservationStore, model: Model) -> Text:
-    runs = store.runs(model.identity)
-    groups = {}
-    for run in runs:
-        groups.setdefault(run.comparison_key, []).append(run)
-    text = Text(
-        f"{model.label}\n{len(runs)} recorded executions; {len(groups)} condition series\n"
-        "Hardware, workload, precision, and protocol remain separate.\n"
-        "Unmeasured conditions have no inferred performance.\n\n"
-    )
-    for history in groups.values():
-        latest = history[0]
-        text.append(
-            f"{latest.context.engine} · {latest.scope.kind} "
-            f"{latest.scope.formula.id if latest.scope.formula else ''}\n"
-            f"  Host: {latest.context.host or 'unrecorded'} · Hardware: {latest.context.hardware}\n"
-            f"  Latest measured: {latest.created.isoformat()} · {latest.status} · "
-            f"{latest.context.implementation[:16]}\n"
-        )
-        for metric in latest.metrics:
-            text.append(f"  {metric.name}: {metric.median:.6g} {metric.unit.name}\n")
-        for identity in latest.measurements:
-            current = store.measurement(identity)
-            compatible = [store.measurement(i) for run in history for i in run.measurements]
-            qualified = [
-                m
-                for m in compatible
-                if m.series == current.series
-                and m.outcome == Outcome.COMPLETE
-                and m.checked
-                and m.median_seconds is not None
-            ]
-            if current.observed_seconds is not None:
-                text.append(f"  Isolated: {current.observed_seconds:.6g}s")
-                if not current.checked:
-                    text.append(" · numerically unqualified")
-            if qualified:
-                best = min(
-                    qualified,
-                    key=lambda m: (
-                        m.median_seconds if m.median_seconds is not None else float("inf")
-                    ),
-                )
-                text.append(f" · best correct: {best.median_seconds:.6g}s")
-            text.append("\n")
-        text.append(f"  History: {len(history)} executions; ceiling details on selection\n\n")
-    text.append(
-        "Implementation freshness beyond recorded revisions: unknown\n"
-        "The agent publishes measurements; this view never starts work."
-    )
+def performance_model(store, model):
+    from formula_performance.evidence import evaluate
+    from formula_performance.records import Publication
+
+    publications = []
+    for run in store.runs(model.identity):
+        artifact = run.attachments.get("formula-performance")
+        if artifact:
+            publications.append(Publication.model_validate_json(store.artifact(artifact)))
+        for measurement_id in run.measurements:
+            measurement = store.measurement(measurement_id)
+            artifact = measurement.artifacts.get("formula-performance")
+            if artifact:
+                publications.append(Publication.model_validate_json(store.artifact(artifact)))
+    return evaluate(publications)
+
+
+def component_details(relation):
+    text = Text(relation["label"] + " · " + relation["metric"]["unit"]["name"] + "/s\n")
+    text.append("One hardware-parameterized formula relation across recorded conditions.\n")
+    for point in relation["points"]:
+        bound = point["roofline"]
+        text.append(f"\n{point['boundary']}: {point['rate']} · ceiling {bound['ceiling']} · {bound['kind']}\n")
+        if point["attainment"] is not None:
+            text.append(f"{point['attainment']:.1%} attained\n")
+    for prediction in relation["predictions"]:
+        text.append(f"Conditional prediction: {prediction['seconds']:.6g} s\n")
     return text
+
+
+def model_details(store, model):
+    report = performance_model(store, model)
+    root = report["components"].get("")
+    return component_details(root) if root else Text(model.label + " · no analytical publication")
 
 
 class ModelApp(App):
     TITLE = "Model performance"
     BINDINGS = [("r", "refresh", "Refresh evidence"), ("q", "quit", "Quit")]
-    CSS = """
-    #models { width: 40%; }
-    #detail { width: 60%; }
-    #details { padding: 1 2; }
-    """
+    CSS = "#models { width: 55%; } #detail { width: 45%; } #details { padding: 1; }"
 
-    def __init__(self, store: ObservationStore):
+    def __init__(self, store):
         super().__init__()
         self.store = store
 
@@ -154,9 +132,7 @@ class ModelApp(App):
         with Horizontal():
             yield Tree("Models", id="models")
             with VerticalScroll(id="detail"):
-                yield Static(
-                    "Select a model. No measurements run when browsing.", id="details", markup=False
-                )
+                yield Static("Choose a model", id="details", markup=False)
         yield Footer()
 
     def on_mount(self):
@@ -166,105 +142,25 @@ class ModelApp(App):
         tree = self.query_one("#models", Tree)
         tree.clear()
         for model in self.store.models():
-            node = tree.root.add(Text(model.label), data=model)
-            for run in self.store.runs(model.identity):
-                label = (
-                    f"{run.context.engine} · {run.scope.kind} · {run.created:%m-%d %H:%M} "
-                    f"· {run.context.hardware[:16]} · {run.status}"
-                )
-                entry = node.add(Text(label), data=run)
-                if run.configuration is not None:
-                    configuration = next(
-                        c for c in self.store.configurations() if c.identity == run.configuration
-                    )
-                    nodes = {}
-                    for formula in configuration.formulas:
-                        parent = nodes.get(formula.parent, entry)
-                        nodes[formula.occurrence] = parent.add(
-                            Text(formula.definition.id), data=(run, configuration, formula)
-                        )
+            report = performance_model(self.store, model)
+            root = tree.root.add(model.label, data=model)
+            nodes = {"": root}
+            for key, relation in sorted(report["components"].items(), key=lambda item: item[0].count("/")):
+                label = relation["label"] + " · " + relation["metric"]["unit"]["name"] + "/s"
+                attainment = relation["attainment"]
+                if attainment:
+                    label += f" · {attainment['minimum']:.0%}–{attainment['maximum']:.0%}"
+                if key:
+                    nodes[key] = nodes[relation["parent"]].add(label, data=relation)
+                else:
+                    root.data = relation
+            root.expand()
         tree.root.expand()
         tree.focus()
-        if not self.store.models():
-            self.query_one("#details", Static).update(
-                "No model evidence has been published. The agent must run or import measurements."
-            )
 
-    def on_tree_node_highlighted(self, event: Tree.NodeHighlighted):
+    def on_tree_node_highlighted(self, event):
         value = event.node.data
-        if isinstance(value, Model):
-            detail = model_details(self.store, value)
-        elif isinstance(value, RunEvidence):
-            detail = run_details(self.store, value)
-        elif isinstance(value, tuple):
-            from .tui import RecordedState, details
-
-            run, configuration, formula = value
-            from .records import History
-
-            linked = [self.store.measurement(i) for i in run.measurements]
-            exact = [
-                m
-                for m in linked
-                if m.series.formula == formula.definition
-                and m.series.semantics == formula.semantics
-                and run.scope.occurrence == formula.occurrence
-            ]
-            history = None
-            if exact:
-                measurement = exact[0]
-                success = measurement if measurement.outcome == Outcome.COMPLETE else None
-                history = History(
-                    series=measurement.series,
-                    latest=measurement,
-                    latest_success=success,
-                    best=success,
-                    observations=(measurement,),
-                )
-            detail = details(RecordedState(formula, history))
-            detail.append(
-                "\nEvidence from this selected run only; other runs remain in model history."
-            )
-            from ..runtime.observation import KernelObservation
-
-            for sample in run.observations:
-                native = sample.kernels
-                if native is None or native.attribution != "compiled-order-and-symbols":
-                    detail.append("\nIn-parent native attribution unavailable for this sample.")
-                    continue
-                activities = tuple(
-                    a for a in native.activities if a.graph == run.attachments.get("compiled_graph")
-                )
-                inclusive = tuple(a for a in activities if formula.occurrence in a.origins)
-                exclusive = tuple(a for a in activities if formula.occurrence == a.owner)
-                for label, events in (
-                    ("Inclusive (may share fused work)", inclusive),
-                    ("Exclusively attributed", exclusive),
-                ):
-                    busy = KernelObservation(native.clock, events).busy_ns
-                    detail.append(
-                        f"\n{label}: {busy / 1e9 if busy is not None else 'unknown'} s GPU union"
-                    )
-            for external in self.store.runs(run.context.model.identity):
-                for mapping in external.mappings:
-                    if any(
-                        scope.formula == formula.definition and scope.semantics == formula.semantics
-                        for scope in mapping.scopes
-                    ):
-                        detail.append(
-                            f"\n\nReference: {external.context.engine} · {mapping.region}"
-                            f" · {mapping.relationship}\nHost: {external.context.host}"
-                            f" · Hardware: {external.context.hardware}"
-                            f"\nDifferences: {mapping.differences}"
-                        )
-                        detail.append(
-                            "\nEnclosing source observations (not an inferred formula share):"
-                        )
-                        for metric in external.metrics:
-                            detail.append(
-                                f"\n  {metric.name}: {metric.median:.6g} {metric.unit.name}"
-                                f" · {metric.boundary}"
-                            )
-        else:
-            return
-        self.query_one("#details", Static).update(detail)
+        if isinstance(value, dict):
+            self.query_one("#details", Static).update(component_details(value))
+        elif isinstance(value, Model):
+            self.query_one("#details", Static).update(model_details(self.store, value))

@@ -53,8 +53,6 @@ def parser() -> argparse.ArgumentParser:
         "run", help="run selected sessions and record results automatically"
     )
     execute.add_argument("--model", action="append", default=[])
-    execute.add_argument("--model-identity", help="stable model identity for shared performance history")
-    execute.add_argument("--evidence-store", type=Path, help="shared performance SQLite store")
     execute.add_argument("--engine", action="append", choices=ENGINES, default=[])
     execute.add_argument("--target", action="append", default=[], metavar="ENGINE=ARTIFACT")
     execute.add_argument("--suite", default="context", help=", ".join(SECTIONS))
@@ -155,8 +153,6 @@ def main(argv=None) -> int:
     root = project_root()
     try:
         if args.command == "run":
-            if (args.model_identity is None) != (args.evidence_store is None):
-                raise ValueError("--model-identity and --evidence-store must be supplied together")
             selected = models.select(root, args.model, args.engine, args.target)
             sections = choices(args.suite, tuple(SECTIONS))
             checkpoints = contexts(args.context, preserve_order=args.retrieval)
@@ -225,8 +221,6 @@ def main(argv=None) -> int:
                         args.prose,
                         retrieval,
                         needle_depth,
-                        args.model_identity,
-                        args.evidence_store,
                     )
                 )
             print(

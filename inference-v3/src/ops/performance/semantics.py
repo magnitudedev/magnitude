@@ -96,7 +96,7 @@ def recurrence(inputs, attrs, outputs, *, values=None):
 def persistent_attention(inputs, attrs, outputs, *, values=None):
     query, history, keys, value, visible = inputs
     rows, heads, width = query.shape
-    if values is None:
+    if values is None or values[4] is None:
         pairs = Bounds(0, rows * heads * (history.shape[0] + keys.shape[0]))
     else:
         ranges = values[4]

@@ -94,18 +94,18 @@ class Characterization(Record):
         return self
 
 
-@formula(id="device-probe.copy", version=1)
+@formula(id="device-probe.copy", version=1, metric="copy-bytes")
 def copy(source, destination, extent):
     quantity("copy-bytes", 2 * source.shape[0], unit=units.byte)
     return tensor.byte_copy(source, destination, extent)
 
 
-@formula(id="device-probe.memory", version=1)
+@formula(id="device-probe.memory", version=1, metric="boundary-bytes")
 def memory(source):
     return tensor.add(source, source)
 
 
-@formula(id="device-probe.matrix", version=2)
+@formula(id="device-probe.matrix", version=2, metric="floating-work")
 def matrix(left, right):
     result = tensor.linear(left, right, output_dtype=DType.F32)
     for _ in range(63):
@@ -145,7 +145,7 @@ def matrix_probe(context):
     return context.kernel(body)
 
 
-@formula(id="device-probe.arithmetic", version=1)
+@formula(id="device-probe.arithmetic", version=1, metric="output-elements")
 def arithmetic(left, right):
     result = left
     for _ in range(32):
@@ -153,7 +153,7 @@ def arithmetic(left, right):
     return result
 
 
-@formula(id="device-probe.special", version=1)
+@formula(id="device-probe.special", version=1, metric="special-functions")
 def special(value):
     result = value
     for _ in range(16):
@@ -161,7 +161,7 @@ def special(value):
     return result
 
 
-@formula(id="device-probe.comparisons", version=1)
+@formula(id="device-probe.comparisons", version=1, metric="comparisons")
 def comparisons(left, right):
     result = left
     for _ in range(32):

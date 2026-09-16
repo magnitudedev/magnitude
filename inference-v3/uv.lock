@@ -581,6 +581,7 @@ dependencies = [
     { name = "httpx" },
     { name = "jinja2" },
     { name = "llguidance" },
+    { name = "magnitude-formula-performance" },
     { name = "numpy" },
     { name = "psutil" },
     { name = "pydantic" },
@@ -602,6 +603,9 @@ dev = [
     { name = "ruff" },
     { name = "transformers" },
 ]
+performance = [
+    { name = "gguf" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -609,6 +613,7 @@ requires-dist = [
     { name = "httpx", specifier = "==0.28.1" },
     { name = "jinja2", specifier = "==3.1.6" },
     { name = "llguidance", specifier = "==1.8.0" },
+    { name = "magnitude-formula-performance", editable = "formula-performance" },
     { name = "numpy", specifier = ">=2.5.3" },
     { name = "psutil", specifier = ">=7" },
     { name = "pydantic", specifier = "==2.13.5" },
@@ -630,6 +635,18 @@ dev = [
     { name = "ruff", specifier = ">=0.16.6" },
     { name = "transformers", specifier = "==5.16.1" },
 ]
+performance = [{ name = "gguf", specifier = "==0.19.0" }]
+
+[[package]]
+name = "magnitude-formula-performance"
+version = "0.1.0"
+source = { editable = "formula-performance" }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pydantic", specifier = ">=2.13,<3" }]
 
 [[package]]
 name = "markdown-it-py"

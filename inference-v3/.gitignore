@@ -10,3 +10,7 @@ dist/
 results/
 experiments/
 src/templates/_native/
+
+# Machine-local Roofline definitions
+/roofline/models.json
+/roofline/targets.json

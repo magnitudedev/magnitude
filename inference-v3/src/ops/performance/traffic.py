@@ -8,16 +8,19 @@ selection and mutable state use concrete controls, never allocated capacity.
 import math
 
 
-def boundary_accesses(graph, values):
+def boundary_accesses(graph, values, *, unresolved=None):
     from ..tensor.primitive import primitives
     from ..kv import KVRepresentation
 
     external = {graph.alias_root(value) for value in (*graph.inputs, *graph.constants, *graph.resources)}
     reads, writes = {}, {}
+    unknown_writes = set()
 
     def record(table, identity, regions=None):
         spec = graph.value(identity).spec
         root = graph.alias_root(identity)
+        if table is reads and root in unknown_writes:
+            return
         if regions is None:
             regions = ((0, spec.elements),)
         # Fractional byte addressing is an optimistic bit-density convention for
@@ -62,7 +65,24 @@ def boundary_accesses(graph, values):
             continue
         selected, mutated, omitted = {}, {}, set()
         specs = tuple(graph.value(value).spec for value in node.inputs)
-        if node.operation in {"embedding", "take_rows"}:
+        # A symbolic binding retains the proven subset of unavoidable traffic.
+        # Unresolved indexed accesses are explicit nonnegative obligations; they
+        # cannot erase known reads elsewhere or be replaced by allocated capacity.
+        controls = {"embedding": (0,), "take_rows": (1,), "routed_experts": (1,),
+                    "causal_attention": (2,) if len(node.inputs) == 3 else (),
+                    "persistent_attention": (4,), "kv_append": (3,), "kv_copy": (1,),
+                    "byte_copy": (2,)}.get(node.operation, ())
+        missing = [index for index in controls if node.inputs[index] not in values]
+        if missing and unresolved is not None:
+            accessed = {"embedding": (1,), "take_rows": (0,), "routed_experts": (3, 4, 5),
+                        "causal_attention": (1,), "persistent_attention": (1, 2, 3),
+                        "kv_append": (0, 1, 2), "kv_copy": (0,), "byte_copy": (0, 1)}[node.operation]
+            selected.update((index, ()) for index in accessed)
+            for index in primitive.resource_writes:
+                mutated[index] = ()
+                unknown_writes.add(graph.alias_root(node.inputs[index]))
+            unresolved.extend(f"{node.operation} indexed traffic requires value {node.inputs[index]}" for index in missing)
+        elif node.operation in {"embedding", "take_rows"}:
             table, indices = (1, 0) if node.operation == "embedding" else (0, 1)
             selected[table] = rows(specs[table], concrete(node, indices).flat)
         elif node.operation == "routed_experts":
@@ -137,3 +157,11 @@ def unique_bytes(regions):
 def boundary_traffic(graph, values):
     reads, writes = boundary_accesses(graph, values)
     return sum(unique_bytes(regions) for table in (reads, writes) for regions in table.values())
+
+
+def boundary_traffic_bound(graph, values):
+    """Certified lower demand plus the still-unbound indexed demand parameters."""
+    unresolved = []
+    reads, writes = boundary_accesses(graph, values, unresolved=unresolved)
+    amount = sum(unique_bytes(regions) for table in (reads, writes) for regions in table.values())
+    return amount, tuple(unresolved)

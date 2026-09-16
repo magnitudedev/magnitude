@@ -31,16 +31,19 @@ class Invocation:
         graph = self.compiled.formulas.graph
         device = self.compiled.device
         values = {}
+        physical = {}
         for identity, resource in zip(graph.inputs, self.inputs, strict=True):
             values[identity] = decode_dense(device.read(resource), resource.spec).copy()
         for identity in graph.resources:
             value = graph.value(identity)
             resource = self.resources[value.name]
-            values[identity] = decode_dense(device.read(resource), resource.spec).copy()
+            content = device.read(resource)
+            values[identity] = decode_dense(content, resource.spec).copy()
+            physical[identity] = content
         bindings = {
             identity: self.weights[graph.value(identity).name] for identity in graph.constants
         }
-        return Fixture.from_inputs(graph, values, bindings=bindings, capture=decode_weight)
+        return Fixture.from_inputs(graph, values, bindings={**bindings, **physical}, capture=decode_weight)
 
 
 @contextmanager
@@ -134,5 +137,23 @@ def publish_forward(store, context, invocation: Invocation, observation):
         attachments={"compiled_graph": invocation.compiled.graph.fingerprint},
         unavailable=("Production observation does not perform an independent numerical check",),
     )
+    from formula_performance.records import Observation, Publication, identity
+    from ops.performance.publication import manifest, hardware, capture
+
+    graph = manifest(tree.graph, compiled=invocation.compiled)
+    system = hardware(invocation.compiled.device)
+    captured = capture(graph, observation, capture_id=run.identity + ":native",
+                       execution_graph=invocation.compiled.graph.fingerprint)
+    publication = Publication(manifests=(graph,), hardware=(system,),
+        captures=(captured,) if captured else (), observations=(Observation(
+            identity=run.identity, manifest=identity(graph), component="",
+            hardware=identity(system), implementation=run.context.implementation,
+            created=run.created.isoformat(), coordinates=run.context.conditions,
+            samples=(observation.elapsed_ns / 1e9,), boundary="prepare-through-forward-retirement",
+            correctness=run.correctness, status="complete" if run.status == "complete" else "failed",
+            captures=(captured.identity,) if captured else (), evidence=(run.identity,),
+        ),))
+    artifact = store.put_artifact(publication.model_dump_json().encode())
+    run = run.model_copy(update={"attachments": {**run.attachments, "formula-performance": artifact}})
     store.publish_run(run)
     return run

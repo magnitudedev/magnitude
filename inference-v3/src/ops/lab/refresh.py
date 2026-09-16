@@ -32,20 +32,32 @@ class ModuleSource:
         return hashlib.sha256(self.content).hexdigest()
 
     @property
-    def imports(self) -> frozenset[str]:
-        """Read import dependencies, not a second kernel language or AST emitter."""
+    def import_groups(self) -> tuple[tuple[str, ...], ...]:
+        """Module candidates for each independent eager import binding."""
         package = self.name if self.package else self.name.rpartition(".")[0]
-        names = set()
-        for node in ast.walk(ast.parse(self.content, filename=str(self.path))):
+        groups = []
+        def eager_nodes(node):
+            # Imports inside function bodies execute on invocation, after modules
+            # are installed. They are not module initialization dependencies.
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                return
+            yield node
+            for child in ast.iter_child_nodes(node):
+                yield from eager_nodes(child)
+
+        for node in eager_nodes(ast.parse(self.content, filename=str(self.path))):
             if isinstance(node, ast.Import):
-                names.update(alias.name for alias in node.names)
+                groups.extend((alias.name,) for alias in node.names)
             elif isinstance(node, ast.ImportFrom):
                 module = node.module or ""
                 if node.level:
                     module = importlib.util.resolve_name("." * node.level + module, package)
-                names.add(module)
-                names.update(f"{module}.{alias.name}" for alias in node.names)
-        return frozenset(names)
+                groups.extend((f"{module}.{alias.name}", module) for alias in node.names)
+        return tuple(groups)
+
+    @property
+    def imports(self) -> frozenset[str]:
+        return frozenset(name for group in self.import_groups for name in group)
 
 
 class _SnapshotLoader(SourceFileLoader):
@@ -112,7 +124,15 @@ class _LoadedSources:
             return RefreshResult((), frozenset())
         if removed := self._sources.keys() - sources.keys():
             raise ValueError(f"operation modules removed; reopen the configuration: {sorted(removed)}")
-        dependencies = {name: source.imports & sources.keys() for name, source in sources.items()}
+        dependencies = {}
+        for name, source in sources.items():
+            # `from . import child` binds the child module, not the package's
+            # re-exported definitions. Resolve each binding independently: another
+            # import of a package-level function still depends on the package.
+            dependencies[name] = {
+                next(module for module in group if module in sources)
+                for group in source.import_groups if any(module in sources for module in group)
+            }
         # A dependent module's from-import bindings must refer to the new object.
         affected = set(changed_modules)
         while parents := {name for name, imports in dependencies.items()

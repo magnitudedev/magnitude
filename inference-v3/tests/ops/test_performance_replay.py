@@ -15,7 +15,7 @@ from ops.lab.store import ObservationStore
 from tests.ops.test_model_evidence import run
 
 
-@ops.formula(id="test.performance.upstream")
+@ops.formula(id="test.performance.upstream", metric="output-elements")
 def upstream(value):
     return ops.silu(ops.tanh(value))
 

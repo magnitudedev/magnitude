@@ -201,19 +201,55 @@ class ReferenceResult:
     values: Mapping[int, Any] = field(default_factory=dict)
 
 
-def evaluate_reference(graph, bindings: Mapping[int | str, Any]) -> ReferenceResult:
+def evaluate_reference(graph, bindings: Mapping[int | str, Any], *, load=None,
+                       retain: set[int] | None = None) -> ReferenceResult:
+    """Evaluate declared primitives, optionally loading inputs at first use.
+
+    A finite retained set releases intermediate arrays and decoded constants after
+    their last consumer. Outputs are always retained. The default retains the
+    complete value table for interactive formula inspection.
+    """
+    from collections import Counter
+
     values: dict[int, Any] = {}
-    for value_id in (*graph.inputs, *graph.constants, *graph.resources):
+    declared = set((*graph.inputs, *graph.constants, *graph.resources))
+    keep = None if retain is None else set(retain) | set(graph.outputs)
+    consumers = Counter(item for node in graph.nodes for item in node.inputs)
+
+    def require(value_id):
+        if value_id in values:
+            return values[value_id]
         value = graph.value(value_id)
+        if value_id not in declared:
+            raise KeyError(f"reference dependency {value_id} has not been evaluated")
         if value_id in bindings:
-            values[value_id] = bindings[value_id]
+            result = bindings[value_id]
         elif value.name is not None and value.name in bindings:
-            values[value_id] = bindings[value.name]
+            result = bindings[value.name]
+        elif load is not None:
+            result = load(value)
         else:
             raise KeyError(f"missing reference binding for {value.name or value_id}")
+        values[value_id] = result
+        return result
+
+    if keep is None:
+        for value_id in sorted(declared):
+            require(value_id)
     for node in graph.nodes:
         definition = primitives.get(node.operation)
-        outputs = definition.evaluate(tuple(values[item] for item in node.inputs), node.attributes,
+        outputs = definition.evaluate(tuple(require(item) for item in node.inputs), node.attributes,
                                       tuple(graph.value(item).spec for item in node.outputs))
         values.update(zip(node.outputs, outputs, strict=True))
+        if keep is not None:
+            for item in node.inputs:
+                consumers[item] -= 1
+                if not consumers[item] and item not in keep:
+                    values.pop(item, None)
+            for item in node.outputs:
+                if not consumers[item] and item not in keep:
+                    values.pop(item, None)
+        del outputs
+    for item in graph.outputs if keep is None else keep:
+        require(item)
     return ReferenceResult(tuple(values[item] for item in graph.outputs), MappingProxyType(values))
