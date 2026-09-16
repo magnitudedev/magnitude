@@ -23,7 +23,7 @@ import { NativeTrayFactory, NativeTrayFailed, TrayOwner, TrayOwnerLive } from ".
 import { CommandExecutor, FetchHttpClient } from "@effect/platform"
 import { NodeContext } from "@effect/platform-node"
 import { NodeSqliteDriverLayer } from "@magnitudedev/daemon-management/node"
-import { makeHarnessConnectionService, harnessConnectionPaths, harnessExecutableSearchPath } from "@magnitudedev/harness-connections"
+import { makeHarnessConnectionService, resolveHarnessConnectionPaths, harnessExecutableSearchPath } from "@magnitudedev/harness-connections"
 import { HttpsUrlSchema, MAGNITUDE_RPC_VERSION } from "@magnitudedev/sdk"
 import { slate } from "@magnitudedev/client-common"
 import { app, autoUpdater, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, powerMonitor, shell, Tray } from "electron"
@@ -252,7 +252,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     const environment = yield* Fiber.join(harnessEnvironment)
     const executor = yield* harnessCommandExecutor(environment)
     return yield* makeHarnessConnectionService({
-      paths: harnessConnectionPaths(isolatedProfile ? join(dataDir, "harness-home") : undefined, environment),
+      paths: yield* resolveHarnessConnectionPaths(isolatedProfile ? join(dataDir, "harness-home") : undefined, environment),
       serviceEndpoint: endpoint,
       detect: connector => connector.detect(harnessExecutableSearchPath(environment.PATH)),
     }).pipe(Effect.provideService(CommandExecutor.CommandExecutor, executor))

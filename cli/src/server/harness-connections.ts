@@ -3,7 +3,7 @@ import { Effect } from "effect"
 import { isAbsolute, resolve } from "node:path"
 import { HarnessConnectionError } from "@magnitudedev/client-common"
 import { BunSqliteDriverLayer } from "@magnitudedev/daemon-management/bun"
-import { makeHarnessConnectionService, harnessConnectionPaths, makeHarnessConnectorRegistry, type HarnessConnectionOptions, type HarnessConnectionPaths } from "@magnitudedev/harness-connections"
+import { makeHarnessConnectionService, harnessConnectionPaths, resolveHarnessConnectionPaths, makeHarnessConnectorRegistry, type HarnessConnectionOptions, type HarnessConnectionPaths } from "@magnitudedev/harness-connections"
 import { isDevelopmentBuild } from "../runtime/environment"
 const failure = (operation: HarnessConnectionError["operation"], message: string) => new HarnessConnectionError({ operation, message })
 /** One development scope shared by the launcher and every CLI it hosts. */
@@ -28,7 +28,10 @@ export const piDevelopmentConnectionOptions = (root: string): HarnessConnectionO
 
 export const makeHarnessConnection = Effect.suspend(() => {
   const root = process.env.MAGNITUDE_PI_DEVELOPMENT_ROOT
-  if (root === undefined) return makeHarnessConnectionService({ paths: desktopIsolatedProfile ? harnessConnectionPaths(resolve(desktopDataDirectory, "harness-home")) : harnessConnectionPaths(), serviceEndpoint: desktopServiceOrigin }).pipe(Effect.provide(BunSqliteDriverLayer))
+  if (root === undefined) return resolveHarnessConnectionPaths(desktopIsolatedProfile ? resolve(desktopDataDirectory, "harness-home") : undefined).pipe(
+    Effect.flatMap(paths => makeHarnessConnectionService({ paths, serviceEndpoint: desktopServiceOrigin })),
+    Effect.provide(BunSqliteDriverLayer),
+  )
   if (!isDevelopmentBuild() || !isAbsolute(root)) {
     return Effect.fail(failure("connect", "Pi development connection scope requires a source CLI and an absolute directory"))
   }

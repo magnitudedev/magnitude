@@ -1,3 +1,4 @@
+import { json5Object } from "./json5"
 import { Effect, Option, Schema } from "effect"
 import { parse as parseToml } from "smol-toml"
 import { parseDocument } from "yaml"
@@ -10,7 +11,7 @@ import { clineModelCatalog, clineProviderSettings } from "./connectors/cline"
 import { hermesProviderConfig } from "./connectors/hermes"
 import { ohMyPiProviderConfig } from "./connectors/oh-my-pi"
 import { openClawProviderConfig } from "./connectors/openclaw"
-import { openCodeProviderConfig } from "./connectors/opencode"
+import { openCodeProviderConfig, readOpenCodeConfiguration } from "./connectors/opencode"
 import { piProviderConfig } from "./connectors/pi"
 
 import { ConnectionInspection } from "@magnitudedev/client-common"
@@ -39,20 +40,26 @@ export const inspectHarnessConnection = (
   serviceEndpoint?: string,
 ) => Effect.gen(function* () {
   const endpoints = harnessEndpoints(serviceEndpoint)
-  const read = (path: string, format: "json" | "yaml" | "toml" = "json") => readOr(path, format === "toml" ? "" : "{}").pipe(
+  const read = (path: string, format: "json" | "json5" | "yaml" | "toml" = "json") => readOr(path, format === "toml" ? "" : "{}").pipe(
     Effect.flatMap((source) => Effect.try({
-      try: () => format === "yaml" ? yamlObject(source) : format === "toml" ? parseToml(source) : jsonObject(source),
-      catch: () => disconnected(`Configuration is invalid: ${path}`),
+      try: () => format === "yaml" ? yamlObject(source) : format === "toml" ? parseToml(source) : format === "json5" ? json5Object(source) : jsonObject(source),
+      catch: (): ConnectionInspection => ({ _tag: "Unavailable", reason: `Fix invalid configuration in ${path} before reconnecting or disconnecting` }),
     })),
   )
-  const provider = (path: string, segments: ReadonlyArray<string>, expected: unknown, format: "json" | "yaml" = "json") =>
+  const provider = (path: string, segments: ReadonlyArray<string>, expected: unknown, format: "json" | "json5" | "yaml" = "json") =>
     read(path, format).pipe(Effect.map((document) => includesFields(valueAt(document, segments), expected)))
   let valid = false
   switch (connector.id) {
     case "pi": valid = yield* provider(paths.piModels, ["providers", "magnitude"], piProviderConfig(models, endpoints.openai)); break
-    case "opencode": valid = yield* provider(paths.opencode, ["provider", "magnitude"], openCodeProviderConfig(models, endpoints.openai)); break
+    case "opencode": {
+      const document = yield* readOpenCodeConfiguration(paths).pipe(
+        Effect.catchTag("UnknownException", () => Effect.fail<ConnectionInspection>({ _tag: "Unavailable", reason: "Fix invalid OpenCode configuration before reconnecting or disconnecting" })),
+      )
+      valid = includesFields(valueAt(document, ["provider", "magnitude"]), openCodeProviderConfig(models, endpoints.openai))
+      break
+    }
     case "hermes": valid = yield* provider(paths.hermes, ["providers", "magnitude"], hermesProviderConfig(endpoints.openai), "yaml"); break
-    case "openclaw": valid = yield* provider(paths.openclaw, ["models", "providers", "magnitude"], openClawProviderConfig(models, endpoints.openai)); break
+    case "openclaw": valid = yield* provider(paths.openclaw, ["models", "providers", "magnitude"], openClawProviderConfig(models, endpoints.openai), "json5"); break
     case "oh-my-pi": valid = yield* provider(paths.ompModels, ["providers", "magnitude"], ohMyPiProviderConfig(models, endpoints.openai), "yaml"); break
     case "claude-code": valid = yield* provider(paths.claude, ["env"], {
       ANTHROPIC_BASE_URL: endpoints.anthropic, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY,
