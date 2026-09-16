@@ -1,0 +1,442 @@
+[
+  {
+    "case": "persistent-decode-group-1",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-decode-group-2",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-decode-group-3",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-decode-group-4",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-decode-group-8",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-decode-group-12",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-decode-group-16",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "experts-prefill-rows1-experts256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "routed_experts.packet-selected@0"
+    ]
+  },
+  {
+    "case": "experts-decode-rows1-experts256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "routed_experts.packet-selected@0"
+    ]
+  },
+  {
+    "case": "experts-prefill-rows16-experts256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "routed_experts.packet-selected@0"
+    ]
+  },
+  {
+    "case": "experts-decode-rows16-experts256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "routed_experts.packet-selected@0"
+    ]
+  },
+  {
+    "case": "experts-prefill-rows32-experts256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "routed_experts.grouped@0"
+    ]
+  },
+  {
+    "case": "experts-decode-rows32-experts256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "routed_experts.packet-selected@0"
+    ]
+  },
+  {
+    "case": "experts-prefill-rows64-experts512",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "routed_experts.grouped@0"
+    ]
+  },
+  {
+    "case": "experts-decode-rows64-experts512",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "routed_experts.packet-selected@0"
+    ]
+  },
+  {
+    "case": "q8-linear-1x32",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.packet-gemm@0"
+    ]
+  },
+  {
+    "case": "q8-linear-8x32",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.packet-gemm@0"
+    ]
+  },
+  {
+    "case": "q8-linear-1x64",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.packet-gemm@0"
+    ]
+  },
+  {
+    "case": "q8-linear-8x64",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.packet-gemm@0"
+    ]
+  },
+  {
+    "case": "q8-linear-1x128",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.packet-gemm@0"
+    ]
+  },
+  {
+    "case": "q8-linear-8x128",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.packet-gemm@0"
+    ]
+  },
+  {
+    "case": "q8-linear-1x256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.packet-vector@0"
+    ]
+  },
+  {
+    "case": "q8-linear-8x256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.packet-gemm@0"
+    ]
+  },
+  {
+    "case": "q8-linear-1x288",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.packet-gemm@0"
+    ]
+  },
+  {
+    "case": "q8-linear-8x288",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.packet-gemm@0"
+    ]
+  },
+  {
+    "case": "q8-linear-1x512",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.packet-vector@0"
+    ]
+  },
+  {
+    "case": "q8-linear-8x512",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.packet-gemm@0"
+    ]
+  },
+  {
+    "case": "rms-rank1",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "rms_norm.parallel@0"
+    ]
+  },
+  {
+    "case": "linear-rank1",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.dense-vector@0"
+    ]
+  },
+  {
+    "case": "rms-rank2",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "rms_norm.parallel@0"
+    ]
+  },
+  {
+    "case": "linear-rank2",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.dense-vector@0"
+    ]
+  },
+  {
+    "case": "rms-rank3",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "rms_norm.parallel@0"
+    ]
+  },
+  {
+    "case": "linear-rank3",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.dense-vector@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-dense-width16",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width16",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-dense-width32",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width32",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-dense-width64",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width64",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-dense-width96",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width96",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-dense-width128",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width128",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-dense-width192",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width192",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-dense-width256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-dense-width512",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width512",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "dense-expert-banks-prefill",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "routed_experts.packet-selected@0"
+    ]
+  },
+  {
+    "case": "dense-expert-banks-decode",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "routed_experts.packet-selected@0"
+    ]
+  },
+  {
+    "case": "route-topk-experts256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "route_topk.subgroup@0"
+    ]
+  },
+  {
+    "case": "route-topk-experts512",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "route_topk.subgroup@0"
+    ]
+  },
+  {
+    "case": "route-topk-experts1024",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "route_topk.subgroup@0"
+    ]
+  },
+  {
+    "case": "route-topk-experts1025",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "route_topk.subgroup@0"
+    ]
+  }
+]

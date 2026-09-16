@@ -276,7 +276,7 @@ class RMSRule:
             return ()
         specs = tuple(graph.values[value].spec for value in (*node.inputs, *node.outputs))
         source = specs[0]
-        if any(not spec.static for spec in specs) or source.rank < 2:
+        if any(not spec.static for spec in specs) or source.rank < 1:
             return ()
         width = cast(int, source.shape[-1])
         threads = _reduction_threads(width, context)

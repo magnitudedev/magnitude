@@ -121,12 +121,70 @@ def _subgroup_topk(source, indices, weights, rows, experts, selected, scoring, n
         _finish_topk(raw, indices, weights, row, experts, selected, scoring, normalize, threads)
 
 
+@T.macro
+def _tiled_topk(source, indices, weights, rows, experts, selected, scoring, normalize, threads):
+    extent = 1 << (experts - 1).bit_length()
+    with T.Kernel(rows, threads=threads) as row:
+        scores = T.alloc_fragment((extent,), "float32")
+        candidates = T.alloc_fragment((extent,), "int32")
+        layout = T.Fragment((extent,), forward_thread_fn=lambda i: i % threads,
+                            forward_index_fn=lambda i: i // threads)
+        T.annotate_layout({scores: layout, candidates: layout})
+        peak = T.alloc_fragment((1,), "float32")
+        total = T.alloc_fragment((1,), "float32")
+        winner = T.alloc_fragment((1,), "int32")
+        shared_peak = T.alloc_shared((1,), "float32")
+        shared_total = T.alloc_shared((1,), "float32")
+        shared_winner = T.alloc_shared((1,), "int32")
+        winners = T.alloc_shared((selected,), "float32")
+        for expert in T.Parallel(extent):
+            scores[expert] = T.if_then_else(expert < experts, T.cast(source[row, expert], "float32"), -float("inf"))
+        if scoring == "softmax":
+            T.reduce_max(scores, peak, dim=0)
+            T.copy(peak, shared_peak)
+            T.sync_threads()
+            for expert in T.Parallel(extent):
+                scores[expert] = T.if_then_else(expert < experts, T.exp(scores[expert] - shared_peak[0]), 0.0)
+            T.reduce_sum(scores, total, dim=0)
+            T.copy(total, shared_total)
+            T.sync_threads()
+        else:
+            for expert in T.Parallel(extent):
+                scores[expert] = T.if_then_else(expert < experts, T.sigmoid(scores[expert]), 0.0)
+        for expert in T.Parallel(extent):
+            scores[expert] = T.if_then_else(expert < experts, scores[expert], -float("inf"))
+        for rank in T.serial(selected):
+            T.reduce_max(scores, peak, dim=0)
+            T.copy(peak, shared_peak)
+            T.sync_threads()
+            for expert in T.Parallel(extent):
+                candidates[expert] = T.if_then_else(expert < experts and scores[expert] == shared_peak[0], expert, -1)
+            T.reduce_max(candidates, winner, dim=0)
+            T.copy(winner, shared_winner)
+            T.sync_threads()
+            if T.get_thread_binding() == 0:
+                indices[row, selected - 1 - rank] = shared_winner[0]
+                winners[rank] = shared_peak[0] / shared_total[0] if scoring == "softmax" and not normalize else shared_peak[0]
+            for expert in T.Parallel(extent):
+                scores[expert] = T.if_then_else(expert == shared_winner[0], -float("inf"), scores[expert])
+        T.sync_threads()
+        denominator = T.alloc_local((1,), "float32")
+        denominator[0] = 1.0
+        if normalize:
+            denominator[0] = 0.0
+            for rank in T.serial(selected):
+                denominator[0] += winners[rank]
+        for rank in T.Parallel(selected):
+            weights[row, selected - 1 - rank] = winners[rank] / denominator[0]
+
+
 class _RoutingEmitter:
     def __init__(self, rows, experts, selected, scoring, normalize, threads):
         self.args = rows, experts, selected, scoring, normalize, threads
 
     def __call__(self, operands: tuple[Any, ...]) -> None:
-        _subgroup_topk(operands[0], operands[1], operands[2], *self.args)
+        body = _tiled_topk if self.args[1] > self.args[-1] else _subgroup_topk
+        body(operands[0], operands[1], operands[2], *self.args)
 
 
 class RoutingRule:
@@ -140,10 +198,13 @@ class RoutingRule:
         if not source.static or source.rank != 2 or context.compiler_target.subgroup_width != 32:
             return ()
         rows, experts = cast(tuple[int, int], source.shape)
-        threads = max(32, 1 << (experts - 1).bit_length())
-        if threads > context.compiler_target.threads_per_group:
-            return ()
+        threads = min(max(32, 1 << (experts - 1).bit_length()),
+                      1 << (context.compiler_target.threads_per_group.bit_length() - 1))
         selected = node.attributes["k"]
+        shared_bytes = (selected * 4 + 12 if experts > threads
+                        else selected * 8 + (threads // 32) * 8 + 12)
+        if threads < 32 or shared_bytes > context.compiler_target.shared_memory_bytes:
+            return ()
         return (
             BoundOperation(
                 f"route_topk.subgroup@{root}",

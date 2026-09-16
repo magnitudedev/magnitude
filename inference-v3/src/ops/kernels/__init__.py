@@ -72,7 +72,18 @@ def build_primitive(graph, root, context, *, remaining):
             if any(binding is None for binding in bindings):
                 raise ValueError("streamed experts require all three source bank bindings")
             return (expert_loop(graph, root, context, bindings),)
-        body = SelectedExpertsRule() if context.mode == "decode" else GroupedExpertsRule()
+        routes = graph.value(node.inputs[1]).spec
+        experts = graph.value(node.inputs[3]).spec.shape[0]
+        if context.mode == "decode" or routes.elements < experts:
+            selected = SelectedExpertsRule()
+            result = selected.build(graph, root, context)
+            if result:
+                return _authored(result, selected)
+        grouped = GroupedExpertsRule()
+        result = grouped.build(graph, root, context)
+        if result:
+            return _authored(result, grouped)
+        body = SelectedExpertsRule()
     elif node.operation == "embedding" and packet_format(graph.value(node.inputs[1]).spec) is not None:
         body = PackedEmbeddingRule()
     elif node.operation == "recurrent_prepare":

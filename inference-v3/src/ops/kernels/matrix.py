@@ -134,6 +134,8 @@ class _PackedVectorEmitter:
         source, weight = operands[:2]
         bias = operands[2] if self.bias else source
         result = operands[3] if self.bias else operands[2]
+        source = T.view(source, shape=(self.m, self.k))
+        result = T.view(result, shape=(self.m, self.n))
         _packed_vector(
             source,
             weight,
@@ -218,6 +220,8 @@ class _PackedMatrixEmitter:
         source, weight = operands[:2]
         bias = operands[2] if self.bias else source
         result = operands[3] if self.bias else operands[2]
+        source = T.view(source, shape=(self.m, self.k))
+        result = T.view(result, shape=(self.m, self.n))
         _packed_matrix(
             source,
             weight,
@@ -271,6 +275,8 @@ class _DenseVectorEmitter:
         source, weight = operands[:2]
         bias = operands[2] if self.bias else source
         result = operands[3] if self.bias else operands[2]
+        source = T.view(source, shape=(self.m, self.k))
+        result = T.view(result, shape=(self.m, self.n))
         _dense_vector(source, weight, bias, result, self.m, self.n, self.k, self.output, self.bias)
 
 
@@ -349,6 +355,8 @@ class _DenseMatrixEmitter:
         source, weight = operands[:2]
         bias = operands[2] if self.bias else source
         result = operands[3] if self.bias else operands[2]
+        source = T.view(source, shape=(self.m, self.k))
+        result = T.view(result, shape=(self.m, self.n))
         _dense_matrix(
             source,
             weight,
@@ -721,13 +729,13 @@ class ParallelPackedMatrixRule:
             if bk % 8:
                 return ()
             threads = min(threads, bm // 8 * context.compiler_target.subgroup_width)
-            if affine_shared_bytes(bm, bn, bk, source_spec.dtype, *weight_specs) > context.compiler_target.shared_memory_bytes:
-                return ()
             schedule = select_affine_tile(
                 context, source_spec, weight_specs, (bm, bn, bk, threads),
                 template=_ParallelPackedEmitter, name="linear.parallel-affine",
                 workload=output_specs,
             )
+            if schedule is None:
+                return ()
             tile = (schedule.rows, schedule.columns, schedule.reduction)
             threads, contraction_schedule = schedule.threads, schedule.operands
         moved = sum(spec.storage_nbytes for spec in weight_specs)
@@ -765,18 +773,19 @@ class PackedMatrixRule:
             packet is None
             or not left.static
             or not right.static
-            or left.rank != 2
+            or left.rank < 1
             or right.rank != 2
             or context.compiler_target.subgroup_width != 32
         ):
             return ()
-        m, k = cast(tuple[int, int], left.shape)
+        k = cast(int, left.shape[-1])
+        m = left.elements // k
         n = cast(int, right.shape[0])
-        if k % packet.tile:
+        if k % packet.matrix_packet:
             return ()
         output = graph.values[node.outputs[0]].spec
         vector = _packed_vector_geometry(right, context)
-        if vector is not None and m < 8:
+        if vector is not None and m < 8 and k % packet.tile == 0:
             threads, outputs_per_subgroup = vector
             emitter = _PackedVectorEmitter(
                 right,
@@ -799,6 +808,8 @@ class PackedMatrixRule:
                 template=_PackedMatrixEmitter, name="linear.affine",
                 workload=(output, len(node.inputs) == 3),
             )
+            if schedule is None:
+                return ()
             emitter = _PackedMatrixEmitter(right, m, n, k, schedule.operands,
                                            output.dtype.value, schedule.threads,
                                            (schedule.rows, schedule.columns, schedule.reduction),
@@ -820,7 +831,7 @@ class DenseMatrixRule:
             not left.static
             or not right.static
             or not _dense(right)
-            or left.rank != 2
+            or (left.rank != 2 if node.operation == "matmul" else left.rank < 1)
             or right.rank != 2
         ):
             return ()

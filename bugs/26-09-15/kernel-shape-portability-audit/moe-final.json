@@ -1,0 +1,233 @@
+[
+  {
+    "iteration": 0,
+    "stage": "prefill",
+    "elapsed_ns": 72718484750,
+    "warmup": true,
+    "top_token": 114
+  },
+  {
+    "iteration": 0,
+    "stage": "decode-1",
+    "elapsed_ns": 36972546750,
+    "warmup": true,
+    "top_token": 104
+  },
+  {
+    "iteration": 0,
+    "stage": "decode-2",
+    "elapsed_ns": 21127167,
+    "warmup": true,
+    "top_token": 121
+  },
+  {
+    "iteration": 1,
+    "stage": "prefill",
+    "elapsed_ns": 55709459,
+    "warmup": true,
+    "top_token": 114
+  },
+  {
+    "iteration": 1,
+    "stage": "decode-1",
+    "elapsed_ns": 9835125,
+    "warmup": true,
+    "top_token": 104
+  },
+  {
+    "iteration": 1,
+    "stage": "decode-2",
+    "elapsed_ns": 9954292,
+    "warmup": true,
+    "top_token": 121
+  },
+  {
+    "iteration": 2,
+    "stage": "prefill",
+    "elapsed_ns": 55210791,
+    "warmup": false,
+    "top_token": 114
+  },
+  {
+    "iteration": 2,
+    "stage": "decode-1",
+    "elapsed_ns": 10501833,
+    "warmup": false,
+    "top_token": 104
+  },
+  {
+    "iteration": 2,
+    "stage": "decode-2",
+    "elapsed_ns": 9408333,
+    "warmup": false,
+    "top_token": 121
+  },
+  {
+    "iteration": 3,
+    "stage": "prefill",
+    "elapsed_ns": 55744417,
+    "warmup": false,
+    "top_token": 114
+  },
+  {
+    "iteration": 3,
+    "stage": "decode-1",
+    "elapsed_ns": 9516708,
+    "warmup": false,
+    "top_token": 104
+  },
+  {
+    "iteration": 3,
+    "stage": "decode-2",
+    "elapsed_ns": 9543625,
+    "warmup": false,
+    "top_token": 121
+  },
+  {
+    "iteration": 4,
+    "stage": "prefill",
+    "elapsed_ns": 55207542,
+    "warmup": false,
+    "top_token": 114
+  },
+  {
+    "iteration": 4,
+    "stage": "decode-1",
+    "elapsed_ns": 9749875,
+    "warmup": false,
+    "top_token": 104
+  },
+  {
+    "iteration": 4,
+    "stage": "decode-2",
+    "elapsed_ns": 10479125,
+    "warmup": false,
+    "top_token": 121
+  },
+  {
+    "iteration": 5,
+    "stage": "prefill",
+    "elapsed_ns": 55855166,
+    "warmup": false,
+    "top_token": 114
+  },
+  {
+    "iteration": 5,
+    "stage": "decode-1",
+    "elapsed_ns": 10477750,
+    "warmup": false,
+    "top_token": 104
+  },
+  {
+    "iteration": 5,
+    "stage": "decode-2",
+    "elapsed_ns": 9345542,
+    "warmup": false,
+    "top_token": 121
+  },
+  {
+    "iteration": 6,
+    "stage": "prefill",
+    "elapsed_ns": 54988083,
+    "warmup": false,
+    "top_token": 114
+  },
+  {
+    "iteration": 6,
+    "stage": "decode-1",
+    "elapsed_ns": 9749958,
+    "warmup": false,
+    "top_token": 104
+  },
+  {
+    "iteration": 6,
+    "stage": "decode-2",
+    "elapsed_ns": 9626750,
+    "warmup": false,
+    "top_token": 121
+  },
+  {
+    "iteration": 7,
+    "stage": "prefill",
+    "elapsed_ns": 55099291,
+    "warmup": false,
+    "top_token": 114
+  },
+  {
+    "iteration": 7,
+    "stage": "decode-1",
+    "elapsed_ns": 9560166,
+    "warmup": false,
+    "top_token": 104
+  },
+  {
+    "iteration": 7,
+    "stage": "decode-2",
+    "elapsed_ns": 10161792,
+    "warmup": false,
+    "top_token": 121
+  },
+  {
+    "iteration": 8,
+    "stage": "prefill",
+    "elapsed_ns": 55029959,
+    "warmup": false,
+    "top_token": 114
+  },
+  {
+    "iteration": 8,
+    "stage": "decode-1",
+    "elapsed_ns": 9829083,
+    "warmup": false,
+    "top_token": 104
+  },
+  {
+    "iteration": 8,
+    "stage": "decode-2",
+    "elapsed_ns": 9792625,
+    "warmup": false,
+    "top_token": 121
+  },
+  {
+    "iteration": 9,
+    "stage": "prefill",
+    "elapsed_ns": 54991917,
+    "warmup": false,
+    "top_token": 114
+  },
+  {
+    "iteration": 9,
+    "stage": "decode-1",
+    "elapsed_ns": 10239333,
+    "warmup": false,
+    "top_token": 104
+  },
+  {
+    "iteration": 9,
+    "stage": "decode-2",
+    "elapsed_ns": 9755625,
+    "warmup": false,
+    "top_token": 121
+  },
+  {
+    "iteration": 10,
+    "stage": "prefill",
+    "elapsed_ns": 55363625,
+    "warmup": false,
+    "top_token": 114
+  },
+  {
+    "iteration": 10,
+    "stage": "decode-1",
+    "elapsed_ns": 9664416,
+    "warmup": false,
+    "top_token": 104
+  },
+  {
+    "iteration": 10,
+    "stage": "decode-2",
+    "elapsed_ns": 9655333,
+    "warmup": false,
+    "top_token": 121
+  }
+]

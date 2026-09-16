@@ -13,7 +13,6 @@ from .experts import _routed_shared_region
 from .matrix import _packet_reduction_width
 from .packed import (
     affine_gemm,
-    affine_shared_bytes,
     affine_storage,
     load_matrix_tile,
     packet_format,
@@ -25,6 +24,21 @@ from .schedules import select_affine_region
 def _aligned_capacity(rows: int, selected: int, experts: int, tile: int) -> int:
     routes = rows * selected
     return ((routes + experts * (tile - 1) + tile - 1) // tile) * tile
+
+
+def _grouped_workspace(rows, selected, experts, width, intermediate, dtype, tile, shared_width=None):
+    capacity = _aligned_capacity(rows, selected, experts, tile)
+    return (
+        TensorSpec((capacity,), DType.I32),
+        TensorSpec((rows * selected,), DType.I32),
+        TensorSpec((capacity // tile, 2), DType.I32),
+        TensorSpec((1,), DType.I32),
+        TensorSpec((capacity, intermediate), dtype),
+        *((TensorSpec((rows, shared_width), dtype),) if shared_width is not None else ()),
+        TensorSpec((capacity, width), dtype),
+        *((TensorSpec((rows, width), dtype),) if shared_width is not None else ()),
+        TensorSpec((capacity, width), dtype),
+    )
 
 
 @T.macro
@@ -47,8 +61,8 @@ def _group_routes(
         lane = T.get_thread_binding(0)
         counts = T.alloc_shared((experts,), "int32")
         cursors = T.alloc_shared((experts,), "int32")
-        if lane < experts:
-            counts[lane] = 0
+        for expert in T.Parallel(experts):
+            counts[expert] = 0
         for chunk in T.serial(T.ceildiv(capacity, 256)):
             position = chunk * 256 + lane
             if position < capacity:
@@ -597,7 +611,6 @@ class GroupedExpertsRule:
         if (
             node.operation != "routed_experts"
             or node.attributes["activation"] != "silu"
-            or context.mode == "decode"
             or context.compiler_target.shared_memory_bytes <= 0
         ):
             return ()
@@ -610,19 +623,19 @@ class GroupedExpertsRule:
         experts, intermediate, input_width = cast(tuple[int, int, int], gate.shape)
         gate_packet, up_packet, down_packet = (packet_format(spec) for spec in (gate, up, down))
         if (
-            rows * selected < experts
-            or input_width != width
+            input_width != width
             or up.shape != gate.shape
             or down.shape != (experts, width, intermediate)
             or scores.shape != routes.shape
             or output.shape != hidden.shape
-            or experts > 256
+            or experts * 8 > context.compiler_target.shared_memory_bytes
+            or context.compiler_target.threads_per_group < 256
             or gate_packet is None
             or up_packet is None
             or down_packet is None
             or gate_packet != up_packet
-            or width % gate_packet.tile
-            or intermediate % down_packet.tile
+            or width % gate_packet.matrix_packet
+            or intermediate % down_packet.matrix_packet
         ):
             return ()
         if rows >= 256:
@@ -639,31 +652,19 @@ class GroupedExpertsRule:
             context.compiler_target.subgroup_width * 4,
             bm // 8 * context.compiler_target.subgroup_width,
         )
-        shared = max(
-            affine_shared_bytes(bm, 2 * bn, bk, hidden.dtype, gate, up),
-            affine_shared_bytes(bm, 2 * bn, down_bk, hidden.dtype, down),
-        )
-        if shared > context.compiler_target.shared_memory_bytes:
-            return ()
         schedule = select_affine_region(
             context, hidden, ((False, bk, (gate, up)), (True, down_bk, (down,))),
             (bm, bn, bk, threads), template=_GroupedExpertsEmitter,
             name="experts.grouped-affine", workload=specs,
+            workspace=lambda candidate: _grouped_workspace(
+                rows, selected, experts, width, intermediate, hidden.dtype, candidate.rows),
         )
+        if schedule is None:
+            return ()
         bm = schedule.rows
         capacity = _aligned_capacity(rows, selected, experts, bm)
         blocks = capacity // bm
-        workspace = (
-            TensorSpec((capacity,), DType.I32),
-            TensorSpec((rows * selected,), DType.I32),
-            TensorSpec((blocks, 2), DType.I32),
-            TensorSpec((1,), DType.I32),
-            TensorSpec((capacity, intermediate), hidden.dtype),
-            TensorSpec((capacity, width), hidden.dtype),
-            TensorSpec((capacity, width), hidden.dtype),
-        )
-        if sum(value.storage_nbytes for value in workspace) > context.workspace_limit:
-            return ()
+        workspace = _grouped_workspace(rows, selected, experts, width, intermediate, hidden.dtype, bm)
         return (
             BoundOperation(
                 f"routed_experts.grouped@{root}",
@@ -719,7 +720,8 @@ def _grouped_shared_operation(
         or packets[0] != packets[1]
         or packets[3] != packets[4]
         or rows * selected < experts
-        or experts > 256
+        or experts * 8 > context.compiler_target.shared_memory_bytes
+        or context.compiler_target.threads_per_group < 256
         or input_width != width
         or expert_up.shape != expert_gate.shape
         or expert_down.shape != (experts, width, expert_width)
@@ -732,10 +734,10 @@ def _grouped_shared_operation(
         return None
     concrete_packets = cast(tuple[Any, ...], packets)
     if (
-        width % concrete_packets[0].tile
-        or width % concrete_packets[3].tile
-        or expert_width % concrete_packets[2].tile
-        or shared_width % concrete_packets[5].tile
+        width % concrete_packets[0].matrix_packet
+        or width % concrete_packets[3].matrix_packet
+        or expert_width % concrete_packets[2].matrix_packet
+        or shared_width % concrete_packets[5].matrix_packet
     ):
         return None
     if rows >= 256:
@@ -754,38 +756,23 @@ def _grouped_shared_operation(
         context.compiler_target.subgroup_width * 4,
         bm // 8 * context.compiler_target.subgroup_width,
     )
-    shared_bytes = max(
-        affine_shared_bytes(bm, 2 * bn, bk, hidden.dtype, expert_gate, expert_up),
-        affine_shared_bytes(bm, 2 * bn, shared_bk, hidden.dtype, shared_gate, shared_up),
-        affine_shared_bytes(bm, 2 * bn, down_bk, hidden.dtype, expert_down),
-        affine_shared_bytes(bm, 2 * bn, shared_down_bk, hidden.dtype, shared_down),
-    )
-    if shared_bytes > context.compiler_target.shared_memory_bytes:
-        return None
     schedule = select_affine_region(
         context, hidden, ((False, bk, (expert_gate, expert_up)),
                           (False, shared_bk, (shared_gate, shared_up)),
                           (True, down_bk, (expert_down,)), (True, shared_down_bk, (shared_down,))),
         (bm, bn, bk, threads), template=_GroupedSharedExpertsEmitter,
         name="experts.grouped-shared-affine", workload=specs,
+        workspace=lambda candidate: _grouped_workspace(
+            rows, selected, experts, width, expert_width, hidden.dtype, candidate.rows, shared_width),
     )
+    if schedule is None:
+        return None
     bm = schedule.rows
     capacity = _aligned_capacity(rows, selected, experts, bm)
     expert_blocks = capacity // bm
     shared_blocks = (rows + bm - 1) // bm
-    workspace = (
-        TensorSpec((capacity,), DType.I32),
-        TensorSpec((rows * selected,), DType.I32),
-        TensorSpec((expert_blocks, 2), DType.I32),
-        TensorSpec((1,), DType.I32),
-        TensorSpec((capacity, expert_width), hidden.dtype),
-        TensorSpec((rows, shared_width), hidden.dtype),
-        TensorSpec((capacity, width), hidden.dtype),
-        TensorSpec((rows, width), hidden.dtype),
-        TensorSpec((capacity, width), hidden.dtype),
-    )
-    if sum(value.storage_nbytes for value in workspace) > context.workspace_limit:
-        return None
+    workspace = _grouped_workspace(rows, selected, experts, width, expert_width,
+                                   hidden.dtype, bm, shared_width)
     return BoundOperation(
         f"routed_experts.grouped@{root}:{max(nodes)}",
         nodes,

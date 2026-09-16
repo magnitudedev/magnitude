@@ -1,0 +1,17 @@
+{
+  "native_gate": {
+    "command": "PYTHONPATH=inference-v3/src inference-v3/.venv/bin/pytest -o addopts='' -q inference-v3/tests/ops/test_kernel_shape_portability.py inference-v3/tests/ops/test_persistent_decode_cohorts.py inference-v3/tests/ops/test_expert_lowering.py inference-v3/tests/ops/test_chunked_recurrent.py inference-v3/tests/ops/test_persistent_attention_schedules.py inference-v3/tests/ops/test_streamed_execution.py inference-v3/tests/ops/test_tilelang_runtime.py inference-v3/tests/ops/test_affine_schedule_numerics.py inference-v3/tests/ops/test_partitioned_sampling.py inference-v3/tests/ops/test_attention_normalization_lowering.py inference-v3/tests/ops/test_schedule_selection.py",
+    "passed": 189,
+    "skipped": 21,
+    "seconds": 225.58
+  },
+  "final_schedule_gate": {
+    "passed": 7,
+    "seconds": 2.27
+  },
+  "planning": {
+    "accepted": 55,
+    "rejected": 0
+  },
+  "lint": "New native regression files pass Ruff. Existing unused imports/locals elsewhere remain baseline diagnostics."
+}

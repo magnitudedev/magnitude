@@ -1,0 +1,913 @@
+[
+  {
+    "case": "persistent-decode-group-1",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-decode-group-2",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-decode-group-3",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-decode-group-4",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-decode-group-8",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-decode-group-12",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-decode-group-16",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "experts-prefill-rows1-experts256",
+    "plan": "rejected",
+    "error": "ValueError: routed_experts has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "experts-decode-rows1-experts256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "routed_experts.packet-selected@0"
+    ]
+  },
+  {
+    "case": "experts-prefill-rows16-experts256",
+    "plan": "rejected",
+    "error": "ValueError: routed_experts has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "experts-decode-rows16-experts256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "routed_experts.packet-selected@0"
+    ]
+  },
+  {
+    "case": "experts-prefill-rows32-experts256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "routed_experts.grouped@0"
+    ]
+  },
+  {
+    "case": "experts-decode-rows32-experts256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "routed_experts.packet-selected@0"
+    ]
+  },
+  {
+    "case": "experts-prefill-rows64-experts512",
+    "plan": "rejected",
+    "error": "ValueError: routed_experts has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "experts-decode-rows64-experts512",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "routed_experts.packet-selected@0"
+    ]
+  },
+  {
+    "case": "q8-linear-1x32",
+    "plan": "rejected",
+    "error": "ValueError: linear has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "q8-linear-8x32",
+    "plan": "rejected",
+    "error": "ValueError: linear has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "q8-linear-1x64",
+    "plan": "rejected",
+    "error": "ValueError: linear has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "q8-linear-8x64",
+    "plan": "rejected",
+    "error": "ValueError: linear has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "q8-linear-1x128",
+    "plan": "rejected",
+    "error": "ValueError: linear has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "q8-linear-8x128",
+    "plan": "rejected",
+    "error": "ValueError: linear has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "q8-linear-1x256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.packet-vector@0"
+    ]
+  },
+  {
+    "case": "q8-linear-8x256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.packet-gemm@0"
+    ]
+  },
+  {
+    "case": "q8-linear-1x288",
+    "plan": "rejected",
+    "error": "ValueError: linear has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "q8-linear-8x288",
+    "plan": "rejected",
+    "error": "ValueError: linear has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "q8-linear-1x512",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.packet-vector@0"
+    ]
+  },
+  {
+    "case": "q8-linear-8x512",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.packet-gemm@0"
+    ]
+  },
+  {
+    "case": "rms-rank1",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "rms_norm.parallel@0"
+    ]
+  },
+  {
+    "case": "linear-rank1",
+    "plan": "rejected",
+    "error": "ValueError: linear has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "rms-rank2",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "rms_norm.parallel@0"
+    ]
+  },
+  {
+    "case": "linear-rank2",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.dense-vector@0"
+    ]
+  },
+  {
+    "case": "rms-rank3",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "rms_norm.parallel@0"
+    ]
+  },
+  {
+    "case": "linear-rank3",
+    "plan": "rejected",
+    "error": "ValueError: linear has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "persistent-prefill-dense-width16",
+    "plan": "rejected",
+    "error": "ValueError: packed KV realization requires equal widths divisible by the subgroup width"
+  },
+  {
+    "case": "persistent-prefill-affine-width16",
+    "plan": "rejected",
+    "error": "ValueError: packed KV realization requires equal widths divisible by the subgroup width"
+  },
+  {
+    "case": "persistent-prefill-dense-width32",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width32",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-dense-width64",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width64",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-dense-width96",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width96",
+    "plan": "rejected",
+    "error": "ValueError: packed KV coordinates must partition complete word ownership groups"
+  },
+  {
+    "case": "persistent-prefill-dense-width128",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width128",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-dense-width192",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width192",
+    "plan": "rejected",
+    "error": "ValueError: packed KV coordinates must partition complete word ownership groups"
+  },
+  {
+    "case": "persistent-prefill-dense-width256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-dense-width512",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width512",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "dense-expert-banks-prefill",
+    "plan": "rejected",
+    "error": "ValueError: routed_experts has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "dense-expert-banks-decode",
+    "plan": "rejected",
+    "error": "ValueError: routed_experts has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "route-topk-experts256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "route_topk.subgroup@0"
+    ]
+  },
+  {
+    "case": "route-topk-experts512",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "route_topk.subgroup@0"
+    ]
+  },
+  {
+    "case": "route-topk-experts1024",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "route_topk.subgroup@0"
+    ]
+  },
+  {
+    "case": "route-topk-experts1025",
+    "plan": "rejected",
+    "error": "ValueError: route_topk has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "recurrent-prepare-width6-offsets[0, 1, 4]",
+    "native": "passed",
+    "matches": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "max_abs": [
+      3.166496753692627e-08,
+      8.940696716308594e-08,
+      1.862645149230957e-09,
+      2.9802322387695312e-08,
+      5.960464477539063e-08,
+      0.0
+    ],
+    "nan_counts": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "submit_wait_ns": [
+      280958,
+      211500,
+      226750,
+      202250,
+      193375,
+      196667,
+      191708,
+      186625,
+      182708,
+      288125,
+      184292,
+      196167,
+      193167,
+      185833,
+      191042,
+      178583,
+      301333,
+      447250,
+      254500,
+      218708,
+      204417
+    ],
+    "median_submit_wait_ns": 196667
+  },
+  {
+    "case": "recurrent-prepare-width6-offsets[0, 0, 4]",
+    "native": "passed",
+    "matches": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "max_abs": [
+      2.9802322387695312e-08,
+      1.1920928955078125e-07,
+      1.862645149230957e-09,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "nan_counts": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "submit_wait_ns": [
+      184458,
+      183250,
+      197500,
+      347583,
+      483708,
+      233333,
+      212875,
+      217292,
+      196458,
+      199583,
+      211125,
+      194209,
+      225292,
+      194875,
+      188959,
+      185583,
+      180583,
+      179083,
+      172042,
+      200625,
+      187959
+    ],
+    "median_submit_wait_ns": 196458
+  },
+  {
+    "case": "recurrent-prepare-width1025-offsets[0, 1]",
+    "native": "passed",
+    "matches": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "max_abs": [
+      4.656612873077393e-10,
+      1.4901161193847656e-08,
+      3.725290298461914e-09,
+      0.0,
+      1.1920928955078125e-07,
+      0.0
+    ],
+    "nan_counts": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "submit_wait_ns": [
+      311209,
+      385458,
+      456333,
+      231417,
+      213000,
+      217083,
+      215083,
+      214417,
+      217292,
+      278375,
+      226792,
+      235375,
+      214125,
+      207709,
+      220625,
+      282583,
+      223750,
+      207708,
+      268334,
+      260209,
+      207917
+    ],
+    "median_submit_wait_ns": 223750
+  },
+  {
+    "case": "softmax-width4095-maskedTrue",
+    "native": "passed",
+    "matches": [
+      true
+    ],
+    "max_abs": [
+      0.0
+    ],
+    "nan_counts": [
+      0
+    ],
+    "submit_wait_ns": [
+      136000,
+      133000,
+      163833,
+      133333,
+      150916,
+      139333,
+      130084,
+      134917,
+      131583,
+      126375,
+      127500,
+      126416,
+      198292,
+      129459,
+      123291,
+      144083,
+      188041,
+      153792,
+      149416,
+      215459,
+      328667
+    ],
+    "median_submit_wait_ns": 136000
+  },
+  {
+    "case": "softmax-width4097-maskedFalse",
+    "native": "passed",
+    "matches": [
+      true
+    ],
+    "max_abs": [
+      0.0
+    ],
+    "nan_counts": [
+      0
+    ],
+    "submit_wait_ns": [
+      1511417,
+      1260333,
+      1183167,
+      1202750,
+      1436666,
+      1300875,
+      1269375,
+      1263709,
+      1468833,
+      1278625,
+      1246000,
+      1188959,
+      1613625,
+      1248750,
+      1211292,
+      1193625,
+      1449750,
+      1158375,
+      1210625,
+      1322500,
+      1317542
+    ],
+    "median_submit_wait_ns": 1263709
+  },
+  {
+    "case": "softmax-width4097-maskedTrue",
+    "native": "passed",
+    "matches": [
+      true
+    ],
+    "max_abs": [
+      0.0
+    ],
+    "nan_counts": [
+      0
+    ],
+    "submit_wait_ns": [
+      1301833,
+      1174375,
+      1176417,
+      1496416,
+      1281834,
+      1186750,
+      1181833,
+      1482292,
+      1274709,
+      1200334,
+      1169500,
+      1468125,
+      1240375,
+      1179750,
+      1206583,
+      1587167,
+      1262917,
+      1214791,
+      1258667,
+      1366791,
+      1205875
+    ],
+    "median_submit_wait_ns": 1240375
+  },
+  {
+    "case": "rms-native-(3, 17)",
+    "native": "passed",
+    "matches": [
+      true
+    ],
+    "max_abs": [
+      2.384185791015625e-07
+    ],
+    "nan_counts": [
+      0
+    ],
+    "submit_wait_ns": [
+      139500,
+      230125,
+      218167,
+      186833,
+      156916,
+      159875,
+      169334,
+      176541,
+      185916,
+      166375,
+      169458,
+      146250,
+      153583,
+      174875,
+      149375,
+      149875,
+      153709,
+      144625,
+      141375,
+      161250,
+      143750
+    ],
+    "median_submit_wait_ns": 159875
+  },
+  {
+    "case": "rms-native-(2, 3, 17)",
+    "native": "passed",
+    "matches": [
+      true
+    ],
+    "max_abs": [
+      2.384185791015625e-07
+    ],
+    "nan_counts": [
+      0
+    ],
+    "submit_wait_ns": [
+      191500,
+      178959,
+      167542,
+      172250,
+      158208,
+      218541,
+      141959,
+      191250,
+      174542,
+      171083,
+      190666,
+      172417,
+      168166,
+      158833,
+      165375,
+      163375,
+      160541,
+      233167,
+      174375,
+      170125,
+      160750
+    ],
+    "median_submit_wait_ns": 171083
+  },
+  {
+    "case": "dense-tail-1-17-31",
+    "native": "passed",
+    "matches": [
+      true
+    ],
+    "max_abs": [
+      2.2351741790771484e-08
+    ],
+    "nan_counts": [
+      0
+    ],
+    "submit_wait_ns": [
+      176834,
+      189541,
+      170083,
+      166875,
+      170334,
+      232375,
+      181667,
+      191708,
+      263625,
+      244500,
+      207250,
+      182834,
+      180292,
+      208291,
+      272709,
+      177750,
+      168750,
+      164541,
+      156542,
+      158584,
+      159375
+    ],
+    "median_submit_wait_ns": 180292
+  },
+  {
+    "case": "dense-tail-8-17-31",
+    "native": "passed",
+    "matches": [
+      true
+    ],
+    "max_abs": [
+      4.0978193283081055e-08
+    ],
+    "nan_counts": [
+      0
+    ],
+    "submit_wait_ns": [
+      178583,
+      153167,
+      174333,
+      160500,
+      154125,
+      160541,
+      147000,
+      146792,
+      158208,
+      268500,
+      161042,
+      165209,
+      167541,
+      170000,
+      191792,
+      175125,
+      170125,
+      184833,
+      125500,
+      183833,
+      183541
+    ],
+    "median_submit_wait_ns": 167541
+  },
+  {
+    "case": "dense-tail-9-33-65",
+    "native": "passed",
+    "matches": [
+      true
+    ],
+    "max_abs": [
+      7.450580596923828e-08
+    ],
+    "nan_counts": [
+      0
+    ],
+    "submit_wait_ns": [
+      175917,
+      191625,
+      176958,
+      183209,
+      169375,
+      169250,
+      175583,
+      164167,
+      173083,
+      178792,
+      173125,
+      176625,
+      166500,
+      211583,
+      151333,
+      155792,
+      156708,
+      158625,
+      165209,
+      174292,
+      157167
+    ],
+    "median_submit_wait_ns": 173083
+  },
+  {
+    "case": "persistent-attention-width",
+    "width": 256,
+    "expected": "all ones: one visible value row",
+    "first_half_correct": true,
+    "tail_correct": true,
+    "incorrect": 0,
+    "submit_wait_ns": [
+      232584,
+      233625,
+      222166,
+      214750,
+      223916,
+      205750,
+      608709,
+      288250,
+      221625,
+      216625,
+      238541,
+      225667,
+      245708,
+      296458,
+      233583,
+      213541,
+      210458,
+      210292,
+      211667,
+      205250,
+      223709
+    ],
+    "median_submit_wait_ns": 223709
+  },
+  {
+    "case": "persistent-attention-width",
+    "width": 512,
+    "expected": "all ones: one visible value row",
+    "first_half_correct": true,
+    "tail_correct": true,
+    "incorrect": 0,
+    "submit_wait_ns": [
+      368959,
+      281083,
+      302125,
+      296333,
+      284250,
+      279625,
+      462334,
+      321375,
+      303916,
+      295833,
+      788375,
+      318375,
+      298542,
+      342875,
+      293292,
+      316833,
+      313708,
+      299791,
+      287834,
+      276708,
+      397709
+    ],
+    "median_submit_wait_ns": 302125
+  },
+  {
+    "case": "packed-embedding-rank",
+    "shape": [
+      2
+    ],
+    "status": "passed"
+  },
+  {
+    "case": "packed-embedding-rank",
+    "shape": [
+      1,
+      2
+    ],
+    "status": "passed"
+  }
+]

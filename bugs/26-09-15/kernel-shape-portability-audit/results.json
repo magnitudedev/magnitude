@@ -1,0 +1,584 @@
+[
+  {
+    "case": "persistent-decode-group-1",
+    "plan": "rejected",
+    "error": "ValueError: persistent grouped decode requires a legal complete head cohort"
+  },
+  {
+    "case": "persistent-decode-group-2",
+    "plan": "rejected",
+    "error": "ValueError: persistent grouped decode requires a legal complete head cohort"
+  },
+  {
+    "case": "persistent-decode-group-3",
+    "plan": "rejected",
+    "error": "ValueError: persistent grouped decode requires a legal complete head cohort"
+  },
+  {
+    "case": "persistent-decode-group-4",
+    "plan": "rejected",
+    "error": "ValueError: persistent grouped decode requires a legal complete head cohort"
+  },
+  {
+    "case": "persistent-decode-group-8",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-decode-group-12",
+    "plan": "rejected",
+    "error": "ValueError: persistent grouped decode requires a legal complete head cohort"
+  },
+  {
+    "case": "persistent-decode-group-16",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "experts-prefill-rows1-experts256",
+    "plan": "rejected",
+    "error": "ValueError: routed_experts has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "experts-decode-rows1-experts256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "routed_experts.packet-selected@0"
+    ]
+  },
+  {
+    "case": "experts-prefill-rows16-experts256",
+    "plan": "rejected",
+    "error": "ValueError: routed_experts has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "experts-decode-rows16-experts256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "routed_experts.packet-selected@0"
+    ]
+  },
+  {
+    "case": "experts-prefill-rows32-experts256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "routed_experts.grouped@0"
+    ]
+  },
+  {
+    "case": "experts-decode-rows32-experts256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "routed_experts.packet-selected@0"
+    ]
+  },
+  {
+    "case": "experts-prefill-rows64-experts512",
+    "plan": "rejected",
+    "error": "ValueError: routed_experts has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "experts-decode-rows64-experts512",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "routed_experts.packet-selected@0"
+    ]
+  },
+  {
+    "case": "q8-linear-1x32",
+    "plan": "rejected",
+    "error": "ValueError: linear has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "q8-linear-8x32",
+    "plan": "rejected",
+    "error": "ValueError: linear has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "q8-linear-1x64",
+    "plan": "rejected",
+    "error": "ValueError: linear has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "q8-linear-8x64",
+    "plan": "rejected",
+    "error": "ValueError: linear has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "q8-linear-1x128",
+    "plan": "rejected",
+    "error": "ValueError: linear has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "q8-linear-8x128",
+    "plan": "rejected",
+    "error": "ValueError: linear has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "q8-linear-1x256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.packet-vector@0"
+    ]
+  },
+  {
+    "case": "q8-linear-8x256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.packet-gemm@0"
+    ]
+  },
+  {
+    "case": "q8-linear-1x288",
+    "plan": "rejected",
+    "error": "ValueError: linear has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "q8-linear-8x288",
+    "plan": "rejected",
+    "error": "ValueError: linear has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "q8-linear-1x512",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.packet-vector@0"
+    ]
+  },
+  {
+    "case": "q8-linear-8x512",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.packet-gemm@0"
+    ]
+  },
+  {
+    "case": "rms-rank1",
+    "plan": "rejected",
+    "error": "ValueError: rms_norm has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "linear-rank1",
+    "plan": "rejected",
+    "error": "ValueError: linear has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "rms-rank2",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "rms_norm.parallel@0"
+    ]
+  },
+  {
+    "case": "linear-rank2",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "linear.dense-vector@0"
+    ]
+  },
+  {
+    "case": "rms-rank3",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "rms_norm.parallel@0"
+    ]
+  },
+  {
+    "case": "linear-rank3",
+    "plan": "rejected",
+    "error": "ValueError: linear has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "persistent-prefill-dense-width16",
+    "plan": "rejected",
+    "error": "ValueError: packed KV realization requires equal widths divisible by the subgroup width"
+  },
+  {
+    "case": "persistent-prefill-affine-width16",
+    "plan": "rejected",
+    "error": "ValueError: packed KV realization requires equal widths divisible by the subgroup width"
+  },
+  {
+    "case": "persistent-prefill-dense-width32",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width32",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-dense-width64",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width64",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-dense-width96",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width96",
+    "plan": "rejected",
+    "error": "ValueError: packed KV coordinates must partition complete word ownership groups"
+  },
+  {
+    "case": "persistent-prefill-dense-width128",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width128",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-dense-width192",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width192",
+    "plan": "rejected",
+    "error": "ValueError: packed KV coordinates must partition complete word ownership groups"
+  },
+  {
+    "case": "persistent-prefill-dense-width256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-dense-width512",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "persistent-prefill-affine-width512",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "attention.persistent@0"
+    ]
+  },
+  {
+    "case": "dense-expert-banks-prefill",
+    "plan": "rejected",
+    "error": "ValueError: routed_experts has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "dense-expert-banks-decode",
+    "plan": "rejected",
+    "error": "ValueError: routed_experts has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "route-topk-experts256",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "route_topk.subgroup@0"
+    ]
+  },
+  {
+    "case": "route-topk-experts512",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "route_topk.subgroup@0"
+    ]
+  },
+  {
+    "case": "route-topk-experts1024",
+    "trace": "accepted",
+    "plan": "accepted",
+    "operations": [
+      "route_topk.subgroup@0"
+    ]
+  },
+  {
+    "case": "route-topk-experts1025",
+    "plan": "rejected",
+    "error": "ValueError: route_topk has no legal realization for these shapes, precision and compiler_target"
+  },
+  {
+    "case": "recurrent-prepare-width6-offsets[0, 1, 4]",
+    "native": "passed",
+    "matches": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "max_abs": [
+      3.166496753692627e-08,
+      8.940696716308594e-08,
+      1.862645149230957e-09,
+      2.9802322387695312e-08,
+      5.960464477539063e-08,
+      0.0
+    ],
+    "nan_counts": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  {
+    "case": "recurrent-prepare-width6-offsets[0, 0, 4]",
+    "native": "mismatch",
+    "matches": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      false
+    ],
+    "max_abs": [
+      2.9802322387695312e-08,
+      1.1920928955078125e-07,
+      1.862645149230957e-09,
+      0.0,
+      0.0,
+      0.325111448764801
+    ],
+    "nan_counts": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  {
+    "case": "recurrent-prepare-width1025-offsets[0, 1]",
+    "native": "mismatch",
+    "matches": [
+      true,
+      false,
+      false,
+      true,
+      true,
+      false
+    ],
+    "max_abs": [
+      0.0011354037560522556,
+      0.022805199027061462,
+      0.003236349206417799,
+      0.0,
+      1.1920928955078125e-07,
+      0.109665647149086
+    ],
+    "nan_counts": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  {
+    "case": "softmax-width4095-maskedTrue",
+    "native": "passed",
+    "matches": [
+      true
+    ],
+    "max_abs": [
+      0.0
+    ],
+    "nan_counts": [
+      0
+    ]
+  },
+  {
+    "case": "softmax-width4097-maskedFalse",
+    "native": "passed",
+    "matches": [
+      true
+    ],
+    "max_abs": [
+      0.0
+    ],
+    "nan_counts": [
+      0
+    ]
+  },
+  {
+    "case": "softmax-width4097-maskedTrue",
+    "native": "mismatch",
+    "matches": [
+      false
+    ],
+    "max_abs": [
+      "nan"
+    ],
+    "nan_counts": [
+      4097
+    ]
+  },
+  {
+    "case": "rms-native-(3, 17)",
+    "native": "passed",
+    "matches": [
+      true
+    ],
+    "max_abs": [
+      2.384185791015625e-07
+    ],
+    "nan_counts": [
+      0
+    ]
+  },
+  {
+    "case": "rms-native-(2, 3, 17)",
+    "native": "passed",
+    "matches": [
+      true
+    ],
+    "max_abs": [
+      2.384185791015625e-07
+    ],
+    "nan_counts": [
+      0
+    ]
+  },
+  {
+    "case": "dense-tail-1-17-31",
+    "native": "passed",
+    "matches": [
+      true
+    ],
+    "max_abs": [
+      2.2351741790771484e-08
+    ],
+    "nan_counts": [
+      0
+    ]
+  },
+  {
+    "case": "dense-tail-8-17-31",
+    "native": "passed",
+    "matches": [
+      true
+    ],
+    "max_abs": [
+      4.0978193283081055e-08
+    ],
+    "nan_counts": [
+      0
+    ]
+  },
+  {
+    "case": "dense-tail-9-33-65",
+    "native": "passed",
+    "matches": [
+      true
+    ],
+    "max_abs": [
+      7.450580596923828e-08
+    ],
+    "nan_counts": [
+      0
+    ]
+  },
+  {
+    "case": "persistent-attention-width",
+    "width": 256,
+    "expected": "all ones: one visible value row",
+    "first_half_correct": true,
+    "tail_correct": true,
+    "incorrect": 0
+  },
+  {
+    "case": "persistent-attention-width",
+    "width": 512,
+    "expected": "all ones: one visible value row",
+    "first_half_correct": true,
+    "tail_correct": false,
+    "incorrect": 2048
+  },
+  {
+    "case": "packed-embedding-rank",
+    "shape": [
+      2
+    ],
+    "status": "passed"
+  },
+  {
+    "case": "packed-embedding-rank",
+    "shape": [
+      1,
+      2
+    ],
+    "status": "failed",
+    "error": "IndexError: Buffer p0 is 2-dimensional (shape=(1, 2)), but 1 index(es) were provided: [bx]. Please provide exactly 2 index/indices or slice(s)."
+  }
+]

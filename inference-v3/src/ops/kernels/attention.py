@@ -18,7 +18,7 @@ from .matrix import (
     _packed_vector_geometry,
     _packet_reduction_width,
 )
-from .packed import affine_shared_bytes, packet_format
+from .packed import packet_format
 from .schedules import ProbabilityTransfer, select_affine_tile
 
 
@@ -53,18 +53,18 @@ class _DecodeAttentionSchedule:
 def _decode_attention_schedule(query, history, context, *, template=None, workload=()):
     """Use grouped heads as matrix rows and reduce history in complete tiles.
 
-    Only complete head cohorts use this schedule. K/V retain their storage
-    precision; both contractions and all normalization state are FP32.
+    Logical head cohorts stay inside one KV group and are padded to physical
+    matrix rows. K/V retain their storage precision; both contractions and all normalization state are FP32.
     """
     if context.mode != "decode":
         return None
     rows, heads, width = query.shape
     group = heads // history.shape[2]
-    head_tile = 8
+    head_tile = math.gcd(group, 8)
     matrix_rows = 16
     keys = 32
-    contraction = 32
-    columns = 64
+    contraction = math.gcd(width, 32)
+    columns = math.gcd(width, 64)
     threads = context.compiler_target.subgroup_width * 4
     padding = 8
     def staging_bytes():
@@ -76,9 +76,7 @@ def _decode_attention_schedule(query, history, context, *, template=None, worklo
     # Each subgroup owns at least one complete eight-column QK strip.
     # A narrower history tile needs fewer participants, not empty column owners.
     threads = context.compiler_target.subgroup_width * min(4, keys // 8)
-    if (group % head_tile or width % contraction or width % columns
-            or threads > context.compiler_target.threads_per_group
-            or staging_bytes() > context.compiler_target.shared_memory_bytes):
+    if width % 8:
         return None
     # Each partition amortizes staging over a bounded history segment. The
     # complete grid remains independent of changing visible token counts.
@@ -91,14 +89,18 @@ def _decode_attention_schedule(query, history, context, *, template=None, worklo
                 threads=context.compiler_target.subgroup_width * min(4, key_columns // 8),
                 span=history_span, partitions=math.ceil(history.shape[1] / history_span))
         for physical_rows in (8, 16)
-        for value_columns in (32, 64)
-        for key_columns, history_span in dict.fromkeys(((keys, span), (16, 256), (32, 256), (32, 1024)))
+        for value_columns in sorted({columns, 32, 64})
+        for key_columns, history_span in dict.fromkeys(((keys, span), (8, 128), (16, 256), (32, 256), (32, 1024)))
         if width % value_columns == 0
         and context.compiler_target.subgroup_width * min(4, key_columns // 8) <= context.compiler_target.threads_per_group
         and ((width + padding) * (key_columns + padding) * history.dtype.itemsize
              + physical_rows * key_columns * DType.F32.itemsize
              <= context.compiler_target.shared_memory_bytes)
     )
+    if not candidates:
+        return None
+    if default not in candidates:
+        default = candidates[0]
     return select_schedule(context, "attention.decode", candidates, default,
                            template=template or _PartitionedAttentionEmitter,
                            workload=(query, history, workload))
@@ -135,8 +137,6 @@ def _matrix_attention_schedule(
     value_tile = min(width, query_tile * 2)
     if key_tile % 8 or (query_tile * head_tile) % 8 or value_tile % 8:
         return None
-    if threads > context.compiler_target.threads_per_group or shared_bytes > context.compiler_target.shared_memory_bytes:
-        return None
     capacity = cast(int, history.shape[1])
     partitions = math.ceil(capacity / 4096)
     span = math.ceil(capacity / (partitions * key_tile)) * key_tile
@@ -148,7 +148,12 @@ def _matrix_attention_schedule(
     )
     inferred = replace(default, probability_transfer=ProbabilityTransfer.INFERRED,
                        shared_bytes=shared_bytes - query_tile * head_tile * 8 * DType.F32.itemsize)
-    return select_schedule(context, "attention.prefill", (default, inferred), default,
+    candidates = tuple(candidate for candidate in (default, inferred)
+                       if candidate.tile[2] <= context.compiler_target.threads_per_group
+                       and candidate.shared_bytes <= context.compiler_target.shared_memory_bytes)
+    if not candidates:
+        return None
+    return select_schedule(context, "attention.prefill", candidates, candidates[0],
                            template=template or _MatrixAttentionEmitter,
                            workload=(query, history, sequence_count, workload))
 
@@ -235,12 +240,12 @@ def _attention_values(scores, values, outputs, rows, width, keys, columns, reduc
 @T.macro
 def _attention_publish_tile(output, denominator, gate, partials, first_row, first_head,
                             partition, partitions, tokens, query_tile, head_tile,
-                            width, columns, first_column, dtype, fuse_gate):
-    for row, column in T.Parallel(query_tile * head_tile, columns):
+                            width, columns, first_column, dtype, fuse_gate, physical_rows):
+    for row, column in T.Parallel(physical_rows, columns):
         token = first_row + row % query_tile
         head = first_head + row // query_tile
         channel = first_column + column
-        if token < tokens and channel < width:
+        if row < query_tile * head_tile and token < tokens and channel < width:
             if fuse_gate and partitions == 1:
                 attended = T.cast(output[row, column] / T.max(denominator[row], 1e-30), dtype)
                 coefficient = T.cast(T.sigmoid(T.cast(gate[token, head, channel], "float32")), dtype)
@@ -253,11 +258,12 @@ def _attention_publish_tile(output, denominator, gate, partials, first_row, firs
 
 def _attention_publish(outputs, denominator, gate, partials, first_row, first_head,
                        partition, partitions, tokens, query_tile, head_tile, width,
-                       columns, dtype, fuse_gate):
+                       columns, dtype, fuse_gate, physical_rows=None):
+    physical_rows = query_tile * head_tile if physical_rows is None else physical_rows
     for index, output in enumerate(outputs):
         _attention_publish_tile(output, denominator, gate, partials, first_row, first_head,
                                 partition, partitions, tokens, query_tile, head_tile, width,
-                                columns, index * columns, dtype, fuse_gate)
+                                columns, index * columns, dtype, fuse_gate, physical_rows)
 
 
 @T.macro
@@ -553,13 +559,14 @@ def _tiled_decode_attention(query, history, visible, partials, statistics,
             T.copy(scores, probabilities)
             _attention_shared_values(probabilities, values, outputs, matrix_rows, width, key_tile,
                               columns, schedule.reduction_step)
-        for head in T.Parallel(head_tile):
-            statistics[partition, token, first_head + head, 0] = T.if_then_else(
-                denominator[head] > 0, maximum[head] / log2e, -3.402823466e38)
-            statistics[partition, token, first_head + head, 1] = denominator[head]
+        for head in T.Parallel(matrix_rows):
+            if head < head_tile:
+                statistics[partition, token, first_head + head, 0] = T.if_then_else(
+                    denominator[head] > 0, maximum[head] / log2e, -3.402823466e38)
+                statistics[partition, token, first_head + head, 1] = denominator[head]
         _attention_publish(outputs, denominator, query, partials, token, first_head,
                            partition, schedule.partitions, tokens, 1, head_tile,
-                           width, columns, query.dtype, False)
+                           width, columns, query.dtype, False, matrix_rows)
 
 
 def _decode_partition_body(query, history, visible, partials, statistics, tokens,
@@ -705,13 +712,17 @@ def _merge_attention(
         for partition in T.serial(partitions):
             if statistics[partition, token, head, 1] > 0:
                 maximum[0] = T.max(maximum[0], statistics[partition, token, head, 0])
-        if lane < width:
-            for partition in T.serial(partitions):
-                if statistics[partition, token, head, 1] > 0:
-                    weight = T.__exp(statistics[partition, token, head, 0] - maximum[0])
-                    denominator[0] += weight * statistics[partition, token, head, 1]
-                    answer[0] += weight * partials[partition, token, head, lane]
-            output[token, head, lane] = T.cast(answer[0] / T.max(denominator[0], 1e-30), dtype)
+        for chunk in T.unroll(T.ceildiv(width, threads)):
+            channel = chunk * threads + lane
+            denominator[0] = 0.0
+            answer[0] = 0.0
+            if channel < width:
+                for partition in T.serial(partitions):
+                    if statistics[partition, token, head, 1] > 0:
+                        weight = T.__exp(statistics[partition, token, head, 0] - maximum[0])
+                        denominator[0] += weight * statistics[partition, token, head, 1]
+                        answer[0] += weight * partials[partition, token, head, channel]
+                output[token, head, channel] = T.cast(answer[0] / T.max(denominator[0], 1e-30), dtype)
 
 
 class _MatrixAttentionEmitter:
@@ -997,18 +1008,22 @@ def _merge_attention_gate(
         for partition in T.serial(partitions):
             if statistics[partition, token, head, 1] > 0:
                 maximum[0] = T.max(maximum[0], statistics[partition, token, head, 0])
-        if lane < width:
-            for partition in T.serial(partitions):
-                if statistics[partition, token, head, 1] > 0:
-                    weight = T.__exp(statistics[partition, token, head, 0] - maximum[0])
-                    denominator[0] += weight * statistics[partition, token, head, 1]
-                    answer[0] += weight * partials[partition, token, head, lane]
-            gate_value = T.cast(gate[token, head, lane], "float32")
-            attended = T.cast(answer[0] / T.max(denominator[0], 1e-30), dtype)
-            coefficient = T.cast(T.sigmoid(gate_value), dtype)
-            output[token, head * width + lane] = T.cast(
-                T.cast(attended, "float32") * T.cast(coefficient, "float32"), dtype
-            )
+        for chunk in T.unroll(T.ceildiv(width, threads)):
+            channel = chunk * threads + lane
+            denominator[0] = 0.0
+            answer[0] = 0.0
+            if channel < width:
+                for partition in T.serial(partitions):
+                    if statistics[partition, token, head, 1] > 0:
+                        weight = T.__exp(statistics[partition, token, head, 0] - maximum[0])
+                        denominator[0] += weight * statistics[partition, token, head, 1]
+                        answer[0] += weight * partials[partition, token, head, channel]
+                gate_value = T.cast(gate[token, head, channel], "float32")
+                attended = T.cast(answer[0] / T.max(denominator[0], 1e-30), dtype)
+                coefficient = T.cast(T.sigmoid(gate_value), dtype)
+                output[token, head * width + channel] = T.cast(
+                    T.cast(attended, "float32") * T.cast(coefficient, "float32"), dtype
+                )
 
 
 def _attention_output_region(graph: Graph, root: int):
@@ -1161,11 +1176,13 @@ def attention_projection_tile(context, activation, weight, *, template, workload
     bk = _packet_reduction_width(weight)
     threads = min(context.compiler_target.threads_per_group, 128,
                   bm // 8 * context.compiler_target.subgroup_width)
-    if bk % 8 or affine_shared_bytes(bm, bn, bk, activation.dtype, weight) > context.compiler_target.shared_memory_bytes:
+    if bk % 8:
         return None
     schedule = select_affine_tile(context, activation, (weight,), (bm, bn, bk, threads),
                                   template=template, name="attention.output-affine",
                                   workload=workload)
+    if schedule is None:
+        return None
     return schedule.threads, schedule.rows, schedule.columns, schedule.reduction, schedule.operands
 
 

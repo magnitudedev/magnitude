@@ -17,7 +17,7 @@ from .matrix import (
     _packet_reduction_width,
 )
 from .normalization import _reduction_threads
-from .packed import affine_shared_bytes, packet_format
+from .packed import packet_format
 from .schedules import select_affine_tile
 
 
@@ -50,10 +50,11 @@ def _channel_parallel_prepare(
     subgroup_width,
 ):
     heads = 2 * key_heads + value_heads
+    strips = T.ceildiv(width, threads)
     with T.Kernel(heads, rows, threads=threads) as (head, row):
         lane = T.get_thread_binding(0)
         warp_sums = T.alloc_shared((T.ceildiv(threads, subgroup_width),), "float32")
-        convolved = T.alloc_local((1,), "float32")
+        convolved = T.alloc_local((strips,), "float32")
         square_sum = T.alloc_local((1,), "float32")
         sequence = T.alloc_local((1,), "int32")
         sequence[0] = 0
@@ -61,28 +62,26 @@ def _channel_parallel_prepare(
             if offsets[candidate] <= row and row < offsets[candidate + 1]:
                 sequence[0] = candidate
         step = row - offsets[sequence[0]]
-        packed = head * width + lane
         count = offsets[sequence[0] + 1] - offsets[sequence[0]]
-        convolved[0] = 0.0
-        if lane < width:
-            for time in T.serial(history):
-                source_step = step - history + time
-                convolved[0] += (
-                    T.if_then_else(
-                        source_step < 0,
-                        previous[sequence[0], packed, source_step + history],
-                        projected[offsets[sequence[0]] + source_step, packed],
+        square_sum[0] = 0.0
+        for strip in T.unroll(strips):
+            channel = strip * threads + lane
+            packed = head * width + channel
+            convolved[strip] = 0.0
+            if channel < width:
+                for time in T.serial(history):
+                    source_step = step - history + time
+                    convolved[strip] += (
+                        T.if_then_else(
+                            source_step < 0,
+                            previous[sequence[0], packed, source_step + history],
+                            projected[offsets[sequence[0]] + source_step, packed],
+                        ) * convolution[packed, time]
                     )
-                    * convolution[packed, time]
-                )
-            convolved[0] += projected[row, packed] * convolution[packed, history]
-            convolved[0] *= T.sigmoid(convolved[0])
+                convolved[strip] += projected[row, packed] * convolution[packed, history]
+                convolved[strip] *= T.sigmoid(convolved[strip])
+            square_sum[0] += convolved[strip] * convolved[strip]
         if head < 2 * key_heads:
-            square_sum[0] = T.if_then_else(
-                lane < width,
-                convolved[0] * convolved[0],
-                0.0,
-            )
             reduced = T.warp_reduce_sum(square_sum[0])
             if lane % subgroup_width == 0:
                 warp_sums[lane // subgroup_width] = reduced
@@ -90,35 +89,48 @@ def _channel_parallel_prepare(
             square_sum[0] = 0.0
             for warp in T.unroll(T.ceildiv(threads, subgroup_width), explicit=True):
                 square_sum[0] += warp_sums[warp]
-            if lane < width:
-                if head < key_heads:
-                    query[row, head, lane] = T.cast(
-                        convolved[0] * T.rsqrt(square_sum[0] + epsilon) * query_gain,
-                        dtype,
-                    )
-                else:
-                    key[row, head - key_heads, lane] = T.cast(
-                        convolved[0] * T.rsqrt(square_sum[0] + epsilon), dtype
-                    )
+            for strip in T.unroll(strips):
+                channel = strip * threads + lane
+                if channel < width:
+                    if head < key_heads:
+                        query[row, head, channel] = T.cast(
+                            convolved[strip] * T.rsqrt(square_sum[0] + epsilon) * query_gain, dtype)
+                    else:
+                        key[row, head - key_heads, channel] = T.cast(
+                            convolved[strip] * T.rsqrt(square_sum[0] + epsilon), dtype)
         else:
             value_head = head - 2 * key_heads
-            if lane < width:
-                value[row, value_head, lane] = T.cast(convolved[0], dtype)
+            for strip in T.unroll(strips):
+                channel = strip * threads + lane
+                if channel < width:
+                    value[row, value_head, channel] = T.cast(convolved[strip], dtype)
             if lane == 0:
                 beta[row, value_head] = T.cast(T.sigmoid(beta_input[row, value_head]), dtype)
-                shifted = T.cast(alpha[row, value_head], "float32") + T.cast(
-                    bias[value_head], "float32"
-                )
+                shifted = T.cast(alpha[row, value_head], "float32") + T.cast(bias[value_head], "float32")
                 softplus = T.max(shifted, 0.0) + T.log(1 + T.exp(-T.abs(shifted)))
                 decay[row, value_head] = T.exp(T.cast(rate[value_head], "float32") * softplus)
-        if step == 0 and lane < width:
-            for time in T.serial(history):
-                source_step = count - history + time
-                following[sequence[0], packed, time] = T.if_then_else(
-                    source_step < 0,
-                    previous[sequence[0], packed, source_step + history],
-                    projected[offsets[sequence[0]] + source_step, packed],
-                )
+        if step == 0:
+            for strip in T.unroll(strips):
+                channel = strip * threads + lane
+                packed = head * width + channel
+                if channel < width:
+                    for time in T.serial(history):
+                        source_step = count - history + time
+                        following[sequence[0], packed, time] = T.if_then_else(
+                            source_step < 0,
+                            previous[sequence[0], packed, source_step + history],
+                            projected[offsets[sequence[0]] + source_step, packed])
+        # Empty sequences have no token owner. The first row's workgroups
+        # carry their state; no extra launch or whole-state copy is needed.
+        if batch > 1:
+            if row == 0:
+                for empty in T.serial(batch):
+                    if offsets[empty] == offsets[empty + 1]:
+                        for strip in T.unroll(strips):
+                            channel = strip * threads + lane
+                            if channel < width:
+                                for time in T.serial(history):
+                                    following[empty, head * width + channel, time] = previous[empty, head * width + channel, time]
 
 
 class _RecurrentPrepareEmitter:
@@ -176,7 +188,6 @@ class RecurrentPrepareRule:
         threads = _reduction_threads(width, context)
         if threads is None:
             return ()
-        moved = sum(spec.storage_nbytes for spec in specs)
         return (
             BoundOperation(
                 f"recurrent_prepare.channel-parallel@{root}",
@@ -367,27 +378,30 @@ def _recurrent_norm_gate(
     with T.Kernel(heads, rows, threads=threads) as (head, row):
         lane = T.get_thread_binding()
         warp_sums = T.alloc_shared((T.ceildiv(threads, subgroup_width),), "float32")
-        value = T.alloc_local((1,), "float32")
-        value[0] = T.if_then_else(lane < width, T.cast(mixed[row, head, lane], "float32"), 0.0)
-        reduced = T.warp_reduce_sum(value[0] * value[0])
+        value = T.alloc_local((T.ceildiv(width, threads),), "float32")
+        square_sum = T.alloc_local((1,), "float32")
+        square_sum[0] = 0.0
+        for strip in T.unroll(T.ceildiv(width, threads)):
+            channel = strip * threads + lane
+            value[strip] = T.if_then_else(channel < width, T.cast(mixed[row, head, channel], "float32"), 0.0)
+            square_sum[0] += value[strip] * value[strip]
+        reduced = T.warp_reduce_sum(square_sum[0])
         if lane % subgroup_width == 0:
             warp_sums[lane // subgroup_width] = reduced
         T.sync_threads()
-        square_sum = T.alloc_local((1,), "float32")
         square_sum[0] = 0.0
         for warp in T.unroll(T.ceildiv(threads, subgroup_width), explicit=True):
             square_sum[0] += warp_sums[warp]
-        if lane < width:
-            channel = head * width + lane
-            normalized = T.cast(
-                value[0] * T.rsqrt(square_sum[0] / width + epsilon) * T.cast(norm[lane], "float32"),
-                dtype,
-            )
-            gate_value = T.cast(gate[row, channel], "float32")
-            activated_gate = T.cast(gate_value * T.sigmoid(gate_value), dtype)
-            activation[row, channel] = T.cast(
-                T.cast(normalized, "float32") * T.cast(activated_gate, "float32"), dtype
-            )
+        for strip in T.unroll(T.ceildiv(width, threads)):
+            within = strip * threads + lane
+            if within < width:
+                channel = head * width + within
+                normalized = T.cast(
+                    value[strip] * T.rsqrt(square_sum[0] / width + epsilon) * T.cast(norm[within], "float32"), dtype)
+                gate_value = T.cast(gate[row, channel], "float32")
+                activated_gate = T.cast(gate_value * T.sigmoid(gate_value), dtype)
+                activation[row, channel] = T.cast(
+                    T.cast(normalized, "float32") * T.cast(activated_gate, "float32"), dtype)
 
 
 def _recurrent_output_region(graph: Graph, root: int):
@@ -514,20 +528,19 @@ class RecurrentOutputRule:
                 context.compiler_target.subgroup_width * 4,
                 bm // 8 * context.compiler_target.subgroup_width,
             )
-            if affine_shared_bytes(bm, bn, bk, specs[0].dtype, specs[3]) > context.compiler_target.shared_memory_bytes:
-                return ()
             schedule = select_affine_tile(
                 context, TensorSpec((rows, channels), specs[0].dtype), (specs[3],),
                 (bm, bn, bk, threads), template=_RecurrentOutputEmitter,
                 name="recurrent.output-affine", workload=(specs, epsilon),
             )
+            if schedule is None:
+                return ()
             tile = (schedule.threads, schedule.rows, schedule.columns, schedule.reduction, schedule.operands)
         else:
             vector = _packed_vector_geometry(specs[3], context)
             if rows > 8 or vector is None:
                 return ()
         activation = TensorSpec((rows, channels), specs[0].dtype)
-        moved = sum(spec.storage_nbytes for spec in specs)
         return (
             BoundOperation(
                 f"recurrent.output-{context.mode}@{root}:{max(nodes)}",
