@@ -165,6 +165,12 @@ their existing semantics. Missing provider artwork must not be replaced with ano
 Do not create a separate palette, substitute fonts, or copy a second appearance store. Desktop
 sources must be included in Tailwind scanning. Both light and dark treatments require live visual
 acceptance, including disabled controls, focus, progress, failures, and native window chrome.
+Every destination retains its page shell during initial loading. Pending observations use skeletons
+with the same card geometry and responsive breakpoints as their content; independent sections settle
+independently. Available content stays visible during refresh, and failures replace skeletons with
+explicit unavailable states. Placeholder values never imply zero usage, no models, or a disconnected
+harness. Loading regions announce once, expose no actions, and respect reduced motion. Unknown
+collection lengths and installation states remain unknown until observed.
 
 ## Login startup
 

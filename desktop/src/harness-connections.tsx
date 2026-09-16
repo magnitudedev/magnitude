@@ -1,3 +1,4 @@
+import { pageLayout } from "./page-layout"
 import type { DesktopHarnessConnection, HarnessId } from "@magnitudedev/client-common"
 import { Brand } from "effect"
 import { ArrowUpRight } from "lucide-react"
@@ -31,9 +32,9 @@ export function HarnessConnections({ connections, busy, canConnect, onConnect, o
     const title = installed ? "Installed on your machine" : "Not installed"
     return <section key={title} aria-label={title}>
       <h2 className="mb-4 text-sm font-medium text-slate-500">{title}</h2>
-      <div className="grid items-start gap-5 xl:grid-cols-2">{rows.map(row => {
+      <div className={pageLayout.harnessGrid}>{rows.map(row => {
         const needsAttention = row.managed && row.inspection._tag === "Disconnected"
-        return <article key={row.id} aria-label={row.name} className="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-750 dark:bg-slate-850">
+        return <article key={row.id} aria-label={row.name} className={pageLayout.harnessCard}>
         <div className="flex items-center justify-between gap-4">
           <div className="flex min-w-0 items-center gap-3">
             <HarnessLogo id={row.id} name={row.name} />

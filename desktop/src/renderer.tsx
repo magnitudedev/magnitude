@@ -1,3 +1,5 @@
+import { LoadingRegion, SkeletonLine, ModelsSkeleton, RecommendationsSkeleton, ConnectionsSkeleton, LoginSkeleton, UpdatesSkeleton, modelDescriptions } from "./page-skeletons"
+import { pageLayout } from "./page-layout"
 import { ModelPreferenceSlider } from "./model-preference-slider"
 import { ServingUsage } from "./serving-usage"
 import { initializeAppearance, setAppearancePreference, useAppearancePreference, subscribeAppearance, getAppearancePreference } from "../../web/src/stores/appearance-store"
@@ -134,8 +136,8 @@ function ModelCard({ model, showMemory = false, replacing }: { model: CatalogLoc
   const residency = "residencyState" in acquisition ? acquisition.residencyState : undefined
   const statusLabel = acquisition._tag === "Removing" ? "Removing…" : acquisition._tag === "RemoveFailed" ? "Removal failed" : residency?._tag === "Ready" ? "Loaded" : residency?._tag === "Unloaded" ? "Downloaded" : residency?._tag ?? (acquisition._tag === "NotInstalled" ? "" : acquisition._tag)
   const status = (statusLabel || showMemory) && <div className="mt-1 flex flex-wrap items-center gap-x-3 text-sm text-slate-500">{statusLabel && <span className={residency?._tag === "Ready" ? "text-green-600 dark:text-green-400" : ""}>{statusLabel}</span>}{showMemory && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits" && <><span aria-hidden="true">·</span><span>{formatMemorySize(model.servingState.assessment.memory.totalRequiredBytes)} memory</span></>}</div>
-  return <article className="rounded-2xl border border-slate-200 bg-white p-5 dark:border-slate-750 dark:bg-slate-850">
-    <div className="grid items-center gap-4 lg:grid-cols-[minmax(0,1fr)_auto]">
+  return <article className={pageLayout.modelCard}>
+    <div className={pageLayout.modelRow}>
       <div className="flex min-w-0 items-center gap-4"><ModelLogo model={model} /><div className="min-w-0"><h2 className="text-lg font-semibold">{formatLocalModelDisplayName(model)}</h2>{status}</div></div>
       <ModelControls model={model} {...(replacing ? { replacing } : {})}>
         <Button variant="ghost" aria-expanded={detailsOpen} aria-controls={detailsId} onClick={() => setDetailsOpen(value => !value)}>Details<ChevronDown aria-hidden="true" className={`size-4 ${detailsOpen ? "rotate-180" : ""}`} /></Button>
@@ -146,8 +148,8 @@ function ModelCard({ model, showMemory = false, replacing }: { model: CatalogLoc
 }
 function SelectedRecommendation({ model, active }: { model: CatalogLocalModel; active: ReturnType<typeof activeLocalModel> }) {
   const [view, setView] = useState<"profile" | "details">("profile")
-  return <div className="min-w-0 border-t border-slate-200 p-5 dark:border-slate-750 lg:border-l lg:border-t-0" aria-label="Selected model profile">
-    <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+  return <div className={pageLayout.recommendationPane} aria-label="Selected model profile">
+    <div className={pageLayout.recommendationToolbar}>
     <div className="flex items-center gap-1" aria-label="Model information">
       <Button variant={view === "profile" ? "secondary" : "ghost"} aria-pressed={view === "profile"} onClick={() => setView("profile")}>Profile</Button>
       <Button variant={view === "details" ? "secondary" : "ghost"} aria-pressed={view === "details"} onClick={() => setView("details")}>Details</Button>
@@ -165,8 +167,8 @@ function Recommendations({ models, active }: { models: readonly CatalogLocalMode
   const selected = models.find(model => model.modelId === selectedId) ?? models[0]
   if (!selected) return null
   return <section aria-label="Top recommendations" className="mb-8">
-    <div className="grid overflow-hidden rounded-2xl border border-slate-200 bg-white dark:border-slate-750 dark:bg-slate-850 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
-      <div className="space-y-2 p-3" aria-label="Recommended models">{models.map((model, rank) => <button key={model.modelId} type="button" aria-pressed={model.modelId === selected.modelId} onClick={() => setSelectedId(model.modelId)} className={`flex min-h-16 w-full items-center gap-3 rounded-xl border px-3 py-4 text-left transition-colors focus-visible:outline-2 focus-visible:outline-blue-500 ${model.modelId === selected.modelId ? "border-blue-300 bg-blue-50 dark:border-blue-700 dark:bg-slate-800" : "border-transparent hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
+    <div className={pageLayout.recommendations}>
+      <div className={pageLayout.recommendationList} aria-label="Recommended models">{models.map((model, rank) => <button key={model.modelId} type="button" aria-pressed={model.modelId === selected.modelId} onClick={() => setSelectedId(model.modelId)} className={`${pageLayout.recommendationRow} transition-colors focus-visible:outline-2 focus-visible:outline-blue-500 ${model.modelId === selected.modelId ? "border-blue-300 bg-blue-50 dark:border-blue-700 dark:bg-slate-800" : "border-transparent hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
         <span className="w-4 shrink-0 text-sm tabular-nums text-slate-500">{rank + 1}</span>
         <ModelLogo model={model} className="size-7" />
         <span className="min-w-0 text-sm font-medium">{formatLocalModelDisplayName(model)}</span>
@@ -192,33 +194,38 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const preference = Result.isSuccess(preferenceResult) ? preferenceResult.value : 2
   const setPreference = useAtomSet(useMemo(() => client.runtime.fn((index: number) => Effect.flatMap(DesktopSession, service => service.setRankingPreference(index))), [client]))
   if (Result.isFailure(catalog)) return <p role="alert">{localModelFailureMessage(catalog.cause, "Could not read the model catalog. Check Status and try again.")}</p>
-  if (!Result.isSuccess(catalog)) return <p>Reading the curated catalog…</p>
+  if (!Result.isSuccess(catalog)) return <ModelsSkeleton page={page} />
   const models = catalog.value.models.filter((model): model is CatalogLocalModel => model._tag === "Catalog")
   const ranked = !installedOnly && Result.isSuccess(hardware) ? rankedLocalModelOptions(models.map(model => ({ id: model.modelId, kind: localModelIsInstalled(model) ? "stored" as const : "downloadable" as const, model })), { fastToSmart: LOCAL_MODEL_RANKING_SCALE_VALUES[preference]!, memoryBudgetBytes: targetPhysicalMemoryBytes(hardware.value) }, models.length).flatMap(option => option.model._tag === "Catalog" ? [option.model] : []) : []
+  const recommendationsPending = Result.isInitial(hardware) || !catalog.value.preparation.assessment.complete
   const rankedIds = new Set(ranked.map(model => model.modelId))
   const ordered = installedOnly ? models : [...ranked, ...models.filter(model => !rankedIds.has(model.modelId))]
   const visible = ordered.filter(model => (!installedOnly || model.acquisitionState._tag !== "NotInstalled") && (!fitOnly || model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits") && `${formatLocalModelDisplayName(model)} ${model.presentation.description}`.toLowerCase().includes(search.toLowerCase()))
   return <>
-    <p className="mt-2 text-slate-500">{installedOnly ? "Your downloads and installed models, in one place." : discover ? "Your best local models, matched to your machine." : "Explore every model in the curated catalog."}</p>
+    <p className="mt-2 text-slate-500">{modelDescriptions[page]}</p>
     {discover && <HardwareOverview /> }
     {Option.isSome(stopResult.failure) && <p role="alert" className="mt-5 text-sm">{stopResult.failure.value}</p>}
     {discover && <section aria-label="Recommendation preference" className="my-6"><div className="flex items-end justify-between gap-4"><div><h2 className="font-heading text-xl">Find your balance</h2><p className="mt-2 text-sm text-slate-500">Quick responses or deeper thinking. Choose what matters to you.</p></div><span className="rounded-full bg-blue-50 px-4 py-2 text-sm font-medium text-blue-700 dark:bg-slate-800 dark:text-blue-400">{LOCAL_MODEL_RANKING_SCALE_LABELS[preference]}</span></div><ModelPreferenceSlider value={preference} onChange={setPreference} /></section>}
     {!catalog.value.preparation.assessment.complete && <p className="mb-4 text-sm text-slate-500">Assessing models · {catalog.value.preparation.assessment.settledModels} of {catalog.value.preparation.assessment.totalModels}</p>}
+    {discover && ranked.length === 0 && recommendationsPending && <RecommendationsSkeleton />}
     {discover && <Recommendations key={preference} models={featuredCatalogModels(ranked, 5)} active={Option.fromNullable(active)} />}
     {!discover && <>
-    <div className="mb-5 mt-8 flex flex-wrap items-center justify-between gap-4"><h2 className="font-heading text-xl">{installedOnly?"Your library":"Explore the catalog"}</h2><Input aria-label="Search models" placeholder="Find a model…" className="max-w-sm" value={search} onChange={event=>setSearch(event.target.value)} /></div>
+    <div className={pageLayout.catalogToolbar}><h2 className="font-heading text-xl">{installedOnly?"Your library":"Explore the catalog"}</h2><Input aria-label="Search models" placeholder="Find a model…" className="max-w-sm" value={search} onChange={event=>setSearch(event.target.value)} /></div>
     {!installedOnly && <div className="mb-5 flex items-center justify-between text-sm text-slate-500"><label className="flex items-center gap-2"><input type="checkbox" checked={fitOnly} onChange={event => setFitOnly(event.target.checked)} className="accent-blue-600" />Fits my machine</label><span>{visible.length} configurations</span></div>}
     <div className="grid items-start gap-5">{visible.map(model => <ModelCard key={model.modelId} model={model} showMemory={installedOnly} {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})} />)}</div>
     {visible.length === 0 && <p className="py-8 text-slate-500">{search ? "No matching models." : installedOnly ? "No models downloaded yet. Find one in Discover." : "No models match this filter."}</p>}
     </>}
-    {discover && ranked.length === 0 && catalog.value.preparation.assessment.complete && <p className="py-8 text-slate-500">No fitting recommendations right now. Explore Catalog for compatibility details.</p>}
+    {discover && ranked.length === 0 && !recommendationsPending && Result.isSuccess(hardware) && <p className="py-8 text-slate-500">No fitting recommendations right now. Explore Catalog for compatibility details.</p>}
   </>
 }
 function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; selectedModel: Option.Option<ProviderModelId> }) {
   const client = useAgentClient()
   const session = useMemo(() => client.runtime.atom(DesktopSession), [client])
   const service = useAtomValue(session)
-  return Result.isSuccess(service) ? <ConnectionsView service={service.value} serviceReady={serviceReady} selectedModel={selectedModel} /> : <p className="mt-5">Preparing connections…</p>
+  return Result.isSuccess(service) ? <ConnectionsView service={service.value} serviceReady={serviceReady} selectedModel={selectedModel} /> : Result.isFailure(service) ? <p role="alert" className="mt-5">Could not prepare connections. {hostFailureMessage(service.cause)}</p> : <><ConnectionsDescription /><ConnectionsSkeleton /></>
+}
+function ConnectionsDescription() {
+  return <p className="mt-2 text-slate-500">Use your local models in the tools you already work with. Connect installs the configuration and Magnitude instructions.</p>
 }
 function ConnectionsView({ service, serviceReady, selectedModel }: { service: DesktopSession; serviceReady: boolean; selectedModel: Option.Option<ProviderModelId> }) {
   const models = useLocalModels()
@@ -233,12 +240,12 @@ function ConnectionsView({ service, serviceReady, selectedModel }: { service: De
   const busy = connecting.waiting || disconnecting.waiting
   const error = [connecting, disconnecting].find(Result.isFailure)
   return <>
-    <p className="mt-2 text-slate-500">Use your local models in the tools you already work with. Connect installs the configuration and Magnitude instructions.</p>
+    <ConnectionsDescription />
     {!serviceReady && <p className="mt-5 text-sm text-slate-500">Configuration checks are available. Start the service from Status before connecting a harness.</p>}
-    {serviceReady && !canConnect && <div className="mt-5 flex flex-wrap items-center gap-3 text-sm text-slate-500"><p>{Result.isFailure(models) ? "Model availability could not be checked." : !Result.isSuccess(models) ? "Checking available models…" : "Download a compatible model before connecting a harness. It doesn’t need to be loaded."}</p><Button variant="outline" onClick={() => discover()}>Discover models</Button></div>}
+    {serviceReady && !canConnect && !Result.isInitial(models) && <div className="mt-5 flex flex-wrap items-center gap-3 text-sm text-slate-500"><p>{Result.isFailure(models) ? "Model availability could not be checked." : !Result.isSuccess(models) ? "Checking available models…" : "Download a compatible model before connecting a harness. It doesn’t need to be loaded."}</p><Button variant="outline" onClick={() => discover()}>Discover models</Button></div>}
     {error && Result.isFailure(error) && <p role="alert" className="mt-5 text-sm">{hostFailureMessage(error.cause)}</p>}
     {Result.isFailure(rows) ? <p role="alert" className="mt-5">Could not check connections. {hostFailureMessage(rows.cause)}</p>
-      : !Result.isSuccess(rows) ? <p className="mt-5">Checking harness configuration…</p>
+      : !Result.isSuccess(rows) ? <ConnectionsSkeleton />
       : rows.value._tag === "Unavailable" ? <p role="alert" className="mt-5">Could not check connections. {rows.value.message}</p>
       : <HarnessConnections connections={rows.value.connections} busy={busy} canConnect={canConnect}
           onConnect={harness => connect({ harness, model: selectedModel })} onDisconnect={harness => disconnect(harness)} />}
@@ -250,6 +257,7 @@ function ModelStatus() {
   const stopping = useLocalModelStopStatus()
   const presentation = Result.isSuccess(models) ? modelTrayPresentation(models.value) : null
   const active = Result.isSuccess(models) ? Option.getOrUndefined(activeLocalModel(models.value)) : undefined
+  if (Result.isInitial(models)) return <LoadingRegion label="Loading model status" className="mt-3"><SkeletonLine className="h-[1lh] w-48" /></LoadingRegion>
   return <div className="mt-3">
     <div className="flex items-center gap-3">{active && <ModelLogo model={active.model} className="size-7" />}<p>{presentation?.label ?? (Result.isFailure(models) ? "Model status unavailable" : "Reading model status…")}</p></div>
     {active?.residency._tag === "Loading" && <div className="mt-4"><Progress aria-label="Model loading progress" indicatorClassName="bg-blue-700 dark:bg-blue-500" value={Option.match(active.residency.progress, { onNone: () => null, onSome: fraction => fraction * 100 })} /></div>}
@@ -261,6 +269,7 @@ function ModelStatus() {
 function DownloadActivity() {
   const models = useLocalModels()
   const active = Result.isSuccess(models) ? models.value.models.filter((model): model is CatalogLocalModel => model._tag === "Catalog" && (model.acquisitionState._tag === "Installing" || model.acquisitionState._tag === "Updating" || model.acquisitionState._tag === "Removing")) : []
+  if (Result.isInitial(models)) return null
   if (Result.isSuccess(models) && active.length === 0) return null
   return <div className="mt-5 border-t border-slate-200 pt-5 dark:border-slate-700">
     {!Result.isSuccess(models) ? <p className="mt-3 text-sm text-slate-500">{Result.isFailure(models) ? "Download activity unavailable" : "Reading download activity…"}</p> : <ul className="space-y-5">{active.map(model => <li key={model.modelId}><div className="flex items-center gap-3"><ModelLogo model={model} className="size-6" /><p className="text-sm">{formatLocalModelDisplayName(model)} · {model.acquisitionState._tag === "Removing" ? "Removing files…" : model.acquisitionState._tag === "Updating" ? "Updating" : "Downloading"}</p></div><DownloadProgress acquisition={model.acquisitionState} /></li>)}</ul>}
@@ -269,15 +278,15 @@ function DownloadActivity() {
 function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null }) {
   const service = snapshot?.service
   const ready=service?._tag === "Ready"
-  return <div className="mt-7 space-y-6">
-    <section className="relative overflow-hidden rounded-2xl border border-blue-200 bg-gradient-to-br from-blue-50 to-white p-7 dark:border-slate-700 dark:from-slate-800 dark:to-slate-900">
-      <div className="flex items-center gap-5"><div className={`flex size-16 shrink-0 items-center justify-center rounded-full border bg-white dark:bg-slate-900 ${ready ? "border-green-300 text-green-600 dark:border-green-800 dark:text-green-400" : "border-blue-300 text-blue-600 dark:border-blue-800 dark:text-blue-400"}`}>{ready ? <Check aria-label="Service ready" className="size-7 text-green-600 dark:text-green-400" /> : <Activity className="size-7" />}</div><div><p className="text-xs font-medium uppercase tracking-widest text-slate-500">Magnitude service</p><h2 className="mt-2 font-heading text-2xl">{ready ? "Ready when you are" : service?._tag === "CleanupFailed" ? "Cleanup needs attention" : service?._tag === "Failed" ? "Let’s get you running" : "Starting your local engine"}</h2>{ready ? <ModelStatus /> : <p className="mt-2 text-sm text-slate-500">{service?._tag ?? "Connecting"}</p>}</div></div>
+  return <div className={pageLayout.statusStack}>
+    <section aria-busy={!snapshot} aria-label={!snapshot ? "Loading service status" : undefined} className={pageLayout.statusHero}>
+      <div className="flex items-center gap-5"><div className={`flex size-16 shrink-0 items-center justify-center rounded-full border bg-white dark:bg-slate-900 ${ready ? "border-green-300 text-green-600 dark:border-green-800 dark:text-green-400" : "border-blue-300 text-blue-600 dark:border-blue-800 dark:text-blue-400"}`}>{ready ? <Check aria-label="Service ready" className="size-7 text-green-600 dark:text-green-400" /> : <Activity className="size-7" />}</div><div><p className="text-xs font-medium uppercase tracking-widest text-slate-500">Magnitude service</p><h2 className="mt-2 font-heading text-2xl">{!snapshot ? <SkeletonLine className="h-8 w-72 text-2xl" /> : ready ? "Ready when you are" : service?._tag === "CleanupFailed" ? "Cleanup needs attention" : service?._tag === "Failed" ? "Let’s get you running" : "Starting your local engine"}</h2>{ready ? <ModelStatus /> : !snapshot ? <SkeletonLine className="mt-2 h-5 text-sm" /> : <p className="mt-2 text-sm text-slate-500">{service?._tag}</p>}</div></div>
       {ready && <DownloadActivity />}
       {service && "message" in service && <p role="alert" className="mt-5 text-sm">{service.message}</p>}
       {service?._tag === "Failed" && <Button className="mt-5" variant="outline" onClick={() => host.retry()}>Retry service</Button>}
     </section>
     <MemoryBreakdown />
-    <section className="rounded-2xl border border-slate-200 bg-white p-6 dark:border-slate-750 dark:bg-slate-850"><div className="flex items-center gap-3"><Plug className="size-5 text-blue-600 dark:text-blue-400" /><h2 className="font-heading text-lg">Local connection</h2></div><p className="mt-2 text-sm text-slate-500">Your tools connect to Magnitude on this machine.</p><p className="mt-4 break-all rounded-lg bg-slate-50 p-4 font-mono text-sm dark:bg-slate-900">{snapshot?.endpoint ?? "Endpoint unavailable"}</p><div className="mt-5 flex items-start gap-3"><span className={`mt-1 size-2 shrink-0 rounded-full ${snapshot?.tray._tag === "Registered" ? "bg-blue-500" : "bg-slate-400"}`} /><div><p className="text-sm font-medium">Background activity</p><p className="mt-1 text-sm text-slate-500">{snapshot?.tray._tag === "Registered" ? "Magnitude keeps running when you close the window." : snapshot?.tray._tag === "Unavailable" ? snapshot.tray.message : snapshot?.tray._tag === "Closed" ? "Magnitude is quitting." : "Checking tray availability…"}</p></div></div></section>
+    <section className={pageLayout.card}><div className="flex items-center gap-3"><Plug className="size-5 text-blue-600 dark:text-blue-400" /><h2 className="font-heading text-lg">Local connection</h2></div><p className="mt-2 text-sm text-slate-500">Your tools connect to Magnitude on this machine.</p><p className="mt-4 break-all rounded-lg bg-slate-50 p-4 font-mono text-sm dark:bg-slate-900">{snapshot?.endpoint ?? <SkeletonLine className="h-5 text-sm" width="200px" />}</p><div className="mt-5 flex items-start gap-3"><span className={`mt-1 size-2 shrink-0 rounded-full ${snapshot?.tray._tag === "Registered" ? "bg-blue-500" : "bg-slate-400"}`} /><div><p className="text-sm font-medium">Background activity</p><p className="mt-1 text-sm text-slate-500">{snapshot?.tray._tag === "Registered" ? "Magnitude keeps running when you close the window." : snapshot?.tray._tag === "Unavailable" ? snapshot.tray.message : snapshot?.tray._tag === "Closed" ? "Magnitude is quitting." : <SkeletonLine className="h-5 w-72 text-sm" />}</p></div></div></section>
   </div>
 }
 function ApplicationSettings() {
@@ -285,10 +294,10 @@ function ApplicationSettings() {
   const session = useMemo(() => client.runtime.atom(DesktopSession), [client])
   const service = useAtomValue(session)
   const info = useAtomValue(useMemo(() => Atom.make(get => Result.flatMap(get(session), value => get(value.applicationInfo))), [session]))
-  return <section className="mt-6 rounded-lg border border-slate-300 bg-white px-5 py-5 dark:border-slate-750 dark:bg-slate-850">
+  return <section className={pageLayout.settingsCard}>
     <h2 className="font-heading text-lg">About Magnitude</h2>
-    <p className="mt-2 text-sm text-slate-500">{Result.isSuccess(info) ? `Version ${info.value.version}` : Result.isFailure(info) ? "Version unavailable" : "Reading app version…"}</p>
-    {Result.isSuccess(service) && <UpdateSettingsView service={service.value} />}
+    <p className="mt-2 text-sm text-slate-500">{Result.isSuccess(info) ? `Version ${info.value.version}` : Result.isFailure(info) ? "Version unavailable" : <SkeletonLine className="h-5 text-sm" width="96px" />}</p>
+    {Result.isSuccess(service) ? <UpdateSettingsView service={service.value} /> : Result.isFailure(service) ? <p role="alert">Update settings unavailable.</p> : <UpdatesSkeleton />}
   </section>
 }
 function UpdateSettingsView({ service }: { service: DesktopSession }) {
@@ -314,13 +323,13 @@ function UpdateSettingsView({ service }: { service: DesktopSession }) {
     : current._tag === "Staging" ? `Preparing version ${current.version}…`
     : current._tag === "Ready" ? `Version ${current.version} is ready to install. Restart Magnitude to update.`
     : current._tag === "Closed" ? "Magnitude is quitting…" : current.message
+  if (Result.isInitial(observation)) return <UpdatesSkeleton />
   return <div className="mt-5 border-t border-slate-200 pt-5 dark:border-slate-750">
     <h3 className="font-medium">Application updates</h3>
     {snapshot?.preference._tag === "Known" && <label className="mt-3 flex items-center gap-3 text-sm">
       <input type="checkbox" className="size-4 accent-sky-500" checked={snapshot.preference.autoDownload} disabled={saving.waiting || current?._tag === "Closed"} onChange={event => setAutoDownload(event.target.checked)} />
       Auto-download updates
     </label>}
-    {snapshot?.preference._tag === "Known" && <p className="mt-1 text-sm text-slate-500">Checks continue every hour when automatic downloads are off.</p>}
     {snapshot?.preference._tag === "Unavailable" && current?._tag !== "Unavailable" && <div className="mt-2">
       <p role="alert" className="text-sm">{snapshot.preference.message}</p>
       <div className="mt-2 flex gap-2"><Button variant="outline" disabled={saving.waiting} onClick={() => setAutoDownload(true)}>Enable automatic downloads</Button>
@@ -351,15 +360,16 @@ function LoginSettings() {
   const client = useAgentClient()
   const session = useMemo(() => client.runtime.atom(DesktopSession), [client])
   const service = useAtomValue(session)
-  return Result.isSuccess(service) ? <LoginSettingsView service={service.value} /> : null
+  return Result.isSuccess(service) ? <LoginSettingsView service={service.value} /> : Result.isFailure(service) ? <p role="alert" className="mt-6">Login settings unavailable.</p> : <LoginSkeleton />
 }
 function LoginSettingsView({ service }: { service: DesktopSession }) {
   const state = useAtomValue(service.loginStartup)
   const set = useAtomSet(service.setLoginStartup)
   const change = useAtomValue(service.setLoginStartup)
   const current = Result.isSuccess(state) ? state.value : null
+  if (Result.isInitial(state)) return <LoginSkeleton />
   const enabled = current?._tag === "Enabled" || current?._tag === "RequiresApproval"
-  return <section className="mt-6 rounded-lg border border-slate-300 bg-white px-5 py-5 dark:border-slate-750 dark:bg-slate-850">
+  return <section className={pageLayout.settingsCard}>
     <div className="flex items-center justify-between gap-6"><div><h2 className="font-heading text-lg">Launch at login</h2><p className="mt-2 text-sm text-slate-500">Start Magnitude in the background with its tray icon. The window stays closed.</p></div>
     <Button variant="outline" disabled={!current || current._tag === "Unavailable" || change.waiting} aria-pressed={enabled} onClick={() => set(!enabled)}>{enabled ? "Disable" : "Enable"}</Button></div>
     {current?._tag === "Unavailable" && <p className="mt-3 text-sm text-slate-500">{current.message}</p>}
@@ -377,20 +387,26 @@ function App() {
   const pageResult = useAtomValue(pageAtom)
   const page = Result.isSuccess(pageResult) ? pageResult.value : "discover"
   const service = Result.isSuccess(state) ? state.value.service : null
-  return <div className="flex h-screen bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200">
-    <aside className="flex w-56 shrink-0 flex-col border-r border-slate-200 px-4 py-8 dark:border-slate-750"><div className="mb-10 flex items-center gap-3 px-3 font-heading text-base font-semibold"><MagnitudeMark className="h-8 w-8" />Magnitude</div><nav className="flex min-h-0 flex-1 flex-col gap-2">{(Object.keys(pageNames) as Page[]).map(key => <Button variant="ghost" key={key} onClick={() => navigate(key)} aria-current={page === key ? "page" : undefined} className={`h-10 justify-start gap-3 rounded-lg px-3 text-left text-sm font-medium ${key === "status" ? "mt-auto" : ""} ${page === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>{(() => { const Icon = pageIcons[key]; return <Icon className="size-4" /> })()}{pageNames[key]}</Button>)}</nav></aside>
-    <main key={page} className="min-w-0 flex-1 overflow-y-auto px-10 py-9"><h1 className="font-heading text-[28px] font-semibold tracking-tight">{pageNames[page]}</h1>
-      {page === "status" ? <Status snapshot={Result.isSuccess(state) ? state.value : null} />
+  return <DesktopShell page={page} navigate={navigate}>
+      {page === "status" ? Result.isFailure(state) ? <p role="alert" className="mt-7">{hostFailureMessage(state.cause)}</p> : <Status snapshot={Result.isSuccess(state) ? state.value : null} />
       : page === "usage" ? <ServingUsage />
       : page === "settings" ? <><AppearanceSettings /><LoginSettings /><ApplicationSettings /></>
       : page === "connections" ? <Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} />
-      : service?._tag !== "Ready" ? <p className="mt-8">{service?._tag === "Failed" ? "The service needs attention. Open Status for details." : "Starting the Magnitude service…"}</p>
+      : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(state) ? <p role="alert" className="mt-8">The service needs attention. Open Status for details.</p> : <ModelsSkeleton page={page} />)
       : page === "discover" || page === "catalog" || page === "models" ? <Models page={page} />
       : null}
+  </DesktopShell>
+}
+function DesktopShell({ page, navigate, children }: { page: Page; navigate?: (page: Page) => void; children: ReactNode }) {
+  return <div className="flex h-screen bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200">
+    <aside className="flex w-56 shrink-0 flex-col border-r border-slate-200 px-4 py-8 dark:border-slate-750"><div className="mb-10 flex items-center gap-3 px-3 font-heading text-base font-semibold"><MagnitudeMark className="h-8 w-8" />Magnitude</div><nav className="flex min-h-0 flex-1 flex-col gap-2">{(Object.keys(pageNames) as Page[]).map(key => <Button variant="ghost" key={key} disabled={!navigate} onClick={() => navigate?.(key)} aria-current={page === key ? "page" : undefined} className={`h-10 justify-start gap-3 rounded-lg px-3 text-left text-sm font-medium ${key === "status" ? "mt-auto" : ""} ${page === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>{(() => { const Icon = pageIcons[key]; return <Icon className="size-4" /> })()}{pageNames[key]}</Button>)}</nav></aside>
+    <main key={page} className="min-w-0 flex-1 overflow-y-auto px-10 py-9"><h1 className="font-heading text-[28px] font-semibold tracking-tight">{pageNames[page]}</h1>
+      {children}
     </main>
   </div>
 }
 const root = createRoot(document.getElementById("root")!)
+root.render(<DesktopShell page="discover"><ModelsSkeleton page="discover" /></DesktopShell>)
 const boot = Effect.gen(function* () {
   const initial = yield* observation.pipe(Stream.take(1), Stream.runHead, Effect.flatMap(value => value._tag === "Some" ? Effect.succeed(value.value) : Effect.fail(new DesktopHostUnavailable())))
   const scope = yield* Scope.make()
