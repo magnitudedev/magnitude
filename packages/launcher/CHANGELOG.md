@@ -1,5 +1,15 @@
 # @magnitudedev/cli
 
+## 0.0.15
+
+### Patch Changes
+
+- [`a5a5711`](https://github.com/magnitudedev/magnitude/commit/a5a5711a7d7c0deee96f3c476df4711bc1df409c) Thanks [@anerli](https://github.com/anerli)! - Add AssociatedBundleIdentifiers to launchd plist for macOS so login item shows correct icon and name
+
+- [`d349ed8`](https://github.com/magnitudedev/magnitude/commit/d349ed8d06308f140393270eab7168fe793b38fd) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Show a desktop migration notice during installation and setup.
+
+- [`1cbaafc`](https://github.com/magnitudedev/magnitude/commit/1cbaafc04ad38393c7c54b1ae4ea70dc5ab4c32f) Thanks [@anerli](https://github.com/anerli)! - Apple signing
+
 ## 0.0.15-alpha.1
 
 ### Patch Changes
