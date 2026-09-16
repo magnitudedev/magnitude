@@ -10,6 +10,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from ".
 import { Progress } from "../../web/src/components/ui/progress"
 import { MagnitudeMark } from "../../web/src/components/magnitude-mark"
 import {
+  SidebarSimpleIcon,
   CaretDownIcon,
   EyeIcon,
   ArrowUpRightIcon,
@@ -453,13 +454,41 @@ function App() {
   </DesktopShell>
 }
 function DesktopShell({ page, navigate, children }: { page: Page; navigate?: (page: Page) => void; children: ReactNode }) {
-  return <div className="flex h-screen bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200">
-    <aside className="flex w-56 shrink-0 flex-col border-r border-slate-200 px-4 py-8 dark:border-slate-750"><div className="mb-10 flex items-center gap-3 px-3 font-heading text-base font-semibold"><MagnitudeMark className="h-8 w-8" />Magnitude</div><nav className="flex min-h-0 flex-1 flex-col gap-2">{(Object.keys(pageNames) as Page[]).map(key => <Button variant="ghost" key={key} disabled={!navigate} onClick={() => navigate?.(key)} aria-current={page === key ? "page" : undefined} className={`h-10 justify-start gap-3 rounded-lg px-3 text-left text-sm font-medium ${key === "status" ? "mt-auto" : ""} ${page === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>{(() => { const Icon = pageIcons[key]; return <Icon className="size-4" /> })()}{pageNames[key]}</Button>)}</nav></aside>
-    <main key={page} className="min-w-0 flex-1 overflow-y-auto px-10 py-9">{page !== "catalog" && page !== "models" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}
-      {children}
+  const platform = window.__magnitudeDesktop.platform
+  const [collapsed, setCollapsed] = useState(false)
+  const integratedControls = platform === "darwin" || platform === "win32"
+  const sidebarWidth = collapsed ? 0 : 224
+  return <div className="relative flex h-screen bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200">
+    {platform === "win32" && <div aria-hidden="true" data-window-drag-region style={{ left: sidebarWidth }} className="absolute right-0 top-0 z-50 h-8 select-none transition-[left] duration-250 ease-in-out motion-reduce:transition-none [-webkit-app-region:drag]" />}
+    <div data-window-drag-region={integratedControls ? "" : undefined} style={{ width: collapsed ? (platform === "darwin" ? 128 : 64) : sidebarWidth }} className={`absolute left-0 top-0 z-50 flex h-[42px] items-center justify-end px-4 transition-[width] duration-250 ease-in-out motion-reduce:transition-none ${integratedControls ? "select-none [-webkit-app-region:drag]" : ""}`}>
+      <button type="button" className="inline-flex size-6 items-center justify-center rounded-sm text-slate-500 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-100 [-webkit-app-region:no-drag]" aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"} aria-expanded={!collapsed} aria-controls="desktop-navigation" onClick={() => setCollapsed(value => !value)}>
+        <SidebarSimpleIcon className="size-5" />
+      </button>
+    </div>
+    <aside aria-hidden={collapsed} inert={collapsed} style={{ width: sidebarWidth }} className="shrink-0 overflow-hidden transition-[width] duration-250 ease-in-out motion-reduce:transition-none">
+      <div className={`flex h-full w-56 flex-col border-r border-slate-200 pt-10 pb-8 transition-transform duration-250 ease-in-out motion-reduce:transition-none dark:border-slate-750 ${collapsed ? "-translate-x-full" : "translate-x-0"}`}>
+      <div className="mb-10 mt-4 flex h-8 shrink-0 items-center gap-3 px-7 font-heading text-base font-semibold">
+        <MagnitudeMark className="h-8 w-8 shrink-0" />Magnitude
+      </div>
+      <nav id="desktop-navigation" className="flex min-h-0 flex-1 flex-col gap-2 px-4">
+        {(Object.keys(pageNames) as Page[]).map(key => {
+          const Icon = pageIcons[key]
+          return <Button variant="ghost" key={key} disabled={!navigate} onClick={() => navigate?.(key)} aria-label={pageNames[key]} aria-current={page === key ? "page" : undefined} className={`h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start ${key === "status" ? "mt-auto" : ""} ${page === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
+            <Icon className="size-4 shrink-0" />{pageNames[key]}
+          </Button>
+        })}
+      </nav>
+      </div>
+    </aside>
+    <main key={page} className="min-w-0 flex-1 overflow-y-auto">
+      <div data-page-content className={`mx-auto w-[calc(100vw-224px)] max-w-6xl px-10 pb-9 ${platform === "win32" ? "pt-14" : "pt-9"}`}>
+        {page !== "catalog" && page !== "models" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}
+        {children}
+      </div>
     </main>
   </div>
 }
+
 const root = createRoot(document.getElementById("root")!)
 root.render(<DesktopShell page="discover"><ModelsSkeleton page="discover" /></DesktopShell>)
 const boot = Effect.gen(function* () {
