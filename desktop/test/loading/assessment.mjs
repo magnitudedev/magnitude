@@ -1,0 +1,41 @@
+import {chromium} from 'playwright'
+import assert from 'node:assert/strict'
+import {mkdir} from 'node:fs/promises'
+const output = new URL('../../../specs/26-09-15/page-skeletons/screenshots/', import.meta.url).pathname
+await mkdir(output, {recursive:true})
+const browser = await chromium.launch({headless:true})
+const errors=[]
+for (const theme of ['light','dark']) for (const width of [800,1120,1600]) {
+ const page=await browser.newPage({viewport:{width,height:1000},reducedMotion:'reduce'})
+ page.on('pageerror', e=>errors.push(e.message))
+ await page.goto('http://127.0.0.1:6091/loading.html')
+ await page.getByRole('navigation').waitFor()
+ await page.evaluate(theme=>{document.documentElement.dataset.theme=theme;window.loadingFixture.setPhase('assessing')},theme)
+ const loading=page.getByLabel('Loading recommendations')
+ await loading.waitFor()
+ assert.equal(await page.evaluate(()=>document.documentElement.dataset.theme),theme)
+ await page.getByText('2 of 5 assessed').waitFor()
+ assert.equal(await page.getByLabel('Recommended models',{exact:true}).count(),0)
+ assert.equal(await page.locator('main [data-slot="skeleton"]').count(),await loading.locator('[data-slot="skeleton"]').count())
+ let before=await loading.boundingBox()
+ await page.evaluate(()=>window.loadingFixture.setPhase('assessing-more'))
+ await page.getByText('4 of 5 assessed').waitFor()
+ assert.deepEqual(await loading.boundingBox(),before)
+ await loading.screenshot({path:`${output}assessment-${theme}-${width}.png`})
+ before=await loading.boundingBox()
+ await page.evaluate(()=>window.loadingFixture.setPhase('loaded'))
+ const ready=page.getByLabel('Top recommendations')
+ await ready.waitFor()
+ const after=await ready.boundingBox()
+ for (const dimension of ['x','y','width','height']) assert.ok(Math.abs(before[dimension]-after[dimension])<=1,`${width} ${dimension}: ${before[dimension]} -> ${after[dimension]}`)
+ assert.equal(await page.getByText('Assessing models',{exact:true}).count(),0)
+ assert.equal(await page.locator('[data-slot="skeleton"]').count(),0)
+ assert.equal(await ready.evaluate(n=>getComputedStyle(n).animationName),'none')
+ await ready.screenshot({path:`${output}assessment-ready-${theme}-${width}.png`})
+ await page.evaluate(()=>window.loadingFixture.setPhase('error'))
+ assert.equal(await page.locator('[data-slot="skeleton"]').count(),0)
+ await page.close()
+}
+await browser.close()
+assert.deepEqual(errors,[])
+console.log('PASS assessment count, no partial recommendations, unchanged panel geometry, failure, and reduced motion at three widths in both themes')

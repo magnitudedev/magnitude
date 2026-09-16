@@ -1,6 +1,6 @@
 import { LoadingRegion, SkeletonLine, ModelsSkeleton, RecommendationsSkeleton, ConnectionsSkeleton, LoginSkeleton, UpdatesSkeleton, modelDescriptions } from "./page-skeletons"
 import { pageLayout } from "./page-layout"
-import { ModelPreferenceSlider } from "./model-preference-slider"
+import { RecommendationPreference } from "./model-preference-slider"
 import { ServingUsage } from "./serving-usage"
 import { initializeAppearance, setAppearancePreference, useAppearancePreference, subscribeAppearance, getAppearancePreference } from "../../web/src/stores/appearance-store"
 import { ActionTooltip, TooltipProvider } from "../../web/src/components/ui/tooltip"
@@ -21,7 +21,7 @@ import {
   createAgentClient, AgentClientProvider, useAgentClient, makeFirstPartyConnection,
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, localModelFailureMessage, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
   formatStorageSize, formatMemorySize, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes,
-  LOCAL_MODEL_RANKING_SCALE_LABELS, LOCAL_MODEL_RANKING_SCALE_VALUES,
+  LOCAL_MODEL_RANKING_SCALE_VALUES,
 } from "@magnitudedev/client-common"
 import { HardwareOverview, ModelRadar } from "./discovery-visuals"
 import { MemoryBreakdown } from "./memory-breakdown"
@@ -166,7 +166,7 @@ function Recommendations({ models, active }: { models: readonly CatalogLocalMode
   const [selectedId, setSelectedId] = useState<CatalogLocalModel["modelId"] | null>(null)
   const selected = models.find(model => model.modelId === selectedId) ?? models[0]
   if (!selected) return null
-  return <section aria-label="Top recommendations" className="mb-8">
+  return <section aria-label="Top recommendations" className="mb-8 motion-safe:animate-in motion-safe:fade-in motion-safe:duration-300">
     <div className={pageLayout.recommendations}>
       <div className={pageLayout.recommendationList} aria-label="Recommended models">{models.map((model, rank) => <button key={model.modelId} type="button" aria-pressed={model.modelId === selected.modelId} onClick={() => setSelectedId(model.modelId)} className={`${pageLayout.recommendationRow} transition-colors focus-visible:outline-2 focus-visible:outline-blue-500 ${model.modelId === selected.modelId ? "border-blue-300 bg-blue-50 dark:border-blue-700 dark:bg-slate-800" : "border-transparent hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
         <span className="w-4 shrink-0 text-sm tabular-nums text-slate-500">{rank + 1}</span>
@@ -194,10 +194,11 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const preference = Result.isSuccess(preferenceResult) ? preferenceResult.value : 2
   const setPreference = useAtomSet(useMemo(() => client.runtime.fn((index: number) => Effect.flatMap(DesktopSession, service => service.setRankingPreference(index))), [client]))
   if (Result.isFailure(catalog)) return <p role="alert">{localModelFailureMessage(catalog.cause, "Could not read the model catalog. Check Status and try again.")}</p>
-  if (!Result.isSuccess(catalog)) return <ModelsSkeleton page={page} />
-  const models = catalog.value.models.filter((model): model is CatalogLocalModel => model._tag === "Catalog")
+  if (!Result.isSuccess(catalog) && !discover) return <ModelsSkeleton page={page} />
+  const models = (Result.isSuccess(catalog) ? catalog.value.models : []).filter((model): model is CatalogLocalModel => model._tag === "Catalog")
   const ranked = !installedOnly && Result.isSuccess(hardware) ? rankedLocalModelOptions(models.map(model => ({ id: model.modelId, kind: localModelIsInstalled(model) ? "stored" as const : "downloadable" as const, model })), { fastToSmart: LOCAL_MODEL_RANKING_SCALE_VALUES[preference]!, memoryBudgetBytes: targetPhysicalMemoryBytes(hardware.value) }, models.length).flatMap(option => option.model._tag === "Catalog" ? [option.model] : []) : []
-  const recommendationsPending = Result.isInitial(hardware) || !catalog.value.preparation.assessment.complete
+  const assessment = Result.isSuccess(catalog) ? catalog.value.preparation.assessment : undefined
+  const recommendationsPending = !Result.isFailure(hardware) && (Result.isInitial(hardware) || !assessment?.complete)
   const rankedIds = new Set(ranked.map(model => model.modelId))
   const ordered = installedOnly ? models : [...ranked, ...models.filter(model => !rankedIds.has(model.modelId))]
   const visible = ordered.filter(model => (!installedOnly || model.acquisitionState._tag !== "NotInstalled") && (!fitOnly || model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits") && `${formatLocalModelDisplayName(model)} ${model.presentation.description}`.toLowerCase().includes(search.toLowerCase()))
@@ -205,10 +206,11 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
     <p className="mt-2 text-slate-500">{modelDescriptions[page]}</p>
     {discover && <HardwareOverview /> }
     {Option.isSome(stopResult.failure) && <p role="alert" className="mt-5 text-sm">{stopResult.failure.value}</p>}
-    {discover && <section aria-label="Recommendation preference" className="my-6"><div className="flex items-end justify-between gap-4"><div><h2 className="font-heading text-xl">Find your balance</h2><p className="mt-2 text-sm text-slate-500">Quick responses or deeper thinking. Choose what matters to you.</p></div><span className="rounded-full bg-blue-50 px-4 py-2 text-sm font-medium text-blue-700 dark:bg-slate-800 dark:text-blue-400">{LOCAL_MODEL_RANKING_SCALE_LABELS[preference]}</span></div><ModelPreferenceSlider value={preference} onChange={setPreference} /></section>}
-    {!catalog.value.preparation.assessment.complete && <p className="mb-4 text-sm text-slate-500">Assessing models · {catalog.value.preparation.assessment.settledModels} of {catalog.value.preparation.assessment.totalModels}</p>}
-    {discover && ranked.length === 0 && recommendationsPending && <RecommendationsSkeleton />}
-    {discover && <Recommendations key={preference} models={featuredCatalogModels(ranked, 5)} active={Option.fromNullable(active)} />}
+    {discover && <RecommendationPreference value={preference} onChange={setPreference} />}
+    {!discover && assessment && !assessment.complete && <p className="mb-4 text-sm text-slate-500">Assessing models · {assessment.settledModels} of {assessment.totalModels}</p>}
+    {discover && (recommendationsPending
+      ? <RecommendationsSkeleton assessment={assessment} />
+      : <Recommendations key={preference} models={featuredCatalogModels(ranked, 5)} active={Option.fromNullable(active)} />)}
     {!discover && <>
     <div className={pageLayout.catalogToolbar}><h2 className="font-heading text-xl">{installedOnly?"Your library":"Explore the catalog"}</h2><Input aria-label="Search models" placeholder="Find a model…" className="max-w-sm" value={search} onChange={event=>setSearch(event.target.value)} /></div>
     {!installedOnly && <div className="mb-5 flex items-center justify-between text-sm text-slate-500"><label className="flex items-center gap-2"><input type="checkbox" checked={fitOnly} onChange={event => setFitOnly(event.target.checked)} className="accent-blue-600" />Fits my machine</label><span>{visible.length} configurations</span></div>}

@@ -1,4 +1,4 @@
-import { HardwareSkeleton } from "./page-skeletons"
+import { HardwarePending } from "./page-skeletons"
 import { pageLayout } from "./page-layout"
 import { Option } from "effect"
 import { useMemo } from "react"
@@ -41,7 +41,7 @@ export function HardwareOverview() {
 }
 function ObservedHardware({ service }: { service: DesktopSession }) {
   const identity = useAtomValue(service.machineIdentity)
-  if (Result.isInitial(identity)) return <HardwareSkeleton />
+  if (Result.isInitial(identity)) return <HardwarePending />
   return <HardwareCard identity={Result.isSuccess(identity) ? identity.value : null} />
 }
 function HardwarePhotograph({ photo }: { photo: HardwarePhoto }) {
@@ -51,7 +51,7 @@ function HardwarePhotograph({ photo }: { photo: HardwarePhoto }) {
 }
 function HardwareCard({ identity }: { identity: MachineIdentityObservation | null }) {
   const hardware = useLocalInferenceHardware()
-  if (Result.isInitial(hardware)) return <HardwareSkeleton />
+  if (Result.isInitial(hardware)) return <HardwarePending />
   if (!Result.isSuccess(hardware)) return <div className="my-6 rounded-2xl border border-slate-200 p-6 text-sm text-slate-500 dark:border-slate-750">{Result.isFailure(hardware) ? "Hardware observation unavailable. Recommendations will return when it recovers." : "Getting to know your machine…"}</div>
   const value = hardware.value
   const presentation = hardwarePresentation(identity, value.accelerators.map(accelerator => accelerator.name))
