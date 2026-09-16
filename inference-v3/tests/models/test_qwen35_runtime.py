@@ -184,7 +184,7 @@ def test_runtime_allocates_only_configured_context_capacity():
     )
 
     assert model.context_capacity == 8
-    assert model.states.attention[0].spec.shape == (24, 1, 64)
+    assert model.states.history[0].spec.shape == (24, 1, 64)
 
     model.close()
     for resource in residency.resources:

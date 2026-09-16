@@ -85,19 +85,21 @@ class _PersistentEmitter:
         elif isinstance(codec, AffineKVCodec) and not self.matrix:
             sums = scratch[0]
             query_sums(query, sums, tokens, heads, width)
-        for from_history, source_query, schedule, offset in (
-            (True, history_query, self.history_schedule, 0),
-            (False, query, self.current_schedule, self.history_schedule.partitions),
-        ):
+        segments = (self.specs[4].shape[1] - 2) // 2
+        for segment in range(segments + 1):
+            from_history = segment < segments
+            source_query = history_query if from_history else query
+            schedule = self.history_schedule if from_history else self.current_schedule
+            offset = segment * self.history_schedule.partitions
             if self.matrix:
                 dimension_tiled_prefill(source_query, history, visible, keys, values, sums, partials, statistics,
                                    tokens, heads, history_spec.shape[1], width, self.scale, schedule,
-                                   query_spec.dtype.value, history_spec, from_history, offset)
+                                   query_spec.dtype.value, history_spec, from_history, offset, 2 * segment)
             else:
                 _persistent_decode(source_query, history, visible, keys, values, sums, partials, statistics,
                                    tokens, heads, history_spec.shape[1], width, self.scale, schedule,
-                                   history_spec, from_history, offset)
-        partitions = self.history_schedule.partitions + self.current_schedule.partitions
+                                   history_spec, from_history, offset, 2 * segment)
+        partitions = segments * self.history_schedule.partitions + self.current_schedule.partitions
         if self.fuse_gate:
             _merge_attention_gate(partials, statistics, gate, output, tokens, heads, width,
                                   partitions, self.threads, query_spec.dtype.value)
@@ -118,7 +120,7 @@ class PersistentAttentionRule:
             raise ValueError("compact history contraction requires affine value storage")
         # Select the streamed prefill or compact decode ownership by geometry.
         logical_history = TensorSpec((2, history.shape[0], history.shape[1], width), query.dtype)
-        matrix = context.mode == "prefill" and node.attributes["sequence_count"] == 1
+        matrix = context.mode == "prefill"
         if matrix:
             schedule = prefill_schedule(query, history, context, template=_PersistentEmitter, workload=specs)
             if schedule is None:
@@ -165,7 +167,8 @@ class PersistentAttentionRule:
                     query, logical_history, replace(context, mode="decode"),
                     template=_PersistentEmitter, workload=specs)
                 current = replace(schedule, partitions=math.ceil(keys.shape[0] / schedule.span))
-        partitions = schedule.partitions + current.partitions
+        segments = (visible.shape[1] - 2) // 2
+        partitions = segments * schedule.partitions + current.partitions
         if isinstance(history.representation.key, (AffineKVCodec, RotatedLloydMax)):
             max_words = max(p.row_elements for p in history.representation.planes(history.shape[0] * history.shape[1])
                             if p.name.endswith(".codes"))
@@ -192,7 +195,7 @@ class PersistentAttentionRule:
                                _PersistentEmitter(specs, node.attributes["scale"], schedule, current, matrix,
                                                   min(256, context.compiler_target.threads_per_group),
                                                   context.compiler_target.subgroup_width),
-                               workspace=workspace, kernel_count=4 if rotated or (isinstance(history.representation.key, AffineKVCodec) and not matrix) else 3),)
+                               workspace=workspace, kernel_count=segments + 2 + int(rotated or (isinstance(history.representation.key, AffineKVCodec) and not matrix))),)
 
 
 class PersistentAttentionGateRule:
@@ -219,7 +222,7 @@ class PersistentAttentionGateRule:
 
 @T.macro
 def _persistent_decode(query, history, visible, current_keys, current_values, sums, partials, statistics,
-                             tokens, heads, kv_heads, width, scale, schedule, history_spec, from_history, partition_offset):
+                             tokens, heads, kv_heads, width, scale, schedule, history_spec, from_history, partition_offset, visibility_column):
     """One K/V tile serves a complete query-head cohort and a stable softmax.
 
     The online dependency advances per history tile. Both QK and PV use matrix
@@ -260,8 +263,8 @@ def _persistent_decode(query, history, visible, current_keys, current_values, su
         denominator = T.alloc_fragment((matrix_rows,), "float32")
         local_sum = T.alloc_fragment((matrix_rows,), "float32")
         alpha = T.alloc_fragment((matrix_rows,), "float32")
-        base = T.cast(visible[token, 0 if from_history else 2], "int32")
-        count = T.cast(visible[token, 1 if from_history else 3], "int32")
+        base = T.cast(visible[token, visibility_column], "int32")
+        count = T.cast(visible[token, visibility_column + 1], "int32")
         # Engine visibility is a valid interval inside this physical history.
         T.assume(base >= 0)
         T.assume(count >= 0)

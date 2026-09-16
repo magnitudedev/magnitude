@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from threading import get_ident
 from typing import TYPE_CHECKING, Any, Protocol
@@ -279,6 +279,22 @@ class Resource:
         self.device._check_thread()
         self._lease.check()
         return self._lease.allocation.claims == 1
+
+    @staticmethod
+    def reclaimable_bytes(resources: Iterable[Resource]) -> int:
+        """Unique backing released by closing precisely these resource leases.
+
+        Other views and completion pins keep their allocations non-reclaimable.
+        This is allocation ownership, not engine history-range ownership.
+        """
+        leases = {id(resource._lease): resource._lease for resource in resources}
+        claims = {}
+        for lease in leases.values():
+            lease.check()
+            lease.allocation.device._check_thread()
+            claims[lease.allocation] = claims.get(lease.allocation, 0) + 1
+        return sum(allocation.charged_bytes for allocation, count in claims.items()
+                   if allocation.claims == count)
 
     def view(self, spec: TensorSpec, offset: int = 0) -> Resource:
         if offset == 0 and spec == self.spec:

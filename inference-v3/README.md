@@ -68,6 +68,16 @@ in chunks within `batch_tokens`; `LogitsSelection.NONE` requests state-only work
 Readout returns owned host rows and waits for completion. Sampling is optional and
 explicit through `ModelRequest.draw_words`; reading logits does not commit an advance.
 Use the ordinary sequence checkpoint/fork methods for independent continuations.
+Forks share committed KV storage and recurrent value versions; subsequent appends
+reserve private ranges. The shared KV arena is bounded by configured capacity,
+allocated on first use, and released when idle. Sharing reduces occupied ranges;
+it does not shrink an already allocated arena.
+
+Pass `vocabulary=(token_a, token_b, ...)` to `ModelRequest` to project only those
+output-weight rows. Host columns follow that order, and the values are raw logits.
+Every request in a packed batch must use the same ordered vocabulary; selected
+readout cannot be combined with sampling. `selection` still chooses `LAST` or
+`ALL` input positions. Empty, duplicate, and out-of-range vocabulary IDs are rejected.
 All model handles must be closed within the load context and used on its owner thread.
 
 To build the existing distribution with this import surface, run `uv build --wheel`.
