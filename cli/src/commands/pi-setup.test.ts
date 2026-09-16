@@ -30,7 +30,9 @@ describe("hidden Pi setup host option", () => {
     const result = run("setup", "--host", "pi")
     expect(result.status).toBe(1)
     expect(result.stdout).toBe("")
-    expect(result.stderr.trim()).toBe("Pi setup requires an interactive terminal")
+    expect(result.stderr).toContain("MAGNITUDE HAS MOVED TO A FREE, OPEN SOURCE DESKTOP APP.")
+    expect(result.stderr.trim()).toMatch(/Pi setup requires an interactive terminal$/)
+    expect(result.stderr).not.toContain("\u001b[")
   })
   it.each([
     ["setup", "--host", "unknown"], ["setup", "--host"],
