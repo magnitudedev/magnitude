@@ -22,7 +22,14 @@ applies_to:
 Service startup and update choice are inline terminal work owned by the command runtime. OpenTUI is
 not a bootstrap surface. The interactive command creates its renderer only after the update choice,
 exact service readiness, and onboarding preflight have completed. Consequently, a warm launch makes
-no terminal writes before the application's first frame.
+no terminal writes before the application's first frame, except for explicit legacy setup.
+
+Legacy `magnitude setup` prints the desktop migration notice to stderr before starting setup,
+including hosted Pi setup. It states that the desktop app is free and open source, links to
+https://magnitude.dev, and explains that the legacy CLI will receive no further updates.
+Interactive terminals pause for three seconds before continuing normally; redirected invocations
+print plain text without a delay. Help, version, and invalid invocations do not show the notice.
+Interruption during the pause must not start setup.
 
 User-facing copy always says **service**. `ACN`, `daemon`, `server`, JIT, ownership, and endpoint
 selection remain implementation terms.
