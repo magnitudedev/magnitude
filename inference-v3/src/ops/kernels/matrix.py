@@ -12,6 +12,8 @@ from typing import Any, cast
 
 import tilelang.language as T
 
+from .buffers import rebase_buffer, reshape_buffer
+
 from ..compiler.lowering import BoundOperation, LoweringContext
 from ..compiler.schedules import select_schedule
 from ..representations import Affine, Dense
@@ -134,8 +136,8 @@ class _PackedVectorEmitter:
         source, weight = operands[:2]
         bias = operands[2] if self.bias else source
         result = operands[3] if self.bias else operands[2]
-        source = T.view(source, shape=(self.m, self.k))
-        result = T.view(result, shape=(self.m, self.n))
+        source = reshape_buffer(source, shape=(self.m, self.k))
+        result = reshape_buffer(result, shape=(self.m, self.n))
         _packed_vector(
             source,
             weight,
@@ -181,6 +183,7 @@ def _packed_matrix(
         and (bn * bk // packet.matrix_packet) % threads == 0
     )
     with T.Kernel(T.ceildiv(n, bn), T.ceildiv(m, bm), threads=threads) as (bx, by):
+        source = rebase_buffer(source)
         offset = extent[0] if extent is not None else 0
         storage = affine_storage(bm, bn, bk, source.dtype, contraction_schedule, (spec,))
         left, right, coefficients, accum, b = storage
@@ -220,8 +223,8 @@ class _PackedMatrixEmitter:
         source, weight = operands[:2]
         bias = operands[2] if self.bias else source
         result = operands[3] if self.bias else operands[2]
-        source = T.view(source, shape=(self.m, self.k))
-        result = T.view(result, shape=(self.m, self.n))
+        source = reshape_buffer(source, shape=(self.m, self.k))
+        result = reshape_buffer(result, shape=(self.m, self.n))
         _packed_matrix(
             source,
             weight,
@@ -275,8 +278,8 @@ class _DenseVectorEmitter:
         source, weight = operands[:2]
         bias = operands[2] if self.bias else source
         result = operands[3] if self.bias else operands[2]
-        source = T.view(source, shape=(self.m, self.k))
-        result = T.view(result, shape=(self.m, self.n))
+        source = reshape_buffer(source, shape=(self.m, self.k))
+        result = reshape_buffer(result, shape=(self.m, self.n))
         _dense_vector(source, weight, bias, result, self.m, self.n, self.k, self.output, self.bias)
 
 
@@ -355,8 +358,8 @@ class _DenseMatrixEmitter:
         source, weight = operands[:2]
         bias = operands[2] if self.bias else source
         result = operands[3] if self.bias else operands[2]
-        source = T.view(source, shape=(self.m, self.k))
-        result = T.view(result, shape=(self.m, self.n))
+        source = reshape_buffer(source, shape=(self.m, self.k))
+        result = reshape_buffer(result, shape=(self.m, self.n))
         _dense_matrix(
             source,
             weight,
@@ -512,6 +515,7 @@ def _parallel_packed_matrix(
     total_blocks = sum(blocks[:count])
     full_rows = rows % bm == 0 and width % bk == 0
     with T.Kernel(total_blocks, T.ceildiv(rows, bm), threads=threads) as (branch_block, by):
+        source = rebase_buffer(source)
         storage = affine_storage(bm, bn, bk, source.dtype, contraction_schedule, specs[:count])
         left, right, coefficients, accum, b = storage
         T.clear(accum)

@@ -6,6 +6,8 @@ from dataclasses import replace
 
 import tilelang.language as T
 
+from .buffers import rebase_buffer
+
 from ..compiler.lowering import BoundOperation
 from ..compiler.schedules import schedule_boundary, select_schedule
 from ..kv import AffineKVCodec, RotatedLloydMax
@@ -230,6 +232,9 @@ def _persistent_decode(query, history, visible, current_keys, current_values, su
     log2e = 1.4426950408889634
     with T.Kernel(heads // head_tile, tokens, schedule.partitions,
                   threads=schedule.threads) as (cohort, token, partition):
+        query = rebase_buffer(query)
+        current_keys = rebase_buffer(current_keys)
+        current_values = rebase_buffer(current_values)
         table = prepare_codebook(history_spec, from_history)
         first_head = cohort * head_tile
         kv_head = first_head // group

@@ -35,9 +35,19 @@ class TextPart(Record):
     text: str
 
 
+class ImageURL(Record):
+    url: str = Field(min_length=1, max_length=24 << 20)
+    detail: Literal["auto"] = "auto"
+
+
+class ImagePart(Record):
+    type: Literal["image_url"]
+    image_url: ImageURL
+
+
 class Message(Record):
     role: Literal["system", "developer", "user", "assistant", "tool"]
-    content: str | list[TextPart] | None = None
+    content: str | list[TextPart | ImagePart] | None = None
     reasoning_content: str | None = None
     tool_calls: list[ToolCall] = Field(default_factory=list)
     tool_call_id: str | None = None

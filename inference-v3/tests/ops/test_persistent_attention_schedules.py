@@ -112,7 +112,12 @@ def test_persistent_attention_tail_empty_and_mixed_sources(
     with ops.DeviceRuntime.open(
         DevicePlan.discover(backend=backend, maximum_bytes=64 << 20)
     ) as device:
-        resources = tuple(device.upload(s, b) for s, b in zip(specs, contents, strict=True))
+        # Packed planes must honor a borrowed allocation's nonzero byte offset.
+        backings = tuple(
+            device.upload(ops.TensorSpec((len(b) + 256,), ops.DType.U8), bytes([0x55]) * 256 + b)
+            for b in contents
+        )
+        resources = tuple(backing.view(s, 256) for s, backing in zip(specs, backings, strict=True))
         program = None
         try:
             try:
@@ -148,3 +153,5 @@ def test_persistent_attention_tail_empty_and_mixed_sources(
                 program.close()
             for resource in resources:
                 resource.close()
+            for backing in backings:
+                backing.close()

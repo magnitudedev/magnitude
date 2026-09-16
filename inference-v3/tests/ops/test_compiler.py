@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 import ops
 from tests.ops.composed_formulas import activation_residual
 
@@ -100,6 +102,44 @@ class Runtime:
 
     def close(self):
         pass
+
+
+@pytest.mark.parametrize("offset", [0, 16])
+def test_fixed_binding_origins_specialize_both_entry_and_private_kernel_ports(offset):
+    runtime = Runtime()
+    device = ops.DeviceRuntime(runtime, budget_bytes=1 << 20)
+    spec = ops.TensorSpec((4,), ops.DType.F32)
+    backing = device.allocate(ops.TensorSpec((8,), ops.DType.F32))
+    fixed = backing.view(spec, offset)
+    compiled = None
+    try:
+        compiled = ops.compile(
+            lambda x, w, s: x + w + s,
+            signature=ops.Signature((
+                ops.Argument(spec, "x"),
+                ops.Argument(spec, "w", ops.ValueKind.CONSTANT),
+                ops.Argument(spec, "s", ops.ValueKind.RESOURCE),
+            )),
+            device=device, constants={"w": fixed}, static_resources={"s": fixed},
+            options=ops.CompileOptions(mode="decode"),
+        )
+        unit = runtime.programs[0]
+        names = {value.id: value.name for value in compiled.graph.values}
+        parameters = {names[p.key[1]]: p for p in unit.parameters if p.key[0] == "value"
+                      and names[p.key[1]] in ("x", "w", "s")}
+        assert parameters["x"].offset
+        assert parameters["w"].offset == bool(offset)
+        assert parameters["s"].offset == bool(offset)
+        by_name = {p.name: p for p in unit.parameters}
+        for call in unit.calls:
+            for port, binding in zip(call.operation.definition.ports, call.bindings, strict=True):
+                assert port.offset == by_name[binding.parameter].offset
+    finally:
+        if compiled is not None:
+            compiled.close()
+        fixed.close()
+        backing.close()
+        device.close()
 
 
 def test_compile_uses_one_unit_and_prebinds_constants_and_temporary_slots():

@@ -22,9 +22,11 @@ def validate_vector_codec(spec, subgroup_width):
 def plane_view(storage, spec, name):
     plane = next(p for p in spec.representation.planes(spec.shape[0] * spec.shape[1])
                  if p.name == name)
-    view = T.decl_buffer((spec.storage_nbytes // plane.dtype.itemsize,),
-                         plane.dtype.value, data=storage.data,
-                         elem_offset=storage.elem_offset * 4 // plane.dtype.itemsize)
+    # Resolve the borrowed buffer's byte offset once at the pointer boundary.
+    # Relative plane indexing then retains its natural integer width, including
+    # vectorized staging. The full-width address still supports sliced storage.
+    view = T.make_tensor(T.access_ptr(storage, "rw"),
+                         (spec.storage_nbytes // plane.dtype.itemsize,), plane.dtype.value)
     return view, plane.offset // plane.dtype.itemsize, plane.row_elements
 
 

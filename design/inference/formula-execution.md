@@ -135,6 +135,11 @@ work composes into maximal native entrypoints, with immutable operands partially
 bound. A required host observation, streaming dependency or documented native
 limit may split a unit. Fusion means eliminating an intermediate inside one
 kernel; several kernels behind one host entrypoint are not fusion.
+Fixed resource bindings may specialize their proven storage origins in the entry
+and private kernel interfaces. Unbound operands and nonzero views retain their
+offsets, including immutable constants. This specialization belongs to the exact
+materialized compilation unit and its observed kernel identities; it must not
+introduce copies or make callers promise that arbitrary borrowed views start at zero.
 Safe contiguous device-launch regions also share the native queue handoff and
 compute-pass lifetime where the execution adapter supports it. Argument-frame
 preparation may enter that region; arbitrary host callbacks, external effects and

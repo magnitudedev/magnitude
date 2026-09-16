@@ -15,6 +15,7 @@ from engine.data import Record, TokenId
 from engine.generation.constraints import ConstraintPlan, ConstraintVocabulary
 from engine.generation.plain import Options, OutputToken
 from engine.inputs.formats.gguf_tokenizer import TokenizerArtifact
+from engine.inputs.media import PreparedMedia
 from engine.models.qwen35.inputs import InputPlan
 from engine.models.qwen35.runtime import DenseRuntime
 from engine.platform.backend import Backend
@@ -75,6 +76,7 @@ class ServerProperties(Record):
 class Ready:
     properties: ServerProperties
     tokenizer: TokenizerArtifact
+    image_directory: Path | None = None
 
 
 class Runtime:
@@ -86,6 +88,8 @@ class Runtime:
             raise ValueError("this serving composition requires the dense Qwen adapter")
         self.model = engine.model
         self._constraint_vocabulary: ConstraintVocabulary | None = None
+        self._vision = None
+        self._image_processor_identity: str | None = None
         self.receivers: dict[RequestId, Future[Publication]] = {}
         self.detached: set[RequestId] = set()
 
@@ -94,6 +98,7 @@ class Runtime:
         tokens: tuple[TokenId, ...],
         options: Options,
         constraint: ConstraintPlan | None = None,
+        media: PreparedMedia | None = None,
     ) -> RequestId:
         state = None
         if constraint is not None:
@@ -106,7 +111,33 @@ class Runtime:
                     projection_vocabulary=self.model.geometry.vocabulary,
                 )
             state = self._constraint_vocabulary.bind(constraint)
-        source = self.model.input(InputPlan.text(tokens))
+        if media is None:
+            source = self.model.input(InputPlan.text(tokens))
+        else:
+            from engine.models.qwen35.formats.vision_mlx import describe
+            from engine.models.qwen35.preparation import interpret, preparation_identity
+            from engine.models.qwen35.vision_runtime import ImageSource, VisionEncoder
+            from engine.weights.formats.mlx_safetensors import MLXFormat
+            from engine.weights.tensor_residency import TensorWeights
+
+            if self.ready.image_directory is None:
+                raise ValueError("the served artifact does not provide an image encoder")
+            if self._vision is None:
+                weights = self.model.weights
+                if not isinstance(weights, TensorWeights) or not isinstance(
+                    weights.format, MLXFormat
+                ):
+                    raise ValueError("image encoding requires the bound MLX image artifact")
+                self._vision = VisionEncoder(describe(weights.format), self.model.device, weights)
+                self._image_processor_identity = preparation_identity(self.ready.image_directory)
+            assert self._image_processor_identity is not None
+            prepared = interpret(
+                tokens,
+                media,
+                processor=self._image_processor_identity,
+                geometry=self._vision.description.geometry.image,
+            )
+            source = ImageSource(self.model, self._vision, prepared)
         try:
             return self.engine.admit(source, options, constraint=state)
         except BaseException:
@@ -172,6 +203,9 @@ class Runtime:
             if receiver.set_running_or_notify_cancel():
                 receiver.set_exception(RuntimeError("serving execution stopped"))
         self.receivers.clear()
+        if self._vision is not None:
+            self.engine.close()
+            self._vision.close()
 
 
 @contextmanager
@@ -237,6 +271,7 @@ def open_runtime(config: Config) -> Iterator[Runtime]:
                 artifact_identity=bound.tokenizer.config.artifact_identity,
             ),
             bound.tokenizer,
+            Path(config.target).expanduser().resolve() if Path(config.target).is_dir() else None,
         )
         runtime = Runtime(bound.engine, ready)
         try:

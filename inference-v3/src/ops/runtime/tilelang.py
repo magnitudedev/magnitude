@@ -307,10 +307,10 @@ class TileLangRuntime:
         self._device = None
 
 
-def _annotation(T, spec: TensorSpec):
+def _annotation(T, spec: TensorSpec, *, offset: bool = True):
     from ..compiler.program import annotation
 
-    return annotation(T, spec)
+    return annotation(T, spec, offset=offset)
 
 
 @contextmanager
@@ -346,7 +346,9 @@ def _build_reusable_module(unit: TileCompilationUnit):
             actual.storage_nbytes < port.spec.storage_nbytes
             for actual, port in zip(operand_specs, definition.ports, strict=True)
         ):
-            raise ValueError("materialization backing does not contain the declared operation ports")
+            raise ValueError(
+                "materialization backing does not contain the declared operation ports"
+            )
         key = definition.identity
         template = templates.get(key)
         if template is None:
@@ -356,7 +358,15 @@ def _build_reusable_module(unit: TileCompilationUnit):
         calls.append((template, operand_parameters, definition.ports))
 
     entry_parameters = tuple(
-        (parameter.name, _annotation(T, parameter.spec)) for parameter in unit.parameters
+        (
+            parameter.name,
+            _annotation(
+                T,
+                parameter.spec,
+                offset=parameter.offset,
+            ),
+        )
+        for parameter in unit.parameters
     )
 
     def entry_body(private, *bound) -> None:
@@ -373,10 +383,28 @@ def _build_reusable_module(unit: TileCompilationUnit):
                         shape, dtype = ((port.spec.storage_nbytes + 3) // 4,), "uint32"
                     else:
                         shape = port.spec.shape
-                        dtype = (representation.dtype if isinstance(representation, Dense) else port.spec.dtype).value
-                    value = T.view(value, shape=shape, dtype=dtype)
+                        dtype = (
+                            representation.dtype
+                            if isinstance(representation, Dense)
+                            else port.spec.dtype
+                        ).value
+                    original = value
+                    value = T.view(original, shape=shape, dtype=dtype)
+                    value = cast(Any, T).decl_buffer(
+                        shape, dtype, data=value.data,
+                        elem_offset=(original.elem_offset * DType(original.dtype).itemsize
+                                     // DType(dtype).itemsize),
+                        scope=original.scope(),
+                    )
                 arguments.append(value)
-            private[schedule](*arguments)
+            private[schedule](
+                *arguments,
+                *(
+                    value.elem_offset
+                    for value, port in zip(arguments, ports, strict=True)
+                    if port.offset
+                ),
+            )
 
     return T.build_prim_module("main", entry_parameters, entry_body, definitions)
 

@@ -9,6 +9,7 @@ class PreparationMetrics(Record):
     profile_cache_hit: bool = False
     render_ns: int = 0
     tokenize_ns: int = 0
+    image_prepare_ns: int = 0
 
 
 class ParsingMetrics(Record):
