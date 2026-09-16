@@ -1,4 +1,5 @@
 import type { ReactNode } from "react"
+import { RecommendationPreference } from "./model-preference-slider"
 import { Skeleton } from "../../web/src/components/ui/skeleton"
 import { pageLayout } from "./page-layout"
 
@@ -21,8 +22,8 @@ export function RadarSkeleton() {
     </svg>
   </div>
 }
-export function HardwareSkeleton() {
-  return <LoadingRegion label="Loading your hardware" className={pageLayout.hardware}>
+export function HardwarePending() {
+  return <LoadingRegion label="Detecting your hardware" className={pageLayout.hardware}>
     <div className={`grid items-center gap-6 ${pageLayout.hardwareGrid}`}>
       <div className={pageLayout.hardwarePhoto}><Skeleton className="aspect-[4/3] w-full rounded-none" /></div>
       <div className="min-w-0"><p className="text-xs font-medium uppercase tracking-widest text-slate-500">Your machine</p><SkeletonLine className="mt-2 h-7 text-xl" width="80%" /><SkeletonLine className="mt-2 h-5 text-sm" width="55%" />
@@ -31,13 +32,21 @@ export function HardwareSkeleton() {
     </div>
   </LoadingRegion>
 }
-export function RecommendationsSkeleton() {
-  return <LoadingRegion label="Loading recommendations" className="mb-8">
+export function RecommendationsSkeleton({ assessment }: { assessment?: { settledModels: number; totalModels: number } }) {
+  return <div aria-busy="true" aria-label="Loading recommendations" className="relative mb-8" data-loading-region="">
+    <div aria-hidden="true">
     <div className={pageLayout.recommendations}>
       <div className={pageLayout.recommendationList}>{Array.from({length:5},(_,index) => <div key={index} className={`${pageLayout.recommendationRow} border-transparent`}><span className="w-4 shrink-0 text-sm text-slate-500">{index+1}</span><Skeleton className="size-7 shrink-0" /><SkeletonLine className="h-5 min-w-0 flex-1 text-sm" width={index%2 ? "90%" : "75%"} /></div>)}</div>
       <div className={pageLayout.recommendationPane}><div className={pageLayout.recommendationToolbar}><div className="flex gap-1"><Skeleton className="h-8 w-16" /><Skeleton className="h-8 w-16" /></div><Skeleton className="h-8 w-40" /></div><div className="grid min-h-72"><RadarSkeleton /></div></div>
     </div>
-  </LoadingRegion>
+    </div>
+    <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-5">
+      <div role="status" className="rounded-xl border border-slate-200 bg-white px-5 py-3 text-center text-sm shadow-sm dark:border-slate-700 dark:bg-slate-850">
+        <p className="font-medium">Assessing models</p>
+        {assessment && <p className="mt-1 tabular-nums text-slate-500">{assessment.settledModels} of {assessment.totalModels} assessed</p>}
+      </div>
+    </div>
+  </div>
 }
 export function ModelCardsSkeleton({ library = false }: { library?: boolean }) {
   return <LoadingRegion label={library ? "Loading your models" : "Loading catalog models"}>
@@ -49,7 +58,7 @@ export function ModelCardsSkeleton({ library = false }: { library?: boolean }) {
 }
 export const modelDescriptions = { discover: "Your best local models, matched to your machine.", catalog: "Explore every model in the curated catalog.", models: "Your downloads and installed models, in one place." } as const
 export function ModelsSkeleton({ page }: { page: keyof typeof modelDescriptions }) {
-  return <><p className="mt-2 text-slate-500">{modelDescriptions[page]}</p>{page === "discover" ? <><HardwareSkeleton /><LoadingRegion label="Loading recommendation preference" className="my-6"><div className="flex items-end justify-between gap-4"><div><h2 className="font-heading text-xl">Find your balance</h2><p className="mt-2 text-sm text-slate-500">Quick responses or deeper thinking. Choose what matters to you.</p></div><Skeleton className="h-9 w-24 shrink-0 rounded-full" /></div><div className="mt-5"><div className="flex h-6 items-center"><Skeleton className="h-1.5 w-full" /></div><div className="mt-2 flex h-8 items-center justify-between">{[0,1,2,3,4].map(index => <Skeleton key={index} className="h-2 w-12" />)}</div></div></LoadingRegion><RecommendationsSkeleton /></> : <><div className={pageLayout.catalogToolbar}><h2 className="font-heading text-xl">{page === "models" ? "Your library" : "Explore the catalog"}</h2><Skeleton className="h-8 w-full max-w-sm" /></div>{page === "catalog" && <div className="mb-5 flex h-5 items-center justify-between"><Skeleton className="h-3 w-32" /><Skeleton className="h-3 w-28" /></div>}<ModelCardsSkeleton library={page === "models"} /></>}</>
+  return <><p className="mt-2 text-slate-500">{modelDescriptions[page]}</p>{page === "discover" ? <><HardwarePending /><RecommendationPreference /><RecommendationsSkeleton /></> : <><div className={pageLayout.catalogToolbar}><h2 className="font-heading text-xl">{page === "models" ? "Your library" : "Explore the catalog"}</h2><Skeleton className="h-8 w-full max-w-sm" /></div>{page === "catalog" && <div className="mb-5 flex h-5 items-center justify-between"><Skeleton className="h-3 w-32" /><Skeleton className="h-3 w-28" /></div>}<ModelCardsSkeleton library={page === "models"} /></>}</>
 }
 export function ConnectionsSkeleton() {
   return <LoadingRegion label="Loading connections" className="mt-7 space-y-8"><SkeletonLine className="mb-4 h-5 text-sm" width="180px" /><div className={pageLayout.harnessGrid}>{Array.from({length:8},(_,index) => <article className={pageLayout.harnessCard} key={index}><div className="flex flex-wrap items-center justify-between gap-4"><div className="flex min-w-0 items-center gap-3"><Skeleton className="size-14 shrink-0 rounded-2xl" /><div><SkeletonLine className="h-7 w-32 text-lg" /><SkeletonLine className="mt-1 h-5 w-28 text-sm" /></div></div><Skeleton className="h-8 w-24" /></div></article>)}</div></LoadingRegion>

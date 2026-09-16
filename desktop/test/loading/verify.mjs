@@ -23,7 +23,7 @@ for(const theme of ['light','dark']) for(const width of [800,1120,1600]) {
    if(name==='status') nodes=[...main.querySelectorAll('section')];
    if(name==='settings') nodes=[...main.querySelectorAll('h2')].map(n=>n.closest('section,[aria-busy]'));
    if(name==='catalog'||name==='models'||name==='connections') nodes=[main.querySelector('article')];
-   if(name==='discover') nodes=[main.querySelector('[aria-label="Your hardware"],[aria-label="Loading your hardware"]'),main.querySelector('[aria-label="Top recommendations"] > div,[aria-label="Loading recommendations"] > div')];
+   if(name==='discover') nodes=[main.querySelector('[aria-label="Your hardware"],[aria-label="Loading your hardware"],[aria-label="Detecting your hardware"]'),main.querySelector('[aria-label="Top recommendations"] > div,[aria-label="Loading recommendations"] > div[aria-hidden] > div')];
    return nodes.filter(Boolean).map(n=>{const b=n.getBoundingClientRect();return {x:b.x,y:b.y,width:b.width,height:b.height}})
   },name)
   const before=await stableFrames()
