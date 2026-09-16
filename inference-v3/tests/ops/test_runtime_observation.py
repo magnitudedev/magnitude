@@ -9,7 +9,7 @@ import pytest
 from ops.binding import MemorySource, SourceSpan
 from ops.runtime.memory import Limit, ReservationLedger
 from ops.runtime.observation import Activity, KernelActivity, ObservationStatus
-from ops.runtime.resources import Completion, DeviceRuntime, NativeSubmissionError
+from ops.runtime.resources import Completion, DeviceRuntime, NativeSubmissionError, NativeUpload
 from ops.tensor.types import DType, TensorSpec
 
 
@@ -63,6 +63,101 @@ class Runtime:
 
     def close(self):
         pass
+
+
+class UploadRuntime(Runtime):
+    def __init__(self, *, extra_bytes=0):
+        self.pending = NativeCompletion()
+        self.staging = Allocation(b"staging")
+        self.extra_bytes = extra_bytes
+        self.uploads = 0
+
+    def upload_async(self, spec, content):
+        self.uploads += 1
+        self.destination = Allocation(content + bytes(self.extra_bytes))
+        return NativeUpload(self.destination, self.pending, self.staging)
+
+
+def test_async_upload_pins_source_and_destination_after_output_is_abandoned():
+    runtime = UploadRuntime()
+    with DeviceRuntime(runtime, budget_bytes=32) as device:
+        execution = device.upload_async(TensorSpec((8,), DType.U8), b"abcdefgh")
+        execution.outputs[0].close()
+        assert device.allocated_bytes == 16
+        assert not execution.completion.done
+        assert not runtime.destination.closed and not runtime.staging.closed
+        device.drain()
+        assert runtime.destination.closed and runtime.staging.closed
+        assert device.allocated_bytes == 0
+        assert not device._submissions and not device._completions
+
+
+def test_async_upload_observation_requires_transfer_completion():
+    runtime = UploadRuntime()
+    with DeviceRuntime(runtime, budget_bytes=32) as device:
+        with pytest.raises(RuntimeError, match="before execution completed"):
+            with device.observe() as capture:
+                execution = device.upload_async(TensorSpec((8,), DType.U8), b"abcdefgh")
+        assert capture.result.status == ObservationStatus.INCOMPLETE
+        assert capture.result.completed_bytes(Activity.UPLOAD) == 0
+        assert not runtime.staging.closed
+        execution.completion.wait()
+        assert device.read(execution.outputs[0]) == b"abcdefgh"
+        assert device.allocated_bytes == 8
+        execution.outputs[0].close()
+
+
+def test_async_upload_charges_host_capacity_before_native_submission():
+    from ops.runtime.memory import CapacityError
+
+    runtime = UploadRuntime()
+    with DeviceRuntime(runtime, budget_bytes=12) as device:
+        with pytest.raises(CapacityError):
+            device.upload_async(TensorSpec((8,), DType.U8), b"abcdefgh")
+        assert runtime.uploads == 0
+        assert device.allocated_bytes == 0
+
+
+def test_joined_transfer_and_consumer_retire_every_completion_lease():
+    runtime = UploadRuntime()
+    with DeviceRuntime(runtime, budget_bytes=32) as device:
+        with device.observe() as capture:
+            transfer = device.upload_async(TensorSpec((8,), DType.U8), b"abcdefgh")
+            source = transfer.outputs[0]
+            submitted = device.submit_native(Entrypoint(), (source.native,))
+            consumer = Completion(device, submitted, (source.fork(),))
+            joined = Completion.join((transfer.completion, consumer))
+            source.close()
+            assert device.allocated_bytes == 16
+            assert not runtime.staging.closed and not runtime.destination.closed
+            joined.wait()
+            assert runtime.staging.closed and runtime.destination.closed
+            assert not device._submissions and not device._completions
+        assert capture.result.status == ObservationStatus.COMPLETE
+        assert capture.result.completed_bytes(Activity.UPLOAD) == 8
+        assert capture.result.memory.end_bytes == 0
+
+
+def test_invalid_async_upload_retains_ownership_when_drain_fails():
+    class FailedWait(NativeCompletion):
+        fail = True
+
+        def wait(self):
+            if self.fail:
+                raise RuntimeError("transfer drain failed")
+            super().wait()
+
+    runtime = UploadRuntime(extra_bytes=1)
+    runtime.pending = FailedWait()
+    with DeviceRuntime(runtime, budget_bytes=32) as device:
+        with pytest.raises(RuntimeError, match="transfer drain failed"):
+            device.upload_async(TensorSpec((8,), DType.U8), b"abcdefgh")
+        assert not runtime.staging.closed and not runtime.destination.closed
+        assert device.allocated_bytes == 16
+        runtime.pending.fail = False
+        device.drain()
+        assert runtime.staging.closed and runtime.destination.closed
+        assert device.allocated_bytes == 0
 
 
 class NativeCapture:

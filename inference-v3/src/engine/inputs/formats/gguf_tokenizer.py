@@ -9,9 +9,11 @@ from pathlib import Path
 from pydantic import TypeAdapter
 
 from engine.data import Record, TokenId
+from engine.inputs.formats.templates import directory_templates, gguf_templates
 from engine.inputs.tokenizer import BPEConfig, PieceKind
 from engine.weights.formats.gguf import GGUFFormat
 from engine.weights.formats.mlx_safetensors import MLXFormat
+from templates.bundle import TemplateBundle
 
 
 def qwen35_tokenizer(artifact: GGUFFormat) -> BPEConfig:
@@ -66,15 +68,15 @@ class TokenizerArtifact(Record):
     """Immutable tokenizer and chat metadata, without mapped-file ownership."""
 
     config: BPEConfig
-    chat_template: str
+    templates: TemplateBundle
 
     @classmethod
     def interpret(cls, artifact: GGUFFormat):
         config = qwen35_tokenizer(artifact)
-        template = artifact.directory.value("tokenizer.chat_template")
-        if not isinstance(template, str) or not template:
-            raise ValueError("GGUF must contain its chat template")
-        return cls(config=config, chat_template=template)
+        return cls(
+            config=config,
+            templates=gguf_templates(artifact.directory, provenance=artifact.identity),
+        )
 
     @classmethod
     def load(cls, path: Path):
@@ -141,8 +143,4 @@ def mlx_tokenizer(artifact: MLXFormat) -> TokenizerArtifact:
             TokenId(i) for i, piece in enumerate(pieces) if piece in ("<|im_end|>", "<|endoftext|>")
         ),
     )
-    with FileSource(artifact.path / "chat_template.jinja") as source:
-        template = source.read(0, source.size).decode("utf-8")
-    if not template:
-        raise ValueError("MLX artifact must contain its chat template")
-    return TokenizerArtifact(config=config, chat_template=template)
+    return TokenizerArtifact(config=config, templates=directory_templates(artifact.path))

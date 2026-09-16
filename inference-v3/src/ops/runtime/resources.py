@@ -33,6 +33,13 @@ class NativeCompletion(Protocol):
     def wait(self) -> None: ...
 
 
+@dataclass(frozen=True)
+class NativeUpload:
+    allocation: NativeAllocation
+    completion: NativeCompletion
+    staging: object
+
+
 class NativeSubmissionError(RuntimeError):
     """A launch failed after potentially submitting work; completion still owns it."""
 
@@ -80,6 +87,8 @@ class NativeRuntime(Protocol):
     def allocate(self, size: int, alignment: int) -> NativeAllocation: ...
 
     def upload(self, spec: TensorSpec, content: bytes) -> NativeAllocation: ...
+
+    def upload_async(self, spec: TensorSpec, content: bytes) -> NativeUpload: ...
 
     def download(self, value: Any) -> bytes: ...
 
@@ -309,6 +318,21 @@ class Completion:
         self._on_release = on_release
         self._released = False
         device._completions.add(self)
+
+    @classmethod
+    def join(cls, completions: tuple[Completion, ...]) -> Completion:
+        if not completions:
+            raise ValueError("completion join requires submitted work")
+        device = completions[0].device
+        if any(completion.device is not device for completion in completions):
+            raise ValueError("joined completions belong to different devices")
+        native = device.join(tuple(completion._native for completion in completions))
+
+        def release():
+            for completion in completions:
+                completion._release()
+
+        return cls(device, native, completions, release)
 
     def ready(self) -> bool:
         self.device._check_thread()
@@ -686,6 +710,63 @@ class DeviceRuntime:
         finally:
             if stage is not None:
                 stage.close()
+
+    def upload_async(self, spec: TensorSpec, content: bytes) -> Execution:
+        """Submit an ordered transfer with completion-owned staging and output.
+
+        Later device work may consume the output on the same execution domain.
+        The caller joins or waits for the transfer before considering its physical
+        boundary complete, including when it abandons the output without using it.
+        """
+        self._check()
+        if len(content) != spec.storage_nbytes:
+            raise ValueError("upload byte count differs from tensor specification")
+        from ..representations import Dense
+
+        packed = spec.representation is not None and not isinstance(spec.representation, Dense)
+        charge = (spec.storage_nbytes + 3) // 4 * 4 if packed else spec.storage_nbytes
+        if charge > self.maximum_allocation_bytes:
+            raise CapacityError(charge, self.maximum_allocation_bytes, constraint="maximum allocation")
+        reservation = self.memory.reserve(charge, self.domains)
+        stage = None
+        completion = None
+        try:
+            stage = self.memory.reserve(charge, self.host_domains)
+            with self.observations.span(
+                Activity.UPLOAD, source=tuple(sorted(self.host_domains)),
+                target=tuple(sorted(self.domains)), size=len(content),
+            ) as activity:
+                native = self.runtime.upload_async(spec, content)
+            tracked = _TrackedCompletion(self, native.completion)
+            allocation = _Allocation(self, native.allocation, spec.storage_nbytes, reservation)
+            transferred_bytes = len(content)
+
+            def completed():
+                if activity is not None:
+                    activity.complete_bytes(transferred_bytes)
+
+            completion = Completion(
+                self, tracked, (stage, native.staging, allocation.acquire()), completed
+            )
+            if native.allocation.allocated_bytes != charge:
+                raise RuntimeError("upload returned storage different from its reserved size")
+            lease = allocation.acquire()
+            try:
+                output = Resource(lease, spec)
+            except BaseException:
+                lease.close()
+                raise
+            return Execution((output,), completion)
+        except BaseException:
+            if completion is not None:
+                # If waiting itself fails, the registered completion continues
+                # to own the source, destination and reservations for a retry.
+                completion.wait()
+            else:
+                if stage is not None:
+                    stage.close()
+                reservation.close()
+            raise
 
     def read(self, resource: Resource, *, after: Completion | None = None) -> bytes:
         self._check()

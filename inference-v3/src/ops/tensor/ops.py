@@ -402,6 +402,54 @@ def sample(logits: Tensor, draws: Tensor) -> Tensor:
     return _emit("sample", logits, draws)
 
 
+def _constrained_sample_reference(inputs, _attrs):
+    logits, draws, masks, mask_rows = inputs
+    np = _np()
+    masked = logits.copy()
+    for row, mask_row in enumerate(mask_rows):
+        if mask_row < -1 or mask_row >= len(masks):
+            masked[row] = np.nan
+            continue
+        if mask_row >= 0:
+            allowed = np.asarray([
+                bool(int(masks[mask_row, token // 32]) & (1 << (token % 32)))
+                for token in range(logits.shape[1])
+            ])
+            masked[row, ~allowed] = -np.inf
+    result = _sample_reference(masked, draws)
+    # Masking cannot turn an invalid source distribution into a valid one.
+    result[np.any(np.isnan(logits) | np.isposinf(logits), axis=1)] = (-1, 2)
+    return (result,)
+
+
+@primitive(
+    "sample_constrained",
+    work=useful.constrained_sampling,
+    reference=_constrained_sample_reference,
+    tags=frozenset({"sampling", "host-output"}),
+    host_observation=True,
+)
+def _sample_constrained(inputs, _attrs):
+    _one(inputs, 4, "sample_constrained")
+    logits, draws, masks, mask_rows = inputs
+    output = _sample((logits, draws), {})
+    if (masks.rank != 2 or masks.dtype != DType.U32
+            or masks.shape[1] != (logits.shape[1] + 31) // 32
+            or mask_rows != TensorSpec((logits.shape[0],), DType.I32)):
+        raise ValueError("constrained sampling requires packed uint32 masks and signed row indices")
+    return output
+
+
+@formula(id="sample_constrained", version=1)
+def sample_constrained(logits: Tensor, draws: Tensor, masks: Tensor, mask_rows: Tensor) -> Tensor:
+    """Sample allowed logits; -1 mask rows preserve ordinary selection.
+
+    Each mask bit denotes one vocabulary ID. Unset logits are negative infinity
+    for selection. NaN/positive infinity in the original row still fail that row.
+    """
+    return _emit("sample_constrained", logits, draws, masks, mask_rows)
+
+
 def _sample_reference(logits, draws):
     np = _np()
     output = np.empty((logits.shape[0], 2), dtype=np.int32)

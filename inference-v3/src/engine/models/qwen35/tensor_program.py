@@ -44,6 +44,8 @@ class InvocationSpecs:
     feature_rows: tuple[ops.TensorSpec, ...] = ()
     recurrent_sequence_length: int | None = None
     packed_controls: bool = False
+    masks: ops.TensorSpec | None = None
+    mask_rows: ops.TensorSpec | None = None
 
     def __post_init__(self) -> None:
         if self.packed_controls and (self.features or self.feature_rows
@@ -72,11 +74,19 @@ class InvocationSpecs:
         ):
             raise ValueError("Qwen output rows must be one-dimensional integer indices")
         output_rows = self.output_rows
-        if (output_rows is None) != (self.draws is None) or (
-            output_rows is not None
-            and self.draws != ops.TensorSpec((output_rows.shape[0], 6), ops.DType.U32)
+        if self.draws is not None and (
+            output_rows is None
+            or self.draws != ops.TensorSpec((output_rows.shape[0], 6), ops.DType.U32)
         ):
             raise ValueError("Qwen draw rows must exactly match selected output rows")
+        if (self.masks is None) != (self.mask_rows is None) or (
+            self.masks is not None and (
+                output_rows is None or self.draws is None
+                or self.masks.rank != 2 or self.masks.dtype != ops.DType.U32
+                or self.mask_rows != ops.TensorSpec((output_rows.shape[0],), ops.DType.I32)
+            )
+        ):
+            raise ValueError("selection masks and output row mapping must be paired")
         if len(self.features) != len(self.feature_rows) or any(
             value.rank != 2
             or value.dtype != ops.DType.F32
@@ -93,7 +103,11 @@ class InvocationSpecs:
         if self.recurrent_offsets is not None:
             fields.append(self.recurrent_offsets)
         if self.output_rows is not None:
-            fields.extend((self.output_rows, cast(ops.TensorSpec, self.draws)))
+            fields.append(self.output_rows)
+        if self.draws is not None:
+            fields.append(self.draws)
+        if self.masks is not None:
+            fields.extend((self.masks, cast(ops.TensorSpec, self.mask_rows)))
         if self.destinations:
             fields.extend((self.destinations[0], self.visible[0]))
         return tuple(fields)
@@ -244,7 +258,11 @@ def define(
         arguments.append(ops.Argument(specs.recurrent_offsets, "recurrent_offsets"))
     if specs.output_rows is not None:
         arguments.append(ops.Argument(specs.output_rows, "output_rows"))
-        arguments.append(ops.Argument(cast(ops.TensorSpec, specs.draws), "draws"))
+    if specs.draws is not None:
+        arguments.append(ops.Argument(specs.draws, "draws"))
+    if specs.masks is not None:
+        arguments.append(ops.Argument(specs.masks, "masks"))
+        arguments.append(ops.Argument(cast(ops.TensorSpec, specs.mask_rows), "mask_rows"))
     arguments.extend(
         ops.Argument(spec, f"feature.{index}.rows") for index, spec in enumerate(specs.feature_rows)
     )
@@ -270,6 +288,10 @@ def define(
         cursor += specs.output_rows is not None
         draws = args[cursor] if specs.draws is not None else None
         cursor += specs.draws is not None
+        masks = args[cursor] if specs.masks is not None else None
+        cursor += specs.masks is not None
+        mask_rows = args[cursor] if specs.mask_rows is not None else None
+        cursor += specs.mask_rows is not None
         feature_rows = tuple(args[cursor:])
         feature_values = tuple(
             bound[f"feature.{index}.values"] for index in range(len(specs.features))
@@ -311,7 +333,12 @@ def define(
         if draws is None:
             return result
         outputs = cast(tuple[ops.Tensor, ...], result)
-        return outputs[0], ops.sample(outputs[0], draws), *outputs[1:]
+        if masks is None:
+            sampled = ops.sample(outputs[0], draws)
+        else:
+            assert mask_rows is not None
+            sampled = ops.sample_constrained(outputs[0], draws, masks, mask_rows)
+        return outputs[0], sampled, *outputs[1:]
 
     return ProgramDefinition(
         function,

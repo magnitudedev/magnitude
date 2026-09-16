@@ -211,8 +211,10 @@ Its public typed materialization preserves every signed-index and random-draw
 bit, owns its output storage, and remains inside the measured invocation. Fields
 shared across layer consumers need materialization only once; mutable model state
 retains its ordinary resource and completion ownership.
-Report preparation and submission-through-completion time separately so reducing
-host preparation cannot masquerade as faster numerical kernels.
+Report host preparation and completion intervals explicitly so reducing host
+preparation cannot masquerade as faster numerical kernels. When preparation
+overlaps submitted device work, phase wall time counts the interval union once;
+the post-preparation completion interval alone is not numerical execution time.
 
 Kernel composition uses public Python-native TileLang construction, not generated
 source, AST fabrication or direct TIR manipulation. Physical storage planning
@@ -226,6 +228,11 @@ allocation. Shared backing is charged once; aliases and leases do not allocate
 again. Retain resources until every submitted consumer completes. Cancellation
 stops future work and drains submitted work before reclaiming its storage.
 Physical completion does not imply logical acceptance of a prefix advance.
+Asynchronous transfers retain and charge source staging and destination storage
+through their completion, including when an unused output is abandoned. Ordered
+device consumers need no intervening host wait; completed observations still
+require the transfer to drain. A completion marker starts pending work without
+waiting, allowing independent host preparation to overlap device execution.
 
 A failed composite launch may already have submitted earlier kernels. Its failure
 carries completion ownership; enclosing invocations and streamed tile scopes keep

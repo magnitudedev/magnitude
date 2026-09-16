@@ -53,9 +53,24 @@ class NamedChoice(Record):
     function: NamedFunction
 
 
-class TemplateOptions(Record):
-    enable_thinking: bool = False
-    add_vision_id: bool = False
+class TextFormat(Record):
+    type: Literal["text"] = "text"
+
+
+class ObjectFormat(Record):
+    type: Literal["json_object"]
+
+
+class SchemaDefinition(Record):
+    name: str = Field(min_length=1)
+    description: str | None = None
+    schema_: dict[str, JsonValue] = Field(alias="schema")
+    strict: bool = True
+
+
+class SchemaFormat(Record):
+    type: Literal["json_schema"]
+    json_schema: SchemaDefinition
 
 
 class StreamOptions(Record):
@@ -68,7 +83,13 @@ class ChatRequest(Record):
     tools: list[Tool] = Field(default_factory=list, max_length=512)
     tool_choice: Literal["auto", "required", "none"] | NamedChoice = "auto"
     parallel_tool_calls: bool = True
-    chat_template_kwargs: TemplateOptions = TemplateOptions()
+    chat_template_kwargs: dict[str, JsonValue] = Field(default_factory=dict)
+    reasoning_effort: (
+        Literal["none", "minimal", "low", "medium", "high", "xhigh", "max", "adaptive"] | None
+    ) = None
+    response_format: TextFormat | ObjectFormat | SchemaFormat = Field(
+        default_factory=TextFormat, discriminator="type"
+    )
     max_tokens: int | None = Field(default=None, ge=0, le=0x7FFFFFFF)
     max_completion_tokens: int | None = Field(default=None, ge=0, le=0x7FFFFFFF)
     temperature: float = Field(default=1.0, ge=0, allow_inf_nan=False)
@@ -129,5 +150,5 @@ class ChatRequest(Record):
                 "distribution transformations are not implemented; "
                 "use temperature 0 or 1 with unmodified logits"
             )
-        if self.tool_choice not in ("auto", "none"):
-            raise ValueError("required/named tool constraints are not implemented")
+        if self.response_format.type != "text" and self.tools and self.tool_choice != "none":
+            raise ValueError("JSON response formats cannot be combined with offered tools")

@@ -3,7 +3,8 @@ from engine.data import TokenId
 from engine.models.qwen35.inputs import InputPlan
 from engine.models.qwen35.runtime import DenseRuntime
 from engine.models.sequence import LogitsSelection, ModelRequest
-from tests.models.test_qwen35_tensor_program import Residency, _description
+from tests.models.test_qwen35_tensor_program import Residency
+from tests.models.test_forced_advance_numerics import description as _description
 from tests.ops.test_compiler import Runtime
 
 
@@ -99,7 +100,7 @@ def test_mixed_length_prefill_batch_uses_explicit_recurrent_row_offsets():
     device.close()
 
 
-def test_prefill_uses_reusable_physical_row_capacity():
+def test_prefill_uses_bounded_reusable_row_buckets():
     native = Runtime()
     device = ops.DeviceRuntime(native, budget_bytes=1 << 24)
     residency = ModelResidency(device)
@@ -118,7 +119,7 @@ def test_prefill_uses_reusable_physical_row_capacity():
     )
     programs = len(native.programs)
     assert any(
-        parameter.spec == ops.TensorSpec((4,), ops.DType.I32)
+        parameter.spec == ops.TensorSpec((2,), ops.DType.I32)
         for parameter in native.programs[-1].parameters
     )
     first_batch.completion.wait()
@@ -136,12 +137,13 @@ def test_prefill_uses_reusable_physical_row_capacity():
             ),
         )
     )
-    assert len(native.programs) == programs
+    assert len(native.programs) > programs
+    assert {specs.tokens.shape[0] for _, specs, _ in model.program._compiled} == {2, 4}
     second_batch.completion.wait()
     second_batch.close()
     second.close()
 
-    assert all(specs.recurrent_sequence_length is None for _, specs, _ in model.program._compiled)
+    assert {specs.recurrent_sequence_length for _, specs, _ in model.program._compiled} == {None, 2}
     for repeat in range(2):
         tokens = (TokenId(1), TokenId(2), TokenId(3), TokenId(4))
         full = model.create(InputPlan.text(tokens))
@@ -182,7 +184,7 @@ def test_runtime_allocates_only_configured_context_capacity():
     )
 
     assert model.context_capacity == 8
-    assert model.states.attention[0].spec.shape == (2, 24, 1, 4)
+    assert model.states.attention[0].spec.shape == (24, 1, 64)
 
     model.close()
     for resource in residency.resources:
@@ -205,10 +207,11 @@ def test_prime_materializes_state_prefill_logits_prefill_and_decode():
 
     model.prime(4, 8)
 
-    assert len(native.programs) == 5
+    assert len(native.programs) == 12
+    assert len(model._samplers) == 1
     assert {(mode, specs.recurrent_sequence_length)
             for mode, specs, _ in model.program._compiled} == {
-        ("prefill", 4), ("prefill", None), ("decode", None),
+        ("prefill", 2), ("prefill", 4), ("prefill", None), ("decode", None),
     }
     model.close()
     for resource in residency.resources:

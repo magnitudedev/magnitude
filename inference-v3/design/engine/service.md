@@ -24,6 +24,11 @@ completion, and drains output. Idle service does nothing until something changes
 Under contention (both prefill and decode candidates exist) decode runs first,
 then prefill accrues **decode debt** at the configured share `s`:
 
+Phase cost includes preparation through observed completion. Preparation can
+overlap numerical execution, so it cannot be discarded when charging time or
+ranking accumulated service. Reported preparation and the remaining completion
+interval partition that wall time; neither is a native GPU duration.
+
 ```text
 prefill lasting p:   debt += p × s / (1 − s)
 decode lasting d:    debt −= d
@@ -50,7 +55,7 @@ releasable bytes, never tensor layouts or allocation kinds:
 |---|---|
 | Reclaim: ask owners to retire unclaimed temporary capacity and idle caches | Nothing already paid for |
 | Drop the last selected request from the batch | That request waits a step |
-| Halve the prefill allowance | Smaller chunks repeat execution overhead |
+| Halve the actual multi-token allowance, including forced decode | Smaller chunks repeat execution overhead |
 | Evict victims priced by the model | Their prompts are replayed |
 | Block until the service epoch changes | Wait for a peer to finish, publish or cancel |
 | Fail with the required and available bytes | Nothing else can change the answer |

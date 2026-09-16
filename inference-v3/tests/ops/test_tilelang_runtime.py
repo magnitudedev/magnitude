@@ -32,6 +32,49 @@ class _QuantizedFormat:
 
 
 @pytest.mark.device
+@pytest.mark.parametrize("asynchronous_upload", [False, True])
+def test_metal_submission_progresses_without_a_host_wait(asynchronous_upload):
+    import time
+
+    if not torch.backends.mps.is_available():
+        pytest.skip("completion progress integration check requires MPS")
+    with ops.DeviceRuntime.open(
+        DevicePlan.discover(backend="metal", maximum_bytes=1 << 20)
+    ) as device:
+        spec = ops.TensorSpec((32,), ops.DType.F32)
+        expected = np.arange(32, dtype=np.float32)
+        transfer = device.upload_async(spec, expected.tobytes()) if asynchronous_upload else None
+        source = (transfer.outputs[0] if transfer is not None
+                  else device.upload(spec, expected.tobytes()))
+        compiled = execution = None
+        try:
+            compiled = ops.compile(
+                lambda value: ops.add(value, value),
+                signature=ops.Signature((ops.Argument(spec, "source"),)),
+                device=device, constants={}, options=ops.CompileOptions(mode="decode"),
+            )
+            execution = compiled.submit(source)
+            source.close()  # The submitted work retains its own input lease.
+            deadline = time.monotonic() + 10
+            while not execution.completion.done and time.monotonic() < deadline:
+                time.sleep(0.001)
+            assert execution.completion.done, "submission did not progress without a wait"
+            np.testing.assert_array_equal(
+                np.frombuffer(device.read(execution.outputs[0]), np.float32), expected * 2
+            )
+        finally:
+            if execution is not None:
+                execution.completion.wait()
+                for output in execution.outputs:
+                    output.close()
+            if transfer is not None:
+                transfer.completion.wait()
+            if compiled is not None:
+                compiled.close()
+            source.close()
+
+
+@pytest.mark.device
 def test_cuda_detected_target_compiles_and_executes_shared_memory_normalization():
     if not torch.cuda.is_available():
         pytest.skip("CUDA normalization integration check requires CUDA")

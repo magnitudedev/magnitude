@@ -13,6 +13,7 @@ class ServiceLimits(Blueprint[Limits]):
     max_requests: int = 128
     max_batch: int = 8
     prefill_tokens: int = 512
+    decode_tokens: int = 32
     decode_share: float = 0.5
     locality_seconds: float = 0.05
 

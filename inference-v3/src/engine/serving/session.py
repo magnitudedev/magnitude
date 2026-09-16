@@ -9,11 +9,12 @@ from engine.generation.plain import FinishReason, Options
 from engine.operations.sampling import SamplingSeed, SelectionKind
 from engine.platform.host.worker import Worker
 from engine.service.engine import Snapshot
-from engine.serving.parsing import OutputParser, TextDelta, ToolCall
-from engine.serving.requests import ChatRequest
+from engine.serving.requests import ChatRequest, SchemaFormat
 from engine.serving.runtime import Config, Runtime, ServerProperties, open_runtime
 from engine.serving.template import ChatTemplate, PreparedChat
 from engine.serving.text import StopText
+from engine.serving.metrics import PreparationMetrics, ParsingMetrics
+from templates.events import ContentDelta, ReasoningDelta, ToolArguments, ToolComplete, ToolStart
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,8 @@ class ChatFinished:
     prompt_tokens: int
     native: Snapshot
     string_stop: str | None
+    preparation: PreparationMetrics = PreparationMetrics()
+    parsing: ParsingMetrics = ParsingMetrics()
 
 
 class ChatService:
@@ -37,7 +40,9 @@ class ChatService:
         try:
             await asyncio.shield(asyncio.wrap_future(worker.ready))
             ready = await asyncio.wrap_future(worker.call(lambda owner: owner.ready))
-            template = ChatTemplate(ready.tokenizer)
+            template = ChatTemplate(
+                ready.tokenizer, variant=config.template_variant, override=config.template_override
+            )
             return cls(worker, ready.properties, template)
         except BaseException:
             await asyncio.to_thread(worker.close)
@@ -50,15 +55,26 @@ class ChatService:
             tools=body.tools,
             tool_choice=body.tool_choice,
             parallel_tool_calls=body.parallel_tool_calls,
-            chat_template_kwargs=body.chat_template_kwargs.model_dump(),
+            chat_template_kwargs=body.chat_template_kwargs,
+            reasoning_effort=body.reasoning_effort,
+            json_schema=(
+                body.response_format.json_schema.schema_
+                if isinstance(body.response_format, SchemaFormat)
+                else {"type": "object"}
+                if body.response_format.type == "json_object"
+                else None
+            ),
         )
         if len(prompt.tokens) > self.properties.context_tokens:
+            prompt.close()
             raise ValueError("rendered prompt exceeds the configured context limit")
         return prompt
 
     async def events(
         self, body: ChatRequest, prompt: PreparedChat
-    ) -> AsyncGenerator[TextDelta | ToolCall | ChatFinished, None]:
+    ) -> AsyncGenerator[
+        ContentDelta | ReasoningDelta | ToolStart | ToolArguments | ChatFinished, None
+    ]:
         options = Options(
             max_tokens=min(
                 body.output_limit, self.properties.context_tokens - len(prompt.tokens) + 1
@@ -67,17 +83,21 @@ class ChatService:
             selection=SelectionKind.GREEDY if body.temperature == 0 else SelectionKind.CATEGORICAL,
             seed=SamplingSeed(body.seed),
             output_capacity=self.properties.output_capacity,
+            forced_quantum=self.properties.forced_quantum,
         )
-        admission = asyncio.wrap_future(
-            self.worker.call(lambda owner: owner.admit(prompt.tokens, options))
-        )
+        admission = None
         identity = None
-        decoder = self.template.tokenizer.decoder(skip_control=False)
-        parser = OutputParser(
-            prompt.format, prompt.tools, reasoning_prefilled=prompt.reasoning_prefilled
-        )
-        stops = StopText(body.stops)
+        parser = None
+        calls_completed = False
         try:
+            decoder = self.template.tokenizer.decoder(skip_control=False)
+            parser = prompt.native.stream()
+            stops = StopText(body.stops + prompt.native.description.additional_stops)
+            admission = asyncio.wrap_future(
+                self.worker.call(
+                    lambda owner: owner.admit(prompt.tokens, options, prompt.constraint)
+                )
+            )
             # A cancelled await must not orphan an admission that already began.
             identity = await asyncio.shield(admission)
             request_id = identity
@@ -94,8 +114,13 @@ class ChatService:
                         raise RuntimeError(
                             f"tokenizer cannot decode model token {int(item.token)}"
                         ) from error
-                    for event in parser.feed(stops.feed(decoded)):
-                        yield event
+                    for event in parser.feed(stops.feed(decoded).encode("utf-8")):
+                        if isinstance(event, ToolComplete):
+                            calls_completed = True
+                        if isinstance(
+                            event, (ContentDelta, ReasoningDelta, ToolStart, ToolArguments)
+                        ):
+                            yield event
                 if stops.matched is not None:
                     state = await asyncio.wrap_future(
                         self.worker.call(lambda owner: owner.stop(request_id))
@@ -115,14 +140,36 @@ class ChatService:
                         else "length"
                     )
                     tail = stops.feed(decoder.finish(), final=True)
-                    for event in parser.feed(tail, final=True, truncated=reason == "length"):
-                        yield event
-                    if parser.call_index:
-                        reason = "tool_calls" if reason == "stop" else reason
-                    yield ChatFinished(reason, len(prompt.tokens), state, stops.matched)
+                    cause = (
+                        "user_stop"
+                        if stops.matched in body.stops
+                        else "length"
+                        if reason == "length"
+                        else "natural"
+                    )
+                    for event in parser.feed(tail.encode("utf-8")) + parser.finish(cause):
+                        if isinstance(event, ToolComplete):
+                            calls_completed = True
+                        if isinstance(
+                            event, (ContentDelta, ReasoningDelta, ToolStart, ToolArguments)
+                        ):
+                            yield event
+                    if calls_completed and cause == "natural":
+                        reason = "tool_calls"
+                    yield ChatFinished(
+                        reason, len(prompt.tokens), state, stops.matched, prompt.metrics,
+                        ParsingMetrics(
+                            elapsed_ns=parser.elapsed_ns,
+                            input_bytes=parser.input_bytes,
+                            calls=parser.calls,
+                        ),
+                    )
                     return
         finally:
-            if identity is None:
+            if parser is not None:
+                parser.close()
+            prompt.close()
+            if identity is None and admission is not None:
                 try:
                     identity = await asyncio.shield(admission)
                 except Exception:

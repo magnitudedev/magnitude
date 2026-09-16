@@ -179,6 +179,28 @@ def sampling(inputs, attrs, outputs, *, values=None):
                 comparisons=comparisons, integer=101 * randomized)
 
 
+def constrained_sampling(inputs, attrs, outputs, *, values=None):
+    if values is None or any(value is None for value in values):
+        raise ValueError("constrained sampling requires concrete distributions and masks")
+    import numpy as np
+
+    logits, draws, masks, mask_rows = values
+    masked = logits.copy()
+    for row, mask_row in enumerate(mask_rows):
+        if mask_row < -1 or mask_row >= len(masks):
+            masked[row] = np.nan
+            continue
+        if mask_row >= 0:
+            for token in range(logits.shape[1]):
+                if not int(masks[mask_row, token // 32]) & (1 << (token % 32)):
+                    masked[row, token] = -np.inf
+    invalid = np.any(np.isnan(logits) | np.isposinf(logits), axis=1)
+    masked[invalid] = np.nan
+    membership_tests = int(np.sum((mask_rows >= 0) & (mask_rows < len(masks)))) * logits.shape[1]
+    return (sampling(inputs[:2], attrs, outputs, values=(masked, draws))
+            + work(integer=membership_tests, comparisons=membership_tests))
+
+
 @dataclass(frozen=True, slots=True)
 class FormulaWork:
     work: UsefulWork

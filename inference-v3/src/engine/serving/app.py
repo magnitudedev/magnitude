@@ -7,13 +7,13 @@ from contextlib import aclosing, asynccontextmanager
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
-from jinja2 import TemplateError
 
 from engine.platform.host.worker import WorkerUnavailable
 from engine.serving.requests import ChatRequest
 from engine.serving.responses import ChatResponse, sse
 from engine.serving.runtime import Config
 from engine.serving.session import ChatFinished, ChatService
+from templates import NativeError
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +49,10 @@ def create_app(config: Config) -> FastAPI:
     async def health():
         service = ready()
         await asyncio.wrap_future(service.worker.call(lambda owner: None))
-        return service.properties.model_dump(mode="json")
+        return {
+            **service.properties.model_dump(mode="json"),
+            "templates": await asyncio.to_thread(service.template.describe),
+        }
 
     @app.get("/v1/models")
     async def models():
@@ -65,7 +68,7 @@ def create_app(config: Config) -> FastAPI:
             return JSONResponse(error_payload("requested model is not loaded"), status_code=404)
         try:
             prompt = await asyncio.to_thread(service.prepare, body)
-        except (ValueError, TypeError, TemplateError) as error:
+        except (ValueError, TypeError, NativeError) as error:
             return JSONResponse(error_payload(str(error)), status_code=400)
         response = ChatResponse(body.model)
 
@@ -85,6 +88,8 @@ def create_app(config: Config) -> FastAPI:
                 logger.exception("streaming generation failed")
                 yield sse(error_payload(str(error), "server_error"))
                 yield sse("[DONE]")
+            finally:
+                prompt.close()
 
         if body.stream:
             return StreamingResponse(
@@ -102,6 +107,8 @@ def create_app(config: Config) -> FastAPI:
             return JSONResponse(error_payload(str(error)), status_code=400)
         except RuntimeError as error:
             return JSONResponse(error_payload(str(error), "server_error"), status_code=500)
+        finally:
+            prompt.close()
         return JSONResponse(error_payload("generation ended without completion"), status_code=500)
 
     return app

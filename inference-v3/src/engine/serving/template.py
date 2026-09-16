@@ -1,53 +1,125 @@
-"""Artifact-owned rendering, independent of numerical execution and scheduling."""
+"""One native preparation owns prompt, parser, constraints and template identity."""
 
 import json
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
+from time import time, perf_counter_ns
 from typing import Literal
 
-from jinja2 import TemplateError
-from jinja2.sandbox import ImmutableSandboxedEnvironment
 from pydantic import TypeAdapter
 
 from engine.data import TokenId
+from engine.generation.constraints import ConstraintPlan
 from engine.inputs.formats.gguf_tokenizer import TokenizerArtifact
 from engine.inputs.tokenizer import ByteBPETokenizer
-from engine.serving.formats import ChatFormat
-from engine.serving.requests import Message, NamedChoice, TemplateOptions, Tool
+from engine.serving.requests import Message, NamedChoice, Tool
 from engine.serving.tool_choice import select_tools
+from engine.serving.metrics import PreparationMetrics
+from templates import Template
+from templates.bundle import Variant
+from templates.native import PreparedRequest
+from templates.reasoning import REASONING_CONTROLS, ReasoningProfile, inspect_reasoning
 
 
 @dataclass(frozen=True)
 class PreparedChat:
     text: str
     tokens: tuple[TokenId, ...]
-    format: ChatFormat
-    tools: list[dict]
-    reasoning_prefilled: bool
+    native: PreparedRequest
+    constraint: ConstraintPlan | None
+    variant: Variant
+    profile: ReasoningProfile
+    metrics: PreparationMetrics
+
+    def close(self) -> None:
+        self.native.close()
 
 
 class ChatTemplate:
-    def __init__(self, artifact: TokenizerArtifact):
+    def __init__(
+        self,
+        artifact: TokenizerArtifact,
+        *,
+        variant: str | None = None,
+        override: Variant | None = None,
+    ):
         self.artifact = artifact
         self.tokenizer = ByteBPETokenizer(artifact.config)
-        environment = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+        self.variant, self.override = variant, override
+        self._lock = threading.RLock()
+        self._closed = False
+        self._templates: dict[str, Template] = {}
+        self._profiles: OrderedDict[tuple[str, str], tuple[ReasoningProfile, int]] = OrderedDict()
+        self._profile_bytes = 0
+        # Validate configured selection even before the first request.
+        artifact.templates.select(tools_offered=False, variant=variant, override=override)
 
-        def reject(message):
-            raise TemplateError(message)
+    def describe(self) -> dict:
+        """Report profiles per effective selection, never a union of capabilities."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("chat template is closed")
+            profiles = {}
+            for offered in (False, True):
+                variant, template, profile, _ = self._selected(offered)
+                profiles[variant.name] = {
+                    "provenance": variant.provenance,
+                    "identity": template.identity,
+                    "reasoning": profile.model_dump(mode="json"),
+                    "reasoning_fingerprint": profile.fingerprint,
+                    "native_capabilities": template.capabilities(),
+                }
+            return {
+                "bundle_fingerprint": self.artifact.templates.fingerprint,
+                "available_variants": [
+                    variant.name for variant in self.artifact.templates.variants
+                ],
+                "profiles": profiles,
+            }
 
-        def tojson(value, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
-            return json.dumps(
-                value,
-                ensure_ascii=ensure_ascii,
-                indent=indent,
-                separators=separators,
-                sort_keys=sort_keys,
-                allow_nan=False,
+    def _selected(self, tools_offered, arguments=None):
+        selected = self.artifact.templates.select(
+            tools_offered=tools_offered, variant=self.variant, override=self.override
+        )
+        create_ns = probe_ns = 0
+        if selected.name not in self._templates:
+            started = perf_counter_ns()
+            self._templates[selected.name] = Template(
+                selected.source,
+                special_tokens={
+                    token.name: token.text for token in self.artifact.templates.special_tokens
+                },
             )
-
-        environment.filters["tojson"] = tojson
-        environment.globals["raise_exception"] = reject
-        self._template = environment.from_string(artifact.chat_template)
-        self.format = ChatFormat("xml", "<tool_call>", "</tool_call>", "<think>", "</think>")
+            create_ns = perf_counter_ns() - started
+        template = self._templates[selected.name]
+        context = {
+            name: value
+            for name, value in (arguments or {}).items()
+            if name not in REASONING_CONTROLS
+        }
+        context_json = json.dumps(context, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        key = template.identity, context_json
+        hit = key in self._profiles
+        if hit:
+            self._profiles.move_to_end(key)
+            profile = self._profiles[key][0]
+        else:
+            started = perf_counter_ns()
+            profile = inspect_reasoning(template, template_arguments=context)
+            probe_ns = perf_counter_ns() - started
+            size = len(context_json.encode()) + len(profile.model_dump_json().encode())
+            if size <= 1024 * 1024:
+                while self._profiles and (
+                    len(self._profiles) >= 16 or self._profile_bytes + size > 1024 * 1024
+                ):
+                    _, (_, removed) = self._profiles.popitem(last=False)
+                    self._profile_bytes -= removed
+                self._profiles[key] = profile, size
+                self._profile_bytes += size
+        return selected, template, profile, PreparationMetrics(
+            template_create_ns=create_ns, effort_probe_ns=probe_ns, profile_cache_hit=hit
+        )
 
     def render(
         self,
@@ -57,15 +129,15 @@ class ChatTemplate:
         tool_choice: Literal["auto", "required", "none"] | NamedChoice = "auto",
         parallel_tool_calls=True,
         chat_template_kwargs=None,
+        reasoning_effort=None,
+        json_schema=None,
+        now: int | None = None,
     ) -> PreparedChat:
-        # Serialization here is an explicit wire normalization, not mutation of
-        # caller-owned history. Typed public messages also share this route.
         messages = TypeAdapter(list[Message]).validate_python(messages)
         tools = TypeAdapter(list[Tool]).validate_python([] if tools is None else tools)
-        options = TemplateOptions.model_validate(chat_template_kwargs or {})
         normalized = [message.model_dump(mode="json", exclude_none=True) for message in messages]
         for message in normalized:
-            content = message["content"] if "content" in message else ""
+            content = message.get("content", "")
             message["content"] = (
                 "".join(part["text"] for part in content) if isinstance(content, list) else content
             )
@@ -90,19 +162,64 @@ class ChatTemplate:
             else tool_choice
         )
         selection = select_tools(offered, choice)
-        normalized = selection.instruct(normalized, parallel=parallel_tool_calls)
-        text = self._template.render(
-            messages=normalized,
-            tools=list(selection.tools),
-            add_generation_prompt=True,
-            **options.model_dump(),
-        )
-        tokens = self.tokenizer.encode(text)
-        if not tokens:
-            raise ValueError("chat template produced no input tokens")
-        return PreparedChat(
-            text, tokens, self.format, list(selection.tools), text.endswith("<think>\n")
-        )
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("chat template is closed")
+            arguments = dict(chat_template_kwargs or {})
+            variant, template, profile, metrics = self._selected(bool(selection.tools), arguments)
+            reasoning_controls = {
+                control.name for mapping in profile.mappings for control in mapping.controls
+            }
+            if reasoning_effort is not None and reasoning_controls.intersection(arguments):
+                raise ValueError("reasoning_effort conflicts with raw template reasoning controls")
+            arguments.update(profile.resolve(reasoning_effort))
+            started = perf_counter_ns()
+            native = template.prepare(
+                normalized,
+                tools=list(selection.tools),
+                tool_choice="required" if selection.required else "auto",
+                parallel_tool_calls=parallel_tool_calls,
+                template_arguments=arguments,
+                json_schema=json_schema,
+                now=int(time()) if now is None else now,
+            )
+            rendered = perf_counter_ns()
+            try:
+                description = native.description
+                tokens = self.tokenizer.encode(description.prompt)
+                tokenized = perf_counter_ns()
+                if not tokens:
+                    raise ValueError("chat template produced no input tokens")
+                constraint = (
+                    ConstraintPlan(
+                        artifact_identity=self.artifact.config.artifact_identity,
+                        template_identity=template.identity,
+                        grammar=description.grammar,
+                        initial_prefix=description.grammar_initial_prefix,
+                    )
+                    if description.grammar
+                    else None
+                )
+                if (selection.required or json_schema is not None) and constraint is None:
+                    raise ValueError(
+                        "selected template did not produce required output constraints"
+                    )
+                return PreparedChat(
+                    description.prompt, tokens, native, constraint, variant, profile,
+                    metrics.model_copy(update={
+                        "render_ns": rendered - started,
+                        "tokenize_ns": tokenized - rendered,
+                    }),
+                )
+            except BaseException:
+                native.close()
+                raise
 
     def close(self) -> None:
-        pass
+        with self._lock:
+            self._closed = True
+            for template in self._templates.values():
+                template.close()
+            self._templates.clear()
+            self._profiles.clear()
+            self._profile_bytes = 0

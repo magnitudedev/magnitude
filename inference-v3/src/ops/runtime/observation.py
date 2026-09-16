@@ -158,6 +158,18 @@ class _Span(AbstractContextManager):
         self._size, self._offset = size, offset
         self._source_info = source_info
         self.bytes_completed: int | None = None
+        self._record_index: int | None = None
+
+    def complete_bytes(self, size: int) -> None:
+        """Attach transfer completion without extending its host API interval.
+
+        An already finalized incomplete capture remains historical evidence;
+        a later drain cannot turn it into a completed measurement.
+        """
+        self.bytes_completed = size
+        if self._record_index is not None and self._capture._result is None:
+            record = self._capture._activities[self._record_index]
+            self._capture._activities[self._record_index] = replace(record, bytes_completed=size)
 
     def __enter__(self) -> _Span:
         capture = self._capture
@@ -172,6 +184,7 @@ class _Span(AbstractContextManager):
         finished = perf_counter_ns()
         capture = self._capture
         capture._stack.pop()
+        self._record_index = len(capture._activities)
         capture._activities.append(HostActivity(
             self._index, self._parent, self._kind,
             self._started - capture._started, finished - self._started,

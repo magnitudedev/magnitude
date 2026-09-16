@@ -48,6 +48,11 @@ Logical acceptance is separate. Magnitude may abort a candidate advance after
 its device work completes; Ops still fulfilled and retired the physical
 execution correctly.
 
+An asynchronous transfer retains both source staging and destination capacity
+until completion, even when its output is abandoned. Ordered device consumers
+can use that output without a host wait. Completion markers start queued work
+without waiting so independent host preparation can overlap device execution.
+
 ## Compiled callables
 
 A compiled callable contains maximal compilation units, immutable constant
