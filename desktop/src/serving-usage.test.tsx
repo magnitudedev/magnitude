@@ -23,3 +23,15 @@ it("renders missing measurements without diagnostic notices", () => {
   expect(html).not.toContain('complete usage evidence')
   expect(html).not.toContain('could not be saved')
 })
+
+it("shows requests and cache share without the explanatory section", () => {
+  const html = renderToStaticMarkup(<UsageFigures usage={usage} />)
+  expect(html).toContain('data-usage="requests">2</p>')
+  expect(html).toContain('40% of input tokens served from cache.')
+  expect(html).not.toContain('About these numbers')
+})
+it("does not present missing cache measurements as a zero percentage", () => {
+  const html = renderToStaticMarkup(<UsageFigures usage={{ ...usage, cachedInputRequests: 0 }} />)
+  expect(html).toContain('Cache usage was not reported.')
+  expect(html).not.toContain('% of input tokens served from cache.')
+})
