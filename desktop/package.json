@@ -21,8 +21,8 @@
     "@magnitudedev/sdk": "workspace:*",
     "@magnitudedev/web": "workspace:*",
     "effect": "^3.21.2",
-    "lucide-react": "^0.460.0",
-    "@magnitudedev/utils": "workspace:*"
+    "@magnitudedev/utils": "workspace:*",
+    "@phosphor-icons/react": "^2.1.10"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",

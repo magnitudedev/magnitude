@@ -6,7 +6,7 @@
  */
 import { type ReactNode } from "react"
 import { Option } from "effect"
-import { Target, CheckCircle2 } from "lucide-react"
+import { TargetIcon, CheckCircleIcon } from "@phosphor-icons/react"
 import type { GoalStatusMessage as GoalStatusType } from "@magnitudedev/sdk"
 export function GoalStatus({
   message,
@@ -18,7 +18,7 @@ export function GoalStatus({
   if (message.status === "started") {
     return (
       <div className="flex items-center [gap:6px] [padding:2px_0]">
-        <Target
+        <TargetIcon
           size={14}
           className="text-green-700 dark:text-green-500 shrink-0"
         />
@@ -36,7 +36,7 @@ export function GoalStatus({
   // finished
   return (
     <div className="flex items-center [gap:6px] [padding:2px_0]">
-      <CheckCircle2
+      <CheckCircleIcon
         size={14}
         className="text-green-700 dark:text-green-500 shrink-0"
       />

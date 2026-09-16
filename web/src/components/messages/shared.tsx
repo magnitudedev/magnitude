@@ -4,14 +4,7 @@ import { Button } from "@/components/ui/button"
  * Shared utilities for message components — copy button, timestamp, attachment pill.
  */
 import { useState, useSyncExternalStore, type ReactNode } from "react"
-import {
-  Copy,
-  Check,
-  Clock,
-  FileText,
-  Folder,
-  Image as ImageIcon,
-} from "lucide-react"
+import { CopyIcon, CheckIcon, ClockIcon, FileTextIcon, FolderIcon, ImageIcon } from "@phosphor-icons/react"
 import type { DisplayAttachment } from "@magnitudedev/sdk"
 import {
   formatShortTimestamp,
@@ -42,7 +35,7 @@ export function CopyButton({
       className="text-slate-500 hover:text-slate-900 dark:hover:text-slate-200 data-[copied=true]:text-green-700 data-[copied=true]:hover:text-green-700 dark:data-[copied=true]:text-green-500 dark:data-[copied=true]:hover:text-green-500 [background:transparent] border-0 cursor-pointer flex items-center [gap:4px] text-[13px] font-sans [padding:0px]"
       data-copied={copied ? "true" : "false"}
     >
-      {copied ? <Check size={14} /> : <Copy size={14} />}
+      {copied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
       {!iconOnly && label}
     </Button>
   )
@@ -71,7 +64,7 @@ export function RelativeTimestamp({ ts }: { ts: number }): ReactNode {
 export function QueuedIndicator(): ReactNode {
   return (
     <span className="flex items-center [gap:4px] text-slate-500 font-sans text-[13px]">
-      <Clock size={14} />
+      <ClockIcon size={14} />
       Queued
     </span>
   )
@@ -100,7 +93,7 @@ export function AttachmentPill({
       </div>
     )
   }
-  const Icon = attachment.type === "mention_directory" ? Folder : FileText
+  const Icon = attachment.type === "mention_directory" ? FolderIcon : FileTextIcon
   const rangeSuffix =
     attachment.type === "mention_file_range"
       ? `:${attachment.startLine}-${attachment.endLine}`

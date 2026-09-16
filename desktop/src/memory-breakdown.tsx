@@ -3,7 +3,7 @@ import { Skeleton } from "../../web/src/components/ui/skeleton"
 import { pageLayout } from "./page-layout"
 import { Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
-import { MemoryStick } from "lucide-react"
+import { MemoryIcon } from "@phosphor-icons/react"
 import type { ModelInstanceAllocation } from "@magnitudedev/sdk"
 import { activeLocalModel, formatMemorySize, useLocalModels } from "@magnitudedev/client-common"
 
@@ -44,7 +44,7 @@ function ModelMemory() {
 
 export function MemoryBreakdown() {
   return <section aria-label="Memory usage" className={pageLayout.card}>
-    <div className="flex items-center gap-3"><MemoryStick className="size-5 text-blue-600 dark:text-blue-400" /><h2 className="font-heading text-lg">Memory</h2></div>
+    <div className="flex items-center gap-3"><MemoryIcon className="size-5 text-blue-600 dark:text-blue-400" /><h2 className="font-heading text-lg">Memory</h2></div>
     <ModelMemory />
   </section>
 }

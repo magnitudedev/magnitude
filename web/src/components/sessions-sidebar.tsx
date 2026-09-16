@@ -1,14 +1,14 @@
 import { useMemo, useState, type ReactNode } from "react"
 import {
-  ArrowLeft,
-  HardDrive,
-  Layers3,
-  Monitor,
-  Moon,
-  Settings2,
-  SlidersHorizontal,
-  Sun,
-} from "lucide-react"
+  ArrowLeftIcon,
+  HardDriveIcon,
+  StackIcon,
+  MonitorIcon,
+  MoonIcon,
+  SlidersIcon,
+  SlidersHorizontalIcon,
+  SunIcon,
+} from "@phosphor-icons/react"
 import {
   CaretDown,
   CaretRight,
@@ -92,17 +92,17 @@ export interface SessionsSidebarProps {
 }
 
 const settingsSections = [
-  { id: "general", label: "General", icon: Settings2 },
-  { id: "models", label: "Models", icon: Layers3 },
+  { id: "general", label: "General", icon: SlidersIcon },
+  { id: "models", label: "Models", icon: StackIcon },
   {
     id: "catalog",
     label: "Catalog",
-    icon: SlidersHorizontal,
+    icon: SlidersHorizontalIcon,
   },
   {
     id: "hardware",
     label: "Hardware",
-    icon: HardDrive,
+    icon: HardDriveIcon,
   },
   {
     id: "archived",
@@ -123,7 +123,7 @@ function SettingsNavigation({
   const appearance = useAppearancePreference()
   const nextAppearance =
     appearance === "system" ? "light" : appearance === "light" ? "dark" : "system"
-  const AppearanceIcon = appearance === "light" ? Sun : appearance === "dark" ? Moon : Monitor
+  const AppearanceIcon = appearance === "light" ? SunIcon : appearance === "dark" ? MoonIcon : MonitorIcon
   return (
     <>
       <Button
@@ -133,7 +133,7 @@ function SettingsNavigation({
         onClick={onBack}
         className="mx-2 mb-[5px] mt-1 flex h-9 w-[calc(100%-16px)] shrink-0 cursor-pointer items-center gap-2 rounded-[7px] border-0 bg-transparent px-2.5 text-left text-slate-600 [-webkit-app-region:no-drag] hover:bg-slate-150 dark:text-slate-400 dark:hover:bg-slate-750"
       >
-        <ArrowLeft size={16} />
+        <ArrowLeftIcon size={16} />
         <strong className="text-[14px] font-semibold text-slate-900 dark:text-slate-200">
           Settings
         </strong>

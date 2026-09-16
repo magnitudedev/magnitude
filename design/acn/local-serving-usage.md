@@ -36,7 +36,11 @@ Messages streaming currently lacks measured cache reads; this is unavailable evi
 
 The canonical replay-safe model query exposes totals, measurement coverage, known models and storage
 availability. Today uses the caller's named time zone and its actual local midnight, including DST;
-All time covers retained history. Filtering changes presentation, never storage. Client-common owns
+All time covers retained history. The snapshot also includes ordered daily token totals for 53
+Sunday-first weeks through the caller's current local day, independent of the summary period and
+respecting the requested model. Each day is bounded by local midnights, including DST and fractional
+time-zone offsets. Totals include cached input exactly once through the inclusive input count.
+Missing days have zero recorded tokens; future dates are absent. Filtering changes presentation, never storage. Client-common owns
 observed query refresh so midnight rollover and newly completed requests become visible without
 component polling or a second cache. An unobserved window does not acquire a polling lifetime.
 

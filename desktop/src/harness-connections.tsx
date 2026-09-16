@@ -1,7 +1,7 @@
 import { pageLayout } from "./page-layout"
 import type { DesktopHarnessConnection, HarnessId } from "@magnitudedev/client-common"
 import { Brand } from "effect"
-import { ArrowUpRight } from "lucide-react"
+import { ArrowUpRightIcon } from "@phosphor-icons/react"
 import { Button } from "../../web/src/components/ui/button"
 import { HarnessLogo } from "./harness-logo"
 
@@ -47,9 +47,9 @@ export function HarnessConnections({ connections, busy, canConnect, onConnect, o
             </div>
           </div>
           <div className="ml-auto flex shrink-0 flex-wrap items-center justify-end gap-3">
-            {installed && row.id === "pi" && row.plugin._tag === "Some" && <span className="text-sm text-slate-500">Includes <a href="https://pi.dev/packages/@magnitudedev/pi-extension" target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:underline">Pi extension<ArrowUpRight aria-hidden="true" className="size-3.5" /></a></span>}
+            {installed && row.id === "pi" && row.plugin._tag === "Some" && <span className="text-sm text-slate-500">Includes <a href="https://pi.dev/packages/@magnitudedev/pi-extension" target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:underline">Pi extension<ArrowUpRightIcon aria-hidden="true" className="size-3.5" /></a></span>}
             {installed ? <><Button disabled={busy || !canConnect} onClick={() => onConnect(row.id)}>{needsAttention ? "Repair connection" : row.inspection._tag === "Connected" ? "Reconnect" : "Connect"}</Button>{!needsAttention && (row.managed || row.inspection._tag === "Connected") && <Button variant="outline" disabled={busy} onClick={() => onDisconnect(row.id)}>Disconnect</Button>}</>
-              : <a href={installationDocs[Brand.unbranded(row.id)]} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-sm text-slate-500 hover:underline">Install {row.name}<ArrowUpRight aria-hidden="true" className="size-4" /></a>}
+              : <a href={installationDocs[Brand.unbranded(row.id)]} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-sm text-slate-500 hover:underline">Install {row.name}<ArrowUpRightIcon aria-hidden="true" className="size-4" /></a>}
           </div>
         </div>
         {installed && row.inspection._tag === "Connected" && <div className="mt-4 border-t border-slate-200 pt-4 text-sm text-slate-500 dark:border-slate-750"><p>Configuration files</p><ul className="mt-2 space-y-1">{row.configurationFiles.map(file => <li key={file} className="break-all font-mono text-xs">{file}</li>)}</ul></div>}

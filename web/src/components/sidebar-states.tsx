@@ -4,7 +4,7 @@
  * Empty state: MessageSquare icon, "No sessions found", helpful subtitle.
  * Loading state: skeleton rows sized to match real session rows.
  */
-import { MessageSquare } from "lucide-react"
+import { ChatIcon } from "@phosphor-icons/react"
 import type { ReactNode } from "react"
 
 // ── Empty state ──
@@ -16,7 +16,7 @@ export function SidebarEmptyState({
 }): ReactNode {
   return (
     <div className="flex flex-col items-center justify-center [padding:32px_16px] text-center">
-      <MessageSquare size={24} className="text-slate-500 [margin-bottom:8px]" />
+      <ChatIcon size={24} className="text-slate-500 [margin-bottom:8px]" />
       <div className="font-sans text-[14px] text-slate-600 dark:text-slate-400">
         No sessions found
       </div>

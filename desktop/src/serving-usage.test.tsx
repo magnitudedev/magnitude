@@ -3,7 +3,7 @@ import { expect, it } from "vitest"
 import type { ServingUsageSnapshot } from "@magnitudedev/sdk"
 import { UsageFigures } from "./serving-usage"
 const usage: Extract<ServingUsageSnapshot, { _tag: "Available" }> = {
-  _tag: "Available", since: 1789187320947, requests: 2, incompleteRequests: 0,
+  _tag: "Available", dailyActivity: [], since: 1789187320947, requests: 2, incompleteRequests: 0,
   inputTokens: 100, cachedInputTokens: 40, outputTokens: 20, totalTokens: 120,
   cachedInputRequests: 2, tokensPerSecond: 80, timeToFirstTokenMs: 125,
   speedSamples: 2, latencySamples: 2, models: [], recordingFailures: 0,

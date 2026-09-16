@@ -9,7 +9,27 @@ import { Input } from "../../web/src/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../web/src/components/ui/select"
 import { Progress } from "../../web/src/components/ui/progress"
 import { MagnitudeMark } from "../../web/src/components/magnitude-mark"
-import { ChevronDown, Eye, ArrowUpRight, Layers3, Library, HardDrive, Plug, Activity, BarChart3, Check, Settings2, Download, Play, Square, Trash2, X, Monitor, Sun, Moon } from "lucide-react"
+import {
+  CaretDownIcon,
+  EyeIcon,
+  ArrowUpRightIcon,
+  StackIcon,
+  SquaresFourIcon,
+  CubeIcon,
+  PlugIcon,
+  PulseIcon,
+  ChartBarIcon,
+  CheckIcon,
+  SlidersIcon,
+  DownloadSimpleIcon,
+  PlayIcon,
+  SquareIcon,
+  TrashIcon,
+  XIcon,
+  MonitorIcon,
+  SunIcon,
+  MoonIcon,
+} from "@phosphor-icons/react"
 import { createRoot } from "react-dom/client"
 import { useId, useMemo, useState, type ReactNode } from "react"
 import { Atom, RegistryProvider, Result, useAtomValue, useAtomSet } from "@effect-atom/atom-react"
@@ -54,7 +74,7 @@ const observation = Stream.asyncPush<typeof ApplicationSnapshot.Type, DesktopHos
 ).pipe(Effect.asVoid))
 const hostState = Atom.keepAlive(Atom.make(observation))
 const pageNames: Record<Page, string> = { discover: "Discover", catalog: "Catalog", models: "My Models", connections: "Connections", usage: "Usage", status: "Status", settings: "Settings" }
-const pageIcons = { discover: Layers3, catalog: Library, models: HardDrive, connections: Plug, usage: BarChart3, status: Activity, settings: Settings2 }
+const pageIcons = { discover: StackIcon, catalog: SquaresFourIcon, models: CubeIcon, connections: PlugIcon, usage: ChartBarIcon, status: PulseIcon, settings: SlidersIcon }
 
 function ModelFit({ model }: { model: CatalogLocalModel }) {
   const serving = model.servingState
@@ -74,12 +94,12 @@ function ModelDetails({ model, radar = false, open, contentId, compact = false }
         <dl className="flex flex-wrap gap-x-8 gap-y-3">
           <div><dt className="text-xs text-slate-500">License</dt><dd className="mt-1">{Option.getOrElse(model.presentation.license, () => "Not specified")}</dd></div>
           {serving._tag === "Assessed" && <div><dt className="text-xs text-slate-500">Context window</dt><dd className="mt-1">{serving.assessment.profile.contextLength.toLocaleString()} tokens</dd></div>}
-          {serving._tag === "Assessed" && serving.capabilities.vision && <div className="self-end"><TooltipProvider><ActionTooltip label="Supports vision" trigger={<button type="button" aria-label="Supports vision" className="rounded p-1 text-slate-500 hover:text-slate-800 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-200"><Eye aria-hidden="true" className="size-4" /></button>} /></TooltipProvider></div>}
+          {serving._tag === "Assessed" && serving.capabilities.vision && <div className="self-end"><TooltipProvider><ActionTooltip label="Supports vision" trigger={<button type="button" aria-label="Supports vision" className="rounded p-1 text-slate-500 hover:text-slate-800 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-200"><EyeIcon aria-hidden="true" className="size-4" /></button>} /></TooltipProvider></div>}
         </dl>
         {model.presentation.sourceUrls.length > 0 && <div><p className="mb-2 text-xs text-slate-500">Sources</p><div className="flex flex-wrap gap-x-4 gap-y-2">{model.presentation.sourceUrls.map(url => {
           const source = new URL(url)
           const label = source.hostname === "huggingface.co" ? `Hugging Face · ${source.pathname.split("/")[1]}` : source.hostname.replace(/^www\./, "")
-          return <a className="inline-flex items-center gap-1 text-sm text-slate-600 hover:underline dark:text-slate-300" key={url} href={url} title={url} target="_blank" rel="noreferrer">{label}<ArrowUpRight aria-hidden="true" className="size-3.5" /></a>
+          return <a className="inline-flex items-center gap-1 text-sm text-slate-600 hover:underline dark:text-slate-300" key={url} href={url} title={url} target="_blank" rel="noreferrer">{label}<ArrowUpRightIcon aria-hidden="true" className="size-3.5" /></a>
         })}</div></div>}
       </div>
       {serving._tag === "Assessed" && serving.assessment._tag === "Fits" && serving.assessment.performance.length > 0 && <div className="min-w-0">
@@ -95,7 +115,7 @@ function ModelDetails({ model, radar = false, open, contentId, compact = false }
   )
   if (open !== undefined) return open ? <div id={contentId}>{content}</div> : null
   return <details className="group mt-4 text-sm">
-    <summary className="flex cursor-pointer list-none items-center justify-end gap-1 rounded py-1 text-slate-600 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-300 [&::-webkit-details-marker]:hidden">Model details<ChevronDown aria-hidden="true" className="size-4 group-open:rotate-180" /></summary>
+    <summary className="flex cursor-pointer list-none items-center justify-end gap-1 rounded py-1 text-slate-600 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-300 [&::-webkit-details-marker]:hidden">Model details<CaretDownIcon aria-hidden="true" className="size-4 group-open:rotate-180" /></summary>
     {content}
   </details>
 }
@@ -115,9 +135,9 @@ function ModelControls({ model, replacing, children }: { model: CatalogLocalMode
   const transferring = acquisition._tag === "Installing" || acquisition._tag === "Updating"
   return <div>
     <div className="flex flex-wrap items-center gap-2">{children}
-      {transferring ? <Button variant="outline" onClick={() => cancel(model.modelId)}><X />Cancel download</Button> : !installed ? <Button disabled={pending || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><Download />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <>
-        {canStop ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><Square />Stop model</Button> : <Button className="min-w-28" disabled={pending} onClick={() => { if (!replacing || window.confirm(`Loading ${formatLocalModelDisplayName(model)} will stop ${replacing}. Continue?`)) load(model.modelId) }}><Play />Load model</Button>}
-        <Button variant="ghost" size="icon" aria-label={`Remove ${formatLocalModelDisplayName(model)}`} title="Remove download" disabled={pending} onClick={() => { if (window.confirm(`Remove the downloaded files for ${formatLocalModelDisplayName(model)}?`)) remove(model.modelId) }}><Trash2 /></Button>
+      {transferring ? <Button variant="outline" onClick={() => cancel(model.modelId)}><XIcon />Cancel download</Button> : !installed ? <Button disabled={pending || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <>
+        {canStop ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button> : <Button className="min-w-28" disabled={pending} onClick={() => { if (!replacing || window.confirm(`Loading ${formatLocalModelDisplayName(model)} will stop ${replacing}. Continue?`)) load(model.modelId) }}><PlayIcon />Load model</Button>}
+        <Button variant="ghost" size="icon" aria-label={`Remove ${formatLocalModelDisplayName(model)}`} title="Remove download" disabled={pending} onClick={() => { if (window.confirm(`Remove the downloaded files for ${formatLocalModelDisplayName(model)}?`)) remove(model.modelId) }}><TrashIcon /></Button>
         {(acquisition._tag === "UpdateAvailable" || acquisition._tag === "UpdateFailed") && <Button variant="outline" disabled={pending} onClick={() => install(model.modelId)}>Update</Button>}
       </>}
       {(acquisition._tag === "InstallFailed" || acquisition._tag === "UpdateFailed") && <Button variant="outline" onClick={() => dismiss(model.modelId)}>Dismiss error</Button>}
@@ -141,7 +161,7 @@ function ModelCard({ model, showMemory = false, replacing }: { model: CatalogLoc
     <div className={pageLayout.modelRow}>
       <div className="flex min-w-0 items-center gap-4"><ModelLogo model={model} /><div className="min-w-0"><h2 className="text-lg font-semibold">{formatLocalModelDisplayName(model)}</h2>{status}</div></div>
       <ModelControls model={model} {...(replacing ? { replacing } : {})}>
-        <Button variant="ghost" aria-expanded={detailsOpen} aria-controls={detailsId} onClick={() => setDetailsOpen(value => !value)}>Details<ChevronDown aria-hidden="true" className={`size-4 ${detailsOpen ? "rotate-180" : ""}`} /></Button>
+        <Button variant="ghost" aria-expanded={detailsOpen} aria-controls={detailsId} onClick={() => setDetailsOpen(value => !value)}>Details<CaretDownIcon aria-hidden="true" className={`size-4 ${detailsOpen ? "rotate-180" : ""}`} /></Button>
       </ModelControls>
     </div>
     <ModelDetails model={model} radar open={detailsOpen} contentId={detailsId} />
@@ -297,7 +317,7 @@ function ModelStatus() {
     <div className="flex items-center gap-3">{active && <ModelLogo model={active.model} className="size-7" />}<p>{presentation?.label ?? (Result.isFailure(models) ? "Model status unavailable" : "Reading model status…")}</p></div>
     {active?.residency._tag === "Loading" && <div className="mt-4"><Progress aria-label="Model loading progress" indicatorClassName="bg-blue-700 dark:bg-blue-500" value={Option.match(active.residency.progress, { onNone: () => null, onSome: fraction => fraction * 100 })} /></div>}
     {Result.isFailure(models) && <p role="alert" className="mt-2 text-sm text-slate-500">{localModelFailureMessage(models.cause, "Could not read model status. Check Status and try again.")}</p>}
-    {presentation?.canStop && <Button className="mt-4" variant="outline" disabled={stopping.pending} onClick={() => stop()}><Square />Stop model</Button>}
+    {presentation?.canStop && <Button className="mt-4" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button>}
     {Option.isSome(stopping.failure) && <p role="alert" className="mt-2 text-sm">{stopping.failure.value}</p>}
   </div>
 }
@@ -315,13 +335,13 @@ function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null
   const ready=service?._tag === "Ready"
   return <div className={pageLayout.statusStack}>
     <section aria-busy={!snapshot} aria-label={!snapshot ? "Loading service status" : undefined} className={pageLayout.statusHero}>
-      <div className="flex items-center gap-5"><div className={`flex size-16 shrink-0 items-center justify-center rounded-full border bg-white dark:bg-slate-900 ${ready ? "border-green-300 text-green-600 dark:border-green-800 dark:text-green-400" : "border-blue-300 text-blue-600 dark:border-blue-800 dark:text-blue-400"}`}>{ready ? <Check aria-label="Service ready" className="size-7 text-green-600 dark:text-green-400" /> : <Activity className="size-7" />}</div><div><p className="text-xs font-medium uppercase tracking-widest text-slate-500">Magnitude service</p><h2 className="mt-2 font-heading text-2xl">{!snapshot ? <SkeletonLine className="h-8 w-72 text-2xl" /> : ready ? "Ready when you are" : service?._tag === "CleanupFailed" ? "Cleanup needs attention" : service?._tag === "Failed" ? "Let’s get you running" : "Starting your local engine"}</h2>{ready ? <ModelStatus /> : !snapshot ? <SkeletonLine className="mt-2 h-5 text-sm" /> : <p className="mt-2 text-sm text-slate-500">{service?._tag}</p>}</div></div>
+      <div className="flex items-center gap-5"><div className={`flex size-16 shrink-0 items-center justify-center rounded-full border bg-white dark:bg-slate-900 ${ready ? "border-green-300 text-green-600 dark:border-green-800 dark:text-green-400" : "border-blue-300 text-blue-600 dark:border-blue-800 dark:text-blue-400"}`}>{ready ? <CheckIcon aria-label="Service ready" className="size-7 text-green-600 dark:text-green-400" /> : <PulseIcon className="size-7" />}</div><div><p className="text-xs font-medium uppercase tracking-widest text-slate-500">Magnitude service</p><h2 className="mt-2 font-heading text-2xl">{!snapshot ? <SkeletonLine className="h-8 w-72 text-2xl" /> : ready ? "Ready when you are" : service?._tag === "CleanupFailed" ? "Cleanup needs attention" : service?._tag === "Failed" ? "Let’s get you running" : "Starting your local engine"}</h2>{ready ? <ModelStatus /> : !snapshot ? <SkeletonLine className="mt-2 h-5 text-sm" /> : <p className="mt-2 text-sm text-slate-500">{service?._tag}</p>}</div></div>
       {ready && <DownloadActivity />}
       {service && "message" in service && <p role="alert" className="mt-5 text-sm">{service.message}</p>}
       {service?._tag === "Failed" && <Button className="mt-5" variant="outline" onClick={() => host.retry()}>Retry service</Button>}
     </section>
     <MemoryBreakdown />
-    <section className={pageLayout.card}><div className="flex items-center gap-3"><Plug className="size-5 text-blue-600 dark:text-blue-400" /><h2 className="font-heading text-lg">Local connection</h2></div><p className="mt-2 text-sm text-slate-500">Your tools connect to Magnitude on this machine.</p><p className="mt-4 break-all rounded-lg bg-slate-50 p-4 font-mono text-sm dark:bg-slate-900">{snapshot?.endpoint ?? <SkeletonLine className="h-5 text-sm" width="200px" />}</p><div className="mt-5 flex items-start gap-3"><span className={`mt-1 size-2 shrink-0 rounded-full ${snapshot?.tray._tag === "Registered" ? "bg-blue-500" : "bg-slate-400"}`} /><div><p className="text-sm font-medium">Background activity</p><p className="mt-1 text-sm text-slate-500">{snapshot?.tray._tag === "Registered" ? "Magnitude keeps running when you close the window." : snapshot?.tray._tag === "Unavailable" ? snapshot.tray.message : snapshot?.tray._tag === "Closed" ? "Magnitude is quitting." : <SkeletonLine className="h-5 w-72 text-sm" />}</p></div></div></section>
+    <section className={pageLayout.card}><div className="flex items-center gap-3"><PlugIcon className="size-5 text-blue-600 dark:text-blue-400" /><h2 className="font-heading text-lg">Local connection</h2></div><p className="mt-2 text-sm text-slate-500">Your tools connect to Magnitude on this machine.</p><p className="mt-4 break-all rounded-lg bg-slate-50 p-4 font-mono text-sm dark:bg-slate-900">{snapshot?.endpoint ?? <SkeletonLine className="h-5 text-sm" width="200px" />}</p><div className="mt-5 flex items-start gap-3"><span className={`mt-1 size-2 shrink-0 rounded-full ${snapshot?.tray._tag === "Registered" ? "bg-blue-500" : "bg-slate-400"}`} /><div><p className="text-sm font-medium">Background activity</p><p className="mt-1 text-sm text-slate-500">{snapshot?.tray._tag === "Registered" ? "Magnitude keeps running when you close the window." : snapshot?.tray._tag === "Unavailable" ? snapshot.tray.message : snapshot?.tray._tag === "Closed" ? "Magnitude is quitting." : <SkeletonLine className="h-5 w-72 text-sm" />}</p></div></div></section>
   </div>
 }
 function ApplicationSettings() {
@@ -387,7 +407,7 @@ function AppearanceSettings() {
   return <section aria-labelledby="appearance-heading" className="mt-8 overflow-hidden rounded-lg border border-slate-300 bg-white dark:border-slate-750 dark:bg-slate-850">
     <header className="border-b border-slate-200 px-5 py-4 dark:border-slate-800"><h2 id="appearance-heading" className="font-heading text-lg">Appearance</h2></header>
     <div className="flex flex-wrap items-center justify-between gap-6 px-5 py-5"><div><p className="font-medium">Theme</p><p className="mt-1 text-sm text-slate-500">Use your system appearance or choose a theme.</p></div>
-      <div className="flex gap-2" role="group" aria-label="Theme">{(["system", "light", "dark"] as const).map(value => { const Icon = value === "system" ? Monitor : value === "light" ? Sun : Moon; return <Button key={value} variant={appearance === value ? "default" : "outline"} aria-pressed={appearance === value} onClick={() => setAppearancePreference(value)}><Icon />{value[0]!.toUpperCase() + value.slice(1)}</Button> })}</div>
+      <div className="flex gap-2" role="group" aria-label="Theme">{(["system", "light", "dark"] as const).map(value => { const Icon = value === "system" ? MonitorIcon : value === "light" ? SunIcon : MoonIcon; return <Button key={value} variant={appearance === value ? "default" : "outline"} aria-pressed={appearance === value} onClick={() => setAppearancePreference(value)}><Icon />{value[0]!.toUpperCase() + value.slice(1)}</Button> })}</div>
     </div>
   </section>
 }
