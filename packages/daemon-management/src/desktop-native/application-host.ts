@@ -1,3 +1,4 @@
+import { resolveMacApplicationPath } from "./mac-application-path"
 import { ApplicationControlFailed, ApplicationControlUnavailable, requestApplication, requestLoginStartup, requestApplicationUpdate } from "./application-control"
 import { access } from "node:fs/promises"
 import { join } from "node:path"
@@ -62,7 +63,7 @@ export const makeDesktopApplicationHost = (developmentRepository: Option.Option<
         return yield* launchApplicationProcess({ executable, arguments: [join(repository, "desktop"), ...argumentsForIntent], environment }, observe)
       }
       if (process.platform === "darwin") {
-        const bundle = process.env.MAGNITUDE_DESKTOP_PATH ?? "/Applications/Magnitude.app"
+        const bundle = yield* resolveMacApplicationPath(process.execPath, homedir(), process.env.MAGNITUDE_DESKTOP_PATH)
         // The old service-only Magnitude.app is not a desktop installation.
         yield* exists(join(bundle, "Contents/Frameworks/Electron Framework.framework"))
         yield* waitForMacApplicationInstallation(bundle).pipe(Effect.provide(NativeMacApplicationInstallation),

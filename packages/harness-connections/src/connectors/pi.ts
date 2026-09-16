@@ -6,7 +6,7 @@ import { modelInput, modelMaxTokens, zeroCost } from "../model-fields"
 import { hasReasoning, projectReasoningControls } from "../reasoning"
 import { makePiCompanion } from "./pi-package"
 import { readPiSettings } from "./pi-settings"
-export { PI_COMPANION_EXTENSION_PATH, PI_COMPANION_PACKAGE_IDENTITY, PI_COMPANION_PACKAGE_SOURCE, makePiCompanion, piPackageExtensionEnabled } from "./pi-package"
+export { PI_COMPANION_EXTENSION_PATH, PI_COMPANION_PACKAGE_IDENTITY, makePiCompanion, piPackageExtensionEnabled } from "./pi-package"
 
 const PI_THINKING_SURFACE = {
   controls: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
@@ -52,7 +52,7 @@ export const makePiConnector = (
   executable: "pi",
   skillInstallationTarget: "shared-agents",
   skillRequired: true,
-  companion: options.companion ?? makePiCompanion(paths, options.packageSource),
+  ...(options.companion ? { companion: options.companion } : options.packageSource ? { companion: makePiCompanion(paths, options.packageSource) } : {}),
   configurationFiles: [paths.piModels, paths.piSettings],
   connect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.piModels, "{}\n")

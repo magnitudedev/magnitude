@@ -15,8 +15,8 @@ Runtime acquisition installs only artifacts selected from the version's release 
 
 ## Ownership
 
-- The npm launcher locates and executes the installed desktop application's bundled CLI. It
-  downloads nothing; a missing application produces desktop installation guidance.
+- The desktop installation exposes its bundled CLI through a Mac symlink, Windows user PATH,
+  or the Linux package-owned link. The CLI has no separate npm installation or download.
 - The installed desktop application bundles and owns its matching ACN executable. CLI and harness
   demand locate that application; they do not acquire a standalone daemon. Desktop distribution
   validates the application signature and publisher before installation.

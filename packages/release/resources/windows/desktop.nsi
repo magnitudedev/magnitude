@@ -178,6 +178,17 @@ stageFailed:
   SetErrorLevel 1
   Abort "Setup could not complete. Installation files were retained for recovery. Close applications using them and run setup again."
 installed:
+  System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::ConfigureCliPath(w "$INSTDIR\resources", w "${REGKEY}", i 0) i .r0'
+  ${If} $0 != 0
+    SetErrorLevel 1
+    Abort "Magnitude is installed, but its command could not be added to PATH (code $0). Run setup again to repair command registration."
+  ${EndIf}
+  System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::RemovePreviousCliCommands(w "$INSTDIR\resources", w .r8, i 1024) i .r0'
+  ${If} $0 != 0
+    SetErrorLevel 1
+    Abort "Magnitude is installed, but setup could not replace a previous command: $8 (code $0). Close programs using it and run setup again."
+  ${EndIf}
+  DetailPrint "The magnitude command is available in new terminals."
 SectionEnd
 Function un.onInit
   SetShellVarContext current
@@ -191,6 +202,11 @@ Function un.onInit
   ${EndIf}
 FunctionEnd
 Section "Uninstall"
+  System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::ConfigureCliPath(w "$INSTDIR\resources", w "${REGKEY}", i 1) i .r0'
+  ${If} $0 != 0
+    SetErrorLevel 1
+    Abort "Command registration could not be removed (code $0). Application files were preserved."
+  ${EndIf}
   System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::RemoveOwnedStartup(w "$INSTDIR\Magnitude.exe") i .r0'
   ${If} $0 != 0
     MessageBox MB_OK|MB_ICONSTOP "Startup registration could not be removed (code $0). Application files were preserved." /SD IDOK

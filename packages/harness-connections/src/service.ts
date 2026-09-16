@@ -63,7 +63,6 @@ export { openCodeProviderConfig } from "./connectors/opencode"
 export {
   PI_COMPANION_EXTENSION_PATH,
   PI_COMPANION_PACKAGE_IDENTITY,
-  PI_COMPANION_PACKAGE_SOURCE,
   makePiCompanion,
   piPackageExtensionEnabled,
   piProviderConfig,

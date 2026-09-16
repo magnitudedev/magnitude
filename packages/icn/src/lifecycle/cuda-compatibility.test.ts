@@ -41,7 +41,7 @@ const manifest = (artifacts: readonly ReleaseArtifact[]): ReleaseManifest => ({
   version: "1.0.0",
   acnRevision: 0,
   rpc: releasePlan.rpc,
-  plugins: Schema.decodeUnknownSync(ReleaseManifestSchema.fields.plugins)(releasePlan.plugins.map(plugin => plugin.artifact)),
+  plugins: Schema.decodeUnknownSync(ReleaseManifestSchema.fields.plugins)([]),
   tag: "@magnitudedev/cli@1.0.0",
   sourceCommit: "b".repeat(40),
   artifacts: artifacts as [ReleaseArtifact, ...ReleaseArtifact[]],

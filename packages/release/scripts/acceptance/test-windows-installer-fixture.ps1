@@ -23,9 +23,27 @@ function Assert-Version([string]$Version) {
   if ((Get-ItemProperty $registration).DisplayVersion -ne $Version) { throw 'Registered version differs' }
   if ([IO.File]::ReadAllText((Join-Path $installation 'resources\fixture-version.txt')) -ne $Version) { throw 'Installed payload version differs' }
 }
+$environment = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+$originalPath = $environment.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+$cliDirectory = Join-Path $installation 'resources'
+function Assert-CliPath {
+  $expected = if ([string]::IsNullOrEmpty($originalPath)) { $cliDirectory } else { "$cliDirectory;$originalPath" }
+  if ($environment.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) -cne $expected) { throw 'Installer PATH registration differs' }
+  if ((Get-ItemProperty $registration).OwnedCliPath -ne $cliDirectory) { throw 'Installer did not record CLI PATH ownership' }
+}
 $old = Join-Path $Root '1.2.3\magnitude-desktop-windows-x64-1.2.3.exe'
 $next = Join-Path $Root '1.2.4\magnitude-desktop-windows-x64-1.2.4.exe'
+$conflict = Join-Path $Root 'old npm bin'
+New-Item -ItemType Directory $conflict | Out-Null
+[IO.File]::WriteAllText((Join-Path $conflict 'magnitude.cmd'), '@exit /b 0')
+$launchPath = $env:PATH
+try {
+  $env:PATH = "$conflict;$launchPath"
+  Invoke-Installer $old 0
+  if (Test-Path (Join-Path $conflict 'magnitude.cmd')) { throw 'Installer left the old command on PATH' }
+} finally { $env:PATH = $launchPath }
 Invoke-Installer $old 0
+Assert-CliPath
 Assert-Version '1.2.3'
 $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path ([Environment]::GetFolderPath('Programs')) 'Magnitude.lnk'))
 if ($shortcut.WorkingDirectory -ne $installation) { throw 'Application shortcut has an invalid working directory' }
@@ -77,11 +95,15 @@ try {
   $process.Dispose()
 }
 Assert-Version '1.2.4'
+Assert-CliPath
 if ((Get-ItemProperty $run).'dev.magnitude.desktop' -ne $startup) { throw 'Update changed startup preference' }
 Invoke-Installer (Join-Path $installation 'Uninstall Magnitude.exe') 0
 $deadline = (Get-Date).AddSeconds(30)
 while ((Test-Path $installation) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
 if ((Test-Path $installation) -or (Test-Path $registration)) { throw 'Uninstaller did not finish' }
 if ((Get-ItemProperty $run -Name 'dev.magnitude.desktop' -ErrorAction SilentlyContinue)) { throw 'Uninstaller retained owned startup' }
+$afterPath = $environment.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+if ([string]$afterPath -cne [string]$originalPath) { throw 'Uninstall changed unrelated PATH entries' }
+$environment.Dispose()
 Write-Output 'PASS actual NSIS fresh install, unknown-file refusal, owner-exit handoff, upgrade, startup preservation and uninstall'
 $global:LASTEXITCODE = 0

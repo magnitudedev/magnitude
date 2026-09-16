@@ -320,7 +320,7 @@ const manifest = Schema.decodeUnknownSync(ReleaseManifestSchema)({
   tag: releaseTag(version),
   sourceCommit,
   rpc: releasePlan.rpc,
-  plugins: releasePlan.plugins.map(plugin => plugin.artifact),
+  plugins: [],
   artifacts: artifacts
     .slice()
     .sort((left, right) => left.id.localeCompare(right.id))

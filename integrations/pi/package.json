@@ -1,5 +1,6 @@
 {
   "name": "@magnitudedev/pi-extension",
+  "private": true,
   "version": "0.0.2",
   "description": "Run local AI models in Pi with Magnitude",
   "type": "module",
@@ -8,9 +9,6 @@
     "type": "git",
     "url": "git+https://github.com/magnitudedev/magnitude.git",
     "directory": "integrations/pi"
-  },
-  "publishConfig": {
-    "access": "public"
   },
   "files": [
     "dist",

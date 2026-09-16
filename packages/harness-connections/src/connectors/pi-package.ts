@@ -7,7 +7,6 @@ import { homedir } from "node:os"
 import { isDeepStrictEqual } from "node:util"
 import { satisfies, validRange } from "semver"
 import { MAGNITUDE_RPC_VERSION } from "@magnitudedev/sdk"
-import releasePlan from "@magnitudedev/release/plan"
 import { verifyPluginContent } from "@magnitudedev/release/plugin-content"
 import type { HarnessCompanionPackage, HarnessCompanionState } from "../contract"
 import type { HarnessConnectionPaths } from "../paths"
@@ -22,11 +21,6 @@ import {
 
 export const PI_COMPANION_PACKAGE_NAME = "Magnitude for Pi"
 export const PI_COMPANION_PACKAGE_IDENTITY = "@magnitudedev/pi-extension"
-const selectedPackage = Option.getOrThrowWith(
-  Array.findFirst(releasePlan.plugins, ({ artifact }) => artifact.host === "pi"),
-  () => new TypeError("Release preparation omitted the Pi plugin selection"),
-).artifact
-export const PI_COMPANION_PACKAGE_SOURCE = PiPackageSourceSchema.make(`npm:${selectedPackage.name}@${selectedPackage.version}`)
 export const PI_COMPANION_EXTENSION_PATH = "dist/magnitude.js"
 
 export class PiPackageError extends Schema.TaggedError<PiPackageError>()("PiPackageError", {
@@ -74,7 +68,7 @@ export const piPackageExtensionEnabled = (entry: PiPackageEntry, packageRoot = "
 const PackageManifest = Schema.Struct({ name: Schema.String, version: Schema.String, pi: Schema.Struct({ extensions: Schema.Array(Schema.String) }) })
 const decodeManifest = Schema.decodeUnknown(Schema.parseJson(PackageManifest))
 
-export const makePiCompanion = (paths: HarnessConnectionPaths, desiredSource: string = PI_COMPANION_PACKAGE_SOURCE): HarnessCompanionPackage => {
+export const makePiCompanion = (paths: HarnessConnectionPaths, desiredSource: string): HarnessCompanionPackage => {
   const agentDir = dirname(paths.piSettings)
   const readSettings = readPiSettings(paths.piSettings)
   const find = (settings: PiSettings, source: PiPackageSource, byIdentity = false) =>
