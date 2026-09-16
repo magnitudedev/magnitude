@@ -1,4 +1,5 @@
 import type { ReactNode } from "react"
+import { CircleNotchIcon } from "@phosphor-icons/react"
 import { RecommendationPreference } from "./model-preference-slider"
 import { Skeleton } from "../../web/src/components/ui/skeleton"
 import { pageLayout } from "./page-layout"
@@ -22,28 +23,40 @@ export function RadarSkeleton() {
     </svg>
   </div>
 }
-export function HardwarePending() {
-  return <LoadingRegion label="Detecting your hardware" className={pageLayout.hardware}>
+function LoadingStatus({ title, detail, assessment }: { title: string; detail: string; assessment?: { settledModels: number; totalModels: number } }) {
+  return <div className="w-full max-w-sm py-3">
+    <div role="status" className="text-sm">
+      <div className="flex items-center gap-2"><CircleNotchIcon aria-hidden="true" className="size-4 shrink-0 text-blue-500 motion-safe:animate-spin" /><p className="font-medium">{title}</p></div>
+      <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">{detail}</p>
+      {assessment && assessment.totalModels > 0 && <>
+        <progress aria-label="Model assessments completed" max={assessment.totalModels} value={assessment.settledModels} className="mt-3 block h-1.5 w-full overflow-hidden rounded-full [&::-webkit-progress-bar]:bg-slate-200 dark:[&::-webkit-progress-bar]:bg-slate-700 [&::-webkit-progress-value]:bg-blue-500 [&::-moz-progress-bar]:bg-blue-500" />
+        <p className="mt-2 text-xs tabular-nums text-slate-500 dark:text-slate-400">{assessment.settledModels} of {assessment.totalModels} assessed</p>
+      </>}
+    </div>
+  </div>
+}
+export function HardwarePending({ identifying = false }: { identifying?: boolean }) {
+  return <div aria-busy="true" aria-label="Detecting your hardware" className={`relative ${pageLayout.hardware}`} data-loading-region="">
     <div className={`grid items-center gap-6 ${pageLayout.hardwareGrid}`}>
-      <div className={pageLayout.hardwarePhoto}><Skeleton className="aspect-[4/3] w-full rounded-none" /></div>
-      <div className="min-w-0"><p className="text-xs font-medium uppercase tracking-widest text-slate-500">Your machine</p><SkeletonLine className="mt-2 h-7 text-xl" width="80%" /><SkeletonLine className="mt-2 h-5 text-sm" width="55%" />
-        <div className="mt-5 flex flex-wrap gap-x-7 gap-y-4">{[0,1].map(index => <div key={index} className="flex items-center gap-3"><Skeleton className="size-5 shrink-0" /><div><SkeletonLine className={index === 0 ? "h-7 w-24 text-lg" : "h-5 w-24 text-sm"} /><SkeletonLine className="h-4 w-24 text-xs" /></div></div>)}</div>
+      <div aria-hidden="true" className={pageLayout.hardwarePhoto}><Skeleton className="aspect-[4/3] w-full rounded-none" /></div>
+      <div className="min-w-0"><p className="text-xs font-medium uppercase tracking-widest text-slate-500">Your machine</p><LoadingStatus title={identifying ? "Identifying your machine" : "Reading hardware capabilities"} detail={identifying ? "Looking up your computer’s make and model." : "Checking your chip, graphics, and available memory."} />
+        <div aria-hidden="true" className="mt-5 flex flex-wrap gap-x-7 gap-y-4">{[0,1].map(index => <div key={index} className="flex items-center gap-3"><Skeleton className="size-5 shrink-0" /><div><SkeletonLine className={index === 0 ? "h-7 w-24 text-lg" : "h-5 w-24 text-sm"} /><SkeletonLine className="h-4 w-24 text-xs" /></div></div>)}</div>
       </div>
     </div>
-  </LoadingRegion>
+  </div>
 }
-export function RecommendationsSkeleton({ assessment }: { assessment?: { settledModels: number; totalModels: number } }) {
+export function RecommendationsSkeleton({ assessment, waitingForHardware = false }: { assessment?: { settledModels: number; totalModels: number }; waitingForHardware?: boolean }) {
   return <div aria-busy="true" aria-label="Loading recommendations" className="relative mb-8" data-loading-region="">
-    <div aria-hidden="true">
     <div className={pageLayout.recommendations}>
-      <div className={pageLayout.recommendationList}>{Array.from({length:5},(_,index) => <div key={index} className={`${pageLayout.recommendationRow} border-transparent`}><span className="w-4 shrink-0 text-sm text-slate-500">{index+1}</span><Skeleton className="size-7 shrink-0" /><SkeletonLine className="h-5 min-w-0 flex-1 text-sm" width={index%2 ? "90%" : "75%"} /></div>)}</div>
-      <div className={pageLayout.recommendationPane}><div className={pageLayout.recommendationToolbar}><div className="flex gap-1"><Skeleton className="h-8 w-16" /><Skeleton className="h-8 w-16" /></div><Skeleton className="h-8 w-40" /></div><div className="grid min-h-72"><RadarSkeleton /></div></div>
-    </div>
-    </div>
-    <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-5">
-      <div role="status" className="rounded-xl border border-slate-200 bg-white px-5 py-3 text-center text-sm shadow-sm dark:border-slate-700 dark:bg-slate-850">
-        <p className="font-medium">Assessing models</p>
-        {assessment && <p className="mt-1 tabular-nums text-slate-500">{assessment.settledModels} of {assessment.totalModels} assessed</p>}
+      <div aria-hidden="true" className={pageLayout.recommendationList}>{Array.from({length:5},(_,index) => <div key={index} className={`${pageLayout.recommendationRow} border-transparent`}><span className="w-4 shrink-0 text-sm text-slate-500">{index+1}</span><Skeleton className="size-7 shrink-0" /><SkeletonLine className="h-5 min-w-0 flex-1 text-sm" width={index%2 ? "90%" : "75%"} /></div>)}</div>
+      <div className={pageLayout.recommendationPane}>
+        <div aria-hidden="true" className={pageLayout.recommendationToolbar}><div className="flex gap-1"><Skeleton className="h-8 w-16" /><Skeleton className="h-8 w-16" /></div><Skeleton className="h-8 w-40" /></div>
+        <div className="grid min-h-72">
+          <div aria-hidden="true" className="invisible col-start-1 row-start-1 min-w-0"><RadarSkeleton /></div>
+          <div className="col-start-1 row-start-1 flex min-w-0 items-center px-3">
+          <LoadingStatus title={waitingForHardware ? "Waiting for hardware" : assessment ? "Assessing models" : "Loading model catalog"} detail={waitingForHardware ? "Recommendations need your machine’s capabilities." : assessment ? "Estimating memory fit and speed on your machine." : "Preparing model configurations for assessment."} assessment={waitingForHardware ? undefined : assessment} />
+          </div>
+        </div>
       </div>
     </div>
   </div>

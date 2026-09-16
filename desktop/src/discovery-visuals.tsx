@@ -42,7 +42,7 @@ export function HardwareOverview() {
 }
 function ObservedHardware({ service }: { service: DesktopSession }) {
   const identity = useAtomValue(service.machineIdentity)
-  if (Result.isInitial(identity)) return <HardwarePending />
+  if (Result.isInitial(identity)) return <HardwarePending identifying />
   return <HardwareCard identity={Result.isSuccess(identity) ? identity.value : null} />
 }
 export function HardwarePhotograph({ photo }: { photo: HardwarePhoto }) {

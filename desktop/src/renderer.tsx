@@ -269,7 +269,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
     {discover && <RecommendationPreference value={preference} onChange={setPreference} />}
     {!discover && assessment && !assessment.complete && <p className="mb-4 text-sm text-slate-500">Assessing models · {assessment.settledModels} of {assessment.totalModels}</p>}
     {discover && (recommendationsPending
-      ? <RecommendationsSkeleton assessment={assessment} />
+      ? <RecommendationsSkeleton assessment={assessment} waitingForHardware={Result.isInitial(hardware)} />
       : <Recommendations key={preference} models={featuredCatalogModels(ranked, 5)} active={Option.fromNullable(active)} />)}
     {!discover && <>
     <div className="grid items-start gap-5">{visible.map(model => <ModelCard key={model.modelId} model={model} showMemory={installedOnly} {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})} />)}</div>

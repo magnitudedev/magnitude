@@ -174,9 +174,9 @@ sources must be included in Tailwind scanning. Both light and dark treatments re
 acceptance, including disabled controls, focus, progress, failures, and native window chrome.
 Discover keeps its hardware and preference controls separate from model assessment. Only its combined
 recommendation list and profile panel uses an assessment skeleton, with the live settled/total count
-inside the panel. Partial rankings are withheld until all assessments settle; the completed panel
+inside the panel and a determinate theme-blue progress bar when a nonzero total is known. Before assessment, the panel distinguishes waiting for hardware from loading the catalog. The hardware skeleton has an inline status in its text column distinguishing machine identification from reading chip, graphics, and memory capabilities. Recommendation status replaces the pending profile graphic, without a floating card or overlay. Indeterminate stages use a reduced-motion-aware Phosphor spinner, never a fabricated percentage or timed sequence. Partial rankings are withheld until all assessments settle; the completed panel
 fades in without an external status row shifting its position. Hardware discovery uses photo, name, and specification placeholders matching the
-shared hardware card layout while unobserved. Reduced-motion preferences disable the fade.
+shared hardware card layout while unobserved. Loading geometry follows the natural loaded layout, including the responsive radar aspect ratio. Never impose fixed heights, added spacing, or internal scrolling on loaded content to make it match a skeleton. Unknown hardware specifications and model details can affect final height; skeletons must not claim exact geometry for unobserved content. Reduced-motion preferences disable the fade.
 Every destination retains its page shell during initial loading. Other pending observations use skeletons
 with the same card geometry and responsive breakpoints as their content; independent sections settle
 independently. Available content stays visible during refresh, and failures replace skeletons with
