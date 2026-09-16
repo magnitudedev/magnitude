@@ -35,11 +35,18 @@ class TokenMask(Protocol):
 
 @dataclass(frozen=True)
 class ModelRequest:
+    """Advance tokens and optionally read raw logits.
+
+    Host rows follow the selected input positions; columns follow ``vocabulary``
+    order, or token-ID order when omitted. A packed batch shares one vocabulary.
+    Selected vocabulary readout is unsampled and does not normalize logits.
+    """
     sequence: ModelSequence
     tokens: tuple[TokenId, ...]
     selection: LogitsSelection = LogitsSelection.LAST
     draw_words: tuple[int, int, int, int, int, int] | None = None
     allowed_tokens: bytes | TokenMask | None = None
+    vocabulary: tuple[TokenId, ...] | None = None
 
 
 class ModelBatch(Protocol):

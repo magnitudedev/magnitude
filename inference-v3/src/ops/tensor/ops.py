@@ -1136,7 +1136,8 @@ def _persistent_attention(inputs, attrs):
             or values.shape[2] != representation.value_width
             or history.shape[2] != representation.logical_width):
         raise ValueError("persistent attention source geometry disagrees")
-    if visible.shape != (queries.shape[0], 4) or visible.dtype != DType.I32:
+    if (visible.rank != 2 or visible.shape[0] != queries.shape[0]
+            or visible.shape[1] < 4 or visible.shape[1] % 2 or visible.dtype != DType.I32):
         raise ValueError("visibility requires history start/count and current start/count")
     if not math.isfinite(attrs["scale"]) or attrs["scale"] <= 0:
         raise ValueError("attention scale must be finite and positive")
@@ -1155,18 +1156,19 @@ def _persistent_attention_reference(inputs, attrs):
     result = np.zeros((*queries.shape[:2], values.shape[-1]), dtype=np.float32)
     group = queries.shape[1] // keys.shape[1]
     for row, ranges in enumerate(visible):
-        start, count, current, current_count = map(int, ranges)
-        if (min(start, count, current, current_count) < 0
-                or start + count > history.shape[0]
-                or current + current_count > keys.shape[0]):
+        spans = tuple(zip(map(int, ranges[:-2:2]), map(int, ranges[1:-2:2]), strict=True))
+        current, current_count = map(int, ranges[-2:])
+        if (current < 0 or current_count < 0 or current + current_count > keys.shape[0]
+                or any(start < 0 or count < 0 or start + count > history.shape[0]
+                       for start, count in spans)):
             raise ValueError("persistent attention visibility lies outside its sources")
-        if count + current_count == 0:
+        if sum(count for _, count in spans) + current_count == 0:
             continue
         for head in range(queries.shape[1]):
             kv_head = head // group
-            k = np.concatenate((history[start:start + count, kv_head, :width],
+            k = np.concatenate((*[history[start:start + count, kv_head, :width] for start, count in spans],
                                 keys[current:current + current_count, kv_head]), axis=0).astype(np.float32)
-            v = np.concatenate((history[start:start + count, kv_head, width:],
+            v = np.concatenate((*[history[start:start + count, kv_head, width:] for start, count in spans],
                                 values[current:current + current_count, kv_head]), axis=0).astype(np.float32)
             logits = queries[row, head].astype(np.float32) @ k.T * attrs["scale"]
             result[row, head] = _softmax_reference(logits, -1) @ v
@@ -1179,8 +1181,8 @@ def persistent_attention(queries: Tensor, history: Tensor, keys: Tensor, values:
                          sequence_count: int | None = None) -> Tensor:
     """Attend to committed history and dense current rows in a single softmax.
 
-    Visibility rows are [history_start, history_count, current_start,
-    current_count]. The caller excludes newly reserved cache destinations from
+    Visibility rows contain history start/count pairs followed by one current
+    start/count pair. Empty history segments have count zero. The caller excludes newly reserved cache destinations from
     history and supplies current causal ranges explicitly.
     """
     return _emit("persistent_attention", queries, history, keys, values, visible,

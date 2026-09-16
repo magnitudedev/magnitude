@@ -86,13 +86,13 @@ def test_hybrid_state_only_run_matches_repeated_advances_and_next_logits(monkeyp
                 states = tuple(
                     (
                         np.frombuffer(
-                            device.read(state.convolution, after=batch.completion), np.float16
+                            device.read(convolution, after=batch.completion), np.float16
                         ).copy(),
                         np.frombuffer(
-                            device.read(state.delta, after=batch.completion), np.float32
+                            device.read(delta, after=batch.completion), np.float32
                         ).copy(),
                     )
-                    for state in sequence.state.recurrent
+                    for convolution, delta in zip(sequence.state.values[::2], sequence.state.values[1::2], strict=True)
                 )
                 return data, states
             finally:

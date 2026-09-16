@@ -17,12 +17,8 @@ from engine.models.qwen35.sequence import (
     SequenceAdvance,
     SequenceBatch,
 )
-from engine.models.qwen35.state import (
-    QwenAdvance,
-    QwenState,
-    QwenStateStore,
-    RecurrentState,
-)
+from engine.models.qwen35.state import make_state_store
+from engine.state.sequence import SequenceState, StateAdvance
 from engine.models.qwen35.tensor_program import InvocationSpecs, TensorProgram
 from engine.models.sequence import (
     LogitsSelection,
@@ -36,11 +32,12 @@ from engine.weights.residency import WeightResidency
 
 @dataclass(frozen=True)
 class ForwardRequest:
-    state: QwenState
+    state: SequenceState
     inputs: Inputs
     selection: LogitsSelection = LogitsSelection.LAST
     draw_words: tuple[int, int, int, int, int, int] | None = None
     allowed_tokens: bytes | TokenMask | None = None
+    vocabulary: tuple[TokenId, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -55,7 +52,7 @@ class ForwardOutput:
     def __init__(
         self,
         runtime: DenseRuntime,
-        advance: QwenAdvance,
+        advance: StateAdvance,
         logits: ops.Resource | None,
         sample: ops.Resource | None,
     ):
@@ -109,13 +106,17 @@ class Forward:
         if not self.closed:
             for output in self.outputs:
                 output.close()
-            for resource in self.execution.outputs:
-                resource.close()
             self._owned.close()
             self.closed = True
             self.runtime._forwards.discard(self)
             if self._observation is not None:
                 self._observation()
+
+
+def _close_execution(execution: ops.Execution) -> None:
+    execution.completion.wait()
+    for resource in execution.outputs:
+        resource.close()
 
 
 class DenseRuntime(ModelExecutor):
@@ -140,7 +141,8 @@ class DenseRuntime(ModelExecutor):
         self.prefill_rows = prefill_rows
         self.program = TensorProgram(description, device, weights)
         self._samplers: dict[tuple[int, int], ops.CompiledFunction] = {}
-        self.states = QwenStateStore(
+        self.max_sequences = max_sequences
+        self.states = make_state_store(
             device,
             self.geometry,
             max_sequences,
@@ -200,8 +202,17 @@ class DenseRuntime(ModelExecutor):
             sequence.close()
 
     def reclaim(self) -> int:
-        return (self.states.release_idle() + self.program.reclaim()
-                + sum(sampler.release_output_storage() for sampler in self._samplers.values()))
+        before = self.device.allocated_bytes
+        if self.states.idle:
+            # Compiled bindings retain this arena. Drop them before releasing it
+            # so the next arena cannot inherit a specialization bound to old storage.
+            self.program.close()
+            self.states.release_idle()
+        else:
+            self.program.reclaim()
+        for sampler in self._samplers.values():
+            sampler.release_output_storage()
+        return before - self.device.allocated_bytes
 
     def reclaimable(self, sequences: tuple[ModelSequence, ...]) -> int:
         states = []
@@ -235,10 +246,20 @@ class DenseRuntime(ModelExecutor):
             raise
 
     def prepare(self, requests: tuple[ModelRequest, ...]) -> SequenceBatch:
-        if not requests or len(requests) > self.states.slots:
-            raise ValueError("model preparation requires a nonempty batch within its slot limit")
+        if not requests or len(requests) > self.max_sequences:
+            raise ValueError("model preparation requires a nonempty batch within its sequence limit")
         if len({id(request.sequence) for request in requests}) != len(requests):
             raise ValueError("model preparation requires distinct sequences")
+        vocabulary = requests[0].vocabulary
+        if any(request.vocabulary != vocabulary for request in requests):
+            raise ValueError("a packed batch requires the same ordered readout vocabulary")
+        if vocabulary is not None and (
+            not vocabulary or len(set(vocabulary)) != len(vocabulary)
+            or any(type(token) is not int or not 0 <= token < self.geometry.vocabulary for token in vocabulary)
+            or any(request.draw_words is not None or request.allowed_tokens is not None
+                   or request.selection == LogitsSelection.NONE for request in requests)
+        ):
+            raise ValueError("selected readout requires distinct vocabulary IDs and unsampled logits")
         sequences = []
         numerical = []
         following = []
@@ -274,7 +295,7 @@ class DenseRuntime(ModelExecutor):
                 following.append(next_inputs)
                 numerical.append(
                     ForwardRequest(sequence.state, inputs, request.selection, request.draw_words,
-                                   request.allowed_tokens)
+                                   request.allowed_tokens, request.vocabulary)
                 )
             forward = self._prepare_numerical(tuple(numerical))
             cleanup.callback(forward.close)
@@ -321,7 +342,10 @@ class DenseRuntime(ModelExecutor):
             selections = []
             advances = []
             feature_slices = []
-            for request in requests:
+            history_ranges = tuple(r.state.history_ranges for r in requests)
+            segment_count = max(1, max(map(len, history_ranges)))
+            segment_count = 1 << (segment_count - 1).bit_length()
+            for request, ranges in zip(requests, history_ranges, strict=True):
                 state, inputs = request.state, request.inputs
                 advance = state.begin(len(inputs.tokens))
                 owned.callback(advance.abort)
@@ -329,10 +353,11 @@ class DenseRuntime(ModelExecutor):
                 start = len(tokens)
                 tokens.extend(inputs.tokens)
                 coordinates.extend(value for triple in inputs.coordinates for value in triple)
-                base = state.slot * self.context_capacity
+                destinations.extend(advance.destinations)
+                descriptors = tuple(item for pair in ranges for item in pair)
+                descriptors += (0, 0) * (segment_count - len(ranges))
                 for offset in range(len(inputs.tokens)):
-                    destinations.append(base + state.position + offset)
-                    visible.extend((base, state.position, start, offset + 1))
+                    visible.extend((*descriptors, start, offset + 1))
                 selected = (
                     range(start, start + len(inputs.tokens))
                     if request.selection == LogitsSelection.ALL
@@ -358,13 +383,13 @@ class DenseRuntime(ModelExecutor):
             tokens.extend(TokenId(0) for _ in range(padding))
             coordinates.extend(0 for _ in range(padding * 3))
             destinations.extend(-1 for _ in range(padding))
-            visible.extend(0 for _ in range(padding * 4))
+            visible.extend(0 for _ in range(padding * (2 * segment_count + 2)))
 
             packed_controls = mode == "decode" and not feature_slices
             token_spec = ops.TensorSpec((len(tokens),), ops.DType.I32)
             coordinate_spec = ops.TensorSpec((len(tokens), 3), ops.DType.I32)
             destination_spec = ops.TensorSpec((len(tokens),), ops.DType.I32)
-            visible_spec = ops.TensorSpec((len(tokens), 4), ops.DType.I32)
+            visible_spec = ops.TensorSpec((len(tokens), 2 * segment_count + 2), ops.DType.I32)
             def field(name, code, values, spec) -> tuple[str, bytes, ops.TensorSpec]:
                 return name, struct.pack(f"={len(values)}{code}", *values), spec
 
@@ -384,6 +409,12 @@ class DenseRuntime(ModelExecutor):
                 if not deferred and any(request.draw_words is not None for request in requests):
                     draw_spec = ops.TensorSpec((len(output_rows), 6), ops.DType.U32)
                     fields.append(field("draws", "I", draw_words, draw_spec))
+            vocabulary = requests[0].vocabulary
+            vocabulary_spec = None
+            output_width = self.geometry.vocabulary if vocabulary is None else len(vocabulary)
+            if vocabulary is not None:
+                vocabulary_spec = ops.TensorSpec((len(vocabulary),), ops.DType.I32)
+                fields.append(field("vocabulary", "i", vocabulary, vocabulary_spec))
             masks_spec = mask_rows_spec = None
             if mask_payload:
                 masks_spec = ops.TensorSpec((len(mask_payload) // (mask_width * 4), mask_width), ops.DType.U32)
@@ -391,7 +422,7 @@ class DenseRuntime(ModelExecutor):
                 fields.extend((("masks", bytes(mask_payload), masks_spec),
                                field("mask_rows", "i", mask_rows, mask_rows_spec)))
             argument_fields = len(fields)
-            if self.states.attention:
+            if self.states.history:
                 fields.extend((field("destinations", "i", destinations, destination_spec),
                                field("visible", "i", visible, visible_spec)))
             control_resources = {}
@@ -423,13 +454,13 @@ class DenseRuntime(ModelExecutor):
                 feature_values.append(value)
                 feature_rows.append(row_resource)
             dynamic.extend(feature_rows)
-            recurrent = [state for request in requests for state in request.state.recurrent]
-            recurrent_layers = len(recurrent) // len(requests)
-            recurrent = [
-                requests[sequence].state.recurrent[layer]
-                for layer in range(recurrent_layers)
-                for sequence in range(len(requests))
-            ]
+            recurrent_layers = len(requests[0].state.values) // 2
+            convolution_values = [requests[sequence].state.values[2 * layer]
+                                  for layer in range(recurrent_layers)
+                                  for sequence in range(len(requests))]
+            delta_values = [requests[sequence].state.values[2 * layer + 1]
+                           for layer in range(recurrent_layers)
+                           for sequence in range(len(requests))]
             specs = InvocationSpecs(
                 batch=len(requests),
                 tokens=token_spec,
@@ -437,13 +468,14 @@ class DenseRuntime(ModelExecutor):
                 recurrent_offsets=recurrent_offset_spec,
                 output_rows=output_spec,
                 draws=draw_spec,
+                vocabulary=vocabulary_spec,
                 masks=masks_spec,
                 mask_rows=mask_rows_spec,
-                destinations=tuple(destination_spec for _ in self.states.attention),
-                visible=tuple(visible_spec for _ in self.states.attention),
-                attention_state=tuple(cache.spec for cache in self.states.attention),
-                convolution_state=tuple(value.convolution.spec for value in recurrent),
-                delta_state=tuple(value.delta.spec for value in recurrent),
+                destinations=tuple(destination_spec for _ in self.states.history),
+                visible=tuple(visible_spec for _ in self.states.history),
+                attention_state=tuple(cache.spec for cache in self.states.history),
+                convolution_state=tuple(value.spec for value in convolution_values),
+                delta_state=tuple(value.spec for value in delta_values),
                 features=tuple(value.spec for value in feature_values),
                 feature_rows=tuple(value.spec for value in feature_rows),
                 packed_controls=packed_controls,
@@ -455,15 +487,15 @@ class DenseRuntime(ModelExecutor):
                 ),
             )
             resources = {}
-            for index, cache in enumerate(self.states.attention):
+            for index, cache in enumerate(self.states.history):
                 if not packed_controls:
                     resources[f"attention.{index}.destinations"] = control_resources["destinations"]
                     resources[f"attention.{index}.visible"] = control_resources["visible"]
                 resources[f"attention.{index}.state"] = cache
-            for index, value in enumerate(recurrent):
+            for index, (convolution_value, delta_value) in enumerate(zip(convolution_values, delta_values, strict=True)):
                 layer, sequence = divmod(index, len(requests))
-                resources[f"recurrent.{layer}.{sequence}.convolution"] = value.convolution
-                resources[f"recurrent.{layer}.{sequence}.delta"] = value.delta
+                resources[f"recurrent.{layer}.{sequence}.convolution"] = convolution_value
+                resources[f"recurrent.{layer}.{sequence}.delta"] = delta_value
             for index, value in enumerate(feature_values):
                 resources[f"feature.{index}.values"] = value
             compiled = self.program.specialize(
@@ -471,7 +503,7 @@ class DenseRuntime(ModelExecutor):
                 specs,
                 static_resources={
                     f"attention.{index}.state": cache
-                    for index, cache in enumerate(self.states.attention)
+                    for index, cache in enumerate(self.states.history)
                 },
             )
             if self._inspection is not None:
@@ -489,7 +521,8 @@ class DenseRuntime(ModelExecutor):
             execution = compiled.submit(*dynamic, resources=resources)
             if sampler is not None:
                 execution = self._sample_deferred(execution, sampler, requests, selections, draw_words)
-            attention_count = len(self.states.attention)
+            owned.callback(_close_execution, execution)
+            attention_count = len(self.states.history)
             sampled = bool(output_rows) and (draw_spec is not None or deferred)
             cursor = (2 if sampled else 1) if output_rows else 0
             logits = execution.outputs[0] if output_rows else None
@@ -506,24 +539,28 @@ class DenseRuntime(ModelExecutor):
                 if count:
                     assert logits is not None
                     logit = logits.view(
-                        ops.TensorSpec((count, self.geometry.vocabulary), ops.DType.F32),
-                        first * self.geometry.vocabulary * 4,
+                        ops.TensorSpec((count, output_width), ops.DType.F32),
+                        first * output_width * 4,
                     )
+                    owned.callback(logit.close)
                     if samples is not None and requests[sequence].draw_words is not None:
                         sample = samples.view(
                             ops.TensorSpec((count, 2), ops.DType.I32), first * 8
                         )
+                        owned.callback(sample.close)
                 following_states = []
-                for layer in range(recurrent_layers):
-                    conv_spec = recurrent[layer * len(requests) + sequence].convolution.spec
-                    delta_spec = recurrent[layer * len(requests) + sequence].delta.spec
-                    following_states.append(
-                        RecurrentState(
-                            convolution[layer].view(conv_spec, sequence * conv_spec.storage_nbytes),
-                            delta[layer].view(delta_spec, sequence * delta_spec.storage_nbytes),
-                        )
-                    )
-                advance.submitted(execution.completion, tuple(following_states))
+                try:
+                    for layer in range(recurrent_layers):
+                        conv_spec = convolution_values[layer * len(requests) + sequence].spec
+                        delta_spec = delta_values[layer * len(requests) + sequence].spec
+                        for backing, spec in ((convolution[layer], conv_spec), (delta[layer], delta_spec)):
+                            view = backing.view(spec, sequence * spec.storage_nbytes)
+                            following_states.append(view)
+                    advance.submitted(execution.completion, tuple(following_states))
+                except BaseException:
+                    for view in following_states:
+                        view.close()
+                    raise
                 outputs.append(ForwardOutput(self, advance, logit, sample))
             forward = Forward(self, outputs, execution, owned.pop_all())
             if capture is not None:

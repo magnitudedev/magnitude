@@ -105,12 +105,15 @@ def persistent_attention(inputs, attrs, outputs, *, values=None):
         pairs = Bounds(0, rows * heads * (history.shape[0] + keys.shape[0]))
     else:
         ranges = values[4]
-        for history_start, history_count, current_start, current_count in ranges:
-            if (min(history_start, history_count, current_start, current_count) < 0
-                    or history_start + history_count > history.shape[0]
-                    or current_start + current_count > keys.shape[0]):
+        for row in ranges:
+            spans = tuple(zip(row[:-2:2], row[1:-2:2], strict=True))
+            current_start, current_count = row[-2:]
+            if (min(current_start, current_count) < 0
+                    or current_start + current_count > keys.shape[0]
+                    or any(min(start, count) < 0 or start + count > history.shape[0]
+                           for start, count in spans)):
                 raise ValueError("persistent attention visibility lies outside its sources")
-        pairs = heads * sum(int(row[1]) + int(row[3]) for row in ranges)
+        pairs = heads * sum(sum(int(count) for count in row[1::2]) for row in ranges)
     contractions = pairs * 2 * (width + value.shape[-1])
     return work(floating=contractions + pairs * 4, matrix=contractions,
                 special=pairs, comparisons=pairs,

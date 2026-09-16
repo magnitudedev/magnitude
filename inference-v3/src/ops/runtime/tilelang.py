@@ -58,6 +58,7 @@ class _Allocation(NativeAllocation):
     def __init__(self, tensor: torch.Tensor):
         self._tensor: torch.Tensor | None = tensor
         self._views: dict[tuple, torch.Tensor] = {}
+        self._last_view: tuple[TensorSpec, int, torch.Tensor] | None = None
 
     def _require_tensor(self) -> torch.Tensor:
         if self._tensor is None:
@@ -70,6 +71,9 @@ class _Allocation(NativeAllocation):
 
     def view(self, spec: TensorSpec, offset: int = 0) -> torch.Tensor:
         tensor = self._require_tensor()
+        last = self._last_view
+        if last is not None and last[0] is spec and last[1] == offset:
+            return last[2]
         representation = spec.representation
         if representation is not None and not isinstance(representation, Dense):
             # Encoded compute kernels consume aligned packets, not individual
@@ -82,6 +86,7 @@ class _Allocation(NativeAllocation):
         key = offset, shape, dtype
         existing = self._views.get(key)
         if existing is not None:
+            self._last_view = spec, offset, existing
             return existing
         torch_dtype = getattr(torch, dtype.value)
         width = dtype.itemsize
@@ -93,9 +98,11 @@ class _Allocation(NativeAllocation):
         result = tensor[offset : offset + count * width].view(torch_dtype).view(shape)
         if len(self._views) < 64:
             self._views[key] = result
+        self._last_view = spec, offset, result
         return result
 
     def close(self) -> None:
+        self._last_view = None
         self._views.clear()
         self._tensor = None
 

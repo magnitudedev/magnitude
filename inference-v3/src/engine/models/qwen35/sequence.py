@@ -7,7 +7,7 @@ from contextlib import ExitStack
 from typing import TYPE_CHECKING
 
 from engine.models.qwen35.inputs import Feature, InputPlan, InputState
-from engine.models.qwen35.state import QwenCheckpoint, QwenState
+from engine.state.sequence import StateCheckpoint, SequenceState
 
 if TYPE_CHECKING:
     from engine.models.qwen35.runtime import DenseRuntime, Forward, ForwardOutput
@@ -78,7 +78,7 @@ class SequenceBatch:
 
 
 class Sequence:
-    def __init__(self, runtime: DenseRuntime, state: QwenState, inputs: InputState):
+    def __init__(self, runtime: DenseRuntime, state: SequenceState, inputs: InputState):
         if state.position != inputs.position or state.store is not runtime.states:
             raise ValueError("numerical and semantic continuation boundaries differ")
         self.runtime, self.state, self.inputs = runtime, state, inputs
@@ -138,7 +138,7 @@ class Sequence:
 
 
 class Checkpoint:
-    def __init__(self, runtime: DenseRuntime, numerical: QwenCheckpoint, inputs: InputState):
+    def __init__(self, runtime: DenseRuntime, numerical: StateCheckpoint, inputs: InputState):
         self.runtime, self.numerical, self.inputs = runtime, numerical, inputs
         self.position, self.closed = numerical.position, False
         runtime._checkpoints.add(self)

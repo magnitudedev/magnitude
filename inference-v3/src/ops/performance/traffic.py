@@ -103,11 +103,11 @@ def boundary_accesses(graph, values, *, unresolved=None):
             visible = concrete(node, 4)
             stride = math.prod(specs[1].shape[1:])
             selected[1] = tuple((int(start) * stride, (int(start) + int(count)) * stride)
-                                for start, count, _, _ in visible)
+                                for row in visible for start, count in zip(row[:-2:2], row[1:-2:2], strict=True))
             for index in (2, 3):
                 stride = math.prod(specs[index].shape[1:])
                 selected[index] = tuple((int(start) * stride, (int(start) + int(count)) * stride)
-                                        for _, _, start, count in visible)
+                                        for row in visible for start, count in (row[-2:],))
         elif node.operation == "kv_append":
             destinations = concrete(node, 3)
             axis = 0 if isinstance(specs[0].representation, KVRepresentation) else 1

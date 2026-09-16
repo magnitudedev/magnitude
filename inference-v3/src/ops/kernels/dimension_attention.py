@@ -126,6 +126,7 @@ def dimension_tiled_prefill(
     history_spec,
     from_history,
     partition_offset,
+    visibility_column,
 ):
     """Stream head slices while preserving register ownership of probabilities."""
     group = heads // kv_heads
@@ -168,7 +169,7 @@ def dimension_tiled_prefill(
         alpha = T.alloc_fragment((query_rows,), "float32")
         first_row = block * query_tile
         base, count, common_first, common_last = _matrix_visible_interval(
-            visible, first_row, query_tile, tokens, 1 if from_history else 3)
+            visible, first_row, query_tile, tokens, visibility_column + 1)
         # Visibility is a valid interval within the history allocation. The
         # staged union may include gaps; masks retain each row's own interval.
         T.assume(base >= 0)
@@ -219,9 +220,9 @@ def dimension_tiled_prefill(
                     relative = first + chunk * key_tile + item
                     scores[row, item] = T.if_then_else(
                         token < tokens
-                        and base + relative >= visible[token, 0 if from_history else 2]
-                        and base + relative < (visible[token, 0 if from_history else 2]
-                                               + visible[token, 1 if from_history else 3]),
+                        and base + relative >= visible[token, visibility_column]
+                        and base + relative < (visible[token, visibility_column]
+                                               + visible[token, visibility_column + 1]),
                         scores[row, item] * scale * log2e,
                         -3.402823466e38,
                     )

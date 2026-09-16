@@ -46,6 +46,7 @@ class InvocationSpecs:
     packed_controls: bool = False
     masks: ops.TensorSpec | None = None
     mask_rows: ops.TensorSpec | None = None
+    vocabulary: ops.TensorSpec | None = None
 
     def __post_init__(self) -> None:
         if self.packed_controls and (self.features or self.feature_rows
@@ -79,6 +80,11 @@ class InvocationSpecs:
             or self.draws != ops.TensorSpec((output_rows.shape[0], 6), ops.DType.U32)
         ):
             raise ValueError("Qwen draw rows must exactly match selected output rows")
+        if self.vocabulary is not None and (
+            output_rows is None or self.draws is not None or self.vocabulary.rank != 1
+            or self.vocabulary.dtype != ops.DType.I32 or self.vocabulary.shape[0] <= 0
+        ):
+            raise ValueError("selected vocabulary requires unsampled output rows and integer indices")
         if (self.masks is None) != (self.mask_rows is None) or (
             self.masks is not None and (
                 output_rows is None or self.draws is None
@@ -106,6 +112,8 @@ class InvocationSpecs:
             fields.append(self.output_rows)
         if self.draws is not None:
             fields.append(self.draws)
+        if self.vocabulary is not None:
+            fields.append(self.vocabulary)
         if self.masks is not None:
             fields.extend((self.masks, cast(ops.TensorSpec, self.mask_rows)))
         if self.destinations:
@@ -260,6 +268,8 @@ def define(
         arguments.append(ops.Argument(specs.output_rows, "output_rows"))
     if specs.draws is not None:
         arguments.append(ops.Argument(specs.draws, "draws"))
+    if specs.vocabulary is not None:
+        arguments.append(ops.Argument(specs.vocabulary, "vocabulary"))
     if specs.masks is not None:
         arguments.append(ops.Argument(specs.masks, "masks"))
         arguments.append(ops.Argument(cast(ops.TensorSpec, specs.mask_rows), "mask_rows"))
@@ -290,6 +300,8 @@ def define(
         cursor += specs.output_rows is not None
         draws = args[cursor] if specs.draws is not None else None
         cursor += specs.draws is not None
+        vocabulary = args[cursor] if specs.vocabulary is not None else None
+        cursor += specs.vocabulary is not None
         masks = args[cursor] if specs.masks is not None else None
         cursor += specs.masks is not None
         mask_rows = args[cursor] if specs.mask_rows is not None else None
@@ -329,6 +341,7 @@ def define(
             sequence_count=specs.batch,
             recurrent_sequence_length=specs.recurrent_sequence_length,
             output_rows=output_rows,
+            vocabulary=vocabulary,
             feature_values=(ops.concatenate(feature_values, axis=0) if feature_values else None),
             feature_rows=(ops.concatenate(feature_rows, axis=0) if feature_rows else None),
         )

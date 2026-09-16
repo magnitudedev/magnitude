@@ -334,6 +334,7 @@ def decoder(
     sequence_count: int = 1,
     recurrent_sequence_length: int | None = None,
     output_rows: ops.Tensor | None = None,
+    vocabulary: ops.Tensor | None = None,
     feature_values: ops.Tensor | None = None,
     feature_rows: ops.Tensor | None = None,
 ):
@@ -418,5 +419,6 @@ def decoder(
         return states
     selected = ops.take_rows(hidden, output_rows)
     selected = ops.rms_norm(selected, weights.output_norm, epsilon=weights.epsilon)
-    logits = ops.linear(selected, weights.readout, output_dtype=ops.DType.F32)
+    readout = weights.readout if vocabulary is None else ops.embedding(vocabulary, weights.readout)
+    logits = ops.linear(selected, readout, output_dtype=ops.DType.F32)
     return logits, *states
