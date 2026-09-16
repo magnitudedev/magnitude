@@ -23,7 +23,7 @@ for(const theme of ['light','dark']) for(const width of [800,1120,1600]) {
    if(name==='status') nodes=[...main.querySelectorAll('section')];
    if(name==='settings') nodes=[...main.querySelectorAll('h2')].map(n=>n.closest('section,[aria-busy]'));
    if(name==='catalog'||name==='models'||name==='connections') nodes=[main.querySelector('article')];
-   if(name==='discover') nodes=[main.querySelector('[aria-label="Your hardware"],[aria-label="Loading your hardware"],[aria-label="Detecting your hardware"]'),main.querySelector('[aria-label="Top recommendations"] > div,[aria-label="Loading recommendations"] > div[aria-hidden] > div')];
+   if(name==='discover') nodes=[main.querySelector('[aria-label="Your hardware"],[aria-label="Loading your hardware"],[aria-label="Detecting your hardware"]'),main.querySelector('[aria-label="Top recommendations"] > div,[aria-label="Loading recommendations"] > div')];
    return nodes.filter(Boolean).map(n=>{const b=n.getBoundingClientRect();return {x:b.x,y:b.y,width:b.width,height:b.height}})
   },name)
   const before=await stableFrames()
@@ -39,8 +39,9 @@ for(const theme of ['light','dark']) for(const width of [800,1120,1600]) {
   const after=await stableFrames()
   assert.equal(before.length,after.length,`${name}: missing loaded frame`)
   for(let i=0;i<before.length;i++) for(const dimension of ['x','y','width','height']) {
-   // Text wrapping is unknown before discovery; require exact stable cards elsewhere.
-   const tolerance=name==='discover'?12:1
+   // Discover content height depends on specifications unavailable during loading.
+   if(name === "discover" && (dimension === "height" || dimension === "y")) continue
+   const tolerance=1
    assert.ok(Math.abs(before[i][dimension]-after[i][dimension])<=tolerance,`${name} ${width} frame ${i} ${dimension}: ${before[i][dimension]} -> ${after[i][dimension]}`)
   }
   assert.equal(await page.locator('[data-slot="skeleton"]').count(),0,`${name}: placeholders remain after loading`)

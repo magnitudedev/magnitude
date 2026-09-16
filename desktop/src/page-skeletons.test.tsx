@@ -33,3 +33,16 @@ it("shows assessment progress inside the recommendation skeleton", () => {
   expect(html).toContain("12 of 55 assessed")
   expect(html).toContain('role="status"')
 })
+
+it("distinguishes waiting from measurable assessment without inventing progress", () => {
+  const waiting = renderToStaticMarkup(<RecommendationsSkeleton waitingForHardware assessment={{ settledModels: 0, totalModels: 55 }} />)
+  expect(waiting).toContain("Waiting for hardware")
+  expect(waiting).not.toContain('<progress')
+  const unknown = renderToStaticMarkup(<RecommendationsSkeleton />)
+  expect(unknown).toContain("Loading model catalog")
+  expect(unknown).not.toContain('<progress')
+  const measured = renderToStaticMarkup(<RecommendationsSkeleton assessment={{ settledModels: 12, totalModels: 55 }} />)
+  expect(measured).toContain('max="55" value="12"')
+  expect(renderToStaticMarkup(<HardwarePending identifying />)).toContain("Identifying your machine")
+  expect(renderToStaticMarkup(<HardwarePending />)).toContain("Reading hardware capabilities")
+})
