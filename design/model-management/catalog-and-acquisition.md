@@ -75,12 +75,10 @@ Repeated references to one immutable package reuse one package identity and cont
 Incomplete coverage, integrity mismatch, invalid relationships, or assessment mismatch fails
 generation or ICN readiness.
 
-An issued configuration remains resolvable by its canonical identity across later releases.
-Deprecation excludes an entry from ranking and first-time discovery without deleting its
-configuration or package declaration. Existing selections, installed artifacts, and explicit
-reacquisition can therefore resolve the same bundle and profile without a user-state copy of the
-catalog entry. Runtime catalog use performs no upstream discovery and does not follow mutable
-revisions.
+Removing a model from the release catalog removes all its variants, revision pins, and planner
+inputs. Its former catalog IDs no longer resolve; removal does not alias them to a replacement
+model or delete downloaded artifacts. Catalog membership and physical artifact presence remain
+separate. Runtime catalog use performs no upstream discovery and does not follow mutable revisions.
 
 ## Package resolution
 
