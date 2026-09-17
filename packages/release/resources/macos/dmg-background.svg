@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="380" viewBox="0 0 600 380">
+  <rect width="600" height="380" fill="#f7f7f2"/>
+  <path d="M0 0H600V5H0Z" fill="#087ca1"/>
+  <text x="300" y="62" text-anchor="middle" font-family="Helvetica Neue, Helvetica, sans-serif" font-size="28" font-weight="700" fill="#202c30">Welcome to Magnitude</text>
+  <text x="300" y="94" text-anchor="middle" font-family="Helvetica Neue, Helvetica, sans-serif" font-size="16" fill="#526269">Drag Magnitude to Applications to install.</text>
+  <rect x="63" y="131" width="164" height="143" rx="22" fill="#e9efec"/>
+  <rect x="373" y="131" width="164" height="143" rx="22" fill="#e9efec"/>
+  <path d="M270 194H330M318 182L330 194L318 206" fill="none" stroke="#087ca1" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="300" y="229" text-anchor="middle" font-family="Helvetica Neue, Helvetica, sans-serif" font-size="12" font-weight="500" fill="#526269">DRAG</text>
+  <path d="M64 303H536" stroke="#d9e0db"/>
+  <text x="300" y="332" text-anchor="middle" font-family="Helvetica Neue, Helvetica, sans-serif" font-size="14" fill="#526269">Then open Magnitude from Applications.</text>
+  <text x="300" y="355" text-anchor="middle" font-family="Helvetica Neue, Helvetica, sans-serif" font-size="12" fill="#718078">You can eject this disk when you're done.</text>
+</svg>
