@@ -142,6 +142,8 @@ jobs:
           "MAGNITUDE_NODE_HEADERS=$(Join-Path $dependencyRoot 'node_modules/node-api-headers/include')" >> $env:GITHUB_ENV
       - name: Install workspace dependencies for native and compiled CLI acceptance
         run: bun install --frozen-lockfile --ignore-scripts
+      - name: Generate service and CLI build identity
+        run: bun packages/version/scripts/generate-version.ts
       - name: Compile and exercise native ownership and Node/Bun pipe interoperability
         shell: pwsh
         run: ./packages/daemon-management/scripts/test-windows-native.ps1 -Headers $env:MAGNITUDE_NODE_HEADERS -NodeLibrary $env:MAGNITUDE_NODE_LIBRARY
