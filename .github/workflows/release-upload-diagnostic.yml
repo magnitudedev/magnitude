@@ -6,7 +6,7 @@ on:
       mode:
         type: choice
         default: recovery
-        options: [comparison, recovery, curl]
+        options: [comparison, recovery, curl, exact-archive]
 
 permissions:
   contents: write
@@ -118,14 +118,15 @@ jobs:
             console.log("Verified real upload digests and preserved asset IDs on resume");
           '
   curl:
-    if: inputs.mode == 'curl'
+    if: inputs.mode == 'curl' || inputs.mode == 'exact-archive'
     runs-on: ubuntu-22.04
-    timeout-minutes: 6
+    timeout-minutes: 10
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       SOURCE_COMMIT: ${{ github.sha }}
       DIAGNOSTIC_TAG: upload-curl-${{ github.run_id }}-${{ github.run_attempt }}
+      PROBE_MODE: ${{ inputs.mode }}
     steps:
       - name: Probe a fresh HTTP connection with transfer metrics
         shell: bash
@@ -136,9 +137,16 @@ jobs:
           release_id=$(gh release view "$DIAGNOSTIC_TAG" --json databaseId --jq .databaseId)
           upload_url=$(gh api "repos/$GH_REPO/releases/$release_id" --jq .upload_url)
           upload_url="${upload_url%%\{*}"
-          dd if=/dev/urandom of=payload.bin bs=1M count=128 status=none
-          curl --http1.1 --fail-with-body --silent --show-error --connect-timeout 15 --max-time 180 \
-            --speed-time 60 --speed-limit 1024 \
+          if [ "$PROBE_MODE" = exact-archive ]; then
+            curl --fail --location --silent --show-error --connect-timeout 15 --max-time 180 \
+              'https://github.com/magnitudedev/magnitude/releases/download/%40magnitudedev/cli%400.1.0-alpha.0/magnitude-icn-cuda-12.9-linux-arm64-gnu.tar.gz' -o payload.bin
+            echo 'b86f49fe8044addd56b64472785267b7cbc6b0e58aec2e45b52107620c375a78  payload.bin' | sha256sum --check
+          else
+            dd if=/dev/urandom of=payload.bin bs=1M count=128 status=none
+          fi
+          echo "Uploading $(stat -c%s payload.bin) bytes with curl; 30-second low-speed cutoff, 180-second total deadline"
+          curl --http1.1 --fail-with-body --show-error --connect-timeout 15 --max-time 180 \
+            --speed-time 30 --speed-limit 1024 \
             -H "Authorization: Bearer $GH_TOKEN" -H 'Content-Type: application/octet-stream' \
             -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
             -H 'Connection: close' \
