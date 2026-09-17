@@ -89,7 +89,7 @@ try {
     assert.equal(alive(failedOwner.pid), true);
     if (attempt === 0) {
       await failedWindow.getByRole('button', { name: 'Retry service', exact: true }).click();
-      await failedWindow.getByText('Starting', { exact: true }).waitFor();
+      await failedWindow.getByRole('paragraph').filter({ hasText: /^Starting$/ }).waitFor();
     }
   }
   const failedQuit = application.waitForEvent('close', { timeout: 10000 });
