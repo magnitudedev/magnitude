@@ -18,8 +18,8 @@ export function ModelRadar({ model }: { model: CatalogLocalModel }) {
     return [180 + Math.cos(angle) * radius, 138 + Math.sin(angle) * radius]
   }
   const polygon = (radius: number) => axes.value.map((_, index) => point(index, radius).join(",")).join(" ")
-  return <div className="my-3">
-    <svg viewBox="0 0 360 270" role="img" aria-label={`${model.presentation.displayName} capability profile`} className="mx-auto w-full text-blue-600 dark:text-blue-400">
+  return <div className={pageLayout.modelRadar}>
+    <svg viewBox="0 0 360 270" role="img" aria-label={`${model.presentation.displayName} capability profile`} className="block h-full w-full text-blue-600 dark:text-blue-400">
       <title>{axes.value.map(axis => `${axis.label}: ${axis.detail}`).join("; ")}</title>
       {[20,40,60,80].map(radius => <polygon key={radius} points={polygon(radius)} fill="none" className="stroke-slate-200 dark:stroke-slate-700" strokeWidth="0.8" />)}
       {axes.value.map((axis,index) => <line key={axis.label} x1="180" y1="138" x2={point(index,80)[0]} y2={point(index,80)[1]} className="stroke-slate-200 dark:stroke-slate-700" strokeWidth="0.8" />)}

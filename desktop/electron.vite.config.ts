@@ -39,6 +39,9 @@ const updateConfiguration = acceptanceConfig ? {
 export default defineConfig({
   main: {
     define: {
+      // Keep ws on its portable implementations; optional native addons are not shipped.
+      "process.env.WS_NO_BUFFER_UTIL": "true",
+      "process.env.WS_NO_UTF_8_VALIDATE": "true",
       __MAGNITUDE_UPDATE_CONFIGURATION__: JSON.stringify(updateConfiguration),
       __MAGNITUDE_UPDATE_ACCEPTANCE__: JSON.stringify(Boolean(acceptanceConfig)),
     },

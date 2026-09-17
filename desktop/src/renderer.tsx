@@ -23,6 +23,7 @@ import {
   CheckIcon,
   SlidersIcon,
   DownloadSimpleIcon,
+  CircleNotchIcon,
   PlayIcon,
   SquareIcon,
   TrashIcon,
@@ -42,7 +43,7 @@ import {
   DesktopApplicationInfo, DesktopUpdateState, DesktopConnectRequest, DesktopHostUnavailable, DesktopSession, DesktopConnectionsSnapshot, activeLocalModel, modelDownloadFailureMessage,
   createAgentClient, AgentClientProvider, useAgentClient, makeFirstPartyConnection,
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, localModelFailureMessage, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
-  formatStorageSize, formatMemorySize, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes,
+  formatStorageSize, formatTransferRate, formatMemorySize, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes,
   LOCAL_MODEL_RANKING_SCALE_VALUES,
 } from "@magnitudedev/client-common"
 import { HardwareOverview, ModelRadar } from "./discovery-visuals"
@@ -120,9 +121,27 @@ function ModelDetails({ model, radar = false, open, contentId, compact = false }
     {content}
   </details>
 }
-function DownloadProgress({ acquisition }: { acquisition: CatalogLocalModel["acquisitionState"] }) {
+function DownloadProgress({ acquisition, modelName, onCancel, pending = false }: { acquisition: CatalogLocalModel["acquisitionState"]; modelName: string; onCancel?: () => void; pending?: boolean }) {
   if (acquisition._tag !== "Installing" && acquisition._tag !== "Updating") return null
-  return <div className="mt-4"><p className="mb-2 text-sm">{acquisition.progress.stage === "downloading" ? `${formatStorageSize(acquisition.progress.completedBytes)} of ${formatStorageSize(acquisition.progress.totalBytes)}` : acquisition.progress.stage.replaceAll("_", " ")}</p><Progress aria-label="Download progress" indicatorClassName="bg-blue-700 dark:bg-blue-500" value={acquisition.progress.totalBytes ? acquisition.progress.completedBytes / acquisition.progress.totalBytes * 100 : null} /></div>
+  const { progress } = acquisition
+  const downloading = progress.stage === "downloading"
+  const percent = progress.totalBytes > 0 ? progress.completedBytes / progress.totalBytes * 100 : null
+  const rate = downloading ? Option.getOrNull(progress.bytesPerSecond) : null
+  const eta = downloading && rate !== null && rate > 0 && progress.totalBytes > 0
+    ? `About ${Math.max(1, Math.ceil((progress.totalBytes - progress.completedBytes) / rate / 60))} min`
+    : downloading ? "Estimating…" : "—"
+  const stages = { queued: "Queued", resolving: "Preparing download", checking_space: "Checking space", downloading: "Downloading", verifying: "Verifying download", publishing: "Finishing download" }
+  const bytes = `${formatStorageSize(progress.completedBytes)} / ${progress.totalBytes > 0 ? formatStorageSize(progress.totalBytes) : "Unknown total"}`
+  return <div className="w-full min-w-0" aria-label="Model download">
+    <h3 className="mb-6 flex items-center gap-2 text-sm font-medium">
+      {downloading ? <><span className="shrink-0">Downloading</span><span className="min-w-0 flex-1 truncate" title={modelName}>{modelName}</span></> : <span className="min-w-0 flex-1 truncate">{stages[progress.stage]}</span>}
+      <CircleNotchIcon aria-hidden="true" className="size-3.5 shrink-0 text-blue-700 motion-safe:animate-spin dark:text-blue-400" />
+    </h3>
+    <Progress aria-label="Download progress" aria-valuetext={bytes} value={percent} trackClassName="h-2" indicatorClassName={`bg-blue-700 dark:bg-blue-500 ${percent === null ? "w-full motion-safe:animate-pulse" : ""}`} />
+    <div className="mt-3 flex items-baseline justify-between gap-3 text-sm tabular-nums text-slate-600 dark:text-slate-300"><span>{bytes}</span><span>{percent !== null ? `${Math.floor(percent)}%` : "—"}</span></div>
+    <dl className="mt-6 grid grid-cols-2 gap-4 text-sm"><div><dt className="text-xs text-slate-500 dark:text-slate-400">Download speed</dt><dd className="mt-1 font-medium tabular-nums text-slate-800 dark:text-slate-200">{rate !== null ? formatTransferRate(rate) : "—"}</dd></div><div className="text-right"><dt className="text-xs text-slate-500 dark:text-slate-400">Time remaining</dt><dd className="mt-1 font-medium tabular-nums text-slate-800 dark:text-slate-200">{eta}</dd></div></dl>
+    {onCancel && <div className="mt-7 flex justify-center"><Button variant="ghost" className="hover:bg-transparent hover:text-red-600 dark:hover:bg-transparent dark:hover:text-red-400" disabled={pending} onClick={onCancel}><XIcon />Cancel download</Button></div>}
+  </div>
 }
 function ModelControls({ model, replacing, children }: { model: CatalogLocalModel; replacing?: string; children?: ReactNode }) {
   const { install, load, stop, cancel, remove, dismissFailure: dismiss } = useLocalModelMutations()
@@ -136,7 +155,7 @@ function ModelControls({ model, replacing, children }: { model: CatalogLocalMode
   const transferring = acquisition._tag === "Installing" || acquisition._tag === "Updating"
   return <div>
     <div className="flex flex-wrap items-center gap-2">{children}
-      {transferring ? <Button variant="outline" onClick={() => cancel(model.modelId)}><XIcon />Cancel download</Button> : !installed ? <Button disabled={pending || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <>
+      {transferring ? <DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={acquisition} pending={command.pending} onCancel={() => cancel(model.modelId)} /> : !installed ? <Button disabled={pending || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <>
         {canStop ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button> : <Button className="min-w-28" disabled={pending} onClick={() => { if (!replacing || window.confirm(`Loading ${formatLocalModelDisplayName(model)} will stop ${replacing}. Continue?`)) load(model.modelId) }}><PlayIcon />Load model</Button>}
         <Button variant="ghost" size="icon" aria-label={`Remove ${formatLocalModelDisplayName(model)}`} title="Remove download" disabled={pending} onClick={() => { if (window.confirm(`Remove the downloaded files for ${formatLocalModelDisplayName(model)}?`)) remove(model.modelId) }}><TrashIcon /></Button>
         {(acquisition._tag === "UpdateAvailable" || acquisition._tag === "UpdateFailed") && <Button variant="outline" disabled={pending} onClick={() => install(model.modelId)}>Update</Button>}
@@ -144,7 +163,6 @@ function ModelControls({ model, replacing, children }: { model: CatalogLocalMode
       {(acquisition._tag === "InstallFailed" || acquisition._tag === "UpdateFailed") && <Button variant="outline" onClick={() => dismiss(model.modelId)}>Dismiss error</Button>}
     </div>
     {(model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits") && <ModelFit model={model} />}
-    <DownloadProgress acquisition={acquisition} />
     {"failure" in acquisition && <p role="alert" className="mt-3 text-sm">{acquisition._tag === "InstallFailed" || acquisition._tag === "UpdateFailed" ? modelDownloadFailureMessage(acquisition.failure) : acquisition.failure.message}</p>}
     {residency?._tag === "Failed" && <p role="alert" className="mt-3 text-sm">{residency.failure.message}</p>}
     {command.failures.map(message => <p key={message} role="alert" className="mt-3 text-sm">{message}</p>)}
@@ -170,23 +188,36 @@ function ModelCard({ model, showMemory = false, replacing }: { model: CatalogLoc
 }
 function SelectedRecommendation({ model, active }: { model: CatalogLocalModel; active: ReturnType<typeof activeLocalModel> }) {
   const [view, setView] = useState<"profile" | "details">("profile")
-  return <div className={pageLayout.recommendationPane} aria-label="Selected model profile">
+  const { cancel } = useLocalModelMutations()
+  const command = useLocalModelCommandStatus(model.modelId)
+  const transferring = model.acquisitionState._tag === "Installing" || model.acquisitionState._tag === "Updating"
+  return <div className={`relative ${pageLayout.recommendationPane}`} aria-label="Selected model profile">
+    <div className={transferring ? "invisible" : undefined} inert={transferring} aria-hidden={transferring}>
     <div className={pageLayout.recommendationToolbar}>
     <div className="flex items-center gap-1" aria-label="Model information">
       <Button variant={view === "profile" ? "secondary" : "ghost"} aria-pressed={view === "profile"} onClick={() => setView("profile")}>Profile</Button>
       <Button variant={view === "details" ? "secondary" : "ghost"} aria-pressed={view === "details"} onClick={() => setView("details")}>Details</Button>
     </div>
-      <ModelControls model={model} {...(Option.isSome(active) && active.value.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.value.model) } : {})} />
+      {transferring ? <Button disabled><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <ModelControls model={model} {...(Option.isSome(active) && active.value.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.value.model) } : {})} />}
     </div>
     <div className="grid min-h-72">
       <div className={`col-start-1 row-start-1 min-w-0 ${view === "profile" ? "" : "invisible"}`} aria-hidden={view !== "profile"}><ModelRadar model={model} /></div>
       <div className={`col-start-1 row-start-1 min-w-0 ${view === "details" ? "" : "invisible"}`} aria-hidden={view !== "details"}><ModelDetails model={model} compact open /></div>
     </div>
+    </div>
+    {transferring && <div className="absolute inset-5 flex items-center justify-center overflow-y-auto" aria-label="Download panel">
+      <div className="w-full max-w-sm px-3 py-4">
+        <DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={model.acquisitionState} pending={command.pending} onCancel={() => cancel(model.modelId)} />
+        {command.failures.map(message => <p key={message} role="alert" className="mt-3 text-sm">{message}</p>)}
+      </div>
+    </div>}
   </div>
 }
 function Recommendations({ models, active }: { models: readonly CatalogLocalModel[]; active: ReturnType<typeof activeLocalModel> }) {
   const [selectedId, setSelectedId] = useState<CatalogLocalModel["modelId"] | null>(null)
-  const selected = models.find(model => model.modelId === selectedId) ?? models[0]
+  const downloads = models.filter(model => model.acquisitionState._tag === "Installing" || model.acquisitionState._tag === "Updating")
+  const selectable = downloads.length > 0 ? downloads : models
+  const selected = selectable.find(model => model.modelId === selectedId) ?? selectable[0]
   if (!selected) return null
   return <section aria-label="Top recommendations" className="mb-8 motion-safe:animate-in motion-safe:fade-in motion-safe:duration-300">
     <div className={pageLayout.recommendations}>
@@ -328,7 +359,7 @@ function DownloadActivity() {
   if (Result.isInitial(models)) return null
   if (Result.isSuccess(models) && active.length === 0) return null
   return <div className="mt-5 border-t border-slate-200 pt-5 dark:border-slate-700">
-    {!Result.isSuccess(models) ? <p className="mt-3 text-sm text-slate-500">{Result.isFailure(models) ? "Download activity unavailable" : "Reading download activity…"}</p> : <ul className="space-y-5">{active.map(model => <li key={model.modelId}><div className="flex items-center gap-3"><ModelLogo model={model} className="size-6" /><p className="text-sm">{formatLocalModelDisplayName(model)} · {model.acquisitionState._tag === "Removing" ? "Removing files…" : model.acquisitionState._tag === "Updating" ? "Updating" : "Downloading"}</p></div><DownloadProgress acquisition={model.acquisitionState} /></li>)}</ul>}
+    {!Result.isSuccess(models) ? <p className="mt-3 text-sm text-slate-500">{Result.isFailure(models) ? "Download activity unavailable" : "Reading download activity…"}</p> : <ul className="space-y-5">{active.map(model => <li key={model.modelId}><div className="flex items-center gap-3"><ModelLogo model={model} className="size-6" /><p className="text-sm">{formatLocalModelDisplayName(model)} · {model.acquisitionState._tag === "Removing" ? "Removing files…" : model.acquisitionState._tag === "Updating" ? "Updating" : "Downloading"}</p></div><DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={model.acquisitionState} /></li>)}</ul>}
   </div>
 }
 function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null }) {

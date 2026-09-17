@@ -9,6 +9,7 @@ export const pageLayout = {
   recommendationList: "space-y-2 p-3",
   recommendationPane: "min-w-0 border-t border-slate-200 p-5 dark:border-slate-750 lg:border-l lg:border-t-0",
   recommendationToolbar: "mb-4 flex flex-wrap items-center justify-between gap-3",
+  modelRadar: "mx-auto my-3 aspect-[360/270] w-full max-w-sm",
   statusStack: "mt-7 space-y-6",
   statusHero: "relative overflow-hidden rounded-2xl border border-blue-200 bg-gradient-to-br from-blue-50 to-white p-7 dark:border-slate-700 dark:from-slate-800 dark:to-slate-900",
   card: "rounded-2xl border border-slate-200 bg-white p-6 dark:border-slate-750 dark:bg-slate-850",
