@@ -34,8 +34,8 @@ import { fileURLToPath } from "node:url"
 import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, PubSub, Queue, Ref, Runtime, Schema, Schedule, Scope, Stream } from "effect"
 import { RpcServer } from "@effect/rpc"
 import {
-  acquireApplicationOwner, applicationStateDirectory, isUpdateInstallationActive, makeOwnedService, makeUnixOwnedChildSpawner, makeWindowsOwnedChildSpawner, requireServicePort, NativeHost, nativeHostLayer,
-  OwnedChildSpawner, serveApplicationControl, serveWindowsApplicationControl, type ApplicationControlOptions,
+  previousInstallationUpgrade, acquireApplicationOwner, applicationStateDirectory, isUpdateInstallationActive, makeOwnedService, makeUnixOwnedChildSpawner, makeWindowsOwnedChildSpawner, requireServicePort, NativeHost, nativeHostLayer,
+  OwnedChildSpawner, OwnedChildSpawnFailed, serveApplicationControl, serveWindowsApplicationControl, type ApplicationControlOptions,
   LinuxTrayHost, linuxTrayHostLayer, guardedCommandLayer,
   unixPrivateFilePermissions, windowsPrivateFilePermissions,
   nativeWindowsInstallerVerifier,
@@ -230,7 +230,13 @@ const program = Effect.scoped(Effect.gen(function* () {
     const jobs = yield* Layer.build(nativeWindowsJobOwnerLayer(addonPath))
     return yield* makeWindowsOwnedChildSpawner.pipe(Effect.provide(pipes), Effect.provide(jobs))
   }) : yield* makeUnixOwnedChildSpawner
-  const admittedSpawner = yield* requireServicePort(port).pipe(Effect.provideService(OwnedChildSpawner, spawner))
+  const upgrade: Effect.Effect<void, { readonly message: string }> = app.isPackaged && !isolatedProfile && process.platform !== "win32"
+    ? yield* previousInstallationUpgrade({ home: homedir(), dataDirectory: dataDir, stateDirectory: stateDir }).pipe(Effect.provide(NodeSqliteDriverLayer))
+    : Effect.void
+  const portCheckedSpawner = yield* requireServicePort(port).pipe(Effect.provideService(OwnedChildSpawner, spawner))
+  const admittedSpawner = OwnedChildSpawner.of({ spawn: command => upgrade.pipe(
+    Effect.mapError(error => new OwnedChildSpawnFailed({ executable: command.executable, message: error.message })),
+    Effect.zipRight(portCheckedSpawner.spawn(command))) })
   const service = yield* makeOwnedService({
     executable: app.isPackaged ? join(process.resourcesPath, process.platform === "win32" ? "magnitude-service.exe" : "magnitude-service") : process.env.MAGNITUDE_BUN_PATH ?? "bun",
     arguments: [...(app.isPackaged ? [] : [join(root, "packages/acn/src/binary.ts")]), "serve", "--data-dir", dataDir, "--port", String(port)],

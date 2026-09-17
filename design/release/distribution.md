@@ -54,9 +54,9 @@ notarization precede final installer checksums. Ad-hoc local builds never imply 
 Initial desktop installation uses direct platform downloads, with a DMG on macOS and no curl/shell
 installer. Both Mac architectures open a compact, styled installer window with explicit drag-to-install
 instructions, the app on the left, a directional arrow, and a working Applications shortcut on the right.
-The transition from standalone daemon installations requires users to stop and disable
-their previous installation before opening the new app. No old-service migration helper ships;
-user models and settings remain outside the installed bundle.
+On macOS and Linux, opening the new desktop automatically retires verified previous standalone services and their
+startup registrations before starting the bundled service. No command or confirmation is required.
+User models, caches and settings remain outside the installed bundle and are preserved in place.
 Each Apple host also produces an update ZIP from the same signed and stapled desktop bundle as
 its DMG. The ZIP is a separate desktop artifact covered by the release manifest and acceptance
 receipts. It is not an inference/runtime acquisition archive. Producing it does not establish
