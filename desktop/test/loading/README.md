@@ -18,3 +18,5 @@ The skeleton primitive follows [shadcn Skeleton](https://ui.shadcn.com/docs/comp
 For Discover assessment progress, run `node desktop/test/loading/assessment.mjs` with the same fixture server. It checks partial assessment, count updates, withheld recommendations, unchanged panel geometry at completion, errors, and reduced motion across three widths and both themes.
 
 For the Discover download takeover, run `node desktop/test/loading/download.mjs` with the same fixture server. It checks unchanged panel geometry, hidden profile controls, byte counts, transfer speed, ETA, indeterminate progress, cancellation access, and profile restoration at three widths in both themes.
+
+For preference changes, run `node desktop/test/loading/preference.mjs`. It checks that ranking changes preserve the live panel and radar, reset selection to the best match, interpolate the radar shape, and honor reduced motion.

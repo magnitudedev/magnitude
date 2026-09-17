@@ -18,12 +18,13 @@ export function ModelRadar({ model }: { model: CatalogLocalModel }) {
     return [180 + Math.cos(angle) * radius, 138 + Math.sin(angle) * radius]
   }
   const polygon = (radius: number) => axes.value.map((_, index) => point(index, radius).join(",")).join(" ")
+  const profilePath = axes.value.map((axis, index) => `${index === 0 ? "M" : "L"} ${point(index, Option.getOrElse(axis.value, () => 0) * 80).join(" ")}`).join(" ") + " Z"
   return <div className={pageLayout.modelRadar}>
     <svg viewBox="0 0 360 270" role="img" aria-label={`${model.presentation.displayName} capability profile`} className="block h-full w-full text-blue-600 dark:text-blue-400">
       <title>{axes.value.map(axis => `${axis.label}: ${axis.detail}`).join("; ")}</title>
       {[20,40,60,80].map(radius => <polygon key={radius} points={polygon(radius)} fill="none" className="stroke-slate-200 dark:stroke-slate-700" strokeWidth="0.8" />)}
       {axes.value.map((axis,index) => <line key={axis.label} x1="180" y1="138" x2={point(index,80)[0]} y2={point(index,80)[1]} className="stroke-slate-200 dark:stroke-slate-700" strokeWidth="0.8" />)}
-      <polygon points={axes.value.map((axis,index) => point(index,Option.getOrElse(axis.value,()=>0)*80).join(",")).join(" ")} fill="currentColor" fillOpacity="0.13" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
+      <path d={profilePath} style={{ d: `path("${profilePath}")` }} className="motion-safe:transition-[d] motion-safe:duration-300 motion-safe:ease-out" fill="currentColor" fillOpacity="0.13" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
       {axes.value.map((axis,index) => {
         const [x,y] = [[180,20],[290,83],[258,238],[102,238],[70,83]][index]!
         return <text key={axis.label} x={x} y={y} textAnchor="middle">
