@@ -1,7 +1,8 @@
 import * as FileSystem from "@effect/platform/FileSystem"
 import { Config, Effect, Option, Schedule, Schema } from "effect"
 import { sign, walk } from "@electron/osx-sign"
-import { basename, join, resolve } from "node:path"
+import { basename, dirname, join, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
 import { ReleaseArtifactSchema } from "../../src/contracts"
 import { sha256File } from "../../src/macos-app"
 import { ACN_EXECUTABLE_NAME } from "../../src/executables"
@@ -12,11 +13,24 @@ import { AppleDistributionFailed, appleCommand, appleSigning } from "./signing"
 import { notarizeAppleUnit } from "./distribution"
 import { verifyAppleDeploymentTarget } from "../build/common"
 
-const resources = resolve(import.meta.dir, "../../resources/macos")
+const resources = resolve(dirname(fileURLToPath(import.meta.url)), "../../resources/macos")
+
+export const attachDesktopDmg = (image: string, mount: string, mode: "-readonly" | "-readwrite") => Effect.gen(function* () {
+  const plist = yield* appleCommand("/usr/bin/hdiutil", "attach", "-plist", mode, "-nobrowse", "-mountpoint", mount, image)
+  const json = yield* Command.make("/usr/bin/plutil", "-convert", "json", "-o", "-", "-").pipe(
+    Command.feed(plist), Command.string,
+  )
+  const attached = yield* Schema.decodeUnknown(Schema.parseJson(Schema.Struct({
+    "system-entities": Schema.Array(Schema.Struct({ "dev-entry": Schema.String })),
+  })))(json)
+  const device = attached["system-entities"].find(entity => /^\/dev\/disk\d+$/.test(entity["dev-entry"]))
+  if (!device) return yield* new AppleDistributionFailed({ message: "Mounted disk image did not report a whole-disk device" })
+  return device["dev-entry"]
+})
 
 // Finder and Spotlight can retain a newly mounted image briefly after its window closes.
 // Retry only a busy volume; never force-detach an image that may still be writing.
-export const detachDesktopDmg = (mount: string) => appleCommand("/usr/bin/hdiutil", "detach", mount).pipe(
+export const detachDesktopDmg = (device: string) => appleCommand("/usr/bin/hdiutil", "detach", device).pipe(
   Effect.retry({
     schedule: Schedule.spaced("2 seconds"),
     times: 10,
@@ -39,8 +53,8 @@ export const packageDesktopDmg = (app: string, output: string) => Effect.scoped(
   yield* appleCommand("/usr/bin/hdiutil", "create", "-volname", "Install Magnitude", "-srcfolder", contents, "-format", "UDRW", writable)
   yield* Effect.scoped(Effect.gen(function* () {
     yield* Effect.acquireRelease(
-      appleCommand("/usr/bin/hdiutil", "attach", "-readwrite", "-nobrowse", "-mountpoint", mount, writable),
-      () => detachDesktopDmg(mount).pipe(Effect.orDie),
+      attachDesktopDmg(writable, mount, "-readwrite"),
+      device => detachDesktopDmg(device).pipe(Effect.orDie),
     )
     yield* appleCommand("/usr/bin/osascript", join(resources, "dmg-layout.applescript"), mount).pipe(
       Effect.timeoutFail({ duration: "45 seconds", onTimeout: () => new AppleDistributionFailed({ message: "Finder did not finish configuring the installer layout" }) }),
@@ -58,8 +72,8 @@ export const validateDesktopDistribution = (options: { readonly image: string; r
   const signing = yield* appleSigning
   const mount = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-dmg-consumer-" })
   yield* Effect.acquireRelease(
-    appleCommand("/usr/bin/hdiutil", "attach", "-readonly", "-nobrowse", "-mountpoint", mount, options.image),
-    () => detachDesktopDmg(mount).pipe(Effect.orDie),
+    attachDesktopDmg(options.image, mount, "-readonly"),
+    device => detachDesktopDmg(device).pipe(Effect.orDie),
   )
   const extracted = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-update-consumer-" })
   yield* appleCommand("/usr/bin/ditto", "-x", "-k", options.updateArchive, extracted)

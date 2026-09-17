@@ -140,7 +140,8 @@ Desktop consumer acceptance mounts the final DMG read-only, verifies its sealed 
 service version, and executes lifecycle tests against the extracted release ICN base. It covers
 hidden and concurrent startup, close-to-tray, renderer recovery, full Quit, and owner-crash cleanup.
 Installer packaging and acceptance allow bounded retries when macOS reports a busy mounted image;
-they never force-detach it, and persistent detach failures still fail the build.
+they retain the attached device identity because an unsuccessful eject may already have removed
+the mount path. They never force-detach it, and persistent detach failures still fail the build.
 Publication requires a consumer receipt covering the desktop's exact final bytes.
 The Mac update ZIP has its own final digest and must be independently consumed alongside the DMG.
 Apple consumers extract it, compare its app with the installer payload, verify the sealed signature
