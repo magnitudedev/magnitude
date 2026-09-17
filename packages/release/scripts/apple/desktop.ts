@@ -1,5 +1,5 @@
 import * as FileSystem from "@effect/platform/FileSystem"
-import { Config, Effect, Option, Schema } from "effect"
+import { Config, Effect, Option, Schedule, Schema } from "effect"
 import { sign, walk } from "@electron/osx-sign"
 import { basename, join, resolve } from "node:path"
 import { ReleaseArtifactSchema } from "../../src/contracts"
@@ -13,6 +13,16 @@ import { notarizeAppleUnit } from "./distribution"
 import { verifyAppleDeploymentTarget } from "../build/common"
 
 const resources = resolve(import.meta.dir, "../../resources/macos")
+
+// Finder and Spotlight can retain a newly mounted image briefly after its window closes.
+// Retry only a busy volume; never force-detach an image that may still be writing.
+export const detachDesktopDmg = (mount: string) => appleCommand("/usr/bin/hdiutil", "detach", mount).pipe(
+  Effect.retry({
+    schedule: Schedule.spaced("2 seconds"),
+    times: 10,
+    while: error => error.message.includes("hdiutil exited 16:") && error.message.includes("Resource busy"),
+  }),
+)
 
 /** Lay out the installer around the sealed app without changing its contents. */
 export const packageDesktopDmg = (app: string, output: string) => Effect.scoped(Effect.gen(function* () {
@@ -30,7 +40,7 @@ export const packageDesktopDmg = (app: string, output: string) => Effect.scoped(
   yield* Effect.scoped(Effect.gen(function* () {
     yield* Effect.acquireRelease(
       appleCommand("/usr/bin/hdiutil", "attach", "-readwrite", "-nobrowse", "-mountpoint", mount, writable),
-      () => appleCommand("/usr/bin/hdiutil", "detach", mount).pipe(Effect.orDie),
+      () => detachDesktopDmg(mount).pipe(Effect.orDie),
     )
     yield* appleCommand("/usr/bin/osascript", join(resources, "dmg-layout.applescript"), mount).pipe(
       Effect.timeoutFail({ duration: "45 seconds", onTimeout: () => new AppleDistributionFailed({ message: "Finder did not finish configuring the installer layout" }) }),
@@ -49,7 +59,7 @@ export const validateDesktopDistribution = (options: { readonly image: string; r
   const mount = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-dmg-consumer-" })
   yield* Effect.acquireRelease(
     appleCommand("/usr/bin/hdiutil", "attach", "-readonly", "-nobrowse", "-mountpoint", mount, options.image),
-    () => appleCommand("/usr/bin/hdiutil", "detach", mount).pipe(Effect.orDie),
+    () => detachDesktopDmg(mount).pipe(Effect.orDie),
   )
   const extracted = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-update-consumer-" })
   yield* appleCommand("/usr/bin/ditto", "-x", "-k", options.updateArchive, extracted)
