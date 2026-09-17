@@ -146,6 +146,8 @@ jobs:
         run: bun install --frozen-lockfile --ignore-scripts
       - name: Generate service and CLI build identity
         run: bun packages/version/scripts/generate-version.ts
+      - name: Build the native adapter used by installer acceptance
+        run: bun packages/daemon-management/scripts/build-native.ts
       - name: Compile and exercise native ownership and Node/Bun pipe interoperability
         shell: pwsh
         run: ./packages/daemon-management/scripts/test-windows-native.ps1 -Headers $env:MAGNITUDE_NODE_HEADERS -NodeLibrary $env:MAGNITUDE_NODE_LIBRARY
