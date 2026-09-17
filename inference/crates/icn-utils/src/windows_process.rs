@@ -540,8 +540,9 @@ mod tests {
                 let line = line.unwrap();
                 if let Some((_, pid)) = line.split_once("LEAF ") {
                     sender.send(pid.trim().parse::<u32>().unwrap()).unwrap();
-                    return;
                 }
+                // Keep draining the inherited pipe until retirement. Closing it here can
+                // kill the leaf when libtest writes its own startup output.
             }
         });
         let pid = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
