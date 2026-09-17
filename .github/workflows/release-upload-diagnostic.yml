@@ -6,7 +6,7 @@ on:
       mode:
         type: choice
         default: recovery
-        options: [comparison, recovery]
+        options: [comparison, recovery, curl]
 
 permissions:
   contents: write
@@ -117,3 +117,33 @@ jobs:
             if (JSON.stringify(before.map(a=>a.id).sort()) !== JSON.stringify(after.map(a=>a.id).sort())) throw new Error("Resume replaced verified assets");
             console.log("Verified real upload digests and preserved asset IDs on resume");
           '
+  curl:
+    if: inputs.mode == 'curl'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 6
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SOURCE_COMMIT: ${{ github.sha }}
+      DIAGNOSTIC_TAG: upload-curl-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Probe a fresh HTTP connection with transfer metrics
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$DIAGNOSTIC_TAG" --draft --target "$SOURCE_COMMIT" --title 'Temporary curl upload probe' --notes 'Disposable validation; never published.'
+          trap 'gh release delete "$DIAGNOSTIC_TAG" --yes' EXIT
+          release_id=$(gh release view "$DIAGNOSTIC_TAG" --json databaseId --jq .databaseId)
+          upload_url=$(gh api "repos/$GH_REPO/releases/$release_id" --jq .upload_url)
+          upload_url="${upload_url%%\{*}"
+          dd if=/dev/urandom of=payload.bin bs=1M count=128 status=none
+          curl --http1.1 --fail-with-body --silent --show-error --connect-timeout 15 --max-time 180 \
+            --speed-time 60 --speed-limit 1024 \
+            -H "Authorization: Bearer $GH_TOKEN" -H 'Content-Type: application/octet-stream' \
+            -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
+            -H 'Connection: close' \
+            --data-binary @payload.bin --output response.json --dump-header response.headers \
+            --write-out 'status=%{http_code} bytes_sent=%{size_upload} speed=%{speed_upload} connect=%{time_connect} tls=%{time_appconnect} first_byte=%{time_starttransfer} total=%{time_total}\n' \
+            "$upload_url?name=payload.bin" || { cat response.headers; cat response.json; exit 1; }
+          cat response.headers
+          jq '{id,name,size,state,digest}' response.json
