@@ -239,6 +239,9 @@ try {
   await eventually(visibility, [{ visible: true, minimized: false }]);
   console.log('Dock activation event and Open restore hidden/minimized windows');
 
+  // Start the crash scenario on the same page that a fresh renderer restores.
+  await window.getByRole('button', { name: 'Discover', exact: true }).click();
+  await window.getByRole('heading', { name: 'Discover', exact: true }).waitFor();
   await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].close());
   const rendererReady = () => app.evaluate(async ({ BrowserWindow }) => {
     const contents = BrowserWindow.getAllWindows()[0].webContents;
