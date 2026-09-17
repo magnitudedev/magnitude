@@ -34,8 +34,9 @@ jobs:
           bun --version
           gh release create "$DIAGNOSTIC_TAG" --draft --target "$SOURCE_COMMIT" --title 'Temporary upload diagnostic' --notes 'Disposable CI transport comparison; never published.'
           trap 'gh release delete "$DIAGNOSTIC_TAG" --yes' EXIT
-          release_id=$(gh api "repos/$GH_REPO/releases?per_page=100" --jq ".[] | select(.tag_name == \"$DIAGNOSTIC_TAG\") | .id")
-          export UPLOAD_URL="https://uploads.github.com/repos/$GH_REPO/releases/$release_id/assets"
+          release_id=$(gh release view "$DIAGNOSTIC_TAG" --json databaseId --jq .databaseId)
+          upload_url=$(gh api "repos/$GH_REPO/releases/$release_id" --jq .upload_url)
+          export UPLOAD_URL="${upload_url%%\{*}"
           dd if=/dev/urandom of=payload.bin bs=1M count=32 status=none
           for attempt in 1 2 3; do
             export ASSET_NAME="payload-$attempt.bin"
