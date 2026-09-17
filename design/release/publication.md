@@ -66,7 +66,13 @@ Linux lifecycle acceptance uses the package-owned /usr/bin/magnitude command.
 ## Recovery
 
 Private GitHub drafts are retryable. Public assets are immutable. An ambiguous publication is
-resolved from GitHub state. Baseline changes require refreshing preparation, not renumbering
+resolved from GitHub state. Draft upload recovery uses the paginated release-asset endpoint,
+including incomplete assets omitted from the release object. It preserves uploads only when
+their completed state, size, and digest match the accepted candidate, removes incomplete or
+mismatched entries, and retries individual network/server failures with bounded backoff.
+Each retry reconciles remote state first, including when an upload succeeded but its response
+was lost. Failures retain the HTTP status, GitHub request identity, and bounded response details.
+Baseline changes require refreshing preparation, not renumbering
 already-built candidates. A missing release or exact resumable draft selects the native release
 path; an exact public release selects hosted metadata registration. Orphan tags and mismatched
 source commits are rejected.

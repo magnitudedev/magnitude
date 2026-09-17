@@ -2,12 +2,18 @@ name: Release upload diagnostic
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        default: recovery
+        options: [comparison, recovery]
 
 permissions:
   contents: write
 
 jobs:
   upload:
+    if: inputs.mode == 'comparison'
     strategy:
       fail-fast: false
       matrix:
@@ -60,3 +66,54 @@ jobs:
             fi
             sleep 1
           done
+  recovery:
+    if: inputs.mode == 'recovery'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SOURCE_COMMIT: ${{ github.sha }}
+      DIAGNOSTIC_TAG: upload-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+      - run: bun install --frozen-lockfile
+      - name: Verify uploads and a no-op resume against GitHub
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$DIAGNOSTIC_TAG" --draft --target "$SOURCE_COMMIT" --title 'Temporary upload recovery validation' --notes 'Disposable validation; never published.'
+          trap 'gh release delete "$DIAGNOSTIC_TAG" --yes' EXIT
+          export RELEASE_ID=$(gh release view "$DIAGNOSTIC_TAG" --json databaseId --jq .databaseId)
+          dd if=/dev/urandom of=small.bin bs=1M count=32 status=none
+          dd if=/dev/urandom of=large.bin bs=1M count=128 status=none
+          bun -e '
+            import { Effect } from "effect";
+            import { createHash } from "node:crypto";
+            import { uploadReleaseAssets } from "./packages/release/scripts/github-upload";
+            const files = [];
+            for (const name of ["small.bin", "large.bin"]) {
+              const hash = createHash("sha256");
+              for await (const chunk of Bun.file(name).stream()) hash.update(chunk);
+              files.push({name, path:name, bytes:Bun.file(name).size, sha256:hash.digest("hex")});
+            }
+            const options = { repository:process.env.GH_REPO, token:process.env.GH_TOKEN, releaseId:Number(process.env.RELEASE_ID), tag:process.env.DIAGNOSTIC_TAG, sourceCommit:process.env.SOURCE_COMMIT, uploadUrl:`https://uploads.github.com/repos/${process.env.GH_REPO}/releases/${process.env.RELEASE_ID}/assets`, files };
+            const list = async () => {
+              const response = await fetch(`https://api.github.com/repos/${options.repository}/releases/${options.releaseId}/assets`, {headers:{authorization:`Bearer ${options.token}`}});
+              if (!response.ok) throw new Error(`asset lookup: ${response.status}`);
+              return await response.json();
+            };
+            await Effect.runPromise(uploadReleaseAssets(options));
+            const before = await list();
+            for (const file of files) {
+              const asset = before.find(asset => asset.name === file.name);
+              if (asset?.state !== "uploaded" || asset.size !== file.bytes || asset.digest !== `sha256:${file.sha256}`) throw new Error(`unverified upload: ${file.name}`);
+            }
+            await Effect.runPromise(uploadReleaseAssets(options));
+            const after = await list();
+            if (JSON.stringify(before.map(a=>a.id).sort()) !== JSON.stringify(after.map(a=>a.id).sort())) throw new Error("Resume replaced verified assets");
+            console.log("Verified real upload digests and preserved asset IDs on resume");
+          '
