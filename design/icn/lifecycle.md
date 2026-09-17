@@ -431,8 +431,9 @@ and consumes that snapshot's memory topology; it does not rediscover memory shar
 native allocation locations independently.
 
 Inference-worker lifetime is subordinate to ICN even on abrupt failure. Unix children disable
-core dumps and run a dedicated parent-liveness watchdog; Linux additionally requests
-`PR_SET_PDEATHSIG`. Windows workers enter a kill-on-close Job Object during process creation. The retained child
+core dumps and run a dedicated process-parent-liveness watchdog. Retirement of a thread that
+spawned a worker cannot terminate that worker while its owning ICN process remains alive. Windows
+workers enter a kill-on-close Job Object during process creation. The retained child
 or Job handle, rather than a later PID lookup, performs forced termination and reaping.
 
 An ordinary inference request names only the canonical model ID. ICN validates installation, joins

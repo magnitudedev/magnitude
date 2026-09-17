@@ -239,10 +239,8 @@ fn configure_parent_lifetime(command: &mut Command) -> anyhow::Result<()> {
             if libc::setrlimit(libc::RLIMIT_CORE, &limit) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            #[cfg(target_os = "linux")]
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+            // Linux PDEATHSIG follows the spawning thread, which may be a temporary
+            // blocking-pool thread. The worker's process-parent watchdog owns lifetime.
             if libc::getppid() != parent {
                 return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
             }
@@ -368,6 +366,103 @@ mod tests {
     use icn_contracts::bootstrap_protocol::{IcnInstallationBackend, IcnInstallationDeclaration};
 
     use super::{NativeWorkerArgs, NativeWorkerLauncher, NativeWorkerRole};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_survives_the_spawning_thread() {
+        let mut child = std::thread::spawn(|| {
+            let mut command = std::process::Command::new("/bin/sh");
+            super::configure_parent_lifetime(&mut command).unwrap();
+            command.args(["-c", "sleep 0.2"]).spawn().unwrap()
+        })
+        .join()
+        .unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    // Re-enter the test executable to exercise the real watchdog across process death.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parent_lifetime_fixture() {
+        let Ok(directory) = std::env::var("ICN_PARENT_LIFETIME_FIXTURE") else {
+            return;
+        };
+        let directory = std::path::PathBuf::from(directory);
+        if std::env::var_os("ICN_PARENT_LIFETIME_WORKER").is_some() {
+            super::install_parent_watchdog().unwrap();
+            fs::write(directory.join("ready"), b"ready").unwrap();
+        } else {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            super::configure_parent_lifetime(&mut command).unwrap();
+            let child = command
+                .args(["--exact", "worker_process::tests::parent_lifetime_fixture"])
+                .env("ICN_PARENT_LIFETIME_WORKER", "1")
+                .spawn()
+                .unwrap();
+            fs::write(directory.join("pid.tmp"), child.id().to_string()).unwrap();
+            fs::rename(directory.join("pid.tmp"), directory.join("pid")).unwrap();
+        }
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_exits_when_its_parent_process_dies() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        struct Fixture(std::process::Child, Option<libc::pid_t>);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+                if let Some(pid) = self.1 {
+                    // This private fixture worker cannot outlive a failed assertion.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let parent = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "worker_process::tests::parent_lifetime_fixture"])
+            .env("ICN_PARENT_LIFETIME_FIXTURE", directory.path())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut fixture = Fixture(parent, None);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !directory.path().join("ready").exists() || fixture.1.is_none() {
+            if let Ok(pid) = fs::read_to_string(directory.path().join("pid")) {
+                fixture.1 = Some(pid.parse().unwrap());
+            }
+            assert!(
+                fixture.0.try_wait().unwrap().is_none(),
+                "fixture parent exited"
+            );
+            assert!(Instant::now() < deadline, "worker readiness timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fixture.0.kill().unwrap();
+        fixture.0.wait().unwrap();
+        let pid = fixture.1.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Ok(stat) if stat.rsplit_once(") ").unwrap().1.starts_with('Z') => break,
+                Err(error) => panic!("cannot observe fixture worker: {error}"),
+                Ok(_) => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker survived parent process loss"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fixture.1 = None;
+    }
 
     #[test]
     fn worker_runtime_authority_is_explicit() {
