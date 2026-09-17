@@ -16,3 +16,5 @@ When changing a layout, edit `page-layout.ts` and its content/skeleton slots tog
 The skeleton primitive follows [shadcn Skeleton](https://ui.shadcn.com/docs/components/radix/skeleton), adapted to the shared slate palette and reduced motion. Headings and immediately available settings remain visible. Errors never become indefinite skeletons.
 
 For Discover assessment progress, run `node desktop/test/loading/assessment.mjs` with the same fixture server. It checks partial assessment, count updates, withheld recommendations, unchanged panel geometry at completion, errors, and reduced motion across three widths and both themes.
+
+For the Discover download takeover, run `node desktop/test/loading/download.mjs` with the same fixture server. It checks unchanged panel geometry, hidden profile controls, byte counts, transfer speed, ETA, indeterminate progress, cancellation access, and profile restoration at three widths in both themes.

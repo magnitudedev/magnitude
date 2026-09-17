@@ -16,7 +16,7 @@ export function SkeletonLine({ className = "h-5", width = "70%" }: { className?:
   return <span className={`flex max-w-full items-center ${className}`}><Skeleton className="h-[0.65em] max-w-full" style={{ width }} /></span>
 }
 export function RadarSkeleton() {
-  return <div className="my-3 aspect-[360/270] w-full" aria-hidden="true">
+  return <div className={pageLayout.modelRadar} aria-hidden="true">
     <svg viewBox="0 0 360 270" className="h-full w-full motion-safe:animate-pulse fill-slate-200 dark:fill-slate-750">
       <polygon points="180,58 256,113 227,203 133,203 104,113" fill="none" className="stroke-slate-200 dark:stroke-slate-750" strokeWidth="2" />
       {[[180,20],[290,83],[258,238],[102,238],[70,83]].map(([x,y]) => <g key={`${x}-${y}`}><rect x={x!-30} y={y!-8} width="60" height="8" rx="3" /><rect x={x!-40} y={y!+9} width="80" height="11" rx="3" /></g>)}
