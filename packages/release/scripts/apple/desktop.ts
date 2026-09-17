@@ -14,6 +14,35 @@ import { verifyAppleDeploymentTarget } from "../build/common"
 
 const resources = resolve(import.meta.dir, "../../resources/macos")
 
+/** Lay out the installer around the sealed app without changing its contents. */
+export const packageDesktopDmg = (app: string, output: string) => Effect.scoped(Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const stage = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-dmg-" })
+  const contents = join(stage, "contents")
+  yield* fs.makeDirectory(join(contents, ".background"), { recursive: true })
+  yield* appleCommand("/usr/bin/ditto", app, join(contents, "Magnitude.app"))
+  yield* fs.symlink("/Applications", join(contents, "Applications"))
+  yield* appleCommand("/usr/bin/tiffutil", "-cathidpicheck", join(resources, "dmg-background.png"), join(resources, "dmg-background@2x.png"), "-out", join(contents, ".background/background.tiff"))
+  const writable = join(stage, "installer.dmg")
+  const mount = join(stage, "mounted")
+  yield* fs.makeDirectory(mount)
+  yield* appleCommand("/usr/bin/hdiutil", "create", "-volname", "Install Magnitude", "-srcfolder", contents, "-format", "UDRW", writable)
+  yield* Effect.scoped(Effect.gen(function* () {
+    yield* Effect.acquireRelease(
+      appleCommand("/usr/bin/hdiutil", "attach", "-readwrite", "-nobrowse", "-mountpoint", mount, writable),
+      () => appleCommand("/usr/bin/hdiutil", "detach", mount).pipe(Effect.orDie),
+    )
+    yield* appleCommand("/usr/bin/osascript", join(resources, "dmg-layout.applescript"), mount).pipe(
+      Effect.timeoutFail({ duration: "45 seconds", onTimeout: () => new AppleDistributionFailed({ message: "Finder did not finish configuring the installer layout" }) }),
+    )
+    if (!(yield* fs.exists(join(mount, ".DS_Store")))) {
+      return yield* new AppleDistributionFailed({ message: "Finder did not save the installer layout" })
+    }
+  }))
+  yield* appleCommand("/usr/bin/hdiutil", "convert", writable, "-format", "UDZO", "-o", output)
+  yield* appleCommand("/usr/bin/hdiutil", "verify", output)
+}))
+
 export const validateDesktopDistribution = (options: { readonly image: string; readonly updateArchive: string; readonly version: string; readonly revision: number; readonly rpcVersion: number; readonly inferenceInstallation: string }) => Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const signing = yield* appleSigning
@@ -106,14 +135,10 @@ export const buildDesktopDmg = (options: {
     yield* appleCommand("/usr/bin/xcrun", "stapler", "staple", options.app)
     yield* appleCommand("/usr/bin/xcrun", "stapler", "validate", options.app)
   }
-  const stage = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-dmg-" })
-  yield* appleCommand("/usr/bin/ditto", options.app, join(stage, "Magnitude.app"))
-  yield* fs.symlink("/Applications", join(stage, "Applications"))
   yield* fs.makeDirectory(options.output, { recursive: true })
   const filename = desktopInstaller(options.host)
   const output = join(options.output, filename)
-  yield* appleCommand("/usr/bin/hdiutil", "create", "-ov", "-volname", "Magnitude", "-srcfolder", stage, "-format", "UDZO", output)
-  yield* appleCommand("/usr/bin/hdiutil", "verify", output)
+  yield* packageDesktopDmg(options.app, output)
   const info = yield* fs.stat(output)
   const artifact = yield* Schema.decodeUnknown(ReleaseArtifactSchema)({
     id: `desktop-${options.host}`, kind: "desktop", host: options.host,

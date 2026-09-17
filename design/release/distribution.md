@@ -52,7 +52,9 @@ remain outside the app. Its installer preserves the sealed native bundle, includ
 symlinks; runtime archive extraction never installs or interprets a desktop artifact. Signing and
 notarization precede final installer checksums. Ad-hoc local builds never imply publisher trust.
 Initial desktop installation uses direct platform downloads, with a DMG on macOS and no curl/shell
-installer. The transition from standalone daemon installations requires users to stop and disable
+installer. Both Mac architectures open a compact, styled installer window with explicit drag-to-install
+instructions, the app on the left, a directional arrow, and a working Applications shortcut on the right.
+The transition from standalone daemon installations requires users to stop and disable
 their previous installation before opening the new app. No old-service migration helper ships;
 user models and settings remain outside the installed bundle.
 Each Apple host also produces an update ZIP from the same signed and stapled desktop bundle as
