@@ -9,8 +9,8 @@
       "fingerprint": "dfba86a156b5dd9647f66bead4d1ed2b22809fb7003955caa94adf6690f5b66f"
     }
   },
-  "cliVersion": "0.0.15",
-  "revision": 39,
+  "cliVersion": "0.1.0-alpha.0",
+  "revision": 40,
   "rpc": {
     "version": 2,
     "fingerprint": "19098ef2a96c3c51e4c22c1dbe6e8a9d70d93ae517bdc51c850a714695f849d0"

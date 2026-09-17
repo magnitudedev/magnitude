@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.1.0-alpha.0
+
+### Minor Changes
+
+- [#105](https://github.com/magnitudedev/magnitude/pull/105) [`9d52ca8`](https://github.com/magnitudedev/magnitude/commit/9d52ca81d18fc98a26f81c7a8e7b40c064392ca6) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Move local-model onboarding into the Magnitude desktop application. The bundled CLI is headless and no longer hosts interactive onboarding or the Magnitude harness. Desktop installation exposes the magnitude command without npm. Pi connections configure the external harness without installing the Magnitude Pi extension.
+
 ## 0.0.15
 
 ### Patch Changes

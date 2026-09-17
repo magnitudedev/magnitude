@@ -36,7 +36,10 @@
     "@magnitudedev/tracing": "0.0.1",
     "@magnitudedev/utils": "0.0.1",
     "@magnitudedev/vcs": "0.0.1",
-    "@magnitudedev/version": "0.0.1"
+    "@magnitudedev/version": "0.0.1",
+    "@magnitudedev/harness-connections": "0.0.1"
   },
-  "changesets": []
+  "changesets": [
+    "desktop-pi-handoff"
+  ]
 }
