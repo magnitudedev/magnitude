@@ -17,7 +17,7 @@
   <a href="https://github.com/magnitudedev/magnitude/stargazers"><img src="https://img.shields.io/github/stars/magnitudedev/magnitude" alt="GitHub Repo stars"></a>
 </p>
 
-Magnitude is an open source inference engine optimized for consumer hardware. It profiles your machine, recommends the best models for it, and runs them tuned for your hardware. One click connects the agent you already use. Runs on Apple Silicon, NVIDIA, AMD, or nothing but a CPU.
+Magnitude is an open source inference engine optimized for consumer hardware. It profiles your machine, recommends the best models for it, then downloads, tunes, and runs them. One click connects the agent you already use. Works on Apple Silicon, NVIDIA, AMD, or nothing but a CPU.
 
 ⭐ Help us reach more developers and grow the Magnitude community. Star this repo!
 
