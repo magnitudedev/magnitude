@@ -1,42 +1,20 @@
 ---
-title: Get Started
-description: "Discover local models and connect your harness in the desktop app"
-icon: /icons/rocket.svg
+title: "Get started"
+description: "Download a model and use it with your agent."
 ---
 
-## Install the desktop app
+## 1. Install Magnitude
 
-Download a desktop installer available for your platform from the [Magnitude releases](https://github.com/magnitudedev/magnitude/releases). Install and open the application. Installing the npm CLI alone does not install the desktop application.
+[Download Magnitude](https://magnitude.dev/download), install it, and open the app.
 
-## Choose a model
+Need help installing? See the guide for [macOS](/installation/macos), [Windows](/installation/windows), or [Linux](/installation/linux).
 
-1. Open **Discover** to see curated recommendations for your machine.
-2. Adjust the speed-to-intelligence preference and compare estimated memory and performance.
-3. Download a model. Track its download and load or stop it in **My Models**.
-4. Open **Connections** and connect an external harness.
+## 2. Download a model
 
-Connect writes configuration and the supported skill or plugin files. It does not launch the harness. Open your harness yourself and select the configured Magnitude model.
+Open **Discover**, select a recommendation, and click **Download**. Start with **Balanced**, or adjust the slider toward speed or intelligence.
 
-Supported connectors include Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline. The connection status checks the actual managed configuration; repair a disconnected configuration from Connections.
+## 3. Connect your agent
 
-## Background operation
+Open **Connections**, find your installed agent, and click **Connect**. Open or restart the agent, select a Magnitude model, and start working.
 
-Closing the window leaves the application and its service running. Use **Quit Magnitude** to stop the whole application, including inference. **Stop model** unloads the model while keeping the service available.
-
-**Status** distinguishes the running service from a loaded model. **Settings** controls Light, Dark, or System appearance and launch at login. Login startup opens the background process and tray without showing a window. Some Linux desktops do not provide a supported tray host; you can still reopen the application from the applications menu.
-
-## Optional headless CLI
-
-For agents and scripts:
-
-```sh
-npm install -g @magnitudedev/cli
-magnitude docs cli
-magnitude service status
-```
-
-The CLI controls the same desktop-owned service and has no interactive onboarding or built-in agent harness. `magnitude service start` starts the app in the background and waits for its service. `magnitude app open` explicitly opens the window.
-
-<Note>
-  Codex and Claude Code connections use Magnitude's local gateway while connected, including when using hosted models. Keep Magnitude running, or disconnect the integration before quitting it.
-</Note>
+See your agent’s [integration guide](/integrations/overview) for details. Keep Magnitude running; it loads the model when needed.

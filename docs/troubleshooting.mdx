@@ -1,65 +1,82 @@
 ---
-title: Troubleshooting
-description: "Resolve service, connection, download, and model problems"
-icon: /icons/wrench.svg
+title: "Troubleshooting"
+description: "Find the problem and take the next useful action."
 ---
 
-Start with **Status** in the desktop app. It reports the service, model, downloads, and tray separately. Agents can inspect the same system with `magnitude service status`, `magnitude models status`, and `magnitude connections list`; `magnitude docs cli` describes the headless commands.
+Start with **Status** in Magnitude. It distinguishes service startup from model loading and downloads.
 
-## Setup did not finish
+## The service won't start
 
-Reopen Magnitude and continue in Discover. Completed downloads remain available in My Models. Onboarding lives in the desktop application.
+Read the error on Status and use **Retry service** when offered. If it reports an occupied port, close the application using that port before retrying. Do not start another standalone Magnitude daemon.
 
-If the CLI reports that the desktop is missing, install the desktop application for your platform. Reinstalling the npm CLI alone does not install the desktop or its service.
-
-## Service is unavailable
-
-Open Status and read the failure. Use **Retry service** when offered. A service failure does not imply that a downloaded model was deleted.
+For terminal diagnostics:
 
 ```sh
 magnitude service status
-magnitude service start
 ```
 
-Start requests run the desktop in the background. Use `magnitude app open` to show its window. If Status reports **Cleanup needs attention**, resolve that failure before attempting replacement processes; do not start a separate daemon manually.
+## Magnitude command not found
 
-## Harness cannot use Magnitude
+Open the desktop app once, then open a **new terminal** and run `magnitude --help`.
 
-Check Connections. Its status reflects the managed configuration on disk; external edits can disconnect an integration. Connect again to repair it, or use:
+- **macOS:** the app registers its CLI through `~/.magnitude/bin` and supported shell startup files.
+- **Windows:** the installer updates your user PATH; existing terminals may retain the old PATH. Rerun the installer if command registration failed.
+- **Linux:** install the desktop package through your package manager; it owns `/usr/bin/magnitude`.
 
+If an old CLI still runs, inspect which executable your terminal finds:
+
+<Tabs>
+<Tab title="macOS / Linux">
 ```sh
-magnitude connections list
-magnitude connections sync
+command -v magnitude
 ```
-
-Connect writes the configuration and supported integration files without launching the harness. Restart or reload the harness yourself when its configuration requires it.
-
-Codex and Claude Code use Magnitude's local gateway while connected, including for hosted models. Keep Magnitude running, or remove the connection and restart the harness:
-
-```sh
-magnitude connections remove codex
-# or
-magnitude connections remove claude-code
+</Tab>
+<Tab title="Windows">
+```powershell
+where.exe magnitude
 ```
+</Tab>
+</Tabs>
 
-## Model download failed
+Don't install the old npm package to repair the desktop CLI.
 
-Check network access and free disk space, then retry from Discover or My Models. Magnitude can resume partial downloads when the source permits. Use the curated catalog in the app to select another model.
+## A download failed
 
-## Model will not load or was stopped
+Check your internet connection and free disk space. Read the failure in **My Models**, then retry the download. Keep completed models; you do not need to erase all downloads to repair one failure.
 
-A downloaded model occupies disk space; a loaded model also needs inference memory. Check the model's failure in My Models and the current state in Status. Other applications can reduce available memory after the fit assessment. Free memory or choose a smaller recommendation and try again.
+## A model won't load or was stopped
 
-Stopping a model preserves its downloaded files and keeps the service available. A later inference request can load the selected model again. Full **Quit Magnitude** stops the service and its inference processes.
+Read its error in **Status** or **My Models**. Close memory-heavy applications or choose a smaller recommendation. A model's fit assessment does not reserve that memory against other apps.
 
-## Tray or login startup is unavailable
+Stopping a model does not delete its files. Use **Load model** to try again when enough memory is available.
 
-Some Linux desktop environments do not expose a supported tray host. Status reports this explicitly. Reopen Magnitude through your applications menu or `magnitude app open`; quit through the application menu or `magnitude service stop`.
+## My agent can't see or use a model
 
-Use Settings to enable launch at login. The CLI equivalents are `magnitude service install` to enable it and start the background app, and `magnitude service uninstall` to disable it and quit. `magnitude service stop` preserves the login setting.
+1. Confirm the model has finished downloading.
+2. Check **Connections**. Use **Repair connection** if offered, or **Reconnect** to refresh a connected agent.
+3. Restart or reload the agent and select the Magnitude model.
+4. Keep Magnitude running and check Status if requests still fail.
+
+See your [integration guide](/integrations/overview) for specific model-selection and gateway behavior.
+
+## An app update failed
+
+Open **Settings → Application updates** and read the error. Use **Retry update** when offered. You can **Discard download** if you want to remove the retained installer and download it again.
+
+On Linux, installation may require package-manager authorization. Do not quit the installer while it is replacing the app.
+
+## There's no tray icon
+
+Some Linux desktops do not provide a supported tray host. Open Magnitude from the applications menu. You can stop it with **Quit Magnitude** or `magnitude service stop`.
+
+## Responses are slower than expected
+
+Check **Usage** to distinguish generation speed from time to first token. Loading, longer prompts, concurrent agents, and memory pressure can all affect response time. Try a smaller or faster recommendation and reduce simultaneous work. See [Inference](/inference).
 
 ## Report a problem
 
-Include the app version, operating system, service/model status, and the steps that failed. On Linux, include your desktop environment and whether the session uses X11 or Wayland. Remove prompts, project contents, private paths, and credentials from any logs you share.
+Include your app version, OS, hardware, the model involved, the exact error, and the steps to reproduce it. For Linux desktop issues, include your desktop environment and whether you use X11 or Wayland.
 
-Do not delete the complete `~/.magnitude` directory as a troubleshooting step; it contains models and configuration. Open a [GitHub issue](https://github.com/magnitudedev/magnitude/issues) or ask in [Discord](https://discord.gg/EHt48pPWdC).
+Remove credentials, prompts, and private project data from anything you share. Don't delete the entire `.magnitude` folder as a general repair step.
+
+[Report an issue](https://github.com/magnitudedev/magnitude/issues) or ask in [Discord](https://discord.gg/EHt48pPWdC).

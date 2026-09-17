@@ -1,49 +1,42 @@
 ---
-title: Models
-description: "Hardware-aware recommendations, model trade-offs, and downloads"
-icon: /icons/boxes.svg
+title: "Models"
+description: "Find, compare, download, and manage local models."
 ---
 
-Magnitude recommends complete model configurations for your machine. Each recommendation includes a model, quantization, and context size that Magnitude expects to fit and run well.
+## Choose a recommendation
 
-## Hardware profile
+**Discover** assesses your hardware and shows up to five recommendations. Start with **Balanced**, or choose Fastest, Faster, Smarter, or Smartest to shift the speed–intelligence trade-off.
 
-Magnitude detects your processor, memory, architecture, and acceleration such as Metal or CUDA. It calibrates the machine and uses model metadata to estimate which configurations will fit and how fast they should run without downloading the full model weights.
+## Read the model details
 
-Magnitude caches this profile and recalibrates when needed.
+| Detail | How to use it |
+| --- | --- |
+| Intelligence | Compare model capability using its benchmark index. The displayed percentage is an index score, not an accuracy percentage. |
+| Speed | Compare estimated generation throughput on your machine. It is an estimate, not a benchmark of your current task. |
+| Memory | Check expected runtime memory, which is different from download size. |
+| Fidelity / quantization | Lower-bit variants generally use less memory and disk space; higher fidelity preserves more of the original model. |
+| Context | Check how much conversation and working material the serving configuration can accommodate. |
+| Capabilities | Check whether the model supports features your task needs, such as vision or tool use. |
+| Speculation | See the speculative-decoding method prepared for the model. Magnitude handles its setup. |
 
-## Recommendations
+Use **Details** for source, license, and configuration information. Model licenses are separate from Magnitude's license.
 
-Discover ranks curated configurations using:
+## Browse Catalog
 
-- Model intelligence
-- Estimated generation speed
-- Quantization quality
-- Configured context size
-- Physical memory
+**Catalog** lets you search beyond the recommendations, filter by compatibility, and sort models. A model appearing in Catalog does not guarantee it fits your machine. Read its compatibility information before downloading.
 
-Choose Fastest, Faster, Balanced, Smarter, or Smartest in Discover. The CLI recommendation command uses the same shared ranking over the service catalog and hardware assessments.
+## Download and manage models
 
-Model details show estimated generation speed at assessed context sizes. Actual performance varies with prompt length, concurrent work, available memory, and model revision.
+Click **Download** for the selected model. **My Models** shows downloaded models and acquisition progress; its search, filters, and sorting help you find them later.
 
-## Model catalog
+- **Load model** puts a downloaded model into memory. Replacing a running model asks for confirmation.
+- **Stop model** unloads it without deleting the download. A later request can load it again.
+- **Remove** deletes the installed model files to recover disk space.
 
-The catalog contains all curated configurations that fit the current hardware, not only the top recommendations. It includes memory, intelligence, quantization, speed, context, and license information.
+Downloading and loading are different steps. A downloaded model uses disk space even while stopped; a loaded model also uses inference memory.
 
-Magnitude-managed models are stored in `~/.magnitude/models`. Downloading a model stores it on disk. It does not keep the model permanently loaded in memory.
+## Change your agent's model
 
-## Change models later
+Choose a downloaded Magnitude model in your agent's model selector. If it isn't listed, reconnect the agent from **Connections**, then reload or restart it as described in its [integration guide](/integrations/overview).
 
-Initial setup should provide the best starting configuration. Revisit the model choice when new models are released or when you want a different speed, intelligence, context, or memory trade-off.
-
-Choose another installed model from your harness model dropdown. You can also ask your agent to research and install a new model. For example:
-
-- “Are there newer models in Magnitude that would run better on this machine?”
-- “Find a faster Magnitude model than my current one.”
-- “Install this new model in Magnitude and switch to it.”
-
-The agent can use the Magnitude CLI to inspect the hardware and catalog and install the model. Select it from your harness when it is ready.
-
-## Curated discovery
-
-The desktop app downloads models from the curated catalog. Model details explain the assessed context, capabilities, license, and memory requirements. A fit estimate is not a guarantee of free memory when you load the model.
+For terminal control, see [CLI reference](/reference).

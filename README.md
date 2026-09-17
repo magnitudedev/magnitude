@@ -15,7 +15,6 @@
   <a href="https://discord.gg/EHt48pPWdC"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white&labelColor=5865F2&color=gray" alt="Discord"></a>
   <a href="https://x.com/usemagnitude"><img src="https://img.shields.io/badge/Twitter-Follow-000000?style=flat-square&logo=x&logoColor=white&labelColor=000000&color=gray" alt="Follow Magnitude on Twitter"></a>
   <a href="https://github.com/magnitudedev/magnitude/stargazers"><img src="https://img.shields.io/github/stars/magnitudedev/magnitude" alt="GitHub Repo stars"></a>
-  <a href="https://www.npmjs.com/package/@magnitudedev/cli"><img src="https://img.shields.io/npm/v/%40magnitudedev%2Fcli" alt="npm version"></a>
 </p>
 
 Magnitude is an open source local inference engine. It runs on the hardware you already have, whether that's a Mac, an NVIDIA or AMD GPU, or just a CPU. It profiles your machine, recommends the right models for it, then downloads, tunes, and runs them. Plug it into Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline.
@@ -24,32 +23,13 @@ Magnitude is an open source local inference engine. It runs on the hardware you 
 
 ## Get started
 
-Install the Magnitude desktop application from the [release downloads](https://github.com/magnitudedev/magnitude/releases), using the DMG on macOS or an installer available for your platform. On macOS, open the DMG, drag Magnitude into Applications, and launch it from there. Open the app to browse **Discover**, compare curated recommendations for your machine, and download a model.
+**[Download Magnitude for macOS, Windows, or Linux](https://magnitude.dev/download)**
 
-Use **My Models** to load or stop models, **Connections** to configure an external harness, **Status** to inspect service and model state, and **Settings** for appearance and launch at login. Connect writes the harness configuration and supported integration files; open the harness yourself when it is ready.
+1. Install and open the Magnitude app.
+2. Choose a recommended model in **Discover** and download it.
+3. Connect your agent in **Connections** and start using it.
 
-Closing the window keeps Magnitude running in the background. **Quit Magnitude** stops the service and its inference processes. On Linux desktops without a supported tray host, reopen the app from your applications menu.
-
-### Moving from the previous application
-
-Quit the old application and stop and disable its standalone service before installing the new
-desktop. Download the new installer directly; there is no automatic migration or shell installer.
-Keep your Magnitude data directory to retain downloaded models and settings. Update your CLI if you
-use it, then reconnect your external harnesses from **Connections**. Set **Launch at login** in the
-new app if desired. If Status reports an occupied port, stop the process using it and select
-**Retry service**.
-
-### Headless CLI
-
-The desktop includes the headless CLI. You can optionally add an npm launcher for agents, scripts, and terminal use:
-
-```sh
-npm i -g @magnitudedev/cli
-magnitude docs cli
-magnitude service status
-```
-
-The npm package runs the CLI bundled with your installed desktop app; it does not download a separate CLI. App updates update the bundled CLI too. The CLI controls the same desktop-owned service. Background startup does not open a window. Use `magnitude app open` when you explicitly want to show the app. Onboarding lives in the desktop application.
+The desktop app includes the `magnitude` CLI. No separate installation is needed.
 
 ## Why Magnitude?
 
@@ -78,7 +58,7 @@ There's no fixed minimum. Magnitude profiles your machine and recommends what ru
 
 ### What systems does Magnitude support?
 
-Installer availability is listed with each release. Hardware support depends on the inference backend available for that platform. Magnitude profiles your machine and recommends compatible catalog models; Linux tray support also depends on your desktop environment.
+macOS, Windows, and Linux. See the [download page](https://magnitude.dev/download) for available installers and system requirements.
 
 ### Which harnesses work with it?
 

@@ -1,0 +1,47 @@
+---
+title: "Claude Code"
+description: "Connect Claude Code to your downloaded Magnitude models."
+---
+
+## Connect
+
+1. [Install Claude Code](https://code.claude.com/docs/en/overview) if needed.
+2. Download a compatible model in Magnitude.
+3. Open **Connections → Claude Code** and click **Connect**.
+4. Open or restart Claude Code and choose your Magnitude model.
+
+Magnitude configures Claude Code’s gateway. Local model IDs use the `anthropic-local/` prefix. Keep Magnitude running while connected, including for hosted models: hosted requests still go to their provider through the gateway. Disconnect and restart Claude Code before using it independently again.
+
+## Select a model from the terminal
+
+To configure the connection and select a specific downloaded model, first find its exact ID:
+
+```sh
+magnitude models status
+magnitude connections add claude-code --set-model "MODEL_ID"
+```
+
+Replace `MODEL_ID` with the ID from the first command, not the friendly display name. Restart the agent after changing its configuration.
+
+## Configuration
+
+Default configuration files:
+
+- `~/.claude/settings.json`
+
+On Windows, `~` means your user profile directory.
+
+Supported location overrides: `CLAUDE_CONFIG_DIR`. The paths displayed in Connections show which files Magnitude is actually checking.
+
+## Repair or disconnect
+
+If Connections shows **Connection needs repair**, click **Repair connection**. To stop using the integration, click **Disconnect**, then restart the agent.
+
+Terminal equivalents:
+
+```sh
+magnitude connections sync claude-code
+magnitude connections remove claude-code
+```
+
+See [connection states](/integrations/overview#connection-states) if the agent is not detected or its configuration cannot be verified.
