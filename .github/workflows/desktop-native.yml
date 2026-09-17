@@ -96,9 +96,9 @@ jobs:
             import { buildLinuxDesktopInstaller } from "./packages/release/scripts/build/desktop-linux";
             await Effect.runPromise(Effect.gen(function* () {
               const service = yield* Effect.tryPromise(() => buildAcnBinary("bun-linux-x64"));
-              yield* Effect.tryPromise(() => buildCliBinary("bun-linux-x64"));
+              const cli = yield* Effect.tryPromise(() => buildCliBinary("bun-linux-x64"));
               const options = { version: MAGNITUDE_VERSION, revision: ACN_COORDINATION_REVISION };
-              const apps = yield* buildDesktopApplication({ ...options, service, outputDirectory: "/tmp/magnitude-desktop-ci/app" });
+              const apps = yield* buildDesktopApplication({ ...options, service, cli, outputDirectory: "/tmp/magnitude-desktop-ci/app" });
               yield* buildLinuxDesktopInstaller({ ...options, app: apps[0]!, format: "deb", arch: "x64", output: "/tmp/magnitude-desktop-ci/installers" });
             }).pipe(Effect.provide(NodeContext.layer)));
           '
