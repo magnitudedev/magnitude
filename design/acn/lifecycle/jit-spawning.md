@@ -51,9 +51,9 @@ is required in addition to unit tests.
 
 Exact SDK RPC-version and instance fencing remain. Application updates own replacement of their
 matched bundled service; an older CLI cannot downgrade a live app's child. Users install the new
-desktop explicitly and stop and disable any previous standalone service. The application does not
-inspect old coordination records or migrate OS registrations. An occupied service port is a
-retryable conflict, never authority to adopt or terminate its current listener.
+desktop explicitly. On macOS and Linux, startup automatically retires verified previous standalone installations
+under the native ownership upgrade contract, preserving user data. An occupied service port alone
+is never authority to adopt or terminate its current listener.
 
 Existing SDK connections reconnect only to an existing owner. Full Quit cannot be undone by stale
 subscriptions or background retries. Fresh explicit demand may launch a new application lifetime.

@@ -171,19 +171,24 @@ stacks and stderr remain in logs instead of becoming the ordinary Status label.
 Failed child attempts retain bounded diagnostics in logs even when control-channel closure is
 observed before process exit; diagnostic visibility cannot depend on which failure wins that race.
 
-The desktop is a clean cutover from independently installed daemon versions. Users download the
-new application and stop and disable any previous daemon installation themselves. The application
-does not read old coordination databases, inspect or unregister old startup jobs, retire old
-processes, transfer login preferences, or persist migration checkpoints. Existing models, settings,
-and unrelated files remain untouched by cutover. Only this application's owned children may be stopped.
+On macOS and Linux, production startup automatically retires a verified previous standalone Magnitude installation
+before spawning its bundled service, while holding the application lock. This bounded upgrade is
+the sole exception to stopping only application-owned children. It verifies historical registration,
+user, executable and exact process identity, captures inference descendants before disabling old
+startup, and proves retirement before service admission. A port or process name alone grants no
+termination authority. Old coordination records are read-only evidence, never runtime election.
+Native Windows had no standalone predecessor and does not run this upgrade path.
 
-Before each service spawn, a loopback port check reports an occupied port as an actionable, retryable
-failure inside the supervisor. The tray and application control remain available, including Quit.
-The check never contacts or adopts the incumbent, and is diagnostic rather than an ownership lock;
-the service's own bind remains authoritative if another process races startup. Once the user removes
-the conflict, Retry may start a fresh owned service. Acceptance verifies that retries leave an
-incumbent alive, stale or malformed coordination files do not gate startup, and no migration state
-is created.
+Startup registration retirement and process cleanup tolerate interruption through a private atomic
+recovery record; every replay revalidates live identities. Development profiles cannot access real
+user startup registrations. Models, caches, settings, credentials and sessions remain in place.
+No custom path migration or login preference transfer is performed. Optional obsolete binary cleanup
+cannot block a successful startup or remove an unverified path.
+
+Upgrade runs within supervised startup with bounded deadlines and responsive application control.
+The existing port preflight still rejects unrelated incumbents, and the service bind remains
+authoritative against races. Acceptance covers real old-package upgrades, dormant registrations,
+manual services, inference descendants, interrupted/repeated launches and data/model reuse.
 
 Linux tray-host observation belongs to the application scope, independently of service and renderer
 lifetime. Subscribe to watcher ownership, host registration, and property changes before the initial
