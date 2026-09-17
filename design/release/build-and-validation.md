@@ -89,7 +89,10 @@ CUDA pack dependencies are resolved from explicitly selected toolkit DLLs; Vulka
 libraries are capability-owned only for their respective accelerator compositions. Magnitude-built
 backend DLLs are signed before archiving; vendor runtime DLLs retain their vendor signatures.
 A manually dispatched Windows-backend-only check builds the same accelerator archives without
-publishing or claiming full candidate acceptance.
+publishing or claiming full candidate acceptance. GPU execution validation composes the final base
+and accelerator pack on a driver-equipped Windows host without development toolkits, verifies GPU
+allocations and owned module paths, and exercises generation, streaming, cancellation, concurrent
+admission, model reload, and worker cleanup.
 An independent Windows consumer extracts and runs the final archives, checks their metadata,
 and exercises engine readiness and parent-loss shutdown before candidate assembly can pass.
 Production Windows packaging uses Artifact Signing with an explicit publisher identity. Owned code,
