@@ -89,11 +89,11 @@ jobs:
           trap 'gh release delete "$DIAGNOSTIC_TAG" --yes' EXIT
           export RELEASE_ID=$(gh release view "$DIAGNOSTIC_TAG" --json databaseId --jq .databaseId)
           dd if=/dev/urandom of=small.bin bs=1M count=32 status=none
-          dd if=/dev/urandom of=large.bin bs=1M count=128 status=none
+          dd if=/dev/urandom of=large.bin bs=1M count=640 status=none
           bun -e '
             import { Effect } from "effect";
             import { createHash } from "node:crypto";
-            import { uploadReleaseAssets } from "./packages/release/scripts/github-upload";
+            import { CurlReleaseUploadTransport, uploadReleaseAssets } from "./packages/release/scripts/github-upload";
             const files = [];
             for (const name of ["small.bin", "large.bin"]) {
               const hash = createHash("sha256");
@@ -106,13 +106,13 @@ jobs:
               if (!response.ok) throw new Error(`asset lookup: ${response.status}`);
               return await response.json();
             };
-            await Effect.runPromise(uploadReleaseAssets(options));
+            await Effect.runPromise(uploadReleaseAssets(options).pipe(Effect.provide(CurlReleaseUploadTransport)));
             const before = await list();
             for (const file of files) {
               const asset = before.find(asset => asset.name === file.name);
               if (asset?.state !== "uploaded" || asset.size !== file.bytes || asset.digest !== `sha256:${file.sha256}`) throw new Error(`unverified upload: ${file.name}`);
             }
-            await Effect.runPromise(uploadReleaseAssets(options));
+            await Effect.runPromise(uploadReleaseAssets(options).pipe(Effect.provide(CurlReleaseUploadTransport)));
             const after = await list();
             if (JSON.stringify(before.map(a=>a.id).sort()) !== JSON.stringify(after.map(a=>a.id).sort())) throw new Error("Resume replaced verified assets");
             console.log("Verified real upload digests and preserved asset IDs on resume");
