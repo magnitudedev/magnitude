@@ -1,7 +1,7 @@
 name: Release
 
 on:
-  pull_request:
+  pull_request_target:
     branches: [main]
     types: [closed]
   workflow_dispatch:
@@ -49,7 +49,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          EVENT_COMMIT: ${{ github.event_name == 'pull_request' && github.sha || '' }}
+          EVENT_COMMIT: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.merge_commit_sha || '' }}
           SOURCE_COMMIT_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && inputs.source_commit || '' }}
         run: |
           release_commit="$EVENT_COMMIT"
