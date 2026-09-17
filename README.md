@@ -17,7 +17,7 @@
   <a href="https://github.com/magnitudedev/magnitude/stargazers"><img src="https://img.shields.io/github/stars/magnitudedev/magnitude" alt="GitHub Repo stars"></a>
 </p>
 
-Magnitude is an open source local inference engine. It runs on the hardware you already have, whether that's a Mac, an NVIDIA or AMD GPU, or just a CPU. It profiles your machine, recommends the right models for it, then downloads, tunes, and runs them. Plug it into Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline.
+Magnitude is an open source inference engine optimized for consumer hardware. It profiles your machine, recommends the best models for it, and runs them tuned for your hardware. One click connects the agent you already use. Runs on Apple Silicon, NVIDIA, AMD, or nothing but a CPU.
 
 ⭐ Help us reach more developers and grow the Magnitude community. Star this repo!
 
@@ -33,10 +33,10 @@ The desktop app includes the `magnitude` CLI. No separate installation is needed
 
 ## Why Magnitude?
 
-- **Knows your machine:** profiles your hardware to assess fit and estimate tok/s
+- **Knows your machine:** profiles your hardware and estimates tok/s before you download
 - **Recommends the best models:** ranked by speed, accuracy, intelligence, and memory
 - **Tuned end to end:** speculative decoding and more, all set for your hardware
-- **Easy setup:** discover a model and connect your harness in the desktop app
+- **Works with your agent:** one click to connect Pi, OpenCode, Hermes, and more
 - **Free to run:** no token costs, API keys, or rate limits
 - **Fully private and offline:** models, prompts, and files stay on your machine
 - **Models on demand:** loaded on request, unloaded when idle or memory fills
