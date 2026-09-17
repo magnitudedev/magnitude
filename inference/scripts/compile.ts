@@ -4,6 +4,8 @@ import {
   stat,
 } from "node:fs/promises"
 import { basename, delimiter, dirname, resolve } from "node:path"
+import { createHash } from "node:crypto"
+import { tmpdir } from "node:os"
 import { fileURLToPath } from "node:url"
 import { IcnBinaryIdentity } from "@magnitudedev/icn-protocol"
 import { ICN_EXECUTABLE_NAME } from "@magnitudedev/release/executables"
@@ -283,11 +285,10 @@ export const buildIcnBinary = async ({
   extraRuntimeLibraries = [],
 }: BuildIcnInput): Promise<IcnBuild> => {
   const cargoTarget = rustTarget(target)
-  const targetDirectory = resolve(
-    PROJECT_ROOT,
-    "inference/target",
-    `release-${profile}`,
-  )
+  // Cargo and CMake append deeply nested paths; MSVC still fails on long PDB/object paths.
+  const targetDirectory = process.platform === "win32"
+    ? resolve(tmpdir(), `icn-${createHash("sha256").update(profile).digest("hex").slice(0, 12)}`)
+    : resolve(PROJECT_ROOT, "inference/target", `release-${profile}`)
   if (clean) await rm(targetDirectory, { recursive: true, force: true })
 
   const metadata = JSON.parse(await run([
