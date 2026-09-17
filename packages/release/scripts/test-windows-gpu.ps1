@@ -177,7 +177,7 @@ try {
 
   # Build Unicode independently of the PowerShell host's source-file encoding.
   $unicode='caf'+[char]0x00e9+', '+[char]0x6771+[char]0x4eac+', na'+[char]0x00ef+'ve, '+[char]::ConvertFromUtf32(0x1f680)+'.'
-  $body=Payload "Return this phrase as the JSON value: $unicode" 1024
+  $body=Payload "Return a JSON object with exactly one key named value. Its string value must be exactly: $unicode" 2048
   $body.response_format=@{type='json_schema';json_schema=@{name='unicode_echo';strict=$true;schema=@{type='object';properties=@{value=@{type='string';const=$unicode}};required=@('value');additionalProperties=$false}}}
   $response=Request POST '/v1/chat/completions' $body
   AssertResponse $response
