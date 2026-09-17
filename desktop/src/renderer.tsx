@@ -213,20 +213,22 @@ function SelectedRecommendation({ model, active }: { model: CatalogLocalModel; a
     </div>}
   </div>
 }
-function Recommendations({ models, active }: { models: readonly CatalogLocalModel[]; active: ReturnType<typeof activeLocalModel> }) {
-  const [selectedId, setSelectedId] = useState<CatalogLocalModel["modelId"] | null>(null)
+function Recommendations({ models, active, preference }: { models: readonly CatalogLocalModel[]; preference: number; active: ReturnType<typeof activeLocalModel> }) {
+  const [selection, setSelection] = useState<{ preference: number; modelId: CatalogLocalModel["modelId"] | null }>({ preference, modelId: null })
+  if (selection.preference !== preference) setSelection({ preference, modelId: null })
+  const selectedId = selection.preference === preference ? selection.modelId : null
   const downloads = models.filter(model => model.acquisitionState._tag === "Installing" || model.acquisitionState._tag === "Updating")
   const selectable = downloads.length > 0 ? downloads : models
   const selected = selectable.find(model => model.modelId === selectedId) ?? selectable[0]
   if (!selected) return null
-  return <section aria-label="Top recommendations" className="mb-8 motion-safe:animate-in motion-safe:fade-in motion-safe:duration-300">
+  return <section aria-label="Top recommendations" className="mb-8">
     <div className={pageLayout.recommendations}>
-      <div className={pageLayout.recommendationList} aria-label="Recommended models">{models.map((model, rank) => <button key={model.modelId} type="button" aria-pressed={model.modelId === selected.modelId} onClick={() => setSelectedId(model.modelId)} className={`${pageLayout.recommendationRow} transition-colors focus-visible:outline-2 focus-visible:outline-blue-500 ${model.modelId === selected.modelId ? "border-blue-300 bg-blue-50 dark:border-blue-700 dark:bg-slate-800" : "border-transparent hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
+      <div className={pageLayout.recommendationList} aria-label="Recommended models">{models.map((model, rank) => <button key={model.modelId} type="button" aria-pressed={model.modelId === selected.modelId} onClick={() => setSelection({ preference, modelId: model.modelId })} className={`${pageLayout.recommendationRow} transition-colors focus-visible:outline-2 focus-visible:outline-blue-500 ${model.modelId === selected.modelId ? "border-blue-300 bg-blue-50 dark:border-blue-700 dark:bg-slate-800" : "border-transparent hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
         <span className="w-4 shrink-0 text-sm tabular-nums text-slate-500">{rank + 1}</span>
         <ModelLogo model={model} className="size-7" />
         <span className="min-w-0 text-sm font-medium">{formatLocalModelDisplayName(model)}</span>
       </button>)}</div>
-      <SelectedRecommendation key={selected.modelId} model={selected} active={active} />
+      <SelectedRecommendation model={selected} active={active} />
     </div>
   </section>
 }
@@ -301,7 +303,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
     {!discover && assessment && !assessment.complete && <p className="mb-4 text-sm text-slate-500">Assessing models · {assessment.settledModels} of {assessment.totalModels}</p>}
     {discover && (recommendationsPending
       ? <RecommendationsSkeleton assessment={assessment} waitingForHardware={Result.isInitial(hardware)} />
-      : <Recommendations key={preference} models={featuredCatalogModels(ranked, 5)} active={Option.fromNullable(active)} />)}
+      : <Recommendations preference={preference} models={featuredCatalogModels(ranked, 5)} active={Option.fromNullable(active)} />)}
     {!discover && <>
     <div className="grid items-start gap-5">{visible.map(model => <ModelCard key={model.modelId} model={model} showMemory={installedOnly} {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})} />)}</div>
     {visible.length === 0 && <p className="py-8 text-slate-500">{search.trim() || filter !== "all" ? "No models match your search or filter." : installedOnly ? "No models downloaded yet. Find one in Discover." : "No models match this filter."}</p>}
@@ -344,12 +346,20 @@ function ModelStatus() {
   const stopping = useLocalModelStopStatus()
   const presentation = Result.isSuccess(models) ? modelTrayPresentation(models.value) : null
   const active = Result.isSuccess(models) ? Option.getOrUndefined(activeLocalModel(models.value)) : undefined
-  if (Result.isInitial(models)) return <LoadingRegion label="Loading model status" className="mt-3"><SkeletonLine className="h-[1lh] w-48" /></LoadingRegion>
-  return <div className="mt-3">
-    <div className="flex items-center gap-3">{active && <ModelLogo model={active.model} className="size-7" />}<p>{presentation?.label ?? (Result.isFailure(models) ? "Model status unavailable" : "Reading model status…")}</p></div>
+  if (Result.isInitial(models)) return <LoadingRegion label="Loading model status" className="mt-5"><div className="flex h-12 items-center gap-3"><SkeletonLine className="h-6 w-64" /></div></LoadingRegion>
+  return <div className="mt-5">
+    <div className="flex min-h-12 items-center justify-between gap-5">
+      <div className="flex min-w-0 items-center gap-3">
+        {active && <ModelLogo model={active.model} className="size-6 shrink-0" />}
+        <div className="min-w-0">
+          <p className="m-0 break-words text-lg font-medium leading-snug text-slate-800 dark:text-slate-200">{active ? formatLocalModelDisplayName(active.model) : presentation?.label ?? (Result.isFailure(models) ? "Model status unavailable" : "Reading model status…")}</p>
+          {active && <p className={`mb-0 mt-1 text-xs ${active.residency._tag === "Ready" ? "text-green-700 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>{active.residency._tag === "Ready" ? "Loaded" : active.residency._tag === "Requested" ? "Queued" : `${active.residency._tag}…`}</p>}
+        </div>
+      </div>
+      {presentation?.canStop && <Button variant="outline" className="hover:border-red-300 hover:text-red-600 dark:hover:border-red-800 dark:hover:text-red-400" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button>}
+    </div>
     {active?.residency._tag === "Loading" && <div className="mt-4"><Progress aria-label="Model loading progress" indicatorClassName="bg-blue-700 dark:bg-blue-500" value={Option.match(active.residency.progress, { onNone: () => null, onSome: fraction => fraction * 100 })} /></div>}
     {Result.isFailure(models) && <p role="alert" className="mt-2 text-sm text-slate-500">{localModelFailureMessage(models.cause, "Could not read model status. Check Status and try again.")}</p>}
-    {presentation?.canStop && <Button className="mt-4" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button>}
     {Option.isSome(stopping.failure) && <p role="alert" className="mt-2 text-sm">{stopping.failure.value}</p>}
   </div>
 }
@@ -367,7 +377,14 @@ function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null
   const ready=service?._tag === "Ready"
   return <div className={pageLayout.statusStack}>
     <section aria-busy={!snapshot} aria-label={!snapshot ? "Loading service status" : undefined} className={pageLayout.statusHero}>
-      <div className="flex items-center gap-5"><div className={`flex size-16 shrink-0 items-center justify-center rounded-full border bg-white dark:bg-slate-900 ${ready ? "border-green-300 text-green-600 dark:border-green-800 dark:text-green-400" : "border-blue-300 text-blue-600 dark:border-blue-800 dark:text-blue-400"}`}>{ready ? <CheckIcon aria-label="Service ready" className="size-7 text-green-600 dark:text-green-400" /> : <PulseIcon className="size-7" />}</div><div><p className="text-xs font-medium uppercase tracking-widest text-slate-500">Magnitude service</p><h2 className="mt-2 font-heading text-2xl">{!snapshot ? <SkeletonLine className="h-8 w-72 text-2xl" /> : ready ? "Ready when you are" : service?._tag === "CleanupFailed" ? "Cleanup needs attention" : service?._tag === "Failed" ? "Let’s get you running" : "Starting your local engine"}</h2>{ready ? <ModelStatus /> : !snapshot ? <SkeletonLine className="mt-2 h-5 text-sm" /> : <p className="mt-2 text-sm text-slate-500">{service?._tag}</p>}</div></div>
+      <div className="flex items-center justify-between gap-4 border-b border-slate-200 pb-4 dark:border-slate-700">
+        <h2 className="m-0 text-sm font-medium text-slate-600 dark:text-slate-300">Magnitude service</h2>
+        <div className={`flex items-center gap-1.5 text-xs ${ready ? "text-green-700 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>
+          {ready ? <CheckIcon aria-label="Service ready" className="size-4 shrink-0" /> : <PulseIcon className="size-4 shrink-0" />}
+          <span>{!snapshot ? <SkeletonLine className="h-4 w-16 text-xs" /> : ready ? "Ready" : service?._tag === "CleanupFailed" ? "Cleanup needs attention" : service?._tag === "Failed" ? "Unavailable" : "Starting"}</span>
+        </div>
+      </div>
+      {ready ? <ModelStatus /> : !snapshot ? <SkeletonLine className="mt-5 h-12 w-64" /> : <p className="mt-5 text-sm text-slate-500">{service?._tag}</p>}
       {ready && <DownloadActivity />}
       {service && "message" in service && <p role="alert" className="mt-5 text-sm">{service.message}</p>}
       {service?._tag === "Failed" && <Button className="mt-5" variant="outline" onClick={() => host.retry()}>Retry service</Button>}
