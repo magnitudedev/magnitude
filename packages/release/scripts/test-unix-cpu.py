@@ -49,19 +49,8 @@ architecture = subprocess.check_output(['/usr/bin/lipo', '-archs', str(binary)],
 assert architecture == platform.machine(), architecture
 record('native-architecture', {'host': host, 'architecture': architecture})
 
-repository = 'Qwen/Qwen2.5-0.5B-Instruct-GGUF'
-revision = '9217f5db79a29953eb74d5343926648285ec7e67'
-filename = 'qwen2.5-0.5b-instruct-q4_k_m.gguf'
-model = f'hf:{repository}/{filename}'
-model_path = root / 'hf' / ('models--' + repository.replace('/', '--')) / 'snapshots' / revision / filename
-model_path.parent.mkdir(parents=True)
-with urllib.request.urlopen(f'https://huggingface.co/{repository}/resolve/{revision}/{filename}', timeout=120) as source, model_path.open('wb') as target:
-    while chunk := source.read(1024 * 1024):
-        target.write(chunk)
-model_digest = digest(model_path)
-assert model_path.stat().st_size == 491400032
-assert model_digest == '74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db'
-record('model-integrity', {'model': model, 'revision': revision, 'sha256': model_digest})
+model = 'lfm2.5-2.6b:gguf:q4'
+catalog_path = '/api/v1/catalog/models/' + urllib.parse.quote(model, safe='')
 
 token = uuid.uuid4().hex
 origin = 'http://127.0.0.1:18843'
@@ -72,7 +61,7 @@ def request(path, body=None, raw=False):
         value = response.read().decode()
     return value if raw else (json.loads(value) if value else None)
 def payload(text, tokens=48):
-    return dict(model=model, messages=[dict(role='user', content=text)], temperature=0, seed=42, max_tokens=tokens)
+    return dict(model=model, messages=[dict(role='user', content=text)], temperature=0, seed=42, max_tokens=tokens, reasoning_effort='none')
 def generate(text):
     response = request('/v1/chat/completions', payload(text))
     assert response['choices'][0]['message']['content'].strip()
@@ -85,7 +74,7 @@ environment.update(MAGNITUDE_ICN_AUTH_TOKEN=token, RUST_LOG='info')
 with (root / 'server.log').open('w') as log:
     process = subprocess.Popen([str(binary), 'serve', '--bind', '127.0.0.1:18843', '--instance-id', 'cpu-acceptance-' + uuid.uuid4().hex,
         '--installation', str(installation / 'installation.json'), '--model-store', str(root / 'models'),
-        '--cache-root', str(root / 'cache'), '--hf-cache', str(root / 'hf')],
+        '--cache-root', str(root / 'cache')],
         env=environment, stdout=log, stderr=log, start_new_session=True)
     try:
         for _ in range(120):
@@ -102,6 +91,46 @@ with (root / 'server.log').open('w') as log:
         assert hardware['native_build'] == metadata['nativeBuild']
         assert hardware['enabled_backends'] == ['cpu']
         record('hardware-identity', hardware)
+        catalog_model = request(catalog_path)
+        assert catalog_model['id'] == model
+        assert catalog_model['localState']['_tag'] == 'NotInstalled'
+        assert catalog_model['desired']['profile']['contextLength'] == 64000
+        record('catalog-model', catalog_model)
+        admission = request(catalog_path + '/install', {})
+        assert admission['_tag'] == 'Admitted', admission
+        record('catalog-install-admission', admission)
+        operation_path = '/api/v1/catalog/installations/' + admission['operationId']
+        for _ in range(1200):
+            operation = request(operation_path)
+            assert operation['modelId'] == model
+            state = operation['state']['_tag']
+            if state == 'Completed':
+                break
+            if state in ('Failed', 'Cancelled'):
+                record('catalog-install-failure', operation)
+                raise AssertionError(operation)
+            time.sleep(1)
+        else:
+            raise AssertionError('Catalog installation did not complete')
+        record('catalog-install-completed', operation)
+        installed = request(catalog_path)
+        assert installed['localState']['_tag'] == 'Installed'
+        assert installed['localState']['effective']['_tag'] == 'Ready', installed
+        assert installed['localState']['installation']['ownership'] == 'Magnitude'
+        assert installed['localState']['updateState']['_tag'] == 'Current'
+        record('catalog-installed', installed)
+        # Independently check the content-addressed bytes fetched by the product downloader.
+        blobs = sorted((root / 'models' / 'hub').glob('models--*/blobs/lfs-sha256-*'))
+        assert len(blobs) == 2, 'Catalog target and DSpark draft must both be installed'
+        integrity = []
+        for blob in blobs:
+            assert not blob.name.endswith('.incomplete'), blob
+            actual = digest(blob)
+            assert actual == blob.name.removeprefix('lfs-sha256-'), blob
+            integrity.append({'file': str(blob.relative_to(root)), 'bytes': blob.stat().st_size, 'sha256': actual})
+        record('catalog-material-integrity', integrity)
+        assert request(catalog_path + '/install', {})['_tag'] == 'Current'
+        record('catalog-install-idempotent', {'model': model})
         for _ in range(120):
             models = request('/v1/models')
             if model in [item['id'] for item in models['data']]:

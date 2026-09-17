@@ -195,8 +195,9 @@ observe a Ready service; an intentionally missing engine only certifies failure 
 satisfy candidate bootstrap acceptance. Engine readiness does not imply model-serving acceptance.
 
 A manual macOS Intel CPU consumer downloads a selected run's final host archive, verifies its
-digest and native identity, and performs real inference with a pinned, checksum-verified small
-model. It exercises streaming, concurrent requests, prefill, unload and reload on native Intel
+digest and native identity, installs the smallest shipped catalog model through the canonical
+catalog operation, and performs real inference with its locked target and draft configuration.
+It exercises streaming, concurrent requests, prefill, unload and reload on native Intel
 hardware, retaining results and server diagnostics without publishing or replacing candidate gates.
 
 Pull requests run the complete build and acceptance graph without publishing. A manually dispatched
