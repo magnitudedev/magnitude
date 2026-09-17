@@ -1,0 +1,61 @@
+name: Release upload diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  upload:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [blacksmith-4vcpu-ubuntu-2204, ubuntu-22.04]
+        client: [bun, gh]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      UPLOAD_CLIENT: ${{ matrix.client }}
+      DIAGNOSTIC_TAG: upload-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}-${{ matrix.client }}
+    steps:
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+      - name: Compare sequential binary uploads to a disposable draft
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          gh --version
+          bun --version
+          gh release create "$DIAGNOSTIC_TAG" --draft --target "$SOURCE_COMMIT" --title 'Temporary upload diagnostic' --notes 'Disposable CI transport comparison; never published.'
+          trap 'gh release delete "$DIAGNOSTIC_TAG" --yes' EXIT
+          release_id=$(gh api "repos/$GH_REPO/releases?per_page=100" --jq ".[] | select(.tag_name == \"$DIAGNOSTIC_TAG\") | .id")
+          export UPLOAD_URL="https://uploads.github.com/repos/$GH_REPO/releases/$release_id/assets"
+          dd if=/dev/urandom of=payload.bin bs=1M count=32 status=none
+          for attempt in 1 2 3; do
+            export ASSET_NAME="payload-$attempt.bin"
+            echo "Starting $UPLOAD_CLIENT upload $attempt at $(date -u +%FT%TZ)"
+            if [ "$UPLOAD_CLIENT" = gh ]; then
+              cp payload.bin "$ASSET_NAME"
+              time timeout 150 gh release upload "$DIAGNOSTIC_TAG" "$ASSET_NAME"
+            else
+              bun -e '
+                const started = performance.now();
+                const response = await fetch(`${process.env.UPLOAD_URL}?name=${process.env.ASSET_NAME}`, {
+                  method: "POST",
+                  headers: { authorization: `Bearer ${process.env.GH_TOKEN}`, accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28", "content-type": "application/octet-stream" },
+                  body: Bun.file("payload.bin"),
+                  signal: AbortSignal.timeout(150_000),
+                });
+                const body = await response.text();
+                console.log(JSON.stringify({ status: response.status, elapsedMs: Math.round(performance.now() - started), requestId: response.headers.get("x-github-request-id"), retryAfter: response.headers.get("retry-after"), body }));
+                if (!response.ok) process.exit(1);
+              '
+            fi
+            sleep 1
+          done
