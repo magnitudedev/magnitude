@@ -60,11 +60,11 @@ def request(path, body=None, raw=False):
     with urllib.request.urlopen(req, timeout=600) as response:
         value = response.read().decode()
     return value if raw else (json.loads(value) if value else None)
-def payload(text, tokens=48):
+def payload(text, tokens=512):
     return dict(model=model, messages=[dict(role='user', content=text)], temperature=0, seed=42, max_tokens=tokens, reasoning_effort='none')
 def generate(text):
     response = request('/v1/chat/completions', payload(text))
-    assert response['choices'][0]['message']['content'].strip()
+    assert response['choices'][0]['message']['content'].strip(), response
     assert response['usage']['completion_tokens'] > 0
     assert response['choices'][0]['finish_reason'] in ('stop', 'length')
     return response
@@ -120,7 +120,7 @@ with (root / 'server.log').open('w') as log:
         assert installed['localState']['updateState']['_tag'] == 'Current'
         record('catalog-installed', installed)
         # Independently check the content-addressed bytes fetched by the product downloader.
-        blobs = sorted((root / 'models' / 'hub').glob('models--*/blobs/lfs-sha256-*'))
+        blobs = sorted(blob for blob in (root / 'models' / 'hub').glob('models--*/blobs/lfs-sha256-*') if blob.suffix != '.integrity')
         assert len(blobs) == 2, 'Catalog target and DSpark draft must both be installed'
         integrity = []
         for blob in blobs:
@@ -148,7 +148,7 @@ with (root / 'server.log').open('w') as log:
         record('resident-allocation', instances)
         for index in range(4):
             record(f'repeat-{index}', generate('Say hello in one sentence.'))
-        body = payload('Count from one to ten.', 80)
+        body = payload('Count from one to ten.', 512)
         body['stream'] = True
         stream = request('/v1/chat/completions', body, raw=True)
         assert 'data: [DONE]' in stream
