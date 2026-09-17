@@ -394,13 +394,14 @@ mod tests {
         } else {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             super::configure_parent_lifetime(&mut command).unwrap();
-            let child = command
+            let mut child = command
                 .args(["--exact", "worker_process::tests::parent_lifetime_fixture"])
                 .env("ICN_PARENT_LIFETIME_WORKER", "1")
                 .spawn()
                 .unwrap();
             fs::write(directory.join("pid.tmp"), child.id().to_string()).unwrap();
             fs::rename(directory.join("pid.tmp"), directory.join("pid")).unwrap();
+            panic!("worker exited before its parent: {}", child.wait().unwrap());
         }
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
