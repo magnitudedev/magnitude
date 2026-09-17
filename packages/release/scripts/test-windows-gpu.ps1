@@ -3,10 +3,11 @@ param(
   [Parameter(Mandatory = $true)][string]$InstallationDirectory,
   [Parameter(Mandatory = $true)][string]$ModelId,
   [Parameter(Mandatory = $true)][string]$OutputDirectory,
+  [switch]$Extended,
   [string]$Origin = 'http://127.0.0.1:8080',
   [string]$AuthToken = $env:MAGNITUDE_ICN_AUTH_TOKEN
 )
-# Exercise an already-running, isolated Windows ICN with a small instruction model.
+# Exercise an already-running, isolated Windows ICN with an instruction model.
 # The caller owns the process and GPU-machine lifetime; this script never provisions resources.
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -21,8 +22,13 @@ $results=New-Object System.Collections.Generic.List[object]
 function Record($name,$detail) { $results.Add(@{test=$name;detail=$detail}); Write-Output "PASS $name" }
 function Request($method,$path,$body) {
  $requestParameters=@{Uri="$origin$path";Headers=$headers;Method=$method;TimeoutSec=600}
- if ($null -ne $body) {$requestParameters.ContentType='application/json';$requestParameters.Body=($body | ConvertTo-Json -Depth 30 -Compress)}
- Invoke-RestMethod @requestParameters
+ if ($null -ne $body) {$requestParameters.ContentType='application/json; charset=utf-8';$requestParameters.Body=[Text.Encoding]::UTF8.GetBytes(($body | ConvertTo-Json -Depth 30 -Compress))}
+ # Windows PowerShell 5 defaults JSON without a charset to a legacy encoding.
+ # Decode the response bytes as UTF-8, as required by the JSON wire format.
+ $response=Invoke-WebRequest @requestParameters -UseBasicParsing
+ $response.RawContentStream.Position=0
+ $reader=New-Object IO.StreamReader($response.RawContentStream,[Text.Encoding]::UTF8)
+ try { $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
 }
 function Payload($text,[int]$tokens=48) { @{model=$ModelId;messages=@(@{role='user';content=$text});temperature=0;seed=42;max_tokens=$tokens;stream=$false} }
 function AssertResponse($response) {
@@ -63,6 +69,7 @@ try {
  AssertResponse $response
  if ($response.usage.prompt_tokens -lt 1000) { throw 'Long prefill did not exercise at least 1000 tokens' }
  Record 'long-prefill' $response
+ $prefillPromptTokens=$response.usage.prompt_tokens
  $body=Payload 'Count from one to ten.' 80;$body.stream=$true
  $stream=Invoke-WebRequest "$origin/v1/chat/completions" -Headers $headers -Method Post -ContentType 'application/json' -Body ($body | ConvertTo-Json -Depth 20) -UseBasicParsing -TimeoutSec 600
  $streamText = ''
@@ -118,6 +125,79 @@ try {
  try { Request POST '/v1/chat/completions' $invalid | Out-Null } catch { $rejected=[int]$_.Exception.Response.StatusCode -in @(400,422) }
  if (!$rejected) { throw 'Malformed inference request was not rejected' }
  Record 'invalid-request-rejected' $true
+ if ($Extended) {
+  $body=Payload 'Return the city Paris and country France as JSON.' 128
+  $body.response_format=@{type='json_schema';json_schema=@{name='location';strict=$true;schema=@{type='object';properties=@{city=@{type='string';const='Paris'};country=@{type='string';const='France'}};required=@('city','country');additionalProperties=$false}}}
+  $response=Request POST '/v1/chat/completions' $body
+  AssertResponse $response
+  $structured=$response.choices[0].message.content | ConvertFrom-Json
+  if ($structured.city -cne 'Paris' -or $structured.country -cne 'France') { throw 'Constrained JSON output did not satisfy the schema' }
+  Record 'strict-json-schema' $response
+
+  $body=Payload 'What is the weather in Paris? Use the weather tool.' 128
+  $body.tools=@(@{type='function';function=@{name='weather';description='Get the weather for a city';parameters=@{type='object';properties=@{city=@{type='string';const='Paris'}};required=@('city');additionalProperties=$false}}})
+  $body.tool_choice=@{type='function';function=@{name='weather'}}
+  $body.parallel_tool_calls=$false
+  $response=Request POST '/v1/chat/completions' $body
+  $calls=@($response.choices[0].message.tool_calls)
+  if ($response.choices[0].finish_reason -ne 'tool_calls' -or $calls.Count -ne 1 -or $calls[0].function.name -ne 'weather') { throw 'Forced tool call was not emitted' }
+  $arguments=$calls[0].function.arguments | ConvertFrom-Json
+  if ($arguments.city -cne 'Paris' -or !$calls[0].id) { throw 'Tool call arguments or identity are invalid' }
+  Record 'forced-tool-call' $response
+  $followup=Payload 'unused' 128
+  $followup.messages=@($body.messages[0],@{role='assistant';content=$null;tool_calls=$calls},@{role='tool';tool_call_id=$calls[0].id;content='{"city":"Paris","weather":"sunny"}'})
+  $followup.tools=$body.tools;$followup.tool_choice='none'
+  $response=Request POST '/v1/chat/completions' $followup
+  AssertResponse $response
+  Record 'tool-result-round-trip' $response
+
+  $body=Payload 'Write a detailed story about a lighthouse.' 256;$body.ignore_eos=$true
+  $response=Request POST '/v1/chat/completions' $body
+  AssertResponse $response
+  if ($response.usage.completion_tokens -ne 256 -or $response.choices[0].finish_reason -ne 'length') { throw 'Long decode did not reach its token limit' }
+  Record 'long-decode-token-limit' $response
+
+  # Build Unicode independently of the PowerShell host's source-file encoding.
+  $unicode='caf'+[char]0x00e9+', '+[char]0x6771+[char]0x4eac+', na'+[char]0x00ef+'ve, '+[char]::ConvertFromUtf32(0x1f680)+'.'
+  $body=Payload "Return this phrase as the JSON value: $unicode" 128
+  $body.response_format=@{type='json_schema';json_schema=@{name='unicode_echo';strict=$true;schema=@{type='object';properties=@{value=@{type='string';const=$unicode}};required=@('value');additionalProperties=$false}}}
+  $response=Request POST '/v1/chat/completions' $body
+  AssertResponse $response
+  $echo=$response.choices[0].message.content | ConvertFrom-Json
+  if ($echo.value -cne $unicode) { throw 'Unicode response did not round-trip exactly' }
+  Record 'unicode-request-and-response' $response
+
+  $paragraph='The orchard has apples, pears, and peaches. The gardener waters the trees every morning. '
+  $instruction='Summarize this description in one sentence.'
+  $probe=Request POST '/v1/chat/completions' (Payload (($paragraph * 40)+$instruction) 1)
+  $tokensPerParagraph=($prefillPromptTokens-$probe.usage.prompt_tokens)/40
+  if ($tokensPerParagraph -le 0) { throw 'Unable to measure prompt token growth' }
+  $overhead=$probe.usage.prompt_tokens-(40*$tokensPerParagraph)
+  $context=[int]$ready[0].lifecycle.allocation.contextWindowTokens
+  $paragraphCount=[int][Math]::Floor((0.9*$context-64-$overhead)/$tokensPerParagraph)
+  $nearLimitText=($paragraph * $paragraphCount)+$instruction
+  $body=Payload $nearLimitText 32;$body.cache_prompt=$false
+  $response=Request POST '/v1/chat/completions' $body
+  AssertResponse $response
+  if ($response.usage.prompt_tokens -lt 0.8*$context) { throw 'Near-limit prefill did not cover at least 80 percent of the allocated context' }
+  Record 'near-context-limit' $response
+  $tooLong=Payload ($nearLimitText+$nearLimitText) 32
+  $rejected=$false
+  try { Request POST '/v1/chat/completions' $tooLong | Out-Null } catch {
+   $rejected=[int]$_.Exception.Response.StatusCode -eq 400 -and $_.ErrorDetails.Message -match 'context_length_exceeded'
+  }
+  if (!$rejected) { throw 'Oversized prompt did not report context_length_exceeded' }
+  Record 'context-overflow-rejected' $true
+  $response=Request POST '/v1/chat/completions' (Payload 'What is two plus two?')
+  AssertResponse $response
+  Record 'context-overflow-recovery' $response
+
+  for ($i=0;$i -lt 32;$i++) {
+   $response=Request POST '/v1/chat/completions' (Payload "Write a brief sentence about item $i." 32)
+   AssertResponse $response
+  }
+  Record 'sustained-repeated-generation' @{requests=32;lastResponse=$response}
+ }
  $instances=Request GET '/api/v1/instances' $null
  foreach($instance in @($instances.instances | Where-Object {$_.modelId -eq $ModelId -and $_.lifecycle._tag -eq 'Ready'})) {
   Request POST "/api/v1/instances/$($instance.id)/stop" $null | Out-Null
