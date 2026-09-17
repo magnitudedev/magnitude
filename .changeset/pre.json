@@ -20,7 +20,7 @@
     "@magnitudedev/icn-protocol": "0.0.1",
     "@magnitudedev/inference-benchmark": "0.0.1",
     "@magnitudedev/inference-benchmark-dashboard": "0.0.1",
-    "@magnitudedev/cli": "0.0.14",
+    "@magnitudedev/cli": "0.0.15",
     "@magnitudedev/logger": "0.0.1",
     "@magnitude/markdown-cst": "0.0.1",
     "@magnitudedev/openapi-effect": "0.0.1",

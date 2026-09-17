@@ -1,7 +1,7 @@
 {
   "name": "@magnitudedev/cli",
   "private": true,
-  "version": "0.0.14",
+  "version": "0.0.15",
   "description": "Command-line launcher for the installed Magnitude desktop app",
   "license": "Apache-2.0",
   "repository": {
