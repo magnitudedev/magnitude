@@ -287,8 +287,8 @@ export const buildIcnBinary = async ({
   const cargoTarget = rustTarget(target)
   // Cargo and CMake append deeply nested paths; MSVC still fails on long PDB/object paths.
   const targetDirectory = process.platform === "win32"
-    ? resolve(parse(tmpdir()).root, "icn", createHash("sha256")
-      .update(`${tmpdir()}:${PROJECT_ROOT}:${profile}`).digest("hex").slice(0, 12))
+    ? resolve(parse(tmpdir()).root, createHash("sha256")
+      .update(`${tmpdir()}:${PROJECT_ROOT}:${profile}`).digest("hex").slice(0, 8))
     : resolve(PROJECT_ROOT, "inference/target", `release-${profile}`)
   if (clean) await rm(targetDirectory, { recursive: true, force: true })
 
