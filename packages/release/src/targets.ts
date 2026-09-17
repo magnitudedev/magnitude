@@ -149,7 +149,8 @@ export const backendPacks: readonly BackendPack[] = [
     cargoFeatures: ["dynamic-backends", "cuda-no-vmm"],
     module: "ggml-cuda.dll",
     runtimeLibraries: ["cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll"],
-    cuda: { toolkitVersion: "12.9", architectures: ["80-virtual", "90-virtual", "120-virtual"] },
+    // Ship cubins as well as PTX so the first model load does not JIT every kernel.
+    cuda: { toolkitVersion: "12.9", architectures: ["80", "90", "120"] },
   },
   {
     id: "vulkan1-windows-x64-msvc",

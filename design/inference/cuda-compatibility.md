@@ -34,7 +34,7 @@ system symlinks.
 
 ## Shipped artifact contract
 
-Each CUDA pack declares only facts needed for current PTX-only artifacts:
+Each CUDA pack derives its compatibility floor from retained PTX images:
 
 - exact toolkit release and compiler identity;
 - every embedded PTX image's `.version`, numeric target, and whether the target is ordinary or
@@ -62,6 +62,9 @@ These four host/toolkit jobs run concurrently on Ubuntu 22.04 for both x64 and S
 Linux pack retains the release userspace ABI baseline. Host CPU architecture never selects a CUDA
 toolkit generation. Windows x64 independently builds CUDA 12.9 with the same PTX targets as the
 Linux 12.9 packs, using the native MSVC toolchain and shipping the required NVIDIA runtime DLLs.
+The Windows pack also emits native cubins for those compiler targets to avoid lengthy first-load
+JIT compilation. Retained PTX preserves forward compatibility; the advertised driver floor remains
+the inspected PTX floor, including when a native cubin can execute on the host.
 
 Release compatibility inspection consumes `cuobjdump` output as a stream and retains only the
 distinct PTX image facts. Its memory use must not scale with the textual PTX dump.
