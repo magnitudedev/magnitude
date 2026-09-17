@@ -1,5 +1,7 @@
 //! Model assessment over the exact pinned llama.cpp native-planning path.
 
+mod cpu_topology;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, NulError};
 use std::num::NonZeroU32;
@@ -349,6 +351,7 @@ struct HardwareEnvironment {
     platform: String,
     architecture: String,
     system_product_name: Option<String>,
+    physical_cores: Option<usize>,
     logical_cores: usize,
     system_memory: HardwareSystemMemory,
 }
@@ -425,6 +428,7 @@ pub fn discover_hardware(
             platform: std::env::consts::OS.to_owned(),
             architecture: std::env::consts::ARCH.to_owned(),
             system_product_name: discover_system_product_name(std::env::consts::OS),
+            physical_cores: cpu_topology::physical_cores(),
             logical_cores: std::thread::available_parallelism().map_or(1, |value| value.get()),
             system_memory,
         },
@@ -557,6 +561,7 @@ fn hardware_snapshot_from_devices(
             .flat_map(|domain| &domain.devices)
             .find(|device| device.kind == HardwareDeviceKind::Cpu)
             .map(|device| device.description.clone()),
+        physical_cores: environment.physical_cores,
         logical_cores: environment.logical_cores,
         system_memory: environment.system_memory,
         native_build: environment.native_build,
@@ -2840,6 +2845,7 @@ mod tests {
                 platform: platform.to_owned(),
                 architecture: architecture.to_owned(),
                 system_product_name: None,
+                physical_cores: Some(4),
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
                     physical_capacity_bytes: system_memory_bytes,
@@ -2914,6 +2920,7 @@ mod tests {
                 platform: "linux".to_owned(),
                 architecture: "x86_64".to_owned(),
                 system_product_name: None,
+                physical_cores: Some(4),
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
                     physical_capacity_bytes: 64_000,
@@ -2933,6 +2940,8 @@ mod tests {
             assert_eq!(domain.devices.len(), 2);
         }
         assert_eq!(snapshot.enabled_backends, vec!["cuda", "vulkan"]);
+        assert_eq!(snapshot.physical_cores, Some(4));
+        assert_eq!(snapshot.logical_cores, 8);
         assert_eq!(snapshot.system_product_name, None);
         let topology = MemoryTopology::from_snapshot(&snapshot).expect("valid topology");
         assert_eq!(topology.system_domain(), &MemoryDomainId::system(),);
@@ -2996,6 +3005,7 @@ mod tests {
                 platform: "linux".to_owned(),
                 architecture: "x86_64".to_owned(),
                 system_product_name: None,
+                physical_cores: Some(4),
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
                     physical_capacity_bytes: 64_000,
@@ -3054,6 +3064,7 @@ mod tests {
                 platform: "macos".to_owned(),
                 architecture: "aarch64".to_owned(),
                 system_product_name: Some("MacBook Pro".to_owned()),
+                physical_cores: Some(4),
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
                     physical_capacity_bytes: 64_000,
@@ -3079,6 +3090,7 @@ mod tests {
                 platform: "macos".to_owned(),
                 architecture: "aarch64".to_owned(),
                 system_product_name: Some("MacBook Pro".to_owned()),
+                physical_cores: Some(4),
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
                     physical_capacity_bytes: 64_000,
@@ -3147,6 +3159,7 @@ mod tests {
                 platform: "macos".to_owned(),
                 architecture: "aarch64".to_owned(),
                 system_product_name: Some("MacBook Pro".to_owned()),
+                physical_cores: Some(4),
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
                     physical_capacity_bytes: 64_000,
@@ -3225,6 +3238,7 @@ mod tests {
                 platform: "macos".to_owned(),
                 architecture: "x86_64".to_owned(),
                 system_product_name: None,
+                physical_cores: Some(4),
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
                     physical_capacity_bytes: 64_000,
@@ -3707,6 +3721,7 @@ mod tests {
                 platform: "macos".to_owned(),
                 architecture: "aarch64".to_owned(),
                 system_product_name: Some("Mac".to_owned()),
+                physical_cores: Some(4),
                 logical_cores: 8,
                 system_memory: HardwareSystemMemory {
                     physical_capacity_bytes: 64_000,

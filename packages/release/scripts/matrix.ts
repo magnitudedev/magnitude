@@ -1,6 +1,10 @@
 import { appendFile } from "node:fs/promises"
 import { backendPacks, releaseHosts } from "../src/targets"
 
+const selectedPacks = process.argv.includes("--windows-backends-only")
+  ? backendPacks.filter(pack => pack.host === "windows-x64-msvc")
+  : backendPacks
+
 const matrices = {
   hosts: {
     include: releaseHosts.map((host) => ({
@@ -10,7 +14,7 @@ const matrices = {
     })),
   },
   backends: {
-    include: backendPacks.map((pack) => ({
+    include: selectedPacks.map((pack) => ({
       id: pack.id,
       host: pack.host,
       backend: pack.backend,
@@ -24,7 +28,12 @@ const matrices = {
   linuxHosts: {
     include: releaseHosts
       .filter((host) => host.id.startsWith("linux-"))
-      .map((host) => ({ id: host.id, runner: host.runner })),
+      .map((host) => ({
+        id: host.id,
+        runner: host.id === "linux-arm64-gnu"
+          ? "blacksmith-8vcpu-ubuntu-2204-arm"
+          : "blacksmith-8vcpu-ubuntu-2204",
+      })),
   },
 }
 

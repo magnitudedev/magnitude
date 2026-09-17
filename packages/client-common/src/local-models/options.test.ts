@@ -1,8 +1,9 @@
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
-import type { LocalInferenceHardware, LocalModel, ProviderModelId } from "@magnitudedev/sdk"
+import type { CatalogLocalModel, LocalInferenceHardware, LocalModel, ProviderModelId } from "@magnitudedev/sdk"
 import {
   localModelRankingUtility,
+  featuredCatalogModels,
   rankedLocalModelOptions,
   targetPhysicalMemoryBytes,
   type LocalModelOption,
@@ -31,6 +32,23 @@ const option = (
 })
 
 describe("local model ranking", () => {
+  it("features up to two configurations per base while preserving ranking order", () => {
+    const scores = { intelligence: 1, speed: 1, fidelity: 1 }
+    const model = (id: string) => option(id, 1, scores).model as CatalogLocalModel
+    const best = model("first:gguf:q8")
+    const sameBase = model("first:gguf:q4")
+    const thirdQuant = model("first:gguf:q6")
+    const second = model("second:gguf:q4")
+    const third = model("third:gguf:q4")
+    const fourth = model("fourth:gguf:q4")
+    const ranked = [best, second, sameBase, thirdQuant, third, fourth]
+    expect(featuredCatalogModels(ranked)).toEqual([best, second, sameBase, third, fourth])
+    expect(featuredCatalogModels(ranked, 2)).toEqual([best, second])
+    expect(featuredCatalogModels(ranked, 0)).toEqual([])
+    expect(featuredCatalogModels([sameBase, thirdQuant, best, second])).toEqual([sameBase, thirdQuant, second])
+    expect(featuredCatalogModels([best, sameBase, thirdQuant])).toEqual([best, sameBase])
+  })
+
   it("moves utility from speed toward intelligence while fidelity always contributes", () => {
     const scores = { intelligence: 0.8, speed: 0.4, fidelity: 0.5 }
     expect(localModelRankingUtility(scores, 0)).toBeCloseTo(0.4 ** 0.9 * 0.5 ** 0.1)

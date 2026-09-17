@@ -1,0 +1,398 @@
+[
+  {
+    "id": "book16",
+    "file": "book16.webp",
+    "width": 960,
+    "height": 960,
+    "bytes": 183472,
+    "transparent": true,
+    "sha256": "2eb183a51eba38df3f2493e5e50ff574d4b98722e601974792bf8e216394ab61"
+  },
+  {
+    "id": "book14",
+    "file": "book14.webp",
+    "width": 960,
+    "height": 960,
+    "bytes": 138080,
+    "transparent": true,
+    "sha256": "19381f3550071825931ee5ddbbb820fc914fa1b6ea616e83cd267cea25dae727"
+  },
+  {
+    "id": "air13",
+    "file": "air13.webp",
+    "width": 960,
+    "height": 960,
+    "bytes": 236820,
+    "transparent": true,
+    "sha256": "5f8bb72ead26fa7fdd76f476668a78d9a6abdb635d6ce1089d6c738f2b1a4134"
+  },
+  {
+    "id": "air15-m4",
+    "file": "air15-m4.webp",
+    "width": 960,
+    "height": 960,
+    "bytes": 346952,
+    "transparent": true,
+    "sha256": "8336f2848dafa4ac7fa0366099eb36f0a3128bddce2f909f7408326655111f1f"
+  },
+  {
+    "id": "air13-m1",
+    "file": "air13-m1.webp",
+    "width": 960,
+    "height": 960,
+    "bytes": 213630,
+    "transparent": true,
+    "sha256": "ae85789d34ffc9a66b8e2c1adb1aee495c64cbfc57c82978922138d84185fa9d"
+  },
+  {
+    "id": "pro13-m1",
+    "file": "pro13-m1.webp",
+    "width": 960,
+    "height": 960,
+    "bytes": 298178,
+    "transparent": true,
+    "sha256": "0368f9f4a11aaac70fc1048d8e4d658c67ce0f0555fd36b4ca51f0ed7aad8f32"
+  },
+  {
+    "id": "studio",
+    "file": "studio.webp",
+    "width": 1472,
+    "height": 1130,
+    "bytes": 374802,
+    "transparent": true,
+    "sha256": "9598f3f4a4b2b8370751aaf2f73c6928d656427bd6257ea74034ab673e050438"
+  },
+  {
+    "id": "mini",
+    "file": "mini.webp",
+    "width": 1440,
+    "height": 1107,
+    "bytes": 161464,
+    "transparent": true,
+    "sha256": "420fd5d7396ffea24c58b72d533d0d953ca23ab88dd1c2b4ee36040b564e0050"
+  },
+  {
+    "id": "mini-m1",
+    "file": "mini-m1.webp",
+    "width": 960,
+    "height": 960,
+    "bytes": 115044,
+    "transparent": true,
+    "sha256": "e260b2c8d0d652763fb134af85b3aab1a87a6761237d5f448bb48c0df40afbff"
+  },
+  {
+    "id": "imac-m4",
+    "file": "imac-m4.webp",
+    "width": 960,
+    "height": 960,
+    "bytes": 217818,
+    "transparent": true,
+    "sha256": "c94edc859ce05f40f7deb6cfd3b5755624e5848fc2231c37c865caa0a68b3906"
+  },
+  {
+    "id": "mac-pro-2013",
+    "file": "mac-pro-2013.webp",
+    "width": 551,
+    "height": 960,
+    "bytes": 265790,
+    "transparent": true,
+    "sha256": "c4ebfe6334fe717edf7ed5f863d1040ae1e82f0b4575719f2accd2bac5d32f6b"
+  },
+  {
+    "id": "rtx5090",
+    "file": "rtx5090.webp",
+    "width": 800,
+    "height": 800,
+    "bytes": 218250,
+    "transparent": true,
+    "sha256": "d763e929d86b6519fd4000b8a2364c02c99f15e8acd15800c8724d805d142279"
+  },
+  {
+    "id": "rtx5080",
+    "file": "rtx5080.webp",
+    "width": 800,
+    "height": 800,
+    "bytes": 71568,
+    "transparent": true,
+    "sha256": "045af104720b233e2b73c06e136b93f75068d48f99928b29d7eb0aa1a5c58bdd"
+  },
+  {
+    "id": "rtx5070ti",
+    "file": "rtx5070ti.webp",
+    "width": 800,
+    "height": 800,
+    "bytes": 95882,
+    "transparent": true,
+    "sha256": "2afefa6cb4d3ac018516022c22844d05d7c4e721a826763ea65e4705c7a20f02"
+  },
+  {
+    "id": "rtx5070",
+    "file": "rtx5070.webp",
+    "width": 800,
+    "height": 800,
+    "bytes": 78166,
+    "transparent": true,
+    "sha256": "dedb62244fdf2016e2706ee350e32a165418b3ebfcc0327199d5ce9c35e83fcb"
+  },
+  {
+    "id": "rtx5060",
+    "file": "rtx5060.webp",
+    "width": 800,
+    "height": 800,
+    "bytes": 101212,
+    "transparent": true,
+    "sha256": "ce0a8ffaebbdebb47ba5de9b1b990ce5b8bc942745a14d07b7c4dc9320ab2c40"
+  },
+  {
+    "id": "rtx4090",
+    "file": "rtx4090.webp",
+    "width": 800,
+    "height": 800,
+    "bytes": 156490,
+    "transparent": true,
+    "sha256": "309090d059a0795f768b0ab3ebe608463719e25b40146aa3eaaf4fe6a250ecde"
+  },
+  {
+    "id": "rtx4070super",
+    "file": "rtx4070super.webp",
+    "width": 800,
+    "height": 800,
+    "bytes": 93804,
+    "transparent": true,
+    "sha256": "a5c553b9553151f319d2fcb39bc18c438ab4bb9a9314339f3c779c40bae96a17"
+  },
+  {
+    "id": "rtx3070",
+    "file": "rtx3070.webp",
+    "width": 1000,
+    "height": 1000,
+    "bytes": 172234,
+    "transparent": true,
+    "sha256": "51c60ee86e71e26a4f47d22718b88e78c0874da08a04d1a36faa3071f482d425"
+  },
+  {
+    "id": "rtx3060",
+    "file": "rtx3060.webp",
+    "width": 800,
+    "height": 800,
+    "bytes": 148084,
+    "transparent": true,
+    "sha256": "5f78314955a8e86db798a37cc2b5fae7af942c64ce09a13be66a8280c4f4381b"
+  },
+  {
+    "id": "rtx3090",
+    "file": "rtx3090.webp",
+    "width": 1000,
+    "height": 1000,
+    "bytes": 133922,
+    "transparent": true,
+    "sha256": "14ef373b6ecd43576e063d90576c1fc578c8e25e377ceba9b872f75cb06726f2"
+  },
+  {
+    "id": "rx6800xt",
+    "file": "rx6800xt.webp",
+    "width": 900,
+    "height": 500,
+    "bytes": 32056,
+    "transparent": true,
+    "sha256": "e13168372502ac2a48d490f7370dfd949fe76e2d6a611863cb12efb04d2d26d9"
+  },
+  {
+    "id": "rx7900xtx",
+    "file": "rx7900.webp",
+    "width": 900,
+    "height": 500,
+    "bytes": 76264,
+    "transparent": true,
+    "sha256": "d6f540b846c83b78f36d3ef78009d039d94131aa42ac6f4b752c6024085dbf2a"
+  },
+  {
+    "id": "arc-b580",
+    "file": "arc-b580.webp",
+    "width": 960,
+    "height": 960,
+    "bytes": 309736,
+    "transparent": true,
+    "sha256": "f09cc8ef1d55082326a6be63c5030ce145d493b6df40b22dfd8cccbace9a5c62"
+  },
+  {
+    "id": "rx580",
+    "file": "rx580.webp",
+    "width": 800,
+    "height": 500,
+    "bytes": 261566,
+    "transparent": true,
+    "sha256": "eda88eaca2fb8f01f6b789f047843b82a87f0fe65506526d4b0f356a3a8f247e"
+  },
+  {
+    "id": "rx9060xt",
+    "file": "rx9060xt.webp",
+    "width": 900,
+    "height": 500,
+    "bytes": 22492,
+    "transparent": true,
+    "sha256": "3a925bc2d282003527b23e8f0f6c64f47e857b0682a866f170847beed4051a14"
+  },
+  {
+    "id": "arc-a770",
+    "file": "arc-a770.webp",
+    "width": 960,
+    "height": 960,
+    "bytes": 310536,
+    "transparent": true,
+    "sha256": "64c3ac2ce8f5ca3734654df4d00baca7fa8c80ccc4c800be35bc2961ecc48337"
+  },
+  {
+    "id": "dgx-a100",
+    "file": "dgx-a100.webp",
+    "width": 639,
+    "height": 325,
+    "bytes": 217786,
+    "transparent": true,
+    "sha256": "5d13f646c0b9021fad6e24028a1872dad1290a224ec76892107ac82f22fc78a4"
+  },
+  {
+    "id": "surface-go",
+    "file": "surface-go.webp",
+    "width": 960,
+    "height": 540,
+    "bytes": 107084,
+    "transparent": true,
+    "sha256": "00d498386b608cf8f5f612f9812fa7a7ebe050d08793a1a27c68711c8818f838"
+  },
+  {
+    "id": "surface-studio",
+    "file": "surface-studio.webp",
+    "width": 2240,
+    "height": 1619,
+    "bytes": 154792,
+    "transparent": true,
+    "sha256": "530b39debc8ed5b42083bb463d4760a762541421a3741ce660784e4d3880ce02"
+  },
+  {
+    "id": "dell-xps",
+    "file": "dell-xps.webp",
+    "width": 960,
+    "height": 395,
+    "bytes": 258026,
+    "transparent": true,
+    "sha256": "356093b01e85a52e319a69820f93dbf82763bc37f123375693909353d30b0f82"
+  },
+  {
+    "id": "dell-inspiron-open",
+    "file": "dell-inspiron-open.webp",
+    "width": 960,
+    "height": 637,
+    "bytes": 732128,
+    "transparent": true,
+    "sha256": "f6262851e7375ef697e2ba3c1a2db0af869be86769a5e8fd58202b363cedeb86"
+  },
+  {
+    "id": "dell-g15",
+    "file": "dell-g15.webp",
+    "width": 1600,
+    "height": 774,
+    "bytes": 484860,
+    "transparent": true,
+    "sha256": "c19216b6cbcf054526324db482b67fdce5c4efebc28ab520e8173449bea80e76"
+  },
+  {
+    "id": "hp-elitebook-co",
+    "file": "hp-elitebook-co.webp",
+    "width": 1200,
+    "height": 901,
+    "bytes": 171218,
+    "transparent": true,
+    "sha256": "a3f2b3dde52555534b7184a64605141ccac67b8b277c66970a8ecf1c3e4b58f2"
+  },
+  {
+    "id": "hp-pavilion",
+    "file": "hp-pavilion.webp",
+    "width": 575,
+    "height": 432,
+    "bytes": 33792,
+    "transparent": true,
+    "sha256": "a955ded124cfb58bdf01f2e3c19586702339c1cd501eb5f8b6525aa1ec96f1d3"
+  },
+  {
+    "id": "hp-envy",
+    "file": "hp-envy.webp",
+    "width": 500,
+    "height": 376,
+    "bytes": 35720,
+    "transparent": true,
+    "sha256": "3185869f5e3403156f46ac43456e4e6f2d2804d3256ab1208a8e08dd3eb0d136"
+  },
+  {
+    "id": "rog-g14",
+    "file": "rog-g14.webp",
+    "width": 960,
+    "height": 669,
+    "bytes": 81842,
+    "transparent": true,
+    "sha256": "82370e3baa6b98f9dd105f1cd6e81a659cf4d4539293c94e9e4a9c053b57b0b0"
+  },
+  {
+    "id": "rog-z13",
+    "file": "rog-z13.webp",
+    "width": 1000,
+    "height": 808,
+    "bytes": 26290,
+    "transparent": true,
+    "sha256": "68ccfe0c016b3a27017ae431845f045b8ed930d30f6df36700c3a030e4fd67ce"
+  },
+  {
+    "id": "dgx-spark",
+    "file": "dgx-spark.webp",
+    "width": 800,
+    "height": 800,
+    "bytes": 46638,
+    "transparent": true,
+    "sha256": "30bcbd489c85fce4a6970b8d591a958b12f0ee5b482119c34c5c1bf987c2cc27"
+  },
+  {
+    "id": "beelink-gtr9",
+    "file": "beelink-gtr9.webp",
+    "width": 960,
+    "height": 960,
+    "bytes": 223196,
+    "transparent": true,
+    "sha256": "4e3c313b7f0a800800db7f69c4539c217e5ee7b03ff776c65156f530ea2ff254"
+  },
+  {
+    "id": "minisforum-ms-s1",
+    "file": "minisforum-ms-s1.webp",
+    "width": 960,
+    "height": 960,
+    "bytes": 278952,
+    "transparent": true,
+    "sha256": "1f7f242caf7938c6f87bb2a5ae8bdf36a9c3567c812e7537aebde0c9b56feaf0"
+  },
+  {
+    "id": "hp-z2a",
+    "file": "hp-z2a.webp",
+    "width": 960,
+    "height": 452,
+    "bytes": 157064,
+    "transparent": true,
+    "sha256": "f9bdef1599b4a77728534d674ba5cbe17b032696ff4eaca14d55c465014b898e"
+  },
+  {
+    "id": "hp-zbook",
+    "file": "hp-zbook.webp",
+    "width": 1276,
+    "height": 996,
+    "bytes": 112964,
+    "transparent": true,
+    "sha256": "f3660114385cb73d5799cc869e8c0a7bfb81a66ca923daa3aafdb0d568ea0da0"
+  },
+  {
+    "id": "thinkpad-t14",
+    "file": "thinkpad-t14.webp",
+    "width": 584,
+    "height": 584,
+    "bytes": 103908,
+    "transparent": true,
+    "sha256": "793051a57f90297ae69c2368b7518b34ac3f9ca7601f605dbc57287f3044ccfa"
+  }
+]

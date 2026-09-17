@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button"
  */
 import { useState, type ReactNode } from "react"
 import { Option } from "effect"
-import { Mail, ChevronDown } from "lucide-react"
+import { EnvelopeIcon, CaretDownIcon } from "@phosphor-icons/react"
 import type { AgentCommunicationMessage as AgentCommType } from "@magnitudedev/sdk"
 import { MarkdownContent } from "../markdown-content"
 function capitalize(s: string): string {
@@ -45,7 +45,7 @@ export function AgentCommunication({
   return (
     <div className="[padding-left:12px]">
       <div className="flex items-center [gap:6px] [padding:2px_0]">
-        <Mail
+        <EnvelopeIcon
           size={14}
           className="text-slate-600 dark:text-slate-400 shrink-0"
         />
@@ -72,7 +72,7 @@ export function AgentCommunication({
           onClick={() => setExpanded(!expanded)}
           className="[background:transparent] border-0 cursor-pointer flex items-center [gap:4px] text-slate-500 font-sans text-[11px] [padding:0px] [margin-top:2px]"
         >
-          <ChevronDown
+          <CaretDownIcon
             size={12}
             className={`${
               expanded ? "[transform:rotate(180deg)]" : "[transform:none]"

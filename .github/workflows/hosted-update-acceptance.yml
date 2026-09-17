@@ -1,0 +1,312 @@
+name: Hosted update acceptance
+
+on:
+  push:
+    branches: [app]
+    paths:
+      - '.github/workflows/hosted-update-acceptance.yml'
+      - 'desktop/src/*update*'
+      - 'cli/src/startup/*update*'
+      - 'packages/daemon-management/src/desktop-native/*update*'
+      - 'packages/daemon-management/native/windows-update*'
+      - 'packages/release/native/windows-installer*'
+      - 'packages/release/src/artifact-download*'
+      - 'packages/release/src/hosted-update/installer-download*'
+      - 'packages/release/src/hosted-update/release-candidate*'
+      - 'packages/release/scripts/acceptance/*'
+      - 'packages/release/scripts/build/desktop-*'
+      - 'packages/release/scripts/build/linux-maintainer-scripts.ts'
+  workflow_dispatch:
+    inputs:
+      build_artifacts:
+        description: Build and upload a new installer cohort in addition to native checks
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-update-acceptance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-packages:
+    permissions:
+      contents: write
+    # Reuse immutable cohorts while iterating consumer checks.
+    if: inputs.build_artifacts
+    runs-on: blacksmith-8vcpu-windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - name: Build signed Windows applications and verify real hosted transfers
+        shell: pwsh
+        run: ./packages/release/scripts/acceptance/build-windows-cohort.ps1
+        env:
+          MAGNITUDE_ACCEPTANCE_COMMIT: ${{ github.sha }}
+          DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY: ${{ secrets.DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prepared-windows-installers
+          path: |
+            ${{ runner.temp }}/magnitude-windows-update-acceptance/*/artifacts/*
+            ${{ runner.temp }}/magnitude-windows-update-acceptance/acceptance-publisher.cer
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Exercise the installed Windows application against the hosted update channel
+        shell: pwsh
+        run: ./packages/release/scripts/acceptance/test-windows-hosted-update.ps1
+        env:
+          MAGNITUDE_WINDOWS_ACCEPTANCE_FROM: '0.0.38'
+          MAGNITUDE_WINDOWS_ACCEPTANCE_TO: '0.0.39'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-installed-update-evidence
+          path: ${{ runner.temp }}/magnitude-windows-update-acceptance/consumer
+          if-no-files-found: warn
+          retention-days: 14
+
+  signed-mac-apps:
+    permissions:
+      contents: write
+    if: inputs.build_artifacts
+    environment: apple-release
+    runs-on: blacksmith-12vcpu-macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["0.0.38", "0.0.39"]
+    env:
+      MAGNITUDE_APPLE_DISTRIBUTION: developer-id
+      MAGNITUDE_ACCEPTANCE_VERSION: ${{ matrix.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - name: Import Apple signing credentials
+        run: bash packages/release/scripts/apple/credentials.sh
+        env:
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_NOTARY_API_KEY_P8: ${{ secrets.APPLE_NOTARY_API_KEY_P8 }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+      - name: Build matched application and service without rebuilding inference
+        run: bun packages/release/scripts/acceptance/build-desktop.ts
+        env:
+          MAGNITUDE_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/magnitude-update-acceptance
+      - name: Publish GitHub acceptance artifacts and register metadata
+        run: bun packages/release/scripts/acceptance/prepare-artifacts.ts
+        env:
+          MAGNITUDE_ACCEPTANCE_ARTIFACTS: ${{ runner.temp }}/magnitude-update-acceptance/artifacts
+          MAGNITUDE_ACCEPTANCE_COMMIT: ${{ github.sha }}
+          DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY: ${{ secrets.DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+      - name: Retain signed installers and notarization evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: update-acceptance-mac-${{ matrix.version }}
+          path: |
+            ${{ runner.temp }}/magnitude-update-acceptance/artifacts/*.dmg
+            ${{ runner.temp }}/magnitude-update-acceptance/artifacts/*.zip
+            ${{ runner.temp }}/magnitude-update-acceptance/artifacts/*.json
+            ${{ runner.temp }}/magnitude-update-acceptance/artifacts/.apple/*.json
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prepared-mac-${{ matrix.version }}
+          path: ${{ runner.temp }}/magnitude-update-acceptance/artifacts/prepared-manifests.json
+          if-no-files-found: error
+      - name: Remove signing credentials
+        if: always()
+        run: bash packages/release/scripts/apple/cleanup-credentials.sh
+
+  linux-packages:
+    permissions:
+      contents: write
+    if: inputs.build_artifacts
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            runner: blacksmith-8vcpu-ubuntu-2204
+          - os: ubuntu-24.04-arm
+            runner: blacksmith-8vcpu-ubuntu-2404-arm
+        version: ["0.0.38", "0.0.39"]
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:22.04
+    timeout-minutes: 30
+    steps:
+      - name: Install packaging dependencies at the supported Linux baseline
+        run: apt-get update && apt-get install -y git gh ca-certificates curl unzip build-essential python3 fakeroot rpm libgtk-3-0 libnss3 libasound2 libgbm1 libxss1 libxtst6
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - name: Build matched Linux application and packages without rebuilding inference
+        run: bun packages/release/scripts/acceptance/build-desktop.ts
+        env:
+          MAGNITUDE_ACCEPTANCE_VERSION: ${{ matrix.version }}
+          MAGNITUDE_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/magnitude-update-acceptance
+      - name: Verify Linux installation lease does not escape into updater children
+        shell: bash
+        run: |
+          addon=$(find "$RUNNER_TEMP/magnitude-update-acceptance/application" -name desktop-host.node -print -quit)
+          test -n "$addon"
+          fixture="$GITHUB_WORKSPACE/packages/daemon-management/src/desktop-native/fixtures/linux-installation-lease.cjs"
+          install -d -m 755 /var/lib/magnitude-desktop
+          touch /var/lib/magnitude-desktop/installation.lock
+          chmod 444 /var/lib/magnitude-desktop/installation.lock
+          node "$fixture" "$addon" invalid
+          node "$fixture" "$addon" invalid 9</dev/null
+          node "$fixture" "$addon" valid 9</var/lib/magnitude-desktop/installation.lock
+          touch /var/lib/magnitude-desktop/installing
+          node "$fixture" "$addon" invalid 9</var/lib/magnitude-desktop/installation.lock
+          rm /var/lib/magnitude-desktop/installing
+      - name: Publish GitHub acceptance artifacts and register metadata
+        run: bun packages/release/scripts/acceptance/prepare-artifacts.ts
+        env:
+          MAGNITUDE_ACCEPTANCE_VERSION: ${{ matrix.version }}
+          MAGNITUDE_ACCEPTANCE_ARTIFACTS: ${{ runner.temp }}/magnitude-update-acceptance/artifacts
+          MAGNITUDE_ACCEPTANCE_COMMIT: ${{ github.sha }}
+          DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY: ${{ secrets.DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+      - uses: actions/upload-artifact@v4
+        if: success() || failure()
+        with:
+          name: update-acceptance-linux-${{ matrix.os }}-${{ matrix.version }}
+          path: ${{ runner.temp }}/magnitude-update-acceptance/artifacts
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prepared-linux-${{ matrix.os }}-${{ matrix.version }}
+          path: ${{ runner.temp }}/magnitude-update-acceptance/artifacts/prepared-manifests.json
+          if-no-files-found: error
+
+  native-checks:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            runner: blacksmith-8vcpu-windows-2025
+          - os: ubuntu-22.04
+            runner: blacksmith-8vcpu-ubuntu-2204
+          - os: ubuntu-24.04
+            runner: blacksmith-8vcpu-ubuntu-2404
+          - os: ubuntu-24.04-arm
+            runner: blacksmith-8vcpu-ubuntu-2404-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - name: Exercise signed requests and update ownership on the native runtime
+        # Installation skips scripts; protocol/build identities must exist before imports.
+        run: bun run packages/version/scripts/generate-version.ts
+      - name: Test signed requests and update ownership on the native runtime
+        working-directory: desktop
+        run: bunx --bun vitest run src/update-identity.test.ts src/update-preferences.test.ts src/update-schedule.test.ts src/application-update.test.ts
+      - name: Verify bounded installer transfers and interrupted range recovery
+        run: bunx --bun vitest run packages/release/src/artifact-download.test.ts packages/release/src/hosted-update/installer-download.test.ts packages/release/src/hosted-update/release-candidate.test.ts packages/release/src/hosted-update/publication.test.ts
+      - name: Validate Windows private key permissions with native ACLs
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          . ./packages/daemon-management/scripts/windows-toolchain.ps1
+          $source = Join-Path $env:GITHUB_WORKSPACE 'packages/daemon-management/native'
+          $fixture = Join-Path $env:RUNNER_TEMP 'update-key-permissions'
+          New-Item -ItemType Directory -Force $fixture | Out-Null
+          Push-Location $fixture
+          try {
+            npm install --prefix $fixture --ignore-scripts --no-audit --no-fund node-api-headers@1.9.0
+            if ($LASTEXITCODE -ne 0) { throw 'Node-API header acquisition failed' }
+            $headers = Join-Path $fixture 'node_modules/node-api-headers/include'
+            & cl.exe /nologo /c /W4 /WX /O2 /std:c11 /D_WIN32_WINNT=0x0A00 /DNAPI_VERSION=8 /D_CRT_SECURE_NO_WARNINGS "/I$headers" (Join-Path $source 'desktop-host.c') (Join-Path $source 'windows-update-napi.c')
+            if ($LASTEXITCODE -ne 0) { throw 'Windows update binding compilation failed' }
+            & cl.exe /nologo /W4 /WX /O2 /std:c11 /D_WIN32_WINNT=0x0A00 /D_CRT_SECURE_NO_WARNINGS (Join-Path $source 'windows-security.c') (Join-Path $source 'windows-security-test.c') /Fe:security.exe /link advapi32.lib
+            if ($LASTEXITCODE -ne 0) { throw 'Native permission compilation failed' }
+            & ./security.exe
+            if ($LASTEXITCODE -ne 0) { throw 'Native permission acceptance failed' }
+          } finally { Pop-Location }
+      - name: Validate package permission regressions
+        working-directory: packages/release
+        run: bunx --bun vitest run scripts/build/desktop-linux.test.ts
+      - name: Verify real Debian package rollback restores application admission
+        if: runner.os == 'Linux'
+        run: bun packages/release/scripts/acceptance/linux-update-rollback.ts
+      - name: Build Windows native host for installer acceptance
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $library = Join-Path $env:RUNNER_TEMP 'magnitude-node.lib'
+          $version = (node -p process.versions.node).Trim()
+          $base = "https://nodejs.org/download/release/v$version"
+          Invoke-WebRequest "$base/win-x64/node.lib" -OutFile $library
+          $checksums = (Invoke-WebRequest "$base/SHASUMS256.txt").Content
+          $match = [regex]::Match($checksums, '(?m)^([a-f0-9]{64})\s+win-x64/node\.lib\r?$')
+          if (!$match.Success -or (Get-FileHash $library -Algorithm SHA256).Hash.ToLowerInvariant() -ne $match.Groups[1].Value) { throw 'Node import library integrity check failed' }
+          $env:MAGNITUDE_NODE_LIBRARY = $library
+          bun packages/daemon-management/scripts/build-native.ts
+          if ($LASTEXITCODE -ne 0) { throw 'Windows native host build failed' }
+      - name: Validate Windows installation inventory and configuration ownership
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./packages/release/scripts/test-windows-installer.ps1
+      - name: Verify Windows update handoff state and cancellation
+        if: runner.os == 'Windows'
+        working-directory: packages/daemon-management
+        run: bunx --bun vitest run src/desktop-native/windows-update-handoff.test.ts
+      - name: Verify Windows installer staging and rejection
+        if: runner.os == 'Windows'
+        working-directory: desktop
+        run: bunx --bun vitest run src/windows-update-source.test.ts
+      - name: Verify Windows Authenticode with actual signed and tampered executables
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./packages/daemon-management/scripts/test-windows-update-signature.ps1
+      - name: Send a real signed check to the isolated hosted endpoint
+        run: bun packages/release/scripts/acceptance/check.ts
+        env:
+          MAGNITUDE_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/update-check.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: update-check-${{ matrix.os }}
+          path: ${{ runner.temp }}/update-check.json
+          if-no-files-found: error
+          retention-days: 14

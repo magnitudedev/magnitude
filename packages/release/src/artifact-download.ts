@@ -277,7 +277,7 @@ const sequentialAttempt = (
     yield* report(input, "Sequential", 0, attempt)
     const response = yield* client.execute(
       HttpClientRequest.get(input.url).pipe(
-        HttpClientRequest.setHeader("accept-encoding", "identity"),
+        HttpClientRequest.setHeader("accept-encoding", "identity;q=1, *;q=0"),
       ),
     ).pipe(
       Effect.mapError(() =>
@@ -356,7 +356,7 @@ const rangeRequest = (
     const request = HttpClientRequest.get(input.url).pipe(
       HttpClientRequest.setHeaders({
         range: `bytes=${range.start}-${range.end}`,
-        "accept-encoding": "identity",
+        "accept-encoding": "identity;q=1, *;q=0",
         "if-range": Option.getOrUndefined(representation),
       }),
     )
@@ -390,7 +390,8 @@ const rangeRequest = (
       yield* discardResponse(response)
       return yield* downloadError(
         "protocol",
-        `range ${range.index} returned inconsistent Content-Range`,
+        `range ${range.index} returned inconsistent Content-Range: ${contentRange.start}-${contentRange.end}/${contentRange.total}; expected ${range.start}-${range.end}/${input.bytes}`,
+        true,
       )
     }
     const expectedBytes = range.end - range.start + 1
@@ -612,7 +613,7 @@ const downloadSegmented = (
       }),
       Effect.retry({
         while: (error) =>
-          error._tag === "ArtifactDownloadError" && error.transient,
+          error._tag === "ArtifactDownloadError" && (error.transient || error.phase === "protocol"),
         schedule: retrySchedule(
           input.policy.retryCount,
           input.policy.retryDelay,

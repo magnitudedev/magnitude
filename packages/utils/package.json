@@ -8,10 +8,14 @@
   "exports": {
     ".": "./src/index.ts",
     "./fsm": "./src/fsm/index.ts",
+    "./windows-native": "./src/windows-native/index.ts",
+    "./process-groups": "./src/process-groups/index.ts",
+    "./process-groups/native": "./src/process-groups/exact-process.ts",
     "./process": "./src/process/index.ts",
     "./schema": "./src/schema/index.ts",
     "./patch": "./src/patch/index.ts",
     "./canonical-key": "./src/canonical-key.ts",
+    "./json-line-channel": "./src/json-line-channel.ts",
     "./atomic-file": "./src/atomic-file.ts"
   },
   "scripts": {

@@ -1119,7 +1119,9 @@ impl ManagedModelStore {
                 .open(&path)
                 .map_err(|error| InventoryError::Io(error.to_string()))?;
             file.write_all(&bytes)
-                .and_then(|()| file.set_len(cached.component.size_bytes))
+                .and_then(|()| {
+                    icn_utils::sparse_file::set_sparse_len(&file, cached.component.size_bytes)
+                })
                 .map_err(|error| InventoryError::Io(error.to_string()))?;
         }
         let components = artifact
@@ -1336,25 +1338,26 @@ fn select_components<'a>(
     siblings: &'a [HubSibling],
     primary: &Path,
 ) -> Result<Vec<&'a HubSibling>, InventoryError> {
-    let primary_name = primary.to_string_lossy();
     if let Some((prefix, total)) = split_parts(primary) {
         let parent = primary.parent().unwrap_or_else(|| Path::new(""));
         return (1..=total)
             .map(|index| {
                 let path = parent.join(format!("{prefix}-{index:05}-of-{total:05}.gguf"));
-                let name = path.to_string_lossy();
                 siblings
                     .iter()
-                    .find(|sibling| sibling.rfilename == name)
+                    .find(|sibling| Path::new(&sibling.rfilename) == path)
                     .ok_or_else(|| {
-                        InventoryError::Integrity(format!("missing preview shard {name}"))
+                        InventoryError::Integrity(format!(
+                            "missing preview shard {}",
+                            path.display()
+                        ))
                     })
             })
             .collect();
     }
     siblings
         .iter()
-        .find(|sibling| sibling.rfilename == primary_name)
+        .find(|sibling| Path::new(&sibling.rfilename) == primary)
         .map(|sibling| vec![sibling])
         .ok_or_else(|| InventoryError::Integrity("preview GGUF does not exist".to_owned()))
 }
@@ -1898,6 +1901,7 @@ mod tests {
                     architecture: "test".to_owned(),
                     system_product_name: None,
                     cpu_model: None,
+                    physical_cores: None,
                     logical_cores: 1,
                     system_memory: icn_contracts::HardwareSystemMemory {
                         physical_capacity_bytes: 1,

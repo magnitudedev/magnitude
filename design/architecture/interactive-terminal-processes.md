@@ -2,8 +2,7 @@
 applies_to:
   - packages/utils/src/process/**
   - packages/launcher/src/cli-process-spawner.ts
-  - cli/src/runtime/interactive.tsx
-  - integrations/pi/extensions/setup.ts
+  - scripts/dev-pi.ts
 ---
 
 # Interactive terminal processes
@@ -24,22 +23,20 @@ handoff. Magnitude and the child must never render concurrently. The process pri
 child until it exits, reports normal and signal termination distinctly, and terminates and reaps
 the child when its owning Effect scope is interrupted.
 
-This contract governs both the npm launcher handing the terminal to the native Magnitude CLI and
-the native CLI handing it to an external harness. General-purpose command executors remain valid
-for non-interactive subprocesses but do not satisfy this contract.
+This contract governs the npm launcher invoking the headless native Magnitude CLI and the
+explicit development launcher invoking Pi. The native CLI does not launch an agent harness or
+render onboarding. Its inherited terminal streams remain useful for normal command output and
+signal propagation.
 
-Pi-hosted setup uses the same primitive in the opposite direction. Pi's custom UI leases its
-terminal, stops its TUI before launching Magnitude, and restarts/redraws it only after the child
-has exited or been terminated and reaped. Exit status distinguishes completion, cancellation, and
-failure. Only successful completion reads the primary model through the existing SDK, after terminal
-restoration. Resource reload occurs only after the process and SDK scopes have closed.
-CLI installation and executable checks are non-interactive preparation: they use scoped piped
-subprocesses while Pi keeps rendering its native cancellable loader. Their output never inherits
-the terminal. Cancelling preparation reaps subprocess work before closing the loader.
+Pi's `/magnitude-setup` invokes the finite `magnitude app open` command with piped output while
+Pi retains its terminal. The desktop owns onboarding. Successful command completion acknowledges
+that the window opened; it does not prove model setup or connection completion. The user connects
+Pi in the desktop and explicitly reloads Pi afterward. This navigation command is not an
+interactive terminal handoff.
 
 ## Required guarantees
 
-- Terminal resizes reach an interactive child at both launch boundaries.
+- Terminal resizes reach an interactive child at each interactive launch boundary.
 - Shrinking and growing the terminal repeatedly does not require polling or application-level
   resize relays.
 - Arguments are passed literally and cannot be interpreted by a shell.

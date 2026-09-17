@@ -1,5 +1,5 @@
 import { useMemo, useState, type ReactNode } from "react"
-import { ArchiveRestore, Search, Trash2 } from "lucide-react"
+import { BoxArrowUpIcon, MagnifyingGlassIcon, TrashIcon } from "@phosphor-icons/react"
 import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import {
   formatCwdForDisplay,
@@ -115,7 +115,7 @@ export function ArchivedChatsView(): ReactNode {
 
       <div className="mb-3 flex items-center gap-3">
         <div className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-md border border-slate-300 bg-white px-2.5 dark:border-slate-750 dark:bg-slate-850">
-          <Search size={16} className="shrink-0 text-slate-500" aria-hidden="true" />
+          <MagnifyingGlassIcon size={16} className="shrink-0 text-slate-500" aria-hidden="true" />
           <Input
             value={search}
             disabled={selectingAll}
@@ -175,7 +175,7 @@ export function ArchivedChatsView(): ReactNode {
               onClick={() => void restore([...selectedIds])}
               aria-label="Restore selected chats"
             >
-              <ArchiveRestore data-icon="inline-start" />
+              <BoxArrowUpIcon data-icon="inline-start" />
               Restore
             </Button>
             <Button
@@ -185,7 +185,7 @@ export function ArchivedChatsView(): ReactNode {
               className="text-red-600 hover:bg-red-200/40 hover:text-red-700 dark:text-red-400 dark:hover:bg-red-800/30 dark:hover:text-red-300"
               onClick={() => setDeleteIds([...selectedIds])}
             >
-              <Trash2 data-icon="inline-start" />
+              <TrashIcon data-icon="inline-start" />
               Delete permanently
             </Button>
           </>
@@ -204,7 +204,7 @@ export function ArchivedChatsView(): ReactNode {
           </div>
         ) : page.sessions.length === 0 ? (
           <div className="flex min-h-[240px] flex-col items-center justify-center text-center">
-            <ArchiveRestore size={25} className="mb-3 text-slate-500" aria-hidden="true" />
+            <BoxArrowUpIcon size={25} className="mb-3 text-slate-500" aria-hidden="true" />
             <strong className="font-sans text-[13px] font-semibold text-slate-800 dark:text-slate-200">
               {trimmedSearch ? "No archived chats match your search" : "No archived chats"}
             </strong>
@@ -252,7 +252,7 @@ export function ArchivedChatsView(): ReactNode {
                           onClick={() => void restore([session.id])}
                           aria-label={`Restore ${session.title}`}
                         >
-                          <ArchiveRestore />
+                          <BoxArrowUpIcon />
                         </Button>
                       }
                     />
@@ -267,7 +267,7 @@ export function ArchivedChatsView(): ReactNode {
                           aria-label={`Permanently delete ${session.title}`}
                           className="text-slate-500 hover:text-red-600 dark:hover:text-red-400"
                         >
-                          <Trash2 />
+                          <TrashIcon />
                         </Button>
                       }
                     />

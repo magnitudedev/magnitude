@@ -3,9 +3,6 @@ applies_to:
   - packages/acn/src/service-lifecycle.ts
   - packages/acn/src/server.ts
   - packages/acn/src/server.test.ts
-  - packages/daemon-management/src/acn-jit/acn-owner-observer.ts
-  - packages/daemon-management/src/service.ts
-  - packages/acn/src/ownership-monitor.ts
   - packages/acn/src/acn-subscriptions.ts
   - packages/acn/src/icn/**
   - cli/src/commands/server.ts
@@ -29,25 +26,15 @@ lifetime.
 
 ## Process admission
 
-A JIT candidate starts only a stable health/shutdown control server. It remains parent-bound until
-its exact owner row commits, and may not construct application or ICN services before that.
+The desktop application owns ACN as a direct child for the full application lifetime. ACN installs
+native parent-loss protection and opens its inherited control channel before application or ICN
+initialization. It reports Booted and waits for the owner to validate its retained child identity and
+send Start. No SQLite owner row, competing candidate, adoption, or ownership polling participates in
+normal serving. A missing owner channel fails startup.
 
-After binding its control endpoint, the candidate reads the complete current owner, proves that
-predecessor's dedicated process group absent, then atomically replaces the singleton SQLite owner
-row only if the complete owner remains unchanged. That commit is process admission. Owner mismatch
-makes the candidate stop and exit without expensive initialization. Successful admission removes
-dependence on its launching manager, installs the mandatory lifetime owner monitor, and permits
-application startup.
-
-An admitted ACN does not poll durable version intent, but it continuously proves that the complete
-owner row still equals the row it admitted. A confirmed missing or changed row begins
-`Stopping(ownership-lost)`. Any surfaced owner-store failure means ownership can no longer be
-proven and fails closed through `Stopping(fatal)`. A manager prepares a successor before asking a
-lower-revision live owner to stop, then proves the predecessor ACN process group absent before the
-successor may commit ownership. Retirement otherwise begins through exact explicit shutdown,
-ownership loss, loss of a mandatory process-owned subsystem such as ICN, application startup
-failure, or process signals. Failures owned by a session, request, transfer, subscription, or other
-bounded domain remain in that domain.
+The parent lifetime channel remains open after readiness. Owner loss terminates the owned service
+tree; native protection does not depend on the JavaScript event loop. Only the desktop supervisor
+may restart a failed service, after predecessor cleanup. Domain failures remain in their domains.
 
 ## Readiness and admission
 
@@ -59,49 +46,24 @@ the complete application and private ICN exist.
 observable. The first stop reason wins; both transitions are
 monotonic and idempotent.
 
-External JIT ensurance treats observable `Starting` health as live regardless of whether optional
-phase or measured-progress diagnostics change. It bounds startup with an absolute five-minute
-ceiling and separately bounds loss of observable health. ACN independently owns a five-minute
-absolute application-startup ceiling that never restarts. Expiry commits
-`Stopping(startup-failed)`.
+The desktop bounds startup and recovery. ACN independently owns a five-minute absolute
+application-startup ceiling; optional progress cannot extend it. Expiry enters Stopping(startup-failed).
 
-## Per-user service
+## Per-user application
 
-ACN is installed as a per-user login service and, after owner admission, binds the stable public
-loopback endpoint `127.0.0.1:10100` for application RPC (`POST /rpc`), health, and inference. RPC
-is served only there. Its cross-version health/shutdown control listener remains on the
-independently bindable endpoint published in the owner record. Keeping
-these listeners distinct preserves concurrent candidate admission and fenced takeover while giving
-saved harness configuration one stable endpoint. Both listeners belong to the same ACN process,
-lifecycle, release, and authority. The platform service manager owns login startup and restart. The
-service remains alive without an RPC client so a saved third-party harness endpoint continues to
-work. On macOS, the login service uses the Standard process classification: serving user-requested
-inference must not inherit Background resource restrictions merely because the service has no
-window. Explicit service start reconciles a changed installed definition by reloading the job;
-startup registration alone does not change the running job's classification.
+Login launches the desktop process in the graphical user session with background intent. The app
+owns the tray and service; its optional visible window has no effect on that ownership. OS startup
+registration does not install a second independently supervised ACN. Explicit Quit stops the owned
+tree and exits the desktop; login preference remains for the next login without immediate restart.
 
-Readiness is published only after the public listener and application dispatch are installed.
-Every RPC requires the selected instance ID; a missing or different ID returns `409` without
-dispatching. Successive daemons reuse the public address, not the instance identity. The control
-listener never serves RPC, including during startup or replacement. Client and daemon routing
-changes ship together; there is no private-port RPC compatibility fallback.
+ACN binds one public loopback endpoint, normally 127.0.0.1:10100. Isolated development/test owners
+may supply another explicit port. Health is available during startup. RPC dispatch is admitted only
+at Ready and fenced by the selected instance ID. Inference paths remain unchanged. The inherited
+control channel carries startup health and shutdown; there is no discoverable coordination listener.
 
-Interactive onboarding may register this service for future user-session startup while its ACN
-connection is the current foreground client. Registration writes the exact service definition and
-enables it, but does not retire or replace the process serving setup. Normal client close remains
-the leading teardown action; the platform definition takes effect at the next login or through an
-explicit `magnitude service start` operation.
-
-Fatal, ICN-loss, and startup-failure termination exit unsuccessfully so the
-platform manager restarts the service. Administrative stop, fenced replacement, ownership loss,
-and a rejected pre-admission candidate exit successfully and are not restarted; this prevents an
-old installed service definition from fighting a newer admitted release.
-
-RPCs, subscriptions, session work, inference, status/file watches, display streams, ICN
-observation, telemetry, and introspection do not participate in process idleness. They remain
-bounded by their own caller, operation, session, model, and application scopes. There is no
-client-presence lifecycle or policy. Inference request leases independently protect a resident
-Instance while a harness request is active.
+RPCs, subscriptions, sessions, requests, and observation do not determine process presence. Closing
+an ordinary client cannot stop the service. Closing the desktop window hides it; full application
+Quit is the owner shutdown command. ICN remains the private mandatory child.
 
 ## Shutdown
 
@@ -113,7 +75,7 @@ commit Stopping and close admission
   -> close application and session scopes
   -> terminate and reap private ICN
   -> exit ACN
-  -> external manager proves ACN process group absent and may acquire ownership
+  -> desktop owner proves its child tree absent before restart or full Quit
 ```
 
 `beginStopping` completes immediately after the atomic stopping/admission transition; it never
@@ -123,19 +85,21 @@ uninterruptible finalizer cannot retain escalation. Abrupt ACN loss closes ICN's
 ICN is not durably recorded or reconciled by the external manager. The ACN never removes or
 reassigns its own ACN occurrence.
 
-The control router accepts shutdown before application readiness. The process receiving the request
-idempotently commits `Stopping` and returns after that transition. Safety against delayed shutdown
-belongs to manager-side owner and exact-process revalidation, not a required endpoint token.
+The inherited control channel accepts Shutdown before application readiness. Native parent-loss
+protection remains armed throughout startup, serving, and teardown. Every public health value and
+control-channel Health observation derives from the same authoritative lifecycle.
+The ordered health forwarder belongs to the enclosing owner lifetime, not the fallible application
+scope. Before closing application scope, ACN gives that forwarder a bounded two-second
+window to finish reporting Stopping and receive the desktop acknowledgement. Startup failure cannot cancel that final report merely because
+the application acquisition failed first. Channel failure or the deadline still permits teardown;
+this delivery boundary neither delays the atomic stopping transition nor proves process exit.
 
 ## Guarantees
 
-- One lifecycle value governs health, readiness, RPC dispatch, and shutdown.
-- No application or ICN work starts before atomic exact-owner admission.
-- Losing owner acquisition cannot initialize expensive resources.
-- No application work is admitted outside the exact admitted `Ready` ACN.
-- A confirmed missing or changed owner row stops the admitted ACN, and any store failure fails
-  closed rather than leaving an unfenced service alive.
-- Client absence does not retire the per-user service.
+- One lifecycle governs health, readiness, RPC dispatch, and shutdown.
+- No application or ICN work precedes Start from the retained parent channel.
+- Parent ownership remains mandatory after admission; no admitted detachment exists.
+- No steady-state owner database, election, or owner polling remains in ACN.
 - A bounded domain failure cannot retire the process or interrupt unrelated domains.
-- The stopping transition is single-flight; cooperative teardown and external exact-process-group escalation
-  are independently bounded.
+- Window close and ordinary client close preserve serving; full owner Quit stops the tree.
+- Cooperative teardown and exact owned-process escalation are independently bounded.

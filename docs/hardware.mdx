@@ -1,0 +1,58 @@
+---
+title: "Hardware"
+description: "Understand what your machine can run and what affects performance."
+---
+
+Magnitude assesses your machine and recommends models that fit. Start with those recommendations rather than choosing a model by parameter count alone.
+
+## Supported configurations
+
+| Machine | Inference support |
+| --- | --- |
+| Apple Silicon Mac | Metal GPU acceleration |
+| Intel Mac | CPU |
+| Windows x64 | CPU |
+| Linux x64 or ARM64 | CPU, supported NVIDIA CUDA GPUs, or supported Vulkan GPUs |
+
+See [macOS](/installation/macos), [Windows](/installation/windows), and [Linux](/installation/linux) for OS requirements and installers.
+
+## Apple Silicon
+
+Apple Silicon shares memory between the CPU and GPU. That gives the GPU access to a larger memory pool than a typical laptop's dedicated graphics memory, but macOS and other apps use the same pool.
+
+For example, a Mac with 32 GB of unified memory does not have all 32 GB available for a model. Use Discover's fit assessment and close memory-heavy apps if loading fails.
+
+Metal support is supplied by macOS; you do not need a separate GPU toolkit.
+
+## NVIDIA GPUs
+
+On Linux, Magnitude can use its CUDA backend with a compatible NVIDIA GPU and driver. The current CUDA builds target Ampere-class and newer GPUs; older CUDA-capable cards are not automatically supported.
+
+Install your GPU's supported NVIDIA driver. You can check that the driver sees it with:
+
+```sh
+nvidia-smi
+```
+
+Magnitude acquires compatible runtime components; you do not need the CUDA development toolkit. If acceleration is unavailable, check the hardware and compatibility information in the app before downloading a large model.
+
+## AMD and other Vulkan GPUs
+
+Linux GPU support uses Vulkan for compatible devices. Magnitude does **not** currently ship a ROCm backend. Windows GPU backends are also not included in the current release configuration.
+
+Use your distribution's supported graphics driver and Vulkan runtime. The backend requires Vulkan 1.1 or later, but the version alone does not guarantee that a particular GPU supports every model. Check the model's compatibility in Catalog.
+
+## CPU-only machines
+
+Magnitude can run models without a supported GPU, including on Intel Macs and the current Windows build. Smaller models and lower-bit quantizations are usually more practical when response speed matters.
+
+CPU inference uses system RAM. Having enough memory to fit a large model does not mean it will generate quickly; use the speed estimates when choosing.
+
+## Memory and speed trade-offs
+
+- **More memory** lets you consider larger models, higher-fidelity quantizations, or larger contexts.
+- **GPU memory** matters on dedicated-GPU systems. A machine with 64 GB of system RAM and an 8 GB GPU does not have 72 GB of interchangeable GPU memory.
+- **Longer context** increases memory demand and can slow responses.
+- **Other applications** reduce available memory and can affect speed after assessment.
+
+For a faster starting point, move Discover's slider toward **Faster**. For a model that needs less memory, compare the Memory values and quantized variants. See [Models](/models) and [Inference](/inference).

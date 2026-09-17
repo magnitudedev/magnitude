@@ -1,7 +1,7 @@
 import { Button } from "@/components/ui/button"
 import { ActionTooltip } from "@/components/ui/tooltip"
 import type { ReactNode } from "react"
-import { ArrowLeft } from "lucide-react"
+import { ArrowLeftIcon } from "@phosphor-icons/react"
 export interface ChatColumnPageProps {
   title: ReactNode
   backLabel?: string
@@ -29,7 +29,7 @@ export function ChatColumnPage({
               aria-label={backLabel}
               className="bg-transparent hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 [width:28px] [height:28px] flex items-center justify-center [background:transparent] border-0 rounded-[4px] cursor-pointer shrink-0 [margin-right:8px]"
             >
-              <ArrowLeft size={16} />
+              <ArrowLeftIcon size={16} />
             </Button>
           }
         />

@@ -4,10 +4,8 @@ applies_to:
   - packages/release/src/archive*.ts
   - packages/release/src/artifact-download*.ts
   - packages/release/src/contracts.ts
-  - packages/release/src/launcher*.ts
-  - packages/launcher/src/wrapper.ts
+  - packages/launcher/src/**
   - packages/launcher/scripts/build-launcher.ts
-  - packages/daemon-management/src/binary.ts
   - packages/icn/src/lifecycle/release-installation.ts
 ---
 
@@ -17,9 +15,11 @@ Runtime acquisition installs only artifacts selected from the version's release 
 
 ## Ownership
 
-- The npm launcher acquires CLI.
-- The private daemon-management package acquires ACN. On macOS it verifies the acquired
-  `Magnitude.app` signature and publisher before executing the service inside it.
+- The desktop installation exposes its bundled CLI through a Mac symlink, Windows user PATH,
+  or the Linux package-owned link. The CLI has no separate npm installation or download.
+- The installed desktop application bundles and owns its matching ACN executable. CLI and harness
+  demand locate that application; they do not acquire a standalone daemon. Desktop distribution
+  validates the application signature and publisher before installation.
 - The ICN lifecycle acquires the ICN base and optional backend pack and composes their installation.
 
 These responsibilities do not overlap.
@@ -39,7 +39,7 @@ These responsibilities do not overlap.
 
 ## Backend composition
 
-Apple arm64 selects Metal. Linux considers compatible CUDA, then compatible Vulkan, then CPU only
+Apple arm64 selects Metal. Linux and Windows consider compatible CUDA, then compatible Vulkan, then CPU only
 when successful capability probes show that no supported accelerator is usable.
 
 Authentication, acquisition, capability probing, ABI validation, module loading, and device

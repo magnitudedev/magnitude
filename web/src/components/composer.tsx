@@ -10,14 +10,14 @@ import { ActionTooltip } from "@/components/ui/tooltip"
  */
 import { useState, useRef, useCallback, useMemo, type ReactNode } from "react"
 import {
-  ArrowUp,
-  Square,
-  FileText,
-  Folder,
-  X,
-  Terminal,
-  Sparkles,
-} from "lucide-react"
+  ArrowUpIcon,
+  SquareIcon,
+  FileTextIcon,
+  FolderIcon,
+  XIcon,
+  TerminalIcon,
+  SparkleIcon,
+} from "@phosphor-icons/react"
 import {
   applyTextEditWithPastesAndMentions,
   insertMentionSegment,
@@ -49,7 +49,7 @@ import {
   composerHistoryIndexAtom,
 } from "@magnitudedev/client-common"
 import type { MentionAttachment, RawMessageUpload, RawMentionOccurrence } from "@magnitudedev/sdk"
-import { FileCodeIcon, PlusIcon, XIcon } from "@phosphor-icons/react"
+import { FileCodeIcon, PlusIcon } from "@phosphor-icons/react"
 import { Spinner } from "@/components/ui/spinner"
 import { appendMessageUploads, ingestClientFiles, MESSAGE_UPLOAD_ACCEPT } from "@/lib/message-uploads"
 export interface ComposerProps {
@@ -757,15 +757,15 @@ export function Composer({
                 }
               >
                 {!canSend && isStreaming ? (
-                  <Square
+                  <SquareIcon
                     size={16}
                     fill="currentColor"
                     className="text-red-600 dark:text-red-500"
                   />
                 ) : (
-                  <ArrowUp
+                  <ArrowUpIcon
                     size={17}
-                    strokeWidth={2.4}
+                    weight="bold"
                     className={`${
                       canSend && !disabledReason
                         ? "text-blue-700 dark:text-blue-500 group-hover:text-slate-900 dark:group-hover:text-slate-200"
@@ -901,12 +901,12 @@ function SlashCommandMenu({
             onMouseEnter={() => onSelectIndex(i)}
           >
             {cmd.source === "skill" ? (
-              <Sparkles
+              <SparkleIcon
                 size={14}
                 className="text-slate-600 dark:text-slate-400 shrink-0"
               />
             ) : (
-              <Terminal
+              <TerminalIcon
                 size={14}
                 className="text-slate-600 dark:text-slate-400 shrink-0"
               />
@@ -1005,7 +1005,7 @@ function MentionMenuItem({
   selected: boolean
   onHover: () => void
 }): ReactNode {
-  const Icon = item.kind === "directory" ? Folder : FileText
+  const Icon = item.kind === "directory" ? FolderIcon : FileTextIcon
   return (
     <div
       className="flex h-8 items-center gap-2 bg-transparent px-2.5 cursor-pointer hover:bg-slate-150 data-[selected=true]:bg-slate-200 dark:hover:bg-slate-750 dark:data-[selected=true]:bg-slate-700"
@@ -1034,7 +1034,7 @@ function AttachmentPill({
   attachment: MentionAttachment
   onRemove: () => void
 }): ReactNode {
-  const Icon = attachment.type === "mention_directory" ? Folder : FileText
+  const Icon = attachment.type === "mention_directory" ? FolderIcon : FileTextIcon
   const rangeSuffix =
     attachment.type === "mention_file_range"
       ? `:${attachment.startLine}-${attachment.endLine}`
@@ -1051,7 +1051,7 @@ function AttachmentPill({
         aria-label="Remove attachment"
         className="[background:transparent] border-0 text-slate-500 cursor-pointer [padding:0px] flex"
       >
-        <X size={14} />
+        <XIcon size={14} />
       </Button>
     </span>
   )

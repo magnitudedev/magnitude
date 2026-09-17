@@ -20,7 +20,7 @@ permissions:
   pull-requests: read
 
 env:
-  BUN_VERSION: "1.3.14"
+  BUN_VERSION: "1.4.2"
   RUST_VERSION: "1.91.1"
   NPM_VERSION: "11.6.2"
 
@@ -33,7 +33,7 @@ jobs:
         github.event.pull_request.head.ref == 'changeset-release/main' &&
         github.event.pull_request.head.repo.full_name == github.repository
       )
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       action: ${{ steps.preflight.outputs.action }}
       version: ${{ steps.preflight.outputs.version }}
@@ -117,17 +117,19 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MAGNITUDE_RELEASE_COMMIT: ${{ steps.source.outputs.release_commit }}
           MAGNITUDE_SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Validate the preflight action
         shell: bash
         env:
           ACTION: ${{ steps.preflight.outputs.action }}
         run: |
           case "$ACTION" in
-            release|publish-npm|complete) ;;
+            release|register-metadata) ;;
             *) echo "::error::Invalid preflight action: '${ACTION}'"; exit 1 ;;
           esac
   build:
+    permissions:
+      contents: read
+      id-token: write
     needs: preflight
     if: needs.preflight.outputs.action == 'release'
     uses: ./.github/workflows/release-build.yml
@@ -135,6 +137,7 @@ jobs:
       source_commit: ${{ needs.preflight.outputs.source_commit }}
       validate_candidate: false
       apple_distribution: true
+      windows_distribution: true
     secrets: inherit
 
   publish:
@@ -144,7 +147,7 @@ jobs:
       MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
     needs: [preflight, build]
     if: needs.preflight.outputs.action == 'release'
-    runs-on: ubuntu-22.04
+    runs-on: blacksmith-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
         with:
@@ -158,7 +161,7 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
       - run: bun install --frozen-lockfile
-      - run: sudo apt-get update && sudo apt-get install -y binutils
+      - run: sudo apt-get update && sudo apt-get install -y binutils rpm xvfb dbus-x11 xfwm4 x11-utils xauth desktop-file-utils libglib2.0-bin
       - uses: actions/download-artifact@v4
         with:
           pattern: host-*
@@ -172,16 +175,11 @@ jobs:
           pattern: apple-consumer-*
           path: release-artifacts
       - run: npm install --global "npm@${NPM_VERSION}"
-      - run: bun scripts/prepare-integrations.ts
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - id: npm-candidate
-        run: bun run packages/release/scripts/prepare-npm.ts release/npm-candidate
       - run: bun run packages/release/scripts/assemble.ts release-artifacts release-candidate
         env:
           MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
           MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
-      - run: bun run scripts/accept-release-candidate.ts release-candidate "${{ steps.npm-candidate.outputs.tarball }}" release/integration-candidate
+      - run: bun run scripts/accept-release-candidate.ts release-candidate
       - name: Commit-point recheck
         run: bun run packages/release/scripts/preflight.ts
         env:
@@ -190,7 +188,6 @@ jobs:
           MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
           MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
           MAGNITUDE_REQUIRE_RELEASE: "true"
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - uses: actions/upload-artifact@v4
         with:
           name: accepted-integrations
@@ -201,83 +198,24 @@ jobs:
         run: bun packages/release/scripts/apple/verify-receipts.ts release-artifacts release-candidate
         env:
           APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
-      - run: bun scripts/publish-integrations.ts
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - run: bun run packages/release/scripts/publish.ts release-candidate
         env:
           APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
-      - name: Verify public CLI acquisition
-        run: bun run packages/release/scripts/accept-public-cli.ts "${{ steps.npm-candidate.outputs.tarball }}"
+      - name: Register accepted GitHub desktop release metadata
+        run: bun packages/release/scripts/publish-hosted.ts
         env:
           MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
-      - name: Publish accepted CLI tarball
-        run: bun run publish "${{ steps.npm-candidate.outputs.tarball }}"
-        env:
-          MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
-          MAGNITUDE_EXPECTED_NPM_INTEGRITY: ${{ steps.npm-candidate.outputs.integrity }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-  public-smoke:
-    needs: [preflight, publish]
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          registry-url: https://registry.npmjs.org
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: ${{ env.BUN_VERSION }}
-      - shell: bash
-        run: |
-          npm install --global "@magnitudedev/cli@${{ needs.preflight.outputs.version }}"
-          magnitude --version
-
-  # The CLI is already public: this Version PR changed only plugins, or is a retry after
-  # a complete CLI release. Plugins publish on their own; unchanged ones verify as no-ops.
-  publish-integrations:
+          MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+          DISTRIBUTION_PUBLISHER_PRIVATE_KEY: ${{ secrets.DISTRIBUTION_PUBLISHER_PRIVATE_KEY }}
+          DISTRIBUTION_PUBLISHER_DATABASE_URL: ${{ secrets.DISTRIBUTION_PUBLISHER_DATABASE_URL }}
+          DISTRIBUTION_DATABASE_CA: ${{ secrets.DISTRIBUTION_DATABASE_CA }}
+          GH_TOKEN: ${{ github.token }}
+  register-metadata:
     needs: preflight
-    if: needs.preflight.outputs.action == 'complete'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.preflight.outputs.source_commit }}
-          fetch-depth: 0
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: ${{ env.BUN_VERSION }}
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          registry-url: https://registry.npmjs.org
-      - run: bun install --frozen-lockfile
-      - run: npm install --global "npm@${NPM_VERSION}"
-      - run: bun run --cwd integrations/pi typecheck
-      - run: bun run --cwd integrations/pi test
-      - run: bun scripts/prepare-integrations.ts
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - run: bun scripts/accept-integrations.ts
-      - uses: actions/upload-artifact@v4
-        with:
-          name: accepted-integrations
-          path: release/integration-candidate
-          if-no-files-found: ignore
-          overwrite: true
-      - run: bun scripts/publish-integrations.ts
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  publish-npm:
-    needs: preflight
-    if: needs.preflight.outputs.action == 'publish-npm'
-    uses: ./.github/workflows/publish-npm.yml
+    if: needs.preflight.outputs.action == 'register-metadata'
+    uses: ./.github/workflows/register-release.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
       within_release: true

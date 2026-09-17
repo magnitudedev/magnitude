@@ -1,0 +1,68 @@
+name: Recover desktop release metadata
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      within_release:
+        required: true
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact public GitHub release version to register
+        required: true
+        type: string
+
+concurrency:
+  group: >-
+    ${{ inputs.within_release
+      && format('magnitude-metadata-completion-{0}', github.run_id)
+      || 'magnitude-production-release' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  BUN_VERSION: "1.4.2"
+
+jobs:
+  register:
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: "@magnitudedev/cli@${{ inputs.version }}"
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: bun install --frozen-lockfile
+      - name: Verify released source
+        id: source
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          test "$(node -p "require('./packages/launcher/package.json').version")" = "$RELEASE_VERSION"
+          test "$(git rev-parse "@magnitudedev/cli@${RELEASE_VERSION}^{commit}")" = "$(git rev-parse HEAD)"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - run: bun run packages/release/scripts/verify-public-release.ts
+        env:
+          MAGNITUDE_RELEASE_VERSION: ${{ inputs.version }}
+          MAGNITUDE_SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+      - name: Register accepted GitHub desktop release metadata
+        run: bun packages/release/scripts/publish-hosted.ts
+        env:
+          MAGNITUDE_RELEASE_VERSION: ${{ inputs.version }}
+          MAGNITUDE_SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+          DISTRIBUTION_PUBLISHER_PRIVATE_KEY: ${{ secrets.DISTRIBUTION_PUBLISHER_PRIVATE_KEY }}
+          DISTRIBUTION_PUBLISHER_DATABASE_URL: ${{ secrets.DISTRIBUTION_PUBLISHER_DATABASE_URL }}
+          DISTRIBUTION_DATABASE_CA: ${{ secrets.DISTRIBUTION_DATABASE_CA }}
+          GH_TOKEN: ${{ github.token }}

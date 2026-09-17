@@ -11,20 +11,20 @@ import { useCallback, useMemo, useRef, type ReactNode } from "react"
 import { Atom, useAtomMount } from "@effect-atom/atom-react"
 import { Effect } from "effect"
 import {
-  Download,
-  FileDiff,
-  FilePen,
-  FileText,
-  FolderTree,
-  GitBranch,
-  Globe,
-  Image as ImageIcon,
-  Search,
-  Sparkles,
-  Terminal,
-  Wrench,
-  type LucideIcon,
-} from "lucide-react"
+  DownloadSimpleIcon,
+  FileCodeIcon,
+  NotePencilIcon,
+  FileTextIcon,
+  TreeStructureIcon,
+  GitBranchIcon,
+  GlobeIcon,
+  ImageIcon,
+  MagnifyingGlassIcon,
+  SparkleIcon,
+  TerminalIcon,
+  WrenchIcon,
+  type Icon,
+} from "@phosphor-icons/react"
 import {
   getFork,
   messageForEntry,
@@ -82,19 +82,19 @@ import {
   type AssistantResponsePresentation,
 } from "./assistant-response-presentation"
 const DEFAULT_SHELL_LINE_CAP = 8
-const TOOL_ICONS: Record<ToolIcon, LucideIcon> = {
-  file: FileText,
-  edit: FilePen,
-  diff: FileDiff,
-  search: Search,
-  tree: FolderTree,
-  terminal: Terminal,
-  web: Globe,
-  download: Download,
-  skill: Sparkles,
-  worker: Wrench,
-  checkpoint: GitBranch,
-  tool: Wrench,
+const TOOL_ICONS: Record<ToolIcon, Icon> = {
+  file: FileTextIcon,
+  edit: NotePencilIcon,
+  diff: FileCodeIcon,
+  search: MagnifyingGlassIcon,
+  tree: TreeStructureIcon,
+  terminal: TerminalIcon,
+  web: GlobeIcon,
+  download: DownloadSimpleIcon,
+  skill: SparkleIcon,
+  worker: WrenchIcon,
+  checkpoint: GitBranchIcon,
+  tool: WrenchIcon,
   image: ImageIcon,
 }
 function toneClass(tone: ToolTone | undefined): string {
@@ -151,7 +151,7 @@ function ToolSummaryRow({
   >
 }): ReactNode {
   const summary = entry.summary
-  const Icon = TOOL_ICONS[summary.icon] ?? Wrench
+  const Icon = TOOL_ICONS[summary.icon] ?? WrenchIcon
   const label = toolSummaryLabel(summary)
   return (
     <div className="grid [grid-template-columns:16px_minmax(0,_1fr)] [gap:7px] items-center font-sans text-[13px] leading-[18px] [max-width:min(860px,_100%)]">

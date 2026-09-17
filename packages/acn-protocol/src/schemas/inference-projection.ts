@@ -59,6 +59,7 @@ export const projectInferenceHardware = (
     architecture,
     productName: Option.flatMap(hardware.system_product_name, Option.fromNullable),
     processor: Option.flatMap(hardware.cpu_model, Option.fromNullable),
+    physicalCores: Option.filter(Option.flatMap(hardware.physical_cores, Option.fromNullable), count => count > 0),
     logicalCores: Math.max(1, hardware.logical_cores),
     totalSystemMemoryBytes: hardware.system_memory.physical_capacity_bytes,
     availableSystemMemoryBytes: hardware.system_memory.physical_available_bytes,

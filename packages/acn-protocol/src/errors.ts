@@ -249,11 +249,3 @@ export const LocalInferenceError = Schema.Union(
   ModelSlotMutationFailed,
 )
 export type LocalInferenceError = Schema.Schema.Type<typeof LocalInferenceError>
-
-export class OnboardingError extends Schema.TaggedError<OnboardingError>()(
-  "OnboardingError",
-  {
-    operation: Schema.String,
-    message: Schema.String,
-  },
-) {}

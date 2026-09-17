@@ -11,13 +11,13 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  BUN_VERSION: "1.3.14"
+  BUN_VERSION: "1.4.2"
   RUST_VERSION: "1.91.1"
   NPM_VERSION: "11.6.2"
 
 jobs:
   candidate:
-    runs-on: ubuntu-22.04
+    runs-on: blacksmith-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,8 +48,6 @@ jobs:
           linux-x64-gnu
           inference/target/catalog-inputs
           release/linux-x64-gnu
-      - id: npm-candidate
-        run: bun run packages/release/scripts/prepare-npm.ts release/npm-candidate
       - id: version
         run: echo "version=$(jq -r '.version' packages/launcher/package.json)" >> "$GITHUB_OUTPUT"
       - name: Assemble the Linux x64 candidate
@@ -65,4 +63,3 @@ jobs:
         run: >-
           bun run scripts/accept-release-candidate.ts
           release-candidate
-          "${{ steps.npm-candidate.outputs.tarball }}"

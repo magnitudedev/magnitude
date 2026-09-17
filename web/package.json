@@ -26,7 +26,6 @@
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
     "effect": "^3.21.2",
-    "lucide-react": "^0.460.0",
     "monaco-editor": "^0.56.0",
     "react": "^19.0.0",
     "react-arborist": "^3.16.0",

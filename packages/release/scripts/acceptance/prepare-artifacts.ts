@@ -1,0 +1,43 @@
+import { publishGithubAcceptance } from "../../src/hosted-update/github-acceptance"
+import { verifyGithubRelease } from "../../src/hosted-update/github-release"
+import { FileSystem, FetchHttpClient } from "@effect/platform"
+import { BunContext, BunRuntime } from "@effect/platform-bun"
+import { Config, Effect, Option, Schema } from "effect"
+import { join } from "node:path"
+import { ReleaseArtifactSchema } from "../../src/contracts"
+import { decodePublisherPrivateKey, PublisherKeyId, PublishedUpdate, UpdateManifest } from "../../src/hosted-update/manifest"
+import { prepareHostedRelease } from "../../src/hosted-update/publication"
+import { isValidVersion } from "../../src/client-update/release-channels"
+
+class AcceptancePreparationFailed extends Schema.TaggedError<AcceptancePreparationFailed>()("AcceptancePreparationFailed", {}) {}
+const run = Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const directory = yield* Config.string("MAGNITUDE_ACCEPTANCE_ARTIFACTS")
+  const version = yield* Schema.decodeUnknown(Schema.String.pipe(Schema.filter(isValidVersion)))(yield* Config.string("MAGNITUDE_ACCEPTANCE_VERSION"))
+  const commit = yield* Config.string("MAGNITUDE_ACCEPTANCE_COMMIT")
+  const key = yield* decodePublisherPrivateKey(yield* Config.string("DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY"))
+  const artifacts = yield* Effect.forEach((yield* fs.readDirectory(directory)).filter(name => name.endsWith(".artifact.json")), name => Effect.gen(function* () {
+    const artifact = yield* Schema.decodeUnknown(Schema.parseJson(ReleaseArtifactSchema))(yield* fs.readFileString(join(directory, name)))
+    if (artifact.kind !== "desktop" || Option.isNone(artifact.host)) return yield* new AcceptancePreparationFailed()
+    const host = artifact.host.value
+    if (host.startsWith("darwin-") ? !/\.(dmg|zip)$/.test(artifact.filename)
+      : host === "windows-x64-msvc" ? !artifact.filename.endsWith(".exe")
+      : !host.startsWith("linux-") || !/\.(deb|rpm)$/.test(artifact.filename)) return yield* new AcceptancePreparationFailed()
+    const target = host.startsWith("darwin-") ? { os: "darwin", arch: host.endsWith("arm64") ? "arm64" : "x64", package: artifact.filename.endsWith(".dmg") ? "dmg" : "mac-zip" }
+      : host === "windows-x64-msvc" ? { os: "windows", arch: "x64", package: "windows-exe" }
+      : { os: "linux", arch: host.includes("arm64") ? "arm64" : "x64", package: artifact.filename.endsWith(".deb") ? "deb" : "rpm" }
+    const manifest = yield* Schema.decodeUnknown(UpdateManifest)({ protocol: 1, version, commit, tag: `desktop-update-acceptance/${commit}/${version}`,
+      artifact: { id: artifact.id, target, filename: artifact.filename, bytes: artifact.bytes, sha256: artifact.sha256 },
+    })
+    return { file: join(directory, artifact.filename), manifest }
+  }))
+  const token = yield* Config.string("GH_TOKEN")
+  yield* publishGithubAcceptance(artifacts, token)
+  const manifests = artifacts.map(a => a.manifest)
+  yield* verifyGithubRelease(manifests, Option.some(token))
+  const envelopes = yield* prepareHostedRelease({ artifacts: manifests, keyId: PublisherKeyId.make("acceptance"), privateKey: key,
+  })
+  yield* fs.writeFileString(join(directory, "prepared-manifests.json"), yield* Schema.encode(Schema.parseJson(Schema.Array(PublishedUpdate)))(envelopes))
+  yield* Effect.logInfo("Acceptance artifacts published to GitHub, verified and publisher-signed; no channel promoted", { version, artifacts: envelopes.length })
+})
+BunRuntime.runMain(run.pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer])))

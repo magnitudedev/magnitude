@@ -1,73 +1,96 @@
 ---
-title: Reference
-description: "CLI, inference APIs, configuration, and local files"
-icon: book-open
+title: "CLI reference"
+description: "Control the installed Magnitude app from your terminal."
 ---
 
-Magnitude normally configures and manages these interfaces automatically. This reference is for agents, automation, advanced integrations, and manual recovery.
+The desktop app includes the `magnitude` CLI. Open the app once, then open a new terminal and run:
 
-## CLI
+```sh
+magnitude --help
+```
+
+Running `magnitude` without a subcommand prints help. Setup and model browsing are available in the desktop app; no npm installation is required.
+
+## Find and download models
+
+```sh
+magnitude hardware
+magnitude catalog recommendations --preference balanced --limit 5
+magnitude catalog list
+```
+
+Copy the exact model ID from the output, then replace `MODEL_ID` below:
+
+```sh
+magnitude catalog show "MODEL_ID"
+magnitude catalog pull "MODEL_ID"
+magnitude models status "MODEL_ID"
+```
+
+Assessment and downloads run in the background. Use status commands to check progress.
 
 | Command | Purpose |
-|---|---|
-| `magnitude setup` | Open interactive model browsing and setup |
-| `magnitude service install` | Install and enable the per-user service without starting it |
-| `magnitude service start` | Install or refresh, start, and await the user service |
-| `magnitude service status` | Show installation, startup, runtime, and active-model status |
-| `magnitude service stop` | Stop the service without uninstalling it |
-| `magnitude service uninstall` | Stop and remove the service definition while preserving user data |
-| `magnitude catalog list` | Show catalog, assessment, acquisition, and residency state |
-| `magnitude catalog pull <model-id>` | Install or update a catalog model |
-| `magnitude catalog remove <model-id>` | Remove an installed catalog model |
-| `magnitude catalog cancel <model-id>` | Cancel active acquisition work |
-| `magnitude models status` | Show installed models and their residency state |
-| `magnitude models load <model-id>` | Load a model by canonical model ID |
-| `magnitude models stop` | Stop the active local model |
-| `magnitude connections list` | Show supported and installed harnesses |
-| `magnitude connections add <harness> [--set-model <model-id>] [--install-skill]` | Connect installed models and optionally select a model and refresh the harness skill |
-| `magnitude connections sync [harness]` | Refresh connected harness configuration |
-| `magnitude connections remove <harness>` | Remove a harness connection |
-| `magnitude docs [topic-id]` | List or read bundled documentation for agents |
-| `magnitude docs onboarding` | Read the complete agent-guided setup workflow |
-| `magnitude update` | Update Magnitude |
+| --- | --- |
+| `hardware` | Inspect detected hardware and memory. |
+| `catalog status` | Check catalog preparation and assessment. |
+| `catalog list` | List compatible catalog models. |
+| `catalog show <model-id>` | Read model details. |
+| `catalog recommendations` | Rank recommendations; defaults to Balanced and a limit of 10. |
+| `catalog pull <model-id>` | Download or update a catalog model. |
+| `catalog cancel <model-id>` | Cancel a download or model update. |
+| `catalog remove <model-id>` | Remove an installed model. |
+| `models status [model-id]` | Inspect downloaded models and loading state. |
+| `models load <model-id>` | Load a downloaded model into memory. |
+| `models stop` | Stop the active model without deleting it. |
 
-Run `magnitude --help` or append `--help` to a command for its complete options. Every
-non-interactive observation command supports `--json`; agents should begin with
-`magnitude docs onboarding` for the complete CLI-only setup and model-selection workflow.
+Prefix each command with `magnitude`. Recommendation preferences are `fastest`, `faster`, `balanced`, `smarter`, and `smartest`; use `--preference` and `--limit` to choose.
 
-## Inference APIs
+## Connections
 
-The background service listens on loopback at `http://127.0.0.1:10100`.
+| Command | Purpose |
+| --- | --- |
+| `magnitude connections list` | Inspect installed agents and connection state. |
+| `magnitude connections add <harness>` | Configure an agent. |
+| `magnitude connections sync [harness]` | Refresh one or all configured integrations. |
+| `magnitude connections remove <harness>` | Disconnect an agent. |
 
-| API | Base URL |
-|---|---|
-| OpenAI-compatible | `http://127.0.0.1:10100/inference/v1` |
-| Anthropic-compatible | `http://127.0.0.1:10100/inference/anthropic` |
+`connections add` accepts `--set-model <model-id>` to select a model and `--install-skill` to install or refresh its Magnitude skill. Skill installation is automatic for Pi.
 
-The OpenAI-compatible API supports model listing, Chat Completions, and Responses. The Anthropic-compatible API supports Messages and token counting. Harness setup configures the correct interface automatically.
+Harness IDs: `pi`, `opencode`, `hermes`, `openclaw`, `codex`, `claude-code`, `oh-my-pi`, and `cline`. See [Integrations](/integrations/overview) for agent-specific instructions.
+
+## App and background service
+
+| Command | Purpose |
+| --- | --- |
+| `magnitude app open` | Show the desktop window. |
+| `magnitude service start` | Start the app in the background and wait for its service. |
+| `magnitude service status` | Inspect service and active-model status. |
+| `magnitude service stop` | Stop Magnitude without disabling launch at login. |
+| `magnitude service install` | Enable launch at login and start in the background. |
+| `magnitude service uninstall` | Disable launch at login and stop Magnitude. |
+
+`service uninstall` does **not** uninstall the desktop app or delete your models. The CLI controls the desktop-owned service; it is not a separate server installation.
+
+## Updates
+
+| Command | Purpose |
+| --- | --- |
+| `magnitude update` or `magnitude update check` | Check for a newer desktop release. |
+| `magnitude update status` | Read update state without starting the app. |
+| `magnitude update download` | Start downloading the available update. |
+| `magnitude update install` | Install a prepared update and restart Magnitude. |
+| `magnitude update discard` | Remove a retained update download. |
+
+Downloading is asynchronous; check `magnitude update status` for progress. Installing stops the current model and service. These commands update the desktop, bundled service, and CLI together.
+
+## Help
+
+Use `--help` after any command to see its options. `magnitude --version` prints the installed CLI version. `magnitude docs` lists documentation bundled with the CLI, and `magnitude docs cli` prints its command guide.
 
 ## Environment variables
 
-| Variable | Purpose |
-|---|---|
-| `EXA_API_KEY` | Enable web search in Magnitude Harness |
-| `HF_HUB_CACHE` | Set the Hugging Face Hub cache directory |
-| `HUGGINGFACE_HUB_CACHE` | Legacy Hugging Face Hub cache override |
-| `HF_HOME` | Set the Hugging Face data directory |
-| `XDG_CACHE_HOME` | Set the base cache directory |
-
-Hugging Face cache settings are checked in the order shown. If none is set, Magnitude checks `~/.cache/huggingface/hub`.
+For integration configuration overrides, see your [agent guide](/integrations/overview). For model storage and cached downloads, see the [FAQ](/faq#where-are-models-and-settings-stored).
 
 ## Files and directories
 
-| Path | Purpose |
-|---|---|
-| `~/.magnitude/models/` | Magnitude-managed local models |
-| `~/.magnitude/cache/` | Model metadata, hardware profiles, and disposable caches |
-| `~/.magnitude/sessions/` | Magnitude Harness conversations and session logs |
-| `~/.magnitude/logs/` | CLI logs and macOS service logs |
-| `~/.magnitude/traces/` | Local trace data when tracing is enabled |
-| `~/.magnitude/config.json` | User settings and model selections |
-| `~/.magnitude/harness-connections.json` | Managed harness connections |
-
-Deleting `~/.magnitude/cache` causes derived data to be rebuilt but does not delete downloaded models. Do not delete the complete `~/.magnitude` directory as a general troubleshooting step.
+See [storage locations](/faq#where-are-models-and-settings-stored).

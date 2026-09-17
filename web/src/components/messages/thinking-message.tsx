@@ -1,6 +1,6 @@
 import { useState, useSyncExternalStore, type ReactNode } from "react"
 import { Option } from "effect"
-import { ChevronRight } from "lucide-react"
+import { CaretRightIcon } from "@phosphor-icons/react"
 import type { ThinkingMessage as ThinkingMessageType } from "@magnitudedev/sdk"
 import {
   formatWorkDuration,
@@ -39,7 +39,7 @@ export function ThinkingMessage({ message }: ThinkingMessageProps): ReactNode {
         aria-expanded={expanded}
         className="flex min-h-7 items-center gap-1.5 rounded-md border-0 bg-transparent px-1.5 text-[13px] text-slate-600 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-850"
       >
-        <ChevronRight
+        <CaretRightIcon
           size={13}
           className={`${expanded ? "rotate-90" : "rotate-0"} shrink-0 transition-transform duration-100`}
         />

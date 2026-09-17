@@ -1,7 +1,8 @@
 # Magnitude CLI
 
-Run `magnitude` without a subcommand for the interactive experience. Use these commands for a
-non-interactive shell workflow:
+The CLI is headless. Running `magnitude` without a subcommand prints help and exits.
+Onboarding lives in the Magnitude desktop app: use Discover to choose models and Connections to
+configure external harnesses. Agents can use the following commands to operate inference:
 
 ```text
 magnitude update
@@ -25,7 +26,7 @@ Each command prints only the product information relevant to that operation. Col
 use borderless tables when the rows are directly comparable; detail commands use labeled fields.
 Exact model and harness IDs are always printed so their output can be used in later commands.
 
-`catalog` owns model discovery and assessment progress, reviewed model choices, recommendation
+`catalog` owns catalog assessment progress, reviewed model choices, recommendation
 evidence, and download operations. `models` owns models on this computer and their current
 installation or runtime state. Catalog assessment and model loading are background work:
 observation commands return the current state and never wait for either to settle.

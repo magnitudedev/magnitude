@@ -1,5 +1,5 @@
 import type { ReactNode } from "react"
-import { AlertTriangle } from "lucide-react"
+import { WarningIcon } from "@phosphor-icons/react"
 import { Option } from "effect"
 import { Button } from "@/components/ui/button"
 import { Progress } from "@/components/ui/progress"
@@ -77,11 +77,10 @@ export function AcnBootstrapScreen({
             {failureTitle(state)}
           </h1>
           <div className="mx-auto mt-4 flex max-w-[540px] items-start justify-center gap-2.5">
-            <AlertTriangle
+            <WarningIcon
               aria-hidden="true"
               className="mt-0.5 shrink-0 text-red-600 dark:text-red-400"
               size={18}
-              strokeWidth={1.8}
             />
             <p className="text-left text-[14px] leading-5 text-slate-600 dark:text-slate-400">
               {state.message}

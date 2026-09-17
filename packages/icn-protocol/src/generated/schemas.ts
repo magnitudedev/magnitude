@@ -1118,6 +1118,10 @@ export const HardwareSnapshot = S.Struct({
     S.suspend((): S.Schema<HardwareMemoryDomain, HardwareMemoryDomainEncoded> => HardwareMemoryDomain),
   ),
   native_build: S.String,
+  physical_cores: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
+    exact: true,
+    as: "Option",
+  }),
   platform: S.String,
   system_memory: S.suspend((): S.Schema<HardwareSystemMemory, HardwareSystemMemoryEncoded> => HardwareSystemMemory),
   system_product_name: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
@@ -1255,6 +1259,16 @@ export const IcnInstallationDeclaration = S.Struct({
 })
 export type IcnInstallationDeclaration = S.Schema.Type<typeof IcnInstallationDeclaration>
 export type IcnInstallationDeclarationEncoded = S.Schema.Encoded<typeof IcnInstallationDeclaration>
+
+export const IcnParentCommand = S.Struct({
+  type: S.suspend((): S.Schema<IcnParentCommandType, IcnParentCommandTypeEncoded> => IcnParentCommandType),
+})
+export type IcnParentCommand = S.Schema.Type<typeof IcnParentCommand>
+export type IcnParentCommandEncoded = S.Schema.Encoded<typeof IcnParentCommand>
+
+export const IcnParentCommandType = S.Literal("shutdown")
+export type IcnParentCommandType = S.Schema.Type<typeof IcnParentCommandType>
+export type IcnParentCommandTypeEncoded = S.Schema.Encoded<typeof IcnParentCommandType>
 
 export const IcnStartupBackend = S.Union(
   S.extend(
@@ -1901,6 +1915,7 @@ export const ModelReleaseReason = S.Union(
   S.Literal("idle_timeout"),
   S.Literal("replacement"),
   S.Literal("memory_pressure"),
+  S.Literal("failure"),
 )
 export type ModelReleaseReason = S.Schema.Type<typeof ModelReleaseReason>
 export type ModelReleaseReasonEncoded = S.Schema.Encoded<typeof ModelReleaseReason>

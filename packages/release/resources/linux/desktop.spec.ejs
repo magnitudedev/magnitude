@@ -1,0 +1,51 @@
+# The payload is an already assembled application, not compiler inputs. Do not
+# strip, rewrite debug sections, or otherwise alter embedded native executables.
+%global __os_install_post %{nil}
+%global debug_package %{nil}
+%define _binary_payload w2.xzdio
+
+Name: <%= name %>
+Version: <%= version %>
+Release: <%= revision %>
+Summary: <%= description %>
+License: <%= license %>
+URL: <%= homepage %>
+Requires: <%= requires.join(', ') %>
+AutoReqProv: no
+
+%description
+<%= productDescription %>
+
+%install
+mkdir -p %{buildroot}/usr/
+cp -a usr/. %{buildroot}/usr/
+find %{buildroot}/usr/lib/<%= name %> -type d -exec chmod 0755 {} +
+find %{buildroot}/usr/lib/<%= name %> -type f -exec chmod go-w {} +
+ln -s ../lib/<%= name %>/resources/magnitude %{buildroot}/usr/bin/magnitude
+
+%files
+%defattr(-,root,root)
+/usr/bin/<%= name %>
+/usr/bin/magnitude
+/usr/lib/<%= name %>/
+/usr/share/applications/<%= name %>.desktop
+/usr/share/doc/<%= name %>/
+/usr/share/icons/hicolor/256x256/apps/<%= name %>.png
+
+%pre
+set -eu
+@MAGNITUDE_INSTALL_BEGIN@
+
+%post
+set -eu
+@MAGNITUDE_INSTALL_END@
+
+%preun
+set -eu
+[ "$1" -eq 0 ] || exit 0
+@MAGNITUDE_INSTALL_BEGIN@
+
+%postun
+set -eu
+[ "$1" -eq 0 ] || exit 0
+@MAGNITUDE_INSTALL_END@

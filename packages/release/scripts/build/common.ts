@@ -9,7 +9,7 @@ import {
 import { basename, dirname } from "node:path"
 import { pipeline } from "node:stream/promises"
 import { createGzip } from "node:zlib"
-import { Schema } from "effect"
+import { Effect, Schema } from "effect"
 import { pack } from "tar-stream"
 import {
   ReleaseArtifactSchema,
@@ -45,32 +45,32 @@ export const fileSha256 = async (file: string): Promise<string> => {
   return hash.digest("hex")
 }
 
-export const run = async (
+class BuildCommandFailed extends Schema.TaggedError<BuildCommandFailed>()("BuildCommandFailed", { message: Schema.String }) {}
+
+export const run = (
   command: readonly string[],
   options: {
     readonly cwd?: string
     readonly env?: Readonly<Record<string, string | undefined>>
   } = {},
-): Promise<string> => {
-  const child = Bun.spawn([...command], {
+): Promise<string> => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+  const child = yield* Effect.acquireRelease(Effect.try(() => Bun.spawn([...command], {
     cwd: options.cwd,
     env: options.env,
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
-  })
-  const [code, stdout, stderr] = await Promise.all([
+  })), child => Effect.promise(async () => { await child[Symbol.asyncDispose]() }))
+  const [code, stdout, stderr] = yield* Effect.tryPromise(() => Promise.all([
     child.exited,
     new Response(child.stdout).text(),
     new Response(child.stderr).text(),
-  ])
+  ]))
   if (code !== 0) {
-    throw new Error(
-      `${command[0]} failed with exit ${code}: ${(stderr || stdout).trim().slice(0, 4_000)}`,
-    )
+    return yield* new BuildCommandFailed({ message: `${command[0]} failed with exit ${code}: ${[stdout.trim(), stderr.trim()].filter(Boolean).join("\n").slice(-4_000)}` })
   }
   return stdout
-}
+})))
 
 const compareVersions = (left: string, right: string): number => {
   const leftParts = left.split(".").map(Number)
@@ -96,14 +96,11 @@ export const verifyAppleDeploymentTarget = async (
       "-show-build",
       file,
     ])
-    // Modern linkers emit LC_BUILD_VERSION (platform + minos); older x86_64 toolchains, including
-    // the upstream Intel ripgrep, still emit LC_VERSION_MIN_MACOSX (version only). Both declare
-    // a macOS deployment target.
     const platform = report.match(/^\s*platform\s+(\S+)\s*$/m)?.[1]
     const minimum = platform === "MACOS"
       ? report.match(/^\s*minos\s+(\d+(?:\.\d+){1,2})\s*$/m)?.[1]
-      : /^\s*cmd LC_VERSION_MIN_MACOSX\s*$/m.test(report)
-        ? report.match(/^\s*version\s+(\d+(?:\.\d+){1,2})\s*$/m)?.[1]
+      : platform === undefined
+        ? report.match(/\bcmd\s+LC_VERSION_MIN_MACOSX\s+cmdsize\s+\d+\s+version\s+(\d+(?:\.\d+){1,2})\b/)?.[1]
         : undefined
     if (minimum === undefined) {
       throw new Error(`${basename(file)} has no macOS deployment target`)

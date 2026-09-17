@@ -5,7 +5,15 @@ import {
   type FormEvent,
   type ReactNode,
 } from "react"
-import { ArrowLeft, ArrowRight, Download, ExternalLink, FolderOpen, RotateCw, X } from "lucide-react"
+import {
+  ArrowLeftIcon,
+  ArrowRightIcon,
+  DownloadSimpleIcon,
+  ArrowSquareOutIcon,
+  FolderOpenIcon,
+  ArrowClockwiseIcon,
+  XIcon,
+} from "@phosphor-icons/react"
 import { Atom, useAtomMount } from "@effect-atom/atom-react"
 import { Effect } from "effect"
 import {
@@ -51,7 +59,7 @@ function BrowserDownload({
     <div className="flex h-9 shrink-0 items-center gap-2 border-b border-slate-200 px-3 font-sans text-xs dark:border-slate-800">
       {download.status === "progressing"
         ? <Spinner className="size-3.5 text-blue-600 motion-reduce:animate-none dark:text-blue-400" />
-        : <Download className="size-3.5 text-slate-500 dark:text-slate-400" />}
+        : <DownloadSimpleIcon className="size-3.5 text-slate-500 dark:text-slate-400" />}
       <span className="min-w-0 flex-1 truncate text-slate-700 dark:text-slate-300">{download.fileName}</span>
       <span className="shrink-0 tabular-nums text-slate-500 dark:text-slate-400">
         {download.status === "progressing"
@@ -62,13 +70,13 @@ function BrowserDownload({
       {download.status === "progressing" ? (
         <ActionTooltip label="Cancel download" side="bottom" trigger={(
           <Button variant="ghost" size="icon-xs" aria-label="Cancel download" onClick={() => runCommand(browser.cancelDownload(download.id), "Could not cancel download.")}>
-            <X size={13} />
+            <XIcon size={13} />
           </Button>
         )} />
       ) : download.status === "completed" ? (
         <ActionTooltip label="Reveal download" side="bottom" trigger={(
           <Button variant="ghost" size="icon-xs" aria-label="Reveal download" onClick={() => runCommand(browser.revealDownload(download.id), "Could not reveal download.")}>
-            <FolderOpen size={13} />
+            <FolderOpenIcon size={13} />
           </Button>
         )} />
       ) : null}
@@ -156,10 +164,10 @@ export function BrowserContent({
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <form onSubmit={navigate} className="relative flex h-11 shrink-0 items-center gap-1.5 border-b border-slate-200 px-2 dark:border-slate-800">
-        <Button variant="ghost" size="icon-sm" type="button" disabled={!activeTab.canGoBack} aria-label="Back" onClick={() => runCommand(browser.goBack(), "Could not go back.")}><ArrowLeft size={16} /></Button>
-        <Button variant="ghost" size="icon-sm" type="button" disabled={!activeTab.canGoForward} aria-label="Forward" onClick={() => runCommand(browser.goForward(), "Could not go forward.")}><ArrowRight size={16} /></Button>
+        <Button variant="ghost" size="icon-sm" type="button" disabled={!activeTab.canGoBack} aria-label="Back" onClick={() => runCommand(browser.goBack(), "Could not go back.")}><ArrowLeftIcon size={16} /></Button>
+        <Button variant="ghost" size="icon-sm" type="button" disabled={!activeTab.canGoForward} aria-label="Forward" onClick={() => runCommand(browser.goForward(), "Could not go forward.")}><ArrowRightIcon size={16} /></Button>
         <Button variant="ghost" size="icon-sm" type="button" disabled={activeTab.phase === "blank"} aria-label={activeTab.phase === "loading" ? "Stop" : "Reload"} onClick={() => runCommand(activeTab.phase === "loading" ? browser.stop() : browser.reload(), activeTab.phase === "loading" ? "Could not stop loading." : "Could not reload this page.")}>
-          {activeTab.phase === "loading" ? <X size={15} /> : <RotateCw size={15} />}
+          {activeTab.phase === "loading" ? <XIcon size={15} /> : <ArrowClockwiseIcon size={15} />}
         </Button>
         <Input
           ref={addressRef}
@@ -182,7 +190,7 @@ export function BrowserContent({
           }}
         />
         <ActionTooltip label="Open in default browser" side="top" trigger={(
-          <Button variant="ghost" size="icon-sm" type="button" disabled={activeTab.url.length === 0} aria-label="Open in default browser" onClick={() => runCommand(browser.openExternal(), "Could not open the default browser.")}><ExternalLink size={15} /></Button>
+          <Button variant="ghost" size="icon-sm" type="button" disabled={activeTab.url.length === 0} aria-label="Open in default browser" onClick={() => runCommand(browser.openExternal(), "Could not open the default browser.")}><ArrowSquareOutIcon size={15} /></Button>
         )} />
         {activeTab.phase === "loading" ? <div className="absolute inset-x-0 bottom-0 h-0.5 overflow-hidden bg-blue-200 dark:bg-blue-900"><div className="h-full w-1/3 animate-[browser-loading_1.2s_ease-in-out_infinite] bg-blue-600 motion-reduce:w-full motion-reduce:animate-none dark:bg-blue-400" /></div> : null}
       </form>

@@ -62,7 +62,10 @@ export const notarizeAppleUnit = (unit: string, output: string, sources: readonl
   const directory = resolve(output, ".apple", unit)
   yield* fs.makeDirectory(directory, { recursive: true })
   for (const [index, source] of sources.entries()) {
-    yield* fs.copy(source, resolve(directory, `${index}-${basename(source)}`), { overwrite: false })
+    const destination = resolve(directory, `${index}-${basename(source)}`)
+    if (yield* fs.exists(destination)) return yield* new AppleDistributionFailed({ message: `Notarization staging already exists: ${destination}` })
+    // Preserve sealed framework links verbatim; generic recursive copies may rewrite them.
+    yield* appleCommand("/usr/bin/ditto", source, destination)
   }
   const archive = resolve(output, ".apple", `${unit}.zip`)
   yield* appleCommand("/usr/bin/ditto", "-c", "-k", "--keepParent", directory, archive)

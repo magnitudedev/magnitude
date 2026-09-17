@@ -1,4 +1,5 @@
 import { Option } from "effect"
+import { parseModelId, type CatalogLocalModel } from "@magnitudedev/sdk"
 import type {
   LocalInferenceHardware,
   LocalModel,
@@ -84,6 +85,22 @@ export const rankedLocalModelOptions = (
     || left.option.model.modelId.localeCompare(right.option.model.modelId))
   .slice(0, Math.max(0, Math.floor(limit)))
   .map(({ option }) => option)
+
+/** Keep up to two configurations of each catalog base, preserving ranking order. */
+export const featuredCatalogModels = (
+  ranked: readonly CatalogLocalModel[],
+  limit = 5,
+): readonly CatalogLocalModel[] => {
+  const represented = new Map<string, number>()
+  return ranked.filter(model => {
+    const identity = parseModelId(model.modelId)
+    const baseId = identity._tag === "Catalog" ? identity.baseId : model.modelId
+    const count = represented.get(baseId) ?? 0
+    if (count >= 2) return false
+    represented.set(baseId, count + 1)
+    return true
+  }).slice(0, Math.max(0, Math.floor(limit)))
+}
 
 export const localModelOptions = (
   models: LocalModelsState,

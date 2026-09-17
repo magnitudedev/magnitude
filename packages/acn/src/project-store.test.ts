@@ -2,7 +2,7 @@ import { mkdtemp } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { describe, expect, it } from "vitest"
-import { Effect, Either, Option } from "effect"
+import { Effect, Either, Layer, Option } from "effect"
 import {
   DirectoryPathSchema,
   ProjectIdSchema,
@@ -36,8 +36,7 @@ const run = <A, E>(
       const storage = yield* MagnitudeStorage
       return yield* body(store, storage)
     }).pipe(
-      Effect.provide(ProjectStoreLive),
-      Effect.provide(storageLayer),
+      Effect.provide(ProjectStoreLive.pipe(Layer.provideMerge(storageLayer))),
     )
   }))
 
