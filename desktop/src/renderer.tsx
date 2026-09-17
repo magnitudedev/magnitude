@@ -20,7 +20,7 @@ import {
   PlugIcon,
   PulseIcon,
   ChartBarIcon,
-  CheckIcon,
+  CheckCircleIcon,
   SlidersIcon,
   DownloadSimpleIcon,
   CircleNotchIcon,
@@ -347,13 +347,14 @@ function ModelStatus() {
   const presentation = Result.isSuccess(models) ? modelTrayPresentation(models.value) : null
   const active = Result.isSuccess(models) ? Option.getOrUndefined(activeLocalModel(models.value)) : undefined
   if (Result.isInitial(models)) return <LoadingRegion label="Loading model status" className="mt-5"><div className="flex h-12 items-center gap-3"><SkeletonLine className="h-6 w-64" /></div></LoadingRegion>
+  if (Result.isSuccess(models) && !active) return <div className="mt-5 flex min-h-12 items-center"><p className="m-0 text-base text-slate-500 dark:text-slate-400">Your model loads automatically when you start chatting.</p></div>
   return <div className="mt-5">
     <div className="flex min-h-12 items-center justify-between gap-5">
       <div className="flex min-w-0 items-center gap-3">
-        {active && <ModelLogo model={active.model} className="size-6 shrink-0" />}
-        <div className="min-w-0">
-          <p className="m-0 break-words text-lg font-medium leading-snug text-slate-800 dark:text-slate-200">{active ? formatLocalModelDisplayName(active.model) : presentation?.label ?? (Result.isFailure(models) ? "Model status unavailable" : "Reading model status…")}</p>
-          {active && <p className={`mb-0 mt-1 text-xs ${active.residency._tag === "Ready" ? "text-green-700 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>{active.residency._tag === "Ready" ? "Loaded" : active.residency._tag === "Requested" ? "Queued" : `${active.residency._tag}…`}</p>}
+        {active ? <ModelLogo model={active.model} className="size-6 shrink-0" /> : <CubeIcon aria-hidden="true" className="size-5 shrink-0 text-slate-400 dark:text-slate-500" />}
+        <div className="flex min-w-0 items-baseline gap-2">
+          <p title={active ? formatLocalModelDisplayName(active.model) : undefined} className={`m-0 min-w-0 truncate ${active ? "text-base font-medium text-slate-800 dark:text-slate-200" : "text-sm text-slate-500 dark:text-slate-400"}`}>{active ? formatLocalModelDisplayName(active.model) : presentation?.label ?? (Result.isFailure(models) ? "Model status unavailable" : "Reading model status…")}</p>
+          {active && <><span aria-hidden="true" className="text-slate-400 dark:text-slate-500">·</span><span className={`shrink-0 text-xs ${active.residency._tag === "Ready" ? "text-green-700 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>{active.residency._tag === "Ready" ? "Loaded" : active.residency._tag === "Requested" ? "Queued" : `${active.residency._tag}…`}</span></>}
         </div>
       </div>
       {presentation?.canStop && <Button variant="outline" className="hover:border-red-300 hover:text-red-600 dark:hover:border-red-800 dark:hover:text-red-400" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button>}
@@ -378,9 +379,9 @@ function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null
   return <div className={pageLayout.statusStack}>
     <section aria-busy={!snapshot} aria-label={!snapshot ? "Loading service status" : undefined} className={pageLayout.statusHero}>
       <div className="flex items-center justify-between gap-4 border-b border-slate-200 pb-4 dark:border-slate-700">
-        <h2 className="m-0 text-sm font-medium text-slate-600 dark:text-slate-300">Magnitude service</h2>
-        <div className={`flex items-center gap-1.5 text-xs ${ready ? "text-green-700 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>
-          {ready ? <CheckIcon aria-label="Service ready" className="size-4 shrink-0" /> : <PulseIcon className="size-4 shrink-0" />}
+        <h2 className="m-0 text-base font-medium text-slate-600 dark:text-slate-300">Magnitude service</h2>
+        <div className={`flex h-8 items-center gap-2 rounded-full px-3 text-sm font-medium ${ready ? "bg-green-200/20 text-green-700 dark:bg-green-800/20 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>
+          {ready ? <CheckCircleIcon aria-label="Service ready" weight="fill" className="size-5 shrink-0" /> : <PulseIcon className="size-4 shrink-0" />}
           <span>{!snapshot ? <SkeletonLine className="h-4 w-16 text-xs" /> : ready ? "Ready" : service?._tag === "CleanupFailed" ? "Cleanup needs attention" : service?._tag === "Failed" ? "Unavailable" : "Starting"}</span>
         </div>
       </div>
