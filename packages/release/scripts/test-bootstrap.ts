@@ -8,7 +8,6 @@ import {
   buildLocalRelease,
   loadLocalRelease,
   refreshLocalRelease,
-  runRepoCommand,
   type LocalRelease,
 } from "./local-release"
 
@@ -178,8 +177,7 @@ const launchCli = (
     }
     const child = Bun.spawn(
       [
-        "node",
-        resolve(PROJECT_ROOT, "packages/launcher/bin/magnitude.js"),
+        resolve(PROJECT_ROOT, "bin", process.platform === "win32" ? "magnitude-cli.exe" : "magnitude-cli"),
         ...arguments_,
       ],
       {
@@ -232,11 +230,6 @@ const program = Effect.gen(function* () {
   const release = rebuild
     ? loadedRelease
     : yield* refreshLocalRelease(loadedRelease)
-  yield* runRepoCommand(
-    "bun",
-    "run",
-    "packages/launcher/scripts/build-launcher.ts",
-  )
 
   const fs = yield* FileSystem.FileSystem
   const home = yield* fs.makeTempDirectory({

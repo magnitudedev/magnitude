@@ -49,7 +49,7 @@ export const buildAcnBinary = async (target: string): Promise<string> => {
   if (info.platform === "darwin") return withRipgrepEmbed(false, () => runAppleBuild(compileAppleBun(resolve(PROJECT_ROOT, "packages/acn/src/binary.ts"), binary, target, "acn")))
   await withRipgrepEmbed(info.platform === "windows", () =>
     run([
-      "bun",
+      process.execPath,
       "build",
       resolve(PROJECT_ROOT, "packages/acn/src/binary.ts"),
       "--compile",

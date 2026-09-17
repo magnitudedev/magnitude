@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button"
  * Task rows with assignee status, expand/collapse, worker timers.
  */
 import { useState, useSyncExternalStore } from "react"
-import { ChevronDown, ChevronUp, Circle, Plus, X } from "lucide-react"
+import { CaretDownIcon, CaretUpIcon, CircleIcon, PlusIcon, XIcon } from "@phosphor-icons/react"
 import { formatElapsedMs } from "@magnitudedev/client-common"
 import type {
   TaskDisplayRow,
@@ -76,7 +76,7 @@ export function TaskList({
             title={expanded ? "Collapse" : "Expand"}
             className="[background:transparent] border-0 text-slate-600 dark:text-slate-400 cursor-pointer flex items-center [gap:2px] font-mono text-[12px] [padding:2px_4px] rounded-[3px]"
           >
-            {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+            {expanded ? <CaretUpIcon size={14} /> : <CaretDownIcon size={14} />}
             <span>{expanded ? "Collapse" : "Expand"}</span>
           </Button>
         </div>
@@ -196,7 +196,7 @@ function AssigneeCell({
   if (assignee.kind === "worker") {
     return (
       <span className="flex items-center [gap:4px]">
-        <Plus
+        <PlusIcon
           size={12}
           className="animate-pulse-dot text-blue-700 dark:text-blue-500"
         />
@@ -209,7 +209,7 @@ function AssigneeCell({
   if (assignee.taskState === "killing") {
     return (
       <span className="flex items-center [gap:4px]">
-        <X size={12} className="text-red-600 dark:text-red-500" />
+        <XIcon size={12} className="text-red-600 dark:text-red-500" />
         <span className="text-red-600 dark:text-red-500">
           {assignee.actorKey}
         </span>
@@ -223,7 +223,7 @@ function AssigneeCell({
   }
   return (
     <span className="flex items-center [gap:4px] overflow-hidden">
-      <Circle
+      <CircleIcon
         size={8}
         fill="currentColor"
         className="text-slate-500 shrink-0"

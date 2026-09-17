@@ -3,10 +3,18 @@ name: Release build
 on:
   workflow_call:
     inputs:
+      windows_backends_only:
+        required: false
+        default: false
+        type: boolean
       source_commit:
         required: true
         type: string
       apple_distribution:
+        required: false
+        default: false
+        type: boolean
+      windows_distribution:
         required: false
         default: false
         type: boolean
@@ -18,7 +26,7 @@ permissions:
   contents: read
 
 env:
-  BUN_VERSION: "1.3.14"
+  BUN_VERSION: "1.4.2"
   RUST_VERSION: "1.91.1"
   NPM_VERSION: "11.6.2"
   MAGNITUDE_SOURCE_COMMIT: ${{ inputs.source_commit }}
@@ -26,7 +34,7 @@ env:
 
 jobs:
   matrix:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       hosts: ${{ steps.matrix.outputs.hosts }}
       backends: ${{ steps.matrix.outputs.backends }}
@@ -42,13 +50,14 @@ jobs:
           bun-version: ${{ env.BUN_VERSION }}
       - run: bun install --frozen-lockfile
       - id: matrix
-        run: bun run packages/release/scripts/matrix.ts
+        run: bun run packages/release/scripts/matrix.ts ${{ inputs.windows_backends_only && '--windows-backends-only' || '' }}
       - id: version
         shell: bash
         run: echo "version=$(jq -r '.version' packages/launcher/package.json)" >> "$GITHUB_OUTPUT"
 
   catalog:
-    runs-on: ubuntu-latest
+    if: ${{ !inputs.windows_backends_only }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
         with:
@@ -60,6 +69,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
+      - uses: ./.github/actions/build-cache
+        with:
+          scope: catalog
       - run: bun install --frozen-lockfile
       - run: bun run icn:catalog:build-bundle
       - uses: actions/upload-artifact@v4
@@ -69,7 +81,11 @@ jobs:
           if-no-files-found: error
 
   host:
-    environment: ${{ inputs.apple_distribution && 'apple-release' || 'release-validation' }}
+    if: ${{ !inputs.windows_backends_only }}
+    permissions:
+      contents: read
+      id-token: write
+    environment: ${{ matrix.id == 'windows-x64-msvc' && inputs.windows_distribution && 'windows-signing' || startsWith(matrix.id, 'darwin-') && inputs.apple_distribution && 'apple-release' || 'release-validation' }}
     needs: [matrix, catalog]
     strategy:
       fail-fast: false
@@ -80,6 +96,9 @@ jobs:
         with:
           ref: ${{ inputs.source_commit }}
           submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
@@ -87,15 +106,36 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           targets: ${{ matrix.rustTarget }}
+      - uses: ./.github/actions/build-cache
+        with:
+          scope: ${{ matrix.id }}
       - name: Install Linux build tools
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake libclang-dev
+        uses: ./.github/actions/linux-build-tools
+        with:
+          packages: build-essential cmake libclang-dev fakeroot rpm libgtk-3-0 libnss3 libasound2 libgbm1 libxss1 libxtst6 ${{ matrix.id == 'linux-arm64-gnu' && 'clang' || '' }}
       - name: Install Linux ARM64 compiler
         if: runner.os == 'Linux' && matrix.id == 'linux-arm64-gnu'
         run: |
-          sudo apt-get install -y clang
           echo "CC=clang" >> "$GITHUB_ENV"
           echo "CXX=clang++" >> "$GITHUB_ENV"
+      - name: Install Windows native build components
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installerRoot = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer'
+          $installation = & (Join-Path $installerRoot 'vswhere.exe') -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$installation) { throw 'Visual Studio C++ Build Tools are required.' }
+          $arguments = @('modify', '--installPath', "`"$installation`"", '--add', 'Microsoft.VisualStudio.Component.VC.Llvm.Clang', '--add', 'Microsoft.VisualStudio.Component.VC.CMake.Project', '--quiet', '--norestart')
+          $setup = Start-Process -FilePath (Join-Path $installerRoot 'setup.exe') -ArgumentList $arguments -Wait -PassThru
+          if ($setup.ExitCode -notin @(0, 3010)) { throw "Visual Studio component installation failed ($($setup.ExitCode))." }
+          if (!(Test-Path (Join-Path $installation 'VC\Tools\Llvm\x64\bin\libclang.dll'))) { throw 'Visual Studio Clang installation is incomplete.' }
+      - name: Install Windows installer tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nsis --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS installation failed' }
       - run: bun install --frozen-lockfile
       - uses: actions/download-artifact@v4
         with:
@@ -112,7 +152,31 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
           APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
           APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
-      - run: bun run packages/release/scripts/build/host.ts "${{ matrix.id }}" catalog-inputs "release/${{ matrix.id }}"
+      - name: Build Unix host
+        if: runner.os != 'Windows'
+        run: bun run packages/release/scripts/build/host.ts "${{ matrix.id }}" catalog-inputs "release/${{ matrix.id }}"
+      - name: Install Windows signing runtime
+        if: runner.os == 'Windows' && inputs.windows_distribution
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Authenticate Windows Artifact Signing
+        if: runner.os == 'Windows' && inputs.windows_distribution
+        uses: azure/login@8216e11d8cd9b42fe925c852af8e76311ff067ac # v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Build Windows host
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./packages/release/scripts/build/windows.ps1 -CatalogDirectory catalog-inputs -OutputDirectory "release/${{ matrix.id }}"
+        env:
+          MAGNITUDE_WINDOWS_DISTRIBUTION: ${{ inputs.windows_distribution && 'artifact-signing' || 'unsigned' }}
+          MAGNITUDE_WINDOWS_PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
+          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_CERTIFICATE_PROFILE: ${{ vars.AZURE_SIGNING_CERTIFICATE_PROFILE }}
       - uses: actions/upload-artifact@v4
         with:
           name: host-${{ matrix.id }}
@@ -132,7 +196,10 @@ jobs:
         run: bash packages/release/scripts/apple/cleanup-credentials.sh
 
   backend:
-    environment: ${{ inputs.apple_distribution && 'apple-release' || 'release-validation' }}
+    permissions:
+      contents: read
+      id-token: write
+    environment: ${{ matrix.host == 'windows-x64-msvc' && inputs.windows_distribution && 'windows-signing' || startsWith(matrix.host, 'darwin-') && inputs.apple_distribution && 'apple-release' || 'release-validation' }}
     needs: matrix
     strategy:
       fail-fast: false
@@ -149,21 +216,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
+      - uses: ./.github/actions/build-cache
+        with:
+          scope: ${{ matrix.id }}
       - name: Install Linux build tools
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake libclang-dev
+        uses: ./.github/actions/linux-build-tools
+        with:
+          packages: build-essential cmake libclang-dev ${{ matrix.host == 'linux-arm64-gnu' && 'clang' || '' }} ${{ matrix.backend == 'vulkan' && 'libvulkan-dev spirv-headers ninja-build python3' || '' }}
       - name: Install Linux ARM64 compiler
         if: runner.os == 'Linux' && matrix.host == 'linux-arm64-gnu'
         run: |
-          sudo apt-get install -y clang
           echo "CC=clang" >> "$GITHUB_ENV"
           echo "CXX=clang++" >> "$GITHUB_ENV"
+      - name: Cache Linux Vulkan tools
+        if: runner.os == 'Linux' && matrix.backend == 'vulkan'
+        id: vulkan-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/vulkan-sdk-1.4.313
+          key: vulkan-tools-jammy-${{ runner.arch }}-headers-409c16be502e39fe70dd6fe2d9ad4842ef2c9a53-shaderc-e6edd6d48fa5bdd9d176794c6810fae7f8e938e1
       - name: Install Linux Vulkan tools
         if: runner.os == 'Linux' && matrix.backend == 'vulkan'
         shell: bash
         run: |
-          sudo apt-get install -y libvulkan-dev spirv-headers ninja-build python3
           vulkan_root="$RUNNER_TEMP/vulkan-sdk-1.4.313"
+          if [ "${{ steps.vulkan-cache.outputs.cache-hit }}" != "true" ]; then
           headers_root="$RUNNER_TEMP/vulkan-headers-1.4.313"
           shaderc_root="$RUNNER_TEMP/shaderc-v2023.8"
           git clone --filter=blob:none https://github.com/google/shaderc.git "$shaderc_root"
@@ -187,10 +265,22 @@ jobs:
           cmake --build "$headers_root/build" --target install
           mkdir -p "$vulkan_root/bin"
           cp "$shaderc_root/build/glslc/glslc" "$vulkan_root/bin/glslc"
+          fi
           "$vulkan_root/bin/glslc" --version
           test -f "$vulkan_root/include/vulkan/vulkan.hpp"
           echo "VULKAN_SDK=$vulkan_root" >> "$GITHUB_ENV"
           echo "$vulkan_root/bin" >> "$GITHUB_PATH"
+      - name: Install Windows native build components
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installerRoot = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer'
+          $installation = & (Join-Path $installerRoot 'vswhere.exe') -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$installation) { throw 'Visual Studio C++ Build Tools are required.' }
+          $arguments = @('modify', '--installPath', "`"$installation`"", '--add', 'Microsoft.VisualStudio.Component.VC.Llvm.Clang', '--add', 'Microsoft.VisualStudio.Component.VC.CMake.Project', '--quiet', '--norestart')
+          $setup = Start-Process -FilePath (Join-Path $installerRoot 'setup.exe') -ArgumentList $arguments -Wait -PassThru
+          if ($setup.ExitCode -notin @(0, 3010)) { throw "Visual Studio component installation failed ($($setup.ExitCode))." }
+          if (!(Test-Path (Join-Path $installation 'VC\Tools\Llvm\x64\bin\libclang.dll'))) { throw 'Visual Studio Clang installation is incomplete.' }
       - name: Install Windows Vulkan SDK
         if: runner.os == 'Windows' && matrix.backend == 'vulkan'
         shell: pwsh
@@ -200,12 +290,6 @@ jobs:
           if (-not $sdk) { throw "Vulkan SDK installation did not publish VULKAN_SDK" }
           "VULKAN_SDK=$sdk" >> $env:GITHUB_ENV
           "$sdk\Bin" >> $env:GITHUB_PATH
-      - name: Use Ninja for Windows backend build
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          ninja --version
-          "CMAKE_GENERATOR=Ninja" >> $env:GITHUB_ENV
       - name: Install Linux CUDA toolkit
         if: runner.os == 'Linux' && matrix.backend == 'cuda'
         shell: bash
@@ -253,7 +337,31 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
           APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
           APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
-      - run: bun run packages/release/scripts/build/backend.ts "${{ matrix.id }}" "release/${{ matrix.id }}"
+      - name: Build Unix backend
+        if: runner.os != 'Windows'
+        run: bun run packages/release/scripts/build/backend.ts "${{ matrix.id }}" "release/${{ matrix.id }}"
+      - name: Install Windows signing runtime
+        if: runner.os == 'Windows' && inputs.windows_distribution
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Authenticate Windows Artifact Signing
+        if: runner.os == 'Windows' && inputs.windows_distribution
+        uses: azure/login@8216e11d8cd9b42fe925c852af8e76311ff067ac # v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Build Windows backend
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./packages/release/scripts/build/windows-backend.ps1 -PackId "${{ matrix.id }}" -OutputDirectory "release/${{ matrix.id }}"
+        env:
+          MAGNITUDE_WINDOWS_DISTRIBUTION: ${{ inputs.windows_distribution && 'artifact-signing' || 'unsigned' }}
+          MAGNITUDE_WINDOWS_PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
+          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_CERTIFICATE_PROFILE: ${{ vars.AZURE_SIGNING_CERTIFICATE_PROFILE }}
       - uses: actions/upload-artifact@v4
         with:
           name: backend-${{ matrix.id }}
@@ -273,6 +381,7 @@ jobs:
         run: bash packages/release/scripts/apple/cleanup-credentials.sh
 
   linux-consumer:
+    if: ${{ !inputs.windows_backends_only }}
     needs: [matrix, host]
     strategy:
       fail-fast: false
@@ -282,9 +391,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.source_commit }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
+      - run: sudo apt-get update && sudo apt-get install -y rpm xvfb dbus-x11 xfwm4 x11-utils xauth desktop-file-utils libglib2.0-bin
       - run: bun install --frozen-lockfile
       - uses: actions/download-artifact@v4
         with:
@@ -292,7 +405,53 @@ jobs:
           path: release/${{ matrix.id }}
       - run: bun run packages/release/scripts/validate-host.ts "${{ matrix.id }}" "release/${{ matrix.id }}"
 
+      - name: Install the accepted DEB and exercise desktop ownership
+        env:
+          MAGNITUDE_TEST_CLI_EXECUTABLE: ${{ runner.temp }}/magnitude-release-cli/bin/magnitude-cli
+        run: |
+          set -- ./release/${{ matrix.id }}/*.deb
+          test "$#" -eq 1
+          sudo apt-get install -y --no-install-recommends "$1"
+          mkdir -p "$RUNNER_TEMP/magnitude-release-cli"
+          tar -xzf "release/${{ matrix.id }}/magnitude-cli-${{ matrix.id }}.tar.gz" -C "$RUNNER_TEMP/magnitude-release-cli"
+          tar -xzf "release/${{ matrix.id }}/magnitude-acn-${{ matrix.id }}.tar.gz" -C "$RUNNER_TEMP/magnitude-release-cli"
+          cmp "$RUNNER_TEMP/magnitude-release-cli/bin/magnitude-service" /usr/lib/magnitude-desktop/resources/magnitude-service
+          xvfb-run -a dbus-run-session -- node desktop/src/fixtures/linux-installed-lifecycle.mjs
+
+      - name: Install the accepted RPM in Fedora and exercise desktop ownership
+        timeout-minutes: 15
+        run: |
+          node_root="$(dirname "$(dirname "$(readlink -f "$(command -v node)")")")"
+          # Permit Chromium's own namespace sandbox without disabling container seccomp.
+          curl --fail --silent --show-error --location \
+            https://raw.githubusercontent.com/moby/profiles/3c28324314729dbade8287e868eef6338c42807a/seccomp/default.json \
+            -o "$RUNNER_TEMP/docker-seccomp.json"
+          echo "536529b665dd0972c37bfb569f5d4ac8a53592e7b00752bc39ff063ca9864c74  $RUNNER_TEMP/docker-seccomp.json" | sha256sum --check
+          jq '.syscalls += [{"names": ["clone", "setns", "unshare"], "action": "SCMP_ACT_ALLOW"}]' \
+            "$RUNNER_TEMP/docker-seccomp.json" > "$RUNNER_TEMP/chromium-seccomp.json"
+          docker run --rm --init \
+            --security-opt "seccomp=$RUNNER_TEMP/chromium-seccomp.json" \
+            -v "$GITHUB_WORKSPACE:/workspace:ro" \
+            -v "$RUNNER_TEMP/magnitude-release-cli:/accepted:ro" \
+            -v "$node_root:/node:ro" \
+            registry.fedoraproject.org/fedora:44 bash -euc '
+              set -- /workspace/release/${{ matrix.id }}/*.rpm
+              test "$#" -eq 1
+              dnf install -y --setopt=install_weak_deps=False \
+                --setopt=minrate=100000 --setopt=timeout=30 --setopt=max_parallel_downloads=10 "$1" \
+                xorg-x11-server-Xvfb xorg-x11-xauth xprop dbus-daemon \
+                xfwm4 desktop-file-utils shadow-utils diffutils
+              cmp /accepted/bin/magnitude-service /usr/lib/magnitude-desktop/resources/magnitude-service
+              test "$(stat -c "%u:%g:%a" /usr/lib/magnitude-desktop/chrome-sandbox)" = "0:0:4755"
+              useradd --create-home magnitude-test
+              runuser -u magnitude-test -- env PATH=/node/bin:/usr/bin:/bin \
+                DEBUG=pw:browser \
+                MAGNITUDE_TEST_CLI_EXECUTABLE=/accepted/bin/magnitude-cli \
+                xvfb-run -a dbus-run-session -- node /workspace/desktop/src/fixtures/linux-installed-lifecycle.mjs
+            '
+
   apple-consumer:
+    if: ${{ !inputs.windows_backends_only }}
     needs: [matrix, host]
     environment: ${{ inputs.apple_distribution && 'apple-release' || 'release-validation' }}
     strategy:
@@ -303,6 +462,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.source_commit }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
@@ -321,10 +483,38 @@ jobs:
           path: release/${{ matrix.id }}/apple-consumer.receipt.json
           if-no-files-found: error
 
+  windows-consumer:
+    if: ${{ !inputs.windows_backends_only }}
+    needs: [matrix, host]
+    environment: ${{ inputs.windows_distribution && 'windows-signing' || 'release-validation' }}
+    runs-on: blacksmith-8vcpu-windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_commit }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: host-windows-x64-msvc
+          path: release/windows-x64-msvc
+      - run: bun run packages/release/scripts/validate-host.ts windows-x64-msvc release/windows-x64-msvc
+      - name: Install and remove the accepted Windows application
+        timeout-minutes: 10
+        shell: pwsh
+        run: ./packages/release/scripts/test-windows-installed.ps1 -Directory release/windows-x64-msvc -Version '${{ needs.matrix.outputs.version }}' -RequireSignature:([bool]::Parse('${{ inputs.windows_distribution }}'))
+        env:
+          MAGNITUDE_WINDOWS_PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
+
   candidate:
-    needs: [matrix, host, backend, linux-consumer, apple-consumer]
-    if: inputs.validate_candidate
-    runs-on: ubuntu-22.04
+    needs: [matrix, host, backend, linux-consumer, apple-consumer, windows-consumer]
+    if: inputs.validate_candidate && !inputs.windows_backends_only
+    runs-on: blacksmith-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
         with:
@@ -337,7 +527,7 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
       - run: npm install --global "npm@${NPM_VERSION}"
-      - run: sudo apt-get update && sudo apt-get install -y binutils
+      - run: sudo apt-get update && sudo apt-get install -y binutils rpm xvfb dbus-x11 xfwm4 x11-utils xauth desktop-file-utils libglib2.0-bin
       - run: bun install --frozen-lockfile
       - uses: actions/download-artifact@v4
         with:
@@ -347,10 +537,8 @@ jobs:
         with:
           pattern: backend-*
           path: release-artifacts
-      - id: npm-candidate
-        run: bun run packages/release/scripts/prepare-npm.ts release/npm-candidate
       - run: bun run packages/release/scripts/assemble.ts release-artifacts release-candidate
         env:
           MAGNITUDE_RELEASE_VERSION: ${{ needs.matrix.outputs.version }}
           MAGNITUDE_SOURCE_COMMIT: ${{ inputs.source_commit }}
-      - run: bun run scripts/accept-release-candidate.ts release-candidate "${{ steps.npm-candidate.outputs.tarball }}"
+      - run: bun run scripts/accept-release-candidate.ts release-candidate

@@ -4,26 +4,31 @@ import { BunContext, BunRuntime } from "@effect/platform-bun"
 import { FetchHttpClient } from "@effect/platform"
 import { Console, Data, Effect, Layer } from "effect"
 import { launchAcnServer } from "./server"
+import { installOwnerGuard, makeAcnOwnerControl } from "./owned-control"
 import { ACN_REVISION, ACN_VERSION } from "./version"
 import { resolveRgPath } from "@magnitudedev/ripgrep"
 import { defaultDataDir } from "./data-dir"
 import { ACN_EXECUTABLE_NAME } from "@magnitudedev/release/executables"
 
 const debug = Options.boolean("debug")
-const parentBound = Options.boolean("parent-bound")
+const port = Options.integer("port").pipe(Options.withDefault(10100))
 const dataDir = Options.text("data-dir").pipe(Options.withDefault(defaultDataDir()))
 
 const launchServer = (options: {
-  readonly parentBound: boolean
+  readonly port: number
   readonly debug: boolean
   readonly dataDir: string
-}) => launchAcnServer(options)
+}) => Effect.scoped(Effect.gen(function* () {
+  yield* installOwnerGuard
+  const owner = yield* makeAcnOwnerControl
+  yield* launchAcnServer(options, owner)
+}))
 
-const serve = Command.make("serve", { parentBound, debug, dataDir }, launchServer).pipe(
+const serve = Command.make("serve", { port, debug, dataDir }, launchServer).pipe(
   Command.withDescription("Start the ACN server"),
 )
 
-const server = Command.make("server", { parentBound, debug, dataDir }, launchServer).pipe(
+const server = Command.make("server", { port, debug, dataDir }, launchServer).pipe(
   Command.withDescription("Alias for serve"),
 )
 
@@ -70,7 +75,7 @@ const doctor = Command.make("doctor", {}, () =>
   ),
 ).pipe(Command.withDescription("Verify packaged ACN runtime dependencies"))
 
-const acn = Command.make(ACN_EXECUTABLE_NAME, { parentBound, debug, dataDir }, launchServer).pipe(
+const acn = Command.make(ACN_EXECUTABLE_NAME, { port, debug, dataDir }, launchServer).pipe(
   Command.withDescription("Magnitude Agent Control Node"),
   Command.withSubcommands([serve, server, version, coordinationRevision, doctor]),
 )

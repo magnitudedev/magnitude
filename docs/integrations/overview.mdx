@@ -1,0 +1,43 @@
+---
+title: "Overview"
+description: "Use Magnitude models with your agent."
+---
+
+Download a model in Magnitude, then open **Connections** to configure your agent. Magnitude supports Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline.
+
+## Connect an agent
+
+1. Install the agent using its official instructions.
+2. Find it in **Connections** and click **Connect**.
+3. Open or restart the agent and choose a Magnitude model.
+
+Connecting configures the agent; it does not launch it. Keep Magnitude running while you use its local models.
+
+## Connection states
+
+| State | What to do |
+| --- | --- |
+| Not installed | Follow the installation link, install the agent, and return to Connections. |
+| Not connected | Click Connect. |
+| Connected | Open the agent and select a Magnitude model. |
+| Connection needs repair | Click Repair connection, then reload the agent. |
+| Could not verify connection | Check the reported problem, such as an inaccessible configuration file, before trying again. |
+
+Connected means the configuration is present and valid. It does not mean a model is currently loaded or that an inference request has succeeded.
+
+## Refresh or disconnect
+
+Use **Reconnect** to refresh a connected agent's Magnitude configuration. Use **Disconnect** to remove the Magnitude connection. Restart the agent if it still has the old settings loaded.
+
+The connected card lists its configuration files. Prefer the app's actions over deleting the agent's configuration: those files may also contain unrelated settings.
+
+## Choose your agent
+
+- [Pi](/integrations/pi)
+- [OpenCode](/integrations/opencode)
+- [Hermes](/integrations/hermes)
+- [OpenClaw](/integrations/openclaw)
+- [Codex](/integrations/codex)
+- [Claude Code](/integrations/claude-code)
+- [Oh My Pi](/integrations/oh-my-pi)
+- [Cline](/integrations/cline)

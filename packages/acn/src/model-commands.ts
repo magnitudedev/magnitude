@@ -60,7 +60,7 @@ export const ModelCommandsLive: Layer.Layer<
   )
   const stopModel = (modelId: ModelId) => Effect.gen(function* () {
     const instance = (yield* instances.get).instances.findLast((candidate) => candidate.modelId === modelId
-      && (candidate.lifecycle._tag === "Loading" || candidate.lifecycle._tag === "Ready"))
+      && (candidate.lifecycle._tag === "Loading" || candidate.lifecycle._tag === "Ready" || candidate.lifecycle._tag === "Stopping"))
     if (instance !== undefined) yield* client.models.stopModelInstance({ path: { instance_id: instance.id } })
     return {}
   }).pipe(Effect.mapError((cause) => modelCommandFailure("stop", cause)))
@@ -103,7 +103,7 @@ export const ModelCommandsLive: Layer.Layer<
       Effect.as({}), Effect.mapError((cause) => modelCommandFailure("load", cause))),
     stopActiveModel: instances.get.pipe(Effect.flatMap(({ instances: current }) => {
       const active = current.findLast((instance) =>
-        instance.lifecycle._tag === "Loading" || instance.lifecycle._tag === "Ready")
+        instance.lifecycle._tag === "Loading" || instance.lifecycle._tag === "Ready" || instance.lifecycle._tag === "Stopping")
       return active === undefined ? Effect.succeed({}) : client.models.stopModelInstance({ path: { instance_id: active.id } }).pipe(Effect.as({}))
     }), Effect.mapError((cause) => modelCommandFailure("stop", cause))),
   })

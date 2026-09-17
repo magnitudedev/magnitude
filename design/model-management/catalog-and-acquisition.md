@@ -75,12 +75,10 @@ Repeated references to one immutable package reuse one package identity and cont
 Incomplete coverage, integrity mismatch, invalid relationships, or assessment mismatch fails
 generation or ICN readiness.
 
-An issued configuration remains resolvable by its canonical identity across later releases.
-Deprecation excludes an entry from ranking and first-time discovery without deleting its
-configuration or package declaration. Existing selections, installed artifacts, and explicit
-reacquisition can therefore resolve the same bundle and profile without a user-state copy of the
-catalog entry. Runtime catalog use performs no upstream discovery and does not follow mutable
-revisions.
+Removing a model from the release catalog removes all its variants, revision pins, and planner
+inputs. Its former catalog IDs no longer resolve; removal does not alias them to a replacement
+model or delete downloaded artifacts. Catalog membership and physical artifact presence remain
+separate. Runtime catalog use performs no upstream discovery and does not follow mutable revisions.
 
 ## Package resolution
 
@@ -111,6 +109,8 @@ Each repository in the Magnitude-owned store may contain any number of complete 
 Each snapshot directory names its immutable revision and contains links to installed
 content-addressed blobs. Publishing a package is additive: it adds that package's exact components
 to its revision snapshot and does not infer that other components or revisions are obsolete.
+Snapshot links must identify the same underlying file as the verified blob: Unix symbolic links
+and Windows hard links satisfy this requirement. Equal paths or equal byte sizes alone do not.
 
 ICN derives managed inventory by bounded, containment-safe enumeration of every complete snapshot.
 The observation path never creates, repairs, or removes artifact links. Component paths, sizes, content
@@ -222,6 +222,10 @@ A partial component may carry a narrowly scoped integrity checkpoint containing 
 content identity and size, committed offset, and serializable digest state. The retry command
 supplies acquisition intent. Missing or invalid checkpoint evidence discards the reusable prefix;
 it never hides completed files or fails startup. Checkpoints have no format-version gate.
+The component prefix is flushed before its checkpoint is atomically replaced. Unix also flushes
+the containing directory; Windows uses file flushing and atomic rename without attempting Unix
+directory fsync. Lost checkpoint or snapshot entries after interruption cause verified recovery or
+reacquisition, never acceptance of incomplete bytes.
 
 ## Product projection
 

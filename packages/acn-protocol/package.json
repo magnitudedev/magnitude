@@ -7,13 +7,10 @@
   "types": "src/index.ts",
   "exports": {
     ".": "./src/index.ts",
+    "./desktop-control": "./src/desktop-control.ts",
     "./boundary": "./src/boundary/index.ts",
     "./transport": "./src/transport/index.ts",
-    "./acn-identity": "./src/acn-identity.ts",
-    "./coordination": "./src/coordination/index.ts",
-    "./coordination/bun": "./src/coordination/bun.ts",
-    "./coordination/exact-process": "./src/coordination/exact-process.ts",
-    "./coordination/sqlite-driver": "./src/coordination/sqlite-driver.ts"
+    "./acn-identity": "./src/acn-identity.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"

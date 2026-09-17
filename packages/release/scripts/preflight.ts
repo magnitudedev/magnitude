@@ -28,18 +28,6 @@ const github = async (path: string): Promise<unknown | undefined> => {
   return response.json()
 }
 
-const npm = async (version: string): Promise<unknown | undefined> => {
-  const response = await fetch(
-    `https://registry.npmjs.org/%40magnitudedev%2Fcli/${encodeURIComponent(version)}`,
-    { signal: AbortSignal.timeout(30_000) },
-  )
-  if (response.status === 404) return undefined
-  if (!response.ok) {
-    throw new Error(`npm preflight returned HTTP ${response.status}`)
-  }
-  return response.json()
-}
-
 const packageJson = JSON.parse(
   await readFile(resolve(PROJECT_ROOT, "packages/launcher/package.json"), "utf8"),
 ) as { readonly version?: string }
@@ -93,7 +81,7 @@ await run([
 
 const repository = required("GITHUB_REPOSITORY")
 const tag = releaseTag(version)
-const [tagRef, release, npmVersion] = await Promise.all([
+const [tagRef, release] = await Promise.all([
   github(`/repos/${repository}/git/ref/tags/${encodeURIComponent(tag)}`),
   findGithubRelease(
     repository,
@@ -101,17 +89,11 @@ const [tagRef, release, npmVersion] = await Promise.all([
     tag,
     sourceCommit,
   ),
-  npm(version),
 ])
 const exactRelease = release?.tag_name === tag &&
   release.target_commitish === sourceCommit
-let action: "release" | "publish-npm" | "complete"
-if (npmVersion) {
-  if (!exactRelease || release?.draft || !tagRef) {
-    throw new Error("npm version does not have the exact public GitHub release")
-  }
-  action = "complete"
-} else if (release?.draft) {
+let action: "release" | "register-metadata"
+if (release?.draft) {
   if (!exactRelease || tagRef) {
     throw new Error("existing GitHub release is not the exact resumable draft")
   }
@@ -120,7 +102,7 @@ if (npmVersion) {
   if (!exactRelease || !tagRef) {
     throw new Error("existing public GitHub release is inconsistent")
   }
-  action = "publish-npm"
+  action = "register-metadata"
 } else if (tagRef) {
   throw new Error("GitHub has an orphan release tag")
 } else {
@@ -130,11 +112,6 @@ if (npmVersion) {
 if (process.env.MAGNITUDE_REQUIRE_RELEASE === "true" && action !== "release") {
   throw new Error("release state changed before publication")
 }
-if (action !== "complete") {
-  required("NODE_AUTH_TOKEN")
-  await run(["npm", "whoami", "--registry", "https://registry.npmjs.org"])
-}
-
 const output = process.env.GITHUB_OUTPUT
 if (output) {
   await appendFile(output, [

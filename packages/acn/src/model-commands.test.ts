@@ -42,3 +42,34 @@ describe("modelCommandFailure", () => {
     })
   })
 })
+
+it("retries active and slot Stop against the exact stopping instance", async () => {
+  const { Effect, Schema } = await import("effect")
+  const { IcnClient, IcnInstances, IcnCatalog, IcnCatalogInstallations } = await import("@magnitudedev/icn")
+  const { ModelInstancesSnapshot } = await import("@magnitudedev/icn-protocol/schemas")
+  const { PRIMARY_SLOT_ID } = await import("@magnitudedev/acn-protocol")
+  const { ModelCommands, ModelCommandsLive } = await import("./model-commands")
+  const { ModelSlotController } = await import("./model-slot-controller")
+  const { LocalModelRemovals } = await import("./local-model-removals")
+  const stopped: string[] = []
+  const snapshot = Schema.decodeUnknownSync(ModelInstancesSnapshot)({ revision: 1, instances: [{
+    id: "retained-instance", modelId: "model-a:gguf:test",
+    lifecycle: { _tag: "Stopping", reason: "user_stop", allocation: { _tag: "Planned" } },
+  }] })
+  // These focused host fixtures expose only operations used by Stop; unrelated capabilities
+  // are intentionally absent so this test cannot perform catalog or filesystem work.
+  await Effect.runPromise(Effect.gen(function* () {
+    const commands = yield* ModelCommands
+    yield* commands.stopActiveModel
+    yield* commands.stopSlot(PRIMARY_SLOT_ID)
+  }).pipe(
+    Effect.provide(ModelCommandsLive),
+    Effect.provideService(IcnInstances, { get: Effect.succeed(snapshot) } as never),
+    Effect.provideService(IcnClient, { models: { stopModelInstance: ({ path }: { path: { instance_id: string } }) => Effect.sync(() => { stopped.push(path.instance_id); return {} }) } } as never),
+    Effect.provideService(ModelSlotController, { state: Effect.succeed({ slots: { primary: { _tag: "ConfiguredLocal", selection: { providerModelId: "model-a:gguf:test" } } } }) } as never),
+    Effect.provideService(IcnCatalog, {} as never),
+    Effect.provideService(IcnCatalogInstallations, {} as never),
+    Effect.provideService(LocalModelRemovals, {} as never),
+  ))
+  expect(stopped).toEqual(["retained-instance", "retained-instance"])
+})

@@ -1,98 +1,125 @@
 {
-    "$schema": "https://mintlify.com/docs.json",
-    "name": "Magnitude",
-    "theme": "linden",
-    "description": "Run the best local models for your machine",
-    "logo": {
-        "light": "/wordmark-black.svg",
-        "dark": "/wordmark-white.svg"
+  "$schema": "https://mintlify.com/docs.json",
+  "name": "Magnitude",
+  "theme": "linden",
+  "description": "Run the best local models for your machine",
+  "logo": {
+    "light": "/wordmark-black.svg",
+    "dark": "/wordmark-white.svg"
+  },
+  "favicon": "/logo.svg",
+  "fonts": {
+    "heading": {
+      "family": "Martian Mono",
+      "weight": 700
     },
-    "favicon": "/logo.svg",
-    "icons": {
-        "library": "lucide"
-    },
-    "fonts": {
-        "heading": {
-            "family": "Martian Mono",
-            "weight": 700
-        },
-        "body": {
-            "family": "Inter"
-        }
-    },
-    "colors": {
-        "primary": "#0369a1",
-        "light": "#0ea5e9",
-        "dark": "#075985"
-    },
-    "background": {
-        "color": {
-            "dark": "#0f1826"
-        }
-    },
-    "navbar": {
-        "links": [
-            {
-                "label": "Join community",
-                "href": "https://discord.gg/EHt48pPWdC"
-            }
-        ],
-        "primary": {
-            "type": "github",
-            "href": "https://github.com/magnitudedev/magnitude"
-        }
-    },
-    "navigation": {
-        "global": {
-            "anchors": [
-                {
-                    "anchor": "GitHub",
-                    "icon": "github",
-                    "href": "https://github.com/magnitudedev/magnitude"
-                },
-                {
-                    "anchor": "Community",
-                    "icon": "discord",
-                    "href": "https://discord.gg/EHt48pPWdC"
-                },
-                {
-                    "anchor": "Contact",
-                    "icon": "mail",
-                    "href": "mailto:founders@magnitude.dev"
-                }
-            ]
-        },
-        "pages": [
-            "introduction",
-            "get-started",
-            "models",
-            "inference",
-            "magnitude-harness",
-            "troubleshooting",
-            "reference",
-            "faq"
-        ]
-    },
-    "styling": {
-        "codeblocks": {
-            "theme": {
-                "light": "github-light",
-                "dark": "github-dark"
-            }
-        }
-    },
-    "search": {
-        "prompt": "Search or ask..."
-    },
-    "seo": {
-        "indexing": "all"
-    },
-    "contextual": {
-        "options": [
-            "copy",
-            "view",
-            "chatgpt",
-            "claude"
-        ]
+    "body": {
+      "family": "Inter"
     }
+  },
+  "colors": {
+    "primary": "#0369a1",
+    "light": "#0ea5e9",
+    "dark": "#0284c7"
+  },
+  "background": {
+    "color": {
+      "dark": "#0f1826"
+    }
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Join community",
+        "href": "https://discord.gg/EHt48pPWdC"
+      }
+    ],
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/magnitudedev/magnitude"
+    }
+  },
+  "navigation": {
+    "global": {
+      "anchors": [
+        {
+          "anchor": "GitHub",
+          "icon": "github",
+          "href": "https://github.com/magnitudedev/magnitude"
+        },
+        {
+          "anchor": "Community",
+          "icon": "discord",
+          "href": "https://discord.gg/EHt48pPWdC"
+        },
+        {
+          "anchor": "Contact",
+          "icon": "mail",
+          "href": "mailto:founders@magnitude.dev"
+        }
+      ]
+    },
+    "pages": [
+      {
+        "group": "Installation",
+        "pages": [
+          "introduction",
+          "get-started",
+          "installation/macos",
+          "installation/windows",
+          "installation/linux",
+          "hardware",
+          "models"
+        ]
+      },
+      {
+        "group": "Integrations",
+        "pages": [
+          "integrations/overview",
+          "integrations/pi",
+          "integrations/opencode",
+          "integrations/hermes",
+          "integrations/openclaw",
+          "integrations/codex",
+          "integrations/claude-code",
+          "integrations/oh-my-pi",
+          "integrations/cline"
+        ]
+      },
+      {
+        "group": "More Info",
+        "pages": [
+          "inference",
+          "reference",
+          "troubleshooting",
+          "faq"
+        ]
+      }
+    ]
+  },
+  "styling": {
+    "codeblocks": {
+      "theme": {
+        "light": "github-light",
+        "dark": "github-dark"
+      }
+    }
+  },
+  "search": {
+    "prompt": "Search or ask..."
+  },
+  "seo": {
+    "indexing": "all"
+  },
+  "contextual": {
+    "options": [
+      "copy",
+      "view",
+      "chatgpt",
+      "claude"
+    ]
+  },
+  "icons": {
+    "library": "lucide"
+  }
 }

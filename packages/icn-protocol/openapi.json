@@ -4039,6 +4039,14 @@
               "null"
             ]
           },
+          "physical_cores": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "OS-reported physical CPU cores, independent of process scheduling limits.",
+            "minimum": 0
+          },
           "logical_cores": {
             "type": "integer",
             "minimum": 0
@@ -4445,6 +4453,25 @@
           }
         },
         "additionalProperties": false
+      },
+      "IcnParentCommand": {
+        "type": "object",
+        "description": "Private parent-to-child control; never exposed as a management HTTP endpoint.",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/IcnParentCommandType"
+          }
+        },
+        "additionalProperties": false
+      },
+      "IcnParentCommandType": {
+        "type": "string",
+        "enum": [
+          "shutdown"
+        ]
       },
       "IcnStartupBackend": {
         "oneOf": [
@@ -6005,7 +6032,8 @@
           "user_stop",
           "idle_timeout",
           "replacement",
-          "memory_pressure"
+          "memory_pressure",
+          "failure"
         ]
       },
       "ModelStoppingAllocation": {

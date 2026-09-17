@@ -46,7 +46,6 @@ describe("new application-state initialization", () => {
       const storage = yield* MagnitudeStorage
       return {
         models: yield* storage.models.get,
-        onboarding: yield* storage.onboarding.get,
       }
     }).pipe(Effect.provide(StorageLive.pipe(Layer.provide(dependencies())))))
 
@@ -55,8 +54,6 @@ describe("new application-state initialization", () => {
       recentModels: { primary: [], secondary: [] },
       favorites: [],
     })
-    expect(state.onboarding).toEqual({ completed: false })
     expect(await Bun.file(paths.modelsFile).exists()).toBe(true)
-    expect(await Bun.file(paths.onboardingFile).exists()).toBe(true)
   })
 })

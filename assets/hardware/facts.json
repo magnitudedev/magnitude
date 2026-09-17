@@ -1,0 +1,2075 @@
+[
+  {
+    "names": [
+      "Apple M4"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "120 GB/s"
+      },
+      {
+        "label": "CPU core options (spec)",
+        "value": "8 or 10"
+      }
+    ],
+    "source": "https://www.apple.com/ie/newsroom/2024/10/apple-introduces-m4-pro-and-m4-max/",
+    "additionalSources": [
+      "https://support.apple.com/en-gb/121556"
+    ]
+  },
+  {
+    "names": [
+      "Apple M4 Pro"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "273 GB/s"
+      },
+      {
+        "label": "Neural Engine cores (spec)",
+        "value": "16"
+      },
+      {
+        "label": "CPU core options (spec)",
+        "value": "12 or 14"
+      }
+    ],
+    "source": "https://support.apple.com/en-us/121553",
+    "variants": [
+      {
+        "physicalCpuCores": 12,
+        "facts": [
+          {
+            "label": "GPU cores (spec)",
+            "value": "16"
+          }
+        ]
+      },
+      {
+        "physicalCpuCores": 14,
+        "facts": [
+          {
+            "label": "GPU cores (spec)",
+            "value": "20"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "names": [
+      "RTX 5090",
+      "RTX 5090 Founders Edition"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "CUDA cores (spec)",
+        "value": "21,760"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "1,792 GB/s"
+      }
+    ],
+    "source": "https://www.nvidia.com/en-us/geforce/graphics-cards/50-series/rtx-5090/"
+  },
+  {
+    "names": [
+      "RTX 4090",
+      "RTX 4090 Founders Edition"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "CUDA cores (spec)",
+        "value": "16,384"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "1,008 GB/s"
+      }
+    ],
+    "source": "https://images.nvidia.com/aem-dam/Solutions/geforce/ada/nvidia-ada-gpu-architecture.pdf"
+  },
+  {
+    "names": [
+      "Radeon 8060S Graphics",
+      "Radeon 8060S"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "GPU compute units (spec)",
+        "value": "40"
+      }
+    ],
+    "source": "https://rocm.docs.amd.com/en/docs-7.14.1/reference/gpu-specs.html"
+  },
+  {
+    "names": [
+      "Radeon 8050S Graphics",
+      "Radeon 8050S"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "GPU compute units (spec)",
+        "value": "32"
+      }
+    ],
+    "source": "https://rocm.docs.amd.com/en/docs-7.14.1/reference/gpu-specs.html"
+  },
+  {
+    "names": [
+      "dgx-spark"
+    ],
+    "target": "Device",
+    "facts": [
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "273 GB/s"
+      }
+    ],
+    "source": "https://docs.nvidia.com/dgx/dgx-spark/hardware.html"
+  },
+  {
+    "names": [
+      "RTX 5080"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "CUDA cores (spec)",
+        "value": "10,752"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "960 GB/s"
+      }
+    ],
+    "source": "https://www.nvidia.com/en-us/geforce/graphics-cards/compare/"
+  },
+  {
+    "names": [
+      "RTX 5070 Ti"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "CUDA cores (spec)",
+        "value": "8,960"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "896 GB/s"
+      }
+    ],
+    "source": "https://www.nvidia.com/en-us/geforce/graphics-cards/compare/"
+  },
+  {
+    "names": [
+      "RTX 5070"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "CUDA cores (spec)",
+        "value": "6,144"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "672 GB/s"
+      }
+    ],
+    "source": "https://www.nvidia.com/en-us/geforce/graphics-cards/compare/"
+  },
+  {
+    "names": [
+      "RTX 5060 Ti"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "CUDA cores (spec)",
+        "value": "4,608"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "448 GB/s"
+      }
+    ],
+    "source": "https://www.nvidia.com/en-us/geforce/graphics-cards/compare/"
+  },
+  {
+    "names": [
+      "RTX 5060"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "CUDA cores (spec)",
+        "value": "3,840"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "448 GB/s"
+      }
+    ],
+    "source": "https://www.nvidia.com/en-us/geforce/graphics-cards/compare/"
+  },
+  {
+    "names": [
+      "Apple M3 Pro"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "150 GB/s"
+      },
+      {
+        "label": "Neural Engine cores (spec)",
+        "value": "16"
+      },
+      {
+        "label": "CPU core options (spec)",
+        "value": "11 or 12"
+      }
+    ],
+    "source": "https://support.apple.com/en-us/117736",
+    "variants": [
+      {
+        "physicalCpuCores": 11,
+        "facts": [
+          {
+            "label": "GPU cores (spec)",
+            "value": "14"
+          }
+        ]
+      },
+      {
+        "physicalCpuCores": 12,
+        "facts": [
+          {
+            "label": "GPU cores (spec)",
+            "value": "18"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "names": [
+      "Intel Core i5-13500H"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "12"
+      }
+    ],
+    "source": "https://www.dell.com/support/manuals/en-us/xps-15-9530-laptop/xps-15-9530-setup-and-specifications/processor?guid=guid-8f9ccf13-6058-450a-ab47-ab607f32696b&lang=en-us"
+  },
+  {
+    "names": [
+      "Intel Core i7-13620H"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "10"
+      }
+    ],
+    "source": "https://www.dell.com/support/manuals/en-us/xps-15-9530-laptop/xps-15-9530-setup-and-specifications/processor?guid=guid-8f9ccf13-6058-450a-ab47-ab607f32696b&lang=en-us"
+  },
+  {
+    "names": [
+      "Intel Core i7-13700H"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "14"
+      }
+    ],
+    "source": "https://www.dell.com/support/manuals/en-us/xps-15-9530-laptop/xps-15-9530-setup-and-specifications/processor?guid=guid-8f9ccf13-6058-450a-ab47-ab607f32696b&lang=en-us"
+  },
+  {
+    "names": [
+      "Intel Core i9-13900H"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "14"
+      }
+    ],
+    "source": "https://www.dell.com/support/manuals/en-us/xps-15-9530-laptop/xps-15-9530-setup-and-specifications/processor?guid=guid-8f9ccf13-6058-450a-ab47-ab607f32696b&lang=en-us"
+  },
+  {
+    "names": [
+      "Intel Core i5-13450HX"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "10"
+      }
+    ],
+    "source": "https://www.dell.com/support/manuals/en-us/g-series-15-5530-laptop/dell-g15-5530-owners-manual/processor?guid=guid-44e8114f-cf39-4d53-ab93-a873c4a6ab0a&lang=en-us"
+  },
+  {
+    "names": [
+      "Intel Core i7-13650HX"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "14"
+      }
+    ],
+    "source": "https://www.dell.com/support/manuals/en-us/g-series-15-5530-laptop/dell-g15-5530-owners-manual/processor?guid=guid-44e8114f-cf39-4d53-ab93-a873c4a6ab0a&lang=en-us"
+  },
+  {
+    "names": [
+      "Intel Core i7-13700HX"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "16"
+      }
+    ],
+    "source": "https://www.dell.com/support/manuals/en-us/g-series-15-5530-laptop/dell-g15-5530-owners-manual/processor?guid=guid-44e8114f-cf39-4d53-ab93-a873c4a6ab0a&lang=en-us"
+  },
+  {
+    "names": [
+      "Intel Core i9-13900HX"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "24"
+      }
+    ],
+    "source": "https://www.dell.com/support/manuals/en-us/g-series-15-5530-laptop/dell-g15-5530-owners-manual/processor?guid=guid-44e8114f-cf39-4d53-ab93-a873c4a6ab0a&lang=en-us"
+  },
+  {
+    "names": [
+      "Intel Core i7-1165G7"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "4"
+      }
+    ],
+    "source": "https://www.dell.com/support/manuals/en-us/inspiron-15-3520-laptop/inspiron_3520_ss/processor?guid=guid-3fa8a438-c8cd-4d01-b101-3924958b26fe"
+  },
+  {
+    "names": [
+      "Intel Core i5-1155G7"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "4"
+      }
+    ],
+    "source": "https://www.dell.com/support/manuals/en-us/inspiron-15-3520-laptop/inspiron_3520_ss/processor?guid=guid-3fa8a438-c8cd-4d01-b101-3924958b26fe"
+  },
+  {
+    "names": [
+      "Intel Core i5-1135G7"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "4"
+      }
+    ],
+    "source": "https://www.dell.com/support/manuals/en-us/inspiron-15-3520-laptop/inspiron_3520_ss/processor?guid=guid-3fa8a438-c8cd-4d01-b101-3924958b26fe"
+  },
+  {
+    "names": [
+      "Intel Core i3-1115G4"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "2"
+      }
+    ],
+    "source": "https://www.dell.com/support/manuals/en-us/inspiron-15-3520-laptop/inspiron_3520_ss/processor?guid=guid-3fa8a438-c8cd-4d01-b101-3924958b26fe"
+  },
+  {
+    "names": [
+      "Intel Core i7-1255U"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "10"
+      }
+    ],
+    "source": "https://www.dell.com/support/manuals/en-us/inspiron-15-3520-laptop/inspiron_3520_ss/processor?guid=guid-3fa8a438-c8cd-4d01-b101-3924958b26fe"
+  },
+  {
+    "names": [
+      "Intel Core i5-1235U"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "10"
+      }
+    ],
+    "source": "https://www.dell.com/support/manuals/en-us/inspiron-15-3520-laptop/inspiron_3520_ss/processor?guid=guid-3fa8a438-c8cd-4d01-b101-3924958b26fe"
+  },
+  {
+    "names": [
+      "Intel Core i3-1215U"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "6"
+      }
+    ],
+    "source": "https://www.dell.com/support/manuals/en-us/inspiron-15-3520-laptop/inspiron_3520_ss/processor?guid=guid-3fa8a438-c8cd-4d01-b101-3924958b26fe"
+  },
+  {
+    "names": [
+      "Intel Core i7-1370P"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "14"
+      }
+    ],
+    "source": "https://support.hp.com/ca-en/document/ish_7775077-7775121-16"
+  },
+  {
+    "names": [
+      "Intel Core i7-1360P"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "12"
+      }
+    ],
+    "source": "https://support.hp.com/ca-en/document/ish_7775077-7775121-16"
+  },
+  {
+    "names": [
+      "Intel Core i5-1350P"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "12"
+      }
+    ],
+    "source": "https://support.hp.com/ca-en/document/ish_7775077-7775121-16"
+  },
+  {
+    "names": [
+      "Intel Core i5-1340P"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "12"
+      }
+    ],
+    "source": "https://support.hp.com/ca-en/document/ish_7775077-7775121-16"
+  },
+  {
+    "names": [
+      "Intel Core i7-1365U"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "10"
+      }
+    ],
+    "source": "https://support.hp.com/ca-en/document/ish_7775077-7775121-16"
+  },
+  {
+    "names": [
+      "Intel Core i7-1355U"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "10"
+      }
+    ],
+    "source": "https://support.hp.com/ca-en/document/ish_7775077-7775121-16"
+  },
+  {
+    "names": [
+      "Intel Core i5-1345U"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "10"
+      }
+    ],
+    "source": "https://support.hp.com/ca-en/document/ish_7775077-7775121-16"
+  },
+  {
+    "names": [
+      "Intel Core i5-1335U"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "10"
+      }
+    ],
+    "source": "https://support.hp.com/ca-en/document/ish_7775077-7775121-16"
+  },
+  {
+    "names": [
+      "Intel Pentium Gold 7505"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "2"
+      }
+    ],
+    "source": "https://www.dell.com/support/manuals/en-us/inspiron-15-3520-laptop/inspiron_3520_ss/processor?guid=guid-3fa8a438-c8cd-4d01-b101-3924958b26fe"
+  },
+  {
+    "names": [
+      "Intel Pentium Gold 8505"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "5"
+      }
+    ],
+    "source": "https://www.dell.com/support/manuals/en-us/inspiron-15-3520-laptop/inspiron_3520_ss/processor?guid=guid-3fa8a438-c8cd-4d01-b101-3924958b26fe"
+  },
+  {
+    "names": [
+      "Intel Celeron 7305"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "5"
+      }
+    ],
+    "source": "https://www.dell.com/support/manuals/en-us/inspiron-15-3520-laptop/inspiron_3520_ss/processor?guid=guid-3fa8a438-c8cd-4d01-b101-3924958b26fe"
+  },
+  {
+    "names": [
+      "AMD Ryzen 7 7840H"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "8"
+      }
+    ],
+    "source": "https://support.hp.com/my-en/document/ish_9174005-9174073-16"
+  },
+  {
+    "names": [
+      "AMD Ryzen 7 7840U"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "8"
+      }
+    ],
+    "source": "https://support.hp.com/my-en/document/ish_9174005-9174073-16"
+  },
+  {
+    "names": [
+      "AMD Ryzen 5 7640H"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "6"
+      }
+    ],
+    "source": "https://support.hp.com/my-en/document/ish_9174005-9174073-16"
+  },
+  {
+    "names": [
+      "AMD Ryzen 5 7540U"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "6"
+      }
+    ],
+    "source": "https://support.hp.com/my-en/document/ish_9174005-9174073-16"
+  },
+  {
+    "names": [
+      "Intel Core i5-11300H"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "4"
+      }
+    ],
+    "source": "https://www.microsoft.com/en-gb/d/surface-laptop-studio/8SRDF62SWKPF/55DD"
+  },
+  {
+    "names": [
+      "Intel Core i7-11370H"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "4"
+      }
+    ],
+    "source": "https://www.microsoft.com/en-gb/d/surface-laptop-studio/8SRDF62SWKPF/55DD"
+  },
+  {
+    "names": [
+      "Apple M1"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "8"
+      },
+      {
+        "label": "Neural Engine cores (spec)",
+        "value": "16"
+      }
+    ],
+    "source": "https://support.apple.com/en-us/111883"
+  },
+  {
+    "names": [
+      "Apple M1 Pro"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "200 GB/s"
+      },
+      {
+        "label": "Neural Engine cores (spec)",
+        "value": "16"
+      },
+      {
+        "label": "CPU core options (spec)",
+        "value": "8 or 10"
+      }
+    ],
+    "source": "https://support.apple.com/en-us/111902",
+    "variants": [
+      {
+        "physicalCpuCores": 8,
+        "facts": [
+          {
+            "label": "GPU cores (spec)",
+            "value": "14"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "names": [
+      "Apple M1 Max"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "10"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "400 GB/s"
+      },
+      {
+        "label": "Neural Engine cores (spec)",
+        "value": "16"
+      }
+    ],
+    "source": "https://support.apple.com/en-us/111900"
+  },
+  {
+    "names": [
+      "Apple M1 Ultra"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "20"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "800 GB/s"
+      },
+      {
+        "label": "Neural Engine cores (spec)",
+        "value": "32"
+      }
+    ],
+    "source": "https://support.apple.com/en-us/111900"
+  },
+  {
+    "names": [
+      "Apple M2"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "8"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "100 GB/s"
+      },
+      {
+        "label": "Neural Engine cores (spec)",
+        "value": "16"
+      }
+    ],
+    "source": "https://support.apple.com/en-us/111867"
+  },
+  {
+    "names": [
+      "Apple M2 Pro"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "200 GB/s"
+      },
+      {
+        "label": "Neural Engine cores (spec)",
+        "value": "16"
+      },
+      {
+        "label": "CPU core options (spec)",
+        "value": "10 or 12"
+      }
+    ],
+    "source": "https://support.apple.com/en-us/111340",
+    "variants": [
+      {
+        "physicalCpuCores": 10,
+        "facts": [
+          {
+            "label": "GPU cores (spec)",
+            "value": "16"
+          }
+        ]
+      },
+      {
+        "physicalCpuCores": 12,
+        "facts": [
+          {
+            "label": "GPU cores (spec)",
+            "value": "19"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "names": [
+      "Apple M2 Max"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "12"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "400 GB/s"
+      },
+      {
+        "label": "Neural Engine cores (spec)",
+        "value": "16"
+      }
+    ],
+    "source": "https://support.apple.com/en-us/111835"
+  },
+  {
+    "names": [
+      "Apple M2 Ultra"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "24"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "800 GB/s"
+      },
+      {
+        "label": "Neural Engine cores (spec)",
+        "value": "32"
+      }
+    ],
+    "source": "https://support.apple.com/en-us/111835"
+  },
+  {
+    "names": [
+      "Apple M3"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "8"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "100 GB/s"
+      },
+      {
+        "label": "Neural Engine cores (spec)",
+        "value": "16"
+      }
+    ],
+    "source": "https://support.apple.com/en-us/118551"
+  },
+  {
+    "names": [
+      "Apple M3 Max"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "Neural Engine cores (spec)",
+        "value": "16"
+      },
+      {
+        "label": "CPU core options (spec)",
+        "value": "14 or 16"
+      }
+    ],
+    "source": "https://support.apple.com/en-us/117736",
+    "variants": [
+      {
+        "physicalCpuCores": 14,
+        "facts": [
+          {
+            "label": "GPU cores (spec)",
+            "value": "30"
+          },
+          {
+            "label": "Memory bandwidth (spec)",
+            "value": "300 GB/s"
+          }
+        ]
+      },
+      {
+        "physicalCpuCores": 16,
+        "facts": [
+          {
+            "label": "GPU cores (spec)",
+            "value": "40"
+          },
+          {
+            "label": "Memory bandwidth (spec)",
+            "value": "400 GB/s"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "names": [
+      "Apple M3 Ultra"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "819 GB/s"
+      },
+      {
+        "label": "Neural Engine cores (spec)",
+        "value": "32"
+      },
+      {
+        "label": "CPU core options (spec)",
+        "value": "28 or 32"
+      }
+    ],
+    "source": "https://support.apple.com/en-us/122211",
+    "variants": [
+      {
+        "physicalCpuCores": 28,
+        "facts": [
+          {
+            "label": "GPU cores (spec)",
+            "value": "60"
+          }
+        ]
+      },
+      {
+        "physicalCpuCores": 32,
+        "facts": [
+          {
+            "label": "GPU cores (spec)",
+            "value": "80"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "names": [
+      "Apple M4 Max"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "Neural Engine cores (spec)",
+        "value": "16"
+      },
+      {
+        "label": "CPU core options (spec)",
+        "value": "14 or 16"
+      }
+    ],
+    "source": "https://support.apple.com/en-us/121553",
+    "variants": [
+      {
+        "physicalCpuCores": 14,
+        "facts": [
+          {
+            "label": "GPU cores (spec)",
+            "value": "32"
+          },
+          {
+            "label": "Memory bandwidth (spec)",
+            "value": "410 GB/s"
+          }
+        ]
+      },
+      {
+        "physicalCpuCores": 16,
+        "facts": [
+          {
+            "label": "GPU cores (spec)",
+            "value": "40"
+          },
+          {
+            "label": "Memory bandwidth (spec)",
+            "value": "546 GB/s"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "names": [
+      "Apple M5"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "10"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "153 GB/s"
+      },
+      {
+        "label": "Neural Engine cores (spec)",
+        "value": "16"
+      }
+    ],
+    "source": "https://support.apple.com/en-ie/126320"
+  },
+  {
+    "names": [
+      "Apple M5 Pro"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "307 GB/s"
+      },
+      {
+        "label": "Neural Engine cores (spec)",
+        "value": "16"
+      },
+      {
+        "label": "CPU core options (spec)",
+        "value": "15 or 18"
+      }
+    ],
+    "source": "https://support.apple.com/it-it/126318",
+    "variants": [
+      {
+        "physicalCpuCores": 15,
+        "facts": [
+          {
+            "label": "GPU cores (spec)",
+            "value": "16"
+          }
+        ]
+      },
+      {
+        "physicalCpuCores": 18,
+        "facts": [
+          {
+            "label": "GPU cores (spec)",
+            "value": "20"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "names": [
+      "Apple M5 Max"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "18"
+      },
+      {
+        "label": "Neural Engine cores (spec)",
+        "value": "16"
+      }
+    ],
+    "source": "https://support.apple.com/en-ie/126319"
+  },
+  {
+    "names": [
+      "RTX 4070 SUPER"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "CUDA cores (spec)",
+        "value": "7,168"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "504 GB/s"
+      }
+    ],
+    "source": "https://www.nvidia.com/en-us/geforce/graphics-cards/compare/",
+    "additionalSources": [
+      "https://www.pny.com/PNY-GeForce-RTX-4070-Super-12-GB-VERTO-OC-Edition-Dual-Fan"
+    ]
+  },
+  {
+    "names": [
+      "RTX 3090"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "CUDA cores (spec)",
+        "value": "10,496"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "936 GB/s"
+      }
+    ],
+    "source": "https://www.nvidia.com/en-us/geforce/graphics-cards/compare/",
+    "additionalSources": [
+      "https://www.nvidia.com/content/dam/en-zz/Solutions/geforce/ampere/pdf/NVIDIA-ampere-GA102-GPU-Architecture-Whitepaper-V1.pdf"
+    ]
+  },
+  {
+    "names": [
+      "RTX 3070"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "CUDA cores (spec)",
+        "value": "5,888"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "448 GB/s"
+      }
+    ],
+    "source": "https://www.nvidia.com/en-us/geforce/graphics-cards/compare/",
+    "additionalSources": [
+      "https://www.nvidia.com/content/dam/en-zz/Solutions/geforce/ampere/pdf/NVIDIA-ampere-GA102-GPU-Architecture-Whitepaper-V1.pdf"
+    ]
+  },
+  {
+    "names": [
+      "RTX 3060"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "CUDA cores (spec)",
+        "value": "3,584"
+      }
+    ],
+    "source": "https://www.nvidia.com/en-us/geforce/graphics-cards/compare/",
+    "memoryVariants": [
+      {
+        "memoryGiB": 8,
+        "facts": [
+          {
+            "label": "Memory bandwidth (spec)",
+            "value": "240 GB/s"
+          }
+        ]
+      },
+      {
+        "memoryGiB": 12,
+        "facts": [
+          {
+            "label": "Memory bandwidth (spec)",
+            "value": "360 GB/s"
+          }
+        ]
+      }
+    ],
+    "additionalSources": [
+      "https://www.gainward.com/main/product/vga/pro/p01164/p01164_datasheet_763635110a425f9a.pdf?s=51",
+      "https://www.pny.com/pny-geforce-rtx3060-12gb-verto-dual-fan"
+    ]
+  },
+  {
+    "names": [
+      "RTX 4090 Laptop GPU"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "CUDA cores (spec)",
+        "value": "9,728"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "Up to 576 GB/s"
+      }
+    ],
+    "source": "https://www.nvidia.com/en-us/geforce/laptops/40-series/",
+    "additionalSources": [
+      "https://content.etilize.com/Additional-pdf6/1077119365.pdf"
+    ]
+  },
+  {
+    "names": [
+      "RTX 4080 Laptop GPU"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "CUDA cores (spec)",
+        "value": "7,424"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "Up to 432 GB/s"
+      }
+    ],
+    "source": "https://www.nvidia.com/en-us/geforce/laptops/40-series/",
+    "additionalSources": [
+      "https://www.notebookcheck.net/Lenovo-Legion-Pro-7-16-2024-review-Cream-of-the-crop-amongst-RTX-4080-laptops.819046.0.html"
+    ]
+  },
+  {
+    "names": [
+      "RTX 4070 Laptop GPU"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "CUDA cores (spec)",
+        "value": "4,608"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "Up to 256 GB/s"
+      }
+    ],
+    "source": "https://www.nvidia.com/en-us/geforce/laptops/40-series/",
+    "additionalSources": [
+      "https://thinkstation-specs.com/thinkpad/p1-gen-7-2024/"
+    ]
+  },
+  {
+    "names": [
+      "RTX 4060 Laptop GPU"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "CUDA cores (spec)",
+        "value": "3,072"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "Up to 256 GB/s"
+      }
+    ],
+    "source": "https://www.nvidia.com/en-us/geforce/laptops/40-series/",
+    "additionalSources": [
+      "https://www.purepc.pl/test-nvidia-geforce-rtx-4060-laptop-gpu-kontra-amd-radeon-rx-7600s-w-notebookach-asus-tuf-gaming"
+    ]
+  },
+  {
+    "names": [
+      "RTX 4050 Laptop GPU"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "CUDA cores (spec)",
+        "value": "2,560"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "Up to 192 GB/s"
+      }
+    ],
+    "source": "https://www.nvidia.com/en-us/geforce/laptops/40-series/",
+    "additionalSources": [
+      "https://www.usenix.org/system/files/osdi25-park-yeonhong.pdf"
+    ]
+  },
+  {
+    "names": [
+      "RX 6800 XT"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "GPU compute units (spec)",
+        "value": "72"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "Up to 512 GB/s"
+      }
+    ],
+    "source": "https://rocm.docs.amd.com/en/docs-6.1.2/reference/gpu-arch-specs.html",
+    "additionalSources": [
+      "https://www.amd.com/en/products/graphics/desktops/radeon/6000-series/amd-radeon-rx-6800-xt.html"
+    ]
+  },
+  {
+    "names": [
+      "RX 6900 XT"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "GPU compute units (spec)",
+        "value": "80"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "Up to 512 GB/s"
+      }
+    ],
+    "source": "https://rocm.docs.amd.com/en/docs-6.1.2/reference/gpu-arch-specs.html",
+    "additionalSources": [
+      "https://www.amd.com/en/products/graphics/desktops/radeon/6000-series/amd-radeon-rx-6900-xt.html"
+    ]
+  },
+  {
+    "names": [
+      "RX 7900 XT"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "GPU compute units (spec)",
+        "value": "84"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "Up to 800 GB/s"
+      }
+    ],
+    "source": "https://rocm.docs.amd.com/en/docs-6.1.2/reference/gpu-arch-specs.html",
+    "additionalSources": [
+      "https://www.amd.com/en/products/graphics/desktops/radeon/7000-series/amd-radeon-rx-7900xt.html"
+    ]
+  },
+  {
+    "names": [
+      "RX 7900 XTX"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "GPU compute units (spec)",
+        "value": "96"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "Up to 960 GB/s"
+      }
+    ],
+    "source": "https://rocm.docs.amd.com/en/docs-6.1.2/reference/gpu-arch-specs.html",
+    "additionalSources": [
+      "https://www.xfxforce.com/shop/amd-radeon-rx-7900xtx"
+    ]
+  },
+  {
+    "names": [
+      "RX 9060 XT"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "GPU compute units (spec)",
+        "value": "32"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "Up to 320 GB/s"
+      }
+    ],
+    "source": "https://ir.amd.com/news-events/press-releases/detail/1253/amd-introduces-new-radeon-graphics-cards-and-ryzen-threadripper-processors-at-computex-2025",
+    "additionalSources": [
+      "https://www.amd.com/content/dam/amd/en/documents/partner-hub/radeon/radeon-rx-9000-series-quick-reference-guide-competitive.pdf"
+    ]
+  },
+  {
+    "names": [
+      "Arc B580"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "Xe cores (spec)",
+        "value": "20"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "456 GB/s"
+      }
+    ],
+    "source": "https://www.intel.com/content/www/us/en/products/sku/241598/intel-arc-b580-graphics/specifications.html"
+  },
+  {
+    "names": [
+      "Arc A770"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "Xe cores (spec)",
+        "value": "32"
+      }
+    ],
+    "source": "https://game.intel.com/stories/intel-arc-graphics-qa-hardware-specs/",
+    "memoryVariants": [
+      {
+        "memoryGiB": 8,
+        "facts": [
+          {
+            "label": "Memory bandwidth (spec)",
+            "value": "Up to 512 GB/s"
+          }
+        ]
+      },
+      {
+        "memoryGiB": 16,
+        "facts": [
+          {
+            "label": "Memory bandwidth (spec)",
+            "value": "Up to 560 GB/s"
+          }
+        ]
+      }
+    ],
+    "additionalSources": [
+      "https://www.intel.com/content/www/us/en/ark/products/series/227960/intel-arc-dedicated-graphics-family.html"
+    ]
+  },
+  {
+    "names": [
+      "Arc A370M"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "Xe cores (spec)",
+        "value": "8"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "Up to 112 GB/s"
+      }
+    ],
+    "source": "https://www.intel.com.tw/content/www/tw/zh/support/articles/000091109/graphics.html",
+    "additionalSources": [
+      "https://www.intel.com/content/www/us/en/ark/products/series/227960/intel-arc-dedicated-graphics-family.html"
+    ]
+  },
+  {
+    "names": [
+      "AMD Ryzen 7 8845H"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "8"
+      }
+    ],
+    "source": "https://support.hp.com/in-en/document/ish_9938732-9938845-16"
+  },
+  {
+    "names": [
+      "AMD Ryzen 7 8845HS"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "8"
+      }
+    ],
+    "source": "https://support.hp.com/in-en/document/ish_9938732-9938845-16"
+  },
+  {
+    "names": [
+      "AMD Ryzen 5 8645H"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "6"
+      }
+    ],
+    "source": "https://support.hp.com/in-en/document/ish_9938732-9938845-16"
+  },
+  {
+    "names": [
+      "AMD Ryzen 5 8645HS"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "6"
+      }
+    ],
+    "source": "https://support.hp.com/in-en/document/ish_9938732-9938845-16"
+  },
+  {
+    "names": [
+      "Intel Core Ultra 7 155U"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "12"
+      }
+    ],
+    "source": "https://support.hp.com/us-en/document/ish_10206518-10206567-16"
+  },
+  {
+    "names": [
+      "Intel Core Ultra 7 155H"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "16"
+      }
+    ],
+    "source": "https://support.hp.com/us-en/document/ish_10206518-10206567-16"
+  },
+  {
+    "names": [
+      "Intel Core Ultra 5 125H"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "14"
+      }
+    ],
+    "source": "https://support.hp.com/us-en/document/ish_10206518-10206567-16"
+  },
+  {
+    "names": [
+      "AMD Ryzen 9 8945HS"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "8"
+      }
+    ],
+    "source": "https://rog.asus.com/us/laptops/rog-zephyrus/rog-zephyrus-g14-2024/spec/"
+  },
+  {
+    "names": [
+      "AMD Ryzen AI Max+ 395"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "16"
+      }
+    ],
+    "source": "https://www.amd.com/content/dam/amd/en/documents/partner-hub/ryzen/ryzen-ai-max-series-how-to-sell-guide-competitive.pdf"
+  },
+  {
+    "names": [
+      "AMD Ryzen AI Max 390"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "12"
+      }
+    ],
+    "source": "https://www.amd.com/content/dam/amd/en/documents/partner-hub/ryzen/ryzen-ai-max-series-how-to-sell-guide-competitive.pdf"
+  },
+  {
+    "names": [
+      "AMD Ryzen AI Max 385"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "8"
+      }
+    ],
+    "source": "https://www.amd.com/content/dam/amd/en/documents/partner-hub/ryzen/ryzen-ai-max-series-how-to-sell-guide-competitive.pdf"
+  },
+  {
+    "names": [
+      "AMD Ryzen AI Max+ PRO 395"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "16"
+      }
+    ],
+    "source": "https://h20195.www2.hp.com/v2/GetPDF.aspx/c09086887"
+  },
+  {
+    "names": [
+      "AMD Ryzen AI Max PRO 390"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "12"
+      }
+    ],
+    "source": "https://h20195.www2.hp.com/v2/GetPDF.aspx/c09086887"
+  },
+  {
+    "names": [
+      "AMD Ryzen AI Max PRO 385"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "8"
+      }
+    ],
+    "source": "https://h20195.www2.hp.com/v2/GetPDF.aspx/c09086887"
+  },
+  {
+    "names": [
+      "AMD Ryzen AI Max PRO 380"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "6"
+      }
+    ],
+    "source": "https://h20195.www2.hp.com/v2/GetPDF.aspx/c09086887"
+  },
+  {
+    "names": [
+      "AMD Ryzen 5 PRO 7540U"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "6"
+      }
+    ],
+    "source": "https://psref.lenovo.com/syspool/Sys/PDF/ThinkPad/ThinkPad_T14_Gen_4_AMD/ThinkPad_T14_Gen_4_AMD_Spec.pdf"
+  },
+  {
+    "names": [
+      "AMD Ryzen 7 PRO 7840U"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "8"
+      }
+    ],
+    "source": "https://psref.lenovo.com/syspool/Sys/PDF/ThinkPad/ThinkPad_T14_Gen_4_AMD/ThinkPad_T14_Gen_4_AMD_Spec.pdf"
+  },
+  {
+    "names": [
+      "AMD EPYC 7742"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "64"
+      }
+    ],
+    "source": "https://www.amd.com/en/blogs/2019/an-update-on-the-hpc-software-ecosystem-for-amd-epyc.html"
+  },
+  {
+    "names": [
+      "NVIDIA GB10"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "20"
+      }
+    ],
+    "source": "https://docs.nvidia.com/dgx/dgx-spark/hardware.html"
+  },
+  {
+    "names": [
+      "Intel Core i5-1035G1"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "4"
+      }
+    ],
+    "source": "https://edc.intel.com/content/www/us/en/products/performance/benchmarks/12th-generation-intel-core-processor/intel.com/performanceindex/"
+  },
+  {
+    "names": [
+      "Radeon 8040S Graphics",
+      "Radeon 8040S"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "GPU compute units (spec)",
+        "value": "16"
+      }
+    ],
+    "source": "https://www.amd.com/en/products/processors/laptop/ryzen-pro/ai-max-pro-300-series/amd-ryzen-ai-max-pro-380.html"
+  },
+  {
+    "names": [
+      "RX 580"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "Stream processors (spec)",
+        "value": "2,304"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "Up to 256 GB/s"
+      }
+    ],
+    "source": "https://www.sapphiretech.com/en/consumer/pulse-rx-580-4g-g5",
+    "additionalSources": [
+      "https://www.amd.com/en/support/downloads/drivers.html/graphics/radeon-600-500-400/radeon-rx-500-series/radeon-rx-580.html"
+    ]
+  },
+  {
+    "names": [
+      "Intel Xeon E5-1620 v2",
+      "Intel Xeon CPU E5-1620 v2"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "4"
+      }
+    ],
+    "source": "https://www.intel.co.uk/content/dam/www/public/us/en/documents/specification-updates/xeon-e5-v2-spec-update.pdf"
+  },
+  {
+    "names": [
+      "Intel Xeon E5-1650 v2",
+      "Intel Xeon CPU E5-1650 v2"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "6"
+      }
+    ],
+    "source": "https://www.intel.co.uk/content/dam/www/public/us/en/documents/specification-updates/xeon-e5-v2-spec-update.pdf"
+  },
+  {
+    "names": [
+      "Intel Xeon E5-1680 v2",
+      "Intel Xeon CPU E5-1680 v2"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "8"
+      }
+    ],
+    "source": "https://www.intel.co.uk/content/dam/www/public/us/en/documents/specification-updates/xeon-e5-v2-spec-update.pdf"
+  },
+  {
+    "names": [
+      "Intel Xeon E5-2697 v2",
+      "Intel Xeon CPU E5-2697 v2"
+    ],
+    "target": "Processor",
+    "facts": [
+      {
+        "label": "CPU cores / processor (spec)",
+        "value": "12"
+      }
+    ],
+    "source": "https://www.intel.co.uk/content/dam/www/public/us/en/documents/specification-updates/xeon-e5-v2-spec-update.pdf"
+  },
+  {
+    "names": [
+      "FirePro D300",
+      "FirePro D300 Compute Engine",
+      "Radeon HD - FirePro D300"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "160 GB/s"
+      },
+      {
+        "label": "Stream processors (spec)",
+        "value": "1280"
+      }
+    ],
+    "source": "https://support.apple.com/en-la/112025"
+  },
+  {
+    "names": [
+      "FirePro D500",
+      "FirePro D500 Compute Engine",
+      "Radeon HD - FirePro D500"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "240 GB/s"
+      }
+    ],
+    "source": "https://support.apple.com/en-la/112025"
+  },
+  {
+    "names": [
+      "FirePro D700",
+      "FirePro D700 Compute Engine",
+      "Radeon HD - FirePro D700"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "264 GB/s"
+      },
+      {
+        "label": "Stream processors (spec)",
+        "value": "2048"
+      }
+    ],
+    "source": "https://support.apple.com/en-la/112025"
+  },
+  {
+    "names": [
+      "RTX 3050 Ti Laptop GPU"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "CUDA cores (spec)",
+        "value": "2,560"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "Up to 192 GB/s"
+      }
+    ],
+    "source": "https://learn.microsoft.com/en-us/surface/surface-laptop-studio-graphics"
+  },
+  {
+    "names": [
+      "RTX A2000 Laptop GPU"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "CUDA cores (spec)",
+        "value": "2,560"
+      }
+    ],
+    "source": "https://learn.microsoft.com/en-us/surface/surface-laptop-studio-graphics",
+    "memoryVariants": [
+      {
+        "memoryGiB": 4,
+        "facts": [
+          {
+            "label": "Memory bandwidth (spec)",
+            "value": "Up to 192 GB/s"
+          }
+        ]
+      },
+      {
+        "memoryGiB": 8,
+        "facts": [
+          {
+            "label": "Memory bandwidth (spec)",
+            "value": "Up to 224 GB/s"
+          }
+        ]
+      }
+    ],
+    "additionalSources": [
+      "https://images.nvidia.com/aem-dam/en-zz/Solutions/design-visualization/documents/proviz-rtx-mobile-line-card.pdf"
+    ]
+  },
+  {
+    "names": [
+      "A100-SXM4-40GB",
+      "A100-PCIE-40GB"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "CUDA cores (spec)",
+        "value": "6,912"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "1,555 GB/s"
+      }
+    ],
+    "source": "https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf",
+    "additionalSources": [
+      "https://www.nvidia.com/pt-br/data-center/a100/"
+    ]
+  },
+  {
+    "names": [
+      "A100-SXM4-80GB"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "CUDA cores (spec)",
+        "value": "6,912"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "2,039 GB/s"
+      }
+    ],
+    "source": "https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf",
+    "additionalSources": [
+      "https://www.nvidia.com/pt-br/data-center/a100/"
+    ]
+  },
+  {
+    "names": [
+      "A100-PCIE-80GB",
+      "A100 80GB PCIe"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "CUDA cores (spec)",
+        "value": "6,912"
+      },
+      {
+        "label": "Memory bandwidth (spec)",
+        "value": "1,935 GB/s"
+      }
+    ],
+    "source": "https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf",
+    "additionalSources": [
+      "https://www.nvidia.com/pt-br/data-center/a100/"
+    ]
+  },
+  {
+    "names": [
+      "RTX 3050 Laptop GPU"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "GPU architecture (spec)",
+        "value": "Ampere"
+      }
+    ],
+    "source": "https://www.nvidia.com/en-ph/geforce/laptops/30-series/",
+    "memoryVariants": [
+      {
+        "memoryGiB": 4,
+        "facts": [
+          {
+            "label": "Memory bandwidth (spec)",
+            "value": "Up to 192 GB/s"
+          }
+        ]
+      },
+      {
+        "memoryGiB": 6,
+        "facts": [
+          {
+            "label": "Memory bandwidth (spec)",
+            "value": "Up to 168 GB/s"
+          }
+        ]
+      }
+    ],
+    "additionalSources": [
+      "https://idus.us.es/bitstreams/dcbde8ab-8b5f-4de6-bb70-22d157a9e637/download",
+      "https://repositorio.ufes.br/server/api/core/bitstreams/658c0257-f26c-4263-8f4e-b48fea307625/content"
+    ]
+  },
+  {
+    "names": [
+      "Radeon 780M",
+      "Radeon 780M Graphics"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "GPU compute units (spec)",
+        "value": "12"
+      }
+    ],
+    "source": "https://rocm.docs.amd.com/en/docs-7.14.1/reference/gpu-specs.html"
+  },
+  {
+    "names": [
+      "Radeon 760M",
+      "Radeon 760M Graphics"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "GPU compute units (spec)",
+        "value": "8"
+      }
+    ],
+    "source": "https://rocm.docs.amd.com/en/docs-7.14.1/reference/gpu-specs.html"
+  },
+  {
+    "names": [
+      "Radeon 740M",
+      "Radeon 740M Graphics"
+    ],
+    "target": "Accelerator",
+    "facts": [
+      {
+        "label": "GPU compute units (spec)",
+        "value": "4"
+      }
+    ],
+    "source": "https://rocm.docs.amd.com/en/docs-7.14.1/reference/gpu-specs.html"
+  }
+]

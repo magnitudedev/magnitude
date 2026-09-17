@@ -3,7 +3,6 @@ applies_to:
   - packages/release/**
   - packages/icn/src/lifecycle/release-installation.ts
   - packages/icn/src/lifecycle/installation-environment.ts
-  - packages/daemon-management/src/binary.ts
   - inference/**
   - .github/workflows/release-build.yml
 ---
@@ -42,8 +41,7 @@ acquisition has its own network requirements.
 
 Customer systems do not need Rust, Bun, CMake, C/C++ compilers, CUDA toolkits, Vulkan SDKs,
 developer headers, OpenSSL packages, OpenMP packages, or build-system package-manager prefixes.
-The npm launcher requires its supported Node.js runtime, but acquired native artifacts do not use
-Node.js as a native dependency.
+The desktop-bundled CLI needs neither npm nor a separately installed Node.js runtime.
 
 ## GNU Linux contract
 
@@ -78,6 +76,24 @@ Linux executables resolve owned libraries from `../runtime`; libraries and backe
 from their own directory or `../runtime`. Allowed loader paths are therefore `$ORIGIN` and
 `$ORIGIN/../runtime`. Releases must not require `LD_LIBRARY_PATH`.
 
+### Linux graphical desktop
+
+The Electron application additionally requires the distribution's graphical userspace: GLib/GIO,
+GTK3, NSS/NSPR, ATK/AT-SPI, D-Bus, Cairo/Pango, CUPS, X11/XCB, xkbcommon, GBM/DRM, expat, udev,
+and ALSA libraries, plus util-linux for installation admission and Polkit/pkexec for update authorization. These are package-manager dependencies, including when the application uses
+Wayland. They do not become requirements of the headless CLI or inference artifacts. FFmpeg,
+Electron, and the bundled rendering libraries are artifact-owned. Package metadata must resolve
+the graphical dependencies on each supported distribution without relying on optional recommends
+for directly linked libraries. Native consumer checks validate the final installed application's
+loader closure and sandbox permissions; a build-host launch is insufficient.
+
+## Windows contract
+
+Windows accelerator compositions follow the same dependency ownership: `nvcuda.dll` and
+`vulkan-1.dll` belong to their respective host capabilities, while CUDA toolkit DLLs are shipped
+in the pack and the Microsoft CRT is shipped with the base. CPU installations require neither
+accelerator capability.
+
 ## Apple contract
 
 Apple artifacts may depend on operating-system libraries and frameworks included with the supported
@@ -106,3 +122,8 @@ expected architecture and deployment target of every executable and native libra
 - Base and accelerator artifacts for one host share the same platform contract.
 - Dynamic-loader failure remains distinct from protocol-decoding failure and retains bounded native
   diagnostics.
+
+Linux application packages must install their payload directories as root-owned mode0755 and
+remove group/other write permission from payload files while preserving executable and sandbox
+mode bits. Package validation rejects unprotected directories or files before publication; the
+privileged updater independently checks installed publisher-trust ancestry before authorizing an update.

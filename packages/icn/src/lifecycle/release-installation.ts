@@ -21,7 +21,7 @@ import {
   type ReleaseManifest,
 } from "@magnitudedev/release"
 import { IcnPreparationReporter } from "./preparation.js"
-import { installationLoaderEnvironment } from "./installation-environment.js"
+import { installationLoaderEnvironment, installationNativePath } from "./installation-environment.js"
 import { selectCudaArtifact } from "./cuda-compatibility.js"
 import { Data, Effect, Fiber, Option, Schema, Stream } from "effect"
 type SelectedBackend = {
@@ -72,7 +72,7 @@ const run = (
   CommandExecutor.CommandExecutor
 > =>
   Effect.scoped(Effect.gen(function* () {
-    const process = yield* Command.start(Command.make(...command).pipe(
+    const process = yield* Command.start(Command.make(installationNativePath(command[0]), ...command.slice(1)).pipe(
       Command.env(environment),
     ))
     const stdout = yield* outputTail(process.stdout).pipe(Effect.forkScoped)

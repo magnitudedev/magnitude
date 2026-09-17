@@ -3,7 +3,7 @@ import {
   developmentBuildEnvironment,
   developmentBuildProfile,
 } from "./build-local"
-import { readCargoMessages } from "./compile"
+import { readCargoMessages, runCargoBuild } from "./compile"
 import { ICN_EXECUTABLE_NAME } from "@magnitudedev/release/executables"
 
 const stream = (...chunks: readonly string[]): ReadableStream<Uint8Array> => {
@@ -17,6 +17,13 @@ const stream = (...chunks: readonly string[]): ReadableStream<Uint8Array> => {
 }
 
 describe("ICN compilation", () => {
+  test.each(["all", "errors"] as const)("retains stderr and structured diagnostics in %s mode when Cargo fails", async diagnostics => {
+    const diagnostic = JSON.stringify({ reason: "compiler-message", message: { rendered: "tensor binding failed" } })
+    await expect(runCargoBuild([process.execPath, "-e", `console.log(${JSON.stringify(diagnostic)}); process.stderr.write("native linker failed"); process.exitCode = 101`], {
+      cwd: process.cwd(), env: process.env, diagnostics,
+    })).rejects.toThrow(/native linker failed[\s\S]*tensor binding failed/)
+  })
+
   test("targets only attached GPUs for local CUDA builds", () => {
     expect(developmentBuildEnvironment("cuda")).toEqual({
       CMAKE_CUDA_ARCHITECTURES: "native",

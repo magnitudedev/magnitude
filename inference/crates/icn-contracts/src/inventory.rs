@@ -663,6 +663,8 @@ pub struct HardwareSnapshot {
     #[serde(default)]
     pub system_product_name: Option<String>,
     pub cpu_model: Option<String>,
+    /// OS-reported physical CPU cores, independent of process scheduling limits.
+    pub physical_cores: Option<usize>,
     pub logical_cores: usize,
     pub system_memory: HardwareSystemMemory,
     pub native_build: String,

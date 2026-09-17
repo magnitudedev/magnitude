@@ -15,7 +15,7 @@ const notary = (unit: string) => ({ id: `accepted-${unit}`, unit, status: "Accep
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "magnitude-apple-receipts-"))
   const groups = [
-    ...releaseHosts.filter((host) => host.id.startsWith("darwin-")).map((host) => ({ directory: host.id, host: host.id, ids: ["cli", "acn", "icn-base"].map((kind) => ({ id: `${kind}-${host.id}`, kind })), units: ["cli", "inference", "app"], stapledApp: true })),
+    ...releaseHosts.filter((host) => host.id.startsWith("darwin-")).map((host) => ({ directory: host.id, host: host.id, ids: [...["cli", "acn", "icn-base", "desktop"].map((kind) => ({ id: `${kind}-${host.id}`, kind })), { id: `desktop-update-${host.id}`, kind: "desktop" }], units: ["cli", "inference", "app", "desktop"], stapledApp: true })),
     ...backendPacks.filter((pack) => pack.host.startsWith("darwin-")).map((pack) => ({ directory: pack.id, host: pack.host, ids: [{ id: `icn-backend-${pack.id}`, kind: "icn-backend" }], units: [pack.id], stapledApp: false })),
   ]
   for (const group of groups) {
@@ -25,8 +25,9 @@ beforeEach(async () => {
     for (const { id, kind } of group.ids) {
       const sha256 = createHash("sha256").update(id).digest("hex")
       artifacts.push({ id, sha256 })
-      await writeFile(join(directory, `${id}.tar.gz`), id)
-      await write(join(directory, `${id}.artifact.json`), { id, kind, host: group.host, filename: `${id}.tar.gz`, bytes: id.length, sha256 })
+      const filename = `${id}.${id.startsWith("desktop-update-") ? "zip" : kind === "desktop" ? "dmg" : "tar.gz"}`
+      await writeFile(join(directory, filename), id)
+      await write(join(directory, `${id}.artifact.json`), { id, kind, host: group.host, filename, bytes: id.length, sha256 })
     }
     await write(join(directory, "apple-distribution.receipt.json"), { sourceCommit: commit, team, artifacts, notarizations: group.units.map(notary), stapledApp: group.stapledApp })
     if (group.stapledApp) await write(join(directory, "apple-consumer.receipt.json"), { sourceCommit: commit, artifacts })
@@ -42,6 +43,35 @@ describe("Apple publication receipts", () => {
   it("rejects missing independent consumer validation", async () => {
     await rm(join(root, "darwin-arm64/apple-consumer.receipt.json"))
     await expect(run()).rejects.toThrow("independent Apple host consumer")
+  })
+  it("rejects desktop bytes changed after native acceptance", async () => {
+    await writeFile(join(root, "darwin-arm64/desktop-darwin-arm64.dmg"), "changed")
+    await expect(run()).rejects.toThrow("Apple accepted bytes changed")
+  })
+  it("rejects update archive bytes changed after native acceptance", async () => {
+    await writeFile(join(root, "darwin-arm64/desktop-update-darwin-arm64.zip"), "changed")
+    await expect(run()).rejects.toThrow("Apple accepted bytes changed")
+  })
+  it("requires independent consumer acceptance of the update archive", async () => {
+    const file = join(root, "darwin-arm64/apple-consumer.receipt.json")
+    const receipt = JSON.parse(await readFile(file, "utf8"))
+    receipt.artifacts = receipt.artifacts.filter((entry: { id: string }) => entry.id !== "desktop-update-darwin-arm64")
+    await write(file, receipt)
+    await expect(run()).rejects.toThrow("independent Apple host consumer acceptance")
+  })
+  it("requires the desktop notarization even when the service app was notarized", async () => {
+    const file = join(root, "darwin-arm64/apple-distribution.receipt.json")
+    const receipt = JSON.parse(await readFile(file, "utf8"))
+    receipt.notarizations = receipt.notarizations.filter((entry: { unit: string }) => entry.unit !== "desktop")
+    await write(file, receipt)
+    await expect(run()).rejects.toThrow("missing a native software submission")
+  })
+  it("requires independent consumer acceptance of the desktop itself", async () => {
+    const file = join(root, "darwin-arm64/apple-consumer.receipt.json")
+    const receipt = JSON.parse(await readFile(file, "utf8"))
+    receipt.artifacts = receipt.artifacts.filter((entry: { id: string }) => entry.id !== "desktop-darwin-arm64")
+    await write(file, receipt)
+    await expect(run()).rejects.toThrow("independent Apple host consumer acceptance")
   })
   it("rejects an unstapled app", async () => {
     const file = join(root, "darwin-arm64/apple-distribution.receipt.json")

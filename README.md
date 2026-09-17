@@ -15,40 +15,28 @@
   <a href="https://discord.gg/EHt48pPWdC"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white&labelColor=5865F2&color=gray" alt="Discord"></a>
   <a href="https://x.com/usemagnitude"><img src="https://img.shields.io/badge/Twitter-Follow-000000?style=flat-square&logo=x&logoColor=white&labelColor=000000&color=gray" alt="Follow Magnitude on Twitter"></a>
   <a href="https://github.com/magnitudedev/magnitude/stargazers"><img src="https://img.shields.io/github/stars/magnitudedev/magnitude" alt="GitHub Repo stars"></a>
-  <a href="https://www.npmjs.com/package/@magnitudedev/cli"><img src="https://img.shields.io/npm/v/%40magnitudedev%2Fcli" alt="npm version"></a>
 </p>
 
 Magnitude is an open source local inference engine. It runs on the hardware you already have, whether that's a Mac, an NVIDIA or AMD GPU, or just a CPU. It profiles your machine, recommends the right models for it, then downloads, tunes, and runs them. Plug it into Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline.
 
 ⭐ Help us reach more developers and grow the Magnitude community. Star this repo!
 
-![Magnitude demo: run local models on your machine](assets/readme/demo9-9.gif)
-
 ## Get started
 
-See what your machine can run:
+**[Download Magnitude for macOS, Windows, or Linux](https://magnitude.dev/download)**
 
-```sh
-npm i -g @magnitudedev/cli
-magnitude setup
-```
+1. Install and open the Magnitude app.
+2. Choose a recommended model in **Discover** and download it.
+3. Connect your agent in **Connections** and start using it.
 
-Setup profiles your hardware, ranks models by speed, accuracy, intelligence, and memory, and connects your harness to the one you pick.
-
-Or let your agent handle it. Send this to Pi, Claude Code, OpenCode, or whatever you use:
-
-```text
-Set up local models for me with the Magnitude CLI. Install it with `npm i -g @magnitudedev/cli` (or my package manager), then run `magnitude docs onboarding` and follow the instructions.
-```
-
-Your agent will profile your hardware, walk you through the best local models for it, download the ones you pick, and switch itself over to them.
+The desktop app includes the `magnitude` CLI. No separate installation is needed.
 
 ## Why Magnitude?
 
 - **Knows your machine:** profiles your hardware to assess fit and estimate tok/s
 - **Recommends the best models:** ranked by speed, accuracy, intelligence, and memory
 - **Tuned end to end:** speculative decoding and more, all set for your hardware
-- **Easy setup:** one command and your agent is running local models
+- **Easy setup:** discover a model and connect your harness in the desktop app
 - **Free to run:** no token costs, API keys, or rate limits
 - **Fully private and offline:** models, prompts, and files stay on your machine
 - **Models on demand:** loaded on request, unloaded when idle or memory fills
@@ -70,11 +58,11 @@ There's no fixed minimum. Magnitude profiles your machine and recommends what ru
 
 ### What systems does Magnitude support?
 
-Magnitude runs on macOS, Linux, and Windows through WSL. It supports Apple Silicon, NVIDIA GPUs, AMD GPUs, and CPU-only setups. It profiles your hardware and recommends models that fit.
+macOS, Windows, and Linux. See the [download page](https://magnitude.dev/download) for available installers and system requirements.
 
 ### Which harnesses work with it?
 
-Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline. During setup, your agent connects your harness to the model you pick.
+Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline. Use Connections in the desktop app to configure your harness without launching it.
 
 ### Do I need to manage it after setup?
 

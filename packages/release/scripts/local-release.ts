@@ -312,7 +312,7 @@ export const buildLocalRelease: Effect.Effect<
     version,
     acnRevision: ACN_COORDINATION_REVISION,
     rpc: releasePlan.rpc,
-    plugins: yield* Schema.decodeUnknown(ReleaseManifestSchema.fields.plugins)(releasePlan.plugins.map(plugin => plugin.artifact)).pipe(Effect.mapError(error => localReleaseFailure(`Invalid plugin inventory: ${String(error)}`))),
+    plugins: yield* Schema.decodeUnknown(ReleaseManifestSchema.fields.plugins)([]).pipe(Effect.mapError(error => localReleaseFailure(`Invalid plugin inventory: ${String(error)}`))),
     tag: releaseTag(version),
     sourceCommit,
     artifacts: [firstArtifact, ...remainingArtifacts],

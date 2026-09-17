@@ -8,7 +8,7 @@ import {
   type AcnStoppingReason,
 } from "@magnitudedev/acn-protocol"
 import { HttpServerRequest, HttpServerResponse } from "@effect/platform"
-import { Context, Deferred, Effect, Layer, Option, Ref, type Scope } from "effect"
+import { Context, Deferred, Effect, Layer, Option, SubscriptionRef, Stream, type Scope } from "effect"
 
 export type AcnRpcApplication = Effect.Effect<
   HttpServerResponse.HttpServerResponse,
@@ -27,6 +27,7 @@ interface AcnRuntimeState {
 }
 
 export interface AcnServiceLifecycleApi {
+  readonly changes: Stream.Stream<AcnHealthState>
   readonly state: Effect.Effect<AcnHealthState>
   readonly dispatchRpc: AcnRpcApplication
   readonly reportStarting: (
@@ -54,7 +55,7 @@ const unavailable = (state: AcnHealthState) =>
 
 export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi, never, Scope.Scope> =>
   Effect.gen(function* () {
-    const runtime = yield* Ref.make<AcnRuntimeState>({
+    const runtime = yield* SubscriptionRef.make<AcnRuntimeState>({
       lifecycle: new AcnStarting({
         activity: "WaitingForOwnership",
         progress: Option.none(),
@@ -63,7 +64,7 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
     })
     const transitionLock = yield* Effect.makeSemaphore(1)
     const stopping = yield* Deferred.make<AcnStopping>()
-    const replaceState = (next: AcnRuntimeState) => Ref.set(runtime, next)
+    const replaceState = (next: AcnRuntimeState) => SubscriptionRef.set(runtime, next)
 
     const commitStopping = (
       current: AcnRuntimeState,
@@ -90,7 +91,7 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
 
     const beginStopping: AcnServiceLifecycleApi["beginStopping"] = (request) =>
       transitionLock.withPermits(1)(
-        Ref.get(runtime).pipe(
+        SubscriptionRef.get(runtime).pipe(
           Effect.flatMap((current) => commitStopping(current, request)),
           Effect.uninterruptible,
         ),
@@ -100,7 +101,7 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
       (activity, progress) =>
         transitionLock.withPermits(1)(
           Effect.gen(function* () {
-            const current = yield* Ref.get(runtime)
+            const current = yield* SubscriptionRef.get(runtime)
             if (current.lifecycle._tag === "Stopping") return
             if (current.lifecycle._tag !== "Starting") {
               return yield* Effect.dieMessage(
@@ -120,7 +121,7 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
     const becomeReady: AcnServiceLifecycleApi["becomeReady"] = (rpc) =>
       transitionLock.withPermits(1)(
         Effect.gen(function* () {
-          const current = yield* Ref.get(runtime)
+          const current = yield* SubscriptionRef.get(runtime)
           if (current.lifecycle._tag === "Stopping") return
           if (current.lifecycle._tag !== "Starting") {
             return yield* Effect.dieMessage("ACN became ready more than once")
@@ -136,13 +137,14 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
         }).pipe(Effect.uninterruptible),
       )
 
-    const state = Ref.get(runtime).pipe(
+    const state = SubscriptionRef.get(runtime).pipe(
       Effect.map((current) => current.lifecycle),
     )
 
     return AcnServiceLifecycle.of({
       state,
-      dispatchRpc: Ref.get(runtime).pipe(
+      changes: runtime.changes.pipe(Stream.map(value => value.lifecycle)),
+      dispatchRpc: SubscriptionRef.get(runtime).pipe(
         Effect.flatMap((current) =>
           current.lifecycle._tag === "Ready" && Option.isSome(current.rpc)
             ? current.rpc.value

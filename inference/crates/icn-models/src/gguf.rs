@@ -477,12 +477,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_tensor_size_handles_platform_enum_boundaries() {
+        // GGUF type 0 is F32. Windows exposes ggml_type as signed; Unix exposes it as unsigned.
+        assert_eq!(
+            llama_cpp_2::gguf::tensor_storage_bytes(0, &[4, 3]),
+            Some(48)
+        );
+        assert_eq!(
+            llama_cpp_2::gguf::tensor_storage_bytes(u32::MAX, &[4]),
+            None
+        );
+        assert_eq!(
+            llama_cpp_2::gguf::tensor_storage_bytes(i32::MAX as u32, &[4]),
+            None
+        );
+        assert_eq!(llama_cpp_2::gguf::tensor_storage_bytes(0, &[]), None);
+        assert_eq!(llama_cpp_2::gguf::tensor_storage_bytes(0, &[0]), None);
+    }
+
+    #[test]
     fn rejects_non_gguf_without_panicking() {
-        let path = std::env::temp_dir().join(format!(
-            "icn-gguf-invalid-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("invalid.gguf");
         std::fs::write(&path, b"not a gguf").unwrap();
         let result = inspect(&path);
         std::fs::remove_file(path).unwrap();
@@ -496,11 +512,8 @@ mod tests {
 
     #[test]
     fn extracts_effective_template_variants_and_token_strings() {
-        let path = std::env::temp_dir().join(format!(
-            "icn-gguf-template-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("template.gguf");
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"GGUF");
         bytes.extend_from_slice(&3_u32.to_le_bytes());
@@ -540,11 +553,8 @@ mod tests {
 
     #[test]
     fn extracts_embedded_nextn_layer_count() {
-        let path = std::env::temp_dir().join(format!(
-            "icn-gguf-nextn-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("nextn.gguf");
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"GGUF");
         bytes.extend_from_slice(&3_u32.to_le_bytes());

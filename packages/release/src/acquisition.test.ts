@@ -55,7 +55,7 @@ const manifestBytes = (
     version,
     acnRevision: 1_000_000,
     rpc: releasePlan.rpc,
-    plugins: releasePlan.plugins.map(plugin => plugin.artifact),
+    plugins: [],
     tag,
     sourceCommit,
     artifacts: [Schema.encodeSync(ReleaseArtifactSchema)(artifact)],

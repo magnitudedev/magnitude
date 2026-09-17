@@ -3,7 +3,7 @@ import type { Command } from "@commander-js/extra-typings"
 const loadRuntime = () => import("./server-runtime")
 
 export const registerServiceCommand = (program: Command): void => {
-  // Release-only probe: the signed CLI must still load its native renderer and run Bun under Hardened Runtime.
+  // Release-only probe: the signed CLI must still load its native database and run Bun under Hardened Runtime.
   program.command("native-runtime-check", { hidden: true })
     .action(() => import("./native-runtime-check").then(({ runNativeRuntimeCheck }) => runNativeRuntimeCheck()))
 
@@ -11,7 +11,7 @@ export const registerServiceCommand = (program: Command): void => {
     .description("Manage the Magnitude background service")
 
   service.command("install")
-    .description("Start Magnitude automatically at login without starting it now")
+    .description("Enable Magnitude at login and start it in the background")
     .action(() => loadRuntime().then(({ runServiceInstall }) => runServiceInstall()))
 
   service.command("uninstall")
@@ -19,7 +19,7 @@ export const registerServiceCommand = (program: Command): void => {
     .action(() => loadRuntime().then(({ runServiceUninstall }) => runServiceUninstall()))
 
   service.command("start")
-    .description("Install and start the Magnitude service")
+    .description("Start Magnitude in the background and wait for its service")
     .action(() => loadRuntime().then(({ runServiceStart }) => runServiceStart()))
 
   service.command("stop")

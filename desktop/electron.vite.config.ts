@@ -2,31 +2,58 @@ import { defineConfig } from "electron-vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { isBuiltin } from "node:module";
+import type { Plugin } from "vite";
+
+if (process.versions.bun) {
+  throw new Error("Build Electron with Node.js installed on PATH; Bun's built-in modules differ from Electron's.");
+}
+
+// The installed app contains bundled JavaScript, not a repository node_modules tree.
+const bundledRuntime = (): Plugin => ({
+  name: "bundled-desktop-runtime",
+  generateBundle(_options, bundle) {
+    for (const output of Object.values(bundle)) {
+      if (output.type !== "chunk") continue;
+      for (const dependency of [...output.imports, ...output.dynamicImports]) {
+        if (dependency !== "electron" && !isBuiltin(dependency) && !bundle[dependency]) {
+          this.error(`Desktop runtime dependency was not bundled: ${dependency}`);
+        }
+      }
+    }
+  },
+});
+
+const acceptanceConfig = process.env.MAGNITUDE_UPDATE_ACCEPTANCE_CONFIG;
+const updateConfiguration = acceptanceConfig ? {
+  ...JSON.parse(readFileSync(acceptanceConfig, "utf8")), acceptance: true,
+} : {
+  origin: "https://magnitude.dev",
+  keyId: "magnitude-2026-01",
+  publicKey: readFileSync(resolve(__dirname, "../packages/release/resources/distribution/magnitude-2026-01.pub.pem"), "utf8"),
+  acceptance: false,
+  ...(process.env.MAGNITUDE_WINDOWS_PUBLISHER ? { windowsPublisher: process.env.MAGNITUDE_WINDOWS_PUBLISHER } : {}),
+};
 
 export default defineConfig({
   main: {
-    resolve: {
-      alias: {
-        "@magnitudedev/client-common/platform/embedded-browser": resolve(__dirname, "../packages/client-common/src/platform/embedded-browser.ts"),
-        "@magnitudedev/client-common/types/menu-action": resolve(__dirname, "../packages/client-common/src/types/menu-action.ts"),
-      },
+    define: {
+      __MAGNITUDE_UPDATE_CONFIGURATION__: JSON.stringify(updateConfiguration),
+      __MAGNITUDE_UPDATE_ACCEPTANCE__: JSON.stringify(Boolean(acceptanceConfig)),
     },
+    plugins: [bundledRuntime(), { name: "harness-skill-text", load(id) { if (id.endsWith(".md")) return `export default ${JSON.stringify(readFileSync(id, "utf8"))}` } }, {
+      name: "installed-update-trust",
+      generateBundle() {
+        this.emitFile({ type: "asset", fileName: "update-trust.json", source: JSON.stringify({ keyId: updateConfiguration.keyId, publicKey: updateConfiguration.publicKey }) });
+      },
+    }],
     build: {
       // Workspace packages publish TypeScript source for Bun. Bundle them for
       // Electron's Node runtime so production does not depend on repository
       // source files or Node's TypeScript resolution behavior.
-      externalizeDeps: {
-        exclude: [
-          "@magnitudedev/client-common",
-          "@magnitudedev/client-common/platform/embedded-browser",
-          "@magnitudedev/client-common/types/menu-action",
-          "@magnitudedev/sdk",
-        ],
-      },
+      externalizeDeps: false,
       rollupOptions: {
-        // sqlite3 is a native CommonJS addon. It must remain a runtime Node
-        // dependency; bundling its tracing helper into ESM erases __filename.
-        external: ["sqlite3"],
         input: {
           main: resolve(__dirname, "src/main.ts"),
         },
@@ -34,21 +61,9 @@ export default defineConfig({
     },
   },
   preload: {
-    resolve: {
-      alias: {
-        "@magnitudedev/client-common/platform/embedded-browser": resolve(__dirname, "../packages/client-common/src/platform/embedded-browser.ts"),
-        "@magnitudedev/client-common/types/menu-action": resolve(__dirname, "../packages/client-common/src/types/menu-action.ts"),
-      },
-    },
+    plugins: [bundledRuntime()],
     build: {
-      externalizeDeps: {
-        exclude: [
-          "@magnitudedev/client-common",
-          "@magnitudedev/client-common/platform/embedded-browser",
-          "@magnitudedev/client-common/types/menu-action",
-          "@magnitudedev/sdk",
-        ],
-      },
+      externalizeDeps: false,
       rollupOptions: {
         input: {
           preload: resolve(__dirname, "src/preload.ts"),
@@ -101,6 +116,14 @@ export default defineConfig({
     optimizeDeps: {
       exclude: [
         "@magnitudedev/sdk",
+          "@magnitudedev/sdk/desktop-host",
+          "@magnitudedev/daemon-management",
+          "@magnitudedev/daemon-management/desktop-native",
+          "@magnitudedev/utils",
+          "@magnitudedev/harness-connections",
+          "@magnitudedev/daemon-management/node",
+          "@magnitudedev/storage",
+          "@magnitudedev/release",
         "@magnitudedev/client-common",
         "@magnitudedev/generate-id",
         "@magnitudedev/web",

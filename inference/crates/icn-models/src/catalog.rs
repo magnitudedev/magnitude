@@ -1041,7 +1041,9 @@ fn materialize_planner_package<'a>(
             .open(&path)
             .map_err(|error| InventoryError::Io(error.to_string()))?;
         file.write_all(&input)
-            .and_then(|()| file.set_len(component.component.size_bytes))
+            .and_then(|()| {
+                icn_utils::sparse_file::set_sparse_len(&file, component.component.size_bytes)
+            })
             .map_err(|error| InventoryError::Io(error.to_string()))?;
     }
     let components = artifact

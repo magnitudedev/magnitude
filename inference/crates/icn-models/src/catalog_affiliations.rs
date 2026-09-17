@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -79,7 +79,9 @@ impl CatalogAffiliations {
             file.sync_all()?;
             drop(file);
             fs::rename(&temporary, &destination)?;
-            File::open(root)?.sync_all()
+            #[cfg(unix)]
+            std::fs::File::open(root)?.sync_all()?;
+            Ok(())
         })() {
             let _ = fs::remove_file(&temporary);
             return Err(error);

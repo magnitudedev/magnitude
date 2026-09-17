@@ -1,5 +1,11 @@
 import { acnExecutableRelativePath } from "../../src/macos-app"
 import { buildMacApp } from "../apple/build-app"
+import { buildDesktopApplication, DesktopBuildFailed } from "./desktop"
+import { buildLinuxDesktopInstaller } from "./desktop-linux"
+import { buildWindowsDesktopInstaller } from "./desktop-windows"
+import { isWindowsEngineLibrary, signWindowsCode } from "./windows-signing"
+import { BunContext } from "@effect/platform-bun"
+import { buildDesktopDmg, validateDesktopDistribution } from "../apple/desktop"
 import { appleSigning, signAppleCode, appleCommand } from "../apple/signing"
 import { runAppleBuild } from "../apple/compile-bun"
 import { notarizeAppleUnit, regularAppleFiles, writeAppleReceipt } from "../apple/distribution"
@@ -13,7 +19,9 @@ import {
 } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { basename, delimiter, dirname, resolve } from "node:path"
-import { Option, Schema } from "effect"
+import { Effect, Option, Schedule, Schema } from "effect"
+import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native"
+import { mergeWindowsEnvironment } from "@magnitudedev/utils/windows-native"
 import {
   BackendEligibilityReport,
   IcnInstallationDeclaration,
@@ -24,6 +32,8 @@ import {
 } from "../../src/contracts"
 import {
   acnArchive,
+  desktopInstaller,
+  desktopUpdateArchive,
   cliArchive,
   currentHost,
   hostById,
@@ -42,6 +52,7 @@ import {
 } from "./common"
 import { buildIcnBinary } from "../../../../inference/scripts/compile"
 import { ACN_COORDINATION_REVISION } from "@magnitudedev/version"
+import { MAGNITUDE_RPC_VERSION } from "@magnitudedev/acn-protocol"
 import { appleRequirement } from "../../src/trust"
 import {
   ACN_EXECUTABLE_NAME,
@@ -80,6 +91,8 @@ const smokeIcnServer = async (
     cacheRoot,
   ], {
     cwd: root,
+    // Managed ICN lifetime guards require it to lead its own process group.
+    detached: process.platform !== "win32",
     env: { ...environment, MAGNITUDE_ICN_AUTH_TOKEN: token },
     stdin: "pipe",
     stdout: "pipe",
@@ -138,6 +151,8 @@ const smokeIcnServer = async (
     if (!hardware.ok) {
       throw new Error(`ICN authenticated hardware returned HTTP ${hardware.status}`)
     }
+    const owned = process.platform === "win32" ? Option.none() : await Effect.runPromise(ProcessGroupControllerLive.inspect(child.pid))
+    if (process.platform !== "win32" && Option.isNone(owned)) throw new Error("ICN disappeared before parent-loss acceptance")
     child.stdin.end()
     const exitCode = await Promise.race<number | undefined>([
       child.exited,
@@ -147,8 +162,12 @@ const smokeIcnServer = async (
       throw new Error("ICN did not exit after its managed parent pipe closed")
     }
     reaped = true
-    if (exitCode !== 0) {
-      throw new Error(`ICN parent-pipe shutdown exited with code ${exitCode}`)
+    // EOF means owner loss, so the watchdog kills its group rather than exiting gracefully.
+    if (exitCode !== 91 && child.signalCode !== "SIGKILL") {
+      throw new Error(`ICN parent-loss watchdog exited with unexpected code ${exitCode} and signal ${child.signalCode}`)
+    }
+    if (Option.isSome(owned) && !await Effect.runPromise(ProcessGroupControllerLive.waitForGroupExit({ leader: owned.value }, "5 seconds"))) {
+      throw new Error("ICN parent-loss watchdog left process-group members alive")
     }
   } finally {
     if (!reaped) {
@@ -163,6 +182,7 @@ const smokeIcnServer = async (
         await child.exited
       }
     }
+    await child[Symbol.asyncDispose]()
   }
 }
 
@@ -226,12 +246,11 @@ export const smokeHostArchives = async (
       backendModuleAbi: Option.getOrThrow(icnArtifact.backendModuleAbi),
     })}\n`)
     const environment = host.id.startsWith("windows-")
-      ? {
-        ...process.env,
+      ? mergeWindowsEnvironment(process.env, {
         PATH: [resolve(icnRoot, "runtime"), process.env.PATH]
           .filter(Boolean)
           .join(delimiter),
-      }
+      })
       : {
         ...process.env,
         ...(host.id.startsWith("darwin-")
@@ -241,6 +260,11 @@ export const smokeHostArchives = async (
     const icnBinary = resolve(icnRoot, `bin/${ICN_EXECUTABLE_NAME}${extension}`)
     await smokeIcnServer(icnBinary, declaration, icnRoot, environment)
     if (host.id.startsWith("darwin-")) {
+      await runAppleBuild(validateDesktopDistribution({
+        image: resolve(dirname(acnArchivePath), desktopInstaller(Schema.decodeUnknownSync(Schema.Literal("darwin-arm64", "darwin-x64"))(host.id))),
+        updateArchive: resolve(dirname(acnArchivePath), desktopUpdateArchive(Schema.decodeUnknownSync(Schema.Literal("darwin-arm64", "darwin-x64"))(host.id))),
+        version, revision: ACN_COORDINATION_REVISION, rpcVersion: MAGNITUDE_RPC_VERSION, inferenceInstallation: declaration,
+      }))
       await run([resolve(cliRoot, "bin/magnitude-cli"), "native-runtime-check"])
       const app = resolve(acnRoot, "Magnitude.app")
       const signing = await runAppleBuild(appleSigning)
@@ -249,7 +273,10 @@ export const smokeHostArchives = async (
       if (signing.mode === "developer-id") await run(["/usr/bin/xcrun", "stapler", "validate", app])
     }
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await Effect.runPromise(Effect.tryPromise(() => rm(root, { recursive: true, force: true })).pipe(
+      Effect.retry({ times: 6, schedule: Schedule.spaced("500 millis"), while: error => process.platform === "win32" &&
+        Schema.is(Schema.Struct({ code: Schema.Literal("EPERM", "EBUSY", "ENOTEMPTY") }))(error.cause) }),
+    ))
   }
 }
 
@@ -346,6 +373,11 @@ export const buildHostArtifacts = async (
   )(eligibility)
 
   const cliArchivePath = resolve(output, cliArchive(host.id))
+  if (host.id === "windows-x64-msvc") {
+    await Effect.runPromise(Effect.forEach([cli, acn, icn.binary, ...cpuModules,
+      ...icn.runtimeLibraries.filter(file => isWindowsEngineLibrary(basename(file))),
+    ], signWindowsCode, { discard: true }).pipe(Effect.provide(BunContext.layer)))
+  }
   const acnArchivePath = resolve(output, acnArchive(host.id))
   const icnArchivePath = resolve(output, icnBaseArchive(host.id))
   const cliNotary = host.id.startsWith("darwin-")
@@ -373,8 +405,11 @@ export const buildHostArtifacts = async (
   )
   let acnSources: readonly ArchiveSource[] = [{ path: `bin/${ACN_EXECUTABLE_NAME}${host.executableExtension}`, source: acn, mode: 0o755 }]
   const notarizations = [cliNotary, icnNotary]
+  const desktopArtifacts: ReleaseArtifact[] = []
+  const version = Schema.decodeUnknownSync(Schema.parseJson(Schema.Struct({ version: Schema.NonEmptyString })))(
+    await readFile(resolve(PROJECT_ROOT, "packages/launcher/package.json"), "utf8"),
+  ).version
   if (host.id.startsWith("darwin-")) {
-    const version = (JSON.parse(await readFile(resolve(PROJECT_ROOT, "packages/launcher/package.json"), "utf8")) as { version: string }).version
     const appRoot = resolve(output, ".app-build")
     const app = await runAppleBuild(buildMacApp(appRoot, acn, version, ACN_COORDINATION_REVISION))
     notarizations.push(await runAppleBuild(notarizeAppleUnit("app", output, [app, resolve(PROJECT_ROOT, "bin/apple-inputs/acn")])))
@@ -383,6 +418,48 @@ export const buildHostArtifacts = async (
       await runAppleBuild(appleCommand("/usr/bin/xcrun", "stapler", "validate", app))
     }
     acnSources = (await runAppleBuild(regularAppleFiles(app))).map((file) => ({ ...file, path: `Magnitude.app/${file.path}` }))
+    await run(["bun", "run", "build"], { cwd: resolve(PROJECT_ROOT, "desktop") })
+    const packages = await runAppleBuild(buildDesktopApplication({ service: acn, cli, outputDirectory: resolve(output, ".desktop-build"), version, revision: ACN_COORDINATION_REVISION }))
+    if (packages.length !== 1) throw new Error("Desktop packaging did not produce exactly one host application")
+    const desktop = await runAppleBuild(buildDesktopDmg({ app: resolve(packages[0]!, "Magnitude.app"), output, host: Schema.decodeUnknownSync(Schema.Literal("darwin-arm64", "darwin-x64"))(host.id) }))
+    desktopArtifacts.push(desktop.artifact, desktop.updateArtifact)
+    notarizations.push(desktop.notarization)
+  } else if (host.id.startsWith("linux-")) {
+    await run(["bun", "run", "build"], { cwd: resolve(PROJECT_ROOT, "desktop") })
+    const installers = await Effect.runPromise(Effect.gen(function* () {
+      const arch = host.id === "linux-arm64-gnu" ? "arm64" : "x64"
+      const applications = yield* buildDesktopApplication({
+        service: acn, cli, outputDirectory: resolve(output, ".desktop-build"),
+        version, revision: ACN_COORDINATION_REVISION, target: { platform: "linux", arch },
+      })
+      if (applications.length !== 1) return yield* new DesktopBuildFailed({ message: "Desktop packaging did not produce exactly one Linux application" })
+      const artifacts: ReleaseArtifact[] = []
+      for (const format of ["deb", "rpm"] as const) {
+        const installer = yield* buildLinuxDesktopInstaller({
+          app: applications[0]!, output, arch, format, version, revision: ACN_COORDINATION_REVISION,
+        })
+        artifacts.push(installer.artifact)
+      }
+      return artifacts
+    }).pipe(Effect.provide(BunContext.layer)))
+    desktopArtifacts.push(...installers)
+  } else if (host.id === "windows-x64-msvc") {
+    await run(["bun", "run", "build"], { cwd: resolve(PROJECT_ROOT, "desktop") })
+    const guard = resolve(output, ".desktop-build", "MagnitudeInstallGuard.dll")
+    await run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+      resolve(PROJECT_ROOT, "packages/release/scripts/build/windows-installer.ps1"), "-Output", guard])
+    const installer = await Effect.runPromise(Effect.gen(function* () {
+      const applications = yield* buildDesktopApplication({
+        service: acn, cli, outputDirectory: resolve(output, ".desktop-build", "application"),
+        version, revision: ACN_COORDINATION_REVISION, target: { platform: "win32", arch: "x64" },
+      })
+      if (applications.length !== 1) return yield* new DesktopBuildFailed({ message: "Desktop packaging did not produce exactly one Windows application" })
+      return yield* buildWindowsDesktopInstaller({
+        app: applications[0]!, guard, makensis: "makensis.exe", version,
+        revision: ACN_COORDINATION_REVISION, output,
+      })
+    }).pipe(Effect.provide(BunContext.layer)))
+    desktopArtifacts.push(installer.artifact)
   }
   const acnArtifact = await buildArchive(
     acnArchivePath,
@@ -435,9 +512,10 @@ export const buildHostArtifacts = async (
     icnArtifact,
   )
   if (host.id.startsWith("darwin-")) {
-    await runAppleBuild(writeAppleReceipt(output, [cliArtifact, acnArtifact, icnArtifact], notarizations, true))
+    await runAppleBuild(writeAppleReceipt(output, [cliArtifact, acnArtifact, icnArtifact, ...desktopArtifacts], notarizations, true))
     await rm(resolve(output, ".app-build"), { recursive: true, force: true })
   }
+  await rm(resolve(output, ".desktop-build"), { recursive: true, force: true })
 }
 
 if (import.meta.main) {

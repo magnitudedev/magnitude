@@ -1,97 +1,29 @@
-import {
-  LAUNCH_PROTOCOL_VERSION,
-  LAUNCH_PROTOCOL_VERSION_VARIABLE,
-  MANAGED_BY_VARIABLE,
-  MANAGED_PACKAGE_ROOT_VARIABLE,
-  type PackageManager,
-} from "@magnitudedev/release"
-import {
-  interactiveProcessExitCode,
-  runInteractiveProcess,
-} from "@magnitudedev/utils/process"
-import { Context, Effect, Layer, Option, Schema } from "effect"
-import {
-  CliBinaryResolver,
-  type CliBinaryUnavailable,
-} from "./cli-binary-resolver"
-import {
-  LauncherInstallationInspector,
-  type LauncherInstallation,
-  type LauncherPackageNotFound,
-} from "./launcher-installation-inspector"
+import { interactiveProcessExitCode, runInteractiveProcess } from "@magnitudedev/utils/process"
+import { Context, Effect, Layer, Schema } from "effect"
+import { CliBinaryResolver, type CliBinaryUnavailable } from "./cli-binary-resolver"
 
-export class CliSpawnFailed extends Schema.TaggedError<CliSpawnFailed>()(
-  "CliSpawnFailed",
-  { reason: Schema.String },
-) {}
+export class CliSpawnFailed extends Schema.TaggedError<CliSpawnFailed>()("CliSpawnFailed", { reason: Schema.String }) {}
 
-/**
- * Spawns the native CLI on this terminal and reports its exit code. Encodes
- * install ownership into the child environment — the wire format of the
- * launcher→CLI contract — internally.
- */
-export class CliProcessSpawner extends Context.Tag("launcher/CliProcessSpawner")<
-  CliProcessSpawner, {
-    readonly spawn: Effect.Effect<
-      number,
-      CliSpawnFailed | CliBinaryUnavailable | LauncherPackageNotFound
-    >
-  }
->() {}
+export interface CliProcessSpawner {
+  readonly spawn: Effect.Effect<number, CliSpawnFailed | CliBinaryUnavailable>
+}
+export const CliProcessSpawner = Context.GenericTag<CliProcessSpawner>("launcher/CliProcessSpawner")
 
-export interface CliProcessSpawnerConfig {
+export const cliProcessSpawnerLayer = (config: {
   readonly args: ReadonlyArray<string>
   readonly environment: Readonly<Record<string, string | undefined>>
-}
-
-const definedEntries = (
-  environment: Readonly<Record<string, string | undefined>>,
-): Record<string, string> => {
-  const defined: Record<string, string> = {}
-  for (const [name, value] of Object.entries(environment)) {
-    if (value !== undefined) defined[name] = value
-  }
-  return defined
-}
-
-const childEnvironment = (
-  installation: LauncherInstallation,
-  environment: Readonly<Record<string, string | undefined>>,
-): Record<string, string> => ({
-  ...definedEntries(environment),
-  [MANAGED_BY_VARIABLE]: Option.getOrElse(
-    installation.packageManager,
-    (): PackageManager => "npm",
-  ),
-  [MANAGED_PACKAGE_ROOT_VARIABLE]: installation.root,
-  [LAUNCH_PROTOCOL_VERSION_VARIABLE]: String(LAUNCH_PROTOCOL_VERSION),
-})
-
-export const cliProcessSpawnerLayer = (
-  config: CliProcessSpawnerConfig,
-): Layer.Layer<
-  CliProcessSpawner,
-  never,
-  | CliBinaryResolver
-  | LauncherInstallationInspector
-> => Layer.effect(CliProcessSpawner, Effect.gen(function* () {
+}) => Layer.effect(CliProcessSpawner, Effect.gen(function* () {
   const resolver = yield* CliBinaryResolver
-  const inspector = yield* LauncherInstallationInspector
-
-  const spawn = Effect.gen(function* () {
-    const installation = yield* inspector.inspect
+  return { spawn: Effect.gen(function* () {
     const binary = yield* resolver.resolve
-    return yield* runInteractiveProcess({
-      executable: binary,
-      args: config.args,
-      environment: childEnvironment(installation, config.environment),
-    }).pipe(
+    const environment: Record<string, string> = {}
+    for (const [name, value] of Object.entries(config.environment)) {
+      if (value !== undefined) environment[name] = value
+    }
+    environment.MAGNITUDE_DESKTOP_PATH = binary.application
+    return yield* runInteractiveProcess({ executable: binary.executable, args: config.args, environment }).pipe(
       Effect.map(interactiveProcessExitCode),
-      Effect.mapError((error) => new CliSpawnFailed({
-        reason: error.message,
-      })),
+      Effect.mapError(error => new CliSpawnFailed({ reason: error.message })),
     )
-  })
-
-  return { spawn }
+  }) }
 }))

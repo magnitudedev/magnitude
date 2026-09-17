@@ -312,6 +312,22 @@ describe("MagnitudeClient", () => {
     );
   });
 
+  it("never invokes the application starter after an established owner disappears", async () => {
+    const f = fixture();
+    await Effect.runPromise(Effect.gen(function* () {
+      const client = yield* MagnitudeClient;
+      yield* client.connection.connect;
+      f.stop();
+      const result = yield* Effect.either(client.models.stop({}));
+      expect(result._tag).toBe("Left");
+      expect(f.starts()).toBe(0);
+      f.resume();
+      yield* client.connection.connect;
+      expect((yield* client.connection.state)._tag).toBe("Ready");
+      expect(f.starts()).toBe(0);
+    }).pipe(Effect.provide(f.live)));
+  });
+
   it("rechecks a replacement at the same address before redispatch", async () => {
     const f = fixture();
     await Effect.runPromise(

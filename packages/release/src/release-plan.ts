@@ -2,14 +2,13 @@ import { Effect, Option, Schema } from "effect";
 import { gt, inc, prerelease } from "semver";
 import {
   PluginArtifactSchema,
-  PluginHostSchema,
   type PluginArtifact,
   type PluginHost,
   RpcReleaseSchema,
   type PluginContentManifest,
 } from "./plugins";
 
-/** The last stable CLI release. Plugins have their own baseline: what npm publishes as latest. */
+/** The last stable desktop/CLI release published on GitHub. */
 export const PublicBaselineSchema = Schema.Struct({
   tag: Schema.String,
   sourceCommit: Schema.String.pipe(Schema.pattern(/^[a-f0-9]{40}$/)),
@@ -154,14 +153,5 @@ export const validatePreparedRelease = (plan: PreparedRelease) =>
       names.add(artifact.name);
       hosts.add(artifact.host);
     }
-    const missingHosts = PluginHostSchema.literals.filter(
-      (host) => !hosts.has(host)
-    );
-    if (missingHosts.length > 0)
-      return yield* new ReleasePreparationFailed({
-        message: `Missing plugin selection for hosts: ${missingHosts.join(
-          ", "
-        )}`,
-      });
     return plan;
   });

@@ -70,7 +70,7 @@ describe("public-baseline release allocation", () => {
     ).toBe("Left");
   });
 
-  it("requires one selection per declared host, independently of package naming", async () => {
+  it("allows no shipped plugins while validating any explicit selections", async () => {
     const renamed = {
       ...prepared,
       plugins: [
@@ -83,9 +83,7 @@ describe("public-baseline release allocation", () => {
     expect(await Effect.runPromise(validatePreparedRelease(renamed))).toBe(
       renamed
     );
-    await expect(
-      Effect.runPromise(validatePreparedRelease({ ...prepared, plugins: [] }))
-    ).rejects.toThrow("Missing plugin selection for hosts: pi");
+    expect((await Effect.runPromise(validatePreparedRelease({ ...prepared, plugins: [] }))).plugins).toEqual([]);
     await expect(
       Effect.runPromise(
         validatePreparedRelease({

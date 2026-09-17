@@ -5,7 +5,18 @@ import {
   type DragPreviewProps,
   type NodeRendererProps,
 } from "react-arborist"
-import { CircleAlert, ChevronDown, ChevronRight, Ellipsis, File, FileText, Folder, FolderOpen, Save as SaveIcon, Trash2 } from "lucide-react"
+import {
+  WarningCircleIcon,
+  CaretDownIcon,
+  CaretRightIcon,
+  DotsThreeIcon,
+  FileIcon,
+  FileTextIcon,
+  FolderIcon,
+  FolderOpenIcon,
+  FloppyDiskIcon,
+  TrashIcon,
+} from "@phosphor-icons/react"
 import { Atom, Result, useAtomMount, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { Cause, Effect, Option } from "effect"
 import {
@@ -105,7 +116,7 @@ const buildNodes = (
 }))
 
 function TreeNode({ node, style, dragHandle }: NodeRendererProps<FileNode>): ReactNode {
-  const Icon = node.data.kind === "directory" ? (node.isOpen ? FolderOpen : Folder) : File
+  const Icon = node.data.kind === "directory" ? (node.isOpen ? FolderOpenIcon : FolderIcon) : FileIcon
   return (
     <div
       ref={dragHandle}
@@ -134,8 +145,8 @@ function TreeNode({ node, style, dragHandle }: NodeRendererProps<FileNode>): Rea
           node.isOpen && node.data.loadState === "loading"
             ? <Spinner className="size-3 text-blue-600 motion-reduce:animate-none dark:text-blue-400" />
             : node.data.loadState === "failed"
-              ? <CircleAlert className="size-3 text-red-600 dark:text-red-400" aria-label="Could not load folder" />
-              : node.isOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />
+              ? <WarningCircleIcon className="size-3 text-red-600 dark:text-red-400" aria-label="Could not load folder" />
+              : node.isOpen ? <CaretDownIcon size={12} /> : <CaretRightIcon size={12} />
         ) : null}
       </span>
       <Icon size={13} className={node.data.kind === "directory" ? "shrink-0 text-blue-600 dark:text-blue-400" : "shrink-0 text-slate-500 dark:text-slate-400"} />
@@ -147,7 +158,7 @@ function TreeNode({ node, style, dragHandle }: NodeRendererProps<FileNode>): Rea
 function TreeDragPreview({ offset, id, isDragging, kind }: DragPreviewProps & { readonly kind?: FileNode["kind"] }): ReactNode {
   if (!isDragging || offset === null || id === null) return null
   const name = id.slice(id.lastIndexOf("/") + 1)
-  const Icon = kind === "directory" ? Folder : File
+  const Icon = kind === "directory" ? FolderIcon : FileIcon
   return (
     <div className="pointer-events-none fixed inset-0 z-50">
       <div style={{ transform: `translate(${offset.x + 8}px, ${offset.y + 8}px)` }} className="absolute left-0 top-0 flex max-w-64 items-center gap-2 rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-[13px] text-slate-800 shadow-sm dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100">
@@ -388,7 +399,7 @@ export function ProjectFileContent({
   if (document === null) {
     return (
       <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
-        <FileText size={28} className="text-slate-400 dark:text-slate-500" />
+        <FileTextIcon size={28} className="text-slate-400 dark:text-slate-500" />
         <div>
           <div className="font-mono text-base font-semibold text-slate-900 dark:text-slate-100">Select a file</div>
           <div className="mt-1 font-sans text-sm text-slate-500 dark:text-slate-400">Choose a file from Project Files.</div>
@@ -421,15 +432,15 @@ export function ProjectFileContent({
                   content: activeDraft?.content ?? snapshot.content,
                   expectedContentHash: displayedConflict?.contentHash ?? activeDraft?.baseContentHash ?? snapshot.contentHash,
                 })}
-              ><SaveIcon size={16} /></Button>
+              ><FloppyDiskIcon size={16} /></Button>
             )} />
           </>
         ) : null}
         {snapshot !== null && snapshot._tag !== "unsupported" ? (
           <DropdownMenu>
-            <DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" className="[-webkit-app-region:no-drag]" aria-label="File actions" />}><Ellipsis size={16} /></DropdownMenuTrigger>
+            <DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" className="[-webkit-app-region:no-drag]" aria-label="File actions" />}><DotsThreeIcon size={16} /></DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="w-40">
-              <DropdownMenuItem variant="destructive" onClick={() => setDeleteOpen(true)}><Trash2 />Remove file</DropdownMenuItem>
+              <DropdownMenuItem variant="destructive" onClick={() => setDeleteOpen(true)}><TrashIcon />Remove file</DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
         ) : null}

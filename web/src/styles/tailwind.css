@@ -6,7 +6,7 @@
 @import "shadcn/tailwind.css";
 
 @source "../";
-@source "../../../desktop/src/renderer.tsx";
+@source "../../../desktop/src/";
 
 @custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
 @custom-variant mac (&:where([data-desktop-platform="darwin"], [data-desktop-platform="darwin"] *));

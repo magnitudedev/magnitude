@@ -53,7 +53,7 @@ export type BackendPack =
 export const releaseHosts = [
   {
     id: "darwin-arm64",
-    runner: "macos-latest",
+    runner: "blacksmith-12vcpu-macos-15",
     bunTarget: "bun-darwin-arm64",
     rustTarget: "aarch64-apple-darwin",
     executableExtension: "",
@@ -61,7 +61,7 @@ export const releaseHosts = [
   },
   {
     id: "darwin-x64",
-    runner: "macos-15-intel",
+    runner: "macos-15-large",
     bunTarget: "bun-darwin-x64",
     rustTarget: "x86_64-apple-darwin",
     executableExtension: "",
@@ -69,7 +69,7 @@ export const releaseHosts = [
   },
   {
     id: "linux-arm64-gnu",
-    runner: "ubuntu-22.04-arm",
+    runner: "blacksmith-16vcpu-ubuntu-2204-arm",
     bunTarget: "bun-linux-arm64",
     rustTarget: "aarch64-unknown-linux-gnu",
     executableExtension: "",
@@ -77,10 +77,18 @@ export const releaseHosts = [
   },
   {
     id: "linux-x64-gnu",
-    runner: "ubuntu-22.04",
+    runner: "blacksmith-16vcpu-ubuntu-2204",
     bunTarget: "bun-linux-x64-baseline",
     rustTarget: "x86_64-unknown-linux-gnu",
     executableExtension: "",
+    cargoFeatures: ["mtmd", "dynamic-backends"],
+  },
+  {
+    id: "windows-x64-msvc",
+    runner: "blacksmith-16vcpu-windows-2025",
+    bunTarget: "bun-windows-x64",
+    rustTarget: "x86_64-pc-windows-msvc",
+    executableExtension: ".exe",
     cargoFeatures: ["mtmd", "dynamic-backends"],
   },
 ] as const satisfies readonly ReleaseHost[]
@@ -101,11 +109,11 @@ const cudaBuilds = [
 const cudaHosts = [
   {
     host: "linux-arm64-gnu",
-    runners: { "11.8": "ubuntu-22.04-arm", "12.9": "ubuntu-22.04-arm" },
+    runners: { "11.8": "blacksmith-16vcpu-ubuntu-2204-arm", "12.9": "blacksmith-16vcpu-ubuntu-2204-arm" },
   },
   {
     host: "linux-x64-gnu",
-    runners: { "11.8": "ubuntu-22.04", "12.9": "ubuntu-22.04" },
+    runners: { "11.8": "blacksmith-16vcpu-ubuntu-2204", "12.9": "blacksmith-16vcpu-ubuntu-2204" },
   },
 ] as const
 
@@ -121,14 +129,12 @@ const cudaBackendPacks: readonly BackendPack[] = cudaHosts.flatMap(({ host, runn
     cuda,
   })))
 
-// Windows release artifacts are intentionally disabled for now. Runtime support outside the
-// release system remains available to revisit once Windows builds are reliable.
 export const backendPacks: readonly BackendPack[] = [
   {
     id: "metal-darwin-arm64",
     host: "darwin-arm64",
     backend: "metal",
-    runner: "macos-latest",
+    runner: "blacksmith-12vcpu-macos-15",
     cargoFeatures: ["dynamic-backends", "metal"],
     module: "libggml-metal.so",
     runtimeLibraries: [],
@@ -136,10 +142,31 @@ export const backendPacks: readonly BackendPack[] = [
   },
   ...cudaBackendPacks,
   {
+    id: "cuda-12.9-windows-x64-msvc",
+    host: "windows-x64-msvc",
+    backend: "cuda",
+    runner: "blacksmith-16vcpu-windows-2025",
+    cargoFeatures: ["dynamic-backends", "cuda-no-vmm"],
+    module: "ggml-cuda.dll",
+    runtimeLibraries: ["cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll"],
+    // Ship cubins as well as PTX so the first model load does not JIT every kernel.
+    cuda: { toolkitVersion: "12.9", architectures: ["80", "90", "120"] },
+  },
+  {
+    id: "vulkan1-windows-x64-msvc",
+    host: "windows-x64-msvc",
+    backend: "vulkan",
+    runner: "blacksmith-16vcpu-windows-2025",
+    cargoFeatures: ["dynamic-backends", "vulkan"],
+    module: "ggml-vulkan.dll",
+    runtimeLibraries: [],
+    compatibility: { kind: "vulkan", minimumApi: "1.1.0" },
+  },
+  {
     id: "vulkan1-linux-arm64-gnu",
     host: "linux-arm64-gnu",
     backend: "vulkan",
-    runner: "ubuntu-22.04-arm",
+    runner: "blacksmith-16vcpu-ubuntu-2204-arm",
     cargoFeatures: ["dynamic-backends", "vulkan"],
     module: "libggml-vulkan.so",
     runtimeLibraries: [],
@@ -149,7 +176,7 @@ export const backendPacks: readonly BackendPack[] = [
     id: "vulkan1-linux-x64-gnu",
     host: "linux-x64-gnu",
     backend: "vulkan",
-    runner: "ubuntu-22.04",
+    runner: "blacksmith-16vcpu-ubuntu-2204",
     cargoFeatures: ["dynamic-backends", "vulkan"],
     module: "libggml-vulkan.so",
     runtimeLibraries: [],
@@ -175,6 +202,15 @@ export const releaseBuildEnvironment = (
 
 export const cliArchive = (host: HostId) => `magnitude-cli-${host}.tar.gz`
 export const acnArchive = (host: HostId) => `magnitude-acn-${host}.tar.gz`
+export const desktopInstaller = (host: "darwin-arm64" | "darwin-x64") => `magnitude-desktop-${host}.dmg`
+export const desktopUpdateArchive = (host: "darwin-arm64" | "darwin-x64") => `magnitude-desktop-${host}.zip`
+export const windowsDesktopInstaller = (version: string) => `magnitude-desktop-windows-x64-${version}.exe`
+export const linuxDesktopInstaller = (host: "linux-arm64-gnu" | "linux-x64-gnu", format: "deb" | "rpm", version: string, revision: number) => {
+  const packageVersion = version.replace("-", "~")
+  return format === "deb"
+    ? `magnitude-desktop_${packageVersion}-${revision}_${host === "linux-arm64-gnu" ? "arm64" : "amd64"}.deb`
+    : `magnitude-desktop-${packageVersion}-${revision}.${host === "linux-arm64-gnu" ? "aarch64" : "x86_64"}.rpm`
+}
 export const icnBaseArchive = (host: HostId) => `magnitude-icn-base-${host}.tar.gz`
 export const backendArchive = (pack: BackendPack) => `magnitude-icn-${pack.id}.tar.gz`
 

@@ -1,5 +1,5 @@
 import type { ModelCatalogState } from "@magnitudedev/sdk"
-import { makeInstalledCatalogModel, makeCatalogOnlyModel } from "../cli/src/features/local-inference/test-fixtures"
+import { makeInstalledCatalogModel, makeCatalogModel } from "../cli/src/commands/fixtures/inference"
 import { Effect, Fiber, Option, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
 import { awaitPiDevelopmentModel, piDevelopmentArgs, resolvePiDevelopmentExecutable } from "./dev-pi"
@@ -81,7 +81,7 @@ describe("Pi development SDK model readiness", () => {
     let reads = 0
     const installed = makeInstalledCatalogModel()
     const snapshots: ModelCatalogState[] = [
-      { _tag: "Initializing" }, readyCatalog([]), readyCatalog([makeCatalogOnlyModel()]), readyCatalog([installed]),
+      { _tag: "Initializing" }, readyCatalog([]), readyCatalog([makeCatalogModel()]), readyCatalog([installed]),
     ]
     const result = await Effect.runPromise(awaitPiDevelopmentModel(Effect.suspend(() => Effect.succeed(snapshots[reads++]!))))
     expect(result.modelId).toBe(installed.modelId)

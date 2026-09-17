@@ -1,0 +1,36 @@
+{
+  "name": "@magnitudedev/harness-connections",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/service.ts",
+    "./contract": "./src/contract.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bunx --bun vitest run"
+  },
+  "dependencies": {
+    "@effect/platform": "^0.96.1",
+    "@magnitudedev/client-common": "workspace:*",
+    "@magnitudedev/daemon-management": "workspace:*",
+    "@magnitudedev/release": "workspace:*",
+    "@magnitudedev/sdk": "workspace:*",
+    "@magnitudedev/storage": "workspace:*",
+    "@magnitudedev/utils": "workspace:*",
+    "effect": "3.21.2",
+    "jju": "1.4.0",
+    "jsonc-parser": "^3.3.1",
+    "minimatch": "^10.2.4",
+    "semver": "^7.7.3",
+    "smol-toml": "^1.8.0",
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@effect/platform-bun": "^0.90.0",
+    "@types/jju": "^1.4.5",
+    "@types/semver": "^7.7.1",
+    "vitest": "^3.2.4"
+  }
+}

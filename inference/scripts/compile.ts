@@ -3,11 +3,14 @@ import {
   rm,
   stat,
 } from "node:fs/promises"
-import { basename, delimiter, dirname, resolve } from "node:path"
+import { basename, delimiter, dirname, parse, resolve } from "node:path"
+import { createHash } from "node:crypto"
+import { tmpdir } from "node:os"
 import { fileURLToPath } from "node:url"
 import { IcnBinaryIdentity } from "@magnitudedev/icn-protocol"
 import { ICN_EXECUTABLE_NAME } from "@magnitudedev/release/executables"
-import { Schema } from "effect"
+import { Effect, Schema } from "effect"
+import { collectWindowsRuntime } from "../../packages/release/scripts/build/windows-runtime"
 import { getTargetInfo } from "../../scripts/release-target"
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..")
@@ -107,40 +110,51 @@ export const readCargoMessages = async (
   }
 }
 
-const runCargoBuild = async (
+export const runCargoBuild = (
   command: readonly string[],
   options: {
     readonly cwd: string
     readonly env: Readonly<Record<string, string | undefined>>
     readonly diagnostics: "all" | "errors"
   },
-): Promise<readonly CargoMessage[]> => {
-  const child = Bun.spawn([...command], {
+): Promise<readonly CargoMessage[]> => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+  const child = yield* Effect.acquireRelease(Effect.try(() => Bun.spawn([...command], {
     cwd: options.cwd,
     env: options.env,
     stdin: "ignore",
     stdout: "pipe",
-    stderr: options.diagnostics === "all" ? "inherit" : "pipe",
-  })
+    stderr: "pipe",
+  })), child => Effect.promise(async () => { await child[Symbol.asyncDispose]() }))
   const renderedDiagnostics: string[] = []
-  const [code, messages, stderr] = await Promise.all([
+  const [capturedStderr, displayedStderr] = child.stderr.tee()
+  const [code, messages, stderr] = yield* Effect.tryPromise(() => Promise.all([
     child.exited,
-    readCargoMessages(child.stdout, options.diagnostics === "all"
-      ? (rendered) => process.stderr.write(rendered)
-      : (rendered) => renderedDiagnostics.push(rendered)),
-    options.diagnostics === "all"
-      ? Promise.resolve("")
-      : new Response(child.stderr).text(),
-  ])
+    readCargoMessages(child.stdout, rendered => {
+      renderedDiagnostics.push(rendered)
+      if (options.diagnostics === "all") process.stderr.write(rendered)
+    }),
+    new Response(capturedStderr).text(),
+    displayedStderr.pipeTo(new WritableStream({
+      async write(chunk) {
+        if (options.diagnostics === "all") await Bun.write(Bun.stderr, chunk)
+      },
+    })),
+  ]))
   if (code !== 0) {
     const diagnostics = [stderr, ...renderedDiagnostics]
-      .filter((value) => value.trim().length > 0)
+      .filter(value => value.trim().length > 0)
       .join("\n")
       .trim()
-    throw new Error(`${command[0]} failed with exit ${code}${diagnostics.length > 0 ? `: ${diagnostics}` : ""}`)
+    return yield* new CargoBuildFailed({ command: command[0] ?? "cargo", code, diagnostics })
   }
   return messages
-}
+})))
+
+class CargoBuildFailed extends Schema.TaggedError<CargoBuildFailed>()("CargoBuildFailed", {
+  command: Schema.String,
+  code: Schema.Number,
+  diagnostics: Schema.String,
+}) {}
 
 const rustTarget = (target: string): string => {
   const { platform, arch } = getTargetInfo(target)
@@ -156,7 +170,7 @@ const rustTarget = (target: string): string => {
   return value
 }
 
-const nativeRuntimeLinkageEnvironment = (
+const nativeBuildEnvironment = (
   target: string,
 ): Readonly<Record<string, string>> => {
   const { platform } = getTargetInfo(target)
@@ -169,6 +183,15 @@ const nativeRuntimeLinkageEnvironment = (
   if (platform === "darwin") {
     return {
       CMAKE_INSTALL_RPATH: "@loader_path;@loader_path/../runtime",
+    }
+  }
+  if (platform === "windows") {
+    return {
+      // Follow the x64 artifact target even on Windows ARM running x64 tools.
+      CMAKE_SYSTEM_NAME: "Windows",
+      CMAKE_SYSTEM_PROCESSOR: "AMD64",
+      // The fit wrapper uses C++ entry points, as does llama-common's existing Windows build.
+      CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS: "ON",
     }
   }
   return {}
@@ -247,6 +270,8 @@ export interface BuildIcnInput {
   readonly buildEnvironment?: Readonly<Record<string, string>>
   /** Print successful compiler diagnostics, or retain them only for a failed build. */
   readonly diagnostics?: "all" | "errors"
+  /** Explicit redistributable inputs needed to close a Windows accelerator's import graph. */
+  readonly extraRuntimeLibraries?: readonly string[]
 }
 
 export const buildIcnBinary = async ({
@@ -257,13 +282,14 @@ export const buildIcnBinary = async ({
   clean = true,
   buildEnvironment = {},
   diagnostics = "all",
+  extraRuntimeLibraries = [],
 }: BuildIcnInput): Promise<IcnBuild> => {
   const cargoTarget = rustTarget(target)
-  const targetDirectory = resolve(
-    PROJECT_ROOT,
-    "inference/target",
-    `release-${profile}`,
-  )
+  // Cargo and CMake append deeply nested paths; MSVC still fails on long PDB/object paths.
+  const targetDirectory = process.platform === "win32"
+    ? resolve(parse(tmpdir()).root, createHash("sha256")
+      .update(`${tmpdir()}:${PROJECT_ROOT}:${profile}`).digest("hex").slice(0, 8))
+    : resolve(PROJECT_ROOT, "inference/target", `release-${profile}`)
   if (clean) await rm(targetDirectory, { recursive: true, force: true })
 
   const metadata = JSON.parse(await run([
@@ -302,7 +328,7 @@ export const buildIcnBinary = async ({
     env: {
       ...process.env,
       ...buildEnvironment,
-      ...nativeRuntimeLinkageEnvironment(target),
+      ...nativeBuildEnvironment(target),
       CARGO_TARGET_DIR: targetDirectory,
     },
   })
@@ -346,7 +372,20 @@ export const buildIcnBinary = async ({
   const runtimeLibraries = [
     ...installedRuntimeLibraries,
     ...supplementalRuntimeLibraries,
+    ...extraRuntimeLibraries,
   ]
+  if (getTargetInfo(target).platform === "windows") {
+    const redist = process.env.VCToolsRedistDir
+    if (!redist) throw new Error("Windows engine builds require the Visual Studio compiler environment (VCToolsRedistDir)")
+    runtimeLibraries.push(...await Effect.runPromise(collectWindowsRuntime({
+      files: [binary, ...backendModules, ...runtimeLibraries],
+      redistributable: resolve(redist, "x64", "Microsoft.VC143.CRT"),
+      capabilities: [
+        ...(features.some(feature => feature === "cuda" || feature === "cuda-no-vmm") ? ["cuda" as const] : []),
+        ...(features.includes("vulkan") ? ["vulkan" as const] : []),
+      ],
+    })))
+  }
   const identity = await readIdentity(
     binary,
     [...new Set(runtimeLibraries.map(dirname))],

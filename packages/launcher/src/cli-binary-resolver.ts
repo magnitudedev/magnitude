@@ -1,73 +1,61 @@
-import * as CommandExecutor from "@effect/platform/CommandExecutor"
-import * as FileSystem from "@effect/platform/FileSystem"
-import * as HttpClient from "@effect/platform/HttpClient"
-import * as Path from "@effect/platform/Path"
-import { ArchiveExtractor } from "@magnitudedev/release"
-import { ensureBinaryEffect } from "@magnitudedev/release/launcher"
-import { Brand, Context, Effect, Layer, Schema } from "effect"
-import {
-  LauncherInstallationInspector,
-  LauncherPackageNotFound,
-} from "./launcher-installation-inspector"
-
-/** A path to a runnable native CLI binary; minted only by resolver layers. */
-export type ExecutablePath = string & Brand.Brand<"ExecutablePath">
-const ExecutablePath = Brand.nominal<ExecutablePath>()
+import { FileSystem, Path } from "@effect/platform"
+import { Context, Effect, Layer, Option, Schema } from "effect"
 
 export class CliBinaryUnavailable extends Schema.TaggedError<CliBinaryUnavailable>()(
-  "CliBinaryUnavailable",
-  { reason: Schema.String },
+  "CliBinaryUnavailable", { reason: Schema.String },
 ) {}
 
-/**
- * Resolves the installed version to a runnable native CLI binary on disk,
- * acquiring it from the release source when it is not already cached.
- */
-export class CliBinaryResolver extends Context.Tag("launcher/CliBinaryResolver")<
-  CliBinaryResolver, {
-    readonly resolve: Effect.Effect<
-      ExecutablePath,
-      CliBinaryUnavailable | LauncherPackageNotFound
-    >
-  }
->() {}
+export interface DesktopCli {
+  readonly executable: string
+  readonly application: string
+}
 
-export const cliBinaryResolverLayer: Layer.Layer<
-  CliBinaryResolver,
-  never,
-  | LauncherInstallationInspector
-  | CommandExecutor.CommandExecutor
-  | FileSystem.FileSystem
-  | HttpClient.HttpClient
-  | Path.Path
-  | ArchiveExtractor
-> = Layer.effect(CliBinaryResolver, Effect.gen(function* () {
-  const inspector = yield* LauncherInstallationInspector
-  const context = yield* Effect.context<
-    | CommandExecutor.CommandExecutor
-    | FileSystem.FileSystem
-    | HttpClient.HttpClient
-    | Path.Path
-    | ArchiveExtractor
-  >()
+export interface CliBinaryResolver {
+  readonly resolve: Effect.Effect<DesktopCli, CliBinaryUnavailable>
+}
+export const CliBinaryResolver = Context.GenericTag<CliBinaryResolver>("launcher/CliBinaryResolver")
 
-  const resolve = Effect.gen(function* () {
-    const installation = yield* inspector.inspect
-    const binary = yield* ensureBinaryEffect(installation.version).pipe(
-      Effect.provide(context),
-      Effect.mapError((error) => new CliBinaryUnavailable({
-        reason: error instanceof Error ? error.message : String(error),
-      })),
-    )
-    return ExecutablePath(binary)
+export interface DesktopLocation {
+  readonly platform: string
+  readonly home: string
+  readonly application: Option.Option<string>
+  readonly localAppData: Option.Option<string>
+}
+
+/** Only known desktop locations are considered; searching PATH could find this launcher itself. */
+export const cliBinaryResolverLayer = (location: DesktopLocation) => Layer.effect(CliBinaryResolver, Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const path = yield* Path.Path
+  const unavailable = () => new CliBinaryUnavailable({
+    reason: "Magnitude desktop is not installed or its bundled CLI is unavailable. Download and install Magnitude from https://magnitude.dev, then run this command again.",
   })
-
+  const resolve = Effect.gen(function* () {
+    if (!["darwin", "linux", "win32"].includes(location.platform)) return yield* unavailable()
+    const applications = Option.match(location.application, {
+      onSome: application => [application],
+      onNone: () => location.platform === "darwin"
+        ? ["/Applications/Magnitude.app", path.join(location.home, "Applications", "Magnitude.app")]
+        : location.platform === "linux" ? ["/usr/bin/magnitude-desktop"]
+        : Option.match(location.localAppData, {
+          onNone: () => [],
+          onSome: directory => [path.join(directory, "Programs", "Magnitude", "Magnitude.exe")],
+        }),
+    })
+    for (const application of applications) {
+      if (!path.isAbsolute(application)) continue
+      const executable = location.platform === "darwin"
+        ? path.join(application, "Contents", "Resources", "magnitude")
+        : location.platform === "linux" && application === "/usr/bin/magnitude-desktop"
+        ? "/usr/lib/magnitude-desktop/resources/magnitude"
+        : path.join(path.dirname(application), "resources", location.platform === "win32" ? "magnitude.exe" : "magnitude")
+      const appExecutable = location.platform === "darwin" ? path.join(application, "Contents", "MacOS", "Magnitude") : application
+      const usable = yield* Effect.forEach([appExecutable, executable], file => fs.stat(file).pipe(
+        Effect.flatMap(info => info.type === "File" && (location.platform === "win32" || (info.mode & 0o111) !== 0) ? fs.access(file).pipe(Effect.as(true)) : Effect.succeed(false)),
+        Effect.catchAll(() => Effect.succeed(false)),
+      ))
+      if (usable.every(Boolean)) return { application, executable }
+    }
+    return yield* unavailable()
+  })
   return { resolve }
 }))
-
-/** Dev mode: use a locally built native CLI binary instead of acquiring one. */
-export const cliBinaryResolverPinnedLayer = (
-  binary: string,
-): Layer.Layer<CliBinaryResolver> => Layer.succeed(CliBinaryResolver, {
-  resolve: Effect.succeed(ExecutablePath(binary)),
-})

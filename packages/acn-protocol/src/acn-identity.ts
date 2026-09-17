@@ -10,10 +10,7 @@ export const AcnInstanceIdSchema = Schema.NonEmptyString.pipe(
 )
 export type AcnInstanceId = typeof AcnInstanceIdSchema.Type
 
-export const ProcessStartIdentitySchema = Schema.NonEmptyString.pipe(
-  Schema.brand("ProcessStartIdentity"),
-)
-export type ProcessStartIdentity = typeof ProcessStartIdentitySchema.Type
+export { ProcessStartIdentitySchema, type ProcessStartIdentity } from "@magnitudedev/utils/process-groups"
 
 export type AcnIdentityComparison = -1 | 0 | 1
 

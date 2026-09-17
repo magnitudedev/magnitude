@@ -1,6 +1,6 @@
 ---
 applies_to:
-  - cli/src/index.tsx
+  - cli/src/index.ts
   - cli/src/commands/docs.ts
   - cli/src/agent-docs/**
   - cli/src/types/text-imports.d.ts
@@ -20,28 +20,11 @@ The topic corpus is distinct from the public documentation site and from interna
 documents. Its Markdown is bundled into the compiled CLI executable. The leader prompt advertises
 the lookup mechanism without adding topic contents or the topic list to every context.
 
-The installed Magnitude skill is a small, stable entrypoint into this directory. It routes
-agent-guided setup to the `onboarding` topic, which owns the current CLI sequence, interpretation of
-machine-specific catalog evidence, user model-selection conversation, progress observation, and
-harness connection behavior. Keeping the procedure in the CLI documentation corpus lets a refreshed
-CLI provide current guidance without requiring an already-installed skill copy to duplicate it.
-
-The onboarding topic begins with an explicit conversational contract: agents briefly explain major
-actions, narrate meaningful progress, communicate choices and tradeoffs clearly, and welcome user
-questions throughout the process. It directs Magnitude-specific questions to the bundled topic
-directory first. It distinguishes service registration from first startup, model
-acquisition from model loading, and persistent harness selection from the already-running session.
-It gives agents adaptive polling guidance that balances estimated operation duration with meaningful
-user updates, waits for the catalog's authoritative discovery and assessment completion states,
-starts model selection with balanced recommendations, uses Faster and Smarter for ordinary
-directional requests, and reserves Fastest and Smartest for clearly requested extremes after
-explaining what the opposing signal gives up. It names every supported harness ID and its
-harness-specific handoff. Magnitude selection is automatic, Pi exposes the supported
-current-process switching path, and every other external harness requires exiting the running
-process with Ctrl+C and relaunching from the printed command. Persistent harness model choice is
-communicated as selecting a model, not setting a default. Guidance defines outcomes and decision
-boundaries without scripting exact user-facing sentences. The procedure must not claim completion
-signals or side effects that the non-interactive CLI does not expose.
+The installed Magnitude skill is a small, stable entrypoint into this directory. It documents
+headless operation and directs first-time onboarding to the desktop application. There is no
+parallel CLI onboarding procedure or built-in Magnitude harness. Agents may perform explicit
+model and connection operations through the documented commands; documentation does not create
+another interactive product flow.
 
 The `speculative-methods` topic owns the self-contained user-facing explanation of the acceleration
 methods reported by Magnitude. It defines their practical typical ordering, explains the mechanism
