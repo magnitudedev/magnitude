@@ -54,13 +54,13 @@ export const uploadReleaseAssets = (options: {
     error instanceof UploadTransportError ||
     (error instanceof UploadHttpError && (error.status >= 500 || error.status === 422))
 
-  const request = (url: string, init: RequestInit = {}) => Effect.gen(function* () {
+  const request = (url: string, init: RequestInit = {}, timeoutMs = 60_000) => Effect.gen(function* () {
     const result = yield* Effect.tryPromise({
       try: async () => {
         const response = await fetch(url, {
           ...init,
           headers: { ...headers, ...init.headers },
-          signal: AbortSignal.timeout(init.method === "POST" ? 30 * 60_000 : 60_000),
+          signal: AbortSignal.timeout(timeoutMs),
         })
         return {
           ok: response.ok,
@@ -121,11 +121,14 @@ export const uploadReleaseAssets = (options: {
       }
       yield* Console.log(`Uploading ${file.name} (${file.bytes} bytes), attempt ${attempt}/4`)
       const started = yield* Effect.clockWith(clock => clock.currentTimeMillis)
+      // Allow a minute of overhead plus one second per MiB, with a two-minute floor.
+      // Small stalled uploads must not consume the old thirty-minute timeout per attempt.
+      const timeoutMs = Math.max(120_000, 60_000 + Math.ceil(file.bytes / 1_048_576) * 1_000)
       yield* request(`${options.uploadUrl}?name=${encodeURIComponent(file.name)}`, {
         method: "POST",
         headers: { "content-type": "application/octet-stream" },
         body: Bun.file(file.path),
-      })
+      }, timeoutMs)
       const finished = yield* Effect.clockWith(clock => clock.currentTimeMillis)
       yield* Console.log(`Uploaded ${file.name} in ${finished - started}ms`)
     }).pipe(
