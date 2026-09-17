@@ -34,7 +34,7 @@ system symlinks.
 
 ## Shipped artifact contract
 
-Each CUDA pack declares only facts needed for current PTX-only artifacts:
+Each CUDA pack derives its compatibility floor from retained PTX images:
 
 - exact toolkit release and compiler identity;
 - every embedded PTX image's `.version`, numeric target, and whether the target is ordinary or
@@ -46,8 +46,8 @@ publishes the inspected result as artifact truth. The configured architecture li
 compiler input and is not duplicated as a second compatibility declaration. An unknown PTX version
 has no implicit driver floor and fails publication.
 
-Cubins and additional target relations are not part of this contract until Magnitude actually
-ships them.
+Native cubins optimize execution without introducing another advertised compatibility floor;
+selection remains conservative against the retained PTX contract.
 
 ## Build matrix
 
@@ -60,7 +60,14 @@ Linux x64 and ARM64 build the same two compiler configurations independently:
 
 These four host/toolkit jobs run concurrently on Ubuntu 22.04 for both x64 and SBSA ARM64 so every
 Linux pack retains the release userspace ABI baseline. Host CPU architecture never selects a CUDA
-toolkit generation.
+toolkit generation. Windows x64 independently builds CUDA 12.9 with the same PTX targets as the
+Linux 12.9 packs, using the native MSVC toolchain and shipping the required NVIDIA runtime DLLs.
+The Windows pack also emits native cubins for those compiler targets to avoid lengthy first-load
+JIT compilation. Retained PTX preserves forward compatibility; the advertised driver floor remains
+the inspected PTX floor, including when a native cubin can execute on the host.
+CUDA graphs are disabled at build time in the Windows pack because graph capture stalled during
+Windows GPU validation. Ordinary CUDA execution is the supported Windows path; users do not need
+an environment-variable workaround.
 
 Release compatibility inspection consumes `cuobjdump` output as a stream and retains only the
 distinct PTX image facts. Its memory use must not scale with the textual PTX dump.

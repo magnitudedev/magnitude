@@ -39,7 +39,7 @@ These responsibilities do not overlap.
 
 ## Backend composition
 
-Apple arm64 selects Metal. Linux considers compatible CUDA, then compatible Vulkan, then CPU only
+Apple arm64 selects Metal. Linux and Windows consider compatible CUDA, then compatible Vulkan, then CPU only
 when successful capability probes show that no supported accelerator is usable.
 
 Authentication, acquisition, capability probing, ABI validation, module loading, and device

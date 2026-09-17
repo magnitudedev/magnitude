@@ -129,7 +129,6 @@ const cudaBackendPacks: readonly BackendPack[] = cudaHosts.flatMap(({ host, runn
     cuda,
   })))
 
-// Windows currently ships the CPU base; accelerator packs remain host-specific.
 export const backendPacks: readonly BackendPack[] = [
   {
     id: "metal-darwin-arm64",
@@ -142,6 +141,27 @@ export const backendPacks: readonly BackendPack[] = [
     compatibility: { kind: "metal" },
   },
   ...cudaBackendPacks,
+  {
+    id: "cuda-12.9-windows-x64-msvc",
+    host: "windows-x64-msvc",
+    backend: "cuda",
+    runner: "blacksmith-16vcpu-windows-2025",
+    cargoFeatures: ["dynamic-backends", "cuda-no-vmm"],
+    module: "ggml-cuda.dll",
+    runtimeLibraries: ["cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll"],
+    // Ship cubins as well as PTX so the first model load does not JIT every kernel.
+    cuda: { toolkitVersion: "12.9", architectures: ["80", "90", "120"] },
+  },
+  {
+    id: "vulkan1-windows-x64-msvc",
+    host: "windows-x64-msvc",
+    backend: "vulkan",
+    runner: "blacksmith-16vcpu-windows-2025",
+    cargoFeatures: ["dynamic-backends", "vulkan"],
+    module: "ggml-vulkan.dll",
+    runtimeLibraries: [],
+    compatibility: { kind: "vulkan", minimumApi: "1.1.0" },
+  },
   {
     id: "vulkan1-linux-arm64-gnu",
     host: "linux-arm64-gnu",
