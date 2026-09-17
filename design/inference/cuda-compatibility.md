@@ -65,6 +65,9 @@ Linux 12.9 packs, using the native MSVC toolchain and shipping the required NVID
 The Windows pack also emits native cubins for those compiler targets to avoid lengthy first-load
 JIT compilation. Retained PTX preserves forward compatibility; the advertised driver floor remains
 the inspected PTX floor, including when a native cubin can execute on the host.
+CUDA graphs are disabled at build time in the Windows pack because graph capture stalled during
+Windows GPU validation. Ordinary CUDA execution is the supported Windows path; users do not need
+an environment-variable workaround.
 
 Release compatibility inspection consumes `cuobjdump` output as a stream and retains only the
 distinct PTX image facts. Its memory use must not scale with the textual PTX dump.

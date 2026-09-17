@@ -3,6 +3,7 @@ import { runAppleBuild } from "../apple/compile-bun"
 import { notarizeAppleUnit, writeAppleReceipt } from "../apple/distribution"
 import { access, mkdir, rm } from "node:fs/promises"
 import { basename, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
 import { Effect, Option } from "effect"
 import { BunContext } from "@effect/platform-bun"
 import { signWindowsCode } from "./windows-signing"
@@ -74,6 +75,9 @@ export const buildBackendArtifact = async (
       ...(pack.backend === "cuda"
         ? {
           CMAKE_CUDA_ARCHITECTURES: pack.cuda.architectures.join(";"),
+          ...(host.id === "windows-x64-msvc" ? {
+            CMAKE_PROJECT_TOP_LEVEL_INCLUDES: fileURLToPath(new URL("./windows-cuda.cmake", import.meta.url)).replaceAll("\\", "/"),
+          } : {}),
         }
         : {}),
     },
