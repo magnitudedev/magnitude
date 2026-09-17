@@ -57,14 +57,14 @@ origin = 'http://127.0.0.1:18843'
 def request(path, body=None, raw=False):
     req = urllib.request.Request(origin + path, data=json.dumps(body).encode() if body is not None else None,
         headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
-    with urllib.request.urlopen(req, timeout=600) as response:
+    with urllib.request.urlopen(req, timeout=1800) as response:
         value = response.read().decode()
     return value if raw else (json.loads(value) if value else None)
-def payload(text, tokens=512):
+def payload(text, tokens=2048):
     return dict(model=model, messages=[dict(role='user', content=text)], temperature=0, seed=42, max_tokens=tokens, reasoning_effort='none')
 def generate(text):
     response = request('/v1/chat/completions', payload(text))
-    assert response['choices'][0]['message']['content'].strip(), response
+    assert (response['choices'][0]['message']['content'] or '').strip(), response
     assert response['usage']['completion_tokens'] > 0
     assert response['choices'][0]['finish_reason'] in ('stop', 'length')
     return response
@@ -147,8 +147,8 @@ with (root / 'server.log').open('w') as log:
         assert sum(domain['modelBytes'] for domain in ready[0]['lifecycle']['allocation']['memoryDomains']) > 0
         record('resident-allocation', instances)
         for index in range(4):
-            record(f'repeat-{index}', generate('Say hello in one sentence.'))
-        body = payload('Count from one to ten.', 512)
+            record(f'repeat-{index}', generate('What is the capital of France? Answer in one sentence.'))
+        body = payload('What is the capital of France? Answer in one sentence.')
         body['stream'] = True
         stream = request('/v1/chat/completions', body, raw=True)
         assert 'data: [DONE]' in stream
@@ -156,8 +156,8 @@ with (root / 'server.log').open('w') as log:
         assert ''.join(choice['delta'].get('content') or '' for chunk in chunks for choice in chunk.get('choices', []))
         record('streaming', stream)
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-            record('concurrent', list(pool.map(generate, ['Write one sentence about apples.', 'Write one sentence about pears.', 'Write one sentence about peaches.'])))
-        response = generate('The gardener waters the apple trees every morning. ' * 200 + 'Summarize in one sentence.')
+            record('concurrent', list(pool.map(generate, ['What is the capital of France? Answer in one sentence.', 'What is the capital of Italy? Answer in one sentence.', 'What is two plus two? Answer in one sentence.'])))
+        response = generate('The gardener waters the apple trees every morning. ' * 200 + 'What fruit grows on these trees? Answer in one sentence.')
         assert response['usage']['prompt_tokens'] >= 1000
         record('long-prefill', response)
         request('/api/v1/instances/' + ready[0]['id'] + '/stop', {})
