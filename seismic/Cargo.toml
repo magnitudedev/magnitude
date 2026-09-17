@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/seismic-lang", "crates/seismic-model", "crates/seismic-metal", "crates/seismic-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+seismic-lang = { path = "crates/seismic-lang" }
+seismic-metal = { path = "crates/seismic-metal" }
+seismic-model = { path = "crates/seismic-model" }

@@ -1,0 +1,13 @@
+# SwiGLU gate and up projections of one activation row over packed weights, sharing the
+# activation stream: out = silu(x·gate) * (x·up).
+fn gated_projection[N, K](x: tensor[1, K] bf16, gate: tensor[N, K] q4g64, up: tensor[N, K] q4g64, out: tensor[1, N] bf16):
+  for col in parallel:
+    g = tile[1, 1] f32
+    u = tile[1, 1] f32
+    for i, j in owned(g): g[i, j] = 0.0; u[i, j] = 0.0
+    for xt, gt, ut in load((x, gate[col : col + 1], up[col : col + 1]), over=1):
+      matmul(xt, gt, g)
+      matmul(xt, ut, u)
+    y = tile[1, 1] f32
+    for i, j in owned(y): y[i, j] = g[i, j] / (1.0 + exp(-g[i, j])) * u[i, j]
+    store(y, out[0 : 1, col : col + 1])

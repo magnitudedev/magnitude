@@ -1,0 +1,10 @@
+# One activation row against a packed weight matrix, added to a residual row.
+fn projection_add[N, K](x: tensor[1, K] bf16, w: tensor[N, K] q4g64, residual: tensor[1, N] bf16, out: tensor[1, N] bf16):
+  for col in parallel:
+    acc = tile[1, 1] f32
+    for i, j in owned(acc): acc[i, j] = 0.0
+    for xt, wt in load((x, w[col : col + 1]), over=1):
+      matmul(xt, wt, acc)
+    y = tile[1, 1] f32
+    for i, j in owned(y): y[i, j] = acc[i, j] + f32(residual[0, col])
+    store(y, out[0 : 1, col : col + 1])

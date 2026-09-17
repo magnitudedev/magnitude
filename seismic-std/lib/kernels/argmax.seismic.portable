@@ -1,0 +1,18 @@
+# Index of the largest value of a row, in two phases: block winners, then the winner of
+# winners. Ties go to the smaller index.
+fn argmax_row[V, B](x: tensor[1, V] f32, values: tensor[V / B] f32, indices: tensor[V / B] i32, out: tensor[1] i32):
+  for b in parallel:
+    t = load(x[0, b * B : (b + 1) * B])
+    best = reduce(t, 0, argmax)
+    val = tile[1] f32
+    idx = tile[1] i32
+    for i in owned(val): val[i] = t[best]; idx[i] = best + b * B
+    store(val, values[b : b + 1])
+    store(idx, indices[b : b + 1])
+  for one in parallel:
+    vs = load(values)
+    is = load(indices)
+    w = reduce(vs, 0, argmax)
+    r = tile[1] i32
+    for i in owned(r): r[i] = is[w]
+    store(r, out[one : one + 1])

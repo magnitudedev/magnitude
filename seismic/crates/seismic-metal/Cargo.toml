@@ -1,0 +1,11 @@
+[package]
+name = "seismic-metal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSError", "NSArray", "NSObject", "NSRange"] }
+objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLLibrary", "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder", "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLBuffer", "MTLResource", "MTLTypes", "MTLAllocation", "MTLPipeline", "MTLDrawable", "MTLCounters"] }
+seismic-lang.workspace = true

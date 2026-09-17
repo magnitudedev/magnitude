@@ -1,0 +1,32 @@
+# Streaming causal attention over grouped query heads. Q query rows attend to a history of
+# T positions; H query heads share KV key-value heads, H / KV per group. visible[q] is the
+# [start, end) of the history query row q may read. The history is streamed in pieces the
+# model sizes, with the running maximum and denominator carried across them, so no partial
+# results and no merge phase appear in the text.
+fn attention[Q, T, H, KV, W](q: tensor[Q, H, W] bf16, k: tensor[T, KV, W] bf16, v: tensor[T, KV, W] bf16,
+                             visible: tensor[Q, 2] i32, out: tensor[Q, H, W] bf16, scale: f32):
+  for row, kv_head in parallel:
+    qt = load(q[row, kv_head * (H / KV) : (kv_head + 1) * (H / KV)])
+    m = tile[H / KV] f32
+    l = tile[H / KV] f32
+    acc = tile[H / KV, W] f32
+    for i in owned(m): m[i] = -inf; l[i] = 0.0
+    for i, j in owned(acc): acc[i, j] = 0.0
+    for kt, vt in load((k, v)[visible[row, 0] : visible[row, 1], kv_head], over=0):
+      s = tile[H / KV, extent(kt, 0)] f32
+      for i, j in owned(s): s[i, j] = 0.0
+      matmul(qt, kt, s)
+      rowmax = reduce(s, 1, max)
+      m2 = tile[H / KV] f32
+      for i in owned(m2): m2[i] = max(m[i], rowmax[i] * scale)
+      for i, j in owned(s): s[i, j] = exp(s[i, j] * scale - m2[i])
+      a = tile[H / KV] f32
+      for i in owned(a): a[i] = exp(m[i] - m2[i])
+      rowsum = reduce(s, 1, sum)
+      for i in owned(l): l[i] = fma(l[i], a[i], rowsum[i])
+      for i, j in owned(acc): acc[i, j] = acc[i, j] * a[i]
+      matmul(s, vt.T, acc)
+      m = m2
+    y = tile[H / KV, W] f32
+    for i, j in owned(y): y[i, j] = acc[i, j] / l[i]
+    store(y, out[row, kv_head * (H / KV) : (kv_head + 1) * (H / KV)])

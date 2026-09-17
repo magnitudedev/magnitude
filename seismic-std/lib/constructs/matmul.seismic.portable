@@ -1,0 +1,7 @@
+# Contraction over the last axis of both operands: acc[i, j] += sum_k A[i, k] * B[j, k].
+# B is [N, K] so a packed weight matrix, which packs along K, is consumed without a transpose.
+# The reduction over K is reassociable.
+construct matmul[M, N, K](A: tile[M, K] T, B: tile[N, K] U, acc: tile[M, N] f32):
+  for i, j in owned(acc):
+    for k in range(K):
+      acc[i, j] = fma(A[i, k], B[j, k], acc[i, j])

@@ -1,0 +1,7 @@
+# One packed embedding row, decoded to the activation dtype.
+fn embedding[V, K](table: tensor[V, K] q4g64, token: index[V], out: tensor[1, K] bf16):
+  for c in parallel:
+    t = load(table[token, c * 64 : (c + 1) * 64])
+    y = tile[64] f32
+    for i in owned(y): y[i] = t[i]
+    store(y, out[0, c * 64 : (c + 1) * 64])

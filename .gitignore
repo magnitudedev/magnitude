@@ -40,3 +40,12 @@ packages/launcher/bin/magnitude.js
 packages/acn-protocol/src/rpc-version.ts
 
 .humanlayer/tasks/
+
+# Seismic toolchain and standard library build output
+seismic/target/
+seismic/**/target/
+seismic-std/target/
+seismic-std/**/target/
+# Seismic tuning cache and device binaries
+.seismic-cache/
+seismic-qwen35/**/target/
