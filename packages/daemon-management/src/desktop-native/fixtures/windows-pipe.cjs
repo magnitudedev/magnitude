@@ -141,6 +141,8 @@ const readExactly = async (pipe, size) => {
       while (!text.includes('\n')) text += (await native.readPrivatePipe(output.pipe)).toString();
       assert.deepEqual(JSON.parse(text), { pid: identity.pid, argument, empty: "", unicode: "模型🙂" });
       native.terminateOwnedProcess(owned);
+      // Root exit and job retirement are separate native observations.
+      while (native.ownedProcessExit(owned) === null) await new Promise(resolve => setTimeout(resolve, 10));
       while (native.ownedProcessActiveCount(owned) !== 0) await new Promise(resolve => setTimeout(resolve, 10));
       assert.equal(native.ownedProcessExit(owned), 1);
       assert.deepEqual(native.ownedProcessIdentity(owned), identity);
