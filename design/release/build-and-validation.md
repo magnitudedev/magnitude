@@ -73,7 +73,7 @@ release target; an installer extension or matching checksum alone is insufficien
 
 ## Windows build baseline
 
-Windows CPU artifacts target x64 MSVC. CMake receives that target explicitly, including when the
+Windows CPU and accelerator artifacts target x64 MSVC. CMake receives that target explicitly, including when the
 build tools run under x64 emulation on Windows ARM; the build machine's processor must not select
 ARM backend variants for an x64 artifact. Desktop, service, and installer builds share the native
 host toolchain discovery. The Node import library is verified against the selected Node release's
@@ -84,6 +84,12 @@ Build validation resolves imports only against the owned payload, the selected t
 redistributable, and Windows system libraries/API sets. An ambient developer PATH or installed VC
 redistributable cannot satisfy a missing package dependency. Redistributable DLL imports are checked
 recursively; the resulting files use the existing installation-owned runtime directory.
+Backend builds initialize the same native compiler environment as host builds and use Ninja.
+CUDA pack dependencies are resolved from explicitly selected toolkit DLLs; Vulkan and CUDA driver
+libraries are capability-owned only for their respective accelerator compositions. Magnitude-built
+backend DLLs are signed before archiving; vendor runtime DLLs retain their vendor signatures.
+A manually dispatched Windows-backend-only check builds the same accelerator archives without
+publishing or claiming full candidate acceptance.
 An independent Windows consumer extracts and runs the final archives, checks their metadata,
 and exercises engine readiness and parent-loss shutdown before candidate assembly can pass.
 Production Windows packaging uses Artifact Signing with an explicit publisher identity. Owned code,

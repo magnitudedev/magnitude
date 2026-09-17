@@ -29,10 +29,17 @@ export const windowsSystemLibrary = (name: string): boolean => {
 export const windowsImportedLibraries = (report: string): readonly string[] =>
   [...new Set([...report.matchAll(/^\s+([\w.-]+\.dll)\s*$/gim)].map(match => match[1]!.toLowerCase()))]
 
+export type WindowsCapability = "cuda" | "vulkan"
+
+export const windowsCapabilityLibrary = (name: string, capabilities: readonly WindowsCapability[]): boolean =>
+  (name.toLowerCase() === "nvcuda.dll" && capabilities.includes("cuda")) ||
+  (name.toLowerCase() === "vulkan-1.dll" && capabilities.includes("vulkan"))
+
 /** Close the native import graph using only owned files, the selected MSVC CRT, and Windows. */
 export const collectWindowsRuntime = (input: {
   readonly files: readonly string[]
   readonly redistributable: string
+  readonly capabilities?: readonly WindowsCapability[]
 }) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const available = new Map<string, string>()
@@ -53,7 +60,7 @@ export const collectWindowsRuntime = (input: {
     const imports = windowsImportedLibraries(report)
     if (imports.length === 0) return yield* new WindowsRuntimeInvalid({ message: `No Windows imports reported for ${file}` })
     for (const dependency of imports) {
-      if (owned.has(dependency) || windowsSystemLibrary(dependency)) continue
+      if (owned.has(dependency) || windowsSystemLibrary(dependency) || windowsCapabilityLibrary(dependency, input.capabilities ?? [])) continue
       const source = available.get(dependency)
       if (!source) return yield* new WindowsRuntimeInvalid({ message: `${basename(file)} requires unbundled Windows library ${dependency}` })
       owned.set(dependency, source)

@@ -3,7 +3,9 @@ import { runAppleBuild } from "../apple/compile-bun"
 import { notarizeAppleUnit, writeAppleReceipt } from "../apple/distribution"
 import { access, mkdir, rm } from "node:fs/promises"
 import { basename, resolve } from "node:path"
-import { Option } from "effect"
+import { Effect, Option } from "effect"
+import { BunContext } from "@effect/platform-bun"
+import { signWindowsCode } from "./windows-signing"
 import {
   backendArchive,
   backendPacks,
@@ -64,6 +66,9 @@ export const buildBackendArtifact = async (
     target: host.bunTarget,
     profile: `backend-${pack.id}`,
     features: pack.cargoFeatures,
+    extraRuntimeLibraries: host.id === "windows-x64-msvc"
+      ? await Promise.all(pack.runtimeLibraries.map(name => resolveRuntimeLibrary(name, [])))
+      : [],
     buildEnvironment: {
       ...releaseBuildEnvironment(host),
       ...(pack.backend === "cuda"
@@ -101,6 +106,11 @@ export const buildBackendArtifact = async (
     for (const file of [...modules, ...runtime]) {
       await runAppleBuild(signAppleCode(file, `dev.magnitude.inference.${basename(file)}`, "library"))
     }
+  }
+  if (host.id === "windows-x64-msvc") {
+    await Effect.runPromise(Effect.forEach(modules, signWindowsCode, { discard: true }).pipe(
+      Effect.provide(BunContext.layer),
+    ))
   }
   const sources: ArchiveSource[] = [
     ...modules.map((source) => ({

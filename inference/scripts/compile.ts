@@ -268,6 +268,8 @@ export interface BuildIcnInput {
   readonly buildEnvironment?: Readonly<Record<string, string>>
   /** Print successful compiler diagnostics, or retain them only for a failed build. */
   readonly diagnostics?: "all" | "errors"
+  /** Explicit redistributable inputs needed to close a Windows accelerator's import graph. */
+  readonly extraRuntimeLibraries?: readonly string[]
 }
 
 export const buildIcnBinary = async ({
@@ -278,6 +280,7 @@ export const buildIcnBinary = async ({
   clean = true,
   buildEnvironment = {},
   diagnostics = "all",
+  extraRuntimeLibraries = [],
 }: BuildIcnInput): Promise<IcnBuild> => {
   const cargoTarget = rustTarget(target)
   const targetDirectory = resolve(
@@ -367,6 +370,7 @@ export const buildIcnBinary = async ({
   const runtimeLibraries = [
     ...installedRuntimeLibraries,
     ...supplementalRuntimeLibraries,
+    ...extraRuntimeLibraries,
   ]
   if (getTargetInfo(target).platform === "windows") {
     const redist = process.env.VCToolsRedistDir
@@ -374,6 +378,10 @@ export const buildIcnBinary = async ({
     runtimeLibraries.push(...await Effect.runPromise(collectWindowsRuntime({
       files: [binary, ...backendModules, ...runtimeLibraries],
       redistributable: resolve(redist, "x64", "Microsoft.VC143.CRT"),
+      capabilities: [
+        ...(features.some(feature => feature === "cuda" || feature === "cuda-no-vmm") ? ["cuda" as const] : []),
+        ...(features.includes("vulkan") ? ["vulkan" as const] : []),
+      ],
     })))
   }
   const identity = await readIdentity(
