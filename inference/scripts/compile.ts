@@ -3,7 +3,9 @@ import {
   rm,
   stat,
 } from "node:fs/promises"
-import { basename, delimiter, dirname, resolve } from "node:path"
+import { basename, delimiter, dirname, parse, resolve } from "node:path"
+import { createHash } from "node:crypto"
+import { tmpdir } from "node:os"
 import { fileURLToPath } from "node:url"
 import { IcnBinaryIdentity } from "@magnitudedev/icn-protocol"
 import { ICN_EXECUTABLE_NAME } from "@magnitudedev/release/executables"
@@ -268,6 +270,8 @@ export interface BuildIcnInput {
   readonly buildEnvironment?: Readonly<Record<string, string>>
   /** Print successful compiler diagnostics, or retain them only for a failed build. */
   readonly diagnostics?: "all" | "errors"
+  /** Explicit redistributable inputs needed to close a Windows accelerator's import graph. */
+  readonly extraRuntimeLibraries?: readonly string[]
 }
 
 export const buildIcnBinary = async ({
@@ -278,13 +282,14 @@ export const buildIcnBinary = async ({
   clean = true,
   buildEnvironment = {},
   diagnostics = "all",
+  extraRuntimeLibraries = [],
 }: BuildIcnInput): Promise<IcnBuild> => {
   const cargoTarget = rustTarget(target)
-  const targetDirectory = resolve(
-    PROJECT_ROOT,
-    "inference/target",
-    `release-${profile}`,
-  )
+  // Cargo and CMake append deeply nested paths; MSVC still fails on long PDB/object paths.
+  const targetDirectory = process.platform === "win32"
+    ? resolve(parse(tmpdir()).root, createHash("sha256")
+      .update(`${tmpdir()}:${PROJECT_ROOT}:${profile}`).digest("hex").slice(0, 8))
+    : resolve(PROJECT_ROOT, "inference/target", `release-${profile}`)
   if (clean) await rm(targetDirectory, { recursive: true, force: true })
 
   const metadata = JSON.parse(await run([
@@ -367,6 +372,7 @@ export const buildIcnBinary = async ({
   const runtimeLibraries = [
     ...installedRuntimeLibraries,
     ...supplementalRuntimeLibraries,
+    ...extraRuntimeLibraries,
   ]
   if (getTargetInfo(target).platform === "windows") {
     const redist = process.env.VCToolsRedistDir
@@ -374,6 +380,10 @@ export const buildIcnBinary = async ({
     runtimeLibraries.push(...await Effect.runPromise(collectWindowsRuntime({
       files: [binary, ...backendModules, ...runtimeLibraries],
       redistributable: resolve(redist, "x64", "Microsoft.VC143.CRT"),
+      capabilities: [
+        ...(features.some(feature => feature === "cuda" || feature === "cuda-no-vmm") ? ["cuda" as const] : []),
+        ...(features.includes("vulkan") ? ["vulkan" as const] : []),
+      ],
     })))
   }
   const identity = await readIdentity(

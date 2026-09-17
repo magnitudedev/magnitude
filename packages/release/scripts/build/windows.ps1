@@ -5,14 +5,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-# Keep compiler discovery shared with the desktop native addon and installer helper.
-. (Join-Path $PSScriptRoot '../../../daemon-management/scripts/windows-toolchain.ps1')
-$cmakeRoot = Join-Path $env:VSINSTALLDIR 'Common7\IDE\CommonExtensions\Microsoft\CMake'
-$clang = Join-Path $env:VSINSTALLDIR 'VC\Tools\Llvm\x64\bin\libclang.dll'
-if (!(Test-Path -LiteralPath $clang)) { throw 'Visual Studio x64 Clang tools are required for Rust bindings.' }
-$env:LIBCLANG_PATH = Split-Path $clang
-$env:CMAKE_GENERATOR = 'Ninja'
-$env:PATH = "$(Join-Path $cmakeRoot 'CMake\bin');$(Join-Path $cmakeRoot 'Ninja');${env:ProgramFiles(x86)}\NSIS;$env:PATH"
+. (Join-Path $PSScriptRoot 'windows-engine-toolchain.ps1')
+$env:PATH = "${env:ProgramFiles(x86)}\NSIS;$env:PATH"
 foreach ($tool in @('cmake.exe', 'ninja.exe', 'makensis.exe', 'pwsh.exe', 'node.exe', 'bun.exe', 'cargo.exe')) {
   Get-Command $tool -ErrorAction Stop | Out-Null
 }
