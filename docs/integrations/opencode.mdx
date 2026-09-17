@@ -1,0 +1,47 @@
+---
+title: "OpenCode"
+description: "Connect OpenCode to your downloaded Magnitude models."
+---
+
+## Connect
+
+1. [Install OpenCode](https://opencode.ai/docs/#install) if needed.
+2. Download a compatible model in Magnitude.
+3. Open **Connections → OpenCode** and click **Connect**.
+4. Open or restart OpenCode and choose your Magnitude model.
+
+Choose a Magnitude model in OpenCode’s model selector. If you use JSONC or an explicit OpenCode config, check the configuration paths shown in Connections: OpenCode can merge more than one file.
+
+## Select a model from the terminal
+
+To configure the connection and select a specific downloaded model, first find its exact ID:
+
+```sh
+magnitude models status
+magnitude connections add opencode --set-model "MODEL_ID"
+```
+
+Replace `MODEL_ID` with the ID from the first command, not the friendly display name. Restart the agent after changing its configuration.
+
+## Configuration
+
+Default configuration files:
+
+- `~/.config/opencode/opencode.json`
+
+On Windows, `~` means your user profile directory.
+
+Supported location overrides: `OPENCODE_CONFIG`, `XDG_CONFIG_HOME`. The paths displayed in Connections show which files Magnitude is actually checking.
+
+## Repair or disconnect
+
+If Connections shows **Connection needs repair**, click **Repair connection**. To stop using the integration, click **Disconnect**, then restart the agent.
+
+Terminal equivalents:
+
+```sh
+magnitude connections sync opencode
+magnitude connections remove opencode
+```
+
+See [connection states](/integrations/overview#connection-states) if the agent is not detected or its configuration cannot be verified.

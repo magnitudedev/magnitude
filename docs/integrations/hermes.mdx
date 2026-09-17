@@ -1,0 +1,47 @@
+---
+title: "Hermes"
+description: "Connect Hermes to your downloaded Magnitude models."
+---
+
+## Connect
+
+1. [Install Hermes](https://hermes-agent.nousresearch.com/docs/getting-started/installation/) if needed.
+2. Download a compatible model in Magnitude.
+3. Open **Connections → Hermes** and click **Connect**.
+4. Open or restart Hermes and choose your Magnitude model.
+
+Magnitude adds a custom provider named `magnitude`. You can select a model explicitly with the CLI example below before restarting Hermes.
+
+## Select a model from the terminal
+
+To configure the connection and select a specific downloaded model, first find its exact ID:
+
+```sh
+magnitude models status
+magnitude connections add hermes --set-model "MODEL_ID"
+```
+
+Replace `MODEL_ID` with the ID from the first command, not the friendly display name. Restart the agent after changing its configuration.
+
+## Configuration
+
+Default configuration files:
+
+- `~/.hermes/config.yaml`
+
+On Windows, `~` means your user profile directory.
+
+Supported location overrides: `HERMES_HOME`. The paths displayed in Connections show which files Magnitude is actually checking.
+
+## Repair or disconnect
+
+If Connections shows **Connection needs repair**, click **Repair connection**. To stop using the integration, click **Disconnect**, then restart the agent.
+
+Terminal equivalents:
+
+```sh
+magnitude connections sync hermes
+magnitude connections remove hermes
+```
+
+See [connection states](/integrations/overview#connection-states) if the agent is not detected or its configuration cannot be verified.
