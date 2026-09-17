@@ -147,7 +147,7 @@ jobs:
       MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
     needs: [preflight, build]
     if: needs.preflight.outputs.action == 'release'
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:

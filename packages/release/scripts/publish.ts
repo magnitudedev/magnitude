@@ -1,4 +1,5 @@
 import { verifyAppleReceipts } from "./apple/verify-receipts"
+import { uploadReleaseAssets } from "./github-upload"
 import { createHash } from "node:crypto"
 import { readdir, readFile, stat } from "node:fs/promises"
 import { resolve } from "node:path"
@@ -145,28 +146,15 @@ const local = new Map(await Promise.all([...expectedNames].map(async (name) => {
   }] as const
 })))
 
-// A draft is private and tied to this exact commit/version. Replacing its assets makes an
-// interrupted upload genuinely resumable without pretending native builds are reproducible.
-for (const asset of release.assets) {
-  await github(`/repos/${repository}/releases/assets/${asset.id}`, {
-    method: "DELETE",
-  })
-}
-const uploadUrl = release.upload_url.slice(0, release.upload_url.indexOf("{"))
-for (const [name, value] of local) {
-  const response = await fetch(`${uploadUrl}?name=${encodeURIComponent(name)}`, {
-    method: "POST",
-    headers: {
-      ...headers,
-      "content-type": "application/octet-stream",
-    },
-    body: Bun.file(value.path),
-    signal: AbortSignal.timeout(30 * 60_000),
-  })
-  if (!response.ok) {
-    throw new Error(`upload of ${name} returned HTTP ${response.status}`)
-  }
-}
+await Effect.runPromise(uploadReleaseAssets({
+  repository,
+  token,
+  releaseId: release.id,
+  tag: manifest.tag,
+  sourceCommit,
+  uploadUrl: release.upload_url.slice(0, release.upload_url.indexOf("{")),
+  files: [...local].map(([name, value]) => ({ name, ...value })),
+}))
 
 release = await github<GithubRelease>(
   `/repos/${repository}/releases/${release.id}`,
