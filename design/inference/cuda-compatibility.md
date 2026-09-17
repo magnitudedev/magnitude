@@ -46,8 +46,8 @@ publishes the inspected result as artifact truth. The configured architecture li
 compiler input and is not duplicated as a second compatibility declaration. An unknown PTX version
 has no implicit driver floor and fails publication.
 
-Cubins and additional target relations are not part of this contract until Magnitude actually
-ships them.
+Native cubins optimize execution without introducing another advertised compatibility floor;
+selection remains conservative against the retained PTX contract.
 
 ## Build matrix
 
