@@ -3,7 +3,7 @@ import {
   rm,
   stat,
 } from "node:fs/promises"
-import { basename, delimiter, dirname, resolve } from "node:path"
+import { basename, delimiter, dirname, parse, resolve } from "node:path"
 import { createHash } from "node:crypto"
 import { tmpdir } from "node:os"
 import { fileURLToPath } from "node:url"
@@ -287,7 +287,8 @@ export const buildIcnBinary = async ({
   const cargoTarget = rustTarget(target)
   // Cargo and CMake append deeply nested paths; MSVC still fails on long PDB/object paths.
   const targetDirectory = process.platform === "win32"
-    ? resolve(tmpdir(), `icn-${createHash("sha256").update(profile).digest("hex").slice(0, 12)}`)
+    ? resolve(parse(tmpdir()).root, "icn", createHash("sha256")
+      .update(`${tmpdir()}:${PROJECT_ROOT}:${profile}`).digest("hex").slice(0, 12))
     : resolve(PROJECT_ROOT, "inference/target", `release-${profile}`)
   if (clean) await rm(targetDirectory, { recursive: true, force: true })
 
