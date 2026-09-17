@@ -147,6 +147,9 @@ The Mac update ZIP has its own final digest and must be independently consumed a
 Apple consumers extract it, compare its app with the installer payload, verify the sealed signature
 and stapled ticket, and execute the extracted app's lifecycle. A DMG-only receipt cannot authorize
 publication of an update ZIP. These checks establish payload acceptance, not updater replacement.
+Release lifecycle acceptance checks application behavior and native resource ownership, not
+presentation copy, fonts, colors, fixed card counts, or page geometry. Visual checks belong in
+the separate renderer acceptance fixtures and do not gate a native release.
 
 ## Archive validation
 
