@@ -71,6 +71,9 @@ their completed state, size, and digest match the accepted candidate, removes in
 mismatched entries, and retries individual network/server failures with bounded backoff.
 Each retry reconciles remote state first, including when an upload succeeded but its response
 was lost. Failures retain the HTTP status, GitHub request identity, and bounded response details.
+Transfers expose byte progress and final transfer metrics, terminate after thirty seconds below
+one KiB per second, and have a three-minute total deadline. Every attempt uses a fresh connection;
+credentials are excluded from process arguments and progress logs.
 Baseline changes require refreshing preparation, not renumbering
 already-built candidates. A missing release or exact resumable draft selects the native release
 path; an exact public release selects hosted metadata registration. Orphan tags and mismatched

@@ -1,5 +1,5 @@
 import { verifyAppleReceipts } from "./apple/verify-receipts"
-import { uploadReleaseAssets } from "./github-upload"
+import { CurlReleaseUploadTransport, uploadReleaseAssets } from "./github-upload"
 import { createHash } from "node:crypto"
 import { readdir, readFile, stat } from "node:fs/promises"
 import { resolve } from "node:path"
@@ -154,7 +154,7 @@ await Effect.runPromise(uploadReleaseAssets({
   sourceCommit,
   uploadUrl: release.upload_url.slice(0, release.upload_url.indexOf("{")),
   files: [...local].map(([name, value]) => ({ name, ...value })),
-}))
+}).pipe(Effect.provide(CurlReleaseUploadTransport)))
 
 release = await github<GithubRelease>(
   `/repos/${repository}/releases/${release.id}`,
