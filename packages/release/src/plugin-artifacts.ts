@@ -287,10 +287,10 @@ export interface RegistryReadBack {
   readonly attempts: number;
   readonly interval: Duration.DurationInput;
 }
-/** npm's registry lags a fresh publish; sixty seconds of polling covers it. */
+/** npm's registry lags a fresh publish by minutes (2.5 observed); poll for ten. */
 export const REGISTRY_READ_BACK: RegistryReadBack = {
-  attempts: 20,
-  interval: "3 seconds",
+  attempts: 120,
+  interval: "5 seconds",
 };
 
 /**
