@@ -1,0 +1,10 @@
+# Stored float values are decoded by their element type. Transforms publish f32
+# before the destination's explicit storage conversion.
+fn import_weight[N](source: tensor[N] T, out: tensor[N] U, negative_exp: bool):
+  for row in parallel:
+    x = load(source[row:row+1])
+    y = tile[1] f32
+    for i in owned(y):
+      y[i] = f32(x[i])
+      if negative_exp: y[i] = -exp(y[i])
+    store(y, out[row:row+1])

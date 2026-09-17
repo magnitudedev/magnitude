@@ -1,0 +1,10 @@
+# Persist one prepared decode row after its fresh-value attention consumption.
+# Destination admission and logical sequence advancement belong to the engine.
+fn kv_append[T, KV, W](key: tensor[1, KV, W] A, value: tensor[1, KV, W] A,
+                      history_key: tensor[T, KV, W] A, history_value: tensor[T, KV, W] A,
+                      destination: index[T]):
+  for head in parallel:
+    kt = load(key[0, head])
+    vt = load(value[0, head])
+    store(kt, history_key[destination, head])
+    store(vt, history_value[destination, head])

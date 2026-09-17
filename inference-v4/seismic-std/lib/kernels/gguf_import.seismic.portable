@@ -1,0 +1,113 @@
+# GGUF residency codecs, ported from V3 GGUFCodec. Raw words and half views
+# alias the same uploaded bytes; no numerical conversion runs on the host.
+fn import_q4k[B](data: tensor[(B * 144 + 3) / 4] u32, halves: tensor[B * 72] f16, words: tensor[B * 32] u32, scale: tensor[B * 8] f32, bias: tensor[B * 8] f32):
+  for block in parallel:
+    packed = tile[32] u32
+    for w in owned(packed):
+      word = u32(0)
+      for c in range(8):
+        index = w * 8 + c
+        code = (((data[(block * 144 + 16 + index / 64 * 32 + index % 32) / 4] >> (8 * ((block * 144 + 16 + index / 64 * 32 + index % 32) % 4))) & 255) >> (index % 64 / 32 * 4)) & 15
+        word = word | (code << (4 * c))
+      packed[w] = word
+    store(packed, words[block * 32 : (block + 1) * 32])
+    scales = tile[8] f32
+    biases = tile[8] f32
+    for g in owned(scales):
+      low = ((data[(block * 144 + 4 + g % 4) / 4] >> (8 * ((block * 144 + 4 + g % 4) % 4))) & 255)
+      high = ((data[(block * 144 + 12 + g % 4) / 4] >> (8 * ((block * 144 + 12 + g % 4) % 4))) & 255)
+      local = low & 63
+      if g >= 4: local = (high & 15) | ((low >> 6) << 4)
+      scales[g] = f32(halves[block * 72]) * f32(local)
+    store(scales, scale[block * 8 : (block + 1) * 8])
+    for g in owned(biases):
+      low = ((data[(block * 144 + 8 + g % 4) / 4] >> (8 * ((block * 144 + 8 + g % 4) % 4))) & 255)
+      high = ((data[(block * 144 + 12 + g % 4) / 4] >> (8 * ((block * 144 + 12 + g % 4) % 4))) & 255)
+      local = low & 63
+      if g >= 4: local = (high >> 4) | ((low >> 6) << 4)
+      biases[g] = -f32(halves[block * 72 + 1]) * f32(local)
+    store(biases, bias[block * 8 : (block + 1) * 8])
+
+fn import_q5k[B](data: tensor[(B * 176 + 3) / 4] u32, halves: tensor[B * 88] f16, words: tensor[B * 64] u32, scale: tensor[B * 8] f32, bias: tensor[B * 8] f32):
+  for block in parallel:
+    packed = tile[64] u32
+    for w in owned(packed):
+      word = u32(0)
+      for c in range(4):
+        index = w * 4 + c
+        code = (((data[(block * 176 + 48 + index / 64 * 32 + index % 32) / 4] >> (8 * ((block * 176 + 48 + index / 64 * 32 + index % 32) % 4))) & 255) >> (index % 64 / 32 * 4)) & 15
+        code = code | (((((data[(block * 176 + 16 + index % 32) / 4] >> (8 * ((block * 176 + 16 + index % 32) % 4))) & 255) >> (index / 32)) & 1) << 4)
+        word = word | (code << (8 * c))
+      packed[w] = word
+    store(packed, words[block * 64 : (block + 1) * 64])
+    scales = tile[8] f32
+    biases = tile[8] f32
+    for g in owned(scales):
+      low = ((data[(block * 176 + 4 + g % 4) / 4] >> (8 * ((block * 176 + 4 + g % 4) % 4))) & 255)
+      high = ((data[(block * 176 + 12 + g % 4) / 4] >> (8 * ((block * 176 + 12 + g % 4) % 4))) & 255)
+      local = low & 63
+      if g >= 4: local = (high & 15) | ((low >> 6) << 4)
+      scales[g] = f32(halves[block * 88]) * f32(local)
+    store(scales, scale[block * 8 : (block + 1) * 8])
+    for g in owned(biases):
+      low = ((data[(block * 176 + 8 + g % 4) / 4] >> (8 * ((block * 176 + 8 + g % 4) % 4))) & 255)
+      high = ((data[(block * 176 + 12 + g % 4) / 4] >> (8 * ((block * 176 + 12 + g % 4) % 4))) & 255)
+      local = low & 63
+      if g >= 4: local = (high >> 4) | ((low >> 6) << 4)
+      biases[g] = -f32(halves[block * 88 + 1]) * f32(local)
+    store(biases, bias[block * 8 : (block + 1) * 8])
+
+fn import_q6k[B](data: tensor[(B * 210 + 3) / 4] u32, halves: tensor[B * 105] f16, words: tensor[B * 64] u32, scale: tensor[B * 16] f32):
+  for block in parallel:
+    packed = tile[64] u32
+    for w in owned(packed):
+      word = u32(0)
+      for c in range(4):
+        index = w * 4 + c
+        code = (((data[(block * 210 + index / 128 * 64 + index % 64) / 4] >> (8 * ((block * 210 + index / 128 * 64 + index % 64) % 4))) & 255) >> (index % 128 / 64 * 4)) & 15
+        code = code | (((((data[(block * 210 + 128 + index / 128 * 32 + index % 32) / 4] >> (8 * ((block * 210 + 128 + index / 128 * 32 + index % 32) % 4))) & 255) >> (index % 128 / 32 * 2)) & 3) << 4)
+        word = word | (code << (8 * c))
+      packed[w] = word
+    store(packed, words[block * 64 : (block + 1) * 64])
+    scales = tile[16] f32
+    for g in owned(scales):
+      local = i32(((data[(block * 210 + 192 + g) / 4] >> (8 * ((block * 210 + 192 + g) % 4))) & 255))
+      if local >= 128: local = local - 256
+      scales[g] = f32(halves[block * 105 + 104]) * f32(local)
+    store(scales, scale[block * 16 : (block + 1) * 16])
+
+fn import_q8_0[B](data: tensor[(B * 34 + 3) / 4] u32, halves: tensor[B * 17] f16, words: tensor[B * 8] u32, scale: tensor[B * 1] f16):
+  for block in parallel:
+    packed = tile[8] u32
+    for w in owned(packed):
+      word = u32(0)
+      for c in range(4):
+        index = w * 4 + c
+        code = ((data[(block * 34 + 2 + index) / 4] >> (8 * ((block * 34 + 2 + index) % 4))) & 255)
+        word = word | (code << (8 * c))
+      packed[w] = word
+    store(packed, words[block * 8 : (block + 1) * 8])
+    scales = tile[1] f16
+    for g in owned(scales):
+      scales[g] = halves[block * 17]
+    store(scales, scale[block * 1 : (block + 1) * 1])
+
+fn import_iq4_xs[B](data: tensor[(B * 136 + 3) / 4] u32, halves: tensor[B * 68] f16, words: tensor[B * 32] u32, scale: tensor[B * 8] f32):
+  for block in parallel:
+    packed = tile[32] u32
+    for w in owned(packed):
+      word = u32(0)
+      for c in range(8):
+        index = w * 8 + c
+        code = (((data[(block * 136 + 8 + index / 32 * 16 + index % 16) / 4] >> (8 * ((block * 136 + 8 + index / 32 * 16 + index % 16) % 4))) & 255) >> (index % 32 / 16 * 4)) & 15
+        word = word | (code << (4 * c))
+      packed[w] = word
+    store(packed, words[block * 32 : (block + 1) * 32])
+    scales = tile[8] f32
+    for g in owned(scales):
+      high = ((data[(block * 136 + 2) / 4] >> (8 * ((block * 136 + 2) % 4))) & 255) | (((data[(block * 136 + 3) / 4] >> (8 * ((block * 136 + 3) % 4))) & 255) << 8)
+      low = (((data[(block * 136 + 4 + g / 2) / 4] >> (8 * ((block * 136 + 4 + g / 2) % 4))) & 255) >> (g % 2 * 4)) & 15
+      local = i32(low | (((high >> (2 * g)) & 3) << 4)) - 32
+      scales[g] = f32(halves[block * 68]) * f32(local)
+    store(scales, scale[block * 8 : (block + 1) * 8])
+

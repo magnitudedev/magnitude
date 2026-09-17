@@ -1,0 +1,12 @@
+# The compact embedding publication precedes the model's F32 residual cast.
+fn embedding_row[V, K](table: tensor[V, K] T, token: index[V], out: tensor[1, K] A):
+  for row in parallel:
+    values = load(table[token])
+    decoded = tile[K] f32
+    for i in owned(decoded): decoded[i] = values[i]
+    store(decoded, out[row])
+
+fn cast_rows[M, K](input: tensor[M, K] T, out: tensor[M, K] U):
+  for row in parallel:
+    values = load(input[row])
+    store(values, out[row])

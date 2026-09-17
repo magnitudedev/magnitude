@@ -1,0 +1,166 @@
+# Tile assignment copies values; later mutation cannot alter the source tile.
+fn tile_copy(x: tensor[4] f32, out: tensor[4] f32):
+  t = load(x)
+  u = t
+  for i in owned(u): u[i] = 0.0
+  store(t, out)
+
+# A loop-carried tile retains its value while the next iteration allocates locals.
+fn loop_carried(out: tensor[1] f32):
+  m = tile[1] f32
+  a = tile[1] f32
+  for i in owned(m): m[i] = 1.0; a[i] = 0.0
+  for step in range(3):
+    n = tile[1] f32
+    for i in owned(n): n[i] = m[i] + 1.0
+    for i in owned(a): a[i] = m[i] + n[i]
+    m = n
+  store(a, out)
+
+# Existing scalar bindings merge through control flow; branch locals do not escape.
+fn branch_merge(out: tensor[1] f32, choose: bool):
+  value = 3.0
+  if choose:
+    value = 7.0
+  else:
+    value = 11.0
+  y = tile[1] f32
+  for i in owned(y): y[i] = value
+  store(y, out)
+
+# BF16 arithmetic publishes a BF16 value even when the next expression widens it.
+fn bf16_rounding(x: tensor[1] bf16, out: tensor[1] f32):
+  t = load(x)
+  y = tile[1] f32
+  for i in owned(y): y[i] = f32(t[i] * t[i])
+  store(y, out)
+
+# Producer substitution cannot move a read past mutation of its source tile.
+fn changed_source(x: tensor[4] f32, out: tensor[4] f32):
+  t = load(x)
+  y = tile[4] f32
+  for i in owned(y): y[i] = t[i] * 2.0
+  for i in owned(t): t[i] = 0.0
+  z = tile[4] f32
+  for i in owned(z): z[i] = y[i] + 1.0
+  store(z, out)
+
+fn mixed_scalars(out: tensor[1] f32, first: bool, a: f32, b: bf16, last: bool):
+  value = a + f32(b)
+  if first:
+    value += 10.0
+  if last:
+    value *= 10.0
+  y = tile[1] f32
+  for i in owned(y): y[i] = value
+  store(y, out)
+
+# A loaded value remains a snapshot even when its tensor backing is overwritten.
+fn large_snapshot(x: tensor[65] f32, out: tensor[65] f32):
+  t = load(x)
+  zero = tile[65] f32
+  for i in owned(zero): zero[i] = 0.0
+  store(zero, x)
+  y = tile[65] f32
+  for i in owned(y): y[i] = t[64 - i]
+  store(y, out)
+
+fn stream_snapshot(x: tensor[65] f32, out: tensor[1] f32):
+  acc = tile[1] f32
+  for i in owned(acc): acc[i] = 0.0
+  for t in load(x, over=0):
+    zero = tile[65] f32
+    for i in owned(zero): zero[i] = 0.0
+    store(zero, x)
+    total = reduce(t, 0, sum)
+    for i in owned(acc): acc[i] += total
+  store(acc, out)
+
+# Mutating a streamed tile does not mutate its source tensor.
+fn stream_mutation(x: tensor[65] f32, out: tensor[1] f32):
+  acc = tile[1] f32
+  for i in owned(acc): acc[i] = 0.0
+  for t in load(x, over=0):
+    for i in owned(t): t[i] = 0.0
+    total = reduce(t, 0, sum)
+    for i in owned(acc): acc[i] += total
+  store(acc, out)
+
+fn half_rounding(x: tensor[1] f16, out: tensor[1] f32, value: f16):
+  t = load(x)
+  y = tile[1] f32
+  for i in owned(y): y[i] = f32(t[i] * value)
+  store(y,out)
+
+fn bounded_index(x: tensor[4] f32, pos: index[4], out: tensor[1] f32):
+  t = load(x[pos : pos + 1])
+  store(t, out)
+
+fn reduction_extrema(x: tensor[3, 65] f32, minima: tensor[3] f32, maxima: tensor[3] f32, indices: tensor[3] i32):
+  t = load(x)
+  low = reduce(t, 1, min)
+  high = reduce(t, 1, max)
+  at = reduce(t, 1, argmax)
+  store(low, minima)
+  store(high, maxima)
+  store(at, indices)
+
+fn argmax_lookup(x: tensor[65] f32, out: tensor[1] f32, index: tensor[1] i32):
+  t = load(x)
+  at = reduce(t, 0, argmax)
+  value = tile[1] f32
+  winner = tile[1] i32
+  for i in owned(value): value[i] = t[at]; winner[i] = at
+  store(value, out)
+  store(winner, index)
+
+fn narrow_sum(x: tensor[4] bf16, h: tensor[4] f16, out: tensor[2] f32):
+  t = load(x)
+  u = load(h)
+  s = reduce(t, 0, sum, ordered=true)
+  r = reduce(u, 0, sum, ordered=true)
+  value = tile[2] f32
+  for i in owned(value):
+    if i == 0: value[i] = f32(s)
+    else: value[i] = f32(r)
+  store(value, out)
+
+fn integer_extrema(x: tensor[2, 33] i32, minima: tensor[2] i32, maxima: tensor[2] i32, indices: tensor[2] i32):
+  t = load(x)
+  low = reduce(t, 1, min)
+  high = reduce(t, 1, max)
+  at = reduce(t, 1, argmax)
+  store(low, minima)
+  store(high, maxima)
+  store(at, indices)
+
+fn ordered_large_sum(x: tensor[65] f32, b: tensor[65] bf16, h: tensor[65] f16, out: tensor[3] f32):
+  xt = load(x)
+  bt = load(b)
+  ht = load(h)
+  xs = reduce(xt, 0, sum, ordered=true)
+  bs = reduce(bt, 0, sum, ordered=true)
+  hs = reduce(ht, 0, sum, ordered=true)
+  value = tile[3] f32
+  for i in owned(value):
+    if i == 0: value[i] = xs
+    else:
+      if i == 1: value[i] = f32(bs)
+      else: value[i] = f32(hs)
+  store(value, out)
+
+fn explicit_fma(x: tensor[3] f32, out: tensor[2] f32):
+  t = load(x)
+  y = tile[2] f32
+  for i in owned(y):
+    if i == 0: y[i] = t[0] * t[1] + t[2]
+    else: y[i] = fma(t[0], t[1], t[2])
+  store(y, out)
+
+# Empty streams have no pieces; their body must not publish any effects.
+fn empty_stream(x: tensor[1] f32, out: tensor[1] f32):
+  acc = tile[1] f32
+  for i in owned(acc): acc[i] = 0.0
+  for t in load(x[0:0], over=0):
+    acc[0] += 1.0
+  store(acc, out)

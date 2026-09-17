@@ -1,0 +1,18 @@
+[package]
+name = "qwen35-harness"
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+
+[[bin]]
+name = "qwen35"
+path = "src/main.rs"
+required-features = ["metal-poc"]
+
+[features]
+metal-poc = []
+
+[dependencies]
+seismic-lang = { workspace = true }
+seismic-metal = { workspace = true }
+tokenizers = "0.22"

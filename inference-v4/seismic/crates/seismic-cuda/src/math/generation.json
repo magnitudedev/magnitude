@@ -1,0 +1,32 @@
+{
+  "compiler": "Ubuntu clang version 18.1.3 (1ubuntu1)\nTarget: aarch64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /usr/bin\n",
+  "flags": [
+    "-target",
+    "nvptx64-nvidia-cuda",
+    "-march=sm_80",
+    "-Xclang",
+    "-target-feature",
+    "-Xclang",
+    "-ptx83",
+    "-Xclang",
+    "-target-feature",
+    "-Xclang",
+    "+ptx70",
+    "-S",
+    "-O2",
+    "-ffp-contract=off",
+    "-fno-fast-math",
+    "-fno-builtin",
+    "-nostdinc",
+    "-Ibuild-headers",
+    "portable_math.c"
+  ],
+  "adapter_sha256": {
+    "portable_math.c": "f08071f064cb4b59de41076a9e82aefb318aebd0b026cde2db93bdea027748f3",
+    "build-headers/features.h": "c2d8b7699ad55dfdcd491b1aec9cfd8d398fc5ee9f2d1bc2b9d5c7a026b78d4a",
+    "build-headers/libm.h": "ad67b85a96effd567a31913312e82475f9ca9210447ea56608b6a8b4559de45b",
+    "build-headers/math.h": "b92cfd9e8f960410aee39e7af1ac976c22a16e47873167dad6fde5fdef4ce325",
+    "build-headers/stdint.h": "b92cfd9e8f960410aee39e7af1ac976c22a16e47873167dad6fde5fdef4ce325"
+  },
+  "ptx_sha256": "4c8f4a7965896612f8e2183b9dc3ec3de079fbb17c2d1fe9667454ad08c463ae"
+}

@@ -41,11 +41,14 @@ packages/acn-protocol/src/rpc-version.ts
 
 .humanlayer/tasks/
 
-# Seismic toolchain and standard library build output
-seismic/target/
-seismic/**/target/
-seismic-std/target/
-seismic-std/**/target/
-# Seismic tuning cache and device binaries
+# Seismic V4 build output and local validation evidence
+inference-v4/target/
+inference-v4/**/target/
+inference-v4/validation/results/
 .seismic-cache/
-seismic-qwen35/**/target/
+
+# Generated Seismic validation fixtures, reports, and measurements.
+inference-v4/validation/**/*.json
+inference-v4/validation/**/*.jsonl
+inference-v4/validation/**/*.ndjson
+inference-v4/validation/**/__pycache__/

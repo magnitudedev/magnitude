@@ -1,0 +1,19 @@
+[package]
+name = "seismic-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "seismic"
+path = "src/main.rs"
+
+[dependencies]
+seismic-lang.workspace = true
+seismic-metal.workspace = true
+seismic-accounting.workspace = true
+seismic-cpu.workspace = true
+seismic-cuda.workspace = true
+seismic-compiler.workspace = true
+
+seismic-realization.workspace = true

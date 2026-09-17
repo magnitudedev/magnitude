@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+  "engine",
+  "seismic-std",
+  "seismic/crates/seismic-lang",
+  "seismic/crates/seismic-accounting",
+  "seismic/crates/seismic-metal",
+  "seismic/crates/seismic-cli",
+  "seismic/crates/seismic-cpu",
+  "seismic/crates/seismic-compiler",
+  "seismic/crates/seismic-realization",
+  "seismic/crates/seismic-cuda",
+  "seismic/crates/seismic-runtime",
+  "validation/qwen35-poc/harness",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+seismic-std = { path = "seismic-std" }
+seismic-lang = { path = "seismic/crates/seismic-lang" }
+seismic-metal = { path = "seismic/crates/seismic-metal" }
+seismic-accounting = { path = "seismic/crates/seismic-accounting" }
+seismic-cpu = { path = "seismic/crates/seismic-cpu" }
+seismic-realization = { path = "seismic/crates/seismic-realization" }
+seismic-compiler = { path = "seismic/crates/seismic-compiler" }
+seismic-cuda = { path = "seismic/crates/seismic-cuda" }
+seismic-runtime = { path = "seismic/crates/seismic-runtime" }
+
+[profile.release]
+debug = 1
